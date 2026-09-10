@@ -855,6 +855,21 @@ type SyncManager struct {
 	// analogue of the blockBacklog guard. Read by handleCheckSyncPeer.
 	blockPrefetchWaiters atomic.Int64
 
+	// blockPrefetchReserved shadows how many bytes of blockPrefetchBudget are
+	// currently reserved, purely so the figure can be reported.
+	//
+	// It exists because golang.org/x/sync/semaphore does not expose its own
+	// occupancy, and that is why every consumer-stall report to date has been
+	// blind to the one budget that can silence every peer at once: a read-loop
+	// blocked in AcquireBlockPrefetch reads nothing further from its socket, so
+	// the peer goes quiet whatever it owes. The watchdog printed the window's
+	// byte budget instead, which is empty during exactly that fault.
+	//
+	// Written only alongside a successful acquire or the single release that
+	// hands bytes back, so it cannot drift from the semaphore it shadows. It
+	// changes no decision — nothing reads it but the report.
+	blockPrefetchReserved atomic.Int64
+
 	// The following fields are used for headers-first mode.
 	//
 	// headerMu is the single owner of headerList, startHeader and
@@ -6171,6 +6186,8 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 
 	// Fast path: budget available right now, no waiter accounting needed.
 	if sm.blockPrefetchBudget.TryAcquire(weight) {
+		sm.blockPrefetchReserved.Add(weight)
+
 		return weight, nil
 	}
 
@@ -6208,6 +6225,8 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 		removeInFlight()
 		return 0, err
 	}
+
+	sm.blockPrefetchReserved.Add(weight)
 
 	return weight, nil
 }
@@ -6291,6 +6310,7 @@ func (sm *SyncManager) ReleaseBlockPrefetchBytes(blockHash chainhash.Hash, weigh
 	sm.inFlightBlocksMu.Unlock()
 
 	sm.blockPrefetchBudget.Release(weight)
+	sm.blockPrefetchReserved.Add(-weight)
 }
 
 // noteCommittedHeight records the height of a block that has just joined the

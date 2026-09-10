@@ -97,6 +97,25 @@ type consumerWait struct {
 	// blocks downloaded".
 	parked int
 
+	// downloadBudget, downloadHeld and downloadWaiters describe the byte budget
+	// that admits a block off the wire, which is a DIFFERENT budget from the
+	// window's and the one this report was missing.
+	//
+	// It is the budget that can silence every peer at once. A read-loop blocked
+	// acquiring it reads nothing further from its socket, so that peer stops
+	// delivering whatever it owes, and eight quiet peers look exactly like eight
+	// peers with nothing to send. The wedge this whole file was written for, at
+	// height 754,895 on 2026-09-08, was thirteen goroutines holding weight here
+	// with two read-loops blocked in the acquire — and the report described the
+	// window instead, which is empty during precisely that fault.
+	//
+	// downloadBudget is zero when prefetch is disabled, which is a real state
+	// (synchronous ingestion) rather than a missing reading, so the report says
+	// nothing at all rather than inventing a constraint of zero.
+	downloadBudget  int64
+	downloadHeld    int64
+	downloadWaiters int64
+
 	// drainDeclines is how many turns have been offered to the drain and given
 	// back. It is the fact the first version of this report was missing: a drain
 	// that walks its queue, rules every parent out and drops them leaves no
@@ -136,6 +155,12 @@ func (sm *SyncManager) publishConsumerWait(now time.Time, queueArmOpen bool, pen
 
 	if sm.blockPark != nil {
 		w.parked = sm.blockPark.Len()
+	}
+
+	if sm.blockPrefetchBudget != nil {
+		w.downloadBudget = sm.blockPrefetchBudgetBytes
+		w.downloadHeld = sm.blockPrefetchReserved.Load()
+		w.downloadWaiters = sm.blockPrefetchWaiters.Load()
 	}
 
 	w.drainDeclines = sm.drainDeclined.Load()
@@ -299,6 +324,25 @@ func (w *consumerWait) describe(now time.Time) string {
 	b.WriteString("; ")
 	b.WriteString(strconv.Itoa(w.parked))
 	b.WriteString(" blocks parked")
+
+	// The download budget, and the read-loops parked on it. Said last of the
+	// capacity figures because it is the one a reader has never seen before, and
+	// said at all because a full one explains a silence the rest of this line
+	// cannot: every other figure here describes work the node has already taken
+	// in, and this is the gate that decides whether any more arrives.
+	if w.downloadBudget > 0 {
+		b.WriteString("; ")
+		b.WriteString(strconv.FormatInt(w.downloadHeld, 10))
+		b.WriteString(" of ")
+		b.WriteString(strconv.FormatInt(w.downloadBudget, 10))
+		b.WriteString(" download budget bytes reserved")
+
+		if w.downloadWaiters > 0 {
+			b.WriteString(" with ")
+			b.WriteString(strconv.FormatInt(w.downloadWaiters, 10))
+			b.WriteString(" peer read loops blocked on it, so those peers are reading nothing at all")
+		}
+	}
 
 	// Last because it is cumulative rather than a snapshot, and it was collected
 	// but never printed: the field's own comment calls it the fact the first
