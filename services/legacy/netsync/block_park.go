@@ -40,6 +40,16 @@ const (
 	// 20 and falls towards 1 as blocks grow).
 	maxParkedEntries = 4096
 
+	// parentMissingRetryAfter is how long a parked block waits before the drain
+	// offers it again after a commit that failed for a missing parent.
+	//
+	// Short enough that a parent arriving normally is acted on promptly, and long
+	// enough that one uncommittable block cannot spend every turn. The park sweep
+	// runs every thirty seconds and re-offers such a block the moment its parent
+	// really is stored, so this is the drain's own floor rather than the only
+	// route back.
+	parentMissingRetryAfter = 5 * time.Second
+
 	// parkStuckThreshold is how old a parked block must be before the sweep
 	// spends an RPC asking whether its parent is in the chain after all. A
 	// missing parent is not the only thing that surfaces as ErrBlockNotFound,
@@ -198,6 +208,22 @@ type parkedBlock struct {
 	// Restore, RestoreAll and Recover all insert entries whose write has already
 	// landed, so the zero value is correct for them.
 	writing bool
+	// parentMissingAt is when a commit of this block last failed because its
+	// parent was not in the chain, zero if it never has.
+	//
+	// It exists to stop a hot retry. A commit that fails this way keeps the
+	// blob and leaves the parent queued for a drain, so the very next turn
+	// picks the same block and fails the same way. Measured on mainnet on
+	// 2026-09-10 at 14:15: 1,494 of the last 3,000 log lines were that one
+	// failure, about seven a second, on the goroutine that commits blocks — and
+	// a second parked block whose parent WAS the tip never got a turn, so the
+	// node ran flat out committing nothing.
+	//
+	// A parent that is genuinely missing is not going to appear within a turn,
+	// so waiting before asking again costs nothing and hands the turn to a block
+	// that can actually be committed.
+	parentMissingAt time.Time
+
 	// parentDrained records that a drain for this block's parent ran while the
 	// block was still being written, and was refused. The drain cannot come
 	// back on its own — it is driven by a commit that has already happened — so
@@ -832,6 +858,13 @@ func (p *blockPark) committableChildLocked(child chainhash.Hash) (*parkedBlock, 
 	if entry.writing {
 		entry.parentDrained = true
 
+		return entry, false
+	}
+
+	// Failed for a missing parent within the backoff, so not worth the turn. The
+	// sweep re-offers it once the parent is genuinely stored, and the drain will
+	// pick it up on its own after the backoff if nothing else does.
+	if !entry.parentMissingAt.IsZero() && time.Since(entry.parentMissingAt) < parentMissingRetryAfter {
 		return entry, false
 	}
 

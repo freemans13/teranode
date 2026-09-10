@@ -318,6 +318,15 @@ func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 	}
 
 	if d.blob == parkBlobKeep {
+		// Stamped before the disposition is carried out, so the entry that goes
+		// back into the park carries it. Without this the parent stays queued
+		// for a drain and the very next turn picks this same block again: 1,494
+		// of 3,000 log lines on mainnet on 2026-09-10, about seven a second,
+		// while a block whose parent was the tip waited behind it.
+		if d.reason == parkDispositionParentGone.reason {
+			entry.parentMissingAt = time.Now()
+		}
+
 		sm.logger.Infof("[commitParkedBlock][%s] leaving the block parked (%s), parent %s: %v", entry.hash, d.reason, entry.prevBlock, err)
 	} else {
 		sm.logger.Errorf("[commitParkedBlock][%s] giving the block up (%s): %v", entry.hash, d.reason, err)
