@@ -358,8 +358,19 @@ func (s *peerSyncState) sampleThroughput(p *peerpkg.Peer) {
 // be fine is one duplicate block, and the cost of not racing a silent one is the
 // stall the race exists to break.
 func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
+	_, pulling := s.readDelta(minSpeed)
+
+	return pulling
+}
+
+// readDelta is isPullingBytes with the measurement it made, so a caller that
+// declines on the answer can log what the answer was made of. The frontier race
+// needs that: the same "an owner is pulling bytes" decline covers an owner
+// genuinely mid-transfer and an association total moving for some other reason,
+// and those want different fixes.
+func (s *peerSyncState) readDelta(minSpeed uint64) (uint64, bool) {
 	if s == nil || s.throughputTicks.Load() < 2 {
-		return false
+		return 0, false
 	}
 
 	cur := s.assocReadBytes.Load()
@@ -369,7 +380,7 @@ func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
 	// dying between samples drops the total. A decrease is the opposite of
 	// progress, not a wrapped-around healthy figure.
 	if cur < prev {
-		return false
+		return 0, false
 	}
 
 	delta := cur - prev
@@ -378,7 +389,7 @@ func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
 	// configured as 0, and a bare comparison against 0 would make a peer that
 	// sent nothing look busy and switch the race off altogether.
 	if delta == 0 {
-		return false
+		return 0, false
 	}
 
 	// Multiplied rather than divided: `delta/seconds >= minSpeed` truncates, and
@@ -390,7 +401,7 @@ func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
 		seconds = 1
 	}
 
-	return delta >= minSpeed*seconds
+	return delta, delta >= minSpeed*seconds
 }
 
 // noteBestKnownHeight raises the peer's best known height to h, and never lowers
@@ -2910,6 +2921,10 @@ func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpo
 	// reinsertHeaderLocked's caller — so a hash in the list is a hash in the
 	// index. Looking it up here is what makes the removal independent of
 	// position.
+	// Whether the lookup below has already said what the frontier should be.
+	// Anything it does not settle has to fall through to the republish after it.
+	frontierSettled := false
+
 	if e := sm.headerIndex[blockHash]; e != nil {
 		if node, ok := e.Value.(*headerNode); ok && node.hash != nil {
 			wasFront := e == sm.headerList.Front()
@@ -2943,8 +2958,32 @@ func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpo
 				} else {
 					sm.publishFrontierLocked(time.Now())
 				}
+
+				frontierSettled = true
 			}
 		}
+	}
+
+	// Nothing above spoke for the frontier, which happens in two ways: the
+	// header had already left the list, so there was nothing to look up, or it
+	// was behind the front, so removing it left the front alone. In both the
+	// frontier is whatever it was before this commit, and it can already be
+	// naming the block that has just committed. The racer chases whatever the
+	// frontier names, so a stale one sends peers after a block this node holds.
+	//
+	// Measured on mainnet: block 762018 committed at 00:53:46 and was raced four
+	// more times over the next five and a half minutes. Its frontier was stamped
+	// eight seconds before the commit and never moved, because by the time the
+	// block committed its header had gone.
+	//
+	// This refreshes rather than republishes, and the difference matters. A full
+	// publish clears the frontier when the list has no front to name, and a
+	// clear takes the racers with it and restarts the outstanding clock on the
+	// next publish, which would delay the very race this is meant to keep
+	// pointed at the right block. Naming a real front is always an improvement;
+	// having no front to name is not a reason to forget the one we had.
+	if !frontierSettled {
+		sm.refreshFrontierLocked(time.Now())
 	}
 
 	sm.headerMu.Unlock()
@@ -5559,8 +5598,15 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		}
 	}
 
-	// by default, we do not process transactions / blocks
-	// only when we are in the running state we process transaction and new block messages
+	// Transaction announcements only. Blocks are accepted in every state, and
+	// have to be: past the last checkpoint headers-first mode is off, and then an
+	// inv is the only way this node hears that a block exists. The Kafka
+	// listeners downstream are wired the same way, with the block listener
+	// unconditionally enabled and the transaction listener gated on RUNNING.
+	//
+	// The name and the state read stay as they are; only the comment was wrong,
+	// and it claimed to cover blocks for long enough that two readers reported
+	// the switch below as a missing gate.
 	processInvs := false
 
 	fsmState, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
@@ -5687,10 +5733,16 @@ outside:
 func (sm *SyncManager) processInvMsg(i int, iv *wire.InvVect, processInvs bool, peer *peerpkg.Peer, exists bool, state *peerSyncState, lastBlock int) {
 	switch iv.Type {
 	case wire.InvTypeBlock:
+		// Deliberately empty, and Go does not fall through. A block
+		// announcement is taken in every FSM state, because past the last
+		// checkpoint headers-first mode is off and an inv is then the only way
+		// this node learns a block exists. Gating it on RUNNING would leave a
+		// node that is catching blocks with no block discovery at all.
 	case wire.InvTypeTx:
 		if !processInvs {
-			// If we are not in running state, we are not interested in new transaction or block messages
-			sm.logger.Debugf("[handleInvMsg] Ignoring inv message from %s, not in running state", peer)
+			// A transaction we are not going to validate yet is a transaction
+			// not worth fetching. Blocks are the other case above.
+			sm.logger.Debugf("[handleInvMsg] Ignoring transaction inv from %s, not in running state", peer)
 			return
 		}
 	default:

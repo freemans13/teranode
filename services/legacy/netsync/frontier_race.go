@@ -137,6 +137,33 @@ func (sm *SyncManager) publishFrontierLocked(now time.Time) {
 	sm.setFrontier(*node.hash, node.height, now)
 }
 
+// refreshFrontierLocked names the list's front as the frontier if there is one
+// to name, and leaves the frontier untouched if there is not.
+//
+// It is publishFrontierLocked without the clear. Callers that know the frontier
+// has just become meaningless want the clear; a caller that only suspects the
+// frontier is stale wants this, because clearing drops the racers registered
+// against it and makes the next publish restart the outstanding clock from
+// zero. Publishing the same hash again is already a no-op inside setFrontier,
+// so on a front that has not moved this costs one comparison.
+func (sm *SyncManager) refreshFrontierLocked(now time.Time) {
+	if !sm.headersFirstMode.Load() || sm.headerList == nil {
+		return
+	}
+
+	front := sm.headerList.Front()
+	if front == nil || front == sm.startHeader {
+		return
+	}
+
+	node, ok := front.Value.(*headerNode)
+	if !ok || node.hash == nil || node.isAnchor {
+		return
+	}
+
+	sm.setFrontier(*node.hash, node.height, now)
+}
+
 // clearFrontier records that there is currently no block whose absence is
 // holding up sync.
 func (sm *SyncManager) clearFrontier() {
@@ -381,11 +408,32 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 			continue
 		}
 
-		if state, ok := sm.peerStates.Get(owner); ok && state.isPullingBytes(sm.minSyncPeerNetworkSpeed) {
-			sm.noteRaceDeclined("an owner is visibly pulling bytes, so it is slow rather than stalled")
-
-			return none, 0, nil, false
+		state, ok := sm.peerStates.Get(owner)
+		if !ok {
+			continue
 		}
+
+		delta, pulling := state.readDelta(sm.minSyncPeerNetworkSpeed)
+		if !pulling {
+			continue
+		}
+
+		// Say what was measured, not just that something was. This decline is
+		// the one that switches the race off, and on mainnet it did so 1,663
+		// times in a row across a four-and-a-half-minute stall while the sync
+		// peer's own socket had read nothing for twelve minutes. Two very
+		// different faults produce that line — an owner genuinely mid-transfer
+		// on some OTHER block it owes, or an association-wide byte total moving
+		// for a reason that is not this peer's socket — and they need different
+		// fixes. The four figures below tell them apart: bytes over the tick,
+		// how long since that socket last read anything, and how many blocks
+		// the owner owes besides this one.
+		sm.noteRaceDeclinedAs("an owner is visibly pulling bytes",
+			fmt.Sprintf("an owner is visibly pulling bytes, so it is slow rather than stalled: %s pulled %d bytes over the last %s (floor %d/s), last read %s ago, and owes %d blocks",
+				owner, delta, frontierCheckInterval, sm.minSyncPeerNetworkSpeed,
+				time.Since(owner.LastRecv()).Round(time.Second), sm.blockDownloads.CountForPeer(owner)))
+
+		return none, 0, nil, false
 	}
 
 	// Counted so the decline can say why nobody qualified, rather than only that
@@ -706,8 +754,6 @@ func (sm *SyncManager) BlockRacedTo(peer *peerpkg.Peer, blockHash *chainhash.Has
 // way to tell which condition had refused it; guessing cost four wrong theories
 // in a single day. A rate-limited line that names the condition ends that.
 func (sm *SyncManager) noteRaceDeclined(reason string) {
-	now := time.Now()
-
 	// Keyed on the first few words rather than the whole string, because two of
 	// the reasons name the block and a per-block key would defeat the rate limit
 	// and fill the log.
@@ -715,6 +761,16 @@ func (sm *SyncManager) noteRaceDeclined(reason string) {
 	if i := strings.Index(key, " block "); i > 0 {
 		key = key[:i]
 	}
+
+	sm.noteRaceDeclinedAs(key, reason)
+}
+
+// noteRaceDeclinedAs is noteRaceDeclined with the rate-limit key given rather
+// than derived. A reason that carries measurements has a different string every
+// time, and deriving the key from it would give every measurement its own
+// bucket and put the whole thing in the log once per tick.
+func (sm *SyncManager) noteRaceDeclinedAs(key, reason string) {
+	now := time.Now()
 
 	sm.raceDeclinedMu.Lock()
 	defer sm.raceDeclinedMu.Unlock()

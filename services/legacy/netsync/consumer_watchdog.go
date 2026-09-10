@@ -300,6 +300,18 @@ func (w *consumerWait) describe(now time.Time) string {
 	b.WriteString(strconv.Itoa(w.parked))
 	b.WriteString(" blocks parked")
 
+	// Last because it is cumulative rather than a snapshot, and it was collected
+	// but never printed: the field's own comment calls it the fact the first
+	// version of this report was missing, and the report went on missing it. A
+	// drain that walks its queue, rules every parent out and drops them leaves
+	// no trace in the queue length, so without this a loop that has just thrown
+	// a turn away is indistinguishable from a loop with no work.
+	if w.drainDeclines > 0 {
+		b.WriteString("; the drain has declined ")
+		b.WriteString(strconv.FormatInt(w.drainDeclines, 10))
+		b.WriteString(" turns since start")
+	}
+
 	return b.String()
 }
 
