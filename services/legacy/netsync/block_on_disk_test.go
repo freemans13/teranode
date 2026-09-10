@@ -5,7 +5,9 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,7 +46,9 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 	t.Run("the block is adopted and a drain is asked for", func(t *testing.T) {
 		h := withConsumer(t)
 
-		parent := chainhash.Hash{0xaa}
+		// A parent the harness has in its header list, because an invented one is
+		// now correctly refused as unreachable.
+		parent := h.blocks[1].MsgBlock().BlockHash()
 		body := bodyFor(parent, 1<<20)
 
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
@@ -62,7 +66,7 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 	t.Run("the delivering peer is recorded", func(t *testing.T) {
 		h := withConsumer(t)
 
-		body := bodyFor(chainhash.Hash{0xbb}, 4096)
+		body := bodyFor(h.blocks[1].MsgBlock().BlockHash(), 4096)
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
 
 		entry, ok := h.sm.blockPark.Take(body.Hash)
@@ -74,7 +78,7 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 	t.Run("a re-delivered body is not adopted twice", func(t *testing.T) {
 		h := withConsumer(t)
 
-		body := bodyFor(chainhash.Hash{0xcc}, 2048)
+		body := bodyFor(h.blocks[1].MsgBlock().BlockHash(), 2048)
 
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
@@ -100,7 +104,7 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 		}
 		h.sm.blockPark.mu.Unlock()
 
-		body := bodyFor(chainhash.Hash{0xdd}, 512)
+		body := bodyFor(h.blocks[1].MsgBlock().BlockHash(), 512)
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
 
 		require.False(t, h.sm.blockPark.Has(body.Hash))
@@ -113,7 +117,75 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 		h.sm.blockPark = nil
 
 		require.NotPanics(t, func() {
-			h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: bodyFor(chainhash.Hash{0xee}, 8), peer: h.peer})
+			h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: bodyFor(h.blocks[1].MsgBlock().BlockHash(), 8), peer: h.peer})
 		}, "a nil park is how every other call site reads the park being switched off")
+	})
+}
+
+// TestHandleBlockOnDiskMsg_RefusesAnUnreachableParent is the regression test for
+// a fault this path caused on mainnet on 2026-09-10.
+//
+// Three streamed blocks whose parents were never in the header list produced
+// 23,111 "the parent is missing again" retries in two hours, against zero on each
+// of the three preceding days. Each retry is a store lookup on the goroutine that
+// commits blocks, so an unreachable block competes with the work the operator is
+// waiting for rather than merely sitting there.
+//
+// The decoded path never had to ask this, because a block only reaches its park
+// call after the header list has been walked for it. Streaming skips that walk by
+// design, so the question moves here.
+func TestHandleBlockOnDiskMsg_RefusesAnUnreachableParent(t *testing.T) {
+	bodyFor := func(prev chainhash.Hash) peerpkg.BlockBody {
+		header := wire.BlockHeader{Version: 1, PrevBlock: prev}
+
+		return peerpkg.BlockBody{Header: header, TxCount: 1, Size: 4096, Hash: header.BlockHash()}
+	}
+
+	t.Run("a parent in neither the chain nor the header list is refused", func(t *testing.T) {
+		h := newParkWiringHarness(t, true)
+		h.sm.drainAsync.Store(true)
+
+		// The harness answers "no such block" for every header lookup, and the
+		// header list holds only the harness's own three blocks, so this parent
+		// is in neither.
+		body := bodyFor(chainhash.Hash{0x9e})
+
+		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
+
+		require.False(t, h.sm.blockPark.Has(body.Hash),
+			"an unreachable block must not be held, or the drain offers it to the chain forever")
+		require.Empty(t, h.sm.drainQueue,
+			"and no drain should be asked for on its behalf")
+	})
+
+	t.Run("a parent still ahead of us in the header list is accepted", func(t *testing.T) {
+		h := newParkWiringHarness(t, true)
+		h.sm.drainAsync.Store(true)
+
+		// The harness seeds the header list with its three blocks, so any of
+		// them is a parent we have asked for and will get.
+		parent := h.blocks[1].MsgBlock().BlockHash()
+		body := bodyFor(parent)
+
+		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
+
+		require.True(t, h.sm.blockPark.Has(body.Hash),
+			"a block waiting on a parent we asked for is exactly what the park is for")
+	})
+
+	t.Run("a store fault reads as reachable rather than throwing the download away", func(t *testing.T) {
+		h := newParkWiringHarness(t, true)
+		h.sm.drainAsync.Store(true)
+
+		h.noSuchBlock.Unset()
+		h.client.On("GetBlockHeader", mock.Anything, mock.Anything).
+			Return(nil, nil, errors.NewStorageError("the store is not answering"))
+
+		body := bodyFor(chainhash.Hash{0x9f})
+
+		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
+
+		require.True(t, h.sm.blockPark.Has(body.Hash),
+			"our own storage being briefly unwell says nothing about the block, and discarding it would pay for the download twice")
 	})
 }
