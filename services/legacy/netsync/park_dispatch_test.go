@@ -202,9 +202,18 @@ func TestParkDispatch_ADispatchedParkedBlockNeverTouchesTheBacklog(t *testing.T)
 //
 // A resolved parent would make HandleBlockDirect take the parent's word for the
 // height and skip the chain lookup, and that lookup is the thing that enforces
-// "never hand block validation a block whose parent is not committed". A
-// non-empty frontier would mean the server-side window already holds a legacy
-// entry, so an unwindowed parked block would be refused admission there.
+// "never hand block validation a block whose parent is not committed". An
+// UNWINDOWED parked block arriving into a non-empty frontier would mean the
+// server-side window already holds a legacy entry, so it would be refused
+// admission there.
+//
+// Being windowed was a third wrong shape and is not one any more. A drained
+// dispatch on the window route with a known height is now marked windowed
+// deliberately, so it can run beside another block instead of waiting for the
+// window to empty, which is what left the validator idle between every block
+// drained from the park. TestParkedDispatchMayBeWindowed covers the accepted
+// case; the emptiness rule below still applies to a dispatch that is not
+// windowed, which is what the height-zero case remains.
 func TestParkDispatch_TheWrongShapeIsRefusedAndTheEntryRestored(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -215,10 +224,6 @@ func TestParkDispatch_TheWrongShapeIsRefusedAndTheEntryRestored(t *testing.T) {
 			break_: func(d *blockDispatch, _ *blockDispatcher) {
 				d.parent = &inflightParent{height: 750_699}
 			},
-		},
-		{
-			name:   "marked windowed",
-			break_: func(d *blockDispatch, _ *blockDispatcher) { d.windowed = true },
 		},
 		{
 			name: "a non-empty frontier",

@@ -2679,7 +2679,19 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 		// One admission per turn, chosen rather than raced. The choice itself is
 		// nextAdmission, so it can be read and tested on its own.
 		canLive := pending != nil && bd.canDispatch(pending)
-		drainOpen := len(sm.drainQueue) > 0 && bd.frontierEmpty()
+		// Anything queued makes the drain a candidate. Capacity is drainStep's
+		// own business: it peeks the block, tests it with the same canDispatch
+		// the live arm uses, and declines the turn without cost if there is no
+		// room, which the branch below already handles.
+		//
+		// This used to require an empty window as well, and that requirement is
+		// what left the validator idle between every block drained from the
+		// park. It was a consequence of a parked dispatch never being windowed
+		// rather than a rule of its own: an unwindowed block is admitted only
+		// into an empty window, so demanding one here merely restated it. With a
+		// drained block able to be windowed, restating it would keep the fault
+		// while looking like it had been fixed.
+		drainOpen := len(sm.drainQueue) > 0
 
 		choice := nextAdmission(sm.lastDispatchWasDrained, canLive, drainOpen)
 
