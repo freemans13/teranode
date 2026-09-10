@@ -240,6 +240,32 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		peer:      msg.peer,
 	}
 
+	// A parked block is only ever committable if its parent is something this
+	// node is going to get: already in the chain, or still ahead of us in the
+	// header list because we asked for it. A block above a hole that is in
+	// neither is unreachable, and the drain will keep offering it to the chain
+	// for as long as it is held.
+	//
+	// Measured on mainnet on 2026-09-10, and caused by this path: three streamed
+	// blocks whose parents were never in the header list produced 23,111 "the
+	// parent is missing again" retries in two hours, against zero on each of the
+	// three preceding days. Each retry is a store lookup on the goroutine that
+	// commits blocks, so an unreachable block does not merely sit there, it
+	// competes with the work the operator is waiting for.
+	//
+	// The decoded path never had to ask this question, because a block only
+	// reaches its park call after handleBlockMsg has walked the header list for
+	// it. Streaming skips that walk by design, which is the point of it, so the
+	// question has to be asked here instead.
+	if !sm.parentIsReachable(entry.prevBlock) {
+		sm.logger.Infof("[blockOnDisk][%s] parent %s is neither in the chain nor in the header list, so this block is unreachable; discarding the body",
+			entry.hash, entry.prevBlock)
+
+		sm.blockPark.Delete(sm.ctx, entry)
+
+		return
+	}
+
 	// Said at info, once per streamed block, because without it there is no way
 	// to tell from a running node whether this path is carrying anything at all.
 	// Both paths end with a body in the same store under the same name, so the
@@ -262,4 +288,38 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	}
 
 	sm.scheduleDrain(entry.prevBlock, 0)
+}
+
+// parentIsReachable reports whether a parked block's parent is something this
+// node will end up holding: in the chain now, or still ahead of us in the header
+// list because we asked for it.
+//
+// Consumer goroutine only. It takes headerMu for the index lookup alone and
+// releases it before the store call, because every other reader of the list
+// holds that lock and a blocking client call underneath it would serialise the
+// whole sync path.
+func (sm *SyncManager) parentIsReachable(parent chainhash.Hash) bool {
+	sm.headerMu.Lock()
+	_, inList := sm.headerIndex[parent]
+	sm.headerMu.Unlock()
+
+	if inList {
+		return true
+	}
+
+	if sm.blockchainClient == nil {
+		return true
+	}
+
+	// Not in the list, so the only way it is reachable is that we hold it
+	// already. A store error reads as reachable: refusing a block because our
+	// own storage was briefly unwell would throw away a completed download over
+	// a condition that is over in seconds, which is the same judgement the
+	// drain's retry-later disposition makes.
+	_, _, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &parent)
+	if err == nil {
+		return true
+	}
+
+	return !errors.Is(err, errors.ErrBlockNotFound) && !errors.Is(err, errors.ErrNotFound)
 }
