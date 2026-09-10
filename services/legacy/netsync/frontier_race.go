@@ -420,18 +420,28 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 
 		// Say what was measured, not just that something was. This decline is
 		// the one that switches the race off, and on mainnet it did so 1,663
-		// times in a row across a four-and-a-half-minute stall while the sync
-		// peer's own socket had read nothing for twelve minutes. Two very
-		// different faults produce that line — an owner genuinely mid-transfer
-		// on some OTHER block it owes, or an association-wide byte total moving
-		// for a reason that is not this peer's socket — and they need different
-		// fixes. The four figures below tell them apart: bytes over the tick,
-		// how long since that socket last read anything, and how many blocks
-		// the owner owes besides this one.
+		// times in a row across a four-and-a-half-minute stall.
+		//
+		// The two figures that matter are the byte delta and the number of
+		// blocks the owner owes, because together they show what the guard
+		// cannot: a peer pulling 4 MB a second while owing eight blocks is
+		// busy on SOME block, and the guard has no way to say whether it is
+		// this one. Measured on mainnet 2026-09-10: 21,578,085 bytes over one
+		// five-second tick against an eight-block debt.
+		//
+		// The last-read age is the PRIMARY stream's, which under the
+		// multistream protocol is the control connection; block bodies arrive
+		// on a data stream that has its own socket and its own stamp, and the
+		// association byte total above sums both. So an idle figure here is
+		// normal during a healthy block download and is not evidence of a
+		// silent peer. It is reported because a stamp that is fresh narrows the
+		// bytes to this socket, and there is no association-wide equivalent to
+		// report instead.
 		sm.noteRaceDeclinedAs("an owner is visibly pulling bytes",
-			fmt.Sprintf("an owner is visibly pulling bytes, so it is slow rather than stalled: %s pulled %d bytes over the last %s (floor %d/s), last read %s ago, and owes %d blocks",
+			fmt.Sprintf("an owner is visibly pulling bytes, so it is slow rather than stalled: %s pulled %d association bytes over the last %s (floor %d/s), owes %d blocks, and its control stream last read %s ago",
 				owner, delta, frontierCheckInterval, sm.minSyncPeerNetworkSpeed,
-				time.Since(owner.LastRecv()).Round(time.Second), sm.blockDownloads.CountForPeer(owner)))
+				sm.blockDownloads.CountForPeer(owner),
+				time.Since(owner.LastRecv()).Round(time.Second)))
 
 		return none, 0, nil, false
 	}
