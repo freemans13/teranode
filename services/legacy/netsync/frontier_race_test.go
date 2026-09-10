@@ -232,6 +232,16 @@ func TestFrontierRaceTarget(t *testing.T) {
 	// pulling makes a peer look like it is actively bringing bytes in, in the
 	// same terms samplePeerThroughput records: two samples a tick apart with a
 	// healthy delta between them.
+	// pulling makes a peer look mid-transfer OF THE FRONTIER: bytes moving, and a
+	// demonstrated claim on the chain that reaches it.
+	//
+	// The claim is not decoration. Busy is only evidence about this block if the
+	// owner has the block, and the scheduler will hand a block to a peer that
+	// never claimed it, so an owner's traffic can be somebody else's blocks
+	// entirely. Without the claim these cases would be asserting that a peer with
+	// no demonstrated interest in the frontier can suppress the one mechanism
+	// that would fetch it, which is the fault that cost 80% of long-gap time on
+	// mainnet on 2026-09-10.
 	pulling := func(t *testing.T, sm *SyncManager, p *peerpkg.Peer) {
 		t.Helper()
 
@@ -241,6 +251,12 @@ func TestFrontierRaceTarget(t *testing.T) {
 		state.assocReadBytesLastTick.Store(0)
 		state.assocReadBytes.Store(64 << 20)
 		state.throughputTicks.Store(2)
+
+		sm.frontierMu.Lock()
+		frontierHeight := sm.frontierHeight
+		sm.frontierMu.Unlock()
+
+		state.noteProvenClaim(chainhash.Hash{0xfe}, frontierHeight)
 	}
 
 	// setup builds a manager in the state where a race SHOULD happen, so each
