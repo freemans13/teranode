@@ -111,10 +111,12 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 	var (
 		gotHash chainhash.Hash
 		gotBody []byte
+		gotN    int64
 	)
 
 	blockBodySink = func(h chainhash.Hash, r io.Reader, n int64) error {
 		gotHash = h
+		gotN = n
 		b, err := io.ReadAll(r)
 		gotBody = b
 
@@ -139,8 +141,17 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 	require.Equal(t, int64(len(payload)), onDisk.Size)
 
 	require.Equal(t, hash, gotHash, "the sink is keyed by the block hash")
-	require.Equal(t, payload[80:], gotBody,
-		"the sink gets everything after the header, byte for byte, including the transaction count")
+
+	// The sink gets the WHOLE block, header included, and this changed: it used
+	// to get only the bytes after the header. The park is where a streamed body
+	// lands, and it reads a body back with the same deserializer it uses for a
+	// block it wrote itself, which expects a complete serialized block. A
+	// header-less file could never have been read back at all, so the old
+	// contract could not have worked once anything was actually installed.
+	require.Equal(t, payload, gotBody,
+		"what is stored must be byte-for-byte a serialized block: header, transaction count, transactions")
+	require.Equal(t, int64(len(payload)), gotN,
+		"the declared length must cover the header too, or a sink that trusts it writes a short file")
 }
 
 // Below the threshold nothing changes: the block is decoded as it always was,

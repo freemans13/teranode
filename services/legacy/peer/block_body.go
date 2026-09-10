@@ -65,6 +65,37 @@ func (m *MsgBlockOnDisk) MaxPayloadLength(pver uint32) uint64 {
 	return (&wire.MsgBlock{}).MaxPayloadLength(pver)
 }
 
+// SetBlockBodyStreaming installs all three callbacks the streaming path needs,
+// or clears all three when any of them is nil.
+//
+// One call rather than three because the three are only safe together. A sink
+// with no gate is a store anybody can fill; a sink with no delete leaves an
+// orphaned body behind on every write that fails after it. The handler already
+// refuses to stream unless a sink and a gate are both present, and this makes
+// the same rule true of how they are installed rather than only of how they are
+// read.
+func SetBlockBodyStreaming(
+	sink func(hash chainhash.Hash, r io.Reader, n int64) error,
+	gate func(hash chainhash.Hash, header *wire.BlockHeader) error,
+	del func(hash chainhash.Hash) error,
+) {
+	if sink == nil || gate == nil || del == nil {
+		blockBodySink, blockBodyGate, blockBodyDelete = nil, nil, nil
+
+		return
+	}
+
+	blockBodySink, blockBodyGate, blockBodyDelete = sink, gate, del
+}
+
+// SetBlockBodySink installs the sink alone. Prefer SetBlockBodyStreaming, which
+// is the only way to install a sink that is actually reachable: the handler
+// checks for a gate too, so a sink installed on its own changes nothing. This
+// exists for tests that exercise the sink in isolation.
+func SetBlockBodySink(f func(hash chainhash.Hash, r io.Reader, n int64) error) {
+	blockBodySink = f
+}
+
 // SetBlockBodyGate installs the gate that decides whether a block's body may
 // be streamed to disk. The sync manager calls this where it installs
 // blockBodySink (via SetBlockBodySink), since a store reachable with no gate

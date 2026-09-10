@@ -3220,6 +3220,7 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			OnMemPool:      sp.OnMemPool,
 			OnTx:           sp.OnTx,
 			OnBlock:        sp.OnBlock,
+			OnBlockOnDisk:  sp.OnBlockOnDisk,
 			OnInv:          sp.OnInv,
 			OnHeaders:      sp.OnHeaders,
 			OnGetData:      sp.OnGetData,
@@ -4662,4 +4663,21 @@ func (s *server) handleBanEvent(_ context.Context, event p2p.BanEvent) {
 	if err != nil {
 		s.logger.Errorf("Error disconnecting banned peers: %v", err)
 	}
+}
+
+// OnBlockOnDisk handles a block whose body the wire layer streamed straight to
+// the park's store instead of decoding it.
+//
+// It is the counterpart of OnBlock and is deliberately much smaller. There is no
+// prefetch budget to reserve, because nothing about this block is in memory; no
+// reply channel, because there is no processing to wait on here; and no
+// hand-off, because the read loop is already free. All that is left is telling
+// the sync manager the bytes exist, which its consumer goroutine turns into a
+// park entry and a drain request.
+func (sp *serverPeer) OnBlockOnDisk(_ *peer.Peer, msg *peer.MsgBlockOnDisk) {
+	if msg == nil || sp.server == nil || sp.server.syncManager == nil {
+		return
+	}
+
+	sp.server.syncManager.QueueBlockOnDisk(msg.BlockBody, sp.Peer)
 }

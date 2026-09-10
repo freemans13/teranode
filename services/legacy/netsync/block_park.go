@@ -648,6 +648,75 @@ func (p *blockPark) write(ctx context.Context, hash chainhash.Hash, msgBlock *wi
 	return err
 }
 
+// WriteStreamedBody stores a body that arrived straight off the wire, putting
+// the header in front of it so what lands is byte-for-byte what write produces
+// for a decoded block: header, transaction count, transactions.
+//
+// The header is passed separately because the wire handler has already read it
+// to compute the hash and to put it to the gate, and putting it back on the
+// stream there would mean re-serializing it into a buffer the streaming path
+// exists to avoid. n is the total size of the finished file, header included.
+func (p *blockPark) WriteStreamedBody(ctx context.Context, hash chainhash.Hash, r io.Reader, n int64) error {
+	if p == nil || p.store == nil {
+		return errors.NewProcessingError("[blockPark][%s] no store to stream into", hash)
+	}
+
+	writeCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	return p.store.SetFromReader(writeCtx, hash[:], parkFileType, io.NopCloser(r), parkOpts...)
+}
+
+// AdoptWritten registers a block whose body is already on disk, and reports
+// whether it was taken.
+//
+// It is the streaming path's way in, and it is the reverse of Admit's order.
+// Admit registers an entry and then writes the bytes, so the flag writing
+// exists to tell readers the blob is not there yet. A streamed body lands
+// before the park hears about it at all: the wire handler puts it in the store
+// on its way past, so by the time anything can register an entry the bytes are
+// down and writing must be false or the block would sit behind a write that
+// already happened.
+//
+// Recovery after a restart builds its entries exactly this way. Its version is
+// inline in Recover because it runs once at start with the park to itself; this
+// one is called from a peer's read loop while the consumer is working, so it
+// takes the lock and reports refusal rather than assuming it can always insert.
+//
+// Refuses a hash already held, so a re-delivered body is neither charged nor
+// indexed twice, and refuses at the entry ceiling, which is what bounds the
+// park.
+func (p *blockPark) AdoptWritten(entry parkedBlock) bool {
+	if p == nil {
+		return false
+	}
+
+	entry.writing = false
+
+	if entry.parkedAt.IsZero() {
+		entry.parkedAt = time.Now()
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, held := p.entries[entry.hash]; held {
+		return false
+	}
+
+	if len(p.entries) >= maxParkedEntries {
+		return false
+	}
+
+	stored := entry
+	p.entries[entry.hash] = &stored
+	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+	p.chargeLocked(entry.hash, entry.size)
+	p.setGauges()
+
+	return true
+}
+
 // Read fetches a parked block back off disk and checks it is the block the key
 // says it is.
 func (p *blockPark) Read(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlock, error) {
