@@ -305,6 +305,11 @@ type peerSyncState struct {
 	// of which runs on its own goroutine. Only noteBestKnownHeight writes it.
 	bestKnownHeight atomic.Int32
 
+	// peerChainClaimState holds what this peer has DEMONSTRATED it has, as
+	// opposed to bestKnownHeight above, which starts from what the peer said
+	// about itself. See peer_chain_claim.go.
+	peerChainClaimState
+
 	// demotedUntil is the UnixNano instant before which this peer must not be
 	// re-elected sync peer, stamped when it is demoted for stalling.
 	//
@@ -1632,9 +1637,18 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](10 * time.Second), // allow the node 10 seconds to respond to the tx request
 	}
 
-	// Seed the peer's best known height from the height it advertised during the
-	// handshake, so a peer is never mistaken for one that has nothing. An atomic
-	// cannot be initialised in the struct literal above.
+	// The height the peer advertised about itself during the handshake. It is
+	// kept, because a peer that says nothing must not be mistaken for one with
+	// nothing when choosing a sync peer, and it is the only figure available at
+	// this point.
+	//
+	// It is deliberately NOT a claim. A claim is what the peer has demonstrated,
+	// and nothing here has been demonstrated: this number is the peer's own word,
+	// the record only ever rises, so a self-report written here could never be
+	// contradicted and every peer would claim every block forever. That is
+	// exactly what made canServe a no-op and left the scheduler asking strangers
+	// for blocks they never had. SV Node keeps the same number in
+	// nStartingHeight and never writes it into pindexBestKnownBlock either.
 	state.noteBestKnownHeight(peer.StartingHeight())
 
 	sm.peerStates.Set(peer, state)
@@ -3885,6 +3899,8 @@ func (sm *SyncManager) handleBlockMsgTail(d *blockDispatch, err error) error {
 	if heightUpdate != 0 {
 		peer.UpdateLastBlockHeight(heightUpdate)
 		state.noteBestKnownHeight(heightUpdate)
+		// It sent us the block. There is no stronger demonstration than that.
+		state.noteProvenClaim(*blkHashUpdate, heightUpdate)
 		sm.logger.Debugf("peer %s reports new best height %d, current %v", peer.String(), peer.LastBlock(), sm.current())
 
 		if sm.current() { // used to check for isOrphan || sm.current()
@@ -5315,6 +5331,12 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// the unlock below so the atomic write stays outside the locked region.
 	var maxHeaderHeight int32
 
+	// The hash that goes with maxHeaderHeight. Tracked alongside rather than
+	// taken from the last header seen, because on a break that last header is
+	// the offending one and crediting a peer for it would credit a chain we
+	// refused.
+	var maxHeaderHash chainhash.Hash
+
 	// How many headers in this batch linked onto the list, and whether the batch
 	// turned out to be a late answer to a getheaders we ourselves sent.
 	var (
@@ -5349,6 +5371,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 
 			if node.height > maxHeaderHeight {
 				maxHeaderHeight = node.height
+				maxHeaderHash = blockHash
 			}
 
 			if sm.startHeader == nil {
@@ -5442,6 +5465,12 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// headerMu.
 	if maxHeaderHeight > 0 {
 		state.noteBestKnownHeight(maxHeaderHeight)
+
+		// The strongest proof there is: this node placed these headers itself,
+		// so the height is ours and the peer demonstrably has that chain. This
+		// is SV Node's UpdateBlockAvailability on the same path that accepts the
+		// batch.
+		state.noteProvenClaim(maxHeaderHash, maxHeaderHeight)
 	}
 
 	if staleReply {
@@ -5610,6 +5639,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 
 			peer.UpdateLastBlockHeight(blockHeightInt32)
 			state.noteBestKnownHeight(blockHeightInt32)
+			// Announced a block we hold, so we know its height without taking
+			// the peer's word for anything.
+			state.noteProvenClaim(invVects[lastBlock].Hash, blockHeightInt32)
 		}
 	}
 

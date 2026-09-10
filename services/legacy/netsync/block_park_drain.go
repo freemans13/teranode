@@ -368,6 +368,9 @@ func (sm *SyncManager) noteCommittedParkedBlock(entry parkedBlock) {
 
 	entry.peer.UpdateLastBlockHeight(height)
 	state.noteBestKnownHeight(height)
+	// Same fact as the direct-delivery path, discovered later: this peer sent us
+	// this block, and the height is the one we committed it at.
+	state.noteProvenClaim(entry.hash, height)
 }
 
 // livePeer returns the peer a post-commit action should be aimed at: the one

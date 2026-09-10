@@ -418,6 +418,34 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 			continue
 		}
 
+		// Busy is only evidence about THIS block if the owner has demonstrated
+		// it has this block. This is the guard's unstated premise, and it was
+		// false: the scheduler asks the first peer with budget when nobody
+		// claims a chain reaching the block, so an owner may never have had it,
+		// and its traffic is then somebody else's blocks.
+		//
+		// SV Node's equivalent guard is the same shape and is sound for exactly
+		// this reason: its download run is built from the peer's own announced
+		// chain, so an owner mid-transfer necessarily has the block.
+		//
+		// Measured on Hetzner mainnet on 2026-09-10: 20 of 27 gaps over two
+		// minutes had a frontier published and no headers round inside, worth
+		// 64% of the long-gap time, and 80% of that time had this decline
+		// suppressing the race. The chain knew which block it wanted and had
+		// asked a peer that never sent it.
+		//
+		// An owner that has proven nothing is not counted, and the loop moves on
+		// to the next owner. If no owner has proven it, the race proceeds, which
+		// is the whole point: nobody has told us this block is coming.
+		if !state.HasProvenTo(height) {
+			sm.noteRaceDeclinedAs("an owner is pulling bytes but has not proven it has this block",
+				fmt.Sprintf("an owner is pulling bytes but has not proven it has this block, so its traffic is somebody else's: %s pulled %d association bytes over the last %s, owes %d blocks, and its best proven height is %d against a frontier at %d",
+					owner, delta, frontierCheckInterval, sm.blockDownloads.CountForPeer(owner),
+					state.Claim().height, height))
+
+			continue
+		}
+
 		// Say what was measured, not just that something was. This decline is
 		// the one that switches the race off, and on mainnet it did so 1,663
 		// times in a row across a four-and-a-half-minute stall.
