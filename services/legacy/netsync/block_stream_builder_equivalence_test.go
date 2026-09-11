@@ -96,7 +96,16 @@ func TestBlockStreamBuilder_MatchesBatchBuild(t *testing.T) {
 		txCount  int
 		maxItems int
 	}{
+		{"one short subtree", 5, 8},
 		{"single subtree, exactly full", 8, 8},
+		// The only shape in this table (and, per review, in the whole package)
+		// where the final subtree comes out of the real builder exactly full
+		// rather than short: it is the sole case that exercises the
+		// accumulator's plain-root branch for a last subtree end to end
+		// through newBlockStreamBuilder's own isLast computation, rather than
+		// through a hand-built subtree in merkle_accumulator_test.go that
+		// bypasses that computation entirely.
+		{"two full subtrees", 16, 8},
 		{"two full subtrees plus a short final one", 20, 8},
 		{"mainnet subtree size, three subtrees", 9000, 4096}, // 4096 is the live setting, not the 1048576 code default
 	} {
