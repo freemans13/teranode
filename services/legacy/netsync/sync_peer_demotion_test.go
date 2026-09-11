@@ -381,10 +381,21 @@ func TestDemotion_LateHeadersFromTheDemotedPeerDoNotCostItItsConnection(t *testi
 	require.True(t, stalled.Connected(), "a late answer to our own getheaders is not misbehaviour")
 	require.Equal(t, lenBefore, sm.headerListLen(), "a late duplicate must not be re-linked into the list")
 
-	// Headers whose parent we have never seen are a different matter.
+	// Headers whose parent we have never seen are a different matter — but they
+	// are charged against a run rather than taken on the first offence, because
+	// the commonest cause of one is our own stale locator. See
+	// TestHandleHeadersMsg_AnUnconnectedBatchCostsNothingFirstTime.
 	junkParent := chainhash.Hash{0x9e}
+
 	junk, _ := linkedHeaders(junkParent, 3, &nonce)
 	sm.handleHeadersMsg(&headersMsg{headers: junk, peer: stalled})
+
+	require.True(t, stalled.Connected(), "the first batch that connects to nothing is forgiven")
+
+	for i := 1; i < maxUnconnectingHeaderBatches; i++ {
+		junk, _ = linkedHeaders(junkParent, 3, &nonce)
+		sm.handleHeadersMsg(&headersMsg{headers: junk, peer: stalled})
+	}
 
 	require.False(t, stalled.Connected(), "headers that connect to nothing we know must still be punished")
 }
@@ -466,6 +477,66 @@ func TestDemotion_ReopensOnlyTheDemotedPeersSliceAndRewindsToItsLowestBlock(t *t
 	for _, h := range successorSlice {
 		require.NotContains(t, asked, h, "a block already in flight must not be asked of a second peer")
 	}
+}
+
+// TestDemotion_TheReopenedCountDistinguishesSettledBlocksFromLostOnes pins the
+// diagnostic the 800128 investigation did not have.
+//
+// Every rotation for seven hours logged "reopened 295 blocks owed by
+// 164.132.247.87 but none of them is still in the header list", which reads as a
+// header that went missing from the middle of the list. No path in this package
+// produces that: every targeted removal takes a block the chain already has, and
+// the two wholesale ones re-Init the list. What a hash that does not resolve
+// actually means is ledger residue — the ledger holds a record per owner and
+// handleBlockMsgHead discharges only the peer that delivered, so every peer that
+// lost a race keeps a record for a block committed long ago.
+//
+// So the node has to be able to say which it is looking at, and the counts are
+// how. This asserts on what rewindToLowestHeader returns rather than on the log
+// text, because the numbers are the finding and the sentence is only its wrapper.
+func TestDemotion_TheReopenedCountDistinguishesSettledBlocksFromLostOnes(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xf5}
+	msg, hashes := linkedHeaders(anchor, 12, &nonce)
+
+	sm := newDemotionManager(t)
+
+	stalled, _, _ := demotionPeer(t, sm, 121, 1000)
+
+	seedFetchHeaders(t, sm, stalled, anchor, msg)
+
+	// Four blocks whose headers are still in the list, and three whose hashes the
+	// ledger carries for blocks the chain has already committed. Both kinds go in
+	// through the ledger, so the mixture the counts describe is the one a real
+	// demotion produces rather than one assembled by the test.
+	inList := hashes[0:4]
+	settled := []chainhash.Hash{{0xd1}, {0xd2}, {0xd3}}
+
+	for _, h := range append(append([]chainhash.Hash{}, inList...), settled...) {
+		require.True(t, sm.blockDownloads.Add(stalled, h))
+	}
+
+	reopened := sm.blockDownloads.ForgetForRetryPeer(stalled, blockRequestRetryInterval)
+	require.Len(t, reopened, len(inList)+len(settled))
+
+	lowestHeight, rewound, found, missing := sm.rewindToLowestHeader(reopened)
+
+	require.True(t, rewound)
+	require.Equal(t, len(inList), found, "the hashes still in the header list are the work that can be re-walked")
+	require.Equal(t, len(settled), missing, "the rest are records for blocks already committed, not lost headers")
+
+	// seedFetchHeaders anchors at height 10, so the first seeded header is 11.
+	require.Equal(t, int32(11), lowestHeight)
+
+	// The 800128 signature itself: a slice where nothing resolves. It has to come
+	// back as none-found rather than as a rewind, and the counts have to say that
+	// every one of them is residue.
+	_, rewound, found, missing = sm.rewindToLowestHeader(settled)
+
+	require.False(t, rewound)
+	require.Zero(t, found)
+	require.Equal(t, len(settled), missing)
 }
 
 // TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore is the rollback lever.
@@ -587,6 +658,13 @@ func TestDemotion_TheLateHeadersCarveOutIsScopedAndExpires(t *testing.T) {
 
 	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: bystander})
 
+	require.True(t, bystander.Connected(),
+		"outside the carve-out the batch is charged against a run, not taken on the first offence")
+
+	for i := 1; i < maxUnconnectingHeaderBatches; i++ {
+		sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: bystander})
+	}
+
 	require.False(t, bystander.Connected(),
 		"the carve-out is for a peer whose late reply we caused, not for anybody re-sending headers we happen to hold")
 
@@ -606,6 +684,13 @@ func TestDemotion_TheLateHeadersCarveOutIsScopedAndExpires(t *testing.T) {
 	state.clearDemotionCooldown()
 
 	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: stalled})
+
+	require.True(t, stalled.Connected(),
+		"the run still has to be earned, the expiry of the carve-out is not itself a disconnect")
+
+	for i := 1; i < maxUnconnectingHeaderBatches; i++ {
+		sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: stalled})
+	}
 
 	require.False(t, stalled.Connected(),
 		"once the cooldown has expired the carve-out no longer covers the demoted peer either")

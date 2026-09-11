@@ -299,11 +299,16 @@ func TestHandleInvMsg_NonSyncPeerInvIsStillIgnoredWhileNotCurrent(t *testing.T) 
 		"learning heights must not be hoisted above the early return that protects IBD")
 }
 
-// TestHandleInvMsg_HeadersFirstInvIsIgnored pins the second early return: while
-// headers-first sync is driving the download, a block inv is noted as known
-// inventory and nothing else. Requesting it here would cut across the header
-// list's own ordering.
-func TestHandleInvMsg_HeadersFirstInvIsIgnored(t *testing.T) {
+// TestHandleInvMsg_HeadersFirstInvAsksForNoBlockData pins the second early
+// return: while headers-first sync is driving the download, a block inv buys no
+// getdata. Requesting the block here would cut across the header list's own
+// ordering.
+//
+// The inv is no longer ignored — an announcement of a block we cannot place now
+// answers with a getheaders, which is the repair route the 2026-09-11 stall
+// needed — so the old name outlived what it described. Only the getdata is
+// dropped, and that is all this test has ever asserted.
+func TestHandleInvMsg_HeadersFirstInvAsksForNoBlockData(t *testing.T) {
 	// Not in the known map, so we do not have it — without the headers-first
 	// guard this inv would be queued and a getdata sent.
 	announced := chainhash.Hash{0xc3}

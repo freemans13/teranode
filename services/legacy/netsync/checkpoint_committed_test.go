@@ -20,6 +20,10 @@ import (
 
 // headerRequestRecorder records what a peer was asked to fetch next: the stop
 // hash of every getheaders, and how many getblocks went out.
+//
+// The stop hash is a zero hash on every headers round the node sends — the round
+// is aimed at a checkpoint but no longer asks up to one — so a test that wants
+// to know WHICH round went out reads nextCheckpointSnapshot, not this.
 type headerRequestRecorder struct {
 	mu        sync.Mutex
 	stopHash  []chainhash.Hash
@@ -40,7 +44,7 @@ func (r *headerRequestRecorder) noteGetBlocks() {
 	r.getBlocks++
 }
 
-func (r *headerRequestRecorder) askedForHeadersUpTo(hash chainhash.Hash) bool {
+func (r *headerRequestRecorder) askedForHeadersWithStopHash(hash chainhash.Hash) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -51,6 +55,16 @@ func (r *headerRequestRecorder) askedForHeadersUpTo(hash chainhash.Hash) bool {
 	}
 
 	return false
+}
+
+// getHeadersCount is how the negatives are spelled now. A stop hash of zero says
+// nothing about which round went out, so "no getheaders at all" is the only
+// honest way left to assert that none did.
+func (r *headerRequestRecorder) getHeadersCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.stopHash)
 }
 
 func (r *headerRequestRecorder) getBlocksCount() int {
@@ -192,7 +206,7 @@ func TestSyncManager_ACheckpointReachedWithNoPeerStillAsksForThoseHeadersLater(t
 
 	sm.handleCheckSyncPeer()
 
-	require.True(t, WaitUntil(func() bool { return rec.askedForHeadersUpTo(*final.Hash) }, 5*time.Second),
+	require.True(t, WaitUntil(func() bool { return rec.askedForHeadersWithStopHash(zeroHash) }, 5*time.Second),
 		"the election must replay the deferred round on its own: the node still has to ask for the headers it has not got")
 
 	require.True(t, sm.headersFirstMode.Load(),
@@ -263,7 +277,7 @@ func TestSyncManager_ACheckpointCommittedWithNothingLeftToReachIsANoOp(t *testin
 	require.NoError(t, sm.checkpointBlockCommitted(peer, *first.Hash))
 
 	require.Zero(t, rec.getBlocksCount(), "nothing to ask for")
-	require.False(t, rec.askedForHeadersUpTo(*first.Hash))
+	require.Zero(t, rec.getHeadersCount(), "nothing to ask for")
 }
 
 // TestSyncManager_ADeferredRoundIsDroppedOnceItHasBeenAskedFor pins the guard on
@@ -351,7 +365,7 @@ func TestSyncManager_ARebuiltHeaderStateAimsAtTheCheckpointAboveTheTip(t *testin
 
 	sm.handleCheckSyncPeer()
 
-	require.True(t, WaitUntil(func() bool { return rec.askedForHeadersUpTo(*final.Hash) }, 5*time.Second),
+	require.True(t, WaitUntil(func() bool { return rec.askedForHeadersWithStopHash(zeroHash) }, 5*time.Second),
 		"the election asks for the round itself, from its own headers-first branch")
 
 	require.True(t, sm.headersFirstMode.Load(),
@@ -374,7 +388,7 @@ func TestSyncManager_ARebuiltHeaderStateAimsAtTheCheckpointAboveTheTip(t *testin
 // not be reachable today. It is pinned because the cost of getting it wrong is
 // the self-inflicted disconnect this PR exists to remove.
 func TestSyncManager_ADeferredRoundIsNotAskedForWithHeadersFirstModeOff(t *testing.T) {
-	sm, first, final := newCheckpointManager(t)
+	sm, first, _ := newCheckpointManager(t)
 	sm.headersFirstMode.Store(true)
 
 	require.NoError(t, sm.checkpointBlockCommitted(nil, *first.Hash))
@@ -394,7 +408,7 @@ func TestSyncManager_ADeferredRoundIsNotAskedForWithHeadersFirstModeOff(t *testi
 
 	// The send is over a real connection, so give it a window to arrive rather
 	// than reading the recorder the instant the call returns.
-	require.False(t, WaitUntil(func() bool { return rec.askedForHeadersUpTo(*final.Hash) }, 500*time.Millisecond),
+	require.False(t, WaitUntil(func() bool { return rec.getHeadersCount() > 0 }, 500*time.Millisecond),
 		"no getheaders may go out with the mode off: the peer would be disconnected for answering it")
 }
 
@@ -463,8 +477,10 @@ func TestSyncManager_AStaleRebuildHeightStillLetsTheElectionReAim(t *testing.T) 
 
 	sm.handleCheckSyncPeer()
 
-	require.True(t, WaitUntil(func() bool { return rec.askedForHeadersUpTo(*final.Hash) }, 5*time.Second),
+	require.True(t, WaitUntil(func() bool { return rec.askedForHeadersWithStopHash(zeroHash) }, 5*time.Second),
 		"the election must re-aim above the committed checkpoint and ask for the round")
+	require.Equal(t, final.Height, sm.nextCheckpointSnapshot().Height,
+		"the round is still aimed at the checkpoint above the tip; only the wire stop hash stopped saying so")
 	require.True(t, sm.headersFirstMode.Load(),
 		"headers-first mode must come back on, or this PR's own feature is off until a restart")
 	require.Zero(t, rec.getBlocksCount(),
