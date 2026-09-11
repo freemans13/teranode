@@ -88,6 +88,9 @@ func TestSubtreeWriter_DeleteAllRemovesEverythingItWrote(t *testing.T) {
 	require.Len(t, w.Written(), 3, "one entry per file written, so all three can be removed")
 
 	require.NoError(t, w.DeleteAll(context.Background()))
+	require.Empty(t, w.Written(),
+		"DeleteAll must actually clear what was written, not just return nil: "+
+			"a failed merkle root depends on this to know cleanup is done")
 }
 
 // TestSubtreeWriter_ReportsWhichWriteFailed pins that a storage failure names the

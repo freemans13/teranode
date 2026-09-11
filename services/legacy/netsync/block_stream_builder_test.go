@@ -141,6 +141,21 @@ func TestBlockStreamBuilder_RefusesMoreTransactionsThanDeclared(t *testing.T) {
 	require.Contains(t, err.Error(), "more transactions than the 4 it declared")
 }
 
+// TestBlockStreamBuilder_RefusesACoinbaseOnlyBlock pins the divergence from
+// prepareSubtrees (handle_block.go), which returns zero subtrees for a
+// coinbase-only block instead of calling this builder at all. Left unguarded,
+// a leaf count of 1 would make this builder emit one subtree whose root is the
+// go-subtree CoinbasePlaceholder constant — the same root for every
+// coinbase-only block in the chain, so each would overwrite the last one's
+// files under the same three keys. This must fail before that can happen.
+func TestBlockStreamBuilder_RefusesACoinbaseOnlyBlock(t *testing.T) {
+	_, err := newBlockStreamBuilder(1, 8, coinbaseTx(t), func(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) error {
+		return nil
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "coinbase-only block, got tx count 1")
+}
+
 // TestBlockStreamBuilder_RefusesFewerTransactionsThanDeclared pins the other end.
 // A truncated stream must fail rather than produce a root over a short block.
 func TestBlockStreamBuilder_RefusesFewerTransactionsThanDeclared(t *testing.T) {

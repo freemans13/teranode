@@ -17,12 +17,19 @@ import (
 //
 // Every rule below is transcribed from CheckMerkleRoot and none of them is
 // optional. The power-of-two guard stops a peer crafting a partition whose root
-// a canonical validator would not agree with. The duplicate-root check is the
-// CVE-2012-2459 guard, and it is the only thing that catches that mutation,
-// because the mutation preserves the block's merkle root via the
-// duplicate-last-when-odd rule. TestMerkleAccumulator_MatchesCheckMerkleRoot
+// a canonical validator would not agree with. The duplicate-root check guards
+// TOP-TREE malleability — two distinct subtrees folding to the same root hash —
+// which is a different mutation from CVE-2012-2459's transaction-level
+// duplication inside a single subtree. TestMerkleAccumulator_MatchesCheckMerkleRoot
 // asserts this produces the identical root, which is the only reason it is safe
 // to use instead.
+//
+// The CVE-2012-2459 transaction-level floor is NOT present in this component.
+// That check, model.CheckSubtreeSlicesForDuplicateTxs, needs every subtree's
+// full transaction list at once to scan for a repeated hash, which is exactly
+// what this accumulator exists to avoid holding. Whoever wires this component
+// into production must apply that scan themselves, the way
+// services/legacy/netsync/handle_block.go does today at lines 328 and 593.
 type merkleAccumulator struct {
 	coinbaseTxID  *chainhash.Hash
 	coinbaseSize  uint64

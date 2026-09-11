@@ -126,10 +126,11 @@ func TestMerkleAccumulator_RejectsANonPowerOfTwoFirstSubtree(t *testing.T) {
 		"the message must name the actual fault, or a future change can satisfy this test without enforcing the rule")
 }
 
-// TestMerkleAccumulator_RejectsADuplicateSubtreeRoot pins the CVE-2012-2459
-// guard. A duplicate-transaction mutation preserves the block's merkle root via
-// the duplicate-last-when-odd rule, so the root comparison alone passes and this
-// is the only thing that catches it.
+// TestMerkleAccumulator_RejectsADuplicateSubtreeRoot pins the top-tree
+// malleability guard: two distinct subtrees folding to the same root hash. This
+// is NOT the CVE-2012-2459 transaction-level duplication check — that scan is
+// model.CheckSubtreeSlicesForDuplicateTxs, needs every subtree's transactions at
+// once, and is not present in this component at all.
 func TestMerkleAccumulator_RejectsADuplicateSubtreeRoot(t *testing.T) {
 	coinbaseID := chainhash.Hash{0xcb}
 

@@ -57,6 +57,18 @@ func newBlockStreamBuilder(txCount, maxItems int, coinbase *bt.Tx, emit subtreeE
 		return nil, errors.NewProcessingError("[blockStreamBuilder] no emit function")
 	}
 
+	// A coinbase-only block (txCount <= 1) has no transactions to stream: the
+	// caller's early return for this case (handle_block.go prepareSubtrees)
+	// produces zero subtrees and zero files, but this builder would instead emit
+	// one subtree whose root is the go-subtree CoinbasePlaceholder constant —
+	// the same placeholder root for every coinbase-only block in the chain, so
+	// every one of them would write three files under the same three keys,
+	// overwriting each other, and hand back a subtree list production never
+	// produces. Refuse it outright rather than diverge from that caller.
+	if txCount <= 1 {
+		return nil, errors.NewProcessingError("[blockStreamBuilder] refusing a coinbase-only block, got tx count %d", txCount)
+	}
+
 	size, count, finalLeaves, err := partitionLegacyBlock(txCount, maxItems)
 	if err != nil {
 		return nil, err

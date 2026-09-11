@@ -83,13 +83,20 @@ func batchBuildSubtrees(txs []*bt.Tx, maxItems int) ([]*subtreepkg.Subtree, []*s
 	return trees, datas, metas, nil
 }
 
-// TestBlockStreamBuilder_MatchesBatchBuild is the equivalence gate for the
-// whole streaming design: the streaming builder must produce byte-identical
-// subtrees, subtree data and subtree meta to building the same block all at
-// once. A root hash alone cannot prove this — two subtrees can share a root
-// while carrying different fee or size fields, and those fields travel on to
-// block validation — so every comparison below is on Serialize() output, not
-// on the root.
+// TestBlockStreamBuilder_MatchesBatchBuild gates one property only: that
+// streaming the same transactions one at a time produces the same partitioning
+// and ordering as building them from a slice all at once. Its oracle,
+// batchBuildSubtrees, is a second transcription of the builder's own AddTx logic
+// run over a slice instead of a stream (see that function's comment above), not
+// an independent implementation, so a root hash alone cannot prove even that
+// much — two subtrees can share a root while carrying different fee or size
+// fields — hence every comparison below is on Serialize() output, not on the
+// root.
+//
+// This test does NOT prove equivalence with the production createSubtrees path
+// (handle_block.go), and never exercises it. One thing it is blind to: both
+// sides here stamp a zero fee, whereas createSubtrees computes a real fee
+// whenever legacyOutpointOnly is off, which is its default.
 func TestBlockStreamBuilder_MatchesBatchBuild(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
