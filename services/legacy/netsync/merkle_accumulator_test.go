@@ -169,16 +169,57 @@ func TestMerkleAccumulator_RejectsAShortNonFinalSubtree(t *testing.T) {
 	require.Contains(t, err.Error(), "only the final subtree may be incomplete")
 }
 
+// TestMerkleAccumulator_RejectsAnOversizedFinalSubtree pins the guard that
+// rejects a final subtree longer than the target set by the first subtree. A
+// final subtree bigger than the others changes where later leaves sit in the
+// tree, so a root computed over it would not match what a canonical validator
+// produces.
+func TestMerkleAccumulator_RejectsAnOversizedFinalSubtree(t *testing.T) {
+	coinbaseID := chainhash.Hash{0xcb}
+
+	first, err := subtreepkg.NewIncompleteTreeByLeafCount(8)
+	require.NoError(t, err)
+	require.NoError(t, first.AddCoinbaseNode())
+
+	for i := 1; i < 8; i++ {
+		var h chainhash.Hash
+		h[0] = byte(i)
+
+		require.NoError(t, first.AddNode(h, 0, 100))
+	}
+
+	oversized, err := subtreepkg.NewIncompleteTreeByLeafCount(10)
+	require.NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		var h chainhash.Hash
+		h[0] = byte(0x10 + i)
+
+		require.NoError(t, oversized.AddNode(h, 0, 100))
+	}
+
+	acc, err := newMerkleAccumulator(2, &coinbaseID, 200)
+	require.NoError(t, err)
+
+	require.NoError(t, acc.Add(first, false))
+
+	err = acc.Add(oversized, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exceeds",
+		"a final subtree bigger than the target must be named as exceeding it, or a future change can satisfy this test without enforcing the rule")
+}
+
 // referenceRootFromSubtrees is a root-value oracle, not a validator: it computes
 // the merkle root the way CheckMerkleRoot does, holding every subtree at once,
 // but it carries none of that function's rejection guards. It does not check
 // that the first subtree's length is a power of two, that only the final
-// subtree is incomplete, or that no subtree root repeats. Given a malformed
-// partition it will compute a root instead of returning an error, so it must
-// never be handed one in the expectation of a failure — the four negative
-// tests exercise the guards directly against the accumulator instead. Valid
-// only for well-formed partitions, this exists so the accumulator's root VALUE
-// can be asserted equal to it.
+// subtree is incomplete, that no final subtree exceeds the target length, or
+// that no subtree root repeats. Given a malformed partition it will compute a
+// root instead of returning an error, so it must never be handed one in the
+// expectation of a failure — the four negative tests exercise the guards
+// directly against the accumulator instead. Valid only for well-formed
+// partitions, this exists so the accumulator's root VALUE can be asserted
+// equal to it.
 func referenceRootFromSubtrees(subtrees []*subtreepkg.Subtree, coinbaseID *chainhash.Hash, coinbaseSize uint64) (*chainhash.Hash, error) {
 	hashes := make([]chainhash.Hash, len(subtrees))
 
