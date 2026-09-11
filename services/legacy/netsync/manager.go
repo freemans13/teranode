@@ -148,6 +148,13 @@ const (
 	// syncManagerShuttingDownMsg is the service error returned to every queued or
 	// in-flight block that is drained when the sync manager stops.
 	syncManagerShuttingDownMsg = "sync manager shutting down"
+
+	// maxUnconnectingHeaderBatches is how many headers batches in a row a peer
+	// may send that connect to nothing at the back of our header list before it
+	// loses its connection. SV Node's MAX_UNCONNECTING_HEADERS
+	// (bitcoin-sv/src/validation.h:220). Why the same number means something
+	// different here is argued at the point it is applied, in handleHeadersMsg.
+	maxUnconnectingHeaderBatches = 10
 )
 
 // zeroHash is the zero-value hash (all zeros).  It is defined as a convenience.
@@ -322,11 +329,32 @@ type peerSyncState struct {
 	// by pointer across the blockHandler goroutine and the per-message handlers.
 	// Nothing sweeps it — the stamp is only ever read.
 	demotedUntil atomic.Int64
+
+	// unconnectingHeaders counts the headers batches this peer has sent in a row
+	// whose first header hung off something that is not the back of our header
+	// list. It is SV Node's nodestate->nUnconnectingHeaders
+	// (net_processing.cpp:3389), and like it, any batch that does connect puts it
+	// back to zero (:3450-3456).
+	//
+	// Atomic for the same reason demotedUntil is: a *peerSyncState is shared by
+	// pointer across the blockHandler goroutine and the per-message handlers.
+	unconnectingHeaders atomic.Int32
 }
 
 // noteDemotedFor bars this peer from election as sync peer for d.
 func (s *peerSyncState) noteDemotedFor(d time.Duration) {
 	s.demotedUntil.Store(time.Now().Add(d).UnixNano())
+}
+
+// noteUnconnectingHeaders records one more headers batch from this peer that
+// connected to nothing at the back of our list, and returns the running count.
+func (s *peerSyncState) noteUnconnectingHeaders() int32 {
+	return s.unconnectingHeaders.Add(1)
+}
+
+// resetUnconnectingHeaders ends the run, which any batch that does connect does.
+func (s *peerSyncState) resetUnconnectingHeaders() {
+	s.unconnectingHeaders.Store(0)
 }
 
 // inDemotionCooldown reports whether this peer was demoted recently enough that
@@ -1230,6 +1258,67 @@ func (sm *SyncManager) nextCheckpointSnapshot() *chaincfg.Checkpoint {
 	return sm.nextCheckpoint
 }
 
+// headerRoundSummary says, in one clause, what state the headers-first round is
+// in: how long the header list is, what sits at each end of it, whether the
+// download walk has a cursor at all, and which checkpoint the round is aiming at.
+// It returns the empty string when headers-first mode is off, because outside a
+// round there is no round to describe.
+//
+// It exists because Hetzner mainnet sat at height 800128 for seven hours on
+// 2026-09-11 and every line it wrote described the window, the park and the
+// download budget. None of them described the header list, and metrics.go has no
+// gauge for it either. Two states produce exactly that silence and want opposite
+// fixes: a front node that is still the round's anchor means no header ever
+// spliced onto it, while a nil startHeader with headers still in the list means
+// the only fetcher is switched off (see the nil-cursor returns in
+// fetchHeaderBlocks and the download walk). Nothing the node writes today tells
+// them apart, so the next stall of this shape is diagnosed on the first tick
+// rather than on a redeploy that destroys the reproduction.
+//
+// Call it only from reportConsumerStall, which runs on the message-handling
+// goroutine's ticker holding no lock, so taking headerMu here cannot invert Rule
+// A's order (headerMu -> frontierMu -> peerStates). It must never be called from
+// publishConsumerWait, which runs on the consumer goroutine that owns the
+// dispatcher.
+func (sm *SyncManager) headerRoundSummary() string {
+	if !sm.headersFirstMode.Load() {
+		return ""
+	}
+
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	checkpoint := "no checkpoint ahead"
+	if sm.nextCheckpoint != nil {
+		checkpoint = fmt.Sprintf("aiming at checkpoint %d", sm.nextCheckpoint.Height)
+	}
+
+	if sm.headerList == nil || sm.headerList.Len() == 0 {
+		return "the header round holds no headers, " + checkpoint
+	}
+
+	cursor := "the download cursor is set"
+	if sm.startHeader == nil {
+		cursor = "the download cursor is nil, so no block is being fetched"
+	}
+
+	front := "the front node is unreadable"
+
+	if node, ok := sm.headerList.Front().Value.(*headerNode); ok && node != nil {
+		front = fmt.Sprintf("front height %d", node.height)
+		if node.isAnchor {
+			front += " which is still the round's anchor, so no header has spliced onto it"
+		}
+	}
+
+	back := "the back node is unreadable"
+	if node, ok := sm.headerList.Back().Value.(*headerNode); ok && node != nil {
+		back = fmt.Sprintf("back height %d", node.height)
+	}
+
+	return fmt.Sprintf("the header round holds %d headers, %s, %s, %s, %s", sm.headerList.Len(), front, back, cursor, checkpoint)
+}
+
 // findNextHeaderCheckpoint returns the next checkpoint after the passed height.
 // It returns nil when there is not one either because the height is already
 // later than the final checkpoint or some other reason such as disabled
@@ -1475,7 +1564,7 @@ func (sm *SyncManager) startSync() {
 	if nextCP != nil &&
 		bestBlockHeightInt32 < nextCP.Height &&
 		sm.chainParams != &chaincfg.RegressionNetParams {
-		if err = bestPeer.PushGetHeadersMsg(locator, nextCP.Hash); err != nil {
+		if err = bestPeer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
 			sm.logger.Warnf("[startSync] Failed to send getheaders message to peer %s: %v", bestPeer.String(), err)
 
 			return
@@ -1854,32 +1943,60 @@ func (sm *SyncManager) reopenDemotedPeerSlice(sp *peerpkg.Peer) {
 		return
 	}
 
-	lowestHeight, rewound := sm.rewindToLowestHeader(reopened)
+	// Read once, and only to say what the hashes that do not resolve most likely
+	// are. A hash the header index cannot find names a block at or below this
+	// height far more often than it names a lost header, because the ledger keeps
+	// one record per owner and discharges only the deliverer.
+	committed := sm.lastCommittedHeight.Load()
+
+	lowestHeight, rewound, found, missing := sm.rewindToLowestHeader(reopened)
 	if !rewound {
-		sm.logger.Warnf("[demoteSyncPeer] reopened %d blocks owed by %s but none of them is still in the header list; recovery is down to the frontier race", len(reopened), sp.String())
+		sm.logger.Warnf("[demoteSyncPeer] reopened %d blocks owed by %s, %d still in the header list and %d not, with the chain committed to height %d, so the rest are ledger records for blocks already committed rather than headers that went missing; recovery is down to the frontier race", len(reopened), sp.String(), found, missing, committed)
 
 		return
 	}
 
-	sm.logger.Infof("[demoteSyncPeer] reopened %d blocks owed by %s and moved the download cursor back to height %d", len(reopened), sp.String(), lowestHeight)
+	sm.logger.Infof("[demoteSyncPeer] reopened %d blocks owed by %s, %d still in the header list and %d not, with the chain committed to height %d, and moved the download cursor back to height %d", len(reopened), sp.String(), found, missing, committed, lowestHeight)
 }
 
 // rewindToLowestHeader moves the download cursor back onto the lowest of hashes
-// that is still in the header list, and reports its height.
-func (sm *SyncManager) rewindToLowestHeader(hashes []chainhash.Hash) (int32, bool) {
+// that is still in the header list, reports its height, and says how many of the
+// hashes resolved in the header index and how many did not.
+//
+// The two counts are for the caller's log line and change no decision here. They
+// exist because the sentence they replaced read as though headers had gone
+// missing from the middle of the list, and that sentence cost a day: on
+// 2026-09-11 Hetzner mainnet logged "reopened 295 blocks owed by 164.132.247.87
+// but none of them is still in the header list" once a rotation for seven hours,
+// and the investigation went looking for the removal path that had lost them.
+// There is no such path. Every targeted removal in this package removes a block
+// the chain already has (trimHeadersTheChainAlreadyHas, advanceHeaderListFor,
+// removeHeaderAnchorLocked, which only ever takes an isAnchor node), and the two
+// wholesale ones call headerList.Init(). A hash that does not resolve is
+// therefore residue: the ledger keeps a record per owner, and only the peer that
+// actually delivered a block is discharged (handleBlockMsgHead), so every peer
+// that lost a race still carries a record for a block the chain committed long
+// ago.
+func (sm *SyncManager) rewindToLowestHeader(hashes []chainhash.Hash) (int32, bool, int, int) {
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
 
 	var (
 		lowest       *list.Element
 		lowestHeight int32
+		found        int
+		missing      int
 	)
 
 	for _, h := range hashes {
 		e := sm.headerIndex[h]
 		if e == nil {
+			missing++
+
 			continue
 		}
+
+		found++
 
 		node, ok := e.Value.(*headerNode)
 		if !ok {
@@ -1892,12 +2009,12 @@ func (sm *SyncManager) rewindToLowestHeader(hashes []chainhash.Hash) (int32, boo
 	}
 
 	if lowest == nil {
-		return 0, false
+		return 0, false, found, missing
 	}
 
 	sm.moveStartHeaderBackLocked(lowest)
 
-	return lowestHeight, true
+	return lowestHeight, true, found, missing
 }
 
 // headersRoundLocator returns the locator to send the next getheaders with.
@@ -1947,6 +2064,16 @@ func (sm *SyncManager) headersRoundLocator(bestHash *chainhash.Hash, bestHeight 
 // peer connected. The list front is appended explicitly because the stride can
 // step over it, and our database best block last because after the checkpoint
 // transition the round's anchor is removed and the front is one above the tip.
+//
+// Our committed tip stays LAST and is never promoted, however far below the back
+// it sits: a peer answers from the first locator hash it recognises
+// (src/validation.cpp:203-217, FindForkInGlobalIndex), so a tip-first locator
+// has every peer answer from tip+1, and that batch's first header connects to
+// the committed tip rather than to headerList.Back() — which the splice test in
+// handleHeadersMsg rejects, and which costs the sender its connection with
+// "Received block header that does not properly connect to the chain" — the one
+// disconnect that removed Hetzner mainnet's last working supplier on
+// 2026-09-11, charged on the first offence.
 func (sm *SyncManager) headerListLocator(bestHash *chainhash.Hash) []*chainhash.Hash {
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
@@ -2086,7 +2213,7 @@ func (sm *SyncManager) reopenStrandedSlice(p *peerpkg.Peer, released []chainhash
 		return
 	}
 
-	lowestHeight, rewound := sm.rewindToLowestHeader(released)
+	lowestHeight, rewound, _, _ := sm.rewindToLowestHeader(released)
 	if !rewound {
 		sm.logger.Debugf("[clearRequestedState] released %d blocks owed by %s, none of them still in the header list", len(released), p.String())
 
@@ -4070,7 +4197,7 @@ func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash ch
 	if nextCP != nil {
 		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
 
-		if err := peer.PushGetHeadersMsg(locator, nextCP.Hash); err != nil {
+		if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
 			return errors.NewServiceError("failed to send getheaders message to peer %s", peer.String(), err)
 		}
 
@@ -5396,11 +5523,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// refused.
 	var maxHeaderHash chainhash.Hash
 
-	// How many headers in this batch linked onto the list, and whether the batch
-	// turned out to be a late answer to a getheaders we ourselves sent.
+	// How many headers in this batch linked onto the list, whether the batch
+	// turned out to be a late answer to a getheaders we ourselves sent, and
+	// whether it connected to nothing at all at the back of the list.
 	var (
-		pushed     int
-		staleReply bool
+		pushed      int
+		staleReply  bool
+		unconnected bool
 	)
 
 	sm.headerMu.Lock()
@@ -5477,7 +5606,31 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 				break
 			}
 
-			disconnectReason = "Received block header that does not properly connect to the chain"
+			if pushed > 0 {
+				// The batch linked onto the back and then jumped sideways. That
+				// is a doctored chain, not a stale locator, and it still costs
+				// the sender its connection on the first offence.
+				//
+				// SV Node splits this differently because it can: it tests
+				// headers[0].hashPrevBlock against the whole of mapBlockIndex, so
+				// "parent unknown" and "internally non-continuous" are two
+				// separate faults to it, and it charges the second one straight
+				// away (net_processing.cpp:3415-3418). Our loop tests each header
+				// against the back of a list with one append point, so a
+				// non-continuous batch can only ever reach here as a non-connect
+				// with pushed > 0. Keying on pushed is therefore the exact
+				// mapping of that split, not an approximation of it.
+				disconnectReason = "Received block header that does not properly connect to the chain"
+
+				break
+			}
+
+			// Nothing in this batch linked: its first header hangs off something
+			// that is not the back of our list. Recorded here and acted on after
+			// the unlock, because a peerSyncState write must not happen under
+			// headerMu — the same reason the maxHeaderHeight credit below is
+			// deferred.
+			unconnected = true
 
 			break
 		}
@@ -5532,6 +5685,68 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		state.noteProvenClaim(maxHeaderHash, maxHeaderHeight)
 	}
 
+	// A batch that connects to nothing at our back is charged, not punished on
+	// the first offence. Its commonest cause is our own locator being stale
+	// rather than the peer lying, and that is exactly what happened on Hetzner
+	// mainnet on 2026-09-11: one such batch at 01:28:30 took the connection of
+	// 51.75.213.175, the only peer still carrying the sync, and dropping its
+	// control connection tore down the stream carrying block bodies with it. The
+	// node committed its last block three minutes later and then sat idle for
+	// seven hours. That log line is the only occurrence of the message in the
+	// whole run.
+	//
+	// The threshold is a deliberate divergence, not a translation. SV Node
+	// charges 20 points of a 100-point ban budget on every tenth consecutive
+	// unconnecting batch (net_processing.cpp:3407-3410, budget at
+	// validation.h:202), so it takes fifty batches to earn a BAN, which survives
+	// reconnection. Our only sanction is a disconnect the peer can reconnect from
+	// immediately and we keep no ban store, so fifty here would not mean what
+	// fifty means there. Ten is the point at which the reference first charges
+	// anything at all (validation.h:220).
+	//
+	// No repair getheaders goes out on the forgiven path, which is where SV Node
+	// sends one. That is enforced by an explicit return below, not by falling out
+	// of this switch: the send at the bottom of this function anchors its locator
+	// on finalHash, and on this path finalHash is the first header of the batch
+	// that did not connect. That is a header this node does not hold, so it is
+	// the one anchor guaranteed to bring back another batch we cannot splice.
+	//
+	// SV Node's repair differs because CChain::GetLocator always walks back to
+	// genesis (src/chain.cpp:27-55), so whatever it sends connects somewhere
+	// (net_processing.cpp:3390-3394). Ours ends at the front of the header list
+	// and the database tip, so the equivalent send would only re-ask the question
+	// this peer has just failed to answer usefully. The recovery route that does
+	// work is the block-announcement repair in handleInvMsg.
+	switch {
+	case unconnected:
+		if runLength := state.noteUnconnectingHeaders(); runLength >= maxUnconnectingHeaderBatches {
+			disconnectReason = fmt.Sprintf("Received %d block header batches in a row that do not properly connect to the chain", runLength)
+		} else {
+			// Logged at info, where the reference logs at debug
+			// (net_processing.cpp:3396). Forgiving this fault silently would
+			// leave the next 800128 no trace at all: the disconnect was the only
+			// evidence the first one happened, and it is the evidence this change
+			// removes. Bounded by the threshold, so a peer costs at most nine of
+			// these before it is gone.
+			sm.logger.Infof("[handleHeadersMsg] %d headers from %s connect to nothing at the back of our list, %d such batches in a row of %d before the connection goes", numHeaders, peer.String(), runLength, maxUnconnectingHeaderBatches)
+
+			// Nothing was spliced, so there is no round to continue and no
+			// answerable question to ask this peer. Falling through would send a
+			// getheaders anchored on the header we just failed to place, whose
+			// only possible reply is another batch we cannot splice: ten of those
+			// is 1.6 MB and ten headerMu acquisitions to arrive at the same
+			// disconnect, which makes forgiving the fault buy latency rather than
+			// survival. The sync-peer rotation and the announcement repair are
+			// what recover from here.
+			return
+		}
+
+	case pushed > 0 && disconnectReason == "":
+		// A batch that connects ends the run, so an intermittent fault never
+		// accumulates to a disconnect over hours (net_processing.cpp:3450-3456).
+		state.resetUnconnectingHeaders()
+	}
+
 	if staleReply {
 		sm.logger.Debugf("[handleHeadersMsg] ignoring %d late headers from %s: they connect to a header we already hold rather than to the back of the list", numHeaders, peer.String())
 
@@ -5584,7 +5799,30 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	if err := peer.PushGetHeadersMsg(locator, nextCP.Hash); err != nil {
+	// The round asks up to the end of the peer's chain, not up to the next
+	// checkpoint. A peer serves fork+1 through and including the stop block: it
+	// pushes each header and only then breaks on the stop hash
+	// (src/net/net_processing.cpp:2958-2963, over the fork point
+	// GetFirstBlockIndexFromLocatorNL resolves at :2783). So a stop hash at the
+	// next checkpoint makes the width of the answer checkpointHeight minus the
+	// height of locator[0], and locator[0] is the back of the header list. On
+	// 2026-09-11 Hetzner mainnet that was 849,999 against a stop hash naming the
+	// 850,000 checkpoint: a one-block question, answered honestly in 7.5 ms with
+	// zero headers. An empty reply returns from the top of handleHeadersMsg
+	// without touching any state, so the node sat on it for seven hours with the
+	// blocks it actually needed 50,000 below where it was asking.
+	//
+	// The checkpoint is still enforced. It always was, by the
+	// node.height == sm.nextCheckpoint.Height compare inside the splice loop
+	// above, which drops anything over the checkpoint rather than splicing it;
+	// the wire stop hash was never what protected it. Four of SV Node's five
+	// getheaders sites send uint256() (src/net/net_processing.cpp:3394, :3474,
+	// :3693, :5087) and the word checkpoint does not appear in that file at all.
+	//
+	// The cost is that the last batch of a checkpoint span can now overshoot by
+	// up to 2000 headers, about 162 KB, decoded and dropped at the checkpoint
+	// break. Roughly ten times over a full mainnet sync.
+	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
 		sm.logger.Warnf("Failed to send getheaders message to peer %s: %v", peer.String(), err)
 	}
 }
@@ -5686,8 +5924,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		return
 	}
 
-	// If a peer announces a block we already
-	// know of, then update their current block height.
+	// One lookup, two outcomes. A block we already know of gives us the
+	// announcer's height for nothing; a block we cannot place is an opportunity
+	// to repair the header chain, and the else arm takes it.
 	if lastBlock != -1 {
 		_, blockHeaderMeta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &invVects[lastBlock].Hash)
 		if err == nil {
@@ -5701,6 +5940,74 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			// Announced a block we hold, so we know its height without taking
 			// the peer's word for anything.
 			state.noteProvenClaim(invVects[lastBlock].Hash, blockHeightInt32)
+		} else {
+			// A block we cannot place. This is the recovery route that does not
+			// run through the headers round, and it is the one that would have
+			// ended the 2026-09-11 Hetzner mainnet stall: the node held headers
+			// to 849,999 with a committed tip of 800,128, its headers round
+			// asked a question whose only honest answer was zero headers, and it
+			// sat idle for seven hours while peers went on announcing a block
+			// roughly every ten minutes.
+			//
+			// Recovery is one block interval, not seconds, and it needs a sync
+			// peer. handleInvMsg returns early above on peer != sp && !current(),
+			// and current() is false throughout a deep sync, so during IBD only
+			// the ELECTED sync peer's announcements reach this arm. That is not a
+			// defect of this code but it does bound what it buys: in the observed
+			// stall the role rotated every 3m30s across eight peers, so each got
+			// a turn well inside one block interval. Every test in
+			// inv_repair_test.go makes the announcer the sync peer, which bakes
+			// the restriction into the harness; it is stated here because the
+			// harness cannot state it. A getheaders
+			// anchored on the back of the header list, sent on one of those
+			// announcements, is answered from 850,000 forward: a batch that
+			// connects to the back, splices, verifies the checkpoint, removes
+			// the anchor and releases fetchHeaderBlocks.
+			//
+			// Remembering the announcer is half the value and is done whatever
+			// else happens here. It is SV Node's UpdateBlockAvailability on the
+			// same path (net_processing.cpp:2426, and again on an unconnecting
+			// headers batch at :3405): without it the peer that told us about
+			// the block is not usable as a download source when its headers
+			// finally arrive.
+			announced := invVects[lastBlock].Hash
+			state.notePendingClaim(announced)
+
+			// Gated on headers-first mode being ON, which SV Node does not do —
+			// it acts on a block inv in every state. The gate is forced by our
+			// own code: handleHeadersMsg disconnects any peer that answers a
+			// getheaders sent while headersFirstMode is false ("Got %d
+			// unrequested headers"), so asking outside the mode would cost us
+			// the peer that helped.
+			//
+			// headerListLocator(nil) rather than headersRoundLocator, so this
+			// path makes no blockchain client call of its own beyond the lookup
+			// three lines up. It takes and releases headerMu itself and the send
+			// is after it returns, so Rule B holds with nothing arranged here. An
+			// empty header list means headers-first has no round in progress, and
+			// there is then nothing this repair could usefully ask for.
+			//
+			// The stop hash is the ANNOUNCED block, as in SV Node
+			// (net_processing.cpp:2440). It makes the served window
+			// headerList.Back()+1 through the announced block rather than a
+			// one-block range, and it varies per announcement — which matters
+			// here more than it does there, because PushGetHeadersMsg filters a
+			// repeat of the same (locator[0], stopHash) pair for the peer's
+			// whole lifetime with no expiry (peer.go:1132-1142). The round's own
+			// request has a constant key and can be swallowed by that filter;
+			// this one cannot.
+			//
+			// No getdata, ever. SV Node removed exactly that send and says why at
+			// net_processing.cpp:2429-2435: falling back to an inv usually means
+			// a reorg, whose headers are needed before any block is worth asking
+			// for.
+			if sm.headersFirstMode.Load() && !sm.blockDownloads.RequestedWithin(announced, blockRequestRetryInterval) {
+				if locator := sm.headerListLocator(nil); len(locator) > 0 {
+					if err := peer.PushGetHeadersMsg(blockchain.BlockLocator(locator), &announced); err != nil {
+						sm.logger.Warnf("[handleInvMsg] Failed to send repair getheaders for announced block %s to peer %s: %v", announced, peer, err)
+					}
+				}
+			}
 		}
 	}
 
@@ -6684,7 +6991,7 @@ func (sm *SyncManager) NotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) 
 		return
 	}
 
-	lowestHeight, rewound := sm.rewindToLowestHeader(released)
+	lowestHeight, rewound, _, _ := sm.rewindToLowestHeader(released)
 	if !rewound {
 		sm.logger.Debugf("[NotFound] released %d blocks %s says it does not have, none of them still in the header list", len(released), peer.String())
 

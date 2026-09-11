@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"container/list"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -236,4 +238,119 @@ func TestConsumerStallLineIsOneLine(t *testing.T) {
 	// tag returns the whole finding rather than its first clause.
 	require.NotContains(t, log.warns[0], "\n")
 	require.False(t, strings.HasSuffix(log.warns[0], " "))
+}
+
+// seedStalledHeaderRound puts a manager into the header state Hetzner mainnet was
+// in at 08:47 on 2026-09-11: headers-first mode on, a list whose front is the
+// round's anchor, headers stacked above it, and a checkpoint ahead. The blocks
+// the node actually needed were fifty thousand heights below the back of this
+// list, which is why the watchdog has to print both ends of it.
+func seedStalledHeaderRound(sm *SyncManager, anchorHeight int32, above int) {
+	sm.headerList = list.New()
+	sm.headerIndex = make(map[chainhash.Hash]*list.Element)
+
+	anchor := &headerNode{height: anchorHeight, hash: &chainhash.Hash{0xa0}, isAnchor: true}
+	sm.headerIndex[*anchor.hash] = sm.headerList.PushBack(anchor)
+
+	for i := 1; i <= above; i++ {
+		node := &headerNode{height: anchorHeight + int32(i), hash: &chainhash.Hash{0xb0, byte(i)}}
+		sm.headerIndex[*node.hash] = sm.headerList.PushBack(node)
+	}
+
+	checkpointHash := chainhash.Hash{0xcc}
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 850000, Hash: &checkpointHash}
+
+	sm.headersFirstMode.Store(true)
+}
+
+// stallReport drives one watchdog tick past the threshold and returns the single
+// line it wrote. It goes through reportConsumerStall rather than calling
+// headerRoundSummary, because the wiring from the watchdog to the header state is
+// the thing under test: the summary existed as a private truth all along, and
+// what the seven-hour stall lacked was a path from it to the log.
+func stallReport(t *testing.T, sm *SyncManager, log *captureLogger) string {
+	t.Helper()
+
+	now := time.Now()
+
+	sm.noteConsumerAdmitted(now)
+	sm.publishConsumerWait(now, true, nil)
+	sm.reportConsumerStall(now.Add(consumerStallAfter + time.Second))
+
+	require.Len(t, log.warns, 1)
+
+	return log.warns[0]
+}
+
+// TestConsumerWatchdog_ReportsTheHeaderRoundWhenTheAnchorIsStillTheFront is the
+// line that would have settled the 800128 stall on the first tick instead of
+// after seven hours and a packet capture.
+func TestConsumerWatchdog_ReportsTheHeaderRoundWhenTheAnchorIsStillTheFront(t *testing.T) {
+	log := &captureLogger{Logger: ulogger.TestLogger{}}
+	sm := &SyncManager{logger: log}
+
+	seedStalledHeaderRound(sm, 849900, 99)
+	sm.startHeader = sm.headerList.Front()
+
+	line := stallReport(t, sm, log)
+
+	require.Contains(t, line, "the header round holds 100 headers")
+	require.Contains(t, line, "front height 849900")
+	require.Contains(t, line, "the round's anchor")
+	require.Contains(t, line, "back height 849999")
+	require.Contains(t, line, "aiming at checkpoint 850000")
+}
+
+// TestConsumerWatchdog_ReportsANilDownloadCursor pins the other terminal state of
+// the walk. A nil startHeader beside a list full of headers switches the only
+// fetcher off, and in every log the node writes today it is indistinguishable
+// from a round whose anchor never had anything splice onto it. The two want
+// opposite fixes, so the report has to name which one it is.
+func TestConsumerWatchdog_ReportsANilDownloadCursor(t *testing.T) {
+	log := &captureLogger{Logger: ulogger.TestLogger{}}
+	sm := &SyncManager{logger: log}
+
+	seedStalledHeaderRound(sm, 800128, 12)
+	sm.startHeader = nil
+
+	line := stallReport(t, sm, log)
+
+	require.Contains(t, line, "the download cursor is nil")
+	require.Contains(t, line, "the header round holds 13 headers")
+}
+
+// TestConsumerWatchdog_SaysNothingExtraWithHeadersFirstOff keeps this scoped to
+// the state it diagnoses. Outside a headers-first round the list is not the thing
+// holding blocks up, and a clause about it would be noise on every other stall.
+func TestConsumerWatchdog_SaysNothingExtraWithHeadersFirstOff(t *testing.T) {
+	log := &captureLogger{Logger: ulogger.TestLogger{}}
+	sm := &SyncManager{logger: log}
+
+	seedStalledHeaderRound(sm, 800128, 12)
+	sm.startHeader = sm.headerList.Front()
+	sm.headersFirstMode.Store(false)
+
+	line := stallReport(t, sm, log)
+
+	require.Contains(t, line, "no block admitted")
+	require.NotContains(t, line, "the header round")
+}
+
+// TestConsumerWatchdog_ANilHeaderListStillProducesAReport matches the harness
+// twelve test files in this package use: a SyncManager built as a struct literal,
+// with no header list and no checkpoint. A watchdog that panicked on one of those
+// would take the whole message-handling goroutine down, which is a worse failure
+// than the stall it reports.
+func TestConsumerWatchdog_ANilHeaderListStillProducesAReport(t *testing.T) {
+	log := &captureLogger{Logger: ulogger.TestLogger{}}
+	sm := &SyncManager{logger: log}
+
+	sm.headersFirstMode.Store(true)
+
+	var line string
+
+	require.NotPanics(t, func() { line = stallReport(t, sm, log) })
+
+	require.Contains(t, line, "the header round holds no headers")
+	require.Contains(t, line, "no checkpoint ahead")
 }

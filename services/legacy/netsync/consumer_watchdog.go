@@ -271,8 +271,17 @@ func (sm *SyncManager) reportConsumerStall(now time.Time) {
 
 	sm.consumerStallLoggedAt.Store(now.UnixNano())
 
+	// The header round is appended rather than folded into describe(), because
+	// describe() reads only the consumer's own snapshot and must stay lock-free:
+	// this call takes headerMu, which is legal here and nowhere on the consumer
+	// goroutine. See headerRoundSummary.
+	report := w.describe(now)
+	if round := sm.headerRoundSummary(); round != "" {
+		report += "; " + round
+	}
+
 	sm.logger.Warnf("[consumerWatchdog] no block admitted for %s: %s",
-		now.Sub(time.Unix(0, last)).Round(time.Second), w.describe(now))
+		now.Sub(time.Unix(0, last)).Round(time.Second), report)
 }
 
 // describe says, in one line, what the loop is waiting for and what is waiting on
