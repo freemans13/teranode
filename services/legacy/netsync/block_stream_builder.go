@@ -1,9 +1,12 @@
 package netsync
 
 import (
+	"strings"
+
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
@@ -43,12 +46,36 @@ type blockStreamBuilder struct {
 	emitted       int
 	seen          int
 	failed        error
+
+	// dedup rejects a transaction whose hash has already appeared in this block.
+	//
+	// The merkle root cannot catch that: the duplicate-last-when-odd rule means a
+	// mutated transaction list produces the same root, the same header and the
+	// same block hash as the honest one, so CheckMerkleRoot passes on it. This is
+	// the only thing that catches it, and it is required below the checkpoint too,
+	// because a checkpoint anchors the block HASH while the peer supplies the BODY
+	// (model/check_duplicate_txs.go:23).
+	//
+	// Put IS the check: it fails when the hash repeats, so there is no second
+	// scan and nothing is re-read. Nil means no dedup, which is the behaviour a
+	// caller that supplies no map had before.
+	dedup txmap.TxMap
 }
 
 // newBlockStreamBuilder prepares a builder for a block declaring txCount
 // transactions, including its coinbase, partitioned into subtrees of at most
-// maxItems leaves.
+// maxItems leaves. It performs no duplicate-transaction detection; see
+// newBlockStreamBuilderWithDedup.
 func newBlockStreamBuilder(txCount, maxItems int, coinbase *bt.Tx, emit subtreeEmitFunc) (*blockStreamBuilder, error) {
+	return newBlockStreamBuilderWithDedup(txCount, maxItems, coinbase, emit, nil)
+}
+
+// newBlockStreamBuilderWithDedup prepares a builder that rejects a block
+// carrying the same transaction twice. dedup may be an in-memory map or the
+// disk-backed one; both satisfy txmap.TxMap, and the pipeline does not care
+// which is in use. A nil dedup disables the check, matching
+// newBlockStreamBuilder's previous behaviour.
+func newBlockStreamBuilderWithDedup(txCount, maxItems int, coinbase *bt.Tx, emit subtreeEmitFunc, dedup txmap.TxMap) (*blockStreamBuilder, error) {
 	if coinbase == nil {
 		return nil, errors.NewProcessingError("[blockStreamBuilder] no coinbase transaction")
 	}
@@ -88,6 +115,7 @@ func newBlockStreamBuilder(txCount, maxItems int, coinbase *bt.Tx, emit subtreeE
 		emit:          emit,
 		acc:           acc,
 		subtreeHashes: make([]chainhash.Hash, 0, count),
+		dedup:         dedup,
 	}
 
 	if err = b.startSubtree(); err != nil {
@@ -141,6 +169,22 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 
 	if b.seen >= b.txCount {
 		return b.fail(errors.NewBlockInvalidError("[blockStreamBuilder] peer sent more transactions than the %d it declared", b.txCount))
+	}
+
+	if b.dedup != nil {
+		if err := b.dedup.Put(*txHash, uint64(b.dedup.Length())); err != nil {
+			// go-tx-map's own in-memory implementations signal a repeat with their
+			// package sentinel wrapped in fmt.Errorf, not with teranode's
+			// errors.ErrTxExists — only the disk-backed model.DiskTxMapUint64
+			// translates to that sentinel. model/Block.go:1280 already carries
+			// this same dual check for the same reason; match it here so the
+			// test holds regardless of which concrete txmap.TxMap is supplied.
+			if errors.Is(err, errors.ErrTxExists) || strings.Contains(err.Error(), "hash already exists in map") {
+				return b.fail(errors.NewBlockInvalidError("[blockStreamBuilder] block contains duplicate transaction %s (CVE-2012-2459)", txHash))
+			}
+
+			return b.fail(errors.NewProcessingError("[blockStreamBuilder] failed recording transaction %s for duplicate detection", txHash, err))
+		}
 	}
 
 	nodeIdx := b.current.Length()
