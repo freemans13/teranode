@@ -1,0 +1,226 @@
+package netsync
+
+import (
+	"testing"
+
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/stretchr/testify/require"
+)
+
+// buildSubtrees partitions leafCount leaves into subtrees of maxItems, filling
+// slot zero of the first subtree with the coinbase placeholder exactly as
+// prepareSubtrees does. It returns the subtrees and the leaf hashes in order.
+func buildSubtrees(t *testing.T, leafCount, maxItems int) ([]*subtreepkg.Subtree, []chainhash.Hash) {
+	t.Helper()
+
+	size, k, finalLeaves, err := partitionLegacyBlock(leafCount, maxItems)
+	require.NoError(t, err)
+
+	subtrees := make([]*subtreepkg.Subtree, k)
+	leaves := make([]chainhash.Hash, 0, leafCount)
+
+	next := 0
+
+	for i := 0; i < k; i++ {
+		capacity := size
+		if i == k-1 && k > 1 && finalLeaves < size {
+			capacity = finalLeaves
+		}
+
+		st, err := subtreepkg.NewIncompleteTreeByLeafCount(capacity)
+		require.NoError(t, err)
+
+		if i == 0 {
+			require.NoError(t, st.AddCoinbaseNode())
+			leaves = append(leaves, chainhash.Hash{})
+			next++
+		}
+
+		for st.Length() < capacity {
+			var h chainhash.Hash
+			h[0] = byte(next)
+			h[1] = byte(next >> 8)
+			h[2] = byte(next >> 16)
+
+			require.NoError(t, st.AddNode(h, 0, 100))
+
+			leaves = append(leaves, h)
+			next++
+		}
+
+		subtrees[i] = st
+	}
+
+	return subtrees, leaves
+}
+
+// TestMerkleAccumulator_MatchesCheckMerkleRoot is the contract. The accumulator
+// exists to avoid holding every subtree at once, so the only thing that makes it
+// safe is producing the identical root to the function that does hold them all.
+// The lift rules, the power-of-two guard on the first subtree and the duplicate
+// check are subtle and security-relevant, so this asserts equality rather than
+// re-deriving them.
+func TestMerkleAccumulator_MatchesCheckMerkleRoot(t *testing.T) {
+	coinbaseID := chainhash.Hash{0xcb}
+
+	for _, tc := range []struct {
+		name      string
+		leafCount int
+		maxItems  int
+	}{
+		{"single subtree exactly full", 8, 8},
+		{"single partial subtree", 5, 8},
+		{"two full subtrees", 16, 8},
+		{"final subtree short", 20, 8},
+		{"final subtree holds one leaf", 17, 8},
+		{"mainnet subtree size", 9000, 4096},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			subtrees, _ := buildSubtrees(t, tc.leafCount, tc.maxItems)
+
+			want, err := referenceRootFromSubtrees(subtrees, &coinbaseID, 200)
+			require.NoError(t, err)
+
+			acc, err := newMerkleAccumulator(len(subtrees), &coinbaseID, 200)
+			require.NoError(t, err)
+
+			for i, st := range subtrees {
+				require.NoError(t, acc.Add(st, i == len(subtrees)-1))
+			}
+
+			got, err := acc.Root()
+			require.NoError(t, err)
+
+			require.Equal(t, want.String(), got.String(),
+				"the accumulator must produce the same root as holding every subtree at once, or it is not a safe substitute")
+		})
+	}
+}
+
+// TestMerkleAccumulator_RejectsANonPowerOfTwoFirstSubtree pins the guard that
+// stops a peer crafting a partition whose root a canonical validator would not
+// agree with. Without it, lengths like [3, 2] produce a root SV Node rejects.
+func TestMerkleAccumulator_RejectsANonPowerOfTwoFirstSubtree(t *testing.T) {
+	coinbaseID := chainhash.Hash{0xcb}
+
+	first, err := subtreepkg.NewIncompleteTreeByLeafCount(3)
+	require.NoError(t, err)
+	require.NoError(t, first.AddCoinbaseNode())
+	require.NoError(t, first.AddNode(chainhash.Hash{0x01}, 0, 100))
+	require.NoError(t, first.AddNode(chainhash.Hash{0x02}, 0, 100))
+
+	second, err := subtreepkg.NewIncompleteTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, second.AddNode(chainhash.Hash{0x03}, 0, 100))
+	require.NoError(t, second.AddNode(chainhash.Hash{0x04}, 0, 100))
+
+	acc, err := newMerkleAccumulator(2, &coinbaseID, 200)
+	require.NoError(t, err)
+
+	require.NoError(t, acc.Add(first, false))
+
+	err = acc.Add(second, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not a power of two",
+		"the message must name the actual fault, or a future change can satisfy this test without enforcing the rule")
+}
+
+// TestMerkleAccumulator_RejectsADuplicateSubtreeRoot pins the CVE-2012-2459
+// guard. A duplicate-transaction mutation preserves the block's merkle root via
+// the duplicate-last-when-odd rule, so the root comparison alone passes and this
+// is the only thing that catches it.
+func TestMerkleAccumulator_RejectsADuplicateSubtreeRoot(t *testing.T) {
+	coinbaseID := chainhash.Hash{0xcb}
+
+	subtrees, _ := buildSubtrees(t, 16, 8)
+
+	acc, err := newMerkleAccumulator(3, &coinbaseID, 200)
+	require.NoError(t, err)
+
+	require.NoError(t, acc.Add(subtrees[0], false))
+	require.NoError(t, acc.Add(subtrees[1], false))
+
+	err = acc.Add(subtrees[1], true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate subtree root",
+		"a repeated subtree root is the CVE-2012-2459 shape and must be named as such")
+}
+
+// TestMerkleAccumulator_RejectsAShortNonFinalSubtree pins the rule that only the
+// final subtree may be incomplete. A short subtree in the middle changes where
+// every later leaf sits in the tree.
+func TestMerkleAccumulator_RejectsAShortNonFinalSubtree(t *testing.T) {
+	coinbaseID := chainhash.Hash{0xcb}
+
+	subtrees, _ := buildSubtrees(t, 24, 8)
+
+	short, err := subtreepkg.NewIncompleteTreeByLeafCount(8)
+	require.NoError(t, err)
+	require.NoError(t, short.AddNode(chainhash.Hash{0xaa}, 0, 100))
+
+	acc, err := newMerkleAccumulator(3, &coinbaseID, 200)
+	require.NoError(t, err)
+
+	require.NoError(t, acc.Add(subtrees[0], false))
+
+	err = acc.Add(short, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "only the final subtree may be incomplete")
+}
+
+// referenceRootFromSubtrees computes the block merkle root the way
+// model.Block.CheckMerkleRoot does, holding every subtree at once. It exists
+// only so the accumulator can be asserted equal to it. Keep it a transcription
+// of that function rather than an independent implementation: if the two ever
+// disagree, the question is which one moved.
+func referenceRootFromSubtrees(subtrees []*subtreepkg.Subtree, coinbaseID *chainhash.Hash, coinbaseSize uint64) (*chainhash.Hash, error) {
+	hashes := make([]chainhash.Hash, len(subtrees))
+
+	for i, st := range subtrees {
+		if i == 0 {
+			root, err := st.RootHashWithReplaceRootNode(coinbaseID, 0, coinbaseSize)
+			if err != nil {
+				return nil, err
+			}
+
+			hashes[i] = *root
+
+			continue
+		}
+
+		hashes[i] = *st.RootHash()
+	}
+
+	if len(hashes) == 1 {
+		return &hashes[0], nil
+	}
+
+	targetLength := subtrees[0].Length()
+	targetHeight := subtrees[0].Height
+
+	last := subtrees[len(subtrees)-1]
+	if last.Length() < targetLength {
+		lifted, err := last.RootHashPadded(targetHeight)
+		if err != nil {
+			return nil, err
+		}
+
+		hashes[len(hashes)-1] = *lifted
+	}
+
+	top, err := subtreepkg.NewIncompleteTreeByLeafCount(len(subtrees))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, h := range hashes {
+		if err = top.AddNode(h, 1, 0); err != nil {
+			return nil, err
+		}
+	}
+
+	root := top.RootHash()
+
+	return chainhash.NewHash(root[:])
+}
