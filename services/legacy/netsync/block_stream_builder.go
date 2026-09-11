@@ -1,8 +1,6 @@
 package netsync
 
 import (
-	"strings"
-
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -173,13 +171,18 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 
 	if b.dedup != nil {
 		if err := b.dedup.Put(*txHash, uint64(b.dedup.Length())); err != nil {
-			// go-tx-map's own in-memory implementations signal a repeat with their
-			// package sentinel wrapped in fmt.Errorf, not with teranode's
-			// errors.ErrTxExists — only the disk-backed model.DiskTxMapUint64
-			// translates to that sentinel. model/Block.go:1280 already carries
-			// this same dual check for the same reason; match it here so the
-			// test holds regardless of which concrete txmap.TxMap is supplied.
-			if errors.Is(err, errors.ErrTxExists) || strings.Contains(err.Error(), "hash already exists in map") {
+			// go-tx-map's own in-memory implementations wrap their exported
+			// sentinel txmap.ErrHashAlreadyExists (tx_map.go:132) with %w, so
+			// errors.Is unwraps it correctly — confirmed against the pinned
+			// go-tx-map version, and matched by the library's own test at
+			// tx_map_test.go:224. The disk-backed model.DiskTxMapUint64 instead
+			// returns teranode's errors.ErrTxExists directly. Checking both
+			// keeps this a BlockInvalidError (peer misbehaviour) rather than a
+			// generic processing error regardless of which concrete
+			// txmap.TxMap a future caller supplies; collapsing to only one
+			// classifies a genuine duplicate as a transient fault the moment
+			// the other map's wording ever changes.
+			if errors.Is(err, errors.ErrTxExists) || errors.Is(err, txmap.ErrHashAlreadyExists) {
 				return b.fail(errors.NewBlockInvalidError("[blockStreamBuilder] block contains duplicate transaction %s (CVE-2012-2459)", txHash))
 			}
 
