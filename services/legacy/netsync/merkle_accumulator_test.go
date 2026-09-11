@@ -169,11 +169,16 @@ func TestMerkleAccumulator_RejectsAShortNonFinalSubtree(t *testing.T) {
 	require.Contains(t, err.Error(), "only the final subtree may be incomplete")
 }
 
-// referenceRootFromSubtrees computes the block merkle root the way
-// model.Block.CheckMerkleRoot does, holding every subtree at once. It exists
-// only so the accumulator can be asserted equal to it. Keep it a transcription
-// of that function rather than an independent implementation: if the two ever
-// disagree, the question is which one moved.
+// referenceRootFromSubtrees is a root-value oracle, not a validator: it computes
+// the merkle root the way CheckMerkleRoot does, holding every subtree at once,
+// but it carries none of that function's rejection guards. It does not check
+// that the first subtree's length is a power of two, that only the final
+// subtree is incomplete, or that no subtree root repeats. Given a malformed
+// partition it will compute a root instead of returning an error, so it must
+// never be handed one in the expectation of a failure — the four negative
+// tests exercise the guards directly against the accumulator instead. Valid
+// only for well-formed partitions, this exists so the accumulator's root VALUE
+// can be asserted equal to it.
 func referenceRootFromSubtrees(subtrees []*subtreepkg.Subtree, coinbaseID *chainhash.Hash, coinbaseSize uint64) (*chainhash.Hash, error) {
 	hashes := make([]chainhash.Hash, len(subtrees))
 
