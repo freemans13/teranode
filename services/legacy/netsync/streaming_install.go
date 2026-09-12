@@ -285,6 +285,38 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		return
 	}
 
+	// The streamed route never touched sm.blockDownloads, the map
+	// handleBlockMsg releases via RemoveOwner/ForgiveOwners (manager.go) the
+	// moment it dequeues a decoded block. Before this branch made the pipeline
+	// send every block down this route, that gap only missed blocks above the
+	// decode-size threshold (rare); with PipelineReceive on it is every block,
+	// so a delivering peer's CountForPeer sticks at MaxBlocksInTransitPerPeer
+	// after roughly sixteen deliveries and the scheduler (block_scheduler.go:144)
+	// stops asking that peer for anything until the hour-long assignment TTL
+	// expires.
+	//
+	// Released HERE — at message intake into this single consumer, the same
+	// point handleBlockMsg releases it, NOT at the block's eventual commit.
+	// By the time this message exists the peer has already fully answered: the
+	// sink ran to completion on the peer's own read loop before
+	// QueueBlockOnDisk was ever called, so there is no copy still being
+	// converted for a duplicate to race against — releasing later, after
+	// AdoptWritten or the eventual park commit (either of which an unreachable
+	// parent or a full park can delay indefinitely), would only widen the
+	// leak's own window instead of closing it. Unconditional on what happens
+	// below: the peer earned the release by delivering the bytes, whether this
+	// node ends up keeping them (AdoptWritten) or discarding them (unreachable
+	// parent, full park).
+	//
+	// Gated on PipelineReceive: before this branch, a block only reached this
+	// on-disk route above the 64 MiB decode threshold, and that pre-existing
+	// (rare) behaviour is not this task's to change — only the route this
+	// branch made universal is.
+	if sm.settings != nil && sm.settings.Legacy.PipelineReceive {
+		sm.blockDownloads.RemoveOwner(msg.peer, msg.body.Hash)
+		sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
+	}
+
 	entry := parkedBlock{
 		hash:      msg.body.Hash,
 		prevBlock: msg.body.Header.PrevBlock,
