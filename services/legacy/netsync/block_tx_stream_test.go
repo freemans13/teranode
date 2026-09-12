@@ -75,9 +75,23 @@ func TestBlockTxStream_RefusesATruncatedStream(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, err = s.Next()
-	require.Error(t, err)
+	require.Error(t, err, "a body that runs out mid-transaction must fail, not silently stop")
 	require.NotErrorIs(t, err, errBlockTxStreamDone,
 		"a truncated body must be an error, not a clean end of stream")
+}
+
+// TestBlockTxStream_RefusesABodyTooShortForACount pins the collision the
+// reviewer found: errBlockTxStreamDone and a body too short to even carry the
+// transaction count varint were both built with NewProcessingError, and
+// teranode's errors.Is matches on code alone, so the two were
+// indistinguishable to a caller doing errors.Is(err, errBlockTxStreamDone). A
+// peer that sends a body too short to carry a count must read as a failure,
+// never as "nothing left to read."
+func TestBlockTxStream_RefusesABodyTooShortForACount(t *testing.T) {
+	_, err := newBlockTxStream(bytes.NewReader(nil), 100)
+	require.Error(t, err, "an empty body cannot even hold a transaction count")
+	require.NotErrorIs(t, err, errBlockTxStreamDone,
+		"a count-read failure must not collide with clean exhaustion on error code")
 }
 
 // TestBlockTxStream_StopsAtTheDeclaredCount pins the other end: trailing bytes

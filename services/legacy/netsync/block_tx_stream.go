@@ -12,6 +12,16 @@ import (
 
 // errBlockTxStreamDone reports that every declared transaction has been read. It
 // is a normal end, not a failure, and is distinct from a truncated body.
+//
+// HAZARD: teranode's (*errors.Error).Is matches purely on the numeric error
+// CODE (errors/errors.go), not on identity or message. This sentinel is a
+// NewProcessingError, so any OTHER error in this file built with
+// NewProcessingError becomes indistinguishable from clean exhaustion to a
+// caller doing errors.Is(err, errBlockTxStreamDone) — a real failure would
+// read as "nothing left to read," and a corrupt block would be treated as a
+// complete one. Nothing else in this file may use NewProcessingError. Give
+// every other failure here its own, different code (NewBlockInvalidError,
+// as used below, is fine — it's code 11, this sentinel is code 4).
 var errBlockTxStreamDone = errors.NewProcessingError("block transaction stream exhausted")
 
 // maxBlockTxCount is the absolute ceiling on the peer-declared transaction count.
@@ -53,7 +63,11 @@ func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
 
 	count, err := wire.ReadVarInt(br, wire.ProtocolVersion)
 	if err != nil {
-		return nil, errors.NewProcessingError("[blockTxStream] could not read the transaction count", err)
+		// NewBlockInvalidError, not NewProcessingError: a body too short to carry
+		// a transaction count is a malformed block from the peer, not a local
+		// processing fault, and giving it errBlockTxStreamDone's code would make
+		// errors.Is match it against clean exhaustion (see the sentinel's comment).
+		return nil, errors.NewBlockInvalidError("[blockTxStream] could not read the transaction count", err)
 	}
 
 	if count == 0 {
