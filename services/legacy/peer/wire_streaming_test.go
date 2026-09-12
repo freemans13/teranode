@@ -53,10 +53,12 @@ func installTestSink(t *testing.T,
 	t.Helper()
 
 	prevSink, prevGate, prevDelete := blockBodySink, blockBodyGate, blockBodyDelete
+	prevStreamsEverySize := blockBodyStreamsEverySize
 	blockBodySink, blockBodyGate, blockBodyDelete = sink, gate, del
 
 	return func() {
 		blockBodySink, blockBodyGate, blockBodyDelete = prevSink, prevGate, prevDelete
+		blockBodyStreamsEverySize = prevStreamsEverySize
 	}
 }
 
@@ -101,8 +103,8 @@ func testBlockPayload(t *testing.T, numTxs int) (*wire.MsgBlock, []byte) {
 // that will replace the body-storing sink needs the coinbase and the merkle root,
 // and re-parsing bytes the wire layer has already parsed is waste on the read loop.
 func TestStreamingBlockHandler_SinkReceivesTheHeader(t *testing.T) {
-	streamToDiskAtLeast = 0
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
+	blockBodyStreamsEverySize = true
+	t.Cleanup(func() { blockBodyStreamsEverySize = false })
 
 	var gotHeader *wire.BlockHeader
 
@@ -132,6 +134,66 @@ func TestStreamingBlockHandler_SinkReceivesTheHeader(t *testing.T) {
 	require.Equal(t, blk.Header.MerkleRoot.String(), gotHeader.MerkleRoot.String(),
 		"and it must be the block's own header, not a zero value")
 	require.Equal(t, blk.BlockHash().String(), gotHash.String())
+}
+
+// TestStreamingBlockHandler_SmallBlocksAlsoStream pins that the size threshold no
+// longer decides the path. It existed because streaming meant "write the body to
+// disk", which was only worth it for a block too large to hold; streaming now
+// means "convert it as it arrives", which is worth it at every size.
+func TestStreamingBlockHandler_SmallBlocksAlsoStream(t *testing.T) {
+	var sinkCalls int
+
+	restore := installTestSink(t,
+		func(_ chainhash.Hash, _ *wire.BlockHeader, r io.Reader, _ int64) error {
+			sinkCalls++
+
+			// readBlockMessage treats an undrained reader as a truncated body and
+			// refuses it; a real sink always reads to the declared length, so the
+			// test one must too or it is not exercising the path it claims to.
+			_, err := io.Copy(io.Discard, r)
+
+			return err
+		},
+		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
+		func(chainhash.Hash) error { return nil },
+	)
+	defer restore()
+
+	blockBodyStreamsEverySize = true
+
+	_, payload := testBlockPayload(t, 3)
+	require.Less(t, len(payload), 64<<20, "sanity: this block is far below the old threshold")
+
+	_, err := readBlockMessage(limitedOver(payload), uint64(len(payload)))
+	require.NoError(t, err)
+	require.Equal(t, 1, sinkCalls, "a small block must reach the sink, not the whole-block decoder")
+}
+
+// TestStreamingBlockHandler_SmallBlocksStillDecodeWhenThePipelineIsOff is the
+// guard on the default path. This branch runs on a live node, and with the
+// pipeline off a small block must reach the decoder exactly as it always has.
+// Removing the size threshold outright would silently move every small block onto
+// the park sink, which is a behaviour change nobody asked for.
+func TestStreamingBlockHandler_SmallBlocksStillDecodeWhenThePipelineIsOff(t *testing.T) {
+	var sinkCalls int
+
+	restore := installTestSink(t,
+		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
+			sinkCalls++
+
+			return nil
+		},
+		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
+		func(chainhash.Hash) error { return nil },
+	)
+	defer restore()
+
+	// blockBodyStreamsEverySize deliberately left false.
+	_, payload := testBlockPayload(t, 3)
+
+	_, err := readBlockMessage(limitedOver(payload), uint64(len(payload)))
+	require.NoError(t, err)
+	require.Zero(t, sinkCalls, "with the pipeline off a small block must still be decoded, not streamed")
 }
 
 func TestStreamingBlockHandler_RoundTrip(t *testing.T) {

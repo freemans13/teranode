@@ -56,10 +56,17 @@ const streamedBodyRequestWindow = 60 * 60 * 1000000000 // one hour, in nanosecon
 // Installing a sink without a gate is refused by the wire layer itself, which
 // falls back to decoding rather than opening the door. This installs all three
 // together for the same reason.
+//
+// set also carries whether the wire layer may ignore its size threshold. The
+// two decisions are made from the same PipelineReceive check and passed on the
+// same call, so a sink can never be installed with the wrong size policy: the
+// park sink only pays for a block too large to hold in memory, but the
+// pipeline sink converts a block as it arrives and pays at every size.
 func (sm *SyncManager) installStreamingBlockPath(set func(
 	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error,
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
 	del func(chainhash.Hash) error,
+	streamsEverySize bool,
 )) {
 	if sm == nil || sm.blockPark == nil || !sm.blockPark.Enabled() {
 		return
@@ -72,7 +79,7 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 
 	sm.logger.Infof("[legacy] streaming block path installed, pipeline=%v", sm.settings.Legacy.PipelineReceive)
 
-	set(sink, sm.streamingBlockGate, sm.streamingBlockDelete)
+	set(sink, sm.streamingBlockGate, sm.streamingBlockDelete, sm.settings.Legacy.PipelineReceive)
 }
 
 // streamingBlockGate answers whether a peer may write this block's body to our

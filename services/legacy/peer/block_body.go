@@ -66,26 +66,35 @@ func (m *MsgBlockOnDisk) MaxPayloadLength(pver uint32) uint64 {
 }
 
 // SetBlockBodyStreaming installs all three callbacks the streaming path needs,
-// or clears all three when any of them is nil.
+// or clears all three when any of them is nil, and sets whether the size
+// threshold is bypassed.
 //
-// One call rather than three because the three are only safe together. A sink
-// with no gate is a store anybody can fill; a sink with no delete leaves an
-// orphaned body behind on every write that fails after it. The handler already
-// refuses to stream unless a sink and a gate are both present, and this makes
-// the same rule true of how they are installed rather than only of how they are
-// read.
+// streamsEverySize travels on the same call as the sink triple so a sink and
+// its size policy can never be installed apart: the park sink only pays for a
+// block too large to hold, but the pipeline sink pays at every size, and which
+// one is true depends entirely on which sink this call is installing.
+//
+// One call rather than several because the three callbacks are only safe
+// together. A sink with no gate is a store anybody can fill; a sink with no
+// delete leaves an orphaned body behind on every write that fails after it.
+// The handler already refuses to stream unless a sink and a gate are both
+// present, and this makes the same rule true of how they are installed rather
+// than only of how they are read.
 func SetBlockBodyStreaming(
 	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error,
 	gate func(hash chainhash.Hash, header *wire.BlockHeader) error,
 	del func(hash chainhash.Hash) error,
+	streamsEverySize bool,
 ) {
 	if sink == nil || gate == nil || del == nil {
 		blockBodySink, blockBodyGate, blockBodyDelete = nil, nil, nil
+		blockBodyStreamsEverySize = false
 
 		return
 	}
 
 	blockBodySink, blockBodyGate, blockBodyDelete = sink, gate, del
+	blockBodyStreamsEverySize = streamsEverySize
 }
 
 // SetBlockBodySink installs the sink alone. Prefer SetBlockBodyStreaming, which

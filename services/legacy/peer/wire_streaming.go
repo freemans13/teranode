@@ -19,6 +19,13 @@ const defaultStreamToDiskAtLeast = 64 << 20 // 64 MiB
 // can set it from the memory limit at startup and tests can move it.
 var streamToDiskAtLeast int64 = defaultStreamToDiskAtLeast
 
+// blockBodyStreamsEverySize makes the handler ignore streamToDiskAtLeast, so
+// every block takes the sink regardless of size. Set from Legacy.PipelineReceive
+// when the sink triple is installed, because only the pipeline sink can pay for a
+// small block: the park sink would merely move small blocks onto the streaming
+// path for no gain, on a branch a live node runs.
+var blockBodyStreamsEverySize bool
+
 // blockBodySink consumes a block's body streamed off the wire. It is handed the
 // already-parsed header rather than header bytes, because every consumer needs the
 // header as structure: the coinbase substitution in the first subtree and the
@@ -119,7 +126,14 @@ func streamingBlockHandler(r io.Reader, length uint64, totalBytes int) (int, wir
 // readBlockMessage returns the block either decoded or as a body on disk,
 // depending on its declared size and whether a sink and a gate are installed.
 func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error) {
-	if blockBodySink == nil || blockBodyGate == nil || int64(length) < streamToDiskAtLeast {
+	// The size threshold applies only when the pipeline is off. It exists because
+	// streaming used to mean writing the body to disk, which only paid for a block
+	// too large to hold in memory. Streaming now means converting the block as it
+	// arrives, which pays at every size, so on the pipeline path the threshold
+	// would keep whole-block residency for the common case while the branch claims
+	// to have removed it. Off the pipeline path it still decides exactly what it
+	// decided before, because changing the default path is not this branch's to do.
+	if blockBodySink == nil || blockBodyGate == nil || (!blockBodyStreamsEverySize && int64(length) < streamToDiskAtLeast) {
 		msg := &wire.MsgBlock{}
 
 		return msg, msg.Bsvdecode(lr, wire.ProtocolVersion, wire.BaseEncoding)
