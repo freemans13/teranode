@@ -299,6 +299,39 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		return errors.NewProcessingError("failed to create model.NewBlock", err)
 	}
 
+	// Everything from here on needs nothing but the model.Block just built: no
+	// wire bytes, no per-transaction data. That is what lets commitPreparedBlock
+	// also serve HandleConvertedBlock, whose model.Block comes from a converted
+	// record on disk instead of from decoding msgBlock — see that method and
+	// the shared tail's own doc comment for why the split sits exactly here.
+	return sm.commitPreparedBlock(ctx, teranodeBlock, blockHash, blockHashStr, blockHeight, parent, preparedSubtreeSlices, txHashes)
+}
+
+// commitPreparedBlock is the tail every route into the committer shares: the
+// proof-of-work check, the (redundant-except-on-the-converted-route) merkle and
+// duplicate re-checks, the in-flight-parent ordering hand-shake, the frontier
+// hand-off, and the commit itself via ProcessBlock, plus the best-effort orphan
+// replay.
+//
+// It is extracted rather than copied because every check in it is
+// consensus-relevant: a second hand-written copy in HandleConvertedBlock could
+// drift from this one on exactly the checks that decide whether a block's
+// transactions land in the UTXO set. Both HandleBlockDirect (teranodeBlock built
+// from a freshly decoded wire block) and HandleConvertedBlock (teranodeBlock read
+// back from a converted record) call this same function with the model.Block
+// they each produced, so there is exactly one place that decides what happens to
+// it next.
+//
+// preparedSubtreeSlices is non-nil only on the unified route's live path, where
+// prepareSubtrees still holds the in-memory subtree slices; a converted block
+// carries no slices (the record holds only subtree root hashes), so the merkle
+// and duplicate re-check below is naturally skipped for it — see the comment at
+// that check for why skipping is safe there, not just convenient.
+//
+// txHashes is the block's transaction hashes, pre-extracted before decoding
+// released the wire block; empty for a converted block, which never decodes one
+// (see the comment at the orphan-replay goroutine below).
+func (sm *SyncManager) commitPreparedBlock(ctx context.Context, teranodeBlock *model.Block, blockHash chainhash.Hash, blockHashStr string, blockHeight uint32, parent *inflightParent, preparedSubtreeSlices []*subtreepkg.Subtree, txHashes []chainhash.Hash) (err error) {
 	// pre-check that there is enough proof of work on the block, before we do any other processing
 	headerValid, _, err := teranodeBlock.Header.HasMetTargetDifficulty()
 	if !headerValid {
@@ -320,29 +353,40 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// before we get here — the second call below is a defensive belt-and-braces on
 	// the unified route's returned slices and is kept in sync with unified_dedup_test.go.
 	// It must run while SubtreeSlices is still populated, before the nil-out below.
+	//
+	// A converted block (preparedSubtreeSlices == nil here, always) never runs this
+	// block at all, and that is not the same as skipping it blindly. Both guarantees
+	// it exists to give already hold, earlier, for a converted block: the pipeline
+	// sink verified the merkle root against the header before the record was ever
+	// written (pipelineBlockSink), and the CVE-2012-2459 dedup floor inside
+	// prepareSubtrees's equivalent (the stream builder's duplicate map) is mandatory
+	// and cannot be disabled — so a duplicate transaction can never reach a written
+	// record in the first place. Re-running either check here would need the
+	// transactions themselves, which is exactly what this route exists not to read.
 	if preparedSubtreeSlices != nil {
 		teranodeBlock.SubtreeSlices = preparedSubtreeSlices
 		if err = teranodeBlock.CheckMerkleRoot(ctx); err != nil {
-			return errors.NewBlockInvalidError("[HandleBlockDirect][%s %d] merkle root mismatch on unified route", blockHashStr, blockHeight, err)
+			return errors.NewBlockInvalidError("[commitPreparedBlock][%s %d] merkle root mismatch on unified route", blockHashStr, blockHeight, err)
 		}
 		if err = model.CheckSubtreeSlicesForDuplicateTxs(preparedSubtreeSlices); err != nil {
-			return errors.NewBlockInvalidError("[HandleBlockDirect][%s %d] duplicate transaction on unified route", blockHashStr, blockHeight, err)
+			return errors.NewBlockInvalidError("[commitPreparedBlock][%s %d] duplicate transaction on unified route", blockHashStr, blockHeight, err)
 		}
 		teranodeBlock.SubtreeSlices = nil
 	}
 
 	// Ordering hand-shake with an in-flight parent (window route only; parent is nil
-	// everywhere else). A child may start its own ProcessBlock RPC once the parent
-	// has started its own — from that point the parent's spends are already queued
-	// behind its own create in commit order, so a spend of a coin the parent creates
-	// can never land ahead of that create. The select needs the pre-check below
-	// because a parent that started its RPC and THEN failed must still let the
-	// child through to its own RPC (where the server-side window aborts it with the
-	// recorded error): only a parent that failed BEFORE starting its RPC — settled
-	// ready with rpcStarted still open — short-circuits here. Without the pre-check,
-	// a select between two simultaneously-ready cases picks uniformly at random, so
-	// a parent settling failed in the same instant it starts its RPC could
-	// non-deterministically take the abort branch instead.
+	// everywhere else, including always for a converted block: see HandleConvertedBlock's
+	// own doc comment on why it never resolves one). A child may start its own
+	// ProcessBlock RPC once the parent has started its own — from that point the
+	// parent's spends are already queued behind its own create in commit order, so a
+	// spend of a coin the parent creates can never land ahead of that create. The
+	// select needs the pre-check below because a parent that started its RPC and THEN
+	// failed must still let the child through to its own RPC (where the server-side
+	// window aborts it with the recorded error): only a parent that failed BEFORE
+	// starting its RPC — settled ready with rpcStarted still open — short-circuits
+	// here. Without the pre-check, a select between two simultaneously-ready cases
+	// picks uniformly at random, so a parent settling failed in the same instant it
+	// starts its RPC could non-deterministically take the abort branch instead.
 	if parent != nil && parent.entry != nil {
 		select {
 		case <-parent.entry.rpcStarted:
@@ -351,7 +395,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 			case <-parent.entry.rpcStarted:
 			case <-parent.entry.settled:
 				if parent.entry.failed.Load() {
-					return errors.NewServiceError("[HandleBlockDirect][%s] predecessor %s failed before this block started; aborting", blockHash.String(), parent.entry.hash.String())
+					return errors.NewServiceError("[commitPreparedBlock][%s] predecessor %s failed before this block started; aborting", blockHash.String(), parent.entry.hash.String())
 				}
 			case <-ctx.Done():
 				return ctx.Err()
@@ -371,8 +415,14 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 
 	// process any orphan transactions that are now valid in background
 	// this will also remove the transactions from the orphan pool.
-	// txHashes was pre-extracted above (before prepareSubtrees) so this
-	// goroutine holds no reference into the decoded block.
+	// txHashes was pre-extracted before decoding released the wire block (or is
+	// empty for a converted block, which never held one), so this goroutine holds
+	// no reference into a decoded block either way. A converted block runs this
+	// loop zero times: it has no per-transaction hash list to check the orphan
+	// pool against, only the subtree root hashes the record carries. That leaves
+	// orphans depending on this block's own transactions unswept until some other
+	// event retires them — a narrower, documented gap, not a silent one, and it
+	// does not affect whether THIS block commits correctly.
 	go func() {
 		acceptedTxs := make([]*TxHashAndFee, 0)
 		for i := range txHashes {
@@ -380,7 +430,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		}
 
 		if len(acceptedTxs) > 0 {
-			sm.logger.Infof("[HandleBlockDirect][%s %d] accepted %d orphan transactions", blockHashStr, blockHeight, len(acceptedTxs))
+			sm.logger.Infof("[commitPreparedBlock][%s %d] accepted %d orphan transactions", blockHashStr, blockHeight, len(acceptedTxs))
 			sm.peerNotifier.AnnounceNewTransactions(acceptedTxs)
 		}
 	}()
