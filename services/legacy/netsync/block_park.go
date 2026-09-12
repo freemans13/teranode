@@ -1120,12 +1120,22 @@ func (p *blockPark) RestoreAll(entries []parkedBlock) {
 // call it explicitly.
 //
 // It always attempts both file types under the entry's hash, never only one.
-// An entry never has both — pipelineBlockSink either converts (writing
-// FileTypeBlock) or falls back to streamingBlockSink (writing
-// FileTypeMsgBlock), and a real delivery only takes one of those routes — so
-// the second delete is always a no-op for an ordinary entry; it is not free
-// lunch on every OTHER hash, because the key is this entry's own block hash,
-// which nothing else's data lives under. This must never be extended to also
+// A single DELIVERY never writes both — pipelineBlockSink either converts
+// (writing FileTypeBlock) or falls back to streamingBlockSink (writing
+// FileTypeMsgBlock), never both in the same call — but a single HASH can
+// still end up with both on disk at once: admitPipelineSink's
+// ErrDuplicateBlockInFlight branch exists precisely to let one peer's read
+// loop convert a hash while a second peer's concurrent delivery of the same
+// hash is declined admission and falls back to streamingBlockSink, which
+// writes the whole body under FileTypeMsgBlock right alongside the first
+// peer's FileTypeBlock record. Attempting both deletes here is what makes
+// that harmless: whichever of the two exists for this hash is removed, and
+// commitParkedBlock already prefers the record over the whole block when an
+// entry could in principle have adopted either (see its own converted field).
+// So the second delete is a no-op only for the ordinary, single-delivery
+// entry, not for every entry; it is not free lunch on every OTHER hash,
+// because the key is this entry's own block hash, which nothing else's data
+// lives under. This must never be extended to also
 // delete the SUBTREE files a converted record names: those are content-
 // addressed and shared, this function runs on the commit path as much as the
 // discard path, and a committed block's subtree files are its own data now —
