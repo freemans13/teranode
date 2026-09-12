@@ -46,7 +46,7 @@ func makeTestBlock(t *testing.T, numTxs, scriptLen int) *wire.MsgBlock {
 // duration of a test and returns a function restoring their previous values,
 // so one test cannot leak state into the next.
 func installTestSink(t *testing.T,
-	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error,
+	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error),
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
 	del func(chainhash.Hash) error,
 ) func() {
@@ -111,13 +111,13 @@ func TestStreamingBlockHandler_SinkReceivesTheHeader(t *testing.T) {
 	var gotHash chainhash.Hash
 
 	restore := installTestSink(t,
-		func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error {
+		func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 			gotHash = hash
 			gotHeader = header
 
 			_, err := io.Copy(io.Discard, r)
 
-			return err
+			return false, err
 		},
 		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
 		func(chainhash.Hash) error { return nil },
@@ -144,7 +144,7 @@ func TestStreamingBlockHandler_SmallBlocksAlsoStream(t *testing.T) {
 	var sinkCalls int
 
 	restore := installTestSink(t,
-		func(_ chainhash.Hash, _ *wire.BlockHeader, r io.Reader, _ int64) error {
+		func(_ chainhash.Hash, _ *wire.BlockHeader, r io.Reader, _ int64) (bool, error) {
 			sinkCalls++
 
 			// readBlockMessage treats an undrained reader as a truncated body and
@@ -152,7 +152,7 @@ func TestStreamingBlockHandler_SmallBlocksAlsoStream(t *testing.T) {
 			// test one must too or it is not exercising the path it claims to.
 			_, err := io.Copy(io.Discard, r)
 
-			return err
+			return false, err
 		},
 		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
 		func(chainhash.Hash) error { return nil },
@@ -178,10 +178,10 @@ func TestStreamingBlockHandler_SmallBlocksStillDecodeWhenThePipelineIsOff(t *tes
 	var sinkCalls int
 
 	restore := installTestSink(t,
-		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
+		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 			sinkCalls++
 
-			return nil
+			return false, nil
 		},
 		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
 		func(chainhash.Hash) error { return nil },

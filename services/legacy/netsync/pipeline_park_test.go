@@ -14,6 +14,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// A test-strength note, not a bug, for every test below that reaches
+// sm.blockPark.store directly (.Exists/.Get/.Set): the in-memory store
+// (stores/blob/memory) ignores the subdirectory and hash-prefix options that
+// parkOpts always passes in production, so a key built here without those
+// options happens to land on the same string as one built with them. Against
+// the real file store the park actually runs on, that would not hold, and the
+// mismatched-record test in particular (TestBlockPark_ReadConvertedRefusesAMismatchedRecord)
+// would pass for the wrong reason there — a plain not-found, rather than the
+// hash-mismatch refusal it is meant to exercise. Nothing here should be read
+// as proof of the on-disk layout; that is what the file-store-backed tests in
+// block_park_test.go are for.
+//
 // TestPipelineSink_ParksARecordNotAPhantom is the defect this task closes. Before
 // it, a pipelined block made the park adopt an entry for a body that was never
 // written: the park charged its byte budget for a blob that did not exist and the
@@ -29,7 +41,9 @@ func TestPipelineSink_ParksARecordNotAPhantom(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the park record")
 
 	exists, err := sm.blockPark.store.Exists(ctx, blk.Hash()[:], fileformat.FileTypeBlock)
 	require.NoError(t, err)
@@ -54,7 +68,9 @@ func TestPipelineSink_TheParkedRecordIsTinyCompared(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the park record")
 
 	raw, err := sm.blockPark.store.Get(ctx, blk.Hash()[:], fileformat.FileTypeBlock)
 	require.NoError(t, err)
@@ -76,7 +92,9 @@ func TestBlockPark_ReadConvertedRoundTrips(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the park record")
 
 	back, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
 	require.NoError(t, err)
@@ -99,7 +117,9 @@ func TestBlockPark_ReadConvertedRefusesAMismatchedRecord(t *testing.T) {
 
 	headerA := &blkA.MsgBlock().Header
 	bodyA := blockBodyBytes(t, blkA)
-	require.NoError(t, sm.pipelineBlockSink(*blkA.Hash(), headerA, bytes.NewReader(bodyA), int64(len(bodyA))))
+	converted, err := sm.pipelineBlockSink(*blkA.Hash(), headerA, bytes.NewReader(bodyA), int64(len(bodyA)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the park record")
 
 	raw, err := sm.blockPark.store.Get(ctx, blkA.Hash()[:], fileformat.FileTypeBlock)
 	require.NoError(t, err)

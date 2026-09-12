@@ -115,14 +115,14 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 		gotN      int64
 	)
 
-	blockBodySink = func(h chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error {
+	blockBodySink = func(h chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 		gotHash = h
 		gotHeader = header
 		gotN = n
 		b, err := io.ReadAll(r)
 		gotBody = b
 
-		return err
+		return false, err
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -165,9 +165,9 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 func TestStreamingBlockHandlerStillDecodesASmallBlock(t *testing.T) {
 	payload, hash := serialisedBlock(t, 2)
 
-	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		t.Fatal("a small block must not reach the sink")
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -200,9 +200,9 @@ func TestStreamingBlockHandlerRefusesABadHeaderBeforeStoring(t *testing.T) {
 
 	called := false
 
-	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		called = true
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -244,9 +244,9 @@ func TestStreamingBlockHandlerRefusesAnEasyTargetBeforeStoring(t *testing.T) {
 
 	called := false
 
-	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		called = true
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -271,9 +271,9 @@ func TestStreamingBlockHandlerRefusesAnUnrequestedBlockBeforeStoring(t *testing.
 
 	called := false
 
-	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		called = true
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -310,9 +310,9 @@ func TestStreamingBlockHandlerFallsBackWithNoSink(t *testing.T) {
 func TestStreamingBlockHandlerNilGateFallsBackToDecodingEvenWithSinkInstalled(t *testing.T) {
 	payload, hash := serialisedBlock(t, 2)
 
-	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		t.Fatal("a nil gate must never let a block reach the sink")
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -343,8 +343,8 @@ func TestStreamingBlockHandlerDeletesATruncatedBodyAfterAWrite(t *testing.T) {
 	// errors.
 	declaredLength := uint64(len(payload)) + 32
 
-	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
-		return nil // a lenient sink: never notices it got fewer bytes than promised
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+		return false, nil // a lenient sink: never notices it got fewer bytes than promised
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -381,9 +381,9 @@ func TestStreamingBlockHandlerDrainsThePayloadAfterAGateRejection(t *testing.T) 
 	tail := []byte("MARKER-AFTER-PAYLOAD")
 	src := io.MultiReader(bytes.NewReader(payload), bytes.NewReader(tail))
 
-	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		t.Fatal("a rejected block must never reach the sink")
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 

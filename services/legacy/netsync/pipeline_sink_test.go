@@ -39,8 +39,9 @@ func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err)
+	require.True(t, converted, "a well-formed block below the checkpoint must convert cleanly")
 
 	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
 	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")
@@ -70,9 +71,10 @@ func TestPipelineSink_RejectsAWrongMerkleRoot(t *testing.T) {
 	bad := blk.MsgBlock().Header
 	bad.MerkleRoot[0] ^= 0xFF
 
-	err := sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), int64(len(body)))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "merkle root")
+	require.False(t, converted, "a rejected block must never report having converted")
 }
 
 // TestPipelineSink_DeletesWhatItWroteOnAWrongMerkleRoot pins the cleanup. Nothing
@@ -90,13 +92,15 @@ func TestPipelineSink_DeletesWhatItWroteOnAWrongMerkleRoot(t *testing.T) {
 	bad := blk.MsgBlock().Header
 	bad.MerkleRoot[0] ^= 0xFF
 
-	_ = sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), int64(len(body)))
+	_, _ = sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), int64(len(body)))
 
 	// The failed run reports no subtrees, so ask a good run which hashes the block
 	// produces and require every one of them to be absent from the failed store.
 	good := newPipelineParkManager(t, memory.New(), 8)
 	pipelineHeaderFixture(t, good, blk)
-	require.NoError(t, good.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body))))
+	goodConverted, goodErr := good.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, goodErr, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, goodConverted, "sanity: the good run must actually convert, or this test asserts nothing")
 
 	goodBlock, err := good.blockPark.ReadConverted(ctx, *blk.Hash())
 	require.NoError(t, err, "the good run's converted record must read back cleanly")
@@ -126,9 +130,10 @@ func TestPipelineSink_RejectsADuplicateTransaction(t *testing.T) {
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyWithADuplicate(t, blk)
 
-	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "duplicate")
+	require.False(t, converted, "a rejected block must never report having converted")
 }
 
 // TestPipelineSink_RecordsAWholeBlockModel pins what the sink hands on. The
@@ -146,7 +151,9 @@ func TestPipelineSink_RecordsAWholeBlockModel(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the recorded block")
 
 	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
 	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")
@@ -174,7 +181,9 @@ func TestPipelineSink_TheRecordedBlockSurvivesASerializationRoundTrip(t *testing
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the recorded block")
 
 	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
 	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")

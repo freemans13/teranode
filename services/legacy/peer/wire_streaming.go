@@ -39,7 +39,11 @@ var blockBodyStreamsEverySize bool
 //
 // Nil until the sync manager installs one, and a nil sink means every block is
 // decoded, which is what keeps callers that never wire a store working unchanged.
-var blockBodySink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error
+//
+// The bool it returns says whether THIS call actually converted the block —
+// see BlockBody.Converted for why that must come from here rather than be
+// inferred afterward from anything in a store.
+var blockBodySink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error)
 
 // blockBodyGate answers whether a block's body may be streamed to disk, and is
 // the only thing standing between a peer and this node's disk. It is
@@ -171,7 +175,8 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 
 	counted.r = lr
 
-	if err := blockBodySink(hash, &header, &counted, int64(length)); err != nil {
+	converted, err := blockBodySink(hash, &header, &counted, int64(length))
+	if err != nil {
 		return nil, deleteOrphanedBody(hash, errors.NewProcessingError("streaming block %s: could not store the body", hash, err))
 	}
 
@@ -206,10 +211,11 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 	}
 
 	return &MsgBlockOnDisk{BlockBody{
-		Header:  header,
-		TxCount: txCount,
-		Size:    int64(length),
-		Hash:    hash,
+		Header:    header,
+		TxCount:   txCount,
+		Size:      int64(length),
+		Hash:      hash,
+		Converted: converted,
 	}}, nil
 }
 

@@ -56,8 +56,9 @@ func TestPipelineSink_ParentInHeaderIndex_IsTheOrdinaryCase(t *testing.T) {
 
 	body := blockBodyBytes(t, blk)
 
-	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err, "a parent only in the in-flight header list must not be treated as a fault")
+	require.True(t, converted, "a parent resolved from the header list must let the block convert, not fall back")
 
 	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
 	require.NoError(t, err, "the converted record for a header-list-only parent must read back cleanly")
@@ -109,8 +110,9 @@ func TestPipelineSink_UnresolvableParent_FallsBackInsteadOfErroring(t *testing.T
 
 	body := blockBodyBytes(t, blk)
 
-	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err, "an unresolvable parent must not surface as an error: any non-nil error here is what peer.shouldHandleReadError classifies as malformed and disconnects the peer over")
+	require.False(t, converted, "the fallback must report that it did NOT convert, since it wrote the raw body instead")
 
 	// The fallback must be a real one, not merely "return nil and drop the
 	// block": prove the bytes actually landed via streamingBlockSink, the

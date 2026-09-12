@@ -883,22 +883,6 @@ func (p *blockPark) IsConverted(ctx context.Context, hash chainhash.Hash) (bool,
 	return p.store.Exists(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
 }
 
-// DeleteConverted removes a converted record from the store. Needed only on the
-// discard path: pipelineBlockDelete calls it when the wire layer's own
-// post-sink checks fail after pipelineBlockSink already wrote a record for this
-// hash, because without it the record would sit under FileTypeBlock forever —
-// nothing commits it, and nothing else ever deletes it.
-func (p *blockPark) DeleteConverted(ctx context.Context, hash chainhash.Hash) error {
-	if p == nil || p.store == nil {
-		return nil
-	}
-
-	delCtx, cancel := p.storeCtx(ctx)
-	defer cancel()
-
-	return p.store.Del(delCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
-}
-
 // convertedRecordSize returns the byte length of the converted record under
 // hash, and whether one exists there at all. handleBlockOnDiskMsg needs this so
 // it can charge the park's byte budget with what a pipelined block actually put
@@ -1106,6 +1090,27 @@ func (p *blockPark) RestoreAll(entries []parkedBlock) {
 // contended pool as the park write, so it can time out — and it carries the
 // configured deadline for exactly that reason. The entry is forgotten either
 // way and the restart sweep collects the file.
+//
+// This is the ONLY place that deletes a parked blob (applyParkDisposition's
+// own comment says as much of its callers), which is exactly why the
+// converted record's delete belongs here too: every path that retires an
+// entry — a successful commit, an eviction, an ordinary discard — already
+// funnels through this one function, so putting the record's cleanup here
+// once covers all of them, rather than only the discard path that happened to
+// call it explicitly.
+//
+// It always attempts both file types under the entry's hash, never only one.
+// An entry never has both — pipelineBlockSink either converts (writing
+// FileTypeBlock) or falls back to streamingBlockSink (writing
+// FileTypeMsgBlock), and a real delivery only takes one of those routes — so
+// the second delete is always a no-op for an ordinary entry; it is not free
+// lunch on every OTHER hash, because the key is this entry's own block hash,
+// which nothing else's data lives under. This must never be extended to also
+// delete the SUBTREE files a converted record names: those are content-
+// addressed and shared, this function runs on the commit path as much as the
+// discard path, and a committed block's subtree files are its own data now —
+// deleting them here would destroy a block this node just accepted. Only
+// pipelineBlockDelete's own discard-only path may remove subtree files.
 func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	if p == nil {
 		return
@@ -1121,6 +1126,10 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 
 	if err := p.store.Del(delCtx, entry.hash[:], fileformat.FileTypeMsgBlock, parkOpts...); err != nil {
 		p.logger.Warnf("[blockPark][%s] failed to delete parked block, leaving it for the next restart sweep: %v", entry.hash, err)
+	}
+
+	if err := p.store.Del(delCtx, entry.hash[:], fileformat.FileTypeBlock, parkOpts...); err != nil {
+		p.logger.Warnf("[blockPark][%s] failed to delete converted record, leaving it for the next restart sweep: %v", entry.hash, err)
 	}
 }
 
@@ -1404,6 +1413,37 @@ func (p *blockPark) Recover(ctx context.Context) {
 			// file ".<name>.<random>.tmp", and nothing else writes to this
 			// directory, so at Start() none of these can be live.
 			p.removeParkFile(name)
+
+			discarded++
+
+			continue
+
+		case strings.HasSuffix(name, "."+string(fileformat.FileTypeBlock)):
+			// A converted record left by a previous run. A future task teaches
+			// Recover to adopt one of these directly — deriving a park entry's
+			// previous-block hash and size from the record itself, the way this
+			// loop already does for a whole block below — but nothing does that
+			// yet, so this discards it rather than leaving it here to be
+			// skipped forever the way the catch-all case below used to treat
+			// it (before this case existed, a name ending in ".block" fell
+			// through to "anything we do not recognise is left alone" and
+			// stayed on disk across every future restart, since nothing else
+			// in this loop, or anywhere else, will ever revisit it).
+			//
+			// Discarding costs a re-conversion the next time this hash is
+			// needed, not correctness: the subtree files it names expire on
+			// their own delete-at-height (subtree_writer.go) regardless of
+			// whether this record survives to point at them again.
+			hash, err := chainhash.NewHashFromStr(strings.TrimSuffix(name, "."+string(fileformat.FileTypeBlock)))
+			if err != nil {
+				p.logger.Warnf("[blockPark] %s in the park directory is not named after a block hash, leaving it alone: %v", name, err)
+
+				skipped++
+
+				continue
+			}
+
+			p.Delete(ctx, parkedBlock{hash: *hash})
 
 			discarded++
 

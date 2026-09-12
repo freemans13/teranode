@@ -32,6 +32,18 @@ type BlockBody struct {
 
 	// Hash is Header.BlockHash(), computed once when the header was read.
 	Hash chainhash.Hash
+
+	// Converted reports whether the sink that accepted this body actually
+	// converted it — wrote a park record derived from its subtrees, as the
+	// pipeline sink does — rather than merely writing the whole body
+	// byte-for-byte. It comes straight from the sink's own return value, set
+	// at the one place that genuinely knows: the sink call itself. Nothing
+	// downstream should ever try to answer this question by inference (for
+	// example, by checking whether some blob happens to exist for this hash),
+	// because a blob that exists for another reason — a stale leftover, a
+	// racing duplicate delivery of the same hash — looks identical to one this
+	// delivery actually produced.
+	Converted bool
 }
 
 // MsgBlockOnDisk is a block message whose body was streamed to the park rather
@@ -81,7 +93,7 @@ func (m *MsgBlockOnDisk) MaxPayloadLength(pver uint32) uint64 {
 // present, and this makes the same rule true of how they are installed rather
 // than only of how they are read.
 func SetBlockBodyStreaming(
-	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error,
+	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error),
 	gate func(hash chainhash.Hash, header *wire.BlockHeader) error,
 	del func(hash chainhash.Hash) error,
 	streamsEverySize bool,
@@ -101,7 +113,7 @@ func SetBlockBodyStreaming(
 // is the only way to install a sink that is actually reachable: the handler
 // checks for a gate too, so a sink installed on its own changes nothing. This
 // exists for tests that exercise the sink in isolation.
-func SetBlockBodySink(f func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error) {
+func SetBlockBodySink(f func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error)) {
 	blockBodySink = f
 }
 

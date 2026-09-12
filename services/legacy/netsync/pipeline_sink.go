@@ -25,7 +25,15 @@ import (
 // validation skips script validation and outpoint-only mode skips the check
 // binding a spend to its spender, so the root is the only thing asserting that
 // this body is the body that header commits to.
-func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error {
+//
+// The bool it returns is the ONLY honest source of "did this delivery convert
+// the block" anywhere in the system: true only on the path that actually wrote
+// a converted record, false on every other return including the fallback.
+// handleBlockOnDiskMsg reads it off BlockBody.Converted rather than inferring
+// conversion by asking whether some blob happens to exist for this hash — see
+// that field's doc comment for why a blob's mere existence is the wrong
+// question.
+func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 	// Resolved before anything is read from r, and that ordering is load-
 	// bearing: the fallback below hands r to streamingBlockSink untouched, and
 	// that only works if nothing — not even the coinbase — has been consumed
@@ -45,20 +53,21 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		// which writes the untouched body to the park exactly as it would with
 		// PipelineReceive off, and lets the existing park/drain machinery
 		// decide the block's fate the way it already correctly does for the
-		// non-pipeline path.
+		// non-pipeline path. streamingBlockSink always reports converted=false,
+		// which is correct here: this call never converts anything.
 		return sm.streamingBlockSink(hash, header, r, n)
 	}
 
 	stream, err := newBlockTxStream(r, n)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// The coinbase is the first transaction in the stream, and the builder needs
 	// it before any other: it occupies slot zero of the first subtree.
 	coinbase, _, err := stream.Next()
 	if err != nil {
-		return errors.NewBlockInvalidError("[pipelineBlockSink][%s] failed reading the coinbase", hash, err)
+		return false, errors.NewBlockInvalidError("[pipelineBlockSink][%s] failed reading the coinbase", hash, err)
 	}
 
 	quickValidation := sm.quickValidationAllowed(height)
@@ -79,7 +88,7 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		// newSubtreeWriter and here.
 		sm.deleteWrittenOnFailure(hash, writer)
 
-		return err
+		return false, err
 	}
 
 	for {
@@ -91,13 +100,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 			sm.deleteWrittenOnFailure(hash, writer)
 
-			return streamErr
+			return false, streamErr
 		}
 
 		if addErr := builder.AddTx(tx, txHash); addErr != nil {
 			sm.deleteWrittenOnFailure(hash, writer)
 
-			return addErr
+			return false, addErr
 		}
 	}
 
@@ -105,13 +114,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	if err != nil {
 		sm.deleteWrittenOnFailure(hash, writer)
 
-		return err
+		return false, err
 	}
 
 	if !root.IsEqual(&header.MerkleRoot) {
 		sm.deleteWrittenOnFailure(hash, writer)
 
-		return errors.NewBlockInvalidError("[pipelineBlockSink][%s] merkle root %s does not match header's %s", hash, root, header.MerkleRoot)
+		return false, errors.NewBlockInvalidError("[pipelineBlockSink][%s] merkle root %s does not match header's %s", hash, root, header.MerkleRoot)
 	}
 
 	// Convert the wire header into a teranode header the same way
@@ -122,14 +131,14 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	if err = header.Serialize(&headerBytes); err != nil {
 		sm.deleteWrittenOnFailure(hash, writer)
 
-		return errors.NewProcessingError("[pipelineBlockSink][%s] failed to serialize header", hash, err)
+		return false, errors.NewProcessingError("[pipelineBlockSink][%s] failed to serialize header", hash, err)
 	}
 
 	modelHeader, err := model.NewBlockHeaderFromBytes(headerBytes.Bytes())
 	if err != nil {
 		sm.deleteWrittenOnFailure(hash, writer)
 
-		return errors.NewProcessingError("[pipelineBlockSink][%s] failed to create block header from bytes", hash, err)
+		return false, errors.NewProcessingError("[pipelineBlockSink][%s] failed to create block header from bytes", hash, err)
 	}
 
 	// Finish returns subtree hashes as values; model.NewBlock wants pointers.
@@ -156,7 +165,7 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	if err != nil {
 		sm.deleteWrittenOnFailure(hash, writer)
 
-		return errors.NewProcessingError("[pipelineBlockSink][%s] failed to build block model", hash, err)
+		return false, errors.NewProcessingError("[pipelineBlockSink][%s] failed to build block model", hash, err)
 	}
 
 	// The record is now genuinely on disk: a serialized model.Block under
@@ -175,10 +184,10 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	if err = sm.blockPark.WriteConvertedBlock(sm.ctx, hash, verified); err != nil {
 		sm.deleteWrittenOnFailure(hash, writer)
 
-		return errors.NewStorageError("[pipelineBlockSink][%s] failed to write the converted record", hash, err)
+		return false, errors.NewStorageError("[pipelineBlockSink][%s] failed to write the converted record", hash, err)
 	}
 
-	return nil
+	return true, nil
 }
 
 // pipelineBlockDelete is the pipeline path's orphan-delete callback, installed
@@ -204,20 +213,31 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // subtreeWriter.Written() used to hand back is reconstructed from the record
 // instead of remembered, which is exactly the thing a hash with no record can
 // never need: pipelineParentHeight's unresolvable-parent fallback (see
-// pipelineBlockSink) returns before any record is written, so ReadConverted's
-// error for that hash is the expected case below, not a fault.
+// pipelineBlockSink) returns before any record is written, so a not-found
+// error from ReadConverted for that hash is the expected case below, not a
+// fault.
+//
+// The converted record itself is NOT deleted here. It is deleted inside
+// blockPark.Delete, which streamingBlockDelete below calls, so that every path
+// that retires a park entry — not only this discard path — retires the
+// record with it. Deleting it a second time here would only race that call
+// harmlessly, so there is nothing to gain by keeping a second delete site, and
+// something to lose: two call sites making the same decision drift apart the
+// moment only one of them is updated.
 //
 // This cleans up everything a call under this hash can have written: the
-// converted record and its subtree artefacts, if pipelineBlockSink completed
-// and verified the block itself; and, unconditionally, whatever
-// streamingBlockDelete itself would remove, because that same fallback hands
-// the block to the raw park-write sink instead of converting it, and that
-// body needs the ordinary park delete regardless of which top-level sink
-// function is nominally "the pipeline sink" for this call.
+// subtree artefacts a completed conversion produced, if pipelineBlockSink got
+// that far; and, unconditionally, whatever streamingBlockDelete itself would
+// remove — the converted record (now, via blockPark.Delete) and, on the
+// unresolvable-parent fallback, the raw body that fallback wrote to the park
+// instead of converting it.
 func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash) error {
 	var firstErr error
 
-	if record, err := sm.blockPark.ReadConverted(sm.ctx, hash); err == nil && record != nil {
+	record, err := sm.blockPark.ReadConverted(sm.ctx, hash)
+
+	switch {
+	case err == nil && record != nil:
 		structureType := fileformat.FileTypeSubtreeToCheck
 		if sm.quickValidationAllowed(record.Height) {
 			structureType = fileformat.FileTypeSubtree
@@ -231,9 +251,17 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash) error {
 			}
 		}
 
-		if delErr := sm.blockPark.DeleteConverted(sm.ctx, hash); delErr != nil && firstErr == nil {
-			firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting the converted record", hash, delErr)
-		}
+	case err != nil && !errors.Is(err, errors.ErrNotFound):
+		// Not the ordinary "this hash was never converted" case (the
+		// unresolvable-parent fallback, which is a not-found error and stays
+		// silent, matching the ordinary case). This is a store timeout, a
+		// permit-pool wait that ran out, or ReadConverted's own hash-mismatch
+		// refusal — every one of which means the subtree files this block's
+		// sink actually wrote, if any, are NOT being deleted here, exactly
+		// the failure mode deleteWrittenOnFailure's own comment warns about
+		// for the same reason: an unlogged cleanup failure is indistinguishable
+		// from a cleanup that never needed to run.
+		sm.logger.Warnf("[pipelineBlockDelete][%s] could not read the converted record, so its subtree files (if any) were not deleted: %v", hash, err)
 	}
 
 	if err := sm.streamingBlockDelete(hash); err != nil && firstErr == nil {

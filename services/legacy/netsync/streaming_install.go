@@ -63,7 +63,7 @@ const streamedBodyRequestWindow = 60 * 60 * 1000000000 // one hour, in nanosecon
 // park sink only pays for a block too large to hold in memory, but the
 // pipeline sink converts a block as it arrives and pays at every size.
 func (sm *SyncManager) installStreamingBlockPath(set func(
-	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error,
+	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
 	del func(chainhash.Hash) error,
 	streamsEverySize bool,
@@ -200,9 +200,14 @@ func describeTarget(t *big.Int) string {
 // layer hands in the parsed header rather than header bytes now, because the
 // pipeline sink that follows this one needs it as structure; this sink's own job
 // is bytes, so it re-serializes the header back onto the front of the body.
-func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error {
+//
+// The bool it returns is always false: this path never converts a block, it
+// only ever writes the whole body byte-for-byte under FileTypeMsgBlock, so
+// nothing downstream may treat what it wrote as a converted record — see
+// BlockBody.Converted.
+func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 	if sm.blockPark == nil {
-		return errors.NewProcessingError("[streamingBlockSink][%s] no park to write to", hash)
+		return false, errors.NewProcessingError("[streamingBlockSink][%s] no park to write to", hash)
 	}
 
 	// The park's file format is a whole serialized block, so this path puts the
@@ -211,10 +216,10 @@ func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, header *wire.Bloc
 	// sink wants the structure and this one wants the bytes.
 	var headerBytes bytes.Buffer
 	if err := header.Serialize(&headerBytes); err != nil {
-		return errors.NewProcessingError("[streamingBlockSink][%s] could not re-serialize the header", hash, err)
+		return false, errors.NewProcessingError("[streamingBlockSink][%s] could not re-serialize the header", hash, err)
 	}
 
-	return sm.blockPark.WriteStreamedBody(sm.ctx, hash, io.MultiReader(bytes.NewReader(headerBytes.Bytes()), r), n)
+	return false, sm.blockPark.WriteStreamedBody(sm.ctx, hash, io.MultiReader(bytes.NewReader(headerBytes.Bytes()), r), n)
 }
 
 // streamingBlockDelete removes a body already written under hash, for the case
@@ -287,23 +292,51 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		peer:      msg.peer,
 	}
 
-	// The pipeline sink, when it is the one active, has already written this
-	// hash's body as a converted record — a few hundred bytes under
-	// FileTypeBlock — before the wire layer ever got here, so there is nothing
-	// on disk shaped like the whole block msg.body.Size describes. Charging
-	// that size against the park's budget would over-charge a pipelined block
-	// by orders of magnitude and starve the park into believing it is nearly
-	// full when it holds almost nothing, so the two paths deliberately charge
-	// different numbers: the plain streaming path charges the whole block's
-	// wire size because that is what write/WriteStreamedBody put on disk, and
-	// this checks for a converted record and, if one exists, charges its own
-	// length instead. With the pipeline off no converted record is ever
-	// written, so this check always answers false and entry.size is left as
-	// msg.body.Size, unchanged from before this existed.
-	if size, converted, err := sm.blockPark.convertedRecordSize(sm.ctx, entry.hash); err != nil {
-		sm.logger.Warnf("[blockOnDisk][%s] failed to check for a converted record, charging the whole block's wire size instead: %v", entry.hash, err)
-	} else if converted {
-		entry.size = size
+	// msg.body.Converted says whether THIS delivery's sink actually converted
+	// the block, straight from the sink's own return value — see
+	// BlockBody.Converted. It is deliberately NOT inferred by asking whether a
+	// converted record happens to exist for this hash: a record surviving from
+	// an unrelated earlier attempt, or from a racing duplicate delivery of the
+	// same hash, would look identical to one this delivery produced, and
+	// charging by that inference once misattributed a stale or foreign
+	// record's size to a delivery that never wrote it.
+	//
+	// Gating the store lookup on this flag also means the lookup itself never
+	// runs unless the pipeline actually converted something on THIS call: with
+	// PipelineReceive off, streamingBlockSink is the only sink ever installed
+	// and it always reports converted=false (see its own doc comment), so this
+	// whole block below is skipped and handleBlockOnDiskMsg does exactly the
+	// store I/O it always did — none — on that path. Before this gate existed,
+	// the lookup ran for every streamed block regardless of the setting, which
+	// meant an extra blob-store round trip, and therefore an extra wait on the
+	// store's shared read-permit pool, on the single goroutine that commits
+	// blocks in order — a path that used to do no I/O at all.
+	if msg.body.Converted {
+		// The pipeline sink, when it is the one active, has already written
+		// this hash's body as a converted record — a few hundred bytes under
+		// FileTypeBlock — before the wire layer ever got here, so there is
+		// nothing on disk shaped like the whole block msg.body.Size describes.
+		// Charging that size against the park's budget would over-charge a
+		// pipelined block by orders of magnitude and starve the park into
+		// believing it is nearly full when it holds almost nothing, so the two
+		// paths deliberately charge different numbers: the plain streaming
+		// path charges the whole block's wire size because that is what
+		// write/WriteStreamedBody put on disk, and this charges the record's
+		// own length instead.
+		if size, found, err := sm.blockPark.convertedRecordSize(sm.ctx, entry.hash); err != nil {
+			sm.logger.Warnf("[blockOnDisk][%s] failed to check for a converted record, charging the whole block's wire size instead: %v", entry.hash, err)
+		} else if found {
+			entry.size = size
+		} else {
+			// The sink says it converted this hash, but the record is not
+			// there. Something else already removed it — for example a racing
+			// discard on the same hash — between the sink returning and this
+			// handler running. Charging the whole block's wire size here would
+			// be wrong the OTHER way for a genuinely converted block, but there
+			// is no better number left to charge, so this falls back to it and
+			// says so rather than silently mischarging.
+			sm.logger.Warnf("[blockOnDisk][%s] the sink reports this delivery converted, but no converted record is on disk; charging the whole block's wire size instead", entry.hash)
+		}
 	}
 
 	// A parked block is only ever committable if its parent is something this
