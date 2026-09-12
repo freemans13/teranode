@@ -66,12 +66,20 @@ func TestHandleBlockOnDiskMsg_ReleasesTheDownloadAssignment(t *testing.T) {
 		"every delivered block must release its assignment, or CountForPeer sticks at MaxBlocksInTransitPerPeer and the scheduler stops asking this peer for anything else")
 }
 
-// TestHandleBlockOnDiskMsg_OwnershipUnchangedWhenPipelineOff pins the scope
-// decision explicitly: this task fixes the route the pipeline made universal,
-// not the pre-existing (rare, >64 MiB) on-disk route that ran before it, and
-// with PipelineReceive off that pre-existing behaviour — leak included — must
-// be untouched.
-func TestHandleBlockOnDiskMsg_OwnershipUnchangedWhenPipelineOff(t *testing.T) {
+// TestHandleBlockOnDiskMsg_ScopedToPipelineReceiveOn pins the scope decision
+// behind this task's PipelineReceive gate, not the pre-existing on-disk
+// route's own leak as something required. With the pipeline off, a block
+// above the 64 MiB decode threshold still reaches this handler today and
+// still leaks its assignment — a pre-existing defect this task did not
+// create and is not fixing. Asserting the count stays at a fixed number would
+// read that leak into the spec: a future fix closing it would turn this test
+// red and look like a regression in this task's own change, when it would
+// actually be progress. What this task actually promises is narrower — its
+// release fires only when PipelineReceive is on — so this asserts the count
+// is UNCHANGED by the call, whatever value it held before, which holds
+// whether or not the pre-existing leak is ever fixed. Update or remove this
+// test, not this task's fix, if that pre-existing leak is later closed.
+func TestHandleBlockOnDiskMsg_ScopedToPipelineReceiveOn(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	h.sm.drainAsync.Store(true)
 	h.sm.parkCommits = make(chan parkCommit, 4)
@@ -82,12 +90,61 @@ func TestHandleBlockOnDiskMsg_OwnershipUnchangedWhenPipelineOff(t *testing.T) {
 	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 4096, Hash: header.BlockHash()}
 
 	require.True(t, h.sm.blockDownloads.Add(h.peer, body.Hash))
-	require.Equal(t, 1, h.sm.blockDownloads.CountForPeer(h.peer))
+	before := h.sm.blockDownloads.CountForPeer(h.peer)
 
 	h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
 
-	require.Equal(t, 1, h.sm.blockDownloads.CountForPeer(h.peer),
-		"with PipelineReceive off, this task must change nothing about the pre-existing on-disk route, including its leak")
+	after := h.sm.blockDownloads.CountForPeer(h.peer)
+	require.Equal(t, before, after,
+		"this task's release is gated on PipelineReceive and must not move this count either way when the setting is off — not an assertion that the pre-existing route's own leak is correct")
+}
+
+// TestHandleBlockOnDiskMsg_ReleasesTheAssociationPrimarysAssignment is the
+// regression test for fix-round item 2. A BlockPriority association routes a
+// block's body to its own DATA1/DATA2 stream sub-peer, so msg.peer here is
+// that sub-peer, never the primary the download ledger actually records
+// ownership under (manager.go:3271-3276's resolve before RemoveOwner, and
+// BlockRequested's identical resolve at manager.go:6530-6538). Passing
+// msg.peer straight through to RemoveOwner made it a silent no-op under a
+// multistream association: sub-peers are never registered in peerStates and
+// so never own anything in blockDownloads. It stayed invisible because
+// ForgiveOwners is peer-agnostic and released every OTHER peer's assignment
+// on the same hash regardless — only this peer's own CountForPeer stuck.
+func TestHandleBlockOnDiskMsg_ReleasesTheAssociationPrimarysAssignment(t *testing.T) {
+	h := newParkWiringHarness(t, true)
+	h.sm.drainAsync.Store(true)
+	h.sm.parkCommits = make(chan parkCommit, 4)
+	h.sm.settings.Legacy.PipelineReceive = true
+
+	// h.peer is already registered as a primary (newParkWiringHarness's own
+	// setup, via registerRacePeer). subPeer is a stream sub-peer associated
+	// with it — exactly what a BlockPriority association's body stream
+	// delivers as msg.peer, and never itself registered in peerStates.
+	subPeer := &peerpkg.Peer{}
+	subPeer.SetAssociation(peerpkg.NewAssociation([]byte{0x01}, h.peer))
+
+	parent := h.blocks[1].MsgBlock().BlockHash()
+	header := wire.BlockHeader{Version: 1, PrevBlock: parent, Nonce: 99}
+	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 4096, Hash: header.BlockHash()}
+
+	require.True(t, h.sm.blockDownloads.Add(h.peer, body.Hash),
+		"the ledger records ownership under the primary, exactly as the download walk does")
+
+	h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: subPeer})
+
+	// HasOwner, not just CountForPeer: ForgiveOwners is peer-agnostic and marks
+	// every owner of this hash forgiven regardless of which peer RemoveOwner was
+	// actually called with, and a forgiven-but-not-removed record still reads as
+	// zero in CountForPeer (its own "forgiven" check) — so CountForPeer alone
+	// passes even when RemoveOwner silently no-ops on the wrong (sub-peer)
+	// identity, exactly the false-green fix round 1 caught. HasOwner does NOT
+	// consult "forgiven" (see its own doc comment): only RemoveOwner actually
+	// deleting the primary's record makes this false.
+	require.False(t, h.sm.blockDownloads.HasOwner(h.peer, body.Hash),
+		"RemoveOwner must actually delete the primary's record; a call keyed by the sub-peer instead leaves it in place and this would still (wrongly) read true")
+
+	require.Equal(t, 0, h.sm.blockDownloads.CountForPeer(h.peer),
+		"the delivery arrived via the association's sub-peer, so the release must resolve to the primary the ledger recorded ownership under, not stay a no-op keyed by the sub-peer identity")
 }
 
 // TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions is the regression
@@ -170,6 +227,82 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 
 	require.NoError(t, sinkErr, "the second block is well-formed and must convert cleanly once admitted")
 	require.True(t, converted, "a well-formed block below the checkpoint must convert, not merely be accepted")
+}
+
+// TestAdmitPipelineSink_FallsBackWhenAcquireTimesOut is the regression test for
+// fix-round item 1: a park in AcquireBlockPrefetch runs INSIDE readMessageStreaming
+// (services/legacy/peer/peer.go), and peer.inHandler only stops the peer's idle
+// timer AFTER that call returns, so an unbounded park here could trip that timer
+// and disconnect a perfectly healthy peer over this node's own admission
+// backpressure. admitPipelineSink now bounds the acquire strictly below
+// legacy_peerIdleTimeout and falls back to the plain body-write path rather
+// than erroring (an error here would disconnect the peer just as surely as the
+// idle timer would) or parking further.
+//
+// legacy_peerIdleTimeout is set small so the bound (half of it) is reached in
+// well under a second rather than the real default's ~62.5s, keeping this test
+// fast without weakening what it proves: the held slot is never released, so
+// the only way the second call can return is by falling back.
+func TestAdmitPipelineSink_FallsBackWhenAcquireTimesOut(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.settings.Legacy.PipelineReceive = true
+	sm.settings.Legacy.PeerIdleTimeout = 200 * time.Millisecond
+
+	sm.blockPrefetchBudgetBytes = 1
+	sm.blockPrefetchBudget = semaphore.NewWeighted(1)
+	sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
+
+	var installedSink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)
+
+	sm.installStreamingBlockPath(func(
+		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
+		gate func(chainhash.Hash, *wire.BlockHeader) error,
+		del func(chainhash.Hash) error,
+		streamsEverySize bool,
+	) {
+		installedSink = sink
+	})
+	require.NotNil(t, installedSink)
+
+	// Occupy the only slot and never release it: the second call's acquire has
+	// no way to succeed within its bound, which is the point.
+	heldHash := chainhash.Hash{0x03}
+	_, err := sm.AcquireBlockPrefetch(context.Background(), nil, heldHash, 1)
+	require.NoError(t, err, "occupying the only slot must succeed before the timeout can be shown to fire")
+
+	blk := wireBlockWithTxs(t, 11, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+	header := &blk.MsgBlock().Header
+	hash := *blk.Hash()
+
+	var (
+		converted bool
+		sinkErr   error
+	)
+
+	done := make(chan struct{})
+
+	go func() {
+		converted, sinkErr = installedSink(hash, header, bytes.NewReader(body), int64(len(body)))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected: the bound (100ms, half of PeerIdleTimeout) fires well
+		// before this 2s ceiling.
+	case <-time.After(2 * time.Second):
+		t.Fatal("the acquire must fall back once its bound expires, not park indefinitely on a slot that is never released")
+	}
+
+	require.NoError(t, sinkErr, "a timed-out acquire must fall back to the plain body-write path, not return an error that would cost the peer its connection")
+	require.False(t, converted, "the fallback path never converts, it only writes the whole body")
+
+	exists, err := sm.blockPark.store.Exists(context.Background(), hash[:], parkFileType)
+	require.NoError(t, err)
+	require.True(t, exists, "the fallback must have actually written the whole body via streamingBlockSink, not silently dropped it")
 }
 
 // TestPipelineOnDiskRoute_AdmissionUntouchedWhenPipelineOff pins that the

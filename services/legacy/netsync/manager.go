@@ -73,12 +73,25 @@ const (
 
 	// pipelineBlockSlotPeerAllowance sizes the download-admission semaphore, in
 	// block-count units, when the pipeline path charges slots instead of bytes.
-	// MaxBlocksInTransitPerPeer already bounds how deep one peer's queue may get
-	// (block_scheduler.go); this multiplies it up to cover a handful of peers
-	// fanning out at once, the same shape of headroom minInFlightBlockWeight's
-	// floor gives the byte path. It deliberately stops well short of MaxPeers: a
-	// slot budget sized to every connected peer at once would let this admission
-	// gate outrun the goroutine and channel memory it exists to bound.
+	//
+	// This reasoning was written for a position the admission charge no longer
+	// occupies. It assumed one peer could hold up to MaxBlocksInTransitPerPeer
+	// slots at once — true at OnBlock, where a read loop admits a block and
+	// returns immediately, so the next block can be admitted before the first is
+	// even processed. Fix round 1 moved the charge into admitPipelineSink
+	// (streaming_install.go), which wraps the sink itself: a read loop is
+	// synchronously inside exactly one call to it at a time, so one peer holds
+	// AT MOST ONE slot, never sixteen. The real ceiling on simultaneous holders
+	// is the download fan-out — how many peers can have a block in flight at
+	// once — which this codebase caps around defaultMaxInFlightBlocks (20), well
+	// under MaxBlocksInTransitPerPeer(16) × 4 = 64. So at shipped defaults this
+	// gate is reachable — AcquireBlockPrefetch is genuinely called, and would
+	// refuse if the count ever exceeded capacity — but not BINDING: real fan-out
+	// cannot reach 64 concurrent holders, so it never actually refuses anything.
+	// The gate is bindable, not bounded, in its current position. Recorded here
+	// rather than silently left wrong; not resized, because shrinking it without
+	// evidence of what fan-out this branch actually produces under load is a
+	// separate, measured decision, not a comment-fix.
 	pipelineBlockSlotPeerAllowance = 4
 
 	// maxBlockQueueSlots caps the block-queue channel capacity so a misconfigured

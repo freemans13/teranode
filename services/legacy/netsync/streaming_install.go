@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/big"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -135,23 +136,52 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 // already accepts for the decoded path: a peer over budget reads nothing
 // further until a slot frees.
 //
-// ctx is sm.ctx, not a per-peer context, and quit is nil: the wire layer's
-// external message handler (services/legacy/peer/wire_streaming.go) calls the
-// installed sink with only a hash, a header and a reader — no peer and no
-// per-connection quit channel are in scope at that layer (streamingBlockGate's
-// own doc comment notes the identical limitation for the gate, which runs one
-// step earlier in the same call). The accepted cost: a read loop parked here
-// unblocks on budget freeing up or on daemon shutdown, but not on that one
-// peer's own teardown — unlike OnBlock's acquire, which is handed sp.quit for
-// exactly that. A parked, now-dead peer's read-loop goroutine therefore
-// lingers until one of those two things happens rather than exiting the moment
-// its connection drops. Threading a per-connection quit channel this deep would
-// mean changing the wire layer's sink signature, which is out of this task's
-// scope; the trade-off is bounded (one goroutine, not an unbounded leak) and is
-// recorded here rather than fixed quietly.
+// ctx passed to the acquire is sm.ctx bounded by pipelineAdmissionAcquireTimeout,
+// not sm.ctx unbounded, and quit is nil. Fix round 1 found a real self-inflicted
+// disconnect in the first version of this function: it parked on sm.ctx with no
+// timeout, and peer.inHandler's idle timer (peer/peer.go:2153) only calls
+// idleTimer.Stop() AFTER readMessageStreaming — which is the call this sink runs
+// inside of — returns. A park here longer than legacy_peerIdleTimeout (125s
+// default) therefore tripped the SAME idle timer OnBlock's acquire was written
+// to be safe from: shouldArmProcessingTimer (peer/peer.go:2193) disarms the
+// separate processing watchdog for block messages under prefetch precisely so a
+// budget park cannot kill a healthy connection, but that disarm only covers the
+// timer armed AFTER a message is read, not the idle timer armed WHILE it is
+// still being read — which is where this sink's park actually happens. Parking
+// long enough here got a perfectly healthy peer disconnected with "No answer
+// from peer", blamed for backpressure that was entirely this node's own.
+//
+// The better fix — thread a per-connection quit channel (and a way for
+// peer.inHandler to know a read is blocked in application logic, not waiting on
+// the peer) into the sink signature, the way peer_server.go:1322 hands OnBlock's
+// acquire sp.quit — is not reachable from here without changing the external
+// dependency go-wire itself. blockBodySink (services/legacy/peer/wire_streaming.go)
+// is invoked from streamingBlockHandler, which is registered globally and
+// peer-agnostically via wire.SetExternalHandler(wire.CmdBlock, ...); go-wire
+// calls it with only (io.Reader, uint64, int) — no peer, no connection, no
+// context of any kind — because that registration is process-wide, shared by
+// every connected peer's read loop, not per-connection. There is no reader
+// identity or type assertion that reliably recovers "which peer is calling
+// this" from the io.Reader go-wire hands the external handler (it is go-wire's
+// own internal wrapper around the socket, not the socket itself), so closing
+// this gap for real means changing go-wire's SetExternalHandler/
+// ReadMessageStreamingN to pass per-call context through — an upstream change,
+// consistent with this codebase's own rule of fixing a dependency rather than
+// working around it in the wrapper, and out of scope for a same-branch fix.
+//
+// So: bounded fallback instead of an unbounded park. pipelineAdmissionAcquireTimeout
+// keeps the wait strictly below legacy_peerIdleTimeout; on that bound expiring,
+// this declines the conversion and defers to the plain body-write path exactly
+// as the duplicate case below does, rather than parking indefinitely into the
+// idle timer's path. That trades a slot's worth of admission control for
+// connection safety under sustained pressure — the same trade every other
+// decline in this function already makes.
 func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)) func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 	return func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
-		weight, err := sm.AcquireBlockPrefetch(sm.ctx, nil, hash, n)
+		acquireCtx, cancel := context.WithTimeout(sm.ctx, sm.pipelineAdmissionAcquireTimeout())
+		defer cancel()
+
+		weight, err := sm.AcquireBlockPrefetch(acquireCtx, nil, hash, n)
 		if err != nil {
 			if errors.Is(err, ErrDuplicateBlockInFlight) {
 				// A copy of this hash is already being converted (or waiting
@@ -166,17 +196,66 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 				// park/drain machinery (AdoptWritten's "already hold this
 				// block" branch) resolves the resulting duplicate body
 				// exactly as it always has.
+				//
+				// Recorded, not fixed here: under the frontier race this
+				// fallback body can win the race to handleBlockOnDiskMsg
+				// ahead of the copy that actually converts. That delivery's
+				// msg.body.Converted is false (streamingBlockSink never
+				// converts, see its own doc comment), so the park charges it
+				// the full wire size rather than the converted record's — the
+				// exact over-charge handleBlockOnDiskMsg's own comment on
+				// msg.body.Converted already warns about for a stale or
+				// foreign record, now reachable here too by a legitimate race
+				// rather than a fault.
 				return sm.streamingBlockSink(hash, header, r, n)
 			}
 
-			// ctx cancelled (shutdown): nothing was reserved, nothing to
-			// convert.
+			if errors.Is(err, context.DeadlineExceeded) {
+				// pipelineAdmissionAcquireTimeout expired, not sm.ctx itself —
+				// distinguished from the shutdown case below by which one a
+				// context.WithTimeout-derived ctx reports. Falling back here
+				// rather than returning an error keeps this peer connected:
+				// any non-benign error from this sink disconnects the peer
+				// (peer.shouldHandleReadError, see pipelineBlockSink's doc
+				// comment on why it never errors for its own declines), so
+				// erroring here would turn OUR admission pressure into a
+				// disconnect blamed on the peer, exactly the failure mode
+				// this bound exists to avoid.
+				return sm.streamingBlockSink(hash, header, r, n)
+			}
+
+			// sm.ctx cancelled (daemon shutdown): nothing was reserved and
+			// nothing productive is left to do with the bytes either.
 			return false, err
 		}
 		defer sm.ReleaseBlockPrefetch(hash, weight)
 
 		return inner(hash, header, r, n)
 	}
+}
+
+// pipelineAdmissionAcquireDivisor is how much smaller admitPipelineSink's
+// acquire bound is than legacy_peerIdleTimeout: half, so a park that hits the
+// bound still leaves a wide margin before the peer's own idle timer would have
+// fired, rather than shaving it to the edge.
+const pipelineAdmissionAcquireDivisor = 2
+
+// pipelineAdmissionAcquireFallback is the acquire bound used when
+// legacy_peerIdleTimeout is unset or non-positive, which should not happen in
+// practice (its own settings doc says not to set it below 120s) but must still
+// produce a bounded wait rather than an unbounded one.
+const pipelineAdmissionAcquireFallback = 45 * time.Second
+
+// pipelineAdmissionAcquireTimeout returns how long admitPipelineSink's acquire
+// may block before falling back, strictly below legacy_peerIdleTimeout so a
+// park here can never itself trip that timer. See admitPipelineSink's doc
+// comment for why the bound exists instead of a per-connection quit channel.
+func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
+	if sm.settings == nil || sm.settings.Legacy.PeerIdleTimeout <= 0 {
+		return pipelineAdmissionAcquireFallback
+	}
+
+	return sm.settings.Legacy.PeerIdleTimeout / pipelineAdmissionAcquireDivisor
 }
 
 // streamingBlockGate answers whether a peer may write this block's body to our
@@ -387,7 +466,29 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// (rare) behaviour is not this task's to change — only the route this
 	// branch made universal is.
 	if sm.settings != nil && sm.settings.Legacy.PipelineReceive {
-		sm.blockDownloads.RemoveOwner(msg.peer, msg.body.Hash)
+		// Resolve a stream sub-peer to its association primary, exactly as
+		// handleBlockMsg does before its own RemoveOwner call (manager.go:3271-3276)
+		// and as BlockRequested does before its HasOwner check (manager.go:6530-6538):
+		// the download ledger records ownership under the primary, never under a
+		// BlockPriority association's DATA1/DATA2 sub-peer. msg.peer is exactly
+		// that sub-peer whenever the body arrived on its own stream — OnBlockOnDisk
+		// (peer_server.go) hands QueueBlockOnDisk sp.Peer, which under a multistream
+		// association is the sub-peer, not the primary. Sub-peers are never
+		// registered in peerStates and so never own anything in blockDownloads;
+		// passing msg.peer straight through here made RemoveOwner a silent no-op in
+		// exactly that configuration. Fix round 1's own test caught only
+		// ForgiveOwners actually working (it is peer-agnostic), never this.
+		//
+		// Guarded on msg.peer != nil: peerStateResolvingPrimary calls
+		// AssociationRef on it, which dereferences a nil receiver.
+		// QueueBlockOnDisk's production caller always hands a real peer, but a nil
+		// one costs nothing extra to tolerate here.
+		primary := msg.peer
+		if msg.peer != nil {
+			_, primary, _ = sm.peerStateResolvingPrimary(msg.peer)
+		}
+
+		sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
 		sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 	}
 
