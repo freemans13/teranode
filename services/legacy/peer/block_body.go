@@ -75,7 +75,7 @@ func (m *MsgBlockOnDisk) MaxPayloadLength(pver uint32) uint64 {
 // the same rule true of how they are installed rather than only of how they are
 // read.
 func SetBlockBodyStreaming(
-	sink func(hash chainhash.Hash, r io.Reader, n int64) error,
+	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error,
 	gate func(hash chainhash.Hash, header *wire.BlockHeader) error,
 	del func(hash chainhash.Hash) error,
 ) {
@@ -92,7 +92,7 @@ func SetBlockBodyStreaming(
 // is the only way to install a sink that is actually reachable: the handler
 // checks for a gate too, so a sink installed on its own changes nothing. This
 // exists for tests that exercise the sink in isolation.
-func SetBlockBodySink(f func(hash chainhash.Hash, r io.Reader, n int64) error) {
+func SetBlockBodySink(f func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error) {
 	blockBodySink = f
 }
 

@@ -57,7 +57,7 @@ const streamedBodyRequestWindow = 60 * 60 * 1000000000 // one hour, in nanosecon
 // falls back to decoding rather than opening the door. This installs all three
 // together for the same reason.
 func (sm *SyncManager) installStreamingBlockPath(set func(
-	sink func(chainhash.Hash, io.Reader, int64) error,
+	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) error,
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
 	del func(chainhash.Hash) error,
 )) {
@@ -159,15 +159,25 @@ func describeTarget(t *big.Int) string {
 //
 // Byte-identical is the whole point. The park reads a body back with the same
 // deserializer whichever path put it there, so a streamed block needs no second
-// read path, no second file type and no flag distinguishing the two. The handler
-// hands the header in ahead of the body for this reason; it has already read the
-// header off the wire to compute the hash and to put it to the gate.
-func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, r io.Reader, n int64) error {
+// read path, no second file type and no flag distinguishing the two. The wire
+// layer hands in the parsed header rather than header bytes now, because the
+// pipeline sink that follows this one needs it as structure; this sink's own job
+// is bytes, so it re-serializes the header back onto the front of the body.
+func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error {
 	if sm.blockPark == nil {
 		return errors.NewProcessingError("[streamingBlockSink][%s] no park to write to", hash)
 	}
 
-	return sm.blockPark.WriteStreamedBody(sm.ctx, hash, r, n)
+	// The park's file format is a whole serialized block, so this path puts the
+	// header back in front of the body. The wire layer stopped doing that when the
+	// sink contract began carrying the header as structure, because the pipeline
+	// sink wants the structure and this one wants the bytes.
+	var headerBytes bytes.Buffer
+	if err := header.Serialize(&headerBytes); err != nil {
+		return errors.NewProcessingError("[streamingBlockSink][%s] could not re-serialize the header", hash, err)
+	}
+
+	return sm.blockPark.WriteStreamedBody(sm.ctx, hash, io.MultiReader(bytes.NewReader(headerBytes.Bytes()), r), n)
 }
 
 // streamingBlockDelete removes a body already written under hash, for the case

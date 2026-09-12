@@ -42,6 +42,98 @@ func makeTestBlock(t *testing.T, numTxs, scriptLen int) *wire.MsgBlock {
 	return block
 }
 
+// installTestSink sets the three package-level streaming hooks for the
+// duration of a test and returns a function restoring their previous values,
+// so one test cannot leak state into the next.
+func installTestSink(t *testing.T,
+	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error,
+	gate func(chainhash.Hash, *wire.BlockHeader) error,
+	del func(chainhash.Hash) error,
+) func() {
+	t.Helper()
+
+	prevSink, prevGate, prevDelete := blockBodySink, blockBodyGate, blockBodyDelete
+	blockBodySink, blockBodyGate, blockBodyDelete = sink, gate, del
+
+	return func() {
+		blockBodySink, blockBodyGate, blockBodyDelete = prevSink, prevGate, prevDelete
+	}
+}
+
+// limitedOver wraps b as the *io.LimitedReader readBlockMessage takes, bounded
+// to its own length exactly as the wire layer bounds the declared payload.
+func limitedOver(b []byte) *io.LimitedReader {
+	return &io.LimitedReader{R: bytes.NewReader(b), N: int64(len(b))}
+}
+
+// testBlockPayload builds a block with numTxs synthetic transactions and a
+// non-zero merkle root, and returns it alongside its full wire serialisation:
+// header, transaction count, transactions. The merkle root must be non-zero
+// (unlike makeTestBlock's) so a test can tell the real header apart from a
+// zero-value one.
+func testBlockPayload(t *testing.T, numTxs int) (*wire.MsgBlock, []byte) {
+	t.Helper()
+
+	prev := chainhash.Hash{0x01}
+	merkle := chainhash.Hash{0xab, 0xcd, 0xef}
+	header := wire.NewBlockHeader(1, &prev, &merkle, 0x1d00ffff, 0)
+
+	block := wire.NewMsgBlock(header)
+	for i := 0; i < numTxs; i++ {
+		tx := wire.NewMsgTx(1)
+		tx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Hash: prev, Index: uint32(i)},
+			SignatureScript:  []byte{byte(i)},
+			Sequence:         0xffffffff,
+		})
+		tx.AddTxOut(&wire.TxOut{Value: 1, PkScript: []byte{0x51}})
+		require.NoError(t, block.AddTransaction(tx))
+	}
+
+	var buf bytes.Buffer
+	require.NoError(t, block.Serialize(&buf))
+
+	return block, buf.Bytes()
+}
+
+// TestStreamingBlockHandler_SinkReceivesTheHeader pins the new contract. The sink
+// needs the header as a value, not as bytes at the front of a reader: the pipeline
+// that will replace the body-storing sink needs the coinbase and the merkle root,
+// and re-parsing bytes the wire layer has already parsed is waste on the read loop.
+func TestStreamingBlockHandler_SinkReceivesTheHeader(t *testing.T) {
+	streamToDiskAtLeast = 0
+	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
+
+	var gotHeader *wire.BlockHeader
+
+	var gotHash chainhash.Hash
+
+	restore := installTestSink(t,
+		func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error {
+			gotHash = hash
+			gotHeader = header
+
+			_, err := io.Copy(io.Discard, r)
+
+			return err
+		},
+		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
+		func(chainhash.Hash) error { return nil },
+	)
+	defer restore()
+
+	blk, payload := testBlockPayload(t, 3)
+
+	msg, err := readBlockMessage(limitedOver(payload), uint64(len(payload)))
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+
+	require.NotNil(t, gotHeader, "the sink must be handed the parsed header")
+	require.Equal(t, blk.Header.MerkleRoot.String(), gotHeader.MerkleRoot.String(),
+		"and it must be the block's own header, not a zero value")
+	require.Equal(t, blk.BlockHash().String(), gotHash.String())
+}
+
 func TestStreamingBlockHandler_RoundTrip(t *testing.T) {
 	wire.SetLimits(4000000000)
 

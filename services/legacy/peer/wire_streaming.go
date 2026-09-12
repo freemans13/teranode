@@ -19,10 +19,20 @@ const defaultStreamToDiskAtLeast = 64 << 20 // 64 MiB
 // can set it from the memory limit at startup and tests can move it.
 var streamToDiskAtLeast int64 = defaultStreamToDiskAtLeast
 
-// blockBodySink stores a block body streamed off the wire. Nil until the sync
-// manager installs one, and a nil sink means every block is decoded, which is
-// what keeps callers that never wire a store working unchanged.
-var blockBodySink func(hash chainhash.Hash, r io.Reader, n int64) error
+// blockBodySink consumes a block's body streamed off the wire. It is handed the
+// already-parsed header rather than header bytes, because every consumer needs the
+// header as structure: the coinbase substitution in the first subtree and the
+// merkle root to compare against both come from it, and re-parsing bytes the wire
+// layer has already parsed puts avoidable work on the read loop.
+//
+// The reader it receives starts at the transaction count varint, NOT at the
+// header. A consumer that wants a byte-for-byte copy of the block must
+// re-serialize the header itself; that is one 80-byte write against a body of
+// hundreds of megabytes.
+//
+// Nil until the sync manager installs one, and a nil sink means every block is
+// decoded, which is what keeps callers that never wire a store working unchanged.
+var blockBodySink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error
 
 // blockBodyGate answers whether a block's body may be streamed to disk, and is
 // the only thing standing between a peer and this node's disk. It is
@@ -140,32 +150,14 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 		return nil, errors.NewProcessingError("streaming block %s: refused", hash, err)
 	}
 
-	// The header goes to the sink ahead of the body, so what is stored is
-	// byte-for-byte what a serialized block is: header, count, transactions.
-	// That is what lets the park read a streamed block back with the same
-	// deserializer it uses for one it wrote itself, with no second file type and
-	// no flag saying which path produced it.
-	//
-	// The header is re-serialized rather than tee'd off the wire because it has
-	// already been consumed by Deserialize above, and 80 bytes is not the size
-	// this path exists to avoid buffering.
-	var headerBytes bytes.Buffer
-	if err := header.Serialize(&headerBytes); err != nil {
-		return nil, errors.NewProcessingError("streaming block %s: could not re-serialize the header", hash, err)
-	}
-
 	// counted wraps the post-header stream only, so the first bytes it sees are
-	// the transaction count. Wrapping the MultiReader instead would put the
-	// header's first nine bytes there and the count would be read out of the
-	// version field. The count is taken from the passing bytes rather than read
-	// here, because reading it here would mean putting it back.
+	// the transaction count. The count is taken from the passing bytes rather
+	// than read here, because reading it here would mean putting it back.
 	var counted countingReader
 
 	counted.r = lr
 
-	body := io.MultiReader(bytes.NewReader(headerBytes.Bytes()), &counted)
-
-	if err := blockBodySink(hash, body, int64(length)); err != nil {
+	if err := blockBodySink(hash, &header, &counted, int64(length)); err != nil {
 		return nil, deleteOrphanedBody(hash, errors.NewProcessingError("streaming block %s: could not store the body", hash, err))
 	}
 
