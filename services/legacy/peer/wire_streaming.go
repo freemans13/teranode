@@ -180,6 +180,21 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 	// truncated body sitting under a well-formed hash. Caught here, before the
 	// caller's generic drain runs, so the orphan can be deleted rather than
 	// left behind uncounted.
+	//
+	// NOTE for the pipeline sink specifically: this check is unreliable on
+	// that path and nobody has fixed it here. blockTxStream
+	// (services/legacy/netsync/block_tx_stream.go) wraps lr in its own
+	// 256 KiB buffered reader, and a bufio.Reader reads ahead of whatever the
+	// caller actually consumed — so for a block small enough to fit inside
+	// that buffer, the read-ahead can already have pulled every remaining
+	// byte off lr before this check ever runs, leaving lr.N at 0 whether or
+	// not the sink's own logic was correct. A large block, where the buffer
+	// cannot get ahead of the whole body, does not have this problem. That
+	// makes this check fire (or not) by block size rather than by
+	// correctness on the pipeline path. Correctness there is still held by
+	// the merkle root comparison inside pipelineBlockSink itself, which does
+	// not depend on this. Not fixed here: this is a note for whoever touches
+	// this next, not a defect this change set is fixing.
 	if lr.N > 0 {
 		return nil, deleteOrphanedBody(hash, errors.NewProcessingError(
 			"streaming block %s: peer declared %d byte payload but the body ended early with %d bytes unread", hash, length, lr.N))

@@ -35,6 +35,13 @@ import (
 type pipelineVerifiedBlock struct {
 	height        uint32
 	subtreeHashes []chainhash.Hash
+	// written is every artefact the subtreeWriter put in the store for this
+	// block, kept so pipelineBlockDelete can remove exactly what the sink
+	// wrote after the writer itself has gone out of scope. Without this, a
+	// post-sink failure in the wire layer (readBlockMessage's short-body
+	// check or its transaction-count read, services/legacy/peer/wire_streaming.go)
+	// had nothing to tell the delete callback which files to remove.
+	written []writtenSubtree
 }
 
 // pipelineBlockSink converts a block as it streams off the socket.
@@ -147,10 +154,56 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		sm.pipelineVerified = make(map[chainhash.Hash]pipelineVerifiedBlock)
 	}
 
-	sm.pipelineVerified[hash] = pipelineVerifiedBlock{height: height, subtreeHashes: subtreeHashes}
+	sm.pipelineVerified[hash] = pipelineVerifiedBlock{height: height, subtreeHashes: subtreeHashes, written: writer.Written()}
 	sm.pipelineVerifiedMu.Unlock()
 
 	return nil
+}
+
+// pipelineBlockDelete is the pipeline path's orphan-delete callback, installed
+// alongside pipelineBlockSink for the same reason streamingBlockDelete is
+// installed alongside streamingBlockSink: a body can be written successfully
+// and only then found unusable by the wire layer's own post-sink checks (the
+// short-body check or the transaction-count read in readBlockMessage,
+// services/legacy/peer/wire_streaming.go).
+//
+// Before this existed, installStreamingBlockPath installed streamingBlockDelete
+// unconditionally, whichever sink was active. That deletes from the park's
+// blob store; the pipeline sink never writes there, so that delete found
+// nothing to remove while the subtree files the pipeline sink actually wrote,
+// and the in-memory pipelineVerified entry, were left behind forever.
+//
+// This cleans up both of what a call under this hash can have written:
+// the subtree files recorded in pipelineVerified, if pipelineBlockSink
+// completed and verified the block itself; and, unconditionally,
+// whatever streamingBlockDelete itself would remove, because
+// pipelineParentHeight's unresolvable-parent fallback (see pipelineBlockSink)
+// hands the block to the raw park-write sink instead of converting it, and
+// that body needs the ordinary park delete regardless of which top-level
+// sink function is nominally "the pipeline sink" for this call.
+func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash) error {
+	sm.pipelineVerifiedMu.Lock()
+	entry, ok := sm.pipelineVerified[hash]
+	if ok {
+		delete(sm.pipelineVerified, hash)
+	}
+	sm.pipelineVerifiedMu.Unlock()
+
+	var firstErr error
+
+	if ok {
+		for _, w := range entry.written {
+			if err := sm.subtreeStore.Del(sm.ctx, w.Hash[:], w.FileType); err != nil && firstErr == nil {
+				firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, w.FileType, w.Hash, err)
+			}
+		}
+	}
+
+	if err := sm.streamingBlockDelete(hash); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
+	return firstErr
 }
 
 // pipelineParentHeight resolves a block's height from its parent's hash,

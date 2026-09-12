@@ -73,13 +73,24 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 	}
 
 	sink := sm.streamingBlockSink
+	del := sm.streamingBlockDelete
+
 	if sm.settings.Legacy.PipelineReceive {
 		sink = sm.pipelineBlockSink
+		// The delete callback is chosen from the same check, on the same
+		// call, as the sink: whichever sink actually wrote something for a
+		// hash is the only thing that knows how to clean it up again, so a
+		// sink can never be installed with the wrong delete callback any
+		// more than it can be installed with the wrong size policy (see
+		// streamsEverySize below). streamingBlockDelete only knows about the
+		// park's blob store; the pipeline sink instead writes subtree files,
+		// so it needs pipelineBlockDelete's own cleanup.
+		del = sm.pipelineBlockDelete
 	}
 
 	sm.logger.Infof("[legacy] streaming block path installed, pipeline=%v", sm.settings.Legacy.PipelineReceive)
 
-	set(sink, sm.streamingBlockGate, sm.streamingBlockDelete, sm.settings.Legacy.PipelineReceive)
+	set(sink, sm.streamingBlockGate, del, sm.settings.Legacy.PipelineReceive)
 }
 
 // streamingBlockGate answers whether a peer may write this block's body to our
