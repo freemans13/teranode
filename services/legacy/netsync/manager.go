@@ -5143,7 +5143,58 @@ func (sm *SyncManager) lookaheadCeilingLocked() (int64, bool) {
 		return 0, false
 	}
 
-	return int64(node.height) + int64(lower), true
+	// Anchored to the last COMMITTED block, and that is the whole rule: never ask
+	// for a block more than the read-ahead depth above what has been validated.
+	//
+	// It used to be anchored to the front of the header list, which advances when
+	// a block ARRIVES rather than when it commits. That made the ceiling a
+	// ratchet driven by downloads: every arrival raised the front, which raised
+	// the ceiling, which licensed another depth's worth of requests, with no
+	// coupling to the committer at all. Measured on mainnet during a genesis
+	// resync on 2026-09-12, the front stood at 4877 with the chain settled at
+	// 868 and the park held its full 4096 entries.
+	//
+	// Anchoring here makes the park self-limiting, so the mechanisms that used to
+	// compensate are unnecessary: the park cannot exceed the depth, so it never
+	// reaches its entry cap, so no block is ever refused, so no hole is ever
+	// punched in the chain of parked blocks. A count of outstanding blocks cannot
+	// achieve any of that, because a block 5000 ahead and a block 1 ahead count
+	// the same.
+	//
+	// The front is deliberately NOT floored in. A front above the ceiling means
+	// this node already holds a depth's worth of unvalidated blocks, and the
+	// right answer is to stop asking until the committer has used some of them.
+	// That is self-healing rather than a stall: committing raises the anchor,
+	// which raises the ceiling.
+	// The anchor is the last COMMITTED block: never ask for a block more than the
+	// read-ahead depth above what has been validated. That single rule makes the
+	// park self-limiting — it cannot exceed the depth, so it never reaches its
+	// entry cap, so no block is ever refused, so no hole is ever punched in the
+	// run of parked blocks waiting to commit.
+	//
+	// It used to be anchored to the front of the header list, which advances when
+	// a block ARRIVES rather than when it commits. That made the ceiling a
+	// ratchet driven by downloads: every arrival raised the front, raising the
+	// ceiling, licensing another depth's worth of requests, with no coupling to
+	// the committer at all. Measured on mainnet during a genesis resync on
+	// 2026-09-12: the front stood at 4877 with the chain settled at 868, the park
+	// held its full 4096 entries, and the node moved 1.8 blocks a minute against
+	// a commit path that takes 23ms per block.
+	//
+	// The fallback is not cosmetic. lastCommittedHeight is written only by
+	// noteCommittedHeight, so it reads zero until this PROCESS commits something,
+	// including on a node restarting mid-chain. Anchoring to zero there would put
+	// the ceiling below the chain's own height and refuse every header, and the
+	// node could never commit the block that would raise the anchor: a permanent
+	// stall on every restart. Until the first commit lands, the front is the only
+	// honest estimate of where the chain is, which is what the old anchor relied
+	// on. One commit replaces it, which happens within seconds of blocks flowing.
+	anchor := int64(sm.lastCommittedHeight.Load())
+	if anchor == 0 {
+		anchor = int64(node.height)
+	}
+
+	return anchor + int64(lower), true
 }
 
 // snapshotHeaderCandidates copies up to limit hashes from startHeader forward,

@@ -146,3 +146,53 @@ func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 
 	require.False(t, ok, "a lower window of zero is no ceiling at all")
 }
+
+// TestReadAhead_IsAnchoredToTheCommittedBlock pins the rule that keeps the park
+// self-limiting: never ask for a block more than the read-ahead depth above the
+// last block this node has actually validated.
+//
+// The ceiling used to be anchored to the front of the header list, which
+// advances when a block ARRIVES rather than when it commits. That made it a
+// ratchet driven by downloads with no coupling to the committer, so the park
+// grew until it hit its entry cap, started refusing blocks, and punched holes in
+// the run waiting to commit. Measured on mainnet during a genesis resync on
+// 2026-09-12: front at 4877, chain settled at 868, park full at 4096, and 1.8
+// blocks a minute against a 23ms commit path.
+func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
+	h := newParkWiringHarness(t, true)
+
+	h.sm.headerMu.Lock()
+	front := h.sm.headerList.Front().Value.(*headerNode).height
+	h.sm.headerMu.Unlock()
+
+	depth := int64(h.sm.settings.Legacy.BlockDownloadLowerWindow)
+	require.Positive(t, depth, "the harness must configure a read-ahead depth or this test proves nothing")
+
+	// Committing moves the ceiling, because the committer is what the read-ahead
+	// is ahead OF. The front is left untouched, so anything that still followed
+	// the front would not move.
+	h.sm.lastCommittedHeight.Store(int32(front) + 500)
+
+	h.sm.headerMu.Lock()
+	ceiling, ok := h.sm.lookaheadCeilingLocked()
+	h.sm.headerMu.Unlock()
+
+	require.True(t, ok)
+	require.Equal(t, int64(front)+500+depth, ceiling,
+		"the ceiling follows the committed block, not the front of the header list")
+
+	// Nothing committed in this process yet — which is every restart, because
+	// lastCommittedHeight is written only when a block commits and is never
+	// seeded. Anchoring to zero there would put the ceiling below the chain's own
+	// height, refuse every header, and leave the node unable to commit the block
+	// that would raise the anchor: a stall on every restart.
+	h.sm.lastCommittedHeight.Store(0)
+
+	h.sm.headerMu.Lock()
+	atStart, ok := h.sm.lookaheadCeilingLocked()
+	h.sm.headerMu.Unlock()
+
+	require.True(t, ok)
+	require.Equal(t, int64(front)+depth, atStart,
+		"before the first commit the front is the only honest estimate of where the chain is")
+}

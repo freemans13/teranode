@@ -92,13 +92,6 @@ func (sm *SyncManager) eligibleBlockPeers() []blockPeer {
 // It takes no locks of its own beyond leaf locks (the block-size tracker, the
 // download ledger, and peerStates' own read lock inside Range), and must be
 // called with headerMu released.
-// minDownloadFloor is the smallest number of blocks the scheduler will ask for
-// in a pass, however far the committer has fallen behind. See the floor's use in
-// newDownloadAssigner: without it, a park holding more blocks than the download
-// window would stop the node requesting the very parent those blocks are waiting
-// on.
-const minDownloadFloor = 16
-
 func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	if sm.blockSizeTracker == nil {
 		return nil
@@ -124,45 +117,15 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 
 	window := max(1, sm.settings.Legacy.BlockDownloadWindow)
 
-	// The window bounds blocks this node has ASKED FOR AND NOT YET COMMITTED, not
-	// blocks in flight on the wire. blockDownloads.Len() counts only the latter:
-	// a hash leaves the tracker the moment its block arrives, whether or not the
-	// block could be committed, so a block that lands and parks stops counting
-	// against the window while still costing a park entry.
-	//
-	// Counting flight alone lets the downloader lap the committer without bound.
-	// Measured on mainnet at genesis on 2026-09-12: a 216-byte block is in flight
-	// for milliseconds and commits in 23ms, so the window emptied continuously and
-	// the park filled to its 4096-entry cap. A full park then refuses the ONE
-	// block that would extend the tip, the drain finds no child for the settled
-	// hash, and the block loop sits idle with thousands of far-ahead blocks on
-	// disk — 804 declined turns and 1.3 blocks a minute, against a commit path
-	// that can do 2600.
-	//
-	// Including the park closes the loop: the node stops asking for block 5000
-	// while it still owes itself block 804.
-	outstanding := sm.blockDownloads.Len() + sm.blockPark.Len()
+	// This bounds blocks in flight on the wire. It is NOT what stops the
+	// downloader racing ahead of the committer: that is lookaheadCeilingLocked,
+	// which refuses any header more than the read-ahead depth above the last
+	// committed block. A count cannot do that job, because a block 5000 ahead and
+	// a block 1 ahead each count as one.
+	remaining := window - sm.blockDownloads.Len()
 
-	remaining := window - outstanding
-
-	// The floor stops the back-pressure above deadlocking the node, and it is not
-	// optional.
-	//
-	// Parked blocks are held BECAUSE their parent is missing, and the only way to
-	// obtain that parent is to download it. A park that is over the window on its
-	// own — after a restart recovers a full park, or whenever the committer has
-	// fallen far behind — would otherwise refuse every request including the one
-	// request that lets the chain advance, and the node would sit forever holding
-	// blocks it can never use.
-	//
-	// It engages ONLY when the park is what is holding the window shut. A window
-	// genuinely smaller than the floor keeps its own meaning, because an operator
-	// who sets a window of 3 means 3.
-	if remaining <= 0 && sm.blockPark.Len() > 0 {
-		remaining = max(0, minDownloadFloor-sm.blockDownloads.Len())
-	}
 	if remaining <= 0 {
-		sm.logger.Debugf("[fetchHeaderBlocks] the node holds %d blocks asked-for-but-uncommitted against a window of %d, not requesting more", outstanding, window)
+		sm.logger.Debugf("[fetchHeaderBlocks] the node is at its block download window of %d, not requesting more", window)
 
 		return nil
 	}
