@@ -1,11 +1,18 @@
 package netsync
 
 import (
+	"bytes"
+	"context"
+	"io"
 	"testing"
+	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/semaphore"
 )
 
 // TestHandleBlockOnDiskMsg_ReleasesTheDownloadAssignment is the regression test
@@ -81,4 +88,137 @@ func TestHandleBlockOnDiskMsg_OwnershipUnchangedWhenPipelineOff(t *testing.T) {
 
 	require.Equal(t, 1, h.sm.blockDownloads.CountForPeer(h.peer),
 		"with PipelineReceive off, this task must change nothing about the pre-existing on-disk route, including its leak")
+}
+
+// TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions is the regression
+// test for the missing admission control. AcquireBlockPrefetch is reached only
+// from OnBlock, which the peer dispatches only for a whole-block message; with
+// the pipeline on every block comes back as *peer.MsgBlockOnDisk instead, so
+// OnBlock — and the admission check inside it — never runs, and the pipeline
+// path has no bound on how many blocks convert concurrently.
+//
+// This occupies the admission budget's only slot directly (simulating another
+// peer's conversion already in flight), then drives a second, real, convertible
+// block through the sink actually installed for the wire layer and requires that
+// it stays blocked until the held slot is released.
+func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.settings.Legacy.PipelineReceive = true
+
+	sm.blockPrefetchBudgetBytes = 1
+	sm.blockPrefetchBudget = semaphore.NewWeighted(1)
+	sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
+
+	var installedSink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)
+
+	sm.installStreamingBlockPath(func(
+		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
+		gate func(chainhash.Hash, *wire.BlockHeader) error,
+		del func(chainhash.Hash) error,
+		streamsEverySize bool,
+	) {
+		installedSink = sink
+	})
+	require.NotNil(t, installedSink, "the park is enabled, so a sink must have been installed")
+
+	// Occupy the only slot, simulating a first block another peer's read loop
+	// is already converting.
+	heldHash := chainhash.Hash{0x01}
+	weight, err := sm.AcquireBlockPrefetch(context.Background(), nil, heldHash, 999)
+	require.NoError(t, err, "occupying the only slot must succeed before the second block can be shown to wait on it")
+
+	// A second, distinct, well-formed block. Distinct transaction count from
+	// any other fixture in this package: wireBlockWithTxs is deterministic and
+	// the wire header's one-second timestamp resolution means two blocks built
+	// moments apart with the same transaction count hash identically.
+	blk := wireBlockWithTxs(t, 7, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+	header := &blk.MsgBlock().Header
+	hash := *blk.Hash()
+
+	var (
+		converted bool
+		sinkErr   error
+	)
+
+	done := make(chan struct{})
+
+	go func() {
+		converted, sinkErr = installedSink(hash, header, bytes.NewReader(body), int64(len(body)))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatalf("the on-disk route converted a second block while the admission budget's only slot was already held (converted=%v err=%v) — admission control is not reachable from this path", converted, sinkErr)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: still blocked on the budget.
+	}
+
+	sm.ReleaseBlockPrefetch(heldHash, weight)
+
+	require.True(t, WaitUntil(func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second), "releasing the held slot must let the second block's conversion proceed")
+
+	require.NoError(t, sinkErr, "the second block is well-formed and must convert cleanly once admitted")
+	require.True(t, converted, "a well-formed block below the checkpoint must convert, not merely be accepted")
+}
+
+// TestPipelineOnDiskRoute_AdmissionUntouchedWhenPipelineOff pins that the
+// admission wrap only ever applies to the pipeline sink: with PipelineReceive
+// off, the installed sink is streamingBlockSink, which never touches the
+// download-admission budget, so a fully occupied budget must not affect it at
+// all.
+func TestPipelineOnDiskRoute_AdmissionUntouchedWhenPipelineOff(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.settings.Legacy.PipelineReceive = false
+
+	sm.blockPrefetchBudgetBytes = 1
+	sm.blockPrefetchBudget = semaphore.NewWeighted(1)
+	sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
+
+	var installedSink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)
+
+	sm.installStreamingBlockPath(func(
+		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
+		gate func(chainhash.Hash, *wire.BlockHeader) error,
+		del func(chainhash.Hash) error,
+		streamsEverySize bool,
+	) {
+		installedSink = sink
+	})
+	require.NotNil(t, installedSink)
+
+	// Hold the only slot, exactly as in the pipeline-on test above.
+	heldHash := chainhash.Hash{0x02}
+	_, err := sm.AcquireBlockPrefetch(context.Background(), nil, heldHash, 1)
+	require.NoError(t, err)
+
+	blk := wireBlockWithTxs(t, 5, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+	header := &blk.MsgBlock().Header
+
+	done := make(chan struct{})
+
+	go func() {
+		_, _ = installedSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected: completes promptly, unaffected by the held slot.
+	case <-time.After(2 * time.Second):
+		t.Fatal("with PipelineReceive off the on-disk route must not be gated by the admission budget at all")
+	}
 }

@@ -46,9 +46,21 @@ func (l *warnCaptureLogger) Warnf(format string, args ...interface{}) {
 // This proves the sink and its matching delete callback are chosen together,
 // the same pattern already used for the streamsEverySize policy: never one
 // without the other.
+//
+// pipeline=true's sink is no longer sm.pipelineBlockSink itself: task 4 wraps
+// it in admitPipelineSink to reach the download-admission budget that used to
+// be unreachable from this route (AcquireBlockPrefetch was only ever called
+// from OnBlock, which the pipeline route never dispatches through). A wrapper
+// closure's reflect code pointer is never equal to the method value it
+// wraps — confirmed separately, not assumed — so pipeline=true's claim is
+// proved behaviourally instead: the installed sink, given a well-formed
+// pipeline-eligible block, must convert it exactly as calling
+// sm.pipelineBlockSink directly would. pipeline=false is untouched by task 4
+// (admitPipelineSink only ever wraps the pipeline branch), so that half keeps
+// the original pointer-identity proof, which doubles as evidence that nothing
+// about the off path changed.
 func TestInstallStreamingBlockPath_ChoosesTheSinkAndDeleteTogether(t *testing.T) {
-	sm := newPipelineManager(t, memory.New(), 8)
-	sm.blockPark = &blockPark{}
+	sm := newPipelineParkManager(t, memory.New(), 8)
 
 	for _, pipelineOn := range []bool{false, true} {
 		sm.settings.Legacy.PipelineReceive = pipelineOn
@@ -70,18 +82,30 @@ func TestInstallStreamingBlockPath_ChoosesTheSinkAndDeleteTogether(t *testing.T)
 			gotStreamsEverySize = streamsEverySize
 		})
 
-		wantSink := reflect.ValueOf(sm.streamingBlockSink).Pointer()
 		wantDelete := reflect.ValueOf(sm.streamingBlockDelete).Pointer()
-
 		if pipelineOn {
-			wantSink = reflect.ValueOf(sm.pipelineBlockSink).Pointer()
 			wantDelete = reflect.ValueOf(sm.pipelineBlockDelete).Pointer()
 		}
 
-		require.Equal(t, wantSink, reflect.ValueOf(gotSink).Pointer(), "pipeline=%v must install the matching sink", pipelineOn)
 		require.Equal(t, wantDelete, reflect.ValueOf(gotDelete).Pointer(), "pipeline=%v must install the matching delete callback, not always streamingBlockDelete", pipelineOn)
 		require.NotNil(t, gotGate, "the gate must always be installed alongside a sink")
 		require.Equal(t, pipelineOn, gotStreamsEverySize, "the size policy must track the same PipelineReceive check")
+
+		if !pipelineOn {
+			wantSink := reflect.ValueOf(sm.streamingBlockSink).Pointer()
+			require.Equal(t, wantSink, reflect.ValueOf(gotSink).Pointer(),
+				"pipeline=false must install streamingBlockSink unwrapped — task 4's admission wrap must never reach this branch")
+
+			continue
+		}
+
+		blk := wireBlockWithTxs(t, 9, false)
+		pipelineHeaderFixture(t, sm, blk)
+		body := blockBodyBytes(t, blk)
+
+		converted, err := gotSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+		require.NoError(t, err, "pipeline=true's installed sink must convert a well-formed block cleanly")
+		require.True(t, converted, "pipeline=true's installed sink must behave like the pipeline sink, not the plain body-write path")
 	}
 }
 

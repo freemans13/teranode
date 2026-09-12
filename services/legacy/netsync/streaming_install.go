@@ -88,7 +88,11 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 	del := sm.streamingBlockDelete
 
 	if pipelineOn {
-		sink = sm.pipelineBlockSink
+		// admitPipelineSink wraps the download-admission budget around the
+		// pipeline sink. See that method's doc comment for why it has to wrap
+		// the sink itself rather than being charged in the on-disk message
+		// handler that runs after the sink has already finished.
+		sink = sm.admitPipelineSink(sm.pipelineBlockSink)
 		// The delete callback is chosen from the same check, on the same
 		// call, as the sink: whichever sink actually wrote something for a
 		// hash is the only thing that knows how to clean it up again, so a
@@ -103,6 +107,76 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 	sm.logger.Infof("[legacy] streaming block path installed, pipeline=%v", pipelineOn)
 
 	set(sink, sm.streamingBlockGate, del, pipelineOn)
+}
+
+// admitPipelineSink wraps inner (the pipeline sink) with the download-admission
+// budget AcquireBlockPrefetch/ReleaseBlockPrefetch already implement, charged
+// one slot per block on this path (see AcquireBlockPrefetch's own
+// PipelineReceive branch, manager.go). That budget was sized for exactly this
+// call site — sm.blockPrefetchBudgetBytes is derived from
+// MaxBlocksInTransitPerPeer specifically when PipelineReceive is on — but was
+// never reachable from it: AcquireBlockPrefetch is only ever called from
+// OnBlock, which the peer only dispatches for a whole *wire.MsgBlock, and with
+// the pipeline on every block comes back as *peer.MsgBlockOnDisk instead, so
+// OnBlock, and the admission check inside it, never runs for this route.
+//
+// Charged here, wrapping the sink itself, NOT in handleBlockOnDiskMsg (the
+// on-disk message handler that runs once the body is already fully on disk).
+// By the time that handler's message even exists, the conversion this budget
+// is meant to bound is already finished: inner has already streamed the whole
+// body through the subtree builder and its ~50MB dedup map
+// (newPipelineDedupMap, pipeline_sink.go) on this peer's own read-loop
+// goroutine. A charge that only runs after that resident cost has already been
+// paid bounds nothing real — which is the exact lesson the byte-budget version
+// of this same check already taught (ReleaseBlockPrefetchBytes's own doc
+// comment): charging after the fact cannot be un-taught by moving the charge to
+// a different post-hoc call site. Charging before inner runs instead blocks the
+// read loop that would otherwise start that work, the same trade-off OnBlock
+// already accepts for the decoded path: a peer over budget reads nothing
+// further until a slot frees.
+//
+// ctx is sm.ctx, not a per-peer context, and quit is nil: the wire layer's
+// external message handler (services/legacy/peer/wire_streaming.go) calls the
+// installed sink with only a hash, a header and a reader — no peer and no
+// per-connection quit channel are in scope at that layer (streamingBlockGate's
+// own doc comment notes the identical limitation for the gate, which runs one
+// step earlier in the same call). The accepted cost: a read loop parked here
+// unblocks on budget freeing up or on daemon shutdown, but not on that one
+// peer's own teardown — unlike OnBlock's acquire, which is handed sp.quit for
+// exactly that. A parked, now-dead peer's read-loop goroutine therefore
+// lingers until one of those two things happens rather than exiting the moment
+// its connection drops. Threading a per-connection quit channel this deep would
+// mean changing the wire layer's sink signature, which is out of this task's
+// scope; the trade-off is bounded (one goroutine, not an unbounded leak) and is
+// recorded here rather than fixed quietly.
+func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)) func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+	return func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
+		weight, err := sm.AcquireBlockPrefetch(sm.ctx, nil, hash, n)
+		if err != nil {
+			if errors.Is(err, ErrDuplicateBlockInFlight) {
+				// A copy of this hash is already being converted (or waiting
+				// for budget) by another peer's read loop — the frontier
+				// race's own duplicate delivery, not a fault. It must not
+				// disconnect this peer or fail this message: decline the
+				// conversion and defer to the plain body-write path, exactly
+				// as pipelineBlockSink's own unresolvable-parent and
+				// not-legacyUnified declines already do (see that function's
+				// doc comment) — r is still untouched at this point, so
+				// handing it to streamingBlockSink is safe. The existing
+				// park/drain machinery (AdoptWritten's "already hold this
+				// block" branch) resolves the resulting duplicate body
+				// exactly as it always has.
+				return sm.streamingBlockSink(hash, header, r, n)
+			}
+
+			// ctx cancelled (shutdown): nothing was reserved, nothing to
+			// convert.
+			return false, err
+		}
+		defer sm.ReleaseBlockPrefetch(hash, weight)
+
+		return inner(hash, header, r, n)
+	}
 }
 
 // streamingBlockGate answers whether a peer may write this block's body to our
