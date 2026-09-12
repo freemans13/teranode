@@ -72,10 +72,22 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 		return
 	}
 
+	// A nil settings pointer here is not a recoverable nil panic the way it
+	// would be for most fields: the reviewer measured Settings.Legacy at
+	// offset 4728 and PipelineReceive at 5112, both past the 4096-byte guard
+	// page a Go process leaves unmapped at low addresses, so reading through
+	// a nil settings pointer this far in can fault outside the range the
+	// runtime is guaranteed to turn back into an ordinary panic. Computed
+	// once here, matching the sm.settings != nil && pattern already used
+	// elsewhere in this package (e.g. handle_block.go's
+	// quickValidationAllowed), and reused below rather than re-read, so
+	// there is exactly one place that can get this wrong instead of three.
+	pipelineOn := sm.settings != nil && sm.settings.Legacy.PipelineReceive
+
 	sink := sm.streamingBlockSink
 	del := sm.streamingBlockDelete
 
-	if sm.settings.Legacy.PipelineReceive {
+	if pipelineOn {
 		sink = sm.pipelineBlockSink
 		// The delete callback is chosen from the same check, on the same
 		// call, as the sink: whichever sink actually wrote something for a
@@ -88,9 +100,9 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 		del = sm.pipelineBlockDelete
 	}
 
-	sm.logger.Infof("[legacy] streaming block path installed, pipeline=%v", sm.settings.Legacy.PipelineReceive)
+	sm.logger.Infof("[legacy] streaming block path installed, pipeline=%v", pipelineOn)
 
-	set(sink, sm.streamingBlockGate, del, sm.settings.Legacy.PipelineReceive)
+	set(sink, sm.streamingBlockGate, del, pipelineOn)
 }
 
 // streamingBlockGate answers whether a peer may write this block's body to our
