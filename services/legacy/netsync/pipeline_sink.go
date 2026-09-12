@@ -51,6 +51,29 @@ type pipelineVerifiedBlock struct {
 // binding a spend to its spender, so the root is the only thing asserting that
 // this body is the body that header commits to.
 func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) error {
+	// Resolved before anything is read from r, and that ordering is load-
+	// bearing: the fallback below hands r to streamingBlockSink untouched, and
+	// that only works if nothing — not even the coinbase — has been consumed
+	// from it yet.
+	height, resolved := sm.pipelineParentHeight(header.PrevBlock)
+	if !resolved {
+		// Neither the in-flight header list nor the committed chain has this
+		// block's parent, which is a genuine miss beyond the ordinary
+		// out-of-order case pipelineParentHeight covers (see its doc comment).
+		//
+		// There is no error return from this sink that the wire layer treats
+		// as anything other than a malformed message: peer.shouldHandleReadError
+		// (services/legacy/peer/peer.go) disconnects on every error except an
+		// exact io.EOF, io.ErrUnexpectedEOF or non-temporary net.OpError, none
+		// of which fit "decline this one and let the ordinary path retry it".
+		// So this does not error. It defers to streamingBlockSink instead,
+		// which writes the untouched body to the park exactly as it would with
+		// PipelineReceive off, and lets the existing park/drain machinery
+		// decide the block's fate the way it already correctly does for the
+		// non-pipeline path.
+		return sm.streamingBlockSink(hash, header, r, n)
+	}
+
 	stream, err := newBlockTxStream(r, n)
 	if err != nil {
 		return err
@@ -62,15 +85,6 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	if err != nil {
 		return errors.NewBlockInvalidError("[pipelineBlockSink][%s] failed reading the coinbase", hash, err)
 	}
-
-	// A missing parent is the ordinary out-of-order case, not a local fault: the
-	// header round can outrun body delivery, and this is how that shows up here.
-	_, parentMeta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &header.PrevBlock)
-	if err != nil {
-		return errors.NewBlockInvalidError("[pipelineBlockSink][%s] parent %s not found", hash, header.PrevBlock, err)
-	}
-
-	height := parentMeta.Height + 1
 
 	quickValidation := sm.quickValidationAllowed(height)
 	writer := newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, quickValidation)
@@ -137,6 +151,44 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	sm.pipelineVerifiedMu.Unlock()
 
 	return nil
+}
+
+// pipelineParentHeight resolves a block's height from its parent's hash,
+// without requiring the parent to be a COMMITTED block.
+//
+// The ordinary out-of-order case is a parent that is still in the in-flight
+// header list (sm.headerIndex) — measured at roughly 91% of blocks on this
+// node — because the header round can outrun body delivery. Asking only
+// sm.blockchainClient.GetBlockHeader, which answers only for a committed
+// block (parentIsInChain in streaming_install.go makes the identical call for
+// exactly that meaning), treated that ordinary case as a fault.
+//
+// The header list is checked first because it is the common case and never
+// blocks. The store is checked second, with headerMu already released,
+// because a blockchain client call can take an unbounded time and headerMu's
+// own invariant (manager.go's "Rule B" comment on the SyncManager struct)
+// forbids holding it across one.
+func (sm *SyncManager) pipelineParentHeight(parent chainhash.Hash) (uint32, bool) {
+	sm.headerMu.Lock()
+	e, inList := sm.headerIndex[parent]
+	sm.headerMu.Unlock()
+
+	if inList && e != nil {
+		if node, ok := e.Value.(*headerNode); ok && node != nil && node.height >= 0 {
+			return uint32(node.height) + 1, true
+		}
+	}
+
+	if sm.blockchainClient == nil {
+		return 0, false
+	}
+
+	_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &parent)
+	if err != nil {
+		return 0, false
+	}
+
+	return meta.Height + 1, true
 }
 
 // dedupInitialCapacity bounds the pipeline dedup map's pre-sizing hint. It is a
