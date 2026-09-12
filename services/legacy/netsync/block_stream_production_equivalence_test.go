@@ -121,8 +121,24 @@ func TestPipeline_ProducesTheSameFilesAsPrepareSubtrees(t *testing.T) {
 
 			seen := txmap.NewSplitSwissMapUint64(uint32(tc.txCount)) //nolint:gosec // test tx count is small
 
-			b, err := newBlockStreamBuilder(tc.txCount, tc.maxItems,
-				coinbaseFromBlock(t, block), writer.Emit(ctx), seen)
+			// streamedTrees captures the *subtreepkg.Subtree the builder emits, so the
+			// root taken from Finish() below can be checked against the real
+			// model.Block.CheckMerkleRoot (checkMerkleRootAgainst), not just compared
+			// hash-for-hash against production's subtree list. Without this, nothing
+			// in this file proves the pipeline's root is one CheckMerkleRoot would
+			// actually accept — see the merkle-citation fix in this same round.
+			var streamedTrees []*subtreepkg.Subtree
+
+			coinbase := coinbaseFromBlock(t, block)
+
+			emit := writer.Emit(ctx)
+			wrappedEmit := func(index int, st *subtreepkg.Subtree, data *subtreepkg.Data, meta *subtreepkg.Meta) error {
+				streamedTrees = append(streamedTrees, st)
+
+				return emit(index, st, data, meta)
+			}
+
+			b, err := newBlockStreamBuilder(tc.txCount, tc.maxItems, coinbase, wrappedEmit, seen)
 			require.NoError(t, err)
 
 			for i, wireTx := range block.Transactions() {
@@ -134,8 +150,11 @@ func TestPipeline_ProducesTheSameFilesAsPrepareSubtrees(t *testing.T) {
 				require.NoError(t, b.AddTx(tx, hash))
 			}
 
-			_, pipeHashes, err := b.Finish()
+			root, pipeHashes, err := b.Finish()
 			require.NoError(t, err)
+
+			require.NoError(t, checkMerkleRootAgainst(t, coinbase, streamedTrees, root),
+				"the pipeline's merkle root must be the one the real model.Block.CheckMerkleRoot accepts, or this test does not carry the claim its file doc comment makes")
 
 			// COMPARE.
 			require.Equal(t, len(prodHashes), len(pipeHashes),

@@ -15,9 +15,23 @@ import (
 // PLACEHOLDER, and named as one rather than hidden. Nothing downstream reads
 // this map yet: the committer still takes its blocks from the park. Replacing
 // it with a park record, so a pipelined block reaches block validation by the
-// same route a parked one does, is the next plan's first task. Until then this
-// sink converts and verifies a block and then drops it, which is why the
-// setting defaults off.
+// same route a parked one does, is the next plan's first task.
+//
+// This is NOT simply "convert, verify and drop". installStreamingBlockPath
+// installs one gate/sink/delete triple regardless of which sink is active, and
+// after ANY sink returns nil the wire layer still dispatches a blockOnDiskMsg
+// that handleBlockOnDiskMsg turns into a blockPark.AdoptWritten call
+// (streaming_install.go). With the pipeline sink on, no body was ever written
+// to the park's store for that hash, so AdoptWritten registers an entry and
+// charges its byte budget for a blob that does not exist, and the drain will
+// later try to read it and fail. That phantom-entry consequence is exactly why
+// the setting must stay off until the committer is wired to reach a pipelined
+// block by some route other than the park — see the setting's longdesc in
+// settings/legacy_settings.go.
+//
+// sm.pipelineVerified is also never pruned: every verified block holds its
+// subtree hashes for the rest of the process's life until that wiring lands,
+// on a branch whose entire purpose is bounding memory.
 type pipelineVerifiedBlock struct {
 	height        uint32
 	subtreeHashes []chainhash.Hash
@@ -67,6 +81,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 	builder, err := newBlockStreamBuilder(int(stream.TxCount()), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup)
 	if err != nil {
+		// newBlockStreamBuilder itself never calls Emit, so writer has written
+		// nothing yet: this call is a no-op today. It is here anyway because the
+		// brief's rule is "every failure path calls DeleteAll" without exception,
+		// and leaving this one out is a trap for whoever adds work between
+		// newSubtreeWriter and here.
+		sm.deleteWrittenOnFailure(hash, writer)
+
 		return err
 	}
 
@@ -77,13 +98,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 				break
 			}
 
-			_ = writer.DeleteAll(sm.ctx)
+			sm.deleteWrittenOnFailure(hash, writer)
 
 			return streamErr
 		}
 
 		if addErr := builder.AddTx(tx, txHash); addErr != nil {
-			_ = writer.DeleteAll(sm.ctx)
+			sm.deleteWrittenOnFailure(hash, writer)
 
 			return addErr
 		}
@@ -91,23 +112,20 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 	root, subtreeHashes, err := builder.Finish()
 	if err != nil {
-		_ = writer.DeleteAll(sm.ctx)
+		sm.deleteWrittenOnFailure(hash, writer)
 
 		return err
 	}
 
 	if !root.IsEqual(&header.MerkleRoot) {
-		_ = writer.DeleteAll(sm.ctx)
+		sm.deleteWrittenOnFailure(hash, writer)
 
 		return errors.NewBlockInvalidError("[pipelineBlockSink][%s] merkle root %s does not match header's %s", hash, root, header.MerkleRoot)
 	}
 
-	// PLACEHOLDER, and named as one rather than hidden. Nothing downstream reads
-	// this map yet: the committer still takes its blocks from the park. Replacing
-	// it with a park record, so a pipelined block reaches block validation by the
-	// same route a parked one does, is the next plan's first task. Until then this
-	// sink converts and verifies a block and then drops it, which is why the
-	// setting defaults off.
+	// PLACEHOLDER: see pipelineVerifiedBlock's doc comment above for what this
+	// is, what it is not (the block is not simply dropped — see the
+	// AdoptWritten/park-budget consequence there), and why it is never pruned.
 	sm.pipelineVerifiedMu.Lock()
 	if sm.pipelineVerified == nil {
 		sm.pipelineVerified = make(map[chainhash.Hash]pipelineVerifiedBlock)
@@ -117,6 +135,19 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	sm.pipelineVerifiedMu.Unlock()
 
 	return nil
+}
+
+// deleteWrittenOnFailure calls writer.DeleteAll and, if the delete itself
+// fails, logs a single-line warning naming the block hash rather than
+// discarding the error silently. subtreeWriter's own doc comment explains why
+// an orphaned subtree file is dangerous (it is content-addressed and shared
+// with any other block carrying the same run of transactions); a cleanup
+// failure that goes unlogged defeats the point of calling DeleteAll at all,
+// since nothing else will ever tell an operator those files are still there.
+func (sm *SyncManager) deleteWrittenOnFailure(hash chainhash.Hash, writer *subtreeWriter) {
+	if delErr := writer.DeleteAll(sm.ctx); delErr != nil {
+		sm.logger.Warnf("[pipelineBlockSink][%s] failed to delete subtree files after a failed block: %v", hash, delErr)
+	}
 }
 
 // pipelineSubtreeHashesFor returns the subtree root hashes pipelineBlockSink

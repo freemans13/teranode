@@ -186,10 +186,19 @@ func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManag
 // The root is computed with the same builder pipelineBlockSink itself drives,
 // over a throwaway store, at the same MaximumMerkleItemsPerSubtree the manager
 // under test uses. That makes this fixture self-consistent, which is all a
-// "good" run needs; it is not a second, independent check that the builder's
-// root is the canonical one — TestPipeline_ProducesTheSameFilesAsPrepareSubtrees
-// (block_stream_production_equivalence_test.go) already carries that claim
-// against prepareSubtrees/CheckMerkleRoot.
+// "good" run needs; it is NOT where the claim that this root is the canonical
+// one (the one the real model.Block.CheckMerkleRoot would accept) is proven.
+// That claim is carried elsewhere, against the real function rather than a
+// second computation of the same code path: TestMerkleAccumulator_MatchesCheckMerkleRoot
+// (merkle_accumulator_test.go) feeds the accumulator subtree shapes covering
+// both this file's 20-at-8 and single-partial-subtree cases and requires
+// CheckMerkleRoot to accept the result, and
+// TestBlockStreamBuilder_RootMatchesTheAllAtOnceComputation
+// (block_stream_builder_test.go) pins the same 20-at-8 shape through Finish()
+// on the real builder. (An earlier version of this comment cited
+// TestPipeline_ProducesTheSameFilesAsPrepareSubtrees for this; that test
+// discarded its root and never checked it against anything until this same
+// review round wired checkMerkleRootAgainst into it.)
 //
 // Called before the first call to blk.Hash(), so the block's cached hash
 // reflects the header actually passed to the sink.
