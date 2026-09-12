@@ -1419,21 +1419,20 @@ func (p *blockPark) Recover(ctx context.Context) {
 			continue
 
 		case strings.HasSuffix(name, "."+string(fileformat.FileTypeBlock)):
-			// A converted record left by a previous run. A future task teaches
-			// Recover to adopt one of these directly — deriving a park entry's
-			// previous-block hash and size from the record itself, the way this
-			// loop already does for a whole block below — but nothing does that
-			// yet, so this discards it rather than leaving it here to be
-			// skipped forever the way the catch-all case below used to treat
-			// it (before this case existed, a name ending in ".block" fell
-			// through to "anything we do not recognise is left alone" and
-			// stayed on disk across every future restart, since nothing else
-			// in this loop, or anywhere else, will ever revisit it).
+			// A converted record left by a previous run: a header, counts and
+			// subtree hashes, not a whole block. Its previous-block hash and size
+			// come from the record itself via ReadConverted, never from a wire
+			// block — there is no wire block on disk to read one from, and even
+			// where a whole-block sibling still existed this record is the thing
+			// that will actually be committed, so it is the thing recovery must
+			// describe.
 			//
-			// Discarding costs a re-conversion the next time this hash is
-			// needed, not correctness: the subtree files it names expire on
-			// their own delete-at-height (subtree_writer.go) regardless of
-			// whether this record survives to point at them again.
+			// Losing one of these to a restart used to be silent: before this
+			// case existed, a name ending in ".block" fell through to "anything
+			// we do not recognise is left alone" and stayed on disk across every
+			// future restart, since nothing else in this loop, or anywhere else,
+			// would ever revisit it — a downloaded block, quietly never asked
+			// for again and never adopted either.
 			hash, err := chainhash.NewHashFromStr(strings.TrimSuffix(name, "."+string(fileformat.FileTypeBlock)))
 			if err != nil {
 				p.logger.Warnf("[blockPark] %s in the park directory is not named after a block hash, leaving it alone: %v", name, err)
@@ -1443,9 +1442,75 @@ func (p *blockPark) Recover(ctx context.Context) {
 				continue
 			}
 
-			p.Delete(ctx, parkedBlock{hash: *hash})
+			if adopted >= maxParkedEntries {
+				// A previous run's park must never exceed what this run will hold.
+				p.Delete(ctx, parkedBlock{hash: *hash})
 
-			discarded++
+				discarded++
+
+				continue
+			}
+
+			record, err := p.ReadConverted(ctx, *hash)
+			if err != nil {
+				// The same policy readParkedPrevBlock's caller applies below: a
+				// failure that says nothing about the record (busy store, budget
+				// ran out) keeps it for the next start; only a positively bad
+				// record — will not decode, or hashes to something else — is
+				// deleted. Discarding one of these costs only a re-conversion the
+				// next time this hash is needed, not correctness: the subtree
+				// files it names expire on their own delete-at-height
+				// (subtree_writer.go) regardless of whether this record survives
+				// to point at them again.
+				d := parkReadFailure(err)
+				if d.blob != parkBlobDrop {
+					p.logger.Warnf("[blockPark][%s] converted record could not be read (%s), leaving it on disk for the next start: %v", hash, d.reason, err)
+
+					skipped++
+
+					continue
+				}
+
+				p.logger.Warnf("[blockPark][%s] converted record is unusable, deleting it: %v", hash, err)
+				p.Delete(ctx, parkedBlock{hash: *hash})
+
+				discarded++
+
+				continue
+			}
+
+			info, err := dirEntry.Info()
+			if err != nil {
+				skipped++
+
+				continue
+			}
+
+			// The store's own 8-byte header is on disk alongside the record, the
+			// same as it is for a whole block below, so it is stripped the same
+			// way to leave the record's own byte count.
+			size := info.Size() - int64(fileformat.Header{}.Size())
+			if size < 0 {
+				size = 0
+			}
+
+			parkedAt := info.ModTime()
+			if parkedAt.IsZero() || parkedAt.After(time.Now()) {
+				parkedAt = time.Now()
+			}
+
+			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, size: size, parkedAt: parkedAt}
+
+			p.mu.Lock()
+			stored := entry
+			p.entries[entry.hash] = &stored
+			p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+			p.chargeLocked(entry.hash, size)
+			p.setGauges()
+			p.mu.Unlock()
+
+			adopted++
+			adoptedBytes += size
 
 			continue
 
