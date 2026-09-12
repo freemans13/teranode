@@ -350,10 +350,13 @@ func TestStreamingBlockHandlerDeletesATruncatedBodyAfterAWrite(t *testing.T) {
 
 	var deletedHash chainhash.Hash
 
+	var deletedConverted bool
+
 	deleteCalled := false
-	blockBodyDelete = func(h chainhash.Hash) error {
+	blockBodyDelete = func(h chainhash.Hash, converted bool) error {
 		deleteCalled = true
 		deletedHash = h
+		deletedConverted = converted
 
 		return nil
 	}
@@ -368,6 +371,7 @@ func TestStreamingBlockHandlerDeletesATruncatedBodyAfterAWrite(t *testing.T) {
 	require.Error(t, err, "a truncated body must be surfaced as an error")
 	require.True(t, deleteCalled, "a body written for a stream that ended short must be deleted")
 	require.Equal(t, hash, deletedHash, "the delete must be keyed by the same hash the sink was")
+	require.False(t, deletedConverted, "this sink reports converted=false, so the delete must be told the same — fix-round item 2's whole point is that this must never be re-derived by asking whether a converted record merely exists for the hash")
 }
 
 // The reviewer's missing test: a gate rejection must still drain the rest of

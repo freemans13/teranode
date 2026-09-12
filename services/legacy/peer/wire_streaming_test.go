@@ -48,7 +48,7 @@ func makeTestBlock(t *testing.T, numTxs, scriptLen int) *wire.MsgBlock {
 func installTestSink(t *testing.T,
 	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error),
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
-	del func(chainhash.Hash) error,
+	del func(hash chainhash.Hash, converted bool) error,
 ) func() {
 	t.Helper()
 
@@ -120,7 +120,7 @@ func TestStreamingBlockHandler_SinkReceivesTheHeader(t *testing.T) {
 			return false, err
 		},
 		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
-		func(chainhash.Hash) error { return nil },
+		func(chainhash.Hash, bool) error { return nil },
 	)
 	defer restore()
 
@@ -155,7 +155,7 @@ func TestStreamingBlockHandler_SmallBlocksAlsoStream(t *testing.T) {
 			return false, err
 		},
 		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
-		func(chainhash.Hash) error { return nil },
+		func(chainhash.Hash, bool) error { return nil },
 	)
 	defer restore()
 
@@ -184,7 +184,7 @@ func TestStreamingBlockHandler_SmallBlocksStillDecodeWhenThePipelineIsOff(t *tes
 			return false, nil
 		},
 		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
-		func(chainhash.Hash) error { return nil },
+		func(chainhash.Hash, bool) error { return nil },
 	)
 	defer restore()
 

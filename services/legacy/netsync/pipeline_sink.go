@@ -230,68 +230,84 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // nothing to remove while the subtree files the pipeline sink actually wrote
 // were left behind forever.
 //
-// This task retired the in-memory pipelineVerified map that used to tell this
-// function which subtree files to remove. It is not replaced with a second
-// map: the converted record ReadConverted hands back already names every
-// subtree the sink wrote (record.Subtrees), and the structure file type each
-// one was written under — FileTypeSubtree or FileTypeSubtreeToCheck — is a
-// pure function of the record's own height via quickValidationAllowed, the
-// same test subtreeWriter used to choose it while writing. So the file list
-// subtreeWriter.Written() used to hand back is reconstructed from the record
-// instead of remembered, which is exactly the thing a hash with no record can
-// never need: pipelineParentHeight's unresolvable-parent fallback (see
-// pipelineBlockSink) returns before any record is written, so a not-found
-// error from ReadConverted for that hash is the expected case below, not a
-// fault.
+// converted is THIS call's own answer to "did the delivery that just failed
+// actually convert anything" — blockBodySink's own return value for that one
+// call, threaded through unchanged by the wire layer (BlockBody.Converted,
+// deleteOrphanedBody). It is NOT re-derived by asking whether a converted
+// record happens to exist for hash right now, which a fix round after this
+// one's first cut found was still wrong: a hash can be re-requested and
+// re-delivered while an EARLIER delivery for it is still genuinely parked,
+// waiting on its own parent — ownership is released as soon as a delivery's
+// sink call finishes, and the streaming gate accepts any hash asked for
+// within the last hour — so a second, unrelated delivery's own failure
+// (a body that ends short, for example) must not read that earlier delivery's
+// record back and delete the subtree files it names out from under it. Only
+// when THIS call is known, from its own return value, to have written a
+// record does this function go looking for what it wrote.
+//
+// This task also retired the in-memory pipelineVerified map that used to tell
+// this function which subtree files to remove. It is not replaced with a
+// second map — a second map keyed by hash would have exactly the same
+// cross-delivery problem converted exists to avoid. Instead, when converted is
+// true, the record ReadConverted hands back names every subtree THIS call's
+// own sink wrote (record.Subtrees) — true only because converted being true
+// guarantees this call was the one that just wrote whatever sits under hash
+// right now, with nothing else able to have raced in between — and the
+// structure file type each one was written under — FileTypeSubtree or
+// FileTypeSubtreeToCheck — is a pure function of the record's own height via
+// quickValidationAllowed, the same test subtreeWriter used to choose it while
+// writing.
 //
 // The converted record itself is NOT deleted here. It is deleted inside
-// blockPark.Delete, which streamingBlockDelete below calls, so that every path
-// that retires a park entry — not only this discard path — retires the
-// record with it. Deleting it a second time here would only race that call
-// harmlessly, so there is nothing to gain by keeping a second delete site, and
-// something to lose: two call sites making the same decision drift apart the
-// moment only one of them is updated.
-//
-// This cleans up everything a call under this hash can have written: the
-// subtree artefacts a completed conversion produced, if pipelineBlockSink got
-// that far; and, unconditionally, whatever streamingBlockDelete itself would
-// remove — the converted record (now, via blockPark.Delete) and, on the
-// unresolvable-parent fallback, the raw body that fallback wrote to the park
-// instead of converting it.
-func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash) error {
+// blockPark.Delete, which streamingBlockDelete below calls unconditionally, so
+// that every path that retires a park entry — not only this discard path —
+// retires the record with it. Deleting it a second time here would only race
+// that call harmlessly, so there is nothing to gain by keeping a second delete
+// site, and something to lose: two call sites making the same decision drift
+// apart the moment only one of them is updated.
+func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) error {
 	var firstErr error
 
-	record, err := sm.blockPark.ReadConverted(sm.ctx, hash)
+	if converted {
+		record, err := sm.blockPark.ReadConverted(sm.ctx, hash)
 
-	switch {
-	case err == nil && record != nil:
-		structureType := fileformat.FileTypeSubtreeToCheck
-		if sm.quickValidationAllowed(record.Height) {
-			structureType = fileformat.FileTypeSubtree
-		}
+		switch {
+		case err == nil && record != nil:
+			structureType := fileformat.FileTypeSubtreeToCheck
+			if sm.quickValidationAllowed(record.Height) {
+				structureType = fileformat.FileTypeSubtree
+			}
 
-		for _, root := range record.Subtrees {
-			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, structureType} {
-				if delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft); delErr != nil && firstErr == nil {
-					firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
+			for _, root := range record.Subtrees {
+				for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, structureType} {
+					if delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft); delErr != nil && firstErr == nil {
+						firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
+					}
 				}
 			}
-		}
 
-	case err != nil && !errors.Is(err, errors.ErrNotFound):
-		// Not the ordinary "this hash was never converted" case (the
-		// unresolvable-parent fallback, which is a not-found error and stays
-		// silent, matching the ordinary case). This is a store timeout, a
-		// permit-pool wait that ran out, or ReadConverted's own hash-mismatch
-		// refusal — every one of which means the subtree files this block's
-		// sink actually wrote, if any, are NOT being deleted here, exactly
-		// the failure mode deleteWrittenOnFailure's own comment warns about
-		// for the same reason: an unlogged cleanup failure is indistinguishable
-		// from a cleanup that never needed to run.
-		sm.logger.Warnf("[pipelineBlockDelete][%s] could not read the converted record, so its subtree files (if any) were not deleted: %v", hash, err)
+		case err != nil && !errors.Is(err, errors.ErrNotFound):
+			// converted being true means THIS call's own sink wrote a record,
+			// so a not-found error here is not the ordinary case it would be
+			// otherwise — it means the write this call just made cannot be
+			// read back. Either way, this is a store timeout, a permit-pool
+			// wait that ran out, or ReadConverted's own hash-mismatch refusal
+			// — every one of which means the subtree files this block's sink
+			// actually wrote are NOT being deleted here, exactly the failure
+			// mode deleteWrittenOnFailure's own comment warns about for the
+			// same reason: an unlogged cleanup failure is indistinguishable
+			// from a cleanup that never needed to run.
+			sm.logger.Warnf("[pipelineBlockDelete][%s] could not read back the record this delivery just converted, so its subtree files were not deleted: %v", hash, err)
+		}
 	}
 
-	if err := sm.streamingBlockDelete(hash); err != nil && firstErr == nil {
+	// Unconditional regardless of converted: on the unresolvable-parent
+	// fallback this call's own sink wrote a raw body here (streamingBlockSink,
+	// converted false), and on every path this also retires whatever the park
+	// holds for hash — see blockPark.Delete's own comment on why attempting
+	// both file types is safe even though only one of them is ever this
+	// call's own.
+	if err := sm.streamingBlockDelete(hash, converted); err != nil && firstErr == nil {
 		firstErr = err
 	}
 

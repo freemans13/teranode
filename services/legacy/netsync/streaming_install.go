@@ -66,7 +66,7 @@ const streamedBodyRequestWindow = 60 * 60 * 1000000000 // one hour, in nanosecon
 func (sm *SyncManager) installStreamingBlockPath(set func(
 	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
-	del func(chainhash.Hash) error,
+	del func(chainhash.Hash, bool) error,
 	streamsEverySize bool,
 )) {
 	if sm == nil || sm.blockPark == nil || !sm.blockPark.Enabled() {
@@ -100,8 +100,12 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 		// sink can never be installed with the wrong delete callback any
 		// more than it can be installed with the wrong size policy (see
 		// streamsEverySize below). streamingBlockDelete only knows about the
-		// park's blob store; the pipeline sink instead writes subtree files,
-		// so it needs pipelineBlockDelete's own cleanup.
+		// park's blob store; the pipeline sink can also write subtree files,
+		// so it needs pipelineBlockDelete's own cleanup — gated on the
+		// converted argument the wire layer passes through from THIS
+		// delivery's own blockBodySink return, never on whether a converted
+		// record merely exists for the hash (see pipelineBlockDelete's own
+		// doc comment for why that inference is exactly the bug this closes).
 		del = sm.pipelineBlockDelete
 	}
 
@@ -384,7 +388,15 @@ func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, header *wire.Bloc
 // asked for again by the walk, while bytes sitting on disk under a well-formed
 // hash look legitimate to everything downstream, and nothing there knows to
 // distrust them.
-func (sm *SyncManager) streamingBlockDelete(hash chainhash.Hash) error {
+//
+// converted is unused here: this path only ever writes a whole body under
+// FileTypeMsgBlock, never a converted record, whether it is running as the
+// plain non-pipeline delete or as pipelineBlockDelete's own unconditional tail
+// call for the fallback-to-raw-body case. It is part of the signature only so
+// this satisfies the same function type pipelineBlockDelete does, which is
+// what lets installStreamingBlockPath assign either one to del without a
+// wrapper closure.
+func (sm *SyncManager) streamingBlockDelete(hash chainhash.Hash, _ bool) error {
 	if sm.blockPark == nil {
 		return nil
 	}

@@ -67,13 +67,13 @@ func TestInstallStreamingBlockPath_ChoosesTheSinkAndDeleteTogether(t *testing.T)
 
 		var gotSink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)
 		var gotGate func(chainhash.Hash, *wire.BlockHeader) error
-		var gotDelete func(chainhash.Hash) error
+		var gotDelete func(chainhash.Hash, bool) error
 		var gotStreamsEverySize bool
 
 		sm.installStreamingBlockPath(func(
 			sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
 			gate func(chainhash.Hash, *wire.BlockHeader) error,
-			del func(chainhash.Hash) error,
+			del func(chainhash.Hash, bool) error,
 			streamsEverySize bool,
 		) {
 			gotSink = sink
@@ -140,7 +140,12 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 	hashes := got.Subtrees
 	require.NotEmpty(t, hashes, "sanity: the sink must have produced subtrees, or this test asserts nothing")
 
-	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash()))
+	// converted: true — exactly the value the sink call above just returned,
+	// which is what the wire layer would actually pass through here (see
+	// BlockBody.Converted / deleteOrphanedBody). Fix-round item 2 gates the
+	// subtree-file cleanup on this being true for THIS call, rather than on
+	// whether a converted record merely exists for the hash.
+	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), true))
 
 	for _, h := range hashes {
 		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
@@ -183,7 +188,11 @@ func TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists, "sanity: the fallback must have written the body to the park, or this test asserts nothing")
 
-	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash()))
+	// converted: false — the fallback never converts (asserted above), so this
+	// is what the sink's own return value would actually be for this delivery.
+	// The raw body must still be cleaned up unconditionally, regardless of
+	// converted.
+	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), false))
 
 	exists, err = parkStore.Exists(ctx, blk.Hash()[:], parkFileType)
 	require.NoError(t, err)
@@ -292,7 +301,10 @@ func TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint(t *testin
 		require.False(t, quick, "sanity: above the checkpoint the writer must NOT also write FileTypeSubtree")
 	}
 
-	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash()))
+	// converted: true — this test stands in for a delivery that converted a
+	// record above the checkpoint (writeConvertedRecordDirect exists because
+	// the sink itself can no longer produce one, see its own doc comment).
+	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), true))
 
 	for _, h := range hashes {
 		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
@@ -361,9 +373,68 @@ func TestPipelineBlockDelete_LogsARealReadFailureInsteadOfSwallowingIt(t *testin
 
 	require.Empty(t, warnings.warnings, "sanity: nothing has failed yet")
 
-	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash()),
+	// converted: true — this delivery's own sink call above genuinely
+	// converted blk, so the read failure below (the store now holds a foreign
+	// block's bytes under blk's key) must still be treated as THIS call's own
+	// record having gone bad, not silently ignored.
+	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), true),
 		"pipelineBlockDelete's own return is unaffected by a read failure here: it still runs streamingBlockDelete, which is what owns the fallback park write")
 
 	require.NotEmpty(t, warnings.warnings, "a read failure that is not \"not found\" must be logged, not swallowed in silence")
 	require.Contains(t, warnings.warnings[0], "pipelineBlockDelete", "the warning must name where it came from")
+}
+
+// TestPipelineBlockDelete_DoesNotTouchAnotherDeliverysSubtreeFiles is
+// fix-round item 2's regression. Before this fix, pipelineBlockDelete found
+// its subtree files to remove by reading whatever converted record sat under
+// the hash — an inference by mere existence, not by this call's own
+// knowledge — so an UNRELATED delivery's failure could delete a genuinely
+// different, still-parked delivery's subtree files out from under it.
+//
+// The concrete shape, per the review: peer A delivers a block, it converts
+// and parks (still waiting on its own parent — genuine, needed). Ownership is
+// released at intake, so the same hash is immediately re-requestable, and the
+// streaming gate accepts any hash asked for within the last hour. Peer B then
+// delivers the SAME hash and its own body ends short, so B's own sink call
+// returns converted=false; the wire layer's orphan-delete callback still runs
+// for B's failed delivery, with the hash B claimed to be delivering — which is
+// the hash A's genuine, still-parked delivery already owns.
+//
+// This builds A's real conversion first (real subtree files, real record),
+// then calls pipelineBlockDelete for the same hash with converted=false —
+// exactly what B's own failed sink call would report — and requires A's
+// subtree files to survive untouched.
+func TestPipelineBlockDelete_DoesNotTouchAnotherDeliverysSubtreeFiles(t *testing.T) {
+	ctx := t.Context()
+
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+
+	// Peer A: a genuine, successful conversion, parked and still needed.
+	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, sinkErr, "sanity: A's delivery must convert cleanly, or this test asserts nothing about protecting it")
+	require.True(t, converted)
+
+	record, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees, "sanity: A's delivery must have produced subtrees, or this test asserts nothing")
+
+	// Peer B: an unrelated, failed delivery of the SAME hash. converted=false
+	// is exactly what B's own sink call would have returned — see
+	// pipelineBlockSink's every error-path return — so this is what the wire
+	// layer's deleteOrphanedBody would actually pass through for B's failure.
+	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), false))
+
+	for _, h := range record.Subtrees {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+			exists, existsErr := store.Exists(ctx, h[:], ft)
+			require.NoError(t, existsErr)
+			require.True(t, exists,
+				"peer B's own failed delivery (converted=false) must never delete peer A's DIFFERENT, still-parked delivery's subtree file %s for subtree %s", ft, h)
+		}
+	}
 }

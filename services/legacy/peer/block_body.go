@@ -95,7 +95,7 @@ func (m *MsgBlockOnDisk) MaxPayloadLength(pver uint32) uint64 {
 func SetBlockBodyStreaming(
 	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error),
 	gate func(hash chainhash.Hash, header *wire.BlockHeader) error,
-	del func(hash chainhash.Hash) error,
+	del func(hash chainhash.Hash, converted bool) error,
 	streamsEverySize bool,
 ) {
 	if sink == nil || gate == nil || del == nil {
@@ -130,7 +130,8 @@ func SetBlockBodyGate(f func(hash chainhash.Hash, header *wire.BlockHeader) erro
 // SetBlockBodyDelete installs the callback that removes a body already
 // written under a hash, for the handler to call when it fails after the sink
 // has already returned success. See blockBodyDelete's doc comment for why an
-// orphaned body is worse than a failed download.
-func SetBlockBodyDelete(f func(hash chainhash.Hash) error) {
+// orphaned body is worse than a failed download, and for what its converted
+// argument is for.
+func SetBlockBodyDelete(f func(hash chainhash.Hash, converted bool) error) {
 	blockBodyDelete = f
 }

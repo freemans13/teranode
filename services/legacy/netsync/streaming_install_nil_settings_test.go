@@ -37,7 +37,7 @@ func TestInstallStreamingBlockPath_NilSettingsDoesNotPanic(t *testing.T) {
 		sm.installStreamingBlockPath(func(
 			sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
 			gate func(chainhash.Hash, *wire.BlockHeader) error,
-			del func(chainhash.Hash) error,
+			del func(chainhash.Hash, bool) error,
 			streamsEverySize bool,
 		) {
 			require.False(t, streamsEverySize, "nil settings must default to pipeline off, not pipeline on")

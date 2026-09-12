@@ -66,7 +66,17 @@ var blockBodyGate func(hash chainhash.Hash, header *wire.BlockHeader) error
 // nothing downstream of this handler knows to distrust bytes sitting on disk
 // under a hash that looks legitimate. Nil until the sync manager installs it,
 // same as the other two.
-var blockBodyDelete func(hash chainhash.Hash) error
+//
+// converted is blockBodySink's own return value for THIS call, passed straight
+// through rather than re-derived. A hash can be re-requested and re-delivered
+// while an earlier, still-parked delivery for it is waiting on its parent —
+// the streaming gate accepts any hash asked for within the last hour, and
+// ownership is released as soon as a delivery's sink call finishes — so an
+// implementation that inferred "did this call convert something" by asking
+// whether a converted record merely exists for hash would find the OTHER
+// delivery's genuine, still-needed record and destroy it. converted is what
+// lets the installed callback tell the two apart without asking.
+var blockBodyDelete func(hash chainhash.Hash, converted bool) error
 
 // streamingBlockHandler is a wire.SetExternalHandler implementation for the
 // "block" message that decodes the block payload directly from the network
@@ -177,7 +187,7 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 
 	converted, err := blockBodySink(hash, &header, &counted, int64(length))
 	if err != nil {
-		return nil, deleteOrphanedBody(hash, errors.NewProcessingError("streaming block %s: could not store the body", hash, err))
+		return nil, deleteOrphanedBody(hash, converted, errors.NewProcessingError("streaming block %s: could not store the body", hash, err))
 	}
 
 	// The sink returned success, but if the peer's declared payload still has
@@ -201,13 +211,13 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 	// not depend on this. Not fixed here: this is a note for whoever touches
 	// this next, not a defect this change set is fixing.
 	if lr.N > 0 {
-		return nil, deleteOrphanedBody(hash, errors.NewProcessingError(
+		return nil, deleteOrphanedBody(hash, converted, errors.NewProcessingError(
 			"streaming block %s: peer declared %d byte payload but the body ended early with %d bytes unread", hash, length, lr.N))
 	}
 
 	txCount, err := wire.ReadVarInt(bytes.NewReader(counted.first), wire.ProtocolVersion)
 	if err != nil {
-		return nil, deleteOrphanedBody(hash, errors.NewProcessingError("streaming block %s: could not read the transaction count", hash, err))
+		return nil, deleteOrphanedBody(hash, converted, errors.NewProcessingError("streaming block %s: could not read the transaction count", hash, err))
 	}
 
 	return &MsgBlockOnDisk{BlockBody{
@@ -221,13 +231,14 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 
 // deleteOrphanedBody removes a body already written under hash before
 // returning err. See blockBodyDelete's doc comment for why an orphaned body is
-// worse than a failed download. The delete is best-effort: its own failure is
-// swallowed rather than returned, because err is the reason the caller is
-// failing in the first place and must not be masked by a secondary cleanup
-// error.
-func deleteOrphanedBody(hash chainhash.Hash, err error) error {
+// worse than a failed download, and for what converted is and why it must
+// come from THIS call's own blockBodySink return rather than be re-derived.
+// The delete is best-effort: its own failure is swallowed rather than
+// returned, because err is the reason the caller is failing in the first
+// place and must not be masked by a secondary cleanup error.
+func deleteOrphanedBody(hash chainhash.Hash, converted bool, err error) error {
 	if blockBodyDelete != nil {
-		_ = blockBodyDelete(hash)
+		_ = blockBodyDelete(hash, converted)
 	}
 
 	return err
