@@ -88,7 +88,10 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 
 	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body))))
 
-	hashes := sm.pipelineSubtreeHashesFor(*blk.Hash())
+	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	require.NotNil(t, got, "sanity: the sink must have recorded a verified block, or this test asserts nothing")
+
+	hashes := got.Subtrees
 	require.NotEmpty(t, hashes, "sanity: the sink must have produced subtrees, or this test asserts nothing")
 
 	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash()))
@@ -101,7 +104,7 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 		}
 	}
 
-	require.Empty(t, sm.pipelineSubtreeHashesFor(*blk.Hash()), "the in-memory pipelineVerified entry must be cleared too, not just the files")
+	require.Nil(t, sm.pipelineVerifiedBlockFor(*blk.Hash()), "the in-memory pipelineVerified entry must be cleared too, not just the files")
 }
 
 // TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite covers FIX 2's

@@ -59,14 +59,13 @@ func TestPipelineSink_ParentInHeaderIndex_IsTheOrdinaryCase(t *testing.T) {
 	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err, "a parent only in the in-flight header list must not be treated as a fault")
 
-	hashes := sm.pipelineSubtreeHashesFor(*blk.Hash())
+	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	require.NotNil(t, got, "the block must actually be converted, not merely accepted")
+
+	hashes := got.Subtrees
 	require.NotEmpty(t, hashes, "the block must actually be converted, not merely accepted")
 
-	sm.pipelineVerifiedMu.Lock()
-	got := sm.pipelineVerified[*blk.Hash()]
-	sm.pipelineVerifiedMu.Unlock()
-
-	require.Equal(t, uint32(42), got.height, "height must come from the header-list parent (41+1), proving the committed store was not what resolved it")
+	require.Equal(t, uint32(42), got.Height, "height must come from the header-list parent (41+1), proving the committed store was not what resolved it")
 
 	for _, h := range hashes {
 		exists, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
@@ -119,7 +118,7 @@ func TestPipelineSink_UnresolvableParent_FallsBackInsteadOfErroring(t *testing.T
 	require.NoError(t, existsErr)
 	require.True(t, exists, "the fallback must write the body to the park, the same as the non-pipeline sink would")
 
-	require.Empty(t, sm.pipelineSubtreeHashesFor(*blk.Hash()), "a block that fell back to the raw sink was never converted, so it must have no pipeline-verified subtree record")
+	require.Nil(t, sm.pipelineVerifiedBlockFor(*blk.Hash()), "a block that fell back to the raw sink was never converted, so it must have no pipeline-verified block record")
 }
 
 // newPipelineManagerWithPark builds on newPipelineManager

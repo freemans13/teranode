@@ -1,15 +1,17 @@
 package netsync
 
 import (
+	"bytes"
 	"io"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
-// pipelineVerifiedBlock is what pipelineBlockSink records once a block's merkle
+// pipelineVerifiedEntry is what pipelineBlockSink records once a block's merkle
 // root has been checked against its header.
 //
 // PLACEHOLDER, and named as one rather than hidden. Nothing downstream reads
@@ -30,11 +32,16 @@ import (
 // settings/legacy_settings.go.
 //
 // sm.pipelineVerified is also never pruned: every verified block holds its
-// subtree hashes for the rest of the process's life until that wiring lands,
-// on a branch whose entire purpose is bounding memory.
-type pipelineVerifiedBlock struct {
-	height        uint32
-	subtreeHashes []chainhash.Hash
+// full model.Block for the rest of the process's life until that wiring
+// lands, on a branch whose entire purpose is bounding memory.
+type pipelineVerifiedEntry struct {
+	// block is recorded as a model.Block rather than a bare subtree list
+	// because that is exactly what the committer needs and exactly what
+	// serializes: (*model.Block).Bytes writes the header, counts, subtree
+	// list and coinbase, and model.NewBlockFromBytes reads them back. A
+	// narrower record would mean inventing a format for it and then
+	// converting to this anyway.
+	block *model.Block
 	// written is every artefact the subtreeWriter put in the store for this
 	// block, kept so pipelineBlockDelete can remove exactly what the sink
 	// wrote after the writer itself has gone out of scope. Without this, a
@@ -146,15 +153,60 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		return errors.NewBlockInvalidError("[pipelineBlockSink][%s] merkle root %s does not match header's %s", hash, root, header.MerkleRoot)
 	}
 
-	// PLACEHOLDER: see pipelineVerifiedBlock's doc comment above for what this
+	// Convert the wire header into a teranode header the same way
+	// HandleBlockDirect does (handle_block.go:209-217): serialise it and
+	// parse it back with model.NewBlockHeaderFromBytes, rather than inventing
+	// a second conversion.
+	var headerBytes bytes.Buffer
+	if err = header.Serialize(&headerBytes); err != nil {
+		sm.deleteWrittenOnFailure(hash, writer)
+
+		return errors.NewProcessingError("[pipelineBlockSink][%s] failed to serialize header", hash, err)
+	}
+
+	modelHeader, err := model.NewBlockHeaderFromBytes(headerBytes.Bytes())
+	if err != nil {
+		sm.deleteWrittenOnFailure(hash, writer)
+
+		return errors.NewProcessingError("[pipelineBlockSink][%s] failed to create block header from bytes", hash, err)
+	}
+
+	// Finish returns subtree hashes as values; model.NewBlock wants pointers.
+	// Take the address of a loop-local copy, never of the range variable —
+	// ranging over subtreeHashes would otherwise leave every pointer aliasing
+	// the same backing slot.
+	subtreeHashPointers := make([]*chainhash.Hash, len(subtreeHashes))
+
+	for i := range subtreeHashes {
+		h := subtreeHashes[i]
+		subtreeHashPointers[i] = &h
+	}
+
+	// Recorded as a model.Block rather than a bare subtree list because that is
+	// exactly what the committer needs and exactly what serializes: (*Block).Bytes
+	// writes the header, counts, subtree list and coinbase, and NewBlockFromBytes
+	// reads them back. Keeping a narrower record would mean inventing a format for
+	// it and then converting to this anyway.
+	//
+	// blockID is 0: on the unified below-checkpoint route the server assigns it
+	// inside quickValidateBlock, which is also where the UTXO work happens. See
+	// handle_block.go:607.
+	verified, err := model.NewBlock(modelHeader, coinbase, subtreeHashPointers, stream.TxCount(), uint64(n), height, 0)
+	if err != nil {
+		sm.deleteWrittenOnFailure(hash, writer)
+
+		return errors.NewProcessingError("[pipelineBlockSink][%s] failed to build block model", hash, err)
+	}
+
+	// PLACEHOLDER: see pipelineVerifiedEntry's doc comment above for what this
 	// is, what it is not (the block is not simply dropped — see the
 	// AdoptWritten/park-budget consequence there), and why it is never pruned.
 	sm.pipelineVerifiedMu.Lock()
 	if sm.pipelineVerified == nil {
-		sm.pipelineVerified = make(map[chainhash.Hash]pipelineVerifiedBlock)
+		sm.pipelineVerified = make(map[chainhash.Hash]pipelineVerifiedEntry)
 	}
 
-	sm.pipelineVerified[hash] = pipelineVerifiedBlock{height: height, subtreeHashes: subtreeHashes, written: writer.Written()}
+	sm.pipelineVerified[hash] = pipelineVerifiedEntry{block: verified, written: writer.Written()}
 	sm.pipelineVerifiedMu.Unlock()
 
 	return nil
@@ -287,11 +339,11 @@ func (sm *SyncManager) deleteWrittenOnFailure(hash chainhash.Hash, writer *subtr
 	}
 }
 
-// pipelineSubtreeHashesFor returns the subtree root hashes pipelineBlockSink
-// recorded for hash, in block order, or nil if the sink has not verified it.
-func (sm *SyncManager) pipelineSubtreeHashesFor(hash chainhash.Hash) []chainhash.Hash {
+// pipelineVerifiedBlockFor returns the model.Block pipelineBlockSink recorded
+// for hash, or nil if the sink has not verified it.
+func (sm *SyncManager) pipelineVerifiedBlockFor(hash chainhash.Hash) *model.Block {
 	sm.pipelineVerifiedMu.Lock()
 	defer sm.pipelineVerifiedMu.Unlock()
 
-	return sm.pipelineVerified[hash].subtreeHashes
+	return sm.pipelineVerified[hash].block
 }

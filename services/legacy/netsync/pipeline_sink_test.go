@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
@@ -41,7 +42,10 @@ func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err)
 
-	hashes := sm.pipelineSubtreeHashesFor(*blk.Hash())
+	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	require.NotNil(t, got, "a verified block must be recorded")
+
+	hashes := got.Subtrees
 	require.NotEmpty(t, hashes, "a 20-transaction block at 8 per subtree must produce subtrees")
 
 	for _, h := range hashes {
@@ -93,7 +97,10 @@ func TestPipelineSink_DeletesWhatItWroteOnAWrongMerkleRoot(t *testing.T) {
 	pipelineHeaderFixture(t, good, blk)
 	require.NoError(t, good.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body))))
 
-	produced := good.pipelineSubtreeHashesFor(*blk.Hash())
+	goodBlock := good.pipelineVerifiedBlockFor(*blk.Hash())
+	require.NotNil(t, goodBlock, "sanity: the good run must record a verified block, or this test asserts nothing")
+
+	produced := goodBlock.Subtrees
 	require.NotEmpty(t, produced, "sanity: the good run must produce subtrees, or this test asserts nothing")
 
 	for _, h := range produced {
@@ -120,6 +127,70 @@ func TestPipelineSink_RejectsADuplicateTransaction(t *testing.T) {
 	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "duplicate")
+}
+
+// TestPipelineSink_RecordsAWholeBlockModel pins what the sink hands on. The
+// committer needs a header, a coinbase, a transaction count, a size, a height and
+// a subtree list; recording only the subtree hashes would mean the committer had
+// to reconstruct the rest from a block nobody kept.
+func TestPipelineSink_RecordsAWholeBlockModel(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineManager(t, store, 8)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+
+	header := &blk.MsgBlock().Header
+	body := blockBodyBytes(t, blk)
+
+	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
+
+	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	require.NotNil(t, got, "a verified block must be recorded")
+
+	require.Equal(t, header.MerkleRoot.String(), got.Header.HashMerkleRoot.String(),
+		"the recorded header must be the block's own")
+	require.Equal(t, uint64(20), got.TransactionCount)
+	require.NotNil(t, got.CoinbaseTx, "the committer serializes the coinbase from this")
+	require.NotEmpty(t, got.Subtrees, "and reads the subtree list from this")
+	require.Equal(t, uint64(len(body)), got.SizeInBytes)
+}
+
+// TestPipelineSink_TheRecordedBlockSurvivesASerializationRoundTrip is what makes
+// Task 2 possible: the record is stored and recovered as bytes, so a field the
+// model does not serialize would be silently lost after a restart.
+func TestPipelineSink_TheRecordedBlockSurvivesASerializationRoundTrip(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineManager(t, store, 8)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+
+	header := &blk.MsgBlock().Header
+	body := blockBodyBytes(t, blk)
+
+	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
+
+	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	require.NotNil(t, got)
+
+	raw, err := got.Bytes()
+	require.NoError(t, err)
+
+	back, err := model.NewBlockFromBytes(raw)
+	require.NoError(t, err)
+
+	require.Equal(t, got.Header.Hash().String(), back.Header.Hash().String())
+	require.Equal(t, got.TransactionCount, back.TransactionCount)
+	require.Equal(t, got.SizeInBytes, back.SizeInBytes)
+	require.Equal(t, len(got.Subtrees), len(back.Subtrees), "the subtree list must survive the round trip")
+
+	for i := range got.Subtrees {
+		require.Equal(t, got.Subtrees[i].String(), back.Subtrees[i].String(),
+			"subtree %d must survive the round trip", i)
+	}
+
+	require.Equal(t, got.CoinbaseTx.TxIDChainHash().String(), back.CoinbaseTx.TxIDChainHash().String())
 }
 
 // pipelineManagerStoreCounter gives each newPipelineManager call its own
