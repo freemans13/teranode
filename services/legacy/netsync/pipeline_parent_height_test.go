@@ -126,6 +126,66 @@ func TestPipelineSink_UnresolvableParent_FallsBackInsteadOfErroring(t *testing.T
 	require.False(t, isConverted, "a block that fell back to the raw sink was never converted, so it must have no converted record")
 }
 
+// TestPipelineSink_IneligibleForTheUnifiedRouteFallsBack is task-3 fix round
+// 1's sink-side pin.
+//
+// Before this fix, pipelineBlockSink converted every block whose parent height
+// resolved, regardless of whether the block's height was actually on the
+// unified route. HandleConvertedBlock (handle_block.go) then refused any
+// record it could not commit correctly — but by then the block's only copy
+// was already the converted record, and refusing it at commit time meant
+// parkCommitFailure's default classified the refusal as
+// parkDispositionBlockRejected: delete the blob, rewind the download cursor,
+// blame the delivering peer, and mark the block failed. Re-delivery converted
+// it again and failed again, identically, forever, at that one height — and
+// every descendant behind it was suppressed by the same recently-failed
+// bookkeeping. Declining the conversion HERE instead costs nothing, because
+// the block was never touched: it falls back to streamingBlockSink and
+// commits later through the ordinary whole-block path
+// (HandleBlockDirect), which does its own UTXO work and needs no blockID
+// from the record.
+//
+// legacyUnified requires more than being below the checkpoint (which
+// quickValidationAllowed alone would grant): it also requires the operator's
+// unified flag. Turning that flag off — leaving the checkpoint and the
+// outpoint-only flag exactly as newPipelineManager's default — is the
+// narrowest way to make legacyUnified false while staying below the
+// checkpoint, and it is one of the two scenarios the review named: an
+// operator running PipelineReceive without LegacyUnifiedBelowCheckpoint. The
+// other scenario (the first block AT or ABOVE the checkpoint on an otherwise
+// unified node) flips the same legacyUnified predicate through BelowCheckpoint
+// instead of through this flag; the sink's gate does not care which conjunct
+// failed, so this is the same code path.
+func TestPipelineSink_IneligibleForTheUnifiedRouteFallsBack(t *testing.T) {
+	ctx := t.Context()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = false
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "declining to convert must not surface as an error: any non-nil error here is what peer.shouldHandleReadError classifies as malformed and disconnects the peer over")
+	require.False(t, converted, "a block not on the unified route must fall back, not convert")
+
+	exists, err := store.Exists(ctx, blk.Hash()[:], parkFileType)
+	require.NoError(t, err)
+	require.True(t, exists, "the fallback must write the whole block to the park, the same as the non-pipeline sink would")
+
+	isConverted, err := sm.blockPark.IsConverted(ctx, *blk.Hash())
+	require.NoError(t, err)
+	require.False(t, isConverted, "a block that fell back must produce no converted record")
+
+	// The point of falling back rather than converting-then-refusing: the
+	// block's only copy is never at risk. Read must find the same whole block
+	// that was handed to the sink.
+	msgBlock, err := sm.blockPark.Read(ctx, *blk.Hash())
+	require.NoError(t, err, "the park must still hold the block after declining to convert it")
+	require.Equal(t, blk.Hash().String(), msgBlock.BlockHash().String(), "the block held must be the block that was handed to the sink")
+}
+
 // newPipelineManagerWithPark builds on newPipelineManager
 // (pipeline_sink_test.go) with a real blockPark wired in, needed only by
 // FIX 2's fallback test: the unresolvable-parent case defers to

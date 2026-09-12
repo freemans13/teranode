@@ -10,7 +10,9 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -164,6 +166,63 @@ func TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite(t *testing.T) {
 	require.False(t, exists, "the pipeline delete callback must also remove a body the fallback wrote to the park, not just subtree files")
 }
 
+// writeConvertedRecordDirect builds and writes a converted record the same
+// way pipelineBlockSink does — the same writer, builder and dedup map — but
+// without going through the sink itself, and returns it.
+//
+// It exists for tests that need a converted record with a structure type
+// (FileTypeSubtree vs FileTypeSubtreeToCheck) the sink can no longer produce
+// on its own after fix round 1: pipelineBlockSink now declines to convert
+// anything legacyUnified does not accept, and legacyUnified requires
+// BelowCheckpoint — the exact same predicate quickValidationAllowed checks —
+// so a record the sink actually wrote can never carry quickValidation=false.
+// Building the record directly decouples "what pipelineBlockDelete cleans up"
+// from "what the sink will currently agree to convert", which is what this
+// helper's callers are actually testing.
+func writeConvertedRecordDirect(t *testing.T, sm *SyncManager, blk *bsvutil.Block, quickValidation bool) *model.Block {
+	t.Helper()
+
+	height, resolved := sm.pipelineParentHeight(blk.MsgBlock().Header.PrevBlock)
+	require.True(t, resolved, "sanity: the fixture must point at a resolvable parent")
+
+	txs := blk.Transactions()
+	coinbase, _ := btTxFromWireTx(t, txs[0])
+
+	writer := newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, quickValidation)
+	dedup := newPipelineDedupMap()
+
+	builder, err := newBlockStreamBuilder(len(txs), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup)
+	require.NoError(t, err)
+
+	for i := 1; i < len(txs); i++ {
+		tx, hash := btTxFromWireTx(t, txs[i])
+		require.NoError(t, builder.AddTx(tx, hash))
+	}
+
+	root, subtreeHashes, err := builder.Finish()
+	require.NoError(t, err)
+	require.True(t, root.IsEqual(&blk.MsgBlock().Header.MerkleRoot), "sanity: the merkle root built here must match the header pipelineHeaderFixture set")
+
+	subtreeHashPointers := make([]*chainhash.Hash, len(subtreeHashes))
+	for i := range subtreeHashes {
+		h := subtreeHashes[i]
+		subtreeHashPointers[i] = &h
+	}
+
+	var headerBytes bytes.Buffer
+	require.NoError(t, blk.MsgBlock().Header.Serialize(&headerBytes))
+
+	modelHeader, err := model.NewBlockHeaderFromBytes(headerBytes.Bytes())
+	require.NoError(t, err)
+
+	verified, err := model.NewBlock(modelHeader, coinbase, subtreeHashPointers, uint64(len(txs)), 0, height, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, sm.blockPark.WriteConvertedBlock(sm.ctx, *blk.Hash(), verified))
+
+	return verified
+}
+
 // TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint is
 // fix-round item 6. Every other test in this file resolves its block to
 // height 1 under a checkpoint at 1000 (newPipelineManager), so
@@ -180,23 +239,20 @@ func TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint(t *testin
 	// BelowCheckpoint (model/checkpoint.go) requires highest > 0, so a
 	// checkpoint height of 0 means "no checkpoint reaches this chain", and
 	// every height — including this fixture's resolved height of 1 — reads as
-	// above it.
+	// above it. That also makes legacyUnified false for every height (it
+	// requires BelowCheckpoint too), so pipelineBlockSink's own eligibility
+	// gate (task-3 fix round 1) would decline to convert this block at all —
+	// see writeConvertedRecordDirect's own comment for why this test builds
+	// the record directly instead of calling the sink.
 	sm.chainParams.Checkpoints = []chaincfg.Checkpoint{{Height: 0}}
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
-	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
-	require.NoError(t, err, "a well-formed block must still convert cleanly above the checkpoint")
-	require.True(t, converted, "sanity: this test needs an actual conversion to test its cleanup")
-
-	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
-	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")
-	require.NotNil(t, got, "sanity: the sink must have recorded a verified block, or this test asserts nothing")
+	got := writeConvertedRecordDirect(t, sm, blk, false)
 
 	hashes := got.Subtrees
-	require.NotEmpty(t, hashes, "sanity: the sink must have produced subtrees, or this test asserts nothing")
+	require.NotEmpty(t, hashes, "sanity: the builder must have produced subtrees, or this test asserts nothing")
 
 	// Sanity on the writer's own choice, not yet on the delete: above the
 	// checkpoint it must have used FileTypeSubtreeToCheck, and NOT

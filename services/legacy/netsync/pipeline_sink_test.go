@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
@@ -235,6 +236,17 @@ func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManag
 	tSettings.ChainCfgParams = &params
 	tSettings.BlockAssembly.MaximumMerkleItemsPerSubtree = maxItems
 
+	// Eligible for the unified route by default: fix round 1 gates the
+	// CONVERSION itself on sm.legacyUnified(height) (pipeline_sink.go), not
+	// only on quickValidationAllowed, so a manager that leaves these off would
+	// have every test in this file fall back instead of converting. Below the
+	// checkpoint set above, this makes every ordinary fixture in this file
+	// eligible; a test that specifically wants ineligibility (ie. above every
+	// checkpoint) sets tSettings.ChainCfgParams.Checkpoints back down, which
+	// makes legacyUnified false too since it also requires BelowCheckpoint.
+	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+
 	dbName := fmt.Sprintf("pipeline_sink_%d", pipelineManagerStoreCounter.Add(1))
 
 	storeURL, err := url.Parse("sqlitememory:///" + dbName)
@@ -254,6 +266,10 @@ func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManag
 		ctx:              ctx,
 		subtreeStore:     store,
 		blockchainClient: bcClient,
+		// SupportsOutpointOnlySpend() true is the other conjunct
+		// legacyOutpointOnly (and so legacyUnified) needs; a nil store
+		// answers false, which would make every fixture ineligible above.
+		utxoStore: &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}},
 	}
 }
 

@@ -8,14 +8,36 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/stretchr/testify/require"
 )
+
+// existsFaultStore wraps a real blob store and, when armed, fails every Exists
+// call with an error of the test's choosing, leaving every other method (Get,
+// GetIoReader, Set, Del, ...) untouched. IsConverted is the only park method
+// that calls Exists, so this is what lets a test put a fault on exactly that
+// one check — the dispatcher's parkedRun asks it before choosing a route —
+// without disturbing the blob a subsequent Get or GetIoReader would read.
+type existsFaultStore struct {
+	blob.Store
+	err error
+}
+
+func (s *existsFaultStore) Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+
+	return s.Store.Exists(ctx, key, fileType, opts...)
+}
 
 // mineRegtestPoW finds a nonce for blk's header that satisfies
 // HasMetTargetDifficulty against blk's own Bits. Regtest's PowLimitBits
@@ -275,4 +297,102 @@ func TestCommitParkedBlock_RoutesAConvertedEntryWithoutReadingAWholeBlock(t *tes
 	noRecord, err := store.Exists(ctx, blk.Hash()[:], fileformat.FileTypeBlock)
 	require.NoError(t, err)
 	require.False(t, noRecord, "a committed entry's converted record must be deleted, the same as a committed whole block's blob")
+}
+
+// TestBlockDispatcher_ParkedRunRoutesAConvertedEntryWithoutReadingAWholeBlock is
+// fix-round item 3: the dispatcher's parked worker (block_dispatcher.go:336-366)
+// had no test driving its real bd.parkedRun closure over a converted entry —
+// every other dispatcher test either exercises the whole-block branch only, or
+// replaces parkedRun wholesale with a stub. This calls the real closure
+// directly (not through bd.dispatch's frontier/worker-pool machinery, which
+// this task did not touch and which TestParkDispatch_ADispatchedParkedBlockCommitsAndTakesTheParkedTail
+// already covers for the whole-block branch), the same way
+// TestCommitParkedBlock_RoutesAConvertedEntryWithoutReadingAWholeBlock drives
+// the serial drain's equivalent, commitParkedBlock.
+func TestBlockDispatcher_ParkedRunRoutesAConvertedEntryWithoutReadingAWholeBlock(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.rejectedTxns = txmap.NewSyncedMap[chainhash.Hash, struct{}](100)
+
+	sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+
+	spy := &convertedRouteSpyValidation{}
+	sm.blockValidation = spy
+
+	blk := wireBlockWithTxs(t, 6, false)
+	blk.MsgBlock().Header.Bits = 0x207fffff
+	pipelineHeaderFixture(t, sm, blk)
+	mineRegtestPoW(t, blk)
+	body := blockBodyBytes(t, blk)
+
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
+
+	bd := newBlockDispatcher(sm)
+
+	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil}}
+
+	runErr := bd.parkedRun(ctx, d)
+	require.NoError(t, runErr, "a valid converted entry, below the checkpoint on the unified route, must commit")
+	require.Nil(t, d.readErr, "a successful commit must not record a read error")
+
+	require.Equal(t, 1, spy.callCount(), "parkedRun must route the converted entry to HandleConvertedBlock, which commits through blockValidation exactly once")
+
+	noWholeBlock, err := store.Exists(ctx, blk.Hash()[:], fileformat.FileTypeMsgBlock)
+	require.NoError(t, err)
+	require.False(t, noWholeBlock, "parkedRun must never have written or read a whole block for a converted entry")
+}
+
+// TestBlockDispatcher_ParkedRunKeepsTheBlockWhenIsConvertedFails pins the other
+// half of fix-round item 3: an IsConverted failure must be recorded as a read
+// error, the same classification a blockPark.Read failure gets, so the parked
+// tail (block_dispatcher.go's bd.parkedTail) keeps the block rather than
+// judging it — parkedReadFailed's default is "keep", parkedBlockFailed's
+// default is "reject and blame the peer", and the two must never be confused
+// for a failure that says nothing about the block itself.
+func TestBlockDispatcher_ParkedRunKeepsTheBlockWhenIsConvertedFails(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	realStore := memory.New()
+	sm := newPipelineParkManager(t, realStore, 8)
+	sm.rejectedTxns = txmap.NewSyncedMap[chainhash.Hash, struct{}](100)
+
+	sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+
+	spy := &convertedRouteSpyValidation{}
+	sm.blockValidation = spy
+
+	blk := wireBlockWithTxs(t, 6, false)
+	blk.MsgBlock().Header.Bits = 0x207fffff
+	pipelineHeaderFixture(t, sm, blk)
+	mineRegtestPoW(t, blk)
+	body := blockBodyBytes(t, blk)
+
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
+
+	// Armed only now, after the real conversion above has already written the
+	// record: this fault must hit the dispatcher's own IsConverted check, not
+	// the sink's earlier writes.
+	faulted := &existsFaultStore{Store: realStore, err: errors.NewProcessingError("the store is having a bad day")}
+	sm.blockPark.store = faulted
+
+	bd := newBlockDispatcher(sm)
+	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil}}
+
+	runErr := bd.parkedRun(ctx, d)
+	require.Error(t, runErr, "an IsConverted failure must propagate as a run error")
+	require.Equal(t, d.readErr, runErr, "an IsConverted failure must be recorded as the dispatch's own read error, exactly as a blockPark.Read failure would be — it is what tells the parked tail to keep the block rather than judge it")
+
+	require.Zero(t, spy.callCount(), "a routing failure must never reach the committer")
 }

@@ -39,22 +39,49 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	// that only works if nothing — not even the coinbase — has been consumed
 	// from it yet.
 	height, resolved := sm.pipelineParentHeight(header.PrevBlock)
-	if !resolved {
-		// Neither the in-flight header list nor the committed chain has this
-		// block's parent, which is a genuine miss beyond the ordinary
+	if !resolved || !sm.legacyUnified(height) {
+		// Two different reasons land in the same fallback, and both belong here
+		// for the same reason: neither is "this body is bad", so neither may
+		// cost the block its only copy.
+		//
+		// !resolved: neither the in-flight header list nor the committed chain
+		// has this block's parent, which is a genuine miss beyond the ordinary
 		// out-of-order case pipelineParentHeight covers (see its doc comment).
 		//
-		// There is no error return from this sink that the wire layer treats
-		// as anything other than a malformed message: peer.shouldHandleReadError
+		// !sm.legacyUnified(height): a converted record's blockID is always 0,
+		// "assign server-side" — correct only because the unified route's
+		// committer (HandleConvertedBlock) hands it to quickValidateBlock, which
+		// assigns one itself and does the UTXO create/spend the record carries
+		// no other way to do. quickValidationAllowed alone (used just below to
+		// pick the subtree writer's file type) is NOT the same gate: it goes
+		// true for the whole below-checkpoint range, while legacyUnified also
+		// requires the operator's unified flag and the outpoint-only gate, so a
+		// block can sit below the checkpoint yet still be ineligible for
+		// conversion — most consequentially the first block AT or ABOVE the
+		// checkpoint on an otherwise fully-unified node, where legacyUnified
+		// goes false one block after it was true for every block so far. A
+		// first cut of this task instead let the sink convert regardless and had
+		// HandleConvertedBlock refuse the record at commit time — which failed
+		// closed in the worst way: the only copy of the block was already gone
+		// (deleted by the park's reject disposition) by the time anything
+		// noticed, so the block could never be re-obtained, and the reject +
+		// recently-failed-blocks entry it produced repeated forever, at that one
+		// height, blocking every descendant behind it. Declining the conversion
+		// here instead costs nothing: the block was never touched.
+		//
+		// There is no error return from this sink that the wire layer treats as
+		// anything other than a malformed message: peer.shouldHandleReadError
 		// (services/legacy/peer/peer.go) disconnects on every error except an
-		// exact io.EOF, io.ErrUnexpectedEOF or non-temporary net.OpError, none
-		// of which fit "decline this one and let the ordinary path retry it".
-		// So this does not error. It defers to streamingBlockSink instead,
-		// which writes the untouched body to the park exactly as it would with
-		// PipelineReceive off, and lets the existing park/drain machinery
-		// decide the block's fate the way it already correctly does for the
-		// non-pipeline path. streamingBlockSink always reports converted=false,
-		// which is correct here: this call never converts anything.
+		// exact io.EOF, io.ErrUnexpectedEOF or non-temporary net.OpError, none of
+		// which fit "decline this one and let the ordinary path retry it". So
+		// this does not error. It defers to streamingBlockSink instead, which
+		// writes the untouched body to the park exactly as it would with
+		// PipelineReceive off, and lets the existing park/drain machinery decide
+		// the block's fate the way it already correctly does for the
+		// non-pipeline path — HandleBlockDirect, not HandleConvertedBlock,
+		// commits it, doing the UTXO work itself the way it always has.
+		// streamingBlockSink always reports converted=false, which is correct
+		// here: this call never converts anything.
 		return sm.streamingBlockSink(hash, header, r, n)
 	}
 

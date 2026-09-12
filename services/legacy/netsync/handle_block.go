@@ -484,16 +484,30 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 		sps.updateLastBlockTime()
 	}
 
-	// The unified below-checkpoint route is the only route this record can be
-	// correct for: pipelineBlockSink writes blockID 0 into every record,
-	// meaning "assign server-side" (handle_block.go's prepareSubtrees makes the
-	// same choice under legacyUnified), and does no local UTXO create/spend of
-	// its own. On any other route a real block ID and local UTXO work are
-	// required before ProcessBlock, neither of which a converted record carries
-	// or this function performs. Refuse rather than hand a record to
-	// commitPreparedBlock under a route it was never built for.
+	// This must be unreachable now: pipelineBlockSink gates the CONVERSION on
+	// this exact same check (see its doc comment, and the eligibility test at
+	// pipeline_sink_test.go), so a record only ever reaches the park when
+	// legacyUnified was already true for its height. It is kept here as an
+	// assertion rather than deleted, because the reason it exists is still
+	// real — pipelineBlockSink always writes blockID 0 ("assign server-side"),
+	// which is only correct on the unified route, and this function has no
+	// transactions to fall back to local UTXO work with — and an assertion
+	// that silently stops being checked is worse than one that stays.
+	//
+	// If it ever fires anyway (a future change to either gate drifting out of
+	// step), the failure must NOT cost the block its only copy: an earlier
+	// version of this guard returned a plain ProcessingError, which
+	// parkCommitFailure has no case for, so it fell to
+	// parkDispositionBlockRejected — delete the blob, rewind the cursor, blame
+	// the peer, and mark the block failed, forever, at that one height (the
+	// only copy of the block is gone, so re-delivery reconverts and re-fails
+	// identically). A ServiceError is IsTransientLocalError, which
+	// parkCommitFailure reads as parkDispositionRetryLater: keep the blob, no
+	// rewind, no blame. That is the fail-safe direction for a check that
+	// should be dead code — it costs a retry loop bounded by the park sweep,
+	// not the block.
 	if !sm.legacyUnified(blk.Height) {
-		return errors.NewProcessingError("[HandleConvertedBlock][%s] converted record at height %d is not eligible for the unified route; refusing to commit it without the transactions it would need on any other route", blockHash.String(), blk.Height)
+		return errors.NewServiceError("[HandleConvertedBlock][%s] converted record at height %d is not eligible for the unified route; this should be unreachable, since pipelineBlockSink gates conversion on the same check", blockHash.String(), blk.Height)
 	}
 
 	// Resolve and verify this block's height from the chain's current view of its
