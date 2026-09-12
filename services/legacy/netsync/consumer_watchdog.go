@@ -109,9 +109,9 @@ type consumerWait struct {
 	// every thirty seconds for two and a half hours.
 	drainShutByWindow bool
 
-	// downloadBudget, downloadHeld and downloadWaiters describe the byte budget
-	// that admits a block off the wire, which is a DIFFERENT budget from the
-	// window's and the one this report was missing.
+	// downloadBudget, downloadHeld and downloadWaiters describe the budget that
+	// admits a block off the wire, which is a DIFFERENT budget from the window's
+	// and the one this report was missing.
 	//
 	// It is the budget that can silence every peer at once. A read-loop blocked
 	// acquiring it reads nothing further from its socket, so that peer stops
@@ -124,9 +124,17 @@ type consumerWait struct {
 	// downloadBudget is zero when prefetch is disabled, which is a real state
 	// (synchronous ingestion) rather than a missing reading, so the report says
 	// nothing at all rather than inventing a constraint of zero.
-	downloadBudget  int64
-	downloadHeld    int64
-	downloadWaiters int64
+	//
+	// downloadBudgetIsSlots is the unit these three numbers are in: bytes off
+	// the wire normally, but on the pipeline path AcquireBlockPrefetch charges
+	// one slot per block instead (the bytes are gone before OnBlock runs), so
+	// the same three fields become a block count. Recorded at snapshot time
+	// rather than assumed at print time so the report never shows a count
+	// labelled as bytes.
+	downloadBudget        int64
+	downloadHeld          int64
+	downloadWaiters       int64
+	downloadBudgetIsSlots bool
 
 	// drainDeclines is how many turns have been offered to the drain and given
 	// back. It is the fact the first version of this report was missing: a drain
@@ -174,6 +182,7 @@ func (sm *SyncManager) publishConsumerWait(now time.Time, queueArmOpen bool, pen
 		w.downloadBudget = sm.blockPrefetchBudgetBytes
 		w.downloadHeld = sm.blockPrefetchReserved.Load()
 		w.downloadWaiters = sm.blockPrefetchWaiters.Load()
+		w.downloadBudgetIsSlots = sm.settings != nil && sm.settings.Legacy.PipelineReceive
 	}
 
 	w.drainDeclines = sm.drainDeclined.Load()
@@ -357,11 +366,18 @@ func (w *consumerWait) describe(now time.Time) string {
 	// cannot: every other figure here describes work the node has already taken
 	// in, and this is the gate that decides whether any more arrives.
 	if w.downloadBudget > 0 {
+		unit := "bytes"
+		if w.downloadBudgetIsSlots {
+			unit = "slots"
+		}
+
 		b.WriteString("; ")
 		b.WriteString(strconv.FormatInt(w.downloadHeld, 10))
 		b.WriteString(" of ")
 		b.WriteString(strconv.FormatInt(w.downloadBudget, 10))
-		b.WriteString(" download budget bytes reserved")
+		b.WriteString(" download budget ")
+		b.WriteString(unit)
+		b.WriteString(" reserved")
 
 		if w.downloadWaiters > 0 {
 			b.WriteString(" with ")
