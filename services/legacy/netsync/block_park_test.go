@@ -368,6 +368,8 @@ func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 		require.True(t, taken[0].hash.IsEqual(&hash))
 		require.Nil(t, taken[0].peer, "a recovered block has no delivering peer")
 		require.Zero(t, taken[0].height, "a recovered block has no reported height; the parent supplies it")
+		require.False(t, taken[0].converted,
+			"fix-round item 1: a recovered whole block must not set entry.converted, or commitParkedBlock/parkedRun would try ReadConverted against a record that was never written")
 	}
 
 	names := parkDirEntries(t, dir)

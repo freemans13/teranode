@@ -497,6 +497,11 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		prevBlock: msg.body.Header.PrevBlock,
 		size:      msg.body.Size,
 		peer:      msg.peer,
+		// Straight from the sink's own return value, the same source
+		// BlockBody.Converted itself documents as the only trustworthy one —
+		// see parkedBlock.converted's own doc comment for why this is what
+		// lets commitParkedBlock and parkedRun stop asking the store.
+		converted: msg.body.Converted,
 	}
 
 	// msg.body.Converted says whether THIS delivery's sink actually converted

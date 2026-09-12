@@ -335,14 +335,12 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	// resolved parent instead would skip the lookup and is the single most
 	// dangerous edit anyone can make here.
 	bd.parkedRun = func(ctx context.Context, d *blockDispatch) error {
-		converted, err := sm.blockPark.IsConverted(ctx, d.parked.hash)
-		if err != nil {
-			d.readErr = err
-
-			return err
-		}
-
-		if converted {
+		// d.parked.converted is set once, at AdoptWritten or Recover, from the
+		// fact that made it true then — see parkedBlock.converted's own doc
+		// comment for why asking the store here (a blockPark.IsConverted call,
+		// this task's own fix) is exactly the extra round trip this worker step
+		// must not pay for every parked block, pipeline on or off.
+		if d.parked.converted {
 			record, err := sm.blockPark.ReadConverted(ctx, d.parked.hash)
 			if err != nil {
 				// Recorded apart from the returned error so the tail cannot classify a

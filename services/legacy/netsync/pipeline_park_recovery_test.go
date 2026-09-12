@@ -132,6 +132,8 @@ func TestBlockPark_RecoveryAdoptsAConvertedRecord(t *testing.T) {
 		"the entry's previous-block hash must come from the record's own header, not a wire block that does not exist on disk")
 	require.Equal(t, expectedSize, entry.size,
 		"the entry's size must come from the converted record, not the whole block")
+	require.True(t, entry.converted,
+		"fix-round item 1: a recovered converted record must set entry.converted, or commitParkedBlock/parkedRun would try to Read a whole block that was never written")
 
 	stillOnDisk, err := restarted.IsConverted(ctx, hash)
 	require.NoError(t, err)

@@ -235,6 +235,26 @@ type parkedBlock struct {
 	// whoever finishes the write has to ask for it again or the block sits in
 	// the park behind a parent that is already in the chain.
 	parentDrained bool
+
+	// converted says whether this entry's blob is a converted record
+	// (FileTypeBlock) rather than a whole block (FileTypeMsgBlock). Set once,
+	// at AdoptWritten (from the sink's own BlockBody.Converted, the only place
+	// that genuinely knows) and at Recover (from which suffix the file on disk
+	// carried), and read from ever after — never re-derived by asking the
+	// store.
+	//
+	// Before this field existed, commitParkedBlock and the dispatcher's
+	// parkedRun each asked blockPark.IsConverted before every commit, which is
+	// a store Exists call: one of the file store's 768 process-wide read
+	// permits, held for the store's configured timeout, on commitParkedBlock's
+	// single goroutine that commits every parked block in order. That ran
+	// unconditionally, for every parked commit, whether or not
+	// legacy_pipelineReceive was ever turned on — the same store round trip
+	// this park already gates on BlockBody.Converted at streaming_install.go's
+	// entry construction (see the comment there), just not here. This field
+	// closes that gap the same way: the answer is a fact this entry already
+	// carries, not a question the store needs to answer again.
+	converted bool
 }
 
 // admitResult says what Admit did with an offered block, and in particular
@@ -1499,7 +1519,11 @@ func (p *blockPark) Recover(ctx context.Context) {
 				parkedAt = time.Now()
 			}
 
-			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, size: size, parkedAt: parkedAt}
+			// converted: true — this branch only ever runs for a name ending in
+			// the converted-record suffix, so commitParkedBlock and parkedRun
+			// must route it to ReadConverted/HandleConvertedBlock, not Read, the
+			// same as an entry adopted straight off the wire would be.
+			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, size: size, parkedAt: parkedAt, converted: true}
 
 			p.mu.Lock()
 			stored := entry

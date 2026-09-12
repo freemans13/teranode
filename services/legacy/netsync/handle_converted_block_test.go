@@ -22,10 +22,11 @@ import (
 
 // existsFaultStore wraps a real blob store and, when armed, fails every Exists
 // call with an error of the test's choosing, leaving every other method (Get,
-// GetIoReader, Set, Del, ...) untouched. IsConverted is the only park method
-// that calls Exists, so this is what lets a test put a fault on exactly that
-// one check — the dispatcher's parkedRun asks it before choosing a route —
-// without disturbing the blob a subsequent Get or GetIoReader would read.
+// GetIoReader, Set, Del, ...) untouched. blockPark.IsConverted is the only
+// park method that calls Exists; fix-round item 1 stopped the commit path
+// (commitParkedBlock, parkedRun) from calling it at all, routing instead on
+// the entry's own converted field, so this now proves the negative — that a
+// faulted Exists no longer has anywhere left on that path to bite.
 type existsFaultStore struct {
 	blob.Store
 	err error
@@ -280,7 +281,11 @@ func TestCommitParkedBlock_RoutesAConvertedEntryWithoutReadingAWholeBlock(t *tes
 	// commitParkedBlock takes an entry already detached from the park's index —
 	// see TakeChildren/Take in production — so it is built directly here rather
 	// than round-tripped through Admit, which this test has no need of.
-	entry := parkedBlock{hash: *blk.Hash(), peer: nil}
+	// converted: true is what AdoptWritten would have set from the sink's own
+	// BlockBody.Converted (fix-round item 1) — commitParkedBlock now reads that
+	// field instead of asking the store, so a test driving it directly has to
+	// set it the same way.
+	entry := parkedBlock{hash: *blk.Hash(), peer: nil, converted: true}
 
 	ok := sm.commitParkedBlock(entry)
 	require.True(t, ok, "a valid converted entry, below the checkpoint on the unified route, must commit")
@@ -336,7 +341,7 @@ func TestBlockDispatcher_ParkedRunRoutesAConvertedEntryWithoutReadingAWholeBlock
 
 	bd := newBlockDispatcher(sm)
 
-	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil}}
+	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil, converted: true}}
 
 	runErr := bd.parkedRun(ctx, d)
 	require.NoError(t, runErr, "a valid converted entry, below the checkpoint on the unified route, must commit")
@@ -349,14 +354,19 @@ func TestBlockDispatcher_ParkedRunRoutesAConvertedEntryWithoutReadingAWholeBlock
 	require.False(t, noWholeBlock, "parkedRun must never have written or read a whole block for a converted entry")
 }
 
-// TestBlockDispatcher_ParkedRunKeepsTheBlockWhenIsConvertedFails pins the other
-// half of fix-round item 3: an IsConverted failure must be recorded as a read
-// error, the same classification a blockPark.Read failure gets, so the parked
-// tail (block_dispatcher.go's bd.parkedTail) keeps the block rather than
-// judging it — parkedReadFailed's default is "keep", parkedBlockFailed's
-// default is "reject and blame the peer", and the two must never be confused
-// for a failure that says nothing about the block itself.
-func TestBlockDispatcher_ParkedRunKeepsTheBlockWhenIsConvertedFails(t *testing.T) {
+// TestBlockDispatcher_ParkedRunNeverConsultsTheStoreToRoute is fix-round item
+// 1. Before it, parkedRun asked blockPark.IsConverted — a store Exists call —
+// before every parked commit, unconditionally: one of the file store's 768
+// process-wide read permits, held for the store's configured timeout, on top
+// of the read that already followed it. A store fault on that one check used
+// to fail the whole commit (TestBlockDispatcher_ParkedRunKeepsTheBlockWhenIsConvertedFails
+// pinned exactly that, and is gone along with the check it pinned).
+//
+// This arms the same existsFaultStore that test used — every Exists call
+// fails — and requires the commit to succeed anyway: d.parked.converted, set
+// at AdoptWritten from the sink's own return value, is what routes this now,
+// and it costs nothing the store can refuse.
+func TestBlockDispatcher_ParkedRunNeverConsultsTheStoreToRoute(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx := context.Background()
@@ -382,17 +392,18 @@ func TestBlockDispatcher_ParkedRunKeepsTheBlockWhenIsConvertedFails(t *testing.T
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 
 	// Armed only now, after the real conversion above has already written the
-	// record: this fault must hit the dispatcher's own IsConverted check, not
-	// the sink's earlier writes.
+	// record: with the fix in place nothing on the commit path below should
+	// ever call Exists again, so arming it earlier would prove nothing either
+	// way.
 	faulted := &existsFaultStore{Store: realStore, err: errors.NewProcessingError("the store is having a bad day")}
 	sm.blockPark.store = faulted
 
 	bd := newBlockDispatcher(sm)
-	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil}}
+	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil, converted: true}}
 
 	runErr := bd.parkedRun(ctx, d)
-	require.Error(t, runErr, "an IsConverted failure must propagate as a run error")
-	require.Equal(t, d.readErr, runErr, "an IsConverted failure must be recorded as the dispatch's own read error, exactly as a blockPark.Read failure would be — it is what tells the parked tail to keep the block rather than judge it")
+	require.NoError(t, runErr, "a faulted Exists must not affect the commit once routing no longer asks the store")
+	require.Nil(t, d.readErr, "no read error either — the fault is on Exists, which routing must never call")
 
-	require.Zero(t, spy.callCount(), "a routing failure must never reach the committer")
+	require.Equal(t, 1, spy.callCount(), "the commit must still go through, proving the fault store was armed for nothing routing does")
 }

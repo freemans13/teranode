@@ -186,15 +186,12 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 // two defaults point opposite ways: a read failure keeps the block, a commit
 // failure judges it.
 func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
-	// A converted entry has a record on disk instead of a whole block — see
-	// IsConverted's own comment for how the two are told apart — and
-	// HandleConvertedBlock commits it without ever reading a whole block back.
-	converted, err := sm.blockPark.IsConverted(sm.ctx, entry.hash)
-	if err != nil {
-		return sm.parkedReadFailed(entry, err)
-	}
-
-	if converted {
+	// A converted entry has a record on disk instead of a whole block —
+	// entry.converted is set once, at AdoptWritten or Recover, from the fact
+	// that made it true then; see its own doc comment for why this must never
+	// go back to asking the store (a blockPark.IsConverted call) on this
+	// goroutine, which commits every parked block in order.
+	if entry.converted {
 		record, err := sm.blockPark.ReadConverted(sm.ctx, entry.hash)
 		if err != nil {
 			return sm.parkedReadFailed(entry, err)
