@@ -909,3 +909,56 @@ func TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest(t *testing.T) {
 	require.False(t, WaitUntil(func() bool { return rec.count() > 0 }, time.Second),
 		"the peer already holds all four requests, so nothing new may go out on the wire")
 }
+
+// TestScheduler_ParkedBlocksCountAgainstTheWindow pins the back-pressure that
+// stops the downloader lapping the committer.
+//
+// The window is meant to bound blocks this node has asked for and not yet
+// committed. It used to subtract only blockDownloads.Len(), which counts blocks
+// in flight ON THE WIRE: a hash leaves that tracker the moment its block
+// arrives, whether or not the block could be committed. So a block that landed
+// and parked stopped counting while still occupying a park entry, and the window
+// refilled immediately.
+//
+// Measured on mainnet at genesis on 2026-09-12, that let the park reach its
+// 4096-entry cap. A full park then refuses the one block that would extend the
+// tip, the drain finds no child for the settled hash, and the block loop idles
+// with thousands of far-ahead blocks on disk: 804 declined turns, 1.3 blocks a
+// minute, against a commit path measured at 23ms per block.
+func TestScheduler_ParkedBlocksCountAgainstTheWindow(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xd7}
+	msg, hashes := linkedHeaders(anchor, 10, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+	sm.settings.Legacy.BlockDownloadWindow = 3
+
+	// Two blocks already downloaded and waiting on a parent. They are not in
+	// flight, so the old accounting could not see them at all.
+	sm.blockPark = &blockPark{entries: map[chainhash.Hash]*parkedBlock{
+		{0xf1}: {hash: chainhash.Hash{0xf1}},
+		{0xf2}: {hash: chainhash.Hash{0xf2}},
+	}}
+
+	syncPeer, syncRec := schedulerPeer(t, sm, 95, 1000)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	_, secondRec := schedulerPeer(t, sm, 96, 1000)
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() == 1 }, 5*time.Second),
+		"a window of 3 with 2 blocks already parked leaves room for exactly 1 more")
+
+	total := syncRec.count() + secondRec.count()
+	require.Equal(t, 1, total,
+		"parked blocks must count against the node-wide window, or the downloader laps the committer and fills the park")
+
+	cursor, ok := startHeaderHash(t, sm)
+	require.True(t, ok, "the cursor must stay in the list")
+	require.Equal(t, hashes[1], cursor,
+		"the first header the window could not cover must still be next, not dropped")
+}
