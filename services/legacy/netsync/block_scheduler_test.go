@@ -962,3 +962,49 @@ func TestScheduler_ParkedBlocksCountAgainstTheWindow(t *testing.T) {
 	require.Equal(t, hashes[1], cursor,
 		"the first header the window could not cover must still be next, not dropped")
 }
+
+// TestScheduler_AParkOverTheWindowStillFillsItsGap pins the floor, which is what
+// stops the park back-pressure deadlocking the node.
+//
+// Parked blocks are held BECAUSE their parent is missing, and the only way to
+// get that parent is to download it. So if a park larger than the whole window
+// shut the downloader down completely — which is exactly the state a restart
+// recovers into, since Recover readmits every parked block before a single one
+// can commit — the node would hold thousands of blocks it could never use and
+// never ask for the one block that would release them.
+func TestScheduler_AParkOverTheWindowStillFillsItsGap(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xd8}
+	msg, _ := linkedHeaders(anchor, 40, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+	sm.settings.Legacy.BlockDownloadWindow = 8
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 64
+
+	// A park holding far more than the entire window, every entry waiting on a
+	// parent this node does not have.
+	entries := make(map[chainhash.Hash]*parkedBlock, 32)
+	for i := range 32 {
+		h := chainhash.Hash{0xf0, byte(i)}
+		entries[h] = &parkedBlock{hash: h}
+	}
+
+	sm.blockPark = &blockPark{entries: entries}
+
+	syncPeer, syncRec := schedulerPeer(t, sm, 97, 1000)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() > 0 }, 5*time.Second),
+		"a park bigger than the window must not stop the node asking for the parent those blocks are waiting on")
+
+	// The floor is a ceiling on this pass, not a target: the block-size ladder
+	// and the per-peer cap still narrow it, and here the ladder is what binds.
+	// What matters is that the number is neither zero nor unbounded.
+	require.LessOrEqual(t, syncRec.count(), minDownloadFloor,
+		"the floor opens a trickle, it does not reopen the whole window")
+}
