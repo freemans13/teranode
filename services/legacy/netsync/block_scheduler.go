@@ -117,9 +117,28 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 
 	window := max(1, sm.settings.Legacy.BlockDownloadWindow)
 
-	remaining := window - sm.blockDownloads.Len()
+	// The window bounds blocks this node has ASKED FOR AND NOT YET COMMITTED, not
+	// blocks in flight on the wire. blockDownloads.Len() counts only the latter:
+	// a hash leaves the tracker the moment its block arrives, whether or not the
+	// block could be committed, so a block that lands and parks stops counting
+	// against the window while still costing a park entry.
+	//
+	// Counting flight alone lets the downloader lap the committer without bound.
+	// Measured on mainnet at genesis on 2026-09-12: a 216-byte block is in flight
+	// for milliseconds and commits in 23ms, so the window emptied continuously and
+	// the park filled to its 4096-entry cap. A full park then refuses the ONE
+	// block that would extend the tip, the drain finds no child for the settled
+	// hash, and the block loop sits idle with thousands of far-ahead blocks on
+	// disk — 804 declined turns and 1.3 blocks a minute, against a commit path
+	// that can do 2600.
+	//
+	// Including the park closes the loop: the node stops asking for block 5000
+	// while it still owes itself block 804.
+	outstanding := sm.blockDownloads.Len() + sm.blockPark.Len()
+
+	remaining := window - outstanding
 	if remaining <= 0 {
-		sm.logger.Debugf("[fetchHeaderBlocks] the node is at its block download window of %d, not requesting more", window)
+		sm.logger.Debugf("[fetchHeaderBlocks] the node holds %d blocks asked-for-but-uncommitted against a window of %d, not requesting more", outstanding, window)
 
 		return nil
 	}
