@@ -527,8 +527,28 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 		return errors.NewProcessingError("failed to get block header for previous block %s", blk.Header.HashPrevBlock, err)
 	}
 
+	// A ServiceError, not a BlockInvalidError, and deliberately so: this is a
+	// disagreement between two things THIS node computed about its own chain
+	// view, not a claim the peer made. blk.Height was resolved once already,
+	// at conversion time (pipelineParentHeight), from whichever of the header
+	// list or the store answered first; this re-derives it from the store's
+	// CURRENT view of the same parent. A mismatch means that view moved
+	// between conversion and commit — a reorg, or the record simply going
+	// stale while it sat parked — not that the block's own header chain or
+	// merkle root lied about anything, both of which are checked elsewhere.
+	// parkCommitFailure has no case for a plain ProcessingError-shaped
+	// BlockInvalidError here either, but the eligibility assertion twenty
+	// lines above already established the pattern this must match: a
+	// ServiceError is IsTransientLocalError, which parkCommitFailure reads as
+	// parkDispositionRetryLater (keep the blob, no rewind, no blame) instead
+	// of parkDispositionBlockRejected (delete the only copy, rewind the
+	// cursor, blame the peer, and fail the block at that height forever). A
+	// converted record has no whole-block fallback to re-derive from, so
+	// treating a local staleness as a bad block would destroy it for a
+	// condition a retry, once this node's own view catches up, resolves
+	// cleanly.
 	if blk.Height != previousBlockHeaderMeta.Height+1 {
-		return errors.NewBlockInvalidError("block height %d is not the correct height for block %s, expected %d", blk.Height, blockHash, previousBlockHeaderMeta.Height+1)
+		return errors.NewServiceError("[HandleConvertedBlock][%s] block height %d is not the correct height for block %s, expected %d", blockHash.String(), blk.Height, blockHash, previousBlockHeaderMeta.Height+1)
 	}
 
 	blockHeight := blk.Height

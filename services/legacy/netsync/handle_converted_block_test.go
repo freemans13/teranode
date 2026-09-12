@@ -243,6 +243,68 @@ func TestHandleConvertedBlock_HasNoSubtreeSlicesToRecheck(t *testing.T) {
 	require.Nil(t, record.SubtreeSlices, "a converted record never carries in-memory subtree slices, so commitPreparedBlock's merkle/duplicate re-check has nothing to run against — it is skipped because it cannot be done cheaply, not merely because nobody called it")
 }
 
+// TestHandleConvertedBlock_AHeightDisagreementIsTransientNotBlockInvalid is
+// fix-round item 4. The height check twenty lines below the eligibility
+// assertion used to return a BlockInvalidError, which parkCommitFailure reads
+// as parkDispositionBlockRejected: delete the converted record — its only
+// copy, there is no whole block to fall back to — rewind the cursor, blame
+// the peer, and fail the block at that height forever.
+//
+// A disagreement here is between two things THIS node computed about its own
+// chain view: the record's height, resolved once at conversion time
+// (pipelineParentHeight), against the parent's CURRENT height from the store.
+// It says nothing about what the peer sent — the header chain and merkle root
+// are checked elsewhere — so it must fail the way the eligibility assertion
+// beside it already does: a ServiceError, which parkCommitFailure reads as
+// parkDispositionRetryLater (keep the blob, no rewind, no blame) instead.
+//
+// The record's own height is bumped after a genuine conversion, rather than
+// building an inconsistent record by hand, so what disagrees is exactly the
+// thing a stale record after a reorg would disagree about.
+func TestHandleConvertedBlock_AHeightDisagreementIsTransientNotBlockInvalid(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+
+	sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+
+	spy := &convertedRouteSpyValidation{}
+	sm.blockValidation = spy
+
+	blk := wireBlockWithTxs(t, 6, false)
+	blk.MsgBlock().Header.Bits = 0x207fffff
+	pipelineHeaderFixture(t, sm, blk)
+	mineRegtestPoW(t, blk)
+	body := blockBodyBytes(t, blk)
+
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
+
+	record, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err)
+
+	// pipelineHeaderFixture parents this block on genesis, so the real,
+	// correct height the store agrees to is 1. Bumping the record's own copy
+	// of it is what disagrees, standing in for a record gone stale between
+	// conversion and commit — a reorg, or simply time passing while it sat
+	// parked.
+	record.Height += 7
+
+	err = sm.HandleConvertedBlock(ctx, nil, *blk.Hash(), record)
+	require.Error(t, err, "a height disagreement must still fail the commit")
+	require.True(t, errors.IsTransientLocalError(err),
+		"a height disagreement is this node's own chain view moving, not a peer's claim, so it must be transient-local (parkDispositionRetryLater), not block-invalid (parkDispositionBlockRejected, which would delete the record's only copy and blame the peer)")
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid),
+		"must not be classified as a bad block: the peer sent nothing wrong here, this node's own height bookkeeping disagreed with itself")
+
+	require.Zero(t, spy.callCount(), "a routing failure must never reach the committer")
+}
+
 // TestCommitParkedBlock_RoutesAConvertedEntryWithoutReadingAWholeBlock exercises
 // Step 5's actual call site rather than calling HandleConvertedBlock directly:
 // commitParkedBlock (block_park_drain.go), the serial drain's committer, given a
