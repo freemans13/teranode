@@ -55,31 +55,33 @@ type blockStreamBuilder struct {
 	// (model/check_duplicate_txs.go:23).
 	//
 	// Put IS the check: it fails when the hash repeats, so there is no second
-	// scan and nothing is re-read. Nil means no dedup, which is the behaviour a
-	// caller that supplies no map had before.
+	// scan and nothing is re-read. The constructor refuses a nil map rather than
+	// accept one: commit 143350330 left one route without this check and
+	// c753d2e46 had to add it back (model/check_duplicate_txs.go), so a
+	// constructor that lets an integrator silently skip it reintroduces the same
+	// fault by a different door.
 	dedup txmap.TxMap
 }
 
 // newBlockStreamBuilder prepares a builder for a block declaring txCount
 // transactions, including its coinbase, partitioned into subtrees of at most
-// maxItems leaves. It performs no duplicate-transaction detection; see
-// newBlockStreamBuilderWithDedup.
-func newBlockStreamBuilder(txCount, maxItems int, coinbase *bt.Tx, emit subtreeEmitFunc) (*blockStreamBuilder, error) {
-	return newBlockStreamBuilderWithDedup(txCount, maxItems, coinbase, emit, nil)
-}
-
-// newBlockStreamBuilderWithDedup prepares a builder that rejects a block
-// carrying the same transaction twice. dedup may be an in-memory map or the
-// disk-backed one; both satisfy txmap.TxMap, and the pipeline does not care
-// which is in use. A nil dedup disables the check, matching
-// newBlockStreamBuilder's previous behaviour.
-func newBlockStreamBuilderWithDedup(txCount, maxItems int, coinbase *bt.Tx, emit subtreeEmitFunc, dedup txmap.TxMap) (*blockStreamBuilder, error) {
+// maxItems leaves. dedup rejects a block carrying the same transaction twice; it
+// may be an in-memory map or the disk-backed one, both of which satisfy
+// txmap.TxMap, and the pipeline does not care which is in use. dedup must not be
+// nil: a nil map would silently disable the CVE-2012-2459 duplicate-transaction
+// check, so the constructor refuses it outright instead of letting a hurried
+// caller reach for nil.
+func newBlockStreamBuilder(txCount, maxItems int, coinbase *bt.Tx, emit subtreeEmitFunc, dedup txmap.TxMap) (*blockStreamBuilder, error) {
 	if coinbase == nil {
 		return nil, errors.NewProcessingError("[blockStreamBuilder] no coinbase transaction")
 	}
 
 	if emit == nil {
 		return nil, errors.NewProcessingError("[blockStreamBuilder] no emit function")
+	}
+
+	if dedup == nil {
+		return nil, errors.NewProcessingError("[blockStreamBuilder] no duplicate-transaction map (dedup)")
 	}
 
 	// A coinbase-only block (txCount <= 1) has no transactions to stream: the
@@ -168,6 +170,22 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 	if b.seen >= b.txCount {
 		return b.fail(errors.NewBlockInvalidError("[blockStreamBuilder] peer sent more transactions than the %d it declared", b.txCount))
 	}
+
+	// Memoise the hash the caller already computed, before anything below can
+	// force it to be recomputed. go-bt's TxIDChainHash returns a cached hash
+	// only after SetTxHash has been called; otherwise it re-serialises the
+	// whole transaction and double-hashes it on every call, and never caches
+	// that result itself. Both currentData.AddTx and
+	// currentMeta.SetTxInpointsFromTx below call TxIDChainHash, so without
+	// this line every transaction is fully re-serialised twice per AddTx. The
+	// same pattern in block validation's extend stage, over a
+	// 100,001-transaction block, cost two full passes over 3.44 GB on one
+	// goroutine — 17.5 microseconds and 41 KB allocated per call for a 33 KB
+	// transaction (see services/blockvalidation/quick_validate.go,
+	// "TxIDChainHash never populates its own cache"). Production does not hit
+	// this: createTxMap calls SetTxHash from the wire hash before handing
+	// transactions on.
+	tx.SetTxHash(txHash)
 
 	if b.dedup != nil {
 		if err := b.dedup.Put(*txHash, uint64(b.dedup.Length())); err != nil {

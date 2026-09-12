@@ -92,7 +92,11 @@ func TestPipeline_ProducesTheSameFilesAsPrepareSubtrees(t *testing.T) {
 		{name: "one full subtree", txCount: 8, maxItems: 8},
 		{name: "two full subtrees", txCount: 16, maxItems: 8},
 		{name: "final subtree short", txCount: 20, maxItems: 8},
-		{name: "mainnet subtree size", txCount: 9000, maxItems: 4096},
+		// Named for the shape it exercises, not for realism: these are ~60-byte
+		// transactions, while a mainnet block at this height averages 27 KB per
+		// transaction. What matters here is 9000/4096, a partition into three
+		// subtrees where the last is neither full nor a power of two.
+		{name: "many subtrees, non-power-of-two final", txCount: 9000, maxItems: 4096},
 		// This is the case that catches an in-block extension gap: every
 		// other case above gives each transaction a parent OUTSIDE the
 		// block, which never exercises extendFromTxMap's same-block fill-in
@@ -117,7 +121,7 @@ func TestPipeline_ProducesTheSameFilesAsPrepareSubtrees(t *testing.T) {
 
 			seen := txmap.NewSplitSwissMapUint64(uint32(tc.txCount)) //nolint:gosec // test tx count is small
 
-			b, err := newBlockStreamBuilderWithDedup(tc.txCount, tc.maxItems,
+			b, err := newBlockStreamBuilder(tc.txCount, tc.maxItems,
 				coinbaseFromBlock(t, block), writer.Emit(ctx), seen)
 			require.NoError(t, err)
 
@@ -189,7 +193,13 @@ func TestPipeline_ProducesTheSameFilesAsPrepareSubtrees(t *testing.T) {
 // PreviousTxSatoshis/PreviousTxScript that the streaming pipeline's do not,
 // and that is a valid difference, not a bug. Transaction id is unaffected by
 // that extension (go-bt computes it from the core fields only), so it is the
-// right thing to compare.
+// right thing to compare. The loosened comparison is not weaker than a byte
+// check where it matters: NewSubtreeDataFromBytes above already validates
+// every parsed transaction against the subtree's node hash at parse time, so
+// a wrong, missing, duplicated or reordered transaction fails at
+// deserialisation, before this function's identity loop ever runs. That
+// loop's only non-redundant job is catching a truncated file — one with
+// fewer transactions than the subtree declares.
 func compareSubtreeData(t *testing.T, subtree *subtreepkg.Subtree, want, got []byte, subtreeIdx int) {
 	t.Helper()
 
@@ -246,7 +256,7 @@ func TestPipeline_DeserialisesToTheSameSubtree(t *testing.T) {
 
 	seen := txmap.NewSplitSwissMapUint64(uint32(txCount)) //nolint:gosec // test tx count is small
 
-	b, err := newBlockStreamBuilderWithDedup(txCount, maxItems, coinbaseFromBlock(t, block), writer.Emit(ctx), seen)
+	b, err := newBlockStreamBuilder(txCount, maxItems, coinbaseFromBlock(t, block), writer.Emit(ctx), seen)
 	require.NoError(t, err)
 
 	for i, wireTx := range block.Transactions() {

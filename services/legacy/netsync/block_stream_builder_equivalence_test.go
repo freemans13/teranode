@@ -142,7 +142,7 @@ func TestBlockStreamBuilder_MatchesBatchBuild(t *testing.T) {
 				return nil
 			}
 
-			b, err := newBlockStreamBuilder(tc.txCount, tc.maxItems, cb, emit)
+			b, err := newBlockStreamBuilder(tc.txCount, tc.maxItems, cb, emit, newDedupMap(tc.txCount))
 			require.NoError(t, err)
 
 			for i := 1; i < tc.txCount; i++ {

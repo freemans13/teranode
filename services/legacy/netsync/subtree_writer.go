@@ -15,7 +15,12 @@ import (
 )
 
 // writtenSubtree records one artefact this block put in the store, so a failed
-// merkle root can remove exactly what it wrote and nothing else.
+// merkle root knows what to try to remove. It is not a record of what this
+// block alone wrote: put treats an already-present blob as success (two blocks
+// can share an identical run of transactions and so the same subtree under the
+// same key), and Emit still records the artefact when that happens. Removing
+// it is acceptable rather than a correctness bug, because the file is
+// content-addressed and rebuildable — see DeleteAll's comment below.
 type writtenSubtree struct {
 	Hash     chainhash.Hash
 	FileType fileformat.FileType

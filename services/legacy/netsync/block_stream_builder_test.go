@@ -6,9 +6,18 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
+
+// newDedupMap returns a fresh in-memory duplicate-transaction map, sized for
+// txCount entries. These tests are about partitioning and streaming, not about
+// dedup (see block_stream_dedup_test.go for that), but the constructor now
+// requires a real map rather than accepting nil.
+func newDedupMap(txCount int) txmap.TxMap {
+	return txmap.NewSplitSwissMapUint64(uint32(txCount)) //nolint:gosec // test tx count is small and non-negative
+}
 
 // streamTx builds a distinct, well-formed transaction for index i. bt.NewOutput
 // does not exist in go-bt v2.7.1, so the input is built with Tx.From against a
@@ -64,7 +73,7 @@ func TestBlockStreamBuilder_EmitsEachSubtreeAsItFills(t *testing.T) {
 		return nil
 	}
 
-	b, err := newBlockStreamBuilder(txCount, maxItems, coinbaseTx(t), emit)
+	b, err := newBlockStreamBuilder(txCount, maxItems, coinbaseTx(t), emit, newDedupMap(txCount))
 	require.NoError(t, err)
 
 	// The coinbase occupies slot zero and is added by the builder, so the stream
@@ -102,7 +111,7 @@ func TestBlockStreamBuilder_RootMatchesTheAllAtOnceComputation(t *testing.T) {
 
 	cb := coinbaseTx(t)
 
-	b, err := newBlockStreamBuilder(txCount, maxItems, cb, emit)
+	b, err := newBlockStreamBuilder(txCount, maxItems, cb, emit, newDedupMap(txCount))
 	require.NoError(t, err)
 
 	for i := 1; i < txCount; i++ {
@@ -126,7 +135,7 @@ func TestBlockStreamBuilder_RootMatchesTheAllAtOnceComputation(t *testing.T) {
 func TestBlockStreamBuilder_RefusesMoreTransactionsThanDeclared(t *testing.T) {
 	b, err := newBlockStreamBuilder(4, 8, coinbaseTx(t), func(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) error {
 		return nil
-	})
+	}, newDedupMap(4))
 	require.NoError(t, err)
 
 	for i := 1; i < 4; i++ {
@@ -151,7 +160,7 @@ func TestBlockStreamBuilder_RefusesMoreTransactionsThanDeclared(t *testing.T) {
 func TestBlockStreamBuilder_RefusesACoinbaseOnlyBlock(t *testing.T) {
 	_, err := newBlockStreamBuilder(1, 8, coinbaseTx(t), func(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) error {
 		return nil
-	})
+	}, newDedupMap(1))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "coinbase-only block, got tx count 1")
 }
@@ -161,7 +170,7 @@ func TestBlockStreamBuilder_RefusesACoinbaseOnlyBlock(t *testing.T) {
 func TestBlockStreamBuilder_RefusesFewerTransactionsThanDeclared(t *testing.T) {
 	b, err := newBlockStreamBuilder(8, 8, coinbaseTx(t), func(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) error {
 		return nil
-	})
+	}, newDedupMap(8))
 	require.NoError(t, err)
 
 	for i := 1; i < 5; i++ {
@@ -180,7 +189,7 @@ func TestBlockStreamBuilder_RefusesFewerTransactionsThanDeclared(t *testing.T) {
 func TestBlockStreamBuilder_StopsOnAnEmitFailure(t *testing.T) {
 	b, err := newBlockStreamBuilder(20, 8, coinbaseTx(t), func(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) error {
 		return errors.NewStorageError("disk on fire")
-	})
+	}, newDedupMap(20))
 	require.NoError(t, err)
 
 	var lastErr error
@@ -208,7 +217,7 @@ func TestBlockStreamBuilder_StopsOnAnEmitFailure(t *testing.T) {
 func TestBlockStreamBuilder_DropsEachSubtreeAfterEmitting(t *testing.T) {
 	b, err := newBlockStreamBuilder(20, 8, coinbaseTx(t), func(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) error {
 		return nil
-	})
+	}, newDedupMap(20))
 	require.NoError(t, err)
 
 	// The coinbase already occupies slot zero of the first subtree (capacity 8),

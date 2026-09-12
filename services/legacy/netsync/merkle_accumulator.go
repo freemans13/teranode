@@ -24,12 +24,13 @@ import (
 // asserts this produces the identical root, which is the only reason it is safe
 // to use instead.
 //
-// The CVE-2012-2459 transaction-level floor is NOT present in this component.
-// That check, model.CheckSubtreeSlicesForDuplicateTxs, needs every subtree's
-// full transaction list at once to scan for a repeated hash, which is exactly
-// what this accumulator exists to avoid holding. Whoever wires this component
-// into production must apply that scan themselves, the way
-// services/legacy/netsync/handle_block.go does today at lines 328 and 593.
+// The CVE-2012-2459 transaction-level floor IS present, but not here: it is
+// applied per transaction as each one streams through newBlockStreamBuilder's
+// AddTx, via the dedup map every caller of that constructor must now supply.
+// This accumulator only ever sees a subtree once AddTx has already accepted
+// every transaction in it, so it is never the thing enforcing that floor —
+// its own duplicate-root check above is the top-tree analogue, not a
+// substitute for it.
 type merkleAccumulator struct {
 	coinbaseTxID  *chainhash.Hash
 	coinbaseSize  uint64

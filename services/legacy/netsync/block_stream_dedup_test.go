@@ -24,7 +24,7 @@ func noopEmit(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) erro
 func TestBlockStreamBuilder_RejectsADuplicateTransaction(t *testing.T) {
 	seen := txmap.NewSplitSwissMapUint64(16)
 
-	b, err := newBlockStreamBuilderWithDedup(6, 8, coinbaseTx(t), noopEmit, seen)
+	b, err := newBlockStreamBuilder(6, 8, coinbaseTx(t), noopEmit, seen)
 	require.NoError(t, err)
 
 	tx1, hash1 := streamTx(t, 1)
@@ -44,7 +44,7 @@ func TestBlockStreamBuilder_RejectsADuplicateTransaction(t *testing.T) {
 func TestBlockStreamBuilder_AcceptsDistinctTransactions(t *testing.T) {
 	seen := txmap.NewSplitSwissMapUint64(16)
 
-	b, err := newBlockStreamBuilderWithDedup(8, 8, coinbaseTx(t), noopEmit, seen)
+	b, err := newBlockStreamBuilder(8, 8, coinbaseTx(t), noopEmit, seen)
 	require.NoError(t, err)
 
 	for i := 1; i < 8; i++ {
@@ -58,16 +58,17 @@ func TestBlockStreamBuilder_AcceptsDistinctTransactions(t *testing.T) {
 	require.Len(t, hashes, 1)
 }
 
-// TestBlockStreamBuilder_WithoutAMapAcceptsDuplicates pins that the check is opt
-// in, so a caller that has not supplied a map gets the previous behaviour rather
-// than a silent nil dereference.
-func TestBlockStreamBuilder_WithoutAMapAcceptsDuplicates(t *testing.T) {
-	b, err := newBlockStreamBuilder(6, 8, coinbaseTx(t), noopEmit)
-	require.NoError(t, err)
-
-	tx1, hash1 := streamTx(t, 1)
-	require.NoError(t, b.AddTx(tx1, hash1))
-	require.NoError(t, b.AddTx(tx1, hash1), "with no map supplied the builder does not dedup")
+// TestBlockStreamBuilder_RefusesANilDedupMap pins that the check cannot be
+// silently disabled. A duplicated transaction is a consensus fault the merkle
+// root cannot detect (see the CVE-2012-2459 tests above); a constructor that
+// accepted a nil map here would be the same shape as the regression fixed by
+// commit c753d2e46 (model/check_duplicate_txs.go), just moved to a new
+// component.
+func TestBlockStreamBuilder_RefusesANilDedupMap(t *testing.T) {
+	_, err := newBlockStreamBuilder(6, 8, coinbaseTx(t), noopEmit, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no duplicate-transaction map",
+		"the message must name what is missing, or a future change could satisfy this test without enforcing the rule")
 }
 
 // TestBlockStreamBuilder_TheCoinbaseIsNotDeduped pins the exemption. The coinbase
@@ -77,7 +78,7 @@ func TestBlockStreamBuilder_WithoutAMapAcceptsDuplicates(t *testing.T) {
 func TestBlockStreamBuilder_TheCoinbaseIsNotDeduped(t *testing.T) {
 	seen := txmap.NewSplitSwissMapUint64(16)
 
-	b, err := newBlockStreamBuilderWithDedup(4, 8, coinbaseTx(t), noopEmit, seen)
+	b, err := newBlockStreamBuilder(4, 8, coinbaseTx(t), noopEmit, seen)
 	require.NoError(t, err)
 
 	for i := 1; i < 4; i++ {
