@@ -98,7 +98,7 @@ func TestBlockPark_RecoveryGivesUpRatherThanHoldingUpTheStart(t *testing.T) {
 
 	start := time.Now()
 
-	park.Recover(ctx)
+	park.Recover(ctx, nil, nil)
 
 	elapsed := time.Since(start)
 
@@ -169,7 +169,7 @@ func TestBlockPark_RecoveryKeepsABlockItCouldNotRead(t *testing.T) {
 	// unavailable. Nothing about the blobs themselves has changed.
 	store.stalling.Store(true)
 
-	park.Recover(ctx)
+	park.Recover(ctx, nil, nil)
 
 	require.ElementsMatch(t, before, parkDirEntries(t, park.dir),
 		"a read that could not get a permit says nothing about the block, so every file must still be there")

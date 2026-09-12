@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blob/file"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
@@ -124,7 +126,7 @@ func TestBlockPark_RecoveryAdoptsAConvertedRecord(t *testing.T) {
 	restarted := newBlockPark(sm.logger, tSettings, store)
 	require.NotNil(t, restarted)
 
-	restarted.Recover(ctx)
+	restarted.Recover(ctx, sm.subtreeStore, sm.quickValidationAllowed)
 
 	entry, ok := restarted.Take(hash)
 	require.True(t, ok, "recovery must adopt a converted record left by a previous run, not silently drop it")
@@ -138,4 +140,121 @@ func TestBlockPark_RecoveryAdoptsAConvertedRecord(t *testing.T) {
 	stillOnDisk, err := restarted.IsConverted(ctx, hash)
 	require.NoError(t, err)
 	require.True(t, stillOnDisk, "recovery adopting a converted record must not delete it")
+}
+
+// TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone is
+// fix-round item 5. The converted record itself carries no delete-at-height
+// and so never expires, but the subtree files it names do
+// (subtree_writer.go), so a record can outlive them — reachable after a long
+// enough park plus a restart, or simply the retention window elapsing while
+// the record sat waiting for a parent that never came. Before this fix,
+// Recover adopted the record regardless; committing it would then fail inside
+// validation once the missing subtree was reached, landing on the same
+// destructive path a genuinely bad block does.
+//
+// This builds a real converted record and then deletes its first subtree's
+// structure file before Recover runs, standing in for that file having
+// already reached its delete-at-height. Recovery must discard the record
+// rather than adopt a commit that can only fail, and must log exactly once so
+// a soak can tell whether this path ever actually fires.
+func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *testing.T) {
+	ctx := context.Background()
+
+	root := t.TempDir()
+
+	storeURL, err := url.Parse("file://" + root)
+	require.NoError(t, err)
+
+	store, err := file.New(ulogger.TestLogger{}, storeURL,
+		options.WithBlobDeletionScheduler(&recordingDeletionScheduler{}),
+		options.WithStoreType(storetypes.TEMPSTORE),
+	)
+	require.NoError(t, err)
+
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = []chaincfg.Checkpoint{{Height: 1000}}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.ChainCfgParams = &params
+	tSettings.BlockAssembly.MaximumMerkleItemsPerSubtree = 8
+	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings.Legacy.TempStore = storeURL
+
+	bcStoreURL, err := url.Parse("sqlitememory:///pipeline_park_recovery_gone_subtree")
+	require.NoError(t, err)
+
+	bcStore, err := blockchainstore.NewStore(ulogger.TestLogger{}, bcStoreURL, tSettings)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = bcStore.Close(ctx) })
+
+	bcClient, err := blockchain2.NewLocalClient(ulogger.TestLogger{}, tSettings, bcStore, nil, nil)
+	require.NoError(t, err)
+
+	sm := &SyncManager{
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &params,
+		ctx:              ctx,
+		subtreeStore:     store,
+		blockchainClient: bcClient,
+		utxoStore:        &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}},
+	}
+
+	sm.blockPark = newBlockPark(sm.logger, tSettings, store)
+	require.NotNil(t, sm.blockPark, "the park must actually be enabled, or this test proves nothing about Recover")
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+
+	converted, err := sm.pipelineBlockSink(hash, &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
+	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about recovery")
+
+	record, err := sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees, "sanity: the converted record must name at least one subtree, or this test asserts nothing")
+
+	firstSubtree := record.Subtrees[0]
+
+	// Below the checkpoint with quick validation on, subtreeWriter's structure
+	// file is FileTypeSubtree — see its own doc comment. Removing exactly that
+	// file, not the whole subtree's data/meta, is what Recover's own check
+	// looks at.
+	require.NoError(t, store.Del(ctx, firstSubtree[:], fileformat.FileTypeSubtree),
+		"sanity: the file recovery must notice missing has to actually be gone")
+
+	stillExists, err := store.Exists(ctx, firstSubtree[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.False(t, stillExists, "sanity: the subtree file must actually be gone before Recover runs")
+
+	warnings := &warnCaptureLogger{}
+
+	restarted := newBlockPark(warnings, tSettings, store)
+	require.NotNil(t, restarted)
+
+	restarted.Recover(ctx, sm.subtreeStore, sm.quickValidationAllowed)
+
+	_, ok := restarted.Take(hash)
+	require.False(t, ok, "a converted record whose first subtree is gone must not be adopted; committing it could only fail inside validation")
+
+	stillOnDisk, err := restarted.IsConverted(ctx, hash)
+	require.NoError(t, err)
+	require.False(t, stillOnDisk, "the record itself must be discarded too, not left to be found again on every future restart")
+
+	require.NotEmpty(t, warnings.warnings, "recovery must log when this fires, so a soak can tell whether it ever does")
+
+	found := false
+
+	for _, w := range warnings.warnings {
+		if strings.Contains(w, "gone") {
+			found = true
+			break
+		}
+	}
+
+	require.True(t, found, "the logged warning must describe a missing subtree, got %v", warnings.warnings)
 }

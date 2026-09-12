@@ -1384,7 +1384,21 @@ func (p *blockPark) setGauges() {
 // It scans the filesystem because blob.Store has no way to list what it holds.
 // That is only sound because every park operation passes the same fixed option
 // set, so the layout is flat and known whatever the temp_store URL says.
-func (p *blockPark) Recover(ctx context.Context) {
+//
+// subtreeStore and quickValidationAllowed exist only for the converted-record
+// case: the record itself carries no delete-at-height and so never expires,
+// but the subtree files it names do (subtree_writer.go), so a record can
+// outlive the files it points at. Adopting one anyway would commit and then
+// fail inside validation, which lands on the same destructive path a bad
+// block does — see HandleConvertedBlock and applyParkDisposition. Before
+// adopting, this checks that the record's first subtree file still exists and
+// discards the record instead if it does not; the fix is cheap because one
+// check stands in for the whole list, and reachability is rated poor because
+// it needs both a long-parked conversion and the retention window to have
+// actually elapsed underneath it. Either argument may be nil (every
+// whole-block test in this file passes neither), in which case this check is
+// skipped entirely and a record is adopted exactly as it was before this task.
+func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickValidationAllowed func(height uint32) bool) {
 	if p == nil {
 		return
 	}
@@ -1507,6 +1521,40 @@ func (p *blockPark) Recover(ctx context.Context) {
 				discarded++
 
 				continue
+			}
+
+			// The record decoded and hashed correctly, but that says nothing
+			// about whether the subtree files it names are still there: the
+			// record has no delete-at-height of its own, while every subtree
+			// file does (subtree_writer.go), so a record can survive long
+			// enough to outlive them. Checking the first subtree stands in for
+			// the whole list — see Recover's own doc comment for why that is
+			// the cheap version of this fix rather than checking every one.
+			// Adopting a record whose files are gone would commit cleanly here
+			// and then fail inside validation, landing on the same destructive
+			// path a bad block does.
+			if subtreeStore != nil && quickValidationAllowed != nil && len(record.Subtrees) > 0 {
+				structureType := fileformat.FileTypeSubtreeToCheck
+				if quickValidationAllowed(record.Height) {
+					structureType = fileformat.FileTypeSubtree
+				}
+
+				firstSubtree := record.Subtrees[0]
+
+				exists, existsErr := subtreeStore.Exists(ctx, firstSubtree[:], structureType)
+				if existsErr != nil || !exists {
+					// Logged once, at WARN, so a soak can tell us whether this
+					// ever actually fires — see Recover's own doc comment on
+					// how narrow the window is: a long-parked conversion whose
+					// retention window has already elapsed underneath it.
+					p.logger.Warnf("[blockPark][%s] converted record's first subtree %s is gone (exists=%v, err=%v); discarding the record instead of adopting a commit that would fail inside validation",
+						hash, firstSubtree, exists, existsErr)
+					p.Delete(ctx, parkedBlock{hash: *hash})
+
+					discarded++
+
+					continue
+				}
 			}
 
 			info, err := dirEntry.Info()

@@ -7066,7 +7066,7 @@ func (sm *SyncManager) Start() {
 	// Adopt whatever a previous run left parked, before anything can drain it.
 	// No RPCs are made here; the parents are reconciled with the chain by the
 	// park sweep once the block-queue consumer is running.
-	sm.blockPark.Recover(sm.ctx)
+	sm.blockPark.Recover(sm.ctx, sm.subtreeStore, sm.quickValidationAllowed)
 
 	go sm.blockHandler()
 }

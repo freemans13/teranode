@@ -140,7 +140,7 @@ func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T)
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.Recover(context.Background())
+	fresh.Recover(context.Background(), nil, nil)
 
 	require.Equal(t, 1, fresh.Len(), "the block must be adopted before anything can be asked about it")
 

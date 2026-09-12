@@ -228,7 +228,7 @@ func TestBlockPark_RoundTripsThroughAShardedStore(t *testing.T) {
 	fresh, _ := newTestPark(t, "?hashPrefix=2")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.Recover(context.Background())
+	fresh.Recover(context.Background(), nil, nil)
 
 	require.Equal(t, 1, fresh.Len(), "a sharded store must not hide parked blocks from the restart scan")
 
@@ -355,7 +355,7 @@ func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.Recover(context.Background())
+	fresh.Recover(context.Background(), nil, nil)
 
 	require.Equal(t, 2, fresh.Len(), "both good blocks must be adopted, whatever else is in the directory")
 
@@ -401,7 +401,7 @@ func TestBlockPark_RecoveryAdoptsEverythingAPreviousRunParked(t *testing.T) {
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.Recover(context.Background())
+	fresh.Recover(context.Background(), nil, nil)
 
 	require.Equal(t, 3, fresh.Len(),
 		"every block a previous run parked is adopted; there is no byte budget to stop at")
@@ -503,7 +503,7 @@ func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
 		require.NotPanics(t, func() {
 			park.Restore(parkedBlock{})
 			park.Delete(context.Background(), parkedBlock{})
-			park.Recover(context.Background())
+			park.Recover(context.Background(), nil, nil)
 		})
 	})
 }
@@ -576,7 +576,7 @@ func TestBlockPark_RecoverDiscardsAConvertedRecordInsteadOfOrphaningItForever(t 
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.Recover(context.Background())
+	fresh.Recover(context.Background(), nil, nil)
 
 	require.Zero(t, fresh.Len(),
 		"a converted record is not adopted as a park entry by this task (that is a later task's job); it must not be silently skipped forever either")
