@@ -74,13 +74,17 @@ func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
 		return nil, errors.NewBlockInvalidError("[blockTxStream] block has no transactions, not even a coinbase")
 	}
 
-	// The body's own length is the tighter of the two bounds and the one that
-	// actually stops the amplification: the caller sizes a duplicate map from this
-	// count before a single transaction arrives, so a peer that declares two
-	// billion transactions in a two-hundred-byte body would have this node
-	// allocate for the claim and then receive nothing. A transaction cannot be
-	// smaller than minSerializedTxSize, so a body this long cannot hold more than
-	// this many, and a larger claim is a lie catchable for free.
+	// The body's own length is a real, cheap bound on the count — a
+	// transaction cannot be smaller than minSerializedTxSize, so a body this
+	// long cannot hold more than payloadLen/minSerializedTxSize of them, and a
+	// larger claim is a lie catchable for free — but it does NOT stop the
+	// allocation amplification below. payloadLen is itself peer-declared
+	// (int64(length) off the wire message header, never measured), and the
+	// wire payload ceiling is 4,000,000,000 bytes (services/legacy/config.go
+	// maxWireBlockPayload), so this check alone still lets a peer declare a
+	// 400,000,000-transaction body it never sends. What actually stops the
+	// amplification is that the caller no longer sizes anything from this
+	// count: see newPipelineDedupMap in pipeline_sink.go.
 	if payloadLen > 0 && count > uint64(payloadLen)/minSerializedTxSize {
 		return nil, errors.NewBlockInvalidError("[blockTxStream] block declares %d transactions, more than its %d-byte body can hold", count, payloadLen)
 	}

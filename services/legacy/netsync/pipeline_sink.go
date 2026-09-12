@@ -75,9 +75,11 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	quickValidation := sm.quickValidationAllowed(height)
 	writer := newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, quickValidation)
 
-	// The uint32 conversion is safe because newBlockTxStream refuses any count
-	// above maxBlockTxCount (1<<31), well inside uint32's range.
-	dedup := txmap.NewSplitSwissMapUint64(uint32(stream.TxCount())) //nolint:gosec // bounded by maxBlockTxCount (1<<31) in newBlockTxStream
+	// dedup is never sized from stream.TxCount(). See newPipelineDedupMap's
+	// doc comment for why: that count is the peer's own declared transaction
+	// count, and sizing a map from it is what let a peer make this node
+	// allocate roughly 19 GB by declaring a number.
+	dedup := newPipelineDedupMap()
 
 	builder, err := newBlockStreamBuilder(int(stream.TxCount()), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup)
 	if err != nil {
@@ -135,6 +137,36 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	sm.pipelineVerifiedMu.Unlock()
 
 	return nil
+}
+
+// dedupInitialCapacity bounds the pipeline dedup map's pre-sizing hint. It is a
+// fixed constant rather than the peer's declared transaction count on purpose
+// — see newPipelineDedupMap.
+//
+// ~1,048,576 slots costs roughly 50 MB with NewSplitSwissMapUint64's own 20%
+// per-bucket headroom (go-tx-map tx_map.go). A block larger than this still
+// dedups correctly: Put is what makes the CVE-2012-2459 check exact, not the
+// pre-sizing, so a map that starts smaller than the block just grows through
+// its own ordinary rehashing as real transactions arrive, the same as any Go
+// map given a low capacity hint.
+const dedupInitialCapacity uint32 = 1 << 20
+
+// newPipelineDedupMap returns a fresh duplicate-transaction map for the
+// pipeline sink, pre-sized at dedupInitialCapacity regardless of what a peer
+// declared for the block's transaction count.
+//
+// The declared count is never trusted for this because it is checked only
+// against the wire payload ceiling (services/legacy/config.go
+// maxWireBlockPayload, 4,000,000,000 bytes) against a 10-byte minimum
+// transaction size — so a peer may declare up to 400,000,000 transactions in
+// a body it then never sends. txmap.NewSplitSwissMapUint64 pre-sizes all 1024
+// buckets eagerly from whatever length it is given (go-tx-map tx_map.go
+// NewSplitSwissMapUint64), so sizing this map from that declared count would
+// allocate roughly 19 GB before a single transaction byte arrives — gated by
+// nothing but a hash and a proof-of-work check that any sync peer already
+// passes.
+func newPipelineDedupMap() txmap.TxMap {
+	return txmap.NewSplitSwissMapUint64(dedupInitialCapacity)
 }
 
 // deleteWrittenOnFailure calls writer.DeleteAll and, if the delete itself
