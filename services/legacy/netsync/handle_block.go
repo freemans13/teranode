@@ -438,6 +438,154 @@ func (sm *SyncManager) commitPreparedBlock(ctx context.Context, teranodeBlock *m
 	return nil
 }
 
+// HandleConvertedBlock commits a block that was converted from wire bytes into
+// a model.Block as it streamed off the socket (pipelineBlockSink), instead of
+// being decoded from a whole block read back off disk. blk is that record,
+// already carrying its header, coinbase, counts and subtree root hashes — see
+// (*blockPark).ReadConverted.
+//
+// It is reached only from the two places that commit a block already sitting in
+// the park — drainParkedDescendants (block_park_drain.go) and the dispatcher's
+// parked worker (block_dispatcher.go) — after IsConverted has told the caller a
+// converted record exists under this hash instead of a whole-block one. Neither
+// caller ever has an in-flight parent to hand it (the comment on the
+// dispatcher's parkedRun calls passing one instead "the single most dangerous
+// edit anyone can make here"): by the time anything commits a parked block, its
+// parent is already in the chain, so the ordinary blockchain-store lookup below
+// is always the right way to resolve its height, exactly as it is for
+// HandleBlockDirect's own nil-parent branch. That is also why this function
+// takes no parent parameter at all, rather than a parameter callers must
+// remember to pass as nil.
+//
+// Everything here up to the call into commitPreparedBlock mirrors
+// HandleBlockDirect's own pre-tail checks, minus everything that needs the
+// block's transactions: there is no wire block to decode, no coinbase to
+// extract, no subtrees to build, and so no prepareSubtrees call. blk already
+// carries what that work would have produced.
+func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, blk *model.Block) (err error) {
+	sm.logger.Debugf("[HandleConvertedBlock][%s] starting handling converted block", blockHash.String())
+
+	// check whether this block already exists
+	blockExists, err := sm.blockchainClient.GetBlockExists(ctx, &blockHash)
+	if err != nil {
+		sm.logger.Errorf("[HandleConvertedBlock][%s] failed to check if block exists: %s", blockHash.String(), err)
+		return errors.NewProcessingError("failed to check if block exists", err)
+	}
+
+	if blockExists {
+		sm.logger.Warnf("[HandleConvertedBlock][%s] block already exists", blockHash.String())
+		return nil
+	}
+
+	// Same reasoning as HandleBlockDirect's identical refresh: the validation
+	// this block is about to go through can run long, and without this the sync
+	// peer looks stalled and gets rotated mid-commit.
+	if sps, ok := sm.syncPeerStateFor(peer); ok {
+		sps.updateLastBlockTime()
+	}
+
+	// The unified below-checkpoint route is the only route this record can be
+	// correct for: pipelineBlockSink writes blockID 0 into every record,
+	// meaning "assign server-side" (handle_block.go's prepareSubtrees makes the
+	// same choice under legacyUnified), and does no local UTXO create/spend of
+	// its own. On any other route a real block ID and local UTXO work are
+	// required before ProcessBlock, neither of which a converted record carries
+	// or this function performs. Refuse rather than hand a record to
+	// commitPreparedBlock under a route it was never built for.
+	if !sm.legacyUnified(blk.Height) {
+		return errors.NewProcessingError("[HandleConvertedBlock][%s] converted record at height %d is not eligible for the unified route; refusing to commit it without the transactions it would need on any other route", blockHash.String(), blk.Height)
+	}
+
+	// Resolve and verify this block's height from the chain's current view of its
+	// parent — the same lookup HandleBlockDirect's nil-parent branch makes. The
+	// record's own Height was resolved once already, at conversion time
+	// (pipelineParentHeight), from whichever of the header list or the store
+	// answered first; re-deriving it here from the store catches the record
+	// having gone stale (e.g. a reorg) between conversion and commit.
+	_, previousBlockHeaderMeta, err := sm.blockchainClient.GetBlockHeader(ctx, blk.Header.HashPrevBlock)
+	if err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) {
+			sm.logger.Debugf("[HandleConvertedBlock][%s] previous block %s not found (orphan/out-of-order; caller will request missing blocks): %v", blockHash.String(), blk.Header.HashPrevBlock, err)
+		} else {
+			sm.logger.Errorf("[HandleConvertedBlock][%s] failed to get block header for previous block %s: %s", blockHash.String(), blk.Header.HashPrevBlock, err)
+		}
+
+		return errors.NewProcessingError("failed to get block header for previous block %s", blk.Header.HashPrevBlock, err)
+	}
+
+	if blk.Height != previousBlockHeaderMeta.Height+1 {
+		return errors.NewBlockInvalidError("block height %d is not the correct height for block %s, expected %d", blk.Height, blockHash, previousBlockHeaderMeta.Height+1)
+	}
+
+	blockHeight := blk.Height
+
+	// A block committed from the park after a restart, or drained by a worker
+	// whose parked entry carries a nil peer, has no delivering peer at all — see
+	// HandleBlockDirect's identical guard.
+	peerLabel := "recovered-from-disk"
+	if peer != nil {
+		peerLabel = peer.String()
+	}
+
+	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "HandleConvertedBlock",
+		tracing.WithLogMessage(
+			sm.logger,
+			"[HandleConvertedBlock][%s %d] %d txs, peer %s",
+			blk.Hash().String(),
+			blockHeight,
+			blk.TransactionCount,
+			peerLabel,
+		),
+		tracing.WithTag("blockHash", blk.Hash().String()),
+		tracing.WithTag("peer", peerLabel),
+		tracing.WithHistogram(prometheusLegacyNetsyncHandleBlockDirect),
+	)
+	defer func() {
+		prometheusLegacyNetsyncBlockHeight.Set(float64(blockHeight))
+
+		// See HandleBlockDirect's identical defer: a nil error here means the
+		// block went into the chain at exactly this height.
+		if err == nil && blockHeight > 0 {
+			sm.noteCommittedHeight(int32(blockHeight))
+		}
+
+		deferFn(err)
+	}()
+
+	// Wait for block assembly to be ready — the same external readiness gate
+	// HandleBlockDirect waits on, called directly rather than through the shared
+	// tail because it is a liveness check against another service, not a
+	// consensus decision: there is nothing here for a second call site to drift
+	// on.
+	if err = blockassemblyutil.WaitForBlockAssemblyReady(ctx, sm.logger, sm.blockAssembly, blockHeight, sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly); err != nil {
+		if sm.windowRoute(blockHeight) {
+			return errors.NewServiceError("[HandleConvertedBlock][%s] block assembly not ready for height %d on the window route", blockHash.String(), blockHeight, err)
+		}
+
+		return err
+	}
+
+	// Wait for the previous block's setTxMined to complete — see
+	// needsParentMinedWait for the redundancy argument; this route only ever
+	// reaches heights where the outpoint-only fast path is active, where the
+	// wait is already skipped.
+	if sm.needsParentMinedWait(blockHeight) {
+		if err = sm.waitForPreviousBlockMined(ctx, blk.Header.HashPrevBlock, blockHeight); err != nil {
+			return err
+		}
+	}
+
+	// The shared tail: proof-of-work check, the merkle/duplicate re-check (a
+	// no-op here — preparedSubtreeSlices is nil, see commitPreparedBlock's own
+	// comment on why that is safe rather than merely convenient for this
+	// route), the in-flight-parent hand-shake (also a no-op — parent is nil, as
+	// it always is for a block committed from the park), the commit itself, and
+	// the orphan replay (a no-op too — txHashes is nil, because this route
+	// never decodes the block's transactions and so never learns their
+	// individual hashes).
+	return sm.commitPreparedBlock(ctx, blk, blockHash, blk.Hash().String(), blockHeight, nil, nil, nil)
+}
+
 // waitForPreviousBlockMined waits for the previous block to have mined_set=true.
 // This ensures setTxMined has completed for the previous block before we validate
 // the next block's transactions, which is critical for BIP68 sequence lock validation

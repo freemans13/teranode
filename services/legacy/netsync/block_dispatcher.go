@@ -323,17 +323,38 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 		return terr
 	}
 
-	// The parked run: read the blob on the worker, then the same call the serial
-	// drain makes. The decoded block lives in this worker's local, so the consumer
-	// never holds one.
+	// The parked run: read the blob (or the converted record) on the worker, then
+	// the same call the serial drain makes. The decoded block, when there is one,
+	// lives in this worker's local, so the consumer never holds one.
 	//
-	// A nil in-flight parent, always. The parent of a parked block is in the chain
-	// by the time anything commits it, so HandleBlockDirect looks it up there, and
-	// that lookup is what enforces "never hand block validation a parentless
-	// block" in the worker rather than on a promise from the consumer. Handing it
-	// a resolved parent instead would skip the lookup and is the single most
+	// A nil in-flight parent, always, on both branches. The parent of a parked
+	// block is in the chain by the time anything commits it, so HandleBlockDirect
+	// and HandleConvertedBlock each look it up there, and that lookup is what
+	// enforces "never hand block validation a parentless block" in the worker
+	// rather than on a promise from the consumer. Handing either of them a
+	// resolved parent instead would skip the lookup and is the single most
 	// dangerous edit anyone can make here.
 	bd.parkedRun = func(ctx context.Context, d *blockDispatch) error {
+		converted, err := sm.blockPark.IsConverted(ctx, d.parked.hash)
+		if err != nil {
+			d.readErr = err
+
+			return err
+		}
+
+		if converted {
+			record, err := sm.blockPark.ReadConverted(ctx, d.parked.hash)
+			if err != nil {
+				// Recorded apart from the returned error so the tail cannot classify a
+				// read failure by the commit table, which judges the block.
+				d.readErr = err
+
+				return err
+			}
+
+			return sm.HandleConvertedBlock(ctx, d.parked.peer, d.parked.hash, record)
+		}
+
 		msgBlock, err := sm.blockPark.Read(ctx, d.parked.hash)
 		if err != nil {
 			// Recorded apart from the returned error so the tail cannot classify a
