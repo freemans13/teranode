@@ -287,6 +287,25 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		peer:      msg.peer,
 	}
 
+	// The pipeline sink, when it is the one active, has already written this
+	// hash's body as a converted record — a few hundred bytes under
+	// FileTypeBlock — before the wire layer ever got here, so there is nothing
+	// on disk shaped like the whole block msg.body.Size describes. Charging
+	// that size against the park's budget would over-charge a pipelined block
+	// by orders of magnitude and starve the park into believing it is nearly
+	// full when it holds almost nothing, so the two paths deliberately charge
+	// different numbers: the plain streaming path charges the whole block's
+	// wire size because that is what write/WriteStreamedBody put on disk, and
+	// this checks for a converted record and, if one exists, charges its own
+	// length instead. With the pipeline off no converted record is ever
+	// written, so this check always answers false and entry.size is left as
+	// msg.body.Size, unchanged from before this existed.
+	if size, converted, err := sm.blockPark.convertedRecordSize(sm.ctx, entry.hash); err != nil {
+		sm.logger.Warnf("[blockOnDisk][%s] failed to check for a converted record, charging the whole block's wire size instead: %v", entry.hash, err)
+	} else if converted {
+		entry.size = size
+	}
+
 	// A parked block is only ever committable if its parent is something this
 	// node is going to get: already in the chain, or still ahead of us in the
 	// header list because we asked for it. A block above a hole that is in

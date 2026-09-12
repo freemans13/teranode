@@ -29,7 +29,7 @@ import (
 func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	ctx := context.Background()
 	store := memory.New()
-	sm := newPipelineManager(t, store, 8)
+	sm := newPipelineParkManager(t, store, 8)
 
 	blk := wireBlockWithTxs(t, 20, false)
 	// wireBlockWithTxs leaves PrevBlock at its zero value, since it builds a
@@ -42,7 +42,8 @@ func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err)
 
-	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")
 	require.NotNil(t, got, "a verified block must be recorded")
 
 	hashes := got.Subtrees
@@ -93,11 +94,12 @@ func TestPipelineSink_DeletesWhatItWroteOnAWrongMerkleRoot(t *testing.T) {
 
 	// The failed run reports no subtrees, so ask a good run which hashes the block
 	// produces and require every one of them to be absent from the failed store.
-	good := newPipelineManager(t, memory.New(), 8)
+	good := newPipelineParkManager(t, memory.New(), 8)
 	pipelineHeaderFixture(t, good, blk)
 	require.NoError(t, good.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body))))
 
-	goodBlock := good.pipelineVerifiedBlockFor(*blk.Hash())
+	goodBlock, err := good.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "the good run's converted record must read back cleanly")
 	require.NotNil(t, goodBlock, "sanity: the good run must record a verified block, or this test asserts nothing")
 
 	produced := goodBlock.Subtrees
@@ -134,8 +136,9 @@ func TestPipelineSink_RejectsADuplicateTransaction(t *testing.T) {
 // a subtree list; recording only the subtree hashes would mean the committer had
 // to reconstruct the rest from a block nobody kept.
 func TestPipelineSink_RecordsAWholeBlockModel(t *testing.T) {
+	ctx := context.Background()
 	store := memory.New()
-	sm := newPipelineManager(t, store, 8)
+	sm := newPipelineParkManager(t, store, 8)
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
@@ -145,7 +148,8 @@ func TestPipelineSink_RecordsAWholeBlockModel(t *testing.T) {
 
 	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
 
-	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")
 	require.NotNil(t, got, "a verified block must be recorded")
 
 	require.Equal(t, header.MerkleRoot.String(), got.Header.HashMerkleRoot.String(),
@@ -160,8 +164,9 @@ func TestPipelineSink_RecordsAWholeBlockModel(t *testing.T) {
 // Task 2 possible: the record is stored and recovered as bytes, so a field the
 // model does not serialize would be silently lost after a restart.
 func TestPipelineSink_TheRecordedBlockSurvivesASerializationRoundTrip(t *testing.T) {
+	ctx := context.Background()
 	store := memory.New()
-	sm := newPipelineManager(t, store, 8)
+	sm := newPipelineParkManager(t, store, 8)
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
@@ -171,8 +176,9 @@ func TestPipelineSink_TheRecordedBlockSurvivesASerializationRoundTrip(t *testing
 
 	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body))))
 
-	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
-	require.NotNil(t, got)
+	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")
+	require.NotNil(t, got, "a verified block must be recorded")
 
 	raw, err := got.Bytes()
 	require.NoError(t, err)

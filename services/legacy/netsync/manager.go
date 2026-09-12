@@ -1014,12 +1014,6 @@ type SyncManager struct {
 	// minSyncPeerNetworkSpeed is the minimum speed allowed for
 	// a sync peer.
 	minSyncPeerNetworkSpeed uint64
-
-	// pipelineVerified and pipelineVerifiedMu back pipelineBlockSink's
-	// PLACEHOLDER record of a block it converted and merkle-verified. Nothing
-	// reads this map yet: see pipeline_sink.go.
-	pipelineVerifiedMu sync.Mutex
-	pipelineVerified   map[chainhash.Hash]pipelineVerifiedEntry
 }
 
 // loadSyncPeer returns the current sync peer, safe for concurrent access.

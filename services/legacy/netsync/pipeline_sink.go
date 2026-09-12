@@ -9,47 +9,8 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 )
-
-// pipelineVerifiedEntry is what pipelineBlockSink records once a block's merkle
-// root has been checked against its header.
-//
-// PLACEHOLDER, and named as one rather than hidden. Nothing downstream reads
-// this map yet: the committer still takes its blocks from the park. Replacing
-// it with a park record, so a pipelined block reaches block validation by the
-// same route a parked one does, is the next plan's first task.
-//
-// This is NOT simply "convert, verify and drop". installStreamingBlockPath
-// installs one gate/sink/delete triple regardless of which sink is active, and
-// after ANY sink returns nil the wire layer still dispatches a blockOnDiskMsg
-// that handleBlockOnDiskMsg turns into a blockPark.AdoptWritten call
-// (streaming_install.go). With the pipeline sink on, no body was ever written
-// to the park's store for that hash, so AdoptWritten registers an entry and
-// charges its byte budget for a blob that does not exist, and the drain will
-// later try to read it and fail. That phantom-entry consequence is exactly why
-// the setting must stay off until the committer is wired to reach a pipelined
-// block by some route other than the park — see the setting's longdesc in
-// settings/legacy_settings.go.
-//
-// sm.pipelineVerified is also never pruned: every verified block holds its
-// full model.Block for the rest of the process's life until that wiring
-// lands, on a branch whose entire purpose is bounding memory.
-type pipelineVerifiedEntry struct {
-	// block is recorded as a model.Block rather than a bare subtree list
-	// because that is exactly what the committer needs and exactly what
-	// serializes: (*model.Block).Bytes writes the header, counts, subtree
-	// list and coinbase, and model.NewBlockFromBytes reads them back. A
-	// narrower record would mean inventing a format for it and then
-	// converting to this anyway.
-	block *model.Block
-	// written is every artefact the subtreeWriter put in the store for this
-	// block, kept so pipelineBlockDelete can remove exactly what the sink
-	// wrote after the writer itself has gone out of scope. Without this, a
-	// post-sink failure in the wire layer (readBlockMessage's short-body
-	// check or its transaction-count read, services/legacy/peer/wire_streaming.go)
-	// had nothing to tell the delete callback which files to remove.
-	written []writtenSubtree
-}
 
 // pipelineBlockSink converts a block as it streams off the socket.
 //
@@ -198,16 +159,24 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		return errors.NewProcessingError("[pipelineBlockSink][%s] failed to build block model", hash, err)
 	}
 
-	// PLACEHOLDER: see pipelineVerifiedEntry's doc comment above for what this
-	// is, what it is not (the block is not simply dropped — see the
-	// AdoptWritten/park-budget consequence there), and why it is never pruned.
-	sm.pipelineVerifiedMu.Lock()
-	if sm.pipelineVerified == nil {
-		sm.pipelineVerified = make(map[chainhash.Hash]pipelineVerifiedEntry)
-	}
+	// The record is now genuinely on disk: a serialized model.Block under
+	// fileformat.FileTypeBlock, a few hundred bytes rather than the gigabytes a
+	// decoded block would take. This is what closes the defect this task
+	// exists for. installStreamingBlockPath installs one gate/sink/delete
+	// triple regardless of which sink is active, and after ANY sink returns
+	// nil the wire layer still dispatches a blockOnDiskMsg that
+	// handleBlockOnDiskMsg turns into a blockPark.AdoptWritten call
+	// (streaming_install.go). Before this write existed, no body had ever been
+	// written to the park's store for this hash, so AdoptWritten registered an
+	// entry and charged the park's byte budget for a blob that did not exist,
+	// and the drain later failed to read it. Writing here, before this
+	// function can report success, means that by the time AdoptWritten runs
+	// there is something real underneath it.
+	if err = sm.blockPark.WriteConvertedBlock(sm.ctx, hash, verified); err != nil {
+		sm.deleteWrittenOnFailure(hash, writer)
 
-	sm.pipelineVerified[hash] = pipelineVerifiedEntry{block: verified, written: writer.Written()}
-	sm.pipelineVerifiedMu.Unlock()
+		return errors.NewStorageError("[pipelineBlockSink][%s] failed to write the converted record", hash, err)
+	}
 
 	return nil
 }
@@ -219,35 +188,51 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // short-body check or the transaction-count read in readBlockMessage,
 // services/legacy/peer/wire_streaming.go).
 //
-// Before this existed, installStreamingBlockPath installed streamingBlockDelete
+// Before FIX 3, installStreamingBlockPath installed streamingBlockDelete
 // unconditionally, whichever sink was active. That deletes from the park's
 // blob store; the pipeline sink never writes there, so that delete found
-// nothing to remove while the subtree files the pipeline sink actually wrote,
-// and the in-memory pipelineVerified entry, were left behind forever.
+// nothing to remove while the subtree files the pipeline sink actually wrote
+// were left behind forever.
 //
-// This cleans up both of what a call under this hash can have written:
-// the subtree files recorded in pipelineVerified, if pipelineBlockSink
-// completed and verified the block itself; and, unconditionally,
-// whatever streamingBlockDelete itself would remove, because
-// pipelineParentHeight's unresolvable-parent fallback (see pipelineBlockSink)
-// hands the block to the raw park-write sink instead of converting it, and
-// that body needs the ordinary park delete regardless of which top-level
-// sink function is nominally "the pipeline sink" for this call.
+// This task retired the in-memory pipelineVerified map that used to tell this
+// function which subtree files to remove. It is not replaced with a second
+// map: the converted record ReadConverted hands back already names every
+// subtree the sink wrote (record.Subtrees), and the structure file type each
+// one was written under — FileTypeSubtree or FileTypeSubtreeToCheck — is a
+// pure function of the record's own height via quickValidationAllowed, the
+// same test subtreeWriter used to choose it while writing. So the file list
+// subtreeWriter.Written() used to hand back is reconstructed from the record
+// instead of remembered, which is exactly the thing a hash with no record can
+// never need: pipelineParentHeight's unresolvable-parent fallback (see
+// pipelineBlockSink) returns before any record is written, so ReadConverted's
+// error for that hash is the expected case below, not a fault.
+//
+// This cleans up everything a call under this hash can have written: the
+// converted record and its subtree artefacts, if pipelineBlockSink completed
+// and verified the block itself; and, unconditionally, whatever
+// streamingBlockDelete itself would remove, because that same fallback hands
+// the block to the raw park-write sink instead of converting it, and that
+// body needs the ordinary park delete regardless of which top-level sink
+// function is nominally "the pipeline sink" for this call.
 func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash) error {
-	sm.pipelineVerifiedMu.Lock()
-	entry, ok := sm.pipelineVerified[hash]
-	if ok {
-		delete(sm.pipelineVerified, hash)
-	}
-	sm.pipelineVerifiedMu.Unlock()
-
 	var firstErr error
 
-	if ok {
-		for _, w := range entry.written {
-			if err := sm.subtreeStore.Del(sm.ctx, w.Hash[:], w.FileType); err != nil && firstErr == nil {
-				firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, w.FileType, w.Hash, err)
+	if record, err := sm.blockPark.ReadConverted(sm.ctx, hash); err == nil && record != nil {
+		structureType := fileformat.FileTypeSubtreeToCheck
+		if sm.quickValidationAllowed(record.Height) {
+			structureType = fileformat.FileTypeSubtree
+		}
+
+		for _, root := range record.Subtrees {
+			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, structureType} {
+				if delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft); delErr != nil && firstErr == nil {
+					firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
+				}
 			}
+		}
+
+		if delErr := sm.blockPark.DeleteConverted(sm.ctx, hash); delErr != nil && firstErr == nil {
+			firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting the converted record", hash, delErr)
 		}
 	}
 
@@ -337,13 +322,4 @@ func (sm *SyncManager) deleteWrittenOnFailure(hash chainhash.Hash, writer *subtr
 	if delErr := writer.DeleteAll(sm.ctx); delErr != nil {
 		sm.logger.Warnf("[pipelineBlockSink][%s] failed to delete subtree files after a failed block: %v", hash, delErr)
 	}
-}
-
-// pipelineVerifiedBlockFor returns the model.Block pipelineBlockSink recorded
-// for hash, or nil if the sink has not verified it.
-func (sm *SyncManager) pipelineVerifiedBlockFor(hash chainhash.Hash) *model.Block {
-	sm.pipelineVerifiedMu.Lock()
-	defer sm.pipelineVerifiedMu.Unlock()
-
-	return sm.pipelineVerified[hash].block
 }

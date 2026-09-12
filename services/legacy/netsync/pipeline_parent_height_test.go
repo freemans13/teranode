@@ -37,7 +37,7 @@ func TestPipelineSink_ParentInHeaderIndex_IsTheOrdinaryCase(t *testing.T) {
 	ctx := t.Context()
 
 	store := memory.New()
-	sm := newPipelineManager(t, store, 8)
+	sm := newPipelineParkManager(t, store, 8)
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk) // computes a correct merkle root using genesis as a scratch parent
@@ -59,7 +59,8 @@ func TestPipelineSink_ParentInHeaderIndex_IsTheOrdinaryCase(t *testing.T) {
 	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err, "a parent only in the in-flight header list must not be treated as a fault")
 
-	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "the converted record for a header-list-only parent must read back cleanly")
 	require.NotNil(t, got, "the block must actually be converted, not merely accepted")
 
 	hashes := got.Subtrees
@@ -118,7 +119,9 @@ func TestPipelineSink_UnresolvableParent_FallsBackInsteadOfErroring(t *testing.T
 	require.NoError(t, existsErr)
 	require.True(t, exists, "the fallback must write the body to the park, the same as the non-pipeline sink would")
 
-	require.Nil(t, sm.pipelineVerifiedBlockFor(*blk.Hash()), "a block that fell back to the raw sink was never converted, so it must have no pipeline-verified block record")
+	isConverted, err := sm.blockPark.IsConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "checking for a converted record must not itself fail")
+	require.False(t, isConverted, "a block that fell back to the raw sink was never converted, so it must have no converted record")
 }
 
 // newPipelineManagerWithPark builds on newPipelineManager

@@ -80,7 +80,7 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 	ctx := t.Context()
 
 	store := memory.New()
-	sm := newPipelineManager(t, store, 8)
+	sm := newPipelineParkManager(t, store, 8)
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
@@ -88,7 +88,8 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 
 	require.NoError(t, sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body))))
 
-	got := sm.pipelineVerifiedBlockFor(*blk.Hash())
+	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")
 	require.NotNil(t, got, "sanity: the sink must have recorded a verified block, or this test asserts nothing")
 
 	hashes := got.Subtrees
@@ -104,7 +105,9 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 		}
 	}
 
-	require.Nil(t, sm.pipelineVerifiedBlockFor(*blk.Hash()), "the in-memory pipelineVerified entry must be cleared too, not just the files")
+	isConverted, err := sm.blockPark.IsConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "checking for a converted record must not itself fail")
+	require.False(t, isConverted, "the converted record must be cleared too, not just the subtree files")
 }
 
 // TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite covers FIX 2's

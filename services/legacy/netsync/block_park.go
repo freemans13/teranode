@@ -698,6 +698,34 @@ func (p *blockPark) WriteStreamedBody(ctx context.Context, hash chainhash.Hash, 
 	return p.store.SetFromReader(writeCtx, hash[:], parkFileType, io.NopCloser(r), parkOpts...)
 }
 
+// WriteConvertedBlock stores a block pipelineBlockSink has already converted and
+// merkle-verified, as a serialized model.Block under fileformat.FileTypeBlock —
+// a few hundred bytes: header, counts, subtree hashes, coinbase — rather than
+// under FileTypeMsgBlock, where write and WriteStreamedBody put the gigabytes a
+// whole decoded block serializes to.
+//
+// Uses the same options as every other park write, parkOpts, so a converted
+// record's DAH is cleared here rather than inherited from the store's own
+// retention (see parkOpts's doc comment), and the same per-operation deadline
+// as WriteStreamedBody, because this runs on the goroutine that is converting
+// the block as it streams off the socket and an unbounded store wait would
+// block that goroutine the same as any other park write would.
+func (p *blockPark) WriteConvertedBlock(ctx context.Context, hash chainhash.Hash, blk *model.Block) error {
+	if p == nil || p.store == nil {
+		return errors.NewProcessingError("[blockPark][%s] no store to write a converted record into", hash)
+	}
+
+	raw, err := blk.Bytes()
+	if err != nil {
+		return errors.NewProcessingError("[blockPark][%s] failed to serialize the converted block", hash, err)
+	}
+
+	writeCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	return p.store.Set(writeCtx, hash[:], fileformat.FileTypeBlock, raw, parkOpts...)
+}
+
 // AdoptWritten registers a block whose body is already on disk, and reports
 // whether it was taken.
 //
@@ -809,6 +837,93 @@ func (p *blockPark) Read(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlo
 	}
 
 	return msgBlock, nil
+}
+
+// ReadConverted reads back a converted record and checks it is the block the
+// key names — the same check Read makes for a whole block, and for the same
+// reason: a blob stored under a well-formed hash looks legitimate to everything
+// downstream, and nothing there knows to distrust it.
+func (p *blockPark) ReadConverted(ctx context.Context, hash chainhash.Hash) (*model.Block, error) {
+	if p == nil || p.store == nil {
+		return nil, errors.NewNotFoundError("[blockPark][%s] no store to read a converted record from", hash)
+	}
+
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	raw, err := p.store.Get(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	blk, err := model.NewBlockFromBytes(raw)
+	if err != nil {
+		return nil, errors.NewBlockInvalidError("[blockPark][%s] converted record would not decode", hash, err)
+	}
+
+	if got := blk.Header.Hash(); !got.IsEqual(&hash) {
+		return nil, errors.NewBlockInvalidError("[blockPark][%s] converted record's header hashes to %s, not the key it was read under", hash, got)
+	}
+
+	return blk, nil
+}
+
+// IsConverted answers whether a converted record exists under hash. Task 3 and
+// Task 4 both need to tell a converted entry apart from a whole-block one, and
+// the blob's own file type already carries that distinction — FileTypeBlock
+// against FileTypeMsgBlock — so nothing new has to be persisted to answer it.
+func (p *blockPark) IsConverted(ctx context.Context, hash chainhash.Hash) (bool, error) {
+	if p == nil || p.store == nil {
+		return false, nil
+	}
+
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	return p.store.Exists(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+}
+
+// DeleteConverted removes a converted record from the store. Needed only on the
+// discard path: pipelineBlockDelete calls it when the wire layer's own
+// post-sink checks fail after pipelineBlockSink already wrote a record for this
+// hash, because without it the record would sit under FileTypeBlock forever —
+// nothing commits it, and nothing else ever deletes it.
+func (p *blockPark) DeleteConverted(ctx context.Context, hash chainhash.Hash) error {
+	if p == nil || p.store == nil {
+		return nil
+	}
+
+	delCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	return p.store.Del(delCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+}
+
+// convertedRecordSize returns the byte length of the converted record under
+// hash, and whether one exists there at all. handleBlockOnDiskMsg needs this so
+// it can charge the park's byte budget with what a pipelined block actually put
+// on disk — a few hundred bytes — instead of the whole block's wire size the
+// streaming path charges; see handleBlockOnDiskMsg's own comment for why the
+// two numbers are deliberately different.
+func (p *blockPark) convertedRecordSize(ctx context.Context, hash chainhash.Hash) (int64, bool, error) {
+	if p == nil || p.store == nil {
+		return 0, false, nil
+	}
+
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	exists, err := p.store.Exists(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+	if err != nil || !exists {
+		return 0, false, err
+	}
+
+	raw, err := p.store.Get(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+	if err != nil {
+		return 0, false, err
+	}
+
+	return int64(len(raw)), true, nil
 }
 
 // TakeChildren removes and returns every block parked directly behind parent,
