@@ -32,6 +32,18 @@ type BlockBody struct {
 
 	// Hash is Header.BlockHash(), computed once when the header was read.
 	Hash chainhash.Hash
+
+	// Converted reports whether the sink that accepted this body actually
+	// converted it — wrote a park record derived from its subtrees, as the
+	// pipeline sink does — rather than merely writing the whole body
+	// byte-for-byte. It comes straight from the sink's own return value, set
+	// at the one place that genuinely knows: the sink call itself. Nothing
+	// downstream should ever try to answer this question by inference (for
+	// example, by checking whether some blob happens to exist for this hash),
+	// because a blob that exists for another reason — a stale leftover, a
+	// racing duplicate delivery of the same hash — looks identical to one this
+	// delivery actually produced.
+	Converted bool
 }
 
 // MsgBlockOnDisk is a block message whose body was streamed to the park rather
@@ -66,33 +78,42 @@ func (m *MsgBlockOnDisk) MaxPayloadLength(pver uint32) uint64 {
 }
 
 // SetBlockBodyStreaming installs all three callbacks the streaming path needs,
-// or clears all three when any of them is nil.
+// or clears all three when any of them is nil, and sets whether the size
+// threshold is bypassed.
 //
-// One call rather than three because the three are only safe together. A sink
-// with no gate is a store anybody can fill; a sink with no delete leaves an
-// orphaned body behind on every write that fails after it. The handler already
-// refuses to stream unless a sink and a gate are both present, and this makes
-// the same rule true of how they are installed rather than only of how they are
-// read.
+// streamsEverySize travels on the same call as the sink triple so a sink and
+// its size policy can never be installed apart: the park sink only pays for a
+// block too large to hold, but the pipeline sink pays at every size, and which
+// one is true depends entirely on which sink this call is installing.
+//
+// One call rather than several because the three callbacks are only safe
+// together. A sink with no gate is a store anybody can fill; a sink with no
+// delete leaves an orphaned body behind on every write that fails after it.
+// The handler already refuses to stream unless a sink and a gate are both
+// present, and this makes the same rule true of how they are installed rather
+// than only of how they are read.
 func SetBlockBodyStreaming(
-	sink func(hash chainhash.Hash, r io.Reader, n int64) error,
+	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error),
 	gate func(hash chainhash.Hash, header *wire.BlockHeader) error,
-	del func(hash chainhash.Hash) error,
+	del func(hash chainhash.Hash, converted bool) error,
+	streamsEverySize bool,
 ) {
 	if sink == nil || gate == nil || del == nil {
 		blockBodySink, blockBodyGate, blockBodyDelete = nil, nil, nil
+		blockBodyStreamsEverySize = false
 
 		return
 	}
 
 	blockBodySink, blockBodyGate, blockBodyDelete = sink, gate, del
+	blockBodyStreamsEverySize = streamsEverySize
 }
 
 // SetBlockBodySink installs the sink alone. Prefer SetBlockBodyStreaming, which
 // is the only way to install a sink that is actually reachable: the handler
 // checks for a gate too, so a sink installed on its own changes nothing. This
 // exists for tests that exercise the sink in isolation.
-func SetBlockBodySink(f func(hash chainhash.Hash, r io.Reader, n int64) error) {
+func SetBlockBodySink(f func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error)) {
 	blockBodySink = f
 }
 
@@ -109,7 +130,8 @@ func SetBlockBodyGate(f func(hash chainhash.Hash, header *wire.BlockHeader) erro
 // SetBlockBodyDelete installs the callback that removes a body already
 // written under a hash, for the handler to call when it fails after the sink
 // has already returned success. See blockBodyDelete's doc comment for why an
-// orphaned body is worse than a failed download.
-func SetBlockBodyDelete(f func(hash chainhash.Hash) error) {
+// orphaned body is worse than a failed download, and for what its converted
+// argument is for.
+func SetBlockBodyDelete(f func(hash chainhash.Hash, converted bool) error) {
 	blockBodyDelete = f
 }

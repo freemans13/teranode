@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -227,7 +228,7 @@ func TestBlockPark_RoundTripsThroughAShardedStore(t *testing.T) {
 	fresh, _ := newTestPark(t, "?hashPrefix=2")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.Recover(context.Background())
+	fresh.Recover(context.Background(), nil, nil)
 
 	require.Equal(t, 1, fresh.Len(), "a sharded store must not hide parked blocks from the restart scan")
 
@@ -354,7 +355,7 @@ func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.Recover(context.Background())
+	fresh.Recover(context.Background(), nil, nil)
 
 	require.Equal(t, 2, fresh.Len(), "both good blocks must be adopted, whatever else is in the directory")
 
@@ -367,6 +368,8 @@ func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 		require.True(t, taken[0].hash.IsEqual(&hash))
 		require.Nil(t, taken[0].peer, "a recovered block has no delivering peer")
 		require.Zero(t, taken[0].height, "a recovered block has no reported height; the parent supplies it")
+		require.False(t, taken[0].converted,
+			"fix-round item 1: a recovered whole block must not set entry.converted, or commitParkedBlock/parkedRun would try ReadConverted against a record that was never written")
 	}
 
 	names := parkDirEntries(t, dir)
@@ -398,7 +401,7 @@ func TestBlockPark_RecoveryAdoptsEverythingAPreviousRunParked(t *testing.T) {
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.Recover(context.Background())
+	fresh.Recover(context.Background(), nil, nil)
 
 	require.Equal(t, 3, fresh.Len(),
 		"every block a previous run parked is adopted; there is no byte budget to stop at")
@@ -500,7 +503,7 @@ func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
 		require.NotPanics(t, func() {
 			park.Restore(parkedBlock{})
 			park.Delete(context.Background(), parkedBlock{})
-			park.Recover(context.Background())
+			park.Recover(context.Background(), nil, nil)
 		})
 	})
 }
@@ -539,4 +542,76 @@ type failingWriteStore struct {
 
 func (s failingWriteStore) SetFromReader(_ context.Context, _ []byte, _ fileformat.FileType, _ io.ReadCloser, _ ...options.FileOption) error {
 	return errors.NewStorageError("[test] the store is not taking writes")
+}
+
+// TestBlockPark_RecoverDiscardsAConvertedRecordInsteadOfOrphaningItForever is
+// fix-round item 2's Recover fix. Before it, Recover recognised only names
+// ending in the whole-block suffix; a name ending in ".block" instead fell
+// through into "anything we do not recognise is left alone" and stayed on
+// disk across every future restart, because nothing else in the park, or
+// anywhere else, ever revisits it. Adopting a converted record as a park
+// entry directly is a later task's job (task 5 in this plan); what this fixes
+// is that Recover now recognises the suffix at all, and discards what it
+// cannot yet adopt rather than orphaning it permanently.
+func TestBlockPark_RecoverDiscardsAConvertedRecordInsteadOfOrphaningItForever(t *testing.T) {
+	park, dir := newTestPark(t, "")
+
+	hash := chainhash.Hash{0x55, 0x66, 0x77}
+
+	// A minimal but genuinely valid converted record — model.NewBlock needs a
+	// header, a coinbase and a subtree list, so this builds one the same way
+	// checkMerkleRootAgainst (merkle_accumulator_test.go) does for the same
+	// reason: a narrower stand-in would mean inventing a format neither
+	// WriteConvertedBlock nor Recover was ever asked to handle.
+	header := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+	blk, err := model.NewBlock(header, coinbaseTx(t), nil, 0, 0, 0, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, park.WriteConvertedBlock(context.Background(), hash, blk))
+
+	names := parkDirEntries(t, dir)
+	require.Contains(t, names, hash.String()+".block",
+		"sanity: the record must actually be on disk before recovery can be tested against it")
+
+	fresh, _ := newTestPark(t, "")
+	fresh.dir = dir
+	fresh.store = park.store
+	fresh.Recover(context.Background(), nil, nil)
+
+	require.Zero(t, fresh.Len(),
+		"a converted record is not adopted as a park entry by this task (that is a later task's job); it must not be silently skipped forever either")
+
+	names = parkDirEntries(t, dir)
+	require.NotContains(t, names, hash.String()+".block",
+		"recovery must not leave a converted record on disk forever; discarding what it cannot yet adopt is the floor this fixes")
+}
+
+// TestBlockPark_DeleteAlsoRemovesAConvertedRecord is fix-round item 2's core
+// claim. Before it, Delete removed only the whole-block file type, so commit,
+// EvictBelow and every other path that retires an entry through Delete
+// (applyParkDisposition's own comment calls it the ONLY place that deletes a
+// parked blob) left a converted record behind. This drives a real converted
+// record onto disk, retires it through the ordinary path every retiring
+// caller already goes through, and requires the record to be gone afterward.
+func TestBlockPark_DeleteAlsoRemovesAConvertedRecord(t *testing.T) {
+	ctx := context.Background()
+	park, dir := newTestPark(t, "")
+
+	hash := chainhash.Hash{0x88, 0x99}
+
+	header := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+	blk, err := model.NewBlock(header, coinbaseTx(t), nil, 0, 0, 0, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
+
+	names := parkDirEntries(t, dir)
+	require.Contains(t, names, hash.String()+".block",
+		"sanity: the record must be on disk before Delete can be tested against it")
+
+	park.Delete(ctx, parkedBlock{hash: hash})
+
+	names = parkDirEntries(t, dir)
+	require.NotContains(t, names, hash.String()+".block",
+		"Delete must remove the converted record too, or every path that retires an entry through it -- commit, eviction, discard -- leaks the record")
 }

@@ -71,6 +71,29 @@ const (
 	// so it never reduces prefetch depth for legitimate traffic.
 	minInFlightBlockWeight = 64 * 1024
 
+	// pipelineBlockSlotPeerAllowance sizes the download-admission semaphore, in
+	// block-count units, when the pipeline path charges slots instead of bytes.
+	//
+	// This reasoning was written for a position the admission charge no longer
+	// occupies. It assumed one peer could hold up to MaxBlocksInTransitPerPeer
+	// slots at once — true at OnBlock, where a read loop admits a block and
+	// returns immediately, so the next block can be admitted before the first is
+	// even processed. Fix round 1 moved the charge into admitPipelineSink
+	// (streaming_install.go), which wraps the sink itself: a read loop is
+	// synchronously inside exactly one call to it at a time, so one peer holds
+	// AT MOST ONE slot, never sixteen. The real ceiling on simultaneous holders
+	// is the download fan-out — how many peers can have a block in flight at
+	// once — which this codebase caps around defaultMaxInFlightBlocks (20), well
+	// under MaxBlocksInTransitPerPeer(16) × 4 = 64. So at shipped defaults this
+	// gate is reachable — AcquireBlockPrefetch is genuinely called, and would
+	// refuse if the count ever exceeded capacity — but not BINDING: real fan-out
+	// cannot reach 64 concurrent holders, so it never actually refuses anything.
+	// The gate is bindable, not bounded, in its current position. Recorded here
+	// rather than silently left wrong; not resized, because shrinking it without
+	// evidence of what fan-out this branch actually produces under load is a
+	// separate, measured decision, not a comment-fix.
+	pipelineBlockSlotPeerAllowance = 4
+
 	// maxBlockQueueSlots caps the block-queue channel capacity so a misconfigured
 	// (e.g. multi-TB) prefetch budget cannot size an enormous channel backing
 	// array. 65536 slots covers budgets up to 4 GiB at the weight floor before the
@@ -6553,16 +6576,32 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 		return 0, nil
 	}
 
-	// Floor the weight so a flood of tiny blocks can't admit an unbounded number
-	// of in-flight goroutines within the byte budget, then clamp to the budget so
-	// an oversized block is admitted alone (and budgets smaller than the floor
-	// still process one block at a time rather than deadlocking).
+	// On the pipeline path the block's bytes are gone by the time this runs: the
+	// wire layer streamed them through the subtree builder and out to files, and
+	// what OnBlock holds is a handle. Charging the serialized size would reserve
+	// hundreds of megabytes against a fixed pool for memory nobody is holding, and
+	// a read loop parked in this acquire reads nothing further from its socket —
+	// which is how a peer-wide byte counter once switched the frontier racer off.
+	//
+	// One slot per in-flight block is what this path can honestly pay, and it is
+	// the unit SV Node bounds by. The semaphore, the dedup set and every release
+	// path are unchanged: the weight is chosen here and handed back verbatim.
 	weight := size
-	if weight < minInFlightBlockWeight {
-		weight = minInFlightBlockWeight
-	}
-	if weight > sm.blockPrefetchBudgetBytes {
-		weight = sm.blockPrefetchBudgetBytes
+	if sm.settings != nil && sm.settings.Legacy.PipelineReceive {
+		weight = 1
+	} else {
+		// Floor the weight so a flood of tiny blocks can't admit an unbounded
+		// number of in-flight goroutines within the byte budget, then clamp to
+		// the budget so an oversized block is admitted alone (and budgets
+		// smaller than the floor still process one block at a time rather than
+		// deadlocking). Neither applies to the slot path above: 1 is always
+		// payable against a budget that is itself sized as a count of at least 1.
+		if weight < minInFlightBlockWeight {
+			weight = minInFlightBlockWeight
+		}
+		if weight > sm.blockPrefetchBudgetBytes {
+			weight = sm.blockPrefetchBudgetBytes
+		}
 	}
 
 	// Dedup: reserve the hash BEFORE reserving budget. Inserting ahead of the
@@ -7027,7 +7066,7 @@ func (sm *SyncManager) Start() {
 	// Adopt whatever a previous run left parked, before anything can drain it.
 	// No RPCs are made here; the parents are reconciled with the chain by the
 	// park sweep once the block-queue consumer is running.
-	sm.blockPark.Recover(sm.ctx)
+	sm.blockPark.Recover(sm.ctx, sm.subtreeStore, sm.quickValidationAllowed)
 
 	go sm.blockHandler()
 }
@@ -7238,13 +7277,32 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	sm.installStreamingBlockPath(peerpkg.SetBlockBodyStreaming)
 
 	// Bounded async block prefetch: with a positive budget OnBlock admits a
-	// block against this global byte-weighted semaphore and returns, so the
+	// block against this global weighted semaphore and returns, so the
 	// read-loop downloads the next block while the current one is validated.
-	// The budget caps the total serialized bytes of in-flight blocks; a budget
-	// of 0 disables prefetch entirely (synchronous, one-block-in-flight).
+	// A budget of 0 disables prefetch entirely (synchronous, one-block-in-flight).
 	if budget := tSettings.Legacy.BlockPrefetchBufferBytes; budget > 0 {
-		sm.blockPrefetchBudgetBytes = budget
-		sm.blockPrefetchBudget = semaphore.NewWeighted(budget)
+		if tSettings.Legacy.PipelineReceive {
+			// On the pipeline path AcquireBlockPrefetch charges one slot per
+			// block, not its serialized size (the bytes are gone by the time it
+			// runs — see that function), so legacy_blockPrefetchBufferBytes no
+			// longer describes anything real for this path. Size the same
+			// semaphore as a block count instead, derived from the per-peer
+			// queue-depth setting rather than a new one: see
+			// pipelineBlockSlotPeerAllowance for the multiplier's reasoning.
+			capacity := int64(tSettings.Legacy.MaxBlocksInTransitPerPeer) * pipelineBlockSlotPeerAllowance
+			if capacity < 1 {
+				capacity = 1
+			}
+
+			sm.blockPrefetchBudgetBytes = capacity
+			sm.blockPrefetchBudget = semaphore.NewWeighted(capacity)
+			logger.Infof("[legacy] pipeline receive on: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
+				capacity, tSettings.Legacy.MaxBlocksInTransitPerPeer, pipelineBlockSlotPeerAllowance)
+		} else {
+			// The budget caps the total serialized bytes of in-flight blocks.
+			sm.blockPrefetchBudgetBytes = budget
+			sm.blockPrefetchBudget = semaphore.NewWeighted(budget)
+		}
 		// Dedup half of the same admission gate as the budget semaphore, created
 		// in lockstep with it: paired 1:1 with each budget reservation so at most
 		// one copy of a block hash is ever admitted/queued at a time.

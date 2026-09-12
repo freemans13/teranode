@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/big"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -56,16 +57,209 @@ const streamedBodyRequestWindow = 60 * 60 * 1000000000 // one hour, in nanosecon
 // Installing a sink without a gate is refused by the wire layer itself, which
 // falls back to decoding rather than opening the door. This installs all three
 // together for the same reason.
+//
+// set also carries whether the wire layer may ignore its size threshold. The
+// two decisions are made from the same PipelineReceive check and passed on the
+// same call, so a sink can never be installed with the wrong size policy: the
+// park sink only pays for a block too large to hold in memory, but the
+// pipeline sink converts a block as it arrives and pays at every size.
 func (sm *SyncManager) installStreamingBlockPath(set func(
-	sink func(chainhash.Hash, io.Reader, int64) error,
+	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
-	del func(chainhash.Hash) error,
+	del func(chainhash.Hash, bool) error,
+	streamsEverySize bool,
 )) {
 	if sm == nil || sm.blockPark == nil || !sm.blockPark.Enabled() {
 		return
 	}
 
-	set(sm.streamingBlockSink, sm.streamingBlockGate, sm.streamingBlockDelete)
+	// A nil settings pointer here is not a recoverable nil panic the way it
+	// would be for most fields: the reviewer measured Settings.Legacy at
+	// offset 4728 and PipelineReceive at 5112, both past the 4096-byte guard
+	// page a Go process leaves unmapped at low addresses, so reading through
+	// a nil settings pointer this far in can fault outside the range the
+	// runtime is guaranteed to turn back into an ordinary panic. Computed
+	// once here, matching the sm.settings != nil && pattern already used
+	// elsewhere in this package (e.g. handle_block.go's
+	// quickValidationAllowed), and reused below rather than re-read, so
+	// there is exactly one place that can get this wrong instead of three.
+	pipelineOn := sm.settings != nil && sm.settings.Legacy.PipelineReceive
+
+	sink := sm.streamingBlockSink
+	del := sm.streamingBlockDelete
+
+	if pipelineOn {
+		// admitPipelineSink wraps the download-admission budget around the
+		// pipeline sink. See that method's doc comment for why it has to wrap
+		// the sink itself rather than being charged in the on-disk message
+		// handler that runs after the sink has already finished.
+		sink = sm.admitPipelineSink(sm.pipelineBlockSink)
+		// The delete callback is chosen from the same check, on the same
+		// call, as the sink: whichever sink actually wrote something for a
+		// hash is the only thing that knows how to clean it up again, so a
+		// sink can never be installed with the wrong delete callback any
+		// more than it can be installed with the wrong size policy (see
+		// streamsEverySize below). streamingBlockDelete only knows about the
+		// park's blob store; the pipeline sink can also write subtree files,
+		// so it needs pipelineBlockDelete's own cleanup — gated on the
+		// converted argument the wire layer passes through from THIS
+		// delivery's own blockBodySink return, never on whether a converted
+		// record merely exists for the hash (see pipelineBlockDelete's own
+		// doc comment for why that inference is exactly the bug this closes).
+		del = sm.pipelineBlockDelete
+	}
+
+	sm.logger.Infof("[legacy] streaming block path installed, pipeline=%v", pipelineOn)
+
+	set(sink, sm.streamingBlockGate, del, pipelineOn)
+}
+
+// admitPipelineSink wraps inner (the pipeline sink) with the download-admission
+// budget AcquireBlockPrefetch/ReleaseBlockPrefetch already implement, charged
+// one slot per block on this path (see AcquireBlockPrefetch's own
+// PipelineReceive branch, manager.go). That budget was sized for exactly this
+// call site — sm.blockPrefetchBudgetBytes is derived from
+// MaxBlocksInTransitPerPeer specifically when PipelineReceive is on — but was
+// never reachable from it: AcquireBlockPrefetch is only ever called from
+// OnBlock, which the peer only dispatches for a whole *wire.MsgBlock, and with
+// the pipeline on every block comes back as *peer.MsgBlockOnDisk instead, so
+// OnBlock, and the admission check inside it, never runs for this route.
+//
+// Charged here, wrapping the sink itself, NOT in handleBlockOnDiskMsg (the
+// on-disk message handler that runs once the body is already fully on disk).
+// By the time that handler's message even exists, the conversion this budget
+// is meant to bound is already finished: inner has already streamed the whole
+// body through the subtree builder and its ~50MB dedup map
+// (newPipelineDedupMap, pipeline_sink.go) on this peer's own read-loop
+// goroutine. A charge that only runs after that resident cost has already been
+// paid bounds nothing real — which is the exact lesson the byte-budget version
+// of this same check already taught (ReleaseBlockPrefetchBytes's own doc
+// comment): charging after the fact cannot be un-taught by moving the charge to
+// a different post-hoc call site. Charging before inner runs instead blocks the
+// read loop that would otherwise start that work, the same trade-off OnBlock
+// already accepts for the decoded path: a peer over budget reads nothing
+// further until a slot frees.
+//
+// ctx passed to the acquire is sm.ctx bounded by pipelineAdmissionAcquireTimeout,
+// not sm.ctx unbounded, and quit is nil. Fix round 1 found a real self-inflicted
+// disconnect in the first version of this function: it parked on sm.ctx with no
+// timeout, and peer.inHandler's idle timer (peer/peer.go:2153) only calls
+// idleTimer.Stop() AFTER readMessageStreaming — which is the call this sink runs
+// inside of — returns. A park here longer than legacy_peerIdleTimeout (125s
+// default) therefore tripped the SAME idle timer OnBlock's acquire was written
+// to be safe from: shouldArmProcessingTimer (peer/peer.go:2193) disarms the
+// separate processing watchdog for block messages under prefetch precisely so a
+// budget park cannot kill a healthy connection, but that disarm only covers the
+// timer armed AFTER a message is read, not the idle timer armed WHILE it is
+// still being read — which is where this sink's park actually happens. Parking
+// long enough here got a perfectly healthy peer disconnected with "No answer
+// from peer", blamed for backpressure that was entirely this node's own.
+//
+// The better fix — thread a per-connection quit channel (and a way for
+// peer.inHandler to know a read is blocked in application logic, not waiting on
+// the peer) into the sink signature, the way peer_server.go:1322 hands OnBlock's
+// acquire sp.quit — is not reachable from here without changing the external
+// dependency go-wire itself. blockBodySink (services/legacy/peer/wire_streaming.go)
+// is invoked from streamingBlockHandler, which is registered globally and
+// peer-agnostically via wire.SetExternalHandler(wire.CmdBlock, ...); go-wire
+// calls it with only (io.Reader, uint64, int) — no peer, no connection, no
+// context of any kind — because that registration is process-wide, shared by
+// every connected peer's read loop, not per-connection. There is no reader
+// identity or type assertion that reliably recovers "which peer is calling
+// this" from the io.Reader go-wire hands the external handler (it is go-wire's
+// own internal wrapper around the socket, not the socket itself), so closing
+// this gap for real means changing go-wire's SetExternalHandler/
+// ReadMessageStreamingN to pass per-call context through — an upstream change,
+// consistent with this codebase's own rule of fixing a dependency rather than
+// working around it in the wrapper, and out of scope for a same-branch fix.
+//
+// So: bounded fallback instead of an unbounded park. pipelineAdmissionAcquireTimeout
+// keeps the wait strictly below legacy_peerIdleTimeout; on that bound expiring,
+// this declines the conversion and defers to the plain body-write path exactly
+// as the duplicate case below does, rather than parking indefinitely into the
+// idle timer's path. That trades a slot's worth of admission control for
+// connection safety under sustained pressure — the same trade every other
+// decline in this function already makes.
+func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)) func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+	return func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
+		acquireCtx, cancel := context.WithTimeout(sm.ctx, sm.pipelineAdmissionAcquireTimeout())
+		defer cancel()
+
+		weight, err := sm.AcquireBlockPrefetch(acquireCtx, nil, hash, n)
+		if err != nil {
+			if errors.Is(err, ErrDuplicateBlockInFlight) {
+				// A copy of this hash is already being converted (or waiting
+				// for budget) by another peer's read loop — the frontier
+				// race's own duplicate delivery, not a fault. It must not
+				// disconnect this peer or fail this message: decline the
+				// conversion and defer to the plain body-write path, exactly
+				// as pipelineBlockSink's own unresolvable-parent and
+				// not-legacyUnified declines already do (see that function's
+				// doc comment) — r is still untouched at this point, so
+				// handing it to streamingBlockSink is safe. The existing
+				// park/drain machinery (AdoptWritten's "already hold this
+				// block" branch) resolves the resulting duplicate body
+				// exactly as it always has.
+				//
+				// Recorded, not fixed here: under the frontier race this
+				// fallback body can win the race to handleBlockOnDiskMsg
+				// ahead of the copy that actually converts. That delivery's
+				// msg.body.Converted is false (streamingBlockSink never
+				// converts, see its own doc comment), so the park charges it
+				// the full wire size rather than the converted record's — the
+				// exact over-charge handleBlockOnDiskMsg's own comment on
+				// msg.body.Converted already warns about for a stale or
+				// foreign record, now reachable here too by a legitimate race
+				// rather than a fault.
+				return sm.streamingBlockSink(hash, header, r, n)
+			}
+
+			if errors.Is(err, context.DeadlineExceeded) {
+				// pipelineAdmissionAcquireTimeout expired, not sm.ctx itself —
+				// distinguished from the shutdown case below by which one a
+				// context.WithTimeout-derived ctx reports. Falling back here
+				// rather than returning an error keeps this peer connected:
+				// any non-benign error from this sink disconnects the peer
+				// (peer.shouldHandleReadError, see pipelineBlockSink's doc
+				// comment on why it never errors for its own declines), so
+				// erroring here would turn OUR admission pressure into a
+				// disconnect blamed on the peer, exactly the failure mode
+				// this bound exists to avoid.
+				return sm.streamingBlockSink(hash, header, r, n)
+			}
+
+			// sm.ctx cancelled (daemon shutdown): nothing was reserved and
+			// nothing productive is left to do with the bytes either.
+			return false, err
+		}
+		defer sm.ReleaseBlockPrefetch(hash, weight)
+
+		return inner(hash, header, r, n)
+	}
+}
+
+// pipelineAdmissionAcquireDivisor is how much smaller admitPipelineSink's
+// acquire bound is than legacy_peerIdleTimeout: half, so a park that hits the
+// bound still leaves a wide margin before the peer's own idle timer would have
+// fired, rather than shaving it to the edge.
+const pipelineAdmissionAcquireDivisor = 2
+
+// pipelineAdmissionAcquireFallback is the acquire bound used when
+// legacy_peerIdleTimeout is unset or non-positive, which should not happen in
+// practice (its own settings doc says not to set it below 120s) but must still
+// produce a bounded wait rather than an unbounded one.
+const pipelineAdmissionAcquireFallback = 45 * time.Second
+
+// pipelineAdmissionAcquireTimeout returns how long admitPipelineSink's acquire
+// may block before falling back, strictly below legacy_peerIdleTimeout so a
+// park here can never itself trip that timer. See admitPipelineSink's doc
+// comment for why the bound exists instead of a per-connection quit channel.
+func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
+	if sm.settings == nil || sm.settings.Legacy.PeerIdleTimeout <= 0 {
+		return pipelineAdmissionAcquireFallback
+	}
+
+	return sm.settings.Legacy.PeerIdleTimeout / pipelineAdmissionAcquireDivisor
 }
 
 // streamingBlockGate answers whether a peer may write this block's body to our
@@ -159,15 +353,30 @@ func describeTarget(t *big.Int) string {
 //
 // Byte-identical is the whole point. The park reads a body back with the same
 // deserializer whichever path put it there, so a streamed block needs no second
-// read path, no second file type and no flag distinguishing the two. The handler
-// hands the header in ahead of the body for this reason; it has already read the
-// header off the wire to compute the hash and to put it to the gate.
-func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, r io.Reader, n int64) error {
+// read path, no second file type and no flag distinguishing the two. The wire
+// layer hands in the parsed header rather than header bytes now, because the
+// pipeline sink that follows this one needs it as structure; this sink's own job
+// is bytes, so it re-serializes the header back onto the front of the body.
+//
+// The bool it returns is always false: this path never converts a block, it
+// only ever writes the whole body byte-for-byte under FileTypeMsgBlock, so
+// nothing downstream may treat what it wrote as a converted record — see
+// BlockBody.Converted.
+func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 	if sm.blockPark == nil {
-		return errors.NewProcessingError("[streamingBlockSink][%s] no park to write to", hash)
+		return false, errors.NewProcessingError("[streamingBlockSink][%s] no park to write to", hash)
 	}
 
-	return sm.blockPark.WriteStreamedBody(sm.ctx, hash, r, n)
+	// The park's file format is a whole serialized block, so this path puts the
+	// header back in front of the body. The wire layer stopped doing that when the
+	// sink contract began carrying the header as structure, because the pipeline
+	// sink wants the structure and this one wants the bytes.
+	var headerBytes bytes.Buffer
+	if err := header.Serialize(&headerBytes); err != nil {
+		return false, errors.NewProcessingError("[streamingBlockSink][%s] could not re-serialize the header", hash, err)
+	}
+
+	return false, sm.blockPark.WriteStreamedBody(sm.ctx, hash, io.MultiReader(bytes.NewReader(headerBytes.Bytes()), r), n)
 }
 
 // streamingBlockDelete removes a body already written under hash, for the case
@@ -179,7 +388,15 @@ func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, r io.Reader, n in
 // asked for again by the walk, while bytes sitting on disk under a well-formed
 // hash look legitimate to everything downstream, and nothing there knows to
 // distrust them.
-func (sm *SyncManager) streamingBlockDelete(hash chainhash.Hash) error {
+//
+// converted is unused here: this path only ever writes a whole body under
+// FileTypeMsgBlock, never a converted record, whether it is running as the
+// plain non-pipeline delete or as pipelineBlockDelete's own unconditional tail
+// call for the fallback-to-raw-body case. It is part of the signature only so
+// this satisfies the same function type pipelineBlockDelete does, which is
+// what lets installStreamingBlockPath assign either one to del without a
+// wrapper closure.
+func (sm *SyncManager) streamingBlockDelete(hash chainhash.Hash, _ bool) error {
 	if sm.blockPark == nil {
 		return nil
 	}
@@ -233,11 +450,117 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		return
 	}
 
+	// The streamed route never touched sm.blockDownloads, the map
+	// handleBlockMsg releases via RemoveOwner/ForgiveOwners (manager.go) the
+	// moment it dequeues a decoded block. Before this branch made the pipeline
+	// send every block down this route, that gap only missed blocks above the
+	// decode-size threshold (rare); with PipelineReceive on it is every block,
+	// so a delivering peer's CountForPeer sticks at MaxBlocksInTransitPerPeer
+	// after roughly sixteen deliveries and the scheduler (block_scheduler.go:144)
+	// stops asking that peer for anything until the hour-long assignment TTL
+	// expires.
+	//
+	// Released HERE — at message intake into this single consumer, the same
+	// point handleBlockMsg releases it, NOT at the block's eventual commit.
+	// By the time this message exists the peer has already fully answered: the
+	// sink ran to completion on the peer's own read loop before
+	// QueueBlockOnDisk was ever called, so there is no copy still being
+	// converted for a duplicate to race against — releasing later, after
+	// AdoptWritten or the eventual park commit (either of which an unreachable
+	// parent or a full park can delay indefinitely), would only widen the
+	// leak's own window instead of closing it. Unconditional on what happens
+	// below: the peer earned the release by delivering the bytes, whether this
+	// node ends up keeping them (AdoptWritten) or discarding them (unreachable
+	// parent, full park).
+	//
+	// Gated on PipelineReceive: before this branch, a block only reached this
+	// on-disk route above the 64 MiB decode threshold, and that pre-existing
+	// (rare) behaviour is not this task's to change — only the route this
+	// branch made universal is.
+	if sm.settings != nil && sm.settings.Legacy.PipelineReceive {
+		// Resolve a stream sub-peer to its association primary, exactly as
+		// handleBlockMsg does before its own RemoveOwner call (manager.go:3271-3276)
+		// and as BlockRequested does before its HasOwner check (manager.go:6530-6538):
+		// the download ledger records ownership under the primary, never under a
+		// BlockPriority association's DATA1/DATA2 sub-peer. msg.peer is exactly
+		// that sub-peer whenever the body arrived on its own stream — OnBlockOnDisk
+		// (peer_server.go) hands QueueBlockOnDisk sp.Peer, which under a multistream
+		// association is the sub-peer, not the primary. Sub-peers are never
+		// registered in peerStates and so never own anything in blockDownloads;
+		// passing msg.peer straight through here made RemoveOwner a silent no-op in
+		// exactly that configuration. Fix round 1's own test caught only
+		// ForgiveOwners actually working (it is peer-agnostic), never this.
+		//
+		// Guarded on msg.peer != nil: peerStateResolvingPrimary calls
+		// AssociationRef on it, which dereferences a nil receiver.
+		// QueueBlockOnDisk's production caller always hands a real peer, but a nil
+		// one costs nothing extra to tolerate here.
+		primary := msg.peer
+		if msg.peer != nil {
+			_, primary, _ = sm.peerStateResolvingPrimary(msg.peer)
+		}
+
+		sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
+		sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
+	}
+
 	entry := parkedBlock{
 		hash:      msg.body.Hash,
 		prevBlock: msg.body.Header.PrevBlock,
 		size:      msg.body.Size,
 		peer:      msg.peer,
+		// Straight from the sink's own return value, the same source
+		// BlockBody.Converted itself documents as the only trustworthy one —
+		// see parkedBlock.converted's own doc comment for why this is what
+		// lets commitParkedBlock and parkedRun stop asking the store.
+		converted: msg.body.Converted,
+	}
+
+	// msg.body.Converted says whether THIS delivery's sink actually converted
+	// the block, straight from the sink's own return value — see
+	// BlockBody.Converted. It is deliberately NOT inferred by asking whether a
+	// converted record happens to exist for this hash: a record surviving from
+	// an unrelated earlier attempt, or from a racing duplicate delivery of the
+	// same hash, would look identical to one this delivery produced, and
+	// charging by that inference once misattributed a stale or foreign
+	// record's size to a delivery that never wrote it.
+	//
+	// Gating the store lookup on this flag also means the lookup itself never
+	// runs unless the pipeline actually converted something on THIS call: with
+	// PipelineReceive off, streamingBlockSink is the only sink ever installed
+	// and it always reports converted=false (see its own doc comment), so this
+	// whole block below is skipped and handleBlockOnDiskMsg does exactly the
+	// store I/O it always did — none — on that path. Before this gate existed,
+	// the lookup ran for every streamed block regardless of the setting, which
+	// meant an extra blob-store round trip, and therefore an extra wait on the
+	// store's shared read-permit pool, on the single goroutine that commits
+	// blocks in order — a path that used to do no I/O at all.
+	if msg.body.Converted {
+		// The pipeline sink, when it is the one active, has already written
+		// this hash's body as a converted record — a few hundred bytes under
+		// FileTypeBlock — before the wire layer ever got here, so there is
+		// nothing on disk shaped like the whole block msg.body.Size describes.
+		// Charging that size against the park's budget would over-charge a
+		// pipelined block by orders of magnitude and starve the park into
+		// believing it is nearly full when it holds almost nothing, so the two
+		// paths deliberately charge different numbers: the plain streaming
+		// path charges the whole block's wire size because that is what
+		// write/WriteStreamedBody put on disk, and this charges the record's
+		// own length instead.
+		if size, found, err := sm.blockPark.convertedRecordSize(sm.ctx, entry.hash); err != nil {
+			sm.logger.Warnf("[blockOnDisk][%s] failed to check for a converted record, charging the whole block's wire size instead: %v", entry.hash, err)
+		} else if found {
+			entry.size = size
+		} else {
+			// The sink says it converted this hash, but the record is not
+			// there. Something else already removed it — for example a racing
+			// discard on the same hash — between the sink returning and this
+			// handler running. Charging the whole block's wire size here would
+			// be wrong the OTHER way for a genuinely converted block, but there
+			// is no better number left to charge, so this falls back to it and
+			// says so rather than silently mischarging.
+			sm.logger.Warnf("[blockOnDisk][%s] the sink reports this delivery converted, but no converted record is on disk; charging the whole block's wire size instead", entry.hash)
+		}
 	}
 
 	// A parked block is only ever committable if its parent is something this

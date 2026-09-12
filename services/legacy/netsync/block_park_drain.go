@@ -186,15 +186,33 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 // two defaults point opposite ways: a read failure keeps the block, a commit
 // failure judges it.
 func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
-	msgBlock, err := sm.blockPark.Read(sm.ctx, entry.hash)
-	if err != nil {
-		return sm.parkedReadFailed(entry, err)
-	}
+	// A converted entry has a record on disk instead of a whole block —
+	// entry.converted is set once, at AdoptWritten or Recover, from the fact
+	// that made it true then; see its own doc comment for why this must never
+	// go back to asking the store (a blockPark.IsConverted call) on this
+	// goroutine, which commits every parked block in order.
+	if entry.converted {
+		record, err := sm.blockPark.ReadConverted(sm.ctx, entry.hash)
+		if err != nil {
+			return sm.parkedReadFailed(entry, err)
+		}
 
-	// A nil in-flight parent: the parent of a parked block is in the chain by the
-	// time anything commits it, so HandleBlockDirect looks it up there.
-	if err = sm.HandleBlockDirect(sm.ctx, entry.peer, entry.hash, msgBlock, nil); err != nil {
-		return sm.parkedBlockFailed(entry, err)
+		// A nil in-flight parent: see HandleConvertedBlock's own doc comment for
+		// why it is never called with anything else.
+		if err = sm.HandleConvertedBlock(sm.ctx, entry.peer, entry.hash, record); err != nil {
+			return sm.parkedBlockFailed(entry, err)
+		}
+	} else {
+		msgBlock, err := sm.blockPark.Read(sm.ctx, entry.hash)
+		if err != nil {
+			return sm.parkedReadFailed(entry, err)
+		}
+
+		// A nil in-flight parent: the parent of a parked block is in the chain by the
+		// time anything commits it, so HandleBlockDirect looks it up there.
+		if err = sm.HandleBlockDirect(sm.ctx, entry.peer, entry.hash, msgBlock, nil); err != nil {
+			return sm.parkedBlockFailed(entry, err)
+		}
 	}
 
 	// The header list is only ever advanced by an arriving block that matches

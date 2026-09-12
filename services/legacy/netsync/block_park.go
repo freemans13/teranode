@@ -235,6 +235,26 @@ type parkedBlock struct {
 	// whoever finishes the write has to ask for it again or the block sits in
 	// the park behind a parent that is already in the chain.
 	parentDrained bool
+
+	// converted says whether this entry's blob is a converted record
+	// (FileTypeBlock) rather than a whole block (FileTypeMsgBlock). Set once,
+	// at AdoptWritten (from the sink's own BlockBody.Converted, the only place
+	// that genuinely knows) and at Recover (from which suffix the file on disk
+	// carried), and read from ever after — never re-derived by asking the
+	// store.
+	//
+	// Before this field existed, commitParkedBlock and the dispatcher's
+	// parkedRun each asked blockPark.IsConverted before every commit, which is
+	// a store Exists call: one of the file store's 768 process-wide read
+	// permits, held for the store's configured timeout, on commitParkedBlock's
+	// single goroutine that commits every parked block in order. That ran
+	// unconditionally, for every parked commit, whether or not
+	// legacy_pipelineReceive was ever turned on — the same store round trip
+	// this park already gates on BlockBody.Converted at streaming_install.go's
+	// entry construction (see the comment there), just not here. This field
+	// closes that gap the same way: the answer is a fact this entry already
+	// carries, not a question the store needs to answer again.
+	converted bool
 }
 
 // admitResult says what Admit did with an offered block, and in particular
@@ -698,6 +718,34 @@ func (p *blockPark) WriteStreamedBody(ctx context.Context, hash chainhash.Hash, 
 	return p.store.SetFromReader(writeCtx, hash[:], parkFileType, io.NopCloser(r), parkOpts...)
 }
 
+// WriteConvertedBlock stores a block pipelineBlockSink has already converted and
+// merkle-verified, as a serialized model.Block under fileformat.FileTypeBlock —
+// a few hundred bytes: header, counts, subtree hashes, coinbase — rather than
+// under FileTypeMsgBlock, where write and WriteStreamedBody put the gigabytes a
+// whole decoded block serializes to.
+//
+// Uses the same options as every other park write, parkOpts, so a converted
+// record's DAH is cleared here rather than inherited from the store's own
+// retention (see parkOpts's doc comment), and the same per-operation deadline
+// as WriteStreamedBody, because this runs on the goroutine that is converting
+// the block as it streams off the socket and an unbounded store wait would
+// block that goroutine the same as any other park write would.
+func (p *blockPark) WriteConvertedBlock(ctx context.Context, hash chainhash.Hash, blk *model.Block) error {
+	if p == nil || p.store == nil {
+		return errors.NewProcessingError("[blockPark][%s] no store to write a converted record into", hash)
+	}
+
+	raw, err := blk.Bytes()
+	if err != nil {
+		return errors.NewProcessingError("[blockPark][%s] failed to serialize the converted block", hash, err)
+	}
+
+	writeCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	return p.store.Set(writeCtx, hash[:], fileformat.FileTypeBlock, raw, parkOpts...)
+}
+
 // AdoptWritten registers a block whose body is already on disk, and reports
 // whether it was taken.
 //
@@ -809,6 +857,77 @@ func (p *blockPark) Read(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlo
 	}
 
 	return msgBlock, nil
+}
+
+// ReadConverted reads back a converted record and checks it is the block the
+// key names — the same check Read makes for a whole block, and for the same
+// reason: a blob stored under a well-formed hash looks legitimate to everything
+// downstream, and nothing there knows to distrust it.
+func (p *blockPark) ReadConverted(ctx context.Context, hash chainhash.Hash) (*model.Block, error) {
+	if p == nil || p.store == nil {
+		return nil, errors.NewNotFoundError("[blockPark][%s] no store to read a converted record from", hash)
+	}
+
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	raw, err := p.store.Get(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	blk, err := model.NewBlockFromBytes(raw)
+	if err != nil {
+		return nil, errors.NewBlockInvalidError("[blockPark][%s] converted record would not decode", hash, err)
+	}
+
+	if got := blk.Header.Hash(); !got.IsEqual(&hash) {
+		return nil, errors.NewBlockInvalidError("[blockPark][%s] converted record's header hashes to %s, not the key it was read under", hash, got)
+	}
+
+	return blk, nil
+}
+
+// IsConverted answers whether a converted record exists under hash. Task 3 and
+// Task 4 both need to tell a converted entry apart from a whole-block one, and
+// the blob's own file type already carries that distinction — FileTypeBlock
+// against FileTypeMsgBlock — so nothing new has to be persisted to answer it.
+func (p *blockPark) IsConverted(ctx context.Context, hash chainhash.Hash) (bool, error) {
+	if p == nil || p.store == nil {
+		return false, nil
+	}
+
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	return p.store.Exists(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+}
+
+// convertedRecordSize returns the byte length of the converted record under
+// hash, and whether one exists there at all. handleBlockOnDiskMsg needs this so
+// it can charge the park's byte budget with what a pipelined block actually put
+// on disk — a few hundred bytes — instead of the whole block's wire size the
+// streaming path charges; see handleBlockOnDiskMsg's own comment for why the
+// two numbers are deliberately different.
+func (p *blockPark) convertedRecordSize(ctx context.Context, hash chainhash.Hash) (int64, bool, error) {
+	if p == nil || p.store == nil {
+		return 0, false, nil
+	}
+
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	exists, err := p.store.Exists(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+	if err != nil || !exists {
+		return 0, false, err
+	}
+
+	raw, err := p.store.Get(readCtx, hash[:], fileformat.FileTypeBlock, parkOpts...)
+	if err != nil {
+		return 0, false, err
+	}
+
+	return int64(len(raw)), true, nil
 }
 
 // TakeChildren removes and returns every block parked directly behind parent,
@@ -991,6 +1110,37 @@ func (p *blockPark) RestoreAll(entries []parkedBlock) {
 // contended pool as the park write, so it can time out — and it carries the
 // configured deadline for exactly that reason. The entry is forgotten either
 // way and the restart sweep collects the file.
+//
+// This is the ONLY place that deletes a parked blob (applyParkDisposition's
+// own comment says as much of its callers), which is exactly why the
+// converted record's delete belongs here too: every path that retires an
+// entry — a successful commit, an eviction, an ordinary discard — already
+// funnels through this one function, so putting the record's cleanup here
+// once covers all of them, rather than only the discard path that happened to
+// call it explicitly.
+//
+// It always attempts both file types under the entry's hash, never only one.
+// A single DELIVERY never writes both — pipelineBlockSink either converts
+// (writing FileTypeBlock) or falls back to streamingBlockSink (writing
+// FileTypeMsgBlock), never both in the same call — but a single HASH can
+// still end up with both on disk at once: admitPipelineSink's
+// ErrDuplicateBlockInFlight branch exists precisely to let one peer's read
+// loop convert a hash while a second peer's concurrent delivery of the same
+// hash is declined admission and falls back to streamingBlockSink, which
+// writes the whole body under FileTypeMsgBlock right alongside the first
+// peer's FileTypeBlock record. Attempting both deletes here is what makes
+// that harmless: whichever of the two exists for this hash is removed, and
+// commitParkedBlock already prefers the record over the whole block when an
+// entry could in principle have adopted either (see its own converted field).
+// So the second delete is a no-op only for the ordinary, single-delivery
+// entry, not for every entry; it is not free lunch on every OTHER hash,
+// because the key is this entry's own block hash, which nothing else's data
+// lives under. This must never be extended to also
+// delete the SUBTREE files a converted record names: those are content-
+// addressed and shared, this function runs on the commit path as much as the
+// discard path, and a committed block's subtree files are its own data now —
+// deleting them here would destroy a block this node just accepted. Only
+// pipelineBlockDelete's own discard-only path may remove subtree files.
 func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	if p == nil {
 		return
@@ -1006,6 +1156,10 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 
 	if err := p.store.Del(delCtx, entry.hash[:], fileformat.FileTypeMsgBlock, parkOpts...); err != nil {
 		p.logger.Warnf("[blockPark][%s] failed to delete parked block, leaving it for the next restart sweep: %v", entry.hash, err)
+	}
+
+	if err := p.store.Del(delCtx, entry.hash[:], fileformat.FileTypeBlock, parkOpts...); err != nil {
+		p.logger.Warnf("[blockPark][%s] failed to delete converted record, leaving it for the next restart sweep: %v", entry.hash, err)
 	}
 }
 
@@ -1230,7 +1384,21 @@ func (p *blockPark) setGauges() {
 // It scans the filesystem because blob.Store has no way to list what it holds.
 // That is only sound because every park operation passes the same fixed option
 // set, so the layout is flat and known whatever the temp_store URL says.
-func (p *blockPark) Recover(ctx context.Context) {
+//
+// subtreeStore and quickValidationAllowed exist only for the converted-record
+// case: the record itself carries no delete-at-height and so never expires,
+// but the subtree files it names do (subtree_writer.go), so a record can
+// outlive the files it points at. Adopting one anyway would commit and then
+// fail inside validation, which lands on the same destructive path a bad
+// block does — see HandleConvertedBlock and applyParkDisposition. Before
+// adopting, this checks that the record's first subtree file still exists and
+// discards the record instead if it does not; the fix is cheap because one
+// check stands in for the whole list, and reachability is rated poor because
+// it needs both a long-parked conversion and the retention window to have
+// actually elapsed underneath it. Either argument may be nil (every
+// whole-block test in this file passes neither), in which case this check is
+// skipped entirely and a record is adopted exactly as it was before this task.
+func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickValidationAllowed func(height uint32) bool) {
 	if p == nil {
 		return
 	}
@@ -1291,6 +1459,140 @@ func (p *blockPark) Recover(ctx context.Context) {
 			p.removeParkFile(name)
 
 			discarded++
+
+			continue
+
+		case strings.HasSuffix(name, "."+string(fileformat.FileTypeBlock)):
+			// A converted record left by a previous run: a header, counts and
+			// subtree hashes, not a whole block. Its previous-block hash and size
+			// come from the record itself via ReadConverted, never from a wire
+			// block — there is no wire block on disk to read one from, and even
+			// where a whole-block sibling still existed this record is the thing
+			// that will actually be committed, so it is the thing recovery must
+			// describe.
+			//
+			// Losing one of these to a restart used to be silent: before this
+			// case existed, a name ending in ".block" fell through to "anything
+			// we do not recognise is left alone" and stayed on disk across every
+			// future restart, since nothing else in this loop, or anywhere else,
+			// would ever revisit it — a downloaded block, quietly never asked
+			// for again and never adopted either.
+			hash, err := chainhash.NewHashFromStr(strings.TrimSuffix(name, "."+string(fileformat.FileTypeBlock)))
+			if err != nil {
+				p.logger.Warnf("[blockPark] %s in the park directory is not named after a block hash, leaving it alone: %v", name, err)
+
+				skipped++
+
+				continue
+			}
+
+			if adopted >= maxParkedEntries {
+				// A previous run's park must never exceed what this run will hold.
+				p.Delete(ctx, parkedBlock{hash: *hash})
+
+				discarded++
+
+				continue
+			}
+
+			record, err := p.ReadConverted(ctx, *hash)
+			if err != nil {
+				// The same policy readParkedPrevBlock's caller applies below: a
+				// failure that says nothing about the record (busy store, budget
+				// ran out) keeps it for the next start; only a positively bad
+				// record — will not decode, or hashes to something else — is
+				// deleted. Discarding one of these costs only a re-conversion the
+				// next time this hash is needed, not correctness: the subtree
+				// files it names expire on their own delete-at-height
+				// (subtree_writer.go) regardless of whether this record survives
+				// to point at them again.
+				d := parkReadFailure(err)
+				if d.blob != parkBlobDrop {
+					p.logger.Warnf("[blockPark][%s] converted record could not be read (%s), leaving it on disk for the next start: %v", hash, d.reason, err)
+
+					skipped++
+
+					continue
+				}
+
+				p.logger.Warnf("[blockPark][%s] converted record is unusable, deleting it: %v", hash, err)
+				p.Delete(ctx, parkedBlock{hash: *hash})
+
+				discarded++
+
+				continue
+			}
+
+			// The record decoded and hashed correctly, but that says nothing
+			// about whether the subtree files it names are still there: the
+			// record has no delete-at-height of its own, while every subtree
+			// file does (subtree_writer.go), so a record can survive long
+			// enough to outlive them. Checking the first subtree stands in for
+			// the whole list — see Recover's own doc comment for why that is
+			// the cheap version of this fix rather than checking every one.
+			// Adopting a record whose files are gone would commit cleanly here
+			// and then fail inside validation, landing on the same destructive
+			// path a bad block does.
+			if subtreeStore != nil && quickValidationAllowed != nil && len(record.Subtrees) > 0 {
+				structureType := fileformat.FileTypeSubtreeToCheck
+				if quickValidationAllowed(record.Height) {
+					structureType = fileformat.FileTypeSubtree
+				}
+
+				firstSubtree := record.Subtrees[0]
+
+				exists, existsErr := subtreeStore.Exists(ctx, firstSubtree[:], structureType)
+				if existsErr != nil || !exists {
+					// Logged once, at WARN, so a soak can tell us whether this
+					// ever actually fires — see Recover's own doc comment on
+					// how narrow the window is: a long-parked conversion whose
+					// retention window has already elapsed underneath it.
+					p.logger.Warnf("[blockPark][%s] converted record's first subtree %s is gone (exists=%v, err=%v); discarding the record instead of adopting a commit that would fail inside validation",
+						hash, firstSubtree, exists, existsErr)
+					p.Delete(ctx, parkedBlock{hash: *hash})
+
+					discarded++
+
+					continue
+				}
+			}
+
+			info, err := dirEntry.Info()
+			if err != nil {
+				skipped++
+
+				continue
+			}
+
+			// The store's own 8-byte header is on disk alongside the record, the
+			// same as it is for a whole block below, so it is stripped the same
+			// way to leave the record's own byte count.
+			size := info.Size() - int64(fileformat.Header{}.Size())
+			if size < 0 {
+				size = 0
+			}
+
+			parkedAt := info.ModTime()
+			if parkedAt.IsZero() || parkedAt.After(time.Now()) {
+				parkedAt = time.Now()
+			}
+
+			// converted: true — this branch only ever runs for a name ending in
+			// the converted-record suffix, so commitParkedBlock and parkedRun
+			// must route it to ReadConverted/HandleConvertedBlock, not Read, the
+			// same as an entry adopted straight off the wire would be.
+			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, size: size, parkedAt: parkedAt, converted: true}
+
+			p.mu.Lock()
+			stored := entry
+			p.entries[entry.hash] = &stored
+			p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+			p.chargeLocked(entry.hash, size)
+			p.setGauges()
+			p.mu.Unlock()
+
+			adopted++
+			adoptedBytes += size
 
 			continue
 

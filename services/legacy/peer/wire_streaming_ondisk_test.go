@@ -109,18 +109,20 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 	payload, hash := serialisedBlock(t, 4)
 
 	var (
-		gotHash chainhash.Hash
-		gotBody []byte
-		gotN    int64
+		gotHash   chainhash.Hash
+		gotHeader *wire.BlockHeader
+		gotBody   []byte
+		gotN      int64
 	)
 
-	blockBodySink = func(h chainhash.Hash, r io.Reader, n int64) error {
+	blockBodySink = func(h chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 		gotHash = h
+		gotHeader = header
 		gotN = n
 		b, err := io.ReadAll(r)
 		gotBody = b
 
-		return err
+		return false, err
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -142,16 +144,20 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 
 	require.Equal(t, hash, gotHash, "the sink is keyed by the block hash")
 
-	// The sink gets the WHOLE block, header included, and this changed: it used
-	// to get only the bytes after the header. The park is where a streamed body
-	// lands, and it reads a body back with the same deserializer it uses for a
-	// block it wrote itself, which expects a complete serialized block. A
-	// header-less file could never have been read back at all, so the old
-	// contract could not have worked once anything was actually installed.
-	require.Equal(t, payload, gotBody,
-		"what is stored must be byte-for-byte a serialized block: header, transaction count, transactions")
+	// The sink is handed the header as structure, not as bytes, and this changed:
+	// it used to get a reader whose first bytes were the re-serialized header. A
+	// consumer that wants a byte-for-byte copy of the whole block, such as the
+	// park, must re-serialize the header itself and put it back in front of what
+	// the reader yields.
+	require.NotNil(t, gotHeader, "the sink must be handed the parsed header")
+	require.Equal(t, hash, gotHeader.BlockHash(), "and it must be the block's own header")
+
+	var headerBytes bytes.Buffer
+	require.NoError(t, gotHeader.Serialize(&headerBytes))
+	require.Equal(t, payload, append(headerBytes.Bytes(), gotBody...),
+		"the re-serialized header followed by what the sink read must reproduce the original payload byte-for-byte")
 	require.Equal(t, int64(len(payload)), gotN,
-		"the declared length must cover the header too, or a sink that trusts it writes a short file")
+		"the declared length must cover the header too, or a consumer that trusts it writes a short file")
 }
 
 // Below the threshold nothing changes: the block is decoded as it always was,
@@ -159,9 +165,9 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 func TestStreamingBlockHandlerStillDecodesASmallBlock(t *testing.T) {
 	payload, hash := serialisedBlock(t, 2)
 
-	blockBodySink = func(chainhash.Hash, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		t.Fatal("a small block must not reach the sink")
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -194,9 +200,9 @@ func TestStreamingBlockHandlerRefusesABadHeaderBeforeStoring(t *testing.T) {
 
 	called := false
 
-	blockBodySink = func(chainhash.Hash, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		called = true
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -238,9 +244,9 @@ func TestStreamingBlockHandlerRefusesAnEasyTargetBeforeStoring(t *testing.T) {
 
 	called := false
 
-	blockBodySink = func(chainhash.Hash, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		called = true
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -265,9 +271,9 @@ func TestStreamingBlockHandlerRefusesAnUnrequestedBlockBeforeStoring(t *testing.
 
 	called := false
 
-	blockBodySink = func(chainhash.Hash, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		called = true
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -304,9 +310,9 @@ func TestStreamingBlockHandlerFallsBackWithNoSink(t *testing.T) {
 func TestStreamingBlockHandlerNilGateFallsBackToDecodingEvenWithSinkInstalled(t *testing.T) {
 	payload, hash := serialisedBlock(t, 2)
 
-	blockBodySink = func(chainhash.Hash, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		t.Fatal("a nil gate must never let a block reach the sink")
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
@@ -337,17 +343,20 @@ func TestStreamingBlockHandlerDeletesATruncatedBodyAfterAWrite(t *testing.T) {
 	// errors.
 	declaredLength := uint64(len(payload)) + 32
 
-	blockBodySink = func(chainhash.Hash, io.Reader, int64) error {
-		return nil // a lenient sink: never notices it got fewer bytes than promised
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+		return false, nil // a lenient sink: never notices it got fewer bytes than promised
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
 	var deletedHash chainhash.Hash
 
+	var deletedConverted bool
+
 	deleteCalled := false
-	blockBodyDelete = func(h chainhash.Hash) error {
+	blockBodyDelete = func(h chainhash.Hash, converted bool) error {
 		deleteCalled = true
 		deletedHash = h
+		deletedConverted = converted
 
 		return nil
 	}
@@ -362,6 +371,7 @@ func TestStreamingBlockHandlerDeletesATruncatedBodyAfterAWrite(t *testing.T) {
 	require.Error(t, err, "a truncated body must be surfaced as an error")
 	require.True(t, deleteCalled, "a body written for a stream that ended short must be deleted")
 	require.Equal(t, hash, deletedHash, "the delete must be keyed by the same hash the sink was")
+	require.False(t, deletedConverted, "this sink reports converted=false, so the delete must be told the same — fix-round item 2's whole point is that this must never be re-derived by asking whether a converted record merely exists for the hash")
 }
 
 // The reviewer's missing test: a gate rejection must still drain the rest of
@@ -375,9 +385,9 @@ func TestStreamingBlockHandlerDrainsThePayloadAfterAGateRejection(t *testing.T) 
 	tail := []byte("MARKER-AFTER-PAYLOAD")
 	src := io.MultiReader(bytes.NewReader(payload), bytes.NewReader(tail))
 
-	blockBodySink = func(chainhash.Hash, io.Reader, int64) error {
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 		t.Fatal("a rejected block must never reach the sink")
-		return nil
+		return false, nil
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
