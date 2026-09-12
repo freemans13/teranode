@@ -1,0 +1,264 @@
+package netsync
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net/url"
+	"sync/atomic"
+	"testing"
+
+	"github.com/bsv-blockchain/go-chaincfg"
+	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/require"
+)
+
+// TestPipelineSink_WritesTheSubtreeFiles is the whole claim: a block arrives as
+// bytes on a reader and leaves as files in the store, without ever being a whole
+// object in memory.
+func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineManager(t, store, 8)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	// wireBlockWithTxs leaves PrevBlock at its zero value, since it builds a
+	// fixture with no real chain context. The sink resolves height by looking
+	// the parent up, so point it at the one header a fresh store already
+	// holds: its genesis. See pipelineHeaderFixture.
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+
+	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err)
+
+	hashes := sm.pipelineSubtreeHashesFor(*blk.Hash())
+	require.NotEmpty(t, hashes, "a 20-transaction block at 8 per subtree must produce subtrees")
+
+	for _, h := range hashes {
+		exists, err := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
+		require.NoError(t, err)
+		require.True(t, exists, "every subtree the sink reported must be in the store")
+	}
+}
+
+// TestPipelineSink_RejectsAWrongMerkleRoot is the integrity floor. The header is
+// the only thing binding a peer-supplied body to work somebody paid for, so a body
+// that does not match it must be refused.
+func TestPipelineSink_RejectsAWrongMerkleRoot(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineManager(t, store, 8)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+
+	bad := blk.MsgBlock().Header
+	bad.MerkleRoot[0] ^= 0xFF
+
+	err := sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), int64(len(body)))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "merkle root")
+}
+
+// TestPipelineSink_DeletesWhatItWroteOnAWrongMerkleRoot pins the cleanup. Nothing
+// reads these files until the block is handed over, so a failed block must leave
+// nothing behind.
+func TestPipelineSink_DeletesWhatItWroteOnAWrongMerkleRoot(t *testing.T) {
+	ctx := context.Background()
+	failStore := memory.New()
+	sm := newPipelineManager(t, failStore, 8)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+
+	bad := blk.MsgBlock().Header
+	bad.MerkleRoot[0] ^= 0xFF
+
+	_ = sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), int64(len(body)))
+
+	// The failed run reports no subtrees, so ask a good run which hashes the block
+	// produces and require every one of them to be absent from the failed store.
+	good := newPipelineManager(t, memory.New(), 8)
+	pipelineHeaderFixture(t, good, blk)
+	require.NoError(t, good.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body))))
+
+	produced := good.pipelineSubtreeHashesFor(*blk.Hash())
+	require.NotEmpty(t, produced, "sanity: the good run must produce subtrees, or this test asserts nothing")
+
+	for _, h := range produced {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+			exists, err := failStore.Exists(ctx, h[:], ft)
+			require.NoError(t, err)
+			require.False(t, exists, "a block that failed its merkle check must leave no %s behind", ft)
+		}
+	}
+}
+
+// TestPipelineSink_RejectsADuplicateTransaction pins the CVE-2012-2459 floor on
+// the receive path. The merkle root cannot catch it, because the duplicate is what
+// reproduces the root; and a checkpoint anchors the block hash, not the
+// peer-supplied body. See model/check_duplicate_txs.go:23.
+func TestPipelineSink_RejectsADuplicateTransaction(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineManager(t, store, 8)
+
+	blk := wireBlockWithTxs(t, 6, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyWithADuplicate(t, blk)
+
+	err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate")
+}
+
+// pipelineManagerStoreCounter gives each newPipelineManager call its own
+// sqlitememory database name, so one test's blockchain client cannot see
+// another's state.
+var pipelineManagerStoreCounter atomic.Int64
+
+// newPipelineManager builds a SyncManager wired for pipelineBlockSink: a real
+// settings/chainParams pair, the subtree store under test, and a real
+// sqlitememory-backed blockchain client (never a mock, per AGENTS.md) so the
+// sink's parent-height lookup runs against a real store rather than a narrowed
+// stand-in.
+//
+// The checkpoint is set high (1000) purely so a fixture block, whose resolved
+// height sits at 1 (one past the fresh store's genesis), reads as below
+// checkpoint: that is what makes the writer choose FileTypeSubtree over
+// FileTypeSubtreeToCheck, which the tests above assert on.
+func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManager {
+	t.Helper()
+
+	ctx := context.Background()
+
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = []chaincfg.Checkpoint{{Height: 1000}}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.ChainCfgParams = &params
+	tSettings.BlockAssembly.MaximumMerkleItemsPerSubtree = maxItems
+
+	dbName := fmt.Sprintf("pipeline_sink_%d", pipelineManagerStoreCounter.Add(1))
+
+	storeURL, err := url.Parse("sqlitememory:///" + dbName)
+	require.NoError(t, err)
+
+	bcStore, err := blockchainstore.NewStore(ulogger.TestLogger{}, storeURL, tSettings)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = bcStore.Close(ctx) })
+
+	bcClient, err := blockchain2.NewLocalClient(ulogger.TestLogger{}, tSettings, bcStore, nil, nil)
+	require.NoError(t, err)
+
+	return &SyncManager{
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &params,
+		ctx:              ctx,
+		subtreeStore:     store,
+		blockchainClient: bcClient,
+	}
+}
+
+// pipelineHeaderFixture points blk's header at a parent the manager's fresh
+// blockchain store actually holds, and sets the header's merkle root to the one
+// this block's own transactions produce.
+//
+// wireBlockWithTxs (task 2's fixture builder) leaves both fields at their zero
+// value, because it was written for prepareSubtrees comparisons that only ever
+// look at subtree root hashes, never the header. pipelineBlockSink uses
+// PrevBlock only to look up the parent's height — it never checks that the
+// parent relates to the block's body — so overwriting it with the store's
+// genesis hash is enough to resolve a height without seeding a whole parent
+// block.
+//
+// The root is computed with the same builder pipelineBlockSink itself drives,
+// over a throwaway store, at the same MaximumMerkleItemsPerSubtree the manager
+// under test uses. That makes this fixture self-consistent, which is all a
+// "good" run needs; it is not a second, independent check that the builder's
+// root is the canonical one — TestPipeline_ProducesTheSameFilesAsPrepareSubtrees
+// (block_stream_production_equivalence_test.go) already carries that claim
+// against prepareSubtrees/CheckMerkleRoot.
+//
+// Called before the first call to blk.Hash(), so the block's cached hash
+// reflects the header actually passed to the sink.
+func pipelineHeaderFixture(t *testing.T, sm *SyncManager, blk *bsvutil.Block) {
+	t.Helper()
+
+	blk.MsgBlock().Header.PrevBlock = *sm.chainParams.GenesisHash
+
+	txs := blk.Transactions()
+	coinbase, _ := btTxFromWireTx(t, txs[0])
+
+	discard := memory.New()
+	writer := newSubtreeWriter(sm.logger, sm.settings, discard, 1, true)
+
+	dedup := txmap.NewSplitSwissMapUint64(uint32(len(txs))) //nolint:gosec // test tx count is small
+
+	builder, err := newBlockStreamBuilder(len(txs), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(context.Background()), dedup)
+	require.NoError(t, err)
+
+	for i := 1; i < len(txs); i++ {
+		tx, hash := btTxFromWireTx(t, txs[i])
+		require.NoError(t, builder.AddTx(tx, hash))
+	}
+
+	root, _, err := builder.Finish()
+	require.NoError(t, err)
+
+	blk.MsgBlock().Header.MerkleRoot = *root
+}
+
+// blockBodyBytes serializes exactly what the wire layer hands the sink: the
+// transaction count varint followed by every transaction, in block order.
+// NOT the header — pipelineBlockSink receives that as parsed structure, not
+// bytes.
+func blockBodyBytes(t *testing.T, blk *bsvutil.Block) []byte {
+	t.Helper()
+
+	txs := blk.Transactions()
+
+	var buf bytes.Buffer
+	require.NoError(t, wire.WriteVarInt(&buf, wire.ProtocolVersion, uint64(len(txs))))
+
+	for _, tx := range txs {
+		require.NoError(t, tx.MsgTx().Serialize(&buf))
+	}
+
+	return buf.Bytes()
+}
+
+// blockBodyWithADuplicate is blockBodyBytes with one non-coinbase transaction
+// repeated in place of another, and the declared count left at the block's
+// real count — the CVE-2012-2459 shape.
+func blockBodyWithADuplicate(t *testing.T, blk *bsvutil.Block) []byte {
+	t.Helper()
+
+	txs := blk.Transactions()
+	require.Greater(t, len(txs), 2, "need a coinbase plus at least two non-coinbase transactions to duplicate one")
+
+	var buf bytes.Buffer
+	require.NoError(t, wire.WriteVarInt(&buf, wire.ProtocolVersion, uint64(len(txs))))
+
+	for i, tx := range txs {
+		toWrite := tx.MsgTx()
+		if i == len(txs)-1 {
+			toWrite = txs[1].MsgTx() // repeat an earlier non-coinbase transaction
+		}
+
+		require.NoError(t, toWrite.Serialize(&buf))
+	}
+
+	return buf.Bytes()
+}

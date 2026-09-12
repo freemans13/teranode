@@ -65,7 +65,14 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 		return
 	}
 
-	set(sm.streamingBlockSink, sm.streamingBlockGate, sm.streamingBlockDelete)
+	sink := sm.streamingBlockSink
+	if sm.settings.Legacy.PipelineReceive {
+		sink = sm.pipelineBlockSink
+	}
+
+	sm.logger.Infof("[legacy] streaming block path installed, pipeline=%v", sm.settings.Legacy.PipelineReceive)
+
+	set(sink, sm.streamingBlockGate, sm.streamingBlockDelete)
 }
 
 // streamingBlockGate answers whether a peer may write this block's body to our

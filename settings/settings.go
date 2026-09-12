@@ -721,6 +721,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ParkWorkers:              getInt("legacy_parkWorkers", 2, alternativeContext...),
 			PeerRegistryEnabled:      getBool("legacy_peerRegistryEnabled", true, alternativeContext...),
 			PeerRegistrySyncInterval: getDuration("legacy_peerRegistrySyncInterval", 10*time.Second, alternativeContext...),
+			PipelineReceive:          getBool("legacy_pipelineReceive", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
