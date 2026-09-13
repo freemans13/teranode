@@ -307,9 +307,16 @@ func TestTail_AnAbortedSuccessorGetsItsHeaderBack(t *testing.T) {
 
 	h.sm.fetchHeaderBlocks()
 
+	// Unwaited is fine for the parent: its own backoff entry filters it
+	// independently, so nothing is ever queued for it to race against. The
+	// child has no second filter of its own, only the cascade mark, so an
+	// instant check proves nothing against a real request that was queued
+	// and sent but has not yet crossed the pipe when the assertion runs -
+	// it must wait, the same way the sibling check in
+	// block_park_front_block_test.go does.
 	require.False(t, h.rec.askedForSince(before, parent),
 		"the failed parent must not be asked for again yet, still inside its backoff and its own recentlyFailedBlocks mark")
-	require.False(t, h.rec.askedForSince(before, child),
+	require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, time.Second),
 		"the aborted successor must not be asked for again yet either, while its own recentlyFailedBlocks mark stands")
 }
 

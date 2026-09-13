@@ -116,21 +116,29 @@ func (sm *SyncManager) wantedBlocks() []wantedBlock {
 // attempt that may yet succeed.
 //
 // The disk checks run next, ahead of the ledger, because a block already on
-// disk (or already proven to be on chain by some route other than legacy's
-// own commit path) should not spend a peer's budget nor be forgiven on a
-// peer's behalf: it is simply done. holdsBlock and the park's own index only
-// know about the filesystem; haveInventory is the fallback for the question
-// neither of them can answer, whether the chain already has this block by a
-// route that never touched this node's own commit path, and it is asked only
-// for what the disk checks left open, which is why it is safe to make a
-// blockchain round trip here.
+// disk should not spend a peer's budget nor be forgiven on a peer's behalf:
+// it is simply done. holdsBlock and the park's own index answer from the
+// filesystem alone.
 //
 // blockGivenUpOn is checked ahead of the transient-failure backoff, not
 // folded into the same map read: a block past its attempt ceiling must never
 // be requested again in this process, where a block merely inside its backoff
 // window is asked for again once that window passes, and conflating the two
 // would either request a given-up block early or never retry a merely
-// backed-off one.
+// backed-off one. Both are map reads, and both run ahead of the blockchain
+// round trip below for exactly that reason: the cheap checks come first, so
+// the round trip is only ever spent on a candidate none of them already
+// rejected.
+//
+// haveInventory is the fallback for the one question none of the checks
+// above can answer: whether the chain already has this block by some route
+// that never touched legacy's own commit path — the block persister, another
+// service entirely — since disk and the park's index know only about the
+// filesystem, and the counter wantedBlocks reads only ever advances from
+// legacy's own commits. Placed last among the per-candidate checks, after
+// the budget cap the caller already applied and after every cheaper check
+// here, so its one round trip is spent only on what nothing free could
+// already answer.
 //
 // Of what is left, the RequestedWithin test comes next, and that order is the
 // rule rather than an accident: a block inside its retry window has an owner
@@ -191,27 +199,6 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 			continue
 		}
 
-		// The blockchain fallback. Disk knows nothing about the chain, so a
-		// block that joined it through some route other than legacy's own
-		// commit path — the block persister, another service entirely — is
-		// invisible to both checks above, and the counter wantedBlocks reads
-		// only ever advances from legacy's own commits. haveInventory answers
-		// that question in one round trip, checking the park again first (a
-		// second, cheap check, not a second cost) and then the blockchain
-		// client. Guarded on blockchainClient itself: haveInventory dereferences
-		// it with no nil check of its own, and Legacy sits past the 4 KB guard
-		// page, where that would be a hardware fault rather than a recoverable
-		// panic, in the many tests that build a SyncManager as a struct literal
-		// with no client at all.
-		if sm.blockchainClient != nil {
-			hash := block.hash
-			if haveInv, err := sm.haveInventory(wire.NewInvVect(wire.InvTypeBlock, &hash)); err != nil {
-				sm.logger.Warnf("[assignWantedBlocks][%s] could not check whether the chain already has this block, asking for it: %v", hash, err)
-			} else if haveInv {
-				continue
-			}
-		}
-
 		// blockGivenUpOn: past its attempt ceiling, this block must not be
 		// requested again in this process at all, not merely throttled. This
 		// is the check handleBlockMsg's delivery-side blockGivenUpOn guards
@@ -219,6 +206,9 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 		// only thing stopping a re-request was ever the transient backoff
 		// below, which forgets the block once its own window passes and lets
 		// the whole attempt count restart from a peer that answers nothing new.
+		// Checked ahead of the blockchain round trip below: it is a map read,
+		// not a network call, so a block this cheap check would already
+		// reject is never charged the round trip's cost first.
 		if sm.blockGivenUpOn(block.hash) {
 			continue
 		}
@@ -229,9 +219,35 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 		// throttle that exists to stop a re-decorate storm never actually
 		// throttles anything: without this check the backoff map fills but
 		// nothing here ever reads it, and a block that cannot be stored yet is
-		// downloaded again on every pass instead of once per window.
+		// downloaded again on every pass instead of once per window. Also
+		// ahead of the round trip below for the same reason blockGivenUpOn is:
+		// it is the cheaper check, so it runs first.
 		if sm.blockFailureBackoff != nil {
 			if fs, backedOff := sm.blockFailureBackoff.Get(block.hash); backedOff && time.Now().Before(fs.nextRetry) {
+				continue
+			}
+		}
+
+		// The blockchain fallback. Disk knows nothing about the chain, so a
+		// block that joined it through some route other than legacy's own
+		// commit path — the block persister, another service entirely — is
+		// invisible to both disk checks above, and the counter wantedBlocks
+		// reads only ever advances from legacy's own commits. haveInventory
+		// answers that question in one round trip, checking the park again
+		// first (a second, cheap check, not a second cost) and then the
+		// blockchain client. Run last among the per-candidate checks, after
+		// every check that answers from memory alone, so the round trip is
+		// never spent on a block one of the cheap checks above was already
+		// going to skip. Guarded on blockchainClient itself: haveInventory
+		// dereferences it with no nil check of its own, and Legacy sits past
+		// the 4 KB guard page, where that would be a hardware fault rather
+		// than a recoverable panic, in the many tests that build a
+		// SyncManager as a struct literal with no client at all.
+		if sm.blockchainClient != nil {
+			hash := block.hash
+			if haveInv, err := sm.haveInventory(wire.NewInvVect(wire.InvTypeBlock, &hash)); err != nil {
+				sm.logger.Warnf("[assignWantedBlocks][%s] could not check whether the chain already has this block, asking for it: %v", hash, err)
+			} else if haveInv {
 				continue
 			}
 		}
