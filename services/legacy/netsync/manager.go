@@ -7005,6 +7005,42 @@ func (sm *SyncManager) ReleaseBlockPrefetchBytes(blockHash chainhash.Hash, weigh
 	sm.blockPrefetchReserved.Add(-weight)
 }
 
+// seedCommittedHeight records the chain's own tip as the best block processed,
+// once, at startup.
+//
+// Without it the counter reads zero until THIS process commits a block, because
+// noteCommittedHeight is its only other writer. On a node restarting mid-chain
+// that is not a small inaccuracy: the wanted range is derived from this counter,
+// so zero means "ask for the block above genesis", which no peer will usefully
+// answer and no header cache above the node's real tip can name. The node then
+// requests nothing, so nothing commits, so the counter stays zero.
+//
+// It reads the tip rather than taking it as an argument so the two callers that
+// want it (New, and any future restart path) cannot disagree about where the
+// number comes from.
+func (sm *SyncManager) seedCommittedHeight(ctx context.Context) error {
+	_, meta, err := sm.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return err
+	}
+
+	if meta == nil {
+		return nil
+	}
+
+	height, err := safeconversion.Uint32ToInt32(meta.Height)
+	if err != nil {
+		return err
+	}
+
+	// noteCommittedHeight rather than a bare Store, so the "never moves
+	// backwards" rule has no exception and a seed can never lower a counter a
+	// concurrent commit has already raised.
+	sm.noteCommittedHeight(height)
+
+	return nil
+}
+
 // noteCommittedHeight records the height of a block that has just joined the
 // chain, and never moves backwards. A reorg lowers the tip, and a floor that
 // followed it down would start keeping blocks it had already been right to
@@ -7615,6 +7651,17 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
+
+	// Seed the best block processed from the chain, before anything reads it.
+	// The height is already in hand here, so this costs no extra round trip; it
+	// is a separate function only so the rule about where the number comes from
+	// lives in one place. See seedCommittedHeight for what a zero counter costs.
+	seedHeight, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
+	if err != nil {
+		return nil, err
+	}
+
+	sm.noteCommittedHeight(seedHeight)
 
 	// Build the per-block backoff map only after the last fallible step above.
 	// newBlockFailureBackoffMap starts a background eviction goroutine that is

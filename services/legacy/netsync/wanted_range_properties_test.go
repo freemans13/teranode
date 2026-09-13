@@ -185,16 +185,15 @@ func TestWantedRange_TheDownloaderCannotOutrunTheCommitter(t *testing.T) {
 }
 
 // TestWantedRange_ARestartingNodeRequestsOnItsFirstPass pins the case the old
-// design could not serve. lastCommittedHeight is written only when a block
-// commits and is never seeded, so it reads zero on a node restarting mid-chain.
+// design could not serve. Before this, lastCommittedHeight was written only when
+// a block committed and was never seeded, so it read zero on a node restarting
+// mid-chain, and the wanted range derived from zero names heights no restarted
+// node's header cache holds.
 //
-// This is not a contrived state. It is every restart: noteCommittedHeight is the
-// only writer of that counter, so a node that has synced to height 800,000,
-// stopped and started again reads zero from it until this PROCESS commits a
-// block — and committing a block is what the download it cannot start would
-// deliver.
+// The counter is set here the way New sets it, rather than asserted to be zero:
+// zero is the bug, not the state under test.
 func TestWantedRange_ARestartingNodeRequestsOnItsFirstPass(t *testing.T) {
-	// A node that is a long way up the chain. Headers for the run it is about to
+	// A node a long way up the chain, with headers for the run it is about to
 	// fetch, at the heights they really have.
 	const restartHeight = int32(800_000)
 
@@ -202,17 +201,42 @@ func TestWantedRange_ARestartingNodeRequestsOnItsFirstPass(t *testing.T) {
 	sm.settings.Legacy.WantedRangeDownload = true
 	sm.settings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
-	_, rec := schedulerPeer(t, sm, 1, restartHeight+1000)
+	// What New now does at startup: read the chain's tip and record it. Without
+	// this line the counter is zero and the pass asks for height 1.
+	sm.lastCommittedHeight.Store(restartHeight)
 
-	// Deliberately not seeded. This is the state the process is in, not a state
-	// the test has arranged: nothing has committed yet in this process.
-	require.Zero(t, sm.lastCommittedHeight.Load(),
-		"the counter must be at its startup value for this test to be about a restart")
+	_, rec := schedulerPeer(t, sm, 1, restartHeight+1000)
 
 	sm.fetchHeaderBlocks()
 
 	require.True(t, WaitUntil(func() bool { return rec.count() > 0 }, 5*time.Second),
-		"a node restarting mid-chain must ask for blocks on its first pass, but the wanted range is derived from a best block of zero and the header list cannot name height 1")
+		"a node restarting mid-chain must ask for blocks on its first pass")
+}
+
+// TestNew_SeedsTheCommittedHeightFromTheChain is the other half, and it is the
+// one that actually pins the production change: the counter must be non-zero
+// before any block has committed in THIS process.
+func TestNew_SeedsTheCommittedHeightFromTheChain(t *testing.T) {
+	const chainHeight = uint32(800_000)
+
+	running := blockchain2.FSMStateRUNNING
+	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+
+	client := &blockchain2.Mock{}
+	client.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	client.Mock.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: chainHeight}, nil)
+
+	sm := newRaceManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = client
+
+	// The production seeding, isolated so this test does not need the whole of
+	// New's twelve dependencies.
+	require.NoError(t, sm.seedCommittedHeight(context.Background()))
+
+	require.Equal(t, int32(chainHeight), sm.lastCommittedHeight.Load(),
+		"a node that starts with a chain at 800,000 must not believe its best block is 0")
 }
 
 // newParkPropertyManager builds a manager the wanted-range pass and the block
