@@ -3,6 +3,7 @@ package netsync
 import (
 	"time"
 
+	"github.com/bsv-blockchain/go-wire"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
@@ -25,16 +26,26 @@ import (
 // fetchHeaderBlocks is now just a dispatch to this: the cursor walk it used to
 // choose between itself and this pass is gone, so this is the only way blocks
 // are chosen.
+//
+// The assigner is built first, and the wanted range is capped to what it can
+// still place, before unownedBlocks spends anything on a candidate: a blob-store
+// existence check, a blockchain round trip, two map lookups and a ledger write.
+// The old walk took the assigner first for the same reason and returned on a
+// nil one; asking about headers there is no budget to hand out was exactly the
+// cost review found this pass reintroduced when that order was dropped.
 func (sm *SyncManager) assignWantedBlocks() {
-	wanted := sm.wantedBlocks()
-
-	candidates := sm.unownedBlocks(wanted)
-	if len(candidates) == 0 {
+	assigner := sm.newDownloadAssigner()
+	if assigner == nil {
 		return
 	}
 
-	assigner := sm.newDownloadAssigner()
-	if assigner == nil {
+	wanted := sm.wantedBlocks()
+	if len(wanted) > assigner.remaining {
+		wanted = wanted[:assigner.remaining]
+	}
+
+	candidates := sm.unownedBlocks(wanted)
+	if len(candidates) == 0 {
 		return
 	}
 
@@ -82,16 +93,51 @@ func (sm *SyncManager) wantedBlocks() []wantedBlock {
 }
 
 // unownedBlocks keeps the wanted blocks this node neither already holds nor
-// currently owes, and lets a quiet owner off the hook on the way past.
+// currently owes, is not given up on, and is not stalled behind a recent
+// failure, and lets a quiet owner off the hook on the way past.
 //
-// The disk check runs first, ahead of the ledger, because a block already on
-// disk should not spend a peer's budget nor be forgiven on a peer's behalf: it
-// is simply done. Of what is left, the RequestedWithin test comes next, and
-// that order is the rule rather than an accident: a block inside its retry
-// window has an owner who may still deliver, and asking for it again spends a
-// peer slot that a block nobody owes could have used. Forgiving it as well
-// would be worse still, because forgiveness frees the owner's budget and the
-// pass would then hand the same peer the same block it is already carrying.
+// wanted must already be capped to the assigner's remaining budget by the
+// caller: every check below costs something, several of them a disk read or a
+// blockchain round trip, and none of it is worth spending on a candidate this
+// pass could not place anyway.
+//
+// The recently-failed check runs first, and it only skips the one entry it
+// names, not everything above it: a failed parent's own children earn no mark
+// of their own until each has actually been downloaded once and refused on
+// arrival (handleBlockMsgHead's delivery-side check, keyed on the arriving
+// block's own parent hash), so the first pass after a failure still names
+// them. What this check bounds is every pass after that one: once a hash is
+// marked, whether the parent itself or a child the cascade has since caught,
+// it is not requested again for the life of the mark, rather than being
+// downloaded and refused afresh every single pass for as long as the parent
+// stays failed. Honouring dispatcher.inFlight is what stops a parent that is
+// being retried right now from being misread as a dead one: it was
+// re-admitted, so its children must not be held back on the strength of an
+// attempt that may yet succeed.
+//
+// The disk checks run next, ahead of the ledger, because a block already on
+// disk (or already proven to be on chain by some route other than legacy's
+// own commit path) should not spend a peer's budget nor be forgiven on a
+// peer's behalf: it is simply done. holdsBlock and the park's own index only
+// know about the filesystem; haveInventory is the fallback for the question
+// neither of them can answer, whether the chain already has this block by a
+// route that never touched this node's own commit path, and it is asked only
+// for what the disk checks left open, which is why it is safe to make a
+// blockchain round trip here.
+//
+// blockGivenUpOn is checked ahead of the transient-failure backoff, not
+// folded into the same map read: a block past its attempt ceiling must never
+// be requested again in this process, where a block merely inside its backoff
+// window is asked for again once that window passes, and conflating the two
+// would either request a given-up block early or never retry a merely
+// backed-off one.
+//
+// Of what is left, the RequestedWithin test comes next, and that order is the
+// rule rather than an accident: a block inside its retry window has an owner
+// who may still deliver, and asking for it again spends a peer slot that a
+// block nobody owes could have used. Forgiving it as well would be worse
+// still, because forgiveness frees the owner's budget and the pass would then
+// hand the same peer the same block it is already carrying.
 //
 // Forgiveness runs before the budgets are read, not after. A peer that has gone
 // quiet holding a full slice keeps every one of those slots against its
@@ -108,12 +154,27 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 	candidates := make([]wantedBlock, 0, len(wanted))
 
 	for _, block := range wanted {
+		// #1333: a block that recently failed to store or validate, judged or
+		// merely unlucky, is not requested again while the mark stands. This is
+		// what actually bounds the cascade review measured: the descendants of
+		// a failed parent are not individually marked until each has been
+		// downloaded once and refused on arrival by the delivery-side check in
+		// handleBlockMsgHead, so the first pass after a failure still names all
+		// of them — but every pass after that skips whichever ones the cascade
+		// has already caught, rather than re-downloading the same read-ahead
+		// depth of blocks for as long as the parent stays written off.
+		// dispatcher.inFlight is honoured for the same reason the delivery-side
+		// check honours it: a parent being retried right now was re-admitted,
+		// so it is not a failed parent and must not hold its children back.
+		if sm.recentlyFailedBlocks != nil && !sm.dispatcher.inFlight(block.hash) {
+			if _, failed := sm.recentlyFailedBlocks.Get(block.hash); failed {
+				continue
+			}
+		}
+
 		// A block already on disk is not wanted, whatever any index says. This
 		// is what makes a restart free: the files survive it, so a node comes
 		// back and asks only for what it genuinely lacks.
-		//
-		// Checked before the ledger, because a block we hold should not spend a
-		// peer's budget nor be forgiven on a peer's behalf.
 		if sm.holdsBlock(sm.ctx, block.hash) {
 			continue
 		}
@@ -127,6 +188,38 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 		// it is that same instant holding, spending a peer's slot on a block
 		// already safely on its way to disk.
 		if sm.blockPark.Has(block.hash) {
+			continue
+		}
+
+		// The blockchain fallback. Disk knows nothing about the chain, so a
+		// block that joined it through some route other than legacy's own
+		// commit path — the block persister, another service entirely — is
+		// invisible to both checks above, and the counter wantedBlocks reads
+		// only ever advances from legacy's own commits. haveInventory answers
+		// that question in one round trip, checking the park again first (a
+		// second, cheap check, not a second cost) and then the blockchain
+		// client. Guarded on blockchainClient itself: haveInventory dereferences
+		// it with no nil check of its own, and Legacy sits past the 4 KB guard
+		// page, where that would be a hardware fault rather than a recoverable
+		// panic, in the many tests that build a SyncManager as a struct literal
+		// with no client at all.
+		if sm.blockchainClient != nil {
+			hash := block.hash
+			if haveInv, err := sm.haveInventory(wire.NewInvVect(wire.InvTypeBlock, &hash)); err != nil {
+				sm.logger.Warnf("[assignWantedBlocks][%s] could not check whether the chain already has this block, asking for it: %v", hash, err)
+			} else if haveInv {
+				continue
+			}
+		}
+
+		// blockGivenUpOn: past its attempt ceiling, this block must not be
+		// requested again in this process at all, not merely throttled. This
+		// is the check handleBlockMsg's delivery-side blockGivenUpOn guards
+		// against ever being reached in the first place — without it here, the
+		// only thing stopping a re-request was ever the transient backoff
+		// below, which forgets the block once its own window passes and lets
+		// the whole attempt count restart from a peer that answers nothing new.
+		if sm.blockGivenUpOn(block.hash) {
 			continue
 		}
 
@@ -177,7 +270,7 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 // On a node with one peer that means the block is not re-asked at all, which is
 // the right answer rather than a gap: there is nobody to help, so the only thing
 // a second getdata could achieve is the disconnect above. Recovery is the peer's
-// own stall detection, the frontier race, and the ledger's expiry.
+// own stall detection and the ledger's expiry.
 func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wantedBlock) {
 	for _, block := range candidates {
 		target, ok := assigner.takeAvoiding(block.height, func(p *peerpkg.Peer) bool {

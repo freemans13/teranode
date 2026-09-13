@@ -209,10 +209,12 @@ func TestTail_ACommittedBlockDrainsWhatWasParkedBehindIt(t *testing.T) {
 
 // TestTail_AnAbortedSuccessorGetsItsHeaderBack covers the one place this rework
 // departs from the design note. An aborted successor — a block whose in-flight
-// parent failed — earns no backoff, but its header did leave the front of the
-// list when it arrived, because its parent's header was already gone. Without a
-// rewind the walk would run from the retried parent straight past it to its
-// children, and every one of those would park behind a block nothing asks for.
+// parent failed — earns no backoff of its own; the predecessor's own backoff
+// throttles the whole run. It still carries the same recentlyFailedBlocks mark
+// every tail failure leaves, aborted or not, because that mark is what lets a
+// grandchild's own cascade check find it later. So it is not immediately
+// re-askable either, not from a throttle of its own, but from the mark it
+// shares with any other failed block.
 func TestTail_AnAbortedSuccessorGetsItsHeaderBack(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	bd := h.withDispatcher(t)
@@ -286,18 +288,29 @@ func TestTail_AnAbortedSuccessorGetsItsHeaderBack(t *testing.T) {
 	_, childBackoff := h.sm.blockFailureBackoff.Get(child)
 	require.False(t, childBackoff, "an aborted successor never ran a failing attempt and earns no backoff")
 
-	// Neither block was put back anywhere — there is nowhere to put a block
-	// back to any more. Both are simply still in the wanted range and unowned,
-	// so the next pass finds them on its own: the child immediately, since it
-	// has no backoff of its own, and the parent once its backoff clears.
+	// handleBlockMsgTail's recentlyFailedBlocks.Set runs for both, unconditional
+	// on d.aborted: the child's own header could reach a grandchild one day,
+	// and that grandchild's cascade check needs the child's mark to be there
+	// regardless of whether the child ran a failing attempt of its own. So
+	// unownedBlocks, which now honours that same map, holds the child back
+	// too, not because it is throttled the way the parent is, but because it
+	// carries the same cascade mark every tail failure leaves. The bound is
+	// the map's own: whichever of the two clears first, a later success or the
+	// ten-minute expiry, is re-askable again from that point.
+	_, parentFailed := h.sm.recentlyFailedBlocks.Get(parent)
+	require.True(t, parentFailed)
+
+	_, childFailed := h.sm.recentlyFailedBlocks.Get(child)
+	require.True(t, childFailed, "the child carries the cascade mark so a grandchild could be short-circuited by it, even though it earned no backoff of its own")
+
 	before := h.rec.getDataCount()
 
 	h.sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
-		"the aborted successor must be asked for again, or the walk skips it for good")
 	require.False(t, h.rec.askedForSince(before, parent),
-		"the failed parent must not be asked for again yet, still inside its backoff")
+		"the failed parent must not be asked for again yet, still inside its backoff and its own recentlyFailedBlocks mark")
+	require.False(t, h.rec.askedForSince(before, child),
+		"the aborted successor must not be asked for again yet either, while its own recentlyFailedBlocks mark stands")
 }
 
 // TestSweep_PostsCommitsToTheConsumerInsteadOfCommitting pins the sweep's one

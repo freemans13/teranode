@@ -321,10 +321,13 @@ func TestSyncManager_AParkedBlockThatWillNotCommitIsGivenUpAndRejected(t *testin
 					"while catching blocks no reject is sent, whether the block is committed from the wire or from the park")
 			}
 
+			_, failed := h.sm.recentlyFailedBlocks.Get(child)
+			require.True(t, failed, "a block written off must be remembered so its descendants are short-circuited")
+
 			h.sm.fetchHeaderBlocks()
 
-			require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
-				"a block given up on must go back into the download walk")
+			require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, time.Second),
+				"a block written off as invalid must not be asked for again while recentlyFailedBlocks still names it")
 		})
 	}
 }

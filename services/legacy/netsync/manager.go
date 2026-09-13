@@ -3231,15 +3231,16 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 				sps.updateLastBlockTime()
 			}
 
-			// No rewind here, and it is worth saying why rather than leaving the
-			// omission to be found again. This block's header is only taken off
-			// the front if this block IS the front, which needs its parent's
-			// header to be gone already. Every path that gives a parent up puts
-			// its header straight back (dropBlockFromWalk), judged or merely
-			// unlucky, so this block is never the front and never leaves the
-			// list. The walk reaches it in order once the parent clears, and
-			// until then the parent's own backoff holds the walk on the parent
-			// rather than letting it run on into descendants like this one.
+			// Nothing to put back, and it is worth saying why rather than
+			// leaving the omission to be found again. unownedBlocks makes the
+			// same check before this block is ever requested a second time,
+			// but it only skips the one entry a hash names, not everything
+			// above it: this block is marked here, on delivery, and is what
+			// keeps unownedBlocks from handing it out again on the next pass,
+			// not a walk stopping short the way the old cursor walk once did.
+			// This delivery-side check is what catches a copy of this
+			// descendant already in flight when its parent failed, which the
+			// request-side one has no way to see.
 			sm.requestMissingBlocks(peer, bmsg.blockHash)
 
 			return nil, true, nil

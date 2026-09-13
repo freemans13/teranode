@@ -1,11 +1,16 @@
 package netsync
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -750,4 +755,103 @@ func TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest(t *testing.T) {
 		"the four reasserts are the whole of this pass's budget")
 	require.False(t, WaitUntil(func() bool { return rec.count() > 0 }, time.Second),
 		"the peer already holds all four requests, so nothing new may go out on the wire")
+}
+
+// blockHeaderLookups counts how many times a pass asked the blockchain service
+// whether we already hold a block. This is the haveInventory fallback's own
+// cost, and only that: holdsBlock and blockPark.Has answer from local state
+// and never touch this mock.
+func blockHeaderLookups(t *testing.T, sm *SyncManager) int {
+	t.Helper()
+
+	client, ok := sm.blockchainClient.(*blockchain2.Mock)
+	require.True(t, ok)
+
+	n := 0
+
+	for _, call := range client.Calls {
+		if call.Method == "GetBlockHeader" {
+			n++
+		}
+	}
+
+	return n
+}
+
+// TestScheduler_DoesNotAskTheBlockchainAboutBlocksItCannotHandOut bounds the
+// cost of a pass. assignWantedBlocks caps the wanted range to the assigner's
+// remaining budget before unownedBlocks ever runs, so a candidate this pass
+// has no room to place is never probed at all: not on disk, and not with the
+// blockchain round trip haveInventory falls back to. With one peer able to
+// take a bounded budget and sixty headers wanted, asking about all sixty to
+// place that budget's worth would be dozens of round trips spent on headers
+// that could not be handed to anybody, and this runs on every arriving block.
+func TestScheduler_DoesNotAskTheBlockchainAboutBlocksItCannotHandOut(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xde}
+	msg, _ := linkedHeaders(anchor, 60, &nonce)
+
+	sm := newHeaderLockManager(t, nil, nil)
+
+	syncPeer, syncRec := schedulerPeer(t, sm, 113, 1000)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	before := blockHeaderLookups(t, sm)
+
+	sm.fetchHeaderBlocks()
+
+	budget := schedulerPeerBudget(sm)
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() == budget }, 5*time.Second),
+		"the pass should have handed out one peer's budget")
+	require.Equal(t, budget, blockHeaderLookups(t, sm)-before,
+		"a pass must not ask the blockchain about headers it has no budget to hand out")
+}
+
+// TestScheduler_DoesNotAskAgainForABlockTheChainAlreadyHasByAnotherRoute is the
+// blockchain fallback holdsBlock and blockPark.Has cannot provide on their own:
+// neither knows anything about the chain, only the filesystem, so a block that
+// joined the chain through some route other than legacy's own commit path — the
+// block persister, another service entirely — is invisible to both, and the
+// counter wantedBlocks reads only ever advances from legacy's own commits.
+// Without haveInventory's blockchain round trip, such a block is downloaded
+// again on every pass for as long as the gap lasts.
+func TestScheduler_DoesNotAskAgainForABlockTheChainAlreadyHasByAnotherRoute(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xf9}
+	msg, hashes := linkedHeaders(anchor, 3, &nonce)
+
+	running := blockchain2.FSMStateRUNNING
+	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+
+	client := &blockchain2.Mock{}
+	client.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	client.On("GetBestBlockHeader", mock.Anything).Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)
+
+	// The first header, and only it, joined the chain by some other route: the
+	// blockchain service already has it, and it is valid.
+	client.On("GetBlockHeader", mock.Anything, &hashes[0]).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 11, Invalid: false}, nil)
+	client.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewNotFoundError("not found"))
+
+	sm := schedulerManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = client
+
+	syncPeer, rec := schedulerPeer(t, sm, 133, 1000)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return rec.count() == len(hashes)-1 }, 5*time.Second),
+		"the rest of the run must still be asked for")
+	require.NotContains(t, rec.all(), hashes[0],
+		"a block the chain already has by another route must not be requested again")
 }

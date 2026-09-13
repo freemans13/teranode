@@ -185,5 +185,12 @@ func TestSyncManager_AParkedFrontBlockThatFailsValidationIsGivenUpAndRejected(t 
 	_, failed := h.sm.recentlyFailedBlocks.Get(front)
 	require.True(t, failed, "a block written off must be remembered so its descendants are short-circuited")
 
-	h.requireBackInTheWalk(t, front, getDataBefore)
+	// Not requireBackInTheWalk here: that helper is for a block given up on
+	// for a reason that says nothing about the block itself. This one was
+	// judged invalid, so unownedBlocks must honour the very mark just
+	// asserted above and not ask for it again while it stands.
+	h.sm.fetchHeaderBlocks()
+
+	require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(getDataBefore, front) }, time.Second),
+		"a block written off as invalid must not be asked for again while recentlyFailedBlocks still names it")
 }
