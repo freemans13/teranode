@@ -3428,29 +3428,24 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		catchingBlocks = true
 	}
 
-	// If we didn't ask for this block then the peer is misbehaving.
+	// If we didn't ask for this block then the peer may be misbehaving, or may
+	// simply be answering a question we have stopped asking.
 	if !sm.blockDownloads.HasOwner(peer, bmsg.blockHash) {
-		// The regression test intentionally sends some blocks twice
-		// to test duplicate block insertion fails.  Don't disconnect
-		// the peer or ignore the block when we're in regression test
-		// mode, in this case, so the chain code is actually fed the
-		// duplicate blocks.
-		if sm.chainParams != &chaincfg.RegressionNetParams {
-			// Unless this is a peer we deliberately asked for a second copy of a
-			// block that has since arrived. Then it is answering our own
-			// question, just too late to be useful, and disconnecting it would
-			// make the stall recovery cost more than the stall.
-			if sm.BlockRacedTo(peer, &bmsg.blockHash) {
-				sm.logger.Debugf("[handleBlockMsg][%s] discarding late copy from %s, another peer already delivered it", bmsg.blockHash, peer)
+		if sm.BlockRacedTo(peer, &bmsg.blockHash) {
+			sm.logger.Debugf("[handleBlockMsg][%s] discarding late copy from %s, another peer already delivered it", bmsg.blockHash, peer)
 
-				return nil, true, errors.NewServiceError("[handleBlockMsg] late copy of block %v from %s", bmsg.blockHash, peer)
-			}
+			return nil, true, errors.NewServiceError("[handleBlockMsg] late copy of block %v from %s", bmsg.blockHash, peer)
+		}
 
+		if sm.punishUnrequestedBlock(catchingBlocks) {
 			reason := fmt.Sprintf("Got unrequested block %v", bmsg.blockHash)
 			peer.DisconnectWithWarning(reason)
 
 			return nil, true, errors.NewServiceError("Got unrequested block %v", bmsg.blockHash)
 		}
+
+		// Catching blocks: the block is free. Fall through and process it.
+		sm.logger.Debugf("[handleBlockMsg][%s] accepting an unrequested block from %s while catching blocks", bmsg.blockHash, peer)
 	}
 
 	// When in headers-first mode, if the block matches the hash of the
@@ -5817,6 +5812,35 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	}
 
 	sm.logger.Infof("[fillHeaderCache] cached %d headers from %s, heights %d to %d", len(msg.Headers), peer, best+1, best+int32(len(msg.Headers))) //nolint:gosec // bounded by the wire limit of 2000
+}
+
+// punishUnrequestedBlock reports whether a block nobody asked for should cost
+// its sender the connection.
+//
+// It should not, while the node is catching blocks. SV Node never punishes an
+// unrequested block at all: its own equivalent check only decides whether to
+// force processing, and the block is processed either way. Below a checkpoint
+// the block has already passed proof of work, its hash is the hash of a header
+// we can check, and the chain rejects it if it is wrong, so the disconnect
+// buys nothing validation is not already buying, and costs a supplier during
+// the one phase where suppliers are scarce.
+//
+// It is also the reason the download ledger is as complicated as it is. Because
+// a late or surprise copy is punished, an assignment has to be recorded before
+// the request goes out, which means a peer that has gone quiet cannot simply
+// have its assignment revoked, revoking would make its in-flight copy look
+// unrequested. Hence a forgiven flag that keeps permission while dropping
+// obligation, a separate retry window, and a re-assert operation. Remove the
+// punishment and all three become deletable.
+//
+// At the tip the flood defence still applies, and on regtest nothing is ever
+// punished because the regression harness feeds unrequested blocks on purpose.
+func (sm *SyncManager) punishUnrequestedBlock(catchingBlocks bool) bool {
+	if sm.chainParams == &chaincfg.RegressionNetParams {
+		return false
+	}
+
+	return !catchingBlocks
 }
 
 // haveInventory returns whether the inventory represented by the passed
