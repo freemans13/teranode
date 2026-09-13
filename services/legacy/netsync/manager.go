@@ -2668,6 +2668,46 @@ func (sm *SyncManager) recordBlockFailureBackoff(blockHash chainhash.Hash) {
 	})
 }
 
+// blockGivenUpOn reports whether a block has failed so many times in a row that
+// asking for it again is pointless.
+//
+// Without this the retry is unbounded. recordBlockFailureBackoff grows the
+// attempt count without limit and caps only the WAIT, so a block that can never
+// be accepted is downloaded again every BlockFailureBackoffMaxDuration for the
+// life of the process, which at the 150 second default is roughly six hundred
+// pointless downloads a day, each one a full block off the wire.
+//
+// Today that loop terminates only by accident: the block-validation service
+// writes a durable invalid row and the next attempt short-circuits on a lookup
+// that reads the block back as present. The newer validation route deliberately
+// writes no such row, so turning it on makes the loop genuinely unbounded. This
+// is the bound that does not depend on that accident.
+//
+// Nothing durable is written here, and that is deliberate rather than a
+// shortcut. A durable mark keyed on the block hash is a poisoning surface: a
+// block's hash commits only to its 80 byte header, so a peer can replay an
+// honest header with a doctored body at no cost, and a durable mark on that hash
+// would condemn the real block permanently. Losing the count on a restart is
+// correct, because a restart is the most likely thing to have cleared the local
+// fault that caused the rejection.
+func (sm *SyncManager) blockGivenUpOn(hash chainhash.Hash) bool {
+	if sm.blockFailureBackoff == nil || sm.settings == nil {
+		return false
+	}
+
+	ceiling := sm.settings.Legacy.BlockFailureAttemptCeiling
+	if ceiling <= 0 {
+		return false
+	}
+
+	fs, ok := sm.blockFailureBackoff.Get(hash)
+	if !ok {
+		return false
+	}
+
+	return fs.attempts >= ceiling
+}
+
 // peerStateResolvingPrimary returns the sync state for peer, resolving a stream
 // sub-peer (e.g. a BlockPriority DATA1 stream, not itself registered in
 // peerStates) to its association's primary peer. It returns the resolved peer
@@ -3468,6 +3508,12 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 	// into the moving average and biasing calculateMaxInFlightBlocks() (only
 	// actually-processed blocks should feed the tracker). Nil-guarded: tests build
 	// SyncManager as a struct literal that bypasses New().
+	if sm.blockGivenUpOn(bmsg.blockHash) {
+		sm.logger.Errorf("[handleBlockMsg][%s] given up on after %d consecutive failures; it will not be requested again in this process. Restarting clears this deliberately, because a restart is the most likely thing to have fixed the local fault", bmsg.blockHash, sm.settings.Legacy.BlockFailureAttemptCeiling)
+
+		return nil, true, errors.NewServiceUnavailableError("[handleBlockMsg][%s] block given up on after %d failures", bmsg.blockHash, sm.settings.Legacy.BlockFailureAttemptCeiling)
+	}
+
 	if sm.blockFailureBackoff != nil {
 		if fs, ok := sm.blockFailureBackoff.Get(bmsg.blockHash); ok && time.Now().Before(fs.nextRetry) {
 			sm.logger.Warnf("[handleBlockMsg][%s] in backoff after %d transient failure(s), skipping until %s", bmsg.blockHash, fs.attempts, fs.nextRetry)
@@ -5563,6 +5609,12 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 		// on it, and the next round picks it up once the backoff has expired.
 		// The cap on that backoff is deliberately below the sync-peer stall
 		// window, so the wait always ends before the peer would be rotated.
+		if !alreadyHave[i] && sm.blockGivenUpOn(hashes[i]) {
+			sm.logger.Errorf("[fetchHeaderBlocks] block %s has been given up on; the walk stops here rather than asking for it again", hashes[i])
+
+			return requested, false
+		}
+
 		if !alreadyHave[i] && sm.blockFailureBackoff != nil {
 			if fs, backedOff := sm.blockFailureBackoff.Get(hashes[i]); backedOff && time.Now().Before(fs.nextRetry) {
 				sm.logger.Debugf("[fetchHeaderBlocks] block %s is still inside its transient-failure backoff, holding the walk here", hashes[i])
