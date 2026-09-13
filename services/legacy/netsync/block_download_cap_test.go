@@ -182,7 +182,7 @@ func TestFetchHeaderBlocks_NeverAsksForABlockTheLedgerWillNotTrack(t *testing.T)
 	var nonce uint32
 
 	headers, hashes := linkedHeaders(anchor, 4, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: headers, peer: syncPeer})
+	spliceHeadersForTest(t, sm, headers.Headers)
 
 	// Somebody else's announcements have taken every slot the ledger has.
 	flooder, _, _ := connectRacePeer(t, 63, 1000)

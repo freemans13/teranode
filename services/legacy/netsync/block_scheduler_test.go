@@ -188,17 +188,18 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 	shortPeer, shortRec := schedulerPeer(t, sm, 89, 5)
 	sm.storeSyncPeer(shortPeer, &syncPeerState{})
 
-	longPeer, longRec := schedulerPeer(t, sm, 90, 1000)
+	_, longRec := schedulerPeer(t, sm, 90, 1000)
 
-	// The headers come from the long peer, because handing us headers up to
-	// height N is itself a claim to have that chain: a peer that delivered these
-	// headers would no longer be the short peer.
+	// The long peer's claim of 1000 comes from schedulerPeer itself, not from
+	// delivering these headers: nothing credits a sender for a headers batch any
+	// more, so the claim has to be independent of who the harness attributes the
+	// batch to.
 	//
 	// Seeded from height 10, so every header is at 11 or above — out of reach of
 	// a peer claiming height 5.
 	sm.resetHeaderState(&anchor, 10)
 	sm.headersFirstMode.Store(true)
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: longPeer})
+	spliceHeadersForTest(t, sm, msg.Headers)
 	require.Equal(t, len(hashes)+1, sm.headerListLen())
 
 	sm.fetchHeaderBlocks()
@@ -214,7 +215,7 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 	state.noteBestKnownHeight(1000)
 
 	more, moreHashes := linkedHeaders(hashes[len(hashes)-1], 3, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: more, peer: longPeer})
+	spliceHeadersForTest(t, sm, more.Headers)
 
 	sm.fetchHeaderBlocks()
 
@@ -576,11 +577,10 @@ func TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked(t *testing.
 
 	sm.resetHeaderState(&anchor, 10)
 	sm.headersFirstMode.Store(true)
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: shortPeer})
+	spliceHeadersForTest(t, sm, msg.Headers)
 	require.Equal(t, len(hashes)+1, sm.headerListLen())
 
-	// Delivering the headers is itself a claim, so put the claim back where the
-	// test wants it: a peer that has told us about nothing above height 3.
+	// A peer that has told us about nothing above height 3.
 	state, exists := sm.peerStates.Get(shortPeer)
 	require.True(t, exists)
 	state.bestKnownHeight.Store(3)

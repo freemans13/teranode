@@ -206,32 +206,6 @@ func TestBestKnownHeight_SeededFromStartingHeight(t *testing.T) {
 		"a newly registered peer must start at the height it announced, not zero")
 }
 
-// TestBestKnownHeight_RaisedFromHeaders pins that a batch of headers raises the
-// sending peer's best known height to the top of the batch. A peer that hands us
-// headers up to 1200 demonstrably has the chain that far.
-func TestBestKnownHeight_RaisedFromHeaders(t *testing.T) {
-	sm := newHeaderLockManager(t, nil, nil)
-
-	syncPeer, _, _ := connectRacePeer(t, 61, 1000)
-	state := registerInvPeer(sm, syncPeer, 1000)
-	sm.storeSyncPeer(syncPeer, &syncPeerState{})
-
-	// Anchor the list at 1190 so a batch of ten headers ends at 1200.
-	// resetHeaderState turns headers-first mode off, so turn it back on.
-	anchor := chainhash.Hash{0xb0}
-	sm.resetHeaderState(&anchor, 1190)
-	sm.headersFirstMode.Store(true)
-
-	var nonce uint32
-
-	msg, _ := linkedHeaders(anchor, 10, &nonce)
-
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
-
-	require.Equal(t, int32(1200), state.BestKnownHeight(),
-		"a headers batch must raise the sending peer's best known height to the top of the batch")
-}
-
 // TestBestKnownHeight_RaisedFromInv pins that an inv from the sync peer for a
 // block we already have raises that peer's best known height to the block's
 // height, reusing the lookup handleInvMsg already does.

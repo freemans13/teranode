@@ -108,9 +108,16 @@ func newDroppedBlock(t *testing.T, peerIdx uint8, backoffBase time.Duration, fai
 	sm.headersFirstMode.Store(true)
 
 	// Reaching the checkpoint is what trims the anchor and sends the round's
-	// first getdata, so this one call puts the node in the state the tests
-	// below start from.
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+	// first getdata, so this puts the node in the state the tests below start
+	// from. handleHeadersMsg used to do both itself; splicing only lands the
+	// headers now.
+	spliceHeadersForTest(t, sm, msg.Headers)
+
+	sm.headerMu.Lock()
+	sm.removeHeaderAnchorLocked()
+	sm.headerMu.Unlock()
+
+	sm.fetchHeaderBlocks()
 
 	require.Equal(t, len(hashes), sm.headerListLen(),
 		"the checkpoint batch links all five headers and takes the anchor off the front")

@@ -58,7 +58,14 @@ func TestSyncManager_ARewindOntoARebuiltHeaderListDoesNotReRequestAStoredBlock(t
 	h.sm.sweepParkedBlocks(time.Now())
 
 	// The headers land, reach the checkpoint, and the walk goes out for blocks.
-	h.sm.handleHeadersMsg(&headersMsg{headers: msg, peer: h.peer})
+	// handleHeadersMsg used to trim the anchor itself on reaching the checkpoint;
+	// splicing only lands the headers now, so the removal is explicit here too.
+	spliceHeadersForTest(t, h.sm, msg.Headers)
+
+	h.sm.headerMu.Lock()
+	h.sm.removeHeaderAnchorLocked()
+	h.sm.headerMu.Unlock()
+
 	h.sm.fetchHeaderBlocks()
 
 	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(getDataBefore, hashes[0]) }, 5*time.Second),

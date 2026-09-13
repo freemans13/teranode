@@ -61,7 +61,7 @@ func TestSyncManager_ATickBetweenHeaderBatchesDoesNotWedgeTheCheckpointTransitio
 
 	// The first batch lands. It does not reach the checkpoint, so the anchor is
 	// still the front of the list.
-	sm.handleHeadersMsg(&headersMsg{headers: first, peer: syncPeer})
+	spliceHeadersForTest(t, sm, first.Headers)
 
 	sm.headerMu.Lock()
 	front := sm.headerList.Front().Value.(*headerNode)
@@ -93,9 +93,17 @@ func TestSyncManager_ATickBetweenHeaderBatchesDoesNotWedgeTheCheckpointTransitio
 	sm.resumeHeaderWalk()
 	deliverWhatWasAskedFor()
 
-	// The second batch reaches the checkpoint, so handleHeadersMsg trims the
-	// anchor and starts fetching blocks.
-	sm.handleHeadersMsg(&headersMsg{headers: second, peer: syncPeer})
+	// The second batch reaches the checkpoint, so handleHeadersMsg used to trim
+	// the anchor and start fetching blocks. Splicing only lands the headers now;
+	// the anchor removal and the fetch are the test's job, the same substitution
+	// made in TestSyncManager_CommittingAParkedBlockMidHeaderRoundDoesNotWedgeTheCheckpoint.
+	spliceHeadersForTest(t, sm, second.Headers)
+
+	sm.headerMu.Lock()
+	sm.removeHeaderAnchorLocked()
+	sm.headerMu.Unlock()
+
+	sm.fetchHeaderBlocks()
 	deliverWhatWasAskedFor()
 
 	require.True(t, sawCheckpoint,
@@ -151,8 +159,15 @@ func TestSyncManager_AFreedInFlightSlotIsToppedUpMidRound(t *testing.T) {
 	sm.headersFirstMode.Store(true)
 
 	// The batch reaches the checkpoint, so the anchor comes off the front and
-	// the round's first getdata goes out.
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+	// the round's first getdata goes out. handleHeadersMsg used to do both itself;
+	// splicing only lands the headers now.
+	spliceHeadersForTest(t, sm, msg.Headers)
+
+	sm.headerMu.Lock()
+	sm.removeHeaderAnchorLocked()
+	sm.headerMu.Unlock()
+
+	sm.fetchHeaderBlocks()
 
 	requested := 0
 
@@ -242,8 +257,15 @@ func TestSyncManager_AGivenUpBlockAfterACheckpointTransitionIsAskedForAgain(t *t
 	sm.headersFirstMode.Store(true)
 
 	// The batch reaches the checkpoint, so the anchor is trimmed and the round's
-	// first getdata goes out.
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+	// first getdata goes out. handleHeadersMsg used to do both itself; splicing
+	// only lands the headers now.
+	spliceHeadersForTest(t, sm, msg.Headers)
+
+	sm.headerMu.Lock()
+	sm.removeHeaderAnchorLocked()
+	sm.headerMu.Unlock()
+
+	sm.fetchHeaderBlocks()
 
 	// The round is delivered in order. The second block's arrival takes its
 	// header off the front, and that header node is what the block carries with

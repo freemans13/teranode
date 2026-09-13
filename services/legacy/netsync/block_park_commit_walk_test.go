@@ -73,7 +73,7 @@ func TestSyncManager_CommittingAParkedBlockMidHeaderRoundDoesNotWedgeTheCheckpoi
 
 	// The first batch lands. It does not reach the checkpoint, so the anchor is
 	// still the front of the list.
-	h.sm.handleHeadersMsg(&headersMsg{headers: first, peer: h.peer})
+	spliceHeadersForTest(t, h.sm, first.Headers)
 
 	h.sm.headerMu.Lock()
 	front := h.sm.headerList.Front().Value.(*headerNode)
@@ -127,7 +127,19 @@ func TestSyncManager_CommittingAParkedBlockMidHeaderRoundDoesNotWedgeTheCheckpoi
 
 	// The second batch reaches the checkpoint, so handleHeadersMsg trims the
 	// anchor and starts fetching blocks.
-	h.sm.handleHeadersMsg(&headersMsg{headers: second, peer: h.peer})
+	spliceHeadersForTest(t, h.sm, second.Headers)
+
+	// Splicing only lands the headers; the two things handleHeadersMsg's deleted
+	// checkpoint branch used to do for them are now the test's job. The anchor
+	// has to come off the front before any of this round's blocks is asked for
+	// -- advanceHeaderListFor only credits a checkpoint match when it is the
+	// FRONT of the list, and the anchor is never one of the round's blocks, so
+	// nothing else ever moves it -- and the request itself has to be asked for.
+	h.sm.headerMu.Lock()
+	h.sm.removeHeaderAnchorLocked()
+	h.sm.headerMu.Unlock()
+
+	h.sm.fetchHeaderBlocks()
 	deliverWhatWasAskedFor()
 
 	require.True(t, sawCheckpoint,

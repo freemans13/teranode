@@ -876,6 +876,13 @@ type SyncManager struct {
 	// the front throws away exactly the block it needs.
 	lastCommittedHeight atomic.Int32
 
+	// headerCache names the block hashes for the heights just above
+	// lastCommittedHeight, from the most recent getheaders reply. It is a
+	// lookup, not a work queue: nothing walks it, nothing holds a position in
+	// it, and discarding it costs one message.
+	//
+	headerCache *headerCache
+
 	// blockPrefetchBudget bounds, by total serialized bytes, the blocks that
 	// have been received from peers but not yet finished processing. It lets
 	// OnBlock admit a block and return (so the read-loop downloads the next
@@ -2094,21 +2101,19 @@ func (sm *SyncManager) rewindToLowestHeader(hashes []chainhash.Hash) (int32, boo
 
 // headersRoundLocator returns the locator to send the next getheaders with.
 //
-// Mid-round it is built from the header list we already have, not from our own
-// database best block: handleHeadersMsg requires every incoming header to connect
-// to the back of the list, so a locator from the database — which after a
-// demotion is hundreds or thousands of headers below it — would have the new sync
-// peer answer honestly and be disconnected for it.
+// The locator is always the chain's own, anchored on what this node has
+// actually committed. That is what makes every reply connect: a peer answers
+// from the first hash it recognises, and the chain's locator steps back from
+// the committed tip to genesis, so any peer sharing any ancestor with us
+// recognises something.
 //
-// With the fan-out off, a sync-peer change resets the header state first, so the
-// database locator is the only correct one and is what this returns.
+// What this replaces anchored at the BACK of the header list, which during a
+// sync sits up to 933,000 blocks above the committed tip. A peer that had not
+// reached that point recognised nothing, fell back to genesis, and replied
+// from height 1: headers whose parent we had never heard of, which cost it
+// its connection for answering honestly. That disconnect took Hetzner
+// mainnet's last working supplier on 2026-09-11.
 func (sm *SyncManager) headersRoundLocator(bestHash *chainhash.Hash, bestHeight uint32) (blockchain.BlockLocator, error) {
-	if sm.settings.Legacy.MultiPeerBlockDownload && sm.headersFirstMode.Load() {
-		if locator := sm.headerListLocator(bestHash); len(locator) > 0 {
-			return blockchain.BlockLocator(locator), nil
-		}
-	}
-
 	return sm.blockchainClient.GetBlockLocator(sm.ctx, bestHash, bestHeight)
 }
 
@@ -5715,7 +5720,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	sm.logger.Debugf("[handleHeadersMsg] received headers message with %d headers from %s", len(hmsg.headers.Headers), hmsg.peer)
 	peer := hmsg.peer
 
-	state, resolved, exists := sm.peerStateResolvingPrimary(peer)
+	_, resolved, exists := sm.peerStateResolvingPrimary(peer)
 	if !exists {
 		sm.logger.Warnf("Received headers message from unknown peer %s", peer)
 		return
@@ -5743,361 +5748,46 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	// Ensure we have a valid starting point for header validation.
-	//
-	// GetBestBlockHeader can block for minutes during initial sync, so headerMu
-	// must not be held across it (Rule B) — which means the emptiness read
-	// above cannot be trusted on the way back. resetHeaderStateIfEmpty re-checks
-	// under the lock and does nothing if another headers message recovered the
-	// state while we were waiting, rather than wiping the headers it added.
-	if sm.headerListEmpty() {
-		sm.logger.Warnf("Header list is empty, attempting to recover sync state")
+	// A headers batch is a cache fill and nothing else: no splice, no front, no
+	// anchor, no epoch. A batch that does not link is refused by the cache and
+	// the peer keeps its connection, because a reply that connects to a point we
+	// have moved past is an honest answer to a question we have stopped asking.
+	sm.fillHeaderCache(hmsg.peer, msg)
 
-		bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
-		if err != nil {
-			peer.DisconnectWithWarning(fmt.Sprintf(failedToGetBestBlockHeaderMsg, err))
-			return
-		}
+	return
+}
 
-		bestBlockHeightInt32, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
-		if err != nil {
-			peer.DisconnectWithWarning(fmt.Sprintf("Failed to convert block height: %v", err))
-			return
-		}
-
-		sm.resetHeaderStateIfEmpty(bestBlockHeader.Hash(), bestBlockHeightInt32)
-
-		if sm.headerListEmpty() {
-			peer.DisconnectWithWarning("Failed to initialize header sync state")
-			return
-		}
+// fillHeaderCache turns a headers batch into the cache the wanted range reads,
+// and does nothing else with it.
+//
+// The batch must link to the block this node has committed, which is what the
+// tip-anchored locator asks for. A batch that does not link is dropped without
+// blaming the sender: under the new model the locator steps back to genesis, so
+// a peer answering from an older shared ancestor is answering correctly, just
+// about a point this node has already passed.
+func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders) {
+	if len(msg.Headers) == 0 {
+		return
 	}
 
-	// Process all the received headers ensuring each one connects to the
-	// previous and that checkpoints match.
-	receivedCheckpoint := false
+	best := sm.lastCommittedHeight.Load()
 
-	var finalHash *chainhash.Hash
-
-	// One lock for the whole loop is the point: it is what stops two concurrent
-	// headers messages interleaving their pushes into the same list. The three
-	// disconnect paths inside collect a reason and break instead of
-	// disconnecting on the spot, because a peer send must not run under headerMu
-	// (Rule B).
-	var disconnectReason string
-
-	// Highest height this batch linked up to, reported to the peer's state after
-	// the unlock below so the atomic write stays outside the locked region.
-	var maxHeaderHeight int32
-
-	// The hash that goes with maxHeaderHeight. Tracked alongside rather than
-	// taken from the last header seen, because on a break that last header is
-	// the offending one and crediting a peer for it would credit a chain we
-	// refused.
-	var maxHeaderHash chainhash.Hash
-
-	// How many headers in this batch linked onto the list, whether the batch
-	// turned out to be a late answer to a getheaders we ourselves sent, and
-	// whether it connected to nothing at all at the back of the list.
-	var (
-		pushed      int
-		staleReply  bool
-		unconnected bool
-	)
-
-	sm.headerMu.Lock()
-
-	for _, blockHeader := range msg.Headers {
-		blockHash := blockHeader.BlockHash()
-		finalHash = &blockHash
-
-		// Ensure there is a previous header to compare against.
-		prevNodeEl := sm.headerList.Back()
-		if prevNodeEl == nil {
-			disconnectReason = "Header list does not contain a previous element as expected"
-
-			break
-		}
-
-		// Ensure the header properly connects to the previous one and
-		// add it to the list of headers.
-		node := headerNode{hash: &blockHash, listEpoch: sm.headerListEpoch}
-
-		prevNode := prevNodeEl.Value.(*headerNode)
-		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
-			node.height = prevNode.height + 1
-			e := sm.headerList.PushBack(&node)
-			sm.indexHeaderLocked(e, blockHash)
-			pushed++
-
-			if node.height > maxHeaderHeight {
-				maxHeaderHeight = node.height
-				maxHeaderHash = blockHash
-			}
-
-			if sm.startHeader == nil {
-				sm.startHeader = e
-			}
-		} else {
-			// A peer we demoted still has our getheaders outstanding, and by the
-			// time it answers the new sync peer has usually extended the list —
-			// so its reply connects to a header we hold rather than to the back.
-			// That is an honest answer to our own question, and disconnecting the
-			// sender with a misbehaviour warning throws away the very peer we
-			// kept connected so it could carry block bodies. Recognised only
-			// while nothing in this batch has linked yet: a batch that starts
-			// connecting and then stops is a different animal, and still costs
-			// the sender its connection.
-			//
-			// Scoped to the two senders whose non-connecting reply we caused,
-			// and to nobody else. Without a scope holdHeader is satisfied by ANY
-			// header currently in the index, so any peer could re-send a batch it
-			// once contributed, or any prefix of it, for ever: up to 2000 headers
-			// of bandwidth and decode plus a headerMu acquisition each time, the
-			// same lock the block-queue consumer takes first in headers-first
-			// mode, and nothing at all for the sender.
-			//
-			// The two are the peer we just demoted, whose getheaders we sent
-			// before the swap, and the current sync peer, which startSync elects
-			// on height alone and so can be hundreds of headers below the back of
-			// the list: it answers our locator from the newest block it has, which
-			// connects to a header we hold rather than to the back. Both expire.
-			// The cooldown expires on its own timer, and a sync peer that only
-			// ever sends headers that do not connect refreshes no block time, so
-			// the stall detector takes the role off it.
-			//
-			// Only reachable with the fan-out on, because that is what keeps a
-			// demoted peer connected in the first place.
-			_, holdParent := sm.headerIndex[blockHeader.PrevBlock]
-			_, holdHeader := sm.headerIndex[blockHash]
-			weAsked := state.inDemotionCooldown() || peer == sm.loadSyncPeer()
-
-			if sm.settings.Legacy.MultiPeerBlockDownload && pushed == 0 &&
-				weAsked && (holdParent || holdHeader) {
-				staleReply = true
-
-				break
-			}
-
-			if pushed > 0 {
-				// The batch linked onto the back and then jumped sideways. That
-				// is a doctored chain, not a stale locator, and it still costs
-				// the sender its connection on the first offence.
-				//
-				// SV Node splits this differently because it can: it tests
-				// headers[0].hashPrevBlock against the whole of mapBlockIndex, so
-				// "parent unknown" and "internally non-continuous" are two
-				// separate faults to it, and it charges the second one straight
-				// away (net_processing.cpp:3415-3418). Our loop tests each header
-				// against the back of a list with one append point, so a
-				// non-continuous batch can only ever reach here as a non-connect
-				// with pushed > 0. Keying on pushed is therefore the exact
-				// mapping of that split, not an approximation of it.
-				disconnectReason = "Received block header that does not properly connect to the chain"
-
-				break
-			}
-
-			// Nothing in this batch linked: its first header hangs off something
-			// that is not the back of our list. Recorded here and acted on after
-			// the unlock, because a peerSyncState write must not happen under
-			// headerMu — the same reason the maxHeaderHeight credit below is
-			// deferred.
-			unconnected = true
-
-			break
-		}
-
-		// Verify the header at the next checkpoint height matches.
-		//
-		// nextCheckpoint is nil once the final one has been passed.
-		// checkpointBlockCommitted advances it under headerMu and only leaves
-		// headers-first mode after releasing the lock, so a second headers
-		// goroutine that had already passed the mode check can hold the lock in
-		// that window and read the nil. Multi-peer demotion makes overlapping
-		// headers replies from the outgoing and incoming sync peer ordinary,
-		// which is what makes the window worth guarding rather than arguing
-		// about. There is no checkpoint left to verify against, so there is
-		// nothing to do but carry on with the batch.
-		if sm.nextCheckpoint != nil && node.height == sm.nextCheckpoint.Height {
-			if node.hash.IsEqual(sm.nextCheckpoint.Hash) {
-				receivedCheckpoint = true
-
-				sm.logger.Infof("Verified downloaded block "+
-					"header against checkpoint at height "+
-					"%d/hash %s", node.height, node.hash)
-			} else {
-				disconnectReason = fmt.Sprintf("Block header at height %d/hash "+
-					"%s does NOT match expected checkpoint hash of %s",
-					node.height, node.hash,
-					sm.nextCheckpoint.Hash)
-			}
-
-			break
-		}
-	}
-
-	sm.headerMu.Unlock()
-
-	// The round may cover ground the chain has already walked, so drop the front
-	// of it before anything reads the list. Done after the unlock, because above
-	// the last checkpoint this asks the blockchain store and headerMu must never
-	// be held across a client call.
-	sm.trimHeadersTheChainAlreadyHas()
-
-	// A peer that hands us headers up to height N has demonstrably got the chain
-	// that far. Done after the unlock, so no peer state is touched under
-	// headerMu.
-	if maxHeaderHeight > 0 {
-		state.noteBestKnownHeight(maxHeaderHeight)
-
-		// The strongest proof there is: this node placed these headers itself,
-		// so the height is ours and the peer demonstrably has that chain. This
-		// is SV Node's UpdateBlockAvailability on the same path that accepts the
-		// batch.
-		state.noteProvenClaim(maxHeaderHash, maxHeaderHeight)
-	}
-
-	// A batch that connects to nothing at our back is charged, not punished on
-	// the first offence. Its commonest cause is our own locator being stale
-	// rather than the peer lying, and that is exactly what happened on Hetzner
-	// mainnet on 2026-09-11: one such batch at 01:28:30 took the connection of
-	// 51.75.213.175, the only peer still carrying the sync, and dropping its
-	// control connection tore down the stream carrying block bodies with it. The
-	// node committed its last block three minutes later and then sat idle for
-	// seven hours. That log line is the only occurrence of the message in the
-	// whole run.
-	//
-	// The threshold is a deliberate divergence, not a translation. SV Node
-	// charges 20 points of a 100-point ban budget on every tenth consecutive
-	// unconnecting batch (net_processing.cpp:3407-3410, budget at
-	// validation.h:202), so it takes fifty batches to earn a BAN, which survives
-	// reconnection. Our only sanction is a disconnect the peer can reconnect from
-	// immediately and we keep no ban store, so fifty here would not mean what
-	// fifty means there. Ten is the point at which the reference first charges
-	// anything at all (validation.h:220).
-	//
-	// No repair getheaders goes out on the forgiven path, which is where SV Node
-	// sends one. That is enforced by an explicit return below, not by falling out
-	// of this switch: the send at the bottom of this function anchors its locator
-	// on finalHash, and on this path finalHash is the first header of the batch
-	// that did not connect. That is a header this node does not hold, so it is
-	// the one anchor guaranteed to bring back another batch we cannot splice.
-	//
-	// SV Node's repair differs because CChain::GetLocator always walks back to
-	// genesis (src/chain.cpp:27-55), so whatever it sends connects somewhere
-	// (net_processing.cpp:3390-3394). Ours ends at the front of the header list
-	// and the database tip, so the equivalent send would only re-ask the question
-	// this peer has just failed to answer usefully. The recovery route that does
-	// work is the block-announcement repair in handleInvMsg.
-	switch {
-	case unconnected:
-		if runLength := state.noteUnconnectingHeaders(); runLength >= maxUnconnectingHeaderBatches {
-			disconnectReason = fmt.Sprintf("Received %d block header batches in a row that do not properly connect to the chain", runLength)
-		} else {
-			// Logged at info, where the reference logs at debug
-			// (net_processing.cpp:3396). Forgiving this fault silently would
-			// leave the next 800128 no trace at all: the disconnect was the only
-			// evidence the first one happened, and it is the evidence this change
-			// removes. Bounded by the threshold, so a peer costs at most nine of
-			// these before it is gone.
-			sm.logger.Infof("[handleHeadersMsg] %d headers from %s connect to nothing at the back of our list, %d such batches in a row of %d before the connection goes", numHeaders, peer.String(), runLength, maxUnconnectingHeaderBatches)
-
-			// Nothing was spliced, so there is no round to continue and no
-			// answerable question to ask this peer. Falling through would send a
-			// getheaders anchored on the header we just failed to place, whose
-			// only possible reply is another batch we cannot splice: ten of those
-			// is 1.6 MB and ten headerMu acquisitions to arrive at the same
-			// disconnect, which makes forgiving the fault buy latency rather than
-			// survival. The sync-peer rotation and the announcement repair are
-			// what recover from here.
-			return
-		}
-
-	case pushed > 0 && disconnectReason == "":
-		// A batch that connects ends the run, so an intermittent fault never
-		// accumulates to a disconnect over hours (net_processing.cpp:3450-3456).
-		state.resetUnconnectingHeaders()
-	}
-
-	if staleReply {
-		sm.logger.Debugf("[handleHeadersMsg] ignoring %d late headers from %s: they connect to a header we already hold rather than to the back of the list", numHeaders, peer.String())
+	tipHeader, _, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+	if err != nil || tipHeader == nil {
+		sm.logger.Warnf("[fillHeaderCache] could not read the chain tip to check the batch from %s links to it: %v", peer, err)
 
 		return
 	}
 
-	if disconnectReason != "" {
-		peer.DisconnectWithWarning(disconnectReason)
+	tipHash := *tipHeader.Hash()
+
+	if !sm.headerCache.Fill(tipHash, best+1, msg.Headers) {
+		sm.logger.Debugf("[fillHeaderCache] batch of %d headers from %s does not link to the committed tip at height %d, dropping it", len(msg.Headers), peer, best)
 
 		return
 	}
 
-	// When this header is a checkpoint, switch to fetching the blocks for
-	// all the headers since the last checkpoint.
-	if receivedCheckpoint {
-		// The round's anchor is a block already in this node's database, in the
-		// list only so this round's first header could prove it links. It has to
-		// go before any of these blocks is asked for: the list is advanced by an
-		// arriving block matching its front, and no peer will ever deliver the
-		// anchor again.
-		sm.headerMu.Lock()
-
-		sm.removeHeaderAnchorLocked()
-
-		remaining := sm.headerList.Len()
-		sm.headerMu.Unlock()
-
-		sm.logger.Infof("Received %v block headers: Fetching blocks", remaining)
-
-		// fetchHeaderBlocks takes headerMu itself, so it must be called after
-		// the unlock — sync.Mutex is not reentrant.
-		sm.fetchHeaderBlocks()
-
-		return
-	}
-
-	// This header is not a checkpoint, so request the next batch of
-	// headers starting from the latest known header and ending with the
-	// next checkpoint.
-	locator := blockchain.BlockLocator([]*chainhash.Hash{finalHash})
-
-	// Same window as the checkpoint compare above: no checkpoint left means
-	// headers-first mode is on its way out and there is no stop hash to ask up
-	// to. Asking for another round here would be asking on behalf of a mode we
-	// are leaving, so leave it to the getblocks that leaveHeadersFirstMode sends.
-	nextCP := sm.nextCheckpointSnapshot()
-	if nextCP == nil {
-		sm.logger.Debugf("[handleHeadersMsg] no checkpoint left to ask up to; leaving the next round to normal mode")
-
-		return
-	}
-
-	// The round asks up to the end of the peer's chain, not up to the next
-	// checkpoint. A peer serves fork+1 through and including the stop block: it
-	// pushes each header and only then breaks on the stop hash
-	// (src/net/net_processing.cpp:2958-2963, over the fork point
-	// GetFirstBlockIndexFromLocatorNL resolves at :2783). So a stop hash at the
-	// next checkpoint makes the width of the answer checkpointHeight minus the
-	// height of locator[0], and locator[0] is the back of the header list. On
-	// 2026-09-11 Hetzner mainnet that was 849,999 against a stop hash naming the
-	// 850,000 checkpoint: a one-block question, answered honestly in 7.5 ms with
-	// zero headers. An empty reply returns from the top of handleHeadersMsg
-	// without touching any state, so the node sat on it for seven hours with the
-	// blocks it actually needed 50,000 below where it was asking.
-	//
-	// The checkpoint is still enforced. It always was, by the
-	// node.height == sm.nextCheckpoint.Height compare inside the splice loop
-	// above, which drops anything over the checkpoint rather than splicing it;
-	// the wire stop hash was never what protected it. Four of SV Node's five
-	// getheaders sites send uint256() (src/net/net_processing.cpp:3394, :3474,
-	// :3693, :5087) and the word checkpoint does not appear in that file at all.
-	//
-	// The cost is that the last batch of a checkpoint span can now overshoot by
-	// up to 2000 headers, about 162 KB, decoded and dropped at the checkpoint
-	// break. Roughly ten times over a full mainnet sync.
-	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
-		sm.logger.Warnf("Failed to send getheaders message to peer %s: %v", peer.String(), err)
-	}
+	sm.logger.Infof("[fillHeaderCache] cached %d headers from %s, heights %d to %d", len(msg.Headers), peer, best+1, best+int32(len(msg.Headers))) //nolint:gosec // bounded by the wire limit of 2000
 }
 
 // haveInventory returns whether the inventory represented by the passed
@@ -7661,6 +7351,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err := sm.seedCommittedHeight(ctx); err != nil {
 		return nil, err
 	}
+
+	sm.headerCache = newHeaderCache()
 
 	// Build the per-block backoff map only after the last fallible step above.
 	// newBlockFailureBackoffMap starts a background eviction goroutine that is

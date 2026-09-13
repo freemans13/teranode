@@ -167,78 +167,11 @@ func TestHeaderList_ConcurrentHeadersAndBlocksDoNotCorruptTheList(t *testing.T) 
 	require.True(t, syncPeer.Connected(), "no honest-peer disconnect should have been provoked")
 }
 
-// TestHandleHeadersMsg_RecoveryDoesNotWipeHeadersAddedWhileWeWereWaiting pins the
-// re-validation the empty-list recovery needs. GetBestBlockHeader can block for
-// minutes during initial sync, so the header lock cannot be held across it — and
-// once it is dropped, whatever was read before the call can no longer be trusted.
-// A handler that comes back and resets unconditionally throws away every header
-// another goroutine added while it was waiting.
-func TestHandleHeadersMsg_RecoveryDoesNotWipeHeadersAddedWhileWeWereWaiting(t *testing.T) {
-	gate := make(chan struct{})
-	entered := make(chan struct{})
-
-	sm := newHeaderLockManager(t, gate, entered)
-
-	peer, _, _ := connectRacePeer(t, 31, 1000)
-	registerRacePeer(sm, peer)
-	sm.storeSyncPeer(peer, &syncPeerState{})
-
-	// The list starts empty, so the first headers message takes the recovery
-	// path and parks inside GetBestBlockHeader.
-	var nonceA uint32
-
-	msgA, _ := linkedHeaders(chainhash.Hash{0xde}, 2, &nonceA)
-
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		sm.handleHeadersMsg(&headersMsg{headers: msgA, peer: peer})
-	}()
-
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		close(gate)
-		t.Fatal("the headers handler never reached GetBestBlockHeader")
-	}
-
-	// Someone else recovers the state and lands two headers while the first
-	// handler is still parked.
-	anchor := chainhash.Hash{0xb0}
-	sm.resetHeaderState(&anchor, 100)
-	sm.headersFirstMode.Store(true)
-
-	var nonceB uint32
-
-	msgB, hashesB := linkedHeaders(anchor, 2, &nonceB)
-	sm.handleHeadersMsg(&headersMsg{headers: msgB, peer: peer})
-
-	require.Equal(t, 3, sm.headerList.Len(), "the second handler should have added two headers to the anchor")
-
-	close(gate)
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the parked headers handler never returned")
-	}
-
-	require.Equal(t, 3, sm.headerList.Len(),
-		"the recovering handler must not wipe headers added while it was waiting")
-	require.NotNil(t, sm.startHeader, "startHeader must survive the recovery")
-
-	startNode, ok := sm.startHeader.Value.(*headerNode)
-	require.True(t, ok)
-	require.Equal(t, hashesB[0], *startNode.hash, "startHeader must still point at the first unfetched header")
-}
-
-// TestHandleHeadersMsg_DoesNotHoldTheHeaderLockAcrossGetBestBlockHeader pins the
-// scoping rule that makes the above safe: the header lock is dropped around the
-// blockchain call, so a second goroutine can still read the header list while
-// the first is parked. During initial sync that call can block for minutes, and
-// a lock held across it would stall every other header-list user behind it.
+// TestHandleHeadersMsg_DoesNotHoldTheHeaderLockAcrossGetBestBlockHeader pins a
+// scoping rule fillHeaderCache still has to honour: it asks the chain for the
+// tip to check with GetBestBlockHeader, and that call must not run with the
+// header lock held, or every other header-list user would stall behind a
+// round trip that can take minutes during initial sync.
 func TestHandleHeadersMsg_DoesNotHoldTheHeaderLockAcrossGetBestBlockHeader(t *testing.T) {
 	gate := make(chan struct{})
 	entered := make(chan struct{})

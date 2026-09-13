@@ -74,6 +74,13 @@ func newFetchLockManager(t *testing.T, alreadyHave []chainhash.Hash, gate, enter
 // startHeader on the first of them — exactly the state a real node is in when a
 // headers batch has just arrived. The batch is passed in rather than built here
 // because a caller may need the hashes before the manager exists.
+//
+// This used to hand the batch to handleHeadersMsg and let it splice the batch
+// onto the list itself. Task 3 turned handleHeadersMsg into a cache fill with no
+// list underneath it, so this helper now does the splice that function no
+// longer does. Every test in this file has fetchHeaderBlocks, the scheduler, or
+// another list reader as its subject, not the headers-round handler, and those
+// readers still walk sm.headerList unchanged.
 func seedFetchHeaders(t *testing.T, sm *SyncManager, p *peerpkg.Peer, anchor chainhash.Hash, msg *wire.MsgHeaders) {
 	t.Helper()
 
@@ -82,9 +89,42 @@ func seedFetchHeaders(t *testing.T, sm *SyncManager, p *peerpkg.Peer, anchor cha
 	// runs in headers-first mode.
 	sm.headersFirstMode.Store(true)
 
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: p})
+	spliceHeadersForTest(t, sm, msg.Headers)
 
 	require.Equal(t, len(msg.Headers)+1, sm.headerListLen(), "the seeded headers should all have linked")
+}
+
+// spliceHeadersForTest pushes a batch of already-linked headers onto the back
+// of sm.headerList, the way handleHeadersMsg did before Task 3 replaced that
+// path with a cache fill. Test-only: it exists so the many tests that seed the
+// list through seedFetchHeaders keep seeing the state they saw before that
+// change, without reaching through handleHeadersMsg, which no longer touches
+// the list at all.
+func spliceHeadersForTest(t *testing.T, sm *SyncManager, headers []*wire.BlockHeader) {
+	t.Helper()
+
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	for _, blockHeader := range headers {
+		blockHash := blockHeader.BlockHash()
+
+		prevNodeEl := sm.headerList.Back()
+		require.NotNil(t, prevNodeEl, "seeding a header batch requires an anchor already on the list")
+
+		prevNode, ok := prevNodeEl.Value.(*headerNode)
+		require.True(t, ok)
+		require.True(t, prevNode.hash.IsEqual(&blockHeader.PrevBlock),
+			"test fixture built a batch that does not link onto the seeded anchor")
+
+		node := headerNode{hash: &blockHash, height: prevNode.height + 1, listEpoch: sm.headerListEpoch}
+		e := sm.headerList.PushBack(&node)
+		sm.indexHeaderLocked(e, blockHash)
+
+		if sm.startHeader == nil {
+			sm.startHeader = e
+		}
+	}
 }
 
 // TestFetchHeaderBlocks_DoesNotHoldTheHeaderLockAcrossTheBlockchainLookup is the

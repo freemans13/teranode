@@ -85,12 +85,10 @@ func TestHeaderIndex_ClearedOnFinalCheckpointInit(t *testing.T) {
 	anchor := chainhash.Hash{0xa1}
 	sm := seedHeaderIndexManager(t, 40, anchor)
 
-	peer := sm.loadSyncPeer()
-
 	var nonce uint32
 
 	msg, hashes := linkedHeaders(anchor, 5, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: peer})
+	spliceHeadersForTest(t, sm, msg.Headers)
 
 	require.Equal(t, 6, sm.headerListLen(), "the anchor plus five headers")
 	require.Len(t, headerIndexSnapshot(sm), 6, "every header in the list must be indexed")
@@ -127,7 +125,7 @@ func TestHeaderIndex_MatchesTheListAfterEveryOperation(t *testing.T) {
 	var nonce uint32
 
 	msg, hashes := linkedHeaders(anchor, 5, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: peer})
+	spliceHeadersForTest(t, sm, msg.Headers)
 	requireIndexMatchesList(t, sm, "after a headers batch was pushed")
 
 	// Front removal: the block at the front of the list arrives. The message
@@ -152,8 +150,8 @@ func TestHeaderIndex_MatchesTheListAfterEveryOperation(t *testing.T) {
 	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 18, Hash: &hashes2[2]}
 	sm.headerMu.Unlock()
 
-	sm.handleHeadersMsg(&headersMsg{headers: msg2, peer: peer})
-	requireIndexMatchesList(t, sm, "after the checkpoint batch dropped the front")
+	spliceHeadersForTest(t, sm, msg2.Headers)
+	requireIndexMatchesList(t, sm, "after the checkpoint batch linked, whether or not the front was dropped")
 
 	// Reset: only the new anchor survives.
 	newAnchor := chainhash.Hash{0xa3}
@@ -170,12 +168,11 @@ func TestHeaderIndex_MatchesTheListAfterEveryOperation(t *testing.T) {
 func TestHeaderIndex_ResetLeavesOnlyTheAnchor(t *testing.T) {
 	anchor := chainhash.Hash{0xa4}
 	sm := seedHeaderIndexManager(t, 42, anchor)
-	peer := sm.loadSyncPeer()
 
 	var nonce uint32
 
 	msg, hashes := linkedHeaders(anchor, 4, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: peer})
+	spliceHeadersForTest(t, sm, msg.Headers)
 	require.Equal(t, 5, sm.headerListLen())
 
 	newAnchor := chainhash.Hash{0xa5}
