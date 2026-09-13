@@ -141,7 +141,7 @@ func TestWantedRange_TheDownloaderCannotOutrunTheCommitter(t *testing.T) {
 	// ever writes it again.
 	const best = int32(100)
 
-	sm.lastCommittedHeight.Store(best)
+	sm.lastCommittedTip.Store(&committedTip{height: best})
 
 	seen := 0
 	highest := int32(0)
@@ -210,7 +210,7 @@ func TestWantedRange_ARestartingNodeRequestsOnItsFirstPass(t *testing.T) {
 
 	// What New now does at startup: read the chain's tip and record it. Without
 	// this line the counter is zero and the pass asks for height 1.
-	sm.lastCommittedHeight.Store(restartHeight)
+	sm.lastCommittedTip.Store(&committedTip{height: restartHeight})
 
 	_, rec := schedulerPeer(t, sm, 1, restartHeight+1000)
 
@@ -242,7 +242,7 @@ func TestNew_SeedsTheCommittedHeightFromTheChain(t *testing.T) {
 	// New's twelve dependencies.
 	require.NoError(t, sm.seedCommittedHeight(context.Background()))
 
-	require.Equal(t, int32(chainHeight), sm.lastCommittedHeight.Load(),
+	require.Equal(t, int32(chainHeight), sm.committedHeight(),
 		"a node that starts with a chain at 800,000 must not believe its best block is 0")
 }
 
@@ -297,7 +297,7 @@ func TestNew_WiresSeedCommittedHeightThroughTheConstructor(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	require.Equal(t, int32(chainHeight), sm.lastCommittedHeight.Load(),
+	require.Equal(t, int32(chainHeight), sm.committedHeight(),
 		"New must seed the committed height from the chain, not leave callers to notice it never did")
 }
 
@@ -436,7 +436,7 @@ func TestWantedRange_TheParkNeverReachesItsEntryCap(t *testing.T) {
 	// every arrival is an orphan and no block ever commits.
 	const parkBest = int32(propertyDepth)
 
-	sm.lastCommittedHeight.Store(parkBest)
+	sm.lastCommittedTip.Store(&committedTip{height: parkBest})
 
 	// Every block above the window, by hash, so the position assertion can be
 	// made against the park directly.

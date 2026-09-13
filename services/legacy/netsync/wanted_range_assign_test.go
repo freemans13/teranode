@@ -84,7 +84,7 @@ func waitForPass(t *testing.T, rec *getDataRecorder) {
 // TestAssignWantedBlocks_AsksForWhatIsWantedAndNotOwed is the ordinary pass.
 func TestAssignWantedBlocks_AsksForWhatIsWantedAndNotOwed(t *testing.T) {
 	sm, rec := assignHarness(t, 1, 20)
-	sm.lastCommittedHeight.Store(10)
+	sm.lastCommittedTip.Store(&committedTip{height: 10})
 
 	sm.assignWantedBlocks()
 
@@ -99,7 +99,7 @@ func TestAssignWantedBlocks_AsksForWhatIsWantedAndNotOwed(t *testing.T) {
 // spent on a block nobody owes.
 func TestAssignWantedBlocks_DoesNotReAskForABlockAlreadyOwed(t *testing.T) {
 	sm, rec := assignHarness(t, 1, 20)
-	sm.lastCommittedHeight.Store(10)
+	sm.lastCommittedTip.Store(&committedTip{height: 10})
 
 	sm.assignWantedBlocks()
 	waitForPass(t, rec)
@@ -122,7 +122,7 @@ func TestAssignWantedBlocks_DoesNotReAskForABlockAlreadyOwed(t *testing.T) {
 // second copy arrive unowned and lose its association for it.
 func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 	sm := assignManager(t, 1, 20)
-	sm.lastCommittedHeight.Store(10)
+	sm.lastCommittedTip.Store(&committedTip{height: 10})
 
 	_, first := schedulerPeer(t, sm, 1, 1020)
 	_, second := schedulerPeer(t, sm, 2, 1020)
@@ -170,7 +170,7 @@ func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 // blockchain round trip per candidate.
 func TestAssignWantedBlocks_TerminatesWhenEverythingIsOwed(t *testing.T) {
 	sm, rec := assignHarness(t, 1, 20)
-	sm.lastCommittedHeight.Store(10)
+	sm.lastCommittedTip.Store(&committedTip{height: 10})
 
 	sm.assignWantedBlocks()
 	waitForPass(t, rec)

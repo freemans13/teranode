@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -165,58 +164,4 @@ func TestHeaderList_ConcurrentHeadersAndBlocksDoNotCorruptTheList(t *testing.T) 
 	wg.Wait()
 
 	require.True(t, syncPeer.Connected(), "no honest-peer disconnect should have been provoked")
-}
-
-// TestHandleHeadersMsg_DoesNotHoldTheHeaderLockAcrossGetBestBlockHeader pins a
-// scoping rule fillHeaderCache still has to honour: it asks the chain for the
-// tip to check with GetBestBlockHeader, and that call must not run with the
-// header lock held, or every other header-list user would stall behind a
-// round trip that can take minutes during initial sync.
-func TestHandleHeadersMsg_DoesNotHoldTheHeaderLockAcrossGetBestBlockHeader(t *testing.T) {
-	gate := make(chan struct{})
-	entered := make(chan struct{})
-
-	sm := newHeaderLockManager(t, gate, entered)
-
-	peer, _, _ := connectRacePeer(t, 32, 1000)
-	registerRacePeer(sm, peer)
-	sm.storeSyncPeer(peer, &syncPeerState{})
-
-	var nonce uint32
-
-	msg, _ := linkedHeaders(chainhash.Hash{0xef}, 2, &nonce)
-
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		sm.handleHeadersMsg(&headersMsg{headers: msg, peer: peer})
-	}()
-
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		close(gate)
-		t.Fatal("the headers handler never reached GetBestBlockHeader")
-	}
-
-	read := make(chan int, 1)
-
-	go func() { read <- sm.headerListLen() }()
-
-	select {
-	case <-read:
-	case <-time.After(2 * time.Second):
-		close(gate)
-		t.Fatal("reading the header list blocked while the headers handler waited on GetBestBlockHeader")
-	}
-
-	close(gate)
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the parked headers handler never returned")
-	}
 }

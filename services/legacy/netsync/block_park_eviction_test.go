@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -34,7 +35,7 @@ func TestSyncManager_ABlockTheChainHasGonePastIsDropped(t *testing.T) {
 		"a node that has committed nothing must keep what it has downloaded")
 
 	// The chain moves past it. deliver stamps the entry at height 2.
-	h.sm.noteCommittedHeight(5)
+	h.sm.noteCommittedHeight(5, chainhash.Hash{})
 
 	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 

@@ -67,7 +67,7 @@ func slowSweepManager(t *testing.T, entries int) (*SyncManager, *blockPark, time
 	// burst to work through. This used to be done by backdating parkedAt past a
 	// thirty-minute expiry; nothing expires on a clock any more, and what makes
 	// a block droppable is the chain having gone past it.
-	sm.noteCommittedHeight(int32(entries + 1))
+	sm.noteCommittedHeight(int32(entries+1), chainhash.Hash{})
 
 	reads := 0
 	sm.parkSweepNow = func() time.Time {

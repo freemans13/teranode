@@ -175,9 +175,11 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		// tip can never be needed again, and the header list cannot answer that
 		// question because an arriving front block's header is removed before
 		// the park ever sees it, which moves the front past the very block being
-		// waited for.
+		// waited for. The hash travels with the height in the same atomic value,
+		// so fillHeaderCache can check linkage without a second, blocking call
+		// back to the blockchain service for it.
 		if err == nil && blockHeight > 0 {
-			sm.noteCommittedHeight(int32(blockHeight))
+			sm.noteCommittedHeight(int32(blockHeight), blockHash)
 		}
 
 		deferFn(err)
@@ -578,9 +580,10 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 		prometheusLegacyNetsyncBlockHeight.Set(float64(blockHeight))
 
 		// See HandleBlockDirect's identical defer: a nil error here means the
-		// block went into the chain at exactly this height.
+		// block went into the chain at exactly this height, and the hash travels
+		// with it for the same reason.
 		if err == nil && blockHeight > 0 {
-			sm.noteCommittedHeight(int32(blockHeight))
+			sm.noteCommittedHeight(int32(blockHeight), blockHash)
 		}
 
 		deferFn(err)

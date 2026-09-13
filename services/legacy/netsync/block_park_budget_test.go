@@ -171,7 +171,7 @@ func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 	// Committing moves the ceiling, because the committer is what the read-ahead
 	// is ahead OF. The front is left untouched, so anything that still followed
 	// the front would not move.
-	h.sm.lastCommittedHeight.Store(int32(front) + 500)
+	h.sm.lastCommittedTip.Store(&committedTip{height: int32(front) + 500})
 
 	h.sm.headerMu.Lock()
 	ceiling, ok := h.sm.lookaheadCeilingLocked()
@@ -186,7 +186,7 @@ func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 	// seeded. Anchoring to zero there would put the ceiling below the chain's own
 	// height, refuse every header, and leave the node unable to commit the block
 	// that would raise the anchor: a stall on every restart.
-	h.sm.lastCommittedHeight.Store(0)
+	h.sm.lastCommittedTip.Store(&committedTip{height: 0})
 
 	h.sm.headerMu.Lock()
 	atStart, ok := h.sm.lookaheadCeilingLocked()

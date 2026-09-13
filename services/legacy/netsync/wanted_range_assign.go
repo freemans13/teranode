@@ -49,7 +49,7 @@ func (sm *SyncManager) wantedBlocks() []wantedBlock {
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
 
-	best := sm.lastCommittedHeight.Load()
+	best := sm.committedHeight()
 
 	// The read-ahead ceiling is an absolute height and is already scaled by the
 	// block size actually being seen, so the depth is derived from it rather

@@ -27,7 +27,7 @@ import (
 func TestFetchHeaderBlocks_ChoosesThePathFromTheSetting(t *testing.T) {
 	sm := newFetchLockManager(t, nil, nil, nil)
 	sm.settings.Legacy.WantedRangeDownload = false
-	sm.lastCommittedHeight.Store(10)
+	sm.lastCommittedTip.Store(&committedTip{height: 10})
 
 	syncPeer, _, rec := connectRacePeer(t, 1, 1000)
 	registerRacePeer(sm, syncPeer)
@@ -80,7 +80,7 @@ func TestFetchHeaderBlocks_ChoosesThePathFromTheSetting(t *testing.T) {
 func TestFetchHeaderBlocks_SettingOnNeverTouchesTheCursorWalk(t *testing.T) {
 	sm, _ := assignHarness(t, 1, 20)
 	sm.settings.Legacy.WantedRangeDownload = true
-	sm.lastCommittedHeight.Store(10)
+	sm.lastCommittedTip.Store(&committedTip{height: 10})
 
 	sm.headerMu.Lock()
 	sm.startHeader = sm.headerList.Front()

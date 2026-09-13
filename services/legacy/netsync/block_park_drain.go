@@ -136,7 +136,7 @@ func (sm *SyncManager) parentChainState(hash chainhash.Hash) (exists bool, inval
 // not committed anything yet. That is the right way round: a node still finding
 // its feet should keep what it has downloaded.
 func (sm *SyncManager) parkEvictionFloor() int32 {
-	return sm.lastCommittedHeight.Load()
+	return sm.committedHeight()
 }
 
 // drainParkedDescendants commits everything parked behind a block that has just
