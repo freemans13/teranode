@@ -46,6 +46,20 @@ func assignHarness(t *testing.T, from, to int32) (*SyncManager, *getDataRecorder
 
 // assignManager is assignHarness without the peer, for a test that needs to
 // connect more than one.
+//
+// The wanted range is named by the header cache now, not the header list, so
+// the run [from, to] is seeded there with chainOfHeaders — real linked headers,
+// the same fixture header_cache_test.go uses, rather than the header list's old
+// fixed byte-pattern hashes. Nothing downstream of assignWantedBlocks reads
+// headerList, so it is left unseeded, and lookaheadCeilingLocked's own front-of-
+// headerList fallback (its last production reader, due to go with the list in a
+// later task) then finds no front and answers unlimited, same as a real running
+// node: fillHeaderCache never pushes onto headerList either.
+//
+// So BlockDownloadWindow is set to assignPassDepth here too, not only
+// BlockDownloadLowerWindow. With the ceiling unable to engage, wantedBlocks
+// falls back to the node-wide window as the depth, and that is the bound these
+// tests actually want to pin.
 func assignManager(t *testing.T, from, to int32) *SyncManager {
 	t.Helper()
 
@@ -53,20 +67,12 @@ func assignManager(t *testing.T, from, to int32) *SyncManager {
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 
 	sm.settings.Legacy.BlockDownloadLowerWindow = assignPassDepth
+	sm.settings.Legacy.BlockDownloadWindow = assignPassDepth
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = assignPassDepth
 
-	sm.headerMu.Lock()
-
-	for h := from; h <= to; h++ {
-		hash := chainhash.Hash{}
-		hash[0] = byte(h)
-		hash[1] = byte(h >> 8)
-
-		element := sm.headerList.PushBack(&headerNode{height: h, hash: &hash})
-		sm.indexHeaderLocked(element, hash)
-	}
-
-	sm.headerMu.Unlock()
+	parent := chainhash.Hash{0xaa}
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(parent, from, chainOfHeaders(parent, int(to-from+1))))
 
 	return sm
 }

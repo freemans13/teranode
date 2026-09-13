@@ -43,3 +43,37 @@ func (sm *SyncManager) wantedBlocksLocked(best int32, depth int32) []wantedBlock
 
 	return wanted
 }
+
+// wantedBlocksFromCache is wantedBlocksLocked's replacement under the new model:
+// the contiguous run above best that the header cache can name, up to depth
+// blocks.
+//
+// It takes no lock, because the cache holds its own and the header list is not
+// consulted. That is the point of the change rather than an incidental benefit:
+// the list is both the thing being read and the thing being mutated by arriving
+// blocks, so every reader of it needed a rule about which of its four meanings
+// was current.
+//
+// The run stops at the first height the cache cannot name rather than skipping
+// it, for the same reason the list version did. A block whose parent never
+// arrives cannot commit, so blocks fetched beyond a hole only wait in the park.
+func (sm *SyncManager) wantedBlocksFromCache(best int32, depth int32) []wantedBlock {
+	if depth < 1 {
+		// A depth of zero asks for nothing for ever, which is a stall wearing a
+		// setting's clothes.
+		depth = 1
+	}
+
+	wanted := make([]wantedBlock, 0, depth)
+
+	for i := int32(1); i <= depth; i++ {
+		hash, ok := sm.headerCache.At(best + i)
+		if !ok {
+			break
+		}
+
+		wanted = append(wanted, wantedBlock{height: best + i, hash: hash})
+	}
+
+	return wanted
+}

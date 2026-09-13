@@ -18,7 +18,11 @@ import peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 // a minute against a 23ms commit path, and a cursor stranded above the limit
 // with 955,208 headers queued and nothing requested.
 //
-// Nothing calls this yet. The wiring is a later task.
+// fetchHeaderBlocks calls this instead of the cursor walk when
+// legacy_wantedRangeDownload is on. Before this task wired wantedBlocks to the
+// header cache, calling it asked for nothing at all: nothing pushes onto
+// sm.headerList any more, so the cursor-shaped reader this pass used to share
+// with the old walk always came back empty.
 func (sm *SyncManager) assignWantedBlocks() {
 	wanted := sm.wantedBlocks()
 
@@ -40,11 +44,14 @@ func (sm *SyncManager) assignWantedBlocks() {
 }
 
 // wantedBlocks is the locked half of the pass: the range the node wants next,
-// bounded by the same scaled read-ahead depth that governs the header walk.
+// bounded by the same scaled read-ahead depth that governs the header walk, and
+// named from the header cache rather than the header list.
 //
 // Split out so the lock has a body with no way to reach a peer or another
-// service from inside it. headerMu is held across two pure in-memory reads and
-// released before anything else happens.
+// service from inside it. headerMu is held only because lookaheadCeilingLocked
+// needs it; the cache that names the range holds its own lock and is read with
+// headerMu still up, not released first, since wantedBlocksFromCache makes no
+// peer send and no blocking client call either.
 func (sm *SyncManager) wantedBlocks() []wantedBlock {
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
@@ -56,33 +63,33 @@ func (sm *SyncManager) wantedBlocks() []wantedBlock {
 	// than configured a second time. One source for "how far ahead may I read"
 	// is the point: two would disagree, and the disagreement would show up as a
 	// park that grows past the bound one of them believed in.
-	if ceiling, limited := sm.lookaheadCeilingLocked(); limited {
-		return sm.wantedBlocksLocked(best, int32(ceiling-int64(best))) //nolint:gosec // the ceiling is best plus a block count
-	}
-
-	// No read-ahead limit configured. The node-wide download window is then the
-	// only honest bound left: nothing past it could be requested in this pass
-	// anyway, so naming more of the header list buys nothing. A nil settings is
-	// possible in a bare-struct test harness, and Legacy sits past the 4 KB
-	// guard page, where an unguarded dereference is a hardware fault rather than
-	// a recoverable panic.
 	depth := int32(1)
-	if sm.settings != nil {
+	if ceiling, limited := sm.lookaheadCeilingLocked(); limited {
+		depth = int32(ceiling - int64(best)) //nolint:gosec // the ceiling is best plus a block count
+	} else if sm.settings != nil {
+		// No read-ahead limit configured. The node-wide download window is then
+		// the only honest bound left: nothing past it could be requested in this
+		// pass anyway, so naming more of the cache buys nothing. A nil settings
+		// is possible in a bare-struct test harness, and Legacy sits past the
+		// 4 KB guard page, where an unguarded dereference is a hardware fault
+		// rather than a recoverable panic.
 		depth = int32(max(1, sm.settings.Legacy.BlockDownloadWindow)) //nolint:gosec // a block count, not a size
 	}
 
-	return sm.wantedBlocksLocked(best, depth)
+	return sm.wantedBlocksFromCache(best, depth)
 }
 
-// unownedBlocks keeps the wanted blocks nobody currently owes us, and lets a
-// quiet owner off the hook on the way past.
+// unownedBlocks keeps the wanted blocks this node neither already holds nor
+// currently owes, and lets a quiet owner off the hook on the way past.
 //
-// The RequestedWithin test comes FIRST, and that order is the rule rather than
-// an accident: a block inside its retry window has an owner who may still
-// deliver, and asking for it again spends a peer slot that a block nobody owes
-// could have used. Forgiving it as well would be worse still, because
-// forgiveness frees the owner's budget and the pass would then hand the same
-// peer the same block it is already carrying.
+// The disk check runs first, ahead of the ledger, because a block already on
+// disk should not spend a peer's budget nor be forgiven on a peer's behalf: it
+// is simply done. Of what is left, the RequestedWithin test comes next, and
+// that order is the rule rather than an accident: a block inside its retry
+// window has an owner who may still deliver, and asking for it again spends a
+// peer slot that a block nobody owes could have used. Forgiving it as well
+// would be worse still, because forgiveness frees the owner's budget and the
+// pass would then hand the same peer the same block it is already carrying.
 //
 // Forgiveness runs before the budgets are read, not after. A peer that has gone
 // quiet holding a full slice keeps every one of those slots against its
@@ -92,12 +99,23 @@ func (sm *SyncManager) wantedBlocks() []wantedBlock {
 // obligation, so a copy still on the wire from the quiet peer is admitted when
 // it lands.
 //
-// Takes no lock but the download ledger's own, so it is safe with headerMu
-// released and must not be called with it held.
+// Takes no lock of its own beyond the download ledger's and the park store's,
+// neither of which is headerMu, so it is safe with headerMu released and must
+// not be called with it held.
 func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 	candidates := make([]wantedBlock, 0, len(wanted))
 
 	for _, block := range wanted {
+		// A block already on disk is not wanted, whatever any index says. This
+		// is what makes a restart free: the files survive it, so a node comes
+		// back and asks only for what it genuinely lacks.
+		//
+		// Checked before the ledger, because a block we hold should not spend a
+		// peer's budget nor be forgiven on a peer's behalf.
+		if sm.holdsBlock(sm.ctx, block.hash) {
+			continue
+		}
+
 		if sm.blockDownloads.RequestedWithin(block.hash, blockRequestRetryInterval) {
 			continue
 		}

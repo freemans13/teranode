@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
@@ -45,32 +46,30 @@ const propertyDepth = 4
 // about read-ahead has to be measured over sustained passes rather than one.
 const propertyPasses = 40
 
-// heightOfRequested resolves a requested hash back to the height the header list
-// gave it, so a test can assert on POSITION rather than on a count. Counting is
-// what failed twice on 2026-09-12: a block 5000 ahead and a block 1 ahead count
-// the same.
+// heightOfRequested resolves a requested hash back to the height the header
+// cache gave it, so a test can assert on POSITION rather than on a count.
+// Counting is what failed twice on 2026-09-12: a block 5000 ahead and a block 1
+// ahead count the same.
 //
-// It takes headerMu itself, so it must be called with that lock released. A
-// header already removed from the list — which is what an arrival does — is
-// reported as not found rather than as height zero, because zero is a real
-// height in these harnesses.
+// The cache maps height to hash, not hash to height, so this walks every height
+// it names — bounded by Top(), which is at most a few hundred in these
+// harnesses — rather than adding a reverse index to the cache itself for a
+// question only tests ask.
 func heightOfRequested(t *testing.T, sm *SyncManager, hash chainhash.Hash) (int32, bool) {
 	t.Helper()
 
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	element := sm.headerIndex[hash]
-	if element == nil {
+	top, ok := sm.headerCache.Top()
+	if !ok {
 		return 0, false
 	}
 
-	node, ok := element.Value.(*headerNode)
-	if !ok || node == nil {
-		return 0, false
+	for height := sm.committedHeight() + 1; height <= top; height++ {
+		if candidate, named := sm.headerCache.At(height); named && candidate == hash {
+			return height, true
+		}
 	}
 
-	return node.height, true
+	return 0, false
 }
 
 // runPass drives one wanted-range pass and returns the hashes it asked for.
@@ -122,10 +121,18 @@ func runPass(t *testing.T, sm *SyncManager, rec *getDataRecorder, seen int, pass
 // the design this replaces.
 func TestWantedRange_TheDownloaderCannotOutrunTheCommitter(t *testing.T) {
 	// Headers run a long way past anything the node may ask for, so a short
-	// header list cannot be what stops the pass.
+	// header cache cannot be what stops the pass.
 	sm := assignManager(t, 1, 400)
 	sm.settings.Legacy.WantedRangeDownload = true
 	sm.settings.Legacy.BlockDownloadLowerWindow = propertyDepth
+
+	// lookaheadCeilingLocked's own anchor still reads the front of headerList,
+	// which fillHeaderCache never populates, so its ceiling cannot engage here
+	// any more than it can on a real running node at this commit; wantedBlocks
+	// falls back to the node-wide window instead. Setting it to the depth too
+	// keeps the bound this test pins at exactly propertyDepth regardless of
+	// which of the two answers the fallback.
+	sm.settings.Legacy.BlockDownloadWindow = propertyDepth
 
 	// Every other bound lifted clear of the depth. The ladder caps this at 20
 	// whatever is asked for, and 20 is five times the depth, which is the point:
@@ -344,6 +351,13 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	tSettings.Legacy.WantedRangeDownload = true
 	tSettings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
+	// lookaheadCeilingLocked's ceiling cannot engage here, for the same reason it
+	// cannot on a real running node at this commit: its anchor is still the front
+	// of headerList, and nothing pushes onto headerList any more (fillHeaderCache
+	// only ever fills the cache). wantedBlocks then falls back to the node-wide
+	// window, so that is set to the depth too rather than left at its default.
+	tSettings.Legacy.BlockDownloadWindow = propertyDepth
+
 	// As in the first test: every other bound lifted clear of the depth, so the
 	// wanted range is the only candidate explanation for where a pass stops.
 	tSettings.Legacy.MaxBlocksInTransitPerPeer = 20
@@ -385,6 +399,24 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	// of the bound and not because a background pass happened not to run.
 	sm.startHeader = nil
 	sm.headerMu.Unlock()
+
+	// The wanted-range pass reads the header cache, not headerList, so the same
+	// run is named there too — from the blocks' own real headers, which really
+	// do link from genesis, rather than a synthetic chain: this harness delivers
+	// the blocks themselves through processQueuedBlock, and a hash the cache
+	// named that did not match a delivered block's real hash would test nothing.
+	headers := make([]*wire.BlockHeader, 0, len(blocks))
+
+	for _, b := range blocks {
+		h := b.MsgBlock().Header
+		headers = append(headers, &h)
+	}
+
+	regtestParams := chaincfg.RegressionNetParams
+
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(*regtestParams.GenesisHash, 1, headers),
+		"the mined chain must genuinely link from genesis or this harness is not testing what it claims to")
 
 	sm.headersFirstMode.Store(true)
 
