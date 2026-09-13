@@ -1,5 +1,7 @@
 package netsync
 
+import peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+
 // assignWantedBlocks asks peers for the blocks this node wants next.
 //
 // There is no loop and no cursor. The pass computes the wanted range from the
@@ -119,19 +121,40 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 // picked up by the next pass, which recomputes the range from the best block
 // processed — there is no position to lose it from.
 //
-// HAZARD for whoever wires this up: with one connected peer, a block whose owner
-// has gone quiet is re-asked of that same peer. Add refreshes the record, so the
-// first copy home discharges the obligation (handleBlockMsg calls RemoveOwner on
-// the answering peer) and a second copy from the same peer then looks
-// unrequested and costs it its association. fetchHeaderBlocks avoids that with
-// ReassertOwner, which cannot be used here: it would mean a single-peer node
-// never re-asks at all, and the quiet peer would hold the frontier for the full
-// hour-long ownership ceiling.
+// A block whose quiet owner has just been forgiven is never re-asked of that
+// same owner. The assigner is told to prefer any other peer with budget, and
+// when the owner is the only peer left the block is reasserted rather than
+// requested a second time. Sending it twice would have the peer answer twice,
+// and the second copy arrives after the first discharged the obligation
+// (handleBlockMsg calls RemoveOwner on the answering peer), so it looks
+// unrequested and costs an honest peer its whole association.
+//
+// On a node with one peer that means the block is not re-asked at all, which is
+// the right answer rather than a gap: there is nobody to help, so the only thing
+// a second getdata could achieve is the disconnect above. Recovery is the peer's
+// own stall detection, the frontier race, and the ledger's expiry.
 func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wantedBlock) {
 	for _, block := range candidates {
-		target, ok := assigner.take(block.height)
+		target, ok := assigner.takeAvoiding(block.height, func(p *peerpkg.Peer) bool {
+			return sm.blockDownloads.HasOwner(p, block.hash)
+		})
 		if !ok {
 			return
+		}
+
+		// The assigner had nobody but the peer that already holds our request
+		// for this block. Re-arm what we hold instead of asking twice: this
+		// refreshes the retry window, so the next pass waits another interval
+		// before considering the block again, and sends nothing.
+		if sm.blockDownloads.ReassertOwner(target.peer, block.hash) {
+			// Charged like a request, because that is what it is to the two
+			// caps. ReassertOwner clears the forgiven flag, so the block is back
+			// in CountForPeer and back in Len from here on, while both budgets
+			// were computed with the forgiven records excluded.
+			target.budget--
+			assigner.remaining--
+
+			continue
 		}
 
 		// Record the request before it goes out. A block the ledger will not

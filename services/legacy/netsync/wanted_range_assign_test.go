@@ -37,6 +37,18 @@ func (r *getDataRecorder) reset() {
 func assignHarness(t *testing.T, from, to int32) (*SyncManager, *getDataRecorder) {
 	t.Helper()
 
+	sm := assignManager(t, from, to)
+
+	_, rec := schedulerPeer(t, sm, 1, to+1000)
+
+	return sm, rec
+}
+
+// assignManager is assignHarness without the peer, for a test that needs to
+// connect more than one.
+func assignManager(t *testing.T, from, to int32) *SyncManager {
+	t.Helper()
+
 	sm := newRaceManager(t)
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 
@@ -56,9 +68,7 @@ func assignHarness(t *testing.T, from, to int32) (*SyncManager, *getDataRecorder
 
 	sm.headerMu.Unlock()
 
-	_, rec := schedulerPeer(t, sm, 1, to+1000)
-
-	return sm, rec
+	return sm
 }
 
 // waitForPass blocks until the pass's getdata has reached the peer's remote end,
@@ -105,17 +115,38 @@ func TestAssignWantedBlocks_DoesNotReAskForABlockAlreadyOwed(t *testing.T) {
 }
 
 // TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet is the help-a-struggling-peer
-// rule. A block owed past the retry window goes to somebody else as well; the
-// first copy home wins and the late one arrives owned, so no honest peer is
-// punished for it.
+// rule, and it needs two peers because the help has to come from somewhere. One
+// peer takes the whole run and goes quiet; once the retry window expires the
+// block must be asked of the OTHER peer, and never a second time of the peer
+// that already owes it — a peer that answered both requests would have its
+// second copy arrive unowned and lose its association for it.
 func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
-	sm, rec := assignHarness(t, 1, 20)
+	sm := assignManager(t, 1, 20)
 	sm.lastCommittedHeight.Store(10)
 
-	sm.assignWantedBlocks()
-	waitForPass(t, rec)
+	_, first := schedulerPeer(t, sm, 1, 1020)
+	_, second := schedulerPeer(t, sm, 2, 1020)
 
-	rec.reset()
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool { return first.count()+second.count() >= assignPassDepth }, 5*time.Second),
+		"the first pass must place the whole wanted range before anybody can go quiet on it")
+
+	// Runs are handed out contiguously, so one peer takes the lot. Which one
+	// depends on peer-id ordering, so read it off the recorders rather than
+	// assuming.
+	quiet, helper := first, second
+	if quiet.count() == 0 {
+		quiet, helper = second, first
+	}
+
+	require.Equal(t, assignPassDepth, quiet.count(),
+		"the run goes to one peer in one piece")
+	require.Zero(t, helper.count(),
+		"which leaves the other peer owing nothing, and free to help")
+
+	quiet.reset()
+	helper.reset()
 
 	// The tracker's clock is already injectable; setting the field is how the
 	// package ages an assignment without sleeping a minute. Safe unsynchronised
@@ -127,8 +158,10 @@ func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 
 	sm.assignWantedBlocks()
 
-	require.True(t, WaitUntil(func() bool { return rec.count() > 0 }, 5*time.Second),
-		"a block whose owner has gone quiet past the retry window must be asked of somebody else")
+	require.True(t, WaitUntil(func() bool { return helper.count() > 0 }, 5*time.Second),
+		"a block whose owner has gone quiet past the retry window must be asked of the other peer")
+	require.False(t, WaitUntil(func() bool { return quiet.count() > 0 }, 2*time.Second),
+		"and never a second time of the peer that already owes it, whose duplicate copy would look unrequested")
 }
 
 // TestAssignWantedBlocks_TerminatesWhenEverythingIsOwed is the spin found in the
@@ -149,6 +182,11 @@ func TestAssignWantedBlocks_TerminatesWhenEverythingIsOwed(t *testing.T) {
 		close(done)
 	}()
 
+	// A failure here reads oddly and it is worth knowing why before blaming
+	// flakiness. t.Fatal below only stops THIS goroutine, so a spinning
+	// assignWantedBlocks keeps the process alive and the run ends as a
+	// package-level "test timed out" panic whose stack points at the call in the
+	// goroutine above. That panic is this guard firing.
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
