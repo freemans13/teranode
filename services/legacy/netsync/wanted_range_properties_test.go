@@ -12,9 +12,16 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -237,6 +244,61 @@ func TestNew_SeedsTheCommittedHeightFromTheChain(t *testing.T) {
 
 	require.Equal(t, int32(chainHeight), sm.lastCommittedHeight.Load(),
 		"a node that starts with a chain at 800,000 must not believe its best block is 0")
+}
+
+// TestNew_WiresSeedCommittedHeightThroughTheConstructor closes the coverage gap
+// TestNew_SeedsTheCommittedHeightFromTheChain leaves open: that test pins what
+// seedCommittedHeight does, but calls it directly, so it cannot notice if New
+// stopped calling it. Without this test, nothing runs New against a non-zero
+// chain height and asserts on the counter afterwards, so a regression that
+// deleted or reimplemented the call inline in New would leave the whole
+// package green.
+func TestNew_WiresSeedCommittedHeightThroughTheConstructor(t *testing.T) {
+	const chainHeight = uint32(800_000)
+
+	// Cancellable rather than context.Background(): New starts a goroutine
+	// (startKafkaListeners) that polls sm.blockchainClient.IsFSMCurrentState
+	// once a second for as long as ctx is alive, and this test's mock has
+	// nothing else it needs to keep answering once the test is done.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+
+	client := &blockchain2.Mock{}
+	client.Mock.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: chainHeight}, nil)
+	// startKafkaListeners' ticker goroutine calls this every second regardless
+	// of what this test is pinning; without a stub the mock panics the whole
+	// test binary the first time it fires.
+	client.Mock.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(false, nil)
+
+	config := &Config{
+		ChainParams: &chaincfg.MainNetParams,
+		// Checkpoints are irrelevant to this test and pull in a real header walk
+		// against bestHeader, which is a bare stand-in and not a chain the
+		// checkpoint tables know about.
+		DisableCheckpoints: true,
+	}
+
+	sm, err := New(
+		ctx,
+		ulogger.TestLogger{},
+		&settings.Settings{},
+		client,
+		&validator.MockValidator{},
+		&utxo.MockUtxostore{},
+		blob_memory.New(),
+		nil,
+		&subtreevalidation.MockSubtreeValidation{},
+		&blockvalidation.MockBlockValidation{},
+		blockassembly.NewMock(),
+		config,
+	)
+	require.NoError(t, err)
+
+	require.Equal(t, int32(chainHeight), sm.lastCommittedHeight.Load(),
+		"New must seed the committed height from the chain, not leave callers to notice it never did")
 }
 
 // newParkPropertyManager builds a manager the wanted-range pass and the block

@@ -7653,15 +7653,14 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	// Seed the best block processed from the chain, before anything reads it.
-	// The height is already in hand here, so this costs no extra round trip; it
-	// is a separate function only so the rule about where the number comes from
-	// lives in one place. See seedCommittedHeight for what a zero counter costs.
-	seedHeight, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
-	if err != nil {
+	// This makes its own GetBestBlockHeader call rather than reusing the result
+	// above, so New pays for two round trips instead of one. That is deliberate:
+	// it happens once per process at startup, and one source of truth for where
+	// the number comes from is worth more than the round trip it costs. See
+	// seedCommittedHeight for what a zero counter costs.
+	if err := sm.seedCommittedHeight(ctx); err != nil {
 		return nil, err
 	}
-
-	sm.noteCommittedHeight(seedHeight)
 
 	// Build the per-block backoff map only after the last fallible step above.
 	// newBlockFailureBackoffMap starts a background eviction goroutine that is
