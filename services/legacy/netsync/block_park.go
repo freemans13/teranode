@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -1527,28 +1528,38 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 			// about whether the subtree files it names are still there: the
 			// record has no delete-at-height of its own, while every subtree
 			// file does (subtree_writer.go), so a record can survive long
-			// enough to outlive them. Checking the first subtree stands in for
-			// the whole list — see Recover's own doc comment for why that is
-			// the cheap version of this fix rather than checking every one.
-			// Adopting a record whose files are gone would commit cleanly here
-			// and then fail inside validation, landing on the same destructive
-			// path a bad block does.
+			// enough to outlive them.
 			if subtreeStore != nil && quickValidationAllowed != nil && len(record.Subtrees) > 0 {
 				structureType := fileformat.FileTypeSubtreeToCheck
 				if quickValidationAllowed(record.Height) {
 					structureType = fileformat.FileTypeSubtree
 				}
 
-				firstSubtree := record.Subtrees[0]
+				// Every subtree the record names, not just the first. Checking
+				// only Subtrees[0] was the cheap version of this fix and it left
+				// the gap it was written to close: a record whose later files
+				// have gone is adopted, commits cleanly here, and then fails
+				// inside validation, landing on the same destructive path a
+				// genuinely bad block does, which deletes the only copy and
+				// blames an honest peer.
+				//
+				// The cost is one stat per subtree per record, once per restart,
+				// against a scan that is already doing a store read per record.
+				missing := false
 
-				exists, existsErr := subtreeStore.Exists(ctx, firstSubtree[:], structureType)
-				if existsErr != nil || !exists {
-					// Logged once, at WARN, so a soak can tell us whether this
-					// ever actually fires — see Recover's own doc comment on
-					// how narrow the window is: a long-parked conversion whose
-					// retention window has already elapsed underneath it.
-					p.logger.Warnf("[blockPark][%s] converted record's first subtree %s is gone (exists=%v, err=%v); discarding the record instead of adopting a commit that would fail inside validation",
-						hash, firstSubtree, exists, existsErr)
+				for _, subtree := range record.Subtrees {
+					exists, existsErr := subtreeStore.Exists(ctx, subtree[:], structureType)
+					if existsErr != nil || !exists {
+						p.logger.Warnf("[blockPark][%s] converted record's subtree %s is gone (exists=%v, err=%v); discarding the record instead of adopting a commit that would fail inside validation",
+							hash, subtree, exists, existsErr)
+
+						missing = true
+
+						break
+					}
+				}
+
+				if missing {
 					p.Delete(ctx, parkedBlock{hash: *hash})
 
 					discarded++
@@ -1581,7 +1592,19 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 			// the converted-record suffix, so commitParkedBlock and parkedRun
 			// must route it to ReadConverted/HandleConvertedBlock, not Read, the
 			// same as an entry adopted straight off the wire would be.
-			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, size: size, parkedAt: parkedAt, converted: true}
+			// The height is in the record and was already read above for the
+			// quick-validation test. Dropping it here is not cosmetic: EvictBelow
+			// skips any entry whose height is not positive, so a recovered entry
+			// was never evictable by the chain frontier and its slot never came
+			// back, a leak of the park's entry budget across every restart.
+			recoveredHeight, heightErr := safeconversion.Uint32ToInt32(record.Height)
+			if heightErr != nil {
+				p.logger.Warnf("[blockPark][%s] converted record's height %d will not fit, adopting it without one", hash, record.Height)
+
+				recoveredHeight = 0
+			}
+
+			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, height: recoveredHeight, size: size, parkedAt: parkedAt, converted: true}
 
 			p.mu.Lock()
 			stored := entry
