@@ -973,6 +973,21 @@ type SyncManager struct {
 	// checkpoint branch, and the wipe in leaveHeadersFirstMode. Miss one and the
 	// index hands back an element that is no longer in any list.
 	headerIndex map[chainhash.Hash]*list.Element
+	// headersByHeight resolves a height to its element in headerList in O(1).
+	//
+	// It exists so the download pass can take the next N headers above the best
+	// block processed without walking. The list reached 955,208 entries on
+	// mainnet with its front 4,000 blocks below the chain, so a walk from the
+	// front is not a cost that can be paid per pass.
+	//
+	// Guarded by headerMu and maintained in indexHeaderLocked and
+	// unindexHeaderLocked for single-element changes and clearHeaderIndexLocked
+	// for a list wipe, which is the same discipline headerIndex keeps — the two
+	// indexes live and die together so they cannot drift apart.
+	// One header per height is safe here because headers-first mode verifies the
+	// chain against checkpoints before a body is ever requested, so the list is
+	// linear rather than a tree.
+	headersByHeight map[int32]*list.Element
 	// headerListEpoch counts how many times the header list has been thrown
 	// away and started from scratch — resetHeaderStateLocked when the sync peer
 	// is rotated, and leaveHeadersFirstMode at the final checkpoint. Every
@@ -1160,6 +1175,18 @@ func (sm *SyncManager) indexHeaderLocked(e *list.Element, hash chainhash.Hash) {
 	}
 
 	sm.headerIndex[hash] = e
+
+	// The height lives on the node the element holds, not on the element
+	// itself, and a node built by a test harness or a future caller may not be
+	// a *headerNode at all. Skip indexing rather than panic, the way every
+	// other reader of e.Value in this package already does.
+	if node, ok := e.Value.(*headerNode); ok {
+		if sm.headersByHeight == nil {
+			sm.headersByHeight = make(map[int32]*list.Element)
+		}
+
+		sm.headersByHeight[node.height] = e
+	}
 }
 
 // unindexHeaderLocked drops hash from the index, but only if the entry still
@@ -1169,24 +1196,49 @@ func (sm *SyncManager) indexHeaderLocked(e *list.Element, hash chainhash.Hash) {
 // in the list twice, removing the older element must not evict the entry that
 // points at the newer one still in the list.
 func (sm *SyncManager) unindexHeaderLocked(e *list.Element, hash chainhash.Hash) {
-	if sm.headerIndex == nil {
-		return
+	if sm.headerIndex != nil && sm.headerIndex[hash] == e {
+		delete(sm.headerIndex, hash)
 	}
 
-	if sm.headerIndex[hash] == e {
-		delete(sm.headerIndex, hash)
+	// Same identity check as the hash entry above: a stale element must not be
+	// allowed to evict the live one a newer element for the same height holds.
+	if sm.headersByHeight != nil {
+		if node, ok := e.Value.(*headerNode); ok && sm.headersByHeight[node.height] == e {
+			delete(sm.headersByHeight, node.height)
+		}
 	}
 }
 
-// clearHeaderIndexLocked empties the index. The caller must hold headerMu.
-// It must be called wherever the header list itself is emptied, or the index
-// keeps resolving hashes to elements that are no longer in any list.
-func (sm *SyncManager) clearHeaderIndexLocked() {
-	if sm.headerIndex == nil {
-		return
+// headerAtHeightLocked returns the header at a height, or false when the list
+// does not hold one. Callers must hold headerMu.
+func (sm *SyncManager) headerAtHeightLocked(height int32) (*headerNode, bool) {
+	e := sm.headersByHeight[height]
+	if e == nil {
+		return nil, false
 	}
 
-	sm.headerIndex = make(map[chainhash.Hash]*list.Element)
+	node, ok := e.Value.(*headerNode)
+
+	return node, ok
+}
+
+// clearHeaderIndexLocked empties both indexes. The caller must hold headerMu.
+// It must be called wherever the header list itself is emptied, or an index
+// keeps resolving a key to an element that is no longer in any list.
+//
+// This is a bulk replace rather than a call through indexHeaderLocked or
+// unindexHeaderLocked, because those two maintain single entries as the list
+// changes one element at a time; a list wipe discards every element at once,
+// so both maps are reset the same way here, together, for the same reason
+// headerListEpoch is bumped alongside them.
+func (sm *SyncManager) clearHeaderIndexLocked() {
+	if sm.headerIndex != nil {
+		sm.headerIndex = make(map[chainhash.Hash]*list.Element)
+	}
+
+	if sm.headersByHeight != nil {
+		sm.headersByHeight = make(map[int32]*list.Element)
+	}
 }
 
 // headerElement returns the header list element holding hash, or nil when the
