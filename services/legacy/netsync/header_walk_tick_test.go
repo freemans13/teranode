@@ -251,6 +251,14 @@ func TestSyncManager_AGivenUpBlockAfterACheckpointTransitionIsAskedForAgain(t *t
 
 	sm.resetHeaderState(&anchor, 11106)
 
+	// lookaheadCeilingLocked anchors on sm.committedHeight() now, not on the
+	// front of the header list, so the fixture's own anchor height has to be
+	// recorded there too — otherwise the ceiling sits at the default
+	// legacy_blockDownloadLowerWindow of 128 above a committed height of zero,
+	// well below every header this round seeds at 11107 and up, and the round's
+	// first fetch asks for nothing.
+	sm.noteCommittedHeight(11106, anchor)
+
 	// resetHeaderState now derives the checkpoint from the height it is given,
 	// so the synthetic one this test needs is put back after it.
 	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 11111, Hash: &checkpoint}

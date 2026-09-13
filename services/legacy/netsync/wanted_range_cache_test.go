@@ -92,3 +92,53 @@ func TestUnownedBlocks_StillDropsBlocksAPeerOwes(t *testing.T) {
 
 	_ = time.Second
 }
+
+// TestWantedBlocks_UsesTheScaledLookaheadCeilingNotTheFlatWindow drives the real
+// path end to end, the way a live headers round does: fillHeaderCache lands a
+// batch in the cache, and wantedBlocks reads it back through
+// lookaheadCeilingLocked.
+//
+// This is the test the fix round found missing. Every existing ceiling test
+// hand-seeded the header list, a structure nothing in production fills any
+// more, so they proved lookaheadCeilingLocked correct in isolation while the
+// integrated path — fillHeaderCache into wantedBlocks — silently answered "no
+// ceiling" on every real node, because its old anchor fallback needed a header
+// list front that was never there. Two later tasks write tests that assume the
+// park cannot exceed the read-ahead depth; against that bug they would have
+// passed for nothing, bounded instead by the flat node-wide window.
+//
+// legacy_blockDownloadLowerWindow and legacy_blockDownloadWindow are set to
+// wildly different values on purpose, so a wantedBlocks that fell back to the
+// window cannot be mistaken for one reading the scaled ceiling: 1000 blocks
+// back would be obvious against the 5 asserted here. The block-size ladder is
+// parked at half its top rung rather than left at its default top — at the top
+// rung scaling is a no-op ratio of one, so a ceiling of 10 would not
+// distinguish "scaled" from "the unscaled lower window itself".
+func TestWantedBlocks_UsesTheScaledLookaheadCeilingNotTheFlatWindow(t *testing.T) {
+	sm := newHeaderCacheManager(t)
+
+	tipHash := chainhash.Hash{0x60}
+	sm.lastCommittedTip.Store(&committedTip{height: 100, hash: tipHash})
+
+	sm.settings.Legacy.BlockDownloadLowerWindow = 10
+	sm.settings.Legacy.BlockDownloadWindow = 1000
+
+	sm.blockSizeTracker = newBlockSizeTracker(10)
+	sm.blockSizeTracker.addBlockSize(150 * 1024 * 1024)
+	require.Equal(t, 10, sm.blockSizeTracker.calculateMaxInFlightBlocks(),
+		"sanity: the ladder is at half its top rung, so scaling is neither a no-op nor a floor")
+
+	peer, _, _ := connectRacePeer(t, 211, 1000)
+
+	var nonce uint32
+	msg, _ := linkedHeaders(tipHash, 20, &nonce)
+
+	sm.fillHeaderCache(peer, msg)
+
+	got := sm.wantedBlocks()
+
+	require.Len(t, got, 5,
+		"the scaled ceiling (10 * 10/20 = 5) must bind, not the unscaled lower window (10) and not the node-wide window (1000)")
+	require.Equal(t, int32(101), got[0].height)
+	require.Equal(t, int32(105), got[len(got)-1].height)
+}

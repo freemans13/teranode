@@ -126,13 +126,12 @@ func TestWantedRange_TheDownloaderCannotOutrunTheCommitter(t *testing.T) {
 	sm.settings.Legacy.WantedRangeDownload = true
 	sm.settings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
-	// lookaheadCeilingLocked's own anchor still reads the front of headerList,
-	// which fillHeaderCache never populates, so its ceiling cannot engage here
-	// any more than it can on a real running node at this commit; wantedBlocks
-	// falls back to the node-wide window instead. Setting it to the depth too
-	// keeps the bound this test pins at exactly propertyDepth regardless of
-	// which of the two answers the fallback.
-	sm.settings.Legacy.BlockDownloadWindow = propertyDepth
+	// BlockDownloadWindow is deliberately left at its real default (1024, far
+	// above propertyDepth) rather than narrowed to match: lookaheadCeilingLocked
+	// anchors on sm.committedHeight(), seeded below, so the ceiling engages on
+	// BlockDownloadLowerWindow alone. Narrowing the window to the same value
+	// would make it impossible to tell from this test's assertions whether the
+	// ceiling or the window was what actually bound each pass to propertyDepth.
 
 	// Every other bound lifted clear of the depth. The ladder caps this at 20
 	// whatever is asked for, and 20 is five times the depth, which is the point:
@@ -351,12 +350,12 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	tSettings.Legacy.WantedRangeDownload = true
 	tSettings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
-	// lookaheadCeilingLocked's ceiling cannot engage here, for the same reason it
-	// cannot on a real running node at this commit: its anchor is still the front
-	// of headerList, and nothing pushes onto headerList any more (fillHeaderCache
-	// only ever fills the cache). wantedBlocks then falls back to the node-wide
-	// window, so that is set to the depth too rather than left at its default.
-	tSettings.Legacy.BlockDownloadWindow = propertyDepth
+	// BlockDownloadWindow stays at its real default here too, for the same
+	// reason as the first test: lookaheadCeilingLocked anchors on
+	// sm.committedHeight(), which the test sets below, so BlockDownloadLowerWindow
+	// alone engages the ceiling. Matching the window to the depth would leave the
+	// park-bound property this test proves unable to say which of the two was
+	// doing the binding.
 
 	// As in the first test: every other bound lifted clear of the depth, so the
 	// wanted range is the only candidate explanation for where a pass stops.

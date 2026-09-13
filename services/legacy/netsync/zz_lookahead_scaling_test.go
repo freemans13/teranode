@@ -1,10 +1,8 @@
 package netsync
 
 import (
-	"container/list"
 	"testing"
 
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +36,6 @@ func TestLookaheadCeilingScalesWithBlockSize(t *testing.T) {
 
 		sm := &SyncManager{
 			settings:         tSettings,
-			headerList:       list.New(),
 			blockSizeTracker: newBlockSizeTracker(10),
 		}
 
@@ -46,13 +43,13 @@ func TestLookaheadCeilingScalesWithBlockSize(t *testing.T) {
 			sm.blockSizeTracker.addBlockSize(avgBlockSize)
 		}
 
-		hash := chainhash.Hash{0x01}
-		sm.headerList.PushBack(&headerNode{height: 1000, hash: &hash})
+		sm.lastCommittedTip.Store(&committedTip{height: 1000})
 
 		ceiling, ok := sm.lookaheadCeilingLocked()
 		require.True(t, ok)
 
-		// The ceiling is a height, so the depth is what it adds to the front.
+		// The ceiling is a height, so the depth is what it adds to the
+		// committed height.
 		return ceiling - 1000
 	}
 
@@ -83,14 +80,12 @@ func TestLookaheadCeilingNeverReachesZero(t *testing.T) {
 
 	sm := &SyncManager{
 		settings:         tSettings,
-		headerList:       list.New(),
 		blockSizeTracker: newBlockSizeTracker(10),
 	}
 
 	sm.blockSizeTracker.addBlockSize(3 * 1024 * 1024 * 1024)
 
-	hash := chainhash.Hash{0x02}
-	sm.headerList.PushBack(&headerNode{height: 500, hash: &hash})
+	sm.lastCommittedTip.Store(&committedTip{height: 500})
 
 	ceiling, ok := sm.lookaheadCeilingLocked()
 	require.True(t, ok)
@@ -105,10 +100,8 @@ func TestLookaheadCeilingWithoutATracker(t *testing.T) {
 	tSettings := &settings.Settings{}
 	tSettings.Legacy.BlockDownloadLowerWindow = 128
 
-	sm := &SyncManager{settings: tSettings, headerList: list.New()}
-
-	hash := chainhash.Hash{0x03}
-	sm.headerList.PushBack(&headerNode{height: 10, hash: &hash})
+	sm := &SyncManager{settings: tSettings}
+	sm.lastCommittedTip.Store(&committedTip{height: 10})
 
 	ceiling, ok := sm.lookaheadCeilingLocked()
 	require.True(t, ok)

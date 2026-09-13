@@ -92,6 +92,17 @@ func seedFetchHeaders(t *testing.T, sm *SyncManager, p *peerpkg.Peer, anchor cha
 	spliceHeadersForTest(t, sm, msg.Headers)
 
 	require.Equal(t, len(msg.Headers)+1, sm.headerListLen(), "the seeded headers should all have linked")
+
+	// lookaheadCeilingLocked anchors on sm.committedHeight() now, not on the
+	// front of the header list, so this fixture's own anchor height has to be
+	// reflected there too or every ceiling-bearing test in this package would
+	// see a committed height of zero against headers seeded at 11 and up — an
+	// absolute ceiling below every header it seeded, rather than the depth
+	// relative to height 10 these tests are written against. anchor really is
+	// the block at height 10 in this fixture's model (spliced headers start at
+	// 11), so this is not a stand-in value, it is what resetHeaderState(&anchor,
+	// 10) already asserts.
+	sm.noteCommittedHeight(10, anchor)
 }
 
 // spliceHeadersForTest pushes a batch of already-linked headers onto the back

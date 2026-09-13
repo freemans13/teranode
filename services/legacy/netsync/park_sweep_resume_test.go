@@ -71,6 +71,14 @@ func TestResumeHeaderWalk_AsksAnIdlePeerWhileTheSyncPeerIsFull(t *testing.T) {
 	}
 	sm.headerMu.Unlock()
 
+	// lookaheadCeilingLocked anchors on sm.committedHeight() now, not on the
+	// front of the header list, so this fixture's committed height has to match
+	// what the manually built list assumes: headers at 11 upwards, above a
+	// committed height of 10. Left at zero, the ceiling would be the scaled
+	// depth alone — 6 blocks at this ladder's bottom rung — which sits at
+	// height 6 and excludes every header this test seeded.
+	sm.noteCommittedHeight(10, anchor)
+
 	// The sync peer is mid-transfer on an unrelated block, which is all it takes
 	// to spend its whole budget at this rung.
 	require.True(t, sm.blockDownloads.Add(syncPeer, chainhash.Hash{0xe0}))

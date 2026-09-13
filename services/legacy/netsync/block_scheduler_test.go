@@ -812,7 +812,12 @@ func TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock(t *testing.T) {
 // parked until everything between it and the chain has landed.
 //
 // The second half of the test is the part that matters: the limit has to be a rate
-// and not a stop. Once the frontier moves, the window moves with it.
+// and not a stop. Once the COMMITTER moves, the window moves with it — and only
+// then. Before this fix round it was keyed to the front of the header list
+// instead, which moves when a block is merely HANDLED, committed or not; that
+// conflation is the ratchet measured on mainnet on 2026-09-12, a download front
+// at 4877 against a chain settled at 868, so this half now drives a real commit
+// rather than a delivery.
 func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
 	var nonce uint32
 
@@ -845,15 +850,17 @@ func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
 	require.Equal(t, hashes[4], cursor,
 		"and it must stop ON the first header it would not ask for, or that block leaves the walk")
 
-	// The frontier moves: the anchor block arrives and leaves the front of the
-	// list, so the window slides up with it and the next header becomes fetchable.
-	require.True(t, sm.blockDownloads.Add(syncPeer, anchor))
-	_ = sm.handleBlockMsg(&blockQueueMsg{blockHash: anchor, peer: syncPeer})
+	// The committer moves: height 11, the block this pass just requested, joins
+	// the chain for real. seedFetchHeaders already recorded height 10 (the
+	// anchor) as committed, which is what let the first half's ceiling engage at
+	// all; committing one more is what has to free one more slot, and nothing
+	// short of a real commit may.
+	sm.noteCommittedHeight(11, hashes[0])
 
 	sm.fetchHeaderBlocks()
 
 	require.True(t, WaitUntil(func() bool { return syncRec.count() >= 5 }, 5*time.Second),
-		"a limit that never lets go once the frontier moves is a stall, not a window")
+		"a limit that never lets go once the committer moves is a stall, not a window")
 	require.Equal(t, hashes[0:5], syncRec.all(),
 		"exactly one more block comes into range for one block committed")
 }

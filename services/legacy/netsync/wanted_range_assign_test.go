@@ -51,15 +51,15 @@ func assignHarness(t *testing.T, from, to int32) (*SyncManager, *getDataRecorder
 // the run [from, to] is seeded there with chainOfHeaders — real linked headers,
 // the same fixture header_cache_test.go uses, rather than the header list's old
 // fixed byte-pattern hashes. Nothing downstream of assignWantedBlocks reads
-// headerList, so it is left unseeded, and lookaheadCeilingLocked's own front-of-
-// headerList fallback (its last production reader, due to go with the list in a
-// later task) then finds no front and answers unlimited, same as a real running
-// node: fillHeaderCache never pushes onto headerList either.
+// headerList, so it is left unseeded.
 //
-// So BlockDownloadWindow is set to assignPassDepth here too, not only
-// BlockDownloadLowerWindow. With the ceiling unable to engage, wantedBlocks
-// falls back to the node-wide window as the depth, and that is the bound these
-// tests actually want to pin.
+// BlockDownloadLowerWindow alone is what bounds these tests at assignPassDepth:
+// lookaheadCeilingLocked anchors on sm.committedHeight() now, which each test
+// seeds for itself after calling this, so the ceiling engages on that alone and
+// BlockDownloadWindow is left at its real default. Setting the node-wide window
+// to the same value as the depth used to be how this fixture routed around a
+// ceiling that could not engage at all; doing that here now would only mask
+// whether the depth or the window was the thing actually binding.
 func assignManager(t *testing.T, from, to int32) *SyncManager {
 	t.Helper()
 
@@ -67,7 +67,6 @@ func assignManager(t *testing.T, from, to int32) *SyncManager {
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 
 	sm.settings.Legacy.BlockDownloadLowerWindow = assignPassDepth
-	sm.settings.Legacy.BlockDownloadWindow = assignPassDepth
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = assignPassDepth
 
 	parent := chainhash.Hash{0xaa}

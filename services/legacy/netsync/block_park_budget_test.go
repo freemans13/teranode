@@ -128,14 +128,11 @@ func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 	ceiling, ok := h.sm.lookaheadCeilingLocked()
 	h.sm.headerMu.Unlock()
 
-	require.True(t, ok, "with a header list and a configured lower window there is a ceiling")
+	require.True(t, ok, "with a configured lower window there is a ceiling")
 
-	h.sm.headerMu.Lock()
-	front := h.sm.headerList.Front().Value.(*headerNode).height
-	h.sm.headerMu.Unlock()
-
-	require.Equal(t, int64(front)+int64(h.sm.settings.Legacy.BlockDownloadLowerWindow), ceiling,
-		"the ceiling is the front of the header list plus the configured depth, in blocks")
+	require.Equal(t, int64(h.sm.committedHeight())+int64(h.sm.settings.Legacy.BlockDownloadLowerWindow), ceiling,
+		"the ceiling is the committed height plus the configured depth, in blocks — "+
+			"not the front of the header list, which this harness never commits past")
 
 	// Zero disables it, which is the compiled default and means no limit.
 	h.sm.settings.Legacy.BlockDownloadLowerWindow = 0
@@ -158,6 +155,10 @@ func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 // the run waiting to commit. Measured on mainnet during a genesis resync on
 // 2026-09-12: front at 4877, chain settled at 868, park full at 4096, and 1.8
 // blocks a minute against a 23ms commit path.
+//
+// That front-of-list fallback is gone as of this fix round, not merely
+// superseded: lookaheadCeilingLocked no longer reads the header list at all, so
+// there is nothing left to fall back onto or seed a header list against here.
 func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
@@ -181,11 +182,15 @@ func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 	require.Equal(t, int64(front)+500+depth, ceiling,
 		"the ceiling follows the committed block, not the front of the header list")
 
-	// Nothing committed in this process yet — which is every restart, because
-	// lastCommittedHeight is written only when a block commits and is never
-	// seeded. Anchoring to zero there would put the ceiling below the chain's own
-	// height, refuse every header, and leave the node unable to commit the block
-	// that would raise the anchor: a stall on every restart.
+	// Nothing committed in this process yet is a real state — genesis, or a
+	// struct-literal test harness — and it is no longer a special case: with the
+	// header-list fallback removed, committedHeight() reading zero here answers
+	// zero plus depth, the same arithmetic as any other height. It reads zero on
+	// a node restarting mid-chain too, but that is no longer this function's
+	// problem to solve: seedCommittedHeight now seeds the real counter at
+	// startup, before this is ever called for real, which is what makes leaving
+	// the fallback out safe rather than a reintroduction of the restart stall
+	// the old comment here warned about.
 	h.sm.lastCommittedTip.Store(&committedTip{height: 0})
 
 	h.sm.headerMu.Lock()
@@ -193,6 +198,6 @@ func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 	h.sm.headerMu.Unlock()
 
 	require.True(t, ok)
-	require.Equal(t, int64(front)+depth, atStart,
-		"before the first commit the front is the only honest estimate of where the chain is")
+	require.Equal(t, depth, atStart,
+		"with nothing committed the ceiling is the depth alone, not the depth above wherever the header list happens to start")
 }

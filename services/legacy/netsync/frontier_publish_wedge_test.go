@@ -27,6 +27,14 @@ func seedStuckWalk(t *testing.T, sm *SyncManager) chainhash.Hash {
 
 	require.NotSame(t, front, sm.startHeader, "the cursor must be past the front for a frontier to exist")
 
+	// lookaheadCeilingLocked anchors on sm.committedHeight() now, not on the
+	// front of the header list. This is the wedge's own height, 75,001, one
+	// below the front this fixture seeds at 75,002: left at the default
+	// committed height of zero, the ceiling sits at 128 and excludes both
+	// seeded headers before the walk ever reaches the peer-eligibility check
+	// this test means to exercise.
+	sm.noteCommittedHeight(75001, chainhash.Hash{0xf0})
+
 	return frontHash
 }
 

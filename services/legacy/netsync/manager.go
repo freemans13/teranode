@@ -5240,11 +5240,26 @@ func (sm *SyncManager) parkedBlockHeight(reported int32, hash chainhash.Hash, re
 // the block we are waiting for cannot be committed when it arrives and sits in
 // the park until everything between it and the chain has landed.
 //
-// Measured from the front of the header list, which is the block being waited on.
-// svnode measures its -blockdownloadlowerwindow from chainActive.Height(), the
-// validated tip; in headers-first mode with in-order commits those are the same
-// place to within one block, and the front is available here without asking the
-// blockchain service anything.
+// Measured from sm.committedHeight() — the last block this node has actually
+// put into the chain — not from the header list. It used to be anchored to the
+// front of the header list, with a fallback to the committed height for when
+// that counter could still read zero on a node restarting mid-chain. Neither
+// half of that is true any more: fillHeaderCache never pushes onto the header
+// list, so the list is never populated in production, and seedCommittedHeight
+// now seeds the counter at startup, so it does not read zero on a restart
+// either. An anchor that depended on a structure nothing fills answered "no
+// limit" on every real node — the read-ahead bound this comment describes was
+// dead from the moment the list stopped being fed, which made the park's
+// self-limiting property a claim about code that was not running. Anchoring on
+// the counter alone is what svnode does too: -blockdownloadlowerwindow measures
+// from chainActive.Height(), the validated tip, which is exactly what
+// committedHeight reports here.
+//
+// "No limit at all" is now only the two honest cases: no settings to read the
+// configuration from, or the configured lower window is zero or less. A depth
+// that engages but then falls back to some other anchor because a data
+// structure happened to be empty was never a real "no limit" state, just an
+// incidental one.
 //
 // Clamped to the node-wide window, as svnode clamps its lower window to its
 // window: a limit looser than that could never bind.
@@ -5300,20 +5315,6 @@ func (sm *SyncManager) lookaheadCeilingLocked() (int64, bool) {
 		}
 	}
 
-	if sm.headerList == nil {
-		return 0, false
-	}
-
-	front := sm.headerList.Front()
-	if front == nil {
-		return 0, false
-	}
-
-	node, isHeaderNode := front.Value.(*headerNode)
-	if !isHeaderNode {
-		return 0, false
-	}
-
 	// Anchored to the last COMMITTED block, and that is the whole rule: never ask
 	// for a block more than the read-ahead depth above what has been validated.
 	//
@@ -5332,40 +5333,12 @@ func (sm *SyncManager) lookaheadCeilingLocked() (int64, bool) {
 	// achieve any of that, because a block 5000 ahead and a block 1 ahead count
 	// the same.
 	//
-	// The front is deliberately NOT floored in. A front above the ceiling means
-	// this node already holds a depth's worth of unvalidated blocks, and the
-	// right answer is to stop asking until the committer has used some of them.
-	// That is self-healing rather than a stall: committing raises the anchor,
-	// which raises the ceiling.
-	// The anchor is the last COMMITTED block: never ask for a block more than the
-	// read-ahead depth above what has been validated. That single rule makes the
-	// park self-limiting — it cannot exceed the depth, so it never reaches its
-	// entry cap, so no block is ever refused, so no hole is ever punched in the
-	// run of parked blocks waiting to commit.
-	//
-	// It used to be anchored to the front of the header list, which advances when
-	// a block ARRIVES rather than when it commits. That made the ceiling a
-	// ratchet driven by downloads: every arrival raised the front, raising the
-	// ceiling, licensing another depth's worth of requests, with no coupling to
-	// the committer at all. Measured on mainnet during a genesis resync on
-	// 2026-09-12: the front stood at 4877 with the chain settled at 868, the park
-	// held its full 4096 entries, and the node moved 1.8 blocks a minute against
-	// a commit path that takes 23ms per block.
-	//
-	// The fallback is not cosmetic. lastCommittedTip is written only by
-	// noteCommittedHeight, so it reads zero until this PROCESS commits something,
-	// including on a node restarting mid-chain. Anchoring to zero there would put
-	// the ceiling below the chain's own height and refuse every header, and the
-	// node could never commit the block that would raise the anchor: a permanent
-	// stall on every restart. Until the first commit lands, the front is the only
-	// honest estimate of where the chain is, which is what the old anchor relied
-	// on. One commit replaces it, which happens within seconds of blocks flowing.
-	anchor := int64(sm.committedHeight())
-	if anchor == 0 {
-		anchor = int64(node.height)
-	}
-
-	return anchor + int64(lower), true
+	// There is no fallback to a header-list front any more, and none is needed:
+	// seedCommittedHeight reads the chain's real tip at startup, so this reads a
+	// genuine height on a node restarting mid-chain rather than the zero that
+	// justified the old fallback. A fallback keyed to a structure nothing fills
+	// would only have reintroduced the bug this function exists to fix.
+	return int64(sm.committedHeight()) + int64(lower), true
 }
 
 // snapshotHeaderCandidates copies up to limit hashes from startHeader forward,
@@ -5745,13 +5718,12 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// the peer keeps its connection, because a reply that connects to a point we
 	// have moved past is an honest answer to a question we have stopped asking.
 	//
-	// INTERMEDIATE STATE, INTENTIONAL, NOT MERGEABLE ON ITS OWN: nothing reads
-	// sm.headerCache yet. Task 5 is what wires the wanted-range pass to read it;
-	// until that lands, a headers batch is filled into the cache and then goes
-	// nowhere — no header is ever pushed onto sm.headerList any more, so
-	// headers-first mode never leaves headers-first mode and no block is ever
-	// requested from a headers round. A node on this commit alone cannot sync.
-	// This series must not be merged until Task 5 is in.
+	// The wanted-range pass reads sm.headerCache: wantedBlocks (in
+	// wanted_range_assign.go) calls wantedBlocksFromCache, which is the only
+	// consumer of what a fill lands here. No header is ever pushed onto
+	// sm.headerList any more — that structure is read only by the cursor walk,
+	// the alternative fetchHeaderBlocks still dispatches to while
+	// legacy_wantedRangeDownload is off.
 	sm.fillHeaderCache(hmsg.peer, msg)
 
 	return
