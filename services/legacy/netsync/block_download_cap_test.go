@@ -176,17 +176,14 @@ func TestFetchHeaderBlocks_NeverAsksForABlockTheLedgerWillNotTrack(t *testing.T)
 
 	anchor := chainhash.Hash{}
 	anchor[31] = 0xa0
-	sm.resetHeaderState(&anchor, 10)
-	sm.headersFirstMode.Store(true)
+	sm.noteCommittedHeight(10, anchor)
 
 	var nonce uint32
 
 	headers, hashes := linkedHeaders(anchor, 4, &nonce)
-	spliceHeadersForTest(t, sm, headers.Headers)
 
-	// assignWantedBlocks reads the header cache, not the header list, so the
-	// same run has to be named there too.
-	sm.noteCommittedHeight(10, anchor)
+	// assignWantedBlocks reads the header cache, so that is what has to name
+	// the seeded run.
 	sm.headerCache = newHeaderCache()
 	require.True(t, sm.headerCache.Fill(anchor, 11, headers.Headers))
 

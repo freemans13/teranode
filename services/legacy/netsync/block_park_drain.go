@@ -215,13 +215,10 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 		}
 	}
 
-	// The header list is only ever advanced by an arriving block that matches
-	// its front. A block committed from disk never passes that code, so without
-	// this the front sticks on a block that is already in the chain, the next
-	// block never matches it, the frontier is never republished and the
-	// checkpoint transition never fires — headers-first sync would wedge one
-	// block after the first successful drain.
-	isCheckpointBlock, _ := sm.advanceHeaderListFor(entry.hash)
+	// isCheckpointHash is a direct hash comparison against the configured
+	// checkpoints, so it needs no header-list bookkeeping to answer this for a
+	// block committed from disk rather than off the wire.
+	isCheckpointBlock := sm.isCheckpointHash(entry.hash)
 
 	sm.parkedBlockCommitted(entry, isCheckpointBlock)
 
@@ -247,15 +244,16 @@ func (sm *SyncManager) parkedReadFailed(entry parkedBlock, err error) bool {
 	return false
 }
 
-// parkedBlockCommitted is everything owed after a parked block has gone into the
-// chain and its header node has been taken off the front: the progress stamp, the
-// disposition that deletes the blob and gives its bytes back, the backoff and
-// cascade clears, the peer bookkeeping, and either the checkpoint transition or
-// the pipeline top-up.
+// parkedBlockCommitted is everything owed after a parked block has gone into
+// the chain: the progress stamp, the disposition that deletes the blob and
+// gives its bytes back, the backoff and cascade clears, the peer bookkeeping,
+// the possible exit from headers-first mode, and the pipeline top-up.
 //
-// isCheckpointBlock is the answer advanceHeaderListFor gave for this block, passed
-// in rather than recomputed, because by the time this runs the front has moved and
-// the question can no longer be asked.
+// isCheckpointBlock is isCheckpointHash's answer for this block, passed in
+// rather than recomputed here purely so a stall investigation can see from the
+// log whether the block that just unstuck a drain was a checkpoint; the
+// decision this function makes no longer depends on it; see
+// maybeLeaveHeadersFirstMode.
 //
 // It deliberately does not drain the blocks parked behind this one. The caller
 // owns that: the serial path walks an explicit stack in drainParkedDescendants,
@@ -281,16 +279,10 @@ func (sm *SyncManager) parkedBlockCommitted(entry parkedBlock, isCheckpointBlock
 	sm.noteCommittedParkedBlock(entry)
 
 	if isCheckpointBlock {
-		// A parked block CAN be the checkpoint block, and if the next round of
-		// headers is never asked for, headers-first sync stops here for good. So
-		// this one falls back to the current sync peer when the peer that
-		// delivered the block has gone.
-		if err := sm.checkpointBlockCommitted(sm.livePeer(entry.peer), entry.hash); err != nil {
-			sm.logger.Errorf("[commitParkedBlock][%s] failed to move past the checkpoint: %v", entry.hash, err)
-		}
-
-		return
+		sm.logger.Infof("[commitParkedBlock][%s] committed a checkpoint block from the park", entry.hash)
 	}
+
+	sm.maybeLeaveHeadersFirstMode(entry.hash.String())
 
 	sm.fetchMoreHeaderBlocks(sm.livePeer(entry.peer))
 }
@@ -577,16 +569,10 @@ type drainRequest struct {
 // it did. It runs on the consumer goroutine, in the same loop turn as the
 // admission test, so the answer cannot go stale between them.
 //
-// The order is peek, test, claim, advance the header front, dispatch. Peeking
+// The order is peek, test, claim, check the checkpoint hash, dispatch. Peeking
 // first is what stops a refused candidate being stranded out of the index, and it
 // is also where the size comes from, which the byte arm of the admission test
-// needs. The header front is advanced here rather than in the tail because the
-// front has to be past this block before the next arriving block is
-// head-processed, and freeing the consumer is precisely what makes that not
-// automatic any more: a live successor examined while the front still sits on an
-// in-flight parked block matches nothing, never removes its own node, never
-// learns it is the checkpoint block, and wedges the walk on a block already
-// committed.
+// needs.
 func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 	for len(sm.drainQueue) > 0 {
 		req := sm.drainQueue[0]
@@ -644,14 +630,7 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 			return false
 		}
 
-		isCheckpointBlock, removedFront := sm.advanceHeaderListFor(entry.hash)
-
-		// Merged onto the entry the dispatch owns, because parkedBlockHeight
-		// reads its height, and by then the node is gone from both the list and
-		// the index.
-		if removedFront != nil {
-			entry.removedFront = removedFront
-		}
+		isCheckpointBlock := sm.isCheckpointHash(entry.hash)
 
 		d.parked = &entry
 		d.parkedIsCheckpoint = isCheckpointBlock

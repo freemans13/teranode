@@ -8,7 +8,6 @@ package netsync
 
 import (
 	"bytes"
-	"container/list"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -238,31 +237,6 @@ type isCurrentMsg struct {
 // unpause channel.
 type pauseMsg struct {
 	unpause <-chan struct{}
-}
-
-// headerNode is used as a node in a list of headers that are linked together
-// between checkpoints.
-type headerNode struct {
-	height int32
-	hash   *chainhash.Hash
-	// listEpoch is the header list this node was made for. See
-	// SyncManager.headerListEpoch.
-	listEpoch uint64
-	// isAnchor marks a node that is in the list only so the next header can
-	// prove it links: its block is already in this node's chain, and no peer
-	// will ever deliver it to us again. resetHeaderStateLocked pushes one when
-	// the list is rebuilt, and checkpointBlockCommitted marks the checkpoint
-	// node it leaves behind to anchor the round that follows. Nothing else sets
-	// it, and it is never cleared — an anchor stops being one by leaving the
-	// list.
-	//
-	// It is recorded on the node rather than worked out from the node's
-	// position, because position lies: a peer can deliver the anchor early,
-	// which takes it out of the list altogether without anything else taking its
-	// place at the front. So "the front" and "the anchor" are not always the
-	// same node, and the one place that has to tell them apart is
-	// removeHeaderAnchorLocked.
-	isAnchor bool
 }
 
 // peerSyncState stores additional information that the SyncManager tracks
@@ -842,14 +816,12 @@ type SyncManager struct {
 
 	// The following fields are used for headers-first mode.
 	//
-	// headerMu is the single owner of headerList and nextCheckpoint. Those two
-	// are reached from three goroutines — the
-	// per-message headers handler (blockHandler dispatches one goroutine per
-	// headers message), the block-queue consumer running handleBlockMsg, and
-	// fetchHeaderBlocks, which both of those call — and container/list is not
-	// goroutine-safe, so without this lock every push, walk and remove races.
-	//
-	// Two rules keep it that way:
+	// headerMu no longer owns a header list or a stored checkpoint — both are
+	// gone, replaced by headerCache (its own lock) and findNextHeaderCheckpoint
+	// (a pure function of the committed height, recomputed wherever it is
+	// needed rather than cached). What is left still takes it for
+	// wantedBlocks' sake, so the rules below stay in force for whatever runs
+	// under it:
 	//
 	// Rule A, lock ordering: headerMu -> peerStates. headerMu is the outer of
 	// the two; nothing may take it while already holding the peerStates map
@@ -860,56 +832,12 @@ type SyncManager struct {
 	// output queue is buffered but finite, so a send can block) and no
 	// blockchain client call that can block for an unbounded time
 	// (GetBestBlockHeader can take minutes during initial sync). There are no
-	// exceptions. fetchHeaderBlocks' haveInventory lookups used to be one, on
-	// the grounds that the number of them was bounded; they are now made with
-	// the lock released, in rounds, because bounding the number of calls does
-	// not bound the time they take — see fetchHeaderBlocks.
+	// exceptions.
 	headerMu         sync.Mutex
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
-	// pendingCheckpoint holds the checkpoint block whose round of headers was
-	// never asked for, because it committed when there was nobody to ask.
-	// checkpointBlockCommitted stores it and drainPendingCheckpoint takes it,
-	// restoring it when there is still nobody to ask. The two run on different
-	// goroutines — the block-queue consumer drains the park, the sync-peer
-	// ticker elects — so it is atomic and is read with a Swap. The restore is a
-	// CompareAndSwap for the same reason: the round in the ticker's hand may
-	// already be the stale one. Nil means there is no round owing.
-	pendingCheckpoint atomic.Pointer[deferredCheckpoint]
 	// currentCached is the last answer current() worked out, so a peer goroutine
 	// can read it without making the blockchain call itself. See IsCurrentCached.
-	currentCached atomic.Bool
-	headerList    *list.List
-	// headerIndex resolves a block hash to its element in headerList in O(1),
-	// so a caller does not have to walk the list to find a header. Guarded by
-	// headerMu, and maintained at every single place headerList changes —
-	// resetHeaderStateLocked's wipe and its anchor push, the front removal in
-	// handleBlockMsg, the push in handleHeadersMsg, the front removal on the
-	// checkpoint branch, and the wipe in leaveHeadersFirstMode. Miss one and the
-	// index hands back an element that is no longer in any list.
-	headerIndex map[chainhash.Hash]*list.Element
-	// headersByHeight resolves a height to its element in headerList in O(1).
-	//
-	// It exists so the download pass can take the next N headers above the best
-	// block processed without walking. The list reached 955,208 entries on
-	// mainnet with its front 4,000 blocks below the chain, so a walk from the
-	// front is not a cost that can be paid per pass.
-	//
-	// Guarded by headerMu and maintained in indexHeaderLocked and
-	// unindexHeaderLocked for single-element changes and clearHeaderIndexLocked
-	// for a list wipe, which is the same discipline headerIndex keeps — the two
-	// indexes live and die together so they cannot drift apart.
-	// One header per height is safe here because headers-first mode verifies the
-	// chain against checkpoints before a body is ever requested, so the list is
-	// linear rather than a tree.
-	headersByHeight map[int32]*list.Element
-	// headerListEpoch counts how many times the header list has been thrown
-	// away and started from scratch — resetHeaderStateLocked when the sync peer
-	// is rotated, and leaveHeadersFirstMode at the final checkpoint. Every
-	// header node is stamped with the epoch it was made under, which is what
-	// tells a node that belongs in this list from one left over from a list
-	// that no longer exists. Guarded by headerMu.
-	headerListEpoch  uint64
-	nextCheckpoint   *chaincfg.Checkpoint
+	currentCached    atomic.Bool
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
 	// dispatcher owns the quick window: it decides how many queued blocks may have
@@ -971,290 +899,93 @@ func (sm *SyncManager) storeSyncPeer(peer *peerpkg.Peer, state *syncPeerState) {
 	sm.syncPeerState = state
 }
 
-// resetHeaderState sets the headers-first mode state to values appropriate for
-// syncing from a new peer. It takes headerMu; callers already holding it must
-// use resetHeaderStateLocked instead, because sync.Mutex is not reentrant.
-func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight int32) {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	sm.resetHeaderStateLocked(newestHash, newestHeight)
-}
-
-// resetHeaderStateLocked is resetHeaderState's body. The caller must hold
-// headerMu.
-func (sm *SyncManager) resetHeaderStateLocked(newestHash *chainhash.Hash, newestHeight int32) {
+// leaveHeadersFirstMode switches out of headers-first mode.
+//
+// It used to also wipe the header list and bump its epoch, which do not exist
+// any more: fillHeaderCache never pushes onto a list, so there is nothing left
+// for a stray node to belong to. headersFirstMode is its own atomic, so
+// nothing here needs headerMu either.
+func (sm *SyncManager) leaveHeadersFirstMode() {
 	sm.headersFirstMode.Store(false)
-	sm.headerList.Init()
-	sm.clearHeaderIndexLocked()
-	// The list that follows is a different list, so anything still holding a
-	// node from the old one is holding a node that belongs nowhere any more.
-	sm.headerListEpoch++
-
-	// The list is being rebuilt from newestHeight, so the checkpoint the old
-	// list was working towards may already be behind it: a checkpoint block that
-	// committed with nobody to ask leaves exactly that state, because the
-	// nil-peer arm of checkpointBlockCommitted deliberately does not advance.
-	// Left stale, startSync's headers-first gate reads
-	// bestHeight < nextCheckpoint.Height as false for good and the node never
-	// turns the mode back on. Deriving it here from the same two inputs New uses
-	// (manager.go, the findNextHeaderCheckpoint call in New) means whoever
-	// rebuilds the list also rebuilds the target it is aimed at.
-	//
-	// Monotonic, because newestHeight cannot be trusted to be current. Both
-	// callers read it outside headerMu and then wait to acquire the lock, and on
-	// this path that lock is contended by every arriving block, so a checkpoint
-	// transition can land in the gap and advance the checkpoint before this runs.
-	// An unconditional assignment would then put it back onto the checkpoint
-	// whose block has just committed, and startSync's gate can never be
-	// satisfied by a checkpoint already in the chain: headers-first mode would
-	// stay off for the life of the process, silently, with the header walk
-	// having nothing to walk. Only ever move it forward, and treat nil as
-	// terminal, so a stale height can leave it alone but never rewind it.
-	//
-	// Writing the rule out rather than arguing an invariant is deliberate. It
-	// also makes the DisableCheckpoints case structural instead of a
-	// reachability argument, because findNextHeaderCheckpoint reads
-	// chainParams.Checkpoints directly and that slice is not emptied by the flag.
-	if sm.nextCheckpoint != nil {
-		if derived := sm.findNextHeaderCheckpoint(newestHeight); derived == nil || derived.Height >= sm.nextCheckpoint.Height {
-			sm.nextCheckpoint = derived
-		}
-	}
-
-	// When there is a next checkpoint, add an entry for the latest known
-	// block into the header pool.  This allows the next downloaded header
-	// to prove it links to the chain properly.
-	if sm.nextCheckpoint != nil {
-		// isAnchor: this block is already in the database. It is here to be
-		// linked to and then removed, which is what the trim at the next
-		// checkpoint has to be able to recognise.
-		node := headerNode{height: newestHeight, hash: newestHash, listEpoch: sm.headerListEpoch, isAnchor: true}
-		sm.indexHeaderLocked(sm.headerList.PushBack(&node), *newestHash)
-	}
 }
 
-// indexHeaderLocked records e as the element holding hash. The caller must hold
-// headerMu.
+// maybeLeaveHeadersFirstMode turns headers-first mode off once there is no
+// longer a checkpoint ahead of the committed height, and is a no-op otherwise.
 //
-// Last write wins: the header list tolerates the same hash appearing twice and a
-// map cannot, so the newest element for a hash owns the entry. That rule only
-// works paired with unindexHeaderLocked's identity check — read the two
-// together.
-//
-// The map is allocated lazily because tests build SyncManager as a struct
-// literal that never goes through New().
-func (sm *SyncManager) indexHeaderLocked(e *list.Element, hash chainhash.Hash) {
-	if e == nil {
+// It replaces checkpointBlockCommitted's anchor bookkeeping and its
+// deferred-retry for "no peer to ask": both existed only to keep a STORED
+// nextCheckpoint field from drifting, and to remember a transition that had
+// nowhere to send its getheaders. With the checkpoint recomputed fresh from
+// committedHeight() on every call, there is nothing stored to drift and
+// nothing to defer — the single fact that matters, whether a checkpoint is
+// still ahead, is simply asked again the next time any block commits, whether
+// or not a peer happens to be available to hand a getheaders to right now. A
+// later commit, or the next sync-peer election in startSync, asks the same
+// question and gets the same, current answer.
+func (sm *SyncManager) maybeLeaveHeadersFirstMode(reason string) {
+	if !sm.headersFirstMode.Load() {
 		return
 	}
 
-	if sm.headerIndex == nil {
-		sm.headerIndex = make(map[chainhash.Hash]*list.Element)
+	if sm.findNextHeaderCheckpoint(sm.committedHeight()) != nil {
+		return
 	}
 
-	sm.headerIndex[hash] = e
+	sm.leaveHeadersFirstMode()
 
-	// The height lives on the node the element holds, not on the element
-	// itself, and a node built by a test harness or a future caller may not be
-	// a *headerNode at all. Skip indexing rather than panic, the way every
-	// other reader of e.Value in this package already does.
-	if node, ok := e.Value.(*headerNode); ok {
-		if sm.headersByHeight == nil {
-			sm.headersByHeight = make(map[int32]*list.Element)
-		}
-
-		sm.headersByHeight[node.height] = e
-	}
+	sm.logger.Infof("[headersFirstMode][%s] committed height %d has passed the final checkpoint, leaving headers-first mode", reason, sm.committedHeight())
 }
 
-// unindexHeaderLocked drops hash from the index, but only if the entry still
-// points at e. The caller must hold headerMu.
+// isCheckpointHash reports whether hash is one of the chain's configured
+// checkpoints, while headers-first mode is on.
 //
-// The identity check is what makes last-write-wins safe: when the same hash is
-// in the list twice, removing the older element must not evict the entry that
-// points at the newer one still in the list.
-func (sm *SyncManager) unindexHeaderLocked(e *list.Element, hash chainhash.Hash) {
-	if sm.headerIndex != nil && sm.headerIndex[hash] == e {
-		delete(sm.headerIndex, hash)
-	}
-
-	// Same identity check as the hash entry above: a stale element must not be
-	// allowed to evict the live one a newer element for the same height holds.
-	if sm.headersByHeight != nil {
-		if node, ok := e.Value.(*headerNode); ok && sm.headersByHeight[node.height] == e {
-			delete(sm.headersByHeight, node.height)
-		}
-	}
-}
-
-// headerAtHeightLocked returns the header at a height, or false when the list
-// does not hold one. Callers must hold headerMu.
-func (sm *SyncManager) headerAtHeightLocked(height int32) (*headerNode, bool) {
-	e := sm.headersByHeight[height]
-	if e == nil {
-		return nil, false
-	}
-
-	node, ok := e.Value.(*headerNode)
-
-	return node, ok
-}
-
-// clearHeaderIndexLocked empties both indexes. The caller must hold headerMu.
-// It must be called wherever the header list itself is emptied, or an index
-// keeps resolving a key to an element that is no longer in any list.
-//
-// This is a bulk replace rather than a call through indexHeaderLocked or
-// unindexHeaderLocked, because those two maintain single entries as the list
-// changes one element at a time; a list wipe discards every element at once,
-// so both maps are reset the same way here, together, for the same reason
-// headerListEpoch is bumped alongside them.
-func (sm *SyncManager) clearHeaderIndexLocked() {
-	if sm.headerIndex != nil {
-		sm.headerIndex = make(map[chainhash.Hash]*list.Element)
-	}
-
-	if sm.headersByHeight != nil {
-		sm.headersByHeight = make(map[int32]*list.Element)
-	}
-}
-
-// headerElement returns the header list element holding hash, or nil when the
-// hash is not queued. It takes headerMu itself; callers already holding it must
-// read sm.headerIndex directly.
-func (sm *SyncManager) headerElement(hash chainhash.Hash) *list.Element {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	return sm.headerIndex[hash]
-}
-
-// resetHeaderStateIfEmpty recovers the header state only if the list is still
-// empty, and reports whether it did.
-//
-// The empty-list recovery in handleHeadersMsg has to drop headerMu across
-// GetBestBlockHeader, which can block for minutes during initial sync (Rule B).
-// Once the lock has been dropped, what was read before the call is no longer
-// true: another headers message may have recovered the state and pushed real
-// headers in the meantime. Resetting unconditionally on the way back would throw
-// those away, so the emptiness is re-checked under the lock instead.
-func (sm *SyncManager) resetHeaderStateIfEmpty(newestHash *chainhash.Hash, newestHeight int32) bool {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	if sm.headerList == nil || sm.headerList.Back() != nil {
+// It used to be answered by advanceHeaderListFor, which took a node with this
+// hash out of the header list — unless the hash matched the round's
+// nextCheckpoint, in which case the node was kept in place to anchor the next
+// round. That gave the right answer only because nextCheckpoint was a stored
+// field, valid for as long as nothing else had advanced it. Comparing hash
+// against the fixed list of configured checkpoints instead needs no such
+// timing assumption: a block's hash either is one of the checkpoints or it
+// never was, whether this runs before this block's own commit (the live
+// path) or after it (the park drain, which commits before this is ever
+// asked). Gated on headersFirstMode for the same reason advanceHeaderListFor
+// was: outside a headers-first round a checkpoint match answers nothing this
+// package still acts on.
+func (sm *SyncManager) isCheckpointHash(hash chainhash.Hash) bool {
+	if !sm.headersFirstMode.Load() || sm.chainParams == nil {
 		return false
 	}
 
-	sm.resetHeaderStateLocked(newestHash, newestHeight)
-
-	return true
-}
-
-// leaveHeadersFirstMode switches out of headers-first mode and wipes the header
-// list. It is the body of handleBlockMsg's "reached the final checkpoint"
-// branch, named so the wipe has one place to be maintained: every field the
-// header list owns has to be cleared together, and inline three-line versions of
-// that are exactly how one of them gets forgotten.
-//
-// It takes headerMu itself, so it must not be called from a locked region.
-func (sm *SyncManager) leaveHeadersFirstMode() {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	sm.headersFirstMode.Store(false)
-	sm.headerList.Init()
-	sm.clearHeaderIndexLocked()
-	// Same reason as resetHeaderStateLocked: the list is gone, so a header node
-	// somebody else is still holding no longer belongs anywhere.
-	sm.headerListEpoch++
-}
-
-// headerListLen returns the number of headers currently queued. Nil-guarded
-// because tests build SyncManager as a struct literal.
-func (sm *SyncManager) headerListLen() int {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	if sm.headerList == nil {
-		return 0
-	}
-
-	return sm.headerList.Len()
-}
-
-// headerListEmpty reports whether there is no header to link the next batch to.
-func (sm *SyncManager) headerListEmpty() bool {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	return sm.headerList == nil || sm.headerList.Back() == nil
-}
-
-// nextCheckpointSnapshot returns the next checkpoint under headerMu.
-//
-// The returned pointer outlives the lock, which is safe only because
-// checkpoints are immutable: findNextHeaderCheckpoint only ever returns
-// pointers into chainParams.Checkpoints, a fixed slice nothing writes to. Do
-// not start mutating one.
-func (sm *SyncManager) nextCheckpointSnapshot() *chaincfg.Checkpoint {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	return sm.nextCheckpoint
-}
-
-// headerRoundSummary says, in one clause, what state the headers-first round is
-// in: how long the header list is, what sits at each end of it, and which
-// checkpoint the round is aiming at. It returns the empty string when
-// headers-first mode is off, because outside a round there is no round to
-// describe.
-//
-// It exists because Hetzner mainnet sat at height 800128 for seven hours on
-// 2026-09-11 and every line it wrote described the window, the park and the
-// download budget. None of them described the header list, and metrics.go has no
-// gauge for it either. A front node that is still the round's anchor means no
-// header has ever spliced onto it, and nothing the node wrote at the time said
-// so, which is what left that stall undiagnosed for seven hours.
-//
-// Call it only from reportConsumerStall, which runs on the message-handling
-// goroutine's ticker holding no lock, so taking headerMu here cannot invert Rule
-// A's order (headerMu -> peerStates). It must never be called from
-// publishConsumerWait, which runs on the consumer goroutine that owns the
-// dispatcher.
-func (sm *SyncManager) headerRoundSummary() string {
-	if !sm.headersFirstMode.Load() {
-		return ""
-	}
-
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	checkpoint := "no checkpoint ahead"
-	if sm.nextCheckpoint != nil {
-		checkpoint = fmt.Sprintf("aiming at checkpoint %d", sm.nextCheckpoint.Height)
-	}
-
-	if sm.headerList == nil || sm.headerList.Len() == 0 {
-		return "the header round holds no headers, " + checkpoint
-	}
-
-	front := "the front node is unreadable"
-
-	if node, ok := sm.headerList.Front().Value.(*headerNode); ok && node != nil {
-		front = fmt.Sprintf("front height %d", node.height)
-		if node.isAnchor {
-			front += " which is still the round's anchor, so no header has spliced onto it"
+	for i := range sm.chainParams.Checkpoints {
+		if cp := sm.chainParams.Checkpoints[i].Hash; cp != nil && cp.IsEqual(&hash) {
+			return true
 		}
 	}
 
-	back := "the back node is unreadable"
-	if node, ok := sm.headerList.Back().Value.(*headerNode); ok && node != nil {
-		back = fmt.Sprintf("back height %d", node.height)
+	return false
+}
+
+// headerRoundSummary describes where the download stands, for the stall
+// watchdog. It names the four things the pass actually reads, so a stalled node
+// says which of them is empty.
+//
+// It replaces a summary of the header list — how long it was, what sat at each
+// end of it, and which checkpoint the round was aiming at — which existed
+// because Hetzner mainnet sat at height 800128 for seven hours on 2026-09-11
+// and every line the node wrote described the window, the park and the
+// download budget. None of them described the header list, and metrics.go had
+// no gauge for it either. That structure and its front-of-list anchor are gone
+// now, replaced by the cache and the counter this reads instead.
+func (sm *SyncManager) headerRoundSummary() string {
+	best := sm.committedHeight()
+
+	top, haveTop := sm.headerCache.Top()
+	if !haveTop {
+		return fmt.Sprintf("best block processed %d, the header cache is empty so the next pass can name nothing and is waiting on a getheaders", best)
 	}
 
-	return fmt.Sprintf("the header round holds %d headers, %s, %s, %s", sm.headerList.Len(), front, back, checkpoint)
+	return fmt.Sprintf("best block processed %d, the header cache names %d heights up to %d, %d blocks are owed by peers",
+		best, sm.headerCache.Len(), top, sm.blockDownloads.Len())
 }
 
 // findNextHeaderCheckpoint returns the next checkpoint after the passed height.
@@ -1477,27 +1208,15 @@ func (sm *SyncManager) startSync() {
 	// and fully validate them.  Finally, regression test mode does
 	// not support the headers-first approach so do normal block
 	// downloads when in regression test mode.
-	// Snapshot the checkpoint under headerMu, then work from the snapshot: the
-	// getheaders send below must not happen with the lock held (Rule B).
-	nextCP := sm.nextCheckpointSnapshot()
-
-	// Re-aim from the height read on this path, which is the only current one
-	// available here, rather than trusting whoever last rebuilt the header list
-	// to have read a fresh one. Both rebuild callers take their height outside
-	// headerMu and then wait for the lock, so a checkpoint transition can commit
-	// in that gap and leave the stored checkpoint naming a block already in our
-	// chain. The gate below can never be satisfied by such a checkpoint, so
-	// headers-first mode would stay off for good and the header walk would have
-	// nothing to walk. Repairing it here makes the gate self-healing whatever
-	// the last rebuild saw.
-	if nextCP != nil && bestBlockHeightInt32 >= nextCP.Height {
-		sm.headerMu.Lock()
-		sm.nextCheckpoint = sm.findNextHeaderCheckpoint(bestBlockHeightInt32)
-		nextCP = sm.nextCheckpoint
-		sm.headerMu.Unlock()
-
-		sm.logger.Infof("[startSync] checkpoint was already in the chain at height %d, re-aimed", bestBlockHeightInt32)
-	}
+	// Computed fresh from the height read on this path, rather than trusting a
+	// stored value somebody else last wrote. That used to matter: a stored
+	// nextCheckpoint could go stale between one goroutine reading a height and
+	// another committing past it, and the gate below could never be satisfied
+	// by a checkpoint already in the chain, so headers-first mode would stay
+	// off for good with nothing to re-aim it. Recomputing it here every time
+	// removes the staleness along with the field it used to live in — there is
+	// nothing left to repair.
+	nextCP := sm.findNextHeaderCheckpoint(bestBlockHeightInt32)
 
 	if nextCP != nil &&
 		bestBlockHeightInt32 < nextCP.Height &&
@@ -1517,6 +1236,13 @@ func (sm *SyncManager) startSync() {
 
 			return
 		}
+
+		// Owned here rather than left to a caller to reset first: this is the
+		// one place that decides whether the round ahead needs headers-first
+		// verification, and a caller re-electing a peer while the flag is still
+		// true from a previous election has nothing else that will ever clear
+		// it for this branch.
+		sm.headersFirstMode.Store(false)
 	}
 
 	bestPeer.SetSyncPeer(true)
@@ -1691,14 +1417,6 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		return
 	}
-
-	// After everything this tick might do to the sync peer, not before: the
-	// arms below elect one when there is none and demote-then-re-elect when the
-	// current one has stalled, and a deferred checkpoint round needs whatever
-	// peer that leaves behind. Deferred rather than placed at each return
-	// because there are several, and missing one loses the round until the next
-	// tick. See drainPendingCheckpoint.
-	defer sm.drainPendingCheckpoint()
 
 	sp, sps := sm.loadSyncPeerAndState()
 
@@ -1878,92 +1596,6 @@ func (sm *SyncManager) headersRoundLocator(bestHash *chainhash.Hash, bestHeight 
 	return sm.blockchainClient.GetBlockLocator(sm.ctx, bestHash, bestHeight)
 }
 
-// headerListLocator builds a block locator out of the header list: the back
-// first, then stepping back through the list at a doubling stride, then the front
-// of the list and our own database best block.
-//
-// The back has to come first, because a peer that has it answers from it and the
-// round continues where it left off. Everything after the back is what makes the
-// question answerable by a peer that has not got that far. startSync elects any
-// connected candidate above our own height, which mid-round can be up to a full
-// headers batch below the back of the list; asked only about the back, such a
-// peer recognises nothing, its node falls back to the genesis block, and it
-// replies from height 1 — headers whose parent we have never heard of, which
-// costs it its connection with a misbehaviour warning for answering honestly.
-// A single hash is the degenerate case of this locator, and the degenerate case
-// is the one that loses peers.
-//
-// Bounding it on the peer's claimed height instead would be cheaper but worse in
-// two ways: a claimed height is a lower bound that goes stale downward, so a peer
-// that does have the back would be sent the database locator and the round would
-// not continue; and the database locator's own reply does not connect to the back
-// either, so it buys nothing beyond not being disconnected.
-//
-// Every entry is a block we hold, so a reply is either a continuation from the
-// back or an answer whose first header connects to a header we hold — which
-// handleHeadersMsg recognises as a late or short answer, ignores, and leaves the
-// peer connected. The list front is appended explicitly because the stride can
-// step over it, and our database best block last because after the checkpoint
-// transition the round's anchor is removed and the front is one above the tip.
-//
-// Our committed tip stays LAST and is never promoted, however far below the back
-// it sits: a peer answers from the first locator hash it recognises
-// (src/validation.cpp:203-217, FindForkInGlobalIndex), so a tip-first locator
-// has every peer answer from tip+1, and that batch's first header connects to
-// the committed tip rather than to headerList.Back() — which the splice test in
-// handleHeadersMsg rejects, and which costs the sender its connection with
-// "Received block header that does not properly connect to the chain" — the one
-// disconnect that removed Hetzner mainnet's last working supplier on
-// 2026-09-11, charged on the first offence.
-func (sm *SyncManager) headerListLocator(bestHash *chainhash.Hash) []*chainhash.Hash {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	if sm.headerList == nil || sm.headerList.Len() == 0 {
-		return nil
-	}
-
-	locator := make([]*chainhash.Hash, 0, 24)
-
-	step := 1
-	skip := 0
-
-	for e := sm.headerList.Back(); e != nil; e = e.Prev() {
-		node, ok := e.Value.(*headerNode)
-		if !ok || node.hash == nil {
-			continue
-		}
-
-		if skip > 0 {
-			skip--
-
-			continue
-		}
-
-		locator = append(locator, node.hash)
-
-		// The first ten are consecutive, as in every other bitcoin locator, so a
-		// peer only a few headers behind the back finds its fork point exactly.
-		if len(locator) > 10 {
-			step *= 2
-		}
-
-		skip = step - 1
-	}
-
-	if front, ok := sm.headerList.Front().Value.(*headerNode); ok && front.hash != nil {
-		if len(locator) == 0 || !locator[len(locator)-1].IsEqual(front.hash) {
-			locator = append(locator, front.hash)
-		}
-	}
-
-	if bestHash != nil && (len(locator) == 0 || !locator[len(locator)-1].IsEqual(bestHash)) {
-		locator = append(locator, bestHash)
-	}
-
-	return locator
-}
-
 // topBlock returns the best chains top block height
 func (sm *SyncManager) topBlock() int32 {
 	sp := sm.loadSyncPeer()
@@ -2040,11 +1672,7 @@ func (sm *SyncManager) updateSyncPeer(_ *peerSyncState) {
 	if sp != nil {
 		// Log current sync state before disconnecting
 		if sm.headersFirstMode.Load() {
-			sm.headerMu.Lock()
-			hlLen := sm.headerList.Len()
-			sm.headerMu.Unlock()
-
-			sm.logger.Debugf("Current header sync state - headerList length: %d", hlLen)
+			sm.logger.Debugf("Current header sync state - header cache names %d heights", sm.headerCache.Len())
 		}
 
 		sp.SetSyncPeer(false)
@@ -2054,26 +1682,11 @@ func (sm *SyncManager) updateSyncPeer(_ *peerSyncState) {
 	// Reset sync peer state
 	sm.storeSyncPeer(nil, nil)
 
-	bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
-	if err != nil {
-		// TODO we should return an error here to the caller
-		sm.logger.Errorf(failedToGetBestBlockHeaderMsg, err)
-		return
-	}
-
-	bestBlockHeightInt32, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
-	if err != nil {
-		sm.logger.Errorf(failedToConvertBlockHeightInt32Msg, err)
-		return // add return to prevent continuing with invalid height
-	}
-
-	if sm.headersFirstMode.Load() {
-		sm.logger.Infof("Resetting header sync state at height %d with hash %v",
-			bestBlockHeightInt32, bestBlockHeader.Hash())
-
-		sm.resetHeaderState(bestBlockHeader.Hash(), bestBlockHeightInt32)
-	}
-
+	// startSync re-derives the checkpoint fresh from the chain's own best
+	// height and owns headersFirstMode in both directions (see its own
+	// getheaders/getblocks branches), so there is nothing to reset here first
+	// any more: no list to rebuild, no stored checkpoint that could have gone
+	// stale since the last time this ran.
 	sm.startSync()
 }
 
@@ -2602,7 +2215,7 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 	// dispatcher is not used at all and the queue is consumed the way it was before the
 	// window existed, so a rollback to the setting is a rollback to the old code path. It
 	// matters because even at depth 1 the dispatcher splits a block's head (the FSM state
-	// call, requestedBlocks, headerList, size sampling, the cascade marks) from its tail,
+	// call, requestedBlocks, the header cache, size sampling, the cascade marks) from its tail,
 	// so block N+1's head would run while N was still in flight.
 	if sm.settings != nil {
 		if depth, _ := sm.settings.BlockValidation.QuickWindowConfiguredDepth(); depth == 0 {
@@ -2887,68 +2500,6 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 	}
 }
 
-// advanceHeaderListFor takes a committed block's header out of the list,
-// wherever in the list it sits.
-//
-// It used to remove a header only when the arriving hash matched the FRONT, and
-// that cost mainnet twenty-eight minutes on 2026-09-09. Two paths commit a
-// parked block and they advance in opposite order: the sweep commits and then
-// advances, the dispatcher advances and then commits, and both race for the
-// same park. So the dispatcher could advance for block N+1 while N was still
-// mid-commit and therefore still the front. N+1 matched nothing and was left
-// behind; N's commit then removed N, and N+1 sat at the front as a block
-// already in the chain with nobody left who would ever advance for it.
-//
-// Downstream that used to be expensive, because the header list's front was read
-// as "the block everything is waiting for" and a stale front sent a frontier race
-// chasing a block already in this node's chain. See
-// TestSyncManager_ACommittedBlockLeavesTheHeaderListWhateverTheOrder.
-//
-// Matching by hash rather than by position makes both orderings safe, and needs
-// no new state: headerIndex already maps hash to list element.
-//
-// One thing it must not disturb: the checkpoint node stays in the list to anchor
-// the next round of headers, and is still reported only from the front, which is
-// safe because a checkpoint block can only commit once every block below it has,
-// and with this fix those have all left the list.
-//
-// It returns whether this was the checkpoint block, and the header node it took
-// out — nil when the block was not in the list, or was the checkpoint and so was
-// left in place. Callers keep that node so parkedBlockHeight can read its height
-// when the block is later parked.
-func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpointBlock bool, removedFront *headerNode) {
-	if !sm.headersFirstMode.Load() {
-		return false, nil
-	}
-
-	// Explicit Unlock, not defer: the callers run for hundreds of lines past
-	// here and make blocking client calls, so a deferred unlock would turn this
-	// into a serialisation bug.
-	sm.headerMu.Lock()
-
-	// headerIndex maps hash to list element and is written at every insertion
-	// that touches headerList — resetHeaderStateLocked and handleHeadersMsg — so
-	// a hash in the list is a hash in the index. Looking it up here is what makes
-	// the removal independent of position.
-	if e := sm.headerIndex[blockHash]; e != nil {
-		if node, ok := e.Value.(*headerNode); ok && node.hash != nil {
-			if sm.nextCheckpoint != nil && node.hash.IsEqual(sm.nextCheckpoint.Hash) {
-				// Left in the list to anchor the next round of headers.
-				isCheckpointBlock = e == sm.headerList.Front()
-			} else {
-				sm.unindexHeaderLocked(e, *node.hash)
-				sm.headerList.Remove(e)
-
-				removedFront = node
-			}
-		}
-	}
-
-	sm.headerMu.Unlock()
-
-	return isCheckpointBlock, removedFront
-}
-
 // noteHandedOff tells the peer's awaiting goroutine that this block's memory is
 // now charged to another budget, so the download bytes it reserved can go back.
 // Closed exactly once, by the consumer goroutine, and safe on a message that
@@ -3023,8 +2574,8 @@ func nextAdmission(lastWasDrained, canLive, drainOpen bool) admissionChoice {
 //
 // It returns (dispatch, false, nil) when the block is ready to be handed to a
 // worker, or (nil, true, err) when the block is finished here and err is what the
-// caller must reply. Everything it touches (headerList, the download ledger,
-// nextCheckpoint, the park index) stays on this one goroutine.
+// caller must reply. Everything it touches (the header cache, the download
+// ledger, the park index) stays on this one goroutine.
 func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, bool, error) {
 	sm.logger.Debugf("[handleBlockMsg][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 	peer := bmsg.peer
@@ -3112,17 +2663,12 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		sm.logger.Debugf("[handleBlockMsg][%s] accepting an unrequested block from %s while catching blocks", bmsg.blockHash, peer)
 	}
 
-	// When in headers-first mode, if the block matches the hash of the
-	// first header in the list of headers that are being fetched, it's
-	// eligible for less validation since the headers have already been
-	// verified to link together and are valid up to the next checkpoint.
-	// Also, remove the list entry for all blocks except the checkpoint
-	// since it is needed to verify the next round of headers links
-	// properly.
-	// isCheckpointBlock says the block just taken off the header list is the
-	// checkpoint the list was anchored on; removedFront is the header node its
-	// arrival took off the front, kept so a drop further down can put it back.
-	isCheckpointBlock, removedFront := sm.advanceHeaderListFor(bmsg.blockHash)
+	// isCheckpointBlock feeds the dispatcher's barrier (canDispatch, dispatch,
+	// complete in block_dispatcher.go): nothing may be admitted behind a
+	// checkpoint block until its tail has run. It is a direct hash comparison
+	// against the configured checkpoints now, needing no list entry to remove
+	// and nothing to put back if the block is later dropped.
+	isCheckpointBlock := sm.isCheckpointHash(bmsg.blockHash)
 
 	// This peer has answered, so it no longer owes us the block: either the
 	// chain will know about it and nobody needs to fetch it again, or the insert
@@ -3295,7 +2841,6 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		prevHash:       prevBlockHash,
 		catchingBlocks: catchingBlocks,
 		isCheckpoint:   isCheckpointBlock,
-		removedFront:   removedFront,
 	}
 
 	// HandleBlockDirect's opening — is the block stored, is its parent — asked
@@ -3468,12 +3013,16 @@ func (sm *SyncManager) parkOrphanBlock(d *blockDispatch, msgBlock *wire.MsgBlock
 	peer := d.peer
 	prevBlockHash := d.prevHash
 	catchingBlocks := d.catchingBlocks
-	removedFront := d.removedFront
 
 	entry := parkedBlock{
 		hash:      bmsg.blockHash,
 		prevBlock: prevBlockHash,
-		height:    sm.parkedBlockHeight(bmsg.blockHeight, bmsg.blockHash, removedFront),
+		// The height as the delivering peer reported it, with no fallback:
+		// there is no header list any more to look a height up in when it
+		// reads zero. A block recovered from disk after a restart always
+		// carried zero anyway, so this simply extends that same honest case
+		// to every block whose wire message did not report one.
+		height: bmsg.blockHeight,
 		// The resolved association primary, not bmsg.peer. A block
 		// delivered on a stream sub-peer (BlockPriority DATA1) carries
 		// that sub-peer, and sub-peers are not registered in peerStates
@@ -3482,12 +3031,6 @@ func (sm *SyncManager) parkOrphanBlock(d *blockDispatch, msgBlock *wire.MsgBlock
 		// skipped. The ledger records the primary too, which is the
 		// identity HasOwner and the reject path ask about.
 		peer: peer,
-		// The header node this block's arrival already took off the
-		// front, so whichever path eventually gives the block up can put
-		// it back. Without it a parked front block is unreachable: its
-		// header is gone from the list and from the index, and the
-		// rewind has nothing to work from.
-		removedFront: removedFront,
 	}
 
 	// Admit is the cheap half: the duplicate check, the byte budget and
@@ -3608,7 +3151,6 @@ func (sm *SyncManager) handleBlockMsgTail(d *blockDispatch, err error) error {
 	peer := d.peer
 	state := d.state
 	catchingBlocks := d.catchingBlocks
-	isCheckpointBlock := d.isCheckpoint
 	prevBlockHash := d.prevHash
 
 	if err != nil {
@@ -3830,269 +3372,44 @@ func (sm *SyncManager) handleBlockMsgTail(d *blockDispatch, err error) error {
 		}
 	}
 
-	// This is headers-first mode, so if the block is not a checkpoint
-	// request more blocks using the header list to maintain the pipeline
-	// at the dynamic max limit (adjusts based on block size).
-	if !isCheckpointBlock {
-		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	// Headers-first mode has nothing left to verify once there is no checkpoint
+	// ahead of the height just committed. This used to be decided only on the
+	// specific block that was the checkpoint, by checkpointBlockCommitted, and
+	// deferred with its own retry machinery when there was no peer to hand a
+	// fresh getheaders to. Recomputed fresh here on every commit there is
+	// nothing to defer: whichever commit or sync-peer election asks next gets
+	// the current answer, not a stale one.
+	sm.maybeLeaveHeadersFirstMode(bmsg.blockHash.String())
 
-		// Sampled a few microseconds before the in-flight count rather than in
-		// the same expression. Harmless: assignWantedBlocks recomputes what is
-		// wanted for itself before doing anything.
-		haveMoreWanted := len(sm.wantedBlocks()) > 0
+	// Ask for more blocks to keep the pipeline at the dynamic max limit
+	// (adjusts based on block size). This no longer distinguishes a checkpoint
+	// block from any other: the wanted-range pass reads whatever heights the
+	// header cache currently names above the committed height, checkpoint or
+	// not, so there is nothing checkpoint-specific left to gate it on.
+	dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 
-		sm.headerMu.Lock()
-		anchorIsStillTheFront := sm.anchorIsStillTheFrontLocked()
-		sm.headerMu.Unlock()
+	// Sampled a few microseconds before the in-flight count rather than in
+	// the same expression. Harmless: assignWantedBlocks recomputes what is
+	// wanted for itself before doing anything.
+	haveMoreWanted := len(sm.wantedBlocks()) > 0
 
-		if anchorIsStillTheFront {
-			// The same "not yet" fetchMoreHeaderBlocks makes, for the same
-			// reason, because this top-up can now run in that state too. A
-			// header round reaching towards a checkpoint several batches away
-			// still has headers wanted with the anchor in front, and multi-peer
-			// assignment plus demotion mean a body can still commit in that
-			// window — a late copy, or a block another peer was carrying. Asking
-			// for the next round then starts blocks that arrive, match nothing at
-			// the front, and sit in the list until the stall detector rebuilds
-			// it. handleHeadersMsg's own call is not affected: it trims the
-			// anchor first, which is why the ordering comment there says it must.
-			sm.logger.Debugf("[handleBlockMsg][%s] the round's anchor is still the front of the header list, not topping the pipeline up yet", bmsg.blockHash)
-		} else if haveMoreWanted && sm.blockDownloads.CountForPeer(peer) < dynamicMax {
-			sm.fetchHeaderBlocks()
-		} else if !sm.current() && sm.blockDownloads.CountForPeer(peer) == 0 {
-			sm.logger.Debugf("Not current, and no headers to sync to, fetching more headers")
+	if haveMoreWanted && sm.blockDownloads.CountForPeer(peer) < dynamicMax {
+		sm.fetchHeaderBlocks()
+	} else if !sm.current() && sm.blockDownloads.CountForPeer(peer) == 0 {
+		sm.logger.Debugf("Not current, and no headers to sync to, fetching more headers")
 
-			latestBlockHeader, _, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
-			if err != nil {
-				return errors.NewServiceError("Failed to get best block header", err)
-			}
-
-			locator := blockchain.BlockLocator([]*chainhash.Hash{latestBlockHeader.Hash()})
-			if err = peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
-				return errors.NewServiceError("Failed to send getblocks message to peer %s", peer.String(), err)
-			}
+		latestBlockHeader, _, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+		if err != nil {
+			return errors.NewServiceError("Failed to get best block header", err)
 		}
 
-		return nil
-	}
-
-	// This is headers-first mode and the block is a checkpoint.
-	return sm.checkpointBlockCommitted(peer, bmsg.blockHash)
-}
-
-// checkpointBlockCommitted moves headers-first sync past the checkpoint the
-// header list was anchored on. When there is a next checkpoint it asks for the
-// next round of headers, from the block after this one up to that checkpoint;
-// when there is not, it leaves headers-first mode and goes back to asking for
-// blocks by inventory.
-//
-// A parked block can be the checkpoint block, so this runs from the park drain
-// too. peer is whoever the caller decided to aim it at: the delivering peer when
-// that peer is still connected, otherwise the current sync peer — because if the
-// getheaders never goes out, headers-first sync stops at this checkpoint
-// forever. A nil peer is a defined state and costs a warning, not a panic; the
-// next sync-peer check restarts sync.
-func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash chainhash.Hash) error {
-	// Before anything is changed, not after. Moving the checkpoint on is the
-	// node's record of which round of headers it still has to fetch, and this
-	// function is the only thing that asks for that round. With no peer to ask,
-	// advancing it first threw away the question as well as the answer: nothing
-	// went out, and when a peer did turn up the node asked for the round AFTER
-	// the one it was missing, so the gap was never filled and headers-first sync
-	// stopped at this checkpoint.
-	//
-	// Leaving the checkpoint where it is is necessary but not sufficient: the
-	// two callers that commit a block are a block committing off the wire and
-	// the park drain, and the replay in drainPendingCheckpoint is the third.
-	// For the two commit routes the block is in the chain by the time either
-	// returns, so haveInventory answers true for it and the download walk never
-	// asks for it again. There is no second delivery to re-enter this arm with.
-	// So the round is remembered here and drainPendingCheckpoint replays it from
-	// the sync-peer ticker once an election has produced somebody to ask.
-	if peer == nil {
-		// Mark the anchor anyway. The block is already in this node's chain, so
-		// if a headers round reaches the list by any other route before the
-		// replay lands, the front must not wedge on a block no peer will send
-		// again — see anchorIsStillTheFrontLocked.
-		sm.headerMu.Lock()
-		sm.markCheckpointAnchorLocked(blockHash)
-		owed := sm.nextCheckpoint
-		sm.headerMu.Unlock()
-
-		// Past the last checkpoint there is no round to ask for and nothing to
-		// defer: the peer-less arm of that case is a no-op, exactly as it is
-		// with a peer.
-		if owed == nil {
-			return nil
+		locator := blockchain.BlockLocator([]*chainhash.Hash{latestBlockHeader.Hash()})
+		if err = peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
+			return errors.NewServiceError("Failed to send getblocks message to peer %s", peer.String(), err)
 		}
-
-		// The checkpoint this round belongs to travels with the hash, so the
-		// replay can tell whether it is still owed. Nothing else advances the
-		// checkpoint, but if something did the replay would otherwise skip a
-		// round rather than repeat one, which is the direction that loses
-		// headers.
-		sm.pendingCheckpoint.Store(&deferredCheckpoint{hash: blockHash, at: owed})
-
-		sm.logger.Warnf("[checkpointBlockCommitted][%s] checkpoint reached with no peer to ask for the next round of headers; the round is deferred until one is elected", blockHash)
-
-		return nil
-	}
-
-	// Advance the checkpoint under headerMu and work from the snapshot, so the
-	// getheaders send and the loadSyncPeer lookup below stay outside the lock.
-	sm.headerMu.Lock()
-
-	sm.markCheckpointAnchorLocked(blockHash)
-
-	if sm.nextCheckpoint == nil {
-		sm.headerMu.Unlock()
-
-		return nil
-	}
-
-	prevHeight := sm.nextCheckpoint.Height
-	prevHash := sm.nextCheckpoint.Hash
-	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
-	nextCP := sm.nextCheckpoint
-	sm.headerMu.Unlock()
-
-	if nextCP != nil {
-		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
-
-		if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
-			return errors.NewServiceError("failed to send getheaders message to peer %s", peer.String(), err)
-		}
-
-		if sp := sm.loadSyncPeer(); sp != nil {
-			sm.logger.Infof(
-				"handleBlockMsg - Downloading headers for blocks %d to %d from peer %s",
-				prevHeight+1,
-				nextCP.Height,
-				sp.String(),
-			)
-		}
-
-		return nil
-	}
-
-	// The block is a checkpoint and there are no more checkpoints, so switch to
-	// normal mode by requesting blocks from the block after this one up to the
-	// end of the chain (zero hash).
-	sm.leaveHeadersFirstMode()
-
-	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
-
-	locator := blockchain.BlockLocator([]*chainhash.Hash{&blockHash})
-	if err := peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
-		return errors.NewServiceError("Failed to send getblocks message to peer %s", peer.String(), err)
 	}
 
 	return nil
-}
-
-// markCheckpointAnchorLocked records that a checkpoint block is now the header
-// list's anchor. Caller holds headerMu.
-//
-// advanceHeaderListFor leaves the checkpoint node in the list so the next
-// round's first header can prove it links to it. That makes it the next round's
-// anchor: a block now in this node's chain that no peer will deliver again. Say
-// so on the node, because this is the moment it becomes true and nothing later
-// can work it out from where the node sits — see headerNode.
-func (sm *SyncManager) markCheckpointAnchorLocked(blockHash chainhash.Hash) {
-	if e := sm.headerIndex[blockHash]; e != nil {
-		if node, ok := e.Value.(*headerNode); ok {
-			node.isAnchor = true
-		}
-	}
-}
-
-// deferredCheckpoint is a checkpoint transition that reached its block but could
-// not ask for the round of headers that follows it, because there was no peer to
-// ask. at is the checkpoint that was still owed at the moment the block
-// committed, kept so the replay can tell the round has not been asked for since.
-type deferredCheckpoint struct {
-	hash chainhash.Hash
-	at   *chaincfg.Checkpoint
-}
-
-// drainPendingCheckpoint replays a checkpoint transition that could not be made
-// because there was no peer to ask, now that the sync-peer check has had its
-// chance to elect one.
-//
-// This is the step that was missing. The two routes into
-// checkpointBlockCommitted that commit a block reach it once each, because a
-// checkpoint block commits exactly once: after that it is in the chain,
-// haveInventory answers true and the download walk never asks for it again. So
-// the nil-peer arm's decision to leave the checkpoint alone preserved the
-// question but nothing ever asked it, and headers-first sync stopped at that
-// checkpoint for the life of the process.
-//
-// This function is the third caller of checkpointBlockCommitted and the only one
-// that does not arrive through advanceHeaderListFor, so it owes by hand the
-// preconditions that gate returns isCheckpointBlock false on: headers-first mode
-// has to be on, and the checkpoint has to be the one the pending round belongs
-// to. Both are checked below. A getheaders sent with the mode off is not a
-// no-op, because handleHeadersMsg disconnects a peer that answers it.
-//
-// Called from handleCheckSyncPeer, which runs on the sync-peer ticker, while the
-// nil-peer arm is written from the block-queue consumer that drains the park.
-// The Swap is what makes that safe: whichever goroutine takes the round owns it.
-// If this tick's election still produced nobody, this function puts the round
-// straight back for the next one, but never over a newer one.
-func (sm *SyncManager) drainPendingCheckpoint() {
-	pending := sm.pendingCheckpoint.Swap(nil)
-	if pending == nil {
-		return
-	}
-
-	// The round is only still owed while the checkpoint has not moved. Nothing
-	// else advances it today, so this cannot currently fire; it is here because
-	// replaying a transition whose round has already been asked for would
-	// advance the checkpoint a second time and skip a round of headers, and a
-	// skipped round is not recoverable by anything.
-	if cp := sm.nextCheckpointSnapshot(); cp == nil || pending.at == nil || cp.Height != pending.at.Height {
-		sm.logger.Infof("[drainPendingCheckpoint][%s] the deferred round has already been asked for, dropping it", pending.hash)
-
-		return
-	}
-
-	// Put the round back for the next tick, but never over a newer one: this runs
-	// on the ticker while checkpointBlockCommitted stores from the block-queue
-	// consumer, so the round in hand may already be the stale one. No reachable
-	// path stores a second round while one is pending, because that needs a
-	// second checkpoint block to commit, which needs that round's headers, which
-	// only the first transition or startSync asks for, and while a round is
-	// pending startSync reads the stale checkpoint and takes the getblocks
-	// branch. The primitive matches the claim anyway, for the same reason the
-	// guard above is here on an unreachable branch.
-	peer := sm.loadSyncPeer()
-	if peer == nil {
-		sm.pendingCheckpoint.CompareAndSwap(nil, pending)
-
-		return
-	}
-
-	// Belt and braces over the re-derive in resetHeaderStateLocked. This is the
-	// only caller of checkpointBlockCommitted that does not arrive through
-	// advanceHeaderListFor, which returns isCheckpointBlock false outright when
-	// the mode is off, so it is the only one that has to establish the mode for
-	// itself. Sending a getheaders with the mode off is not a no-op: the reply
-	// lands in handleHeadersMsg, which disconnects a peer that sends headers
-	// while the mode is off before it even checks whether the message is empty.
-	// With the mode off the round is the election's to ask for, and startSync's
-	// headers-first branch will ask for it once the re-derive has put a
-	// reachable checkpoint back in place.
-	if !sm.headersFirstMode.Load() {
-		sm.logger.Infof("[drainPendingCheckpoint][%s] headers-first mode is off, so the round is the election's to ask for; dropping it", pending.hash)
-
-		return
-	}
-
-	sm.logger.Infof("[drainPendingCheckpoint][%s] a peer is available, asking for the round of headers the checkpoint deferred", pending.hash)
-
-	if err := sm.checkpointBlockCommitted(peer, pending.hash); err != nil {
-		sm.logger.Errorf("[drainPendingCheckpoint][%s] deferred checkpoint transition failed: %v", pending.hash, err)
-	}
 }
 
 // consumeQueuedBlock is the block-queue consumer's whole turn: process the
@@ -4130,269 +3447,10 @@ func (sm *SyncManager) processQueuedBlock(msg *blockQueueMsg) error {
 	return err
 }
 
-// anchorIsStillTheFrontLocked reports whether the front of the header list is
-// an anchor: a block that is already in this node's chain, kept in the list only
-// so the next header can prove it links, and which no peer will ever deliver to
-// us again. The caller must hold headerMu.
-//
-// Nothing may fetch blocks while that is the front. The header list is only ever
-// advanced by a block that matches its front, so blocks fetched now arrive,
-// match nothing and stay in the list; then the batch that reaches the checkpoint
-// trims the anchor and the front becomes a block that has already been
-// delivered, which nothing after it matches either. The checkpoint block is
-// never recognised as the checkpoint, the next round of headers is never asked
-// for, and sync sits until the 180-second stall detector rotates the peer and
-// rebuilds the list. Mainnet checkpoint gaps run to 50,000 blocks — 25
-// sequential header round-trips — so that window is minutes wide, not an
-// instant.
-//
-// The node says so itself: headerNode.isAnchor is set by the only two places
-// that ever create an anchor — resetHeaderStateLocked when it rebuilds the list,
-// and checkpointBlockCommitted for the checkpoint node it leaves behind to
-// anchor the round that follows. Asking the front node is the same question the
-// checkpoint trim asks (removeHeaderAnchorLocked), so the two agree by
-// construction.
-//
-// It used to be inferred from heights instead — a list whose tail was still
-// below the checkpoint height meant the round's headers were still coming in, so
-// the anchor must still be at the front. That is right while headers arrive and
-// wrong straight after a checkpoint transition: the transition leaves the anchor
-// far below the new checkpoint height, and a block given up on in that window is
-// put back into the list AHEAD of the anchor (reinsertHeaderLocked inserts by
-// height). The tail is the anchor and below the checkpoint either way, so the
-// height reading answered "the anchor is still the front" when the front was in
-// fact a block nobody had asked for since — and suppressed the one thing that
-// would have asked for it again.
-func (sm *SyncManager) anchorIsStillTheFrontLocked() bool {
-	if sm.headerList == nil {
-		return false
-	}
-
-	front := sm.headerList.Front()
-	if front == nil {
-		return false
-	}
-
-	node, ok := front.Value.(*headerNode)
-	if !ok {
-		return false
-	}
-
-	return node.isAnchor
-}
-
-// trimHeadersTheChainAlreadyHas drops headers from the FRONT of the list whose
-// blocks are already in the chain.
-//
-// It exists because the chain routinely runs AHEAD of the header list. Blocks
-// arrive out of order, park on disk, and commit from there when their parent
-// lands, so the committed height can be dozens of blocks past the last header
-// the list ever held. The next round of headers then answers from wherever the
-// locator pointed, which is behind the chain, and handleHeadersMsg pushes every
-// header that links onto the back without asking whether we already have it.
-//
-// The front of the list is then a block already in the chain, and everything
-// downstream reads that list as "blocks we still need". The frontier is
-// published from the front, so it names a committed block; the frontier race
-// asks peer after peer for it; and rewindToLowestHeader finds it in the header
-// index, so losing any of those peers winds the whole download back to a height
-// the chain passed long ago.
-//
-// Measured on Hetzner mainnet on 2026-09-09: the list drained to no frontier at
-// 17:30:19, a peer delivered 38,602 headers at 17:30:58, and one second later
-// the frontier named block 761392, which had committed at 17:23:28. It was asked
-// for five more times over the next eight minutes while the tip ran to 761531.
-// An earlier episode cost eight minutes and forty-four seconds with an empty
-// pipeline and nothing on disk. See
-// TestSyncManager_AHeadersRoundDoesNotReaddBlocksTheChainAlreadyHas.
-//
-// How "already in the chain" is decided depends on where we are. Below the last
-// checkpoint the chain is checkpoint-verified and there is one of it, so height
-// against the highest committed height is exact and costs nothing. Above the
-// last checkpoint a header at or below that height is not necessarily one we
-// have, so it asks the blockchain store per header. That is why the store
-// lookups are gathered first and made with headerMu released: every other reader
-// of the list holds that lock, and a blocking client call under it would
-// serialise the whole sync path.
-func (sm *SyncManager) trimHeadersTheChainAlreadyHas() {
-	if !sm.headersFirstMode.Load() {
-		return
-	}
-
-	committed := sm.committedHeight()
-
-	type candidate struct {
-		hash   chainhash.Hash
-		height int32
-	}
-
-	var ask []candidate
-
-	// First pass: take out everything height alone can settle, and collect the
-	// rest to ask the store about.
-	sm.headerMu.Lock()
-
-	for e := sm.headerList.Front(); e != nil; {
-		next := e.Next()
-
-		node, ok := e.Value.(*headerNode)
-		if !ok || node.hash == nil {
-			break
-		}
-
-		// The anchor is the block the round was asked from, so it is below the
-		// chain by definition. It is left alone: removeHeaderAnchorLocked owns
-		// it, and an anchor at the front publishes no frontier anyway.
-		if node.isAnchor {
-			e = next
-			continue
-		}
-
-		// The checkpoint node stays to anchor the round that follows.
-		if sm.nextCheckpoint != nil && node.hash.IsEqual(sm.nextCheckpoint.Hash) {
-			break
-		}
-
-		if node.height <= 0 {
-			break
-		}
-
-		if !model.BelowCheckpoint(sm.chainParams.Checkpoints, uint32(node.height)) { //nolint:gosec
-			ask = append(ask, candidate{hash: *node.hash, height: node.height})
-			e = next
-
-			continue
-		}
-
-		if node.height > committed {
-			break
-		}
-
-		sm.removeHeaderLocked(e, node)
-
-		e = next
-	}
-
-	sm.headerMu.Unlock()
-
-	if len(ask) == 0 {
-		return
-	}
-
-	// Second pass, above the last checkpoint. Ask the store with the lock
-	// released, then take it again and remove only what is still where we left
-	// it: the list can have moved on while we were away.
-	ctx, cancel := sm.chainCtx()
-	defer cancel()
-
-	have := make([]chainhash.Hash, 0, len(ask))
-
-	for _, c := range ask {
-		hash := c.hash
-
-		exists, err := sm.blockchainClient.GetBlockExists(ctx, &hash)
-		if err != nil {
-			// Keeping the header is the safe answer: the block gets asked for
-			// again, which costs a duplicate download rather than a stall.
-			sm.logger.Warnf("[trimHeaders][%s] could not check whether the chain already has this block, keeping its header: %v", hash, err)
-
-			continue
-		}
-
-		if exists {
-			have = append(have, hash)
-		}
-	}
-
-	if len(have) == 0 {
-		return
-	}
-
-	sm.headerMu.Lock()
-
-	for _, hash := range have {
-		e := sm.headerIndex[hash]
-		if e == nil {
-			continue
-		}
-
-		node, ok := e.Value.(*headerNode)
-		if !ok || node.hash == nil {
-			continue
-		}
-
-		if sm.nextCheckpoint != nil && node.hash.IsEqual(sm.nextCheckpoint.Hash) {
-			continue
-		}
-
-		sm.removeHeaderLocked(e, node)
-	}
-
-	sm.headerMu.Unlock()
-}
-
-// removeHeaderLocked takes one header out of the list and the index. The caller
-// must hold headerMu.
-func (sm *SyncManager) removeHeaderLocked(e *list.Element, node *headerNode) {
-	sm.unindexHeaderLocked(e, *node.hash)
-	sm.headerList.Remove(e)
-}
-
-// removeHeaderAnchorLocked takes the round's anchor out of the header list, and
-// does nothing if it has already gone. The caller must hold headerMu.
-//
-// It is what handleHeadersMsg does when a batch reaches the checkpoint, and it
-// used to be "remove Front()" on the strength of a comment: the first entry of
-// the list is always the block already in the database. That assumption failed
-// whenever something else had put a different header in front of the anchor or
-// taken the anchor off the front early, each of which cost the round a real
-// header when it happened. Removing by identity rather than by position is
-// immune to both regardless of what else touches the list.
-//
-// So the anchor is removed by identity, wherever it sits. Anything still marked
-// as an anchor is a block already in our chain (see headerNode.isAnchor), and
-// keeping one anywhere in the list wedges the walk as soon as the front reaches
-// it. The loop runs the whole list rather than stopping at the first hit,
-// because leaving a second one behind would be the same bug one round later; in
-// practice there is exactly one, at or near the front.
-func (sm *SyncManager) removeHeaderAnchorLocked() {
-	if sm.headerList == nil {
-		return
-	}
-
-	for e := sm.headerList.Front(); e != nil; {
-		next := e.Next()
-
-		node, ok := e.Value.(*headerNode)
-		if !ok || !node.isAnchor {
-			e = next
-
-			continue
-		}
-
-		if node.hash != nil {
-			sm.unindexHeaderLocked(e, *node.hash)
-		}
-
-		sm.headerList.Remove(e)
-
-		e = next
-	}
-}
-
 // fetchMoreHeaderBlocks tops the download pipeline back up after a block from
 // this peer stopped being outstanding, whether it was committed or parked.
 // Without it a parked block is a silent loss of one in-flight slot, and the
 // pipeline drains one block at a time until nothing is outstanding at all.
-//
-// Both of its callers, a block accepted into the park and a parked block
-// committed off disk, can run while the round's anchor is still the front of the
-// header list, so the check that says "not yet" lives in topUpHeaderBlocks below
-// rather than in either of them. It is deliberately not the check the sweep
-// ticker used to make: "the cursor is on the front" is true of a rewound cursor
-// and false of an ordinary forward walk, which is right for driving the walk
-// from a timer and would silently switch off the top-up this function exists
-// for.
 //
 // The sweep ticker's resume does NOT come through here, because the per-peer
 // question this asks is the wrong one for it — it calls fetchHeaderBlocks
@@ -4406,20 +3464,15 @@ func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
 // topUpHeaderBlocks is fetchMoreHeaderBlocks with the "has this peer got room"
 // question left to the caller.
 //
-// Never while the round's anchor is still the front of the list: fetchHeaderBlocks
-// is the wanted-range pass now, which reads the header cache rather than the
-// list, so it has no way of knowing on its own that the round has not reached the
-// checkpoint yet.
+// It used to refuse outright while the round's anchor was still the front of
+// the header list — a gate that, in production, was permanently shut: nothing
+// ever advanced the list past its final anchor once every remaining checkpoint
+// was already in it, so every site that called this returned early forever,
+// and only a 30-second cleanup ticker kept requesting anything at all. There
+// is no anchor and no list any more, so there is nothing left to check here
+// beyond whether headers-first mode is even on and the caller still has room.
 func (sm *SyncManager) topUpHeaderBlocks(hasRoom func() bool) {
 	if !sm.headersFirstMode.Load() || sm.blockSizeTracker == nil {
-		return
-	}
-
-	sm.headerMu.Lock()
-	anchorIsStillTheFront := sm.anchorIsStillTheFrontLocked()
-	sm.headerMu.Unlock()
-
-	if anchorIsStillTheFront {
 		return
 	}
 
@@ -4458,44 +3511,6 @@ func (sm *SyncManager) dropBlockFromWalk(blockHash chainhash.Hash) {
 // One pointer, three meanings, and every fix for one broke another.
 func (sm *SyncManager) fetchHeaderBlocks() {
 	sm.assignWantedBlocks()
-}
-
-// parkedBlockHeight is the height to record against a block being parked, and it
-// exists because the obvious source is empty.
-//
-// The queue message's height comes from the decoded block, and a legacy block is
-// built by bsvutil.NewBlockFromBlockAndBytes with no height set, so it arrives as
-// BlockHeightUnknown. parkedBlock.height's own comment has always conceded it is
-// "often 0". Anything that judges a parked block by its height therefore judges
-// nothing at all, which is how a height rule can look correct and do nothing.
-//
-// Two sources that do have it. The header node this block's arrival took off the
-// front travels with the entry already, and carries its height. For a block
-// that was never the front, the header index still holds its node. Between
-// them, every block fetched through the header walk has a height.
-//
-// A block with no height anywhere is left at whatever was reported. Restart
-// recovery is the honest case: those entries are rebuilt from disk with no header
-// list behind them, and a height guessed for them would be worse than none.
-func (sm *SyncManager) parkedBlockHeight(reported int32, hash chainhash.Hash, removedFront *headerNode) int32 {
-	if reported > 0 {
-		return reported
-	}
-
-	if removedFront != nil && removedFront.height > 0 {
-		return removedFront.height
-	}
-
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	if element, ok := sm.headerIndex[hash]; ok && element != nil {
-		if node, isHeaderNode := element.Value.(*headerNode); isHeaderNode && node.height > 0 {
-			return node.height
-		}
-	}
-
-	return reported
 }
 
 // lookaheadCeilingLocked returns the highest block height this round may ask for,
@@ -4644,17 +3659,14 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	}
 
 	// A headers batch is a cache fill and nothing else: no splice, no front, no
-	// anchor, no epoch. A batch that does not link is refused by the cache and
-	// the peer keeps its connection, because a reply that connects to a point we
-	// have moved past is an honest answer to a question we have stopped asking.
+	// anchor, no epoch, no list. A batch that does not link is refused by the
+	// cache and the peer keeps its connection, because a reply that connects to
+	// a point we have moved past is an honest answer to a question we have
+	// stopped asking.
 	//
 	// The wanted-range pass reads sm.headerCache: wantedBlocks (in
 	// wanted_range_assign.go) calls wantedBlocksFromCache, which is the only
-	// consumer of what a fill lands here. No header is ever pushed onto
-	// sm.headerList any more — that structure now only ever holds the anchor
-	// resetHeaderStateLocked seeds and whatever a test splices onto it directly,
-	// and is read for the checkpoint-anchor bookkeeping in advanceHeaderListFor
-	// and removeHeaderAnchorLocked.
+	// consumer of what a fill lands here.
 	sm.fillHeaderCache(hmsg.peer, msg)
 
 	return
@@ -4858,11 +3870,10 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			// a turn well inside one block interval. Every test in
 			// inv_repair_test.go makes the announcer the sync peer, which bakes
 			// the restriction into the harness; it is stated here because the
-			// harness cannot state it. A getheaders
-			// anchored on the back of the header list, sent on one of those
-			// announcements, is answered from 850,000 forward: a batch that
-			// connects to the back, splices, verifies the checkpoint, removes
-			// the anchor and releases fetchHeaderBlocks.
+			// harness cannot state it. A getheaders anchored on the committed
+			// tip, sent on one of those announcements, is answered from the tip
+			// forward: a batch that connects, is cached, and releases
+			// fetchHeaderBlocks.
 			//
 			// Remembering the announcer is half the value and is done whatever
 			// else happens here. It is SV Node's UpdateBlockAvailability on the
@@ -4880,31 +3891,34 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			// unrequested headers"), so asking outside the mode would cost us
 			// the peer that helped.
 			//
-			// headerListLocator(nil) rather than headersRoundLocator, so this
-			// path makes no blockchain client call of its own beyond the lookup
-			// three lines up. It takes and releases headerMu itself and the send
-			// is after it returns, so Rule B holds with nothing arranged here. An
-			// empty header list means headers-first has no round in progress, and
-			// there is then nothing this repair could usefully ask for.
+			// headersRoundLocator anchored on the committed tip, the same
+			// locator startSync uses, rather than a header-list-anchored one:
+			// there is no list any more to anchor on. That does cost a
+			// blockchain client call this repair path did not used to make, but
+			// it is the only source left for a locator that walks back through
+			// real ancestry, and this path fires rarely enough (an unresolved
+			// inv, not every block) that the cost is not a hot-path concern.
 			//
 			// The stop hash is the ANNOUNCED block, as in SV Node
-			// (net_processing.cpp:2440). It makes the served window
-			// headerList.Back()+1 through the announced block rather than a
-			// one-block range, and it varies per announcement — which matters
-			// here more than it does there, because PushGetHeadersMsg filters a
-			// repeat of the same (locator[0], stopHash) pair for the peer's
-			// whole lifetime with no expiry (peer.go:1132-1142). The round's own
-			// request has a constant key and can be swallowed by that filter;
-			// this one cannot.
+			// (net_processing.cpp:2440), and it varies per announcement — which
+			// matters here more than it does there, because PushGetHeadersMsg
+			// filters a repeat of the same (locator[0], stopHash) pair for the
+			// peer's whole lifetime with no expiry (peer.go:1132-1142). The
+			// round's own request has a constant key and can be swallowed by
+			// that filter; this one cannot.
 			//
 			// No getdata, ever. SV Node removed exactly that send and says why at
 			// net_processing.cpp:2429-2435: falling back to an inv usually means
 			// a reorg, whose headers are needed before any block is worth asking
 			// for.
 			if sm.headersFirstMode.Load() && !sm.blockDownloads.RequestedWithin(announced, blockRequestRetryInterval) {
-				if locator := sm.headerListLocator(nil); len(locator) > 0 {
-					if err := peer.PushGetHeadersMsg(blockchain.BlockLocator(locator), &announced); err != nil {
-						sm.logger.Warnf("[handleInvMsg] Failed to send repair getheaders for announced block %s to peer %s: %v", announced, peer, err)
+				if tipHeight, tipHash, ok := sm.committedTipSnapshot(); ok {
+					if locator, lerr := sm.headersRoundLocator(&tipHash, uint32(tipHeight)); lerr != nil { //nolint:gosec // a chain height
+						sm.logger.Warnf("[handleInvMsg] could not build repair getheaders locator for announced block %s: %v", announced, lerr)
+					} else if len(locator) > 0 {
+						if err := peer.PushGetHeadersMsg(locator, &announced); err != nil {
+							sm.logger.Warnf("[handleInvMsg] Failed to send repair getheaders for announced block %s to peer %s: %v", announced, peer, err)
+						}
 					}
 				}
 			}
@@ -6163,8 +5177,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
-		headerList:       list.New(),
-		headerIndex:      make(map[chainhash.Hash]*list.Element),
 		blockSizeTracker: newBlockSizeTracker(10), // track last 10 blocks for rolling average
 		quit:             make(chan struct{}),
 		// feeEstimator:            config.FeeEstimator,
@@ -6279,17 +5291,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 	}()
 
-	bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	// Seed the best block processed from the chain, before anything reads it.
-	// This makes its own GetBestBlockHeader call rather than reusing the result
-	// above, so New pays for two round trips instead of one. That is deliberate:
-	// it happens once per process at startup, and one source of truth for where
-	// the number comes from is worth more than the round trip it costs. See
-	// seedCommittedHeight for what a zero counter costs.
+	// New used to make a second GetBestBlockHeader call here for a stored
+	// checkpoint init that this one round trip's result could not also serve;
+	// that init is gone, so this is now the only call New makes for the chain's
+	// current tip. See seedCommittedHeight for what a zero counter costs.
 	if err := sm.seedCommittedHeight(ctx); err != nil {
 		return nil, err
 	}
@@ -6312,36 +5318,21 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// The dispatcher holds a pointer to the manager returned below, so it must be
 	// built from &sm, not from the local value.
 	sm.dispatcher = newBlockDispatcher(&sm)
-	// Below GetBestBlockHeader for the same reason the two maps above are: a
-	// goroutine started before the last fallible step leaks when that step
-	// returns an error, because the caller receives a nil SyncManager and can
-	// never call Stop.
+	// Below the last fallible step above for the same reason the two maps are: a
+	// goroutine started before it leaks when that step returns an error, because
+	// the caller receives a nil SyncManager and can never call Stop.
 	sm.startParkWorkers(tSettings.Legacy.ParkWorkers)
 
-	if !config.DisableCheckpoints {
-		bestBlockHeightInt32, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
-		if err != nil {
-			sm.logger.Errorf(failedToConvertBlockHeightInt32Msg, err)
-		}
-
-		// Initialize the next checkpoint based on the current height. New is
-		// single-threaded, but the lock is taken anyway so the rule that
-		// nextCheckpoint is only ever written under headerMu has no exceptions
-		// for a future reader. resetHeaderState takes headerMu itself and so
-		// must stay outside the hold — sync.Mutex is not reentrant.
-		sm.headerMu.Lock()
-		sm.nextCheckpoint = sm.findNextHeaderCheckpoint(bestBlockHeightInt32)
-		haveCheckpoint := sm.nextCheckpoint != nil
-		sm.headerMu.Unlock()
-
-		if haveCheckpoint {
-			sm.resetHeaderState(bestBlockHeader.Hash(), bestBlockHeightInt32)
-		}
-	} else {
+	// There is nothing left to prime here. headersFirstMode starts false (the
+	// atomic's own zero value) and startSync derives the checkpoint fresh from
+	// the chain's own best height the first time it runs, rather than from a
+	// value primed once at construction and never revisited until the next
+	// full rebuild.
+	if config.DisableCheckpoints {
 		sm.logger.Infof("Checkpoints are disabled")
 	}
 
-	sm.startKafkaListeners(ctx, err)
+	sm.startKafkaListeners(ctx, nil)
 
 	return &sm, nil
 }

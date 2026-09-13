@@ -1,7 +1,7 @@
 package netsync
 
 import (
-	"container/list"
+	"context"
 	"sync"
 	"testing"
 
@@ -9,9 +9,13 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -123,16 +127,10 @@ func newRaceManager(t *testing.T) *SyncManager {
 		settings:       test.CreateBaseTestSettings(t),
 		chainParams:    &chaincfg.MainNetParams,
 		peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-		headerList:     list.New(),
+		headerCache:    newHeaderCache(),
 		blockDownloads: newBlockDownloadTracker(blockRequestAssignmentTTL),
 	}
 	sm.headersFirstMode.Store(true)
-
-	// Mirror New, which only rebuilds the header state when a checkpoint exists
-	// (see the DisableCheckpoints branch there). resetHeaderStateLocked treats a
-	// nil checkpoint as terminal and will not derive one, so a manager built
-	// without this would push no anchor and the walk would have nothing to do.
-	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(0)
 
 	return sm
 }
@@ -146,4 +144,67 @@ func registerRacePeer(sm *SyncManager, p *peerpkg.Peer) *peerSyncState {
 	sm.peerStates.Set(p, state)
 
 	return state
+}
+
+// linkedHeaders builds a headers message whose headers chain from prev, and
+// returns the hashes in order. nonce is bumped per header so every hash is
+// distinct even when two batches are built in the same second.
+func linkedHeaders(prev chainhash.Hash, n int, nonce *uint32) (*wire.MsgHeaders, []chainhash.Hash) {
+	msg := wire.NewMsgHeaders()
+	hashes := make([]chainhash.Hash, 0, n)
+	cur := prev
+
+	for i := 0; i < n; i++ {
+		*nonce++
+		bh := wire.NewBlockHeader(1, &cur, &chainhash.Hash{}, 0x1d00ffff, *nonce)
+		_ = msg.AddBlockHeader(bh)
+		cur = bh.BlockHash()
+		hashes = append(hashes, cur)
+	}
+
+	return msg, hashes
+}
+
+// newHeaderLockManager builds a SyncManager wired for the header-cache-driven
+// download paths: headers-first mode on, and a blockchain mock that never
+// claims to already have a block, so fetchHeaderBlocks always requests what
+// the cache names.
+//
+// It used to also plant a stored checkpoint far above anything these tests
+// generate, so the checkpoint branches never fired. That field is gone now:
+// isCheckpointHash compares a block's hash against the real checkpoints in
+// chainParams (MainNet, here), and a randomly nonced test header hash never
+// coincides with one of those, so nothing needs faking.
+func newHeaderLockManager(t *testing.T, gate chan struct{}, entered chan struct{}) *SyncManager {
+	t.Helper()
+
+	running := blockchain2.FSMStateRUNNING
+	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	blockchainClient.Mock.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewNotFoundError("not found"))
+
+	best := blockchainClient.Mock.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)
+
+	if gate != nil {
+		var once sync.Once
+
+		best.Run(func(mock.Arguments) {
+			if entered != nil {
+				once.Do(func() { close(entered) })
+			}
+
+			<-gate
+		})
+	}
+
+	sm := newRaceManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = blockchainClient
+	sm.blockSizeTracker = newBlockSizeTracker(10)
+
+	return sm
 }

@@ -663,13 +663,12 @@ func (sm *SyncManager) parentIsInChain(parent chainhash.Hash) bool {
 }
 
 // parentIsReachable reports whether a parked block's parent is something this
-// node will end up holding: in the chain now, or still ahead of us in the header
-// list because we asked for it.
+// node will end up holding: in the chain now, or still ahead of us in the
+// header cache because we asked for it.
 //
-// Consumer goroutine only. It takes headerMu for the index lookup alone and
-// releases it before the store call, because every other reader of the list
-// holds that lock and a blocking client call underneath it would serialise the
-// whole sync path.
+// Consumer goroutine only. The cache holds its own lock for the check, released
+// before the store call below it: a blocking client call behind that lock
+// would serialise the whole sync path.
 func (sm *SyncManager) parentIsReachable(parent chainhash.Hash) bool {
 	// The park first, and this was the omission that made this function a hole
 	// factory. A parked parent is a block we already hold on disk, waiting for
@@ -688,11 +687,7 @@ func (sm *SyncManager) parentIsReachable(parent chainhash.Hash) bool {
 		return true
 	}
 
-	sm.headerMu.Lock()
-	_, inList := sm.headerIndex[parent]
-	sm.headerMu.Unlock()
-
-	if inList {
+	if _, inCache := sm.headerCache.HeightOf(parent); inCache {
 		return true
 	}
 

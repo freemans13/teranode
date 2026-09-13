@@ -1,7 +1,6 @@
 package netsync
 
 import (
-	"container/list"
 	"context"
 	"testing"
 	"time"
@@ -45,72 +44,58 @@ func cacheManager(t *testing.T, best int32, depth int32) (*SyncManager, *peerpkg
 // Hetzner mainnet wedged for ten hours and forty minutes on 2026-09-13, and for
 // eight hours and thirty-three minutes the night before, written as a test.
 //
-// The old path marks the header at a committed checkpoint as an anchor and
-// refuses to walk while that anchor is at the front. The only code that clears
-// the mark runs when an incoming headers batch appends a header matching the
-// next checkpoint, and once the list already holds every remaining checkpoint no
-// batch can ever append one again. The gate then never opens for the life of the
-// process, and only losing the memory it lives in has ever cleared it.
+// The old path marked the header at a committed checkpoint as an anchor and
+// refused to walk while that anchor was at the front. The only code that
+// cleared the mark ran when an incoming headers batch appended a header
+// matching the next checkpoint, and once the list already held every remaining
+// checkpoint no batch could ever append one again. The gate then never opened
+// for the life of the process, and only losing the memory it lived in ever
+// cleared it.
 //
-// The new model has no walk, so there is nothing for an anchor to gate.
+// That whole mechanism — the list, the anchor flag, and the check that read it
+// — is deleted along with the header list itself, so there is no longer a way
+// to even construct the wedged state: cacheManager's ordinary header-cache
+// setup is already the only state fetchHeaderBlocks knows how to read, and it
+// requests blocks from it unconditionally.
 func TestNewModel_ACheckpointAnchorDoesNotGateAnything(t *testing.T) {
 	sm, _, rec := cacheManager(t, 33333, 8)
-
-	// The exact wedged state: the list holds one node, it is the anchor, and
-	// nothing has spliced onto it.
-	sm.headerMu.Lock()
-	anchorHash := chainhash.Hash{0xcc}
-	sm.headerList = list.New()
-	sm.headerList.PushBack(&headerNode{height: 33333, hash: &anchorHash, isAnchor: true})
-	sm.headerMu.Unlock()
 
 	sm.fetchHeaderBlocks()
 
 	require.True(t, WaitUntil(func() bool { return rec.count() > 0 }, 5*time.Second),
-		"a node whose header list front is a checkpoint anchor must still request blocks; this is the 2026-09-13 mainnet stall")
+		"fetchHeaderBlocks must request blocks from the header cache with nothing standing in the way; this is the property whose absence wedged mainnet on 2026-09-13")
 }
 
-// TestNewModel_APeerRotationLosesNothing pins that resetHeaderState — the
-// function that throws away the entire header list, and that on the
-// multi-peer path is never even reached — has nothing left to destroy under
-// the new model. It is worth pinning precisely because it is a recovery of
-// last resort that is both destructive and unreachable: if the wanted range
-// depended on anything it touches, that dependency would be both silent and
-// unrecoverable in production.
+// TestNewModel_LeavingHeadersFirstModeLosesNothing pins that there is no
+// state transition left that can silently change the wanted range.
+//
+// This used to pin resetHeaderState, the function that threw away the entire
+// header list and that on the multi-peer path was never even reached. That
+// function is deleted along with the list it rebuilt: the checkpoint is
+// recomputed on demand from committedHeight() wherever it is needed, and there
+// is no longer a stored copy for anything to reset. leaveHeadersFirstMode is
+// what is left of any headers-first state transition, and it touches exactly
+// one field — the atomic bool itself — which wantedBlocks never reads at all.
 //
 // This asserts the wanted range directly, by height and by hash, rather than
-// by watching a peer get asked. A first version connected a peer, drove a
-// fetchHeaderBlocks pass, reset, aged the download ledger past its retry
-// window, connected a SECOND peer to stand in for a rotation, and asserted
-// that peer got asked. That version passed, but for the wrong reason: with
-// the reset call commented out entirely, it still passed. resetHeaderStateLocked
-// never touches sm.headerCache or sm.blockDownloads — only headerList,
-// headerIndex and the list epoch — so on the
-// wanted-range path the reset is inert by construction, and a test that
-// exercises a whole fetchHeaderBlocks pass around it cannot tell "the reset
-// is harmless" apart from "the reset was never on the path being measured."
-// Asserting sm.wantedBlocks() directly, before and after, is what makes the
-// reset the only thing that could break the assertion.
-//
-// A single peer is enough — wantedBlocks never reads peerStates at all — which
-// also sidesteps the ReassertOwner no-duplicate-ask rule this test's previous
-// version ran into: a single peer that never disconnected genuinely cannot be
-// asked twice for the same block within the ownership ceiling, so trying to
-// observe a resend was never going to work regardless of the reset.
-func TestNewModel_APeerRotationLosesNothing(t *testing.T) {
+// by watching a peer get asked, for the same reason the original version of
+// this test did: a whole fetchHeaderBlocks pass run around the transition
+// cannot tell "the transition is harmless" apart from "the transition was
+// never on the path being measured." Asserting sm.wantedBlocks() directly,
+// before and after, is what makes the transition the only thing that could
+// break the assertion.
+func TestNewModel_LeavingHeadersFirstModeLosesNothing(t *testing.T) {
 	sm, _, _ := cacheManager(t, 500, 8)
 
 	before := sm.wantedBlocks()
-	require.NotEmpty(t, before, "sanity: there must be a wanted range for the reset to have a chance of losing")
+	require.NotEmpty(t, before, "sanity: there must be a wanted range for the transition to have a chance of losing")
 
-	// What a sync-peer rotation does on the old path.
-	anchor := chainhash.Hash{0xdd}
-	sm.resetHeaderState(&anchor, 500)
+	sm.leaveHeadersFirstMode()
 
 	after := sm.wantedBlocks()
 
 	require.Equal(t, before, after,
-		"a header-state reset must not change the wanted range, by height or by hash; the new model reads it from the header cache and the reset never touches that cache")
+		"leaving headers-first mode must not change the wanted range, by height or by hash; the new model reads it from the header cache and the committed height, neither of which that transition touches")
 }
 
 // TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling is the negative half of the

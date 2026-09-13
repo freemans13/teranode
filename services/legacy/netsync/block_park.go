@@ -191,17 +191,8 @@ type parkedBlock struct {
 	size   int64
 	// peer that delivered the block, or nil for a block recovered from disk.
 	// Both nil and disconnected are defined states; see livePeer.
-	peer *peerpkg.Peer
-	// removedFront is the header node this block's arrival took off the front of
-	// the header list, or nil when it was never the front. It has to travel with
-	// the block because advanceHeaderListFor runs before the park does: by the
-	// time a block is parked its header is already removed AND unindexed, so
-	// every path that later gives the block up would have nothing to look the
-	// header up by, and the block would leave the download walk for good. Always
-	// nil for a block recovered from disk after a restart, which is correct —
-	// that node's header list was rebuilt from scratch.
-	removedFront *headerNode
-	parkedAt     time.Time
+	peer     *peerpkg.Peer
+	parkedAt time.Time
 	// lastSweptAt is when the stuck sweep last handed this entry back for a
 	// parent lookup, zero if it never has. The sweep takes the least recently
 	// looked at first, which is what makes it a round robin over the whole park
@@ -498,14 +489,6 @@ func (p *blockPark) Admit(entry parkedBlock, msgBlock *wire.MsgBlock) (parkedBlo
 	if existing, ok := p.entries[entry.hash]; ok {
 		if entry.peer != nil {
 			existing.peer = entry.peer
-		}
-
-		// A re-delivered copy can be the front when the first copy was not, and
-		// then this is the only header node anybody still holds. Never overwrite
-		// a node already recorded with nil: the first copy's is the one the list
-		// is missing.
-		if entry.removedFront != nil {
-			existing.removedFront = entry.removedFront
 		}
 
 		return *existing, admitAlreadyHeld

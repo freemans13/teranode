@@ -1,7 +1,6 @@
 package netsync
 
 import (
-	"container/list"
 	"context"
 	"testing"
 	"time"
@@ -52,8 +51,9 @@ func newSyncPeerChangeManager(t *testing.T) *SyncManager {
 		chainParams:      &chaincfg.MainNetParams,
 		blockchainClient: blockchainClient,
 		peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-		headerList:       list.New(),
+		headerCache:      newHeaderCache(),
 		blockDownloads:   newBlockDownloadTracker(blockRequestAssignmentTTL),
+		blockSizeTracker: newBlockSizeTracker(10),
 	}
 
 	return sm

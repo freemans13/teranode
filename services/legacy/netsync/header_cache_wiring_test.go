@@ -21,9 +21,11 @@ import (
 )
 
 // TestHeadersRoundLocator_UsesTheChain pins the change that ended a seven-hour
-// mainnet stall. The locator it replaces was anchored at the back of the header
+// mainnet stall. The locator it replaces was anchored at the back of a header
 // list, far above what the node had committed, so a peer that had not reached
-// that point recognised nothing in it.
+// that point recognised nothing in it. That list is gone now, along with
+// everything that could anchor a locator on it; this pins that the chain's own
+// locator is what goes out.
 func TestHeadersRoundLocator_UsesTheChain(t *testing.T) {
 	tip := chainhash.Hash{0x11}
 	fromChain := []*chainhash.Hash{{0x22}, {0x33}}
@@ -37,17 +39,10 @@ func TestHeadersRoundLocator_UsesTheChain(t *testing.T) {
 	sm.blockchainClient = client
 	sm.settings.Legacy.MultiPeerBlockDownload = true
 
-	// A header list the OLD locator would happily build from. If the change did
-	// not land, the locator comes from here instead.
-	sm.headerMu.Lock()
-	hash := chainhash.Hash{0x99}
-	sm.headerList.PushBack(&headerNode{height: 500, hash: &hash})
-	sm.headerMu.Unlock()
-
 	got, err := sm.headersRoundLocator(&tip, 100)
 	require.NoError(t, err)
 
-	require.Len(t, got, 2, "the locator must come from the chain, not from the header list")
+	require.Len(t, got, 2, "the locator must come from the chain")
 	require.Equal(t, fromChain[0], got[0])
 }
 

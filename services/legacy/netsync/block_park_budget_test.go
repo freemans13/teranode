@@ -162,9 +162,10 @@ func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
-	h.sm.headerMu.Lock()
-	front := h.sm.headerList.Front().Value.(*headerNode).height
-	h.sm.headerMu.Unlock()
+	// An arbitrary baseline standing in for wherever a real node's committed
+	// height happens to be; the point under test is that the ceiling follows
+	// this number when it moves, not what the number itself is.
+	front := int32(4877)
 
 	depth := int64(h.sm.settings.Legacy.BlockDownloadLowerWindow)
 	require.Positive(t, depth, "the harness must configure a read-ahead depth or this test proves nothing")

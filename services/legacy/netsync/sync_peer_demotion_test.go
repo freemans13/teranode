@@ -100,9 +100,11 @@ func demotionPeer(t *testing.T, sm *SyncManager, idx uint8, lastBlock int32) (*p
 
 // newDemotionManager builds the smallest manager that can run the real
 // handleCheckSyncPeer, the real startSync and the real fetchHeaderBlocks back to
-// back. We are at height 100, every block asked about is unknown, and the next
-// checkpoint is far above anything the tests generate so the headers-first
-// branches are the ones that run.
+// back. We are at height 100, every block asked about is unknown. chainParams is
+// MainNet's real checkpoint table (via newRaceManager), and none of these tests
+// generate a hash that happens to coincide with one, which is what keeps the
+// headers-first branches the ones that run without needing a synthetic
+// checkpoint of their own.
 func newDemotionManager(t *testing.T) *SyncManager {
 	t.Helper()
 
@@ -125,9 +127,6 @@ func newDemotionManager(t *testing.T) *SyncManager {
 	sm.blockchainClient = blockchainClient
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 
-	checkpointHash := chainhash.Hash{0xcc}
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 1_000_000, Hash: &checkpointHash}
-
 	return sm
 }
 
@@ -135,16 +134,6 @@ func newDemotionManager(t *testing.T) *SyncManager {
 // for longer than the stall window, with no throughput sample to excuse it.
 func stalledSyncPeerState() *syncPeerState {
 	return &syncPeerState{lastBlockTime: time.Now().Add(-maxLastBlockTime - time.Minute)}
-}
-
-// headerListEpochNow reads the header list's generation counter, which
-// resetHeaderStateLocked bumps. An unchanged value is what proves the list is
-// the same list rather than a rebuilt one that happens to be the same length.
-func headerListEpochNow(sm *SyncManager) uint64 {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	return sm.headerListEpoch
 }
 
 // TestStalledSyncPeer_IsDemotedAndStaysConnected is the anchor test. A sync peer
@@ -259,9 +248,10 @@ func TestDemotion_WithNoOtherCandidateStillElectsTheDemotedPeer(t *testing.T) {
 // since the last checkpoint, which costs the whole node a fresh getheaders round
 // and every peer its slice because one peer was slow.
 //
-// The generation counter is the assertion that cannot be faked: the reset bumps
-// it, so an unchanged counter proves this is the same list and not a rebuilt one
-// that happens to be the same length.
+// Pointer identity is the assertion that cannot be faked: nothing that merely
+// reads the cache can produce a new *headerCache, so an unchanged pointer
+// proves this is the same cache and not a rebuilt one that happens to hold the
+// same headers.
 func TestDemotion_KeepsTheHeaderList(t *testing.T) {
 	var nonce uint32
 
@@ -275,16 +265,16 @@ func TestDemotion_KeepsTheHeaderList(t *testing.T) {
 
 	seedFetchHeaders(t, sm, stalled, anchor, msg)
 
-	epochBefore := headerListEpochNow(sm)
+	cacheBefore := sm.headerCache
 
 	sm.storeSyncPeer(stalled, stalledSyncPeerState())
 	stalled.SetSyncPeer(true)
 
 	sm.handleCheckSyncPeer()
 
-	require.Equal(t, len(hashes)+1, sm.headerListLen(), "the downloaded headers must survive a demotion")
+	require.Equal(t, len(hashes), sm.headerCache.Len(), "the downloaded headers must survive a demotion")
 	require.True(t, sm.headersFirstMode.Load(), "headers-first mode must stay on")
-	require.Equal(t, epochBefore, headerListEpochNow(sm), "the header list must be the same list, not a rebuilt one")
+	require.Same(t, cacheBefore, sm.headerCache, "the header cache must be the same cache, not a rebuilt one")
 }
 
 // TestDemotion_ReopensOnlyTheDemotedPeersSliceAndAsksForItAgain is the
@@ -358,12 +348,21 @@ func TestDemotion_ReopensOnlyTheDemotedPeersSliceAndAsksForItAgain(t *testing.T)
 	}
 }
 
-// TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore is the rollback lever.
+// TestDemotion_OffPathDisconnectsButKeepsTheHeaderCache is the rollback lever.
 // With multi-peer block download off, the sync peer is the only source of block
-// bodies, so keeping a stalled one buys nothing and today's behaviour is the
-// right behaviour: disconnect it, release everything it owed, and start the
-// header round again from our own best block.
-func TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore(t *testing.T) {
+// bodies, so keeping a stalled one buys nothing: disconnect it and release
+// everything it owed.
+//
+// This used to also pin that the off path threw the header list away and
+// re-anchored it, in contrast with the demotion path's keeping it — that was
+// the very distinction the whole-ledger back-date and header-list rebuild used
+// to draw between the two routes. There is no rebuild left to draw it with:
+// nothing on either path writes sm.headerCache except a fresh getheaders
+// reply, so the off path leaves the cache exactly as untouched as the
+// demotion path does. What is still real and still worth pinning is that the
+// disconnect itself, and the release of what the stalled peer owed, still
+// happen.
+func TestDemotion_OffPathDisconnectsButKeepsTheHeaderCache(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xf5}
@@ -376,7 +375,7 @@ func TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore(t *testing.T) {
 	successor, _, _ := demotionPeer(t, sm, 114, 1000)
 
 	seedFetchHeaders(t, sm, stalled, anchor, msg)
-	epochBefore := headerListEpochNow(sm)
+	cacheBefore := sm.headerCache
 
 	require.True(t, sm.blockDownloads.Add(stalled, hashes[0]))
 
@@ -387,7 +386,6 @@ func TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore(t *testing.T) {
 
 	require.False(t, stalled.Connected(), "with the fan-out off a stalled sync peer is still disconnected")
 	require.Zero(t, sm.blockDownloads.CountForPeer(stalled), "a disconnected peer's blocks must be released")
-	require.Equal(t, 1, sm.headerListLen(), "the header list is still thrown away and re-anchored")
-	require.NotEqual(t, epochBefore, headerListEpochNow(sm), "the reset must bump the list generation")
+	require.Same(t, cacheBefore, sm.headerCache, "even the off-path disconnect must not rebuild the header cache")
 	require.Equal(t, successor, sm.loadSyncPeer())
 }

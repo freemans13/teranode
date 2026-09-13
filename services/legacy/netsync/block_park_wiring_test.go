@@ -1,14 +1,12 @@
 package netsync
 
 import (
-	"container/list"
 	"context"
 	"net/url"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -101,32 +99,16 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 
 	t.Cleanup(func() { sm.recentlyFailedBlocks.Stop() })
 
-	checkpointHash := chainhash.Hash{0xcc}
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 1_000_000, Hash: &checkpointHash}
-
 	syncPeer, _, rec := connectRecordingPeer(t, 71, 1000)
 	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	// The header list a headers-first node has while it is fetching these
-	// blocks: one node per block, in order, none of them requested yet.
-	sm.headerMu.Lock()
-	sm.headerList = list.New()
-	sm.headerIndex = make(map[chainhash.Hash]*list.Element)
-
-	for i, b := range blocks {
-		hash := b.MsgBlock().BlockHash()
-		node := &headerNode{height: int32(i + 1), hash: &hash}
-		sm.indexHeaderLocked(sm.headerList.PushBack(node), hash)
-	}
-	sm.headerMu.Unlock()
 	sm.headersFirstMode.Store(true)
 
-	// assignWantedBlocks reads the header cache, not the header list, so the
-	// same run has to be named there too or a test that calls fetchHeaderBlocks
-	// finds nothing to ask for despite the list above looking fully populated.
-	// committedHeight defaults to zero on a manager nobody has told otherwise,
-	// which is exactly the height these blocks (1, 2, 3, ...) sit above.
+	// assignWantedBlocks reads the header cache, one node per block, in order,
+	// none of them requested yet. committedHeight defaults to zero on a manager
+	// nobody has told otherwise, which is exactly the height these blocks (1, 2,
+	// 3, ...) sit above.
 	sm.headerCache = newHeaderCache()
 	headers := make([]*wire.BlockHeader, len(blocks))
 	for i, b := range blocks {
@@ -210,12 +192,26 @@ func (h *parkWiringHarness) deliverBlock(t *testing.T, msgBlock *wire.MsgBlock, 
 	})
 }
 
+// requireBackInTheWalk asserts the end state a given-up block must reach: it is
+// still wanted and unowed, so the next wanted-range pass asks the peer for it
+// again. There is no header-list or cursor position to inspect any more — the
+// pass recomputes what it wants and who owes it from the committed tip on every
+// call, so "still wanted" is answered by the getdata that follows, not by
+// where anything sits.
+func (h *parkWiringHarness) requireBackInTheWalk(t *testing.T, hash chainhash.Hash, getDataBefore int) {
+	t.Helper()
+
+	h.sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(getDataBefore, hash) }, 5*time.Second),
+		"a block given up on must be asked for again")
+}
+
 // TestSyncManager_AParkedBlockIsCommittedWhenItsParentArrives is the whole
 // commit in one test. A block arrives before its parent; today it is fully
 // downloaded, fully decoded and then thrown away, and nothing ever asks for it
-// again. It must instead be kept and committed once the parent lands — and the
-// header list must move on with it, or headers-first sync wedges one block
-// later.
+// again. It must instead be kept and committed once the parent lands — both
+// the parent and the block drained behind it.
 func TestSyncManager_AParkedBlockIsCommittedWhenItsParentArrives(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
@@ -240,17 +236,6 @@ func TestSyncManager_AParkedBlockIsCommittedWhenItsParentArrives(t *testing.T) {
 	for _, name := range parkDirEntries(t, h.parkDir) {
 		require.NotContains(t, name, child.String(), "a committed block's blob must be deleted")
 	}
-
-	// The header list is only advanced by an arriving block that matches its
-	// front. A block committed off disk never passes that code, so without an
-	// explicit advance the front sticks on a block already in the chain and the
-	// NEXT block never matches it.
-	h.sm.headerMu.Lock()
-	front := h.sm.headerList.Front().Value.(*headerNode)
-	h.sm.headerMu.Unlock()
-
-	require.Equal(t, h.blocks[2].MsgBlock().BlockHash().String(), front.hash.String(),
-		"the header list must have moved past both the parent and the block drained behind it")
 }
 
 // TestSyncManager_AParkedBlockFromADepartedPeerStillCommits. The commit path
@@ -289,13 +274,6 @@ func TestSyncManager_AParkedBlockFromADepartedPeerStillCommits(t *testing.T) {
 
 	_, failed := h.sm.recentlyFailedBlocks.Get(child)
 	require.False(t, failed, "the block must have been committed, not written off as a failure")
-
-	h.sm.headerMu.Lock()
-	front := h.sm.headerList.Front().Value.(*headerNode)
-	h.sm.headerMu.Unlock()
-
-	require.Equal(t, h.blocks[2].MsgBlock().BlockHash().String(), front.hash.String(),
-		"a block committed from the park must move the header list on, whoever delivered it")
 }
 
 // TestSyncManager_NothingIsDrainedAfterABlockThatDidNotCommit pins the guard

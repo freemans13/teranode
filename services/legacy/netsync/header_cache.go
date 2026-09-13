@@ -24,12 +24,22 @@ import (
 type headerCache struct {
 	mu       sync.Mutex
 	byHeight map[int32]chainhash.Hash
-	top      int32
-	filled   bool
+	// byHash is the reverse of byHeight, maintained alongside it. It exists for
+	// pipelineParentHeight, which is handed a block's parent hash — off the
+	// wire, before that parent is committed — and needs the height that hash
+	// names, not the other way round. The old header list answered this from
+	// its own hash-keyed index; a cache keyed only by height could not, so this
+	// is kept in step with byHeight at every Fill and Discard.
+	byHash map[chainhash.Hash]int32
+	top    int32
+	filled bool
 }
 
 func newHeaderCache() *headerCache {
-	return &headerCache{byHeight: make(map[int32]chainhash.Hash)}
+	return &headerCache{
+		byHeight: make(map[int32]chainhash.Hash),
+		byHash:   make(map[chainhash.Hash]int32),
+	}
 }
 
 // Fill replaces the cache with headers, where headers[0] sits at baseHeight and
@@ -70,8 +80,12 @@ func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*w
 	defer c.mu.Unlock()
 
 	c.byHeight = make(map[int32]chainhash.Hash, len(hashes))
+	c.byHash = make(map[chainhash.Hash]int32, len(hashes))
+
 	for i, hash := range hashes {
-		c.byHeight[baseHeight+int32(i)] = hash //nolint:gosec // a batch index, bounded by the wire limit
+		height := baseHeight + int32(i) //nolint:gosec // a batch index, bounded by the wire limit
+		c.byHeight[height] = hash
+		c.byHash[hash] = height
 	}
 
 	c.top = baseHeight + int32(len(hashes)) - 1 //nolint:gosec // as above
@@ -92,6 +106,23 @@ func (c *headerCache) At(height int32) (chainhash.Hash, bool) {
 	hash, ok := c.byHeight[height]
 
 	return hash, ok
+}
+
+// HeightOf is At's reverse: the height this cache names for hash, and whether
+// it names one. Used by pipelineParentHeight to resolve a not-yet-committed
+// parent's height from its hash alone, which is all a block streaming off the
+// wire ever hands over.
+func (c *headerCache) HeightOf(hash chainhash.Hash) (int32, bool) {
+	if c == nil {
+		return 0, false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	height, ok := c.byHash[hash]
+
+	return height, ok
 }
 
 // Top returns the highest height the cache names. A pass that has reached it has
@@ -133,6 +164,7 @@ func (c *headerCache) Discard() {
 	defer c.mu.Unlock()
 
 	c.byHeight = make(map[int32]chainhash.Hash)
+	c.byHash = make(map[chainhash.Hash]int32)
 	c.top = 0
 	c.filled = false
 }

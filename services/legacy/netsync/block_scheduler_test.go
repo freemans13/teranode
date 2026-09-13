@@ -228,7 +228,6 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 	state.noteBestKnownHeight(1000)
 
 	more, moreHashes := linkedHeaders(hashes[len(hashes)-1], 3, &nonce)
-	spliceHeadersForTest(t, sm, more.Headers)
 
 	// The second round's reply is anchored on the last header of the first, the
 	// shape a real getheaders reply has. The header cache's contiguous run has

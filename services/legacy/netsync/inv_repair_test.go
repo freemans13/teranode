@@ -56,41 +56,21 @@ func invRepairPeer(t *testing.T, sm *SyncManager, idx uint8, lastBlock int32) (*
 	return local, data, headers, state
 }
 
-// headerListBackHash reads the hash the next headers round will be asked to
-// continue from. Read off the list itself rather than off headerListLocator, so
-// the assertion is not built out of the function it is checking.
-func headerListBackHash(t *testing.T, sm *SyncManager) chainhash.Hash {
-	t.Helper()
-
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	back := sm.headerList.Back()
-	require.NotNil(t, back)
-
-	node, ok := back.Value.(*headerNode)
-	require.True(t, ok)
-	require.NotNil(t, node.hash)
-
-	return *node.hash
-}
-
-// invRepairHarness is a manager in headers-first mode with a header list that a
-// round has already filled, an announcer that is the sync peer, and a separate
-// peer that supplied those headers.
+// invRepairHarness is a manager in headers-first mode with a header cache that
+// a round has already filled, an announcer that is the sync peer, and a
+// separate peer that supplied those headers.
 //
 // The two peers are separate on purpose. handleHeadersMsg credits the sender of
 // a batch it splices with a PROVEN claim, and a pending claim never displaces a
 // proven one, so an announcer that had also seeded the headers could not show
 // the pending claim the repair records.
 type invRepairHarness struct {
-	sm         *SyncManager
-	announcer  *peerpkg.Peer
-	state      *peerSyncState
-	data       *getDataRecorder
-	headers    *getHeadersRecorder
-	baseline   int
-	headerBack chainhash.Hash
+	sm        *SyncManager
+	announcer *peerpkg.Peer
+	state     *peerSyncState
+	data      *getDataRecorder
+	headers   *getHeadersRecorder
+	baseline  int
 }
 
 func newInvRepairHarness(t *testing.T, idx uint8, known map[chainhash.Hash]uint32) *invRepairHarness {
@@ -99,7 +79,7 @@ func newInvRepairHarness(t *testing.T, idx uint8, known map[chainhash.Hash]uint3
 	sm := newInvManager(t, known)
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 
-	// The peer that fills the header list. It is not the sync peer and never
+	// The peer that fills the header cache. It is not the sync peer and never
 	// announces anything in these tests.
 	seeder, _, _, _ := invRepairPeer(t, sm, idx, 1000)
 
@@ -122,10 +102,7 @@ func newInvRepairHarness(t *testing.T, idx uint8, known map[chainhash.Hash]uint3
 		state:     state,
 		data:      data,
 		headers:   headers,
-		// Seeding the header list ends with a getheaders for the next round, so
-		// what this test is about is the message AFTER that one.
-		baseline:   headers.count(),
-		headerBack: headerListBackHash(t, sm),
+		baseline:  headers.count(),
 	}
 }
 
@@ -139,8 +116,8 @@ func (h *invRepairHarness) announce(hashes ...chainhash.Hash) {
 // On Hetzner mainnet on 2026-09-11 the node held headers to 849,999 with a
 // committed tip of 800,128. Its headers round asked a question whose only honest
 // answer was zero headers, and it sat idle for seven hours while peers went on
-// announcing blocks. A getheaders anchored on the back of the header list, sent
-// on one of those announcements, is answered from the checkpoint span forward.
+// announcing blocks. A getheaders anchored on the committed tip, sent on one of
+// those announcements, is answered from the tip forward.
 func TestHandleInvMsg_AnAnnouncedBlockWeCannotPlaceAsksForItsHeaders(t *testing.T) {
 	// Not in the known map, so the chain answers not-found for it: a block we
 	// cannot place, which is the whole trigger.
@@ -158,11 +135,11 @@ func TestHandleInvMsg_AnAnnouncedBlockWeCannotPlaceAsksForItsHeaders(t *testing.
 	require.NotNil(t, sent)
 
 	require.Equal(t, announced, sent.HashStop,
-		"the stop hash is the announced block, so the peer serves from our back up to it")
+		"the stop hash is the announced block, so the peer serves from our locator up to it")
 
 	require.NotEmpty(t, sent.BlockLocatorHashes)
-	require.Equal(t, h.headerBack, *sent.BlockLocatorHashes[0],
-		"the locator still opens on the back of the header list, so the reply splices onto it")
+	require.Equal(t, chainhash.Hash{}, *sent.BlockLocatorHashes[0],
+		"the locator now comes from the chain's own GetBlockLocator, anchored on the committed tip, not from a header list")
 }
 
 // TestHandleInvMsg_AnAnnouncedBlockAsksForNoBlockData is the negative that
@@ -175,8 +152,9 @@ func TestHandleInvMsg_AnAnnouncedBlockAsksForNoBlockData(t *testing.T) {
 
 	h := newInvRepairHarness(t, 162, nil)
 
-	// Filling the header list hands out block work of its own, so the assertion
-	// is that the announcement adds none, not that none has ever been sent.
+	// Taken before the announcement rather than assumed to be zero, so the
+	// assertion is that the announcement itself adds no getdata, whatever else
+	// the harness may have sent.
 	before := h.data.count()
 
 	h.announce(announced)

@@ -1,7 +1,6 @@
 package netsync
 
 import (
-	"container/list"
 	"context"
 	"net/url"
 	"testing"
@@ -370,22 +369,8 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 
 	t.Cleanup(func() { sm.recentlyFailedBlocks.Stop() })
 
-	checkpointHash := chainhash.Hash{0xcc}
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 1_000_000, Hash: &checkpointHash}
-
 	peer, rec := schedulerPeer(t, sm, 1, int32(len(blocks))+1000)
 	sm.storeSyncPeer(peer, &syncPeerState{})
-
-	sm.headerMu.Lock()
-	sm.headerList = list.New()
-	sm.headerIndex = make(map[chainhash.Hash]*list.Element)
-	sm.headersByHeight = make(map[int32]*list.Element)
-
-	for i, b := range blocks {
-		hash := b.MsgBlock().BlockHash()
-		node := &headerNode{height: int32(i + 1), hash: &hash}
-		sm.indexHeaderLocked(sm.headerList.PushBack(node), hash)
-	}
 
 	// parkOrphanBlock's own top-up (fetchMoreHeaderBlocks) can also fire a pass
 	// as each block below is delivered, alongside the explicit ones the loop
@@ -394,10 +379,9 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	// many distinct calls fired, and every pass — this loop's or a top-up's —
 	// answers to the same depth ceiling. So the park bound holds regardless of
 	// which caller triggered a given pass.
-	sm.headerMu.Unlock()
 
-	// The wanted-range pass reads the header cache, not headerList, so the same
-	// run is named there too — from the blocks' own real headers, which really
+	// The wanted-range pass reads the header cache, so that is what has to name
+	// the same run — from the blocks' own real headers, which really
 	// do link from genesis, rather than a synthetic chain: this harness delivers
 	// the blocks themselves through processQueuedBlock, and a hash the cache
 	// named that did not match a delivered block's real hash would test nothing.

@@ -2,7 +2,6 @@ package netsync
 
 import (
 	"bytes"
-	"container/list"
 	"testing"
 	"time"
 
@@ -14,9 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestPipelineSink_ParentInHeaderIndex_IsTheOrdinaryCase is FIX 2's core claim.
+// TestPipelineSink_ParentInHeaderCache_IsTheOrdinaryCase is FIX 2's core claim.
 //
-// A parent that is only in the in-flight header list — not yet committed to
+// A parent that is only in the in-flight header cache — not yet committed to
 // the blockchain store — is the ordinary out-of-order case on this node:
 // measured at roughly 91% of blocks. Before this fix, pipelineBlockSink asked
 // only sm.blockchainClient.GetBlockHeader, which answers only for a committed
@@ -30,10 +29,10 @@ import (
 // disconnected for a message it did nothing wrong to send.
 //
 // This test proves the ordinary case now resolves a height from the header
-// list and lets the block through — no error, subtrees written — using a
-// height taken from an in-flight headerNode the blockchain store was never
+// cache and lets the block through — no error, subtrees written — using a
+// height taken from an in-flight cache entry the blockchain store was never
 // told about.
-func TestPipelineSink_ParentInHeaderIndex_IsTheOrdinaryCase(t *testing.T) {
+func TestPipelineSink_ParentInHeaderCache_IsTheOrdinaryCase(t *testing.T) {
 	ctx := t.Context()
 
 	store := memory.New()
@@ -43,31 +42,34 @@ func TestPipelineSink_ParentInHeaderIndex_IsTheOrdinaryCase(t *testing.T) {
 	pipelineHeaderFixture(t, sm, blk) // computes a correct merkle root using genesis as a scratch parent
 
 	// Point the block at a parent the fresh blockchain store has never heard
-	// of, so a successful run can only have come from the header list, not
+	// of, so a successful run can only have come from the header cache, not
 	// from sm.blockchainClient.GetBlockHeader.
-	parent := chainhash.HashH([]byte("fix2-header-list-only-parent"))
+	parent := chainhash.HashH([]byte("fix2-header-cache-only-parent"))
 	blk.MsgBlock().Header.PrevBlock = parent
 
-	// Install that parent in the in-flight header list only, at height 41, so
-	// the block under test — its child — must resolve to height 42.
-	sm.headerList = list.New()
-	e := sm.headerList.PushBack(&headerNode{hash: &parent, height: 41, listEpoch: sm.headerListEpoch})
-	sm.headerIndex = map[chainhash.Hash]*list.Element{parent: e}
+	// Install that parent in the in-flight header cache only, at height 41, so
+	// the block under test — its child — must resolve to height 42. Written
+	// directly into the cache's maps, the same as headerCacheParent, because
+	// this needs one specific hash named, not a real chained batch.
+	sm.headerCache = newHeaderCache()
+	sm.headerCache.byHeight[41] = parent
+	sm.headerCache.byHash[parent] = 41
+	sm.headerCache.filled = true
 
 	body := blockBodyBytes(t, blk)
 
 	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
-	require.NoError(t, err, "a parent only in the in-flight header list must not be treated as a fault")
-	require.True(t, converted, "a parent resolved from the header list must let the block convert, not fall back")
+	require.NoError(t, err, "a parent only in the in-flight header cache must not be treated as a fault")
+	require.True(t, converted, "a parent resolved from the header cache must let the block convert, not fall back")
 
 	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
-	require.NoError(t, err, "the converted record for a header-list-only parent must read back cleanly")
+	require.NoError(t, err, "the converted record for a header-cache-only parent must read back cleanly")
 	require.NotNil(t, got, "the block must actually be converted, not merely accepted")
 
 	hashes := got.Subtrees
 	require.NotEmpty(t, hashes, "the block must actually be converted, not merely accepted")
 
-	require.Equal(t, uint32(42), got.Height, "height must come from the header-list parent (41+1), proving the committed store was not what resolved it")
+	require.Equal(t, uint32(42), got.Height, "height must come from the header-cache parent (41+1), proving the committed store was not what resolved it")
 
 	for _, h := range hashes {
 		exists, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
@@ -79,9 +81,9 @@ func TestPipelineSink_ParentInHeaderIndex_IsTheOrdinaryCase(t *testing.T) {
 // TestPipelineSink_UnresolvableParent_FallsBackInsteadOfErroring is FIX 2's
 // fallback claim.
 //
-// A parent that is in neither the header list nor the committed store is a
+// A parent that is in neither the header cache nor the committed store is a
 // genuine miss beyond the ordinary out-of-order case (see
-// pipelineParentHeight's doc comment for why the header list covers the
+// pipelineParentHeight's doc comment for why the header cache covers the
 // ordinary case). There is no error return from this sink that the wire layer
 // treats as anything but a malformed message — peer.shouldHandleReadError
 // disconnects on every error except an exact io.EOF, io.ErrUnexpectedEOF or
@@ -104,7 +106,7 @@ func TestPipelineSink_UnresolvableParent_FallsBackInsteadOfErroring(t *testing.T
 	pipelineHeaderFixture(t, sm, blk)
 
 	// A parent nobody has ever heard of: not in the committed store (a fresh
-	// store only has genesis) and not in the header list (left empty).
+	// store only has genesis) and not in the header cache (left empty).
 	parent := chainhash.HashH([]byte("fix2-nobody-has-heard-of-this-parent"))
 	blk.MsgBlock().Header.PrevBlock = parent
 

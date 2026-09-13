@@ -317,27 +317,19 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 // pipelineParentHeight resolves a block's height from its parent's hash,
 // without requiring the parent to be a COMMITTED block.
 //
-// The ordinary out-of-order case is a parent that is still in the in-flight
-// header list (sm.headerIndex) — measured at roughly 91% of blocks on this
+// The ordinary out-of-order case is a parent that is still only in the
+// header cache (sm.headerCache) — measured at roughly 91% of blocks on this
 // node — because the header round can outrun body delivery. Asking only
 // sm.blockchainClient.GetBlockHeader, which answers only for a committed
 // block (parentIsInChain in streaming_install.go makes the identical call for
 // exactly that meaning), treated that ordinary case as a fault.
 //
-// The header list is checked first because it is the common case and never
-// blocks. The store is checked second, with headerMu already released,
-// because a blockchain client call can take an unbounded time and headerMu's
-// own invariant (manager.go's "Rule B" comment on the SyncManager struct)
-// forbids holding it across one.
+// The cache is checked first because it is the common case and never blocks:
+// it holds its own lock, released before the fallback runs, because a
+// blockchain client call can take an unbounded time.
 func (sm *SyncManager) pipelineParentHeight(parent chainhash.Hash) (uint32, bool) {
-	sm.headerMu.Lock()
-	e, inList := sm.headerIndex[parent]
-	sm.headerMu.Unlock()
-
-	if inList && e != nil {
-		if node, ok := e.Value.(*headerNode); ok && node != nil && node.height >= 0 {
-			return uint32(node.height) + 1, true
-		}
+	if height, ok := sm.headerCache.HeightOf(parent); ok && height >= 0 {
+		return uint32(height) + 1, true
 	}
 
 	if sm.blockchainClient == nil {

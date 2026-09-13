@@ -150,13 +150,6 @@ type blockDispatch struct {
 	windowed       bool
 	bytes          int64
 
-	// removedFront is the header node this block's arrival took off the front of
-	// the headers-first list, or nil when it was not the front. The tail needs it
-	// to put the block back into the download walk when the block fails or is
-	// aborted: by then the header is gone from both the list and the index, so
-	// nothing else can find it. It is an 80-byte header, not the decoded block.
-	removedFront *headerNode
-
 	// parked is the park entry this dispatch commits, and nil for a block that
 	// arrived on the wire. A parked dispatch carries no queue message worth
 	// replying to and no peer obligation to settle: its blob is read by the
@@ -166,10 +159,9 @@ type blockDispatch struct {
 	// cannot share a code path by accident.
 	parked *parkedBlock
 
-	// parkedIsCheckpoint is what advanceHeaderListFor answered for a parked
-	// dispatch when its header node was taken off the front, which happens at
-	// dispatch rather than at commit. By the time the tail runs the front has
-	// moved on and the question can no longer be asked.
+	// parkedIsCheckpoint is what isCheckpointHash answered for a parked
+	// dispatch's own hash, computed at dispatch rather than at commit and
+	// passed through to parkedBlockCommitted's tail.
 	parkedIsCheckpoint bool
 
 	// readErr is a parked dispatch's blob-read failure, kept apart from the

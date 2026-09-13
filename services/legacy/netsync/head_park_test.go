@@ -230,8 +230,7 @@ func TestTail_AnAbortedSuccessorGetsItsHeaderBack(t *testing.T) {
 	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
 
-	// Both blocks go through the head in order. The parent is the front, so its
-	// header leaves the list; then the child is the front, so its header does too.
+	// Both blocks go through the head in order.
 	release := make(chan struct{})
 
 	bd.run = func(_ context.Context, d *blockDispatch, _ *inflightParent) error {
@@ -247,24 +246,14 @@ func TestTail_AnAbortedSuccessorGetsItsHeaderBack(t *testing.T) {
 	dParent, finished, err, _ := h.headFor(t, 0, nil)
 	require.NoError(t, err)
 	require.False(t, finished)
-	require.NotNil(t, dParent.removedFront, "the parent was the front, so its header left the list")
 
 	bd.dispatch(dParent)
 
 	dChild, finished, err, _ := h.headFor(t, 1, nil)
 	require.NoError(t, err)
 	require.False(t, finished, "the child's parent is in flight, so the child is dispatched, not parked")
-	require.NotNil(t, dChild.removedFront, "the child was the front once the parent's header had gone")
 
 	bd.dispatch(dChild)
-
-	h.sm.headerMu.Lock()
-	_, parentIndexed := h.sm.headerIndex[parent]
-	_, childIndexed := h.sm.headerIndex[child]
-	h.sm.headerMu.Unlock()
-
-	require.False(t, parentIndexed, "precondition: the parent's header has left the list")
-	require.False(t, childIndexed, "precondition: the child's header has left the list")
 
 	// The parent fails; the child is aborted behind it. Both tails run in order.
 	close(release)

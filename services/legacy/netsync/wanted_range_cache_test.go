@@ -47,6 +47,21 @@ func TestWantedBlocksFromCache_IsEmptyWithNoCache(t *testing.T) {
 		"no cache means nothing can be named, so the pass asks for nothing and the next getheaders fixes it")
 }
 
+// TestWantedBlocksFromCache_ClampsANonPositiveDepthToOne pins the floor. A
+// depth of zero would ask for nothing for ever, which is a stall dressed as a
+// setting.
+func TestWantedBlocksFromCache_ClampsANonPositiveDepthToOne(t *testing.T) {
+	parent := chainhash.Hash{0xaa}
+
+	sm := newRaceManager(t)
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(parent, 101, chainOfHeaders(parent, 10)))
+
+	got := sm.wantedBlocksFromCache(100, 0)
+
+	require.Len(t, got, 1, "a depth below one is clamped to one, never to zero")
+}
+
 // TestUnownedBlocks_DropsBlocksAlreadyOnDisk is the deletion the whole model
 // turns on: a block we hold is not wanted, whatever any index says.
 func TestUnownedBlocks_DropsBlocksAlreadyOnDisk(t *testing.T) {

@@ -172,10 +172,9 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		// was derived from its parent's row rather than from anything the peer
 		// claimed, so this is the one place the committed height is known
 		// exactly. The park sweep needs it: a block parked below the committed
-		// tip can never be needed again, and the header list cannot answer that
-		// question because an arriving front block's header is removed before
-		// the park ever sees it, which moves the front past the very block being
-		// waited for. The hash travels with the height in the same atomic value,
+		// tip can never be needed again, and the header cache cannot answer that
+		// question: it names heights above the committed tip, not below it. The
+		// hash travels with the height in the same atomic value,
 		// so fillHeaderCache can check linkage without a second, blocking call
 		// back to the blockchain service for it.
 		if err == nil && blockHeight > 0 {
@@ -515,7 +514,7 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	// Resolve and verify this block's height from the chain's current view of its
 	// parent — the same lookup HandleBlockDirect's nil-parent branch makes. The
 	// record's own Height was resolved once already, at conversion time
-	// (pipelineParentHeight), from whichever of the header list or the store
+	// (pipelineParentHeight), from whichever of the header cache or the store
 	// answered first; re-deriving it here from the store catches the record
 	// having gone stale (e.g. a reorg) between conversion and commit.
 	_, previousBlockHeaderMeta, err := sm.blockchainClient.GetBlockHeader(ctx, blk.Header.HashPrevBlock)
@@ -533,7 +532,7 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	// disagreement between two things THIS node computed about its own chain
 	// view, not a claim the peer made. blk.Height was resolved once already,
 	// at conversion time (pipelineParentHeight), from whichever of the header
-	// list or the store answered first; this re-derives it from the store's
+	// cache or the store answered first; this re-derives it from the store's
 	// CURRENT view of the same parent. A mismatch means that view moved
 	// between conversion and commit — a reorg, or the record simply going
 	// stale while it sat parked — not that the block's own header chain or

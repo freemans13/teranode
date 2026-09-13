@@ -2,7 +2,6 @@ package netsync
 
 import (
 	"bytes"
-	"container/list"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -13,23 +12,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// headerListParent points sm's in-flight header list at one synthetic parent
-// hash, at height 0, and returns that hash. It is enough for
-// parentIsReachable to answer true without ever consulting the blockchain
-// client — headerIndex membership is checked first and short-circuits — which
-// is what keeps these tests from needing to wire a consumer goroutine or a
-// parkCommits channel: the block is reachable (worth charging) but never
-// committed (never reaches submitParkCommit).
-func headerListParent(t *testing.T, sm *SyncManager, name string) chainhash.Hash {
+// headerCacheParent points sm's header cache at one synthetic parent hash, at
+// height 0, and returns that hash. It is enough for parentIsReachable to
+// answer true without ever consulting the blockchain client — the cache is
+// checked first and short-circuits — which is what keeps these tests from
+// needing to wire a consumer goroutine or a parkCommits channel: the block is
+// reachable (worth charging) but never committed (never reaches
+// submitParkCommit).
+//
+// Written directly into the cache's own maps rather than through Fill, which
+// demands a batch that actually chains together: this needs one specific,
+// arbitrary hash to be found there, not a real header run.
+func headerCacheParent(t *testing.T, sm *SyncManager, name string) chainhash.Hash {
 	t.Helper()
 
 	parent := chainhash.HashH([]byte(name))
 
-	sm.headerMu.Lock()
-	sm.headerList = list.New()
-	e := sm.headerList.PushBack(&headerNode{hash: &parent, height: 0})
-	sm.headerIndex = map[chainhash.Hash]*list.Element{parent: e}
-	sm.headerMu.Unlock()
+	sm.headerCache = newHeaderCache()
+	sm.headerCache.byHeight[0] = parent
+	sm.headerCache.byHash[parent] = 0
+	sm.headerCache.filled = true
 
 	return parent
 }
@@ -58,7 +60,7 @@ func TestHandleBlockOnDiskMsg_ChargesTheRecordOnlyWhenConverted(t *testing.T) {
 		require.NoError(t, err, "sanity: the converted record must actually be readable back")
 		require.NotZero(t, len(raw), "sanity: an empty record proves nothing about the charge")
 
-		parent := headerListParent(t, sm, "handle-block-on-disk-honest-size-converted-parent")
+		parent := headerCacheParent(t, sm, "handle-block-on-disk-honest-size-converted-parent")
 
 		msg := &blockOnDiskMsg{body: peerpkg.BlockBody{
 			Header: wire.BlockHeader{PrevBlock: parent},
@@ -80,7 +82,7 @@ func TestHandleBlockOnDiskMsg_ChargesTheRecordOnlyWhenConverted(t *testing.T) {
 		store := memory.New()
 		sm := newPipelineParkManager(t, store, 8)
 
-		parent := headerListParent(t, sm, "handle-block-on-disk-honest-size-unconverted-parent")
+		parent := headerCacheParent(t, sm, "handle-block-on-disk-honest-size-unconverted-parent")
 		hash := chainhash.HashH([]byte("handle-block-on-disk-honest-size-unconverted-hash"))
 
 		msg := &blockOnDiskMsg{body: peerpkg.BlockBody{
@@ -112,7 +114,7 @@ func TestHandleBlockOnDiskMsg_NeverChecksForARecordWhenNotConverted(t *testing.T
 	store := memory.New()
 	sm := newPipelineParkManager(t, store, 8)
 
-	parent := headerListParent(t, sm, "handle-block-on-disk-no-io-parent")
+	parent := headerCacheParent(t, sm, "handle-block-on-disk-no-io-parent")
 	hash := chainhash.HashH([]byte("handle-block-on-disk-no-io-hash"))
 
 	before := store.Counters["exists"] + store.Counters["get"]
