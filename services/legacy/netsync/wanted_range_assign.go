@@ -1,6 +1,10 @@
 package netsync
 
-import peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+import (
+	"time"
+
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+)
 
 // assignWantedBlocks asks peers for the blocks this node wants next.
 //
@@ -18,11 +22,9 @@ import peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 // a minute against a 23ms commit path, and a cursor stranded above the limit
 // with 955,208 headers queued and nothing requested.
 //
-// fetchHeaderBlocks calls this instead of the cursor walk when
-// legacy_wantedRangeDownload is on. Before this task wired wantedBlocks to the
-// header cache, calling it asked for nothing at all: nothing pushes onto
-// sm.headerList any more, so the cursor-shaped reader this pass used to share
-// with the old walk always came back empty.
+// fetchHeaderBlocks is now just a dispatch to this: the cursor walk it used to
+// choose between itself and this pass is gone, so this is the only way blocks
+// are chosen.
 func (sm *SyncManager) assignWantedBlocks() {
 	wanted := sm.wantedBlocks()
 
@@ -114,6 +116,31 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 		// peer's budget nor be forgiven on a peer's behalf.
 		if sm.holdsBlock(sm.ctx, block.hash) {
 			continue
+		}
+
+		// The park's own in-memory index, checked separately from holdsBlock:
+		// Admit registers a block there synchronously, before its blob write
+		// is handed to a worker, so a pass that lands in the gap between
+		// admission and the write landing on disk must still see it as held.
+		// Without this, a pass triggered from inside the admission itself —
+		// parkOrphanBlock's own top-up call among them — re-requests the block
+		// it is that same instant holding, spending a peer's slot on a block
+		// already safely on its way to disk.
+		if sm.blockPark.Has(block.hash) {
+			continue
+		}
+
+		// The #1187 transient-failure backoff. A block that just failed with a
+		// local, non-judgemental fault (dropBlockFromWalk records it) must wait
+		// out its backoff window before the next pass asks for it again, or the
+		// throttle that exists to stop a re-decorate storm never actually
+		// throttles anything: without this check the backoff map fills but
+		// nothing here ever reads it, and a block that cannot be stored yet is
+		// downloaded again on every pass instead of once per window.
+		if sm.blockFailureBackoff != nil {
+			if fs, backedOff := sm.blockFailureBackoff.Get(block.hash); backedOff && time.Now().Before(fs.nextRetry) {
+				continue
+			}
 		}
 
 		if sm.blockDownloads.RequestedWithin(block.hash, blockRequestRetryInterval) {

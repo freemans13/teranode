@@ -184,6 +184,12 @@ func TestFetchHeaderBlocks_NeverAsksForABlockTheLedgerWillNotTrack(t *testing.T)
 	headers, hashes := linkedHeaders(anchor, 4, &nonce)
 	spliceHeadersForTest(t, sm, headers.Headers)
 
+	// assignWantedBlocks reads the header cache, not the header list, so the
+	// same run has to be named there too.
+	sm.noteCommittedHeight(10, anchor)
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(anchor, 11, headers.Headers))
+
 	// Somebody else's announcements have taken every slot the ledger has.
 	flooder, _, _ := connectRacePeer(t, 63, 1000)
 	registerRacePeer(sm, flooder)

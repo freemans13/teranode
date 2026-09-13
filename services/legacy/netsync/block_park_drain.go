@@ -412,58 +412,8 @@ func (sm *SyncManager) livePeer(recorded *peerpkg.Peer) *peerpkg.Peer {
 	return sm.loadSyncPeer()
 }
 
-// resumeHeaderWalk sends the download walk out again from wherever the cursor
-// now is.
-//
-// Every rewind moves the cursor back and sends nothing. What actually issues a
-// getdata is fetchHeaderBlocks, and its only callers are a block arriving, a
-// headers message arriving, and the pipeline top-up after a block is committed —
-// all of which are things that happen because sync is moving. In the regime the
-// rewinds exist for, sync is not moving: the block that was given up on was the
-// one everything else was queued behind, so no later block is coming to carry
-// the rewound cursor out with it, and a node would sit on a perfectly good
-// cursor until the stall detector rotated the peer and threw the cursor away.
-//
-// It used to check that the cursor was sitting on the front of the list before
-// sending anything, and to call that check the whole of its safety. The rule it
-// was reaching for — nothing may fetch while the round's anchor is still the
-// front — now lives in topUpHeaderBlocks, which is the one place every one of
-// the top-up callers passes through, and it is stated there as a fact about the
-// list rather than about the cursor. What is left of the old check is an
-// accident: "the cursor is on the front" is also false during an ordinary
-// forward walk, where the cursor is deliberately ahead of the front, so the
-// ticker declined to top the pipeline up in exactly the state the top-up exists
-// for. Keeping it would have meant keeping a condition no test could hold to
-// account, next to a comment claiming it was load-bearing.
-//
-// It is gated on the node having somewhere to put a block, not on the sync peer
-// having room. The gate it used to take, the sync peer's own count against the
-// block-size ladder, is right for topping a peer's queue back up after that
-// peer's block stopped being outstanding, and wrong here: at the ladder's lowest
-// rung the cap is one block, so a sync peer mid-transfer on a multi-gigabyte
-// block holds the resume shut for hours while the assigner would have handed the
-// rewound front block to an idle peer. The frontier race cannot cover it either,
-// because publishFrontierLocked clears the frontier for a front block nobody has
-// asked for, which is exactly what a rewound front is.
-//
-// svnode schedules per peer, in each peer's own send pass, with each peer
-// checking only its own in-flight count and no sync peer involved in block
-// bodies at all (FindNextBlocksToDownload, src/net/net_processing.cpp:5522).
-// Letting the assigner decide is that shape: it spreads over every eligible peer
-// with budget and refuses the pass when the node-wide download window is spent
-// or every peer is at its per-peer cap. With legacy_multiPeerBlockDownload off
-// it collapses to the sync peer at the ladder's budget, which is the behaviour
-// this had before.
-//
-// Called from the park sweep's ticker, on the sweep's own goroutine. Everything
-// it touches is under headerMu or is a peer send, which handleHeadersMsg already
-// does from a goroutine of its own.
-func (sm *SyncManager) resumeHeaderWalk() {
-	sm.topUpHeaderBlocks(nil)
-}
-
-// runParkSweep drives the park sweep and the rewound-cursor resume from a
-// goroutine of their own until the manager stops.
+// runParkSweep drives the park sweep and the periodic top-up from a goroutine of
+// their own until the manager stops.
 //
 // The sweep used to be a ticker arm on the goroutine that committed blocks in
 // order, and that was the whole justification for its per-tick time budget: a
@@ -485,11 +435,14 @@ func (sm *SyncManager) runParkSweep() {
 
 		case <-ticker.C:
 			sm.sweepParkedBlocks(time.Now())
-			// A rewind — from the sweep just above, or from a block given up
-			// on since the last tick — moves the download cursor back and
-			// sends nothing. This is what carries it out. See
-			// resumeHeaderWalk.
-			sm.resumeHeaderWalk()
+
+			// A block given up on since the last tick has nothing put back for
+			// it: the wanted-range pass recomputes what it wants and who owes
+			// it from the committed tip on every call, so this periodic pass is
+			// what re-asks for it once it is genuinely unowed again, without
+			// waiting for a block, a headers message or a peer top-up to
+			// trigger one first.
+			sm.fetchHeaderBlocks()
 		}
 	}
 }
@@ -693,9 +646,9 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 
 		isCheckpointBlock, removedFront := sm.advanceHeaderListFor(entry.hash)
 
-		// Merged onto the entry the dispatch owns, because every path that gives
-		// the block up rewinds from it, and by then the node is gone from both the
-		// list and the index.
+		// Merged onto the entry the dispatch owns, because parkedBlockHeight
+		// reads its height, and by then the node is gone from both the list and
+		// the index.
 		if removedFront != nil {
 			entry.removedFront = removedFront
 		}
@@ -727,9 +680,8 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 // per tick and neither can turn into a pass over the whole park in one go: the
 // chain lookups by parkSweepRPCBudget, and the blocks it gives up on by
 // parkSweepExpiryBudget. The second cap is the one that is easy to miss, and it
-// is the more expensive item — a store delete and a cursor rewind rather than a
-// lookup — and the one that arrives in bursts, because blocks parked together
-// age out together.
+// is the more expensive item — a store delete rather than a lookup — and the
+// one that arrives in bursts, because blocks parked together age out together.
 //
 // Both of those cap a COUNT, and a count is not a bound on the tick. Each item
 // carries its own deadline, chainCtx for a lookup and the park's store timeout
@@ -743,8 +695,7 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 // Stopping is free for the lookups, which leave the block parked for the next
 // tick anyway. It is not free for the expiries, because Expire has already taken
 // those entries out of the index: an entry the tick does not reach is put back,
-// or its blob is left charged against the budget with nothing tracking it and
-// its cursor is never rewound.
+// or its blob is left charged against the budget with nothing tracking it.
 func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	if !sm.blockPark.Enabled() {
 		return

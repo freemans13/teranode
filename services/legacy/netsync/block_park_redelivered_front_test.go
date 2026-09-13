@@ -76,10 +76,12 @@ func TestSyncManager_ARedeliveredCopyThatWasTheFrontKeepsTheBlockReachable(t *te
 	require.False(t, indexed, "still out of the list and out of the index")
 	require.Equal(t, 1, listLen, "only the block after it is left, so nothing but the carried node can bring this one back")
 
+	getDataBefore := h.rec.getDataCount()
+
 	// The block is given up on. The trigger used to be a thirty-minute timer,
 	// which no longer exists, and the rules that replaced it deliberately do not
-	// rewind: a block the chain has gone past should not be asked for again. So
-	// the give-up is driven here through a path that does rewind and that a node
+	// re-request a block the chain has gone past. So the give-up is driven here
+	// through a path that does still leave the block wanted and that a node
 	// meets in earnest — the parent turns up, the sweep goes to commit the
 	// block, and its blob will not read back.
 	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
@@ -89,13 +91,10 @@ func TestSyncManager_ARedeliveredCopyThatWasTheFrontKeepsTheBlockReachable(t *te
 
 	require.Zero(t, h.sm.blockPark.Len())
 
-	h.sm.headerMu.Lock()
-	startHeader := h.sm.startHeader
-	h.sm.headerMu.Unlock()
+	h.sm.fetchHeaderBlocks()
 
-	require.NotNil(t, startHeader,
-		"a block given up on must be back in the download walk; without the header node the second copy took off the front there is nothing to rewind to and nothing ever asks for it again")
-	require.Equal(t, child.String(), startHeader.Value.(*headerNode).hash.String())
+	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(getDataBefore, child) }, 5*time.Second),
+		"a block given up on must be asked for again; the blob was dropped as unusable, so holdsBlock no longer excludes it and it is still above the committed tip")
 }
 
 // TestSyncManager_ALaterCopyOfAParkedFrontBlockDoesNotWipeItsHeaderNode is the

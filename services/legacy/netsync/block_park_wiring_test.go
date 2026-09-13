@@ -119,12 +119,20 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 		node := &headerNode{height: int32(i + 1), hash: &hash}
 		sm.indexHeaderLocked(sm.headerList.PushBack(node), hash)
 	}
-
-	// Everything in the list has already been asked for, which is the state a
-	// node is in while blocks are arriving.
-	sm.startHeader = nil
 	sm.headerMu.Unlock()
 	sm.headersFirstMode.Store(true)
+
+	// assignWantedBlocks reads the header cache, not the header list, so the
+	// same run has to be named there too or a test that calls fetchHeaderBlocks
+	// finds nothing to ask for despite the list above looking fully populated.
+	// committedHeight defaults to zero on a manager nobody has told otherwise,
+	// which is exactly the height these blocks (1, 2, 3, ...) sit above.
+	sm.headerCache = newHeaderCache()
+	headers := make([]*wire.BlockHeader, len(blocks))
+	for i, b := range blocks {
+		headers[i] = &b.MsgBlock().Header
+	}
+	require.True(t, sm.headerCache.Fill(blocks[0].MsgBlock().Header.PrevBlock, 1, headers))
 
 	return &parkWiringHarness{sm: sm, client: client, peer: syncPeer, rec: rec, parkDir: parkDirectory(storeURL), blocks: blocks, store: store, noSuchBlock: noSuchBlock}
 }
@@ -331,10 +339,11 @@ func TestSyncManager_NothingIsDrainedAfterABlockThatDidNotCommit(t *testing.T) {
 // TestSyncManager_WithTheParkOffTheBlockIsDiscardedAndAskedForAgain is the
 // settings-only rollback. With legacy_parkOutOfOrderBlocks false there is no
 // park at all and nothing reaches the disk — but the block is NOT simply
-// forgotten, because the download walk is put back onto it. That rewind is not
-// gated by the setting, and it is the half of the drop path that keeps
-// headers-first sync from stopping on the first out-of-order block, so the test
-// asserts it rather than only asserting the absence of a park.
+// forgotten: it is still wanted and unowed, so the next wanted-range pass asks
+// for it again. That is not gated by the setting, and it is the half of the
+// drop path that keeps headers-first sync from stopping on the first
+// out-of-order block, so the test asserts it rather than only asserting the
+// absence of a park.
 func TestSyncManager_WithTheParkOffTheBlockIsDiscardedAndAskedForAgain(t *testing.T) {
 	h := newParkWiringHarness(t, false)
 
@@ -344,17 +353,17 @@ func TestSyncManager_WithTheParkOffTheBlockIsDiscardedAndAskedForAgain(t *testin
 
 	h.client.On("GetBlockExists", mock.Anything, &child).Return(false, nil).Once()
 
+	before := h.rec.getDataCount()
+
 	require.NoError(t, h.deliver(t, 1))
 
 	require.Empty(t, parkDirEntries(t, h.parkDir), "with the park off nothing may reach the disk")
 	require.Zero(t, h.sm.blockPark.Len())
 
-	h.sm.headerMu.Lock()
-	startHeader := h.sm.startHeader
-	h.sm.headerMu.Unlock()
+	h.sm.fetchHeaderBlocks()
 
-	require.NotNil(t, startHeader, "a discarded block must go back into the download walk")
-	require.Equal(t, child.String(), startHeader.Value.(*headerNode).hash.String())
+	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
+		"a discarded block must be asked for again")
 }
 
 // TestHandleBlockDirect_ToleratesANilPeer. Every block recovered from the park
@@ -455,10 +464,10 @@ func TestSyncManager_TheSweepKeepsABlockWhoseParentIsMerelyLate(t *testing.T) {
 	require.Contains(t, parkDirEntries(t, h.parkDir), child.String()+".msgBlock",
 		"its blob stays on disk, because downloading it again is the cost this avoids")
 
-	h.sm.headerMu.Lock()
-	startHeader := h.sm.startHeader
-	h.sm.headerMu.Unlock()
+	before := h.rec.getDataCount()
 
-	require.Nil(t, startHeader,
-		"and the walk is not rewound onto it, because we already have it")
+	h.sm.fetchHeaderBlocks()
+
+	require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, time.Second),
+		"the block must not be asked for again, because we already have it")
 }

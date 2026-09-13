@@ -32,7 +32,7 @@ import (
 // because its parent is not stored, and returns its hash. Delivering the front
 // is what makes the removedFront threading matter: the header is removed from
 // the list AND unindexed before the park ever sees the block, so any path that
-// later gives the block up has nothing to look it up by.
+// later reads its height (parkedBlockHeight) has nothing to look it up by.
 func (h *parkWiringHarness) parkFrontBlock(t *testing.T) chainhash.Hash {
 	t.Helper()
 
@@ -43,33 +43,21 @@ func (h *parkWiringHarness) parkFrontBlock(t *testing.T) chainhash.Hash {
 
 	h.sm.headerMu.Lock()
 	_, stillIndexed := h.sm.headerIndex[front]
-	startHeader := h.sm.startHeader
 	h.sm.headerMu.Unlock()
 
 	require.False(t, stillIndexed, "an arriving front block's header is removed and unindexed before the park sees it")
-	require.Nil(t, startHeader, "nothing has rewound yet")
 
 	return front
 }
 
-// requireBackInTheWalk asserts the end state a given-up block must reach: its
-// header is back in the list, indexed, at the front, with the download cursor on
-// it, and the peer is asked for the block again.
+// requireBackInTheWalk asserts the end state a given-up block must reach: it is
+// still wanted and unowed, so the next wanted-range pass asks the peer for it
+// again. There is no header-list or cursor position to inspect any more — the
+// pass recomputes what it wants and who owes it from the committed tip on every
+// call, so "still wanted" is answered by the getdata that follows, not by
+// where anything sits.
 func (h *parkWiringHarness) requireBackInTheWalk(t *testing.T, hash chainhash.Hash, getDataBefore int) {
 	t.Helper()
-
-	h.sm.headerMu.Lock()
-	indexed := h.sm.headerIndex[hash]
-	front := h.sm.headerList.Front()
-	startHeader := h.sm.startHeader
-	h.sm.headerMu.Unlock()
-
-	require.NotNil(t, indexed, "a block given up on must be back in the header index")
-	require.NotNil(t, front)
-	require.Equal(t, hash.String(), front.Value.(*headerNode).hash.String(),
-		"a block that was the front when it arrived must go back on the front")
-	require.NotNil(t, startHeader, "the download cursor must be back on it")
-	require.Equal(t, hash.String(), startHeader.Value.(*headerNode).hash.String())
 
 	h.sm.fetchHeaderBlocks()
 

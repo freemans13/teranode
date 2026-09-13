@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -138,6 +139,18 @@ func TestSyncManager_CommittingAParkedBlockMidHeaderRoundDoesNotWedgeTheCheckpoi
 	h.sm.headerMu.Lock()
 	h.sm.removeHeaderAnchorLocked()
 	h.sm.headerMu.Unlock()
+
+	// assignWantedBlocks reads the header cache, not the header list, so this
+	// round's run has to be named there too — replacing whatever the harness
+	// seeded it with for its own three blocks, which have nothing to do with
+	// this round.
+	allHeaders := make([]*wire.BlockHeader, 0, len(first.Headers)+len(second.Headers))
+	allHeaders = append(allHeaders, first.Headers...)
+	allHeaders = append(allHeaders, second.Headers...)
+
+	h.sm.headerCache = newHeaderCache()
+	require.True(t, h.sm.headerCache.Fill(anchor, 11, allHeaders))
+	h.sm.noteCommittedHeight(10, anchor)
 
 	h.sm.fetchHeaderBlocks()
 	deliverWhatWasAskedFor()

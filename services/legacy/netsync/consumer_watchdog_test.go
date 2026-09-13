@@ -290,7 +290,6 @@ func TestConsumerWatchdog_ReportsTheHeaderRoundWhenTheAnchorIsStillTheFront(t *t
 	sm := &SyncManager{logger: log}
 
 	seedStalledHeaderRound(sm, 849900, 99)
-	sm.startHeader = sm.headerList.Front()
 
 	line := stallReport(t, sm, log)
 
@@ -301,24 +300,6 @@ func TestConsumerWatchdog_ReportsTheHeaderRoundWhenTheAnchorIsStillTheFront(t *t
 	require.Contains(t, line, "aiming at checkpoint 850000")
 }
 
-// TestConsumerWatchdog_ReportsANilDownloadCursor pins the other terminal state of
-// the walk. A nil startHeader beside a list full of headers switches the only
-// fetcher off, and in every log the node writes today it is indistinguishable
-// from a round whose anchor never had anything splice onto it. The two want
-// opposite fixes, so the report has to name which one it is.
-func TestConsumerWatchdog_ReportsANilDownloadCursor(t *testing.T) {
-	log := &captureLogger{Logger: ulogger.TestLogger{}}
-	sm := &SyncManager{logger: log}
-
-	seedStalledHeaderRound(sm, 800128, 12)
-	sm.startHeader = nil
-
-	line := stallReport(t, sm, log)
-
-	require.Contains(t, line, "the download cursor is nil")
-	require.Contains(t, line, "the header round holds 13 headers")
-}
-
 // TestConsumerWatchdog_SaysNothingExtraWithHeadersFirstOff keeps this scoped to
 // the state it diagnoses. Outside a headers-first round the list is not the thing
 // holding blocks up, and a clause about it would be noise on every other stall.
@@ -327,7 +308,6 @@ func TestConsumerWatchdog_SaysNothingExtraWithHeadersFirstOff(t *testing.T) {
 	sm := &SyncManager{logger: log}
 
 	seedStalledHeaderRound(sm, 800128, 12)
-	sm.startHeader = sm.headerList.Front()
 	sm.headersFirstMode.Store(false)
 
 	line := stallReport(t, sm, log)
@@ -353,4 +333,23 @@ func TestConsumerWatchdog_ANilHeaderListStillProducesAReport(t *testing.T) {
 
 	require.Contains(t, line, "the header round holds no headers")
 	require.Contains(t, line, "no checkpoint ahead")
+}
+
+// TestConsumerWait_Describe_NamesDeclinedDrainTurns covers the field that was
+// collected and never rendered. A drain that walks its queue, rules every parent
+// out and drops them leaves the queue length at zero, so without this a loop
+// that has just thrown a turn away reads as a loop with no work.
+func TestConsumerWait_Describe_NamesDeclinedDrainTurns(t *testing.T) {
+	now := time.Now()
+
+	w := &consumerWait{at: now, queueArmOpen: true, parked: 113, drainDeclines: 41}
+
+	line := w.describe(now)
+
+	require.Contains(t, line, "the drain has declined 41 turns",
+		"a report that collects the count and prints nothing is the diagnostic stopping where it gets interesting")
+
+	quiet := (&consumerWait{at: now, queueArmOpen: true}).describe(now)
+	require.False(t, strings.Contains(quiet, "declined"),
+		"a drain that has never declined a turn must not add a clause saying so")
 }

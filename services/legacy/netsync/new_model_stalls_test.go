@@ -28,10 +28,6 @@ func cacheManager(t *testing.T, best int32, depth int32) (*SyncManager, *peerpkg
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 	sm.settings.Legacy.BlockDownloadLowerWindow = int(depth)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = int(depth)
-	// The new model: assignWantedBlocks reads the wanted range from the header
-	// cache rather than walking sm.headerList. Off, fetchHeaderBlocks takes the
-	// cursor walk instead, which never looks at the cache these tests fill.
-	sm.settings.Legacy.WantedRangeDownload = true
 
 	committedTipHash := chainhash.Hash{0xbb}
 	sm.noteCommittedHeight(best, committedTipHash)
@@ -89,7 +85,7 @@ func TestNewModel_ACheckpointAnchorDoesNotGateAnything(t *testing.T) {
 // that peer got asked. That version passed, but for the wrong reason: with
 // the reset call commented out entirely, it still passed. resetHeaderStateLocked
 // never touches sm.headerCache or sm.blockDownloads — only headerList,
-// headerIndex, startHeader, the list epoch and the frontier — so on the
+// headerIndex and the list epoch — so on the
 // wanted-range path the reset is inert by construction, and a test that
 // exercises a whole fetchHeaderBlocks pass around it cannot tell "the reset
 // is harmless" apart from "the reset was never on the path being measured."

@@ -286,18 +286,18 @@ func TestTail_AnAbortedSuccessorGetsItsHeaderBack(t *testing.T) {
 	_, childBackoff := h.sm.blockFailureBackoff.Get(child)
 	require.False(t, childBackoff, "an aborted successor never ran a failing attempt and earns no backoff")
 
-	h.sm.headerMu.Lock()
-	defer h.sm.headerMu.Unlock()
+	// Neither block was put back anywhere — there is nowhere to put a block
+	// back to any more. Both are simply still in the wanted range and unowned,
+	// so the next pass finds them on its own: the child immediately, since it
+	// has no backoff of its own, and the parent once its backoff clears.
+	before := h.rec.getDataCount()
 
-	_, parentIndexed = h.sm.headerIndex[parent]
-	_, childIndexed = h.sm.headerIndex[child]
+	h.sm.fetchHeaderBlocks()
 
-	require.True(t, parentIndexed, "the failed parent's header is back in the list")
-	require.True(t, childIndexed, "the aborted successor's header is back in the list too, or the walk skips it for good")
-
-	front := h.sm.headerList.Front().Value.(*headerNode)
-	require.Equal(t, parent.String(), front.hash.String(), "the walk resumes from the parent")
-	require.Equal(t, child.String(), h.sm.headerList.Front().Next().Value.(*headerNode).hash.String(), "with the child behind it, in height order")
+	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
+		"the aborted successor must be asked for again, or the walk skips it for good")
+	require.False(t, h.rec.askedForSince(before, parent),
+		"the failed parent must not be asked for again yet, still inside its backoff")
 }
 
 // TestSweep_PostsCommitsToTheConsumerInsteadOfCommitting pins the sweep's one

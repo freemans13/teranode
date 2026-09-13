@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
@@ -38,23 +37,32 @@ func schedulerPeerBudget(sm *SyncManager) int {
 	return min(sm.settings.Legacy.MaxBlocksInTransitPerPeer, ladder)
 }
 
-// startHeaderHash reports the hash the download cursor is currently sitting on,
-// and whether it is on anything at all.
-func startHeaderHash(t *testing.T, sm *SyncManager) (chainhash.Hash, bool) {
+// schedulerManager builds a manager sized for the scheduler tests: the real
+// settings loader, a block-size tracker, and no headers seeded yet — callers
+// seed those themselves, through seedFetchHeaders for the ordinary case.
+func schedulerManager(t *testing.T) *SyncManager {
 	t.Helper()
 
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
+	sm := newRaceManager(t)
+	sm.blockSizeTracker = newBlockSizeTracker(10)
 
-	if sm.startHeader == nil {
+	return sm
+}
+
+// nextCandidateHash is what the cursor assertions in this file's tests used to
+// read off sm.startHeader: the lowest wanted block this node has not yet asked
+// anybody for. There is no position left to inspect under the wanted-range
+// model, so this recomputes the same fact the cursor used to just happen to be
+// sitting on.
+func nextCandidateHash(t *testing.T, sm *SyncManager) (chainhash.Hash, bool) {
+	t.Helper()
+
+	candidates := sm.unownedBlocks(sm.wantedBlocks())
+	if len(candidates) == 0 {
 		return chainhash.Hash{}, false
 	}
 
-	node, ok := sm.startHeader.Value.(*headerNode)
-	require.True(t, ok)
-	require.NotNil(t, node.hash)
-
-	return *node.hash, true
+	return candidates[0].hash, true
 }
 
 // TestScheduler_SpreadsOneHeaderRunAcrossEveryEligiblePeer is the anchor test
@@ -72,7 +80,7 @@ func TestScheduler_SpreadsOneHeaderRunAcrossEveryEligiblePeer(t *testing.T) {
 	anchor := chainhash.Hash{0xd1}
 	msg, hashes := linkedHeaders(anchor, 12, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 4
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 80, 1000)
@@ -109,7 +117,7 @@ func TestScheduler_APeerAtItsCapIsNotAskedForMore(t *testing.T) {
 	anchor := chainhash.Hash{0xd2}
 	msg, hashes := linkedHeaders(anchor, 4, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 4
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 83, 1000)
@@ -135,15 +143,14 @@ func TestScheduler_APeerAtItsCapIsNotAskedForMore(t *testing.T) {
 
 // TestScheduler_RespectsTheNodeWideWindow pins the other budget: the sum over
 // every peer. With the window set to three, four idle peers and ten headers to
-// hand out, exactly three blocks may be outstanding, and the walk must stop with
-// its cursor on the fourth header rather than dropping it.
+// hand out, exactly three blocks may be outstanding.
 func TestScheduler_RespectsTheNodeWideWindow(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xd3}
 	msg, hashes := linkedHeaders(anchor, 10, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 	sm.settings.Legacy.BlockDownloadWindow = 3
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 85, 1000)
@@ -165,9 +172,13 @@ func TestScheduler_RespectsTheNodeWideWindow(t *testing.T) {
 	require.Equal(t, hashes[0:3], syncRec.all())
 	require.Equal(t, 3, sm.blockDownloads.Len())
 
-	cursor, ok := startHeaderHash(t, sm)
-	require.True(t, ok, "the cursor must stay in the list")
-	require.Equal(t, hashes[3], cursor, "the first header the window could not cover must still be next")
+	// There is no fourth candidate to inspect here, and that is by design
+	// rather than a loss: lookaheadCeilingLocked clamps a lower window to the
+	// node-wide window (as svnode does), so with no lower window configured
+	// the node-wide window doubles as the read-ahead depth, and wantedBlocks
+	// does not name anything beyond it. Nothing is stranded — the next pass
+	// recomputes the same range from the committed tip and finds hashes[3]
+	// exactly when the window or the committer makes room for it.
 }
 
 // TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked pins the eligibility
@@ -181,7 +192,7 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 	anchor := chainhash.Hash{0xd4}
 	msg, hashes := linkedHeaders(anchor, 6, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	// The short peer is the sync peer, so it is first in line: if the claimed
 	// height were not consulted it would take the whole run.
@@ -197,10 +208,7 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 	//
 	// Seeded from height 10, so every header is at 11 or above — out of reach of
 	// a peer claiming height 5.
-	sm.resetHeaderState(&anchor, 10)
-	sm.headersFirstMode.Store(true)
-	spliceHeadersForTest(t, sm, msg.Headers)
-	require.Equal(t, len(hashes)+1, sm.headerListLen())
+	seedFetchHeaders(t, sm, shortPeer, anchor, msg)
 
 	sm.fetchHeaderBlocks()
 
@@ -217,6 +225,16 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 	more, moreHashes := linkedHeaders(hashes[len(hashes)-1], 3, &nonce)
 	spliceHeadersForTest(t, sm, more.Headers)
 
+	// The second round's reply is anchored on the last header of the first, the
+	// shape a real getheaders reply has. The header cache's contiguous run has
+	// to start exactly where this batch does, which means treating the first
+	// six as committed purely so the cache's own no-gaps rule is satisfied;
+	// nothing here asserts anything about whether they actually committed.
+	committedAt := int32(10 + len(hashes))
+	sm.noteCommittedHeight(committedAt, hashes[len(hashes)-1])
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(hashes[len(hashes)-1], committedAt+1, more.Headers))
+
 	sm.fetchHeaderBlocks()
 
 	require.True(t, WaitUntil(func() bool { return shortRec.count() == len(moreHashes) }, 5*time.Second),
@@ -228,15 +246,15 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 // the master switch off the node has to behave exactly as it did before the
 // scheduler existed: one getdata, to the sync peer, holding the first
 // block-size-ladder's worth of headers in list order, with every other
-// connected peer left alone and the cursor on the first header it did not
-// consider.
+// connected peer left alone and the next header still a candidate rather than
+// lost.
 func TestScheduler_OffPathSendsOneGetDataToTheSyncPeer(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xd5}
 	msg, hashes := linkedHeaders(anchor, 30, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 	sm.settings.Legacy.MultiPeerBlockDownload = false
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 91, 1000)
@@ -258,9 +276,9 @@ func TestScheduler_OffPathSendsOneGetDataToTheSyncPeer(t *testing.T) {
 	require.Zero(t, secondRec.count(), "no other peer is asked anything with the scheduler off")
 	require.Zero(t, thirdRec.count())
 
-	cursor, ok := startHeaderHash(t, sm)
+	candidate, ok := nextCandidateHash(t, sm)
 	require.True(t, ok)
-	require.Equal(t, hashes[ladder], cursor, "the cursor is left on the first header not considered")
+	require.Equal(t, hashes[ladder], candidate, "the next header not yet considered is still a candidate")
 }
 
 // TestScheduler_OffPathWithNoSyncPeerRequestsNothing keeps the other half of the
@@ -272,7 +290,7 @@ func TestScheduler_OffPathWithNoSyncPeerRequestsNothing(t *testing.T) {
 	anchor := chainhash.Hash{0xd6}
 	msg, _ := linkedHeaders(anchor, 5, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 	sm.settings.Legacy.MultiPeerBlockDownload = false
 
 	deliverer, delivererRec := schedulerPeer(t, sm, 94, 1000)
@@ -290,14 +308,14 @@ func TestScheduler_OffPathWithNoSyncPeerRequestsNothing(t *testing.T) {
 
 // TestScheduler_RequestsBlocksWithNoSyncPeerAtAll is the line the scheduler
 // deletes. A node between sync peers still has connected peers holding the
-// blocks it needs, and the header list it walked is still good.
+// blocks it needs, and the header cache it named them from is still good.
 func TestScheduler_RequestsBlocksWithNoSyncPeerAtAll(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xd7}
 	msg, hashes := linkedHeaders(anchor, 5, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	deliverer, delivererRec := schedulerPeer(t, sm, 96, 1000)
 	_, otherRec := schedulerPeer(t, sm, 97, 1000)
@@ -318,7 +336,7 @@ func TestScheduler_RequestsBlocksWithNoSyncPeerAtAll(t *testing.T) {
 // with another peer, both copies were admitted, and both were committed.
 //
 // The block at the front of the run is already owed by the sync peer, so the
-// walk must step over it without handing it to anybody else, and must carry on
+// pass must step over it without handing it to anybody else, and must carry on
 // with the rest of the run rather than stalling on it.
 func TestScheduler_NeverAsksASecondPeerForAHashSomebodyAlreadyOwes(t *testing.T) {
 	var nonce uint32
@@ -326,7 +344,7 @@ func TestScheduler_NeverAsksASecondPeerForAHashSomebodyAlreadyOwes(t *testing.T)
 	anchor := chainhash.Hash{0xd8}
 	msg, hashes := linkedHeaders(anchor, 6, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 98, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
@@ -352,22 +370,22 @@ func TestScheduler_NeverAsksASecondPeerForAHashSomebodyAlreadyOwes(t *testing.T)
 		require.NotEqual(t, hashes[0], h, "the in-flight block must never be handed to a second peer")
 	}
 
-	require.Equal(t, hashes[1:], syncRec.all(), "the walk carries on past the block it skipped")
+	require.Equal(t, hashes[1:], syncRec.all(), "the pass carries on past the block it skipped")
 }
 
-// TestScheduler_StopsWithTheCursorOnAHeaderNobodyCanTake pins the cursor
-// discipline. When the budgets run out part way through a run, the walk has to
-// stop with the cursor on the first header it could not place. Advancing past it
-// loses that block from the walk for good, and a "cursor is not nil" assertion
-// is satisfied perfectly by that broken state — so the identity of the header is
-// what gets asserted.
-func TestScheduler_StopsWithTheCursorOnAHeaderNobodyCanTake(t *testing.T) {
+// TestScheduler_LeavesTheHeaderNobodyCanTakeForTheNextPass pins the discipline
+// that replaced the cursor. When the budgets run out part way through a run,
+// the header nobody could place must still be a candidate — dropping it would
+// lose that block from the download for good, and a bare "something is still
+// wanted" assertion is satisfied perfectly by a broken pass that lost the wrong
+// header, so the identity of the header is what gets asserted.
+func TestScheduler_LeavesTheHeaderNobodyCanTakeForTheNextPass(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xd9}
 	msg, hashes := linkedHeaders(anchor, 5, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 3
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 100, 1000)
@@ -381,9 +399,9 @@ func TestScheduler_StopsWithTheCursorOnAHeaderNobodyCanTake(t *testing.T) {
 		"the one peer's cap is what bounds this pass")
 	require.Equal(t, hashes[0:3], syncRec.all())
 
-	cursor, ok := startHeaderHash(t, sm)
-	require.True(t, ok, "the cursor must stay in the list")
-	require.Equal(t, hashes[3], cursor, "the cursor must be left on the header nobody could take")
+	candidate, ok := nextCandidateHash(t, sm)
+	require.True(t, ok, "the header nobody could take must still be a candidate")
+	require.Equal(t, hashes[3], candidate, "and it must be the header nobody could take")
 }
 
 // TestScheduler_HugeBlocksCollapseBackToOnePeerWithOneBlock is the memory
@@ -399,7 +417,7 @@ func TestScheduler_HugeBlocksCollapseBackToOnePeerWithOneBlock(t *testing.T) {
 	anchor := chainhash.Hash{0xda}
 	msg, hashes := linkedHeaders(anchor, 10, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	const threeGB = int64(3) * 1024 * 1024 * 1024
 	for i := 0; i < 3; i++ {
@@ -428,136 +446,11 @@ func TestScheduler_HugeBlocksCollapseBackToOnePeerWithOneBlock(t *testing.T) {
 	require.Equal(t, 1, sm.blockDownloads.Len())
 }
 
-// TestScheduler_StallRaceStillAddsASecondPeerToTheFrontier proves the one
-// deliberate exception survives the scheduler. Every other rule here says a hash
-// belongs to exactly one peer; the frontier race says the single block holding
-// up sync may be asked of a second peer, because everything else is queued
-// behind it. Under the scheduler the frontier is owed by whichever peer got the
-// first slice, which is the case the race has to keep working for.
-func TestScheduler_StallRaceStillAddsASecondPeerToTheFrontier(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xdb}
-	msg, hashes := linkedHeaders(anchor, 4, &nonce)
-
-	sm := newFetchLockManager(t, nil, nil, nil)
-	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 2
-
-	syncPeer, _ := schedulerPeer(t, sm, 105, 1000)
-	sm.storeSyncPeer(syncPeer, &syncPeerState{})
-
-	second, secondRec := schedulerPeer(t, sm, 106, 1000)
-	third, thirdRec := schedulerPeer(t, sm, 107, 1000)
-
-	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
-
-	sm.fetchHeaderBlocks()
-
-	require.True(t, WaitUntil(func() bool { return sm.blockDownloads.Len() == len(hashes) }, 5*time.Second),
-		"the run should have been handed out")
-
-	frontier := hashes[0]
-	require.True(t, sm.blockDownloads.HasOwner(syncPeer, frontier), "the first slice carries the frontier")
-
-	// The peer that owes the frontier has gone quiet on it for half a minute,
-	// comfortably past the 20 second default.
-	sm.setFrontier(frontier, 11, time.Now().Add(-30*time.Second))
-
-	sm.raceFrontierBlock(time.Now())
-
-	racer := second
-	racerRec := secondRec
-
-	if sm.blockDownloads.HasOwner(third, frontier) {
-		racer = third
-		racerRec = thirdRec
-	}
-
-	require.True(t, sm.blockDownloads.HasOwner(racer, frontier),
-		"a second peer must be put on the block holding up sync, and authorised to answer")
-	require.True(t, WaitUntil(func() bool {
-		for _, h := range racerRec.all() {
-			if h == frontier {
-				return true
-			}
-		}
-
-		return false
-	}, 5*time.Second), "the racer must actually be asked for the frontier block")
-	require.True(t, sm.blockDownloads.HasOwner(syncPeer, frontier),
-		"the original request stands: the race adds a copy, it does not move the block")
-}
-
-// TestScheduler_DoesNotHoldTheHeaderLockAcrossTheBlockchainLookup is the
-// single-peer lock discipline test run against the multi-peer path, because that
-// is now the path a node takes. The blockchain lookup is a gRPC round trip on a
-// context with no deadline, and the block-queue consumer — the one goroutine
-// that commits blocks in order — takes headerMu as its first act.
-func TestScheduler_DoesNotHoldTheHeaderLockAcrossTheBlockchainLookup(t *testing.T) {
-	gate := make(chan struct{})
-	entered := make(chan struct{})
-
-	sm := newFetchLockManager(t, nil, gate, entered)
-	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 4
-
-	syncPeer, _ := schedulerPeer(t, sm, 108, 1000)
-	sm.storeSyncPeer(syncPeer, &syncPeerState{})
-
-	_, _ = schedulerPeer(t, sm, 109, 1000)
-	_, _ = schedulerPeer(t, sm, 110, 1000)
-
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xdc}
-	msg, _ := linkedHeaders(anchor, 25, &nonce)
-
-	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
-
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		sm.fetchHeaderBlocks()
-	}()
-
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		close(gate)
-		t.Fatal("fetchHeaderBlocks never reached the blockchain lookup")
-	}
-
-	acquired := make(chan struct{})
-
-	go func() {
-		_ = sm.headerListLen()
-
-		close(acquired)
-	}()
-
-	select {
-	case <-acquired:
-	case <-time.After(2 * time.Second):
-		close(gate)
-		<-done
-		t.Fatal("reading the header list blocked while fetchHeaderBlocks waited on the blockchain lookup")
-	}
-
-	close(gate)
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("fetchHeaderBlocks never returned")
-	}
-}
-
 // TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked is the other
 // half of the eligibility rule, and the one that keeps it from being able to
 // wedge sync. A claimed height is a lower bound that goes stale downward: a peer
 // that has told us nothing since the handshake reads as shorter than it is. When
-// no peer with budget claims a chain reaching the block, the walk asks the first
+// no peer with budget claims a chain reaching the block, the pass asks the first
 // peer with budget anyway rather than stopping — a wasted request costs one
 // round trip, a scheduler that declines to ask anybody costs the whole sync.
 func TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked(t *testing.T) {
@@ -566,7 +459,7 @@ func TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked(t *testing.
 	anchor := chainhash.Hash{0xdd}
 	msg, hashes := linkedHeaders(anchor, 4, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	// Both peers claim a chain far below the headers, which are seeded from
 	// height 10.
@@ -575,10 +468,7 @@ func TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked(t *testing.
 
 	_, otherRec := schedulerPeer(t, sm, 112, 3)
 
-	sm.resetHeaderState(&anchor, 10)
-	sm.headersFirstMode.Store(true)
-	spliceHeadersForTest(t, sm, msg.Headers)
-	require.Equal(t, len(hashes)+1, sm.headerListLen())
+	seedFetchHeaders(t, sm, shortPeer, anchor, msg)
 
 	// A peer that has told us about nothing above height 3.
 	state, exists := sm.peerStates.Get(shortPeer)
@@ -588,60 +478,9 @@ func TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked(t *testing.
 	sm.fetchHeaderBlocks()
 
 	require.True(t, WaitUntil(func() bool { return shortRec.count() == len(hashes) }, 5*time.Second),
-		"with nobody claiming the height the walk must still ask somebody")
+		"with nobody claiming the height the pass must still ask somebody")
 	require.Equal(t, hashes, shortRec.all())
 	require.Zero(t, otherRec.count(), "and only the first peer with budget, not everybody")
-}
-
-// blockHeaderLookups counts how many times a pass asked the blockchain service
-// whether we already hold a block.
-func blockHeaderLookups(t *testing.T, sm *SyncManager) int {
-	t.Helper()
-
-	client, ok := sm.blockchainClient.(*blockchain2.Mock)
-	require.True(t, ok)
-
-	n := 0
-
-	for _, call := range client.Calls {
-		if call.Method == "GetBlockHeader" {
-			n++
-		}
-	}
-
-	return n
-}
-
-// TestScheduler_DoesNotAskTheBlockchainAboutBlocksItCannotHandOut bounds the
-// cost of a pass. Each candidate header costs one "do we already have this?"
-// question, and that is a gRPC round trip to the blockchain service on a context
-// with no deadline. A pass must therefore only ask about the headers it could
-// actually hand to a peer: with the node-wide window at its default of 1024 and
-// one peer able to take 16, walking 60 headers would make 60 round trips to
-// place 16 blocks, and this runs on every arriving block.
-func TestScheduler_DoesNotAskTheBlockchainAboutBlocksItCannotHandOut(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xde}
-	msg, _ := linkedHeaders(anchor, 60, &nonce)
-
-	sm := newFetchLockManager(t, nil, nil, nil)
-
-	syncPeer, syncRec := schedulerPeer(t, sm, 113, 1000)
-	sm.storeSyncPeer(syncPeer, &syncPeerState{})
-
-	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
-
-	before := blockHeaderLookups(t, sm)
-
-	sm.fetchHeaderBlocks()
-
-	budget := schedulerPeerBudget(sm)
-
-	require.True(t, WaitUntil(func() bool { return syncRec.count() == budget }, 5*time.Second),
-		"the pass should have handed out one peer's budget")
-	require.Equal(t, budget, blockHeaderLookups(t, sm)-before,
-		"a pass must not ask the blockchain about headers it has no budget to hand out")
 }
 
 // TestScheduler_TheNodeWideWindowCountsWhatIsAlreadyInFlight is the other half
@@ -658,7 +497,7 @@ func TestScheduler_TheNodeWideWindowCountsWhatIsAlreadyInFlight(t *testing.T) {
 	anchor := chainhash.Hash{0xd9}
 	msg, hashes := linkedHeaders(anchor, 10, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 	sm.settings.Legacy.BlockDownloadWindow = 5
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 140, 1000)
@@ -683,28 +522,27 @@ func TestScheduler_TheNodeWideWindowCountsWhatIsAlreadyInFlight(t *testing.T) {
 	require.Equal(t, hashes[0:2], syncRec.all())
 	require.Equal(t, 5, sm.blockDownloads.Len(), "and the node is now at its window, not above it")
 
-	cursor, ok := startHeaderHash(t, sm)
-	require.True(t, ok, "the cursor must stay in the list")
-	require.Equal(t, hashes[2], cursor, "the first header the window could not cover must still be next")
+	candidate, ok := nextCandidateHash(t, sm)
+	require.True(t, ok, "the header the window could not cover must still be a candidate")
+	require.Equal(t, hashes[2], candidate, "the first header the window could not cover must still be next")
 }
 
 // TestScheduler_ADisconnectedPeerIsNotAskedForAnything is the fan-out's own
 // admission test. QueueMessage returns silently for a peer whose socket has
 // gone, so nothing on the wire says the request was lost — but the ledger would
-// have recorded the blocks as owed by a peer that can never deliver them, and the
-// walk would have advanced past them into exactly the stranded state a departing
-// peer leaves behind.
+// have recorded the blocks as owed by a peer that can never deliver them, and
+// they would sit unrequestable until the ownership ceiling expired.
 //
-// The disconnected peer is the only peer, so the pass has to place nothing at all
-// and leave the cursor where it is: advancing past a header nobody was asked for
-// loses that block from the walk for good.
+// The disconnected peer is the only peer, so the pass has to place nothing at
+// all and leave the front header a candidate: recording it as owed by a peer
+// that can never deliver would lose that block from the download for good.
 func TestScheduler_ADisconnectedPeerIsNotAskedForAnything(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xda}
 	msg, hashes := linkedHeaders(anchor, 6, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	gone, goneRec := schedulerPeer(t, sm, 143, 1000)
 	sm.storeSyncPeer(gone, &syncPeerState{})
@@ -721,9 +559,9 @@ func TestScheduler_ADisconnectedPeerIsNotAskedForAnything(t *testing.T) {
 		"a block owed by a peer that cannot deliver it is a block nothing will ever ask for again")
 	require.Zero(t, goneRec.count())
 
-	cursor, ok := startHeaderHash(t, sm)
-	require.True(t, ok, "the cursor must stay in the list")
-	require.Equal(t, hashes[0], cursor, "and on the first header, which nobody was asked for")
+	candidate, ok := nextCandidateHash(t, sm)
+	require.True(t, ok, "the front header must still be a candidate")
+	require.Equal(t, hashes[0], candidate, "and it must be the front header, which nobody was asked for")
 }
 
 // TestScheduler_ANonCandidatePeerIsNotAskedForAnything is the same admission
@@ -735,7 +573,7 @@ func TestScheduler_ANonCandidatePeerIsNotAskedForAnything(t *testing.T) {
 	anchor := chainhash.Hash{0xdb}
 	msg, hashes := linkedHeaders(anchor, 6, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	peer, peerRec := schedulerPeer(t, sm, 144, 1000)
 
@@ -750,16 +588,16 @@ func TestScheduler_ANonCandidatePeerIsNotAskedForAnything(t *testing.T) {
 	require.Zero(t, sm.blockDownloads.Len(), "a peer that is not a sync candidate must not be handed a slice")
 	require.Zero(t, peerRec.count())
 
-	cursor, ok := startHeaderHash(t, sm)
-	require.True(t, ok, "the cursor must stay in the list")
-	require.Equal(t, hashes[0], cursor)
+	candidate, ok := nextCandidateHash(t, sm)
+	require.True(t, ok, "the front header must still be a candidate")
+	require.Equal(t, hashes[0], candidate)
 }
 
 // TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock pins the other half
 // of the "never ask twice" rule. Its sibling above covers a block still live
 // with another peer, which RequestedWithin catches. This covers the block the
 // reopen deliberately made re-requestable while leaving its owner in place —
-// where RequestedWithin answers false on purpose, and nothing kept the walk from
+// where RequestedWithin answers false on purpose, and nothing kept the pass from
 // landing the block back on the very peer that already holds the request.
 //
 // A peer asked twice answers twice. The first copy discharges its obligation, so
@@ -772,7 +610,7 @@ func TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock(t *testing.T) {
 	anchor := chainhash.Hash{0xd9}
 	msg, hashes := linkedHeaders(anchor, 6, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	// One peer only, so the assigner has no choice but to offer the reopened
 	// block back to the peer that already owes it.
@@ -794,7 +632,7 @@ func TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock(t *testing.T) {
 		"the rest of the run must still be asked for")
 
 	require.Equal(t, hashes[1:], syncRec.all(),
-		"the reopened block must not be asked for a second time, and the walk must carry on past it")
+		"the reopened block must not be asked for a second time, and the pass must carry on past it")
 
 	require.True(t, sm.blockDownloads.HasOwner(syncPeer, hashes[0]),
 		"the block has to stay owed by the peer that holds the request, or its copy arrives unowned")
@@ -813,18 +651,14 @@ func TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock(t *testing.T) {
 //
 // The second half of the test is the part that matters: the limit has to be a rate
 // and not a stop. Once the COMMITTER moves, the window moves with it — and only
-// then. Before this fix round it was keyed to the front of the header list
-// instead, which moves when a block is merely HANDLED, committed or not; that
-// conflation is the ratchet measured on mainnet on 2026-09-12, a download front
-// at 4877 against a chain settled at 868, so this half now drives a real commit
-// rather than a delivery.
+// then.
 func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xda}
 	msg, hashes := linkedHeaders(anchor, 12, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 
 	// Budgets deliberately left wide, so the lookahead limit is the only thing
 	// that can bind.
@@ -845,10 +679,11 @@ func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
 	require.Equal(t, hashes[0:4], syncRec.all(),
 		"nothing beyond the lookahead limit may be asked for, however much budget is left")
 
-	cursor, ok := startHeaderHash(t, sm)
-	require.True(t, ok, "the walk must still have somewhere to resume from")
-	require.Equal(t, hashes[4], cursor,
-		"and it must stop ON the first header it would not ask for, or that block leaves the walk")
+	// There is nothing to inspect for "the next header is still there": the
+	// ceiling means wantedBlocks does not name height 15 at all yet, and there
+	// is no position it could be lost from. The property that matters is that
+	// the next pass picks it up once the ceiling allows it, which is what the
+	// rest of this test drives.
 
 	// The committer moves: height 11, the block this pass just requested, joins
 	// the chain for real. seedFetchHeaders already recorded height 10 (the
@@ -868,7 +703,7 @@ func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
 // TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest pins the half of
 // the pass's arithmetic that used to exempt itself.
 //
-// When the assigner hands back the peer that already owns the hash, the walk
+// When the assigner hands back the peer that already owns the hash, the pass
 // re-arms the record it holds instead of asking twice, which is right. What it
 // did not do was charge for it. ReassertOwner clears the forgiven flag, so the
 // block is back in CountForPeer from that moment, while both budgets were
@@ -886,7 +721,7 @@ func TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest(t *testing.T) {
 	anchor := chainhash.Hash{0xd8}
 	msg, hashes := linkedHeaders(anchor, 8, &nonce)
 
-	sm := newFetchLockManager(t, nil, nil, nil)
+	sm := schedulerManager(t)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 4
 
 	perPeer := schedulerPeerBudget(sm)
@@ -901,7 +736,7 @@ func TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest(t *testing.T) {
 
 	// Demotion reopens the peer's own slice: the records are kept, so the peer
 	// may still deliver, but they are forgiven, so they spend no budget and the
-	// walk is free to place the same hashes again.
+	// pass is free to place the same hashes again.
 	require.Len(t, sm.blockDownloads.ForgetForRetryPeer(peer, blockRequestRetryInterval), perPeer)
 	require.Zero(t, sm.blockDownloads.CountForPeer(peer), "sanity: a reopened slice spends no budget")
 

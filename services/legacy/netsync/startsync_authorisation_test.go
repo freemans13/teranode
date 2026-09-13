@@ -54,11 +54,7 @@ func newSyncPeerChangeManager(t *testing.T) *SyncManager {
 		peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		headerList:       list.New(),
 		blockDownloads:   newBlockDownloadTracker(blockRequestAssignmentTTL),
-		racedBlocks: expiringmap.New[chainhash.Hash, map[*peerpkg.Peer]struct{}](racedBlockGraceTTL).
-			WithMaxSize(racedBlockGraceMaxTracked),
 	}
-
-	t.Cleanup(func() { sm.racedBlocks.Stop() })
 
 	return sm
 }

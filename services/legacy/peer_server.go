@@ -1148,10 +1148,10 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte, payl
 		isBanned, ok := sp.checkBannedBounded(preAdmitCtx, host)
 		if !ok {
 			// A pre-admission DEADLINE means the query path is wedged: the block
-			// was solicited (netsync marked it requested and fetchHeaderBlocks
-			// already advanced startHeader past it), so silently dropping it
-			// strands the hash — nothing re-requests it and IBD stalls on this
-			// single block. Rotate the sync peer instead: the primary disconnect
+			// was solicited (netsync marked it requested), so silently dropping it
+			// strands the hash — nothing re-requests it until its retry window
+			// lapses and IBD stalls on this single block until then. Rotate the
+			// sync peer instead: the primary disconnect
 			// drives handleDonePeerMsg → updateSyncPeer → startSync, which clears
 			// requestedBlocks and re-drives the fetch from a fresh locator
 			// (restoring the pre-prefetch watchdog behaviour). On parent cancel
@@ -1286,15 +1286,6 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte, payl
 		// synchronous backpressure) and also spares fabricated blocks the
 		// SerializeSize walk below. Blocks we actually requested take the fast path.
 		if !sm.BlockRequested(sp.Peer, blockHash) {
-			// One exception: when sync stalls on a single block we ask a second
-			// peer for the same block, and cancel the request with the losers
-			// once a copy arrives. A late copy from one of exactly those peers is
-			// an answer to our own question, so drop it and leave the peer alone.
-			if sm.BlockRacedTo(sp.Peer, blockHash) {
-				sp.server.logger.Debugf("dropping late copy of block %s from %s, another peer already delivered it", blockHash, sp)
-				return
-			}
-
 			// Declined, not punished. The admission control above is real and
 			// stays: a flood of unrequested blocks would otherwise consume the
 			// shared prefetch budget and starve the peer actually syncing us.

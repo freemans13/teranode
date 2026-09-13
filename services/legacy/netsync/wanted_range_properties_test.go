@@ -123,7 +123,6 @@ func TestWantedRange_TheDownloaderCannotOutrunTheCommitter(t *testing.T) {
 	// Headers run a long way past anything the node may ask for, so a short
 	// header cache cannot be what stops the pass.
 	sm := assignManager(t, 1, 400)
-	sm.settings.Legacy.WantedRangeDownload = true
 	sm.settings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
 	// BlockDownloadWindow is deliberately left at its real default (1024, far
@@ -211,7 +210,6 @@ func TestWantedRange_ARestartingNodeRequestsOnItsFirstPass(t *testing.T) {
 	const restartHeight = int32(800_000)
 
 	sm := assignManager(t, restartHeight, restartHeight+200)
-	sm.settings.Legacy.WantedRangeDownload = true
 	sm.settings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
 	// What New now does at startup: read the chain's tip and record it. Without
@@ -347,7 +345,6 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.TempStore = storeURL
 	tSettings.Legacy.ParkOutOfOrderBlocks = true
-	tSettings.Legacy.WantedRangeDownload = true
 	tSettings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
 	// BlockDownloadWindow stays at its real default here too, for the same
@@ -390,13 +387,13 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 		sm.indexHeaderLocked(sm.headerList.PushBack(node), hash)
 	}
 
-	// Nothing is left for the cursor walk to resume from, which is what keeps
-	// this test's passes the only ones that run: fetchMoreHeaderBlocks, which
-	// parkOrphanBlock calls on every parked block, gates on a non-nil startHeader
-	// and returns straight back. The loop below is therefore the sole driver of
-	// fetchHeaderBlocks, and a park that stayed inside its bound did so because
-	// of the bound and not because a background pass happened not to run.
-	sm.startHeader = nil
+	// parkOrphanBlock's own top-up (fetchMoreHeaderBlocks) can also fire a pass
+	// as each block below is delivered, alongside the explicit ones the loop
+	// below drives. That is harmless to what is asserted here: blockDownloads.Len
+	// and blockPark.Len are both read fresh around each call, not counted by how
+	// many distinct calls fired, and every pass — this loop's or a top-up's —
+	// answers to the same depth ceiling. So the park bound holds regardless of
+	// which caller triggered a given pass.
 	sm.headerMu.Unlock()
 
 	// The wanted-range pass reads the header cache, not headerList, so the same

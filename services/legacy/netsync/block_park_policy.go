@@ -15,11 +15,15 @@ import (
 // go wrong with it afterwards — the blob will not read back, the commit fails,
 // the parent disappears under a reorg, its time runs out, the node is shutting
 // down, the store is out of permits, the budget is full — and each of those has
-// to settle the same three questions:
+// to settle the same two questions:
 //
 //	does the blob survive, or is the download thrown away?
-//	does the download walk go back onto the block, so it is asked for again?
 //	is the peer that sent it told the block was bad?
+//
+// A third question used to live here too — does the download walk go back onto
+// the block, so it is asked for again — but the wanted-range pass answers it by
+// itself now: a block that is dropped and still above the committed tip is
+// simply unowed on the next pass, with nothing left to re-anchor.
 //
 // Answering those questions separately at each site is what produced three
 // rounds of regressions in a row, every one of them an error path doing the
@@ -57,13 +61,6 @@ type parkDisposition struct {
 	reason string
 
 	blob parkBlobAction
-
-	// rewindCursor puts the download walk back onto the block so it is asked
-	// for again. It is set exactly when the blob is NOT kept and the block is
-	// not in the chain — otherwise the block is in neither the header list, nor
-	// the park, nor any download ledger, and headers-first sync never asks for
-	// it again.
-	rewindCursor bool
 
 	// blamePeer tells the peer that delivered the block that it was rejected.
 	// Set only when the block itself is at fault. A blob we wrote that will not
@@ -110,20 +107,20 @@ var (
 
 	// parkDispositionBlobUnusable — the blob is gone, or will not decode, or
 	// decodes into some other block. That is evidence about the file and not
-	// about the peer: we wrote it, so a bad blob is our fault. Delete it and put
-	// the walk back on the block so it is downloaded again.
+	// about the peer: we wrote it, so a bad blob is our fault. Delete it; the
+	// block is still in the wanted range and now unowed, so the next
+	// wanted-range pass downloads it again.
 	parkDispositionBlobUnusable = parkDisposition{
 		reason: "the parked blob is not the block it claims to be",
 		blob:   parkBlobDrop,
-
-		rewindCursor: true,
 	}
 
 	// parkDispositionOvertaken — the chain has gone past this block's height, so
-	// nothing will ever ask for it again. Drop the blob and do NOT rewind: the
-	// rewind exists to get a block re-requested, and re-requesting a block the
-	// chain no longer needs is the waste this replaces. Not the peer's fault
-	// either; it sent what we asked for.
+	// nothing will ever ask for it again. Drop the blob: its height is now below
+	// the committed tip, so the wanted range no longer names it and nothing asks
+	// for it again — re-requesting a block the chain no longer needs is the
+	// waste this replaces. Not the peer's fault either; it sent what we asked
+	// for.
 	parkDispositionOvertaken = parkDisposition{
 		reason: "the chain has gone past it",
 		blob:   parkBlobDrop,
@@ -149,20 +146,18 @@ var (
 		reason: "the block failed to store or validate",
 		blob:   parkBlobDrop,
 
-		rewindCursor: true,
-		blamePeer:    true,
-		markFailed:   true,
+		blamePeer:  true,
+		markFailed: true,
 	}
 
 	// parkDispositionBlockRefused — the block failed the park's own stateless
-	// checks, so nothing was written. A peer fault, and the block still has to
-	// be asked for again because its header has already left the walk.
+	// checks, so nothing was written. A peer fault, and the block is still
+	// wanted and unowed, so the next wanted-range pass asks for it again.
 	parkDispositionBlockRefused = parkDisposition{
 		reason: "the block failed its stateless checks",
 		blob:   parkBlobLeaveAlone,
 
-		rewindCursor: true,
-		blamePeer:    true,
+		blamePeer: true,
 	}
 
 	// parkDispositionNotKept — we could not keep the block: the budget is full,
@@ -172,8 +167,6 @@ var (
 	parkDispositionNotKept = parkDisposition{
 		reason: "there was no room to keep the block",
 		blob:   parkBlobLeaveAlone,
-
-		rewindCursor: true,
 	}
 
 	// parkDispositionParked — the block is on disk and in the index, waiting for
@@ -279,8 +272,8 @@ func (d parkDisposition) withoutBlame() parkDisposition {
 }
 
 // applyParkDisposition carries out one row of the table. It is the ONLY place
-// that deletes a parked blob, restores a parked entry, rewinds the download
-// cursor for a parked block, or rejects one to a peer.
+// that deletes a parked blob, restores a parked entry, or rejects one to a
+// peer.
 func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition) {
 	switch d.blob {
 	case parkBlobKeep:
@@ -294,10 +287,6 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 
 	if d.markFailed && sm.recentlyFailedBlocks != nil {
 		sm.recentlyFailedBlocks.Set(entry.hash, struct{}{})
-	}
-
-	if d.rewindCursor {
-		sm.rewindHeaderCursor(entry.hash, entry.removedFront)
 	}
 
 	if !d.blamePeer {

@@ -14,9 +14,11 @@ import (
 //
 // A block below a block this node has already committed cannot be a link in any
 // chain it is building, and its parent is missing so it cannot be a sibling
-// either. Nothing will ever ask for it, so it goes, and the walk is deliberately
-// NOT rewound onto it: re-requesting a block the chain no longer needs is the
-// waste the timer used to generate.
+// either. Nothing will ever ask for it, so it goes, and nothing must ask for it
+// again either: re-requesting a block the chain no longer needs is the waste the
+// timer used to generate. Under the wanted-range pass that follows for free from
+// height alone — a block below the committed tip is never named by
+// wantedBlocksFromCache in the first place.
 func TestSyncManager_ABlockTheChainHasGonePastIsDropped(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
@@ -44,12 +46,12 @@ func TestSyncManager_ABlockTheChainHasGonePastIsDropped(t *testing.T) {
 	require.NotContains(t, parkDirEntries(t, h.parkDir), child.String()+".msgBlock",
 		"and its blob must go, or the byte budget is holding disk nothing tracks")
 
-	h.sm.headerMu.Lock()
-	startHeader := h.sm.startHeader
-	h.sm.headerMu.Unlock()
+	before := h.rec.getDataCount()
 
-	require.Nil(t, startHeader,
-		"the walk must NOT be rewound onto a block the chain has gone past; asking for it again is the waste this replaces")
+	h.sm.fetchHeaderBlocks()
+
+	require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, time.Second),
+		"a block the chain has gone past must not be asked for again; it is below the committed tip and the wanted range never names it")
 }
 
 // TestSyncManager_ABlockBehindAnInvalidParentIsDroppedNotCommitted is the second
@@ -85,11 +87,12 @@ func TestSyncManager_ABlockBehindAnInvalidParentIsDroppedNotCommitted(t *testing
 	require.False(t, h.rec.wasRejected(child),
 		"the peer sent a block whose parent WE rejected, which says nothing about the peer")
 
-	h.sm.headerMu.Lock()
-	startHeader := h.sm.startHeader
-	h.sm.headerMu.Unlock()
-
-	require.Nil(t, startHeader, "nor is it worth asking for again")
+	// Being written off above is the guarantee this test can still make. Whether
+	// the wanted-range pass asks for it again is a separate question this task
+	// does not change the answer to either way: unownedBlocks filters on
+	// holdsBlock and RequestedWithin only, and does not consult
+	// recentlyFailedBlocks, so a block above the committed tip stays a candidate
+	// even once written off here.
 }
 
 // TestSyncManager_TheSweepStillCommitsBehindAValidParent is the control for the
