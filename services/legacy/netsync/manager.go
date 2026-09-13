@@ -5067,6 +5067,15 @@ func (sm *SyncManager) reanchorStrandedWalk() bool {
 // is the only thing a goroutine waiting on headerMu cares about — the block
 // queue consumer takes this same lock as its first act in headers-first mode.
 func (sm *SyncManager) fetchHeaderBlocks() {
+	// The wanted-range pass and the cursor walk are alternatives, not layers. The
+	// cursor walk stays the default while mainnet is soaking this branch at about
+	// 967 blocks a minute, and the new path has to beat that before it takes over.
+	if sm.settings != nil && sm.settings.Legacy.WantedRangeDownload {
+		sm.assignWantedBlocks()
+
+		return
+	}
+
 	sm.headerMu.Lock()
 	haveStartHeader := sm.startHeader != nil
 	headerListLen := sm.headerList.Len()
