@@ -87,6 +87,30 @@ func TestHeaderCache_ReplacesRatherThanMerges(t *testing.T) {
 	require.False(t, ok, "the old batch must be gone, or a stale height could be named from a chain we left")
 }
 
+func TestHeaderCache_ARefusedFillLeavesThePreviousBatchIntact(t *testing.T) {
+	first := chainhash.Hash{0xaa}
+	c := newHeaderCache()
+	require.True(t, c.Fill(first, 101, chainOfHeaders(first, 5)))
+
+	// A batch that links to the parent but breaks its own chain partway through,
+	// the subtler of the two refusal modes: the caller does everything right up
+	// to the point where it doesn't.
+	second := chainhash.Hash{0xdd}
+	headers := chainOfHeaders(second, 4)
+	headers[2].PrevBlock = chainhash.Hash{0xcc}
+
+	require.False(t, c.Fill(second, 900, headers),
+		"a batch that breaks its own chain must be refused")
+
+	require.Equal(t, 5, c.Len(), "a refused fill must not disturb the size of the batch already held")
+
+	for i := 0; i < 5; i++ {
+		got, ok := c.At(int32(101 + i))
+		require.True(t, ok, "height %d from the previous batch must still be named", 101+i)
+		require.Equal(t, chainOfHeaders(first, 5)[i].BlockHash(), got)
+	}
+}
+
 func TestHeaderCache_TopIsTheHighestHeightNamed(t *testing.T) {
 	parent := chainhash.Hash{0xaa}
 	c := newHeaderCache()
