@@ -74,51 +74,47 @@ func TestNewModel_ACheckpointAnchorDoesNotGateAnything(t *testing.T) {
 		"a node whose header list front is a checkpoint anchor must still request blocks; this is the 2026-09-13 mainnet stall")
 }
 
-// TestNewModel_APeerRotationLosesNothing pins the other half. resetHeaderState
-// throws away the entire header list, and on the multi-peer path it is never
-// reached at all, so the recovery of last resort is both destructive and
-// unreachable. Under the new model it clears nothing the pass needs.
+// TestNewModel_APeerRotationLosesNothing pins that resetHeaderState — the
+// function that throws away the entire header list, and that on the
+// multi-peer path is never even reached — has nothing left to destroy under
+// the new model. It is worth pinning precisely because it is a recovery of
+// last resort that is both destructive and unreachable: if the wanted range
+// depended on anything it touches, that dependency would be both silent and
+// unrecoverable in production.
 //
-// The brief this was drafted from re-asked the ORIGINAL peer after merely aging
-// the ledger past the retry window, and that cannot show what it intends: this
-// package's download ledger deliberately never sends a second getdata to a peer
-// that still holds the first one (ReassertOwner, block_download_tracker.go) —
-// aging alone re-arms the existing record and sends nothing, by design, so that
-// assertion would fail even with a perfectly harmless resetHeaderState. A
-// rotation is a genuinely different peer taking over, so this connects a
-// second one — standing in for whichever peer a real rotation hands the work
-// to — and checks that IT gets the same wanted range once the ledger has aged
-// enough to reconsider it.
+// This asserts the wanted range directly, by height and by hash, rather than
+// by watching a peer get asked. A first version connected a peer, drove a
+// fetchHeaderBlocks pass, reset, aged the download ledger past its retry
+// window, connected a SECOND peer to stand in for a rotation, and asserted
+// that peer got asked. That version passed, but for the wrong reason: with
+// the reset call commented out entirely, it still passed. resetHeaderStateLocked
+// never touches sm.headerCache or sm.blockDownloads — only headerList,
+// headerIndex, startHeader, the list epoch and the frontier — so on the
+// wanted-range path the reset is inert by construction, and a test that
+// exercises a whole fetchHeaderBlocks pass around it cannot tell "the reset
+// is harmless" apart from "the reset was never on the path being measured."
+// Asserting sm.wantedBlocks() directly, before and after, is what makes the
+// reset the only thing that could break the assertion.
+//
+// A single peer is enough — wantedBlocks never reads peerStates at all — which
+// also sidesteps the ReassertOwner no-duplicate-ask rule this test's previous
+// version ran into: a single peer that never disconnected genuinely cannot be
+// asked twice for the same block within the ownership ceiling, so trying to
+// observe a resend was never going to work regardless of the reset.
 func TestNewModel_APeerRotationLosesNothing(t *testing.T) {
-	sm, _, recA := cacheManager(t, 500, 8)
+	sm, _, _ := cacheManager(t, 500, 8)
 
-	sm.fetchHeaderBlocks()
-	require.True(t, WaitUntil(func() bool { return recA.count() > 0 }, 5*time.Second),
-		"sanity: the first pass must place work before a rotation can be shown to cost nothing")
-
-	before := recA.count()
+	before := sm.wantedBlocks()
+	require.NotEmpty(t, before, "sanity: there must be a wanted range for the reset to have a chance of losing")
 
 	// What a sync-peer rotation does on the old path.
 	anchor := chainhash.Hash{0xdd}
 	sm.resetHeaderState(&anchor, 500)
 
-	// The peer a rotation would have handed the work to. It owns nothing yet,
-	// so the assigner can place real work on it without waiting out any
-	// ownership ceiling.
-	_, recB := schedulerPeer(t, sm, 2, 1500)
+	after := sm.wantedBlocks()
 
-	// Age the ledger past the retry window so the first peer's outstanding
-	// blocks are reconsidered at all; unownedBlocks skips anything requested
-	// within the window no matter who might take it next.
-	sm.blockDownloads.now = func() time.Time {
-		return time.Now().Add(blockRequestRetryInterval + time.Second)
-	}
-
-	sm.fetchHeaderBlocks()
-
-	require.True(t, WaitUntil(func() bool { return recB.count() > 0 }, 5*time.Second),
-		"after a header-state reset the pass must still name the same blocks to whichever peer is available, because the cache and the files survive it")
-	require.Positive(t, before)
+	require.Equal(t, before, after,
+		"a header-state reset must not change the wanted range, by height or by hash; the new model reads it from the header cache and the reset never touches that cache")
 }
 
 // TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling is the negative half of the
