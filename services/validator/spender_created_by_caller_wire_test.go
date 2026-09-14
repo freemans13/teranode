@@ -33,3 +33,31 @@ func TestHTTPHandlerPath_SpenderCreatedByCaller(t *testing.T) {
 	_, opts := extractValidationParams(ctx)
 	require.True(t, opts.SpenderCreatedByCaller, "SpenderCreatedByCaller must survive the HTTP query string")
 }
+
+// IgnoreLocked became load-bearing on the legacy catchup path this round: the
+// create phase writes every transaction of a block locked, so a child spending
+// an in-block parent must be allowed past that lock. Without the field a remote
+// validator answers TX_LOCKED and catchup wedges on any block with an
+// intra-block parent chain.
+func TestOptionsFromValidateRequest_IgnoreLockedRoundTrip(t *testing.T) {
+	req := buildValidateTxRequest(newTinyTx(t).SerializeBytes(), 620000, &Options{IgnoreLocked: true})
+	got, err := optionsFromValidateRequest(req)
+	require.NoError(t, err)
+	require.True(t, got.IgnoreLocked, "IgnoreLocked must survive the gRPC round-trip")
+
+	req = buildValidateTxRequest(newTinyTx(t).SerializeBytes(), 620000, &Options{SkipPolicyChecks: true})
+	got, err = optionsFromValidateRequest(req)
+	require.NoError(t, err)
+	require.False(t, got.IgnoreLocked, "IgnoreLocked must default to false: a mempool submitter must never bypass a lock")
+}
+
+func TestHTTPHandlerPath_IgnoreLocked(t *testing.T) {
+	q := buildValidateTxHTTPQuery(&Options{IgnoreLocked: true}, 620000)
+
+	e := echo.New()
+	ctx, err := echoRequestWithQuery(e, q.Encode())
+	require.NoError(t, err)
+
+	_, opts := extractValidationParams(ctx)
+	require.True(t, opts.IgnoreLocked, "IgnoreLocked must survive the HTTP query string")
+}
