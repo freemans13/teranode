@@ -15,11 +15,12 @@ import (
 // so the park would be permanently unreachable no matter what an operator
 // configures. This repo has shipped that mistake before.
 //
-// There were three. legacy_parkMaxBytes is gone: a byte ceiling could only be
-// checked after the block had been downloaded and decoded, so it never saved
-// any bandwidth, and a park filled above a hole would refuse the one block that
-// would have drained it. The park is bounded by how many blocks it holds, and
-// the disk by the download walk's read-ahead depth, which is in blocks.
+// Two, and deliberately not a third bounding the park in bytes. A byte ceiling
+// could only be checked after the block had been downloaded and decoded, so it
+// would never save any bandwidth, and a park filled above a hole would refuse
+// the one block that would have drained it. The park is bounded by how many
+// blocks it holds, and the disk by the download walk's read-ahead depth, which
+// is in blocks.
 func TestLegacyBlockPark_Defaults(t *testing.T) {
 	tSettings := NewSettings()
 

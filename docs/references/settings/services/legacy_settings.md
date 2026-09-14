@@ -38,7 +38,6 @@
 | BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Maximum block bodies the whole node may be downloading at once, counting every peer together (a count, not svnode's per-peer height range) |
 | BlockDownloadLowerWindow | int | 0 | legacy_blockDownloadLowerWindow | Never ask for a block more than this many ahead of the one waiting to be committed (0 disables; svnode uses 10 when pruning) |
 | ParkOutOfOrderBlocks | bool | true | legacy_parkOutOfOrderBlocks | Write a block whose parent is not stored yet to the temp store and commit it when the parent arrives, instead of discarding it |
-| ParkMaxBytes | int64 | 4294967296 | legacy_parkMaxBytes | Ceiling on the total serialized bytes of out-of-order blocks held on disk (0 disables the park) |
 | ParkStoreTimeout | time.Duration | 10s | legacy_parkStoreTimeout | Deadline carried by each park blob store operation, bounding the wait for the file store's shared permits on the in-order block commit goroutine |
 | Upnp | bool | false | legacy_upnp | Enable UPnP for automatic port mapping |
 | MaxFeelerPeers | int | 1 | legacy_maxFeelerPeers | Peer slots reserved for short-lived feeler probes (0 disables feelers and the reservation together) |
@@ -128,13 +127,13 @@ peer-selection decision, and the legacy service's own sync engine
 - Each registry call is bounded independently, so an unresponsive blockchain
   service delays a tick rather than stalling the mirror.
 
-**Requirements**
+#### Requirements
 
 - The blockchain service must be reachable, since it hosts the registry. When
   the registry client is unavailable the mirror does not start and the legacy
   service runs normally without dashboard peer visibility.
 
-**Recommendations**
+#### Recommendations
 
 - Keep **PeerRegistryEnabled** at true for operator visibility. Set it to false
   only if the extra registry traffic is unwelcome on a node carrying very many
