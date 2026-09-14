@@ -624,6 +624,10 @@ func optionsFromValidateRequest(req *validator_api.ValidateTransactionRequest) (
 		opts.SpenderCreatedByCaller = *req.SpenderCreatedByCaller
 	}
 
+	if req.IgnoreLocked != nil {
+		opts.IgnoreLocked = *req.IgnoreLocked
+	}
+
 	return opts, nil
 }
 
@@ -962,6 +966,10 @@ func extractValidationParams(c echo.Context) (uint32, *Options) {
 
 	if spenderCreatedStr := c.QueryParam("spenderCreatedByCaller"); spenderCreatedStr != "" {
 		options.SpenderCreatedByCaller = spenderCreatedStr == trueString || spenderCreatedStr == "1"
+	}
+
+	if ignoreLockedStr := c.QueryParam("ignoreLocked"); ignoreLockedStr != "" {
+		options.IgnoreLocked = ignoreLockedStr == trueString || ignoreLockedStr == "1"
 	}
 
 	return blockHeight, options

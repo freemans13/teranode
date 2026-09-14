@@ -346,11 +346,24 @@ func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
 // pruneWithoutDefensiveCheck marks and deletes every transaction past its
 // expiration, with no child-stability verification.
 func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight uint32) (int64, error) {
+	// The join to outputs is load-bearing, not a tidier way to reach the parent.
+	// An input naming a parent outpoint proves only that this child ASKED for it;
+	// a conflicting loser references the same outpoint and never won it, and
+	// losers are pruning candidates like anything else. Marking (parent, loser)
+	// used to be inert because the spend path compared the marker against the
+	// output's stored spender, which is the winner. The check is now keyed on the
+	// incoming spender and runs ahead of every other answer, so a stale marker
+	// would reject that loser's genuinely fresh spend of the output forever, once
+	// the winner's spend is released. Only the child the output actually records
+	// as its spender gets a marker.
 	const markerQuery = `INSERT INTO deleted_children (parent_id, child_hash)
   SELECT DISTINCT parent.id, child.hash
   FROM transactions child
   JOIN inputs i ON i.transaction_id = child.id
   JOIN transactions parent ON parent.hash = i.previous_transaction_hash
+  JOIN outputs o ON o.transaction_id = parent.id
+    AND o.idx = i.previous_tx_idx
+    AND substr(o.spending_data, 1, 32) = child.hash
   WHERE child.delete_at_height IS NOT NULL
     AND child.delete_at_height <= $1
   ON CONFLICT (parent_id, child_hash) DO NOTHING`
@@ -451,6 +464,9 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
   JOIN transactions child ON child.id = candidate.id
   JOIN inputs i ON i.transaction_id = child.id
   JOIN transactions parent ON parent.hash = i.previous_transaction_hash
+  JOIN outputs o ON o.transaction_id = parent.id
+    AND o.idx = i.previous_tx_idx
+    AND substr(o.spending_data, 1, 32) = child.hash
   ON CONFLICT (parent_id, child_hash) DO NOTHING`
 
 	const deleteQuery = `DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)`
