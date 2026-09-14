@@ -42,14 +42,45 @@ func newHeaderCache() *headerCache {
 	}
 }
 
-// Fill replaces the cache with headers, where headers[0] sits at baseHeight and
-// its parent is parent. It reports whether the batch was accepted.
+// Fill replaces the cache with the part of headers that sits above parent,
+// where the first header above parent sits at baseHeight. It reports whether
+// anything was accepted.
 //
-// It refuses a batch that does not link, in either of the two ways a batch can
-// fail to. If the first header names a different parent, the batch describes a
-// chain this node is not on. If any later header does not name the one before
-// it, every height after the break is a guess, and a height is exactly what
-// this structure exists to provide, so a guess is worse than nothing.
+// parent is the node's committed tip, and the batch is a linked run answering a
+// getheaders that was asked from that tip as it stood when the question went
+// out. Those are not the same instant. On Hetzner mainnet the node commits
+// around 18 blocks a second, so by the time a reply crosses the network the tip
+// has moved perhaps 20 blocks into the batch. Requiring headers[0] to name the
+// current tip as its parent therefore threw away the entire 2,000-header reply
+// because its first 20 entries had gone behind us, and the cache could only be
+// refilled once the node had already stopped committing — which is exactly the
+// dead air between refills that this rule removes. Eleven getheaders went out
+// on 2026-09-14 between 13:11:36 and 13:12:26, across eight peers, and not one
+// of the replies was kept; the twelfth landed within a second of its own
+// request, once commits had stopped.
+//
+// So the batch is searched for where it meets the tip rather than being judged
+// on its front. Two shapes, and they are the same case:
+//
+//   - headers[0] names parent as its parent, so the whole batch is usable and
+//     headers[0] sits at baseHeight. This is the cold-start shape, and the only
+//     shape the rule this replaces would accept.
+//   - some headers[i] hashes to parent, so headers[i+1] onward are usable and
+//     headers[i+1] sits at baseHeight. The prefix up to and including i is
+//     behind the committed tip and is dropped.
+//
+// This is not a weaker check than judging the front. The batch is verified to
+// be one internally linked run before anything is kept, and parent is a
+// specific 32-byte value: a header whose PrevBlock is that value builds on this
+// node's tip, wherever in the run it happens to fall.
+//
+// It refuses a batch that does not link, in any of the three ways a batch can
+// fail to. If parent appears nowhere in the run and is not headers[0]'s parent,
+// the batch describes a chain this node is not on, or one it has run clean past.
+// If parent is the run's own last header, the usable suffix is empty and there
+// is nothing to cache. If any header does not name the one before it, every
+// height after the break is a guess, and a height is exactly what this structure
+// exists to provide, so a guess is worse than nothing.
 //
 // Refusing changes nothing. The caller asks again, of the same peer or another.
 func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*wire.BlockHeader) bool {
@@ -57,24 +88,50 @@ func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*w
 		return false
 	}
 
-	if !headers[0].PrevBlock.IsEqual(&parent) {
-		return false
+	// Walk the whole batch before touching the map, so a refusal leaves the
+	// previous contents intact rather than half-replaced. The walk does both
+	// jobs in one pass: it proves every header names the one before it, and it
+	// finds where the run meets the committed tip.
+	hashes := make([]chainhash.Hash, 0, len(headers))
+
+	// start is the index of the first usable header. Set to 0 up front when the
+	// batch's front already builds on the tip, so the loop's search below is
+	// skipped; otherwise the loop sets it to i+1 at the header that hashes to
+	// parent. Left negative if the run never meets the tip.
+	start := -1
+	if headers[0].PrevBlock.IsEqual(&parent) {
+		start = 0
 	}
 
-	// Walk the whole batch before touching the map, so a refusal leaves the
-	// previous contents intact rather than half-replaced.
-	hashes := make([]chainhash.Hash, 0, len(headers))
-	prev := parent
+	var prev chainhash.Hash
 
-	for _, header := range headers {
-		if !header.PrevBlock.IsEqual(&prev) {
+	for i, header := range headers {
+		// i == 0 has nothing before it to link to: whether its own parent is
+		// the tip is the start check above, and a batch whose front is behind
+		// the tip is precisely what this rule exists to accept.
+		if i > 0 && !header.PrevBlock.IsEqual(&prev) {
 			return false
 		}
 
 		hash := header.BlockHash()
+
+		if start < 0 && hash.IsEqual(&parent) {
+			start = i + 1
+		}
+
 		hashes = append(hashes, hash)
 		prev = hash
 	}
+
+	// start == len(hashes) is the tip being the batch's own last header: the run
+	// is honest and connects, there is simply nothing above the tip in it. A
+	// clean refusal, not an empty success — writing an empty map here would
+	// throw away a perfectly good previous batch in exchange for nothing.
+	if start < 0 || start >= len(hashes) {
+		return false
+	}
+
+	hashes = hashes[start:]
 
 	c.mu.Lock()
 	defer c.mu.Unlock()

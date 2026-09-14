@@ -3522,37 +3522,38 @@ const headerCacheRefillInterval = 5 * time.Second
 // so a fresh batch is normally already in hand by the time the current one
 // runs dry.
 //
-// Measured on Hetzner mainnet, and the second measurement is what actually
-// sizes this. First: the node commits a 2,000-header batch in about 100
-// seconds (roughly 1,200 blocks/min, 20 blocks/s) between cache boundaries.
-// Second, and the one that matters, is what a refill actually costs at a
-// boundary: on the run from 8,000, the node asked three different peers, at
-// 12:50:11, 12:50:16 and 12:50:38, and only the third answered. A refill is
-// not one round trip, it is however many attempts the rate limit's 5-second
-// floor (headerCacheRefillInterval) needs to reach a peer that actually
-// replies, and that run cost about 40 seconds of dead time before the ~1%
-// answer landed. The threshold has to buy enough runway for two or three
-// failed attempts, not one.
+// This used to be derived from what a refill cost when the node was moving:
+// three rate-limited attempts and about 40 seconds of dead air, observed at
+// the 8,000 boundary. That cost was self-inflicted and is gone. It was the
+// header cache refusing every reply whose front had slipped behind a tip that
+// advances 18 times a second, so a refill could not succeed until commits
+// stopped. headerCache.Fill now keeps the part of a reply that is still above
+// the tip, so one round trip lands roughly 1,980 usable heights, and the old
+// derivation no longer describes anything real.
 //
-// The natural source for that number would be the read-ahead depth
-// (legacy_blockDownloadLowerWindow), since it already expresses how far
-// ahead of the tip the node is willing to work. It ships at 128
-// (settings/legacy_settings.go), and scales down further under
-// lookaheadCeilingLocked for a large-block era — never up. 128 is only 6.4
-// seconds of runway at 20 blocks/s, nowhere near the observed 40-second
-// stall, so using it directly here would refill every single pass once the
-// tip is within 128 of the cache's end, no earlier than the exhaustion check
-// already fires in practice. It is the wrong quantity: it bounds how far
-// downloads may run ahead of the commit frontier, not how much header
-// lookahead a getheaders round trip needs.
+// What sizes it now is the cadence, not the cost. Two bounds, and the value
+// has to sit between them.
 //
-// wire.MaxBlockHeadersPerMsg is what a getheaders reply actually delivers in
-// one batch (2,000 heights), and it is the other quantity already in the
-// code that scales with the same thing this threshold cares about: how much
-// header runway one round trip buys. Half a batch, 1,000 heights, is about
-// 50 seconds of runway at the measured 20 blocks/s — comfortably past the
-// observed 40-second three-attempt stall — while still leaving the other
-// half of the batch as slack before the backstop below would have to fire.
+// The ceiling is what one reply delivers. A reply is 2,000 headers minus
+// whatever the tip ate in flight, so call it 1,980. Set the threshold near
+// that and the cache is below it the instant it is filled, and the node asks
+// again every headerCacheRefillInterval for ever. Half a batch keeps a clear
+// thousand heights between a fresh fill and the next trigger, which is one
+// refill per batch committed — the cadence the sawtooth had, minus the gap.
+//
+// The floor is what a peer that does not answer costs. Rotation and the
+// 5-second floor mean a silent peer costs one interval per attempt, so 1,000
+// heights is about 50 seconds at the measured 20 blocks/s: ten attempts
+// across rotated peers before the cache runs dry. Asking early is close to
+// free here, because Fill replaces rather than merges and a fresh batch
+// starts at the same committed tip the current one does, so an early reply
+// supersedes what is held without discarding a single usable height.
+//
+// The read-ahead depth (legacy_blockDownloadLowerWindow, 128) is still the
+// wrong quantity to reach for, for the reason it always was: it bounds how
+// far downloads may run ahead of the commit frontier, not how much header
+// lookahead a getheaders round trip needs, and at 128 it is 6.4 seconds of
+// runway.
 const headerCacheRefillThreshold = int32(wire.MaxBlockHeadersPerMsg / 2)
 
 // maybeRequestMoreHeaders is assignWantedBlocks' other half: the wanted range
@@ -3854,30 +3855,60 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	}
 
 	// A headers batch is a cache fill and nothing else: no splice, no front, no
-	// anchor, no epoch, no list. A batch that does not link is refused by the
-	// cache and the peer keeps its connection, because a reply that connects to
-	// a point we have moved past is an honest answer to a question we have
-	// stopped asking.
+	// anchor, no epoch, no list. A batch whose front has gone behind the
+	// committed tip is not a batch that failed to link — the tip moved into it
+	// while it was in flight, and Fill keeps the part still above the tip. Only
+	// a batch that does not reach above the tip at all is refused, and the peer
+	// keeps its connection either way, because a reply that connects to a point
+	// we have moved past is an honest answer to a question we have stopped
+	// asking.
 	//
 	// The wanted-range pass reads sm.headerCache: wantedBlocks (in
 	// wanted_range_assign.go) calls wantedBlocksFromCache, which is the only
 	// consumer of what a fill lands here.
-	sm.fillHeaderCache(hmsg.peer, msg)
+	if !sm.fillHeaderCache(hmsg.peer, msg) {
+		return
+	}
 
-	return
+	// A fill is the one event that makes a run of heights wantable without a
+	// block having arrived or a block having committed, and nothing else was
+	// watching for it. An assignment pass runs on a commit, on a block landing,
+	// on a peer connecting, or on the park sweep's ticker — and at a cache
+	// boundary the first three are all quiet by definition, because the node
+	// has run out of heights to ask for. That left the sweep, at
+	// parkSweepInterval (30 seconds), as the only thing that would notice.
+	// Measured on mainnet on 2026-09-14: the fill landed at 13:12:40 and the
+	// next block was accepted at 13:13:10, exactly one sweep interval later,
+	// and the same 30-second fill-to-first-block delay appears at the 13:10:02
+	// boundary.
+	//
+	// Called inline rather than on a goroutine of its own. This function is
+	// already running on one: the handler's select dispatches headers with
+	// "go sm.handleHeadersMsg(msg)", so a pass here delays no block message,
+	// and spawning again would add an unbounded goroutine per headers message
+	// for nothing. The lock rule is satisfied too — fillHeaderCache takes only
+	// the cache's own mutex and releases it before returning, so headerMu is
+	// free when assignWantedBlocks reaches for it inside wantedBlocks.
+	sm.fetchHeaderBlocks()
 }
 
 // fillHeaderCache turns a headers batch into the cache the wanted range reads,
-// and does nothing else with it.
+// and reports whether anything was cached.
 //
-// The batch must link to the block this node has committed, which is what the
-// tip-anchored locator asks for. A batch that does not link is dropped without
-// blaming the sender: under the new model the locator steps back to genesis, so
-// a peer answering from an older shared ancestor is answering correctly, just
-// about a point this node has already passed.
-func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders) {
+// The batch must contain the block this node has committed, which is what the
+// tip-anchored locator asks for — contain it, not begin just above it: the tip
+// moves under the reply while it is in flight, and Fill keeps whatever part of
+// the run still sits above the tip when it arrives. A batch that does not
+// connect at all is dropped without blaming the sender: under the new model the
+// locator steps back to genesis, so a peer answering from an older shared
+// ancestor is answering correctly, just about a point this node has already
+// passed.
+//
+// The return value is what handleHeadersMsg gates its assignment pass on, so
+// only a batch that actually left heights behind triggers one.
+func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders) bool {
 	if len(msg.Headers) == 0 {
-		return
+		return false
 	}
 
 	// Read as one value, height and hash together, so the batch can never be
@@ -3893,16 +3924,27 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	if !ok {
 		sm.logger.Debugf("[fillHeaderCache] no committed tip recorded yet, dropping %d headers from %s", len(msg.Headers), peer)
 
-		return
+		return false
 	}
 
 	if !sm.headerCache.Fill(tipHash, best+1, msg.Headers) {
-		sm.logger.Debugf("[fillHeaderCache] batch of %d headers from %s does not link to the committed tip at height %d, dropping it", len(msg.Headers), peer, best)
+		sm.logger.Debugf("[fillHeaderCache] batch of %d headers from %s does not reach above the committed tip at height %d, dropping it", len(msg.Headers), peer, best)
 
-		return
+		return false
 	}
 
-	sm.logger.Infof("[fillHeaderCache] cached %d headers from %s, heights %d to %d", len(msg.Headers), peer, best+1, best+int32(len(msg.Headers))) //nolint:gosec // bounded by the wire limit of 2000
+	// Read back from the cache rather than computed from the batch length. Fill
+	// drops whatever prefix the tip has already moved past, so the batch's own
+	// length no longer names the top height — that arithmetic was right only
+	// while a reply had to begin exactly one above the tip, and reporting a top
+	// the cache does not hold would be a lie in the one log line anybody reads
+	// to see how much runway is left.
+	cached := sm.headerCache.Len()
+	top, _ := sm.headerCache.Top()
+
+	sm.logger.Infof("[fillHeaderCache] cached %d of %d headers from %s, heights %d to %d", cached, len(msg.Headers), peer, best+1, top)
+
+	return true
 }
 
 // punishUnrequestedBlock reports whether a block nobody asked for should cost
