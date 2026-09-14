@@ -2491,14 +2491,20 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				  AND (t.delete_at_height IS NULL OR t.delete_at_height < $%d)
 				RETURNING 1
 			)
-			SELECT batch_idx FROM upd_spent
+			-- The two arms are reported apart, not unioned blind. upd_idem is a
+			-- row whose output ALREADY recorded exactly this spend, committed by
+			-- someone else between this statement's snapshot and its update, so
+			-- this call wrote nothing for it. Reported as a fresh write it would
+			-- join the rollback set and a later failure on a sibling input would
+			-- reverse a spend this call never made. See utxo.RollbackSet.
+			SELECT batch_idx, false AS idempotent FROM upd_spent
 			UNION ALL
-			SELECT batch_idx FROM upd_idem`, dahIdx, dahIdx))
+			SELECT batch_idx, true AS idempotent FROM upd_idem`, dahIdx, dahIdx))
 		} else {
 			ub.WriteString(`) AS v(transaction_id,idx,spending_data,batch_idx)
 			WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx
 			AND (o.spending_data IS NULL OR o.spending_data = v.spending_data)
-			RETURNING v.batch_idx`)
+			RETURNING v.batch_idx, (o.spending_data = v.spending_data) AS idempotent`)
 		}
 
 		uRows, err := txn.QueryContext(s.ctx, ub.String(), updateArgs...)
@@ -2517,8 +2523,12 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		}
 
 		for uRows.Next() {
-			var bIdx int
-			if err := uRows.Scan(&bIdx); err != nil {
+			var (
+				bIdx    int
+				wasIdem bool
+			)
+
+			if err := uRows.Scan(&bIdx, &wasIdem); err != nil {
 				uRows.Close()
 				if isDeadlock(err) {
 					return true
@@ -2529,6 +2539,10 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				return false
 			}
 			updatedSet[bIdx] = true
+
+			if wasIdem && bIdx >= 0 && bIdx < len(batch) && batch[bIdx] != nil {
+				batch[bIdx].idempotent = true
+			}
 		}
 		if err := uRows.Close(); err != nil {
 			if isDeadlock(err) {

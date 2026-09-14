@@ -266,6 +266,10 @@ function spend(rec, offset, utxoHash, spendingData, ignoreConflicting, ignoreLoc
     spend['offset'] = offset
     spend['utxoHash'] = utxoHash
     spend['spendingData'] = spendingData
+    -- spendMulti keys everything it reports back (errors, idempotent matches) by
+    -- this index, so the single-spend wrapper has to carry one too. Without it
+    -- spendMulti appends a nil and the response no longer parses.
+    spend['idx'] = 0
 
     local spends = list()
 
