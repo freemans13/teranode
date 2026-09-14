@@ -53,6 +53,43 @@ const (
 	// and restart-recovered blocks never see a commit event for their parent.
 	parkStuckThreshold = 2 * time.Minute
 
+	// parkAbandonAfter is how long a parked block may wait with its parent
+	// genuinely absent from the chain before the sweep gives up on it.
+	//
+	// Without this, a block whose parent never arrives has no reclaim path at
+	// all. The park's own Delete needs the parent positively adjudicated first,
+	// so it never fires for a parent that is simply never coming. The restart
+	// scan only discards a blob that will not decode or hashes wrong, so it
+	// re-adopts an orphaned entry on every boot rather than reclaiming it. And
+	// the blob carries no delete-at-height of its own (parkOpts' WithNoDAH), so
+	// the store cannot prune it underneath the index either. Two ordinary ways
+	// to reach this: a losing fork at the frontier, where two peers race for the
+	// same height and one side's parent is never going to commit, and no race
+	// at all — an unrequested block from a stale or eclipsed peer, parked behind
+	// a parent belonging to a chain this node will never follow.
+	//
+	// The number has to be well clear of any delay a genuinely slow but healthy
+	// commit path can produce, or this becomes a new way to lose good blocks
+	// rather than a way to stop leaking bad ones. This codebase has already
+	// measured what "genuinely slow" can mean: TestNewModel_ACheckpointAnchorDoesNotGateAnything
+	// documents mainnet wedged for 10h40m and, the night before, 8h33m, both
+	// real stalls with real parked blocks that went on to commit once the
+	// underlying bug was fixed. A THIRTY-MINUTE timer was tried in this exact
+	// park before EvictBelow replaced it, and it discarded 39 perfectly good
+	// blocks in one measured 19-minute window on mainnet — direct evidence that
+	// anything under an hour is too tight even in ordinary operation, let alone
+	// during a stall like the ones above. 24 hours is comfortably past both
+	// measured incidents, so a block still unparented after it is far more
+	// likely orphaned than merely waiting, while still bounding the leak to at
+	// most a day's worth of entries rather than the life of the process.
+	//
+	// Deliberately not the store's own block-height retention (8 blocks on
+	// mainnet, under a second at this branch's rate): that number bounds how
+	// long a COMMITTED block's data is kept, a completely different question
+	// answered on a completely different clock, and reusing it here would
+	// abandon every legitimately slow park within moments of it forming.
+	parkAbandonAfter = 24 * time.Hour
+
 	// parkSweepRPCBudget caps how many of those lookups one sweep tick may make,
 	// so the safety net can never turn into a scan of the whole park in one go.
 	//

@@ -629,7 +629,11 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 //
 // It runs on the sweep's own goroutine (runParkSweep) and commits nothing
 // itself: a parked block whose parent turns out to be stored is posted to the
-// block-queue consumer through submitParkCommit. The lookups are capped per tick
+// block-queue consumer through submitParkCommit. A parent that is still
+// genuinely absent after parkAbandonAfter is judged orphaned rather than
+// merely slow, and dropped here directly — this is the only reclaim path an
+// entry in that state has, since neither Delete nor the restart scan nor the
+// store's own retention will ever touch it (see parkAbandonAfter). The lookups are capped per tick
 // by parkSweepRPCBudget, so a restart with a large park can never turn one tick
 // into a pass over the whole thing in one go.
 //
@@ -662,6 +666,22 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 		}
 
 		if !exists {
+			// A missing parent is the ordinary case: keep waiting, unless this
+			// entry has been waiting so long that "still syncing" no longer
+			// explains it. See parkAbandonAfter for why that threshold is what
+			// it is and not something tighter.
+			if now.Sub(candidate.parkedAt) < parkAbandonAfter {
+				continue
+			}
+
+			entry, ok := sm.blockPark.Take(candidate.hash)
+			if !ok {
+				continue
+			}
+
+			sm.logger.Warnf("[sweepParkedBlocks][%s] %s (parked %s ago), dropping it: parent %s", entry.hash, parkDispositionAbandoned.reason, now.Sub(entry.parkedAt).Round(time.Second), entry.prevBlock)
+			sm.applyParkDisposition(entry, parkDispositionAbandoned)
+
 			continue
 		}
 

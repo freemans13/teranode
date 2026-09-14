@@ -155,3 +155,82 @@ func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T)
 		"a block parked before the restart is due a parent lookup at once, not after starting its wait again")
 	require.True(t, candidates[0].hash.IsEqual(&hash))
 }
+
+// TestParkSweep_AbandonsAParentThatNeverArrives is the fix for the leak fix
+// round 1 confirmed: a parked block whose parent is genuinely never coming had
+// no reclaim path at all. Not Delete, which needs the parent positively
+// adjudicated; not the restart scan, which only discards a blob that will not
+// decode; not the store's own retention, which the park disables for its own
+// blobs so nothing there can prune it either. Past parkAbandonAfter with the
+// parent still absent, the sweep must drop it through the ordinary Delete path
+// itself.
+func TestParkSweep_AbandonsAParentThatNeverArrives(t *testing.T) {
+	park, dir := newTestPark(t, "")
+
+	blocks := minedBlocks(t, 1)
+	msgBlock := blocks[0].MsgBlock()
+	hash := msgBlock.BlockHash()
+
+	require.Equal(t, parkAccepted,
+		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+
+	// Comfortably past the abandonment window, not merely past the stuck
+	// threshold that only gates whether a lookup is made at all.
+	park.mu.Lock()
+	park.entries[hash].parkedAt = time.Now().Add(-parkAbandonAfter - time.Minute)
+	park.mu.Unlock()
+
+	client := &blockchain2.Mock{}
+	client.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
+
+	sm := &SyncManager{
+		logger:           ulogger.TestLogger{},
+		ctx:              context.Background(),
+		blockchainClient: client,
+		blockPark:        park,
+	}
+
+	sm.sweepParkedBlocks(time.Now())
+
+	require.Zero(t, park.Len(), "a block whose parent never arrives must eventually be reclaimed")
+	require.Empty(t, parkDirEntries(t, dir),
+		"and its blob must go with it, or the leak just moves from the index onto the disk")
+}
+
+// TestParkSweep_DoesNotAbandonAMerelySlowParent is the other half, and the one
+// that actually matters: a fix that reclaims orphaned blocks by age is only
+// safe if it leaves alone every block that is still going to commit. This is
+// the "still syncing" case parkAbandonAfter exists to not catch — well past
+// parkStuckThreshold, nowhere near parkAbandonAfter — and it must survive the
+// sweep untouched.
+func TestParkSweep_DoesNotAbandonAMerelySlowParent(t *testing.T) {
+	park, dir := newTestPark(t, "")
+
+	blocks := minedBlocks(t, 1)
+	msgBlock := blocks[0].MsgBlock()
+	hash := msgBlock.BlockHash()
+
+	require.Equal(t, parkAccepted,
+		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+
+	park.mu.Lock()
+	park.entries[hash].parkedAt = time.Now().Add(-parkStuckThreshold - time.Minute)
+	park.mu.Unlock()
+
+	client := &blockchain2.Mock{}
+	client.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
+
+	sm := &SyncManager{
+		logger:           ulogger.TestLogger{},
+		ctx:              context.Background(),
+		blockchainClient: client,
+		blockPark:        park,
+	}
+
+	sm.sweepParkedBlocks(time.Now())
+
+	require.Equal(t, 1, park.Len(), "a block merely waiting on a slow parent must not be dropped")
+	require.NotEmpty(t, parkDirEntries(t, dir), "and its blob must still be there for it")
+}

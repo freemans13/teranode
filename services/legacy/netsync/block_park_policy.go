@@ -115,14 +115,16 @@ var (
 		blob:   parkBlobDrop,
 	}
 
-	// parkDispositionOvertaken — the chain has gone past this block's height, so
-	// nothing will ever ask for it again. Drop the blob: its height is now below
-	// the committed tip, so the wanted range no longer names it and nothing asks
-	// for it again — re-requesting a block the chain no longer needs is the
-	// waste this replaces. Not the peer's fault either; it sent what we asked
-	// for.
-	parkDispositionOvertaken = parkDisposition{
-		reason: "the chain has gone past it",
+	// parkDispositionAbandoned — the parent has been genuinely absent from the
+	// chain for longer than parkAbandonAfter, so this is judged orphaned rather
+	// than merely slow: a losing fork at the frontier, or a block from a stale
+	// or eclipsed peer parked behind a parent that belongs to a chain this node
+	// will never follow. Drop the blob; nothing will ask for it again, because
+	// there is no route back to a parent that was never going to arrive. Not the
+	// peer's fault: it sent what we asked for, and being wrong about a fork, or
+	// stale, is not misbehaviour.
+	parkDispositionAbandoned = parkDisposition{
+		reason: "its parent never arrived",
 		blob:   parkBlobDrop,
 	}
 
