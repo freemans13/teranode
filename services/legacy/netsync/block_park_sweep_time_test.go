@@ -16,11 +16,9 @@ import (
 )
 
 // slowSweepManager builds a sweep whose own clock jumps a minute every time it
-// is read, so the first item of each half of the tick is handled and the budget
-// is then spent. That stands in for the real cost, which is not CPU: every
-// expiry is a store delete waiting on a write permit from a pool shared with
-// subtree and transaction writes, carrying its own ten-second deadline, and
-// every lookup is a call to the blockchain service.
+// is read, so the tick's budget is spent after its first lookup. That stands in
+// for the real cost, which is not CPU: every lookup is a call to the blockchain
+// service, on its own deadline, and a contended one is slow rather than free.
 func slowSweepManager(t *testing.T, entries int) (*SyncManager, *blockPark, time.Time, *int) {
 	t.Helper()
 
@@ -63,12 +61,6 @@ func slowSweepManager(t *testing.T, entries int) (*SyncManager, *blockPark, time
 		park.children[prev] = append(park.children[prev], hash)
 	}
 
-	// Every one of them below the chain's tip, so the eviction half has a full
-	// burst to work through. This used to be done by backdating parkedAt past a
-	// thirty-minute expiry; nothing expires on a clock any more, and what makes
-	// a block droppable is the chain having gone past it.
-	sm.noteCommittedHeight(int32(entries+1), chainhash.Hash{})
-
 	reads := 0
 	sm.parkSweepNow = func() time.Time {
 		reads++
@@ -79,75 +71,30 @@ func slowSweepManager(t *testing.T, entries int) (*SyncManager, *blockPark, time
 	return sm, park, parked, &lookups
 }
 
-// TestParkSweep_StopsAtItsTimeBudget is the failure the count caps were supposed
-// to prevent and could not.
+// TestParkSweep_LookupsStopAtTheTimeBudget is the failure the count cap was
+// supposed to prevent and could not on its own.
 //
-// Both halves of the sweep cap how many items they take, and neither caps how
-// long they take. Every expiry does a sequential store Del carrying the park's
-// store timeout, waiting on the blob store's process-wide write permits, and
-// every stuck-candidate lookup is a call to the blockchain service on its own
-// deadline. Expiries arrive in bursts, because blocks parked together age out
-// together, so one tick could hold the block-commit goroutine for minutes: the
-// block queue fills, the outer message loop blocks on it, and disconnects,
-// headers, invs and transaction dispatch stall for every peer.
+// The sweep's lookup half caps how many parents it asks about, and that alone
+// does not cap how long it takes: every lookup is a call to the blockchain
+// service on its own deadline, and a contended one is slow rather than free. A
+// bounded number of them, each allowed several seconds, is still a long tick in
+// the worst case, during which nothing newly stuck is looked at and every
+// commit this tick has already posted waits behind it.
 //
-// The end state pinned here is that a tick which has spent its budget stops, in
-// both halves, whatever its count budget still allows.
-func TestParkSweep_StopsAtItsTimeBudget(t *testing.T) {
+// The end state pinned here is that a tick which has spent its time budget
+// stops, whatever its count budget still allows: with a clock that jumps a
+// minute on every read, the very first lookup already exhausts
+// parkSweepTimeBudget, so no second lookup happens this tick.
+func TestParkSweep_LookupsStopAtTheTimeBudget(t *testing.T) {
 	const entries = 8
 
 	sm, park, parked, lookups := slowSweepManager(t, entries)
 
 	sm.sweepParkedBlocks(parked.Add(parkStuckThreshold + time.Second))
 
-	require.Equal(t, entries-1, park.Len(),
-		"a tick out of time must give up exactly the block it had started on and stop, not work through the whole burst")
-
 	require.Equal(t, 1, *lookups,
-		"and the parent lookups beside it must stop at the same budget")
-}
+		"a tick out of time must stop after the lookup it had already started, not work through the whole burst")
 
-// TestParkSweep_KeepsWhatItDidNotReach is the half of the time budget that is
-// not free.
-//
-// blockPark.EvictBelow takes its entries OUT of the index and hands them back,
-// so a caller that abandons them abandons the only record of them: the blob
-// stays on disk still charged against the park's byte budget with nothing
-// tracking it. So the tick puts back what it did not reach, and the next tick,
-// where the chain is no further back, carries on.
-func TestParkSweep_KeepsWhatItDidNotReach(t *testing.T) {
-	const entries = 8
-
-	sm, park, parked, _ := slowSweepManager(t, entries)
-
-	sm.sweepParkedBlocks(parked.Add(parkStuckThreshold + time.Second))
-	require.Equal(t, entries-1, park.Len(), "sanity: one gone, the rest put back")
-
-	// Every entry the first tick put back is still expired, still indexed under
-	// its parent, and still swept.
-	for _, entry := range park.entries {
-		require.Equal(t, parked, entry.parkedAt, "a block put back keeps the age it was parked at, or it never expires")
-		require.Contains(t, park.children[entry.prevBlock], entry.hash, "a block put back must still be reachable from its parent, or the drain will never find it")
-	}
-
-	for tick := 2; tick <= entries; tick++ {
-		sm.sweepParkedBlocks(parked.Add(time.Duration(tick) * parkSweepInterval))
-	}
-
-	require.Zero(t, park.Len(), "the burst must still drain, one tick's worth at a time")
-}
-
-// TestParkSweep_WholeBurstFitsWhenTheTicksAreFast guards the other direction:
-// the time budget must not turn an ordinary tick into a slow drip. With the
-// store answering promptly, which is every tick that is not in the contended
-// state, the whole burst goes in one tick exactly as it did before.
-func TestParkSweep_WholeBurstFitsWhenTheTicksAreFast(t *testing.T) {
-	const entries = 8
-
-	sm, park, parked, _ := slowSweepManager(t, entries)
-	sm.parkSweepNow = nil
-
-	sm.sweepParkedBlocks(parked.Add(parkStuckThreshold + time.Second))
-
-	require.Zero(t, park.Len(), "a tick inside its budget must clear the whole burst")
+	require.Equal(t, entries, park.Len(),
+		"StuckCandidates never removes what it hands over, so stopping early must not have lost anything from the index")
 }

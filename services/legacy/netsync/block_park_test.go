@@ -274,46 +274,28 @@ func TestBlockPark_AFailedWriteLeavesNoGoroutineBehind(t *testing.T) {
 		"the goroutine serializing the block must terminate when the write fails")
 }
 
-// TestBlockPark_RefusesOverBudgetAndWritesNothing pins both bounds. The byte
-// budget is what an operator sets; the entry cap is what stops the in-memory
-// index growing without limit when blocks are tiny.
-func TestBlockPark_RefusesOverBudgetAndWritesNothing(t *testing.T) {
+// TestBlockPark_SizeAloneNeverRefuses pins what is left once both of the
+// park's old bounds are gone: a byte budget, then an entry cap after it. Both
+// were removed for the same shape of reason. The byte budget could only be
+// evaluated after the block had been downloaded and decoded, so it never saved
+// any bandwidth, only threw away a block already in hand. The entry cap could
+// refuse the one block that would drain the park whenever there was a hole in
+// the run, on every retry, with nothing evicting to make room. What bounds the
+// disk now is upstream of both: the download walk's read-ahead depth, in
+// blocks, checked before anything is fetched.
+func TestBlockPark_SizeAloneNeverRefuses(t *testing.T) {
 	blocks := minedBlocks(t, 1)
 	msgBlock := blocks[0].MsgBlock()
 	hash := msgBlock.BlockHash()
 
-	t.Run("size alone never refuses", func(t *testing.T) {
-		// There used to be a byte budget here and it was removed, because it
-		// could only be evaluated after the block had been downloaded and
-		// decoded, so it never saved any bandwidth, and because a park filled
-		// above a hole would refuse the very block that would drain it. The
-		// bound is now the number of blocks held, and the disk is bounded
-		// upstream by the download walk's read-ahead depth, in blocks.
-		park, dir := newTestPark(t, "")
+	park, dir := newTestPark(t, "")
 
-		require.Equal(t, parkAccepted,
-			park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	require.Equal(t, parkAccepted,
+		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
 
-		require.NotEmpty(t, parkDirEntries(t, dir), "the block must be written whatever its size")
-		require.Equal(t, int64(msgBlock.SerializeSize()), park.Bytes(),
-			"the byte total is still tracked, for the gauge, it just no longer refuses")
-	})
-
-	t.Run("entry cap", func(t *testing.T) {
-		park, dir := newTestPark(t, "")
-
-		// Fill the index without touching the disk.
-		for i := 0; i < maxParkedEntries; i++ {
-			h := chainhash.Hash{}
-			h[0], h[1] = byte(i), byte(i>>8)
-			park.entries[h] = &parkedBlock{hash: h}
-		}
-
-		require.Equal(t, parkUnavailable,
-			park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
-
-		require.Empty(t, parkDirEntries(t, dir))
-	})
+	require.NotEmpty(t, parkDirEntries(t, dir), "the block must be written whatever its size")
+	require.Equal(t, int64(msgBlock.SerializeSize()), park.Bytes(),
+		"the byte total is still tracked, for the gauge, it just no longer refuses")
 }
 
 // TestBlockPark_RecoversWhatAPreviousRunLeftBehind is the restart case. A crash
@@ -418,40 +400,6 @@ func TestBlockPark_RecoveryAdoptsEverythingAPreviousRunParked(t *testing.T) {
 		"a restart must not delete blocks it has already paid to download")
 }
 
-// TestBlockPark_TheBlockCountStillBounds proves the surviving bound actually
-// bounds. Removing the byte budget left the number of blocks held as the park's
-// only limit, so if that stopped refusing there would be nothing at all between
-// an out-of-order flood and the disk.
-func TestBlockPark_TheBlockCountStillBounds(t *testing.T) {
-	park, _ := newTestPark(t, "")
-
-	blocks := minedBlocks(t, 2)
-	first := blocks[0].MsgBlock()
-	second := blocks[1].MsgBlock()
-
-	require.Equal(t, parkAccepted,
-		park.Park(context.Background(), parkedBlock{hash: first.BlockHash(), prevBlock: first.Header.PrevBlock}, first))
-
-	// Filled to the cap directly, because parking maxParkedEntries real blocks
-	// would take minutes. The entries map is what the clause counts.
-	park.mu.Lock()
-	for i := 0; i < maxParkedEntries; i++ {
-		h := chainhash.Hash{}
-		h[0] = byte(i)
-		h[1] = byte(i >> 8)
-		h[2] = byte(i >> 16)
-		park.entries[h] = &parkedBlock{hash: h}
-	}
-	held := len(park.entries)
-	park.mu.Unlock()
-
-	require.GreaterOrEqual(t, held, maxParkedEntries, "precondition: the park is at its cap")
-
-	require.Equal(t, parkUnavailable,
-		park.Park(context.Background(), parkedBlock{hash: second.BlockHash(), prevBlock: second.Header.PrevBlock}, second),
-		"at its block limit the park must refuse, or nothing bounds the disk")
-}
-
 // TestBlockPark_IsOffWhenItCannotBeRecovered covers the two settings-only kill
 // switches and the store it refuses to run on. A store whose contents cannot be
 // listed would leak every parked blob on every restart, so the park declines
@@ -494,7 +442,6 @@ func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
 		require.Zero(t, park.Len())
 		require.Zero(t, park.Bytes())
 		require.Nil(t, park.TakeChildren(chainhash.Hash{}))
-		require.Nil(t, park.EvictBelow(1, parkSweepExpiryBudget))
 		require.Nil(t, park.StuckCandidates(time.Now(), 8))
 
 		_, ok := park.Take(chainhash.Hash{})
@@ -587,8 +534,8 @@ func TestBlockPark_RecoverDiscardsAConvertedRecordInsteadOfOrphaningItForever(t 
 }
 
 // TestBlockPark_DeleteAlsoRemovesAConvertedRecord is fix-round item 2's core
-// claim. Before it, Delete removed only the whole-block file type, so commit,
-// EvictBelow and every other path that retires an entry through Delete
+// claim. Before it, Delete removed only the whole-block file type, so commit
+// and every other path that retires an entry through Delete
 // (applyParkDisposition's own comment calls it the ONLY place that deletes a
 // parked blob) left a converted record behind. This drives a real converted
 // record onto disk, retires it through the ordinary path every retiring

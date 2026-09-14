@@ -101,31 +101,6 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 			"charging a duplicate twice would have the park believe it holds bytes it does not")
 	})
 
-	t.Run("a park that refuses the entry has the orphaned body deleted", func(t *testing.T) {
-		h := withConsumer(t)
-		h.sm.parkCommits = make(chan parkCommit, 4)
-
-		// Fill to the ceiling so adoption is refused for a reason other than
-		// already holding it.
-		h.sm.blockPark.mu.Lock()
-		for i := 0; i < maxParkedEntries; i++ {
-			var hash chainhash.Hash
-			hash[0] = byte(i)
-			hash[1] = byte(i >> 8)
-			hash[2] = 0xfe
-			stored := parkedBlock{hash: hash}
-			h.sm.blockPark.entries[hash] = &stored
-		}
-		h.sm.blockPark.mu.Unlock()
-
-		body := bodyFor(h.blocks[1].MsgBlock().BlockHash(), 512)
-		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
-
-		require.False(t, h.sm.blockPark.Has(body.Hash))
-		require.Empty(t, h.sm.drainQueue,
-			"nothing was adopted, so asking for a drain would send the consumer looking for work that is not there")
-	})
-
 	t.Run("no park means the message is dropped rather than panicking", func(t *testing.T) {
 		h := newParkWiringHarness(t, true)
 		h.sm.blockPark = nil

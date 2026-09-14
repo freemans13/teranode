@@ -403,17 +403,19 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	return sm, rec
 }
 
-// TestWantedRange_TheParkNeverReachesItsEntryCap pins the consequence. A full
-// park refuses the one block that would extend the tip, the drain finds no child
-// for the settled hash, and the node idles with thousands of unusable blocks on
-// disk. That is what the 4096-entry cap did on 2026-09-12.
+// TestWantedRange_TheParkNeverExceedsTheReadAheadDepth pins the consequence. A
+// park with a count-based entry cap could fill above a gap and refuse the one
+// block that would extend the tip, the drain would find no child for the
+// settled hash, and the node would idle with thousands of unusable blocks on
+// disk. That is what the 4096-entry cap did on 2026-09-12, and that cap is gone
+// now: this property is what bounds the park in its place.
 //
 // The park is bounded because the download is bounded by position: a block can
 // only be parked if it was obtained, it can only be obtained if it was
 // requested, and the wanted range will not name a height more than the
 // read-ahead depth above the last committed block. So the park cannot exceed the
-// depth, and the depth — 4 here, 128 as legacy_blockDownloadLowerWindow ships,
-// scaled down from there by block size — is far below the 4096-entry cap.
+// depth — 4 here, 128 as legacy_blockDownloadLowerWindow ships, scaled down from
+// there by block size.
 //
 // Blocks are delivered highest-first so every one of them is an orphan on
 // arrival, which is the case the park exists for and the case that filled it.
@@ -437,7 +439,7 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 // here is the POSITION one, that no block above the window is ever in the park at
 // all. Header removal can only take away a block already obtained; it cannot be
 // what stops a block twenty heights up being requested in the first place.
-func TestWantedRange_TheParkNeverReachesItsEntryCap(t *testing.T) {
+func TestWantedRange_TheParkNeverExceedsTheReadAheadDepth(t *testing.T) {
 	// Six times the depth, so a pass that ran away would have somewhere to run.
 	blocks := minedBlocks(t, propertyDepth*6)
 
@@ -500,11 +502,4 @@ func TestWantedRange_TheParkNeverReachesItsEntryCap(t *testing.T) {
 	// Without this the loop could be vacuously true: a park that was never given
 	// anything satisfies every bound in it.
 	require.Positive(t, sm.blockPark.Len(), "the passes must actually have parked something")
-
-	// The arithmetic the whole property rests on. The park cannot exceed the
-	// depth, so as long as the depth is below the entry cap the cap is
-	// unreachable — which is what the cursor walk, bounded by a count rather than
-	// a position, could not say.
-	require.Less(t, propertyDepth, maxParkedEntries,
-		"a park bounded by the read-ahead depth can only miss its entry cap while the depth is below it")
 }

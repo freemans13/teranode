@@ -72,24 +72,6 @@ func TestAdoptWritten(t *testing.T) {
 		require.Equal(t, int64(4096), p.Bytes())
 	})
 
-	t.Run("adoption stops at the entry ceiling", func(t *testing.T) {
-		p := newPark(t)
-
-		p.mu.Lock()
-		for i := 0; i < maxParkedEntries; i++ {
-			h := chainhash.Hash{}
-			h[0] = byte(i)
-			h[1] = byte(i >> 8)
-			h[2] = 0xff
-			stored := parkedBlock{hash: h}
-			p.entries[h] = &stored
-		}
-		p.mu.Unlock()
-
-		require.False(t, p.AdoptWritten(entryFor(0x04, 1)),
-			"the ceiling is what bounds the park, and a path that ignores it is an unbounded one")
-	})
-
 	t.Run("a nil park refuses rather than panicking", func(t *testing.T) {
 		var p *blockPark
 

@@ -26,16 +26,15 @@ var parkSweepInterval = 30 * time.Second
 // parkSweepTimeBudget is how long one sweep tick may spend before it stops and
 // leaves the rest for the next one.
 //
-// It is the bound the two count caps cannot give. Every item the sweep handles
-// waits on something outside this process, a blob-store write permit for a
-// delete and the blockchain service for a lookup, each with a deadline of its
-// own around ten seconds, and they are handled one after another. Bounded in
-// count is a twenty-minute tick in the worst case; bounded in time is a tick
-// that finishes inside its interval, so a block that becomes stuck is looked at
-// on the next tick rather than after a backlog of somebody else's deletes.
+// It is the bound the count cap beside it cannot give. Every lookup the sweep
+// makes waits on the blockchain service, with a deadline of its own around ten
+// seconds, and they are handled one after another. Bounded in count alone is a
+// long tick in the worst case; bounded in time is a tick that finishes inside
+// its interval, so a block that becomes stuck is looked at on the next tick
+// rather than after a backlog of somebody else's lookups.
 //
 // A sixth of parkSweepInterval, and normal ticks are far under it: a full
-// 128-entry expiry burst against a store with permits free is milliseconds.
+// 128-lookup burst against a service that answers promptly is milliseconds.
 // Nothing is lost by stopping, only deferred by parkSweepInterval, and every item
 // the sweep defers is one already past its own deadline, so the only question is
 // rate.
@@ -119,33 +118,13 @@ func (sm *SyncManager) parentChainState(hash chainhash.Hash) (exists bool, inval
 	return true, meta.Invalid, meta.Height, nil
 }
 
-// parkEvictionFloor is the height below which a parked block can never be
-// needed, or 0 when the node cannot say.
-//
-// It is the highest block this node has actually committed, and eviction is
-// strictly below it. Nothing approximate: a block parked below a block we have
-// already put in the chain cannot be a link in any chain we are building, and
-// its parent is missing so it cannot be a sibling either.
-//
-// It is NOT the front of the header list, which was the obvious reading and is
-// wrong. An arriving front block has its header removed from the list before the
-// park sees it, so the front sits one height above the block being waited on, and
-// a sweep judging by the front evicts exactly the block it needs.
-//
-// Zero until the first commit, which switches eviction off on a node that has
-// not committed anything yet. That is the right way round: a node still finding
-// its feet should keep what it has downloaded.
-func (sm *SyncManager) parkEvictionFloor() int32 {
-	return sm.committedHeight()
-}
-
 // drainParkedDescendants commits everything parked behind a block that has just
 // been committed, and then everything parked behind those, and so on.
 //
 // It walks an explicit stack rather than recursing: a chain of parked blocks can
-// be maxParkedEntries long, and recursion would nest that many frames, each one
-// holding a decoded block. Exactly one block is decoded at a time and it is
-// released before the next is read.
+// run to however many the read-ahead depth admits, and recursion would nest
+// that many frames, each one holding a decoded block. Exactly one block is
+// decoded at a time and it is released before the next is read.
 func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 	if !sm.blockPark.Enabled() {
 		return
@@ -545,16 +524,11 @@ func (sm *SyncManager) scheduleDrain(parent chainhash.Hash, parentHeight uint32)
 		}
 	}
 
-	// Bounded by the number of distinct parents of parked blocks, and capped at
-	// the park's own entry limit besides. A dropped request is not a lost block:
-	// the sweep finds it within its interval, because a parked block whose parent
-	// is stored is exactly what StuckCandidates hands over.
-	if len(sm.drainQueue) >= maxParkedEntries {
-		sm.logger.Warnf("[scheduleDrain][%s] the drain queue is full at %d parents; this one waits for the sweep", parent, len(sm.drainQueue))
-
-		return
-	}
-
+	// Bounded by the number of distinct parents of parked blocks, and nothing
+	// caps that on its own account any more: the park itself no longer has an
+	// entry ceiling to cap this against, and the number of parents that can ever
+	// be distinct is already bounded upstream by the download walk's read-ahead
+	// depth, the same bound that now does the park's own job.
 	sm.drainQueue = append(sm.drainQueue, drainRequest{parent: parent, parentHeight: parentHeight})
 }
 
@@ -655,48 +629,24 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 //
 // It runs on the sweep's own goroutine (runParkSweep) and commits nothing
 // itself: a parked block whose parent turns out to be stored is posted to the
-// block-queue consumer through submitParkCommit. BOTH halves are still capped
-// per tick and neither can turn into a pass over the whole park in one go: the
-// chain lookups by parkSweepRPCBudget, and the blocks it gives up on by
-// parkSweepExpiryBudget. The second cap is the one that is easy to miss, and it
-// is the more expensive item — a store delete rather than a lookup — and the
-// one that arrives in bursts, because blocks parked together age out together.
+// block-queue consumer through submitParkCommit. The lookups are capped per tick
+// by parkSweepRPCBudget, so a restart with a large park can never turn one tick
+// into a pass over the whole thing in one go.
 //
-// Both of those cap a COUNT, and a count is not a bound on the tick. Each item
-// carries its own deadline, chainCtx for a lookup and the park's store timeout
-// for a delete, and both of those wait on resources the rest of the process is
-// competing for: the blockchain service, and the blob store's process-wide write
-// permits. A bounded number of sequential items each allowed ten seconds is a
-// twenty-minute tick, during which nothing newly stuck is looked at and every
-// commit this tick has already posted waits behind it. So the tick has its own
-// elapsed-time budget, parkSweepTimeBudget, and both halves stop at it.
-//
-// Stopping is free for the lookups, which leave the block parked for the next
-// tick anyway. It is not free for the expiries, because Expire has already taken
-// those entries out of the index: an entry the tick does not reach is put back,
-// or its blob is left charged against the budget with nothing tracking it.
+// A count cap is not a bound on the tick, so the tick also has its own
+// elapsed-time budget, parkSweepTimeBudget. Each lookup carries chainCtx's
+// deadline and waits on a resource the rest of the process is competing for,
+// the blockchain service, so a bounded NUMBER of them each allowed ten seconds
+// is still a long tick in the worst case, during which nothing newly stuck is
+// looked at and every commit this tick has already posted waits behind it.
+// Stopping there is free: a lookup the tick does not reach simply leaves the
+// block parked for the next one.
 func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	if !sm.blockPark.Enabled() {
 		return
 	}
 
 	deadline := sm.parkSweepClock().Add(parkSweepTimeBudget)
-
-	expired := sm.blockPark.EvictBelow(sm.parkEvictionFloor(), parkSweepExpiryBudget)
-
-	for i, entry := range expired {
-		// Always one, however long the tick has already run: a budget that can
-		// refuse every item is a sweep that never sweeps.
-		if i > 0 && !sm.parkSweepClock().Before(deadline) {
-			sm.blockPark.RestoreAll(expired[i:])
-			sm.logger.Warnf("[sweepParkedBlocks] out of time after giving up %d blocks, %d put back for the next tick", i, len(expired)-i)
-
-			break
-		}
-
-		sm.logger.Infof("[sweepParkedBlocks][%s] %s (height %d), dropping it: parent %s", entry.hash, parkDispositionOvertaken.reason, entry.height, entry.prevBlock)
-		sm.applyParkDisposition(entry, parkDispositionOvertaken)
-	}
 
 	for i, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {
 		if i > 0 && !sm.parkSweepClock().Before(deadline) {

@@ -47,9 +47,14 @@ func newIndexOnlyPark() *blockPark {
 // together. A sweep that re-sampled the index at random would leave blocks
 // unasked about however long it ran.
 func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
+	// A stand-in for "a full park". There is no entry cap any more to size this
+	// against, so this is simply a park deep enough that the round-robin has
+	// several ticks of real work to do.
+	const parkSize = 4096
+
 	var (
 		mu   sync.Mutex
-		seen = make(map[chainhash.Hash]struct{}, maxParkedEntries)
+		seen = make(map[chainhash.Hash]struct{}, parkSize)
 	)
 
 	client := &blockchain2.Mock{}
@@ -78,7 +83,7 @@ func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
 	// parent, none of them yet looked at.
 	parked := time.Now()
 
-	for i := 0; i < maxParkedEntries; i++ {
+	for i := 0; i < parkSize; i++ {
 		var hash, prev chainhash.Hash
 
 		binary.LittleEndian.PutUint32(hash[:], uint32(i))
@@ -90,7 +95,7 @@ func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
 	// The ticks a block gets between becoming a sweep candidate and running out
 	// of time. Only as many as a full pass needs are used, so the test says "a
 	// full pass fits" rather than "a full pass happens eventually".
-	ticks := maxParkedEntries / parkSweepRPCBudget
+	ticks := parkSize / parkSweepRPCBudget
 
 	require.LessOrEqual(t, time.Duration(ticks)*parkSweepInterval, parkFullPassBudget,
 		"a full pass has to fit between a block becoming a candidate and its time running out")
@@ -99,13 +104,13 @@ func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
 		sm.sweepParkedBlocks(parked.Add(parkStuckThreshold + time.Second + time.Duration(tick)*parkSweepInterval))
 	}
 
-	require.Equal(t, maxParkedEntries, sm.blockPark.Len(),
-		"nothing may have expired while the sweep was still working through the park")
+	require.Equal(t, parkSize, sm.blockPark.Len(),
+		"nothing evicts any more, so the sweep must not have dropped anything either")
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	require.Len(t, seen, maxParkedEntries,
+	require.Len(t, seen, parkSize,
 		"every parked block's parent must have been asked about within %d ticks of %d; whatever the sweep does not reach expires and is downloaded again",
 		ticks, parkSweepRPCBudget)
 }
@@ -149,62 +154,4 @@ func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T)
 	require.Len(t, candidates, 1,
 		"a block parked before the restart is due a parent lookup at once, not after starting its wait again")
 	require.True(t, candidates[0].hash.IsEqual(&hash))
-}
-
-// TestBlockPark_ExpiryIsRatedPerTickLikeTheLookupsBesideIt pins the second of the
-// sweep's two caps.
-//
-// The lookup half was given a per-tick budget with a paragraph of arithmetic
-// behind it; the eviction half directly above it had none, and it is the more
-// expensive item — each block dropped costs a store delete carrying
-// legacy_parkStoreTimeout, on the one goroutine that commits blocks in order. It
-// is also the half that arrives in bursts, because the frontier moving past a
-// run of parked blocks overtakes all of them at once. An uncapped pass could
-// hand the whole index to that goroutine in a single tick, and with blockQueue
-// full the outer loop blocks on it and every peer's dispatch stalls behind it.
-//
-// The asymmetry was the tell, so this asserts the rate rather than the mechanism:
-// a park holding more expired blocks than one tick's budget must give up exactly
-// the budget, and the remainder must still be there afterwards.
-func TestBlockPark_ExpiryIsRatedPerTickLikeTheLookupsBesideIt(t *testing.T) {
-	park, _ := newTestPark(t, "")
-
-	// Comfortably more than one tick's worth, and every one of them below the
-	// floor, so nothing but the budget decides how many go.
-	const parked = parkSweepExpiryBudget + 40
-
-	const floor = int32(parked + 1)
-
-	park.mu.Lock()
-
-	for i := 0; i < parked; i++ {
-		var h, prev chainhash.Hash
-
-		binary.LittleEndian.PutUint32(h[:4], uint32(i))
-		h[31] = 0xb1
-		binary.LittleEndian.PutUint32(prev[:4], uint32(i))
-		prev[31] = 0xb2
-
-		entry := &parkedBlock{hash: h, prevBlock: prev, height: int32(i + 1)}
-		park.entries[h] = entry
-		park.children[prev] = append(park.children[prev], h)
-	}
-
-	park.mu.Unlock()
-
-	require.Equal(t, parked, park.Len(), "harness check: every block is parked")
-
-	// Lengths compared as counts, not with require.Len on the slice: a failure
-	// there prints every parkedBlock it holds and buries the message.
-	first := park.EvictBelow(floor, parkSweepExpiryBudget)
-	require.Equal(t, parkSweepExpiryBudget, len(first),
-		"one tick must give up exactly its budget, however many are ready")
-	require.Equal(t, parked-parkSweepExpiryBudget, park.Len(),
-		"the rest must still be parked, to be given up on the next tick")
-
-	// And the remainder is not stranded: the next tick takes what is left.
-	second := park.EvictBelow(floor, parkSweepExpiryBudget)
-	require.Equal(t, parked-parkSweepExpiryBudget, len(second),
-		"the following tick must take the remainder rather than leaving it behind")
-	require.Zero(t, park.Len())
 }
