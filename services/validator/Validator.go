@@ -957,30 +957,20 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	// utxoHeights, and (b) the OutpointOnlySpend guard in validateTransaction's
 	// phase-2 explicitly skips BIP68 (the only remaining utxoHeights consumer).
 	if !validationOptions.OutpointOnlySpend {
-		// check whether the transaction is extended, extend it if not
-		// we also get the block heights of the inputs of the transaction since we are doing a DB lookup
-		if !tx.IsExtended() {
-			// get the block heights of all inputs of the transaction and extend the inputs of not extended transaction.
-			// utxoHeights is a slice of block heights for each input
-			// txInpoints is a struct containing the parent tx hashes and the vout indexes of each input
-			if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
-				err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
-				span.RecordError(err)
+		// Read the parent of every input: this resolves the block heights BIP68
+		// needs and re-extends the transaction from the parents' own outputs,
+		// whether or not the caller handed us previous-output metadata
+		// (GHSA-v76m-6vc7-g7c7).
+		//
+		// This was two calls behind an `if !tx.IsExtended()` / `if
+		// len(utxoHeights) == 0` pair. Extension is now unconditional, so both
+		// gates selected the same single call and the first read as a gate while
+		// gating nothing.
+		if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
+			err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
+			span.RecordError(err)
 
-				return nil, err
-			}
-		}
-
-		// if the transaction was extended, we still need to get the block heights of the inputs
-		// since that processing did not happen before extending the transaction
-		// This must be done BEFORE validateTransaction to ensure BIP68 sequence lock validation has the required heights
-		if len(utxoHeights) == 0 {
-			if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
-				err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
-				span.RecordError(err)
-
-				return nil, err
-			}
+			return nil, err
 		}
 	}
 
@@ -1539,14 +1529,12 @@ func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.T
 		parentTxHashes[*parentTxHash] = append(parentTxHashes[*parentTxHash], inputIdx)
 	}
 
-	extend := !tx.IsExtended() // if the tx is not extended, we need to extend it with the parent tx hashes
-
 	for parentTxHash, idxs := range parentTxHashes {
 		parentTxHash := parentTxHash
 		inputIdxs := idxs
 
 		g.Go(func() error {
-			if err := v.getUtxoBlockHeightAndExtendForParentTx(gCtx, parentTxHash, inputIdxs, utxoHeights, tx, extend, prefetched); err != nil {
+			if err := v.getUtxoBlockHeightAndExtendForParentTx(gCtx, parentTxHash, inputIdxs, utxoHeights, tx, prefetched); err != nil {
 				if errors.Is(err, errors.ErrTxNotFound) {
 					return errors.NewTxMissingParentError("[Validate][%s] error getting parent transaction %s", txID, parentTxHash, err)
 				}
@@ -1582,7 +1570,7 @@ func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.T
 //     (BDK rejects with bad-txns-unconfirmed-input-in-block) or the candidate
 //     height in policy mode.
 func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context, parentTxHash chainhash.Hash, idxs []int,
-	utxoHeights []uint32, tx *bt.Tx, extend bool, prefetched map[chainhash.Hash]*meta.Data) error {
+	utxoHeights []uint32, tx *bt.Tx, prefetched map[chainhash.Hash]*meta.Data) error {
 	// Validate every target index up front, before any utxoHeights[idx] (the
 	// height loops below) or tx.Inputs[idx] (the extend loop) dereference. idxs
 	// are positions in tx.Inputs, and the caller sizes utxoHeights to
@@ -1596,20 +1584,42 @@ func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context,
 		}
 	}
 
-	f := []fields.FieldName{fields.BlockIDs, fields.BlockHeights}
-
-	if extend {
-		// add the parent tx outputs to the fields, to be able to extend the transaction
-		f = append(f, fields.Tx)
-	}
+	// Parent outputs are always read, so the transaction is re-extended from
+	// them whether or not the caller supplied previous-output metadata. The UTXO
+	// commitment (util.UTXOHashInto) hashes `lockingScript || VarInt(satoshis)`
+	// with no script-length prefix, so the script/value boundary is not pinned: a
+	// shorter script paired with a larger value reproduces the same commitment.
+	// Trusting a submitter's extended fields therefore let a forged
+	// (OP_TRUE, inflated-value) pair spend a genuinely unspendable output and
+	// mint coins, because the store's utxoHash comparison passes on the collision
+	// (GHSA-v76m-6vc7-g7c7). The extend loop below overwrites rather than fills,
+	// so re-reading is sufficient on its own — no supplied-vs-stored comparison
+	// is needed.
+	//
+	// Outputs only, deliberately: fields.Tx would also pull the parent's inputs —
+	// unlocking scripts, the bulk of a typical transaction — and the extend loop
+	// reads nothing but Outputs[vout]. That saving is confined to parents stored
+	// inline: Aerospike keeps a large transaction's body outside the record and
+	// writes no outputs bin for it, so fields.Outputs has to pull that body too
+	// (see the needsFullExternalTx trigger in stores/utxo/aerospike/get.go), and
+	// for those parents the cost is the same as fields.Tx.
+	//
+	// This widens the projection of a Get that already happens for block heights,
+	// but "widens" is not "free" and it is not free on every store: SQL runs an
+	// extra batchDecorateOutputs query for it (stores/utxo/sql/sql.go), and
+	// Aerospike reads the same record for an inline parent but an extra external
+	// blob for a large one. The read itself is mandatory for the fix — the
+	// supplied outputs cannot be trusted — so this is a cost to measure, not one
+	// to claim away.
+	f := []fields.FieldName{fields.BlockIDs, fields.BlockHeights, fields.Outputs}
 
 	// Use a bulk-prefetched parent if the caller supplied one that carries
-	// everything we need (the parent tx outputs too, when extending). This is a
-	// read-source swap only: the height/sentinel logic below is unchanged, and
-	// any parent not prefetched — or prefetched without the Tx needed for
-	// extension — falls back to a store Get, so correctness is never reduced.
+	// everything we need, which now always includes the parent's outputs: the
+	// extension below is unconditional. This is a read-source swap only — the
+	// height/sentinel logic is unchanged. A missing parent or nil Data.Tx falls
+	// back to a store Get; missing outputs on a non-nil Data.Tx fail below.
 	var txMeta *meta.Data
-	if pf, ok := prefetched[parentTxHash]; ok && pf != nil && (!extend || pf.Tx != nil) {
+	if pf, ok := prefetched[parentTxHash]; ok && pf != nil && pf.Tx != nil {
 		txMeta = pf
 	} else {
 		var err error
@@ -1635,27 +1645,26 @@ func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context,
 		}
 	}
 
-	if extend {
-		// extend the transaction inputs with the parent tx outputs (idx bounds
-		// already validated at the top of the function)
-		for _, idx := range idxs {
-			// PreviousTxOutIndex comes from the (untrusted) child transaction, so
-			// bound it against the parent's output count before indexing.
-			// Otherwise a tx referencing a real parent but a non-existent vout
-			// (e.g. vout 99 on a 2-output parent) panics here with index out of
-			// range and crashes the validator. Mirrors the guard in
-			// stores/utxo/aerospike/get.go.
-			vout := tx.Inputs[idx].PreviousTxOutIndex
-			if txMeta.Tx == nil || txMeta.Tx.Outputs == nil ||
-				int(vout) >= len(txMeta.Tx.Outputs) || txMeta.Tx.Outputs[vout] == nil {
-				return errors.NewProcessingError("[Validate][%s] parent transaction %s has no output for index %d",
-					tx.TxIDChainHash().String(), parentTxHash.String(), vout)
-			}
-
-			// extend the input with the parent tx outputs
-			tx.Inputs[idx].PreviousTxSatoshis = txMeta.Tx.Outputs[vout].Satoshis
-			tx.Inputs[idx].PreviousTxScript = txMeta.Tx.Outputs[vout].LockingScript
+	// Extend the transaction inputs from the parent's outputs (idx bounds already
+	// validated at the top of the function). Unconditional: this overwrite is what
+	// discards any previous-output metadata the caller supplied.
+	for _, idx := range idxs {
+		// PreviousTxOutIndex comes from the (untrusted) child transaction, so
+		// bound it against the parent's output count before indexing.
+		// Otherwise a tx referencing a real parent but a non-existent vout
+		// (e.g. vout 99 on a 2-output parent) panics here with index out of
+		// range and crashes the validator. Mirrors the guard in
+		// stores/utxo/aerospike/get.go.
+		vout := tx.Inputs[idx].PreviousTxOutIndex
+		if txMeta.Tx == nil || txMeta.Tx.Outputs == nil ||
+			int(vout) >= len(txMeta.Tx.Outputs) || txMeta.Tx.Outputs[vout] == nil {
+			return errors.NewProcessingError("[Validate][%s] parent transaction %s has no output for index %d",
+				tx.TxIDChainHash().String(), parentTxHash.String(), vout)
 		}
+
+		// extend the input with the parent tx outputs
+		tx.Inputs[idx].PreviousTxSatoshis = txMeta.Tx.Outputs[vout].Satoshis
+		tx.Inputs[idx].PreviousTxScript = txMeta.Tx.Outputs[vout].LockingScript
 	}
 
 	return nil

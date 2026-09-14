@@ -302,7 +302,7 @@ func TestUnlockBlockTransactionsReleasesTheCreatePhaseLock(t *testing.T) {
 		require.True(t, meta.Locked, "precondition: created locked")
 	}
 
-	require.NoError(t, sm.unlockBlockTransactions(ctx, 100, hashes))
+	require.NoError(t, sm.unlockBlockTransactions(ctx, blockRequestOrigin{headerProven: true}, 100, hashes))
 
 	for _, hash := range hashes[1:] {
 		hash := hash

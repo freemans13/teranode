@@ -327,7 +327,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			StoreURL:              getURL("blockchain_store", "sqlite:///blockchain", alternativeContext...),
 			FSMStateRestore:       getBool("fsm_state_restore", false, alternativeContext...),
 			FSMStateChangeDelay:   getDuration("fsm_state_change_delay", 0, alternativeContext...),
-			StoreDBTimeoutMillis:  getInt("blockchain_store_dbTimeoutMillis", 5000, alternativeContext...),
+			StoreDBTimeoutMillis:  getInt("blockchain_store_dbTimeoutMillis", DefaultBlockchainStoreDBTimeoutMillis, alternativeContext...),
 			InitializeNodeInState: strings.TrimSpace(getString("blockchain_initializeNodeInState", "", alternativeContext...)),
 			PostgresPool:          getPostgresPoolSettings("blockchain", alternativeContext...),
 			UseInMemoryChainCheck: getBool("blockchain_use_in_memory_chain_check", false, alternativeContext...),
@@ -355,6 +355,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ValidationMaxRetries:                      getInt("blockvalidation_validation_max_retries", 3, alternativeContext...),
 			ValidationRetrySleep:                      getDuration("blockvalidation_validation_retry_sleep", 5*time.Second, alternativeContext...),
 			OptimisticMining:                          getBool("blockvalidation_optimistic_mining", true, alternativeContext...),
+			OptimisticMiningPeerBlocks:                getBool("blockvalidation_optimistic_mining_peer_blocks", false, alternativeContext...),
 			IsParentMinedRetryMaxRetry:                getInt("blockvalidation_isParentMined_retry_max_retry", 45, alternativeContext...),
 			IsParentMinedRetryBackoffMultiplier:       getInt("blockvalidation_isParentMined_retry_backoff_multiplier", 4, alternativeContext...),
 			IsParentMinedRetryBackoffDuration:         getDuration("blockvalidation_isParentMined_retry_backoff_duration", 20*time.Millisecond, alternativeContext...),
@@ -378,6 +379,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupConcurrency:                    getInt("blockvalidation_catchupConcurrency", max(4, runtime.NumCPU()/2), alternativeContext...),
 			CatchupMaxRetries:                     getInt("blockvalidation_catchup_max_retries", 3, alternativeContext...),
 			CatchupMaxAttemptsPerBlock:            getInt("blockvalidation_catchup_max_attempts_per_block", 5, alternativeContext...),
+			MaxCorruptAttemptsPerBlock:            getInt("blockvalidation_max_corrupt_attempts_per_block", 3, alternativeContext...),
+			CorruptAttemptCooldown:                getDuration("blockvalidation_corrupt_attempt_cooldown", DefaultCorruptAttemptCooldown, alternativeContext...),
 			CatchupIterationTimeout:               getInt("blockvalidation_catchup_iteration_timeout", 30, alternativeContext...),
 			CatchupOperationTimeout:               getInt("blockvalidation_catchup_operation_timeout", 300, alternativeContext...),
 			CatchupMaxAccumulatedHeaders:          getInt("blockvalidation_max_accumulated_headers", 100000, alternativeContext...),
@@ -523,7 +526,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HTTPListenAddress:  getString("p2p_httpListenAddress", "", alternativeContext...),
 			ListenAddresses:    getMultiString("p2p_listen_addresses", "|", []string{}, alternativeContext...),
 			AdvertiseAddresses: getMultiString("p2p_advertise_addresses", "|", []string{}, alternativeContext...), // This is used to announce the node to the network on a different address than the listen address
-			Port:               getInt("p2p_port", 9905, alternativeContext...),                                   // This is the port that go-p2p-message-bus will listen on but only used when the AdvertiseAddresses are specified
+			Port:               getInt("p2p_port", 9905, alternativeContext...),                                   // This is the port that go-p2p-message-bus will listen on (0.0.0.0 and ::)
 			ListenMode:         getString("listen_mode", ListenModeFull, alternativeContext...),
 			PeerID:             getString("p2p_peer_id", "", alternativeContext...),
 			PrivateKey:         getString("p2p_private_key", "", alternativeContext...),
