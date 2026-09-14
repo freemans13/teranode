@@ -792,3 +792,58 @@ func TestOrphanedSpendIsReversedOnTheNextAttempt(t *testing.T) {
 		require.NoError(t, err, "P:0 was never legitimately consumed and must be spendable")
 	})
 }
+
+// TestRejectedReplayRollsBackFreshSpendsAtZeroRetention: with the effective
+// retention driven to 0 the bulk spend takes its non-DAH shape, which used to
+// be a single UPDATE ... RETURNING. RETURNING evaluates against the post-update
+// row on both engines, so the idempotent flag it reported was unconditionally
+// true and a genuinely fresh write came back looking like a match the store
+// already held. utxo.RollbackSet then held it back from a rejected replay's
+// rollback, orphaning exactly the spend that split was added to reverse.
+// A node that pruned under a positive retention and later has it adjusted to 0
+// still has markers, so the two conditions coexist. Found by review.
+//
+// The bulk path is Postgres-only (BatchSQLOperations && engine == "postgres"),
+// so only that subtest exercises the defect; SQLite takes the per-row path and
+// rides along as a control that the fixture itself is sound.
+func TestRejectedReplayRollsBackFreshSpendsAtZeroRetention(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		p, q, child := twoParentPrunedChild(t, ctx, store)
+
+		// The marker on P is what rejects the replay; drop Q's so its output is
+		// free for a genuinely fresh spend by the same replay.
+		_, err := store.db.ExecContext(ctx,
+			"DELETE FROM deleted_children WHERE parent_id IN (SELECT id FROM transactions WHERE hash = $1)", q.TxIDChainHash()[:])
+		require.NoError(t, err)
+
+		// Release Q:0 so the replay's spend of it is new work, not a match.
+		q0Hash, err := util.UTXOHashFromOutput(q.TxIDChainHash(), q.Outputs[0], 0)
+		require.NoError(t, err)
+		require.NoError(t, store.Unspend(ctx, []*utxo.Spend{{
+			TxID: q.TxIDChainHash(), Vout: 0, UTXOHash: q0Hash,
+			SpendingData: spendpkg.NewSpendingData(child.TxIDChainHash(), 1),
+		}}))
+		require.Nil(t, outputSpendingData(t, ctx, store, q, 0), "fixture: Q:0 is free")
+
+		// Drive the effective retention to 0, which selects the non-DAH shape.
+		store.settings.UtxoStore.BlockHeightRetention = 0
+		store.settings.GlobalBlockHeightRetention = 0
+		require.Zero(t, store.settings.GetUtxoStoreBlockHeightRetention(), "fixture: the non-DAH branch is selected")
+
+		_, err = store.Spend(ctx, child, 1200)
+		require.ErrorIs(t, err, errors.ErrUtxoSpendingTxPruned, "the replay is still rejected on P's marker")
+
+		require.Nil(t, outputSpendingData(t, ctx, store, q, 0),
+			"the replay's fresh spend of Q:0 was written by this call and must be rolled back with it")
+
+		// End state: Q:0 is spendable by a real transaction.
+		replacement := bt.NewTx()
+		require.NoError(t, replacement.From(q.TxID(), 0, q.Outputs[0].LockingScript.String(), q.Outputs[0].Satoshis))
+		replacement.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, replacement.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2999))
+		_, _, err = store.SpendAndCreate(ctx, replacement, 1200)
+		require.NoError(t, err, "Q:0 was never legitimately consumed and must be spendable")
+
+		_ = p
+	})
+}

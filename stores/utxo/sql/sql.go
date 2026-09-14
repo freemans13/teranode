@@ -2408,14 +2408,14 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		wrapDAH := retention > 0
 
 		var ub strings.Builder
-		if wrapDAH {
-			ub.WriteString(`WITH v(transaction_id,idx,spending_data,batch_idx) AS (VALUES `)
-		} else {
-			ub.WriteString(`
-			UPDATE outputs o
-			SET spending_data = v.spending_data
-			FROM (VALUES `)
-		}
+		// Both shapes open the same CTE over the VALUES list. The non-DAH branch
+		// used to be a single UPDATE ... RETURNING, which cannot report whether a
+		// row was already spent by this same spender: RETURNING evaluates against
+		// the POST-update row on both engines, so the comparison it returned was
+		// unconditionally true and every fresh write came back flagged idempotent.
+		// Splitting the write from the already-matching rows is the only way to
+		// read that distinction, so both branches now do it.
+		ub.WriteString(`WITH v(transaction_id,idx,spending_data,batch_idx) AS (VALUES `)
 		updateArgs := make([]interface{}, 0, len(dedupedUpdate)*4+1)
 		pidx := 1
 		for j, u := range dedupedUpdate {
@@ -2501,10 +2501,25 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			UNION ALL
 			SELECT batch_idx, true AS idempotent FROM upd_idem`, dahIdx, dahIdx))
 		} else {
-			ub.WriteString(`) AS v(transaction_id,idx,spending_data,batch_idx)
-			WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx
-			AND (o.spending_data IS NULL OR o.spending_data = v.spending_data)
-			RETURNING v.batch_idx, (o.spending_data = v.spending_data) AS idempotent`)
+			ub.WriteString(`),
+			upd_spent AS (
+				UPDATE outputs o
+				SET spending_data = v.spending_data
+				FROM v
+				WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx
+				  AND o.spending_data IS NULL
+				RETURNING v.batch_idx
+			),
+			upd_idem AS (
+				SELECT v.batch_idx
+				FROM v
+				JOIN outputs o
+				  ON o.transaction_id = v.transaction_id AND o.idx = v.idx
+				WHERE o.spending_data = v.spending_data
+			)
+			SELECT batch_idx, false AS idempotent FROM upd_spent
+			UNION ALL
+			SELECT batch_idx, true AS idempotent FROM upd_idem`)
 		}
 
 		uRows, err := txn.QueryContext(s.ctx, ub.String(), updateArgs...)
