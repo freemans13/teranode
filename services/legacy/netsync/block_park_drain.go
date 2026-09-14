@@ -626,17 +626,34 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 // mechanism: a commit is asked for the blocks parked directly behind it, and
 // those drain at once) cannot serve on its own: the event that would have woken
 // it fired, if at all, in a process that no longer exists. That condition holds
-// once, over a set of blocks known once — everything Recover just adopted — so
+// once, over a set of blocks known once, everything Recover just adopted, so
 // it is answered once here rather than by asking about the same blocks again
 // every thirty seconds for the life of the node, which is what the sweep
 // (sweepParkedBlocks) used to be the only thing doing about it.
 //
 // Cost: bounded by AllParked's own bound, which is the park's contents at the
-// moment recovery finishes — itself bounded upstream by the download walk's
-// read-ahead depth (legacy_blockDownloadWindow and
-// legacy_maxBlocksInTransitPerPeer; see Admit's own comment), 128 with every
-// legacy_* setting at its default. So this costs at most one local chain
-// lookup per recovered block, not per park entry per tick, and it runs once.
+// moment recovery finishes. That is NOT legacy_maxBlocksInTransitPerPeer times
+// the peer count: a peer's in-flight slot is freed the moment its block
+// finishes streaming, not when that block commits, so a stalled frontier does
+// not stop peers cycling through slot after slot, parking one block per
+// height as each arrives. What actually stops the download reading past a
+// point is positional, not a count of requests in flight at once:
+// wantedBlocks (wanted_range_assign.go) never asks for a height more than
+// lookaheadCeilingLocked's ceiling above sm.committedHeight(), and that
+// ceiling is legacy_blockDownloadLowerWindow, 128 by default (see
+// settings.go's own getInt call; the "0" on the field's struct tag in
+// legacy_settings.go is stale doc text, not what NewSettings loads, exactly
+// the trap TestLegacyBlockScheduler_Defaults exists to catch), scaled DOWN
+// from there for a large block, never up. legacy_blockDownloadWindow (1024)
+// is a different, count-shaped bound: how many requests may be outstanding
+// at once, the same class of number as the discredited per-peer one above,
+// and it does not gate position at all. TestWantedRange_TheParkNeverExceedsTheReadAheadDepth
+// is what actually proves the park's population bound is the lower window,
+// not this.
+//
+// So the real worst case is on the order of 128 recovered blocks needing a
+// lookup, not 1024, and never per park entry per tick: one chain lookup per
+// recovered block, once.
 //
 // Deliberately NOT called from Start(), where Recover runs: at that point
 // nothing is reading sm.parkCommits yet (dispatchBlocks, the consumer, and
@@ -653,6 +670,12 @@ func (sm *SyncManager) reconcileRecoveredParents(ctx context.Context) int {
 	handed := 0
 
 	for _, candidate := range sm.blockPark.AllParked() {
+		if ctx.Err() != nil {
+			sm.logger.Warnf("[reconcileRecoveredParents] stopping early (%v) after handing on %d block(s); the rest stay parked for the commit-driven drain or the sweep", ctx.Err(), handed)
+
+			break
+		}
+
 		exists, invalid, parentHeight, err := sm.parentChainState(candidate.prevBlock)
 		if err != nil {
 			sm.logger.Warnf("[reconcileRecoveredParents][%s] could not check parent %s: %v", candidate.hash, candidate.prevBlock, err)
@@ -674,7 +697,7 @@ func (sm *SyncManager) reconcileRecoveredParents(ctx context.Context) int {
 
 		if invalid {
 			// The parent is stored and rejected, so this block can never be
-			// committed — the same judgment sweepParkedBlocks makes for the
+			// committed, the same judgment sweepParkedBlocks makes for the
 			// identical condition, and parkDispositionParentInvalid (drop the
 			// blob, mark failed) rather than parkDispositionParentGone (keep
 			// and retry) is what belongs here: nothing about this parent is
@@ -788,7 +811,7 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 		// This is the evidence line the third case earns its keep with: by now
 		// both the commit-driven drain and reconcileRecoveredParents have had
 		// their chance at this block, so the sweep finding it committable means
-		// something neither of them covers actually happened — most likely a
+		// something neither of them covers actually happened, most likely a
 		// parent committed by something other than legacy sync. If a soak never
 		// prints this, the polling this sweep still does has no job left.
 		sm.logger.Infof("[sweepParkedBlocks][%s] parent %s was in the chain after all; the commit-driven drain and the startup pass both missed it", entry.hash, entry.prevBlock)
