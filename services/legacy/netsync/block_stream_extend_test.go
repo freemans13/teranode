@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/require"
 )
 
@@ -119,6 +120,32 @@ func TestStreamBuilder_StampsARealFeeWhenEveryInputIsExtended(t *testing.T) {
 	fee := b.current.Nodes[b.current.Length()-1].Fee
 	require.Positive(t, fee,
 		"a fully extended transaction has a computable fee, so stamping zero throws away something already in hand")
+}
+
+// TestStreamBuilder_DoesNotExtendFromItself is the ordering claim: a
+// transaction must not extend from its own outputs. Nothing in the builder
+// checks that a caller-supplied hash actually matches the transaction it
+// names, so a transaction whose input's previous-transaction id equals the
+// hash passed for that same AddTx call is constructible, not theoretical —
+// this builds exactly that and pins that it comes out unextended, because its
+// own outputs are not remembered until after it has already been processed.
+func TestStreamBuilder_DoesNotExtendFromItself(t *testing.T) {
+	const txCount = 8
+
+	b, err := newBlockStreamBuilder(txCount, 8, coinbaseTx(t), noopEmit, newDedupMap(txCount))
+	require.NoError(t, err)
+
+	var selfHash chainhash.Hash
+	selfHash[0] = 0xAB
+
+	tx := bt.NewTx()
+	require.NoError(t, tx.FromUTXOs(&bt.UTXO{TxIDHash: &selfHash, Vout: 0, Satoshis: 1000}))
+	require.NoError(t, tx.PayToAddress("1BitcoinEaterAddressDontSendf59kuE", 900))
+
+	require.NoError(t, b.AddTx(tx, &selfHash))
+
+	require.False(t, tx.IsExtended(),
+		"a transaction must not extend from its own outputs; they are not remembered until after it is processed")
 }
 
 // TestStreamBuilder_BoundsWhatItRemembers is the memory guard. Remembering every

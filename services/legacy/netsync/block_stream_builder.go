@@ -257,6 +257,17 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 	// consumer downstream.
 	var fee uint64
 
+	// calculateTransactionFee's error return is not propagated, unlike its call
+	// in the production subtree builder (createSubtrees, handle_block.go),
+	// where the same error is fatal for the block. That divergence is
+	// deliberate here, not an oversight: with extended == true the "not
+	// extended" branch of that error is unreachable, so what can still come
+	// back is only its input-less-than-output case, and the fee this builder
+	// stamps is provisional in every case — subtree validation recomputes it
+	// from transaction metadata before any consensus check reads it. Falling
+	// back to the same zero used for a miss costs nothing that path does not
+	// already re-derive; failing the whole block over a number about to be
+	// thrown away would not.
 	if extended {
 		if f, feeErr := calculateTransactionFee(tx); feeErr == nil && f > 0 {
 			fee = f
