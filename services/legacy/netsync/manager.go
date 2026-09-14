@@ -3613,6 +3613,15 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 
 	peer := sm.nextHeaderRefillPeer(peers)
 
+	// This call only ever runs because the header cache came up short, so
+	// every request from here is a deliberate retry: peer rotation closes
+	// the multi-peer case, but with one eligible peer the (locator, stop
+	// hash) pair is unchanged from last time — the stop hash is always the
+	// zero hash and the locator cannot advance until a block commits — and
+	// PushGetHeadersMsg's own dedup filter would otherwise discard it as an
+	// accidental duplicate while logging success.
+	peer.ForgetLastHeadersRequest()
+
 	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
 		sm.logger.Warnf("[assignWantedBlocks][%s] failed to send getheaders to refill the header cache past height %d: %v", peer.String(), last, err)
 
