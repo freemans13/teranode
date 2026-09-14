@@ -135,6 +135,9 @@ func TestLegacyBlockRejectsReplayWhenStoreSurfacesBareTxNotFound(t *testing.T) {
 		prevBlock: chainhash.HashH([]byte("block 100")),
 		height:    101,
 		timestamp: time.Unix(1700000000, 0),
+		// The quick-validation path runs only for a block whose ancestry a
+		// header run proved, which is the path under test.
+		origin: blockRequestOrigin{headerProven: true},
 	}
 
 	blockErr := sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, 101)
@@ -237,7 +240,7 @@ func TestLegacyLeftoverOfFullyPrunedChainIsNotBlessedOnRetry(t *testing.T) {
 	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper]()
 	txMap.Set(*child.TxIDChainHash(), &TxMapWrapper{Tx: child})
 
-	bi := blockIdent{hash: chainhash.HashH([]byte("replayed block 101, leftover")), prevBlock: chainhash.HashH([]byte("block 100")), height: 101, timestamp: time.Unix(1700000000, 0)}
+	bi := blockIdent{hash: chainhash.HashH([]byte("replayed block 101, leftover")), prevBlock: chainhash.HashH([]byte("block 100")), height: 101, timestamp: time.Unix(1700000000, 0), origin: blockRequestOrigin{headerProven: true}}
 
 	// Attempt 1: the create phase only, then the process dies.
 	created, err := sm.createUtxos(ctx, txMap, bi, 101, true)
@@ -290,7 +293,7 @@ func TestUnlockBlockTransactionsReleasesTheCreatePhaseLock(t *testing.T) {
 		hashes = append(hashes, *tx.TxIDChainHash())
 	}
 
-	bi := blockIdent{hash: chainhash.HashH([]byte("block 100")), height: 100}
+	bi := blockIdent{hash: chainhash.HashH([]byte("block 100")), height: 100, origin: blockRequestOrigin{headerProven: true}}
 	created, err := sm.createUtxos(ctx, txMap, bi, 100, true)
 	require.NoError(t, err)
 	require.Len(t, created, 5)
