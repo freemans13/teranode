@@ -1898,11 +1898,12 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	// Mirrors aerospike spend.go:287-420 — enqueue each spend into the batcher,
 	// wait for batch callback to signal completion via errCh.
 	var (
-		mu              sync.Mutex
-		txAlreadyExists bool
-		succeeded       int
-		spentSpends     = make([]*utxo.Spend, 0, len(spends)) // fresh spends only, for the rollback
-		g               errgroup.Group
+		mu               sync.Mutex
+		txAlreadyExists  bool
+		succeeded        int
+		spentSpends      = make([]*utxo.Spend, 0, len(spends)) // written by this call
+		idempotentSpends = make([]*utxo.Spend, 0, len(spends)) // already recorded; this call wrote nothing
+		g                errgroup.Group
 	)
 
 	// Cap per-tx concurrency into the spend batcher. Without this, a single tx
@@ -2010,10 +2011,11 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			succeeded++
 
 			// An idempotent match wrote nothing: the output already recorded this
-			// exact spend from history. It counts as success, but there is nothing
-			// of this call to roll back, and reversing the historical spend would
-			// free a confirmed output.
-			if !item.idempotent {
+			// exact spend. Kept apart from the fresh spends because whether it may
+			// be reversed depends on why the call failed; see rollbackSet.
+			if item.idempotent {
+				idempotentSpends = append(idempotentSpends, spend)
+			} else {
 				spentSpends = append(spentSpends, spend)
 			}
 			mu.Unlock()
@@ -2031,7 +2033,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// (double-spend, frozen, conflicting, hash mismatch). For transient errors, skip
 		// rollback — the optimistic locking makes spends idempotent for the same spender.
 		if needsSpendRollback(spends) {
-			if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
+			if unspendErr := s.Unspend(context.Background(), utxo.RollbackSet(spends, spentSpends, idempotentSpends)); unspendErr != nil {
 				s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
 			}
 		}

@@ -477,7 +477,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// is idempotent for the same spender, so successful spends can
 		// safely remain and will be silently skipped on retry.
 		if result.rollbackNeeded && len(result.spentSpends) > 0 {
-			if unspendErr := s.Unspend(context.Background(), result.spentSpends); unspendErr != nil {
+			if unspendErr := s.Unspend(context.Background(), utxo.RollbackSet(spends, result.spentSpends, result.idempotentSpends)); unspendErr != nil {
 				s.logger.Errorf("error in aerospike unspend (batched mode, after wait error): %v", unspendErr)
 			}
 		}
@@ -512,7 +512,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// script is idempotent for the same spender, so successful spends can safely
 		// remain and will be silently skipped on retry.
 		if result.rollbackNeeded {
-			if unspendErr := s.Unspend(context.Background(), result.spentSpends); unspendErr != nil {
+			if unspendErr := s.Unspend(context.Background(), utxo.RollbackSet(spends, result.spentSpends, result.idempotentSpends)); unspendErr != nil {
 				s.logger.Errorf("error in aerospike unspend (batched mode): %v", unspendErr)
 			}
 		}
@@ -543,9 +543,10 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 // spends succeeded, and whether rollback is warranted for any completed
 // failure.
 type spendCompletionResult struct {
-	spentSpends    []*utxo.Spend // fresh spends only, for the rollback
-	succeeded      int           // every input that did not fail, idempotent matches included
-	rollbackNeeded bool
+	spentSpends      []*utxo.Spend // written by this call
+	idempotentSpends []*utxo.Spend // already recorded; this call wrote nothing
+	succeeded        int           // every input that did not fail, idempotent matches included
+	rollbackNeeded   bool
 }
 
 // resolveSpendCompletions applies the ErrTxNotFound "already blessed"
@@ -612,10 +613,11 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 		result.succeeded++
 
 		// An idempotent match wrote nothing: the output already recorded this
-		// exact spend from history. It counts as success, but there is nothing of
-		// this call to roll back, and reversing the historical spend would free a
-		// confirmed output.
-		if !item.idempotent {
+		// exact spend. Kept apart from the fresh spends because whether it may be
+		// reversed depends on why the call failed; see utxo.RollbackSet.
+		if item.idempotent {
+			result.idempotentSpends = append(result.idempotentSpends, spend)
+		} else {
 			result.spentSpends = append(result.spentSpends, spend)
 		}
 	}

@@ -297,3 +297,42 @@ func retryStoreCall(ctx context.Context, fn func() error) error {
 
 	return err
 }
+
+// RollbackSet decides which of a failed Spend's successful inputs must be
+// reversed: everything this call actually wrote, plus, in most cases, the
+// inputs whose output already recorded exactly this spend.
+//
+// An idempotent match is ambiguous on the record. "This output already records
+// this spender" is byte-identical whether the spend was committed by a mined
+// transaction long ago or by an earlier failed attempt at this very call, so
+// the record cannot tell the two apart and the answer has to come from why the
+// call is failing now.
+//
+// Exactly one rejection makes the match historical: the pruned-replay marker.
+// It fires only for a transaction this store pruned, which happens only once
+// that transaction was mined, fully spent and buried, so any output recording
+// it as spender is recording a confirmed spend. Reversing that would hand a
+// confirmed output to the next spender, which is the double-spend this
+// exclusion was added to prevent.
+//
+// Every other rejection leaves the match reversible, and reversing it is what
+// keeps the store self-healing. The store leaves partial spends committed when
+// a call fails on a transient error, so an attempt that wrote one input and
+// then failed on another leaves that input spent by a transaction it never
+// created. On the next attempt that input reads as an idempotent match. Holding
+// it back unconditionally made the orphan permanent: the output stayed spent by
+// a transaction the store does not hold, and its next legitimate spender was
+// refused with a txid this node has never seen.
+func RollbackSet(all []*Spend, written, idempotent []*Spend) []*Spend {
+	if len(idempotent) == 0 {
+		return written
+	}
+
+	for _, spend := range all {
+		if spend != nil && spend.Err != nil && errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) {
+			return written
+		}
+	}
+
+	return append(written, idempotent...)
+}

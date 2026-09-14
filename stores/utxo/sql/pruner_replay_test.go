@@ -715,3 +715,80 @@ func TestPrunerMarksOnlyTheChildThatHeldTheSpend(t *testing.T) {
 		require.NoError(t, err, "a transaction that never held the output must be able to spend it once it is free")
 	})
 }
+
+// TestOrphanedSpendIsReversedOnTheNextAttempt: the store leaves partial spends
+// committed when a call fails on an error that is not rollback-class, so an
+// attempt that writes one input and then fails on a MISSING parent leaves that
+// input spent by a transaction it never created. On the next attempt that input
+// reads as an idempotent match. Holding every idempotent match back from the
+// rollback made the orphan permanent: the output stayed spent by a transaction
+// the store does not hold, and its next legitimate spender was refused naming a
+// txid this node has never seen. Found by oskarszoon.
+//
+// Only a pruned-replay rejection makes an idempotent match historical, because
+// only a transaction this store pruned was mined, fully spent and buried. Every
+// other rejection, here a frozen output, leaves it reversible.
+func TestOrphanedSpendIsReversedOnTheNextAttempt(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		p := bt.NewTx()
+		require.NoError(t, p.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
+		p.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, p.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+		_, err := store.Create(ctx, p, 1000)
+		require.NoError(t, err)
+
+		// Q is NOT created yet, so the first attempt fails on a missing record,
+		// which is not a rollback-class error.
+		q := bt.NewTx()
+		require.NoError(t, q.From("2222222222222222222222222222222222222222222222222222222222222222", 0, "51", 30000))
+		q.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, q.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+
+		child := bt.NewTx()
+		for _, parent := range []*bt.Tx{p, q} {
+			require.NoError(t, child.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+		}
+
+		for i := range child.Inputs {
+			child.Inputs[i].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		}
+
+		require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 7000))
+
+		_, err = store.Spend(ctx, child, 1000)
+		require.Error(t, err, "fixture: the call fails on the missing parent")
+
+		require.Equal(t, spendpkg.NewSpendingData(child.TxIDChainHash(), 0).Bytes(),
+			outputSpendingData(t, ctx, store, p, 0),
+			"fixture: P:0 is left spent by a transaction the store never created")
+
+		var childExists bool
+		require.NoError(t, store.db.QueryRowContext(ctx,
+			"SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", child.TxIDChainHash()[:]).Scan(&childExists))
+		require.False(t, childExists, "fixture: the spender was never created")
+
+		// Q arrives, with its output frozen, so the next attempt fails on a
+		// rollback-class error instead.
+		_, err = store.Create(ctx, q, 1000)
+		require.NoError(t, err)
+
+		q0Hash, err := util.UTXOHashFromOutput(q.TxIDChainHash(), q.Outputs[0], 0)
+		require.NoError(t, err)
+		require.NoError(t, store.FreezeUTXOs(ctx, []*utxo.Spend{{TxID: q.TxIDChainHash(), Vout: 0, UTXOHash: q0Hash}}, test.CreateBaseTestSettings(t)))
+
+		// Attempt 2: P:0 now reads as an idempotent match and Q:0 fails.
+		_, err = store.Spend(ctx, child, 1000)
+		require.Error(t, err)
+
+		require.Nil(t, outputSpendingData(t, ctx, store, p, 0),
+			"the orphaned spend must be reversed, not held back as if it were historical")
+
+		// End state: P:0 is spendable by a real transaction again.
+		replacement := bt.NewTx()
+		require.NoError(t, replacement.From(p.TxID(), 0, p.Outputs[0].LockingScript.String(), p.Outputs[0].Satoshis))
+		replacement.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, replacement.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3999))
+		_, _, err = store.SpendAndCreate(ctx, replacement, 1001)
+		require.NoError(t, err, "P:0 was never legitimately consumed and must be spendable")
+	})
+}
