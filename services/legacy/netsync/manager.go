@@ -3516,6 +3516,45 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 // interval simply tries again, possibly of a different peer.
 const headerCacheRefillInterval = 5 * time.Second
 
+// headerCacheRefillThreshold is how many heights the cache must still name
+// above the committed tip before maybeRequestMoreHeaders leaves it alone.
+// Below this, a refill goes out even though the cache is not yet exhausted,
+// so a fresh batch is normally already in hand by the time the current one
+// runs dry.
+//
+// Measured on Hetzner mainnet, and the second measurement is what actually
+// sizes this. First: the node commits a 2,000-header batch in about 100
+// seconds (roughly 1,200 blocks/min, 20 blocks/s) between cache boundaries.
+// Second, and the one that matters, is what a refill actually costs at a
+// boundary: on the run from 8,000, the node asked three different peers, at
+// 12:50:11, 12:50:16 and 12:50:38, and only the third answered. A refill is
+// not one round trip, it is however many attempts the rate limit's 5-second
+// floor (headerCacheRefillInterval) needs to reach a peer that actually
+// replies, and that run cost about 40 seconds of dead time before the ~1%
+// answer landed. The threshold has to buy enough runway for two or three
+// failed attempts, not one.
+//
+// The natural source for that number would be the read-ahead depth
+// (legacy_blockDownloadLowerWindow), since it already expresses how far
+// ahead of the tip the node is willing to work. It ships at 128
+// (settings/legacy_settings.go), and scales down further under
+// lookaheadCeilingLocked for a large-block era — never up. 128 is only 6.4
+// seconds of runway at 20 blocks/s, nowhere near the observed 40-second
+// stall, so using it directly here would refill every single pass once the
+// tip is within 128 of the cache's end, no earlier than the exhaustion check
+// already fires in practice. It is the wrong quantity: it bounds how far
+// downloads may run ahead of the commit frontier, not how much header
+// lookahead a getheaders round trip needs.
+//
+// wire.MaxBlockHeadersPerMsg is what a getheaders reply actually delivers in
+// one batch (2,000 heights), and it is the other quantity already in the
+// code that scales with the same thing this threshold cares about: how much
+// header runway one round trip buys. Half a batch, 1,000 heights, is about
+// 50 seconds of runway at the measured 20 blocks/s — comfortably past the
+// observed 40-second three-attempt stall — while still leaving the other
+// half of the batch as slack before the backstop below would have to fire.
+const headerCacheRefillThreshold = int32(wire.MaxBlockHeadersPerMsg / 2)
+
 // maybeRequestMoreHeaders is assignWantedBlocks' other half: the wanted range
 // only ever names what the cache already holds, and nothing before this
 // existed to refill it once a round ran out. wanted is what wantedBlocks()
@@ -3524,12 +3563,21 @@ const headerCacheRefillInterval = 5 * time.Second
 // "is there more of the run to read", so this must see the pass's full range
 // and run whether or not a download budget happens to be free this time.
 //
-// The check is simple: does the cache still name the height right above the
-// last one this pass was handed? If it does, wantedBlocksFromCache stopped at
-// the configured depth with headers to spare, and there is nothing to do here
-// — the next pass reads further into what the cache already has. Only when
-// the cache itself has nothing past that point has the run actually ended,
-// which is when a fresh getheaders is owed.
+// Two checks decide whether to ask again, not one. The backstop: does the
+// cache still name the height right above the last one this pass was handed?
+// If not, wantedBlocksFromCache ran clean off the end of what the cache
+// holds and a fresh getheaders is owed regardless of anything else — this is
+// unchanged from before this comment was written and stays the ultimate
+// fallback. The early trigger, checked only when the backstop finds
+// something: how many heights does the cache still name above the committed
+// tip, independent of the read-ahead depth that capped this pass's own
+// wanted range? wantedBlocksFromCache stops at that depth (128 by default)
+// long before the cache itself runs out, since one getheaders reply names up
+// to 2,000 heights — so waiting for the depth-limited range to reach the
+// cache's own end, as the backstop alone does, means the node only ever asks
+// once the cache is completely drained. headerCacheRefillThreshold asks
+// earlier than that, while there is still cache left to work through, so the
+// reply has time to land before the current batch runs out.
 //
 // The locator is built exactly as startSync's and headersRoundLocator's own
 // callers build theirs: from the committed tip, through the chain's own
@@ -3552,15 +3600,26 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	last, _, _ := sm.committedTip()
+	best, _, _ := sm.committedTip()
+
+	last := best
 	if n := len(wanted); n > 0 {
 		last = wanted[n-1].height
 	}
 
+	top, haveTop := sm.headerCache.Top()
+
 	if _, ok := sm.headerCache.At(last + 1); ok {
-		// The depth cap stopped the pass, not the cache's own end; the rest of
-		// the run is still there for the next pass to read.
-		return
+		// The depth cap stopped the pass, not the cache's own end, so the
+		// backstop alone has nothing to do here. Whether the early trigger
+		// does depends on how much cache is left above the committed tip,
+		// not on the depth cap: top-best can be far bigger than the read-ahead
+		// depth that limited this pass's own wanted range. Only skip the
+		// refill when there is still comfortably more than
+		// headerCacheRefillThreshold left to work through.
+		if haveTop && top-best >= headerCacheRefillThreshold {
+			return
+		}
 	}
 
 	peers := sm.eligibleBlockPeers()
@@ -3605,7 +3664,11 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	sm.logger.Infof("[assignWantedBlocks][%s] the header cache ends at height %d, asked for more", peer.String(), last)
+	if haveTop {
+		sm.logger.Infof("[assignWantedBlocks][%s] the header cache names %d more heights above the committed tip at %d, asked for more", peer.String(), top-best, best)
+	} else {
+		sm.logger.Infof("[assignWantedBlocks][%s] the header cache is empty above height %d, asked for more", peer.String(), last)
+	}
 }
 
 // allowedToRequestMoreHeadersNow is the compare-and-swap that makes the
