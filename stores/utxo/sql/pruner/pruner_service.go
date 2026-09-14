@@ -279,19 +279,25 @@ func (e *pruneStepError) Unwrap() error { return e.err }
 // output already names it, and inferring "pruned" there would let the pruner
 // delete a parent out from under a child that is about to exist.
 //
-// An operator who wants the backlog cleared can run the equivalent one-shot
-// backfill with the node stopped, when no create can be in flight:
+// A one-shot backfill keyed on "the spender has no row" is the obvious way to
+// clear the backlog, and it is NOT safe. Pruning is not the only producer of
+// that state. The validator's shed unwind deletes a transaction's record first
+// and reverses its spends afterwards (services/validator unwindShed, which calls
+// DeleteComplete and has arms that return before the Unspend), so a node that
+// sheds transaction X under backpressure and then fails between those two steps
+// leaves X's spend recorded on a parent output with no row for X. X is a valid
+// unmined transaction whose sender will resubmit it. A backfill cannot tell the
+// two apart, and marking (parent, X) is worse than the gap it closes: every
+// future spend of that output by X is refused permanently with
+// ERR_UTXO_SPENDING_TX_PRUNED, while no one else can take it either, because the
+// output still records X as its spender. The output is burned. Raised by
+// icellan in review.
 //
-//	INSERT INTO deleted_children (parent_id, child_hash)
-//	SELECT DISTINCT o.transaction_id, substr(o.spending_data, 1, 32)
-//	FROM outputs o
-//	WHERE o.spending_data IS NOT NULL
-//	  AND NOT EXISTS (SELECT 1 FROM transactions c WHERE c.hash = substr(o.spending_data, 1, 32))
-//	ON CONFLICT DO NOTHING;
-//
-// That is a full scan of outputs and is deliberately not run automatically: on a
-// mainnet-sized store it is hours of work inside one transaction, which is not
-// something a node should do on every boot.
+// So the backlog has no safe automatic remedy from inside the store, and this
+// package deliberately offers no recipe for one. What an operator can do is
+// re-sync the affected store, which rebuilds both the records and their markers
+// from the chain. Anything narrower needs a source of truth this table does not
+// have: whether the absent spender was mined and pruned, or merely lost.
 func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (int64, error) {
 	// Every statement below is a complete literal. Nothing is concatenated at
 	// runtime and no part of the SQL is ever built from data.
