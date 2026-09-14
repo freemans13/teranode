@@ -71,21 +71,25 @@ func newSubtreeWriter(logger ulogger.Logger, tSettings *settings.Settings, store
 // newSubtreeWriterUnresolvedHeight builds a writer for a block whose parent
 // height pipelineParentHeight could not resolve at conversion time.
 //
-// Both of the height-dependent decisions below get an explicit, safe answer
-// rather than being computed from a height that would otherwise default to
-// zero:
+// Both of the height-dependent decisions below get an explicit answer rather
+// than being computed from a height that would otherwise default to zero:
 //
 // The structure file type is unconditionally .subtreeToCheck (quickValidation
-// is forced false and never exposed as a constructor argument here). A zero
-// height would otherwise be read by quickValidationAllowed as below every
-// checkpoint and select .subtree, which asserts "already validated" for a
-// block this node has no way to place on the checkpoint ladder — the one
-// genuinely unsafe outcome available in this task.
+// is forced false and never exposed as a constructor argument here). This is
+// defence in depth, not a correctness fix: model.BelowCheckpoint
+// (model/checkpoint.go) already requires height > 0 before anything else,
+// deliberately and documented, and that clause predates this branch — a zero
+// height was never going to be read as below any checkpoint, and
+// quickValidationAllowed(0) has always been false. Forcing it explicitly here
+// means this constructor cannot start writing the unearned, already-validated
+// .subtree form if that positivity clause is ever loosened or removed later
+// without this file being touched.
 //
 // The delete-at-height is dah, supplied by the caller rather than computed
 // from height + retention (which a zero height would put far below the chain
 // tip, collecting the files almost immediately out from under a block still
-// waiting). The caller computes it as the committed tip plus the read-ahead
+// waiting — this half IS a real correctness requirement, unlike the file-type
+// half above). The caller computes it as the committed tip plus the read-ahead
 // depth plus the retention — above any height this block can actually have,
 // the same guarantee height + retention gives when the height is real.
 func newSubtreeWriterUnresolvedHeight(logger ulogger.Logger, tSettings *settings.Settings, store blob.Store, dah uint32) *subtreeWriter {

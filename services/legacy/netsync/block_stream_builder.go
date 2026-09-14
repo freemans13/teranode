@@ -210,9 +210,20 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 
 	nodeIdx := b.current.Length()
 
-	// Fee is stamped zero. Subtree fees are not consensus-checked below the
-	// highest hard-coded checkpoint, and the inputs are not decorated on this
-	// path, so a real fee is neither available nor needed.
+	// Fee is stamped zero regardless of height. Below the checkpoint subtree
+	// fees are not consensus-checked at all, so a placeholder is enough on its
+	// own. Above the checkpoint they are checked — but not trusted from
+	// whatever this builder stamped: newSubtreeWriter/newSubtreeWriterUnresolvedHeight
+	// (subtree_writer.go) write every subtree from this path as
+	// FileTypeSubtreeToCheck, never the already-validated FileTypeSubtree,
+	// whenever quickValidationAllowed is false — which above the checkpoint it
+	// always is (task 13 removed the refusal that used to keep this builder
+	// off that range entirely). Subtree validation then re-derives the real
+	// fee from the transactions before anything consensus-relevant reads it,
+	// exactly as it does for a subtree fetched whole from a peer, which also
+	// carries no fee of its own until that same re-derivation runs. Either
+	// way, and the inputs are not decorated on this path, so a real fee is
+	// neither available nor needed here.
 	if err := b.current.AddNode(*txHash, 0, uint64(tx.Size())); err != nil {
 		return b.fail(errors.NewSubtreeError("[blockStreamBuilder] failed adding transaction %s to subtree %d", txHash, b.emitted, err))
 	}

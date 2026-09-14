@@ -38,16 +38,21 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	// block body to one file any more.
 	//
 	// An unknown parent height does not stop it. The height feeds exactly two
-	// decisions and both have a safe answer without one. The subtree file type
-	// takes .subtreeToCheck, which means "still needs validating": conservative,
-	// because writing .subtree unearned would skip validation, while writing
-	// .subtreeToCheck unnecessarily only costs work. The delete-at-height falls
-	// back to the committed tip plus the read-ahead depth plus the retention,
-	// which is above any height this block can actually have, so it gives the
-	// same guarantee a known height does: pruning is driven by the committed
-	// chain, and a block waiting in the park is above it. The committer
-	// re-derives the height from the store before committing anything, so a
-	// record carrying zero is corrected there.
+	// decisions and both have an explicit answer without one. The subtree file
+	// type takes .subtreeToCheck ("still needs validating"), forced there
+	// rather than left to fall out of quickValidationAllowed(0): that call
+	// already returns false for height 0 today, because model.BelowCheckpoint
+	// requires height > 0 before anything else and that clause predates this
+	// branch — so this is defence in depth against that clause moving later,
+	// not a fix for a live misreading. The delete-at-height falls back to the
+	// committed tip plus the read-ahead depth plus the retention, which is
+	// above any height this block can actually have, so it gives the same
+	// guarantee a known height does: pruning is driven by the committed chain,
+	// and a block waiting in the park is above it — this half IS load-bearing,
+	// unlike the file-type half above, because nothing else stops a delete
+	// computed from height + retention landing far below the tip. The
+	// committer re-derives the height from the store before committing
+	// anything, so a record carrying zero is corrected there.
 	//
 	// Two refusals used to sit here and both were wrong. One declined to convert
 	// above the final checkpoint, on the grounds that a converted record carries
@@ -239,13 +244,17 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // structure file type each one was written under — FileTypeSubtree or
 // FileTypeSubtreeToCheck — is a pure function of the record's own height via
 // quickValidationAllowed, the same test subtreeWriter used to choose it while
-// writing, EXCEPT at height 0: that is pipelineParentHeight's own "unresolved"
-// sentinel (see its doc comment), never a real height, and subtreeWriter's
-// unresolved-height constructor always wrote FileTypeSubtreeToCheck for it
-// regardless of what quickValidationAllowed(0) would say (0 reads as below
-// every checkpoint, which is exactly the misreading that constructor exists to
-// avoid). Reusing quickValidationAllowed here for that case would ask for the
-// wrong file type and leave the real one behind.
+// writing. Height 0 is pipelineParentHeight's own "unresolved" sentinel (see
+// its doc comment), never a real height, and subtreeWriter's unresolved-height
+// constructor always writes FileTypeSubtreeToCheck for it. The explicit
+// `record.Height != 0` guard below is NOT what makes that agree with what was
+// actually written: quickValidationAllowed(0) already returns false on its
+// own, because model.BelowCheckpoint requires height > 0 before anything else
+// — a clause that predates this branch — so plain quickValidationAllowed(record.Height)
+// would compute the same FileTypeSubtreeToCheck for height 0 with no guard at
+// all. The guard is left in as defence in depth against that positivity
+// clause moving later, matching subtreeWriter's own belt-and-braces choice,
+// not because removing it would delete the wrong file today.
 //
 // The converted record itself is NOT deleted here. It is deleted inside
 // blockPark.Delete, which streamingBlockDelete below calls unconditionally, so
@@ -355,11 +364,25 @@ func (sm *SyncManager) fallbackSubtreeDAH() uint32 {
 	}
 
 	depth := 1
-	if sm.settings != nil && sm.settings.Legacy.BlockDownloadWindow > depth {
-		depth = sm.settings.Legacy.BlockDownloadWindow
+
+	var retention uint32
+
+	// One guard covering both settings reads, not just the first: reading
+	// GetSubtreeValidationBlockHeightRetention through a nil sm.settings is
+	// the same guard-page hazard this package already tests for elsewhere
+	// (settings/legacy_settings.go's fields sit well past the 4096-byte page a
+	// Go process leaves unmapped at low addresses, so a nil-settings read this
+	// far in can fault outside what the runtime turns back into an ordinary,
+	// catchable panic — see TestInstallStreamingBlockPath_NilSettingsDoesNotPanic).
+	if sm.settings != nil {
+		if sm.settings.Legacy.BlockDownloadWindow > depth {
+			depth = sm.settings.Legacy.BlockDownloadWindow
+		}
+
+		retention = sm.settings.GetSubtreeValidationBlockHeightRetention()
 	}
 
-	return uint32(tip) + uint32(depth) + sm.settings.GetSubtreeValidationBlockHeightRetention()
+	return uint32(tip) + uint32(depth) + retention
 }
 
 // dedupInitialCapacity bounds the pipeline dedup map's pre-sizing hint. It is a

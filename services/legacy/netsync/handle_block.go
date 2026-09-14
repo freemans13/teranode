@@ -496,41 +496,43 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	// full validation reads too).
 	//
 	// What still has to hold is the same "parent resolved" test the sink
-	// itself runs, because everything below this point trusts blk.Height
-	// enough to compare it against the store's own view, and a record whose
-	// height was never resolved (the sentinel 0 pipelineParentHeight's
-	// fallback writes) needs correcting before that comparison means
-	// anything — see the re-derivation a few lines down. By the time a
-	// commit is attempted the parent is already required to be committed
-	// (parentIsInChain, streaming_install.go, gates the drain that gets here),
-	// so this should almost always pass; it is kept as an assertion for the
-	// same reason the legacyUnified check used to be one.
+	// itself runs — a record whose height was never resolved (the sentinel 0
+	// pipelineParentHeight's fallback writes) needs correcting before
+	// anything below trusts blk.Height. That test is answered by THIS lookup,
+	// not a separate pipelineParentHeight call: a first version of this fix
+	// called pipelineParentHeight here too, purely to evaluate the gate,
+	// before making the identical GetBlockHeader call below to re-derive the
+	// height — two store round trips for the same parent, on the single
+	// goroutine that commits every block in order, which starving is this
+	// node's own known stall mode. GetBlockHeader failing with
+	// ErrBlockNotFound below IS "not resolved": by the time a commit is
+	// attempted the parent is already required to be committed
+	// (parentIsInChain, streaming_install.go, gates the drain that gets
+	// here), so pipelineParentHeight's extra header-cache path (needed at
+	// conversion time, when the parent may still only be in flight) answers
+	// nothing here that this store call does not already answer.
 	//
-	// A ServiceError, not anything else, for the same reason the old
-	// assertion used one: parkCommitFailure reads a ServiceError as
-	// parkDispositionRetryLater (keep the blob, no rewind, no blame) rather
-	// than parkDispositionBlockRejected (delete the only copy, rewind the
-	// cursor, blame the peer, and fail the block forever at that height) —
-	// see pipeline_sink.go's own gate comment for the rule this protects:
-	// never let a converted record reach a committer that can refuse it on a
-	// condition the re-download would only reproduce.
-	if _, resolved := sm.pipelineParentHeight(*blk.Header.HashPrevBlock); !resolved {
-		return errors.NewServiceError("[HandleConvertedBlock][%s] parent %s is not yet resolvable; retrying once it is", blockHash.String(), blk.Header.HashPrevBlock)
-	}
-
-	// Resolve and verify this block's height from the chain's current view of its
-	// parent — the same lookup HandleBlockDirect's nil-parent branch makes. The
-	// record's own Height was resolved once already, at conversion time
-	// (pipelineParentHeight), from whichever of the header cache or the store
-	// answered first; re-deriving it here from the store catches the record
-	// having gone stale (e.g. a reorg) between conversion and commit.
+	// A ServiceError, not anything else, for the not-found case: parkCommitFailure
+	// reads a ServiceError as parkDispositionRetryLater (keep the blob, no
+	// rewind, no blame) rather than parkDispositionBlockRejected (delete the
+	// only copy, rewind the cursor, blame the peer, and fail the block
+	// forever at that height) — see pipeline_sink.go's own gate comment for
+	// the rule this protects: never let a converted record reach a committer
+	// that can refuse it on a condition the re-download would only
+	// reproduce. (parkCommitFailure also has its own dedicated
+	// errors.ErrBlockNotFound case, parkDispositionParentGone, which keeps
+	// the blob just as this does; this still classifies explicitly rather
+	// than relying on that fallback matching, so the classification here is
+	// not a silent side effect of what error type happens to wrap what.)
 	_, previousBlockHeaderMeta, err := sm.blockchainClient.GetBlockHeader(ctx, blk.Header.HashPrevBlock)
 	if err != nil {
 		if errors.Is(err, errors.ErrBlockNotFound) {
 			sm.logger.Debugf("[HandleConvertedBlock][%s] previous block %s not found (orphan/out-of-order; caller will request missing blocks): %v", blockHash.String(), blk.Header.HashPrevBlock, err)
-		} else {
-			sm.logger.Errorf("[HandleConvertedBlock][%s] failed to get block header for previous block %s: %s", blockHash.String(), blk.Header.HashPrevBlock, err)
+
+			return errors.NewServiceError("[HandleConvertedBlock][%s] parent %s is not yet resolvable; retrying once it is", blockHash.String(), blk.Header.HashPrevBlock, err)
 		}
+
+		sm.logger.Errorf("[HandleConvertedBlock][%s] failed to get block header for previous block %s: %s", blockHash.String(), blk.Header.HashPrevBlock, err)
 
 		return errors.NewProcessingError("failed to get block header for previous block %s", blk.Header.HashPrevBlock, err)
 	}
@@ -627,9 +629,14 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	}
 
 	// Wait for the previous block's setTxMined to complete — see
-	// needsParentMinedWait for the redundancy argument; this route only ever
-	// reaches heights where the outpoint-only fast path is active, where the
-	// wait is already skipped.
+	// needsParentMinedWait for the redundancy argument. Below the checkpoint,
+	// on the outpoint-only fast path, that wait is skipped as redundant, same
+	// as HandleBlockDirect above. Above the checkpoint this route now also
+	// receives converted records (task 13), where outpoint-only is not
+	// active, so the wait runs here exactly as it does for any other
+	// above-checkpoint block on the ordinary route — not a route that only
+	// ever lands below the checkpoint, as a stale version of this comment
+	// once claimed.
 	if sm.needsParentMinedWait(blockHeight) {
 		if err = sm.waitForPreviousBlockMined(ctx, blk.Header.HashPrevBlock, blockHeight); err != nil {
 			return err
