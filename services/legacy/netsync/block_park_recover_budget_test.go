@@ -48,8 +48,8 @@ func (s *parkStallingStore) GetIoReader(ctx context.Context, key []byte, fileTyp
 // spends is a second the node is not syncing, not answering and not visibly
 // doing anything. Each file it looks at costs one store read, and each read is
 // bounded — but the number of files is not: it is whatever a previous run left
-// behind, and that run may have had a much larger legacy_parkMaxBytes. Files
-// times the per-operation deadline is not a bound anybody chose.
+// behind, and that run may have kept far more blocks on disk than this one
+// will. Files times the per-operation deadline is not a bound anybody chose.
 //
 // The end state asserted here is the one an operator cares about: the node
 // starts. What recovery did not reach is left on disk for the next start.

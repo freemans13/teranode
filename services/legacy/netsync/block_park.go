@@ -1386,10 +1386,10 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 	//
 	// Without it the cost of starting the node is files x storeTimeout, and the
 	// number of files is set by whatever a PREVIOUS run left behind — a run that
-	// may have had a much larger legacy_parkMaxBytes, so this run refuses most of
-	// them and pays a store delete for each. That happens before blockHandler is
-	// started, so it is time the node spends not syncing, not answering, and not
-	// visibly doing anything.
+	// may have kept far more blocks on disk than this one will, so this run
+	// refuses most of them and pays a store delete for each. That happens before
+	// blockHandler is started, so it is time the node spends not syncing, not
+	// answering, and not visibly doing anything.
 	//
 	// Whatever the budget does not reach is simply left on disk. It is not lost:
 	// nothing is charged for it, nothing points at it, and the next start scans
