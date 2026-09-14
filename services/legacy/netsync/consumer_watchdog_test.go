@@ -244,9 +244,11 @@ func TestConsumerStallLineIsOneLine(t *testing.T) {
 // above it. The blocks the node actually needed were fifty thousand heights
 // below the back of the old header list, which is why the watchdog has to
 // print both the committed height and where the cache's own run ends.
-func seedStalledHeaderRound(sm *SyncManager, best int32, above int) {
+func seedStalledHeaderRound(t *testing.T, sm *SyncManager, best int32, above int) {
+	t.Helper()
+
 	anchor := chainhash.Hash{0xa0}
-	sm.lastCommittedTip.Store(&committedTip{height: best, hash: anchor})
+	mockCommittedTip(t, sm, uint32(best), 0) //nolint:gosec // a fixture height, never negative
 
 	var nonce uint32
 	msg, _ := linkedHeaders(anchor, above, &nonce)
@@ -284,7 +286,7 @@ func TestConsumerWatchdog_ReportsTheHeaderCacheState(t *testing.T) {
 	log := &captureLogger{Logger: ulogger.TestLogger{}}
 	sm := &SyncManager{logger: log}
 
-	seedStalledHeaderRound(sm, 849900, 100)
+	seedStalledHeaderRound(t, sm, 849900, 100)
 
 	line := stallReport(t, sm, log)
 
@@ -303,7 +305,7 @@ func TestConsumerWatchdog_ReportsCacheStateEvenWithHeadersFirstOff(t *testing.T)
 	log := &captureLogger{Logger: ulogger.TestLogger{}}
 	sm := &SyncManager{logger: log}
 
-	seedStalledHeaderRound(sm, 800128, 12)
+	seedStalledHeaderRound(t, sm, 800128, 12)
 	sm.headersFirstMode.Store(false)
 
 	line := stallReport(t, sm, log)

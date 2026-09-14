@@ -28,8 +28,7 @@ func cacheManager(t *testing.T, best int32, depth int32) (*SyncManager, *peerpkg
 	sm.settings.Legacy.BlockDownloadLowerWindow = int(depth)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = int(depth)
 
-	committedTipHash := chainhash.Hash{0xbb}
-	sm.noteCommittedHeight(best, committedTipHash)
+	mockCommittedTip(t, sm, uint32(best), 0) //nolint:gosec // a small test height
 
 	parent := chainhash.Hash{0xaa}
 	sm.headerCache = newHeaderCache()
@@ -72,10 +71,11 @@ func TestNewModel_ACheckpointAnchorDoesNotGateAnything(t *testing.T) {
 // This used to pin resetHeaderState, the function that threw away the entire
 // header list and that on the multi-peer path was never even reached. That
 // function is deleted along with the list it rebuilt: the checkpoint is
-// recomputed on demand from committedHeight() wherever it is needed, and there
-// is no longer a stored copy for anything to reset. leaveHeadersFirstMode is
-// what is left of any headers-first state transition, and it touches exactly
-// one field — the atomic bool itself — which wantedBlocks never reads at all.
+// recomputed on demand from the chain's own committed height wherever it is
+// needed, and there is no longer a stored copy for anything to reset.
+// leaveHeadersFirstMode is what is left of any headers-first state
+// transition, and it touches exactly one field — the atomic bool itself —
+// which wantedBlocks never reads at all.
 //
 // This asserts the wanted range directly, by height and by hash, rather than
 // by watching a peer get asked, for the same reason the original version of
@@ -87,12 +87,14 @@ func TestNewModel_ACheckpointAnchorDoesNotGateAnything(t *testing.T) {
 func TestNewModel_LeavingHeadersFirstModeLosesNothing(t *testing.T) {
 	sm, _, _ := cacheManager(t, 500, 8)
 
-	before := sm.wantedBlocks()
+	best, _, _ := sm.committedTip()
+
+	before := sm.wantedBlocks(best)
 	require.NotEmpty(t, before, "sanity: there must be a wanted range for the transition to have a chance of losing")
 
 	sm.leaveHeadersFirstMode()
 
-	after := sm.wantedBlocks()
+	after := sm.wantedBlocks(best)
 
 	require.Equal(t, before, after,
 		"leaving headers-first mode must not change the wanted range, by height or by hash; the new model reads it from the header cache and the committed height, neither of which that transition touches")
@@ -109,10 +111,10 @@ func TestNewModel_LeavingHeadersFirstModeLosesNothing(t *testing.T) {
 // settled at 868, and the park held its full 4,096 entries.
 //
 // A block delivered with no body is exactly that arrival without a commit: the
-// current lookaheadCeilingLocked already anchors on sm.committedHeight() rather
-// than the header list front, and committedHeight only moves on
-// noteCommittedHeight, which a message carrying no block never reaches. This
-// pins that property directly rather than trusting it did not regress.
+// current lookaheadCeilingLocked already anchors on the committed height read
+// from the chain itself, and nothing about an arrival that never commits
+// changes what the chain reports as its tip. This pins that property directly
+// rather than trusting it did not regress.
 //
 // handleBlockMsg here returns a single error, not the three values the
 // original brief called it with — that draft predates the head/tail split this
@@ -129,8 +131,10 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	before := rec.count()
 	rec.reset()
 
+	bestBeforeArrival, _, _ := sm.committedTip()
+
 	sm.headerMu.Lock()
-	ceilingBefore, limitedBefore := sm.lookaheadCeilingLocked()
+	ceilingBefore, limitedBefore := sm.lookaheadCeilingLocked(bestBeforeArrival)
 	sm.headerMu.Unlock()
 
 	require.True(t, limitedBefore, "the ceiling must be engaged, or this test proves nothing")
@@ -139,8 +143,13 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	// ownership) have to be satisfied for the call to reach the "no block"
 	// return this test wants to drive, rather than bailing out earlier at
 	// "unknown peer" — which would exercise nothing.
+	//
+	// Added to the mock cacheManager already installed via mockCommittedTip,
+	// not a fresh replacement for it: committedTip's own GetBestBlockHeader
+	// stub has to stay in place for the "after" read below to answer at all.
 	running := blockchain2.FSMStateRUNNING
-	blockchainClient := &blockchain2.Mock{}
+	blockchainClient, ok := sm.blockchainClient.(*blockchain2.Mock)
+	require.True(t, ok, "harness check: cacheManager must install a *blockchain2.Mock")
 	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
 	// maybeRequestMoreHeaders reaches this once the cache runs past what
 	// cacheManager seeded, which this test's own arrival does not commit past —
@@ -148,7 +157,6 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	blockchainClient.Mock.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 		Return([]*chainhash.Hash{{}}, nil)
 	sm.ctx = context.Background()
-	sm.blockchainClient = blockchainClient
 
 	hash, ok := sm.headerCache.At(501)
 	require.True(t, ok)
@@ -158,8 +166,15 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	err := sm.handleBlockMsg(&blockQueueMsg{blockHash: hash, peer: peer})
 	require.Error(t, err, "a queue message carrying no block is a programming fault, not a sync one, and handleBlockMsg says so")
 
+	// Read fresh again, the same way assignWantedBlocks would on the next pass:
+	// the point under test is that this SECOND read of the real chain still
+	// comes back unchanged, because the arrival above never committed anything.
+	bestAfterArrival, _, _ := sm.committedTip()
+	require.Equal(t, bestBeforeArrival, bestAfterArrival,
+		"an arrival that never committed must not move what the chain reports as its tip")
+
 	sm.headerMu.Lock()
-	ceilingAfter, limitedAfter := sm.lookaheadCeilingLocked()
+	ceilingAfter, limitedAfter := sm.lookaheadCeilingLocked(bestAfterArrival)
 	sm.headerMu.Unlock()
 
 	require.True(t, limitedAfter)

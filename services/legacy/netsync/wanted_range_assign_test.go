@@ -54,8 +54,8 @@ func assignHarness(t *testing.T, from, to int32) (*SyncManager, *getDataRecorder
 // headerList, so it is left unseeded.
 //
 // BlockDownloadLowerWindow alone is what bounds these tests at assignPassDepth:
-// lookaheadCeilingLocked anchors on sm.committedHeight() now, which each test
-// seeds for itself after calling this, so the ceiling engages on that alone and
+// lookaheadCeilingLocked anchors on the committed height now, which each test
+// mocks the chain to report after calling this, so the ceiling engages on that alone and
 // BlockDownloadWindow is left at its real default. Setting the node-wide window
 // to the same value as the depth used to be how this fixture routed around a
 // ceiling that could not engage at all; doing that here now would only mask
@@ -89,7 +89,7 @@ func waitForPass(t *testing.T, rec *getDataRecorder) {
 // TestAssignWantedBlocks_AsksForWhatIsWantedAndNotOwed is the ordinary pass.
 func TestAssignWantedBlocks_AsksForWhatIsWantedAndNotOwed(t *testing.T) {
 	sm, rec := assignHarness(t, 1, 20)
-	sm.lastCommittedTip.Store(&committedTip{height: 10})
+	mockCommittedTip(t, sm, 10, 0)
 
 	sm.assignWantedBlocks()
 
@@ -99,12 +99,53 @@ func TestAssignWantedBlocks_AsksForWhatIsWantedAndNotOwed(t *testing.T) {
 		"and it must not ask beyond the read-ahead depth")
 }
 
+// TestAssignWantedBlocks_FollowsAChainAdvanceMadeOutsideLegacySync pins the
+// other bug the stored, self-updated tip had, alongside the same-height reorg
+// wedge covered in header_cache_wiring_test.go: a chain advance made by any
+// route OTHER than this package's own HandleBlockDirect/HandleConvertedBlock
+// commits — a different node process, a different code path, anything — used
+// to leave the stored copy behind for good, pinning the wanted range below the
+// real tip for the rest of the process's life. Reading the chain directly, as
+// committedTip now does, has no such copy to go stale: the very next read sees
+// whatever the chain reports, whoever advanced it.
+//
+// Asserted on wantedBlocks directly, by height, rather than through a getdata
+// recorder: a second pass's heights 16-18 would already be owed to the peer
+// from the first pass, and filtering that out is unownedBlocks' job, not
+// evidence about what the wanted range itself starts at.
+func TestAssignWantedBlocks_FollowsAChainAdvanceMadeOutsideLegacySync(t *testing.T) {
+	sm := assignManager(t, 1, 30)
+	mockCommittedTip(t, sm, 10, 0)
+
+	best, _, ok := sm.committedTip()
+	require.True(t, ok)
+	require.Equal(t, int32(10), best, "sanity: the mock answers what this test just told it to")
+
+	wanted := sm.wantedBlocks(best)
+	require.NotEmpty(t, wanted)
+	require.Equal(t, int32(11), wanted[0].height, "the range starts just above the old tip")
+
+	// The chain advances by some route this package never touches — no
+	// HandleBlockDirect, no HandleConvertedBlock, nothing on this SyncManager
+	// at all. Only the mocked answer changes, standing in for that other route.
+	mockCommittedTip(t, sm, 15, 1)
+
+	best, _, ok = sm.committedTip()
+	require.True(t, ok)
+	require.Equal(t, int32(15), best, "committedTip must follow the chain's advance on the very next read")
+
+	wanted = sm.wantedBlocks(best)
+	require.NotEmpty(t, wanted)
+	require.Equal(t, int32(16), wanted[0].height,
+		"the wanted range must start above the NEW tip, not the old one a locally cached copy would still be reporting")
+}
+
 // TestAssignWantedBlocks_DoesNotReAskForABlockAlreadyOwed pins the duplicate
 // guard. Asking again inside the retry window wastes a slot the pass could have
 // spent on a block nobody owes.
 func TestAssignWantedBlocks_DoesNotReAskForABlockAlreadyOwed(t *testing.T) {
 	sm, rec := assignHarness(t, 1, 20)
-	sm.lastCommittedTip.Store(&committedTip{height: 10})
+	mockCommittedTip(t, sm, 10, 0)
 
 	sm.assignWantedBlocks()
 	waitForPass(t, rec)
@@ -127,7 +168,7 @@ func TestAssignWantedBlocks_DoesNotReAskForABlockAlreadyOwed(t *testing.T) {
 // second copy arrive unowned and lose its association for it.
 func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 	sm := assignManager(t, 1, 20)
-	sm.lastCommittedTip.Store(&committedTip{height: 10})
+	mockCommittedTip(t, sm, 10, 0)
 
 	_, first := schedulerPeer(t, sm, 1, 1020)
 	_, second := schedulerPeer(t, sm, 2, 1020)
@@ -175,7 +216,7 @@ func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 // blockchain round trip per candidate.
 func TestAssignWantedBlocks_TerminatesWhenEverythingIsOwed(t *testing.T) {
 	sm, rec := assignHarness(t, 1, 20)
-	sm.lastCommittedTip.Store(&committedTip{height: 10})
+	mockCommittedTip(t, sm, 10, 0)
 
 	sm.assignWantedBlocks()
 	waitForPass(t, rec)

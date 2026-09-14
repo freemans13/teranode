@@ -346,19 +346,30 @@ func (sm *SyncManager) pipelineParentHeight(parent chainhash.Hash) (uint32, bool
 // stamps every artefact with, for a block whose parent height
 // pipelineParentHeight could not resolve.
 //
-// committedHeight() is the last block this node has actually put into the
-// chain — never negative in practice, floored at 0 defensively. Added to it is
-// the widest the download walk can read ahead of that tip: legacy_
-// blockDownloadWindow, the node-wide ceiling on outstanding block requests
-// (lookaheadCeilingLocked, manager.go, scales a narrower bound DOWN from this
-// one by block size, never wider), floored at 1 so a misconfigured 0 cannot
-// zero the whole sum. No block this node holds — parked, mid-conversion, or
-// committed — can have a height above committedHeight()+BlockDownloadWindow,
-// so adding the configured retention on top gives a delete-at-height strictly
-// above any height this specific block can actually turn out to have, exactly
-// the guarantee height + retention gives when the height is known.
+// committedTip's height is the chain's actual tip right now — never negative
+// in practice, floored at 0 defensively. Added to it is the widest the
+// download walk can read ahead of that tip: legacy_blockDownloadWindow, the
+// node-wide ceiling on outstanding block requests (lookaheadCeilingLocked,
+// manager.go, scales a narrower bound DOWN from this one by block size, never
+// wider), floored at 1 so a misconfigured 0 cannot zero the whole sum. No
+// block this node holds — parked, mid-conversion, or committed — can have a
+// height above tip+BlockDownloadWindow, so adding the configured retention on
+// top gives a delete-at-height strictly above any height this specific block
+// can actually turn out to have, exactly the guarantee height + retention
+// gives when the height is known.
+//
+// That guarantee assumes tip only moves forward. A reorg of depth R can drop
+// the reported tip by R while a block already in hand was fetched against the
+// old chain, so it can sit as high as (old tip) + BlockDownloadWindow, i.e.
+// (new tip) + R + BlockDownloadWindow — R above what this function accounts
+// for. The bound still holds whenever the configured retention exceeds R,
+// since retention is the only slack in the sum; it stops holding once a reorg
+// goes deeper than the retention this function reads, which tracks
+// global_blockHeightRetention (288 by default) plus this service's own
+// adjustment. Nothing here detects or guards against that; it is a known gap,
+// not a bug to fix in this function.
 func (sm *SyncManager) fallbackSubtreeDAH() uint32 {
-	tip := sm.committedHeight()
+	tip, _, _ := sm.committedTip()
 	if tip < 0 {
 		tip = 0
 	}

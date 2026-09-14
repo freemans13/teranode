@@ -168,19 +168,6 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		// set the block height gauge in the prometheus metrics
 		prometheusLegacyNetsyncBlockHeight.Set(float64(blockHeight))
 
-		// A nil error here means the block went into the chain, and blockHeight
-		// was derived from its parent's row rather than from anything the peer
-		// claimed, so this is the one place the committed height is known
-		// exactly. The park sweep needs it: a block parked below the committed
-		// tip can never be needed again, and the header cache cannot answer that
-		// question: it names heights above the committed tip, not below it. The
-		// hash travels with the height in the same atomic value,
-		// so fillHeaderCache can check linkage without a second, blocking call
-		// back to the blockchain service for it.
-		if err == nil && blockHeight > 0 {
-			sm.noteCommittedHeight(int32(blockHeight), blockHash)
-		}
-
 		deferFn(err)
 	}()
 
@@ -604,13 +591,6 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	)
 	defer func() {
 		prometheusLegacyNetsyncBlockHeight.Set(float64(blockHeight))
-
-		// See HandleBlockDirect's identical defer: a nil error here means the
-		// block went into the chain at exactly this height, and the hash travels
-		// with it for the same reason.
-		if err == nil && blockHeight > 0 {
-			sm.noteCommittedHeight(int32(blockHeight), blockHash)
-		}
 
 		deferFn(err)
 	}()

@@ -103,8 +103,9 @@ func TestNew_BuildsAHeaderCache(t *testing.T) {
 
 // newHeaderCacheManager builds a manager with a header cache ready to fill —
 // the state New leaves it in — without paying for New's other eleven
-// dependencies. Whether lastCommittedTip is also set is each test's own call,
-// since the unset case is one of the three behaviours under test below.
+// dependencies. Whether a blockchain mock is also installed (so committedTip
+// answers with something) is each test's own call, since the no-client case is
+// one of the three behaviours under test below.
 func newHeaderCacheManager(t *testing.T) *SyncManager {
 	t.Helper()
 
@@ -121,8 +122,7 @@ func newHeaderCacheManager(t *testing.T) *SyncManager {
 func TestFillHeaderCache_ABatchThatLinksToTheCommittedTipIsAccepted(t *testing.T) {
 	sm := newHeaderCacheManager(t)
 
-	tipHash := chainhash.Hash{0x50}
-	sm.lastCommittedTip.Store(&committedTip{height: 100, hash: tipHash})
+	tipHash := mockCommittedTip(t, sm, 100, 0)
 
 	peer, _, _ := connectRacePeer(t, 210, 1000)
 
@@ -146,7 +146,7 @@ func TestFillHeaderCache_ABatchThatLinksToTheCommittedTipIsAccepted(t *testing.T
 // against a peer that had told the truth.
 func TestFillHeaderCache_ABatchThatDoesNotLinkIsDroppedAndThePeerKeepsItsConnection(t *testing.T) {
 	sm := newHeaderCacheManager(t)
-	sm.lastCommittedTip.Store(&committedTip{height: 100, hash: chainhash.Hash{0x50}})
+	mockCommittedTip(t, sm, 100, 0)
 
 	peer, _, _ := connectRacePeer(t, 211, 1000)
 
@@ -171,7 +171,7 @@ func TestFillHeaderCache_ABatchThatDoesNotLinkIsDroppedAndThePeerKeepsItsConnect
 // checked, dropped with nobody blamed for it.
 func TestFillHeaderCache_ABatchArrivingWithNoCommittedTipIsDroppedWithoutDisconnecting(t *testing.T) {
 	sm := newHeaderCacheManager(t)
-	// lastCommittedTip left unset on purpose.
+	// No blockchain client installed on purpose: committedTip() reports ok=false.
 
 	peer, _, _ := connectRacePeer(t, 212, 1000)
 
@@ -184,4 +184,55 @@ func TestFillHeaderCache_ABatchArrivingWithNoCommittedTipIsDroppedWithoutDisconn
 	require.False(t, ok, "nothing can be cached before the committed tip is known")
 
 	require.True(t, peer.Connected(), "an unset tip must not cost the peer its connection either")
+}
+
+// TestFillHeaderCache_ASameHeightReorgIsFollowed pins the fix for the wedge
+// found on mainnet: fillHeaderCache used to read a stored, atomically-swapped
+// tip whose update refused any height not strictly greater than the one it
+// already held. A reorg that replaces the tip with a different block at the
+// SAME height can never produce a strictly greater height, so that stored
+// hash could never be replaced — and every future batch, answered honestly
+// from the new chain, failed to link to a hash no peer would ever repeat,
+// wedging the node until it was restarted.
+//
+// Reading the chain directly, as committedTip now does, has no such floor:
+// the mock simply answers with whatever height and hash the test tells it to,
+// and fillHeaderCache judges linkage against that, live, every time.
+func TestFillHeaderCache_ASameHeightReorgIsFollowed(t *testing.T) {
+	sm := newHeaderCacheManager(t)
+
+	// The block "commits": the chain's tip is height 100, this hash.
+	oldHash := mockCommittedTip(t, sm, 100, 0)
+
+	peer, _, _ := connectRacePeer(t, 213, 1000)
+
+	var nonce uint32
+	oldMsg, oldHashes := linkedHeaders(oldHash, 3, &nonce)
+
+	sm.fillHeaderCache(peer, oldMsg)
+
+	for i, want := range oldHashes {
+		height := int32(101 + i) //nolint:gosec // i is bounded by the 3 headers built above
+		got, ok := sm.headerCache.At(height)
+		require.True(t, ok, "height %d must be named", height)
+		require.Equal(t, want, got)
+	}
+
+	// The reorg: the chain now reports a DIFFERENT block at the SAME height.
+	// The old stored-and-monotonic tip could never observe this at all.
+	newHash := mockCommittedTip(t, sm, 100, 1)
+	require.NotEqual(t, oldHash, newHash, "sanity: the reorg must actually change the reported hash")
+
+	newMsg, newHashes := linkedHeaders(newHash, 3, &nonce)
+
+	sm.fillHeaderCache(peer, newMsg)
+
+	for i, want := range newHashes {
+		height := int32(101 + i) //nolint:gosec // i is bounded by the 3 headers built above
+		got, ok := sm.headerCache.At(height)
+		require.True(t, ok, "the cache must accept a batch anchored on the new chain's tip, not refuse it forever")
+		require.Equal(t, want, got)
+	}
+
+	require.True(t, peer.Connected(), "an honest reply from the new chain must not cost the peer its connection")
 }

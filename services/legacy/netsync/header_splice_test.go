@@ -23,13 +23,15 @@ func seedFetchHeaders(t *testing.T, sm *SyncManager, _ *peerpkg.Peer, anchor cha
 
 	sm.headersFirstMode.Store(true)
 
-	// lookaheadCeilingLocked anchors on sm.committedHeight() now, so the
+	// assignWantedBlocks reads the committed height from the chain now, so the
 	// fixture's anchor height has to be reflected there too, or every
 	// ceiling-bearing test in this package would see a committed height of zero
 	// against headers seeded at 11 and up — an absolute ceiling below every
 	// header it seeded, rather than the depth relative to height 10 these tests
-	// are written against.
-	sm.noteCommittedHeight(10, anchor)
+	// are written against. The mocked tip's own hash need not equal anchor: the
+	// header cache below is filled directly, not through fillHeaderCache, so
+	// nothing here checks the two against each other.
+	mockCommittedTip(t, sm, 10, 0)
 
 	sm.headerCache = newHeaderCache()
 	require.True(t, sm.headerCache.Fill(anchor, 11, msg.Headers),

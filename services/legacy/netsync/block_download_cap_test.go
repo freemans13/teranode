@@ -181,7 +181,7 @@ func TestFetchHeaderBlocks_NeverAsksForABlockTheLedgerWillNotTrack(t *testing.T)
 
 	anchor := chainhash.Hash{}
 	anchor[31] = 0xa0
-	sm.noteCommittedHeight(10, anchor)
+	mockCommittedTip(t, sm, 10, 0)
 
 	var nonce uint32
 

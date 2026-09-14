@@ -3,7 +3,6 @@ package netsync
 import (
 	"testing"
 
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
@@ -22,7 +21,7 @@ func TestFallbackSubtreeDAH_IsCommittedTipPlusReadAheadDepthPlusRetention(t *tes
 	tSettings.SubtreeValidation.BlockHeightRetentionAdjustment = 0
 
 	sm := &SyncManager{settings: tSettings}
-	sm.noteCommittedHeight(2000, chainhash.Hash{})
+	mockCommittedTip(t, sm, 2000, 0)
 
 	retention := tSettings.GetSubtreeValidationBlockHeightRetention()
 	require.NotZero(t, retention, "sanity: a zero retention would make this indistinguishable from a formula that dropped the term")
@@ -45,7 +44,7 @@ func TestFallbackSubtreeDAH_FloorsTheReadAheadDepthAtOne(t *testing.T) {
 	tSettings.SubtreeValidation.BlockHeightRetentionAdjustment = 0
 
 	sm := &SyncManager{settings: tSettings}
-	sm.noteCommittedHeight(5, chainhash.Hash{})
+	mockCommittedTip(t, sm, 5, 0)
 
 	retention := tSettings.GetSubtreeValidationBlockHeightRetention()
 	want := uint32(5) + uint32(1) + retention
@@ -55,9 +54,9 @@ func TestFallbackSubtreeDAH_FloorsTheReadAheadDepthAtOne(t *testing.T) {
 }
 
 // TestFallbackSubtreeDAH_DefaultsToZeroTipBeforeAnyCommit pins the other end:
-// before this node has committed or seeded anything, committedHeight() reads
-// 0 (its own documented default), and fallbackSubtreeDAH must use that 0
-// rather than a negative or undefined tip.
+// with no blockchain client at all, committedTip() reports ok=false and its
+// own documented zero value, and fallbackSubtreeDAH must use that 0 rather
+// than a negative or undefined tip.
 func TestFallbackSubtreeDAH_DefaultsToZeroTipBeforeAnyCommit(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.BlockDownloadWindow = 500
@@ -65,7 +64,7 @@ func TestFallbackSubtreeDAH_DefaultsToZeroTipBeforeAnyCommit(t *testing.T) {
 	tSettings.SubtreeValidation.BlockHeightRetentionAdjustment = 0
 
 	sm := &SyncManager{settings: tSettings}
-	// No noteCommittedHeight call: committedHeight() must default to 0.
+	// No blockchainClient set: committedTip() must default to height 0.
 
 	retention := tSettings.GetSubtreeValidationBlockHeightRetention()
 	want := uint32(0) + uint32(500) + retention

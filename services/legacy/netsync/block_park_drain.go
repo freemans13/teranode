@@ -639,7 +639,7 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 // height as each arrives. What actually stops the download reading past a
 // point is positional, not a count of requests in flight at once:
 // wantedBlocks (wanted_range_assign.go) never asks for a height more than
-// lookaheadCeilingLocked's ceiling above sm.committedHeight(), and that
+// lookaheadCeilingLocked's ceiling above the committed height, and that
 // ceiling is legacy_blockDownloadLowerWindow, 128 by default (see
 // settings.go's own getInt call; the "0" on the field's struct tag in
 // legacy_settings.go is stale doc text, not what NewSettings loads, exactly

@@ -67,7 +67,11 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 
 	client := &blockchain2.Mock{}
 	client.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
-	client.On("GetBestBlockHeader", mock.Anything).Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)
+	// Height 0, not some other placeholder: committedTip reads this mock
+	// directly now, and the header cache below is seeded starting at height 1
+	// — genesis plus these mined blocks — so the two have to agree on where
+	// the chain sits or the wanted range computed from them names nothing.
+	client.On("GetBestBlockHeader", mock.Anything).Return(bestHeader, &model.BlockHeaderMeta{Height: 0}, nil)
 	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return([]*chainhash.Hash{{}}, nil)
 	// Nothing is stored, so every parent lookup fails the way it does for a
 	// block that arrives before its parent.
@@ -106,9 +110,8 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	sm.headersFirstMode.Store(true)
 
 	// assignWantedBlocks reads the header cache, one node per block, in order,
-	// none of them requested yet. committedHeight defaults to zero on a manager
-	// nobody has told otherwise, which is exactly the height these blocks (1, 2,
-	// 3, ...) sit above.
+	// none of them requested yet. The chain mock above reports height 0, which
+	// is exactly the height these blocks (1, 2, 3, ...) sit above.
 	sm.headerCache = newHeaderCache()
 	headers := make([]*wire.BlockHeader, len(blocks))
 	for i, b := range blocks {

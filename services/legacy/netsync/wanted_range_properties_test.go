@@ -62,7 +62,9 @@ func heightOfRequested(t *testing.T, sm *SyncManager, hash chainhash.Hash) (int3
 		return 0, false
 	}
 
-	for height := sm.committedHeight() + 1; height <= top; height++ {
+	best, _, _ := sm.committedTip()
+
+	for height := best + 1; height <= top; height++ {
 		if candidate, named := sm.headerCache.At(height); named && candidate == hash {
 			return height, true
 		}
@@ -126,7 +128,7 @@ func TestWantedRange_TheDownloaderCannotOutrunTheCommitter(t *testing.T) {
 
 	// BlockDownloadWindow is deliberately left at its real default (1024, far
 	// above propertyDepth) rather than narrowed to match: lookaheadCeilingLocked
-	// anchors on sm.committedHeight(), seeded below, so the ceiling engages on
+	// anchors on the committed height, mocked below, so the ceiling engages on
 	// BlockDownloadLowerWindow alone. Narrowing the window to the same value
 	// would make it impossible to tell from this test's assertions whether the
 	// ceiling or the window was what actually bound each pass to propertyDepth.
@@ -145,7 +147,7 @@ func TestWantedRange_TheDownloaderCannotOutrunTheCommitter(t *testing.T) {
 	// ever writes it again.
 	const best = int32(100)
 
-	sm.lastCommittedTip.Store(&committedTip{height: best})
+	mockCommittedTip(t, sm, uint32(best), 0)
 
 	seen := 0
 	highest := int32(0)
@@ -211,9 +213,11 @@ func TestWantedRange_ARestartingNodeRequestsOnItsFirstPass(t *testing.T) {
 	sm := assignManager(t, restartHeight, restartHeight+200)
 	sm.settings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
-	// What New now does at startup: read the chain's tip and record it. Without
-	// this line the counter is zero and the pass asks for height 1.
-	sm.lastCommittedTip.Store(&committedTip{height: restartHeight})
+	// committedTip reads the chain directly on every call now, so a restarting
+	// node's first pass sees its real height with nothing to seed. Without this
+	// mock the manager has no blockchain client at all and committedTip answers
+	// height 0, which is the bug this pins the absence of.
+	mockCommittedTip(t, sm, uint32(restartHeight), 0)
 
 	_, rec := schedulerPeer(t, sm, 1, restartHeight+1000)
 
@@ -223,40 +227,17 @@ func TestWantedRange_ARestartingNodeRequestsOnItsFirstPass(t *testing.T) {
 		"a node restarting mid-chain must ask for blocks on its first pass")
 }
 
-// TestNew_SeedsTheCommittedHeightFromTheChain is the other half, and it is the
-// one that actually pins the production change: the counter must be non-zero
-// before any block has committed in THIS process.
-func TestNew_SeedsTheCommittedHeightFromTheChain(t *testing.T) {
-	const chainHeight = uint32(800_000)
-
-	running := blockchain2.FSMStateRUNNING
-	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
-
-	client := &blockchain2.Mock{}
-	client.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
-	client.Mock.On("GetBestBlockHeader", mock.Anything).
-		Return(bestHeader, &model.BlockHeaderMeta{Height: chainHeight}, nil)
-
-	sm := newRaceManager(t)
-	sm.ctx = context.Background()
-	sm.blockchainClient = client
-
-	// The production seeding, isolated so this test does not need the whole of
-	// New's twelve dependencies.
-	require.NoError(t, sm.seedCommittedHeight(context.Background()))
-
-	require.Equal(t, int32(chainHeight), sm.committedHeight(),
-		"a node that starts with a chain at 800,000 must not believe its best block is 0")
-}
-
-// TestNew_WiresSeedCommittedHeightThroughTheConstructor closes the coverage gap
-// TestNew_SeedsTheCommittedHeightFromTheChain leaves open: that test pins what
-// seedCommittedHeight does, but calls it directly, so it cannot notice if New
-// stopped calling it. Without this test, nothing runs New against a non-zero
-// chain height and asserts on the counter afterwards, so a regression that
-// deleted or reimplemented the call inline in New would leave the whole
-// package green.
-func TestNew_WiresSeedCommittedHeightThroughTheConstructor(t *testing.T) {
+// TestNew_CommittedTipReadsTheChainThroughTheConstructor is what is left of
+// the old seeding regression guard now that there is nothing left to seed.
+// Before this fix, lastCommittedHeight was written only when a block
+// committed and was never primed at startup, so it read zero on a node
+// restarting mid-chain until this process's own first commit — and New had to
+// be caught making a seeding call to fix that. committedTip reads
+// sm.blockchainClient directly on every call now, so there is no seeding step
+// for New to own or for a regression to drop; the only thing left for this to
+// guard is that New actually wires blockchainClient at all, which this proves
+// by running the real constructor and reading the tip back through it.
+func TestNew_CommittedTipReadsTheChainThroughTheConstructor(t *testing.T) {
 	const chainHeight = uint32(800_000)
 
 	// Cancellable rather than context.Background(): New starts a goroutine
@@ -300,8 +281,10 @@ func TestNew_WiresSeedCommittedHeightThroughTheConstructor(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	require.Equal(t, int32(chainHeight), sm.committedHeight(),
-		"New must seed the committed height from the chain, not leave callers to notice it never did")
+	height, _, ok := sm.committedTip()
+	require.True(t, ok, "New must wire a blockchain client committedTip can read")
+	require.Equal(t, int32(chainHeight), height,
+		"a node built against a chain at 800,000 must not believe its best block is 0")
 }
 
 // newParkPropertyManager builds a manager the wanted-range pass and the block
@@ -347,8 +330,8 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	tSettings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
 	// BlockDownloadWindow stays at its real default here too, for the same
-	// reason as the first test: lookaheadCeilingLocked anchors on
-	// sm.committedHeight(), which the test sets below, so BlockDownloadLowerWindow
+	// reason as the first test: lookaheadCeilingLocked anchors on the committed
+	// height, which the test mocks below, so BlockDownloadLowerWindow
 	// alone engages the ceiling. Matching the window to the depth would leave the
 	// park-bound property this test proves unable to say which of the two was
 	// doing the binding.
@@ -450,7 +433,7 @@ func TestWantedRange_TheParkNeverExceedsTheReadAheadDepth(t *testing.T) {
 	// every arrival is an orphan and no block ever commits.
 	const parkBest = int32(propertyDepth)
 
-	sm.lastCommittedTip.Store(&committedTip{height: parkBest})
+	mockCommittedTip(t, sm, uint32(parkBest), 0)
 
 	// Every block above the window, by hash, so the position assertion can be
 	// made against the park directly.

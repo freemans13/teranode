@@ -43,9 +43,7 @@ func TestLookaheadCeilingScalesWithBlockSize(t *testing.T) {
 			sm.blockSizeTracker.addBlockSize(avgBlockSize)
 		}
 
-		sm.lastCommittedTip.Store(&committedTip{height: 1000})
-
-		ceiling, ok := sm.lookaheadCeilingLocked()
+		ceiling, ok := sm.lookaheadCeilingLocked(1000)
 		require.True(t, ok)
 
 		// The ceiling is a height, so the depth is what it adds to the
@@ -85,9 +83,7 @@ func TestLookaheadCeilingNeverReachesZero(t *testing.T) {
 
 	sm.blockSizeTracker.addBlockSize(3 * 1024 * 1024 * 1024)
 
-	sm.lastCommittedTip.Store(&committedTip{height: 500})
-
-	ceiling, ok := sm.lookaheadCeilingLocked()
+	ceiling, ok := sm.lookaheadCeilingLocked(500)
 	require.True(t, ok)
 	require.Equal(t, int64(501), ceiling,
 		"a small configured depth against huge blocks must still fetch one block, not none")
@@ -101,9 +97,8 @@ func TestLookaheadCeilingWithoutATracker(t *testing.T) {
 	tSettings.Legacy.BlockDownloadLowerWindow = 128
 
 	sm := &SyncManager{settings: tSettings}
-	sm.lastCommittedTip.Store(&committedTip{height: 10})
 
-	ceiling, ok := sm.lookaheadCeilingLocked()
+	ceiling, ok := sm.lookaheadCeilingLocked(10)
 	require.True(t, ok)
 	require.Equal(t, int64(138), ceiling)
 }

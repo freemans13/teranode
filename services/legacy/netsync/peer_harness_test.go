@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"testing"
@@ -213,4 +214,85 @@ func newHeaderLockManager(t *testing.T, gate chan struct{}, entered chan struct{
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 
 	return sm
+}
+
+// mockCommittedTip makes sm.committedTip() answer with height and a hash
+// derived from (height, salt), and returns that hash. sm.blockchainClient is
+// given a bare *blockchain2.Mock if it has none yet; if it already holds one,
+// this replaces any GetBestBlockHeader expectation on it — the mock's argument
+// pattern is always mock.Anything, so Unset takes out every prior registration
+// with that pattern before this one is added, the same take-out-the-catch-all
+// move chainHolds uses for GetBlockHeader.
+//
+// A block header's hash cannot be chosen directly; it is always whatever
+// double-SHA256 of the serialized header produces. salt varies the header
+// (via HashPrevBlock's first byte) so two calls at the same height can be
+// made to answer with two different hashes, which is what a same-height
+// reorg needs a test to arrange.
+//
+// A freshly provisioned mock also gets the two other stubs unownedBlocks and
+// maybeRequestMoreHeaders reach once there is a real blockchainClient to call:
+// GetBlockHeader answering not-found (so haveInventory's "does the chain
+// already have this" fallback never claims it does) and GetBlockLocator
+// answering with a placeholder locator (so a header cache shorter than the
+// configured read-ahead depth can still ask for more). Before committedTip
+// read the chain directly, a bare manager's nil blockchainClient short-circuited
+// both call sites for free; now that this gives it a client, those call sites
+// are reachable and need an answer. Skipped when a client already exists,
+// since a test that built its own presumably wants its own answers for these.
+func mockCommittedTip(t *testing.T, sm *SyncManager, height uint32, salt byte) chainhash.Hash {
+	t.Helper()
+
+	client, ok := sm.blockchainClient.(*blockchain2.Mock)
+	if !ok {
+		require.Nil(t, sm.blockchainClient, "mockCommittedTip needs sm.blockchainClient to be nil or a *blockchain2.Mock")
+
+		client = &blockchain2.Mock{}
+		client.On("GetBlockHeader", mock.Anything, mock.Anything).
+			Return(nil, nil, errors.NewNotFoundError("not found"))
+		client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+			Return([]*chainhash.Hash{{}}, nil)
+		sm.blockchainClient = client
+	}
+
+	client.On("GetBestBlockHeader", mock.Anything).Unset()
+
+	prev := chainhash.Hash{}
+	prev[0] = salt
+
+	header := &model.BlockHeader{HashPrevBlock: &prev, HashMerkleRoot: &chainhash.Hash{}, Nonce: height}
+
+	client.On("GetBestBlockHeader", mock.Anything).Return(header, &model.BlockHeaderMeta{Height: height}, nil)
+
+	return *header.Hash()
+}
+
+// mockCommittedTipAtHash is mockCommittedTip for the rarer test that needs the
+// committed tip to hash to a value it has already computed elsewhere — a
+// header built by linkedHeaders, say, whose hash the test also asserts a
+// downstream call (GetBlockLocator) was made with. A hash cannot be chosen
+// directly, so this re-encodes hdr's own wire bytes into a model.BlockHeader:
+// same 80 bytes in, same double-SHA256 out, so the two hashes are provably
+// equal rather than merely both plausible.
+func mockCommittedTipAtHash(t *testing.T, sm *SyncManager, height uint32, hdr *wire.BlockHeader) chainhash.Hash {
+	t.Helper()
+
+	client, ok := sm.blockchainClient.(*blockchain2.Mock)
+	if !ok {
+		require.Nil(t, sm.blockchainClient, "mockCommittedTipAtHash needs sm.blockchainClient to be nil or a *blockchain2.Mock")
+
+		client = &blockchain2.Mock{}
+		sm.blockchainClient = client
+	}
+
+	var buf bytes.Buffer
+	require.NoError(t, hdr.Serialize(&buf))
+
+	header, err := model.NewBlockHeaderFromBytes(buf.Bytes())
+	require.NoError(t, err)
+
+	client.On("GetBestBlockHeader", mock.Anything).Unset()
+	client.On("GetBestBlockHeader", mock.Anything).Return(header, &model.BlockHeaderMeta{Height: height}, nil)
+
+	return *header.Hash()
 }

@@ -38,7 +38,12 @@ import (
 // budget, or no peer to place a block with) — a node with nothing to place a
 // block on can still have every reason to ask for more headers.
 func (sm *SyncManager) assignWantedBlocks() {
-	wanted := sm.wantedBlocks()
+	// Read here, before wantedBlocks takes headerMu: committedTip makes a
+	// blocking blockchain call, and this package's lock rule has no exception
+	// for one made while the header lock is held.
+	best, _, _ := sm.committedTip()
+
+	wanted := sm.wantedBlocks(best)
 
 	// Ahead of the assigner and its budget cap on purpose: whether the cache has
 	// run out is a question about the header round, not about whether there is
@@ -71,16 +76,20 @@ func (sm *SyncManager) assignWantedBlocks() {
 // bounded by the same scaled read-ahead depth that governs the header walk, and
 // named from the header cache rather than the header list.
 //
+// best is the committed height, read by the caller before headerMu is taken:
+// committedTip makes a blocking blockchain call, and this package's lock rule
+// has no exception for one made while the header lock is held. lookaheadCeilingLocked
+// takes the same value as a parameter for the same reason, rather than reading
+// it again itself, so only one such call is ever made per pass.
+//
 // Split out so the lock has a body with no way to reach a peer or another
 // service from inside it. headerMu is held only because lookaheadCeilingLocked
 // needs it; the cache that names the range holds its own lock and is read with
 // headerMu still up, not released first, since wantedBlocksFromCache makes no
 // peer send and no blocking client call either.
-func (sm *SyncManager) wantedBlocks() []wantedBlock {
+func (sm *SyncManager) wantedBlocks(best int32) []wantedBlock {
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
-
-	best := sm.committedHeight()
 
 	// The read-ahead ceiling is an absolute height and is already scaled by the
 	// block size actually being seen, so the depth is derived from it rather
@@ -88,7 +97,7 @@ func (sm *SyncManager) wantedBlocks() []wantedBlock {
 	// is the point: two would disagree, and the disagreement would show up as a
 	// park that grows past the bound one of them believed in.
 	depth := int32(1)
-	if ceiling, limited := sm.lookaheadCeilingLocked(); limited {
+	if ceiling, limited := sm.lookaheadCeilingLocked(best); limited {
 		depth = int32(ceiling - int64(best)) //nolint:gosec // the ceiling is best plus a block count
 	} else if sm.settings != nil {
 		// No read-ahead limit configured. The node-wide download window is then

@@ -562,14 +562,6 @@ type blockFailureState struct {
 	nextRetry time.Time
 }
 
-// committedTip is the height and hash of the highest block this node has put
-// into the chain, held together so a reader can never see one updated without
-// the other. See SyncManager.lastCommittedTip.
-type committedTip struct {
-	height int32
-	hash   chainhash.Hash
-}
-
 // SyncManager is used to communicate block related messages with peers. The
 // SyncManager is started as by executing Start() in a goroutine. Once started,
 // it selects peers to sync from and starts the initial block download. Once the
@@ -734,33 +726,10 @@ type SyncManager struct {
 	// noteChainProgress, and read by handleCheckSyncPeer.
 	lastChainProgress atomic.Int64
 
-	// lastCommittedTip is the height AND hash of the highest block this node has
-	// put into the chain, recorded by HandleBlockDirect and HandleConvertedBlock
-	// on success, and seeded once at startup. Monotonic on height, and nil until
-	// the first commit or seed.
-	//
-	// The two live in one atomic value on purpose. fillHeaderCache used to read
-	// the height here and then make a separate, blocking GetBestBlockHeader call
-	// for the hash to check linkage against — a call this package's own docs
-	// warn can take minutes during a sync. Every block committed in that window
-	// moved the two apart, so the batch was keyed under a height the hash no
-	// longer belonged to, and the node would later ask for a block N heights
-	// above the one it actually needed, silently skipping N heights. A single
-	// pointer swapped by the committer means a reader can never observe one half
-	// updated without the other.
-	//
-	// Read by the park sweep, which uses the height to drop blocks the chain has
-	// gone past, and by fillHeaderCache, which uses both. Deliberately not
-	// derived from the header list: an arriving front block's header is removed
-	// before the park sees the block, so the front sits one above the block
-	// being waited for, and a sweep judging by the front throws away exactly the
-	// block it needs.
-	lastCommittedTip atomic.Pointer[committedTip]
-
-	// headerCache names the block hashes for the heights just above
-	// lastCommittedTip's height, from the most recent getheaders reply. It is a
-	// lookup, not a work queue: nothing walks it, nothing holds a position in
-	// it, and discarding it costs one message.
+	// headerCache names the block hashes for the heights just above the
+	// committed tip (see committedTip), from the most recent getheaders reply.
+	// It is a lookup, not a work queue: nothing walks it, nothing holds a
+	// position in it, and discarding it costs one message.
 	//
 	headerCache *headerCache
 
@@ -934,7 +903,7 @@ func (sm *SyncManager) leaveHeadersFirstMode() {
 // deferred-retry for "no peer to ask": both existed only to keep a STORED
 // nextCheckpoint field from drifting, and to remember a transition that had
 // nowhere to send its getheaders. With the checkpoint recomputed fresh from
-// committedHeight() on every call, there is nothing stored to drift and
+// the chain's own tip on every call, there is nothing stored to drift and
 // nothing to defer — the single fact that matters, whether a checkpoint is
 // still ahead, is simply asked again the next time any block commits, whether
 // or not a peer happens to be available to hand a getheaders to right now. A
@@ -945,13 +914,15 @@ func (sm *SyncManager) maybeLeaveHeadersFirstMode(reason string) {
 		return
 	}
 
-	if sm.findNextHeaderCheckpoint(sm.committedHeight()) != nil {
+	height, _, _ := sm.committedTip()
+
+	if sm.findNextHeaderCheckpoint(height) != nil {
 		return
 	}
 
 	sm.leaveHeadersFirstMode()
 
-	sm.logger.Infof("[headersFirstMode][%s] committed height %d has passed the final checkpoint, leaving headers-first mode", reason, sm.committedHeight())
+	sm.logger.Infof("[headersFirstMode][%s] committed height %d has passed the final checkpoint, leaving headers-first mode", reason, height)
 }
 
 // isCheckpointHash reports whether hash is one of the chain's configured
@@ -993,9 +964,9 @@ func (sm *SyncManager) isCheckpointHash(hash chainhash.Hash) bool {
 // and every line the node wrote described the window, the park and the
 // download budget. None of them described the header list, and metrics.go had
 // no gauge for it either. That structure and its front-of-list anchor are gone
-// now, replaced by the cache and the counter this reads instead.
+// now, replaced by the cache and the chain's own tip this reads instead.
 func (sm *SyncManager) headerRoundSummary() string {
-	best := sm.committedHeight()
+	best, _, _ := sm.committedTip()
 
 	top, haveTop := sm.headerCache.Top()
 	if !haveTop {
@@ -3407,7 +3378,13 @@ func (sm *SyncManager) handleBlockMsgTail(d *blockDispatch, err error) error {
 	// Sampled a few microseconds before the in-flight count rather than in
 	// the same expression. Harmless: assignWantedBlocks recomputes what is
 	// wanted for itself before doing anything.
-	haveMoreWanted := len(sm.wantedBlocks()) > 0
+	//
+	// Its own committedTip call, not threaded in from elsewhere in this
+	// function: this goroutine already makes chain calls nearby (sm.current()
+	// above, GetBestBlockHeader below), and saving one more is not worth
+	// passing a parameter through for.
+	best, _, _ := sm.committedTip()
+	haveMoreWanted := len(sm.wantedBlocks(best)) > 0
 
 	if haveMoreWanted && sm.blockDownloads.CountForPeer(peer) < dynamicMax {
 		sm.fetchHeaderBlocks()
@@ -3575,7 +3552,7 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	last := sm.committedHeight()
+	last, _, _ := sm.committedTip()
 	if n := len(wanted); n > 0 {
 		last = wanted[n-1].height
 	}
@@ -3599,7 +3576,7 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	best, tipHash, ok := sm.committedTipSnapshot()
+	best, tipHash, ok := sm.committedTip()
 	if !ok {
 		return
 	}
@@ -3685,20 +3662,13 @@ func (sm *SyncManager) nextHeaderRefillPeer(peers []blockPeer) *peerpkg.Peer {
 // the block we are waiting for cannot be committed when it arrives and sits in
 // the park until everything between it and the chain has landed.
 //
-// Measured from sm.committedHeight() — the last block this node has actually
-// put into the chain — not from the header list. It used to be anchored to the
-// front of the header list, with a fallback to the committed height for when
-// that counter could still read zero on a node restarting mid-chain. Neither
-// half of that is true any more: fillHeaderCache never pushes onto the header
-// list, so the list is never populated in production, and seedCommittedHeight
-// now seeds the counter at startup, so it does not read zero on a restart
-// either. An anchor that depended on a structure nothing fills answered "no
-// limit" on every real node — the read-ahead bound this comment describes was
-// dead from the moment the list stopped being fed, which made the park's
-// self-limiting property a claim about code that was not running. Anchoring on
-// the counter alone is what svnode does too: -blockdownloadlowerwindow measures
-// from chainActive.Height(), the validated tip, which is exactly what
-// committedHeight reports here.
+// best is the last block this node has actually put into the chain, not the
+// header list. It comes in as a parameter rather than being read here because
+// this function runs with headerMu held and reading the chain is a blocking
+// call this package's lock rule has no exception for; wantedBlocks reads it
+// before taking the lock and passes it down. Anchoring on the committed height
+// alone is what svnode does too: -blockdownloadlowerwindow measures from
+// chainActive.Height(), the validated tip.
 //
 // "No limit at all" is now only the two honest cases: no settings to read the
 // configuration from, or the configured lower window is zero or less. A depth
@@ -3708,7 +3678,7 @@ func (sm *SyncManager) nextHeaderRefillPeer(peers []blockPeer) *peerpkg.Peer {
 //
 // Clamped to the node-wide window, as svnode clamps its lower window to its
 // window: a limit looser than that could never bind.
-func (sm *SyncManager) lookaheadCeilingLocked() (int64, bool) {
+func (sm *SyncManager) lookaheadCeilingLocked(best int32) (int64, bool) {
 	if sm.settings == nil {
 		return 0, false
 	}
@@ -3779,11 +3749,11 @@ func (sm *SyncManager) lookaheadCeilingLocked() (int64, bool) {
 	// the same.
 	//
 	// There is no fallback to a header-list front any more, and none is needed:
-	// seedCommittedHeight reads the chain's real tip at startup, so this reads a
-	// genuine height on a node restarting mid-chain rather than the zero that
-	// justified the old fallback. A fallback keyed to a structure nothing fills
-	// would only have reintroduced the bug this function exists to fix.
-	return int64(sm.committedHeight()) + int64(lower), true
+	// best is read fresh from the chain by wantedBlocks on every call, so this
+	// reads a genuine height on a node restarting mid-chain. A fallback keyed to
+	// a structure nothing fills would only have reintroduced the bug this
+	// function exists to fix.
+	return int64(best) + int64(lower), true
 }
 
 // handleHeadersMsg handles block header messages from all peers.  Headers are
@@ -3847,16 +3817,16 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 		return
 	}
 
-	// Read as one value, not as a height then a separate blocking call for the
-	// hash: GetBestBlockHeader used to be called here for the hash alone, and
-	// that round trip can block for minutes during a sync (see fetchHeaderBlocks
-	// and its callers on the same point). Every block committed in that window
-	// would have moved the height and the hash it names apart, keying the batch
-	// under a height the hash no longer belonged to and silently skipping
-	// however many heights committed while the call was in flight. Reading the
-	// pair from lastCommittedTip removes the call and the window with it: the
-	// hash used here is always the hash that belongs to this exact height.
-	best, tipHash, ok := sm.committedTipSnapshot()
+	// Read as one value, height and hash together, so the batch can never be
+	// keyed under a height the hash no longer belongs to: a caller reading the
+	// height and then making a second, separate call for the hash could see a
+	// commit land in between and key the batch wrong. committedTip's single
+	// GetBestBlockHeader call rules that out. It also means this always judges
+	// linkage against the chain's real tip, including a tip a same-height reorg
+	// just replaced: the stored, monotonic-on-height copy this used to read
+	// could never be updated by such a reorg, so the cache refused every batch
+	// forever until the process restarted.
+	best, tipHash, ok := sm.committedTip()
 	if !ok {
 		sm.logger.Debugf("[fillHeaderCache] no committed tip recorded yet, dropping %d headers from %s", len(msg.Headers), peer)
 
@@ -4074,7 +4044,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			// a reorg, whose headers are needed before any block is worth asking
 			// for.
 			if sm.headersFirstMode.Load() && !sm.blockDownloads.RequestedWithin(announced, blockRequestRetryInterval) {
-				if tipHeight, tipHash, ok := sm.committedTipSnapshot(); ok {
+				if tipHeight, tipHash, ok := sm.committedTip(); ok {
 					if locator, lerr := sm.headersRoundLocator(&tipHash, uint32(tipHeight)); lerr != nil { //nolint:gosec // a chain height
 						sm.logger.Warnf("[handleInvMsg] could not build repair getheaders locator for announced block %s: %v", announced, lerr)
 					} else if len(locator) > 0 {
@@ -4812,93 +4782,42 @@ func (sm *SyncManager) ReleaseBlockPrefetchBytes(blockHash chainhash.Hash, weigh
 	sm.blockPrefetchReserved.Add(-weight)
 }
 
-// seedCommittedHeight records the chain's own tip as the best block processed,
-// once, at startup.
+// committedTip reads the chain's own best block header and returns its height
+// and hash together, taken from the same response so a caller can never see
+// one belonging to a different block than the other. false when there is no
+// blockchain client, the call fails, or the chain has no best block yet;
+// height and hash are the zero value in that case.
 //
-// Without it the counter reads zero until THIS process commits a block, because
-// noteCommittedHeight is its only other writer. On a node restarting mid-chain
-// that is not a small inaccuracy: the wanted range is derived from this counter,
-// so zero means "ask for the block above genesis", which no peer will usefully
-// answer and no header cache above the node's real tip can name. The node then
-// requests nothing, so nothing commits, so the counter stays zero.
-//
-// It reads the tip rather than taking it as an argument so the two callers that
-// want it (New, and any future restart path) cannot disagree about where the
-// number comes from. It records the hash alongside the height for the same
-// reason noteCommittedHeight always takes both: fillHeaderCache needs the hash
-// as a fact that can never be stale relative to the height it is keyed under.
-func (sm *SyncManager) seedCommittedHeight(ctx context.Context) error {
-	header, meta, err := sm.blockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		return err
-	}
-
-	if meta == nil || header == nil {
-		return nil
-	}
-
-	height, err := safeconversion.Uint32ToInt32(meta.Height)
-	if err != nil {
-		return err
-	}
-
-	// noteCommittedHeight rather than a bare Store, so the "never moves
-	// backwards" rule has no exception and a seed can never lower a counter a
-	// concurrent commit has already raised.
-	sm.noteCommittedHeight(height, *header.Hash())
-
-	return nil
-}
-
-// noteCommittedHeight records the height AND hash of a block that has just
-// joined the chain, as one atomic swap, and never moves backwards on height. A
-// reorg lowers the tip, and a floor that followed it down would start keeping
-// blocks it had already been right to drop; leaving it where it is costs a
-// little disk and nothing else.
-//
-// The two are swapped together on purpose: a caller that read the height and
-// then made a second, separate call for the hash could read a hash committed
-// after the height it thinks it is asking about, if a commit landed in
-// between. One pointer swap makes that window impossible rather than merely
-// short.
-func (sm *SyncManager) noteCommittedHeight(height int32, hash chainhash.Hash) {
-	next := &committedTip{height: height, hash: hash}
-
-	for {
-		current := sm.lastCommittedTip.Load()
-		if current != nil && height <= current.height {
-			return
-		}
-
-		if sm.lastCommittedTip.CompareAndSwap(current, next) {
-			return
-		}
-	}
-}
-
-// committedHeight returns the height of the highest block this node has put
-// into the chain, or 0 before the first commit or seed. Existing readers of the
-// old lastCommittedHeight counter go through this accessor unchanged.
-func (sm *SyncManager) committedHeight() int32 {
-	tip := sm.lastCommittedTip.Load()
-	if tip == nil {
-		return 0
-	}
-
-	return tip.height
-}
-
-// committedTipSnapshot returns the height and hash of the highest block this
-// node has put into the chain, read as one atomic value so the two can never
-// disagree, and reports whether a tip has been recorded at all. false before
-// the first seed or commit.
-func (sm *SyncManager) committedTipSnapshot() (height int32, hash chainhash.Hash, ok bool) {
-	tip := sm.lastCommittedTip.Load()
-	if tip == nil {
+// It replaces a stored, atomically-swapped copy of the same pair that was
+// seeded once at startup and updated only when this package's own commits
+// advanced it. A chain advance by any other route left that copy behind for
+// good, and its update refused any height not strictly greater than the one
+// it already held — a rule meant to stop a reorg's lower tip from reviving
+// blocks a floor had already been right to evict, back when the copy was also
+// the park's eviction floor. That reader was removed earlier in this branch,
+// leaving the monotonic rule with nothing left to protect and one failure mode
+// it actively caused: a same-height reorg can never produce a height strictly
+// greater than what is stored, so the copy's hash could never be replaced, and
+// fillHeaderCache — which requires an incoming batch's first header to link to
+// that exact hash — refused every batch forever, because peers answer from the
+// chain that is actually current. Reading the chain directly has neither
+// failure mode, at the cost of a blockchain round trip on every call.
+func (sm *SyncManager) committedTip() (height int32, hash chainhash.Hash, ok bool) {
+	if sm.blockchainClient == nil {
 		return 0, chainhash.Hash{}, false
 	}
 
-	return tip.height, tip.hash, true
+	header, meta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+	if err != nil || header == nil || meta == nil {
+		return 0, chainhash.Hash{}, false
+	}
+
+	h, err := safeconversion.Uint32ToInt32(meta.Height)
+	if err != nil {
+		return 0, chainhash.Hash{}, false
+	}
+
+	return h, *header.Hash(), true
 }
 
 // noteChainProgress records that a block joined the chain. Nothing else counts,
@@ -5473,15 +5392,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 			}
 		}
 	}()
-
-	// Seed the best block processed from the chain, before anything reads it.
-	// New used to make a second GetBestBlockHeader call here for a stored
-	// checkpoint init that this one round trip's result could not also serve;
-	// that init is gone, so this is now the only call New makes for the chain's
-	// current tip. See seedCommittedHeight for what a zero counter costs.
-	if err := sm.seedCommittedHeight(ctx); err != nil {
-		return nil, err
-	}
 
 	sm.headerCache = newHeaderCache()
 

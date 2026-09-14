@@ -124,13 +124,19 @@ func TestBlockPark_ARestoredBlockIsStillBilled(t *testing.T) {
 func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
+	// lookaheadCeilingLocked takes the committed height as a parameter now,
+	// read by its caller before headerMu is taken (see wantedBlocks); any
+	// value stands in for it here, since the point under test is the
+	// arithmetic, not where the height comes from.
+	best := int32(0)
+
 	h.sm.headerMu.Lock()
-	ceiling, ok := h.sm.lookaheadCeilingLocked()
+	ceiling, ok := h.sm.lookaheadCeilingLocked(best)
 	h.sm.headerMu.Unlock()
 
 	require.True(t, ok, "with a configured lower window there is a ceiling")
 
-	require.Equal(t, int64(h.sm.committedHeight())+int64(h.sm.settings.Legacy.BlockDownloadLowerWindow), ceiling,
+	require.Equal(t, int64(best)+int64(h.sm.settings.Legacy.BlockDownloadLowerWindow), ceiling,
 		"the ceiling is the committed height plus the configured depth, in blocks — "+
 			"not the front of the header list, which this harness never commits past")
 
@@ -138,7 +144,7 @@ func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 	h.sm.settings.Legacy.BlockDownloadLowerWindow = 0
 
 	h.sm.headerMu.Lock()
-	_, ok = h.sm.lookaheadCeilingLocked()
+	_, ok = h.sm.lookaheadCeilingLocked(best)
 	h.sm.headerMu.Unlock()
 
 	require.False(t, ok, "a lower window of zero is no ceiling at all")
@@ -171,12 +177,11 @@ func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 	require.Positive(t, depth, "the harness must configure a read-ahead depth or this test proves nothing")
 
 	// Committing moves the ceiling, because the committer is what the read-ahead
-	// is ahead OF. The front is left untouched, so anything that still followed
-	// the front would not move.
-	h.sm.lastCommittedTip.Store(&committedTip{height: int32(front) + 500})
-
+	// is ahead OF. best is passed straight in now (see wantedBlocks, which reads
+	// it from the chain before taking headerMu and hands it down), so moving it
+	// is just passing a different value.
 	h.sm.headerMu.Lock()
-	ceiling, ok := h.sm.lookaheadCeilingLocked()
+	ceiling, ok := h.sm.lookaheadCeilingLocked(front + 500)
 	h.sm.headerMu.Unlock()
 
 	require.True(t, ok)
@@ -185,17 +190,10 @@ func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 
 	// Nothing committed in this process yet is a real state — genesis, or a
 	// struct-literal test harness — and it is no longer a special case: with the
-	// header-list fallback removed, committedHeight() reading zero here answers
-	// zero plus depth, the same arithmetic as any other height. It reads zero on
-	// a node restarting mid-chain too, but that is no longer this function's
-	// problem to solve: seedCommittedHeight now seeds the real counter at
-	// startup, before this is ever called for real, which is what makes leaving
-	// the fallback out safe rather than a reintroduction of the restart stall
-	// the old comment here warned about.
-	h.sm.lastCommittedTip.Store(&committedTip{height: 0})
-
+	// header-list fallback removed, a height of zero here answers zero plus
+	// depth, the same arithmetic as any other height.
 	h.sm.headerMu.Lock()
-	atStart, ok := h.sm.lookaheadCeilingLocked()
+	atStart, ok := h.sm.lookaheadCeilingLocked(0)
 	h.sm.headerMu.Unlock()
 
 	require.True(t, ok)

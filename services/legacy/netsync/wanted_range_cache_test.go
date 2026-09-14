@@ -132,8 +132,7 @@ func TestUnownedBlocks_StillDropsBlocksAPeerOwes(t *testing.T) {
 func TestWantedBlocks_UsesTheScaledLookaheadCeilingNotTheFlatWindow(t *testing.T) {
 	sm := newHeaderCacheManager(t)
 
-	tipHash := chainhash.Hash{0x60}
-	sm.lastCommittedTip.Store(&committedTip{height: 100, hash: tipHash})
+	tipHash := mockCommittedTip(t, sm, 100, 0)
 
 	sm.settings.Legacy.BlockDownloadLowerWindow = 10
 	sm.settings.Legacy.BlockDownloadWindow = 1000
@@ -150,7 +149,7 @@ func TestWantedBlocks_UsesTheScaledLookaheadCeilingNotTheFlatWindow(t *testing.T
 
 	sm.fillHeaderCache(peer, msg)
 
-	got := sm.wantedBlocks()
+	got := sm.wantedBlocks(100)
 
 	require.Len(t, got, 5,
 		"the scaled ceiling (10 * 10/20 = 5) must bind, not the unscaled lower window (10) and not the node-wide window (1000)")

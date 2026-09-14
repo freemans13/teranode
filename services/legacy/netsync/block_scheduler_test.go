@@ -62,7 +62,9 @@ func schedulerManager(t *testing.T) *SyncManager {
 func nextCandidateHash(t *testing.T, sm *SyncManager) (chainhash.Hash, bool) {
 	t.Helper()
 
-	candidates := sm.unownedBlocks(sm.wantedBlocks())
+	best, _, _ := sm.committedTip()
+
+	candidates := sm.unownedBlocks(sm.wantedBlocks(best))
 	if len(candidates) == 0 {
 		return chainhash.Hash{}, false
 	}
@@ -235,7 +237,7 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 	// six as committed purely so the cache's own no-gaps rule is satisfied;
 	// nothing here asserts anything about whether they actually committed.
 	committedAt := int32(10 + len(hashes))
-	sm.noteCommittedHeight(committedAt, hashes[len(hashes)-1])
+	mockCommittedTip(t, sm, uint32(committedAt), 1) //nolint:gosec // a small test height
 	sm.headerCache = newHeaderCache()
 	require.True(t, sm.headerCache.Fill(hashes[len(hashes)-1], committedAt+1, more.Headers))
 
@@ -694,7 +696,7 @@ func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
 	// anchor) as committed, which is what let the first half's ceiling engage at
 	// all; committing one more is what has to free one more slot, and nothing
 	// short of a real commit may.
-	sm.noteCommittedHeight(11, hashes[0])
+	mockCommittedTip(t, sm, 11, 1)
 
 	sm.fetchHeaderBlocks()
 

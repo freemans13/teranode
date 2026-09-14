@@ -50,9 +50,11 @@ func TestMaybeRequestMoreHeaders_AsksForMoreOnceTheCacheReachesItsTop(t *testing
 	require.True(t, sm.headerCache.Fill(anchor, 1, msg.Headers))
 
 	// The committed tip has caught all the way up to the last header the cache
-	// names: nothing is left in the cache above it.
-	tip := hashes[len(hashes)-1]
-	sm.noteCommittedHeight(int32(len(hashes)), tip) //nolint:gosec // a small test count
+	// names: nothing is left in the cache above it. mockCommittedTipAtHash makes
+	// the chain mock answer with that exact header, re-encoded, so its hash is
+	// provably hashes[len(hashes)-1] rather than merely standing in for it.
+	tip := mockCommittedTipAtHash(t, sm, uint32(len(hashes)), msg.Headers[len(msg.Headers)-1]) //nolint:gosec // a small test count
+	require.Equal(t, hashes[len(hashes)-1], tip, "sanity: the re-encoded header must hash to what linkedHeaders already computed")
 
 	sm.fetchHeaderBlocks()
 
@@ -91,7 +93,7 @@ func TestMaybeRequestMoreHeaders_DoesNotAskTwiceWithinTheRateLimit(t *testing.T)
 
 	sm.headerCache = newHeaderCache()
 	require.True(t, sm.headerCache.Fill(anchor, 1, msg.Headers))
-	sm.noteCommittedHeight(int32(len(hashes)), hashes[len(hashes)-1]) //nolint:gosec // a small test count
+	mockCommittedTip(t, sm, uint32(len(hashes)), 0) //nolint:gosec // a small test count
 
 	// Twenty passes in a row, the way twenty rapid commits would each call
 	// fetchHeaderBlocks while the first reply is still on the wire.
@@ -140,7 +142,7 @@ func TestMaybeRequestMoreHeaders_RotatesAcrossEligiblePeers(t *testing.T) {
 
 	sm.headerCache = newHeaderCache()
 	require.True(t, sm.headerCache.Fill(anchor, 1, msg.Headers))
-	sm.noteCommittedHeight(int32(len(hashes)), hashes[len(hashes)-1]) //nolint:gosec // a small test count
+	mockCommittedTip(t, sm, uint32(len(hashes)), 0) //nolint:gosec // a small test count
 
 	// Repeated refills, as repeated commit-driven passes would produce while a
 	// single unusable reply leaves the cache dry. The rate limit's floor is
@@ -196,7 +198,7 @@ func TestMaybeRequestMoreHeaders_SinglePeerAsksAgainAfterRateLimitLapses(t *test
 
 	sm.headerCache = newHeaderCache()
 	require.True(t, sm.headerCache.Fill(anchor, 1, msg.Headers))
-	sm.noteCommittedHeight(int32(len(hashes)), hashes[len(hashes)-1]) //nolint:gosec // a small test count
+	mockCommittedTip(t, sm, uint32(len(hashes)), 0) //nolint:gosec // a small test count
 
 	// Repeated refills against the one eligible peer, as repeated
 	// commit-driven passes would produce while a single unusable reply
