@@ -630,3 +630,88 @@ func TestSpendDoesNotBlessSpenderCreatedByCaller(t *testing.T) {
 		require.ErrorIs(t, err, errors.ErrTxNotFound, "a record the caller wrote itself is not proof of prior validation")
 	})
 }
+
+// TestPrunerMarksOnlyTheChildThatHeldTheSpend: a conflicting loser names the
+// same outpoint in its inputs as the winner but never held it. Marking
+// (parent, loser) used to be inert, because the spend path compared the marker
+// against the output's stored spender. This PR keys the check on the incoming
+// spender and runs it before every other answer, which makes a stale marker
+// load-bearing: the loser's genuinely fresh spend of that output, once the
+// winner's spend is released, would be rejected forever on the live
+// above-checkpoint path. Only the child the output records as its spender may
+// be marked.
+func TestPrunerMarksOnlyTheChildThatHeldTheSpend(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		parent := bt.NewTx()
+		require.NoError(t, parent.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
+		parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+		_, err := store.Create(ctx, parent, 1000)
+		require.NoError(t, err)
+
+		// The winner takes P:0 and is later fully spent, so it becomes a prune
+		// candidate and legitimately earns a marker.
+		winner := bt.NewTx()
+		require.NoError(t, winner.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+		winner.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, winner.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+		_, _, err = store.SpendAndCreate(ctx, winner, 1000)
+		require.NoError(t, err)
+
+		// The loser asks for the same outpoint and never gets it. It is created
+		// (as a conflicting record would be) and tombstoned alongside the winner.
+		loser := bt.NewTx()
+		require.NoError(t, loser.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+		loser.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, loser.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2999))
+		_, err = store.Create(ctx, loser, 1000)
+		require.NoError(t, err)
+
+		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash(), winner.TxIDChainHash()},
+			utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+		require.NoError(t, err)
+
+		grandchild := bt.NewTx()
+		require.NoError(t, grandchild.From(winner.TxID(), 0, winner.Outputs[0].LockingScript.String(), winner.Outputs[0].Satoshis))
+		grandchild.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, grandchild.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2000))
+		_, _, err = store.SpendAndCreate(ctx, grandchild, 1001)
+		require.NoError(t, err)
+		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchild.TxIDChainHash()},
+			utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+		require.NoError(t, err)
+
+		// Tombstone the loser too, so both are candidates in the same cycle.
+		_, err = store.db.ExecContext(ctx, "UPDATE transactions SET delete_at_height = 1100 WHERE hash = $1", loser.TxIDChainHash()[:])
+		require.NoError(t, err)
+
+		svc, err := store.GetPrunerService()
+		require.NoError(t, err)
+		_, err = svc.Prune(ctx, 1300, "conflicting-loser")
+		require.NoError(t, err)
+
+		var loserMarkers int
+		require.NoError(t, store.db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM deleted_children WHERE child_hash = $1", loser.TxIDChainHash()[:]).Scan(&loserMarkers))
+		require.Equal(t, 0, loserMarkers,
+			"the loser never held P:0, so marking it would reject its own later spend of that output forever")
+
+		var winnerMarkers int
+		require.NoError(t, store.db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM deleted_children WHERE child_hash = $1", winner.TxIDChainHash()[:]).Scan(&winnerMarkers))
+		require.Equal(t, 1, winnerMarkers, "the child that actually held the spend must still be marked")
+
+		// End state that matters: with the winner's spend released, the loser's
+		// fresh spend of the now-free output must be accepted.
+		utxoHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(), parent.Outputs[0], 0)
+		require.NoError(t, err)
+		require.NoError(t, store.Unspend(ctx, []*utxo.Spend{{
+			TxID: parent.TxIDChainHash(), Vout: 0, UTXOHash: utxoHash,
+			SpendingData: spendpkg.NewSpendingData(winner.TxIDChainHash(), 0),
+		}}))
+
+		_, err = store.Spend(ctx, loser, 1400)
+		require.NoError(t, err, "a transaction that never held the output must be able to spend it once it is free")
+	})
+}
