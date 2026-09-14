@@ -4319,6 +4319,13 @@ func (sm *SyncManager) blockHandler() {
 		sm.dispatchBlocks(blockQueue)
 	}()
 
+	// One pass over whatever Recover adopted, now that the consumer above is
+	// started and has somewhere to hand a committable block to. Must run before
+	// the sweep goroutine below, or a full park would sit through up to
+	// parkStuckThreshold's worth of the sweep's own thirty-second cadence before
+	// anything asked about blocks this pass would have settled at once.
+	sm.reconcileRecoveredParents(sm.ctx)
+
 	// The park sweep gets a goroutine of its own rather than a ticker arm on the
 	// consumer. It used to share the goroutine that committed blocks in order,
 	// and a slow tick there held up commits; under the dispatcher that goroutine
@@ -5129,8 +5136,12 @@ func (sm *SyncManager) Start() {
 	sm.logger.Infof("Starting sync manager")
 
 	// Adopt whatever a previous run left parked, before anything can drain it.
-	// No RPCs are made here; the parents are reconciled with the chain by the
-	// park sweep once the block-queue consumer is running.
+	// No RPCs are made here. blockHandler makes the one pass that reconciles
+	// these against the chain (reconcileRecoveredParents), right after it starts
+	// the consumer that a hand-off needs somewhere to go; the park sweep still
+	// runs behind that as a safety net for a parent committed by something other
+	// than legacy sync, which fires no event either of the other two mechanisms
+	// listens for.
 	sm.blockPark.Recover(sm.ctx, sm.subtreeStore, sm.quickValidationAllowed)
 
 	go sm.blockHandler()

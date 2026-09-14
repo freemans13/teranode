@@ -1176,6 +1176,32 @@ func (p *blockPark) StuckCandidates(now time.Time, limit int) []parkedBlock {
 	return candidates
 }
 
+// AllParked returns a copy of every currently parked entry, with no age
+// threshold and no per-call limit.
+//
+// It exists for reconcileRecoveredParents, which runs once, right after
+// Recover, and needs to ask about every block the restart scan adopted rather
+// than a budgeted, round-robin sample of them the way StuckCandidates does for
+// the sweep's every-thirty-seconds pass. Bounded by whatever Recover put in the
+// park, which is bounded in turn by the download walk's read-ahead depth (see
+// Admit's own comment) rather than by anything in this function.
+func (p *blockPark) AllParked() []parkedBlock {
+	if p == nil {
+		return nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	out := make([]parkedBlock, 0, len(p.entries))
+
+	for _, entry := range p.entries {
+		out = append(out, *entry)
+	}
+
+	return out
+}
+
 // Take removes one specific block from the index, leaving its blob on disk and
 // still charged, exactly as TakeChildren does.
 func (p *blockPark) Take(hash chainhash.Hash) (parkedBlock, bool) {

@@ -618,14 +618,99 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 	return false
 }
 
+// reconcileRecoveredParents asks the chain about the parent of every block the
+// restart scan adopted, once, and hands on the ones that can already commit. It
+// returns how many it handed on.
+//
+// A block recovered from disk is a case the commit-driven drain (the primary
+// mechanism: a commit is asked for the blocks parked directly behind it, and
+// those drain at once) cannot serve on its own: the event that would have woken
+// it fired, if at all, in a process that no longer exists. That condition holds
+// once, over a set of blocks known once — everything Recover just adopted — so
+// it is answered once here rather than by asking about the same blocks again
+// every thirty seconds for the life of the node, which is what the sweep
+// (sweepParkedBlocks) used to be the only thing doing about it.
+//
+// Cost: bounded by AllParked's own bound, which is the park's contents at the
+// moment recovery finishes — itself bounded upstream by the download walk's
+// read-ahead depth (legacy_blockDownloadWindow and
+// legacy_maxBlocksInTransitPerPeer; see Admit's own comment), 128 with every
+// legacy_* setting at its default. So this costs at most one local chain
+// lookup per recovered block, not per park entry per tick, and it runs once.
+//
+// Deliberately NOT called from Start(), where Recover runs: at that point
+// nothing is reading sm.parkCommits yet (dispatchBlocks, the consumer, and
+// runParkSweep both start later, from blockHandler), so handing on more than
+// parkSweepRPCBudget blocks there would block this call forever on a channel
+// nobody drains. Called instead from blockHandler, immediately after the
+// consumer goroutine is started and before the sweep's own goroutine begins,
+// so a hand-off here always has somewhere to go.
+func (sm *SyncManager) reconcileRecoveredParents(ctx context.Context) int {
+	if !sm.blockPark.Enabled() {
+		return 0
+	}
+
+	handed := 0
+
+	for _, candidate := range sm.blockPark.AllParked() {
+		exists, invalid, parentHeight, err := sm.parentChainState(candidate.prevBlock)
+		if err != nil {
+			sm.logger.Warnf("[reconcileRecoveredParents][%s] could not check parent %s: %v", candidate.hash, candidate.prevBlock, err)
+
+			continue
+		}
+
+		if !exists {
+			// The ordinary case: the parent really has not arrived yet, and the
+			// commit-driven drain will pick this block up the moment it does.
+			continue
+		}
+
+		entry, ok := sm.blockPark.Take(candidate.hash)
+		if !ok {
+			// Already gone: a commit that raced this pass took it first.
+			continue
+		}
+
+		if invalid {
+			// The parent is stored and rejected, so this block can never be
+			// committed — the same judgment sweepParkedBlocks makes for the
+			// identical condition, and parkDispositionParentInvalid (drop the
+			// blob, mark failed) rather than parkDispositionParentGone (keep
+			// and retry) is what belongs here: nothing about this parent is
+			// going to change.
+			sm.logger.Warnf("[reconcileRecoveredParents][%s] %s (%s), dropping it", entry.hash, parkDispositionParentInvalid.reason, entry.prevBlock)
+			sm.applyParkDisposition(entry, parkDispositionParentInvalid)
+
+			continue
+		}
+
+		sm.submitParkCommit(parkCommit{entry: entry, parentHeight: parentHeight})
+
+		handed++
+	}
+
+	if handed > 0 {
+		sm.logger.Infof("[reconcileRecoveredParents] handed on %d recovered block(s) whose parent was already in the chain", handed)
+	}
+
+	return handed
+}
+
 // sweepParkedBlocks is the safety net for blocks whose parent never arrives
 // through a commit this node saw.
 //
-// Two things need it. A block can be parked for a reason other than a genuinely
-// absent parent, because a missing parent is not the only thing that surfaces as
-// ErrBlockNotFound. And a block recovered from disk after a restart never sees a
-// commit event for a parent that was already in the chain when the node started,
-// so nothing would ever drain it.
+// One thing needs it now that reconcileRecoveredParents has taken the restart
+// case: a block can be parked for a reason other than a genuinely absent
+// parent, because a missing parent is not the only thing that surfaces as
+// ErrBlockNotFound. A second, likelier than hypothetical, is what
+// reconcileRecoveredParents' own doc comment does not cover either: a parent
+// committed by something other than legacy sync fires no event legacy sync
+// listens for, so neither the commit-driven drain nor the one-off startup pass
+// ever sees it. This sweep is deliberately left running to catch that case, and
+// its commit branch below now logs with its own distinct prefix when it does,
+// so a soak can show whether that third case is real rather than a reasoned
+// guess about it.
 //
 // It runs on the sweep's own goroutine (runParkSweep) and commits nothing
 // itself: a parked block whose parent turns out to be stored is posted to the
@@ -700,7 +785,13 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 			continue
 		}
 
-		sm.logger.Infof("[sweepParkedBlocks][%s] parent %s is in the chain after all, committing the parked block", entry.hash, entry.prevBlock)
+		// This is the evidence line the third case earns its keep with: by now
+		// both the commit-driven drain and reconcileRecoveredParents have had
+		// their chance at this block, so the sweep finding it committable means
+		// something neither of them covers actually happened — most likely a
+		// parent committed by something other than legacy sync. If a soak never
+		// prints this, the polling this sweep still does has no job left.
+		sm.logger.Infof("[sweepParkedBlocks][%s] parent %s was in the chain after all; the commit-driven drain and the startup pass both missed it", entry.hash, entry.prevBlock)
 
 		sm.submitParkCommit(parkCommit{entry: entry, parentHeight: parentHeight})
 	}
