@@ -76,6 +76,11 @@ func TestHandleBlockMsg_FloodMustNotCostTheFrontierPeerItsConnection(t *testing.
 	running := blockchain2.FSMStateRUNNING
 	blockchainClient := &blockchain2.Mock{}
 	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	// handleBlockMsgTail's top-up can reach maybeRequestMoreHeaders once the
+	// header cache (empty here) is found to have nothing past the committed
+	// height, which is every call on a manager this bare.
+	blockchainClient.Mock.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{{}}, nil)
 
 	sm := newRaceManager(t)
 	sm.ctx = context.Background()

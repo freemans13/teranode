@@ -142,6 +142,11 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	running := blockchain2.FSMStateRUNNING
 	blockchainClient := &blockchain2.Mock{}
 	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	// maybeRequestMoreHeaders reaches this once the cache runs past what
+	// cacheManager seeded, which this test's own arrival does not commit past —
+	// harmless if never called, needed if the ceiling ever moves.
+	blockchainClient.Mock.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{{}}, nil)
 	sm.ctx = context.Background()
 	sm.blockchainClient = blockchainClient
 

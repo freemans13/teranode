@@ -27,19 +27,30 @@ import (
 // choose between itself and this pass is gone, so this is the only way blocks
 // are chosen.
 //
-// The assigner is built first, and the wanted range is capped to what it can
-// still place, before unownedBlocks spends anything on a candidate: a blob-store
-// existence check, a blockchain round trip, two map lookups and a ledger write.
-// The old walk took the assigner first for the same reason and returned on a
-// nil one; asking about headers there is no budget to hand out was exactly the
-// cost review found this pass reintroduced when that order was dropped.
+// The wanted range is read once, at the top, and used twice: maybeRequestMoreHeaders
+// reads the whole thing to decide whether the header round itself has run dry,
+// and only after that is it capped to what the assigner can still place, before
+// unownedBlocks spends anything on a candidate — a blob-store existence check, a
+// blockchain round trip, two map lookups and a ledger write. The assigner's cap
+// answers "is there download budget for a block right now", which is not the
+// question a header refill needs answered, so the refill check must see the
+// range before that cap is applied and must not be skipped by a nil assigner (no
+// budget, or no peer to place a block with) — a node with nothing to place a
+// block on can still have every reason to ask for more headers.
 func (sm *SyncManager) assignWantedBlocks() {
+	wanted := sm.wantedBlocks()
+
+	// Ahead of the assigner and its budget cap on purpose: whether the cache has
+	// run out is a question about the header round, not about whether there is
+	// download budget free this instant, so it must be asked on every call this
+	// function makes, not only the ones that go on to place a block.
+	sm.maybeRequestMoreHeaders(wanted)
+
 	assigner := sm.newDownloadAssigner()
 	if assigner == nil {
 		return
 	}
 
-	wanted := sm.wantedBlocks()
 	if len(wanted) > assigner.remaining {
 		wanted = wanted[:assigner.remaining]
 	}

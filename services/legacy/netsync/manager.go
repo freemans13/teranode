@@ -837,8 +837,14 @@ type SyncManager struct {
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
 	// currentCached is the last answer current() worked out, so a peer goroutine
 	// can read it without making the blockchain call itself. See IsCurrentCached.
-	currentCached    atomic.Bool
-	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
+	currentCached atomic.Bool
+	// lastHeaderRequestAt is when assignWantedBlocks last sent its own getheaders
+	// to refill the header cache, in UnixNano, read and written only through
+	// maybeRequestMoreHeaders' compare-and-swap. Every commit can call that pass,
+	// so without this a cache that has run dry would earn one getheaders per
+	// commit instead of one per round trip.
+	lastHeaderRequestAt atomic.Int64
+	blockSizeTracker    *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
 	// dispatcher owns the quick window: it decides how many queued blocks may have
 	// their UTXO store work in flight at once and runs every chain-order step in
@@ -2414,7 +2420,7 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 				sm.parkJobHeld = nil
 			}
 
-			for _, e := range bd.frontier {
+			for _, e := range bd.drainFrontier() {
 				// A parked dispatch has no queue message: nothing incremented the
 				// backlog for it and nobody is waiting on a reply, so finishing it
 				// would send on a nil channel and underflow the counter that
@@ -2432,8 +2438,6 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 
 				finish(e.d.msg, errors.NewServiceError(syncManagerShuttingDownMsg))
 			}
-
-			bd.frontier = nil
 
 			for {
 				select {
@@ -3511,6 +3515,119 @@ func (sm *SyncManager) dropBlockFromWalk(blockHash chainhash.Hash) {
 // One pointer, three meanings, and every fix for one broke another.
 func (sm *SyncManager) fetchHeaderBlocks() {
 	sm.assignWantedBlocks()
+}
+
+// headerCacheRefillInterval bounds how often maybeRequestMoreHeaders may send its
+// own getheaders. assignWantedBlocks runs on every commit, so a cache that has
+// run dry stays dry for many calls in a row while the reply is still in
+// flight; without a floor, each of those calls would send its own getheaders
+// to whichever peer it happened to pick, for no gain over the first one. The
+// floor is a value on lastHeaderRequestAt, not a count of anything in flight,
+// so it self-heals if the peer asked never answers: the next pass past the
+// interval simply tries again, possibly of a different peer.
+const headerCacheRefillInterval = 5 * time.Second
+
+// maybeRequestMoreHeaders is assignWantedBlocks' other half: the wanted range
+// only ever names what the cache already holds, and nothing before this
+// existed to refill it once a round ran out. wanted is what wantedBlocks()
+// returned for this pass, before the assigner's own download-budget cap —
+// that cap answers "is there room for a block", a different question from
+// "is there more of the run to read", so this must see the pass's full range
+// and run whether or not a download budget happens to be free this time.
+//
+// The check is simple: does the cache still name the height right above the
+// last one this pass was handed? If it does, wantedBlocksFromCache stopped at
+// the configured depth with headers to spare, and there is nothing to do here
+// — the next pass reads further into what the cache already has. Only when
+// the cache itself has nothing past that point has the run actually ended,
+// which is when a fresh getheaders is owed.
+//
+// The locator is built exactly as startSync's and headersRoundLocator's own
+// callers build theirs: from the committed tip, through the chain's own
+// GetBlockLocator, never from anything merely downloaded or merely named by
+// the cache. A locator anchored above what this node has actually committed
+// is what had a peer answer from genesis and lose its connection for
+// answering honestly — the 2026-09-11 incident this whole design exists to
+// not repeat.
+//
+// Any eligible peer will do, not only the sync peer: eligibleBlockPeers is
+// the same connected, sync-candidate pool the block-download scheduler draws
+// from, and a getheaders is a lookup any of them can answer. The send is
+// fire-and-forget; the reply lands asynchronously in fillHeaderCache and the
+// next pass reads whatever it left there. A failure to build the locator or
+// to send still counts as having asked, for rate-limiting purposes: retrying
+// a peer or a client call that just failed on every subsequent commit would
+// be the same storm this function exists to prevent.
+func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
+	if !sm.headersFirstMode.Load() || sm.headerCache == nil {
+		return
+	}
+
+	last := sm.committedHeight()
+	if n := len(wanted); n > 0 {
+		last = wanted[n-1].height
+	}
+
+	if _, ok := sm.headerCache.At(last + 1); ok {
+		// The depth cap stopped the pass, not the cache's own end; the rest of
+		// the run is still there for the next pass to read.
+		return
+	}
+
+	peers := sm.eligibleBlockPeers()
+	if len(peers) == 0 {
+		return
+	}
+
+	if !sm.allowedToRequestMoreHeadersNow(time.Now()) {
+		return
+	}
+
+	if sm.blockchainClient == nil {
+		return
+	}
+
+	best, tipHash, ok := sm.committedTipSnapshot()
+	if !ok {
+		return
+	}
+
+	locator, err := sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+	if err != nil {
+		sm.logger.Warnf("[assignWantedBlocks] could not build a getheaders locator to refill the header cache past height %d: %v", last, err)
+
+		return
+	}
+
+	peer := peers[0].peer
+
+	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
+		sm.logger.Warnf("[assignWantedBlocks][%s] failed to send getheaders to refill the header cache past height %d: %v", peer.String(), last, err)
+
+		return
+	}
+
+	sm.logger.Infof("[assignWantedBlocks][%s] the header cache ends at height %d, asked for more", peer.String(), last)
+}
+
+// allowedToRequestMoreHeadersNow is the compare-and-swap that makes the
+// headerCacheRefillInterval floor safe under concurrent callers: assignWantedBlocks
+// runs on the consumer goroutine and, since the park sweep calls fetchHeaderBlocks
+// directly on its own goroutine, on that one too. A plain load-then-store here
+// would let two callers that both read a stale timestamp both decide to send.
+// The loop retries only on a lost CAS race, not on a genuinely-too-recent
+// timestamp, so it always terminates.
+func (sm *SyncManager) allowedToRequestMoreHeadersNow(now time.Time) bool {
+	for {
+		last := sm.lastHeaderRequestAt.Load()
+		if now.Sub(time.Unix(0, last)) < headerCacheRefillInterval {
+			return false
+		}
+
+		if sm.lastHeaderRequestAt.CompareAndSwap(last, now.UnixNano()) {
+			return true
+		}
+	}
 }
 
 // lookaheadCeilingLocked returns the highest block height this round may ask for,

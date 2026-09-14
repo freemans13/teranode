@@ -185,6 +185,12 @@ func newHeaderLockManager(t *testing.T, gate chan struct{}, entered chan struct{
 	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
 	blockchainClient.Mock.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Return(nil, nil, errors.NewNotFoundError("not found"))
+	// maybeRequestMoreHeaders reaches this once a test's cache runs to its own
+	// end, which most of these tests do on purpose: the wanted-range pass is
+	// what is under test, and this is the client call it now makes on that
+	// path, not the earlier headers-first bookkeeping this harness predates.
+	blockchainClient.Mock.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{{}}, nil)
 
 	best := blockchainClient.Mock.On("GetBestBlockHeader", mock.Anything).
 		Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)

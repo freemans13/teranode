@@ -830,6 +830,10 @@ func TestScheduler_DoesNotAskAgainForABlockTheChainAlreadyHasByAnotherRoute(t *t
 	client := &blockchain2.Mock{}
 	client.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
 	client.On("GetBestBlockHeader", mock.Anything).Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)
+	// The cache runs out after these 3 headers; maybeRequestMoreHeaders reaches
+	// this to refill it once fetchHeaderBlocks consumes the last of them.
+	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{{}}, nil)
 
 	// The first header, and only it, joined the chain by some other route: the
 	// blockchain service already has it, and it is valid.
