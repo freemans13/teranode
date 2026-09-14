@@ -58,72 +58,46 @@ const streamedBodyRequestWindow = 60 * 60 * 1000000000 // one hour, in nanosecon
 // falls back to decoding rather than opening the door. This installs all three
 // together for the same reason.
 //
-// set also carries whether the wire layer may ignore its size threshold. The
-// two decisions are made from the same PipelineReceive check and passed on the
-// same call, so a sink can never be installed with the wrong size policy: the
-// park sink only pays for a block too large to hold in memory, but the
-// pipeline sink converts a block as it arrives and pays at every size.
+// The sink installed is always the pipeline sink: every block that reaches
+// this path converts, whatever its size, so there is no second, decode-and-
+// park sink left to choose between.
 func (sm *SyncManager) installStreamingBlockPath(set func(
 	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
 	del func(chainhash.Hash, bool) error,
-	streamsEverySize bool,
 )) {
 	if sm == nil || sm.blockPark == nil || !sm.blockPark.Enabled() {
 		return
 	}
 
-	// A nil settings pointer here is not a recoverable nil panic the way it
-	// would be for most fields: the reviewer measured Settings.Legacy at
-	// offset 4728 and PipelineReceive at 5112, both past the 4096-byte guard
-	// page a Go process leaves unmapped at low addresses, so reading through
-	// a nil settings pointer this far in can fault outside the range the
-	// runtime is guaranteed to turn back into an ordinary panic. Computed
-	// once here, matching the sm.settings != nil && pattern already used
-	// elsewhere in this package (e.g. handle_block.go's
-	// quickValidationAllowed), and reused below rather than re-read, so
-	// there is exactly one place that can get this wrong instead of three.
-	pipelineOn := sm.settings != nil && sm.settings.Legacy.PipelineReceive
+	// admitPipelineSink wraps the download-admission budget around the
+	// pipeline sink. See that method's doc comment for why it has to wrap
+	// the sink itself rather than being charged in the on-disk message
+	// handler that runs after the sink has already finished.
+	//
+	// del is pipelineBlockDelete, never streamingBlockDelete: the pipeline
+	// sink writes subtree files, not a whole-body blob, so only
+	// pipelineBlockDelete's cleanup — gated on the converted argument the wire
+	// layer passes through from THIS delivery's own blockBodySink return,
+	// never on whether a converted record merely exists for the hash (see
+	// pipelineBlockDelete's own doc comment for why that inference is exactly
+	// the bug this closes) — knows how to remove what was actually written.
+	sm.logger.Infof("[legacy] streaming block path installed")
 
-	sink := sm.streamingBlockSink
-	del := sm.streamingBlockDelete
-
-	if pipelineOn {
-		// admitPipelineSink wraps the download-admission budget around the
-		// pipeline sink. See that method's doc comment for why it has to wrap
-		// the sink itself rather than being charged in the on-disk message
-		// handler that runs after the sink has already finished.
-		sink = sm.admitPipelineSink(sm.pipelineBlockSink)
-		// The delete callback is chosen from the same check, on the same
-		// call, as the sink: whichever sink actually wrote something for a
-		// hash is the only thing that knows how to clean it up again, so a
-		// sink can never be installed with the wrong delete callback any
-		// more than it can be installed with the wrong size policy (see
-		// streamsEverySize below). streamingBlockDelete only knows about the
-		// park's blob store; the pipeline sink can also write subtree files,
-		// so it needs pipelineBlockDelete's own cleanup — gated on the
-		// converted argument the wire layer passes through from THIS
-		// delivery's own blockBodySink return, never on whether a converted
-		// record merely exists for the hash (see pipelineBlockDelete's own
-		// doc comment for why that inference is exactly the bug this closes).
-		del = sm.pipelineBlockDelete
-	}
-
-	sm.logger.Infof("[legacy] streaming block path installed, pipeline=%v", pipelineOn)
-
-	set(sink, sm.streamingBlockGate, del, pipelineOn)
+	set(sm.admitPipelineSink(sm.pipelineBlockSink), sm.streamingBlockGate, sm.pipelineBlockDelete)
 }
 
 // admitPipelineSink wraps inner (the pipeline sink) with the download-admission
 // budget AcquireBlockPrefetch/ReleaseBlockPrefetch already implement, charged
 // one slot per block on this path (see AcquireBlockPrefetch's own
-// PipelineReceive branch, manager.go). That budget was sized for exactly this
+// park-enabled branch, manager.go). That budget was sized for exactly this
 // call site — sm.blockPrefetchBudgetBytes is derived from
-// MaxBlocksInTransitPerPeer specifically when PipelineReceive is on — but was
-// never reachable from it: AcquireBlockPrefetch is only ever called from
-// OnBlock, which the peer only dispatches for a whole *wire.MsgBlock, and with
-// the pipeline on every block comes back as *peer.MsgBlockOnDisk instead, so
-// OnBlock, and the admission check inside it, never runs for this route.
+// MaxBlocksInTransitPerPeer whenever the park (and so the streaming pipeline)
+// is enabled — but was never reachable from it: AcquireBlockPrefetch is only
+// ever called from OnBlock, which the peer only dispatches for a whole
+// *wire.MsgBlock, and with the park enabled every block comes back as
+// *peer.MsgBlockOnDisk instead, so OnBlock, and the admission check inside it,
+// never runs for this route.
 //
 // Charged here, wrapping the sink itself, NOT in handleBlockOnDiskMsg (the
 // on-disk message handler that runs once the body is already fully on disk).
@@ -452,11 +426,11 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 
 	// The streamed route never touched sm.blockDownloads, the map
 	// handleBlockMsg releases via RemoveOwner/ForgiveOwners (manager.go) the
-	// moment it dequeues a decoded block. Before this branch made the pipeline
-	// send every block down this route, that gap only missed blocks above the
-	// decode-size threshold (rare); with PipelineReceive on it is every block,
-	// so a delivering peer's CountForPeer sticks at MaxBlocksInTransitPerPeer
-	// after roughly sixteen deliveries and the scheduler (block_scheduler.go:144)
+	// moment it dequeues a decoded block. Streaming is now unconditional
+	// whenever the park is enabled, so this on-disk route is every block that
+	// arrives on such a node, not a rare oversized one: without this release a
+	// delivering peer's CountForPeer sticks at MaxBlocksInTransitPerPeer after
+	// roughly sixteen deliveries and the scheduler (block_scheduler.go:144)
 	// stops asking that peer for anything until the hour-long assignment TTL
 	// expires.
 	//
@@ -473,36 +447,36 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// node ends up keeping them (AdoptWritten) or discarding them (unreachable
 	// parent, full park).
 	//
-	// Gated on PipelineReceive: before this branch, a block only reached this
-	// on-disk route above the 64 MiB decode threshold, and that pre-existing
-	// (rare) behaviour is not this task's to change — only the route this
-	// branch made universal is.
-	if sm.settings != nil && sm.settings.Legacy.PipelineReceive {
-		// Resolve a stream sub-peer to its association primary, exactly as
-		// handleBlockMsg does before its own RemoveOwner call (manager.go:3271-3276)
-		// and as BlockRequested does before its HasOwner check (manager.go:6530-6538):
-		// the download ledger records ownership under the primary, never under a
-		// BlockPriority association's DATA1/DATA2 sub-peer. msg.peer is exactly
-		// that sub-peer whenever the body arrived on its own stream — OnBlockOnDisk
-		// (peer_server.go) hands QueueBlockOnDisk sp.Peer, which under a multistream
-		// association is the sub-peer, not the primary. Sub-peers are never
-		// registered in peerStates and so never own anything in blockDownloads;
-		// passing msg.peer straight through here made RemoveOwner a silent no-op in
-		// exactly that configuration. Fix round 1's own test caught only
-		// ForgiveOwners actually working (it is peer-agnostic), never this.
-		//
-		// Guarded on msg.peer != nil: peerStateResolvingPrimary calls
-		// AssociationRef on it, which dereferences a nil receiver.
-		// QueueBlockOnDisk's production caller always hands a real peer, but a nil
-		// one costs nothing extra to tolerate here.
-		primary := msg.peer
-		if msg.peer != nil {
-			_, primary, _ = sm.peerStateResolvingPrimary(msg.peer)
-		}
-
-		sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
-		sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
+	// Unconditional here too: this handler only ever runs when the wire layer
+	// dispatched a *peer.MsgBlockOnDisk, which only happens when the park is
+	// enabled (installStreamingBlockPath installs the sink only then) — so by
+	// the time this function is reached, the streaming route is the only route
+	// this delivery could have taken.
+	//
+	// Resolve a stream sub-peer to its association primary, exactly as
+	// handleBlockMsg does before its own RemoveOwner call (manager.go:3271-3276)
+	// and as BlockRequested does before its HasOwner check (manager.go:6530-6538):
+	// the download ledger records ownership under the primary, never under a
+	// BlockPriority association's DATA1/DATA2 sub-peer. msg.peer is exactly
+	// that sub-peer whenever the body arrived on its own stream — OnBlockOnDisk
+	// (peer_server.go) hands QueueBlockOnDisk sp.Peer, which under a multistream
+	// association is the sub-peer, not the primary. Sub-peers are never
+	// registered in peerStates and so never own anything in blockDownloads;
+	// passing msg.peer straight through here made RemoveOwner a silent no-op in
+	// exactly that configuration. Fix round 1's own test caught only
+	// ForgiveOwners actually working (it is peer-agnostic), never this.
+	//
+	// Guarded on msg.peer != nil: peerStateResolvingPrimary calls
+	// AssociationRef on it, which dereferences a nil receiver.
+	// QueueBlockOnDisk's production caller always hands a real peer, but a nil
+	// one costs nothing extra to tolerate here.
+	primary := msg.peer
+	if msg.peer != nil {
+		_, primary, _ = sm.peerStateResolvingPrimary(msg.peer)
 	}
+
+	sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
+	sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 
 	entry := parkedBlock{
 		hash:      msg.body.Hash,
@@ -526,15 +500,16 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// record's size to a delivery that never wrote it.
 	//
 	// Gating the store lookup on this flag also means the lookup itself never
-	// runs unless the pipeline actually converted something on THIS call: with
-	// PipelineReceive off, streamingBlockSink is the only sink ever installed
-	// and it always reports converted=false (see its own doc comment), so this
-	// whole block below is skipped and handleBlockOnDiskMsg does exactly the
-	// store I/O it always did — none — on that path. Before this gate existed,
-	// the lookup ran for every streamed block regardless of the setting, which
-	// meant an extra blob-store round trip, and therefore an extra wait on the
-	// store's shared read-permit pool, on the single goroutine that commits
-	// blocks in order — a path that used to do no I/O at all.
+	// runs unless the pipeline actually converted something on THIS call: the
+	// admission-budget fallback inside admitPipelineSink (a duplicate hash
+	// already in flight, or the acquire timing out) calls streamingBlockSink
+	// directly, which always reports converted=false (see its own doc
+	// comment), so this whole block below is skipped and handleBlockOnDiskMsg
+	// does exactly the store I/O it always did on that path — none. Before
+	// this gate existed, the lookup ran for every streamed block regardless,
+	// which meant an extra blob-store round trip, and therefore an extra wait
+	// on the store's shared read-permit pool, on the single goroutine that
+	// commits blocks in order — a path that used to do no I/O at all.
 	if msg.body.Converted {
 		// The pipeline sink, when it is the one active, has already written
 		// this hash's body as a converted record — a few hundred bytes under
@@ -663,13 +638,12 @@ func (sm *SyncManager) parentIsInChain(parent chainhash.Hash) bool {
 }
 
 // parentIsReachable reports whether a parked block's parent is something this
-// node will end up holding: in the chain now, or still ahead of us in the header
-// list because we asked for it.
+// node will end up holding: in the chain now, or still ahead of us in the
+// header cache because we asked for it.
 //
-// Consumer goroutine only. It takes headerMu for the index lookup alone and
-// releases it before the store call, because every other reader of the list
-// holds that lock and a blocking client call underneath it would serialise the
-// whole sync path.
+// Consumer goroutine only. The cache holds its own lock for the check, released
+// before the store call below it: a blocking client call behind that lock
+// would serialise the whole sync path.
 func (sm *SyncManager) parentIsReachable(parent chainhash.Hash) bool {
 	// The park first, and this was the omission that made this function a hole
 	// factory. A parked parent is a block we already hold on disk, waiting for
@@ -688,11 +662,7 @@ func (sm *SyncManager) parentIsReachable(parent chainhash.Hash) bool {
 		return true
 	}
 
-	sm.headerMu.Lock()
-	_, inList := sm.headerIndex[parent]
-	sm.headerMu.Unlock()
-
-	if inList {
+	if _, inCache := sm.headerCache.HeightOf(parent); inCache {
 		return true
 	}
 

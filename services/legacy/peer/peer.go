@@ -1164,6 +1164,25 @@ func (p *Peer) PushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chai
 	return nil
 }
 
+// ForgetLastHeadersRequest clears the remembered (begin hash, stop hash) pair
+// that PushGetHeadersMsg uses to filter a repeat request, so the next call is
+// never mistaken for an accidental duplicate.
+//
+// The filter exists to stop us spamming a peer with the same getheaders by
+// accident; it has no way to tell that apart from a deliberate retry, where
+// the caller already knows the last request was unusable or never answered
+// and is asking again on purpose. This gives such a caller a way to say so.
+// A caller that wants the filter's protection, because it is not making that
+// judgement, simply never calls this.
+//
+// This function is safe for concurrent access.
+func (p *Peer) ForgetLastHeadersRequest() {
+	p.prevGetHdrsMtx.Lock()
+	p.prevGetHdrsBegin = nil
+	p.prevGetHdrsStop = nil
+	p.prevGetHdrsMtx.Unlock()
+}
+
 // PushRejectMsg sends a reject message for the provided command, reject code,
 // reject reason, and hash.  The hash will only be used when the command is a tx
 // or block and should be nil in other cases.  The wait parameter will cause the

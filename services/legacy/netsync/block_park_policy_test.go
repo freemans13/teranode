@@ -53,8 +53,8 @@ func (s *parkReadFaultStore) GetIoReader(ctx context.Context, key []byte, fileTy
 }
 
 // requireStillParked asserts the end state a block that was NOT judged must
-// reach: still in the index, still on disk, still charged, the download walk
-// untouched and the peer unblamed.
+// reach: still in the index, still on disk, still charged, not re-requested and
+// the peer unblamed.
 func (h *parkWiringHarness) requireStillParked(t *testing.T, hash chainhash.Hash, bytesBefore int64) {
 	t.Helper()
 
@@ -63,11 +63,12 @@ func (h *parkWiringHarness) requireStillParked(t *testing.T, hash chainhash.Hash
 	require.Contains(t, parkDirEntries(t, h.parkDir), hash.String()+".msgBlock",
 		"the downloaded block must still be on disk")
 
-	h.sm.headerMu.Lock()
-	startHeader := h.sm.startHeader
-	h.sm.headerMu.Unlock()
+	before := h.rec.getDataCount()
 
-	require.Nil(t, startHeader, "a block that was not judged must not rewind the download walk")
+	h.sm.fetchHeaderBlocks()
+
+	require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, hash) }, time.Second),
+		"a block that was not judged must not be asked for again while it is still on disk — holdsBlock excludes it")
 
 	require.False(t, h.rec.wasRejected(hash), "a local fault is not the peer's fault")
 

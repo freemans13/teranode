@@ -101,26 +101,23 @@ func TestPeerChainClaim(t *testing.T) {
 		}, "tests in this package build managers as struct literals, so every accessor takes a nil receiver")
 	})
 
-	t.Run("a proven claim survives every header list rebuild", func(t *testing.T) {
+	t.Run("a proven claim survives every header-state transition", func(t *testing.T) {
 		// The design decision this pins: the claim stores the height it proved
 		// rather than resolving one on read. "Peer P handed us the header at
-		// height N" is a fact about P and the chain, not about our current walk,
-		// so wiping the walk must not falsify it. A version that resolved height
-		// against headerIndex would collapse to zero at the final checkpoint,
-		// when leaveHeadersFirstMode empties that index, and would then refuse
-		// every peer for good.
+		// height N" is a fact about P and the chain, not about our current
+		// state, so a headers-first transition must not falsify it. A version
+		// that resolved height against a header index would collapse to zero
+		// the moment that index was gone — which it now is, permanently, on
+		// every node — and would then refuse every peer for good.
 		sm := newRaceManager(t)
 		s := &peerSyncState{}
 		s.noteProvenClaim(h1, 721000)
 		sm.peerStates.Set(nil, s)
 
-		sm.headerMu.Lock()
-		sm.resetHeaderStateLocked(&h2, 721000)
-		sm.headerMu.Unlock()
-
+		sm.leaveHeadersFirstMode()
 		sm.leaveHeadersFirstMode()
 
 		require.True(t, s.HasProvenTo(721000),
-			"the walk was thrown away twice and the peer still has the chain it handed us")
+			"the state was thrown away twice and the peer still has the chain it handed us")
 	})
 }

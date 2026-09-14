@@ -176,14 +176,12 @@ func TestSyncManager_AParkedOrphanIsStillAnsweredWithAGetblocks(t *testing.T) {
 	}
 }
 
-// TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp is the case
-// the rewind machinery exists for and nothing exercised. A block that arrives as
-// the front of the header list has its header removed and unindexed before the
-// park ever sees it, so by the time the park gives the block up there is nothing
-// left to look the header up by. Unless the park carried that header node with
-// the block, the rewind finds nothing, and the block is in neither the header
-// list, nor the park, nor any download ledger — sync cannot pass it again
-// without a peer rotation that rebuilds the whole walk.
+// TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp pins the
+// give-up-then-re-request path for the block sync is most exposed on: the very
+// next one it wants. The wanted-range pass recomputes what it wants and who
+// owes it from the committed tip on every call, with no position or index of
+// its own to lose, which is what makes this safe with no header list behind it
+// at all.
 func TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
@@ -193,14 +191,6 @@ func TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp(t *testing.
 
 	require.NoError(t, h.deliver(t, 0))
 	require.Equal(t, 1, h.sm.blockPark.Len(), "the front block parks like any other orphan")
-
-	// This is what makes the case different: its header left the list on
-	// arrival, so an index lookup can no longer find it.
-	h.sm.headerMu.Lock()
-	_, stillIndexed := h.sm.headerIndex[front]
-	h.sm.headerMu.Unlock()
-
-	require.False(t, stillIndexed, "an arriving front block's header is removed before the park sees it")
 
 	// The block is given up on. The trigger used to be a thirty-minute timer;
 	// there is no timer any more, and the rules that replaced it deliberately do
@@ -321,10 +311,13 @@ func TestSyncManager_AParkedBlockThatWillNotCommitIsGivenUpAndRejected(t *testin
 					"while catching blocks no reject is sent, whether the block is committed from the wire or from the park")
 			}
 
+			_, failed := h.sm.recentlyFailedBlocks.Get(child)
+			require.True(t, failed, "a block written off must be remembered so its descendants are short-circuited")
+
 			h.sm.fetchHeaderBlocks()
 
-			require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
-				"a block given up on must go back into the download walk")
+			require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, time.Second),
+				"a block written off as invalid must not be asked for again while recentlyFailedBlocks still names it")
 		})
 	}
 }

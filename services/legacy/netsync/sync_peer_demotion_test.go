@@ -100,9 +100,11 @@ func demotionPeer(t *testing.T, sm *SyncManager, idx uint8, lastBlock int32) (*p
 
 // newDemotionManager builds the smallest manager that can run the real
 // handleCheckSyncPeer, the real startSync and the real fetchHeaderBlocks back to
-// back. We are at height 100, every block asked about is unknown, and the next
-// checkpoint is far above anything the tests generate so the headers-first
-// branches are the ones that run.
+// back. We are at height 100, every block asked about is unknown. chainParams is
+// MainNet's real checkpoint table (via newRaceManager), and none of these tests
+// generate a hash that happens to coincide with one, which is what keeps the
+// headers-first branches the ones that run without needing a synthetic
+// checkpoint of their own.
 func newDemotionManager(t *testing.T) *SyncManager {
 	t.Helper()
 
@@ -125,9 +127,6 @@ func newDemotionManager(t *testing.T) *SyncManager {
 	sm.blockchainClient = blockchainClient
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 
-	checkpointHash := chainhash.Hash{0xcc}
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 1_000_000, Hash: &checkpointHash}
-
 	return sm
 }
 
@@ -135,16 +134,6 @@ func newDemotionManager(t *testing.T) *SyncManager {
 // for longer than the stall window, with no throughput sample to excuse it.
 func stalledSyncPeerState() *syncPeerState {
 	return &syncPeerState{lastBlockTime: time.Now().Add(-maxLastBlockTime - time.Minute)}
-}
-
-// headerListEpochNow reads the header list's generation counter, which
-// resetHeaderStateLocked bumps. An unchanged value is what proves the list is
-// the same list rather than a rebuilt one that happens to be the same length.
-func headerListEpochNow(sm *SyncManager) uint64 {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	return sm.headerListEpoch
 }
 
 // TestStalledSyncPeer_IsDemotedAndStaysConnected is the anchor test. A sync peer
@@ -259,9 +248,10 @@ func TestDemotion_WithNoOtherCandidateStillElectsTheDemotedPeer(t *testing.T) {
 // since the last checkpoint, which costs the whole node a fresh getheaders round
 // and every peer its slice because one peer was slow.
 //
-// The generation counter is the assertion that cannot be faked: the reset bumps
-// it, so an unchanged counter proves this is the same list and not a rebuilt one
-// that happens to be the same length.
+// Pointer identity is the assertion that cannot be faked: nothing that merely
+// reads the cache can produce a new *headerCache, so an unchanged pointer
+// proves this is the same cache and not a rebuilt one that happens to hold the
+// same headers.
 func TestDemotion_KeepsTheHeaderList(t *testing.T) {
 	var nonce uint32
 
@@ -275,142 +265,29 @@ func TestDemotion_KeepsTheHeaderList(t *testing.T) {
 
 	seedFetchHeaders(t, sm, stalled, anchor, msg)
 
-	epochBefore := headerListEpochNow(sm)
-	cursorBefore, ok := startHeaderHash(t, sm)
-	require.True(t, ok)
-	require.Equal(t, hashes[0], cursorBefore)
+	cacheBefore := sm.headerCache
 
 	sm.storeSyncPeer(stalled, stalledSyncPeerState())
 	stalled.SetSyncPeer(true)
 
 	sm.handleCheckSyncPeer()
 
-	require.Equal(t, len(hashes)+1, sm.headerListLen(), "the downloaded headers must survive a demotion")
+	require.Equal(t, len(hashes), sm.headerCache.Len(), "the downloaded headers must survive a demotion")
 	require.True(t, sm.headersFirstMode.Load(), "headers-first mode must stay on")
-	require.Equal(t, epochBefore, headerListEpochNow(sm), "the header list must be the same list, not a rebuilt one")
-
-	cursorAfter, ok := startHeaderHash(t, sm)
-	require.True(t, ok, "the download cursor must stay in the list")
-	require.Equal(t, hashes[0], cursorAfter)
+	require.Same(t, cacheBefore, sm.headerCache, "the header cache must be the same cache, not a rebuilt one")
 }
 
-// TestDemotion_TheNewSyncPeerContinuesTheHeadersRoundFromTheBackOfTheList is the
-// trap that comes with keeping the list. handleHeadersMsg requires every
-// incoming header to connect to the back of the list, and a locator built from
-// our own database best block is hundreds of headers below that — so the new
-// sync peer would answer honestly and be disconnected for it.
-func TestDemotion_TheNewSyncPeerContinuesTheHeadersRoundFromTheBackOfTheList(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xf2}
-	msg, hashes := linkedHeaders(anchor, 40, &nonce)
-
-	sm := newDemotionManager(t)
-
-	stalled, _, _ := demotionPeer(t, sm, 107, 1000)
-	successor, _, successorHeaders := demotionPeer(t, sm, 108, 1000)
-
-	seedFetchHeaders(t, sm, stalled, anchor, msg)
-
-	sm.storeSyncPeer(stalled, stalledSyncPeerState())
-	stalled.SetSyncPeer(true)
-
-	sm.handleCheckSyncPeer()
-	require.Equal(t, successor, sm.loadSyncPeer())
-
-	require.True(t, WaitUntil(func() bool { return successorHeaders.count() > 0 }, 5*time.Second),
-		"the new sync peer should have been asked to continue the headers round")
-
-	got := successorHeaders.last()
-	require.NotNil(t, got)
-	require.NotEmpty(t, got.BlockLocatorHashes)
-	require.Equal(t, &hashes[len(hashes)-1], got.BlockLocatorHashes[0],
-		"the locator must start at the back of the header list we kept")
-	require.Greater(t, len(got.BlockLocatorHashes), 1,
-		"and step back through the list, so a peer that cannot reach the back can still find a fork point")
-
-	// And the honest answer to that locator has to be accepted.
-	more, moreHashes := linkedHeaders(hashes[len(hashes)-1], 5, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: more, peer: successor})
-
-	require.True(t, successor.Connected(), "an honest continuation must not cost the new sync peer its connection")
-	require.Equal(t, len(hashes)+len(moreHashes)+1, sm.headerListLen(),
-		"the continuation headers must have linked onto the list we kept")
-	require.NotEmpty(t, moreHashes)
-}
-
-// TestDemotion_LateHeadersFromTheDemotedPeerDoNotCostItItsConnection is the
-// second half of that trap. The demoted peer still has a getheaders outstanding,
-// and by the time it answers the new sync peer has already extended the list, so
-// its reply no longer connects to the back. It is an honest answer to a question
-// we asked, and disconnecting it — with a misbehaviour warning, no less — throws
-// away the very peer we kept so it could carry block bodies.
-//
-// Genuinely unconnected headers, whose parent we have never heard of, still cost
-// the sender its connection.
-func TestDemotion_LateHeadersFromTheDemotedPeerDoNotCostItItsConnection(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xf3}
-	msg, hashes := linkedHeaders(anchor, 20, &nonce)
-
-	sm := newDemotionManager(t)
-
-	stalled, _, _ := demotionPeer(t, sm, 109, 1000)
-	successor, _, _ := demotionPeer(t, sm, 110, 1000)
-
-	seedFetchHeaders(t, sm, stalled, anchor, msg)
-
-	sm.storeSyncPeer(stalled, stalledSyncPeerState())
-	stalled.SetSyncPeer(true)
-
-	sm.handleCheckSyncPeer()
-	require.Equal(t, successor, sm.loadSyncPeer())
-
-	// The new sync peer extends the list, so the back moves on.
-	continuation, continuationHashes := linkedHeaders(hashes[len(hashes)-1], 5, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: successor})
-
-	lenBefore := sm.headerListLen()
-	require.Equal(t, len(hashes)+len(continuationHashes)+1, lenBefore)
-
-	// The demoted peer's answer to the locator we gave it before the swap: the
-	// same headers, arriving too late to connect to the back.
-	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: stalled})
-
-	require.True(t, stalled.Connected(), "a late answer to our own getheaders is not misbehaviour")
-	require.Equal(t, lenBefore, sm.headerListLen(), "a late duplicate must not be re-linked into the list")
-
-	// Headers whose parent we have never seen are a different matter — but they
-	// are charged against a run rather than taken on the first offence, because
-	// the commonest cause of one is our own stale locator. See
-	// TestHandleHeadersMsg_AnUnconnectedBatchCostsNothingFirstTime.
-	junkParent := chainhash.Hash{0x9e}
-
-	junk, _ := linkedHeaders(junkParent, 3, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: junk, peer: stalled})
-
-	require.True(t, stalled.Connected(), "the first batch that connects to nothing is forgiven")
-
-	for i := 1; i < maxUnconnectingHeaderBatches; i++ {
-		junk, _ = linkedHeaders(junkParent, 3, &nonce)
-		sm.handleHeadersMsg(&headersMsg{headers: junk, peer: stalled})
-	}
-
-	require.False(t, stalled.Connected(), "headers that connect to nothing we know must still be punished")
-}
-
-// TestDemotion_ReopensOnlyTheDemotedPeersSliceAndRewindsToItsLowestBlock is the
+// TestDemotion_ReopensOnlyTheDemotedPeersSliceAndAsksForItAgain is the
 // replacement for the recovery the header-state reset used to provide, and the
 // place the historical duplicate-commit storm has to stay dead.
 //
-// The demoted peer's own outstanding blocks are reopened for re-request and the
-// download cursor is moved back onto the lowest of them, so somebody else can
-// take them on the next pass. Every other peer's outstanding blocks keep
-// vouching for themselves, which is what stops the re-walk asking a second peer
-// for a block that is still in flight — the exact mechanism behind the 40P01
-// deadlock and duplicate-commit storm the whole-ledger back-date caused.
-func TestDemotion_ReopensOnlyTheDemotedPeersSliceAndRewindsToItsLowestBlock(t *testing.T) {
+// The demoted peer's own outstanding blocks are reopened for re-request, so
+// somebody else can take them on the next pass. Every other peer's outstanding
+// blocks keep vouching for themselves, which is what stops the next pass asking
+// a second peer for a block that is still in flight — the exact mechanism
+// behind the 40P01 deadlock and duplicate-commit storm the whole-ledger
+// back-date caused.
+func TestDemotion_ReopensOnlyTheDemotedPeersSliceAndAsksForItAgain(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xf4}
@@ -436,10 +313,6 @@ func TestDemotion_ReopensOnlyTheDemotedPeersSliceAndRewindsToItsLowestBlock(t *t
 		require.True(t, sm.blockDownloads.Add(successor, h))
 	}
 
-	sm.headerMu.Lock()
-	sm.startHeader = sm.headerIndex[hashes[8]]
-	sm.headerMu.Unlock()
-
 	sm.storeSyncPeer(stalled, stalledSyncPeerState())
 	stalled.SetSyncPeer(true)
 
@@ -456,10 +329,6 @@ func TestDemotion_ReopensOnlyTheDemotedPeersSliceAndRewindsToItsLowestBlock(t *t
 		require.True(t, sm.blockDownloads.RequestedWithin(h, blockRequestRetryInterval),
 			"another peer's in-flight block must still vouch for itself, or the re-walk asks a second peer for it")
 	}
-
-	cursor, ok := startHeaderHash(t, sm)
-	require.True(t, ok)
-	require.Equal(t, stalledSlice[0], cursor, "the cursor must be back on the lowest block the demoted peer owed")
 
 	// The next pass has to recover exactly that slice and nothing else.
 	sm.fetchHeaderBlocks()
@@ -479,72 +348,21 @@ func TestDemotion_ReopensOnlyTheDemotedPeersSliceAndRewindsToItsLowestBlock(t *t
 	}
 }
 
-// TestDemotion_TheReopenedCountDistinguishesSettledBlocksFromLostOnes pins the
-// diagnostic the 800128 investigation did not have.
-//
-// Every rotation for seven hours logged "reopened 295 blocks owed by
-// 164.132.247.87 but none of them is still in the header list", which reads as a
-// header that went missing from the middle of the list. No path in this package
-// produces that: every targeted removal takes a block the chain already has, and
-// the two wholesale ones re-Init the list. What a hash that does not resolve
-// actually means is ledger residue — the ledger holds a record per owner and
-// handleBlockMsgHead discharges only the peer that delivered, so every peer that
-// lost a race keeps a record for a block committed long ago.
-//
-// So the node has to be able to say which it is looking at, and the counts are
-// how. This asserts on what rewindToLowestHeader returns rather than on the log
-// text, because the numbers are the finding and the sentence is only its wrapper.
-func TestDemotion_TheReopenedCountDistinguishesSettledBlocksFromLostOnes(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xf5}
-	msg, hashes := linkedHeaders(anchor, 12, &nonce)
-
-	sm := newDemotionManager(t)
-
-	stalled, _, _ := demotionPeer(t, sm, 121, 1000)
-
-	seedFetchHeaders(t, sm, stalled, anchor, msg)
-
-	// Four blocks whose headers are still in the list, and three whose hashes the
-	// ledger carries for blocks the chain has already committed. Both kinds go in
-	// through the ledger, so the mixture the counts describe is the one a real
-	// demotion produces rather than one assembled by the test.
-	inList := hashes[0:4]
-	settled := []chainhash.Hash{{0xd1}, {0xd2}, {0xd3}}
-
-	for _, h := range append(append([]chainhash.Hash{}, inList...), settled...) {
-		require.True(t, sm.blockDownloads.Add(stalled, h))
-	}
-
-	reopened := sm.blockDownloads.ForgetForRetryPeer(stalled, blockRequestRetryInterval)
-	require.Len(t, reopened, len(inList)+len(settled))
-
-	lowestHeight, rewound, found, missing := sm.rewindToLowestHeader(reopened)
-
-	require.True(t, rewound)
-	require.Equal(t, len(inList), found, "the hashes still in the header list are the work that can be re-walked")
-	require.Equal(t, len(settled), missing, "the rest are records for blocks already committed, not lost headers")
-
-	// seedFetchHeaders anchors at height 10, so the first seeded header is 11.
-	require.Equal(t, int32(11), lowestHeight)
-
-	// The 800128 signature itself: a slice where nothing resolves. It has to come
-	// back as none-found rather than as a rewind, and the counts have to say that
-	// every one of them is residue.
-	_, rewound, found, missing = sm.rewindToLowestHeader(settled)
-
-	require.False(t, rewound)
-	require.Zero(t, found)
-	require.Equal(t, len(settled), missing)
-}
-
-// TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore is the rollback lever.
+// TestDemotion_OffPathDisconnectsButKeepsTheHeaderCache is the rollback lever.
 // With multi-peer block download off, the sync peer is the only source of block
-// bodies, so keeping a stalled one buys nothing and today's behaviour is the
-// right behaviour: disconnect it, release everything it owed, and start the
-// header round again from our own best block.
-func TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore(t *testing.T) {
+// bodies, so keeping a stalled one buys nothing: disconnect it and release
+// everything it owed.
+//
+// This used to also pin that the off path threw the header list away and
+// re-anchored it, in contrast with the demotion path's keeping it — that was
+// the very distinction the whole-ledger back-date and header-list rebuild used
+// to draw between the two routes. There is no rebuild left to draw it with:
+// nothing on either path writes sm.headerCache except a fresh getheaders
+// reply, so the off path leaves the cache exactly as untouched as the
+// demotion path does. What is still real and still worth pinning is that the
+// disconnect itself, and the release of what the stalled peer owed, still
+// happen.
+func TestDemotion_OffPathDisconnectsButKeepsTheHeaderCache(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xf5}
@@ -557,7 +375,7 @@ func TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore(t *testing.T) {
 	successor, _, _ := demotionPeer(t, sm, 114, 1000)
 
 	seedFetchHeaders(t, sm, stalled, anchor, msg)
-	epochBefore := headerListEpochNow(sm)
+	cacheBefore := sm.headerCache
 
 	require.True(t, sm.blockDownloads.Add(stalled, hashes[0]))
 
@@ -568,130 +386,6 @@ func TestDemotion_OffPathDisconnectsAndResetsExactlyAsBefore(t *testing.T) {
 
 	require.False(t, stalled.Connected(), "with the fan-out off a stalled sync peer is still disconnected")
 	require.Zero(t, sm.blockDownloads.CountForPeer(stalled), "a disconnected peer's blocks must be released")
-	require.Equal(t, 1, sm.headerListLen(), "the header list is still thrown away and re-anchored")
-	require.NotEqual(t, epochBefore, headerListEpochNow(sm), "the reset must bump the list generation")
+	require.Same(t, cacheBefore, sm.headerCache, "even the off-path disconnect must not rebuild the header cache")
 	require.Equal(t, successor, sm.loadSyncPeer())
-}
-
-// TestDemotion_AHeadersBatchThatStartsConnectingAndThenStopsIsStillPunished pins
-// the narrow shape of the late-reply leniency. Forgiving a batch whose FIRST
-// header connects to a header we hold is recognising our own question coming
-// back late. Forgiving one that links two headers on and then jumps sideways
-// would forgive a peer feeding us a doctored chain, and the check that separates
-// them is that nothing in the batch has linked yet.
-func TestDemotion_AHeadersBatchThatStartsConnectingAndThenStopsIsStillPunished(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xf6}
-	msg, hashes := linkedHeaders(anchor, 10, &nonce)
-
-	sm := newDemotionManager(t)
-
-	peer, _, _ := demotionPeer(t, sm, 116, 1000)
-	seedFetchHeaders(t, sm, peer, anchor, msg)
-
-	// Two headers that link onto the back, then one that hangs off a header from
-	// the middle of the list instead.
-	good, goodHashes := linkedHeaders(hashes[len(hashes)-1], 2, &nonce)
-	sideways, _ := linkedHeaders(hashes[2], 1, &nonce)
-
-	mixed := wire.NewMsgHeaders()
-	for _, h := range good.Headers {
-		require.NoError(t, mixed.AddBlockHeader(h))
-	}
-
-	require.NoError(t, mixed.AddBlockHeader(sideways.Headers[0]))
-
-	sm.handleHeadersMsg(&headersMsg{headers: mixed, peer: peer})
-
-	require.False(t, peer.Connected(),
-		"a batch that links onto the list and then jumps sideways is not a late reply")
-	require.Equal(t, len(hashes)+len(goodHashes)+1, sm.headerListLen(),
-		"the headers that did link stay linked")
-}
-
-// TestDemotion_TheLateHeadersCarveOutIsScopedAndExpires is ChiR5.
-//
-// The carve-out above turns a non-connecting headers batch into a silent ignore
-// instead of a disconnect. Its test was "does this batch's first header, or its
-// parent, sit in the header index?", which any header we currently hold
-// satisfies, from anybody, for as long as we hold it. So a peer that once
-// contributed a batch could re-send it, or any prefix of it, indefinitely: 2000
-// headers of bandwidth and decode plus a headerMu acquisition each time, the
-// same lock the block-queue consumer takes first in headers-first mode, and
-// nothing at all for the sender.
-//
-// Three end states are pinned. A peer that is neither the sync peer nor inside a
-// demotion cooldown is disconnected for a batch that never connects, however
-// familiar its headers are. The demoted peer is covered only while its cooldown
-// is running, which is the expiry the carve-out did not have. And the current
-// sync peer stays covered, because startSync elects on height alone and a peer
-// hundreds of headers below the back of the list answers our locator from the
-// newest block it has: see
-// TestHeadersRoundLocator_APeerThatCannotReachTheBackKeepsItsConnection, which
-// is why scoping this to the demotion cooldown alone is too narrow.
-func TestDemotion_TheLateHeadersCarveOutIsScopedAndExpires(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xf7}
-	msg, hashes := linkedHeaders(anchor, 20, &nonce)
-
-	sm := newDemotionManager(t)
-
-	stalled, _, _ := demotionPeer(t, sm, 121, 1000)
-	successor, _, _ := demotionPeer(t, sm, 122, 1000)
-
-	seedFetchHeaders(t, sm, stalled, anchor, msg)
-
-	sm.storeSyncPeer(stalled, stalledSyncPeerState())
-	stalled.SetSyncPeer(true)
-
-	sm.handleCheckSyncPeer()
-	require.Equal(t, successor, sm.loadSyncPeer())
-
-	continuation, _ := linkedHeaders(hashes[len(hashes)-1], 5, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: successor})
-
-	// Registered after the election, so it cannot have been the peer startSync
-	// picked.
-	bystander, _, _ := demotionPeer(t, sm, 123, 1000)
-
-	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: bystander})
-
-	require.True(t, bystander.Connected(),
-		"outside the carve-out the batch is charged against a run, not taken on the first offence")
-
-	for i := 1; i < maxUnconnectingHeaderBatches; i++ {
-		sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: bystander})
-	}
-
-	require.False(t, bystander.Connected(),
-		"the carve-out is for a peer whose late reply we caused, not for anybody re-sending headers we happen to hold")
-
-	// The sync peer re-sending a batch it already contributed is the elected
-	// peer answering our locator from where its own chain ends, so it keeps the
-	// carve-out.
-	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: successor})
-
-	require.True(t, successor.Connected(),
-		"the current sync peer must keep the carve-out, it is the peer we are asking")
-
-	state, ok := sm.peerStates.Get(stalled)
-	require.True(t, ok)
-	require.True(t, state.inDemotionCooldown(), "demotion should have stamped a cooldown to scope the carve-out to")
-
-	// The demotion window closes. From here the demoted peer is just a peer.
-	state.clearDemotionCooldown()
-
-	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: stalled})
-
-	require.True(t, stalled.Connected(),
-		"the run still has to be earned, the expiry of the carve-out is not itself a disconnect")
-
-	for i := 1; i < maxUnconnectingHeaderBatches; i++ {
-		sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: stalled})
-	}
-
-	require.False(t, stalled.Connected(),
-		"once the cooldown has expired the carve-out no longer covers the demoted peer either")
 }

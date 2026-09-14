@@ -312,7 +312,7 @@ func TestHandleConvertedBlock_AHeightDisagreementIsTransientNotBlockInvalid(t *t
 //
 // blockValidation is the same kind of spy TestHandleConvertedBlock_CommitsWithoutTheBlock
 // uses, and for the same reason: this proves the routing and the post-commit
-// bookkeeping (advanceHeaderListFor, applyParkDisposition, noteCommittedParkedBlock),
+// bookkeeping (isCheckpointHash, applyParkDisposition, noteCommittedParkedBlock),
 // not that the block's transactions validate. See that test's doc comment for the
 // full statement of what a spy blockValidation does and does not prove.
 func TestCommitParkedBlock_RoutesAConvertedEntryWithoutReadingAWholeBlock(t *testing.T) {

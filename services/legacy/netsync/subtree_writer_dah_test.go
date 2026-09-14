@@ -125,3 +125,61 @@ func TestSubtreeWriter_StampsEveryFileWithADeleteAtHeight(t *testing.T) {
 			"%s must be stamped with the block's height plus the configured retention, so the store reclaims it by height rather than leaking it", ft)
 	}
 }
+
+// TestSubtreeWriter_UnresolvedHeightStampsTheCallerSuppliedDAH is the review
+// round 1 gap: the delete-at-height half of newSubtreeWriterUnresolvedHeight's
+// guard had no coverage at all before this test, unlike the file-type half
+// (TestSubtreeWriter_NamesTheStructureByValidationMode). Unlike the file-type
+// choice, the delete-at-height has no second line of defence — nothing else
+// stops a block whose height was never resolved from having its subtree files
+// collected out from under it if this constructor's dah override is ever lost
+// (for example by collapsing the two constructors back into one and falling
+// through to height + retention, where height defaults to 0). This writes a
+// real subtree through the real unresolved-height constructor and reads the
+// scheduled delete-at-height back through the store's own deletion-scheduling
+// path, the same way TestSubtreeWriter_StampsEveryFileWithADeleteAtHeight
+// does, and requires it to be exactly the caller-supplied value — standing in
+// here for "the committed tip plus the read-ahead depth plus the retention",
+// which is what pipelineBlockSink's fallbackSubtreeDAH actually computes (see
+// TestFallbackSubtreeDAH_IsCommittedTipPlusReadAheadDepthPlusRetention for
+// that arithmetic on its own) — never height + retention, since height is
+// never resolved for this constructor.
+func TestSubtreeWriter_UnresolvedHeightStampsTheCallerSuppliedDAH(t *testing.T) {
+	ctx := context.Background()
+
+	storeURL, err := url.Parse("file://" + t.TempDir())
+	require.NoError(t, err)
+
+	scheduler := newDAHCapturingScheduler()
+
+	store, err := file.New(ulogger.TestLogger{}, storeURL,
+		options.WithBlobDeletionScheduler(scheduler),
+		options.WithStoreType(storetypes.TEMPSTORE),
+	)
+	require.NoError(t, err)
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	// Stands in for a real fallbackSubtreeDAH() answer: committed tip + read-
+	// ahead depth + retention, comfortably above any height a real block could
+	// ever have in this test, so a writer that fell back to height (0) +
+	// retention would produce a value nowhere near this one.
+	const dah = uint32(999_999)
+
+	writer := newSubtreeWriterUnresolvedHeight(ulogger.TestLogger{}, tSettings, store, dah)
+
+	st, data, meta := oneSubtree(t, 8)
+	root := st.RootHash()
+
+	require.NoError(t, writer.Emit(ctx)(0, st, data, meta))
+
+	for _, ft := range []fileformat.FileType{
+		fileformat.FileTypeSubtreeData,
+		fileformat.FileTypeSubtreeMeta,
+		fileformat.FileTypeSubtreeToCheck,
+	} {
+		got := scheduler.dahFor(t, root[:], ft)
+		require.Equal(t, dah, got,
+			"%s must be stamped with the caller-supplied delete-at-height, not height (unresolved, so 0) plus retention", ft)
+	}
+}

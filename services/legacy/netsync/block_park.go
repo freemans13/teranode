@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -30,15 +31,6 @@ const (
 	// Nothing else in the repo writes fileformat.FileTypeMsgBlock blobs, so the
 	// park cannot collide with anything already there.
 	parkSubDirectory = "legacy-parked-blocks"
-
-	// maxParkedEntries bounds the in-memory index, which the byte budget does
-	// not: at 11 KB per block, 4 GiB of disk is nearly 400,000 entries. It is a
-	// constant rather than a setting because its only job is to stop the index
-	// growing without limit in the small-block regime, and 4096 is already an
-	// order of magnitude above any out-of-order window multi-peer download can
-	// produce (peers x per-peer in-flight, and the per-peer figure is capped at
-	// 20 and falls towards 1 as blocks grow).
-	maxParkedEntries = 4096
 
 	// parentMissingRetryAfter is how long a parked block waits before the drain
 	// offers it again after a commit that failed for a missing parent.
@@ -61,16 +53,55 @@ const (
 	// and restart-recovered blocks never see a commit event for their parent.
 	parkStuckThreshold = 2 * time.Minute
 
+	// parkAbandonAfter is how long a parked block may wait with its parent
+	// genuinely absent from the chain before the sweep gives up on it.
+	//
+	// Without this, a block whose parent never arrives has no reclaim path at
+	// all. The park's own Delete needs the parent positively adjudicated first,
+	// so it never fires for a parent that is simply never coming. The restart
+	// scan only discards a blob that will not decode or hashes wrong, so it
+	// re-adopts an orphaned entry on every boot rather than reclaiming it. And
+	// the blob carries no delete-at-height of its own (parkOpts' WithNoDAH), so
+	// the store cannot prune it underneath the index either. Two ordinary ways
+	// to reach this: a losing fork at the frontier, where two peers race for the
+	// same height and one side's parent is never going to commit, and no race
+	// at all — an unrequested block from a stale or eclipsed peer, parked behind
+	// a parent belonging to a chain this node will never follow.
+	//
+	// The number has to be well clear of any delay a genuinely slow but healthy
+	// commit path can produce, or this becomes a new way to lose good blocks
+	// rather than a way to stop leaking bad ones. This codebase has already
+	// measured what "genuinely slow" can mean: TestNewModel_ACheckpointAnchorDoesNotGateAnything
+	// documents mainnet wedged for 10h40m and, the night before, 8h33m, both
+	// real stalls with real parked blocks that went on to commit once the
+	// underlying bug was fixed. A THIRTY-MINUTE timer was tried in this exact
+	// park before EvictBelow replaced it, and it discarded 39 perfectly good
+	// blocks in one measured 19-minute window on mainnet — direct evidence that
+	// anything under an hour is too tight even in ordinary operation, let alone
+	// during a stall like the ones above. 24 hours is comfortably past both
+	// measured incidents, so a block still unparented after it is far more
+	// likely orphaned than merely waiting, while still bounding the leak to at
+	// most a day's worth of entries rather than the life of the process.
+	//
+	// Deliberately not the store's own block-height retention (8 blocks on
+	// mainnet, under a second at this branch's rate): that number bounds how
+	// long a COMMITTED block's data is kept, a completely different question
+	// answered on a completely different clock, and reusing it here would
+	// abandon every legitimately slow park within moments of it forming.
+	parkAbandonAfter = 24 * time.Hour
+
 	// parkSweepRPCBudget caps how many of those lookups one sweep tick may make,
 	// so the safety net can never turn into a scan of the whole park in one go.
 	//
 	// It has to be big enough that a full pass over a full park finishes in
 	// minutes rather than hours, or the safety net is not one: a restart with a
 	// full park would leave most of those blocks unexamined, and a parent that
-	// arrived quietly would go unnoticed. The park holds up to maxParkedEntries,
-	// so at 128 a full pass takes 32 ticks, sixteen minutes — and it is still
-	// only 128 sequential chain lookups per thirty seconds on the commit
-	// goroutine, which is well under a percent of it.
+	// arrived quietly would go unnoticed. The park's disk is bounded by the
+	// download walk's read-ahead depth rather than by an entry count, but even a
+	// park several thousand blocks deep — far more than the depth will ever
+	// produce — clears at 128 a tick in tens of ticks, minutes rather than hours,
+	// and it is still only 128 sequential chain lookups per thirty seconds on the
+	// commit goroutine, which is well under a percent of it.
 	// TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires holds the
 	// arithmetic to this.
 	parkSweepRPCBudget = 128
@@ -83,33 +114,6 @@ const (
 	// on a clock any more, so the bound is what an operator will tolerate for a
 	// parent that turned up quietly to be noticed.
 	parkFullPassBudget = 20 * time.Minute
-
-	// parkSweepExpiryBudget caps how many overtaken blocks one sweep tick gives
-	// up on, for the same reason parkSweepRPCBudget caps the lookups beside it, and
-	// against a bill that is larger per item.
-	//
-	// Each one costs a store Del carrying legacy_parkStoreTimeout — a write permit
-	// from a pool of 256 shared process-wide with subtree writes, transaction
-	// writes and both persisters — plus a cursor rewind that takes headerMu. All
-	// of it on the one goroutine that commits blocks in order. Expiry arrives in
-	// bursts by its nature: the blocks in a stalled park were queued together, so
-	// they age out together, and an uncapped pass could hand the whole index to
-	// that goroutine in a single tick. With blockQueue full, the outer message
-	// loop blocks on it and disconnects, rotation, inv, headers and transaction
-	// dispatch stall for every peer.
-	//
-	// 128 matches its neighbour and drains a full park in 32 ticks, sixteen
-	// minutes. Which 128 a tick takes is unspecified, because map order is, and
-	// it does not matter: every candidate is one the chain has already gone
-	// past, so there is no fairness question, only a rate one.
-	//
-	// This cap is on the COUNT and does not on its own do what the paragraph
-	// above describes. Each of the 128 deletes carries legacy_parkStoreTimeout,
-	// so a contended write pool turns a capped tick into a twenty-minute one and
-	// backs the block queue up exactly as an uncapped pass would. What bounds the
-	// tick is parkSweepTimeBudget, applied over both halves of the sweep; this
-	// bounds the work it will start.
-	parkSweepExpiryBudget = 128
 
 	// parkRecoverBudgetOps is how many store operations' worth of waiting the
 	// whole restart scan gets, as a multiple of the per-operation deadline. It is
@@ -190,17 +194,8 @@ type parkedBlock struct {
 	size   int64
 	// peer that delivered the block, or nil for a block recovered from disk.
 	// Both nil and disconnected are defined states; see livePeer.
-	peer *peerpkg.Peer
-	// removedFront is the header node this block's arrival took off the front of
-	// the header list, or nil when it was never the front. It has to travel with
-	// the block because advanceHeaderListFor runs before the park does: by the
-	// time a block is parked its header is already removed AND unindexed, so
-	// every path that later gives the block up would have nothing to look the
-	// header up by, and the block would leave the download walk for good. Always
-	// nil for a block recovered from disk after a restart, which is correct —
-	// that node's header list was rebuilt from scratch.
-	removedFront *headerNode
-	parkedAt     time.Time
+	peer     *peerpkg.Peer
+	parkedAt time.Time
 	// lastSweptAt is when the stuck sweep last handed this entry back for a
 	// parent lookup, zero if it never has. The sweep takes the least recently
 	// looked at first, which is what makes it a round robin over the whole park
@@ -210,7 +205,7 @@ type parkedBlock struct {
 	// the disk. The entry is registered first so that a parent committing in
 	// that window finds the block in children rather than missing it, and the
 	// flag is what stops every reader acting on a blob that is not there yet.
-	// Restore, RestoreAll and Recover all insert entries whose write has already
+	// Restore and Recover both insert entries whose write has already
 	// landed, so the zero value is correct for them.
 	writing bool
 	// parentMissingAt is when a commit of this block last failed because its
@@ -248,8 +243,8 @@ type parkedBlock struct {
 	// a store Exists call: one of the file store's 768 process-wide read
 	// permits, held for the store's configured timeout, on commitParkedBlock's
 	// single goroutine that commits every parked block in order. That ran
-	// unconditionally, for every parked commit, whether or not
-	// legacy_pipelineReceive was ever turned on — the same store round trip
+	// unconditionally, for every parked commit, whether or not the streaming
+	// pipeline was ever active — the same store round trip
 	// this park already gates on BlockBody.Converted at streaming_install.go's
 	// entry construction (see the comment there), just not here. This field
 	// closes that gap the same way: the answer is a fact this entry already
@@ -341,7 +336,7 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		storeTimeout = parkMinStoreTimeout
 	}
 
-	logger.Infof("[blockPark] parking out-of-order blocks in %s, up to %d blocks, store deadline %s", dir, maxParkedEntries, storeTimeout)
+	logger.Infof("[blockPark] parking out-of-order blocks in %s, store deadline %s", dir, storeTimeout)
 
 	return &blockPark{
 		logger:       logger,
@@ -499,45 +494,32 @@ func (p *blockPark) Admit(entry parkedBlock, msgBlock *wire.MsgBlock) (parkedBlo
 			existing.peer = entry.peer
 		}
 
-		// A re-delivered copy can be the front when the first copy was not, and
-		// then this is the only header node anybody still holds. Never overwrite
-		// a node already recorded with nil: the first copy's is the one the list
-		// is missing.
-		if entry.removedFront != nil {
-			existing.removedFront = entry.removedFront
-		}
-
 		return *existing, admitAlreadyHeld
 	}
 
-	// Bounded by the number of blocks held, and by nothing else. There used to be
-	// a byte budget beside this, and it was the wrong shape twice over.
+	// No cap here, and none is needed. There used to be two: a byte budget, and
+	// then an entry count after the byte budget was found to be evaluated too
+	// late to save anything — a block's size is only known once it has been
+	// downloaded and decoded, so neither could stop the bandwidth being spent,
+	// only throw away a block already in hand. On mainnet on 2026-09-09 the byte
+	// budget cost 153 discarded gigabyte-class downloads in two hours, one every
+	// 47 seconds, each one re-requested and paid for again.
 	//
-	// It was evaluated too late to save anything. A block's size is only known
-	// once it has been downloaded and decoded, so the budget could not stop the
-	// bandwidth being spent; all it could do was throw away a block already in
-	// hand. On mainnet on 2026-09-09 that cost 153 discarded gigabyte-class
-	// downloads in two hours, one every 47 seconds, each one re-requested and
-	// paid for again.
-	//
-	// Worse, it could refuse the one block that would empty the park. Its defence
-	// was that the oldest parked block is closest to being committable, so the
-	// newest arrival is the right one to turn away. That is false whenever there
-	// is a hole: the block closest to being committable is the one whose parent
-	// is in the chain, and with a hole that is the newest arrival, not the oldest
-	// resident. A park filled above a hole therefore refused the block that would
-	// have drained it, on every retry, with nothing evicting to make room.
+	// The entry count was worse: it could refuse the one block that would empty
+	// the park. Its defence was that the oldest parked block is closest to being
+	// committable, so the newest arrival is the right one to turn away. That is
+	// false whenever there is a hole: the block closest to being committable is
+	// the one whose parent is in the chain, and with a hole that is the newest
+	// arrival, not the oldest resident. A park filled above a hole therefore
+	// refused the block that would have drained it, on every retry, with nothing
+	// evicting to make room.
 	//
 	// What bounds the disk instead is the download walk's read-ahead depth, which
 	// is legacy_blockDownloadLowerWindow and is expressed in blocks. That is the
 	// bound SV Node uses (fTooFarAhead against MinBlocksToKeep, checked before a
 	// block is written rather than after), and being in blocks it can be checked
-	// before the bandwidth is spent.
-	if len(p.entries) >= maxParkedEntries {
-		p.logger.Warnf("[blockPark][%s] no room for a %d byte block: the park already holds %d blocks, its limit", entry.hash, entry.size, len(p.entries))
-
-		return parkedBlock{}, admitNoRoom
-	}
+	// before the bandwidth is spent. A record already on disk is never in
+	// anyone's way, so nothing here has to choose what to destroy.
 
 	// Registered BEFORE the write, not after it. A parent that commits while
 	// this block is still being written has to find the block in children, or
@@ -763,8 +745,9 @@ func (p *blockPark) WriteConvertedBlock(ctx context.Context, hash chainhash.Hash
 // takes the lock and reports refusal rather than assuming it can always insert.
 //
 // Refuses a hash already held, so a re-delivered body is neither charged nor
-// indexed twice, and refuses at the entry ceiling, which is what bounds the
-// park.
+// indexed twice. There is no entry ceiling to refuse at any more: the park's
+// disk is bounded upstream, by the download walk's read-ahead depth, not by how
+// much room this index has left.
 func (p *blockPark) AdoptWritten(entry parkedBlock) bool {
 	if p == nil {
 		return false
@@ -780,10 +763,6 @@ func (p *blockPark) AdoptWritten(entry parkedBlock) bool {
 	defer p.mu.Unlock()
 
 	if _, held := p.entries[entry.hash]; held {
-		return false
-	}
-
-	if len(p.entries) >= maxParkedEntries {
 		return false
 	}
 
@@ -1073,37 +1052,8 @@ func (p *blockPark) Restore(entry parkedBlock) {
 	p.setGauges()
 }
 
-// RestoreAll puts a batch of taken entries back, for the sweep that runs out of
-// time part-way through a burst of expiries. Expire has already removed them
-// from the index, so an entry nothing puts back is a blob left on disk still
-// charged against the park's byte budget with nothing tracking it, and a block
-// whose cursor is never rewound and which is therefore never asked for again.
-//
-// One lock acquisition rather than one per entry, because the caller is the
-// block-commit goroutine and it is already over its time budget.
-func (p *blockPark) RestoreAll(entries []parkedBlock) {
-	if p == nil {
-		return
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for _, entry := range entries {
-		if _, ok := p.entries[entry.hash]; ok {
-			continue
-		}
-
-		stored := entry
-		p.entries[entry.hash] = &stored
-		p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
-	}
-
-	p.setGauges()
-}
-
 // Delete drops a block's blob and releases its budget. The entry must already
-// have been taken out of the index (TakeChildren, Expire) or this is called
+// have been taken out of the index (TakeChildren, Take) or this is called
 // with one that was never in it.
 //
 // A delete failure is not fatal: Del takes a write permit from the same
@@ -1114,7 +1064,7 @@ func (p *blockPark) RestoreAll(entries []parkedBlock) {
 // This is the ONLY place that deletes a parked blob (applyParkDisposition's
 // own comment says as much of its callers), which is exactly why the
 // converted record's delete belongs here too: every path that retires an
-// entry — a successful commit, an eviction, an ordinary discard — already
+// entry — a successful commit, an ordinary discard — already
 // funnels through this one function, so putting the record's cleanup here
 // once covers all of them, rather than only the discard path that happened to
 // call it explicitly.
@@ -1161,53 +1111,6 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	if err := p.store.Del(delCtx, entry.hash[:], fileformat.FileTypeBlock, parkOpts...); err != nil {
 		p.logger.Warnf("[blockPark][%s] failed to delete converted record, leaving it for the next restart sweep: %v", entry.hash, err)
 	}
-}
-
-// EvictBelow removes and returns up to limit blocks the chain has already gone
-// past. Their blobs stay on disk and stay charged until the caller settles them,
-// exactly as TakeChildren leaves things.
-//
-// This replaces an expiry on a thirty-minute timer. A timer answered the wrong
-// question: it asked how long a block had been waiting, when what matters is
-// whether it can still be used. A block below the chain's frontier cannot, and
-// one still waiting on a late parent can, however long it has waited. The timer
-// threw away perfectly good blocks — 39 of them in one measured 19-minute window
-// on mainnet — and each one had to be downloaded again.
-//
-// An entry with no usable height is skipped rather than guessed at. Restart
-// recovery rebuilds entries from disk with no header list behind them, so they
-// have no height, and evicting one because its height reads as zero would throw
-// away exactly the blocks recovery exists to keep.
-func (p *blockPark) EvictBelow(floor int32, limit int) []parkedBlock {
-	if p == nil || limit <= 0 || floor <= 0 {
-		return nil
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var evicted []parkedBlock
-
-	for h, entry := range p.entries {
-		if len(evicted) == limit {
-			break
-		}
-
-		if entry.writing || entry.height <= 0 || entry.height >= floor {
-			continue
-		}
-
-		evicted = append(evicted, *entry)
-
-		delete(p.entries, h)
-		p.removeChildLocked(entry.prevBlock, h)
-	}
-
-	if len(evicted) > 0 {
-		p.setGauges()
-	}
-
-	return evicted
 }
 
 // StuckCandidates returns up to limit blocks that have been parked longer than
@@ -1271,6 +1174,32 @@ func (p *blockPark) StuckCandidates(now time.Time, limit int) []parkedBlock {
 	}
 
 	return candidates
+}
+
+// AllParked returns a copy of every currently parked entry, with no age
+// threshold and no per-call limit.
+//
+// It exists for reconcileRecoveredParents, which runs once, right after
+// Recover, and needs to ask about every block the restart scan adopted rather
+// than a budgeted, round-robin sample of them the way StuckCandidates does for
+// the sweep's every-thirty-seconds pass. Bounded by whatever Recover put in the
+// park, which is bounded in turn by the download walk's read-ahead depth (see
+// Admit's own comment) rather than by anything in this function.
+func (p *blockPark) AllParked() []parkedBlock {
+	if p == nil {
+		return nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	out := make([]parkedBlock, 0, len(p.entries))
+
+	for _, entry := range p.entries {
+		out = append(out, *entry)
+	}
+
+	return out
 }
 
 // Take removes one specific block from the index, leaving its blob on disk and
@@ -1375,6 +1304,55 @@ func (p *blockPark) setGauges() {
 
 	prometheusLegacyNetsyncParkedBlocks.Set(float64(len(p.entries)))
 	prometheusLegacyNetsyncParkedBytes.Set(float64(p.bytes))
+}
+
+// hasCompleteRecord answers whether a converted record that has already been
+// read and hash-checked (record) is safe to treat as held: every subtree file
+// it names is still on disk. record being nil means the record itself is not
+// there, or would not read, so the answer is false before anything is walked.
+//
+// This is the ONE place that decides "complete" for a converted record.
+// Recover calls it while deciding whether a record left over from a previous
+// run is worth adopting; holdsBlock calls it while deciding whether a block
+// needs downloading again. Both are the same question, so both get the same
+// answer — a record whose subtree files are gone is neither adopted here nor
+// reported as held there.
+//
+// A missing or errored subtree stat answers false. That is the safe
+// direction: the alternative is adopting a commit that fails inside
+// validation and lands on the path that deletes the only copy and blames an
+// honest peer.
+func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, record *model.Block, subtreeStore blob.Store, quickValidationAllowed func(height uint32) bool) bool {
+	if record == nil {
+		return false
+	}
+
+	if subtreeStore == nil || quickValidationAllowed == nil || len(record.Subtrees) == 0 {
+		return true
+	}
+
+	structureType := fileformat.FileTypeSubtreeToCheck
+	if quickValidationAllowed(record.Height) {
+		structureType = fileformat.FileTypeSubtree
+	}
+
+	// Every subtree the record names, not just the first. Checking only
+	// Subtrees[0] was the cheap version of this fix and it left the gap it
+	// was written to close: a record whose later files have gone is adopted,
+	// commits cleanly here, and then fails inside validation, landing on the
+	// same destructive path a genuinely bad block does, which deletes the
+	// only copy and blames an honest peer.
+	for _, subtree := range record.Subtrees {
+		exists, existsErr := subtreeStore.Exists(ctx, subtree[:], structureType)
+		if existsErr != nil || !exists {
+			p.logger.Warnf("[blockPark][%s] converted record's subtree %s is gone (exists=%v, err=%v); treating the record as not held",
+				hash, subtree, exists, existsErr)
+
+			return false
+		}
+	}
+
+	return true
 }
 
 // Recover adopts whatever a previous run left on disk, and cleans up whatever
@@ -1486,15 +1464,6 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 				continue
 			}
 
-			if adopted >= maxParkedEntries {
-				// A previous run's park must never exceed what this run will hold.
-				p.Delete(ctx, parkedBlock{hash: *hash})
-
-				discarded++
-
-				continue
-			}
-
 			record, err := p.ReadConverted(ctx, *hash)
 			if err != nil {
 				// The same policy readParkedPrevBlock's caller applies below: a
@@ -1527,34 +1496,16 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 			// about whether the subtree files it names are still there: the
 			// record has no delete-at-height of its own, while every subtree
 			// file does (subtree_writer.go), so a record can survive long
-			// enough to outlive them. Checking the first subtree stands in for
-			// the whole list — see Recover's own doc comment for why that is
-			// the cheap version of this fix rather than checking every one.
-			// Adopting a record whose files are gone would commit cleanly here
-			// and then fail inside validation, landing on the same destructive
-			// path a bad block does.
-			if subtreeStore != nil && quickValidationAllowed != nil && len(record.Subtrees) > 0 {
-				structureType := fileformat.FileTypeSubtreeToCheck
-				if quickValidationAllowed(record.Height) {
-					structureType = fileformat.FileTypeSubtree
-				}
+			// enough to outlive them. hasCompleteRecord is the one place that
+			// answers this — holdsBlock asks it the identical question when
+			// deciding whether a block needs downloading again, so the two
+			// cannot disagree about what "complete" means.
+			if !p.hasCompleteRecord(ctx, *hash, record, subtreeStore, quickValidationAllowed) {
+				p.Delete(ctx, parkedBlock{hash: *hash})
 
-				firstSubtree := record.Subtrees[0]
+				discarded++
 
-				exists, existsErr := subtreeStore.Exists(ctx, firstSubtree[:], structureType)
-				if existsErr != nil || !exists {
-					// Logged once, at WARN, so a soak can tell us whether this
-					// ever actually fires — see Recover's own doc comment on
-					// how narrow the window is: a long-parked conversion whose
-					// retention window has already elapsed underneath it.
-					p.logger.Warnf("[blockPark][%s] converted record's first subtree %s is gone (exists=%v, err=%v); discarding the record instead of adopting a commit that would fail inside validation",
-						hash, firstSubtree, exists, existsErr)
-					p.Delete(ctx, parkedBlock{hash: *hash})
-
-					discarded++
-
-					continue
-				}
+				continue
 			}
 
 			info, err := dirEntry.Info()
@@ -1581,7 +1532,18 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 			// the converted-record suffix, so commitParkedBlock and parkedRun
 			// must route it to ReadConverted/HandleConvertedBlock, not Read, the
 			// same as an entry adopted straight off the wire would be.
-			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, size: size, parkedAt: parkedAt, converted: true}
+			// The height is in the record and was already read above for the
+			// quick-validation test. Dropping it here is not cosmetic: it is the
+			// same height the drain logs and reasons about for every other entry,
+			// and a recovered entry that never got one would be the one exception.
+			recoveredHeight, heightErr := safeconversion.Uint32ToInt32(record.Height)
+			if heightErr != nil {
+				p.logger.Warnf("[blockPark][%s] converted record's height %d will not fit, adopting it without one", hash, record.Height)
+
+				recoveredHeight = 0
+			}
+
+			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, height: recoveredHeight, size: size, parkedAt: parkedAt, converted: true}
 
 			p.mu.Lock()
 			stored := entry
@@ -1634,15 +1596,6 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 		size := info.Size() - int64(fileformat.Header{}.Size())
 		if size < 0 {
 			size = 0
-		}
-
-		if adopted >= maxParkedEntries {
-			// A previous run's park must never exceed what this run will hold.
-			p.Delete(ctx, parkedBlock{hash: *hash})
-
-			discarded++
-
-			continue
 		}
 
 		prevBlock, d, err := p.readParkedPrevBlock(ctx, *hash)

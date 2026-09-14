@@ -150,13 +150,6 @@ type blockDispatch struct {
 	windowed       bool
 	bytes          int64
 
-	// removedFront is the header node this block's arrival took off the front of
-	// the headers-first list, or nil when it was not the front. The tail needs it
-	// to put the block back into the download walk when the block fails or is
-	// aborted: by then the header is gone from both the list and the index, so
-	// nothing else can find it. It is an 80-byte header, not the decoded block.
-	removedFront *headerNode
-
 	// parked is the park entry this dispatch commits, and nil for a block that
 	// arrived on the wire. A parked dispatch carries no queue message worth
 	// replying to and no peer obligation to settle: its blob is read by the
@@ -166,10 +159,9 @@ type blockDispatch struct {
 	// cannot share a code path by accident.
 	parked *parkedBlock
 
-	// parkedIsCheckpoint is what advanceHeaderListFor answered for a parked
-	// dispatch when its header node was taken off the front, which happens at
-	// dispatch rather than at commit. By the time the tail runs the front has
-	// moved on and the question can no longer be asked.
+	// parkedIsCheckpoint is what isCheckpointHash answered for a parked
+	// dispatch's own hash, computed at dispatch rather than at commit and
+	// passed through to parkedBlockCommitted's tail.
 	parkedIsCheckpoint bool
 
 	// readErr is a parked dispatch's blob-read failure, kept apart from the
@@ -203,12 +195,27 @@ type cachedBAState struct {
 // up to K consecutive below-checkpoint blocks have their UTXO store work in flight at
 // once, while every chain-order step stays in dispatch order on the consumer goroutine.
 //
-// Everything except completions is owned by that one goroutine — frontier, inflight,
-// barrier and baState are never touched from a worker, so the dispatcher needs no lock.
+// inflight, barrier and baState are owned by that one goroutine and never touched from
+// a worker, so they need no lock. frontier used to be the same, until the wanted-range
+// pass gained a second caller: the park sweep's own goroutine now calls fetchHeaderBlocks
+// directly (runParkSweep, block_park_drain.go), which reaches inFlight below to check
+// whether a candidate's parent is being retried right now. That is a read of frontier
+// from a goroutine that is not the consumer, running concurrently with the consumer's own
+// dispatch and complete, which append to and pop from the same slice — a data race,
+// caught by go test -race on TestBlockHandler_TheSweepGoroutinePostsAndTheConsumerCommits
+// and TestSyncManager_TheBlockHandlerRunsTheParkSweep. frontierMu is the fix: every read
+// and write of frontier takes it, for exactly as long as the read or write itself, and
+// never across a call back into tail code (handleBlockMsgTail, by way of fetchHeaderBlocks,
+// can itself call back into inFlight, so complete must release the lock before invoking a
+// dispatch's tail or it would deadlock against itself on the same goroutine).
 type blockDispatcher struct {
-	sm          *SyncManager
-	depth       int
-	budget      int64
+	sm     *SyncManager
+	depth  int
+	budget int64
+
+	// frontierMu guards frontier alone. See the struct comment for why it exists and
+	// the reentrancy rule complete() observes to avoid deadlocking on its own tail call.
+	frontierMu  sync.Mutex
 	frontier    []*frontierEntry
 	inflight    int64
 	barrier     bool
@@ -471,9 +478,44 @@ func (bd *blockDispatcher) blockAssemblyHeight() (uint32, bool) {
 	return bd.baState.height, true
 }
 
+// drainFrontier empties frontier under frontierMu and returns what was in it. It exists
+// for dispatchBlocks' shutdown drain, the one place outside this file that used to read
+// and clear bd.frontier directly, racing the same way dispatch and complete did against
+// a concurrent inFlight call from the park sweep's goroutine. The lock is released before
+// the caller does anything with the returned entries: nothing here needs it held that
+// long, and holding it across a callback is how complete's own lock earned its comment
+// about never doing that.
+func (bd *blockDispatcher) drainFrontier() []*frontierEntry {
+	bd.frontierMu.Lock()
+	defer bd.frontierMu.Unlock()
+
+	entries := bd.frontier
+	bd.frontier = nil
+
+	return entries
+}
+
 // frontierEmpty reports whether nothing is in flight. Nil-safe: tests build SyncManager
 // as a struct literal that bypasses New(), so sm.dispatcher can be nil.
-func (bd *blockDispatcher) frontierEmpty() bool { return bd == nil || len(bd.frontier) == 0 }
+func (bd *blockDispatcher) frontierEmpty() bool {
+	if bd == nil {
+		return true
+	}
+
+	bd.frontierMu.Lock()
+	defer bd.frontierMu.Unlock()
+
+	return len(bd.frontier) == 0
+}
+
+// frontierLen reports how many entries are in flight, under frontierMu. A plain
+// len(bd.frontier) anywhere else in this file is the race this exists to close.
+func (bd *blockDispatcher) frontierLen() int {
+	bd.frontierMu.Lock()
+	defer bd.frontierMu.Unlock()
+
+	return len(bd.frontier)
+}
 
 // tailHeight is the height of the last block admitted, or 0 when nothing is in flight.
 // The zero means the block-assembly lag arm of effectiveDepth sees a lag of 0 until the
@@ -485,6 +527,9 @@ func (bd *blockDispatcher) frontierEmpty() bool { return bd == nil || len(bd.fro
 // right answer for it and needs no special case: such an entry is dispatched un-windowed,
 // so canDispatch admits it only into an empty frontier and it is the only entry there.
 func (bd *blockDispatcher) tailHeight() uint32 {
+	bd.frontierMu.Lock()
+	defer bd.frontierMu.Unlock()
+
 	if n := len(bd.frontier); n > 0 {
 		return bd.frontier[n-1].height
 	}
@@ -512,6 +557,9 @@ func (bd *blockDispatcher) parentFor(prevHash *chainhash.Hash) *inflightParent {
 		return nil
 	}
 
+	bd.frontierMu.Lock()
+	defer bd.frontierMu.Unlock()
+
 	if n := len(bd.frontier); n > 0 && bd.frontier[n-1].hash.IsEqual(prevHash) {
 		e := bd.frontier[n-1]
 
@@ -530,10 +578,18 @@ func (bd *blockDispatcher) parentFor(prevHash *chainhash.Hash) *inflightParent {
 // inFlight reports whether this hash is a block the dispatcher is working on right now.
 // The recently-failed-parent check consults it first: a parent that is being retried is
 // not a failed parent, so its child must not be short-circuited as part of a cascade.
+//
+// Called from two goroutines: the consumer, indirectly through the live and drain
+// paths, and the park sweep's own goroutine, through fetchHeaderBlocks. frontierMu is
+// what makes that safe against dispatch and complete, which append to and pop from the
+// same slice on the consumer.
 func (bd *blockDispatcher) inFlight(hash chainhash.Hash) bool {
 	if bd == nil {
 		return false
 	}
+
+	bd.frontierMu.Lock()
+	defer bd.frontierMu.Unlock()
 
 	for _, e := range bd.frontier {
 		if e.hash.IsEqual(&hash) {
@@ -558,7 +614,7 @@ func (bd *blockDispatcher) canDispatch(d *blockDispatch) bool {
 		return bd.frontierEmpty()
 	}
 
-	if len(bd.frontier) >= bd.effectiveDepth() {
+	if bd.frontierLen() >= bd.effectiveDepth() {
 		return false
 	}
 
@@ -604,7 +660,7 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 	// never being windowed rather than a rule of its own, and it is what kept the
 	// validator idle between every block drained from the park.
 	if d.parked != nil && (d.parent != nil || (!d.windowed && !bd.frontierEmpty())) {
-		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch in the wrong shape: parent=%v windowed=%v frontier=%d", d.parked.hash.String(), d.parent != nil, d.windowed, len(bd.frontier))
+		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch in the wrong shape: parent=%v windowed=%v frontier=%d", d.parked.hash.String(), d.parent != nil, d.windowed, bd.frontierLen())
 		bd.sm.blockPark.Restore(*d.parked)
 
 		return
@@ -623,7 +679,10 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 		d:          d,
 	}
 
+	bd.frontierMu.Lock()
 	bd.frontier = append(bd.frontier, e)
+	bd.frontierMu.Unlock()
+
 	bd.inflight += d.bytes * windowBytesPerWireByte
 
 	// The window now accounts for this block's memory, so the download budget
@@ -679,15 +738,32 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 // complete records a worker's outcome and runs the ordered tail for every settled entry
 // at the head of the frontier. Entries behind a failed one are aborted with a service
 // error, so they are never rejected to the peer and never earn a failure backoff.
+//
+// Each turn of the loop takes frontierMu only for the peek-classify-pop that touches
+// frontier, and releases it before calling the dispatch's own tail. That release is load-
+// bearing, not tidiness: the tail can call back into fetchHeaderBlocks (a checkpoint or an
+// ordinary top-up both can), which reaches inFlight below, and inFlight takes frontierMu
+// itself. Holding the lock across the tail call would deadlock complete against itself on
+// this same goroutine the first time that path fired.
 func (bd *blockDispatcher) complete(c *blockCompletion) {
 	c.entry.settle(c.err)
 
-	for len(bd.frontier) > 0 {
+	for {
+		bd.frontierMu.Lock()
+
+		if len(bd.frontier) == 0 {
+			bd.frontierMu.Unlock()
+
+			return
+		}
+
 		head := bd.frontier[0]
 
 		select {
 		case <-head.settled:
 		default:
+			bd.frontierMu.Unlock()
+
 			return
 		}
 
@@ -715,6 +791,8 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 		}
 
 		if err != nil {
+			// Caller (this function) holds frontierMu; failFrom reads frontier
+			// directly on that strength.
 			bd.failFrom(head)
 		}
 
@@ -730,6 +808,8 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 			bd.barrier = false
 		}
 
+		bd.frontierMu.Unlock()
+
 		_ = bd.tailFor(head.d)(head.d, err)
 	}
 }
@@ -742,6 +822,8 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 // only sound because block validation's window never commits a successor after its
 // predecessor failed mid-RPC: a run that returned nil under a failed predecessor did not
 // commit a block, so calling it failed here matches what the store actually holds.
+//
+// The caller must hold frontierMu; this is complete's only caller and it always does.
 func (bd *blockDispatcher) failFrom(e *frontierEntry) {
 	for _, x := range bd.frontier {
 		if x == e {

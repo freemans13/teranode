@@ -10,9 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
-	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -43,70 +41,46 @@ func (l *warnCaptureLogger) Warnf(format string, args ...interface{}) {
 // that was never written while the subtree files the pipeline sink actually
 // wrote were left behind forever.
 //
-// This proves the sink and its matching delete callback are chosen together,
-// the same pattern already used for the streamsEverySize policy: never one
-// without the other.
+// Streaming is now unconditional, so there is only one sink/delete pair to
+// install any more: this proves it is always pipelineBlockDelete, never
+// streamingBlockDelete alone.
 //
-// pipeline=true's sink is no longer sm.pipelineBlockSink itself: task 4 wraps
-// it in admitPipelineSink to reach the download-admission budget that used to
-// be unreachable from this route (AcquireBlockPrefetch was only ever called
-// from OnBlock, which the pipeline route never dispatches through). A wrapper
+// The installed sink is no longer sm.pipelineBlockSink itself: it is wrapped
+// in admitPipelineSink to reach the download-admission budget that used to be
+// unreachable from this route (AcquireBlockPrefetch was only ever called from
+// OnBlock, which the pipeline route never dispatches through). A wrapper
 // closure's reflect code pointer is never equal to the method value it
-// wraps — confirmed separately, not assumed — so pipeline=true's claim is
-// proved behaviourally instead: the installed sink, given a well-formed
-// pipeline-eligible block, must convert it exactly as calling
-// sm.pipelineBlockSink directly would. pipeline=false is untouched by task 4
-// (admitPipelineSink only ever wraps the pipeline branch), so that half keeps
-// the original pointer-identity proof, which doubles as evidence that nothing
-// about the off path changed.
+// wraps — confirmed separately, not assumed — so the claim is proved
+// behaviourally instead: the installed sink, given a well-formed block, must
+// convert it exactly as calling sm.pipelineBlockSink directly would.
 func TestInstallStreamingBlockPath_ChoosesTheSinkAndDeleteTogether(t *testing.T) {
 	sm := newPipelineParkManager(t, memory.New(), 8)
 
-	for _, pipelineOn := range []bool{false, true} {
-		sm.settings.Legacy.PipelineReceive = pipelineOn
+	var gotSink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)
+	var gotGate func(chainhash.Hash, *wire.BlockHeader) error
+	var gotDelete func(chainhash.Hash, bool) error
 
-		var gotSink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)
-		var gotGate func(chainhash.Hash, *wire.BlockHeader) error
-		var gotDelete func(chainhash.Hash, bool) error
-		var gotStreamsEverySize bool
+	sm.installStreamingBlockPath(func(
+		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
+		gate func(chainhash.Hash, *wire.BlockHeader) error,
+		del func(chainhash.Hash, bool) error,
+	) {
+		gotSink = sink
+		gotGate = gate
+		gotDelete = del
+	})
 
-		sm.installStreamingBlockPath(func(
-			sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
-			gate func(chainhash.Hash, *wire.BlockHeader) error,
-			del func(chainhash.Hash, bool) error,
-			streamsEverySize bool,
-		) {
-			gotSink = sink
-			gotGate = gate
-			gotDelete = del
-			gotStreamsEverySize = streamsEverySize
-		})
+	wantDelete := reflect.ValueOf(sm.pipelineBlockDelete).Pointer()
+	require.Equal(t, wantDelete, reflect.ValueOf(gotDelete).Pointer(), "must install pipelineBlockDelete, not streamingBlockDelete alone")
+	require.NotNil(t, gotGate, "the gate must always be installed alongside a sink")
 
-		wantDelete := reflect.ValueOf(sm.streamingBlockDelete).Pointer()
-		if pipelineOn {
-			wantDelete = reflect.ValueOf(sm.pipelineBlockDelete).Pointer()
-		}
+	blk := wireBlockWithTxs(t, 9, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
 
-		require.Equal(t, wantDelete, reflect.ValueOf(gotDelete).Pointer(), "pipeline=%v must install the matching delete callback, not always streamingBlockDelete", pipelineOn)
-		require.NotNil(t, gotGate, "the gate must always be installed alongside a sink")
-		require.Equal(t, pipelineOn, gotStreamsEverySize, "the size policy must track the same PipelineReceive check")
-
-		if !pipelineOn {
-			wantSink := reflect.ValueOf(sm.streamingBlockSink).Pointer()
-			require.Equal(t, wantSink, reflect.ValueOf(gotSink).Pointer(),
-				"pipeline=false must install streamingBlockSink unwrapped — task 4's admission wrap must never reach this branch")
-
-			continue
-		}
-
-		blk := wireBlockWithTxs(t, 9, false)
-		pipelineHeaderFixture(t, sm, blk)
-		body := blockBodyBytes(t, blk)
-
-		converted, err := gotSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
-		require.NoError(t, err, "pipeline=true's installed sink must convert a well-formed block cleanly")
-		require.True(t, converted, "pipeline=true's installed sink must behave like the pipeline sink, not the plain body-write path")
-	}
+	converted, err := gotSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "the installed sink must convert a well-formed block cleanly")
+	require.True(t, converted, "the installed sink must behave like the pipeline sink, not the plain body-write path")
 }
 
 // TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote is FIX 3's
@@ -161,10 +135,15 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 }
 
 // TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite covers FIX 2's
-// out-of-order fallback: when pipelineBlockSink defers to streamingBlockSink
-// because a block's parent is unresolvable, the body lands in the park under
-// the pipeline path's own name for what "the active sink wrote". The delete
-// callback installed for the pipeline path must still clean that up.
+// out-of-order fallback. pipelineBlockSink itself no longer has an
+// unresolvable-parent fallback — it converts every block, resolved or not
+// (task 13) — but admitPipelineSink's own admission-budget fallback (a
+// duplicate hash already in flight, or the acquire timing out) still defers to
+// streamingBlockSink, which writes the raw body to the park under the
+// pipeline path's own name for what "the active sink wrote". The delete
+// callback installed for the pipeline path must still clean that up. This
+// calls streamingBlockSink directly to stand in for that fallback without
+// needing to reproduce the admission race that reaches it.
 func TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite(t *testing.T) {
 	ctx := t.Context()
 
@@ -174,14 +153,10 @@ func TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite(t *testing.T) {
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
-
-	parent := chainhash.HashH([]byte("fix3-unresolvable-parent-for-delete-test"))
-	blk.MsgBlock().Header.PrevBlock = parent
-
 	body := blockBodyBytes(t, blk)
 
-	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
-	require.NoError(t, sinkErr, "an unresolvable parent must fall back rather than error")
+	converted, sinkErr := sm.streamingBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, sinkErr, "the fallback body write must succeed")
 	require.False(t, converted, "the fallback never converts, it only writes the raw body")
 
 	exists, err := parkStore.Exists(ctx, blk.Hash()[:], parkFileType)
@@ -199,63 +174,6 @@ func TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite(t *testing.T) {
 	require.False(t, exists, "the pipeline delete callback must also remove a body the fallback wrote to the park, not just subtree files")
 }
 
-// writeConvertedRecordDirect builds and writes a converted record the same
-// way pipelineBlockSink does — the same writer, builder and dedup map — but
-// without going through the sink itself, and returns it.
-//
-// It exists for tests that need a converted record with a structure type
-// (FileTypeSubtree vs FileTypeSubtreeToCheck) the sink can no longer produce
-// on its own after fix round 1: pipelineBlockSink now declines to convert
-// anything legacyUnified does not accept, and legacyUnified requires
-// BelowCheckpoint — the exact same predicate quickValidationAllowed checks —
-// so a record the sink actually wrote can never carry quickValidation=false.
-// Building the record directly decouples "what pipelineBlockDelete cleans up"
-// from "what the sink will currently agree to convert", which is what this
-// helper's callers are actually testing.
-func writeConvertedRecordDirect(t *testing.T, sm *SyncManager, blk *bsvutil.Block, quickValidation bool) *model.Block {
-	t.Helper()
-
-	height, resolved := sm.pipelineParentHeight(blk.MsgBlock().Header.PrevBlock)
-	require.True(t, resolved, "sanity: the fixture must point at a resolvable parent")
-
-	txs := blk.Transactions()
-	coinbase, _ := btTxFromWireTx(t, txs[0])
-
-	writer := newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, quickValidation)
-	dedup := newPipelineDedupMap()
-
-	builder, err := newBlockStreamBuilder(len(txs), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup)
-	require.NoError(t, err)
-
-	for i := 1; i < len(txs); i++ {
-		tx, hash := btTxFromWireTx(t, txs[i])
-		require.NoError(t, builder.AddTx(tx, hash))
-	}
-
-	root, subtreeHashes, err := builder.Finish()
-	require.NoError(t, err)
-	require.True(t, root.IsEqual(&blk.MsgBlock().Header.MerkleRoot), "sanity: the merkle root built here must match the header pipelineHeaderFixture set")
-
-	subtreeHashPointers := make([]*chainhash.Hash, len(subtreeHashes))
-	for i := range subtreeHashes {
-		h := subtreeHashes[i]
-		subtreeHashPointers[i] = &h
-	}
-
-	var headerBytes bytes.Buffer
-	require.NoError(t, blk.MsgBlock().Header.Serialize(&headerBytes))
-
-	modelHeader, err := model.NewBlockHeaderFromBytes(headerBytes.Bytes())
-	require.NoError(t, err)
-
-	verified, err := model.NewBlock(modelHeader, coinbase, subtreeHashPointers, uint64(len(txs)), 0, height, 0)
-	require.NoError(t, err)
-
-	require.NoError(t, sm.blockPark.WriteConvertedBlock(sm.ctx, *blk.Hash(), verified))
-
-	return verified
-}
-
 // TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint is
 // fix-round item 6. Every other test in this file resolves its block to
 // height 1 under a checkpoint at 1000 (newPipelineManager), so
@@ -263,6 +181,11 @@ func writeConvertedRecordDirect(t *testing.T, sm *SyncManager, blk *bsvutil.Bloc
 // structure type pipelineBlockDelete deletes — the FileTypeSubtreeToCheck
 // branch, which is what a mainnet block above the highest checkpoint takes,
 // had no test at all.
+//
+// Task 13 removed pipelineBlockSink's own above-checkpoint refusal, so this
+// now drives the real sink rather than building a record by hand: an
+// above-checkpoint block is the ordinary case the sink converts, not a
+// refusal to work around.
 func TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint(t *testing.T) {
 	ctx := t.Context()
 
@@ -272,17 +195,21 @@ func TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint(t *testin
 	// BelowCheckpoint (model/checkpoint.go) requires highest > 0, so a
 	// checkpoint height of 0 means "no checkpoint reaches this chain", and
 	// every height — including this fixture's resolved height of 1 — reads as
-	// above it. That also makes legacyUnified false for every height (it
-	// requires BelowCheckpoint too), so pipelineBlockSink's own eligibility
-	// gate (task-3 fix round 1) would decline to convert this block at all —
-	// see writeConvertedRecordDirect's own comment for why this test builds
-	// the record directly instead of calling the sink.
+	// above it, so quickValidationAllowed is false and the sink must choose
+	// FileTypeSubtreeToCheck.
 	sm.chainParams.Checkpoints = []chaincfg.Checkpoint{{Height: 0}}
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
 
-	got := writeConvertedRecordDirect(t, sm, blk, false)
+	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, sinkErr, "an above-checkpoint block must convert cleanly, not be refused")
+	require.True(t, converted, "sanity: this test needs a real conversion above the checkpoint")
+
+	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err)
+	require.NotNil(t, got)
 
 	hashes := got.Subtrees
 	require.NotEmpty(t, hashes, "sanity: the builder must have produced subtrees, or this test asserts nothing")

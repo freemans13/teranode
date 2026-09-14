@@ -182,7 +182,7 @@ func (sm *SyncManager) publishConsumerWait(now time.Time, queueArmOpen bool, pen
 		w.downloadBudget = sm.blockPrefetchBudgetBytes
 		w.downloadHeld = sm.blockPrefetchReserved.Load()
 		w.downloadWaiters = sm.blockPrefetchWaiters.Load()
-		w.downloadBudgetIsSlots = sm.settings != nil && sm.settings.Legacy.PipelineReceive
+		w.downloadBudgetIsSlots = sm.blockPark != nil && sm.blockPark.Enabled()
 	}
 
 	w.drainDeclines = sm.drainDeclined.Load()
@@ -281,9 +281,10 @@ func (sm *SyncManager) reportConsumerStall(now time.Time) {
 	sm.consumerStallLoggedAt.Store(now.UnixNano())
 
 	// The header round is appended rather than folded into describe(), because
-	// describe() reads only the consumer's own snapshot and must stay lock-free:
-	// this call takes headerMu, which is legal here and nowhere on the consumer
-	// goroutine. See headerRoundSummary.
+	// describe() reads only the consumer's own snapshot and must stay
+	// allocation-free on that goroutine, while this reads the header cache and
+	// the committed-height counter, neither of which the consumer touches. See
+	// headerRoundSummary.
 	report := w.describe(now)
 	if round := sm.headerRoundSummary(); round != "" {
 		report += "; " + round

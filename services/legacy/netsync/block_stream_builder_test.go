@@ -19,11 +19,23 @@ func newDedupMap(txCount int) txmap.TxMap {
 	return txmap.NewSplitSwissMapUint64(uint32(txCount)) //nolint:gosec // test tx count is small and non-negative
 }
 
-// streamTx builds a distinct, well-formed transaction for index i. bt.NewOutput
-// does not exist in go-bt v2.7.1, so the input is built with Tx.From against a
-// per-index parent id instead: one input and one output is enough, because the
-// builder only ever asks for the transaction's size and its inpoints, never its
-// scripts.
+// streamTx builds a distinct, well-formed transaction for index i, spending
+// output 0 of a synthetic per-index parent id that is never itself added to
+// any builder in this file. bt.NewOutput does not exist in go-bt v2.7.1, so
+// the input is built through FromUTXOs instead of a literal *bt.Input.
+//
+// FromUTXOs is used rather than Tx.From deliberately: From parses its
+// prevTxLockingScript argument with bscript.NewFromHexString even when given
+// "", which returns a non-nil, empty *Script — so a transaction built with
+// From already reads as extended (IsExtended only checks for a nil script)
+// before block_stream_builder.go's extendFromBlock ever runs, which would
+// mask the very thing that function is testing. Leaving LockingScript unset on
+// the UTXO here keeps PreviousTxScript genuinely nil, i.e. not yet extended,
+// which is what a transaction spending an out-of-block parent actually looks
+// like on the wire. Because the parent id is synthetic and distinct from any
+// real transaction hash, extendFromBlock's lookup always misses for these
+// transactions regardless of what has already streamed past, so every test in
+// this file that predates fee stamping keeps seeing a fee of zero.
 func streamTx(t *testing.T, i int) (*bt.Tx, *chainhash.Hash) {
 	t.Helper()
 
@@ -35,7 +47,7 @@ func streamTx(t *testing.T, i int) (*bt.Tx, *chainhash.Hash) {
 	parent[1] = byte(i >> 8)
 	parent[2] = byte(i >> 16)
 
-	require.NoError(t, tx.From(parent.String(), 0, "", 1000))
+	require.NoError(t, tx.FromUTXOs(&bt.UTXO{TxIDHash: &parent, Vout: 0, Satoshis: 1000}))
 	require.NoError(t, tx.PayToAddress("1BitcoinEaterAddressDontSendf59kuE", 900))
 
 	return tx, tx.TxIDChainHash()

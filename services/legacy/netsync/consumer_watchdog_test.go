@@ -1,7 +1,6 @@
 package netsync
 
 import (
-	"container/list"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -9,7 +8,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -240,25 +238,23 @@ func TestConsumerStallLineIsOneLine(t *testing.T) {
 	require.False(t, strings.HasSuffix(log.warns[0], " "))
 }
 
-// seedStalledHeaderRound puts a manager into the header state Hetzner mainnet was
-// in at 08:47 on 2026-09-11: headers-first mode on, a list whose front is the
-// round's anchor, headers stacked above it, and a checkpoint ahead. The blocks
-// the node actually needed were fifty thousand heights below the back of this
-// list, which is why the watchdog has to print both ends of it.
-func seedStalledHeaderRound(sm *SyncManager, anchorHeight int32, above int) {
-	sm.headerList = list.New()
-	sm.headerIndex = make(map[chainhash.Hash]*list.Element)
+// seedStalledHeaderRound puts a manager into a header-cache state resembling
+// Hetzner mainnet's at 08:47 on 2026-09-11: headers-first mode on, best names
+// the committed height, and the cache names a run of `above` further heights
+// above it. The blocks the node actually needed were fifty thousand heights
+// below the back of the old header list, which is why the watchdog has to
+// print both the committed height and where the cache's own run ends.
+func seedStalledHeaderRound(t *testing.T, sm *SyncManager, best int32, above int) {
+	t.Helper()
 
-	anchor := &headerNode{height: anchorHeight, hash: &chainhash.Hash{0xa0}, isAnchor: true}
-	sm.headerIndex[*anchor.hash] = sm.headerList.PushBack(anchor)
+	anchor := chainhash.Hash{0xa0}
+	mockCommittedTip(t, sm, uint32(best), 0) //nolint:gosec // a fixture height, never negative
 
-	for i := 1; i <= above; i++ {
-		node := &headerNode{height: anchorHeight + int32(i), hash: &chainhash.Hash{0xb0, byte(i)}}
-		sm.headerIndex[*node.hash] = sm.headerList.PushBack(node)
-	}
+	var nonce uint32
+	msg, _ := linkedHeaders(anchor, above, &nonce)
 
-	checkpointHash := chainhash.Hash{0xcc}
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 850000, Hash: &checkpointHash}
+	sm.headerCache = newHeaderCache()
+	sm.headerCache.Fill(anchor, best+1, msg.Headers)
 
 	sm.headersFirstMode.Store(true)
 }
@@ -282,66 +278,48 @@ func stallReport(t *testing.T, sm *SyncManager, log *captureLogger) string {
 	return log.warns[0]
 }
 
-// TestConsumerWatchdog_ReportsTheHeaderRoundWhenTheAnchorIsStillTheFront is the
-// line that would have settled the 800128 stall on the first tick instead of
-// after seven hours and a packet capture.
-func TestConsumerWatchdog_ReportsTheHeaderRoundWhenTheAnchorIsStillTheFront(t *testing.T) {
+// TestConsumerWatchdog_ReportsTheHeaderCacheState is the line that would have
+// settled the 800128 stall on the first tick instead of after seven hours and
+// a packet capture: the committed height, how many heights the cache names,
+// where its run ends, and how many blocks are still owed.
+func TestConsumerWatchdog_ReportsTheHeaderCacheState(t *testing.T) {
 	log := &captureLogger{Logger: ulogger.TestLogger{}}
 	sm := &SyncManager{logger: log}
 
-	seedStalledHeaderRound(sm, 849900, 99)
-	sm.startHeader = sm.headerList.Front()
+	seedStalledHeaderRound(t, sm, 849900, 100)
 
 	line := stallReport(t, sm, log)
 
-	require.Contains(t, line, "the header round holds 100 headers")
-	require.Contains(t, line, "front height 849900")
-	require.Contains(t, line, "the round's anchor")
-	require.Contains(t, line, "back height 849999")
-	require.Contains(t, line, "aiming at checkpoint 850000")
+	require.Contains(t, line, "best block processed 849900")
+	require.Contains(t, line, "the header cache names 100 heights up to 850000")
+	require.Contains(t, line, "0 blocks are owed by peers")
 }
 
-// TestConsumerWatchdog_ReportsANilDownloadCursor pins the other terminal state of
-// the walk. A nil startHeader beside a list full of headers switches the only
-// fetcher off, and in every log the node writes today it is indistinguishable
-// from a round whose anchor never had anything splice onto it. The two want
-// opposite fixes, so the report has to name which one it is.
-func TestConsumerWatchdog_ReportsANilDownloadCursor(t *testing.T) {
+// TestConsumerWatchdog_ReportsCacheStateEvenWithHeadersFirstOff pins that the
+// report is unconditional now. The old header-list summary said nothing outside
+// a headers-first round, on the reasoning that the list was not the thing
+// holding blocks up in any other state; the header cache and the committed
+// height are worth a reader's attention whatever mode the node is in, so this
+// clause is no longer gated on headersFirstMode at all.
+func TestConsumerWatchdog_ReportsCacheStateEvenWithHeadersFirstOff(t *testing.T) {
 	log := &captureLogger{Logger: ulogger.TestLogger{}}
 	sm := &SyncManager{logger: log}
 
-	seedStalledHeaderRound(sm, 800128, 12)
-	sm.startHeader = nil
-
-	line := stallReport(t, sm, log)
-
-	require.Contains(t, line, "the download cursor is nil")
-	require.Contains(t, line, "the header round holds 13 headers")
-}
-
-// TestConsumerWatchdog_SaysNothingExtraWithHeadersFirstOff keeps this scoped to
-// the state it diagnoses. Outside a headers-first round the list is not the thing
-// holding blocks up, and a clause about it would be noise on every other stall.
-func TestConsumerWatchdog_SaysNothingExtraWithHeadersFirstOff(t *testing.T) {
-	log := &captureLogger{Logger: ulogger.TestLogger{}}
-	sm := &SyncManager{logger: log}
-
-	seedStalledHeaderRound(sm, 800128, 12)
-	sm.startHeader = sm.headerList.Front()
+	seedStalledHeaderRound(t, sm, 800128, 12)
 	sm.headersFirstMode.Store(false)
 
 	line := stallReport(t, sm, log)
 
 	require.Contains(t, line, "no block admitted")
-	require.NotContains(t, line, "the header round")
+	require.Contains(t, line, "the header cache names 12 heights")
 }
 
-// TestConsumerWatchdog_ANilHeaderListStillProducesAReport matches the harness
+// TestConsumerWatchdog_ANilHeaderCacheStillProducesAReport matches the harness
 // twelve test files in this package use: a SyncManager built as a struct literal,
-// with no header list and no checkpoint. A watchdog that panicked on one of those
-// would take the whole message-handling goroutine down, which is a worse failure
-// than the stall it reports.
-func TestConsumerWatchdog_ANilHeaderListStillProducesAReport(t *testing.T) {
+// with no header cache and nothing committed. A watchdog that panicked on one of
+// those would take the whole message-handling goroutine down, which is a worse
+// failure than the stall it reports.
+func TestConsumerWatchdog_ANilHeaderCacheStillProducesAReport(t *testing.T) {
 	log := &captureLogger{Logger: ulogger.TestLogger{}}
 	sm := &SyncManager{logger: log}
 
@@ -351,6 +329,25 @@ func TestConsumerWatchdog_ANilHeaderListStillProducesAReport(t *testing.T) {
 
 	require.NotPanics(t, func() { line = stallReport(t, sm, log) })
 
-	require.Contains(t, line, "the header round holds no headers")
-	require.Contains(t, line, "no checkpoint ahead")
+	require.Contains(t, line, "best block processed 0")
+	require.Contains(t, line, "the header cache is empty")
+}
+
+// TestConsumerWait_Describe_NamesDeclinedDrainTurns covers the field that was
+// collected and never rendered. A drain that walks its queue, rules every parent
+// out and drops them leaves the queue length at zero, so without this a loop
+// that has just thrown a turn away reads as a loop with no work.
+func TestConsumerWait_Describe_NamesDeclinedDrainTurns(t *testing.T) {
+	now := time.Now()
+
+	w := &consumerWait{at: now, queueArmOpen: true, parked: 113, drainDeclines: 41}
+
+	line := w.describe(now)
+
+	require.Contains(t, line, "the drain has declined 41 turns",
+		"a report that collects the count and prints nothing is the diagnostic stopping where it gets interesting")
+
+	quiet := (&consumerWait{at: now, queueArmOpen: true}).describe(now)
+	require.False(t, strings.Contains(quiet, "declined"),
+		"a drain that has never declined a turn must not add a clause saying so")
 }

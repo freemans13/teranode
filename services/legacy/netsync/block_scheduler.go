@@ -220,6 +220,28 @@ func (sm *SyncManager) singlePeerAssigner(ladder int) *downloadAssigner {
 // re-requestable after blockRequestRetryInterval, and the one block that
 // actually gates progress is covered by the frontier race.
 func (a *downloadAssigner) take(height int32) (*assignerPeer, bool) {
+	return a.takeAvoiding(height, nil)
+}
+
+// takeAvoiding is take with a preference: a peer the caller would rather not
+// pick is chosen only when no peer without that mark can be found. avoid may be
+// nil, which is exactly take, and take is the only thing the header walk uses —
+// so this preference cannot change which peer that walk picks for anything.
+//
+// The caller that does use it is the wanted-range assignment pass, whose mark is
+// "this peer already owes us this block". Asking such a peer for it again makes
+// it send the block twice, and the second copy arrives after the first
+// discharged its obligation, so it looks unrequested and costs an honest peer
+// its whole association. A marked peer is still returned when it is all there
+// is, because the caller has something useful to do with it that is not a second
+// getdata; it just must never be preferred over a peer that could actually help.
+//
+// An unmarked peer that has not claimed a chain reaching this height beats a
+// marked peer that has. canServe is a lower bound that goes stale downward, so
+// "has not claimed it" routinely means only that we have not been told, and
+// take's own reasoning already prefers one wasted request to asking nobody. A
+// marked peer, by contrast, can contribute nothing new however high it claims.
+func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) bool) (*assignerPeer, bool) {
 	if a == nil || a.remaining <= 0 {
 		return nil, false
 	}
@@ -228,7 +250,7 @@ func (a *downloadAssigner) take(height int32) (*assignerPeer, bool) {
 		a.idx++
 	}
 
-	var fallback *assignerPeer
+	var fallback, avoidedServer, avoidedFallback *assignerPeer
 
 	for i := a.idx; i < len(a.peers); i++ {
 		p := a.peers[i]
@@ -236,20 +258,38 @@ func (a *downloadAssigner) take(height int32) (*assignerPeer, bool) {
 			continue
 		}
 
+		if avoid == nil || !avoid(p.peer) {
+			if p.canServe(height) {
+				return p, true
+			}
+
+			if fallback == nil {
+				fallback = p
+			}
+
+			continue
+		}
+
 		if p.canServe(height) {
+			if avoidedServer == nil {
+				avoidedServer = p
+			}
+
+			continue
+		}
+
+		if avoidedFallback == nil {
+			avoidedFallback = p
+		}
+	}
+
+	for _, p := range []*assignerPeer{fallback, avoidedServer, avoidedFallback} {
+		if p != nil {
 			return p, true
 		}
-
-		if fallback == nil {
-			fallback = p
-		}
 	}
 
-	if fallback == nil {
-		return nil, false
-	}
-
-	return fallback, true
+	return nil, false
 }
 
 // canServe reports whether this peer has told us about a chain that reaches the

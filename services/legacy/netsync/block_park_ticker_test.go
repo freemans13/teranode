@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -82,69 +82,38 @@ func TestSyncManager_TheBlockHandlerRunsTheParkSweep(t *testing.T) {
 	require.False(t, failed, "the sweep must have committed the block, not given up on it")
 }
 
-// TestSyncManager_TheBlockHandlerCarriesARewoundCursorForward proves the other
+// TestSyncManager_TheBlockHandlerAsksForAGivenUpBlockAgain proves the other
 // call on that ticker is reachable too.
 //
-// A rewind moves the download cursor back and sends nothing. Everything else
-// that issues a getdata does so because sync is moving — a block arrived, a
-// headers message arrived, a block committed — and in the regime a rewind exists
-// for, sync is not moving: the block that was given up on is the one everything
-// else was queued behind. So the ticker is the only thing that carries the
-// cursor out again, and unwired the node sits still until the stall detector
-// rotates the peer and throws the cursor away.
+// Nothing puts a given-up block back anywhere any more — the wanted-range pass
+// recomputes what it wants and who owes it from the committed tip on every
+// call, so a block that is still in range and unowed is simply found again the
+// next time a pass runs. Everything else that issues a getdata does so because
+// sync is moving — a block arrived, a headers message arrived, a block
+// committed — and in the regime this covers, sync is not moving: the block that
+// was given up on is the one everything else was queued behind. So the park
+// sweep's ticker is what carries a fresh pass out on its own, and unwired the
+// node would sit still until the stall detector rotated the peer.
 //
 // There is no park in this manager, so the sweep on the adjacent line cannot be
 // what asks for the block.
-func TestSyncManager_TheBlockHandlerCarriesARewoundCursorForward(t *testing.T) {
-	r := newRefusedBlock(t, 66, time.Millisecond)
+func TestSyncManager_TheBlockHandlerAsksForAGivenUpBlockAgain(t *testing.T) {
+	var nonce uint32
 
-	require.Nil(t, r.sm.blockPark, "the park sweep must not be able to account for the request below")
+	anchor := chainhash.Hash{0xc9}
+	msg, hashes := linkedHeaders(anchor, 3, &nonce)
 
-	runBlockHandlerWithAFastParkSweep(t, r.sm)
+	sm := schedulerManager(t)
 
-	require.True(t, WaitUntil(func() bool { return r.sm.blockDownloads.RequestedWithin(r.hash, time.Minute) }, 5*time.Second),
-		"the block handler's own ticker must carry a rewound cursor forward, or nothing ever asks for the block again")
-}
+	peer, _ := schedulerPeer(t, sm, 66, 1000)
+	sm.storeSyncPeer(peer, &syncPeerState{})
 
-// TestSyncManager_TheBlockHandlerSamplesEveryPeersThroughput proves the sampling
-// the frontier race depends on is actually driven in a running node.
-//
-// isPullingBytes needs two samples a tick apart before it will answer anything
-// but "not downloading". If nothing takes those samples the answer is false for
-// every peer for ever, the race's "is this owner actually sending it?" test can
-// never veto anything, and the veto is dead code that no unit test calling
-// frontierRaceTarget directly would notice — because those tests supply the
-// samples themselves.
-func TestSyncManager_TheBlockHandlerSamplesEveryPeersThroughput(t *testing.T) {
-	sm := newRaceManager(t)
+	seedFetchHeaders(t, sm, peer, anchor, msg)
 
-	first, _, _ := connectRacePeer(t, 90, 1000)
-	second, _, _ := connectRacePeer(t, 91, 1000)
+	require.Nil(t, sm.blockPark, "the park sweep must not be able to account for the request below")
 
-	registerRacePeer(sm, first)
-	registerRacePeer(sm, second)
-	sm.storeSyncPeer(first, &syncPeerState{})
+	runBlockHandlerWithAFastParkSweep(t, sm)
 
-	sm.quit = make(chan struct{})
-	sm.handlerDone = make(chan struct{})
-	sm.msgChan = make(chan interface{}, 1)
-
-	go sm.blockHandler()
-
-	t.Cleanup(func() {
-		close(sm.quit)
-		<-sm.handlerDone
-	})
-
-	ticks := func(p *peerpkg.Peer) uint64 {
-		state, exists := sm.peerStates.Get(p)
-		require.True(t, exists)
-
-		return state.throughputTicks.Load()
-	}
-
-	// Two, not one: one sample is a reading with nothing to subtract from, and
-	// isPullingBytes refuses to answer until there are two.
-	require.True(t, WaitUntil(func() bool { return ticks(first) >= 2 && ticks(second) >= 2 }, 4*frontierCheckInterval),
-		"every registered peer must be sampled by the block handler, not only the sync peer")
+	require.True(t, WaitUntil(func() bool { return sm.blockDownloads.RequestedWithin(hashes[0], time.Minute) }, 5*time.Second),
+		"the block handler's own ticker must ask for the block again, or nothing ever does once sync has stopped moving")
 }

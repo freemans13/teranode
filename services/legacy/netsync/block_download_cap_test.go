@@ -76,6 +76,11 @@ func TestHandleBlockMsg_FloodMustNotCostTheFrontierPeerItsConnection(t *testing.
 	running := blockchain2.FSMStateRUNNING
 	blockchainClient := &blockchain2.Mock{}
 	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	// handleBlockMsgTail's top-up can reach maybeRequestMoreHeaders once the
+	// header cache (empty here) is found to have nothing past the committed
+	// height, which is every call on a manager this bare.
+	blockchainClient.Mock.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{{}}, nil)
 
 	sm := newRaceManager(t)
 	sm.ctx = context.Background()
@@ -176,13 +181,16 @@ func TestFetchHeaderBlocks_NeverAsksForABlockTheLedgerWillNotTrack(t *testing.T)
 
 	anchor := chainhash.Hash{}
 	anchor[31] = 0xa0
-	sm.resetHeaderState(&anchor, 10)
-	sm.headersFirstMode.Store(true)
+	mockCommittedTip(t, sm, 10, 0)
 
 	var nonce uint32
 
 	headers, hashes := linkedHeaders(anchor, 4, &nonce)
-	sm.handleHeadersMsg(&headersMsg{headers: headers, peer: syncPeer})
+
+	// assignWantedBlocks reads the header cache, so that is what has to name
+	// the seeded run.
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(anchor, 11, headers.Headers))
 
 	// Somebody else's announcements have taken every slot the ledger has.
 	flooder, _, _ := connectRacePeer(t, 63, 1000)

@@ -124,24 +124,27 @@ func TestBlockPark_ARestoredBlockIsStillBilled(t *testing.T) {
 func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
+	// lookaheadCeilingLocked takes the committed height as a parameter now,
+	// read by its caller before headerMu is taken (see wantedBlocks); any
+	// value stands in for it here, since the point under test is the
+	// arithmetic, not where the height comes from.
+	best := int32(0)
+
 	h.sm.headerMu.Lock()
-	ceiling, ok := h.sm.lookaheadCeilingLocked()
+	ceiling, ok := h.sm.lookaheadCeilingLocked(best)
 	h.sm.headerMu.Unlock()
 
-	require.True(t, ok, "with a header list and a configured lower window there is a ceiling")
+	require.True(t, ok, "with a configured lower window there is a ceiling")
 
-	h.sm.headerMu.Lock()
-	front := h.sm.headerList.Front().Value.(*headerNode).height
-	h.sm.headerMu.Unlock()
-
-	require.Equal(t, int64(front)+int64(h.sm.settings.Legacy.BlockDownloadLowerWindow), ceiling,
-		"the ceiling is the front of the header list plus the configured depth, in blocks")
+	require.Equal(t, int64(best)+int64(h.sm.settings.Legacy.BlockDownloadLowerWindow), ceiling,
+		"the ceiling is the committed height plus the configured depth, in blocks — "+
+			"not the front of the header list, which this harness never commits past")
 
 	// Zero disables it, which is the compiled default and means no limit.
 	h.sm.settings.Legacy.BlockDownloadLowerWindow = 0
 
 	h.sm.headerMu.Lock()
-	_, ok = h.sm.lookaheadCeilingLocked()
+	_, ok = h.sm.lookaheadCeilingLocked(best)
 	h.sm.headerMu.Unlock()
 
 	require.False(t, ok, "a lower window of zero is no ceiling at all")
@@ -158,41 +161,42 @@ func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 // the run waiting to commit. Measured on mainnet during a genesis resync on
 // 2026-09-12: front at 4877, chain settled at 868, park full at 4096, and 1.8
 // blocks a minute against a 23ms commit path.
+//
+// That front-of-list fallback is gone as of this fix round, not merely
+// superseded: lookaheadCeilingLocked no longer reads the header list at all, so
+// there is nothing left to fall back onto or seed a header list against here.
 func TestReadAhead_IsAnchoredToTheCommittedBlock(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
-	h.sm.headerMu.Lock()
-	front := h.sm.headerList.Front().Value.(*headerNode).height
-	h.sm.headerMu.Unlock()
+	// An arbitrary baseline standing in for wherever a real node's committed
+	// height happens to be; the point under test is that the ceiling follows
+	// this number when it moves, not what the number itself is.
+	front := int32(4877)
 
 	depth := int64(h.sm.settings.Legacy.BlockDownloadLowerWindow)
 	require.Positive(t, depth, "the harness must configure a read-ahead depth or this test proves nothing")
 
 	// Committing moves the ceiling, because the committer is what the read-ahead
-	// is ahead OF. The front is left untouched, so anything that still followed
-	// the front would not move.
-	h.sm.lastCommittedHeight.Store(int32(front) + 500)
-
+	// is ahead OF. best is passed straight in now (see wantedBlocks, which reads
+	// it from the chain before taking headerMu and hands it down), so moving it
+	// is just passing a different value.
 	h.sm.headerMu.Lock()
-	ceiling, ok := h.sm.lookaheadCeilingLocked()
+	ceiling, ok := h.sm.lookaheadCeilingLocked(front + 500)
 	h.sm.headerMu.Unlock()
 
 	require.True(t, ok)
 	require.Equal(t, int64(front)+500+depth, ceiling,
 		"the ceiling follows the committed block, not the front of the header list")
 
-	// Nothing committed in this process yet — which is every restart, because
-	// lastCommittedHeight is written only when a block commits and is never
-	// seeded. Anchoring to zero there would put the ceiling below the chain's own
-	// height, refuse every header, and leave the node unable to commit the block
-	// that would raise the anchor: a stall on every restart.
-	h.sm.lastCommittedHeight.Store(0)
-
+	// Nothing committed in this process yet is a real state — genesis, or a
+	// struct-literal test harness — and it is no longer a special case: with the
+	// header-list fallback removed, a height of zero here answers zero plus
+	// depth, the same arithmetic as any other height.
 	h.sm.headerMu.Lock()
-	atStart, ok := h.sm.lookaheadCeilingLocked()
+	atStart, ok := h.sm.lookaheadCeilingLocked(0)
 	h.sm.headerMu.Unlock()
 
 	require.True(t, ok)
-	require.Equal(t, int64(front)+depth, atStart,
-		"before the first commit the front is the only honest estimate of where the chain is")
+	require.Equal(t, depth, atStart,
+		"with nothing committed the ceiling is the depth alone, not the depth above wherever the header list happens to start")
 }

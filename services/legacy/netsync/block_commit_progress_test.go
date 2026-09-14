@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -48,8 +49,18 @@ func TestSyncManager_AParkedBlockIsNotChainProgress(t *testing.T) {
 // TestSyncManager_ACommittedBlockIsChainProgress is the other half: a block that
 // actually joins the chain has to refresh the signal, or a node committing one
 // slow block would rotate a peer that is doing nothing wrong.
+//
+// Run outside FSMStateCATCHINGBLOCKS deliberately: this test's block is never
+// registered as owned in the download ledger, and since task 7 an unrequested
+// block during catchup is accepted and actually processed rather than turned
+// away at the door, which would walk this synchronous test into the real
+// commit pipeline (GetBlockExists, parent resolution, …) that nothing here
+// mocks. At the tip the old short-circuit still applies — the peer is
+// declined immediately with no further lookups — which is all this test
+// needs to isolate the thing it actually checks: that a committed message
+// stamps chain progress.
 func TestSyncManager_ACommittedBlockIsChainProgress(t *testing.T) {
-	h := newParkWiringHarness(t, true)
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING)
 
 	h.sm.lastChainProgress.Store(time.Now().Add(-time.Hour).UnixNano())
 

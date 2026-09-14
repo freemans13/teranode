@@ -30,7 +30,7 @@ func enablePrefetchBudgetForTest(t *testing.T, sm *SyncManager, capacity int64) 
 // runs, so charging them reserves memory nobody is holding.
 func TestAcquireBlockPrefetch_PipelineChargesOneSlotPerBlock(t *testing.T) {
 	sm := newDemotionManager(t)
-	sm.settings.Legacy.PipelineReceive = true
+	sm.blockPark = &blockPark{} // enabled: streaming (and so the pipeline) is active
 	enablePrefetchBudgetForTest(t, sm, 2)
 
 	huge := int64(512 << 20) // far larger than any byte budget this node would set
@@ -51,10 +51,12 @@ func TestAcquireBlockPrefetch_PipelineChargesOneSlotPerBlock(t *testing.T) {
 }
 
 // TestAcquireBlockPrefetch_WithoutThePipelineStillChargesBytes pins that the old
-// path is untouched, which is what makes the setting safe to leave off.
+// path is untouched, which is what makes a disabled park safe: with no park to
+// stream into, the wire layer falls back to decoding and OnBlock's byte-weighted
+// admission is the only one that ever runs.
 func TestAcquireBlockPrefetch_WithoutThePipelineStillChargesBytes(t *testing.T) {
 	sm := newDemotionManager(t)
-	sm.settings.Legacy.PipelineReceive = false
+	sm.blockPark = nil // disabled: no pipeline, the byte-weighted path applies
 	enablePrefetchBudgetForTest(t, sm, 8<<20)
 
 	w, err := sm.AcquireBlockPrefetch(context.Background(), nil, chainhash.Hash{0x01}, 1<<20)
@@ -67,7 +69,7 @@ func TestAcquireBlockPrefetch_WithoutThePipelineStillChargesBytes(t *testing.T) 
 // rule that stops a second copy of a block entering the pipeline behind the first.
 func TestAcquireBlockPrefetch_PipelineStillRefusesADuplicate(t *testing.T) {
 	sm := newDemotionManager(t)
-	sm.settings.Legacy.PipelineReceive = true
+	sm.blockPark = &blockPark{} // enabled: streaming (and so the pipeline) is active
 	enablePrefetchBudgetForTest(t, sm, 4)
 
 	_, err := sm.AcquireBlockPrefetch(context.Background(), nil, chainhash.Hash{0x01}, 1<<20)

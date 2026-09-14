@@ -177,7 +177,7 @@ func (c *serialProbeClient) GetBlockExists(_ context.Context, _ *chainhash.Hash)
 
 // TestDispatchBlocks_SettingZeroIsATrueBypass proves that at
 // blockvalidation_quick_window_blocks=0 the consumer is the pre-window one: block N+1's head
-// (the FSM state call, the requestedBlocks and headerList bookkeeping, the size sampling, the
+// (the FSM state call, the requestedBlocks and header-cache bookkeeping, the size sampling, the
 // cascade marks) does not run until block N's work and tail have finished. At depth 1 the
 // dispatcher would have split those apart and run N+1's head alongside N's work, which is why
 // 0 has to bypass the dispatcher rather than configure it.

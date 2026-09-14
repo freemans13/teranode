@@ -23,11 +23,12 @@ import (
 //
 // Before this branch made the pipeline send every block down the on-disk route,
 // that gap only bit blocks above the 64 MiB decode threshold, rare enough that
-// nobody noticed a peer's assignment count creeping up. With PipelineReceive on,
-// every block takes this route, so a peer that delivers sixteen blocks (the
-// default MaxBlocksInTransitPerPeer) has its CountForPeer stick there forever —
-// the scheduler's per-peer budget (block_scheduler.go:144) reaches zero and stops
-// asking that peer for anything else until the hour-long assignment TTL expires.
+// nobody noticed a peer's assignment count creeping up. Streaming is now
+// unconditional whenever the park is enabled, so every block takes this route,
+// and a peer that delivers sixteen blocks (the default MaxBlocksInTransitPerPeer)
+// has its CountForPeer stick there forever — the scheduler's per-peer budget
+// (block_scheduler.go:144) reaches zero and stops asking that peer for anything
+// else until the hour-long assignment TTL expires.
 //
 // This drives three blocks through handleBlockOnDiskMsg for one peer and
 // requires CountForPeer to return to zero, exactly as it does for the decoded
@@ -36,7 +37,6 @@ func TestHandleBlockOnDiskMsg_ReleasesTheDownloadAssignment(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	h.sm.drainAsync.Store(true)
 	h.sm.parkCommits = make(chan parkCommit, 4)
-	h.sm.settings.Legacy.PipelineReceive = true
 
 	// A parent already in the harness's header list, so every delivered block
 	// is reachable and handleBlockOnDiskMsg does not discard it before reaching
@@ -66,39 +66,6 @@ func TestHandleBlockOnDiskMsg_ReleasesTheDownloadAssignment(t *testing.T) {
 		"every delivered block must release its assignment, or CountForPeer sticks at MaxBlocksInTransitPerPeer and the scheduler stops asking this peer for anything else")
 }
 
-// TestHandleBlockOnDiskMsg_ScopedToPipelineReceiveOn pins the scope decision
-// behind this task's PipelineReceive gate, not the pre-existing on-disk
-// route's own leak as something required. With the pipeline off, a block
-// above the 64 MiB decode threshold still reaches this handler today and
-// still leaks its assignment — a pre-existing defect this task did not
-// create and is not fixing. Asserting the count stays at a fixed number would
-// read that leak into the spec: a future fix closing it would turn this test
-// red and look like a regression in this task's own change, when it would
-// actually be progress. What this task actually promises is narrower — its
-// release fires only when PipelineReceive is on — so this asserts the count
-// is UNCHANGED by the call, whatever value it held before, which holds
-// whether or not the pre-existing leak is ever fixed. Update or remove this
-// test, not this task's fix, if that pre-existing leak is later closed.
-func TestHandleBlockOnDiskMsg_ScopedToPipelineReceiveOn(t *testing.T) {
-	h := newParkWiringHarness(t, true)
-	h.sm.drainAsync.Store(true)
-	h.sm.parkCommits = make(chan parkCommit, 4)
-	h.sm.settings.Legacy.PipelineReceive = false
-
-	parent := h.blocks[1].MsgBlock().BlockHash()
-	header := wire.BlockHeader{Version: 1, PrevBlock: parent}
-	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 4096, Hash: header.BlockHash()}
-
-	require.True(t, h.sm.blockDownloads.Add(h.peer, body.Hash))
-	before := h.sm.blockDownloads.CountForPeer(h.peer)
-
-	h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
-
-	after := h.sm.blockDownloads.CountForPeer(h.peer)
-	require.Equal(t, before, after,
-		"this task's release is gated on PipelineReceive and must not move this count either way when the setting is off — not an assertion that the pre-existing route's own leak is correct")
-}
-
 // TestHandleBlockOnDiskMsg_ReleasesTheAssociationPrimarysAssignment is the
 // regression test for fix-round item 2. A BlockPriority association routes a
 // block's body to its own DATA1/DATA2 stream sub-peer, so msg.peer here is
@@ -114,7 +81,6 @@ func TestHandleBlockOnDiskMsg_ReleasesTheAssociationPrimarysAssignment(t *testin
 	h := newParkWiringHarness(t, true)
 	h.sm.drainAsync.Store(true)
 	h.sm.parkCommits = make(chan parkCommit, 4)
-	h.sm.settings.Legacy.PipelineReceive = true
 
 	// h.peer is already registered as a primary (newParkWiringHarness's own
 	// setup, via registerRacePeer). subPeer is a stream sub-peer associated
@@ -161,7 +127,6 @@ func TestHandleBlockOnDiskMsg_ReleasesTheAssociationPrimarysAssignment(t *testin
 func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 	store := memory.New()
 	sm := newPipelineParkManager(t, store, 8)
-	sm.settings.Legacy.PipelineReceive = true
 
 	sm.blockPrefetchBudgetBytes = 1
 	sm.blockPrefetchBudget = semaphore.NewWeighted(1)
@@ -173,7 +138,6 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
 		gate func(chainhash.Hash, *wire.BlockHeader) error,
 		del func(chainhash.Hash, bool) error,
-		streamsEverySize bool,
 	) {
 		installedSink = sink
 	})
@@ -246,7 +210,6 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 func TestAdmitPipelineSink_FallsBackWhenAcquireTimesOut(t *testing.T) {
 	store := memory.New()
 	sm := newPipelineParkManager(t, store, 8)
-	sm.settings.Legacy.PipelineReceive = true
 	sm.settings.Legacy.PeerIdleTimeout = 200 * time.Millisecond
 
 	sm.blockPrefetchBudgetBytes = 1
@@ -259,7 +222,6 @@ func TestAdmitPipelineSink_FallsBackWhenAcquireTimesOut(t *testing.T) {
 		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
 		gate func(chainhash.Hash, *wire.BlockHeader) error,
 		del func(chainhash.Hash, bool) error,
-		streamsEverySize bool,
 	) {
 		installedSink = sink
 	})
@@ -303,55 +265,4 @@ func TestAdmitPipelineSink_FallsBackWhenAcquireTimesOut(t *testing.T) {
 	exists, err := sm.blockPark.store.Exists(context.Background(), hash[:], parkFileType)
 	require.NoError(t, err)
 	require.True(t, exists, "the fallback must have actually written the whole body via streamingBlockSink, not silently dropped it")
-}
-
-// TestPipelineOnDiskRoute_AdmissionUntouchedWhenPipelineOff pins that the
-// admission wrap only ever applies to the pipeline sink: with PipelineReceive
-// off, the installed sink is streamingBlockSink, which never touches the
-// download-admission budget, so a fully occupied budget must not affect it at
-// all.
-func TestPipelineOnDiskRoute_AdmissionUntouchedWhenPipelineOff(t *testing.T) {
-	store := memory.New()
-	sm := newPipelineParkManager(t, store, 8)
-	sm.settings.Legacy.PipelineReceive = false
-
-	sm.blockPrefetchBudgetBytes = 1
-	sm.blockPrefetchBudget = semaphore.NewWeighted(1)
-	sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
-
-	var installedSink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)
-
-	sm.installStreamingBlockPath(func(
-		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
-		gate func(chainhash.Hash, *wire.BlockHeader) error,
-		del func(chainhash.Hash, bool) error,
-		streamsEverySize bool,
-	) {
-		installedSink = sink
-	})
-	require.NotNil(t, installedSink)
-
-	// Hold the only slot, exactly as in the pipeline-on test above.
-	heldHash := chainhash.Hash{0x02}
-	_, err := sm.AcquireBlockPrefetch(context.Background(), nil, heldHash, 1)
-	require.NoError(t, err)
-
-	blk := wireBlockWithTxs(t, 5, false)
-	pipelineHeaderFixture(t, sm, blk)
-	body := blockBodyBytes(t, blk)
-	header := &blk.MsgBlock().Header
-
-	done := make(chan struct{})
-
-	go func() {
-		_, _ = installedSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Expected: completes promptly, unaffected by the held slot.
-	case <-time.After(2 * time.Second):
-		t.Fatal("with PipelineReceive off the on-disk route must not be gated by the admission budget at all")
-	}
 }
