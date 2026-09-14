@@ -209,6 +209,65 @@ func TestPipelineSink_TheRecordedBlockSurvivesASerializationRoundTrip(t *testing
 	require.Equal(t, got.CoinbaseTx.TxIDChainHash().String(), back.CoinbaseTx.TxIDChainHash().String())
 }
 
+// TestPipelineSink_CoinbaseOnlyBlockProducesAnEmptyRecord pins the fix for the
+// live-node stall this task exists to close: every mainnet block below roughly
+// height 100 carries only its coinbase, and the streaming builder refuses that
+// shape outright (block_stream_builder.go's newBlockStreamBuilder) rather than
+// emit the corrupt, colliding subtree it would otherwise produce. Before this
+// fix that refusal reached the wire layer as an unreadable message, so every
+// peer that sent block 1 got disconnected for "malformed message" and the node
+// never got past height 0.
+//
+// The non-streaming path's own early return for the identical case
+// (prepareSubtrees, handle_block.go: "if txCount <= 1 { return subtrees, nil,
+// blockID, nil }") produces zero subtrees and zero subtree files, so that is
+// the shape this test requires from the streaming sink too — not a weakened
+// guard, a matched one. The merkle root check is not skipped: for a
+// coinbase-only block the root IS the coinbase transaction's own hash, and
+// the header here carries exactly that, computed independently of the sink
+// under test (bsvutil.Tx.Hash(), not the sink's own accumulator).
+func TestPipelineSink_CoinbaseOnlyBlockProducesAnEmptyRecord(t *testing.T) {
+	ctx := context.Background()
+
+	// subtreeStore is deliberately its own memory store, separate from the
+	// park's, mirroring production (manager.go passes tempStore and
+	// subtreeStore to newBlockPark and the SyncManager as two distinct
+	// stores) and letting this test prove "no subtree files were written" by
+	// reading the store's own Set counter directly, rather than guessing at a
+	// subtree hash that a fixed sink never produces.
+	subtreeStore := memory.New()
+	sm := newPipelineManager(t, subtreeStore, 8)
+
+	park, _ := newTestPark(t, "")
+	require.NotNil(t, park, "the fixture must build a real park over a real file store")
+	sm.blockPark = park
+
+	blk := wireBlockWithTxs(t, 1, false)
+	// wireBlockWithTxs leaves PrevBlock at its zero value; point it at the one
+	// header a fresh blockchain store already holds, its genesis, the same way
+	// pipelineHeaderFixture does for every other test in this file.
+	blk.MsgBlock().Header.PrevBlock = *sm.chainParams.GenesisHash
+	blk.MsgBlock().Header.MerkleRoot = *blk.Transactions()[0].Hash()
+
+	body := blockBodyBytes(t, blk)
+
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err, "a well-formed coinbase-only block must convert cleanly")
+	require.True(t, converted, "a coinbase-only block must still report having converted")
+
+	require.Equal(t, 0, subtreeStore.Counters["set"], "a coinbase-only block must write no subtree files")
+
+	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "the converted record the sink just wrote must read back cleanly")
+	require.NotNil(t, got, "a verified coinbase-only block must still be recorded")
+
+	require.Empty(t, got.Subtrees, "a coinbase-only record must name no subtrees")
+	require.Equal(t, uint64(1), got.TransactionCount)
+
+	require.True(t, sm.holdsBlock(ctx, *blk.Hash()),
+		"the completeness check must treat a record with an empty subtree list as complete, not as missing")
+}
+
 // pipelineManagerStoreCounter gives each newPipelineManager call its own
 // sqlitememory database name, so one test's blockchain client cannot see
 // another's state.

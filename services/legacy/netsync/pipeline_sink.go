@@ -71,7 +71,7 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 	// The coinbase is the first transaction in the stream, and the builder needs
 	// it before any other: it occupies slot zero of the first subtree.
-	coinbase, _, err := stream.Next()
+	coinbase, coinbaseHash, err := stream.Next()
 	if err != nil {
 		return false, errors.NewBlockInvalidError("[pipelineBlockSink][%s] failed reading the coinbase", hash, err)
 	}
@@ -83,48 +83,74 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		writer = newSubtreeWriterUnresolvedHeight(sm.logger, sm.settings, sm.subtreeStore, sm.fallbackSubtreeDAH())
 	}
 
-	// dedup is never sized from stream.TxCount(). See newPipelineDedupMap's
-	// doc comment for why: that count is the peer's own declared transaction
-	// count, and sizing a map from it is what let a peer make this node
-	// allocate roughly 19 GB by declaring a number.
-	dedup := newPipelineDedupMap()
+	var (
+		root          *chainhash.Hash
+		subtreeHashes []chainhash.Hash
+	)
 
-	builder, err := newBlockStreamBuilder(int(stream.TxCount()), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup)
-	if err != nil {
-		// newBlockStreamBuilder itself never calls Emit, so writer has written
-		// nothing yet: this call is a no-op today. It is here anyway because the
-		// brief's rule is "every failure path calls DeleteAll" without exception,
-		// and leaving this one out is a trap for whoever adds work between
-		// newSubtreeWriter and here.
-		sm.deleteWrittenOnFailure(hash, writer)
+	if stream.TxCount() <= 1 {
+		// A coinbase-only block (txCount <= 1) has no transactions to stream, the
+		// same shape newBlockStreamBuilder itself refuses (block_stream_builder.go):
+		// running the builder anyway would emit one subtree whose root is the
+		// go-subtree CoinbasePlaceholder constant, the SAME placeholder root for
+		// every coinbase-only block in the chain, so every one of them would write
+		// three files under the same three keys, overwriting each other, and hand
+		// back a subtree list production never produces.
+		//
+		// The non-streaming path's own early return for this case
+		// (prepareSubtrees, handle_block.go: "if txCount <= 1 { return subtrees,
+		// nil, blockID, nil }") produces ZERO subtrees and ZERO files, so that is
+		// what this branch matches: no builder, no writer.Emit call, subtreeHashes
+		// stays nil. The merkle root is not skipped — for a coinbase-only block it
+		// IS the coinbase transaction's own hash, so that is what is checked
+		// below, on the same path every other block's root is checked on.
+		root = coinbaseHash
+	} else {
+		// dedup is never sized from stream.TxCount(). See newPipelineDedupMap's
+		// doc comment for why: that count is the peer's own declared transaction
+		// count, and sizing a map from it is what let a peer make this node
+		// allocate roughly 19 GB by declaring a number.
+		dedup := newPipelineDedupMap()
 
-		return false, err
-	}
+		builder, buildErr := newBlockStreamBuilder(int(stream.TxCount()), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup)
+		if buildErr != nil {
+			// newBlockStreamBuilder itself never calls Emit, so writer has written
+			// nothing yet: this call is a no-op today. It is here anyway because the
+			// brief's rule is "every failure path calls DeleteAll" without exception,
+			// and leaving this one out is a trap for whoever adds work between
+			// newSubtreeWriter and here.
+			sm.deleteWrittenOnFailure(hash, writer)
 
-	for {
-		tx, txHash, streamErr := stream.Next()
-		if streamErr != nil {
-			if errors.Is(streamErr, errBlockTxStreamDone) {
-				break
+			return false, buildErr
+		}
+
+		for {
+			tx, txHash, streamErr := stream.Next()
+			if streamErr != nil {
+				if errors.Is(streamErr, errBlockTxStreamDone) {
+					break
+				}
+
+				sm.deleteWrittenOnFailure(hash, writer)
+
+				return false, streamErr
 			}
 
-			sm.deleteWrittenOnFailure(hash, writer)
+			if addErr := builder.AddTx(tx, txHash); addErr != nil {
+				sm.deleteWrittenOnFailure(hash, writer)
 
-			return false, streamErr
+				return false, addErr
+			}
 		}
 
-		if addErr := builder.AddTx(tx, txHash); addErr != nil {
+		var finishErr error
+
+		root, subtreeHashes, finishErr = builder.Finish()
+		if finishErr != nil {
 			sm.deleteWrittenOnFailure(hash, writer)
 
-			return false, addErr
+			return false, finishErr
 		}
-	}
-
-	root, subtreeHashes, err := builder.Finish()
-	if err != nil {
-		sm.deleteWrittenOnFailure(hash, writer)
-
-		return false, err
 	}
 
 	if !root.IsEqual(&header.MerkleRoot) {
