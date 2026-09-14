@@ -1306,6 +1306,55 @@ func (p *blockPark) setGauges() {
 	prometheusLegacyNetsyncParkedBytes.Set(float64(p.bytes))
 }
 
+// hasCompleteRecord answers whether a converted record that has already been
+// read and hash-checked (record) is safe to treat as held: every subtree file
+// it names is still on disk. record being nil means the record itself is not
+// there, or would not read, so the answer is false before anything is walked.
+//
+// This is the ONE place that decides "complete" for a converted record.
+// Recover calls it while deciding whether a record left over from a previous
+// run is worth adopting; holdsBlock calls it while deciding whether a block
+// needs downloading again. Both are the same question, so both get the same
+// answer — a record whose subtree files are gone is neither adopted here nor
+// reported as held there.
+//
+// A missing or errored subtree stat answers false. That is the safe
+// direction: the alternative is adopting a commit that fails inside
+// validation and lands on the path that deletes the only copy and blames an
+// honest peer.
+func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, record *model.Block, subtreeStore blob.Store, quickValidationAllowed func(height uint32) bool) bool {
+	if record == nil {
+		return false
+	}
+
+	if subtreeStore == nil || quickValidationAllowed == nil || len(record.Subtrees) == 0 {
+		return true
+	}
+
+	structureType := fileformat.FileTypeSubtreeToCheck
+	if quickValidationAllowed(record.Height) {
+		structureType = fileformat.FileTypeSubtree
+	}
+
+	// Every subtree the record names, not just the first. Checking only
+	// Subtrees[0] was the cheap version of this fix and it left the gap it
+	// was written to close: a record whose later files have gone is adopted,
+	// commits cleanly here, and then fails inside validation, landing on the
+	// same destructive path a genuinely bad block does, which deletes the
+	// only copy and blames an honest peer.
+	for _, subtree := range record.Subtrees {
+		exists, existsErr := subtreeStore.Exists(ctx, subtree[:], structureType)
+		if existsErr != nil || !exists {
+			p.logger.Warnf("[blockPark][%s] converted record's subtree %s is gone (exists=%v, err=%v); treating the record as not held",
+				hash, subtree, exists, existsErr)
+
+			return false
+		}
+	}
+
+	return true
+}
+
 // Recover adopts whatever a previous run left on disk, and cleans up whatever
 // it cannot adopt. It reports the counts so a restart can never be silent about
 // what it found — including finding nothing in a directory that had files in it.
@@ -1447,44 +1496,16 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 			// about whether the subtree files it names are still there: the
 			// record has no delete-at-height of its own, while every subtree
 			// file does (subtree_writer.go), so a record can survive long
-			// enough to outlive them.
-			if subtreeStore != nil && quickValidationAllowed != nil && len(record.Subtrees) > 0 {
-				structureType := fileformat.FileTypeSubtreeToCheck
-				if quickValidationAllowed(record.Height) {
-					structureType = fileformat.FileTypeSubtree
-				}
+			// enough to outlive them. hasCompleteRecord is the one place that
+			// answers this — holdsBlock asks it the identical question when
+			// deciding whether a block needs downloading again, so the two
+			// cannot disagree about what "complete" means.
+			if !p.hasCompleteRecord(ctx, *hash, record, subtreeStore, quickValidationAllowed) {
+				p.Delete(ctx, parkedBlock{hash: *hash})
 
-				// Every subtree the record names, not just the first. Checking
-				// only Subtrees[0] was the cheap version of this fix and it left
-				// the gap it was written to close: a record whose later files
-				// have gone is adopted, commits cleanly here, and then fails
-				// inside validation, landing on the same destructive path a
-				// genuinely bad block does, which deletes the only copy and
-				// blames an honest peer.
-				//
-				// The cost is one stat per subtree per record, once per restart,
-				// against a scan that is already doing a store read per record.
-				missing := false
+				discarded++
 
-				for _, subtree := range record.Subtrees {
-					exists, existsErr := subtreeStore.Exists(ctx, subtree[:], structureType)
-					if existsErr != nil || !exists {
-						p.logger.Warnf("[blockPark][%s] converted record's subtree %s is gone (exists=%v, err=%v); discarding the record instead of adopting a commit that would fail inside validation",
-							hash, subtree, exists, existsErr)
-
-						missing = true
-
-						break
-					}
-				}
-
-				if missing {
-					p.Delete(ctx, parkedBlock{hash: *hash})
-
-					discarded++
-
-					continue
-				}
+				continue
 			}
 
 			info, err := dirEntry.Info()

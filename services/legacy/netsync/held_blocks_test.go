@@ -2,10 +2,12 @@ package netsync
 
 import (
 	"context"
+	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob/file"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -20,6 +22,10 @@ import (
 // WithSubDirectory and WithNoHashPrefix, which the park always passes, so a
 // test writing without those options lands on the same key by accident and
 // passes for the wrong reason.
+//
+// convertedRecordWithSubtrees is the package's existing helper
+// (block_park_recover_subtrees_test.go) for building a converted record whose
+// hash is its own header hash, which is what ReadConverted checks against.
 
 func TestHoldsBlock_FindsAWholeBlockOnDisk(t *testing.T) {
 	park, _ := newTestPark(t, "")
@@ -35,15 +41,57 @@ func TestHoldsBlock_FindsAWholeBlockOnDisk(t *testing.T) {
 		"a whole block written by the streaming path must be found")
 }
 
-func TestHoldsBlock_FindsAConvertedRecordOnDisk(t *testing.T) {
+// TestHoldsBlock_FindsACompleteConvertedRecordOnDisk is the reverse of
+// TestHoldsBlock_ExcludesARecordWithAMissingSubtreeFile: a record whose
+// subtree file is genuinely present must still answer true. Without this, a
+// hasCompleteRecord that returned false unconditionally would also pass the
+// missing-subtree test.
+func TestHoldsBlock_FindsACompleteConvertedRecordOnDisk(t *testing.T) {
+	ctx := context.Background()
+
+	subtreeStoreURL, err := url.Parse("file://" + t.TempDir())
+	require.NoError(t, err)
+
+	subtreeStore, err := file.New(ulogger.TestLogger{}, subtreeStoreURL)
+	require.NoError(t, err)
+
 	park, _ := newTestPark(t, "")
-	sm := &SyncManager{logger: ulogger.TestLogger{}, blockPark: park}
-	hash := chainhash.Hash{0x02}
+	sm := &SyncManager{logger: ulogger.TestLogger{}, blockPark: park, subtreeStore: subtreeStore}
 
-	require.NoError(t, sm.blockPark.store.Set(context.Background(), hash[:], fileformat.FileTypeBlock, []byte("record"), parkOpts...))
+	blk, hash := convertedRecordWithSubtrees(t, 1, 100)
 
-	require.True(t, sm.holdsBlock(context.Background(), hash),
-		"a converted record written by the pipeline path must be found too, or every pipelined block is downloaded twice")
+	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+
+	require.True(t, sm.holdsBlock(ctx, hash),
+		"a converted record written by the pipeline path, with its subtree file present, must be found too, or every pipelined block is downloaded twice")
+}
+
+// TestHoldsBlock_ExcludesARecordWithAMissingSubtreeFile is the test that would
+// have caught the defect: a record naming a subtree whose structure file is
+// NOT on disk. Before this fix, holdsBlock only checked the record's own
+// existence, so it answered true for a block this node can never commit —
+// nothing had adopted the record (recovery had discarded it, or the file was
+// pruned out from under it), so the download pass skipped this height on
+// every pass and the chain stopped there for the life of the process.
+func TestHoldsBlock_ExcludesARecordWithAMissingSubtreeFile(t *testing.T) {
+	ctx := context.Background()
+
+	subtreeStoreURL, err := url.Parse("file://" + t.TempDir())
+	require.NoError(t, err)
+
+	subtreeStore, err := file.New(ulogger.TestLogger{}, subtreeStoreURL)
+	require.NoError(t, err)
+
+	park, _ := newTestPark(t, "")
+	sm := &SyncManager{logger: ulogger.TestLogger{}, blockPark: park, subtreeStore: subtreeStore}
+
+	// A record naming one subtree, but its structure file is never written.
+	blk, hash := convertedRecordWithSubtrees(t, 1, 100)
+	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
+
+	require.False(t, sm.holdsBlock(ctx, hash),
+		"the record exists but its subtree file does not, so this is not a block the node can commit and must be requested again")
 }
 
 // TestHoldsBlock_DoesNotConsultTheEntryMap is the point of the whole task. The
