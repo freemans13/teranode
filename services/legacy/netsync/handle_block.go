@@ -485,30 +485,37 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 		sps.updateLastBlockTime()
 	}
 
-	// This must be unreachable now: pipelineBlockSink gates the CONVERSION on
-	// this exact same check (see its doc comment, and the eligibility test at
-	// pipeline_sink_test.go), so a record only ever reaches the park when
-	// legacyUnified was already true for its height. It is kept here as an
-	// assertion rather than deleted, because the reason it exists is still
-	// real — pipelineBlockSink always writes blockID 0 ("assign server-side"),
-	// which is only correct on the unified route, and this function has no
-	// transactions to fall back to local UTXO work with — and an assertion
-	// that silently stops being checked is worse than one that stays.
+	// pipelineBlockSink no longer refuses to convert a block above the final
+	// checkpoint, or one whose parent height would not resolve at conversion
+	// time — see its own doc comment. So this can no longer assert
+	// legacyUnified(blk.Height): an above-checkpoint record reaching here is
+	// now the ordinary case this task exists to make work, not a bug, and
+	// blockID 0 is correct on both routes regardless of legacyUnified (Step 1
+	// of this task's report: the ordinary route already passes zero above the
+	// checkpoint, and zero is the universal "assign server-side" convention
+	// full validation reads too).
 	//
-	// If it ever fires anyway (a future change to either gate drifting out of
-	// step), the failure must NOT cost the block its only copy: an earlier
-	// version of this guard returned a plain ProcessingError, which
-	// parkCommitFailure has no case for, so it fell to
-	// parkDispositionBlockRejected — delete the blob, rewind the cursor, blame
-	// the peer, and mark the block failed, forever, at that one height (the
-	// only copy of the block is gone, so re-delivery reconverts and re-fails
-	// identically). A ServiceError is IsTransientLocalError, which
-	// parkCommitFailure reads as parkDispositionRetryLater: keep the blob, no
-	// rewind, no blame. That is the fail-safe direction for a check that
-	// should be dead code — it costs a retry loop bounded by the park sweep,
-	// not the block.
-	if !sm.legacyUnified(blk.Height) {
-		return errors.NewServiceError("[HandleConvertedBlock][%s] converted record at height %d is not eligible for the unified route; this should be unreachable, since pipelineBlockSink gates conversion on the same check", blockHash.String(), blk.Height)
+	// What still has to hold is the same "parent resolved" test the sink
+	// itself runs, because everything below this point trusts blk.Height
+	// enough to compare it against the store's own view, and a record whose
+	// height was never resolved (the sentinel 0 pipelineParentHeight's
+	// fallback writes) needs correcting before that comparison means
+	// anything — see the re-derivation a few lines down. By the time a
+	// commit is attempted the parent is already required to be committed
+	// (parentIsInChain, streaming_install.go, gates the drain that gets here),
+	// so this should almost always pass; it is kept as an assertion for the
+	// same reason the legacyUnified check used to be one.
+	//
+	// A ServiceError, not anything else, for the same reason the old
+	// assertion used one: parkCommitFailure reads a ServiceError as
+	// parkDispositionRetryLater (keep the blob, no rewind, no blame) rather
+	// than parkDispositionBlockRejected (delete the only copy, rewind the
+	// cursor, blame the peer, and fail the block forever at that height) —
+	// see pipeline_sink.go's own gate comment for the rule this protects:
+	// never let a converted record reach a committer that can refuse it on a
+	// condition the re-download would only reproduce.
+	if _, resolved := sm.pipelineParentHeight(*blk.Header.HashPrevBlock); !resolved {
+		return errors.NewServiceError("[HandleConvertedBlock][%s] parent %s is not yet resolvable; retrying once it is", blockHash.String(), blk.Header.HashPrevBlock)
 	}
 
 	// Resolve and verify this block's height from the chain's current view of its
@@ -528,28 +535,46 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 		return errors.NewProcessingError("failed to get block header for previous block %s", blk.Header.HashPrevBlock, err)
 	}
 
-	// A ServiceError, not a BlockInvalidError, and deliberately so: this is a
-	// disagreement between two things THIS node computed about its own chain
-	// view, not a claim the peer made. blk.Height was resolved once already,
-	// at conversion time (pipelineParentHeight), from whichever of the header
-	// cache or the store answered first; this re-derives it from the store's
-	// CURRENT view of the same parent. A mismatch means that view moved
-	// between conversion and commit — a reorg, or the record simply going
-	// stale while it sat parked — not that the block's own header chain or
-	// merkle root lied about anything, both of which are checked elsewhere.
-	// parkCommitFailure has no case for a plain ProcessingError-shaped
-	// BlockInvalidError here either, but the eligibility assertion twenty
-	// lines above already established the pattern this must match: a
-	// ServiceError is IsTransientLocalError, which parkCommitFailure reads as
-	// parkDispositionRetryLater (keep the blob, no rewind, no blame) instead
-	// of parkDispositionBlockRejected (delete the only copy, rewind the
-	// cursor, blame the peer, and fail the block at that height forever). A
-	// converted record has no whole-block fallback to re-derive from, so
+	// derivedHeight is the store's own current, authoritative answer.
+	//
+	// blk.Height == 0 is pipelineParentHeight's own "unresolved" sentinel (see
+	// its doc comment): it means this record's height was never really
+	// resolved at conversion time, not that the block is genuinely at height
+	// 0 (genesis is never received over the wire). Correcting it here, now
+	// that the parent is required to be committed, is the re-derivation the
+	// sink's own comment promises ("the committer re-derives the height from
+	// the store before committing anything, so a record carrying zero is
+	// corrected there") — without it, a record stuck at 0 would fail the
+	// mismatch check below forever, since nothing else ever rewrites the
+	// stored record.
+	//
+	// A ServiceError, not a BlockInvalidError, and deliberately so, for every
+	// OTHER mismatch: this is a disagreement between two things THIS node
+	// computed about its own chain view, not a claim the peer made. blk.Height
+	// was resolved once already, at conversion time (pipelineParentHeight),
+	// from whichever of the header cache or the store answered first; this
+	// re-derives it from the store's CURRENT view of the same parent. A
+	// mismatch means that view moved between conversion and commit — a
+	// reorg, or the record simply going stale while it sat parked — not that
+	// the block's own header chain or merkle root lied about anything, both
+	// of which are checked elsewhere. parkCommitFailure has no case for a
+	// plain ProcessingError-shaped BlockInvalidError here either, but the
+	// eligibility assertion above already established the pattern this must
+	// match: a ServiceError is IsTransientLocalError, which parkCommitFailure
+	// reads as parkDispositionRetryLater (keep the blob, no rewind, no blame)
+	// instead of parkDispositionBlockRejected (delete the only copy, rewind
+	// the cursor, blame the peer, and fail the block at that height forever).
+	// A converted record has no whole-block fallback to re-derive from, so
 	// treating a local staleness as a bad block would destroy it for a
 	// condition a retry, once this node's own view catches up, resolves
 	// cleanly.
-	if blk.Height != previousBlockHeaderMeta.Height+1 {
-		return errors.NewServiceError("[HandleConvertedBlock][%s] block height %d is not the correct height for block %s, expected %d", blockHash.String(), blk.Height, blockHash, previousBlockHeaderMeta.Height+1)
+	derivedHeight := previousBlockHeaderMeta.Height + 1
+
+	switch {
+	case blk.Height == 0:
+		blk.Height = derivedHeight
+	case blk.Height != derivedHeight:
+		return errors.NewServiceError("[HandleConvertedBlock][%s] block height %d is not the correct height for block %s, expected %d", blockHash.String(), blk.Height, blockHash, derivedHeight)
 	}
 
 	blockHeight := blk.Height

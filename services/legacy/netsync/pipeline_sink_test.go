@@ -236,14 +236,13 @@ func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManag
 	tSettings.ChainCfgParams = &params
 	tSettings.BlockAssembly.MaximumMerkleItemsPerSubtree = maxItems
 
-	// Eligible for the unified route by default: fix round 1 gates the
-	// CONVERSION itself on sm.legacyUnified(height) (pipeline_sink.go), not
-	// only on quickValidationAllowed, so a manager that leaves these off would
-	// have every test in this file fall back instead of converting. Below the
-	// checkpoint set above, this makes every ordinary fixture in this file
-	// eligible; a test that specifically wants ineligibility (ie. above every
-	// checkpoint) sets tSettings.ChainCfgParams.Checkpoints back down, which
-	// makes legacyUnified false too since it also requires BelowCheckpoint.
+	// Task 13 removed pipelineBlockSink's own legacyUnified gate: every block
+	// converts now, whether or not it is eligible for the unified route (see
+	// pipeline_parent_height_test.go's TestPipelineSink_NotUnifiedRouteStillConverts).
+	// These two stay on regardless, because they are still what
+	// quickValidationAllowed and the structure-file-type choice below the
+	// checkpoint depend on, and other tests in this package (handle_converted_block_test.go)
+	// still exercise the unified commit route on top of a converted record.
 	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
 

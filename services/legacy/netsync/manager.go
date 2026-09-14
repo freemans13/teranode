@@ -4573,7 +4573,8 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 		return 0, nil
 	}
 
-	// On the pipeline path the block's bytes are gone by the time this runs: the
+	// Whenever the park is enabled, streaming (and so conversion) is
+	// unconditional, and the block's bytes are gone by the time this runs: the
 	// wire layer streamed them through the subtree builder and out to files, and
 	// what OnBlock holds is a handle. Charging the serialized size would reserve
 	// hundreds of megabytes against a fixed pool for memory nobody is holding, and
@@ -4583,8 +4584,15 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 	// One slot per in-flight block is what this path can honestly pay, and it is
 	// the unit SV Node bounds by. The semaphore, the dedup set and every release
 	// path are unchanged: the weight is chosen here and handed back verbatim.
+	//
+	// sm.blockPark.Enabled() is the same test installStreamingBlockPath uses to
+	// decide whether the pipeline sink is installed at all: with the park
+	// enabled, every block this function is ever called for arrived through
+	// admitPipelineSink; with it disabled, the wire layer never streams and the
+	// only caller left is OnBlock's decoded path, where the byte-weighted branch
+	// below is the correct one.
 	weight := size
-	if sm.settings != nil && sm.settings.Legacy.PipelineReceive {
+	if sm.blockPark != nil && sm.blockPark.Enabled() {
 		weight = 1
 	} else {
 		// Floor the weight so a flood of tiny blocks can't admit an unbounded
@@ -5328,14 +5336,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// read-loop downloads the next block while the current one is validated.
 	// A budget of 0 disables prefetch entirely (synchronous, one-block-in-flight).
 	if budget := tSettings.Legacy.BlockPrefetchBufferBytes; budget > 0 {
-		if tSettings.Legacy.PipelineReceive {
-			// On the pipeline path AcquireBlockPrefetch charges one slot per
-			// block, not its serialized size (the bytes are gone by the time it
-			// runs — see that function), so legacy_blockPrefetchBufferBytes no
-			// longer describes anything real for this path. Size the same
-			// semaphore as a block count instead, derived from the per-peer
-			// queue-depth setting rather than a new one: see
-			// pipelineBlockSlotPeerAllowance for the multiplier's reasoning.
+		if sm.blockPark != nil && sm.blockPark.Enabled() {
+			// Whenever the park is enabled the streaming pipeline is what
+			// receives every block, and AcquireBlockPrefetch charges one slot
+			// per block on that path, not its serialized size (the bytes are
+			// gone by the time it runs — see that function), so
+			// legacy_blockPrefetchBufferBytes no longer describes anything
+			// real for this path. Size the same semaphore as a block count
+			// instead, derived from the per-peer queue-depth setting rather
+			// than a new one: see pipelineBlockSlotPeerAllowance for the
+			// multiplier's reasoning.
 			capacity := int64(tSettings.Legacy.MaxBlocksInTransitPerPeer) * pipelineBlockSlotPeerAllowance
 			if capacity < 1 {
 				capacity = 1
@@ -5343,7 +5353,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 			sm.blockPrefetchBudgetBytes = capacity
 			sm.blockPrefetchBudget = semaphore.NewWeighted(capacity)
-			logger.Infof("[legacy] pipeline receive on: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
+			logger.Infof("[legacy] streaming pipeline active: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
 				capacity, tSettings.Legacy.MaxBlocksInTransitPerPeer, pipelineBlockSlotPeerAllowance)
 		} else {
 			// The budget caps the total serialized bytes of in-flight blocks.

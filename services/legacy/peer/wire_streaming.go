@@ -10,22 +10,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// defaultStreamToDiskAtLeast is the payload size at or above which a block's
-// body is streamed to disk instead of decoded. Task 5 derives the live value
-// from the process memory limit; this is the fallback when that is unset.
-const defaultStreamToDiskAtLeast = 64 << 20 // 64 MiB
-
-// streamToDiskAtLeast is the live threshold. A package variable so the daemon
-// can set it from the memory limit at startup and tests can move it.
-var streamToDiskAtLeast int64 = defaultStreamToDiskAtLeast
-
-// blockBodyStreamsEverySize makes the handler ignore streamToDiskAtLeast, so
-// every block takes the sink regardless of size. Set from Legacy.PipelineReceive
-// when the sink triple is installed, because only the pipeline sink can pay for a
-// small block: the park sink would merely move small blocks onto the streaming
-// path for no gain, on a branch a live node runs.
-var blockBodyStreamsEverySize bool
-
 // blockBodySink consumes a block's body streamed off the wire. It is handed the
 // already-parsed header rather than header bytes, because every consumer needs the
 // header as structure: the coinbase substitution in the first subtree and the
@@ -98,10 +82,14 @@ var blockBodyDelete func(hash chainhash.Hash, converted bool) error
 // streaming would require a TeeReader → SHA-256 pass over multi-GB
 // payloads, which is not justified given the downstream guarantees.
 //
-// Above streamToDiskAtLeast, and only when both a sink and a gate are
-// installed, the body is never decoded at all: the header is read, put to the
-// gate, and everything after it goes straight to the sink. That is what keeps
-// a multi-gigabyte block from ever existing as a Go object on this path.
+// Whenever both a sink and a gate are installed, the body is never decoded at
+// all, regardless of size: the header is read, put to the gate, and
+// everything after it goes straight to the sink. That is what keeps a
+// multi-gigabyte block from ever existing as a Go object on this path.
+// Streaming used to mean "write the body to disk", which only paid for a
+// block too large to hold in memory, so a size threshold used to decide which
+// path a block took. Streaming now means "convert the block as it arrives",
+// which pays at every size, so there is no threshold left to apply.
 func streamingBlockHandler(r io.Reader, length uint64, totalBytes int) (int, wire.Message, []byte, error) {
 	// Cap the inner reader so a malformed varint cannot read past the declared
 	// payload boundary and desync the next ReadMessage call.
@@ -138,16 +126,16 @@ func streamingBlockHandler(r io.Reader, length uint64, totalBytes int) (int, wir
 }
 
 // readBlockMessage returns the block either decoded or as a body on disk,
-// depending on its declared size and whether a sink and a gate are installed.
+// depending on whether a sink and a gate are installed.
+//
+// The whole-block decode below survives only for when no sink or gate is
+// installed at all: the sync manager's park switched off, or its temp store
+// one whose contents a restart could not enumerate (see newBlockPark's doc
+// comment) — the one configuration this package cannot itself convert a
+// block in. That is a real, if rare, running configuration, not a size
+// threshold to weigh against.
 func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error) {
-	// The size threshold applies only when the pipeline is off. It exists because
-	// streaming used to mean writing the body to disk, which only paid for a block
-	// too large to hold in memory. Streaming now means converting the block as it
-	// arrives, which pays at every size, so on the pipeline path the threshold
-	// would keep whole-block residency for the common case while the branch claims
-	// to have removed it. Off the pipeline path it still decides exactly what it
-	// decided before, because changing the default path is not this branch's to do.
-	if blockBodySink == nil || blockBodyGate == nil || (!blockBodyStreamsEverySize && int64(length) < streamToDiskAtLeast) {
+	if blockBodySink == nil || blockBodyGate == nil {
 		msg := &wire.MsgBlock{}
 
 		return msg, msg.Bsvdecode(lr, wire.ProtocolVersion, wire.BaseEncoding)

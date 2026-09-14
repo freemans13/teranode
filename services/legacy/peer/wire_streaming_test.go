@@ -53,12 +53,10 @@ func installTestSink(t *testing.T,
 	t.Helper()
 
 	prevSink, prevGate, prevDelete := blockBodySink, blockBodyGate, blockBodyDelete
-	prevStreamsEverySize := blockBodyStreamsEverySize
 	blockBodySink, blockBodyGate, blockBodyDelete = sink, gate, del
 
 	return func() {
 		blockBodySink, blockBodyGate, blockBodyDelete = prevSink, prevGate, prevDelete
-		blockBodyStreamsEverySize = prevStreamsEverySize
 	}
 }
 
@@ -103,9 +101,6 @@ func testBlockPayload(t *testing.T, numTxs int) (*wire.MsgBlock, []byte) {
 // that will replace the body-storing sink needs the coinbase and the merkle root,
 // and re-parsing bytes the wire layer has already parsed is waste on the read loop.
 func TestStreamingBlockHandler_SinkReceivesTheHeader(t *testing.T) {
-	blockBodyStreamsEverySize = true
-	t.Cleanup(func() { blockBodyStreamsEverySize = false })
-
 	var gotHeader *wire.BlockHeader
 
 	var gotHash chainhash.Hash
@@ -136,10 +131,11 @@ func TestStreamingBlockHandler_SinkReceivesTheHeader(t *testing.T) {
 	require.Equal(t, blk.BlockHash().String(), gotHash.String())
 }
 
-// TestStreamingBlockHandler_SmallBlocksAlsoStream pins that the size threshold no
-// longer decides the path. It existed because streaming meant "write the body to
-// disk", which was only worth it for a block too large to hold; streaming now
-// means "convert it as it arrives", which is worth it at every size.
+// TestStreamingBlockHandler_SmallBlocksAlsoStream pins that there is no size
+// threshold deciding the path any more. It existed because streaming meant
+// "write the body to disk", which was only worth it for a block too large to
+// hold; streaming now means "convert it as it arrives", which is worth it at
+// every size, so a sink and a gate being installed is the only condition left.
 func TestStreamingBlockHandler_SmallBlocksAlsoStream(t *testing.T) {
 	var sinkCalls int
 
@@ -159,8 +155,6 @@ func TestStreamingBlockHandler_SmallBlocksAlsoStream(t *testing.T) {
 	)
 	defer restore()
 
-	blockBodyStreamsEverySize = true
-
 	_, payload := testBlockPayload(t, 3)
 	require.Less(t, len(payload), 64<<20, "sanity: this block is far below the old threshold")
 
@@ -169,31 +163,24 @@ func TestStreamingBlockHandler_SmallBlocksAlsoStream(t *testing.T) {
 	require.Equal(t, 1, sinkCalls, "a small block must reach the sink, not the whole-block decoder")
 }
 
-// TestStreamingBlockHandler_SmallBlocksStillDecodeWhenThePipelineIsOff is the
-// guard on the default path. This branch runs on a live node, and with the
-// pipeline off a small block must reach the decoder exactly as it always has.
-// Removing the size threshold outright would silently move every small block onto
-// the park sink, which is a behaviour change nobody asked for.
-func TestStreamingBlockHandler_SmallBlocksStillDecodeWhenThePipelineIsOff(t *testing.T) {
-	var sinkCalls int
+// TestStreamingBlockHandler_DecodesWhenNoSinkIsInstalled is the guard on the
+// one configuration this package cannot itself convert a block in: no sink (or
+// no gate) installed at all, which happens when the sync manager's park is
+// switched off or its temp store could not be enumerated on restart. That
+// still has to decode exactly as it always has, sink or no sink.
+func TestStreamingBlockHandler_DecodesWhenNoSinkIsInstalled(t *testing.T) {
+	prevSink, prevGate := blockBodySink, blockBodyGate
+	blockBodySink, blockBodyGate = nil, nil
 
-	restore := installTestSink(t,
-		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
-			sinkCalls++
+	t.Cleanup(func() { blockBodySink, blockBodyGate = prevSink, prevGate })
 
-			return false, nil
-		},
-		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
-		func(chainhash.Hash, bool) error { return nil },
-	)
-	defer restore()
-
-	// blockBodyStreamsEverySize deliberately left false.
 	_, payload := testBlockPayload(t, 3)
 
-	_, err := readBlockMessage(limitedOver(payload), uint64(len(payload)))
+	msg, err := readBlockMessage(limitedOver(payload), uint64(len(payload)))
 	require.NoError(t, err)
-	require.Zero(t, sinkCalls, "with the pipeline off a small block must still be decoded, not streamed")
+
+	_, ok := msg.(*wire.MsgBlock)
+	require.True(t, ok, "with no sink installed a block must still be decoded, not streamed")
 }
 
 func TestStreamingBlockHandler_RoundTrip(t *testing.T) {

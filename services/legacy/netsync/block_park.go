@@ -243,8 +243,8 @@ type parkedBlock struct {
 	// a store Exists call: one of the file store's 768 process-wide read
 	// permits, held for the store's configured timeout, on commitParkedBlock's
 	// single goroutine that commits every parked block in order. That ran
-	// unconditionally, for every parked commit, whether or not
-	// legacy_pipelineReceive was ever turned on — the same store round trip
+	// unconditionally, for every parked commit, whether or not the streaming
+	// pipeline was ever active — the same store round trip
 	// this park already gates on BlockBody.Converted at streaming_install.go's
 	// entry construction (see the comment there), just not here. This field
 	// closes that gap the same way: the answer is a fact this entry already

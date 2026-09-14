@@ -182,7 +182,7 @@ func (sm *SyncManager) publishConsumerWait(now time.Time, queueArmOpen bool, pen
 		w.downloadBudget = sm.blockPrefetchBudgetBytes
 		w.downloadHeld = sm.blockPrefetchReserved.Load()
 		w.downloadWaiters = sm.blockPrefetchWaiters.Load()
-		w.downloadBudgetIsSlots = sm.settings != nil && sm.settings.Legacy.PipelineReceive
+		w.downloadBudgetIsSlots = sm.blockPark != nil && sm.blockPark.Enabled()
 	}
 
 	w.drainDeclines = sm.drainDeclined.Load()

@@ -34,56 +34,30 @@ import (
 // that field's doc comment for why a blob's mere existence is the wrong
 // question.
 func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
-	// Resolved before anything is read from r, and that ordering is load-
-	// bearing: the fallback below hands r to streamingBlockSink untouched, and
-	// that only works if nothing — not even the coinbase — has been consumed
-	// from it yet.
+	// Every block converts. There is no fallback and nothing writes a whole
+	// block body to one file any more.
+	//
+	// An unknown parent height does not stop it. The height feeds exactly two
+	// decisions and both have a safe answer without one. The subtree file type
+	// takes .subtreeToCheck, which means "still needs validating": conservative,
+	// because writing .subtree unearned would skip validation, while writing
+	// .subtreeToCheck unnecessarily only costs work. The delete-at-height falls
+	// back to the committed tip plus the read-ahead depth plus the retention,
+	// which is above any height this block can actually have, so it gives the
+	// same guarantee a known height does: pruning is driven by the committed
+	// chain, and a block waiting in the park is above it. The committer
+	// re-derives the height from the store before committing anything, so a
+	// record carrying zero is corrected there.
+	//
+	// Two refusals used to sit here and both were wrong. One declined to convert
+	// above the final checkpoint, on the grounds that a converted record carries
+	// block ID zero and only quick validation assigns one: but the ordinary route
+	// already passes zero up there, because its assignment sits inside a
+	// quick-validation-only branch, and zero is the universal "assign
+	// server-side" convention that full validation reads too. The other declined
+	// when the parent height would not resolve, which was a constructor argument
+	// with no answer for "unknown" rather than a rule about anything.
 	height, resolved := sm.pipelineParentHeight(header.PrevBlock)
-	if !resolved || !sm.legacyUnified(height) {
-		// Two different reasons land in the same fallback, and both belong here
-		// for the same reason: neither is "this body is bad", so neither may
-		// cost the block its only copy.
-		//
-		// !resolved: neither the in-flight header list nor the committed chain
-		// has this block's parent, which is a genuine miss beyond the ordinary
-		// out-of-order case pipelineParentHeight covers (see its doc comment).
-		//
-		// !sm.legacyUnified(height): a converted record's blockID is always 0,
-		// "assign server-side" — correct only because the unified route's
-		// committer (HandleConvertedBlock) hands it to quickValidateBlock, which
-		// assigns one itself and does the UTXO create/spend the record carries
-		// no other way to do. quickValidationAllowed alone (used just below to
-		// pick the subtree writer's file type) is NOT the same gate: it goes
-		// true for the whole below-checkpoint range, while legacyUnified also
-		// requires the operator's unified flag and the outpoint-only gate, so a
-		// block can sit below the checkpoint yet still be ineligible for
-		// conversion — most consequentially the first block AT or ABOVE the
-		// checkpoint on an otherwise fully-unified node, where legacyUnified
-		// goes false one block after it was true for every block so far. A
-		// first cut of this task instead let the sink convert regardless and had
-		// HandleConvertedBlock refuse the record at commit time — which failed
-		// closed in the worst way: the only copy of the block was already gone
-		// (deleted by the park's reject disposition) by the time anything
-		// noticed, so the block could never be re-obtained, and the reject +
-		// recently-failed-blocks entry it produced repeated forever, at that one
-		// height, blocking every descendant behind it. Declining the conversion
-		// here instead costs nothing: the block was never touched.
-		//
-		// There is no error return from this sink that the wire layer treats as
-		// anything other than a malformed message: peer.shouldHandleReadError
-		// (services/legacy/peer/peer.go) disconnects on every error except an
-		// exact io.EOF, io.ErrUnexpectedEOF or non-temporary net.OpError, none of
-		// which fit "decline this one and let the ordinary path retry it". So
-		// this does not error. It defers to streamingBlockSink instead, which
-		// writes the untouched body to the park exactly as it would with
-		// PipelineReceive off, and lets the existing park/drain machinery decide
-		// the block's fate the way it already correctly does for the
-		// non-pipeline path — HandleBlockDirect, not HandleConvertedBlock,
-		// commits it, doing the UTXO work itself the way it always has.
-		// streamingBlockSink always reports converted=false, which is correct
-		// here: this call never converts anything.
-		return sm.streamingBlockSink(hash, header, r, n)
-	}
 
 	stream, err := newBlockTxStream(r, n)
 	if err != nil {
@@ -97,8 +71,12 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		return false, errors.NewBlockInvalidError("[pipelineBlockSink][%s] failed reading the coinbase", hash, err)
 	}
 
-	quickValidation := sm.quickValidationAllowed(height)
-	writer := newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, quickValidation)
+	var writer *subtreeWriter
+	if resolved {
+		writer = newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, sm.quickValidationAllowed(height))
+	} else {
+		writer = newSubtreeWriterUnresolvedHeight(sm.logger, sm.settings, sm.subtreeStore, sm.fallbackSubtreeDAH())
+	}
 
 	// dedup is never sized from stream.TxCount(). See newPipelineDedupMap's
 	// doc comment for why: that count is the peer's own declared transaction
@@ -185,9 +163,14 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	// reads them back. Keeping a narrower record would mean inventing a format for
 	// it and then converting to this anyway.
 	//
-	// blockID is 0: on the unified below-checkpoint route the server assigns it
-	// inside quickValidateBlock, which is also where the UTXO work happens. See
-	// handle_block.go:607.
+	// blockID is 0 on every route, not only below the checkpoint: it is the
+	// universal "assign server-side" convention. Below the checkpoint,
+	// quickValidateBlock assigns it and does the UTXO create/spend the record
+	// carries no other way to do. Above it, buildAddBlockOpts
+	// (services/blockvalidation/BlockValidation.go) returns nil for a zero ID
+	// and AddBlock behaves exactly as it does for any other peer-fetched block,
+	// which is never pre-assigned one either — see Step 1's finding in the task
+	// report for the file:line evidence.
 	verified, err := model.NewBlock(modelHeader, coinbase, subtreeHashPointers, stream.TxCount(), uint64(n), height, 0)
 	if err != nil {
 		sm.deleteWrittenOnFailure(hash, writer)
@@ -256,7 +239,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // structure file type each one was written under — FileTypeSubtree or
 // FileTypeSubtreeToCheck — is a pure function of the record's own height via
 // quickValidationAllowed, the same test subtreeWriter used to choose it while
-// writing.
+// writing, EXCEPT at height 0: that is pipelineParentHeight's own "unresolved"
+// sentinel (see its doc comment), never a real height, and subtreeWriter's
+// unresolved-height constructor always wrote FileTypeSubtreeToCheck for it
+// regardless of what quickValidationAllowed(0) would say (0 reads as below
+// every checkpoint, which is exactly the misreading that constructor exists to
+// avoid). Reusing quickValidationAllowed here for that case would ask for the
+// wrong file type and leave the real one behind.
 //
 // The converted record itself is NOT deleted here. It is deleted inside
 // blockPark.Delete, which streamingBlockDelete below calls unconditionally, so
@@ -274,7 +263,7 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 		switch {
 		case err == nil && record != nil:
 			structureType := fileformat.FileTypeSubtreeToCheck
-			if sm.quickValidationAllowed(record.Height) {
+			if record.Height != 0 && sm.quickValidationAllowed(record.Height) {
 				structureType = fileformat.FileTypeSubtree
 			}
 
@@ -301,12 +290,12 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 		}
 	}
 
-	// Unconditional regardless of converted: on the unresolvable-parent
-	// fallback this call's own sink wrote a raw body here (streamingBlockSink,
-	// converted false), and on every path this also retires whatever the park
-	// holds for hash — see blockPark.Delete's own comment on why attempting
-	// both file types is safe even though only one of them is ever this
-	// call's own.
+	// Unconditional regardless of converted: on the admission-budget fallback
+	// (admitPipelineSink's duplicate-in-flight and acquire-timeout cases) this
+	// call's own sink wrote a raw body here (streamingBlockSink, converted
+	// false), and on every path this also retires whatever the park holds for
+	// hash — see blockPark.Delete's own comment on why attempting both file
+	// types is safe even though only one of them is ever this call's own.
 	if err := sm.streamingBlockDelete(hash, converted); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -342,6 +331,35 @@ func (sm *SyncManager) pipelineParentHeight(parent chainhash.Hash) (uint32, bool
 	}
 
 	return meta.Height + 1, true
+}
+
+// fallbackSubtreeDAH returns the delete-at-height newSubtreeWriterUnresolvedHeight
+// stamps every artefact with, for a block whose parent height
+// pipelineParentHeight could not resolve.
+//
+// committedHeight() is the last block this node has actually put into the
+// chain — never negative in practice, floored at 0 defensively. Added to it is
+// the widest the download walk can read ahead of that tip: legacy_
+// blockDownloadWindow, the node-wide ceiling on outstanding block requests
+// (lookaheadCeilingLocked, manager.go, scales a narrower bound DOWN from this
+// one by block size, never wider), floored at 1 so a misconfigured 0 cannot
+// zero the whole sum. No block this node holds — parked, mid-conversion, or
+// committed — can have a height above committedHeight()+BlockDownloadWindow,
+// so adding the configured retention on top gives a delete-at-height strictly
+// above any height this specific block can actually turn out to have, exactly
+// the guarantee height + retention gives when the height is known.
+func (sm *SyncManager) fallbackSubtreeDAH() uint32 {
+	tip := sm.committedHeight()
+	if tip < 0 {
+		tip = 0
+	}
+
+	depth := 1
+	if sm.settings != nil && sm.settings.Legacy.BlockDownloadWindow > depth {
+		depth = sm.settings.Legacy.BlockDownloadWindow
+	}
+
+	return uint32(tip) + uint32(depth) + sm.settings.GetSubtreeValidationBlockHeightRetention()
 }
 
 // dedupInitialCapacity bounds the pipeline dedup map's pre-sizing hint. It is a

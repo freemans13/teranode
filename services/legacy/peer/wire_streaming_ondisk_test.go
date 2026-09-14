@@ -102,10 +102,10 @@ func installGate(t *testing.T, gate func(chainhash.Hash, *wire.BlockHeader) erro
 	t.Cleanup(func() { blockBodyGate = nil })
 }
 
-// Above the threshold the handler must not build a wire.MsgBlock at all. It
-// reads the header, asks the gate, and hands the rest of the payload to the
-// sink.
-func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
+// With a sink and a gate installed the handler must not build a wire.MsgBlock
+// at all, whatever the block's size. It reads the header, asks the gate, and
+// hands the rest of the payload to the sink.
+func TestStreamingBlockHandlerSendsABodyToTheSink(t *testing.T) {
 	payload, hash := serialisedBlock(t, 4)
 
 	var (
@@ -128,16 +128,13 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 
 	installGate(t, permissiveGate)
 
-	streamToDiskAtLeast = 1 // every block is "large" for this test
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
-
 	n, msg, buf, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.NoError(t, err)
 	require.Nil(t, buf)
 	require.Equal(t, 24+len(payload), n, "the whole message is accounted for")
 
 	onDisk, ok := msg.(*MsgBlockOnDisk)
-	require.True(t, ok, "a large block must come back as a body on disk, not a decoded block")
+	require.True(t, ok, "the block must come back as a body on disk, not a decoded block")
 	require.Equal(t, hash, onDisk.Hash)
 	require.Equal(t, uint64(4), onDisk.TxCount)
 	require.Equal(t, int64(len(payload)), onDisk.Size)
@@ -160,32 +157,34 @@ func TestStreamingBlockHandlerSendsALargeBodyToTheSink(t *testing.T) {
 		"the declared length must cover the header too, or a consumer that trusts it writes a short file")
 }
 
-// Below the threshold nothing changes: the block is decoded as it always was,
-// and neither the gate nor the sink is even consulted.
-func TestStreamingBlockHandlerStillDecodesASmallBlock(t *testing.T) {
+// A small block streams too, once a sink and a gate are installed: there is
+// no size threshold left to keep it on the decode path. Streaming used to
+// mean "write the body to disk", worth it only for a block too large to hold
+// in memory; it now means "convert the block as it arrives", which pays at
+// every size.
+func TestStreamingBlockHandlerSendsASmallBodyToTheSinkToo(t *testing.T) {
 	payload, hash := serialisedBlock(t, 2)
 
-	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
-		t.Fatal("a small block must not reach the sink")
-		return false, nil
+	sinkCalled := false
+
+	blockBodySink = func(_ chainhash.Hash, _ *wire.BlockHeader, r io.Reader, _ int64) (bool, error) {
+		sinkCalled = true
+
+		_, err := io.Copy(io.Discard, r)
+
+		return false, err
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
-	installGate(t, func(chainhash.Hash, *wire.BlockHeader) error {
-		t.Fatal("a small block must not be put to the gate")
-		return nil
-	})
-
-	streamToDiskAtLeast = int64(len(payload)) + 1
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
+	installGate(t, permissiveGate)
 
 	_, msg, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.NoError(t, err)
+	require.True(t, sinkCalled, "a small block must reach the sink, not the whole-block decoder")
 
-	blk, ok := msg.(*wire.MsgBlock)
-	require.True(t, ok, "a small block is still a decoded block")
-	require.Len(t, blk.Transactions, 2)
-	require.Equal(t, hash, blk.BlockHash())
+	onDisk, ok := msg.(*MsgBlockOnDisk)
+	require.True(t, ok, "a small block must come back as a body on disk too")
+	require.Equal(t, hash, onDisk.Hash)
 }
 
 // A block that fails its own target, having passed the requested and floor
@@ -210,9 +209,6 @@ func TestStreamingBlockHandlerRefusesABadHeaderBeforeStoring(t *testing.T) {
 		map[chainhash.Hash]bool{hash: true},
 		chaincfg.RegressionNetParams.PowLimit,
 	))
-
-	streamToDiskAtLeast = 1
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
 
 	_, _, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.Error(t, err, "a header that fails its own target must be refused")
@@ -252,9 +248,6 @@ func TestStreamingBlockHandlerRefusesAnEasyTargetBeforeStoring(t *testing.T) {
 
 	installGate(t, fakeSyncManagerGate(map[chainhash.Hash]bool{hash: true}, limit))
 
-	streamToDiskAtLeast = 1
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
-
 	_, _, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.Error(t, err, "a header declaring an easier-than-limit target must be refused")
 	require.False(t, called, "nothing may be written for a block declaring an impossible target")
@@ -280,9 +273,6 @@ func TestStreamingBlockHandlerRefusesAnUnrequestedBlockBeforeStoring(t *testing.
 	// Nothing is marked requested, so every hash is refused by this gate.
 	installGate(t, fakeSyncManagerGate(map[chainhash.Hash]bool{}, chaincfg.RegressionNetParams.PowLimit))
 
-	streamToDiskAtLeast = 1
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
-
 	_, _, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.Error(t, err, "a block nobody asked for must be refused")
 	require.False(t, called, "nothing may be written for a block nobody asked for")
@@ -295,9 +285,6 @@ func TestStreamingBlockHandlerFallsBackWithNoSink(t *testing.T) {
 
 	blockBodySink = nil
 	installGate(t, permissiveGate)
-
-	streamToDiskAtLeast = 1
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
 
 	_, msg, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.NoError(t, err)
@@ -317,9 +304,6 @@ func TestStreamingBlockHandlerNilGateFallsBackToDecodingEvenWithSinkInstalled(t 
 	t.Cleanup(func() { blockBodySink = nil })
 
 	blockBodyGate = nil // explicit: this is the condition under test
-
-	streamToDiskAtLeast = 1
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
 
 	_, msg, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.NoError(t, err)
@@ -364,9 +348,6 @@ func TestStreamingBlockHandlerDeletesATruncatedBodyAfterAWrite(t *testing.T) {
 
 	installGate(t, permissiveGate)
 
-	streamToDiskAtLeast = 1
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
-
 	_, _, _, err := streamingBlockHandler(bytes.NewReader(payload), declaredLength, 24)
 	require.Error(t, err, "a truncated body must be surfaced as an error")
 	require.True(t, deleteCalled, "a body written for a stream that ended short must be deleted")
@@ -394,9 +375,6 @@ func TestStreamingBlockHandlerDrainsThePayloadAfterAGateRejection(t *testing.T) 
 	installGate(t, func(chainhash.Hash, *wire.BlockHeader) error {
 		return errors.NewProcessingError("rejected for this test")
 	})
-
-	streamToDiskAtLeast = 1
-	t.Cleanup(func() { streamToDiskAtLeast = defaultStreamToDiskAtLeast })
 
 	_, _, _, err := streamingBlockHandler(src, uint64(len(payload)), 24)
 	require.Error(t, err, "a gate rejection must be surfaced as an error")
