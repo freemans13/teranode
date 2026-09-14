@@ -105,3 +105,66 @@ func TestMaybeRequestMoreHeaders_DoesNotAskTwiceWithinTheRateLimit(t *testing.T)
 		"twenty passes inside the rate limit's window must produce exactly one getheaders")
 	client.AssertNumberOfCalls(t, "GetBlockLocator", 1)
 }
+
+// TestMaybeRequestMoreHeaders_RotatesAcrossEligiblePeers pins the fix for the
+// single-usable-peer stall: PushGetHeadersMsg drops a repeat of the same
+// (locator, stop hash) pair from one peer, and while the header cache is
+// empty neither half of that pair can move — the stop hash is always the
+// zero hash, and the locator is built from the committed tip, which cannot
+// advance until a block commits. Sending to peers[0] on every call therefore
+// sends exactly once and is filtered forever after: with one usable peer, the
+// node never asks again once that first reply is unusable.
+//
+// This drives the refill repeatedly against three connected, eligible peers
+// and requires that more than one of them actually received a request. Before
+// the fix, every one of these passes would have named the same peer and every
+// send after the first would have been silently dropped by that peer's own
+// dedup filter.
+func TestMaybeRequestMoreHeaders_RotatesAcrossEligiblePeers(t *testing.T) {
+	client := &blockchain2.Mock{}
+	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{{0x99}}, nil)
+
+	sm := newRaceManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = client
+
+	_, _, headersA := demotionPeer(t, sm, 240, 1000)
+	_, _, headersB := demotionPeer(t, sm, 241, 1000)
+	_, _, headersC := demotionPeer(t, sm, 242, 1000)
+
+	var nonce uint32
+
+	anchor := chainhash.Hash{0x72}
+	msg, hashes := linkedHeaders(anchor, 5, &nonce)
+
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(anchor, 1, msg.Headers))
+	sm.noteCommittedHeight(int32(len(hashes)), hashes[len(hashes)-1]) //nolint:gosec // a small test count
+
+	// Repeated refills, as repeated commit-driven passes would produce while a
+	// single unusable reply leaves the cache dry. The rate limit's floor is
+	// reset before each pass so every one of them actually reaches a peer,
+	// standing in for headerCacheRefillInterval having elapsed on a live node.
+	for i := 0; i < 3; i++ {
+		want := i + 1
+
+		sm.lastHeaderRequestAt.Store(0)
+		sm.fetchHeaderBlocks()
+
+		require.True(t, WaitUntil(func() bool {
+			return headersA.count()+headersB.count()+headersC.count() >= want
+		}, 5*time.Second), "pass %d must have sent a getheaders", i)
+	}
+
+	distinct := 0
+
+	for _, r := range []*getHeadersRecorder{headersA, headersB, headersC} {
+		if r.count() > 0 {
+			distinct++
+		}
+	}
+
+	require.Greater(t, distinct, 1,
+		"three refills against three connected, eligible peers must not all land on the same one")
+}

@@ -844,6 +844,18 @@ type SyncManager struct {
 	// so without this a cache that has run dry would earn one getheaders per
 	// commit instead of one per round trip.
 	lastHeaderRequestAt atomic.Int64
+	// headerRefillPeerIdx rotates which eligible peer maybeRequestMoreHeaders
+	// asks next. PushGetHeadersMsg silently drops a repeat of the same
+	// (locator, stop hash) pair from a given peer, and while the cache is
+	// empty neither half of that pair can move: the stop hash is always the
+	// zero hash and the locator is built from the committed tip, which does
+	// not advance until a block actually commits. Asking peers[0] every time
+	// therefore sends once and is filtered forever after on a single-peer
+	// node. Rotating picks a different peer each call so the filter never
+	// sees a repeat; it is read and incremented only through
+	// nextHeaderRefillPeer's atomic Add, so concurrent callers never hand out
+	// the same slot twice.
+	headerRefillPeerIdx atomic.Uint64
 	blockSizeTracker    *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
 	// dispatcher owns the quick window: it decides how many queued blocks may have
@@ -3599,7 +3611,7 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	peer := peers[0].peer
+	peer := sm.nextHeaderRefillPeer(peers)
 
 	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
 		sm.logger.Warnf("[assignWantedBlocks][%s] failed to send getheaders to refill the header cache past height %d: %v", peer.String(), last, err)
@@ -3628,6 +3640,30 @@ func (sm *SyncManager) allowedToRequestMoreHeadersNow(now time.Time) bool {
 			return true
 		}
 	}
+}
+
+// nextHeaderRefillPeer picks the peer maybeRequestMoreHeaders asks this call,
+// rotating one step further through peers than the last call did.
+//
+// PushGetHeadersMsg on a peer drops a repeat of the same (locator, stop hash)
+// pair silently, returning nil as though it had sent. While the header cache
+// is empty, neither half of that pair can move: the stop hash is always the
+// zero hash, and the locator is built from the committed tip, which cannot
+// advance until a block commits. Asking the same peer every call, as taking
+// peers[0] used to, sends exactly once and is then filtered forever — with
+// one usable peer, the node never asks again. Rotating means a repeat call
+// reaches a different peer, whose own dedup state has not seen this pair.
+//
+// headerRefillPeerIdx only ever counts up, via a single atomic Add, so two
+// concurrent callers (the commit path and the park sweep both reach this
+// function) always get distinct, increasing slots and never hand out the one
+// peer twice for the same logical call. Reducing modulo the current length,
+// taken fresh from peers on every call, means a peer list that grew or shrank
+// between calls is never indexed out of range.
+func (sm *SyncManager) nextHeaderRefillPeer(peers []blockPeer) *peerpkg.Peer {
+	idx := sm.headerRefillPeerIdx.Add(1) - 1
+
+	return peers[idx%uint64(len(peers))].peer
 }
 
 // lookaheadCeilingLocked returns the highest block height this round may ask for,
