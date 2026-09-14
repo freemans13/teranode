@@ -220,3 +220,94 @@ func TestMaybeRequestMoreHeaders_SinglePeerAsksAgainAfterRateLimitLapses(t *test
 	require.Greater(t, headers.count(), 1,
 		"a single eligible peer must still be asked again once the rate limit lapses")
 }
+
+// TestMaybeRequestMoreHeaders_AsksEarlyWhenRemainingCacheIsBelowThreshold pins
+// the fix itself: on a live Hetzner mainnet node, maybeRequestMoreHeaders only
+// ever asked once wantedBlocksFromCache's depth-limited pass ran clean off the
+// end of the header cache, which happens only once the cache is fully drained.
+// Measured on that node: a 2,000-header batch commits in about 100 seconds,
+// and a refill at a boundary can cost multiple rate-limited attempts before
+// a peer answers (three attempts, ~40 seconds, observed at the 8,000
+// boundary) — dead time repeating every 2,000 blocks for the whole sync.
+//
+// This cache holds far more heights above the committed tip (300) than the
+// read-ahead depth that limits a single pass (legacy_blockDownloadLowerWindow,
+// 128 by default), so the backstop alone — "does the cache still name
+// last+1?" — would find it does and stay quiet. The fix must still ask,
+// because 300 remaining heights is under headerCacheRefillThreshold (1,000).
+func TestMaybeRequestMoreHeaders_AsksEarlyWhenRemainingCacheIsBelowThreshold(t *testing.T) {
+	client := &blockchain2.Mock{}
+	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{{0x99}}, nil)
+
+	sm := newRaceManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = client
+
+	_, _, headers := demotionPeer(t, sm, 251, 1000)
+
+	var nonce uint32
+
+	anchor := chainhash.Hash{0x74}
+	// 1,300 heights above the tip (1,000 to 2,300 named by the cache, tip at
+	// 1,000): comfortably more than the 128-height read-ahead depth, so the
+	// backstop alone sees plenty of cache left, but the 1,300 remaining above
+	// the tip is what headerCacheRefillThreshold judges, and it is not being
+	// tested here directly — the committed tip is placed 300 below the
+	// cache's top instead, so remaining (300) sits under the 1,000 threshold.
+	msg, _ := linkedHeaders(anchor, 1300, &nonce)
+
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(anchor, 1, msg.Headers))
+
+	// Committed tip at height 1,000: the cache names up to height 1,300, so
+	// only 300 heights remain above the tip, under headerCacheRefillThreshold
+	// (1,000), even though the read-ahead depth (128) leaves last+1 = 1,129
+	// well short of the cache's own end at 1,300.
+	mockCommittedTip(t, sm, 1000, 0)
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return headers.count() == 1 }, 5*time.Second),
+		"a cache with only 300 heights left above the tip, under the 1,000-height threshold, must trigger an early refill")
+}
+
+// TestMaybeRequestMoreHeaders_DoesNotAskWhenCacheIsComfortablyFull is the other
+// direction of the same threshold check: a cache that still names well over
+// headerCacheRefillThreshold heights above the committed tip must not trigger
+// a refill, or the fix would just burn the rate-limit slot on every pass while
+// there is nothing yet to gain from asking.
+func TestMaybeRequestMoreHeaders_DoesNotAskWhenCacheIsComfortablyFull(t *testing.T) {
+	client := &blockchain2.Mock{}
+	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{{0x99}}, nil)
+
+	sm := newRaceManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = client
+
+	_, _, headers := demotionPeer(t, sm, 252, 1000)
+
+	var nonce uint32
+
+	anchor := chainhash.Hash{0x75}
+	// The cache names up to height 2,500 and the tip sits at 1,000, so 1,500
+	// heights remain above the tip: over headerCacheRefillThreshold (1,000),
+	// with headroom to spare.
+	msg, _ := linkedHeaders(anchor, 2500, &nonce)
+
+	sm.headerCache = newHeaderCache()
+	require.True(t, sm.headerCache.Fill(anchor, 1, msg.Headers))
+
+	mockCommittedTip(t, sm, 1000, 0)
+
+	// Several passes, the way repeated commits would drive this in practice:
+	// none of them may ask, not just the first.
+	for i := 0; i < 5; i++ {
+		sm.fetchHeaderBlocks()
+	}
+
+	require.Never(t, func() bool { return headers.count() > 0 }, 200*time.Millisecond, 20*time.Millisecond,
+		"a cache with 1,500 heights left above the tip, comfortably over the 1,000-height threshold, must not trigger a refill")
+	client.AssertNotCalled(t, "GetBlockLocator", mock.Anything, mock.Anything, mock.Anything)
+}
