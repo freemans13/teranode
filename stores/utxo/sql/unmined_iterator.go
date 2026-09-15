@@ -147,13 +147,18 @@ func (it *unminedTxIterator) readOne(ctx context.Context) (*utxo.UnminedTransact
 	var (
 		previousTxHashBytes []byte
 		previousTxHash      *chainhash.Hash
+		previousTxIdx       int64
 	)
+
+	// Built once per transaction rather than once per input row: this runs for
+	// every input of every unmined transaction at each block assembly restart.
+	// The outpoint scope never writes through the input argument, so nil is safe.
+	scanTargets := scanTargetsForInputScope(inputsQueryOutpoints, &previousTxHashBytes, &previousTxIdx, nil)
 
 	for rows.Next() {
 		input := &bt.Input{}
-		var previousTxIdx int64
 
-		if err = rows.Scan(scanTargetsForInputScope(inputsQueryOutpoints, &previousTxHashBytes, &previousTxIdx, input)...); err != nil {
+		if err = rows.Scan(scanTargets...); err != nil {
 			if err = it.Close(); err != nil {
 				it.store.logger.Warnf(errFailedCloseIterator, err)
 			}

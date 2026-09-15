@@ -3184,6 +3184,12 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 	// dead on SQL today, and on SQL every unmined transaction is dropped by the
 	// caller when input validation is enabled.
 	//
+	// That is not confined to a redundant path. Input validation is enabled by
+	// every large reorg (handleReorg calls b.reset(ctx, true) unconditionally), by
+	// the fallback reset when subtreeProcessor.Reorg fails, and by the
+	// ResetBlockAssemblyValidateInputs RPC. So a SQL-backed node discards its
+	// whole unmined set on any of those.
+	//
 	// Switching to fields.TxInpoints makes it live on SQL, which is correct but
 	// not a mechanical change: the first transaction that fails takes the
 	// markAsConflicting branch below, which writes to the store while

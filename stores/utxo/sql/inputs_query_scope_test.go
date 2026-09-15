@@ -107,3 +107,24 @@ func TestScanTargetsForInputScopeMatchesColumnCount(t *testing.T) {
 		require.Len(t, strings.Split(strings.TrimPrefix(selectPart, "SELECT "), ","), tc.cols)
 	}
 }
+
+// TestScanTargetsForOutpointScopeIgnoresInput pins the property the unmined
+// iterator relies on to build its Scan targets once per transaction instead of
+// once per input row: in the outpoint scope the input argument is never touched,
+// so passing nil is safe and the targets can be reused across rows.
+func TestScanTargetsForOutpointScopeIgnoresInput(t *testing.T) {
+	var (
+		hashBytes []byte
+		prevTxIdx int64
+	)
+
+	var targets []interface{}
+
+	require.NotPanics(t, func() {
+		targets = scanTargetsForInputScope(inputsQueryOutpoints, &hashBytes, &prevTxIdx, nil)
+	})
+
+	require.Len(t, targets, 2)
+	require.Same(t, &hashBytes, targets[0])
+	require.Same(t, &prevTxIdx, targets[1])
+}
