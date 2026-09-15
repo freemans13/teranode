@@ -475,8 +475,13 @@ func TestMixedExternalAndNormalTransactions(t *testing.T) {
 	keySourceParent := uaerospike.CalculateKeySource(&txIDParent, 0, 128)
 	keyParent, _ := aerospike.NewKey(namespace, set, keySourceParent)
 
+	// Output 0 records the normal child as its spender: a marker is only written
+	// for the child an output really names (keepSpendHolders).
+	txIDNormal := chainhash.HashH([]byte("normal-mixed"))
+
 	err = client.Put(writePolicy, keyParent, aerospike.BinMap{
 		fields.TxID.String():           txIDParent.CloneBytes(),
+		fields.Utxos.String():          []interface{}{spentUtxoElement(&txIDNormal)},
 		fields.DeleteAtHeight.String(): 0,
 	})
 	require.NoError(t, err)
@@ -504,7 +509,6 @@ func TestMixedExternalAndNormalTransactions(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create 1 normal transaction (stored inline)
-	txIDNormal := chainhash.HashH([]byte("normal-mixed"))
 	keyNormal, _ := aerospike.NewKey(namespace, set, txIDNormal[:])
 
 	err = client.Put(writePolicy, keyNormal, aerospike.BinMap{

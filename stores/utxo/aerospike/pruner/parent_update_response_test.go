@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/require"
 )
 
@@ -256,6 +258,58 @@ func TestClassifyParentUpdateResult(t *testing.T) {
 		require.NoError(t, classifyErr)
 		require.Equal(t, parentUpdateOK, outcome)
 	})
+
+	// A record the batch never got an answer for keeps the NO_RESPONSE the client
+	// prepared it with and a nil Err: the client stamps Err only while parsing a
+	// response. On the plain MapPutItems path that used to read as success, so a
+	// node-level BatchOperate failure deleted every child with no marker.
+	t.Run("a record with no answer fails closed on both contracts", func(t *testing.T) {
+		key, err := aerospike.NewKey("test", "utxo", []byte("parent"))
+		require.NoError(t, err)
+
+		for _, usesModTeranode := range []bool{true, false} {
+			outcome, classifyErr := classifyParentUpdateResult(
+				&aerospike.BatchRecord{Key: key, ResultCode: types.NO_RESPONSE}, usesModTeranode)
+			require.Equalf(t, parentUpdateFailed, outcome, "usesModTeranode=%v", usesModTeranode)
+			require.ErrorContains(t, classifyErr, "no answer")
+		}
+	})
+}
+
+// spentUtxoElement builds one utxos-bin element recording spender as the
+// transaction that spent it: a 32-byte utxo hash (zero here) followed by the
+// 36 bytes of spending data, txid then vin.
+func spentUtxoElement(spender *chainhash.Hash) []byte {
+	element := make([]byte, 68)
+	copy(element[32:64], spender[:])
+
+	return element
+}
+
+// TestNamesSpender pins the rule that decides whether a pruned child may be
+// marked on a parent record: the output its input names must record that child
+// as the spender. A conflicting loser names the same outpoint and never held it.
+func TestNamesSpender(t *testing.T) {
+	var winner, loser chainhash.Hash
+	winner[0] = 0xAA
+	loser[0] = 0xBB
+
+	spentBy := func(spender chainhash.Hash) []byte {
+		element := make([]byte, 68)
+		copy(element[32:64], spender[:])
+
+		return element
+	}
+
+	unspent := make([]byte, 32)
+	utxos := []interface{}{spentBy(winner), unspent}
+
+	require.True(t, namesSpender(utxos, []uint32{0}, &winner), "the holder of the output is marked")
+	require.False(t, namesSpender(utxos, []uint32{0}, &loser), "a loser that never held the output is not")
+	require.False(t, namesSpender(utxos, []uint32{1}, &winner), "an unspent output names nobody")
+	require.False(t, namesSpender(utxos, []uint32{7}, &winner), "an offset past the page names nobody")
+	require.True(t, namesSpender(utxos, []uint32{1, 0}, &winner), "any claimed offset that names the child is enough")
+	require.False(t, namesSpender(nil, []uint32{0}, &winner), "a record with no utxos bin names nobody")
 }
 
 // okRecord / notFoundRecord / brokenRecord build the three parent-update results
