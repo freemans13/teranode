@@ -36,6 +36,12 @@ var loggingCalls = regexp.MustCompile(`^(Debugf|Infof|Warnf|Errorf|Fatalf|Panicf
 // urlish matches an argument expression that names itself as a URL.
 var urlish = regexp.MustCompile(`(?i)(url|dsn|connstr)`)
 
+// storeSetting matches a settings field reached through a settings value whose
+// name does not say URL, such as appSettings.UtxoStore.UtxoStore or
+// tSettings.Kafka.InvalidBlocksConfig. Most configured store and Kafka URLs
+// are named for what they point at, so urlish alone cannot see them.
+var storeSetting = regexp.MustCompile(`(?i)settings\.[A-Za-z0-9_.]*(store|config)(\.String\(\))?$`)
+
 // redacted matches an argument that has already been through a redacting
 // helper, either this package's or the standard library's.
 var redacted = regexp.MustCompile(`urlutil\.Redact|\.Redacted\(\)`)
@@ -145,13 +151,17 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 			}
 
 			for i, arg := range call.Args {
-				// Argument 0 is the format string.
-				if i == 0 {
+				// Argument 0 is the format string. A literal one names no
+				// variable, but one built by concatenation, as in
+				// errors.NewConfigurationError("bad URL "+u.String(), err),
+				// carries its operands into the message and is policed.
+				if _, literal := arg.(*ast.BasicLit); i == 0 && literal {
 					continue
 				}
 
 				text := exprText(arg)
-				if !urlish.MatchString(text) || redacted.MatchString(text) || isSafeAccessor(text) {
+				if !(urlish.MatchString(text) || storeSetting.MatchString(text)) ||
+					redacted.MatchString(text) || isSafeAccessor(text) {
 					continue
 				}
 

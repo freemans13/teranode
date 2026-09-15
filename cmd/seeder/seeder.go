@@ -217,7 +217,7 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 			defer wg.Done()
 
 			logger.Infof("Processing UTXOs...")
-			logger.Infof("UTXO store: %s", appSettings.UtxoStore.UtxoStore.String())
+			logger.Infof("UTXO store: %s", urlutil.Redact(appSettings.UtxoStore.UtxoStore))
 
 			// Process the UTXOs
 			tip, err := processUTXOs(ctx, logger, appSettings, blockchainStore, utxoFile, headerFile, force)
@@ -428,7 +428,7 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 		}
 	}
 
-	logger.Infof("Using utxostore at %s", appSettings.UtxoStore.UtxoStore)
+	logger.Infof("Using utxostore at %s", urlutil.Redact(appSettings.UtxoStore.UtxoStore))
 
 	var utxoStore utxo.Store
 
