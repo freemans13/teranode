@@ -40,6 +40,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/pkg/urlutil"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/utxopersister"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -195,7 +196,7 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 			defer wg.Done()
 
 			logger.Infof("Processing headers...")
-			logger.Infof("Blockchain store: %s", appSettings.BlockChain.StoreURL)
+			logger.Infof("Blockchain store: %s", urlutil.Redact(appSettings.BlockChain.StoreURL))
 
 			// Process the headers
 			if err := processHeaders(ctx, logger, blockchainStore, headerFile); err != nil {
@@ -389,7 +390,7 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 		}
 	}
 
-	logger.Infof("Using blockStore at %s with hashPrefix %d", blockStoreURL, hashPrefix)
+	logger.Infof("Using blockStore at %s with hashPrefix %d", urlutil.Redact(blockStoreURL), hashPrefix)
 
 	blockStore, err := blob.NewStore(logger, blockStoreURL, options.WithHashPrefix(hashPrefix))
 	if err != nil {

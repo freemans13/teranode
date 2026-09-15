@@ -1,0 +1,289 @@
+package urlutil_test
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+// This guard lives next to urlutil.Redact because it is what makes the helper
+// load-bearing: without it, the next URL logged unredacted reintroduces the
+// defect that motivated the helper (Teranode store URLs carry credentials in
+// their userinfo, so a URL in a log line is a working credential in a log
+// line).
+//
+// It is deliberately syntax-only. It reads names, not types, so it is fast
+// enough to run in `make test`. The trade is that it catches the realistic
+// regression - somebody writing logger.Infof("...", storeURL) - and not a URL
+// laundered through a variable named something else. A type-aware version
+// would need to load and type-check the whole module, which takes minutes.
+
+// loggingCalls are the call names whose arguments reach an operator: log
+// methods, the fmt printers, and the teranode error constructors, whose
+// messages are logged and can reach an API response.
+var loggingCalls = regexp.MustCompile(`^(Debugf|Infof|Warnf|Errorf|Fatalf|Panicf|Printf|New[A-Za-z]*Error)$`)
+
+// urlish matches an argument expression that names itself as a URL.
+var urlish = regexp.MustCompile(`(?i)(url|dsn|connstr)`)
+
+// redacted matches an argument that has already been through a redacting
+// helper, either this package's or the standard library's.
+var redacted = regexp.MustCompile(`urlutil\.Redact|\.Redacted\(\)`)
+
+// safeAccessors are URL components that carry no credential, so logging them
+// raw is fine. Hostname and Port are methods; Scheme, Host, Path and Opaque
+// are fields. Host keeps a port but never userinfo.
+var safeAccessors = []string{
+	".Scheme", ".Host", ".Hostname()", ".Port()", ".Path", ".Opaque", ".RequestURI()",
+}
+
+// peerURLPackages hold URLs supplied by remote peers over gossip and HTTP,
+// not URLs read from this node's own configuration. A peer's announced
+// DataHubURL or baseURL holds no credential of ours, and these packages log
+// them constantly while diagnosing sync and catch-up. Redacting them would be
+// churn with nothing behind it.
+//
+// Anything in these packages that DOES log a configured store URL still needs
+// urlutil.Redact - this exemption is about which URLs the package handles, so
+// revisit it if one of these packages starts reading store settings.
+var peerURLPackages = []string{
+	"services/blockvalidation/",
+	"services/subtreevalidation/",
+	"services/p2p/",
+	"model/",
+}
+
+// skipDirs are trees this guard does not police: third-party code, fixtures,
+// the dashboard, and the integration harness under test/, which builds URLs
+// for containers it started itself.
+var skipDirs = map[string]bool{
+	".git": true, ".claude": true, ".worktrees": true,
+	"vendor": true, "testdata": true, "node_modules": true,
+	"ui": true, "test": true,
+}
+
+// escapeComment marks a flagged line as reviewed. It must carry a reason:
+//
+//	logger.Infof("store: %s", cfg.StoreURL) // urlsafe: redacted at source in X
+const escapeComment = "urlsafe:"
+
+type violation struct {
+	pos  string
+	call string
+	arg  string
+}
+
+func TestNoUnredactedURLsInLogCalls(t *testing.T) {
+	root := repoRoot(t)
+
+	var violations []violation
+
+	// A repo walk that silently finds nothing would make this test pass while
+	// policing nothing at all, so count what was actually scanned.
+	scanned := 0
+
+	fset := token.NewFileSet()
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // an unreadable tree is not this guard's business
+		}
+
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+
+			return nil
+		}
+
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+
+		rel := filepath.ToSlash(mustRel(t, root, path))
+		for _, pkg := range peerURLPackages {
+			if strings.HasPrefix(rel, pkg) {
+				return nil
+			}
+		}
+
+		src, readErr := os.ReadFile(path) //nolint:gosec // walking a known repo tree
+		if readErr != nil {
+			return nil
+		}
+
+		file, parseErr := parser.ParseFile(fset, path, src, parser.ParseComments)
+		if parseErr != nil {
+			return nil
+		}
+
+		scanned++
+
+		lines := strings.Split(string(src), "\n")
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || !loggingCalls.MatchString(sel.Sel.Name) {
+				return true
+			}
+
+			for i, arg := range call.Args {
+				// Argument 0 is the format string.
+				if i == 0 {
+					continue
+				}
+
+				text := exprText(arg)
+				if !urlish.MatchString(text) || redacted.MatchString(text) || isSafeAccessor(text) {
+					continue
+				}
+
+				argLine := fset.Position(arg.Pos()).Line
+				callLine := fset.Position(call.Pos()).Line
+
+				if hasEscape(lines, argLine) || hasEscape(lines, callLine) || hasEscape(lines, callLine-1) {
+					continue
+				}
+
+				p := fset.Position(arg.Pos())
+
+				violations = append(violations, violation{
+					pos:  fmt.Sprintf("%s:%d:%d", rel, p.Line, p.Column),
+					call: sel.Sel.Name,
+					arg:  text,
+				})
+			}
+
+			return true
+		})
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	// The repo has well over a thousand non-test .go files outside the exempt
+	// trees. The floor only has to be high enough that a broken walk cannot
+	// clear it.
+	require.Greater(t, scanned, 500, "the guard scanned almost nothing, so it proves nothing")
+
+	sort.Slice(violations, func(i, j int) bool { return violations[i].pos < violations[j].pos })
+
+	if len(violations) == 0 {
+		return
+	}
+
+	report := make([]string, 0, len(violations))
+	for _, v := range violations {
+		report = append(report, "  "+v.pos+": "+v.call+"(..., "+v.arg+")")
+	}
+
+	t.Fatalf("URL passed to a logging call without redaction:\n%s\n\n"+
+		"Teranode store URLs carry credentials in their userinfo, so a URL in a log line is a\n"+
+		"working credential in a log line. Wrap the argument in urlutil.Redact (for a *url.URL)\n"+
+		"or urlutil.RedactString (for a string), or log only .Scheme/.Host/.Path.\n"+
+		"If the value is genuinely safe, add a trailing comment saying why:\n"+
+		"    // %s <reason>", strings.Join(report, "\n"), escapeComment)
+}
+
+func hasEscape(lines []string, line int) bool {
+	if line < 1 || line > len(lines) {
+		return false
+	}
+
+	idx := strings.Index(lines[line-1], escapeComment)
+	if idx < 0 {
+		return false
+	}
+
+	// The escape must carry a reason, so it cannot be pasted in blank.
+	return strings.TrimSpace(lines[line-1][idx+len(escapeComment):]) != ""
+}
+
+func isSafeAccessor(text string) bool {
+	for _, s := range safeAccessors {
+		if strings.HasSuffix(text, s) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// exprText renders the shape of an argument expression. It is intentionally
+// lossy: the guard only needs the identifier names to decide whether the
+// argument calls itself a URL.
+func exprText(e ast.Expr) string {
+	switch v := e.(type) {
+	case *ast.Ident:
+		return v.Name
+	case *ast.SelectorExpr:
+		return exprText(v.X) + "." + v.Sel.Name
+	case *ast.CallExpr:
+		return exprText(v.Fun) + "()"
+	case *ast.IndexExpr:
+		return exprText(v.X) + "[]"
+	case *ast.StarExpr:
+		return "*" + exprText(v.X)
+	case *ast.UnaryExpr:
+		return exprText(v.X)
+	case *ast.ParenExpr:
+		return exprText(v.X)
+	case *ast.BinaryExpr:
+		return exprText(v.X) + "+" + exprText(v.Y)
+	default:
+		return ""
+	}
+}
+
+func mustRel(t *testing.T, root, path string) string {
+	t.Helper()
+
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return path
+	}
+
+	return rel
+}
+
+// repoRoot walks up from the test's directory to the module root. It skips the
+// test rather than failing when this package is consumed from outside a
+// teranode checkout, where there is no repo to police.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.Getwd()
+	require.NoError(t, err)
+
+	for {
+		mod := filepath.Join(dir, "go.mod")
+		if b, readErr := os.ReadFile(mod); readErr == nil { //nolint:gosec // walking up from the test's own directory
+			if strings.Contains(string(b), "module github.com/bsv-blockchain/teranode") {
+				return dir
+			}
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Skip("not running inside a teranode checkout")
+		}
+
+		dir = parent
+	}
+}
