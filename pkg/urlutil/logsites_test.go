@@ -42,6 +42,10 @@ var urlish = regexp.MustCompile(`(?i)(url|dsn|connstr)`)
 // are named for what they point at, so urlish alone cannot see them.
 var storeSetting = regexp.MustCompile(`(?i)settings\.[A-Za-z0-9_.]*(store|config)(\.String\(\))?$`)
 
+// viaSettings matches an argument reached through a settings value, which is
+// this node's own configuration even inside a peer-URL package.
+var viaSettings = regexp.MustCompile(`(?i)settings\.`)
+
 // redacted matches an argument that has already been through a redacting
 // helper, either this package's or the standard library's.
 var redacted = regexp.MustCompile(`urlutil\.Redact|\.Redacted\(\)`)
@@ -59,9 +63,9 @@ var safeAccessors = []string{
 // them constantly while diagnosing sync and catch-up. Redacting them would be
 // churn with nothing behind it.
 //
-// Anything in these packages that DOES log a configured store URL still needs
-// urlutil.Redact - this exemption is about which URLs the package handles, so
-// revisit it if one of these packages starts reading store settings.
+// The exemption covers URL-named arguments only. An argument reached through a
+// settings value is this node's configuration, so it is still policed here, as
+// in logger.Infof("%s", tSettings.Kafka.InvalidSubtreesConfig).
 var peerURLPackages = []string{
 	"services/blockvalidation/",
 	"services/subtreevalidation/",
@@ -118,9 +122,13 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 		}
 
 		rel := filepath.ToSlash(mustRel(t, root, path))
+
+		peerPkg := false
+
 		for _, pkg := range peerURLPackages {
 			if strings.HasPrefix(rel, pkg) {
-				return nil
+				peerPkg = true
+				break
 			}
 		}
 
@@ -160,8 +168,7 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 				}
 
 				text := exprText(arg)
-				if !(urlish.MatchString(text) || storeSetting.MatchString(text)) ||
-					redacted.MatchString(text) || isSafeAccessor(text) {
+				if !isConfiguredURL(text, peerPkg) || redacted.MatchString(text) || isSafeAccessor(text) {
 					continue
 				}
 
@@ -278,6 +285,21 @@ func loggingFuncVars(file *ast.File) map[string]string {
 	})
 
 	return bound
+}
+
+// isConfiguredURL reports whether an argument names a URL this guard polices.
+// In a peer-URL package a URL-named argument is a peer's URL unless it is
+// reached through a settings value, so only settings paths count there.
+func isConfiguredURL(text string, peerPkg bool) bool {
+	if storeSetting.MatchString(text) {
+		return true
+	}
+
+	if !urlish.MatchString(text) {
+		return false
+	}
+
+	return !peerPkg || viaSettings.MatchString(text)
 }
 
 func hasEscape(lines []string, line int) bool {
