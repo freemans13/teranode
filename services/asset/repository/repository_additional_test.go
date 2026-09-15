@@ -190,11 +190,15 @@ func TestRepository_GetSubtreeBytes_Success(t *testing.T) {
 // subtree it has only as FileTypeSubtreeToCheck, the pre-validation copy written when this
 // node fetches a subtree from a peer during catch-up (bitcoin-sv/teranode#4842).
 //
-// These five readers each used to fall back to that file type, which is how a peer-chosen
-// hash could be read back out of the victim's own public Asset origin. The test covers all
-// five together so a sixth reader added later is an obvious omission rather than a silent
-// one, and it asserts the negative directly: subtree present ONLY as the pending type, every
-// reader refuses.
+// Five of these readers used to fall back to that file type directly, and the sixth,
+// GetSubtreeDataReader, admitted it as a regeneration source. That is how a peer-chosen hash
+// could be read back out of the victim's own public Asset origin. The test covers all six
+// together so a seventh reader added later is an obvious omission rather than a silent one.
+//
+// Each refusal is asserted as a not-found error, because that is what the HTTP handlers map
+// to 404; a bare "some error" would also pass for a broken fixture or a 500. The final
+// subtest then writes the validated file for the same hash and requires the readers to
+// succeed, so the refusals are proven to come from the file type and nothing else.
 func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 	st, err := subtree.NewTreeByLeafCount(2)
 	require.NoError(t, err)
@@ -212,31 +216,31 @@ func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 
 	t.Run("GetSubtreeBytes", func(t *testing.T) {
 		retrieved, err := repo.GetSubtreeBytes(ctx, subtreeHash)
-		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, retrieved)
 	})
 
 	t.Run("GetSubtreeTxIDsReader", func(t *testing.T) {
 		reader, err := repo.GetSubtreeTxIDsReader(ctx, subtreeHash)
-		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, reader)
 	})
 
 	t.Run("GetSubtree", func(t *testing.T) {
 		retrieved, err := repo.GetSubtree(ctx, subtreeHash)
-		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, retrieved)
 	})
 
 	t.Run("GetSubtreeHead", func(t *testing.T) {
 		retrieved, numNodes, err := repo.GetSubtreeHead(ctx, subtreeHash)
-		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, retrieved)
 		require.Equal(t, 0, numNodes)
 	})
 
-	// GetSubtreeExists gates the public /subtree/:hash/txs and search routes, so a pending
-	// subtree must read as absent rather than merely fail to serve.
+	// GetSubtreeExists gates the public POST /subtree/:hash/txs and search routes, so a
+	// pending subtree must read as absent rather than merely fail to serve.
 	t.Run("GetSubtreeExists", func(t *testing.T) {
 		exists, err := repo.GetSubtreeExists(ctx, subtreeHash)
 		require.NoError(t, err)
@@ -247,8 +251,36 @@ func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 	// subtree must not be a regeneration source either, or the removal above is bypassed.
 	t.Run("GetSubtreeDataReader", func(t *testing.T) {
 		reader, err := repo.GetSubtreeDataReader(ctx, subtreeHash)
-		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, reader)
+	})
+
+	// Positive control on the same repository and hash: once the validated file exists the
+	// readers answer. Without this, every refusal above would also pass against a fixture
+	// that could not serve anything at all.
+	t.Run("ValidatedSubtreeIsServed", func(t *testing.T) {
+		require.NoError(t, repo.SubtreeStore.Set(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtree, subtreeBytes))
+
+		retrievedBytes, err := repo.GetSubtreeBytes(ctx, subtreeHash)
+		require.NoError(t, err)
+		require.Equal(t, subtreeBytes, retrievedBytes)
+
+		reader, err := repo.GetSubtreeTxIDsReader(ctx, subtreeHash)
+		require.NoError(t, err)
+		require.NoError(t, reader.Close())
+
+		retrieved, err := repo.GetSubtree(ctx, subtreeHash)
+		require.NoError(t, err)
+		require.Equal(t, *subtreeHash, *retrieved.RootHash())
+
+		head, numNodes, err := repo.GetSubtreeHead(ctx, subtreeHash)
+		require.NoError(t, err)
+		require.NotNil(t, head)
+		require.Equal(t, 2, numNodes)
+
+		exists, err := repo.GetSubtreeExists(ctx, subtreeHash)
+		require.NoError(t, err)
+		require.True(t, exists)
 	})
 }
 
