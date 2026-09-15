@@ -89,6 +89,10 @@ func (m *MockUtxostore) Get(ctx context.Context, hash *chainhash.Hash, fieldName
 // The derivation is deliberately gated on the field actually being requested, so
 // a caller that forgets to ask for fields.TxInpoints still sees an empty value
 // and its test still fails. A fixture that sets TxInpoints explicitly wins.
+//
+// The derived value goes on a shallow copy, never on the fixture itself. Writing
+// through the fixture pointer would make the gate hold only for the first call,
+// and concurrent Gets on one hash would race on the shared struct.
 func withDerivedTxInpoints(data *meta.Data, fieldNames []fields.FieldName) *meta.Data {
 	if data == nil || data.Tx == nil || len(data.Tx.Inputs) == 0 {
 		return data
@@ -116,9 +120,10 @@ func withDerivedTxInpoints(data *meta.Data, fieldNames []fields.FieldName) *meta
 		return data
 	}
 
-	data.TxInpoints = txInpoints
+	derived := *data
+	derived.TxInpoints = txInpoints
 
-	return data
+	return &derived
 }
 
 // Delete mocks the deletion of transaction metadata from the UTXO store.

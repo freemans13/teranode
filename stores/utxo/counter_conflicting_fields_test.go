@@ -150,3 +150,42 @@ func TestGetCounterConflictingTxHashesWithoutTransactionBody(t *testing.T) {
 	require.Equal(t, []chainhash.Hash{txHash}, result)
 	mockStore.AssertExpectations(t)
 }
+
+// TestGetCounterConflictingTxHashesErrorsOnMissingParentRecord covers the parent
+// lookup, which has the same (nil, nil) contract as the lookup of the
+// transaction itself. Aerospike's BatchDecorate leaves Data nil and Err unset for
+// the coinbase-placeholder hash, and without a guard the walk dereferenced
+// parentTxMeta.SpendingDatas and panicked the subtree-validation goroutine.
+//
+// The end state asserted is an ErrTxNotFound error, not an empty counter set: a
+// parent the store does not hold says nothing about who spent its outputs, so
+// returning only txHash would under-report the counter-conflicting set.
+func TestGetCounterConflictingTxHashesErrorsOnMissingParentRecord(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	txHash := createTestHash("child-of-missing-parent")
+	parentTxHash := createTestHash("missing-parent")
+
+	inpoints := inpointsFromTx(t, createTestTransactionWithInputs(parentTxHash, 0))
+
+	mockStore.On("Get", mock.Anything, &txHash, mock.Anything).
+		Return(&meta.Data{TxInpoints: inpoints}, nil)
+
+	mockStore.On("Get", mock.Anything, &parentTxHash, mock.Anything).
+		Return(nil, nil)
+
+	var (
+		result []chainhash.Hash
+		err    error
+	)
+
+	require.NotPanics(t, func() {
+		result, err = GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0)
+	})
+
+	require.Nil(t, result)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+	mockStore.AssertExpectations(t)
+}

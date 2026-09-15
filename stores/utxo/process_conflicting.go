@@ -1209,6 +1209,14 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 			return nil, err
 		}
 
+		// Same (nil, nil) contract as the lookup above. Report it as not found
+		// rather than skipping the parent: a parent the store does not hold says
+		// nothing about who spent its outputs, so skipping would silently shrink
+		// the counter-conflicting set.
+		if parentTxMeta == nil {
+			return nil, errors.NewTxNotFoundError("[GetCounterConflictingTxHashes][%s] parent tx %s not found", txHash.String(), parentTxHash.String())
+		}
+
 		spendingTxIDs := make([]*chainhash.Hash, len(parentTxMeta.SpendingDatas))
 
 		for idx, spendingData := range parentTxMeta.SpendingDatas {
