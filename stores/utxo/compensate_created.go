@@ -26,17 +26,19 @@ import (
 // scan ever reclaims it, and on the legacy path it is unlocked and spendable
 // even though a mined descendant already consumed those outputs.
 //
-// Two kinds of record qualify.
+// Two kinds of record qualify, and both only when this attempt created them.
 //
-// The rejected transactions themselves are ghosts whether or not this attempt
-// created them. The store rejects a spend on a replay marker only for a
-// transaction this store already pruned, and pruning happens only once every
-// output is spent and the transaction is buried below retention, so there is no
-// route by which it legitimately comes back. A record for it can only be what a
-// replay left behind: this attempt's create phase, or an earlier attempt whose
-// compensating delete failed. Excluding "already existed" here is what made a
-// transient delete failure permanent: the next attempt saw ErrTxExists, filed
-// the leftover as pre-existing and skipped it forever.
+// The rejected transactions themselves are ghosts when createdHere says so. A
+// marker hit is not, on its own, proof that a record is a replay's leftover:
+// the pruner writes a parent's marker before it deletes the child and holds the
+// child back when a sibling parent's marker fails, so a live, mined child can
+// sit behind a marker until a later cycle removes it. Deleting "whatever the
+// store rejected" removed that live transaction, and every dependent this
+// attempt created with it. The leftover of an earlier attempt whose
+// compensating delete failed is still caught, because it is still locked and
+// carries this block's id, which is exactly what createdHere recognises (see
+// LeftoversAmong). With the catch-up lock switched off nothing writes that mark
+// and such a leftover survives; that limit is the lock setting's, stated there.
 //
 // A transaction in the same block that spends an output of a ghost is a ghost
 // too, but only when this attempt created it. Its own markers cannot catch it:
@@ -61,7 +63,10 @@ import (
 // Every hash in rejected must name a transaction in txs, which holds at both
 // call sites because the rejections came from spending exactly that list.
 func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere func(*chainhash.Hash) bool) []*bt.Tx {
-	if len(rejected) == 0 {
+	if len(rejected) == 0 || createdHere == nil {
+		// Without a createdHere answer nothing can be shown to be this attempt's
+		// own write, and deleting a record this attempt did not write is the one
+		// thing this function must never do.
 		return nil
 	}
 
@@ -83,7 +88,7 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 		}
 
 		tx, ok := byHash[*hash]
-		if !ok {
+		if !ok || !createdHere(hash) {
 			continue
 		}
 
@@ -119,28 +124,43 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 // wrote: their presence proves nothing about prior validation, and if the
 // spend phase rejects them they are ghosts to delete.
 //
-// The durable mark is the lock. Both below-checkpoint block paths create every
-// transaction of a block locked and clear the lock only once the block is
-// committed, so a record that already exists AND is locked at create time is a
-// two-phase write that never completed: this block's own earlier attempt, or a
-// sibling validation of the same block, which comes to the same thing. A
-// legitimately pre-existing mined record is never locked: a mempool
-// transaction is created locked but SetMined clears it when its block is
-// processed, and a block-created record is unlocked by that block's post-commit
-// pass. Read BEFORE the caller's SetMinedMulti for existing transactions, which
+// The durable mark is the lock together with this block's id. Both
+// below-checkpoint block paths create every transaction of a block locked, with
+// that block's id, and clear the lock only once the block is committed, so a
+// record that already exists, is locked AND already carries blockID is a
+// two-phase write of this very block that never completed: its own earlier
+// attempt, or a sibling validation of the same block, which comes to the same
+// thing. A retry of the same block gets the same id: both paths reuse the id
+// recorded on the block's first non-coinbase record, and AssignBlockID is
+// idempotent per block hash while the blockchain service holds the reservation.
+//
+// The lock alone is not enough, because other writers leave a record locked: a
+// different block validating concurrently that shares the transaction (its
+// create wrote it locked with ITS id), a post-commit unlock pass that failed,
+// conflict resolution locking a conflicting transaction's parents, or a mempool
+// two-phase create. None of those carries this block's id, so each is filed as
+// pre-existing. That keeps it in the caller's SetMinedMulti, so it gains this
+// block's id instead of failing a descendant block with "has no block IDs", and
+// it keeps it out of the compensation, so it is never deleted as a ghost. Read BEFORE the caller's SetMinedMulti for existing transactions, which
 // clears the lock; the caller then leaves leftovers out of that call, which is
 // safe because AssignBlockID is idempotent per block hash, so a leftover already
 // carries this block's id.
 //
-// Two limits, both stated rather than hidden. With the catch-up lock switched
-// off (blockvalidation_quick_validate_skip_utxo_lock) nothing writes the mark,
-// and a leftover is filed as pre-existing again. And conflict resolution locks
-// the parents of a conflicting transaction for the few store round trips of
-// ProcessConflicting; a replay of such a parent's block in exactly that window
-// would misfile it as a leftover, and if its own parent is pruned too it would
-// be deleted. That fails towards a missing record this node will notice when it
-// next validates a spend of it, not towards a double-spendable output.
-func LeftoversAmong(ctx context.Context, store Store, existing []*chainhash.Hash) (map[chainhash.Hash]struct{}, error) {
+// A store read that fails for any one record fails the whole call. BatchDecorate
+// reports a per-record failure (a timeout, DEVICE_OVERLOAD, a replica read
+// error) in that item's Err and returns nil overall, and reading such an item as
+// "not locked" filed an unknown record as pre-existing, which switched the
+// "already blessed" fallback back on for it. An unreadable record is not an
+// answer; the block is retried instead.
+//
+// Two limits, stated rather than hidden. With the catch-up lock switched off
+// (blockvalidation_quick_validate_skip_utxo_lock) nothing writes the mark, and a
+// leftover is filed as pre-existing again. And the id match assumes the retry
+// gets the id the earlier attempt stamped; if the process restarted (losing the
+// blockchain service's reservation) AND the block's first non-coinbase record is
+// gone (the id-reuse lookup reads it), the retry takes a new id and the other
+// leftovers of the earlier attempt are filed as pre-existing.
+func LeftoversAmong(ctx context.Context, store Store, existing []*chainhash.Hash, blockID uint32) (map[chainhash.Hash]struct{}, error) {
 	if len(existing) == 0 {
 		return nil, nil
 	}
@@ -150,19 +170,38 @@ func LeftoversAmong(ctx context.Context, store Store, existing []*chainhash.Hash
 		unresolved[i] = &UnresolvedMetaData{Hash: *hash, Idx: i}
 	}
 
-	if err := store.BatchDecorate(ctx, unresolved, fields.Locked); err != nil {
+	if err := store.BatchDecorate(ctx, unresolved, fields.Locked, fields.BlockIDs); err != nil {
 		return nil, errors.NewStorageError("[LeftoversAmong] could not read the lock state of %d existing transactions", len(existing), err)
 	}
 
 	leftovers := make(map[chainhash.Hash]struct{})
 
 	for _, item := range unresolved {
-		if item.Data != nil && item.Data.Locked {
+		if item.Err != nil {
+			return nil, errors.NewStorageError("[LeftoversAmong] could not read the lock state of existing transaction %s", item.Hash.String(), item.Err)
+		}
+
+		if item.Data == nil {
+			return nil, errors.NewStorageError("[LeftoversAmong] store returned no data for existing transaction %s", item.Hash.String())
+		}
+
+		if item.Data.Locked && carriesBlockID(item.Data.BlockIDs, blockID) {
 			leftovers[item.Hash] = struct{}{}
 		}
 	}
 
 	return leftovers, nil
+}
+
+// carriesBlockID reports whether blockIDs contains blockID.
+func carriesBlockID(blockIDs []uint32, blockID uint32) bool {
+	for _, id := range blockIDs {
+		if id == blockID {
+			return true
+		}
+	}
+
+	return false
 }
 
 // IsPrunedReplayRejection reports whether a spend-phase error identifies the
@@ -323,16 +362,59 @@ func retryStoreCall(ctx context.Context, fn func() error) error {
 // it back unconditionally made the orphan permanent: the output stayed spent by
 // a transaction the store does not hold, and its next legitimate spender was
 // refused with a txid this node has never seen.
-func RollbackSet(all []*Spend, written, idempotent []*Spend) []*Spend {
-	if len(idempotent) == 0 {
+//
+// historical is the caller's answer to "might this call have been rejected on a
+// pruned-replay marker?". It must be true when any input was, and also whenever
+// the caller does not know every input's answer, as on a spend call aborted
+// while some inputs were still in flight: an input not yet answered may be the
+// marker hit, and reading an in-flight slot is a data race besides. Holding an
+// idempotent match back fails towards an output left spent by a transaction the
+// store does not hold, which the next attempt heals; reversing it wrongly hands
+// a confirmed output to anyone.
+func RollbackSet(written, idempotent []*Spend, historical bool) []*Spend {
+	if len(idempotent) == 0 || historical {
 		return written
 	}
 
-	for _, spend := range all {
+	return append(written, idempotent...)
+}
+
+// AnyPrunedReplay reports whether any spend failed on a pruned-replay marker.
+// Only for spends whose Err slot is safe to read.
+func AnyPrunedReplay(spends []*Spend) bool {
+	for _, spend := range spends {
 		if spend != nil && spend.Err != nil && errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) {
-			return written
+			return true
 		}
 	}
 
-	return append(written, idempotent...)
+	return false
+}
+
+// ReplayRejectionsFirst reorders per-input spend errors so the ones that
+// identify a pruned replay come first: the marker rejection, then a missing
+// parent. Stores and the validator aggregate these with errors.JoinCapped, which
+// keeps only the first few links, so on a wide transaction whose marker hit sat
+// past the cap the rejection vanished from the error and the block paths could
+// not recognise the replay. The order within each group is preserved.
+func ReplayRejectionsFirst(errs []error) []error {
+	ordered := make([]error, 0, len(errs))
+
+	for _, rank := range []func(error) bool{
+		func(err error) bool { return errors.Is(err, errors.ErrUtxoSpendingTxPruned) },
+		func(err error) bool {
+			return !errors.Is(err, errors.ErrUtxoSpendingTxPruned) && errors.Is(err, errors.ErrTxNotFound)
+		},
+		func(err error) bool {
+			return !errors.Is(err, errors.ErrUtxoSpendingTxPruned) && !errors.Is(err, errors.ErrTxNotFound)
+		},
+	} {
+		for _, err := range errs {
+			if err != nil && rank(err) {
+				ordered = append(ordered, err)
+			}
+		}
+	}
+
+	return ordered
 }

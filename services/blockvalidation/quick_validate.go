@@ -1481,7 +1481,12 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// block did not create them.
 	var existingTxsMu sync.Mutex
 	var existingTxHashes []*chainhash.Hash
-	existingTxSet := make(map[chainhash.Hash]struct{})
+
+	// writtenTxSet holds exactly the records phase 1 wrote. It is not "every
+	// transaction that did not already exist": a transaction
+	// shouldSkipUnspendableCreate leaves out was never written, and filing it as
+	// written would tell the store and the compensation it is this attempt's own.
+	writtenTxSet := make(map[chainhash.Hash]struct{})
 
 	minedBlockInfo := utxo.MinedBlockInfo{
 		BlockID:     block.ID,
@@ -1514,12 +1519,16 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 						txHash := tx.TxIDChainHash()
 						existingTxsMu.Lock()
 						existingTxHashes = append(existingTxHashes, txHash)
-						existingTxSet[*txHash] = struct{}{}
 						existingTxsMu.Unlock()
 						return nil
 					}
 					return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to create UTXO for tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
 				}
+
+				existingTxsMu.Lock()
+				writtenTxSet[*tx.TxIDChainHash()] = struct{}{}
+				existingTxsMu.Unlock()
+
 				return nil
 			})
 		}
@@ -1534,7 +1543,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// before phase 1.5, which clears the lock, and left out of it, since
 	// AssignBlockID is idempotent per block hash so they already carry this
 	// block's id.
-	leftovers, err := utxo.LeftoversAmong(ctx, u.utxoStore, existingTxHashes)
+	leftovers, err := utxo.LeftoversAmong(ctx, u.utxoStore, existingTxHashes, block.ID)
 	if err != nil {
 		return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to classify %d existing txs", block.Hash().String(), len(existingTxHashes), err)
 	}
@@ -1583,9 +1592,9 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 			return true
 		}
 
-		_, existed := existingTxSet[*txHash]
+		_, written := writtenTxSet[*txHash]
 
-		return !existed
+		return written
 	}
 
 	prunedReplays, err := u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly, createdHere)
@@ -1697,7 +1706,15 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 				if _, _, err := u.utxoStore.SpendAndCreate(spendCtx, tx, block.Height, utxo.WithSpendOnly(),
 					utxo.WithIgnoreLocked(true), utxo.WithSkipUTXOHashCheck(outpointOnly),
 					utxo.WithSpenderCreatedByCaller(created)); err != nil {
-					if errors.IsRetryableError(err) {
+					// A pruned-replay rejection is classified before the retry test.
+					// It is deterministic, so retrying cannot change it, and the store
+					// joins every input's error into one: a sibling input that failed
+					// on a transient ERR_STORAGE_ERROR makes the whole error retryable,
+					// and if that lasted through every attempt the replay was never
+					// recorded and its recreated record was never removed.
+					pruned := utxo.IsPrunedReplayRejection(err, created)
+
+					if !pruned && errors.IsRetryableError(err) {
 						mu.Lock()
 						retryable = append(retryable, tx)
 						lastErr = err
@@ -1705,7 +1722,7 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 						return nil
 					}
 					mu.Lock()
-					if utxo.IsPrunedReplayRejection(err, created) {
+					if pruned {
 						prunedReplays = append(prunedReplays, txHash)
 					}
 					hardFail = errors.NewProcessingError("[spendBatchWithRetry][%s] failed to spend tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)

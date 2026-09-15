@@ -712,6 +712,15 @@ func (sm *SyncManager) legacyUnified(origin blockRequestOrigin, height uint32) b
 		sm.legacyOutpointOnly(origin, height)
 }
 
+// unlockAttempts and unlockBackoff bound the retry of one post-commit unlock
+// chunk. compensatingDeleteTimeout bounds the detached compensation after a
+// failed pre-validation and the detached unlock pass.
+const (
+	unlockAttempts            = 3
+	unlockBackoff             = 100 * time.Millisecond
+	compensatingDeleteTimeout = 2 * time.Minute
+)
+
 // catchupLocksUTXOs reports whether the legacy create phase locks the records it
 // writes. It follows the same setting as the quick path, so one knob governs
 // the below-checkpoint lock on both routes.
@@ -724,6 +733,15 @@ func (sm *SyncManager) catchupLocksUTXOs() bool {
 // is, because a single call with every transaction of a fat block overruns the
 // aerospike client connection pool. The coinbase is never in the store's create
 // phase and is skipped.
+//
+// Every non-coinbase transaction is unlocked, the same set the quick path's
+// unlockSubtreeTransactions clears. For a record that already existed this is not
+// a new release: createUtxos ran SetMinedMulti on it, and setMined clears the lock.
+//
+// The block is already committed and nothing re-runs it, so a chunk that fails
+// here leaves its records locked for good. Each chunk therefore runs detached
+// from the caller's context, with its own retries, and one chunk's failure does
+// not cancel the others; the error is still returned so the operator sees it.
 func (sm *SyncManager) unlockBlockTransactions(ctx context.Context, origin blockRequestOrigin, height uint32, txHashes []chainhash.Hash) error {
 	if !sm.quickValidationAllowed(origin, height) || sm.legacyUnified(origin, height) || !sm.catchupLocksUTXOs() || len(txHashes) <= 1 {
 		return nil
@@ -736,7 +754,10 @@ func (sm *SyncManager) unlockBlockTransactions(ctx context.Context, origin block
 		chunkSize = 1024
 	}
 
-	g, gCtx := errgroup.WithContext(ctx)
+	unlockCtx, cancelUnlock := context.WithTimeout(context.WithoutCancel(ctx), compensatingDeleteTimeout)
+	defer cancelUnlock()
+
+	g := new(errgroup.Group)
 	util.SafeSetLimit(sm.logger, g, sm.settings.UtxoStore.MaxMinedRoutines)
 
 	for start := 0; start < len(hashes); start += chunkSize {
@@ -748,11 +769,25 @@ func (sm *SyncManager) unlockBlockTransactions(ctx context.Context, origin block
 		chunk := hashes[start:end]
 
 		g.Go(func() error {
-			if err := sm.utxoStore.SetLocked(gCtx, chunk, false); err != nil {
-				return errors.NewProcessingError("[unlockBlockTransactions] failed to unlock %d transactions", len(chunk), err)
+			var err error
+
+			for attempt := 0; attempt < unlockAttempts; attempt++ {
+				if attempt > 0 {
+					select {
+					case <-unlockCtx.Done():
+						return errors.NewProcessingError("[unlockBlockTransactions] gave up unlocking %d transactions of committed block at height %d", len(chunk), height, err)
+					case <-time.After(unlockBackoff * time.Duration(attempt)):
+					}
+				}
+
+				if err = sm.utxoStore.SetLocked(unlockCtx, chunk, false); err == nil {
+					return nil
+				}
 			}
 
-			return nil
+			sm.logger.Errorf("[unlockBlockTransactions] failed to unlock %d transactions of committed block at height %d after %d attempts; they stay locked: %v", len(chunk), height, unlockAttempts, err)
+
+			return errors.NewProcessingError("[unlockBlockTransactions] failed to unlock %d transactions", len(chunk), err)
 		})
 	}
 
@@ -1038,18 +1073,23 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 		// qualifies, and why a rejected transaction is removed even when
 		// createUtxos found it already present, is set out on
 		// utxo.PrunedReplayGhosts. Create never consults the markers, so the
-		// records got written and are only rejected here. On this path they are
-		// created without WithLocked, so leaving one behind is worse than on the
-		// blockvalidation path: mined, unlocked and spendable even though a mined
-		// descendant already consumed those outputs, and with no
-		// delete_at_height nothing ever reclaims it.
+		// records got written and are only rejected here. Each is stored mined
+		// and locked, with no delete_at_height, so nothing else ever reclaims it,
+		// and once unlocked it would be spendable even though a mined descendant
+		// already consumed those outputs.
 		//
 		// Deliberately NOT everything createUtxos wrote. The rest may be valid
 		// and wanted by a concurrently validating sibling block that took
 		// ErrTxExists on them.
 		ghosts := utxo.PrunedReplayGhosts(blockTransactions(txMap), prunedReplays, createdHere)
 
-		if deleteErr := utxo.DeleteCreated(ctx, sm.logger, sm.utxoStore, ghosts,
+		// Detached from ctx, like the quick path's twin: a cancellation landing
+		// at the moment of the hard fail must not abort the compensation and
+		// leave the ghost. The delete gets its own bounded budget instead.
+		deleteCtx, cancelDelete := context.WithTimeout(context.WithoutCancel(ctx), compensatingDeleteTimeout)
+		defer cancelDelete()
+
+		if deleteErr := utxo.DeleteCreated(deleteCtx, sm.logger, sm.utxoStore, ghosts,
 			sm.settings.Legacy.StoreBatcherSize*sm.settings.Legacy.StoreBatcherConcurrency); deleteErr != nil {
 			return errors.NewProcessingError("[validateTransactionsLegacyMode] pre-validation failed and the recreated pruned transactions could not be removed", errors.Join(err, deleteErr))
 		}
@@ -1417,7 +1457,7 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	// idempotent per block hash (and reuseBlockIDFromUTXO keys on it), so they
 	// already carry this block's id. They are reported as created so the spend
 	// phase and the compensation treat them as this node's own writes.
-	leftovers, err := utxo.LeftoversAmong(ctx, sm.utxoStore, existingTxHashes)
+	leftovers, err := utxo.LeftoversAmong(ctx, sm.utxoStore, existingTxHashes, blockID)
 	if err != nil {
 		return nil, errors.NewProcessingError("failed to classify existing utxos", err)
 	}
@@ -1655,6 +1695,21 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					blockHeight,
 					validateOpts...,
 				); validateErr != nil {
+					// A pruned-replay rejection is classified first. It is
+					// deterministic, so neither the conflicting swallow nor a retry
+					// may take it: the store joins every input's error into one, and
+					// a sibling input's transient ERR_STORAGE_ERROR makes the whole
+					// error retryable, which left the replay unrecorded and its
+					// recreated record in place once the retries ran out.
+					if utxo.IsPrunedReplayRejection(validateErr, created) {
+						mu.Lock()
+						prunedReplays = append(prunedReplays, txWrapper.Tx.TxIDChainHash())
+						hardFail = validateErr
+						mu.Unlock()
+
+						return nil
+					}
+
 					// ErrTxConflicting is expected during legacy catchup when the UTXO store
 					// has stale spending data. The block is confirmed, so its transactions
 					// take precedence — the conflict will be resolved by ProcessConflicting
@@ -1678,7 +1733,6 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 						mu.Unlock()
 					} else {
 						mu.Lock()
-						prunedReplays = appendPrunedReplay(prunedReplays, validateErr, txWrapper.Tx.TxIDChainHash(), created)
 						hardFail = validateErr
 						mu.Unlock()
 					}
@@ -1713,17 +1767,6 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 
 	return prunedReplays, errors.NewProcessingError("[PreValidateTransactions] %d of %d transactions still failing after %d retries",
 		len(pendingTxHashes), totalTxCount, maxRetries)
-}
-
-// appendPrunedReplay records txHash when err identifies the transaction as a
-// replay of a pruned transaction (utxo.IsPrunedReplayRejection), so
-// validateTransactionsLegacyMode can remove the record createUtxos wrote for it.
-func appendPrunedReplay(prunedReplays []*chainhash.Hash, err error, txHash *chainhash.Hash, createdHere bool) []*chainhash.Hash {
-	if !utxo.IsPrunedReplayRejection(err, createdHere) {
-		return prunedReplays
-	}
-
-	return append(prunedReplays, txHash)
 }
 
 // classifyAndCountPrewarmError routes a validator error from the pre-warm path

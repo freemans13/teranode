@@ -494,8 +494,18 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// completed, never for a bare timeout/cancel — the Lua spend script
 		// is idempotent for the same spender, so successful spends can
 		// safely remain and will be silently skipped on retry.
-		if result.rollbackNeeded && len(result.spentSpends) > 0 {
-			if unspendErr := s.Unspend(context.Background(), utxo.RollbackSet(spends, result.spentSpends, result.idempotentSpends)); unspendErr != nil {
+		//
+		// Whether an idempotent match is historical is decided from the
+		// completed items only (result.prunedRejection), and an input still in
+		// flight counts as a possible marker hit (result.unresolved): its slot
+		// cannot be read without racing the dispatcher, and an unanswered
+		// marker hit read as "no marker" reversed a confirmed spend. The
+		// guard is on the set actually reversed, so a call whose only
+		// successful inputs were idempotent matches is still healed.
+		rollback := result.rollbackSet()
+
+		if result.rollbackNeeded && len(rollback) > 0 {
+			if unspendErr := s.Unspend(context.Background(), rollback); unspendErr != nil {
 				s.logger.Errorf("error in aerospike unspend (batched mode, after wait error): %v", unspendErr)
 			}
 		}
@@ -530,7 +540,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// script is idempotent for the same spender, so successful spends can safely
 		// remain and will be silently skipped on retry.
 		if result.rollbackNeeded {
-			if unspendErr := s.Unspend(context.Background(), utxo.RollbackSet(spends, result.spentSpends, result.idempotentSpends)); unspendErr != nil {
+			if unspendErr := s.Unspend(context.Background(), result.rollbackSet()); unspendErr != nil {
 				s.logger.Errorf("error in aerospike unspend (batched mode): %v", unspendErr)
 			}
 		}
@@ -549,7 +559,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		}
 
 		// return the errors found
-		return spends, errors.NewUtxoError("error in aerospike spend (batched mode) - errors", errors.JoinCapped(maxAggregatedSpendErrs, failedSpends...))
+		return spends, errors.NewUtxoError("error in aerospike spend (batched mode) - errors", errors.JoinCapped(maxAggregatedSpendErrs, utxo.ReplayRejectionsFirst(failedSpends)...))
 	}
 
 	prometheusUtxoMapSpend.Add(float64(len(spends)))
@@ -565,6 +575,20 @@ type spendCompletionResult struct {
 	idempotentSpends []*utxo.Spend // already recorded; this call wrote nothing
 	succeeded        int           // every input that did not fail, idempotent matches included
 	rollbackNeeded   bool
+	// prunedRejection is true when a resolved input failed on a pruned-replay
+	// marker; see utxo.RollbackSet.
+	prunedRejection bool
+	// unresolved counts inputs skipped because they were still in flight on the
+	// abort path. Their answers are unknown.
+	unresolved int
+}
+
+// rollbackSet is the set a failed call reverses (see utxo.RollbackSet). An
+// idempotent match is held back when a resolved input hit a pruned-replay marker
+// or when any input is still unanswered, since that input may be the marker hit.
+// On the normal path every input is answered, so unresolved is zero there.
+func (r *spendCompletionResult) rollbackSet() []*utxo.Spend {
+	return utxo.RollbackSet(r.spentSpends, r.idempotentSpends, r.prunedRejection || r.unresolved > 0)
 }
 
 // resolveSpendCompletions applies the ErrTxNotFound "already blessed"
@@ -589,6 +613,8 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 
 	for _, item := range items {
 		if onlyCompleted && !item.published.Load() {
+			result.unresolved++
+
 			continue
 		}
 
@@ -622,6 +648,10 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 
 			if isSpendRollbackError(spend.Err) {
 				result.rollbackNeeded = true
+			}
+
+			if errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) {
+				result.prunedRejection = true
 			}
 
 			// don't stop processing the rest of the batch, we want to see all errors

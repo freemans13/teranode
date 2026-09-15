@@ -173,7 +173,7 @@ func testCreateRetryKeyExists(t *testing.T, resend bool) {
 	// (utxo.LeftoversAmong).
 	createdHere := createErr == nil
 	if !createdHere && errors.Is(createErr, errors.ErrTxExists) {
-		leftovers, leftErr := utxo.LeftoversAmong(ctx, store, []*chainhash.Hash{c.TxIDChainHash()})
+		leftovers, leftErr := utxo.LeftoversAmong(ctx, store, []*chainhash.Hash{c.TxIDChainHash()}, minedInfo.BlockID)
 		require.NoError(t, leftErr)
 		_, createdHere = leftovers[*c.TxIDChainHash()]
 	}

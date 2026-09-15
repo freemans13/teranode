@@ -1886,6 +1886,53 @@ func TestQuickValidateLeftoverDependentIsRemovedOnRetry(t *testing.T) {
 
 // failingDeleteStore fails DeleteComplete while failing is set. Everything else
 // goes to the real store.
+// retryableReplayStore wraps a real store and, for a spend the store rejects as a
+// pruned replay, joins in a transient storage error, the shape the aggregate
+// takes when a sibling input of the same transaction hit DEVICE_OVERLOAD.
+type retryableReplayStore struct {
+	utxo.Store
+}
+
+func (s *retryableReplayStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
+	data, spends, err := s.Store.SpendAndCreate(ctx, tx, blockHeight, opts...)
+	if err != nil && errors.Is(err, errors.ErrUtxoSpendingTxPruned) {
+		return data, spends, errors.NewStorageError("injected overload on a sibling input", err)
+	}
+
+	return data, spends, err
+}
+
+// TestQuickValidateRecordsPrunedReplayDespiteRetryableSibling: the spend phase
+// tested IsRetryableError before the pruned-replay classification, and the
+// store's aggregate is retryable as soon as any input carries a storage error.
+// A replay whose sibling input kept failing transiently was retried until the
+// budget ran out, never recorded as a replay, and its recreated record stayed.
+// A pruned replay is deterministic, so it is classified first. Reproduced by
+// review.
+func TestQuickValidateRecordsPrunedReplayDespiteRetryableSibling(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	bv.utxoStore = &retryableReplayStore{Store: store}
+	bv.spendRetryBackoff = time.Millisecond
+
+	block, batch := replayBatch(f.child, f.sibling)
+
+	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err, "a block replaying a pruned transaction must not validate")
+	require.Contains(t, err.Error(), "spending transaction was pruned")
+
+	_, err = store.Get(ctx, f.child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the recreated replay must be removed even when its error also reads as retryable")
+
+	meta, err := store.Get(ctx, f.sibling.TxIDChainHash())
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+}
+
 type failingDeleteStore struct {
 	utxo.Store
 	failing atomic.Bool

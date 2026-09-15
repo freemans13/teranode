@@ -10,6 +10,8 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -75,11 +77,25 @@ func TestPrunedReplayGhosts(t *testing.T) {
 		require.Nil(t, PrunedReplayGhosts(block, nil, createdSet(block...)))
 	})
 
-	t.Run("a rejected transaction is a ghost even when this attempt did not create it", func(t *testing.T) {
-		// The leftover of an earlier attempt whose compensating delete failed
-		// answers ErrTxExists to the create phase. It is still a ghost.
-		ghosts := PrunedReplayGhosts(block, rejected, createdSet())
+	t.Run("a rejected transaction this attempt did not create is left alone", func(t *testing.T) {
+		// A marker hit alone does not prove the record is a replay's leftover:
+		// the pruner marks a parent before it deletes the child and holds the
+		// child back when a sibling parent's marker fails, so a live mined child
+		// can sit behind a marker. Deleting it removed a live transaction. The
+		// leftover of an earlier attempt is still caught, through createdHere
+		// (LeftoversAmong: locked and carrying this block's id).
+		require.Empty(t, PrunedReplayGhosts(block, rejected, createdSet()))
+		require.Empty(t, PrunedReplayGhosts(block, rejected, createdSet(f.grandchild, f.greatGrandchild)),
+			"nor is anything that spends it, since it is not a ghost")
+	})
+
+	t.Run("a rejected transaction this attempt created is a ghost", func(t *testing.T) {
+		ghosts := PrunedReplayGhosts(block, rejected, createdSet(f.child))
 		require.ElementsMatch(t, hashesOf(f.child), hashesOf(ghosts...))
+	})
+
+	t.Run("no createdHere answer removes nothing", func(t *testing.T) {
+		require.Nil(t, PrunedReplayGhosts(block, rejected, nil))
 	})
 
 	t.Run("dependents this attempt created are ghosts, transitively", func(t *testing.T) {
@@ -108,9 +124,47 @@ func TestPrunedReplayGhosts(t *testing.T) {
 	})
 
 	t.Run("duplicate rejections collapse", func(t *testing.T) {
-		ghosts := PrunedReplayGhosts(block, hashesOf(f.child, f.child), createdSet())
+		ghosts := PrunedReplayGhosts(block, hashesOf(f.child, f.child), createdSet(f.child))
 		require.Len(t, ghosts, 1)
 	})
+}
+
+// TestRollbackSet pins which of a failed spend's successful inputs are reversed.
+func TestRollbackSet(t *testing.T) {
+	fresh := []*Spend{{Vout: 1}}
+	idem := []*Spend{{Vout: 2}}
+
+	require.Equal(t, append(append([]*Spend{}, fresh...), idem...), RollbackSet(append([]*Spend{}, fresh...), idem, false),
+		"an idempotent match is reversed when no input can be a marker hit: it may be an orphan of an earlier failed attempt")
+	require.Equal(t, fresh, RollbackSet(fresh, idem, true),
+		"an idempotent match is held back when an input may be a marker hit: it is then the confirmed spend")
+	require.Equal(t, idem, RollbackSet(nil, idem, false),
+		"a call whose only successful inputs were idempotent matches is still healed")
+	require.Empty(t, RollbackSet(nil, idem, true))
+}
+
+// TestReplayRejectionsFirst: errors.JoinCapped keeps only the first few links,
+// so the links that identify a pruned replay must lead.
+func TestReplayRejectionsFirst(t *testing.T) {
+	spent := errors.NewStorageError("device overload")
+	missing := errors.NewTxNotFoundError("parent missing")
+	pruned := errors.NewUtxoSpendingTxPrunedError("pruned")
+
+	errs := make([]error, 0, 23)
+	for i := 0; i < 20; i++ {
+		errs = append(errs, spent)
+	}
+
+	errs = append(errs, missing, nil, pruned)
+
+	ordered := ReplayRejectionsFirst(errs)
+	require.Len(t, ordered, 22, "nil entries are dropped, nothing else is")
+	require.ErrorIs(t, ordered[0], errors.ErrUtxoSpendingTxPruned)
+	require.ErrorIs(t, ordered[1], errors.ErrTxNotFound)
+	require.ErrorIs(t, errors.JoinCapped(10, ordered...), errors.ErrUtxoSpendingTxPruned,
+		"the marker rejection survives the cap on a wide transaction")
+	require.NotErrorIs(t, errors.JoinCapped(10, errs...), errors.ErrUtxoSpendingTxPruned,
+		"control: in input order the cap drops it")
 }
 
 // flakyDeleteStore fails DeleteComplete a fixed number of times before
@@ -193,6 +247,72 @@ func TestDeleteCreatedRetriesATransientFailure(t *testing.T) {
 		store := &flakyDeleteStore{}
 		require.NoError(t, DeleteCreated(ctx, ulogger.TestLogger{}, store, nil, 1))
 		require.Zero(t, store.calls.Load())
+	})
+}
+
+// decorateStore answers BatchDecorate from a fixed table. Only that method is
+// ever called on it.
+type decorateStore struct {
+	Store
+	data map[chainhash.Hash]*meta.Data
+	errs map[chainhash.Hash]error
+}
+
+func (s *decorateStore) BatchDecorate(_ context.Context, items []*UnresolvedMetaData, _ ...fields.FieldName) error {
+	for _, item := range items {
+		if err, ok := s.errs[item.Hash]; ok {
+			item.Err = err
+
+			continue
+		}
+
+		item.Data = s.data[item.Hash]
+	}
+
+	return nil
+}
+
+// TestLeftoversAmong pins what counts as this block's own unfinished write.
+func TestLeftoversAmong(t *testing.T) {
+	ctx := context.Background()
+	const thisBlock = uint32(1400)
+
+	ours := chainhash.HashH([]byte("ours"))
+	sibling := chainhash.HashH([]byte("sibling-block"))
+	committed := chainhash.HashH([]byte("committed"))
+	unreadable := chainhash.HashH([]byte("unreadable"))
+
+	store := &decorateStore{
+		data: map[chainhash.Hash]*meta.Data{
+			ours:      {Locked: true, BlockIDs: []uint32{thisBlock}},
+			sibling:   {Locked: true, BlockIDs: []uint32{1399}},
+			committed: {Locked: false, BlockIDs: []uint32{thisBlock}},
+		},
+		errs: map[chainhash.Hash]error{unreadable: errors.NewStorageError("device overload")},
+	}
+
+	t.Run("locked and carrying this block's id is a leftover; locked by another block is not", func(t *testing.T) {
+		// A concurrently validating block that shares the transaction wrote it
+		// locked with ITS id. Filing that as this block's own write kept this
+		// block's id off it and made it deletable as this block's ghost.
+		leftovers, err := LeftoversAmong(ctx, store, []*chainhash.Hash{&ours, &sibling, &committed}, thisBlock)
+		require.NoError(t, err)
+		require.Equal(t, map[chainhash.Hash]struct{}{ours: {}}, leftovers)
+	})
+
+	t.Run("a record the store could not read fails the call", func(t *testing.T) {
+		// BatchDecorate reports a per-record failure in the item and returns nil.
+		// Reading that as "not locked" filed an unknown record as pre-existing and
+		// switched the already-blessed fallback back on for it.
+		_, err := LeftoversAmong(ctx, store, []*chainhash.Hash{&ours, &unreadable}, thisBlock)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrStorageError)
+	})
+
+	t.Run("a record the store returned no data for fails the call", func(t *testing.T) {
+		missing := chainhash.HashH([]byte("missing"))
+		_, err := LeftoversAmong(ctx, store, []*chainhash.Hash{&missing}, thisBlock)
+		require.Error(t, err)
 	})
 }
 

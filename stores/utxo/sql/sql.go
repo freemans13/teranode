@@ -1916,6 +1916,17 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		g.SetLimit(limit)
 	}
 
+	// Fail closed on missing spending data before any spend is dispatched, as the
+	// Aerospike store does (validateSpendItem). Both spend paths pass the
+	// spender's txid as the parameter the replay marker is matched against, and
+	// with no spending data that parameter is NULL, which "= NULL" never matches:
+	// the marker check would silently pass.
+	for _, spend := range spends {
+		if spend != nil && (spend.SpendingData == nil || spend.SpendingData.TxID == nil) {
+			return nil, errors.NewProcessingError("spend of %s:%d carries no spending data", spend.TxID, spend.Vout)
+		}
+	}
+
 	for idx, spend := range spends {
 		if spend == nil {
 			return nil, errors.NewProcessingError("spend should not be nil")
@@ -2033,7 +2044,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// (double-spend, frozen, conflicting, hash mismatch). For transient errors, skip
 		// rollback — the optimistic locking makes spends idempotent for the same spender.
 		if needsSpendRollback(spends) {
-			if unspendErr := s.Unspend(context.Background(), utxo.RollbackSet(spends, spentSpends, idempotentSpends)); unspendErr != nil {
+			if unspendErr := s.Unspend(context.Background(), utxo.RollbackSet(spentSpends, idempotentSpends, utxo.AnyPrunedReplay(spends))); unspendErr != nil {
 				s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
 			}
 		}

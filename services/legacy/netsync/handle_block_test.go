@@ -1191,7 +1191,11 @@ func newChunkingTestSetup(t *testing.T, totalTxs, batchSize, routines int) (
 	).Return((*meta.Data)(nil), nil, errors.ErrTxExists)
 
 	// None of the existing records is a locked leftover of an earlier attempt.
-	mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		for _, item := range args.Get(1).([]*utxo.UnresolvedMetaData) {
+			item.Data = &meta.Data{}
+		}
+	}).Return(nil).Maybe()
 
 	sm := &SyncManager{
 		settings:  tSettings,

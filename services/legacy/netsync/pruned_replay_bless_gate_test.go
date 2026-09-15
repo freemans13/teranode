@@ -264,6 +264,97 @@ func TestLegacyLeftoverOfFullyPrunedChainIsNotBlessedOnRetry(t *testing.T) {
 	require.Error(t, spendErr, "C:0 was consumed by a mined grandchild and must not be spendable again")
 }
 
+// retryableReplayStore is the real store with one difference: a spend it
+// rejects as a pruned replay comes back wrapped in a transient storage error,
+// the shape the aggregate takes when a sibling input of the same transaction
+// hit DEVICE_OVERLOAD.
+type retryableReplayStore struct {
+	utxostore.Store
+}
+
+func (s *retryableReplayStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxostore.CreateOption) (*meta.Data, []*utxostore.Spend, error) {
+	md, spends, err := s.Store.SpendAndCreate(ctx, tx, blockHeight, opts...)
+	if err != nil && errors.Is(err, errors.ErrUtxoSpendingTxPruned) {
+		return md, spends, errors.NewStorageError("[retryableReplayStore] injected overload on a sibling input", err)
+	}
+
+	return md, spends, err
+}
+
+// TestLegacyRecordsPrunedReplayDespiteRetryableSibling: PreValidateTransactions
+// tested IsRetryableError before the pruned-replay classification, and the
+// store's aggregate is retryable as soon as any input carries a storage error.
+// A replay whose sibling input kept failing transiently was never recorded as a
+// replay, and its recreated record stayed once the retries gave up. A pruned
+// replay is deterministic, so it is classified first. Reproduced by review.
+func TestLegacyRecordsPrunedReplayDespiteRetryableSibling(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings, params := newOutpointOnlySettings(t, true, true, 1000)
+	tSettings.Pruner.UTXODefensiveEnabled = false
+
+	storeURL, err := url.Parse("sqlitememory:///legacy_retryable_pruned_replay")
+	require.NoError(t, err)
+
+	store, err := sql.New(ctx, logger, tSettings, storeURL)
+	require.NoError(t, err)
+
+	sql.ResetPrunerServiceForTests()
+	t.Cleanup(sql.ResetPrunerServiceForTests)
+
+	require.NoError(t, store.SetBlockHeight(102))
+	require.NoError(t, store.SetMedianBlockTime(1700000000))
+
+	script, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+
+	// P keeps output 1 unspent, so it survives the prune and carries C's marker.
+	parent := bt.NewTx()
+	fundingHash := chainhash.HashH([]byte("funding for the marked parent"))
+	fundingInput := &bt.Input{PreviousTxOutIndex: 0, SequenceNumber: 0xffffffff, UnlockingScript: bscript.NewFromBytes([]byte{0x00})}
+	require.NoError(t, fundingInput.PreviousTxIDAdd(&fundingHash))
+	parent.Inputs = append(parent.Inputs, fundingInput)
+	parent.Outputs = append(parent.Outputs, &bt.Output{Satoshis: 500, LockingScript: script}, &bt.Output{Satoshis: 500, LockingScript: script})
+	_, err = store.Create(ctx, parent, 100, utxostore.WithSkipExtendedInputs(true),
+		utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 100, BlockHeight: 100}))
+	require.NoError(t, err)
+
+	child := spendOutput(t, parent, 0, 400, script)
+	mineLikeLegacy(t, ctx, store, child, 101)
+
+	grandchild := spendOutput(t, child, 0, 300, script)
+	mineLikeLegacy(t, ctx, store, grandchild, 102)
+
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+	_, err = svc.Prune(ctx, 102+tSettings.GetUtxoStoreBlockHeightRetention()+10, "prune-child")
+	require.NoError(t, err)
+
+	_, err = store.Get(ctx, child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "fixture: C is pruned and P carries its marker")
+
+	wrapped := &retryableReplayStore{Store: store}
+
+	v, err := validator.New(ctx, logger, tSettings, wrapped, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+
+	sm := &SyncManager{ctx: ctx, settings: tSettings, chainParams: params, logger: logger, utxoStore: wrapped, validationClient: v}
+
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper]()
+	txMap.Set(*child.TxIDChainHash(), &TxMapWrapper{Tx: child})
+
+	bi := blockIdent{hash: chainhash.HashH([]byte("replayed block 101, retryable sibling")), prevBlock: chainhash.HashH([]byte("block 100")), height: 101, timestamp: time.Unix(1700000000, 0), origin: blockRequestOrigin{headerProven: true}}
+
+	blockErr := sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, 101)
+	require.Error(t, blockErr, "a block replaying a pruned transaction must not validate")
+	require.ErrorIs(t, blockErr, errors.ErrUtxoSpendingTxPruned)
+
+	_, getErr := store.Get(ctx, child.TxIDChainHash())
+	require.ErrorIs(t, getErr, errors.ErrTxNotFound, "the recreated replay must be removed even when its error also reads as retryable")
+}
+
 // TestUnlockBlockTransactionsReleasesTheCreatePhaseLock pins the post-commit
 // half of the legacy lock: records created locked by createUtxos are unlocked
 // once the block is committed, in chunks, with the coinbase skipped.

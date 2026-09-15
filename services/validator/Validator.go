@@ -1116,6 +1116,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			// count; an uncapped chain makes every subsequent errors.Is on it
 			// walk the full chain (mainnet IBD stall, block 820116).
 			failedSpends := make([]error, 0, 8)
+			prunedReplay := false
 
 			for _, spend := range spentUtxos {
 				if spend.Err != nil {
@@ -1123,13 +1124,27 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 						saveAsConflicting = true
 					}
 
+					if errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) {
+						prunedReplay = true
+					}
+
 					failedSpends = append(failedSpends, spend.Err)
 				}
 			}
 
+			// A replay of a transaction the pruner removed is never a conflict to
+			// reconcile, even when a sibling input answered ErrSpent. Taking the
+			// conflicting-create branch returned ErrTxConflicting with the marker
+			// rejection dropped from the chain, which the legacy block path
+			// swallows, so the block committed with the replay back in the store.
+			// The rejection must reach the caller as it is.
+			if prunedReplay {
+				saveAsConflicting = false
+			}
+
 			if len(failedSpends) > 0 {
 				if errors.As(err, &tErr) {
-					tErr.SetWrappedErr(errors.JoinCapped(maxAggregatedSpendErrs, failedSpends...))
+					tErr.SetWrappedErr(errors.JoinCapped(maxAggregatedSpendErrs, utxo.ReplayRejectionsFirst(failedSpends)...))
 				}
 			}
 
