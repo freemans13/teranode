@@ -38,6 +38,11 @@ func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	// the parent up, so point it at the one header a fresh store already
 	// holds: its genesis. See pipelineHeaderFixture.
 	pipelineHeaderFixture(t, sm, blk)
+	// Below-checkpoint gating now also demands the header be PROVEN (an ancestry
+	// proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9), not merely below the
+	// checkpoint height, or the sink writes .subtreeToCheck instead of the .subtree
+	// this test checks for. See proveBlockOrigin.
+	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
 	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))

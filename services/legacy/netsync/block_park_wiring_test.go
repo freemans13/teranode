@@ -374,7 +374,7 @@ func TestHandleBlockDirect_ToleratesANilPeer(t *testing.T) {
 	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
 
 	require.NotPanics(t, func() {
-		err := h.sm.HandleBlockDirect(context.Background(), nil, hash, msgBlock, nil)
+		err := h.sm.HandleBlockDirect(context.Background(), nil, hash, msgBlock, nil, blockRequestOrigin{headerProven: true})
 		require.Error(t, err, "the parent is not mined, so this must fail there — not on a nil peer")
 	})
 }

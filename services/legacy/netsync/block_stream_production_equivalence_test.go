@@ -112,7 +112,11 @@ func TestPipeline_ProducesTheSameFilesAsPrepareSubtrees(t *testing.T) {
 			sm := newManagerWithSubtreeStore(t, prodStore, tc.maxItems)
 			block := wireBlockWithTxs(t, tc.txCount, tc.chained)
 
-			prodHashes, _, _, err := sm.prepareSubtrees(ctx, block)
+			// headerProven so the production path takes the same below-checkpoint route
+			// the pipeline path below is configured for (newSubtreeWriter with
+			// quickValidationAllowed true). Without it the two sides would be compared
+			// across different routes and the test would prove nothing.
+			prodHashes, _, _, err := sm.prepareSubtrees(ctx, block, headerProven, bodyCommitment(t, block))
 			require.NoError(t, err, "the production path must succeed, or there is nothing to compare against")
 
 			// PIPELINE PATH. Same transactions, streamed.
@@ -408,6 +412,15 @@ func wireBlockWithTxs(t *testing.T, txCount int, chained bool) *bsvutil.Block {
 		msgBlock.Transactions = append(msgBlock.Transactions, tx)
 		prevTxHash = tx.TxHash()
 	}
+
+	// prepareSubtrees now binds every prepared subtree to the header's declared
+	// merkle root (commitment.CheckMerkleRoot, handle_block.go) before it will
+	// hand any of them back — the fix this branch's own body-commitment work
+	// added, merged in verbatim from upstream. An all-zero MerkleRoot fails that
+	// bind unconditionally, so the header needs the real root over the final
+	// transaction set for prepareSubtrees to get far enough to be compared
+	// against the pipeline at all.
+	setBodyMerkleRoot(msgBlock)
 
 	block := bsvutil.NewBlock(msgBlock)
 	block.SetHeight(height)

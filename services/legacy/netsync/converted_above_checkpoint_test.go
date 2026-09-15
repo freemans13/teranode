@@ -125,7 +125,7 @@ func TestHandleConvertedBlock_CommitsAboveTheCheckpointWithoutTheUnifiedFlag(t *
 	// arithmetic: this record must actually be above the checkpoint (not
 	// eligible for quick validation), or this test is not exercising the case
 	// it claims to.
-	require.False(t, sm.quickValidationAllowed(1001), "sanity: height 1001 must read as above the checkpoint (1000) for this test to mean anything")
+	require.False(t, sm.quickValidationAllowed(headerProven, 1001), "sanity: height 1001 must read as above the checkpoint (1000) for this test to mean anything")
 
 	record, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
 	require.NoError(t, err)

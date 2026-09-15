@@ -293,7 +293,7 @@ func TestHandleBlockDirect_OrderingHandShake(t *testing.T) {
 		own := &frontierEntry{rpcStarted: make(chan struct{}), settled: make(chan struct{})}
 		ctx := contextWithFrontierEntry(context.Background(), own)
 
-		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent})
+		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent}, blockRequestOrigin{headerProven: true})
 		require.NoError(t, err)
 		require.Equal(t, int32(1), recorder.called.Load(), "the child must reach its own RPC")
 
@@ -313,7 +313,7 @@ func TestHandleBlockDirect_OrderingHandShake(t *testing.T) {
 		own := &frontierEntry{rpcStarted: make(chan struct{}), settled: make(chan struct{})}
 		ctx := contextWithFrontierEntry(context.Background(), own)
 
-		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent})
+		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent}, blockRequestOrigin{headerProven: true})
 		require.Error(t, err)
 		require.True(t, errors.IsTransientLocalError(err), "a predecessor's failure is our fault, not the peer's: %v", err)
 		require.Equal(t, int32(0), recorder.called.Load(), "the child must never start its own RPC")
@@ -331,7 +331,7 @@ func TestHandleBlockDirect_OrderingHandShake(t *testing.T) {
 
 		// Both arms are ready, and rpcStarted must win every time: the server-side window is
 		// what aborts this block, with the predecessor's recorded error.
-		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent})
+		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent}, blockRequestOrigin{headerProven: true})
 		require.NoError(t, err)
 		require.Equal(t, int32(1), recorder.called.Load(), "rpcStarted wins over a settled failure")
 	})

@@ -57,7 +57,7 @@ func (sm *SyncManager) holdsBlock(ctx context.Context, hash chainhash.Hash) bool
 	// through to the whole-block check below rather than answering false
 	// outright, since the two shapes are otherwise mutually exclusive.
 	if record, err := sm.blockPark.ReadConverted(readCtx, hash); err == nil {
-		if sm.blockPark.hasCompleteRecord(readCtx, hash, record, sm.subtreeStore, sm.quickValidationAllowed) {
+		if sm.blockPark.hasCompleteRecord(readCtx, hash, record, sm.subtreeStore) {
 			return true
 		}
 	}

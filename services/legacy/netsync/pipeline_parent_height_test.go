@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
@@ -43,18 +45,26 @@ func TestPipelineSink_ParentInHeaderCache_IsTheOrdinaryCase(t *testing.T) {
 
 	// Point the block at a parent the fresh blockchain store has never heard
 	// of, so a successful run can only have come from the header cache, not
-	// from sm.blockchainClient.GetBlockHeader.
-	parent := chainhash.HashH([]byte("fix2-header-cache-only-parent"))
+	// from sm.blockchainClient.GetBlockHeader. The parent is a REAL header's
+	// hash, not an arbitrary preimage: a header cannot be made to hash to a
+	// chosen value, so the placeholder header is built first and its actual
+	// hash is what blk links to.
+	grandparent := chainhash.HashH([]byte("fix2-header-cache-only-grandparent"))
+	parentHeader := wire.BlockHeader{PrevBlock: grandparent, Timestamp: time.Now()}
+	parent := parentHeader.BlockHash()
 	blk.MsgBlock().Header.PrevBlock = parent
 
-	// Install that parent in the in-flight header cache only, at height 41, so
-	// the block under test — its child — must resolve to height 42. Written
-	// directly into the cache's maps, the same as headerCacheParent, because
-	// this needs one specific hash named, not a real chained batch.
-	sm.headerCache = newHeaderCache()
-	sm.headerCache.byHeight[41] = parent
-	sm.headerCache.byHash[parent] = 41
-	sm.headerCache.filled = true
+	// Install that parent in the in-flight header cache via the real Fill, at
+	// height 41, so the block under test — its child — must resolve to height
+	// 42. This also pins a checkpoint at blk's own (height, hash): below-
+	// checkpoint gating now demands the header be PROVEN
+	// (GHSA-gggq-8f59-4jm9), not merely resolved to a height, or the sink
+	// writes .subtreeToCheck instead of the .subtree this test checks for.
+	hash := *blk.Hash()
+	sm.chainParams.Checkpoints = []chaincfg.Checkpoint{{Height: 42, Hash: &hash}}
+	sm.headerCache = newHeaderCache().WithCheckpoints(sm.chainParams.Checkpoints)
+	require.True(t, sm.headerCache.Fill(grandparent, 41, []*wire.BlockHeader{&parentHeader, &blk.MsgBlock().Header}))
+	require.True(t, sm.headerCache.Proven(hash), "sanity: the installed run must actually prove this hash")
 
 	body := blockBodyBytes(t, blk)
 
@@ -143,6 +153,11 @@ func TestPipelineSink_NotUnifiedRouteStillConverts(t *testing.T) {
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
+	// Below-checkpoint gating now also demands the header be PROVEN (an ancestry
+	// proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9), not merely below the
+	// checkpoint height, or the sink writes .subtreeToCheck instead of the .subtree
+	// this test checks for. See proveBlockOrigin.
+	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
 	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))

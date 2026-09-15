@@ -126,7 +126,7 @@ func TestBlockPark_RecoveryAdoptsAConvertedRecord(t *testing.T) {
 	restarted := newBlockPark(sm.logger, tSettings, store)
 	require.NotNil(t, restarted)
 
-	restarted.Recover(ctx, sm.subtreeStore, sm.quickValidationAllowed)
+	restarted.Recover(ctx, sm.subtreeStore)
 
 	entry, ok := restarted.Take(hash)
 	require.True(t, ok, "recovery must adopt a converted record left by a previous run, not silently drop it")
@@ -206,6 +206,13 @@ func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *t
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
+	// Below-checkpoint gating now also demands the header be PROVEN (an ancestry
+	// proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9), not merely below the
+	// checkpoint height, or pipelineBlockSink writes .subtreeToCheck instead of the
+	// .subtree this test deletes below — and hasCompleteRecord accepts either type,
+	// so the sanity that "the file recovery must notice missing" is only true when
+	// the deleted type is the one actually written. See proveBlockOrigin.
+	proveBlockOrigin(t, sm, blk)
 
 	body := blockBodyBytes(t, blk)
 	hash := *blk.Hash()
@@ -236,7 +243,7 @@ func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *t
 	restarted := newBlockPark(warnings, tSettings, store)
 	require.NotNil(t, restarted)
 
-	restarted.Recover(ctx, sm.subtreeStore, sm.quickValidationAllowed)
+	restarted.Recover(ctx, sm.subtreeStore)
 
 	_, ok := restarted.Take(hash)
 	require.False(t, ok, "a converted record whose first subtree is gone must not be adopted; committing it could only fail inside validation")

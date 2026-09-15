@@ -1322,18 +1322,28 @@ func (p *blockPark) setGauges() {
 // direction: the alternative is adopting a commit that fails inside
 // validation and lands on the path that deletes the only copy and blames an
 // honest peer.
-func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, record *model.Block, subtreeStore blob.Store, quickValidationAllowed func(height uint32) bool) bool {
+//
+// Either file type counts, and that is a completeness question rather than a
+// validation one. This used to be handed the fast-path predicate and stat exactly
+// the type that predicate implied, which worked only while the predicate was a
+// pure function of height. It is not any more: the below-checkpoint fast path now
+// also requires a checkpoint-ancestry proof read from the header cache (see
+// blockRequestOrigin), so the answer for the same height legitimately differs
+// between the run that wrote the file and the run that is looking for it, and a
+// record written as .subtree would be judged incomplete and downloaded again.
+//
+// Nothing is laundered by accepting both. The file's type is what it is on disk;
+// this decides only whether the record still points at files that exist.
+// .subtreeToCheck still means "needs validating" to everything downstream, and
+// .subtree still means a previous run decided it did not — that decision is not
+// revisited here and was never revisited here.
+func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, record *model.Block, subtreeStore blob.Store) bool {
 	if record == nil {
 		return false
 	}
 
-	if subtreeStore == nil || quickValidationAllowed == nil || len(record.Subtrees) == 0 {
+	if subtreeStore == nil || len(record.Subtrees) == 0 {
 		return true
-	}
-
-	structureType := fileformat.FileTypeSubtreeToCheck
-	if quickValidationAllowed(record.Height) {
-		structureType = fileformat.FileTypeSubtree
 	}
 
 	// Every subtree the record names, not just the first. Checking only
@@ -1343,7 +1353,18 @@ func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, 
 	// same destructive path a genuinely bad block does, which deletes the
 	// only copy and blames an honest peer.
 	for _, subtree := range record.Subtrees {
-		exists, existsErr := subtreeStore.Exists(ctx, subtree[:], structureType)
+		var (
+			exists    bool
+			existsErr error
+		)
+
+		for _, structureType := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeToCheck} {
+			exists, existsErr = subtreeStore.Exists(ctx, subtree[:], structureType)
+			if existsErr == nil && exists {
+				break
+			}
+		}
+
 		if existsErr != nil || !exists {
 			p.logger.Warnf("[blockPark][%s] converted record's subtree %s is gone (exists=%v, err=%v); treating the record as not held",
 				hash, subtree, exists, existsErr)
@@ -1363,7 +1384,7 @@ func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, 
 // That is only sound because every park operation passes the same fixed option
 // set, so the layout is flat and known whatever the temp_store URL says.
 //
-// subtreeStore and quickValidationAllowed exist only for the converted-record
+// subtreeStore exists only for the converted-record
 // case: the record itself carries no delete-at-height and so never expires,
 // but the subtree files it names do (subtree_writer.go), so a record can
 // outlive the files it points at. Adopting one anyway would commit and then
@@ -1373,10 +1394,13 @@ func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, 
 // discards the record instead if it does not; the fix is cheap because one
 // check stands in for the whole list, and reachability is rated poor because
 // it needs both a long-parked conversion and the retention window to have
-// actually elapsed underneath it. Either argument may be nil (every
-// whole-block test in this file passes neither), in which case this check is
-// skipped entirely and a record is adopted exactly as it was before this task.
-func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickValidationAllowed func(height uint32) bool) {
+// actually elapsed underneath it. A nil store (every whole-block test in this
+// file passes one) skips the check entirely and a record is adopted exactly as it
+// was before this task.
+//
+// The fast-path predicate this used to take as a second argument is gone: see
+// hasCompleteRecord for why the file type is no longer derived from it.
+func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store) {
 	if p == nil {
 		return
 	}
@@ -1500,7 +1524,7 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store, quickV
 			// answers this — holdsBlock asks it the identical question when
 			// deciding whether a block needs downloading again, so the two
 			// cannot disagree about what "complete" means.
-			if !p.hasCompleteRecord(ctx, *hash, record, subtreeStore, quickValidationAllowed) {
+			if !p.hasCompleteRecord(ctx, *hash, record, subtreeStore) {
 				p.Delete(ctx, parkedBlock{hash: *hash})
 
 				discarded++

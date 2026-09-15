@@ -78,7 +78,14 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 	var writer *subtreeWriter
 	if resolved {
-		writer = newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, sm.quickValidationAllowed(height))
+		// The ancestry proof is read here, on the streaming route, because this is
+		// where the below-checkpoint fast path is actually taken: the flag decides
+		// whether the subtree files this block writes are stamped .subtree ("already
+		// validated") or .subtreeToCheck ("still needs validating"). Height alone was
+		// the gate before the merge, and height alone certifies nothing — see
+		// blockRequestOrigin. An unprovable block writes .subtreeToCheck and is
+		// validated in full, which is the safe direction.
+		writer = newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, sm.quickValidationAllowed(sm.blockOrigin(hash), height))
 	} else {
 		writer = newSubtreeWriterUnresolvedHeight(sm.logger, sm.settings, sm.subtreeStore, sm.fallbackSubtreeDAH())
 	}
@@ -298,7 +305,7 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 		switch {
 		case err == nil && record != nil:
 			structureType := fileformat.FileTypeSubtreeToCheck
-			if record.Height != 0 && sm.quickValidationAllowed(record.Height) {
+			if record.Height != 0 && sm.quickValidationAllowed(sm.blockOrigin(hash), record.Height) {
 				structureType = fileformat.FileTypeSubtree
 			}
 

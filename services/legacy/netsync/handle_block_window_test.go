@@ -81,7 +81,7 @@ func TestHandleBlockDirect_UsesResolvedParentHeight(t *testing.T) {
 	}
 	defer sm.orphanTxs.Stop()
 
-	err = sm.HandleBlockDirect(context.Background(), &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99})
+	err = sm.HandleBlockDirect(context.Background(), &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99}, blockRequestOrigin{headerProven: true})
 	require.NoError(t, err)
 
 	subtreeValidationClient.AssertExpectations(t)
@@ -126,12 +126,20 @@ func TestHandleBlockDirect_GateFailureOnWindowRouteIsALocalFault(t *testing.T) {
 
 	require.True(t, sm.windowRoute(blockHeight), "precondition: this block must take the quick-window route")
 
-	msgBlock := &wire.MsgBlock{Header: wire.BlockHeader{}}
+	// HandleBlockDirect now demands real proof-of-work before it will even reach
+	// the block-assembly gate this test is about (GHSA-gggq-8f59-4jm9), so the
+	// all-zero fixture header this test used to send no longer gets that far: it
+	// fails target difficulty first. Give it the easiest legal target for these
+	// regtest-derived params and grind a nonce that actually satisfies it, the
+	// same way body_commitment_test.go does, so the test again exercises the gate
+	// failure rather than the earlier proof-of-work floor.
+	msgBlock := &wire.MsgBlock{Header: wire.BlockHeader{Bits: 0x207fffff}}
+	require.True(t, solveBlock(&msgBlock.Header, params.PowLimit))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 
-	err := sm.HandleBlockDirect(ctx, &peer.Peer{}, chainhash.Hash{0x01}, msgBlock, nil)
+	err := sm.HandleBlockDirect(ctx, &peer.Peer{}, chainhash.Hash{0x01}, msgBlock, nil, blockRequestOrigin{headerProven: true})
 	require.Error(t, err)
 	require.True(t, errors.IsTransientLocalError(err), "a parked gate on the window route must be a local fault, got: %v", err)
 }

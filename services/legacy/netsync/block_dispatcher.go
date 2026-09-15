@@ -147,8 +147,15 @@ type blockDispatch struct {
 	isCheckpoint   bool
 	height         uint32
 	parent         *inflightParent
-	windowed       bool
-	bytes          int64
+
+	// origin is the block's ancestry proof, read from the header cache by
+	// handleBlockMsgHead before anything else touches the block, and carried here
+	// so the worker and the head cannot disagree about it. The zero value denies
+	// every below-checkpoint fast path; see blockRequestOrigin.
+	origin blockRequestOrigin
+
+	windowed bool
+	bytes    int64
 
 	// parked is the park entry this dispatch commits, and nil for a block that
 	// arrived on the wire. A parked dispatch carries no queue message worth
@@ -302,7 +309,7 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	// and log lines name it. d.peer is that peer resolved to its association's primary,
 	// which is what the tail's own bookkeeping needs — the two must not be swapped.
 	bd.run = func(ctx context.Context, d *blockDispatch, parent *inflightParent) error {
-		return sm.HandleBlockDirect(ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, parent)
+		return sm.HandleBlockDirect(ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, parent, d.origin)
 	}
 
 	// The default tail is the pre-window consumer's whole turn after the block's own
@@ -369,7 +376,13 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 			return err
 		}
 
-		return sm.HandleBlockDirect(ctx, d.parked.peer, d.parked.hash, msgBlock, nil)
+		// A parked block is re-read from disk, sometimes after a restart, so the run
+		// that named it may be long gone from the header cache. Ask anyway rather than
+		// hard-coding the zero value: when the cache still names it inside a proven
+		// prefix the proof is genuine and the fast path is as safe as it was on
+		// arrival, and when it does not the answer is the zero value, which is the
+		// same denial hard-coding would have given.
+		return sm.HandleBlockDirect(ctx, d.parked.peer, d.parked.hash, msgBlock, nil, sm.blockOrigin(d.parked.hash))
 	}
 
 	// The parked tail: classify in one place, on the consumer, in admission order,
