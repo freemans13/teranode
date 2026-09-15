@@ -1583,8 +1583,10 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		LockTime: lockTime,
 	}
 
-	if scope := inputsScopeFor(bins); scope != inputsQueryNone {
-		q := inputsQuerySQL(scope, "transaction_id = $1")
+	inputsScope := inputsScopeFor(bins)
+
+	if inputsScope != inputsQueryNone {
+		q := inputsQuerySQL(inputsScope, "transaction_id = $1")
 
 		rows, err := s.db.QueryContext(ctx, q, id)
 		if err != nil {
@@ -1598,7 +1600,7 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 			var previousTxHashBytes []byte
 			var previousTxIdx int64
 
-			if err := rows.Scan(scanTargetsForInputScope(scope, &previousTxHashBytes, &previousTxIdx, input)...); err != nil {
+			if err := rows.Scan(scanTargetsForInputScope(inputsScope, &previousTxHashBytes, &previousTxIdx, input)...); err != nil {
 				return nil, err
 			}
 			input.PreviousTxOutIndex = uint32(previousTxIdx)
@@ -1613,6 +1615,13 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 			}
 
 			tx.Inputs = append(tx.Inputs, input)
+		}
+
+		// This loop feeds data.TxInpoints for utxo.MetaFields and GetMeta, so a
+		// truncated read would report a subset of the transaction's parents to
+		// block assembly and subtree validation with no error.
+		if err = rows.Err(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1757,7 +1766,10 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		// Sizing by the row count then indexes out of range on the first output past a
 		// gap. Grow to cover each idx instead; the query is ORDER BY o.idx, so growth
 		// is monotonic and each append is amortised O(1).
-		data.SpendingDatas = make([]*spendpkg.SpendingData, 0, len(tx.Outputs)) // needs to be nullable
+		// No capacity hint: fields.Utxos no longer runs the outputs read, so
+		// len(tx.Outputs) is zero here unless fields.Tx or fields.Outputs was also
+		// asked for, and the grow loop below sizes the slice either way.
+		data.SpendingDatas = make([]*spendpkg.SpendingData, 0) // needs to be nullable
 
 		for rows.Next() {
 			if err = rows.Scan(&idx, &spendingDataBytes, &frozen); err != nil {
@@ -1779,9 +1791,9 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 				if err != nil {
 					return nil, errors.NewProcessingError("failed to create hash from bytes", err)
 				}
-			} else {
-				data.SpendingDatas[idx] = nil
 			}
+			// An unspent output needs no branch: the grow loop above has already
+			// left this slot nil, and outputs.idx is unique per transaction.
 		}
 
 		// A truncated read would silently under-report the spent set, so surface it
@@ -1798,15 +1810,23 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 	//
 	// fields.Inputs deliberately not included: it has never attached here, and
 	// widening it would change what existing callers of that projection see.
-	if contains(bins, fields.Tx) || contains(bins, fields.Outputs) {
-		data.Tx = &tx
-	}
-
 	if contains(bins, fields.TxInpoints) {
 		data.TxInpoints, err = subtree.NewTxInpointsFromInputs(tx.Inputs)
 		if err != nil {
 			return nil, errors.NewProcessingError("failed to create tx inpoints from inputs", err)
 		}
+	}
+
+	if contains(bins, fields.Tx) || contains(bins, fields.Outputs) {
+		// Outpoint-scope inputs carry no unlocking script, sequence number or
+		// previous output. Attached to Data.Tx they would make a transaction that
+		// meta.Data.TxIsSerializable accepts but whose bytes are wrong, so only
+		// inputs read in full are attached. TxInpoints was derived above.
+		if inputsScope != inputsQueryFull {
+			tx.Inputs = nil
+		}
+
+		data.Tx = &tx
 	}
 
 	return data, nil
@@ -3868,13 +3888,20 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		// Deliberately NOT keyed on needInputs/needOutputs: needInputs is also
 		// true for fields.Inputs, which has always returned a nil Data.Tx, and
 		// callers distinguish "no transaction" by that nil.
+		//
+		// This matches getUnbatched: Data.Tx is attached for fields.Tx and
+		// fields.Outputs only, and carries inputs only when they were read in
+		// full. fields.TxInpoints used to attach a Tx here too, built from
+		// outpoint-scope inputs with no unlocking script, sequence number or
+		// previous output. meta.Data.TxIsSerializable accepts that shape, and
+		// whether a caller got it depended on utxostore_getBatcherSize.
 		var tx *bt.Tx
-		if contains(bins, fields.Tx) || contains(bins, fields.TxInpoints) || contains(bins, fields.Outputs) {
+		if contains(bins, fields.Tx) || contains(bins, fields.Outputs) {
 			tx = &bt.Tx{
 				Version:  row.version,
 				LockTime: row.lockTime,
 			}
-			if inputsScope != inputsQueryNone && row.data.Tx != nil {
+			if inputsScope == inputsQueryFull && row.data.Tx != nil {
 				tx.Inputs = row.data.Tx.Inputs
 			}
 			if needOutputs && row.data.Tx != nil {
@@ -3886,11 +3913,9 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 			row.data.TxInpoints, _ = subtree.NewTxInpointsFromInputs(row.data.Tx.Inputs)
 		}
 
-		if contains(bins, fields.Tx) || inputsScope != inputsQueryNone || needOutputs {
-			row.data.Tx = tx
-		} else {
-			row.data.Tx = nil
-		}
+		// Replaces the scratch Tx that batchDecorateInputs and
+		// batchDecorateOutputs accumulated rows into; nil unless attached above.
+		row.data.Tx = tx
 
 		for _, item := range matchedItems {
 			item.Data = row.data
