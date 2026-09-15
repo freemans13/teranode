@@ -732,7 +732,7 @@ func buildHTTPError(resp *http.Response, rawURL string) error {
 		// maxHTTPErrorBodyBytes is unchanged.
 		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxHTTPErrorBodyBytes+1))
 		if readErr != nil {
-			return errFn("http request [%s] returned status code [%d]", rawURL, resp.StatusCode, readErr)
+			return errFn("http request [%s] returned status code [%d]", urlutil.RedactString(rawURL), resp.StatusCode, readErr)
 		}
 
 		b := raw
@@ -744,14 +744,14 @@ func buildHTTPError(resp *http.Response, rawURL string) error {
 
 		if b != nil {
 			if truncated {
-				return errFn("http request [%s] returned status code [%d] with body %q (truncated)", rawURL, resp.StatusCode, string(b))
+				return errFn("http request [%s] returned status code [%d] with body %q (truncated)", urlutil.RedactString(rawURL), resp.StatusCode, string(b))
 			}
 
-			return errFn("http request [%s] returned status code [%d] with body %q", rawURL, resp.StatusCode, string(b))
+			return errFn("http request [%s] returned status code [%d] with body %q", urlutil.RedactString(rawURL), resp.StatusCode, string(b))
 		}
 	}
 
-	return errFn("http request [%s] returned status code [%d]", rawURL, resp.StatusCode)
+	return errFn("http request [%s] returned status code [%d]", urlutil.RedactString(rawURL), resp.StatusCode)
 }
 
 // parseRetryAfter parses an HTTP Retry-After header value into a duration.

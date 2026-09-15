@@ -131,6 +131,7 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 		scanned++
 
 		lines := strings.Split(string(src), "\n")
+		boundLoggers := loggingFuncVars(file)
 
 		ast.Inspect(file, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -138,8 +139,8 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 				return true
 			}
 
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || !loggingCalls.MatchString(sel.Sel.Name) {
+			callName, ok := loggingCallName(call.Fun, boundLoggers)
+			if !ok {
 				return true
 			}
 
@@ -165,7 +166,7 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 
 				violations = append(violations, violation{
 					pos:  fmt.Sprintf("%s:%d:%d", rel, p.Line, p.Column),
-					call: sel.Sel.Name,
+					call: callName,
 					arg:  text,
 				})
 			}
@@ -199,6 +200,74 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 		"or urlutil.RedactString (for a string), or log only .Scheme/.Host/.Path.\n"+
 		"If the value is genuinely safe, add a trailing comment saying why:\n"+
 		"    // %s <reason>", strings.Join(report, "\n"), escapeComment)
+}
+
+// loggingCallName reports whether a call's function is a logging call, and
+// names it for the report. Most are direct selector calls such as
+// logger.Infof or errors.NewServiceError. A call through a function variable
+// bound to one of those, as in errFn := errors.NewServiceError followed by
+// errFn("...", rawURL), is policed too, because otherwise choosing the error
+// constructor at runtime hides the argument from the guard.
+func loggingCallName(fun ast.Expr, boundLoggers map[string]string) (string, bool) {
+	switch f := fun.(type) {
+	case *ast.SelectorExpr:
+		return f.Sel.Name, loggingCalls.MatchString(f.Sel.Name)
+	case *ast.Ident:
+		if bound, ok := boundLoggers[f.Name]; ok {
+			return f.Name + " (" + bound + ")", true
+		}
+	}
+
+	return "", false
+}
+
+// loggingFuncVars collects the names of variables in a file that are assigned
+// a logging call as a function value, such as errFn := errors.NewServiceError.
+// It matches by name, not by scope, so a same-named variable in another
+// function of the same file is treated alike. That can only add a report,
+// never hide one. A variable declared without a value and assigned later,
+// var errFn func(...) then errFn = errors.NewServiceError, is caught by the
+// later assignment.
+func loggingFuncVars(file *ast.File) map[string]string {
+	bound := map[string]string{}
+
+	record := func(lhs ast.Expr, rhs ast.Expr) {
+		id, ok := lhs.(*ast.Ident)
+		if !ok {
+			return
+		}
+
+		sel, ok := rhs.(*ast.SelectorExpr)
+		if !ok || !loggingCalls.MatchString(sel.Sel.Name) {
+			return
+		}
+
+		// Keep the first binding so the report names the initial constructor.
+		if _, seen := bound[id.Name]; !seen {
+			bound[id.Name] = sel.Sel.Name
+		}
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.AssignStmt:
+			if len(s.Lhs) == len(s.Rhs) {
+				for i := range s.Lhs {
+					record(s.Lhs[i], s.Rhs[i])
+				}
+			}
+		case *ast.ValueSpec:
+			if len(s.Names) == len(s.Values) {
+				for i := range s.Names {
+					record(s.Names[i], s.Values[i])
+				}
+			}
+		}
+
+		return true
+	})
+
+	return bound
 }
 
 func hasEscape(lines []string, line int) bool {
