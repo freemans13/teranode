@@ -314,6 +314,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SplitMapBuckets:                      getInt("blockassembly_splitMapBuckets", 16*1024, alternativeContext...),
 			StoreTxInpointsForSubtreeMeta:        getBool("blockassembly_storeTxInpointsForSubtreeMeta", true, alternativeContext...),
 			IdleSleepDuration:                    getDuration("blockassembly_idle_sleep_duration", 10*time.Millisecond, alternativeContext...),
+			MaxQueueItems:                        getInt64("blockassembly_maxQueueItems", 0, alternativeContext...),
+			QueueFullWaitTimeout:                 getDuration("blockassembly_queueFullWaitTimeout", 100*time.Millisecond, alternativeContext...),
 		},
 
 		BlockChain: BlockChainSettings{
@@ -325,8 +327,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			StoreURL:              getURL("blockchain_store", "sqlite:///blockchain", alternativeContext...),
 			FSMStateRestore:       getBool("fsm_state_restore", false, alternativeContext...),
 			FSMStateChangeDelay:   getDuration("fsm_state_change_delay", 0, alternativeContext...),
-			StoreDBTimeoutMillis:  getInt("blockchain_store_dbTimeoutMillis", 5000, alternativeContext...),
-			InitializeNodeInState: getString("blockchain_initializeNodeInState", "", alternativeContext...),
+			StoreDBTimeoutMillis:  getInt("blockchain_store_dbTimeoutMillis", DefaultBlockchainStoreDBTimeoutMillis, alternativeContext...),
+			InitializeNodeInState: strings.TrimSpace(getString("blockchain_initializeNodeInState", "", alternativeContext...)),
 			PostgresPool:          getPostgresPoolSettings("blockchain", alternativeContext...),
 			UseInMemoryChainCheck: getBool("blockchain_use_in_memory_chain_check", false, alternativeContext...),
 			HeartbeatInterval:     getDuration("blockchain_heartbeat_interval", 10*time.Second, alternativeContext...),
@@ -353,6 +355,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ValidationMaxRetries:                      getInt("blockvalidation_validation_max_retries", 3, alternativeContext...),
 			ValidationRetrySleep:                      getDuration("blockvalidation_validation_retry_sleep", 5*time.Second, alternativeContext...),
 			OptimisticMining:                          getBool("blockvalidation_optimistic_mining", true, alternativeContext...),
+			OptimisticMiningPeerBlocks:                getBool("blockvalidation_optimistic_mining_peer_blocks", false, alternativeContext...),
 			IsParentMinedRetryMaxRetry:                getInt("blockvalidation_isParentMined_retry_max_retry", 45, alternativeContext...),
 			IsParentMinedRetryBackoffMultiplier:       getInt("blockvalidation_isParentMined_retry_backoff_multiplier", 4, alternativeContext...),
 			IsParentMinedRetryBackoffDuration:         getDuration("blockvalidation_isParentMined_retry_backoff_duration", 20*time.Millisecond, alternativeContext...),
@@ -376,6 +379,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupConcurrency:                    getInt("blockvalidation_catchupConcurrency", max(4, runtime.NumCPU()/2), alternativeContext...),
 			CatchupMaxRetries:                     getInt("blockvalidation_catchup_max_retries", 3, alternativeContext...),
 			CatchupMaxAttemptsPerBlock:            getInt("blockvalidation_catchup_max_attempts_per_block", 5, alternativeContext...),
+			MaxCorruptAttemptsPerBlock:            getInt("blockvalidation_max_corrupt_attempts_per_block", 3, alternativeContext...),
+			CorruptAttemptCooldown:                getDuration("blockvalidation_corrupt_attempt_cooldown", DefaultCorruptAttemptCooldown, alternativeContext...),
 			CatchupIterationTimeout:               getInt("blockvalidation_catchup_iteration_timeout", 30, alternativeContext...),
 			CatchupOperationTimeout:               getInt("blockvalidation_catchup_operation_timeout", 300, alternativeContext...),
 			CatchupMaxAccumulatedHeaders:          getInt("blockvalidation_max_accumulated_headers", 100000, alternativeContext...),
@@ -438,6 +443,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TxLockedMaxRetries:                   getInt("validator_txlocked_maxRetries", 3, alternativeContext...),
 			TxMetaWireFormat:                     getString("validator_txmeta_wireFormat", "v1", alternativeContext...),
 			TxMetaNumPartitions:                  getInt("validator_txmeta_numPartitions", 32, alternativeContext...),
+			BlockAssemblyShedRetryTimeout:        getDuration("validator_blockAssemblyShedRetryTimeout", 2*time.Second, alternativeContext...),
+			ShedUnwindTimeout:                    getDuration("validator_shedUnwindTimeout", 2*time.Second, alternativeContext...),
+			HandoffRoundTripSlack:                getDuration("validator_handoffRoundTripSlack", 500*time.Millisecond, alternativeContext...),
+			TwoPhaseCommitTimeout:                getDuration("validator_twoPhaseCommitTimeout", 2*time.Second, alternativeContext...),
+			KafkaBackpressure:                    loadValidatorKafkaBackpressureSettings(alternativeContext...),
 		},
 		Region: RegionSettings{
 			Name: getString("regionName", "defaultRegionName", alternativeContext...),
@@ -520,7 +530,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HTTPListenAddress:  getString("p2p_httpListenAddress", "", alternativeContext...),
 			ListenAddresses:    getMultiString("p2p_listen_addresses", "|", []string{}, alternativeContext...),
 			AdvertiseAddresses: getMultiString("p2p_advertise_addresses", "|", []string{}, alternativeContext...), // This is used to announce the node to the network on a different address than the listen address
-			Port:               getInt("p2p_port", 9905, alternativeContext...),                                   // This is the port that go-p2p-message-bus will listen on but only used when the AdvertiseAddresses are specified
+			Port:               getInt("p2p_port", 9905, alternativeContext...),                                   // This is the port that go-p2p-message-bus will listen on (0.0.0.0 and ::)
 			ListenMode:         getString("listen_mode", ListenModeFull, alternativeContext...),
 			PeerID:             getString("p2p_peer_id", "", alternativeContext...),
 			PrivateKey:         getString("p2p_private_key", "", alternativeContext...),
@@ -604,27 +614,29 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GCTarget: getInt("gc_tuning_gogc", 100, alternativeContext...),
 		},
 		Pruner: PrunerSettings{
-			GRPCAddress:                    getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
-			GRPCListenAddress:              getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
-			BlockAssemblyWaitTimeout:       getDuration("pruner_blockAssemblyWaitTimeout", 10*time.Minute, alternativeContext...), // Wait up to 10 minutes for BA to be ready
-			ConnectionPoolWarningThreshold: getFloat64("pruner_connectionPoolWarningThreshold", 0.7, alternativeContext...),       // Warn/adjust when exceeding 70% of connection pool
-			BlockTrigger:                   getString("pruner_block_trigger", PrunerBlockTriggerOnBlockPersisted, alternativeContext...),
-			UTXODefensiveEnabled:           getBool("pruner_utxoDefensiveEnabled", false, alternativeContext...),                 // Defensive mode off by default (production)
-			UTXODefensiveBatchReadSize:     getInt("pruner_utxoDefensiveBatchReadSize", 10000, alternativeContext...),            // Batch size for child verification
-			UTXOChunkSize:                  getInt("pruner_utxoChunkSize", 1000, alternativeContext...),                          // Chunk size for batch operations
-			UTXOChunkGroupLimit:            getInt("pruner_utxoChunkGroupLimit", 10, alternativeContext...),                      // Process 10 chunks in parallel
-			UTXOProgressLogInterval:        getDuration("pruner_utxoProgressLogInterval", 30*time.Second, alternativeContext...), // Progress every 30s
-			UTXOPartitionQueries:           getInt("pruner_utxoPartitionQueries", 0, alternativeContext...),                      // 0 = auto-detect based on CPU cores
-			UTXOSetTTL:                     getBool("pruner_utxoSetTTL", false, alternativeContext...),                           // Use TTL instead of delete (false = hard delete)
-			RelaxRemovalCommitLevel:        getBool("pruner_relaxRemovalCommitLevel", true, alternativeContext...),               // Pruner removals ACK from the master only (idempotent, re-pruned next scan)
-			SkipBlobDeletion:               getBool("pruner_skipBlobDeletion", false, alternativeContext...),                     // Skip blob deletion disabled by default (deletion enabled)
-			BlobDeletionSafetyWindow:       getUint32("pruner_blobDeletionSafetyWindow", 10, alternativeContext...),              // Wait 10 blocks behind triggering height
-			BlobDeletionBatchSize:          getInt("pruner_blobDeletionBatchSize", 1000, alternativeContext...),                  // Process 1000 deletions per batch
-			BlobDeletionMaxRetries:         getInt("pruner_blobDeletionMaxRetries", 3, alternativeContext...),                    // Retry failed deletions up to 3 times
-			SkipPreserveParents:            getBool("pruner_skipPreserveParents", false, alternativeContext...),                  // Skip Phase 1: preserve parents
-			SkipDeletions:                  getBool("pruner_skipDeletions", false, alternativeContext...),                        // Skip deletions for performance
-			MinBlockHeight:                 getUint32("pruner_min_block_height", 0, alternativeContext...),                       // Do not prune blocks at or below this height
-			UTXOPrunedSetMaxEntries:        getInt("pruner_utxoPrunedSetMaxEntries", 10_000_000, alternativeContext...),          // Soft cap on PrunedTxSet entries; 0 = use built-in 2B default (NOT unlimited)
+			GRPCAddress:                     getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
+			GRPCListenAddress:               getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
+			BlockAssemblyWaitTimeout:        getDuration("pruner_blockAssemblyWaitTimeout", 10*time.Minute, alternativeContext...), // Wait up to 10 minutes for BA to be ready
+			ConnectionPoolWarningThreshold:  getFloat64("pruner_connectionPoolWarningThreshold", 0.7, alternativeContext...),       // Warn/adjust when exceeding 70% of connection pool
+			BlockTrigger:                    getString("pruner_block_trigger", PrunerBlockTriggerOnBlockPersisted, alternativeContext...),
+			SkipDuringCatchup:               getBool("pruner_skipDuringCatchup", false, alternativeContext...),                    // Skip pruning during catchup off by default (see longdesc trade-off)
+			UTXODefensiveEnabled:            getBool("pruner_utxoDefensiveEnabled", false, alternativeContext...),                 // Defensive mode off by default (production)
+			UTXODefensiveBatchReadSize:      getInt("pruner_utxoDefensiveBatchReadSize", 10000, alternativeContext...),            // Batch size for child verification
+			UTXOChunkSize:                   getInt("pruner_utxoChunkSize", 1000, alternativeContext...),                          // Chunk size for batch operations
+			UTXOChunkGroupLimit:             getInt("pruner_utxoChunkGroupLimit", 10, alternativeContext...),                      // Process 10 chunks in parallel
+			UTXOProgressLogInterval:         getDuration("pruner_utxoProgressLogInterval", 30*time.Second, alternativeContext...), // Progress every 30s
+			UTXOPartitionQueries:            getInt("pruner_utxoPartitionQueries", 0, alternativeContext...),                      // 0 = auto-detect based on CPU cores
+			UTXOSetTTL:                      getBool("pruner_utxoSetTTL", false, alternativeContext...),                           // Use TTL instead of delete (false = hard delete)
+			RelaxRemovalCommitLevel:         getBool("pruner_relaxRemovalCommitLevel", true, alternativeContext...),               // Pruner removals ACK from the master only (idempotent, re-pruned next scan)
+			SkipBlobDeletion:                getBool("pruner_skipBlobDeletion", false, alternativeContext...),                     // Skip blob deletion disabled by default (deletion enabled)
+			BlobDeletionSafetyWindow:        getUint32("pruner_blobDeletionSafetyWindow", 10, alternativeContext...),              // Wait 10 blocks behind triggering height
+			BlobDeletionBatchSize:           getInt("pruner_blobDeletionBatchSize", 1000, alternativeContext...),                  // Process 1000 deletions per batch
+			BlobDeletionMaxRetries:          getInt("pruner_blobDeletionMaxRetries", 3, alternativeContext...),                    // Retry failed deletions up to 3 times
+			SkipPreserveParents:             getBool("pruner_skipPreserveParents", false, alternativeContext...),                  // Skip Phase 1: preserve parents
+			SkipProcessExpiredPreservations: getBool("pruner_skipProcessExpiredPreservations", false, alternativeContext...),      // Skip Phase 1b: expire old parent preservations
+			SkipDeletions:                   getBool("pruner_skipDeletions", false, alternativeContext...),                        // Skip deletions for performance
+			MinBlockHeight:                  getUint32("pruner_min_block_height", 0, alternativeContext...),                       // Do not prune blocks at or below this height
+			UTXOPrunedSetMaxEntries:         getInt("pruner_utxoPrunedSetMaxEntries", 10_000_000, alternativeContext...),          // Soft cap on PrunedTxSet entries; 0 = use built-in 2B default (NOT unlimited)
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),

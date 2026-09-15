@@ -239,6 +239,30 @@ type pauseMsg struct {
 	unpause <-chan struct{}
 }
 
+// blockRequestOrigin records what is known about a block's ancestry at the point
+// it was asked for. It is the proof that backs every below-checkpoint fast path:
+// the hardcoded checkpoints certify ONE CHAIN, not a height range, so "this block
+// sits below the highest checkpoint" says nothing about whether it belongs to that
+// chain.
+//
+// The zero value is deliberately untrusted, so a call site that has not thought
+// about provenance fails closed.
+//
+// It arrives from upstream's PR 1390 security merge, where it was threaded through
+// a map from block hash to origin filled by fetchHeaderBlocks as it walked the
+// header list. That list is gone on this branch, so the flag is now answered from
+// the header cache instead — see blockOrigin and headerCache.provenTo. The meaning
+// is identical and the source is narrower: one run, replaced whole, never extended
+// past the point that was verified.
+type blockRequestOrigin struct {
+	// headerProven is true when the block's hash is named by a header-cache run in
+	// which a pinned checkpoint hash was matched at or above this block's height.
+	// Blocks a peer merely advertised (handleInvMsg), blocks adopted from disk at
+	// startup, and blocks re-requested by any route that cannot show that run carry
+	// no such proof and are never header-proven.
+	headerProven bool
+}
+
 // peerSyncState stores additional information that the SyncManager tracks
 // about a peer.
 type peerSyncState struct {
@@ -562,6 +586,25 @@ type blockFailureState struct {
 	nextRetry time.Time
 }
 
+// corruptAttemptState is the per-(hash, peerID) corrupt re-download counter and its fixed cooldown
+// window (bitcoin-sv/teranode#4692). windowExpiry is set once from the first corrupt delivery and
+// preserved across subsequent deliveries so the window is not extended by re-delivery; once it
+// lapses the counter resets and an honest body is admitted again.
+type corruptAttemptState struct {
+	count        int
+	windowExpiry time.Time
+}
+
+// legacyCorruptAttemptKey keys the legacy corrupt re-download cap on (block hash, serving peer
+// address) (bitcoin-sv/teranode#4692). Keying on the pair — not the hash alone — stops one peer's
+// corruption consuming the budget for a hash an honest peer can still serve: each serving identity
+// is capped independently, so an honest sync-peer rotation is never wedged. A peer with no address
+// degrades to a single shared (hash, "") bucket — the hard per-hash bound for that deployment.
+type legacyCorruptAttemptKey struct {
+	hash   chainhash.Hash
+	peerID string
+}
+
 // SyncManager is used to communicate block related messages with peers. The
 // SyncManager is started as by executing Start() in a goroutine. Once started,
 // it selects peers to sync from and starts the initial block download. Once the
@@ -626,6 +669,20 @@ type SyncManager struct {
 	// deleted on successful (re)process. A skipped descendant records its own hash
 	// too, so the whole descendant chain is suppressed transitively.
 	recentlyFailedBlocks *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
+	// blockCorruptAttempts bounds corrupt-body (bitcoin-sv/teranode#4692) re-downloads per
+	// (block hash, serving peer address), independently of the ban score. Once a (hash, peerID)
+	// reaches MaxCorruptAttemptsPerBlock corrupt deliveries within a fixed cooldown window, that
+	// peer's next delivery of the hash is dropped BEFORE the expensive HandleBlockDirect/decorate —
+	// without rejecting-to-peer, without poisoning (invalid is never set), and without setting
+	// recentlyFailedBlocks (so the recentlyFailedBlocks no-NOT_FOUND-cascade property is preserved).
+	// Keying on (hash, peerID) means an honest sync-peer keeps a fresh budget for the same hash, so
+	// a bad peer can never wedge the honest tip; the residual aggregate per-hash work is bounded by
+	// the number of distinct serving peers (MaxPeers) times the cap per window. Unlike
+	// blockFailureBackoff (serviceError-gated, disjoint from corrupt) this is keyed only on corrupt
+	// failures. The window is fixed from the first corrupt delivery (stored in the value, not the map
+	// TTL), so re-delivery cannot extend it and once it lapses an honest body is admitted again
+	// (self-healing). Cleared on successful store.
+	blockCorruptAttempts *expiringmap.ExpiringMap[legacyCorruptAttemptKey, *corruptAttemptState]
 	// blockPark holds blocks that arrived before their parent. Without it such a
 	// block is fully downloaded, fully decoded and then discarded, and the
 	// getblocks sent in its place is ignored for as long as headers-first mode is
@@ -1140,7 +1197,7 @@ func (sm *SyncManager) startSync() {
 	if bestPeer.LastBlock() == bestBlockHeightInt32 {
 		sm.logger.Debugf("[startSync] peer %v is at the same height %d as us, sending RUNNING", bestPeer.String(), bestPeer.LastBlock())
 
-		if err = sm.blockchainClient.Run(sm.ctx, "legacy/netsync/manager/startSync"); err != nil {
+		if err = sm.runIfCatchingBlocks("legacy/netsync/manager/startSync"); err != nil {
 			sm.logger.Errorf("[startSync] failed to set blockchain state to running: %v", err)
 		}
 
@@ -1240,6 +1297,22 @@ func (sm *SyncManager) startSync() {
 		recvBytes:         bestPeer.BytesReceived(),
 		recvBytesLastTick: uint64(0),
 	})
+}
+
+// runIfCatchingBlocks uses the cached observation only to avoid redundant
+// automatic RUN requests from recurring legacy events. It is not admission:
+// the server still checks authoritative state under its transition lock. A
+// temporary synthetic IDLE is rechecked on later events, without latching a
+// pause or changing message/queue ownership.
+func (sm *SyncManager) runIfCatchingBlocks(source string) error {
+	state, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
+	if err != nil {
+		return err
+	}
+	if state == nil || *state != teranodeblockchain.FSMStateCATCHINGBLOCKS {
+		return nil
+	}
+	return sm.blockchainClient.Run(sm.ctx, source)
 }
 
 func (sm *SyncManager) resetFeeFilterToDefault() {
@@ -1659,10 +1732,13 @@ func (sm *SyncManager) updateSyncPeer(_ *peerSyncState) {
 
 	// Only disconnect if we have a valid sync peer
 	if sp != nil {
+		sm.headerMu.Lock()
 		// Log current sync state before disconnecting
 		if sm.headersFirstMode.Load() {
 			sm.logger.Debugf("Current header sync state - header cache names %d heights", sm.headerCache.Len())
 		}
+
+		sm.headerMu.Unlock()
 
 		sp.SetSyncPeer(false)
 		sp.DisconnectWithInfo("updateSyncPeer - disconnect old sync peer")
@@ -2040,6 +2116,77 @@ func (sm *SyncManager) blockGivenUpOn(hash chainhash.Hash) bool {
 	}
 
 	return fs.attempts >= ceiling
+}
+
+// legacyCorruptAttemptCooldown returns the fixed cooldown window for the per-block corrupt
+// re-download cap (bitcoin-sv/teranode#4692), falling back to settings.DefaultCorruptAttemptCooldown
+// when settings are nil or the setting is unset or non-positive. Mirrors corruptAttemptCooldown in
+// services/blockvalidation; both share the one fallback constant so the two caches can never drift
+// apart.
+func legacyCorruptAttemptCooldown(s *settings.Settings) time.Duration {
+	if s != nil {
+		if d := s.BlockValidation.CorruptAttemptCooldown; d > 0 {
+			return d
+		}
+	}
+
+	return settings.DefaultCorruptAttemptCooldown
+}
+
+// recordCorruptBlockAttempt increments and returns the per-(hash, peerID) corrupt-body failure count
+// within a fixed cooldown window (bitcoin-sv/teranode#4692). The window is set once from the first
+// corrupt delivery and preserved across subsequent deliveries (not extended), so once it lapses the
+// counter resets and an honest body is admitted again. Called ONLY on an actual corrupt failure.
+// Nil-safe (SyncManager struct-literal test fixtures that bypass New()): a nil map or nil settings
+// is a no-op returning 0, so the cap simply does not accrue rather than panicking.
+func (sm *SyncManager) recordCorruptBlockAttempt(blockHash chainhash.Hash, peerID string) int {
+	if sm.blockCorruptAttempts == nil || sm.settings == nil {
+		return 0
+	}
+
+	key := legacyCorruptAttemptKey{hash: blockHash, peerID: peerID}
+
+	now := time.Now()
+	if st, ok := sm.blockCorruptAttempts.Get(key); ok && now.Before(st.windowExpiry) {
+		// Preserve the LOGICAL window (windowExpiry) so re-delivery cannot extend the cooldown;
+		// the Set re-extends only the map's retention TTL. A new struct avoids mutating shared state.
+		next := &corruptAttemptState{count: st.count + 1, windowExpiry: st.windowExpiry}
+		sm.blockCorruptAttempts.Set(key, next)
+
+		return next.count
+	}
+
+	sm.blockCorruptAttempts.Set(key, &corruptAttemptState{count: 1, windowExpiry: now.Add(legacyCorruptAttemptCooldown(sm.settings))})
+
+	return 1
+}
+
+// corruptBlockAttemptsExhausted reports whether a (hash, peerID) has reached the corrupt
+// re-download cap and is within its cooldown window (bitcoin-sv/teranode#4692). A cap of <= 0
+// disables the bound (re-opens the corrupt-body bandwidth DoS). Nil-safe: a nil settings or nil map
+// (SyncManager struct-literal test fixtures that bypass New()) behaves as CAP DISABLED — it returns
+// false (never "exhausted"), so a missing config can never silently drop honest blocks.
+func (sm *SyncManager) corruptBlockAttemptsExhausted(blockHash chainhash.Hash, peerID string) bool {
+	if sm.settings == nil || sm.blockCorruptAttempts == nil {
+		return false
+	}
+
+	maxAttempts := sm.settings.BlockValidation.MaxCorruptAttemptsPerBlock
+	if maxAttempts <= 0 {
+		return false
+	}
+
+	st, ok := sm.blockCorruptAttempts.Get(legacyCorruptAttemptKey{hash: blockHash, peerID: peerID})
+
+	return ok && st.count >= maxAttempts && time.Now().Before(st.windowExpiry)
+}
+
+// clearCorruptBlockAttempts drops a (hash, peerID)'s corrupt counter on successful store so an
+// honest body after the window never inherits a stale count (bitcoin-sv/teranode#4692). Nil-safe.
+func (sm *SyncManager) clearCorruptBlockAttempts(blockHash chainhash.Hash, peerID string) {
+	if sm.blockCorruptAttempts != nil {
+		sm.blockCorruptAttempts.Delete(legacyCorruptAttemptKey{hash: blockHash, peerID: peerID})
+	}
 }
 
 // peerStateResolvingPrimary returns the sync state for peer, resolving a stream
@@ -2723,6 +2870,46 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		}
 	}
 
+	// Per-(hash, peerID) corrupt re-download cap (bitcoin-sv/teranode#4692): if THIS serving peer has
+	// already failed with a corrupt body for this hash MaxCorruptAttemptsPerBlock times within the
+	// cooldown window, drop this delivery BEFORE the expensive HandleBlockDirect/decorate. This is the
+	// ban-score-independent bound on corrupt re-download amplification PER SERVING IDENTITY (keyed on
+	// (hash, peerID), not the hash alone, so a bad peer never wedges the honest tip — an honest peer
+	// keeps a fresh budget for the same hash; the residual aggregate per-hash work scales with the
+	// number of distinct serving peers). Drop quietly: do NOT reject the block to the peer, do NOT
+	// mark it failed (recentlyFailedBlocks) — preserving the recentlyFailedBlocks no-NOT_FOUND-cascade
+	// property — and do NOT poison. The peer's stall timer is deliberately NOT refreshed, so if a peer
+	// keeps serving the same corrupt hash the stall detector can rotate to one with an honest body.
+	//
+	// Recovery, precisely, and it is NOT upstream's. Upstream had to argue at length
+	// that this gate must not re-request and must not refill, because its header list
+	// was a linear chain walked by a cursor: anything a refill asked for descended
+	// from the hash just dropped, arrived, refreshed the stall timer and then failed
+	// its parent lookup, so the only recovery left was waiting 180 seconds for the
+	// stall detector to rotate the sync peer.
+	//
+	// None of that applies here. The wanted range is recomputed from the committed
+	// tip on every pass and stops at the first height the header cache cannot name,
+	// so a hash this gate drops is simply asked for again on the next pass — of
+	// whichever peer has budget, not necessarily the capped one — and nothing above
+	// it is requested until it lands. Dropping quietly is therefore all this gate has
+	// to do: no rotation to wait for, no descendants to waste.
+	//
+	// What is unchanged is everything the drop must NOT do: do not reject the block
+	// to the peer, do not mark it failed (recentlyFailedBlocks), preserving the
+	// no-NOT_FOUND-cascade property, and do not poison. The peer's stall timer is
+	// deliberately not refreshed either, so a peer that keeps serving the same
+	// corrupt hash is still rotated away from on the ordinary schedule.
+	//
+	// It self-heals without rotation in both directions: a peer below the cap is
+	// never dropped here at all, and once the fixed window lapses the counter resets
+	// and the same peer's honest body is admitted.
+	if sm.corruptBlockAttemptsExhausted(bmsg.blockHash, bmsg.peer.Addr()) {
+		sm.logger.Warnf("[handleBlockMsgHead][%s] corrupt re-download cap reached for peer %s, dropping delivery until the cooldown window expires (not rejected, not stored invalid)", bmsg.blockHash, bmsg.peer)
+
+		return nil, true, nil
+	}
+
 	// Hand sole ownership of the decoded block to HandleBlockDirect. The
 	// blockHandler goroutine keeps *bmsg alive until the reply is sent, so
 	// leaving the field set would pin the multi-GB wire block (and its decode
@@ -2828,6 +3015,15 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		prevHash:       prevBlockHash,
 		catchingBlocks: catchingBlocks,
 		isCheckpoint:   isCheckpointBlock,
+
+		// Read once, here, and carried through the dispatch, so the head and the
+		// worker cannot reach different answers about the same block. Upstream read it
+		// just before clearing the request bookkeeping, for the same reason: the proof
+		// has to outlive whatever the delivery path tears down. Here it is a header-cache
+		// lookup rather than a map the request path stamped — see blockOrigin — so the
+		// ordering constraint is weaker, but taking it once is still the rule, because a
+		// second read can disagree with the first if a headers batch lands in between.
+		origin: sm.blockOrigin(bmsg.blockHash),
 	}
 
 	// HandleBlockDirect's opening — is the block stored, is its parent — asked
@@ -3123,7 +3319,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 
 	// d.msg.peer is the delivering peer, which is what HandleBlockDirect has always
 	// been given; d.peer is its association's primary, for the tail's bookkeeping.
-	err = sm.HandleBlockDirect(sm.ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, d.parent)
+	err = sm.HandleBlockDirect(sm.ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, d.parent, d.origin)
 
 	return sm.handleBlockMsgTail(d, err)
 }
@@ -3167,6 +3363,57 @@ func (sm *SyncManager) handleBlockMsgTail(d *blockDispatch, err error) error {
 				sm.dropBlockFromWalk(bmsg.blockHash)
 
 				return nil
+			}
+
+			// Corrupt block body (bitcoin-sv/teranode#4692): a body-derived failure (merkle mismatch, CVE
+			// duplicate) that is not bound to the header, so it cannot condemn the hash and is not
+			// a clear peer fault (a body can be corrupted in transit). Drop it WITHOUT rejecting the
+			// block to the peer, WITHOUT marking it failed (which would suppress its descendants),
+			// and WITHOUT disconnecting (see shouldDisconnectOnBlockErr) — re-request is left free so
+			// an honest copy can arrive on the next delivery / sync-peer rotation. Never poison.
+			if errors.IsBlockCorrupt(err) {
+				// Count this corrupt failure toward the per-(hash, peerID) cap (bitcoin-sv/teranode#4692).
+				// Once this serving peer's count for the hash reaches MaxCorruptAttemptsPerBlock the gate
+				// above drops that peer's further deliveries until the fixed window lapses. Recorded ONLY
+				// on an actual corrupt failure, so a below-cap corrupt is still re-downloaded as today.
+				attempts := sm.recordCorruptBlockAttempt(bmsg.blockHash, bmsg.peer.Addr())
+				sm.logger.Warnf("[handleBlockMsg][%s] corrupt block body from peer %s (attempt %d), dropping for re-download (not rejected, not stored invalid): %v", bmsg.blockHash, bmsg.peer, attempts, err)
+
+				// Re-request through the ordinary wanted-range pass rather than through a
+				// direct getdata to the same peer.
+				//
+				// Upstream needed requestBlockDirect here because its recovery routes were
+				// both blocked: a getblocks is answered with an inv and processInvMsg discards
+				// invs while headers-first mode is on, and its header-block walk only ever went
+				// forward from a cursor the dropped hash had already passed. Neither structure
+				// exists on this branch. assignWantedBlocks recomputes the range from the
+				// committed tip every time it runs, so the dropped hash is the first thing it
+				// names; the head has already released this peer's ownership of it, so nothing
+				// holds it back; and the assigner is free to place it with a different peer,
+				// which upstream's direct getdata could not do.
+				//
+				// SKIPPED once this peer has reached the cap, for upstream's reason and gated on
+				// upstream's predicate rather than on a re-derived attempts comparison, so this
+				// decision and the gate above agree by construction: corruptBlockAttemptsExhausted
+				// reads the counter recordCorruptBlockAttempt just wrote and already handles a cap
+				// of <= 0 (DISABLED) and a nil map or settings fixture, both of which fall through
+				// to "ask again", which is the pre-existing behaviour. Below the cap, asking again
+				// and possibly getting the same peer is deliberate: a body can be corrupted in
+				// transit by an honest relay.
+				//
+				// Pipeline maintenance ONLY. The corrupt branch must run no accepted-block
+				// bookkeeping (rejected-tx clear, peer-height update, FSM RUN, fee-filter reset),
+				// which is why this calls the assignment pass directly instead of falling through
+				// to the acceptance footer.
+				if !sm.corruptBlockAttemptsExhausted(bmsg.blockHash, bmsg.peer.Addr()) {
+					sm.fetchHeaderBlocks()
+				}
+
+				// Keep the getblocks as well: in the legacy sync protocol it doubles as the
+				// batch-continuation signal (see requestMissingBlocks), which a getdata does not carry.
+				sm.requestMissingBlocks(peer, bmsg.blockHash)
+
+				return err
 			}
 
 			// Remember this block failed to store/validate so its already-queued
@@ -3270,6 +3517,10 @@ func (sm *SyncManager) handleBlockMsgTail(d *blockDispatch, err error) error {
 		sm.blockFailureBackoff.Delete(bmsg.blockHash)
 	}
 
+	// Also clear the per-(hash, peerID) corrupt counter (bitcoin-sv/teranode#4692) so an honest body
+	// after the window never inherits a stale corrupt count.
+	sm.clearCorruptBlockAttempts(bmsg.blockHash, bmsg.peer.Addr())
+
 	// Also clear any cascade-suppression marker (#1333): this hash now stores, so
 	// its descendants must no longer be short-circuited as children of a failure.
 	if sm.recentlyFailedBlocks != nil {
@@ -3351,7 +3602,7 @@ func (sm *SyncManager) handleBlockMsgTail(d *blockDispatch, err error) error {
 
 			// Since we are current, we can tell FSM to transition to RUN
 			// Blockchain client will check if miner is registered, if so it will send Mine event, and FSM will transition to Mine
-			if err = sm.blockchainClient.Run(sm.ctx, "legacy/netsync/manager/handleBlockMsg"); err != nil {
+			if err = sm.runIfCatchingBlocks("legacy/netsync/manager/handleBlockMsg"); err != nil {
 				sm.logger.Errorf("[Sync Manager] failed to send FSM RUN event %v", err)
 			}
 
@@ -3580,13 +3831,33 @@ const headerCacheRefillThreshold = int32(wire.MaxBlockHeadersPerMsg / 2)
 // earlier than that, while there is still cache left to work through, so the
 // reply has time to land before the current batch runs out.
 //
-// The locator is built exactly as startSync's and headersRoundLocator's own
-// callers build theirs: from the committed tip, through the chain's own
-// GetBlockLocator, never from anything merely downloaded or merely named by
-// the cache. A locator anchored above what this node has actually committed
-// is what had a peer answer from genesis and lose its connection for
-// answering honestly — the 2026-09-11 incident this whole design exists to
-// not repeat.
+// Below the last checkpoint, a third condition can also force a send: the
+// header cache's own walkIncomplete, true when this cache's checkpoints name a
+// checkpoint above the committed tip that its own top has not yet reached (see
+// headerCache.NextCheckpointAbove). That walk's usual driver is
+// continueCheckpointWalkIfNeeded, sent the instant a reply lands, straight
+// back to the peer that answered — this function is its backstop for when
+// that peer goes quiet, which is why walkIncomplete is checked regardless of
+// headerCacheRefillThreshold: top-best can already be comfortably over that
+// threshold (the walk races far ahead of what downloads need) while the walk
+// itself still has tens of thousands of heights left to reach its checkpoint,
+// and waiting for downloads to eat into that headroom before asking again
+// would couple the walk's speed to the download pace it exists to outrun. The
+// interval and peer rotation below still apply exactly as they do for the
+// download-driven trigger, so a stalled walk retries at the normal cadence
+// rather than being asked about on every commit.
+//
+// The locator is built from the committed tip, through the chain's own
+// GetBlockLocator — the same one startSync and headersRoundLocator's other
+// callers use — UNLESS walkIncomplete, in which case it is the list's own top
+// hash followed by that same tip locator (extendingHeadersLocator), because
+// below the last checkpoint every request past the first is answered from
+// where the list already reaches, not from the tip a block or two behind it.
+// A locator anchored ONLY above what this node has actually committed, with a
+// non-zero stop hash, is what had a peer answer truthfully with zero headers
+// and stalled the node for seven hours — see
+// docs/superpowers/specs/2026-09-11-legacy-sync-stall-800128.md — so the tip's
+// own locator entries and the zero stop hash are kept in both branches.
 //
 // Any eligible peer will do, not only the sync peer: eligibleBlockPeers is
 // the same connected, sync-candidate pool the block-download scheduler draws
@@ -3610,16 +3881,21 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 
 	top, haveTop := sm.headerCache.Top()
 
-	if _, ok := sm.headerCache.At(last + 1); ok {
-		// The depth cap stopped the pass, not the cache's own end, so the
-		// backstop alone has nothing to do here. Whether the early trigger
-		// does depends on how much cache is left above the committed tip,
-		// not on the depth cap: top-best can be far bigger than the read-ahead
-		// depth that limited this pass's own wanted range. Only skip the
-		// refill when there is still comfortably more than
-		// headerCacheRefillThreshold left to work through.
-		if haveTop && top-best >= headerCacheRefillThreshold {
-			return
+	next, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
+	walkIncomplete := checkpointAhead && (!haveTop || top < next.Height)
+
+	if !walkIncomplete {
+		if _, ok := sm.headerCache.At(last + 1); ok {
+			// The depth cap stopped the pass, not the cache's own end, so the
+			// backstop alone has nothing to do here. Whether the early trigger
+			// does depends on how much cache is left above the committed tip,
+			// not on the depth cap: top-best can be far bigger than the read-ahead
+			// depth that limited this pass's own wanted range. Only skip the
+			// refill when there is still comfortably more than
+			// headerCacheRefillThreshold left to work through.
+			if haveTop && top-best >= headerCacheRefillThreshold {
+				return
+			}
 		}
 	}
 
@@ -3641,7 +3917,25 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	locator, err := sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+	var (
+		locator blockchain.BlockLocator
+		err     error
+	)
+
+	if walkIncomplete && haveTop {
+		if topHash, ok := sm.headerCache.At(top); ok {
+			locator, err = sm.extendingHeadersLocator(topHash)
+		} else {
+			// The top height Top() just reported is gone from the map: a
+			// concurrent Prune or a whole-list drop landed between the two
+			// calls. Fall through to the ordinary tip-anchored locator, the
+			// same one a genuinely empty list gets below.
+			locator, err = sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+		}
+	} else {
+		locator, err = sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+	}
+
 	if err != nil {
 		sm.logger.Warnf("[assignWantedBlocks] could not build a getheaders locator to refill the header cache past height %d: %v", last, err)
 
@@ -3665,9 +3959,12 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	if haveTop {
+	switch {
+	case walkIncomplete:
+		sm.logger.Infof("[assignWantedBlocks][%s] the walk toward checkpoint height %d has stalled, retrying", peer.String(), next.Height)
+	case haveTop:
 		sm.logger.Infof("[assignWantedBlocks][%s] the header cache names %d more heights above the committed tip at %d, asked for more", peer.String(), top-best, best)
-	} else {
+	default:
 		sm.logger.Infof("[assignWantedBlocks][%s] the header cache is empty above height %d, asked for more", peer.String(), last)
 	}
 }
@@ -3823,6 +4120,13 @@ func (sm *SyncManager) lookaheadCeilingLocked(best int32) (int64, bool) {
 // handleHeadersMsg handles block header messages from all peers.  Headers are
 // requested when performing a headers-first sync.
 func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
+	// No headerMu here, unlike upstream. Upstream holds it for the whole handler
+	// because the handler splices into the header list, which this branch
+	// deleted: a fill lands in headerCache under that cache's own mutex, and
+	// peerStates is its own concurrent map. Holding headerMu would also deadlock,
+	// because a successful fill runs fetchHeaderBlocks below, and wantedBlocks
+	// takes headerMu, which is not re-entrant. The upstream merge reintroduced
+	// exactly that and hung every successful fill.
 	sm.logger.Debugf("[handleHeadersMsg] received headers message with %d headers from %s", len(hmsg.headers.Headers), hmsg.peer)
 	peer := hmsg.peer
 
@@ -3842,6 +4146,11 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	msg := hmsg.headers
 	numHeaders := len(msg.Headers)
 
+	// headersFirstMode alone, without upstream's "|| sm.nextCheckpoint == nil": the
+	// stored checkpoint field is gone, and startSync — the one place that turns this
+	// flag on — already derives the next checkpoint fresh and refuses to enter
+	// headers-first mode when there is none ahead. A second, stored copy of that
+	// decision is what went stale and left the mode unreachable.
 	if !sm.headersFirstMode.Load() {
 		reason := fmt.Sprintf("Got %d unrequested headers from %s", numHeaders, peer.String())
 		peer.DisconnectWithWarning(reason)
@@ -3892,6 +4201,29 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	sm.fetchHeaderBlocks()
 }
 
+// blockOrigin returns the ancestry proof for a block, read from the header cache.
+//
+// This is the replacement for upstream's blockOrigin, which read a per-peer
+// requestedBlocks map that fetchHeaderBlocks had stamped while walking the header
+// list. Neither structure exists here. What does exist is stronger in the one way
+// that matters and weaker in one way that does not:
+//
+//   - stronger, because the cache holds ONE run, verified to be internally linked
+//     and rooted in this node's own committed tip, and it is replaced whole rather
+//     than appended to. Upstream's list could be extended past the point that had
+//     actually been verified, which is the hole its second security commit had to
+//     go back and close with headerNodeProven.
+//   - weaker, because it is read at delivery rather than stamped at request, so a
+//     refill that lands while a block is on the wire can lose the proof. That
+//     direction costs full validation and nothing else. See headerCache.Proven.
+//
+// Every route that cannot show the run gets the zero value: peer advertisements,
+// blocks adopted from disk by park recovery, and anything re-requested outside the
+// wanted range.
+func (sm *SyncManager) blockOrigin(blockHash chainhash.Hash) blockRequestOrigin {
+	return blockRequestOrigin{headerProven: sm.headerCache.Proven(blockHash)}
+}
+
 // fillHeaderCache turns a headers batch into the cache the wanted range reads,
 // and reports whether anything was cached.
 //
@@ -3927,24 +4259,215 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 		return false
 	}
 
+	// Read before Fill, which below the last checkpoint may EXTEND this cache
+	// rather than replace it (see headerCache.Fill and extendLocked). Both are
+	// needed afterward purely to report what happened correctly — the log line
+	// below and the "list dropped" disconnect on the failure path — neither of
+	// which Fill itself is in a position to say: it has no logger, and on a
+	// wrong-hash drop it has already reset the state that would say so.
+	prevTop, havePrevTop := sm.headerCache.Top()
+	prevProven := sm.headerCache.ProvenTo()
+	_, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
+
 	if !sm.headerCache.Fill(tipHash, best+1, msg.Headers) {
+		// Two different refusals arrive here as one false, and only one of them is
+		// the peer's fault. Fill refuses a run that does not reach above the
+		// committed tip, which is an honest answer to a question this node has
+		// stopped asking, and it refuses a run that reaches a checkpoint height
+		// carrying the wrong hash, which is a lie about the certified chain.
+		// Re-deriving which it was costs one walk of the batch and is worth it,
+		// because upstream disconnects for the second (handleHeadersMsg's
+		// "does NOT match expected checkpoint hash") and this branch lost that
+		// defence along with the header list.
+		if cp := sm.contradictedCheckpoint(best+1, msg.Headers); cp != nil {
+			peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash %s", cp.Height, cp.Hash))
+
+			return false
+		}
+
+		// Below the last checkpoint, once this cache already named heights above
+		// the tip, Fill judges the batch against the list's own top instead of
+		// best+1 (extendLocked) — so a wrong hash reached that way shows up only
+		// when the batch is re-walked from prevTop+1, never from best+1 above.
+		// A match here means Fill has already wiped every entry the dropped run
+		// had proven, because they were all one linked chain with the batch that
+		// just failed to agree; this block is purely the classification for the
+		// disconnect and the log, not the decision itself.
+		if havePrevTop && prevTop >= best+1 && checkpointAhead {
+			if cp := sm.contradictedCheckpoint(prevTop+1, msg.Headers); cp != nil {
+				sm.logger.Warnf("[fillHeaderCache][%s] header list dropped: the walk reached checkpoint height %d without the pinned hash %s", peer, cp.Height, cp.Hash)
+				peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash %s", cp.Height, cp.Hash))
+
+				return false
+			}
+		}
+
 		sm.logger.Debugf("[fillHeaderCache] batch of %d headers from %s does not reach above the committed tip at height %d, dropping it", len(msg.Headers), peer, best)
 
 		return false
 	}
 
-	// Read back from the cache rather than computed from the batch length. Fill
-	// drops whatever prefix the tip has already moved past, so the batch's own
-	// length no longer names the top height — that arithmetic was right only
-	// while a reply had to begin exactly one above the tip, and reporting a top
-	// the cache does not hold would be a lie in the one log line anybody reads
-	// to see how much runway is left.
-	cached := sm.headerCache.Len()
+	// Read the new top back from the cache rather than computed from the batch
+	// length: Fill drops whatever prefix does not belong, and below the last
+	// checkpoint it may append onto prevTop instead of starting at best+1, so
+	// the batch's own length no longer names either end on its own.
 	top, _ := sm.headerCache.Top()
 
-	sm.logger.Infof("[fillHeaderCache] cached %d of %d headers from %s, heights %d to %d", cached, len(msg.Headers), peer, best+1, top)
+	// The low end of what THIS call added. extended mirrors exactly the
+	// condition Fill itself used to choose extendLocked over replaceLocked: an
+	// extending fill appended onto prevTop, a replacing one starts at best+1
+	// regardless of what the cache held before. Getting this wrong would have
+	// the one log line an operator panel parses report the whole accumulated
+	// list's size against a single reply's header count.
+	extended := havePrevTop && prevTop >= best+1 && checkpointAhead
+
+	low := best + 1
+	if extended {
+		low = prevTop + 1
+	}
+
+	cached := top - low + 1
+
+	sm.logger.Infof("[fillHeaderCache] cached %d of %d headers from %s, heights %d to %d", cached, len(msg.Headers), peer, low, top)
+
+	if newProven := sm.headerCache.ProvenTo(); newProven > prevProven {
+		sm.logger.Infof("[fillHeaderCache][%s] header walk matched checkpoint at height %d", peer, newProven)
+	}
+
+	sm.continueCheckpointWalkIfNeeded(peer, best, top)
 
 	return true
+}
+
+// continueCheckpointWalkIfNeeded sends the next getheaders immediately when
+// the header list has not yet reached the checkpoint it is walking toward,
+// rather than waiting out headerCacheRefillInterval. That interval exists to
+// stop a dry cache being asked about again on every commit while a reply is
+// already in flight; a reply has just landed here, so there is nothing in
+// flight to duplicate, and at a flat 5 seconds per round trip a 28,000-height
+// gap between mainnet checkpoints would take roughly two minutes to walk
+// instead of however long the network actually takes.
+//
+// Asks the peer that just answered, not a rotated one: it has just proved it
+// holds this chain and is reachable, and asking anyone else here would be a
+// second request for the same range before the first has even had a chance to
+// answer again. Rotation on a stalled walk is still maybeRequestMoreHeaders'
+// job — see its own doc for how it now also owns this walk as a backstop.
+//
+// lastHeaderRequestAt is still updated on a successful send, so the periodic
+// path this same call chain reaches a moment later (fetchHeaderBlocks, called
+// unconditionally by handleHeadersMsg after this) does not also fire and send
+// a second, redundant request for the same range.
+//
+// Guarded on peer.Connected(): every production caller's peer is connected by
+// construction, but several of this package's tests fill the cache directly
+// through fillHeaderCache with a bare, unconnected test peer that was never
+// meant to receive a real getheaders, and this must not be the thing that
+// changes that.
+func (sm *SyncManager) continueCheckpointWalkIfNeeded(peer *peerpkg.Peer, best, top int32) {
+	if !sm.headersFirstMode.Load() || !peer.Connected() {
+		return
+	}
+
+	next, ok := sm.headerCache.NextCheckpointAbove(best)
+	if !ok || top >= next.Height {
+		return
+	}
+
+	topHash, ok := sm.headerCache.At(top)
+	if !ok {
+		return
+	}
+
+	locator, err := sm.extendingHeadersLocator(topHash)
+	if err != nil {
+		sm.logger.Warnf("[fillHeaderCache][%s] could not build a locator to continue the walk toward checkpoint height %d: %v", peer, next.Height, err)
+
+		return
+	}
+
+	peer.ForgetLastHeadersRequest()
+
+	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
+		sm.logger.Warnf("[fillHeaderCache][%s] failed to send the immediate continuation toward checkpoint height %d: %v", peer, next.Height, err)
+
+		return
+	}
+
+	sm.lastHeaderRequestAt.Store(time.Now().UnixNano())
+
+	sm.logger.Infof("[fillHeaderCache][%s] the walk has not yet reached checkpoint height %d, asked immediately for more", peer, next.Height)
+}
+
+// extendingHeadersLocator builds the locator for a request that continues a
+// below-checkpoint walk already under way: the current list top's hash first,
+// so a peer that has it answers immediately from where the walk left off,
+// followed by the ordinary committed-tip locator so an honest peer that has
+// fallen behind the walk — or one that never had the top hash at all — still
+// finds a shared ancestor rather than replying about a point it has moved
+// past.
+//
+// See docs/superpowers/specs/2026-09-11-legacy-sync-stall-800128.md: a locator
+// anchored ONLY above the committed tip, with a non-zero stop hash, produced a
+// truthful empty reply that stalled the node for seven hours, because the
+// range asked about was one the peer had already answered in full. Keeping the
+// tip's own locator entries after the top hash, and leaving the stop hash at
+// the zero hash exactly as every other getheaders in this package does, is
+// what keeps this request safe in the same way: a peer that cannot place the
+// top hash at all still has every reason to answer from the tip instead of
+// answering "nothing" about a range it considers already closed.
+func (sm *SyncManager) extendingHeadersLocator(topHash chainhash.Hash) (blockchain.BlockLocator, error) {
+	best, tipHash, ok := sm.committedTip()
+	if !ok {
+		return nil, errors.NewProcessingError("no committed tip recorded yet")
+	}
+
+	tipLocator, err := sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+	if err != nil {
+		return nil, err
+	}
+
+	locator := make(blockchain.BlockLocator, 0, len(tipLocator)+1)
+	locator = append(locator, &topHash)
+	locator = append(locator, tipLocator...)
+
+	return locator, nil
+}
+
+// contradictedCheckpoint returns the checkpoint a headers batch disagrees with, or
+// nil if it disagrees with none.
+//
+// It walks the batch as delivered, so the height it assigns each header is
+// baseHeight plus its index — the same arithmetic Fill uses for the part of the
+// run it keeps. That is an over-approximation for a batch whose front has slipped
+// behind the committed tip, where Fill drops a prefix and re-bases: a header at a
+// checkpoint height by this arithmetic may not be at that height at all. It is the
+// safe over-approximation, though, and only on a batch Fill has ALREADY refused,
+// so the worst it can do is blame a peer for a batch that was going to be dropped
+// anyway. A batch whose front is behind the tip and whose linkage holds is never
+// refused by Fill, so it never reaches here.
+//
+// Nil checkpoints, or a batch reaching no checkpoint height, both answer nil.
+func (sm *SyncManager) contradictedCheckpoint(baseHeight int32, headers []*wire.BlockHeader) *chaincfg.Checkpoint {
+	if sm.chainParams == nil || len(headers) == 0 {
+		return nil
+	}
+
+	checkpoints := sm.chainParams.Checkpoints
+	top := baseHeight + int32(len(headers)) - 1 //nolint:gosec // a batch index, bounded by the wire limit
+
+	for i := range checkpoints {
+		cp := &checkpoints[i]
+		if cp.Hash == nil || cp.Height < baseHeight || cp.Height > top {
+			continue
+		}
+
+		if hash := headers[cp.Height-baseHeight].BlockHash(); !hash.IsEqual(cp.Hash) {
+			return cp
+		}
+	}
+
+	return nil
 }
 
 // punishUnrequestedBlock reports whether a block nobody asked for should cost
@@ -4478,11 +5001,12 @@ out:
 				sm.logger.Errorf("[SyncManager] failed to get fsm current state")
 			}
 
-			// we reached current in legacy, and current FSM state is not Running, send RUN event
-			if currentState != nil && *currentState != teranodeblockchain.FSMStateRUNNING {
+			// Only observed catchup needs automatic promotion. This cached
+			// prefilter also avoids the expensive current() check while parked.
+			if err == nil && currentState != nil && *currentState == teranodeblockchain.FSMStateCATCHINGBLOCKS {
 				if sm.current() { // only call this when we are not in the running state, it's an expensive call
 					sm.logger.Infof("[SyncManager] Legacy reached current, sending RUN event to FSM")
-					if err = sm.blockchainClient.Run(sm.ctx, "legacy/netsync/manager/blockHandler"); err != nil {
+					if err = sm.runIfCatchingBlocks("legacy/netsync/manager/blockHandler"); err != nil {
 						sm.logger.Infof("[Sync Manager] failed to send FSM RUN event %v", err)
 					}
 
@@ -5211,7 +5735,7 @@ func (sm *SyncManager) Start() {
 	// runs behind that as a safety net for a parent committed by something other
 	// than legacy sync, which fires no event either of the other two mechanisms
 	// listens for.
-	sm.blockPark.Recover(sm.ctx, sm.subtreeStore, sm.quickValidationAllowed)
+	sm.blockPark.Recover(sm.ctx, sm.subtreeStore)
 
 	go sm.blockHandler()
 }
@@ -5252,6 +5776,10 @@ func (sm *SyncManager) Stop() error {
 
 	if sm.recentlyFailedBlocks != nil {
 		sm.recentlyFailedBlocks.Stop()
+	}
+
+	if sm.blockCorruptAttempts != nil {
+		sm.blockCorruptAttempts.Stop()
 	}
 
 	// DC15 / review C1: quiesce Put then drain the tx-announce batcher before
@@ -5498,7 +6026,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 	}()
 
-	sm.headerCache = newHeaderCache()
+	// The checkpoint list goes in with the cache, because the cache is where the
+	// ancestry proof is decided: Fill judges a run against the pinned hashes under
+	// the same lock that installs it, so no reader can ever see this run's contents
+	// with the previous run's proof. config.ChainParams is non-nil on every path
+	// that reaches here (startSync dereferences it unguarded a few lines below);
+	// a nil list simply means no proof is ever granted.
+	sm.headerCache = newHeaderCache().WithCheckpoints(config.ChainParams.Checkpoints)
 
 	// Build the per-block backoff map only after the last fallible step above.
 	// newBlockFailureBackoffMap starts a background eviction goroutine that is
@@ -5512,6 +6046,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// (#1333). Like blockFailureBackoff this starts a background eviction goroutine
 	// stopped only via Stop(), so build it after the last fallible step above.
 	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](recentlyFailedBlocksTTL).WithMaxSize(blockFailureBackoffMaxTracked)
+
+	// Per-(hash, peerID) corrupt re-download cap (bitcoin-sv/teranode#4692), keyed on the serving peer
+	// so a bad peer never wedges an honest tip. The map's retention equals the cooldown window so an
+	// entry survives its own window even with no further deliveries; the LOGICAL fixed window lives in
+	// corruptAttemptState.windowExpiry (Set re-extends map retention but never the logical window).
+	// Like the maps above, started here after the last fallible step.
+	sm.blockCorruptAttempts = expiringmap.New[legacyCorruptAttemptKey, *corruptAttemptState](legacyCorruptAttemptCooldown(tSettings)).WithMaxSize(blockFailureBackoffMaxTracked)
 
 	// The dispatcher holds a pointer to the manager returned below, so it must be
 	// built from &sm, not from the local value.

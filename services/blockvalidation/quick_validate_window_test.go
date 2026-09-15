@@ -83,23 +83,38 @@ func TestWindow_SpendOfInFlightPredecessorWaitsForItsGate(t *testing.T) {
 	e2, _, err := w.Admit(ctx, b2)
 	require.NoError(t, err)
 
-	batch1 := oneWaveBatchFor(t, bv, b1, []*bt.Tx{p})
+	batch1 := oneWaveBatchFor(t, bv, b1, []*bt.Tx{p}, e1)
 	batch1.window = e1
 	gate1, err := e1.RegisterBatch([]chainhash.Hash{*p.TxIDChainHash()})
 	require.NoError(t, err)
 	batch1.gate = gate1
 	e1.RegistrationComplete()
 
-	batch2 := oneWaveBatchFor(t, bv, b2, []*bt.Tx{c})
-	batch2.window = e2
-	gate2, err := e2.RegisterBatch([]chainhash.Hash{*c.TxIDChainHash()})
-	require.NoError(t, err)
-	batch2.gate = gate2
-	e2.RegistrationComplete()
-
-	// Run block 2's batch first. It must not complete until block 1's gate closes.
+	// Block 2's own extend stage meets block 1's gate too now: decorateExternalInputs needs p's
+	// real script and satoshis before c can be applied, not merely p's eventual existence (the
+	// store's UTXO-hash check on create needs the real values, not zero/nil ones), so building
+	// block 2's batch has to run alongside its apply in the same goroutine rather than before it.
 	done2 := make(chan error, 1)
-	go func() { done2 <- bv.createAndSpendUTXOsForBatch(ctx, b2, batch2) }()
+	go func() {
+		batch2, buildErr := oneWaveBatchForErr(bv, b2, []*bt.Tx{c}, e2)
+		if buildErr != nil {
+			done2 <- buildErr
+			return
+		}
+
+		batch2.window = e2
+
+		gate2, regErr := e2.RegisterBatch([]chainhash.Hash{*c.TxIDChainHash()})
+		if regErr != nil {
+			done2 <- regErr
+			return
+		}
+
+		batch2.gate = gate2
+		e2.RegistrationComplete()
+
+		done2 <- bv.createAndSpendUTXOsForBatch(ctx, b2, batch2)
+	}()
 
 	select {
 	case err := <-done2:
@@ -133,21 +148,35 @@ func TestWindow_FailedPredecessorFailsTheDependentBlockAsALocalFault(t *testing.
 	require.NoError(t, err)
 	e1.RegistrationComplete()
 
-	batch2 := oneWaveBatchFor(t, bv, b2, []*bt.Tx{c})
-	batch2.window = e2
-	gate2, err := e2.RegisterBatch([]chainhash.Hash{*c.TxIDChainHash()})
-	require.NoError(t, err)
-	batch2.gate = gate2
-	e2.RegistrationComplete()
-
+	// Block 2's own extend stage waits on block 1's still-open gate too (see the sibling gate
+	// test above), so building its batch has to run alongside the apply in the same goroutine.
 	done2 := make(chan error, 1)
-	go func() { done2 <- bv.createAndSpendUTXOsForBatch(ctx, b2, batch2) }()
+	go func() {
+		batch2, buildErr := oneWaveBatchForErr(bv, b2, []*bt.Tx{c}, e2)
+		if buildErr != nil {
+			done2 <- buildErr
+			return
+		}
+
+		batch2.window = e2
+
+		gate2, regErr := e2.RegisterBatch([]chainhash.Hash{*c.TxIDChainHash()})
+		if regErr != nil {
+			done2 <- regErr
+			return
+		}
+
+		batch2.gate = gate2
+		e2.RegistrationComplete()
+
+		done2 <- bv.createAndSpendUTXOsForBatch(ctx, b2, batch2)
+	}()
 
 	// Park the waiter on block 1's gate BEFORE failing block 1. Without this probe the failure
-	// can win the race against block 2's partition loop: block 1's gate would already be closed
-	// and out of the open map, block 2 would classify c as independent, its combined call would
-	// reach the store and fail with not-found, and the miss backstop would produce an error
-	// that passes every assertion below without batchGate.Wait ever running.
+	// can win a race against block 2's own goroutine: parking here first guarantees block 2 is
+	// already blocked in batchGate.Wait — either from decorateExternalInputs's own wait or, if
+	// that returns first, from the spend phase's waitGates loop — so the error below is provably
+	// the gate's, not a decorate or miss-backstop path that happened to run to completion first.
 	select {
 	case err := <-done2:
 		t.Fatalf("block 2 completed before it parked on block 1's gate: %v", err)
@@ -185,7 +214,7 @@ func TestWindow_IndependentSuccessorDoesNotWait(t *testing.T) {
 	require.NoError(t, err)
 	e1.RegistrationComplete()
 
-	batch2 := oneWaveBatchFor(t, bv, b2, []*bt.Tx{q})
+	batch2 := oneWaveBatchFor(t, bv, b2, []*bt.Tx{q}, e2)
 	batch2.window = e2
 	gate2, err := e2.RegisterBatch([]chainhash.Hash{*q.TxIDChainHash()})
 	require.NoError(t, err)
@@ -229,7 +258,7 @@ func TestWindow_MissOnRegisteredParentIsReclassifiedAndCounted(t *testing.T) {
 	e1.RegistrationComplete()
 	g1.Close()
 
-	batch2 := oneWaveBatchFor(t, bv, b2, []*bt.Tx{c})
+	batch2 := oneWaveBatchFor(t, bv, b2, []*bt.Tx{c}, e2)
 	batch2.window = e2
 	gate2, err := e2.RegisterBatch([]chainhash.Hash{*c.TxIDChainHash()})
 	require.NoError(t, err)
@@ -263,16 +292,50 @@ func TestWindow_CoinbaseOnlyBlockCompletesItsRegistration(t *testing.T) {
 	defer close(release)
 
 	ctx := context.Background()
-	b1, b2 := twoBlocks(t)
 
 	// The zero-subtree branch needs a coinbase to get past the entry point's checks and a
-	// blockchain client to hand out the block id; the block itself carries no subtrees.
+	// blockchain client to hand out the block id; the block itself carries no subtrees. Built
+	// directly rather than via twoBlocks/chainOf: CheckCoinbaseOnlyBodyBound requires a
+	// no-subtrees header's merkle root to BE the coinbase txid (a single-transaction block's
+	// merkle root is that transaction's id), and chainOf fixes every header's merkle root at the
+	// zero hash before any coinbase exists — swapping a coinbase in afterwards, as this test used
+	// to, leaves that binding failing and quickValidateBlockInner returns CORRUPT before it ever
+	// reaches the window registration this test is pinning.
 	_, publicKey := bec.PrivateKeyFromBytes([]byte("window-coinbase-only"))
-	b1.CoinbaseTx = transactions.Create(t,
+	coinbaseTx := transactions.Create(t,
 		transactions.WithCoinbaseData(1, "/coinbase-only/"),
 		transactions.WithP2PKHOutputs(1, 100_000, publicKey),
 	)
-	b1.ID = 0
+
+	b1 := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: coinbaseTx.TxIDChainHash(),
+			Timestamp:      1,
+			Bits:           model.NBit{},
+			Nonce:          1,
+		},
+		Height:     100,
+		CoinbaseTx: coinbaseTx,
+	}
+
+	// b2's parent link is b1's REAL hash, computed after b1's merkle root is fixed above: the
+	// window's own tail check (quickWindow.Admit) compares this against the header hash of
+	// whatever it is actually holding, not against any hash computed before the coinbase swap.
+	b1Hash := *b1.Hash()
+	b2 := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &b1Hash,
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      2,
+			Bits:           model.NBit{},
+			Nonce:          2,
+		},
+		Height: 101,
+		ID:     101,
+	}
 
 	blockchainMock := &blockchain.Mock{}
 	blockchainMock.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(7), nil)
@@ -306,6 +369,53 @@ func TestWindow_CoinbaseOnlyBlockCompletesItsRegistration(t *testing.T) {
 	require.NoError(t, <-done1)
 	require.Equal(t, uint32(100), <-committed)
 	require.Equal(t, uint32(7), b1.ID)
+}
+
+// TestWindow_EarlyReturnReleasesRegistration pins quickValidateBlockInner's own top-level defer:
+// an error returned before either of the two registration-release points it normally reaches
+// (processBlockSubtrees' deferred call, or the no-subtrees branch's explicit one) must still
+// release the entry's registration, or a successor's WaitPredecessorsRegistered blocks for the
+// life of the window. Called directly rather than through quickValidateBlock — the wrapper that
+// production always uses — because the wrapper's own entry.Fail(err) already closes committed,
+// which WaitPredecessorsRegistered also accepts as a fallback; going around it isolates the
+// function's own guarantee from that fallback.
+func TestWindow_EarlyReturnReleasesRegistration(t *testing.T) {
+	bv, _, w, cleanup := windowHarness(t, "window-early-return")
+	defer cleanup()
+
+	ctx := context.Background()
+	b1, b2 := twoBlocks(t)
+
+	// No coinbase at all: quickValidateBlockInner's coinbase-nil check returns before any
+	// registration point, same as the version-floor and CheckCoinbaseOnlyBodyBound checks ahead
+	// of it — any of the three would do, this is just the one requiring no fixture beyond what
+	// twoBlocks already builds.
+	b1.CoinbaseTx = nil
+
+	e1, _, err := w.Admit(ctx, b1)
+	require.NoError(t, err)
+	e2, _, err := w.Admit(ctx, b2)
+	require.NoError(t, err)
+
+	done1 := make(chan error, 1)
+	go func() { done1 <- bv.quickValidateBlockInner(e1.Context(), b1, "test-peer", "", e1) }()
+
+	select {
+	case err := <-done1:
+		require.Error(t, err, "a block with no coinbase must fail")
+	case <-time.After(5 * time.Second):
+		t.Fatal("quickValidateBlockInner did not return for a block with no coinbase")
+	}
+
+	waited := make(chan error, 1)
+	go func() { waited <- e2.WaitPredecessorsRegistered(ctx) }()
+
+	select {
+	case err := <-waited:
+		require.NoError(t, err, "a successor must not see the early failure as ITS OWN error")
+	case <-time.After(5 * time.Second):
+		t.Fatal("block 2 waited forever on block 1's registration after block 1's early return")
+	}
 }
 
 // windowMissCase is one row of the backstop's classification table. ownRegistered runs the row

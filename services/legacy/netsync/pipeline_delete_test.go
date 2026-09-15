@@ -339,6 +339,11 @@ func TestPipelineBlockDelete_DoesNotTouchAnotherDeliverysSubtreeFiles(t *testing
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
+	// Below-checkpoint gating now also demands the header be PROVEN (an ancestry
+	// proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9), not merely below the
+	// checkpoint height, or the sink writes .subtreeToCheck instead of the .subtree
+	// this test's assertion checks for. See proveBlockOrigin.
+	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
 	// Peer A: a genuine, successful conversion, parked and still needed.

@@ -163,3 +163,15 @@ func (s *Store) deleteIn(ctx context.Context, q querier, hashes []chainhash.Hash
 
 	return nil
 }
+
+// DeleteComplete removes a transaction and every record it owns. On this store that is exactly
+// what Delete already does, so it delegates, the same as the SQL store.
+//
+// The interface method exists for paginated backends, where Delete removes only the master record
+// and a surviving pagination record could answer a descendant with TX_LOCKED instead of a clean
+// missing parent. This store keeps no pagination records and no external blobs: Delete removes
+// everything it holds about the transaction, and a transaction it does not hold is already success,
+// which is the idempotence DeleteComplete requires.
+func (s *Store) DeleteComplete(ctx context.Context, hash *chainhash.Hash) error {
+	return s.Delete(ctx, hash)
+}

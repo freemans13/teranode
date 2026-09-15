@@ -189,7 +189,13 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 
 		// A nil in-flight parent: the parent of a parked block is in the chain by the
 		// time anything commits it, so HandleBlockDirect looks it up there.
-		if err = sm.HandleBlockDirect(sm.ctx, entry.peer, entry.hash, msgBlock, nil); err != nil {
+		//
+		// The ancestry proof is re-read from the header cache for the same reason the
+		// dispatcher's parked run does: the run that named this block may have been
+		// replaced, or the process restarted, since it was parked. A cache that still
+		// names it inside a proven prefix gives the same answer it gave on arrival; one
+		// that does not gives the zero value, which denies the fast path.
+		if err = sm.HandleBlockDirect(sm.ctx, entry.peer, entry.hash, msgBlock, nil, sm.blockOrigin(entry.hash)); err != nil {
 			return sm.parkedBlockFailed(entry, err)
 		}
 	}

@@ -1,6 +1,36 @@
 # How to Manage Teranode States
 
-This guide explains how to change and monitor Teranode's state. Note that a fresh Teranode instance starts in CATCHINGBLOCKS state and begins catching up on its own; it reaches RUNNING once catch-up completes above the network's highest checkpoint. A restarted instance resumes whatever state it last persisted.
+This guide explains how to change and monitor Teranode's state. Fresh production
+deployments (`operator` and `docker.m` settings contexts) start in `IDLE`, giving
+an operator a safe inspection window. Other contexts keep the automatic
+`CATCHINGBLOCKS` default. Configure this with
+`blockchain_initializeNodeInState`; it accepts `IDLE`, `CATCHINGBLOCKS`, or
+`RUNNING` (uppercase). Invalid values fail startup only when no FSM state is
+persisted. On a checkpointed network, configured `RUNNING` requires a pre-seeded
+tip at or above the highest checkpoint; otherwise startup fails without fallback.
+Use `CATCHINGBLOCKS` to synchronize a fresh node.
+
+After inspecting a fresh production deployment, start synchronization from
+`IDLE` with `teranode-cli setfsmstate --fsmstate catchingblocks`. A direct
+`RUNNING` request is refused below the highest checkpoint; catch-up promotes the
+node automatically once it reaches that checkpoint.
+
+The setting applies only when no FSM state is persisted. Restarts normally
+restore the persisted state without validating unused boot configuration. A
+persisted `RUNNING` state with a successfully read tip below the active network's
+highest checkpoint is durably migrated to `CATCHINGBLOCKS`. Tip-read failures or
+missing metadata abort startup and leave the persisted state unchanged.
+
+Automatic `Run` and `CatchUpBlocks` requests cannot leave operator `IDLE`.
+This also prevents automatic catchup from bypassing STOP by first entering
+CATCHINGBLOCKS and then requesting RUN. Legacy synchronization reaching the tip
+cannot reverse an operator STOP. To leave IDLE deliberately, use
+`teranode-cli setfsmstate --fsmstate catchingblocks` to start synchronization, or
+explicitly request `running` when checkpoint-safe. IDLE does
+not prove that already admitted work has drained; rewind still requires service
+shutdown. When catchup entry is refused, block validation clears its processing
+markers without penalizing the peer. Explicit resume permits a later block
+notification to retry; this does not guarantee immediate replay of queued work.
 
 ## Prerequisites
 
@@ -159,10 +189,10 @@ grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.GetFSMCurrentSt
 
 ```bash
 # Transition to RUNNING state
-grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.Run
+grpcurl -plaintext -d '{"event":"RUN"}' blockchain:18087 blockchain_api.BlockchainAPI.SendFSMEvent
 
 # Transition to CATCHINGBLOCKS state
-grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.CatchUpBlocks
+grpcurl -plaintext -d '{"event":"CATCHUPBLOCKS"}' blockchain:18087 blockchain_api.BlockchainAPI.SendFSMEvent
 
 # Transition to IDLE state
 grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.Idle
@@ -183,12 +213,12 @@ kubectl port-forward -n teranode-operator service/blockchain 18087:18087
 grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.GetFSMCurrentState
 ```
 
-Expected output (a fresh node reports `CATCHINGBLOCKS`; a restarted node reports
-whatever state it last persisted):
+Expected output for a fresh Kubernetes operator deployment (a restarted node
+normally reports its persisted state):
 
 ```json
 {
-  "state": "CATCHINGBLOCKS"
+  "state": "IDLE"
 }
 ```
 
@@ -196,10 +226,10 @@ whatever state it last persisted):
 
 ```bash
 # Transition to RUNNING state
-grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.Run
+grpcurl -plaintext -d '{"event":"RUN"}' localhost:18087 blockchain_api.BlockchainAPI.SendFSMEvent
 
 # Transition to CATCHINGBLOCKS state
-grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.CatchUpBlocks
+grpcurl -plaintext -d '{"event":"CATCHUPBLOCKS"}' localhost:18087 blockchain_api.BlockchainAPI.SendFSMEvent
 
 # Transition to IDLE state
 grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.Idle
