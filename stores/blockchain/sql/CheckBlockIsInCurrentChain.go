@@ -78,15 +78,16 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	// a cleared guard together with a zero timestamp is precisely the failed-rebuild
 	// case and nothing else.
 	//
-	// A rebuild that fails AFTER an earlier success is not covered here, and does not
-	// need to be: the previous set still holds every fork the node knew about, only
-	// blocks that forked since the last success are missing, and backgroundRefreshLoop
-	// retries every two minutes.
+	// A rebuild that fails AFTER an earlier success is not caught by this check, because
+	// the timestamp is still set from the earlier one. The blocks missing from that set are
+	// exactly the ones that moved since, which is the false positive again, so it is caught
+	// in checkBlockIsInCurrentChainInMemory instead: the snapshot carries the write epoch
+	// its rebuild read at, and a snapshot older than the latest write is not used.
 	if s.lastSuccessfulRebuild.Load() == 0 {
 		return s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
 	}
 
-	result, answeredBy, err := s.checkBlockIsInCurrentChainInMemory(ctx, blockIDs, maxID)
+	result, answeredBy, acceptedID, err := s.checkBlockIsInCurrentChainInMemory(ctx, blockIDs, maxID)
 	if err != nil {
 		return false, err
 	}
@@ -96,7 +97,12 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	if s.chainCheckShadowCompare {
 		switch answeredBy {
 		case answeredByForkedSet:
-			s.shadowCompareChainCheck(ctx, blockIDs, result)
+			// Compare the one id the route accepted, not the whole slice. With ANY-of
+			// semantics SQL can answer true off a different, genuinely on-chain id in the
+			// same call, and the comparison would then report agreement for a route that
+			// accepted a gap id. A tx's parent block ids are exactly that shape, so the
+			// whole-slice comparison could read clean on a node wrong on every call.
+			s.shadowCompareChainCheck(ctx, []uint32{acceptedID}, result)
 		case answeredByMaxBlockIDReject:
 			if s.chainCheckShadowRejectChecks.Add(1)%shadowRejectSampleRate == 0 {
 				s.shadowCompareChainCheck(ctx, blockIDs, result)
@@ -144,14 +150,37 @@ const shadowRejectSampleRate = 1024
 // checkBlockIsInCurrentChainInMemory answers ANY-of "is one of blockIDs on the main
 // chain?" from the forked set and maxBlockID. The second return says which of the three
 // routes produced the answer, so the caller can decide what the shadow comparison would
-// cost and mean; see the answeredBy constants.
+// cost and mean; see the answeredBy constants. The third is the id the forked-set route
+// accepted, and is meaningful only when the second is answeredByForkedSet.
 //
 // Callers must have established that the in-memory route applies: the setting is on,
-// no main-chain rebuild is in flight, and maxID is initialised.
-func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs []uint32, maxID uint32) (bool, answeredBy, error) {
+// no main-chain rebuild was in flight when they looked, and maxID is initialised.
+func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs []uint32, maxID uint32) (bool, answeredBy, uint32, error) {
 	s.offChainBlockIDsMu.RLock()
 	offChain := s.offChainBlockIDs
+	setEpoch := s.offChainSetEpoch.Load() // installOffChainSet writes both under the lock
 	s.offChainBlockIDsMu.RUnlock()
+
+	// Look at the guard again now that the snapshot is taken, then at the epoch, in that
+	// order. The caller's guard check happened before the snapshot, and a reader
+	// descheduled between the two can resume after a mutator has raised the guard and
+	// committed its write but before the rebuild has installed, and would then answer
+	// true from a set missing the block that just moved.
+	//
+	// The guard alone cannot close it, because the mutator may also have finished and
+	// dropped the guard by now. The epoch covers that: every mutator bumps chainStateEpoch
+	// after its write and before dropping the guard, so a guard read as clear AFTER the
+	// mutator finished is followed by an epoch read that includes the bump, and only a set
+	// whose rebuild began reading after that write carries an epoch that high. A guard
+	// read as clear BEFORE the mutator started means the snapshot came before its write
+	// too, and the answer is simply the pre-write one. The same comparison covers a
+	// mutator whose rebuild failed after an earlier success: its bump stays ahead of the
+	// installed set until some rebuild reads past it.
+	if s.mainChainRebuilding.Load() > 0 || setEpoch < s.chainStateEpoch.Load() {
+		result, err := s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
+
+		return result, answeredBySQL, 0, err
+	}
 
 	candidates := make([]uint32, 0, len(blockIDs))
 
@@ -171,7 +200,7 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 		// why absence from the forked set is a positive proof here rather than the
 		// unsound guess it was before PR 1043 closed phantom-id creation.
 		if _, forked := offChain[id]; !forked {
-			return true, answeredByForkedSet, nil
+			return true, answeredByForkedSet, id, nil
 		}
 
 		candidates = append(candidates, id)
@@ -182,7 +211,7 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 	// instead of compared in full, and for the one window in which the two routes can
 	// disagree here.
 	if len(candidates) == 0 {
-		return false, answeredByMaxBlockIDReject, nil
+		return false, answeredByMaxBlockIDReject, 0, nil
 	}
 
 	// Every candidate is in the forked set, so this call is about to reject. Confirm
@@ -202,7 +231,7 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 	// about-to-reject call.
 	result, err := s.checkBlockIsInCurrentChainSQL(ctx, candidates)
 
-	return result, answeredBySQL, err
+	return result, answeredBySQL, 0, err
 }
 
 // shadowCompareChainCheck recomputes an in-memory answer the authoritative way and

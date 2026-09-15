@@ -1836,9 +1836,17 @@ func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool) (err erro
 // up. maxBlockID is advanced before the rebuild runs, so between the two a freshly
 // forked or invalidated block is inside the id<=maxBlockID range but not yet in this
 // set, and the in-memory route would answer true for it. Callers close that window by
-// holding mainChainRebuilding across BOTH the flag change and the rebuild, which sends
-// readers to the flag-free CTE for the whole of it. StoreBlock, InvalidateBlock and
-// RevalidateBlock all do; a new caller that mutates on_main_chain must too.
+// holding mainChainRebuilding across BOTH the flag change and the rebuild, and by
+// bumping chainStateEpoch (triggerRebuildOffChainSetAfterWrite does it) before they drop
+// the guard. StoreBlock, InvalidateBlock, RevalidateBlock and DeleteBlock all do; a new
+// caller that mutates on_main_chain must too.
+//
+// The guard on its own only redirects readers that look at it after it goes up. A reader
+// that checked it before the mutator raised it can still be holding a snapshot taken
+// after the write committed, so checkBlockIsInCurrentChainInMemory checks the guard again
+// once it has the snapshot, and then refuses a snapshot whose epoch is behind
+// chainStateEpoch. The second check is what covers a mutator that finished, and dropped
+// the guard, between the reader's two looks.
 //
 // The extreme case of that third condition is a set that was never built at all. The
 // startup rebuild is asynchronous and its guard is released whether it succeeded or

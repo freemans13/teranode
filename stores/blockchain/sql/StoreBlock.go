@@ -154,26 +154,35 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		block.Header.HashPrevBlock != nil &&
 		*block.Header.HashPrevBlock == *preBestHash
 
-	// Raise the guard before the INSERT, unconditionally, and hold it for the whole call.
+	// Raise the guard before the INSERT and hold it for the whole call: always on a node
+	// running the forked-set route, and only for a non-extend on every other node.
 	//
-	// It used to be raised only when onMainChain was false, on the reasoning that a common
-	// extend writes on_main_chain = true atomically and is never in flux. That is true of
-	// the row, and false of the classification. The INSERT can write true for a block that
-	// the chain_work tiebreak below then places on a fork, and a concurrent StoreBlock can
-	// advance maxBlockID past this id while that is being decided. In that window the row
-	// exists, says true, sits at or below maxBlockID, and is absent from the forked set, so
-	// the in-memory route answers "on the main chain" for a fork block with no query. The
-	// old conditional left exactly that window open, from the INSERT to the guard the slow
-	// path raised much later.
+	// On a forked-set node a common extend needs it too. The INSERT writes on_main_chain =
+	// true atomically, which is true of the row and false of the classification: the INSERT
+	// can write true for a block that the chain_work tiebreak below then places on a fork,
+	// and a concurrent StoreBlock can advance maxBlockID past this id while that is being
+	// decided. In that window the row exists, says true, sits at or below maxBlockID, and
+	// is absent from the forked set, so the in-memory route answers "on the main chain" for
+	// a fork block with no query. Absence from the forked set is positive proof on that
+	// route, so a gap in the guard is a false positive rather than a wasted query.
 	//
-	// The cost is that readers fall back to SQL for the duration of a StoreBlock rather
-	// than only during a fork or reorg. That is the trade this route asks for: absence from
-	// the forked set is now positive proof, so every gap in the guard becomes a false
-	// positive rather than a wasted query. Case 2 below already documented the guard as
-	// covering "the full window from before the INSERT through reconcile"; this makes every
-	// path match that description instead of one of them.
-	s.mainChainRebuilding.Add(1)
-	defer s.mainChainRebuilding.Add(-1)
+	// On every other node the guard stays where it was. mainChainRebuilding is not read
+	// only by the forked-set route: checkBlockIsInCurrentChainSQL and the other
+	// on_main_chain readers use it to choose between their indexed flag lookup and a
+	// flag-free walk, which for CheckBlockIsInCurrentChain is a parent_id CTE from the tip
+	// down to the queried id. Raising it on every extend would move those readers onto the
+	// walk for the length of every StoreBlock, on nodes that gain nothing from it, because
+	// the window it closes is only unsafe on the forked-set route. An SQL-route reader in
+	// that window reads the same true flag it has always read, and slowPathMu is what keeps
+	// that case from arising, per Case 1 below.
+	//
+	// The forked-set node does pay that cost on those other readers. That is the trade the
+	// route asks for, and it is scoped to the nodes that opted into the route.
+	guardWholeCall := s.useInMemoryChainCheck || !onMainChain
+	if guardWholeCall {
+		s.mainChainRebuilding.Add(1)
+		defer s.mainChainRebuilding.Add(-1)
+	}
 
 	newBlockID, height, _, _, err := s.storeBlock(ctx, block, peerID, storeBlockOptions, onMainChain)
 	if err != nil {
@@ -246,11 +255,21 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		// mainChainRebuilding bracketing so concurrent readers fall back to
 		// the CTE for the brief inconsistency window.
 		//
-		// No guard to raise here any more: it went up before the INSERT and is held for
-		// the whole call, which is what this clear and the rebuild below both need.
+		// On a forked-set node the guard is already held for the whole call, which is what
+		// this clear and the rebuild below both need. On any other node it was not raised
+		// for an extend and there is no rebuild to cover, so bracket just the UPDATE, as
+		// this branch always did there.
 		if onMainChain {
+			if !guardWholeCall {
+				s.mainChainRebuilding.Add(1)
+			}
+
 			if _, clearErr := s.db.ExecContext(postBestCtx, `UPDATE blocks SET on_main_chain = false WHERE id = $1`, newBlockID); clearErr != nil {
 				s.logger.Errorf("StoreBlock: clear sibling-fork on_main_chain: %v", clearErr)
+			}
+
+			if !guardWholeCall {
+				s.mainChainRebuilding.Add(-1)
 			}
 		}
 		if s.useInMemoryChainCheck {
