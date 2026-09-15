@@ -74,7 +74,7 @@ import (
 var teranodeLUA []byte
 
 var (
-	LuaPackage      = "teranode_v64" // N.B. Do not have any "." in this string
+	LuaPackage      = "teranode_v65" // N.B. Do not have any "." in this string
 	LuaPackageMined = LuaPackage + "_mined"
 )
 
@@ -447,22 +447,17 @@ func (s *Store) parseLuaMapResponseInto(response interface{}, result *LuaMapResp
 	}
 
 	// Parse idempotent list for spendMulti
+	// Parsed like blockIDs, through luaResponseIntSlice, because the native
+	// dispatcher may encode it as a typed integer slice such as []int64. A bare
+	// []interface{} assertion failed that shape, and a parse failure completes
+	// every spend in the record with an error and demotes the native path.
 	if idempotentField, ok := respMap["idempotent"]; ok {
-		items, ok := idempotentField.([]interface{})
-		if !ok {
-			return errors.NewProcessingError("invalid idempotent type: %T", idempotentField)
+		offsets, err := luaResponseIntSlice(idempotentField)
+		if err != nil {
+			return errors.NewProcessingError("invalid idempotent list (%T)", idempotentField, err)
 		}
 
-		result.Idempotent = result.Idempotent[:0]
-
-		for _, item := range items {
-			offset, ok := luaResponseInt(item)
-			if !ok {
-				return errors.NewProcessingError("invalid idempotent offset type: %T", item)
-			}
-
-			result.Idempotent = append(result.Idempotent, offset)
-		}
+		result.Idempotent = append(result.Idempotent[:0], offsets...)
 	}
 
 	// Parse childCount

@@ -25,6 +25,7 @@ func TestPrunerReplayProtection(t *testing.T) {
 	for _, tc := range []struct {
 		name                                                                            string
 		paginated, markerFailure, ttl, unspend, expressions, defensive, replace, freeze bool
+		conflict, lock                                                                  bool
 	}{
 		{name: "normal"},
 		{name: "ttl", ttl: true},
@@ -57,14 +58,22 @@ func TestPrunerReplayProtection(t *testing.T) {
 		// page-only set in both modes.
 		{name: "defensive", defensive: true},
 		{name: "defensive_paginated_parent", defensive: true, paginated: true},
+		// A record-level answer about the parent (flagged conflicting after a
+		// reorg, or locked) must not hide the marker either: the Lua used to
+		// return those for the whole record before reaching it, answering
+		// CONFLICTING, which the legacy block path swallows, where SQL answers
+		// the replay.
+		{name: "conflicting_parent", conflict: true},
+		{name: "locked_parent", lock: true},
+		{name: "expressions_conflicting_parent", expressions: true, conflict: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl, tc.unspend, tc.expressions, tc.defensive, tc.replace, tc.freeze)
+			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl, tc.unspend, tc.expressions, tc.defensive, tc.replace, tc.freeze, tc.conflict, tc.lock)
 		})
 	}
 }
 
-func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, unspendParent, expressions, defensive, replaceParent, freezeParent bool) {
+func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, unspendParent, expressions, defensive, replaceParent, freezeParent, conflictParent, lockParent bool) {
 	t.Helper()
 	logger := ulogger.New("pruner-replay-test")
 	s := test.CreateBaseTestSettings(t)
@@ -190,6 +199,14 @@ func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, uns
 		utxoHash, hashErr := util.UTXOHashFromOutput(parent.TxIDChainHash(), parent.Outputs[outputIndex], outputIndex)
 		require.NoError(t, hashErr)
 		require.NoError(t, store.FreezeUTXOs(ctx, []*utxo.Spend{{TxID: parent.TxIDChainHash(), Vout: outputIndex, UTXOHash: utxoHash}}, s))
+	}
+	if conflictParent {
+		require.NoError(t, client.Put(nil, parentKeyForOutput(t, store, parent.TxIDChainHash(), outputIndex, s.UtxoStore.UtxoBatchSize),
+			aerospike.BinMap{fields.Conflicting.String(): true}), "fixture: the parent is flagged conflicting")
+	}
+	if lockParent {
+		require.NoError(t, client.Put(nil, parentKeyForOutput(t, store, parent.TxIDChainHash(), outputIndex, s.UtxoStore.UtxoBatchSize),
+			aerospike.BinMap{fields.Locked.String(): true}), "fixture: the parent is locked")
 	}
 	if replaceParent {
 		replacement := bt.NewTx()
@@ -492,4 +509,162 @@ func TestSpendDoesNotBlessSpenderCreatedByCaller(t *testing.T) {
 
 	_, err = store.Spend(ctx, child, 1200, utxo.IgnoreFlags{SpenderCreatedByCaller: true})
 	require.ErrorIs(t, err, errors.ErrTxNotFound, "a record the caller wrote itself is not proof of prior validation")
+}
+
+// TestPrunerMarksOnlyTheChildThatHeldTheSpend is the Aerospike twin of the SQL
+// test of the same name. A conflicting loser names the winner's outpoint in its
+// inputs and never held it, and it is a pruning candidate like any tombstoned
+// record. Marking (parent, loser) used to be inert because the spend path
+// compared the marker against the output's stored spender; it now checks the
+// transaction asking to spend, ahead of every other answer, and nothing clears a
+// marker. So once the winner's spend is released the loser's genuinely fresh
+// spend of that output would be refused forever. Only the child the output
+// records as its spender may be marked. Reproduced by review.
+func TestPrunerMarksOnlyTheChildThatHeldTheSpend(t *testing.T) {
+	logger := ulogger.New("pruner-marker-holder-test")
+	s := test.CreateBaseTestSettings(t)
+	s.UtxoStore.DisableDAHCleaner = false
+	s.Pruner.UTXODefensiveEnabled = false
+	s.Aerospike.EnableSpendFilterExpressions = true
+
+	client, store, ctx, cleanup := initAerospike(t, s, logger)
+	t.Cleanup(cleanup)
+	require.NoError(t, store.SetBlockHeight(1000))
+
+	parent := bt.NewTx()
+	require.NoError(t, parent.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
+	// Output 1 stays unspent so the parent survives the prune cycle.
+	require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+	require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+	_, err := store.Create(ctx, parent, 1000)
+	require.NoError(t, err)
+
+	winner := bt.NewTx()
+	require.NoError(t, winner.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	require.NoError(t, winner.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+	_, _, err = store.SpendAndCreate(ctx, winner, 1000)
+	require.NoError(t, err)
+
+	// The loser asks for the same outpoint and never gets it. It is stored, as a
+	// conflicting record would be, and tombstoned so it is a candidate in the
+	// same cycle as the winner.
+	loser := bt.NewTx()
+	require.NoError(t, loser.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	require.NoError(t, loser.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2999))
+	_, err = store.Create(ctx, loser, 1000)
+	require.NoError(t, err)
+
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash(), winner.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+	require.NoError(t, err)
+
+	grandchild := bt.NewTx()
+	require.NoError(t, grandchild.From(winner.TxID(), 0, winner.Outputs[0].LockingScript.String(), winner.Outputs[0].Satoshis))
+	require.NoError(t, grandchild.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2000))
+	_, _, err = store.SpendAndCreate(ctx, grandchild, 1001)
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchild.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+	require.NoError(t, err)
+
+	loserKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), loser.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+	require.NoError(t, client.Put(nil, loserKey, aerospike.BinMap{fields.DeleteAtHeight.String(): 1100}))
+
+	astore.ResetPrunerServiceForTests()
+	t.Cleanup(astore.ResetPrunerServiceForTests)
+	require.NoError(t, store.CreateIndexIfNotExists(ctx, apruner.IndexName, fields.DeleteAtHeight.String(), aerospike.NUMERIC))
+	require.NoError(t, store.WaitForIndexReady(ctx, apruner.IndexName))
+
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+
+	n, err := svc.(*apruner.Service).PruneWithPartitions(ctx, 1300, "conflicting-loser", 1)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), n, "fixture: both the winner and the loser are pruned")
+
+	parentRecord, err := client.Get(nil, parentKeyForOutput(t, store, parent.TxIDChainHash(), 0, s.UtxoStore.UtxoBatchSize))
+	require.NoError(t, err)
+
+	markers := parentRecord.Bins[fields.DeletedChildren.String()]
+	require.Contains(t, markers, winner.TxID(), "the child that actually held the spend must still be marked")
+	require.NotContains(t, markers, loser.TxID(), "the loser never held P:0, so marking it would reject its own later spend of that output forever")
+
+	// End state that matters: with the winner's spend released, the loser's fresh
+	// spend of the now-free output must be accepted.
+	utxoHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(), parent.Outputs[0], 0)
+	require.NoError(t, err)
+	require.NoError(t, store.Unspend(ctx, []*utxo.Spend{{
+		TxID: parent.TxIDChainHash(), Vout: 0, UTXOHash: utxoHash,
+		SpendingData: spendpkg.NewSpendingData(winner.TxIDChainHash(), 0),
+	}}))
+
+	_, err = store.Spend(ctx, loser, 1400)
+	require.NoError(t, err, "a transaction that never held the output must be able to spend it once it is free")
+}
+
+// TestPrunerSkipDeletionsWritesNoMarkers: with pruner_skipDeletions on, the
+// pruner deletes nothing, so it must mark nothing either. A marker for a child
+// that stays in the store turns that live, mined child's own idempotent re-spend
+// into a pruned-replay rejection, which the block paths then delete as a ghost.
+// Reproduced by review.
+func TestPrunerSkipDeletionsWritesNoMarkers(t *testing.T) {
+	logger := ulogger.New("pruner-skip-deletions-test")
+	s := test.CreateBaseTestSettings(t)
+	s.UtxoStore.DisableDAHCleaner = false
+	s.Pruner.UTXODefensiveEnabled = false
+	s.Pruner.SkipDeletions = true
+	s.Aerospike.EnableSpendFilterExpressions = true
+
+	client, store, ctx, cleanup := initAerospike(t, s, logger)
+	t.Cleanup(cleanup)
+	require.NoError(t, store.SetBlockHeight(1000))
+
+	parent := bt.NewTx()
+	require.NoError(t, parent.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
+	require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+	require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+	_, err := store.Create(ctx, parent, 1000)
+	require.NoError(t, err)
+
+	child := bt.NewTx()
+	require.NoError(t, child.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+	_, _, err = store.SpendAndCreate(ctx, child, 1000)
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash(), child.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+	require.NoError(t, err)
+
+	grandchild := bt.NewTx()
+	require.NoError(t, grandchild.From(child.TxID(), 0, child.Outputs[0].LockingScript.String(), child.Outputs[0].Satoshis))
+	require.NoError(t, grandchild.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2000))
+	_, _, err = store.SpendAndCreate(ctx, grandchild, 1001)
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchild.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+	require.NoError(t, err)
+
+	astore.ResetPrunerServiceForTests()
+	t.Cleanup(astore.ResetPrunerServiceForTests)
+	require.NoError(t, store.CreateIndexIfNotExists(ctx, apruner.IndexName, fields.DeleteAtHeight.String(), aerospike.NUMERIC))
+	require.NoError(t, store.WaitForIndexReady(ctx, apruner.IndexName))
+
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+
+	_, err = svc.(*apruner.Service).PruneWithPartitions(ctx, 1300, "skip-deletions", 1)
+	require.NoError(t, err)
+
+	childKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), child.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+	exists, err := client.Exists(nil, childKey)
+	require.NoError(t, err)
+	require.True(t, exists, "fixture: SkipDeletions retains the child")
+
+	parentRecord, err := client.Get(nil, parentKeyForOutput(t, store, parent.TxIDChainHash(), 0, s.UtxoStore.UtxoBatchSize))
+	require.NoError(t, err)
+
+	if markers := parentRecord.Bins[fields.DeletedChildren.String()]; markers != nil {
+		require.NotContains(t, markers, child.TxID(), "a child the pruner did not delete must not be marked as pruned")
+	}
+
+	_, err = store.Spend(ctx, child, 1200)
+	require.NoError(t, err, "the retained child's idempotent re-spend must still be accepted")
 }

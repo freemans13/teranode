@@ -93,8 +93,30 @@ func encodeNativeOpPayload(subOp uint8, args []any) ([]byte, error) {
 // ProcessConflicting / catchup path, so unspend stays on the UDF path. An
 // ownership-rejection probe analogous to the spend probe could un-fence it in
 // a follow-up once that scenario is exercised end-to-end.
+//
+// The sub-ops that carry the pruner's replay protection are fenced separately,
+// on the outcome of probeNativeReplayProtection rather than for everyone:
+// spendMulti (and the single-output spend) must consult the replay marker and
+// report idempotent matches, and addDeletedChildren writes that marker. A fork
+// build that passes the first-seen probe but predates those semantics keeps the
+// native path for every other sub-op and runs these three through the UDF,
+// instead of losing the native path wholesale.
 func (s *Store) useNativeForSubOp(subOp uint8) bool {
-	return s.useNativeTeranodeOps.Load() && subOp != subOpUnspend
+	if !s.useNativeTeranodeOps.Load() || subOp == subOpUnspend {
+		return false
+	}
+
+	if isReplayProtectionSubOp(subOp) {
+		return s.nativeReplayProtection.Load()
+	}
+
+	return true
+}
+
+// isReplayProtectionSubOp reports whether subOp carries replay-protection
+// semantics that only probeNativeReplayProtection can vouch for.
+func isReplayProtectionSubOp(subOp uint8) bool {
+	return subOp == subOpSpendMulti || subOp == subOpSpend || subOp == subOpAddDeletedChildren
 }
 
 // demoteNativeOnUnsupported permanently demotes the store to the UDF path when
@@ -435,9 +457,14 @@ func (s *Store) detectNativeTeranodeOpSupport(ctx context.Context) bool {
 
 		// First-seen enforcement is not the only semantics spendMulti carries.
 		// The pruner's replay marker and the idempotent-match report are both
-		// enforced in teranode.lua, and neither is exercised above.
-		if !s.probeNativeReplayProtection(ctx, policy) {
-			return false
+		// enforced in teranode.lua, and neither is exercised above. A dispatcher
+		// that fails this keeps the native path for every other sub-op; only the
+		// replay-protection sub-ops are fenced (useNativeForSubOp).
+		replayProtected := s.probeNativeReplayProtection(ctx, policy)
+		s.nativeReplayProtection.Store(replayProtected)
+
+		if !replayProtected {
+			s.logger.Warnf("[teranode-native-op] native dispatcher does not prove replay protection; spendMulti, spend and addDeletedChildren stay on the UDF path, every other sub-op stays native")
 		}
 
 		return true
@@ -493,43 +520,7 @@ func (s *Store) probeNativeSpendSemantics(ctx context.Context, policy *aerospike
 	defer cleanup()
 
 	spendOnce := func(spendingData *spendpkg.SpendingData) (*LuaMapResponse, bool) {
-		if ctx.Err() != nil {
-			s.logger.Warnf("[teranode-native-op] spend probe aborted by context: %v; falling back to UDF path", ctx.Err())
-			return nil, false
-		}
-
-		items := []aerospike.MapValue{aerospike.NewMapValue(map[any]any{
-			"idx":          0,
-			"offset":       s.calculateOffsetForOutput(probeVout),
-			"vOut":         probeVout,
-			"utxoHash":     utxoHashes[0][:],
-			"spendingData": spendingData.Bytes(),
-		})}
-
-		payload, encErr := encodeNativeOpPayload(subOpSpendMulti, []any{
-			items, false, false, probeBlockHeight, s.settings.GetUtxoStoreBlockHeightRetention(),
-		})
-		if encErr != nil {
-			s.logger.Warnf("[teranode-native-op] spend probe payload encode failed: %v; falling back to UDF path", encErr)
-			return nil, false
-		}
-
-		rec, opErr := s.client.Operate(policy, key, aerospike.TeranodeModifyOp(nativeOpResultBin, payload))
-		if opErr != nil {
-			s.logger.Warnf("[teranode-native-op] spend probe operate failed: %v; falling back to UDF path", opErr)
-			return nil, false
-		}
-		if rec == nil || rec.Bins == nil || rec.Bins[nativeOpResultBin] == nil {
-			s.logger.Warnf("[teranode-native-op] spend probe returned no %q bin; %s; falling back to UDF path", nativeOpResultBin, describeAerospikeRecord(rec))
-			return nil, false
-		}
-
-		res, parseErr := s.ParseLuaMapResponse(rec.Bins[nativeOpResultBin])
-		if parseErr != nil {
-			s.logger.Warnf("[teranode-native-op] spend probe returned unparsable response (value %s): %v; falling back to UDF path", describeAerospikeValue(rec.Bins[nativeOpResultBin]), parseErr)
-			return nil, false
-		}
-		return res, true
+		return s.nativeProbeSpend(ctx, policy, "spend probe", key, utxoHashes[0], spendingData, probeBlockHeight, probeVout)
 	}
 
 	firstRes, ok := spendOnce(spendpkg.NewSpendingData(&chainhash.Hash{0x01}, 0))
@@ -551,13 +542,7 @@ func (s *Store) probeNativeSpendSemantics(ctx context.Context, policy *aerospike
 		return false
 	}
 
-	spentRejected := secondRes.ErrorCode == LuaErrorCodeSpent
-	for _, e := range secondRes.Errors {
-		if e.ErrorCode == LuaErrorCodeSpent {
-			spentRejected = true
-		}
-	}
-	if !spentRejected {
+	if !rejectsWith(secondRes, LuaErrorCodeSpent) {
 		s.logger.Warnf("[teranode-native-op] spend probe double-spend rejected with wrong error (%+v), want %s; falling back to UDF path", secondRes, LuaErrorCodeSpent)
 		return false
 	}
@@ -736,11 +721,10 @@ func (s *Store) probeNativeReplayProtection(ctx context.Context, policy *aerospi
 
 	prunedChild := &chainhash.Hash{0x03}
 
-	// Written the way the pruner's addDeletedChildren writes it: a map keyed by
-	// the child's txid string, which is what the spend path looks up.
-	if putErr := s.client.PutBins(policy, markerKey,
-		aerospike.NewBin(fields.DeletedChildren.String(), map[string]any{prunedChild.String(): true})); putErr != nil {
-		s.logger.Warnf("[teranode-native-op] replay-marker probe could not set %q: %v; falling back to UDF path", fields.DeletedChildren.String(), putErr)
+	// Planted through the native addDeletedChildren sub-op, the one the pruner
+	// uses to write the marker, so the probe proves the write and the read agree
+	// on the dispatcher rather than assuming the write's key format.
+	if !s.nativeProbeAddDeletedChildren(ctx, policy, markerKey, prunedChild) {
 		return false
 	}
 
@@ -796,6 +780,40 @@ func (s *Store) probeNativeReplayProtection(ctx context.Context, policy *aerospi
 	if !reportsIdempotent(repeatRes, 0) {
 		s.logger.Warnf("[teranode-native-op] idempotent-report probe: a re-spend by the same spender was accepted but not reported as idempotent (%+v); "+
 			"the rollback would reverse a confirmed spend on this dispatcher; falling back to UDF path", repeatRes)
+		return false
+	}
+
+	return true
+}
+
+// nativeProbeAddDeletedChildren records child as pruned on a probe record through
+// the native addDeletedChildren sub-op and requires an OK response.
+func (s *Store) nativeProbeAddDeletedChildren(ctx context.Context, policy *aerospike.WritePolicy, key *aerospike.Key, child *chainhash.Hash) bool {
+	if ctx.Err() != nil {
+		s.logger.Warnf("[teranode-native-op] replay-marker probe aborted by context: %v", ctx.Err())
+		return false
+	}
+
+	payload, encErr := encodeNativeOpPayload(subOpAddDeletedChildren, []any{[]any{child.String()}})
+	if encErr != nil {
+		s.logger.Warnf("[teranode-native-op] replay-marker probe payload encode failed: %v", encErr)
+		return false
+	}
+
+	rec, opErr := s.client.Operate(policy, key, aerospike.TeranodeModifyOp(nativeOpResultBin, payload))
+	if opErr != nil {
+		s.logger.Warnf("[teranode-native-op] replay-marker probe could not write %q natively: %v", fields.DeletedChildren.String(), opErr)
+		return false
+	}
+
+	if rec == nil || rec.Bins == nil || rec.Bins[nativeOpResultBin] == nil {
+		s.logger.Warnf("[teranode-native-op] replay-marker probe write returned no %q bin; %s", nativeOpResultBin, describeAerospikeRecord(rec))
+		return false
+	}
+
+	res, parseErr := s.ParseLuaMapResponse(rec.Bins[nativeOpResultBin])
+	if parseErr != nil || res.Status != LuaStatusOK {
+		s.logger.Warnf("[teranode-native-op] replay-marker probe write not accepted (response %s, parse error %v)", describeAerospikeValue(rec.Bins[nativeOpResultBin]), parseErr)
 		return false
 	}
 

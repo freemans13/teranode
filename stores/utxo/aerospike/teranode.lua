@@ -307,42 +307,36 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
         return response
     end
 
-    if not ignoreConflicting then
-        if rec[BIN_CONFLICTING] then
-            response[FIELD_STATUS] = STATUS_ERROR
-            response[FIELD_ERROR_CODE] = ERROR_CODE_CONFLICTING
-            response[FIELD_MESSAGE] = MSG_CONFLICTING
+    -- Record-level answers (conflicting, locked, coinbase immaturity, no utxos)
+    -- are decided here but NOT returned yet. The replay marker below takes
+    -- precedence over every other answer about an output, as it does on both SQL
+    -- paths: a replay of a transaction the pruner removed must be answered as
+    -- one, or the block paths cannot recognise it and its recreated record
+    -- survives. Returning these first answered, for example, CONFLICTING for a
+    -- parent flagged by ProcessConflicting after a reorg, which the legacy block
+    -- path swallows. With no marker hit the response is exactly what it was:
+    -- the whole-record error, nothing written.
+    local recordErrorCode = nil
+    local recordErrorMessage = nil
 
-            return response
+    if not ignoreConflicting and rec[BIN_CONFLICTING] then
+        recordErrorCode = ERROR_CODE_CONFLICTING
+        recordErrorMessage = MSG_CONFLICTING
+    elseif not ignoreLocked and rec[BIN_LOCKED] then
+        recordErrorCode = ERROR_CODE_LOCKED
+        recordErrorMessage = MSG_LOCKED
+    else
+        local coinbaseSpendingHeight = rec[BIN_SPENDING_HEIGHT]
+        if coinbaseSpendingHeight and coinbaseSpendingHeight > 0 and coinbaseSpendingHeight > currentBlockHeight then
+            recordErrorCode = ERROR_CODE_COINBASE_IMMATURE
+            recordErrorMessage = MSG_COINBASE_IMMATURE .. ", spendable in block " .. coinbaseSpendingHeight .. " or greater. Current block height is " .. currentBlockHeight
         end
-    end
-
-    if not ignoreLocked then
-        if rec[BIN_LOCKED] then
-            response[FIELD_STATUS] = STATUS_ERROR
-            response[FIELD_ERROR_CODE] = ERROR_CODE_LOCKED
-            response[FIELD_MESSAGE] = MSG_LOCKED
-
-            return response
-        end
-    end
-
-    local coinbaseSpendingHeight = rec[BIN_SPENDING_HEIGHT]
-    if coinbaseSpendingHeight and coinbaseSpendingHeight > 0 and coinbaseSpendingHeight > currentBlockHeight then
-        response[FIELD_STATUS] = STATUS_ERROR
-        response[FIELD_ERROR_CODE] = ERROR_CODE_COINBASE_IMMATURE
-        response[FIELD_MESSAGE] = MSG_COINBASE_IMMATURE .. ", spendable in block " .. coinbaseSpendingHeight .. " or greater. Current block height is " .. currentBlockHeight
-
-        return response
     end
 
     local utxos = rec[BIN_UTXOS]
-    if utxos == nil then
-        response[FIELD_STATUS] = STATUS_ERROR
-        response[FIELD_ERROR_CODE] = ERROR_CODE_UTXOS_NOT_FOUND
-        response[FIELD_MESSAGE] = ERR_UTXOS_NOT_FOUND
-
-        return response
+    if recordErrorCode == nil and utxos == nil then
+        recordErrorCode = ERROR_CODE_UTXOS_NOT_FOUND
+        recordErrorMessage = ERR_UTXOS_NOT_FOUND
     end
 
     local blockIDs = rec[BIN_BLOCK_IDS]
@@ -355,6 +349,7 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
     local spendableIn = rec[BIN_UTXO_SPENDABLE_IN]
     local spendCount = #spends
     local spentUtxos = rec[BIN_SPENT_UTXOS] or 0
+    local markerHit = false
 
     -- Use direct array indexing instead of iterator for better performance
     for i = 1, spendCount do
@@ -363,6 +358,49 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
         local utxoHash = spend['utxoHash']
         local spendingData = spend['spendingData']
         local idx = spend['idx']
+
+        -- Reject a replay of a transaction the pruner already removed.
+        --
+        -- Keyed on the INCOMING spender, not on what this utxo currently
+        -- records, and checked before every other answer: the record-level ones
+        -- above, the utxo lookup and hash check, frozen, and the already-spent
+        -- handling. Nesting it under bytes_equal(existingSpendingData,
+        -- spendingData) let unspend disarm it: unspend resets the utxo to its
+        -- bare hash and deliberately leaves BIN_DELETED_CHILDREN alone, so the
+        -- marker survived but matched nothing. Matching the spender means the
+        -- rejection survives any rollback of the spend it protects.
+        if deletedChildren ~= nil and spendingData ~= nil then
+            local childTxID = spendingDataBytesToTxHex(spendingData)
+            if deletedChildren[childTxID] then
+                local error = map()
+
+                error[FIELD_ERROR_CODE] = ERROR_CODE_INVALID_SPEND
+                error[FIELD_MESSAGE] = MSG_INVALID_SPEND
+
+                if utxos ~= nil then
+                    local _, markedSpendingData, markedErrorInfo = getUTXOAndSpendingData(utxos, offset, utxoHash)
+                    if not markedErrorInfo and markedSpendingData then
+                        error[FIELD_SPENDING_DATA] = spendingDataBytesToHex(markedSpendingData)
+                    end
+                end
+
+                errors[idx] = error
+                markerHit = true
+
+                goto continue
+            end
+        end
+
+        if recordErrorCode ~= nil then
+            local error = map()
+
+            error[FIELD_ERROR_CODE] = recordErrorCode
+            error[FIELD_MESSAGE] = recordErrorMessage
+
+            errors[idx] = error
+
+            goto continue
+        end
 
         -- Get and validate specific UTXO
         local utxo, existingSpendingData, errorInfo = getUTXOAndSpendingData(utxos, offset, utxoHash)
@@ -375,33 +413,6 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
             errors[idx] = error
 
             goto continue
-        end
-
-        -- Reject a replay of a transaction the pruner already removed.
-        --
-        -- Keyed on the INCOMING spender, not on what this utxo currently
-        -- records, and checked before the already-spent handling below. Nesting
-        -- it under bytes_equal(existingSpendingData, spendingData) let unspend
-        -- disarm it: unspend resets the utxo to its bare hash and deliberately
-        -- leaves BIN_DELETED_CHILDREN alone, so the marker survived but matched
-        -- nothing. Matching the spender means the rejection survives any
-        -- rollback of the spend it protects.
-        if deletedChildren ~= nil and spendingData ~= nil then
-            local childTxID = spendingDataBytesToTxHex(spendingData)
-            if deletedChildren[childTxID] then
-                local error = map()
-
-                error[FIELD_ERROR_CODE] = ERROR_CODE_INVALID_SPEND
-                error[FIELD_MESSAGE] = MSG_INVALID_SPEND
-
-                if existingSpendingData then
-                    error[FIELD_SPENDING_DATA] = spendingDataBytesToHex(existingSpendingData)
-                end
-
-                errors[idx] = error
-
-                goto continue
-            end
         end
 
         if spendableIn then
@@ -455,6 +466,22 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
         spentUtxos = spentUtxos + 1
 
         ::continue::
+    end
+
+    -- A record-level answer means nothing was written. Without a marker hit the
+    -- response is the whole-record error it always was; with one, every spend
+    -- already carries its own error (the marker, or the record-level answer).
+    if recordErrorCode ~= nil then
+        response[FIELD_STATUS] = STATUS_ERROR
+
+        if markerHit then
+            response[FIELD_ERRORS] = errors
+        else
+            response[FIELD_ERROR_CODE] = recordErrorCode
+            response[FIELD_MESSAGE] = recordErrorMessage
+        end
+
+        return response
     end
 
     -- Update the record with the new values
