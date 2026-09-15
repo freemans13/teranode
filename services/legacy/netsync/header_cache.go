@@ -43,7 +43,7 @@ type headerCache struct {
 	checkpoints []chaincfg.Checkpoint
 
 	// provenTo is the highest height in the CURRENT contents that is committed
-	// by a pinned checkpoint hash matched inside this very run.
+	// by a pinned checkpoint hash matched somewhere in this run.
 	//
 	// This is the replacement for upstream's SyncManager.verifiedCheckpointHeight
 	// (PR 1390 / the fork security merge), which lived beside the header list this
@@ -56,15 +56,29 @@ type headerCache struct {
 	//
 	// Fill has already proved that this run is one internally linked chain, so a
 	// single hash comparison at a checkpoint height commits every height at or
-	// below it in the same run. Nothing above it is committed by anything: the run
-	// continues past the checkpoint with no further pinned hash to check against,
-	// exactly the hole upstream's headerNodeProven was written to close.
+	// below it in the same run. Nothing above it is committed by anything until a
+	// LATER checkpoint is matched too — exactly the hole upstream's
+	// headerNodeProven was written to close.
 	//
-	// It is deliberately NOT carried across fills. A fill replaces the contents
-	// with a run rooted at whatever the committed tip is now, and a match in the
-	// PREVIOUS run says nothing about the heights in this one — two different runs
-	// can both link to the same tip and diverge above it. Keeping the old number
-	// would be the forgeable-proof bug rather than a fix for it.
+	// Whether a fill may carry the previous value forward depends on whether it
+	// replaced the contents or extended them, and this is the one place the two
+	// are allowed to differ:
+	//
+	//   - A replace (replaceLocked) roots the run at whatever the committed tip is
+	//     now, and a match in the PREVIOUS run says nothing about the heights in
+	//     this one — two different runs can both link to the same tip and diverge
+	//     above it. Carrying the old number forward here would be the
+	//     forgeable-proof bug rather than a fix for it, so a replace always takes
+	//     checkpointProof's answer for the new run alone.
+	//   - An extend (extendLocked) appends onto this cache's own previous top,
+	//     which Fill has already proved links backward, header by header, to the
+	//     very content the earlier proof was computed over. A match already held
+	//     is a match on a PREFIX of the same chain the appended suffix continues,
+	//     not on some other run that merely happens to share a tip, so carrying it
+	//     forward and keeping the higher of the two watermarks is sound. This is
+	//     reachable only below the last checkpoint (see belowLastCheckpointLocked):
+	//     above it the chain can still reorg, and every fill there replaces, for
+	//     exactly the reason above.
 	//
 	// Zero means no proof, and every caller reads it as "deny the fast path".
 	provenTo int32
@@ -99,9 +113,91 @@ func (c *headerCache) WithCheckpoints(checkpoints []chaincfg.Checkpoint) *header
 	return c
 }
 
-// Fill replaces the cache with the part of headers that sits above parent,
-// where the first header above parent sits at baseHeight. It reports whether
-// anything was accepted.
+// Fill installs headers as either an extension of this cache's own previous
+// contents or a fresh replacement of them, and reports whether anything was
+// accepted. Which one happens is decided here, not by the caller: parent is
+// always this node's actual committed tip and baseHeight is always tip+1,
+// exactly as this always worked, but below the last checkpoint a later call
+// may extend past what parent alone would justify — see
+// belowLastCheckpointLocked and provenTo's own doc for why that is safe only
+// in that one direction.
+//
+//   - Replace (replaceLocked): the ordinary case, and the ONLY case above the
+//     last checkpoint, where the chain can still reorg. The batch is searched
+//     for where it meets parent.
+//   - Extend (extendLocked): below the last checkpoint, once a previous fill
+//     has already left this cache naming heights above the tip. The batch is
+//     searched for where it meets this cache's OWN top instead, and a match is
+//     appended rather than replacing anything. A batch that reaches a
+//     checkpoint height with the wrong hash in this mode drops the WHOLE list,
+//     not merely this batch, because every entry already held was built as one
+//     linked chain with the batch that just failed to agree — see
+//     extendLocked's own doc.
+//
+// Both paths share one linkage walk, run once here: every header must name the
+// one before it, or the whole batch is refused before either path is tried,
+// because a break anywhere makes every height after it a guess, and a height
+// is exactly what this structure exists to provide.
+//
+// Refusing changes nothing. The caller asks again, of the same peer or
+// another.
+func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*wire.BlockHeader) bool {
+	if c == nil || len(headers) == 0 {
+		return false
+	}
+
+	// Walk the whole batch before touching anything, so a refusal leaves the
+	// previous contents intact rather than half-replaced.
+	hashes := make([]chainhash.Hash, 0, len(headers))
+
+	var prev chainhash.Hash
+
+	for i, header := range headers {
+		// i == 0 has nothing before it to link to.
+		if i > 0 && !header.PrevBlock.IsEqual(&prev) {
+			return false
+		}
+
+		hash := header.BlockHash()
+		hashes = append(hashes, hash)
+		prev = hash
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.filled && c.top >= baseHeight && c.belowLastCheckpointLocked(baseHeight-1) {
+		return c.extendLocked(headers, hashes)
+	}
+
+	return c.replaceLocked(parent, baseHeight, headers, hashes)
+}
+
+// findAnchor returns the index of the first header in headers usable once the
+// batch is judged against anchor: either headers[0] already builds on anchor,
+// so the whole batch is usable from index 0, or some headers[i] hashes to
+// anchor, so headers[i+1] onward is usable. It returns -1 when neither shape
+// holds — this batch does not meet anchor anywhere, describing a chain this
+// node is not on, or one it has already run past.
+//
+// hashes is headers' own hashes, already computed and verified internally
+// linked by the caller (Fill), so this need not touch header bytes again.
+func findAnchor(headers []*wire.BlockHeader, hashes []chainhash.Hash, anchor chainhash.Hash) int {
+	if headers[0].PrevBlock.IsEqual(&anchor) {
+		return 0
+	}
+
+	for i, hash := range hashes {
+		if hash.IsEqual(&anchor) {
+			return i + 1
+		}
+	}
+
+	return -1
+}
+
+// replaceLocked installs headers as a fresh run rooted at parent, discarding
+// whatever the cache held before. Called with c.mu held.
 //
 // parent is the node's committed tip, and the batch is a linked run answering a
 // getheaders that was asked from that tip as it stood when the question went
@@ -131,54 +227,12 @@ func (c *headerCache) WithCheckpoints(checkpoints []chaincfg.Checkpoint) *header
 // specific 32-byte value: a header whose PrevBlock is that value builds on this
 // node's tip, wherever in the run it happens to fall.
 //
-// It refuses a batch that does not link, in any of the three ways a batch can
-// fail to. If parent appears nowhere in the run and is not headers[0]'s parent,
-// the batch describes a chain this node is not on, or one it has run clean past.
-// If parent is the run's own last header, the usable suffix is empty and there
-// is nothing to cache. If any header does not name the one before it, every
-// height after the break is a guess, and a height is exactly what this structure
-// exists to provide, so a guess is worse than nothing.
-//
-// Refusing changes nothing. The caller asks again, of the same peer or another.
-func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*wire.BlockHeader) bool {
-	if c == nil || len(headers) == 0 {
-		return false
-	}
-
-	// Walk the whole batch before touching the map, so a refusal leaves the
-	// previous contents intact rather than half-replaced. The walk does both
-	// jobs in one pass: it proves every header names the one before it, and it
-	// finds where the run meets the committed tip.
-	hashes := make([]chainhash.Hash, 0, len(headers))
-
-	// start is the index of the first usable header. Set to 0 up front when the
-	// batch's front already builds on the tip, so the loop's search below is
-	// skipped; otherwise the loop sets it to i+1 at the header that hashes to
-	// parent. Left negative if the run never meets the tip.
-	start := -1
-	if headers[0].PrevBlock.IsEqual(&parent) {
-		start = 0
-	}
-
-	var prev chainhash.Hash
-
-	for i, header := range headers {
-		// i == 0 has nothing before it to link to: whether its own parent is
-		// the tip is the start check above, and a batch whose front is behind
-		// the tip is precisely what this rule exists to accept.
-		if i > 0 && !header.PrevBlock.IsEqual(&prev) {
-			return false
-		}
-
-		hash := header.BlockHash()
-
-		if start < 0 && hash.IsEqual(&parent) {
-			start = i + 1
-		}
-
-		hashes = append(hashes, hash)
-		prev = hash
-	}
+// It refuses a batch that does not link to parent. If parent appears nowhere in
+// the run and is not headers[0]'s parent, the batch describes a chain this node
+// is not on, or one it has run clean past. If parent is the run's own last
+// header, the usable suffix is empty and there is nothing to cache.
+func (c *headerCache) replaceLocked(parent chainhash.Hash, baseHeight int32, headers []*wire.BlockHeader, hashes []chainhash.Hash) bool {
+	start := findAnchor(headers, hashes, parent)
 
 	// start == len(hashes) is the tip being the batch's own last header: the run
 	// is honest and connects, there is simply nothing above the tip in it. A
@@ -188,10 +242,7 @@ func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*w
 		return false
 	}
 
-	hashes = hashes[start:]
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	kept := hashes[start:]
 
 	// Checkpoint agreement is judged BEFORE anything is installed, so a run that
 	// contradicts a pinned hash leaves the previous contents untouched rather than
@@ -200,23 +251,82 @@ func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*w
 	// also disconnects the sender (see fillHeaderCache), because a peer whose run
 	// reaches a checkpoint height with the wrong hash is not answering about the
 	// chain we asked about.
-	proven, agrees := checkpointProof(c.checkpoints, baseHeight, hashes)
+	proven, agrees := checkpointProof(c.checkpoints, baseHeight, kept)
 	if !agrees {
 		return false
 	}
 
-	c.byHeight = make(map[int32]chainhash.Hash, len(hashes))
-	c.byHash = make(map[chainhash.Hash]int32, len(hashes))
+	c.byHeight = make(map[int32]chainhash.Hash, len(kept))
+	c.byHash = make(map[chainhash.Hash]int32, len(kept))
 
-	for i, hash := range hashes {
+	for i, hash := range kept {
 		height := baseHeight + int32(i) //nolint:gosec // a batch index, bounded by the wire limit
 		c.byHeight[height] = hash
 		c.byHash[hash] = height
 	}
 
-	c.top = baseHeight + int32(len(hashes)) - 1 //nolint:gosec // as above
+	c.top = baseHeight + int32(len(kept)) - 1 //nolint:gosec // as above
 	c.filled = true
 	c.provenTo = proven
+
+	return true
+}
+
+// extendLocked appends headers onto this cache's own top rather than replacing
+// the cache, called with c.mu held once Fill has decided this run is below the
+// last checkpoint and this cache already names heights above the tip. See
+// Fill's own doc for the dispatch and provenTo's for why proof may be carried
+// forward here and only here.
+//
+// The anchor is this cache's own top hash, not parent: below the last
+// checkpoint every subsequent request this package sends is built from the
+// list's own top (see manager.go's extendingHeadersLocator), so an honest reply
+// connects there, not necessarily at the committed tip a block or two behind
+// it. Searched with the same two-shape rule replaceLocked uses against parent,
+// just aimed at a different hash.
+//
+// A batch that does not meet the top anywhere is refused and the list is left
+// exactly as it stands — an honest answer about a point the walk has already
+// moved past. It is deliberately never re-tried against parent instead: below
+// the last checkpoint a reply that skips the list's own top would, if accepted,
+// either duplicate what is already held or silently discard the run already
+// proven, and the design settles that a below-checkpoint fill only ever grows
+// this way.
+func (c *headerCache) extendLocked(headers []*wire.BlockHeader, hashes []chainhash.Hash) bool {
+	topHash := c.byHeight[c.top]
+
+	start := findAnchor(headers, hashes, topHash)
+	if start < 0 || start >= len(hashes) {
+		return false
+	}
+
+	kept := hashes[start:]
+	newBase := c.top + 1
+
+	// Judged before anything is appended, and unlike replaceLocked's refusal, a
+	// contradiction here does not leave the previous contents alone: every
+	// entry already held was built as one linked chain with the batch that just
+	// failed to agree with a pinned hash, so the checkpoint that would have
+	// certified them has instead shown the whole run is wrong.
+	proven, agrees := checkpointProof(c.checkpoints, newBase, kept)
+	if !agrees {
+		c.resetLocked()
+		return false
+	}
+
+	for i, hash := range kept {
+		height := newBase + int32(i) //nolint:gosec // a batch index, bounded by the wire limit
+		c.byHeight[height] = hash
+		c.byHash[hash] = height
+	}
+
+	c.top = newBase + int32(len(kept)) - 1 //nolint:gosec // as above
+
+	// The higher of the two watermarks: a checkpoint matched in an earlier fill
+	// is still matched, and the new suffix may have reached a further one.
+	if proven > c.provenTo {
+		c.provenTo = proven
+	}
 
 	return true
 }
@@ -262,6 +372,73 @@ func checkpointProof(checkpoints []chaincfg.Checkpoint, baseHeight int32, hashes
 	}
 
 	return proven, true
+}
+
+// nextCheckpointAbove returns the lowest checkpoint in checkpoints whose
+// height is greater than height, or nil when there is none — either because
+// checkpoints is empty or height is already at or past the last one.
+//
+// Mirrors SyncManager.findNextHeaderCheckpoint exactly (the same >= cutoff
+// against the final checkpoint, the same walk-backward-from-the-end search),
+// because the two must agree on when a below-checkpoint walk is still owed a
+// request. This package has no reference back to a SyncManager to call that
+// method directly, so the rule is duplicated here as a pure function rather
+// than guessed at independently.
+func nextCheckpointAbove(checkpoints []chaincfg.Checkpoint, height int32) *chaincfg.Checkpoint {
+	if len(checkpoints) == 0 {
+		return nil
+	}
+
+	final := &checkpoints[len(checkpoints)-1]
+	if height >= final.Height {
+		return nil
+	}
+
+	next := final
+
+	for i := len(checkpoints) - 2; i >= 0; i-- {
+		if height >= checkpoints[i].Height {
+			break
+		}
+
+		next = &checkpoints[i]
+	}
+
+	return next
+}
+
+// belowLastCheckpointLocked reports whether height sits below this cache's
+// final checkpoint, i.e. whether a below-checkpoint walk is still meaningful
+// at all. Called with c.mu held; see Fill's dispatch and provenTo's doc for
+// what this decides.
+func (c *headerCache) belowLastCheckpointLocked(height int32) bool {
+	return nextCheckpointAbove(c.checkpoints, height) != nil
+}
+
+// NextCheckpointAbove returns the lowest pinned checkpoint above height — the
+// committed tip, ordinarily — and whether one exists. maybeRequestMoreHeaders
+// reads this to decide whether a below-checkpoint walk still owes a request
+// regardless of how much runway the cache already holds for downloads, which
+// headerCacheRefillThreshold answers a different question about.
+//
+// Returned by value rather than pointer: c.checkpoints is only ever replaced
+// wholesale (WithCheckpoints, or a test rebuilding the cache), never mutated
+// element-wise, but handing back a value keeps that guarantee local to this
+// file rather than resting on every caller never keeping a pointer past c.mu.
+func (c *headerCache) NextCheckpointAbove(height int32) (chaincfg.Checkpoint, bool) {
+	if c == nil {
+		return chaincfg.Checkpoint{}, false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	cp := nextCheckpointAbove(c.checkpoints, height)
+	if cp == nil {
+		return chaincfg.Checkpoint{}, false
+	}
+
+	return *cp, true
 }
 
 // At returns the hash this cache names for height, and whether it names one.
@@ -378,6 +555,15 @@ func (c *headerCache) Discard() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.resetLocked()
+}
+
+// resetLocked is Discard's body, factored out so extendLocked can drop the
+// whole list under the lock it is already holding, on the same terms: see
+// extendLocked's own doc for why a checkpoint contradiction reached by
+// extending taints everything already held, not merely the batch that just
+// failed.
+func (c *headerCache) resetLocked() {
 	c.byHeight = make(map[int32]chainhash.Hash)
 	c.byHash = make(map[chainhash.Hash]int32)
 	c.top = 0
@@ -385,4 +571,53 @@ func (c *headerCache) Discard() {
 	// The proof belongs to the contents, so it goes with them. Leaving it behind
 	// would have an empty cache claim a proven prefix it can no longer name.
 	c.provenTo = 0
+}
+
+// Prune drops every entry at or below height, the committed tip as of the
+// caller's read. Below the last checkpoint a fill only ever appends
+// (extendLocked), so nothing else shrinks the list as the tip advances past
+// what it already names; without this it would grow for the whole gap between
+// checkpoints instead of staying bounded to roughly one checkpoint interval's
+// worth of headers plus whatever the tip has not yet caught up to.
+//
+// Pruning height itself, not merely below it, is safe because a block's parent
+// hash exactly at the committed tip still resolves once it is gone from here:
+// pipelineParentHeight falls back to sm.blockchainClient.GetBlockHeader for a
+// hash this cache no longer names, and the tip is by definition committed, so
+// that call always answers for it.
+//
+// Above the last checkpoint this is a no-op in practice, because Fill there
+// already replaces the whole map from the tip on every reply; it is still safe
+// to call unconditionally rather than asking every caller to know which regime
+// it is in.
+func (c *headerCache) Prune(height int32) {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.filled {
+		return
+	}
+
+	for h, hash := range c.byHeight {
+		if h <= height {
+			delete(c.byHeight, h)
+			delete(c.byHash, hash)
+		}
+	}
+
+	if len(c.byHeight) == 0 {
+		// Nothing left above height: the same state Fill leaves an empty cache
+		// in, so top and filled must not go on describing a run that is gone —
+		// left stale, extendLocked's next call would look up c.byHeight[c.top],
+		// find nothing there any more, and search the batch for a zero hash.
+		// provenTo is deliberately left alone: pruning is bookkeeping about what
+		// the cache still NAMES, not a verdict on the chain it named, and the
+		// next Fill governs provenTo on its own terms either way.
+		c.top = 0
+		c.filled = false
+	}
 }

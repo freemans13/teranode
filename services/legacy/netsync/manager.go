@@ -3831,13 +3831,33 @@ const headerCacheRefillThreshold = int32(wire.MaxBlockHeadersPerMsg / 2)
 // earlier than that, while there is still cache left to work through, so the
 // reply has time to land before the current batch runs out.
 //
-// The locator is built exactly as startSync's and headersRoundLocator's own
-// callers build theirs: from the committed tip, through the chain's own
-// GetBlockLocator, never from anything merely downloaded or merely named by
-// the cache. A locator anchored above what this node has actually committed
-// is what had a peer answer from genesis and lose its connection for
-// answering honestly — the 2026-09-11 incident this whole design exists to
-// not repeat.
+// Below the last checkpoint, a third condition can also force a send: the
+// header cache's own walkIncomplete, true when this cache's checkpoints name a
+// checkpoint above the committed tip that its own top has not yet reached (see
+// headerCache.NextCheckpointAbove). That walk's usual driver is
+// continueCheckpointWalkIfNeeded, sent the instant a reply lands, straight
+// back to the peer that answered — this function is its backstop for when
+// that peer goes quiet, which is why walkIncomplete is checked regardless of
+// headerCacheRefillThreshold: top-best can already be comfortably over that
+// threshold (the walk races far ahead of what downloads need) while the walk
+// itself still has tens of thousands of heights left to reach its checkpoint,
+// and waiting for downloads to eat into that headroom before asking again
+// would couple the walk's speed to the download pace it exists to outrun. The
+// interval and peer rotation below still apply exactly as they do for the
+// download-driven trigger, so a stalled walk retries at the normal cadence
+// rather than being asked about on every commit.
+//
+// The locator is built from the committed tip, through the chain's own
+// GetBlockLocator — the same one startSync and headersRoundLocator's other
+// callers use — UNLESS walkIncomplete, in which case it is the list's own top
+// hash followed by that same tip locator (extendingHeadersLocator), because
+// below the last checkpoint every request past the first is answered from
+// where the list already reaches, not from the tip a block or two behind it.
+// A locator anchored ONLY above what this node has actually committed, with a
+// non-zero stop hash, is what had a peer answer truthfully with zero headers
+// and stalled the node for seven hours — see
+// docs/superpowers/specs/2026-09-11-legacy-sync-stall-800128.md — so the tip's
+// own locator entries and the zero stop hash are kept in both branches.
 //
 // Any eligible peer will do, not only the sync peer: eligibleBlockPeers is
 // the same connected, sync-candidate pool the block-download scheduler draws
@@ -3861,16 +3881,21 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 
 	top, haveTop := sm.headerCache.Top()
 
-	if _, ok := sm.headerCache.At(last + 1); ok {
-		// The depth cap stopped the pass, not the cache's own end, so the
-		// backstop alone has nothing to do here. Whether the early trigger
-		// does depends on how much cache is left above the committed tip,
-		// not on the depth cap: top-best can be far bigger than the read-ahead
-		// depth that limited this pass's own wanted range. Only skip the
-		// refill when there is still comfortably more than
-		// headerCacheRefillThreshold left to work through.
-		if haveTop && top-best >= headerCacheRefillThreshold {
-			return
+	next, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
+	walkIncomplete := checkpointAhead && (!haveTop || top < next.Height)
+
+	if !walkIncomplete {
+		if _, ok := sm.headerCache.At(last + 1); ok {
+			// The depth cap stopped the pass, not the cache's own end, so the
+			// backstop alone has nothing to do here. Whether the early trigger
+			// does depends on how much cache is left above the committed tip,
+			// not on the depth cap: top-best can be far bigger than the read-ahead
+			// depth that limited this pass's own wanted range. Only skip the
+			// refill when there is still comfortably more than
+			// headerCacheRefillThreshold left to work through.
+			if haveTop && top-best >= headerCacheRefillThreshold {
+				return
+			}
 		}
 	}
 
@@ -3892,7 +3917,25 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	locator, err := sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+	var (
+		locator blockchain.BlockLocator
+		err     error
+	)
+
+	if walkIncomplete && haveTop {
+		if topHash, ok := sm.headerCache.At(top); ok {
+			locator, err = sm.extendingHeadersLocator(topHash)
+		} else {
+			// The top height Top() just reported is gone from the map: a
+			// concurrent Prune or a whole-list drop landed between the two
+			// calls. Fall through to the ordinary tip-anchored locator, the
+			// same one a genuinely empty list gets below.
+			locator, err = sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+		}
+	} else {
+		locator, err = sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+	}
+
 	if err != nil {
 		sm.logger.Warnf("[assignWantedBlocks] could not build a getheaders locator to refill the header cache past height %d: %v", last, err)
 
@@ -3916,9 +3959,12 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
-	if haveTop {
+	switch {
+	case walkIncomplete:
+		sm.logger.Infof("[assignWantedBlocks][%s] the walk toward checkpoint height %d has stalled, retrying", peer.String(), next.Height)
+	case haveTop:
 		sm.logger.Infof("[assignWantedBlocks][%s] the header cache names %d more heights above the committed tip at %d, asked for more", peer.String(), top-best, best)
-	} else {
+	default:
 		sm.logger.Infof("[assignWantedBlocks][%s] the header cache is empty above height %d, asked for more", peer.String(), last)
 	}
 }
@@ -4213,6 +4259,16 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 		return false
 	}
 
+	// Read before Fill, which below the last checkpoint may EXTEND this cache
+	// rather than replace it (see headerCache.Fill and extendLocked). Both are
+	// needed afterward purely to report what happened correctly — the log line
+	// below and the "list dropped" disconnect on the failure path — neither of
+	// which Fill itself is in a position to say: it has no logger, and on a
+	// wrong-hash drop it has already reset the state that would say so.
+	prevTop, havePrevTop := sm.headerCache.Top()
+	prevProven := sm.headerCache.ProvenTo()
+	_, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
+
 	if !sm.headerCache.Fill(tipHash, best+1, msg.Headers) {
 		// Two different refusals arrive here as one false, and only one of them is
 		// the peer's fault. Fill refuses a run that does not reach above the
@@ -4229,23 +4285,153 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 			return false
 		}
 
+		// Below the last checkpoint, once this cache already named heights above
+		// the tip, Fill judges the batch against the list's own top instead of
+		// best+1 (extendLocked) — so a wrong hash reached that way shows up only
+		// when the batch is re-walked from prevTop+1, never from best+1 above.
+		// A match here means Fill has already wiped every entry the dropped run
+		// had proven, because they were all one linked chain with the batch that
+		// just failed to agree; this block is purely the classification for the
+		// disconnect and the log, not the decision itself.
+		if havePrevTop && prevTop >= best+1 && checkpointAhead {
+			if cp := sm.contradictedCheckpoint(prevTop+1, msg.Headers); cp != nil {
+				sm.logger.Warnf("[fillHeaderCache][%s] header list dropped: the walk reached checkpoint height %d without the pinned hash %s", peer, cp.Height, cp.Hash)
+				peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash %s", cp.Height, cp.Hash))
+
+				return false
+			}
+		}
+
 		sm.logger.Debugf("[fillHeaderCache] batch of %d headers from %s does not reach above the committed tip at height %d, dropping it", len(msg.Headers), peer, best)
 
 		return false
 	}
 
-	// Read back from the cache rather than computed from the batch length. Fill
-	// drops whatever prefix the tip has already moved past, so the batch's own
-	// length no longer names the top height — that arithmetic was right only
-	// while a reply had to begin exactly one above the tip, and reporting a top
-	// the cache does not hold would be a lie in the one log line anybody reads
-	// to see how much runway is left.
-	cached := sm.headerCache.Len()
+	// Read the new top back from the cache rather than computed from the batch
+	// length: Fill drops whatever prefix does not belong, and below the last
+	// checkpoint it may append onto prevTop instead of starting at best+1, so
+	// the batch's own length no longer names either end on its own.
 	top, _ := sm.headerCache.Top()
 
-	sm.logger.Infof("[fillHeaderCache] cached %d of %d headers from %s, heights %d to %d", cached, len(msg.Headers), peer, best+1, top)
+	// The low end of what THIS call added. extended mirrors exactly the
+	// condition Fill itself used to choose extendLocked over replaceLocked: an
+	// extending fill appended onto prevTop, a replacing one starts at best+1
+	// regardless of what the cache held before. Getting this wrong would have
+	// the one log line an operator panel parses report the whole accumulated
+	// list's size against a single reply's header count.
+	extended := havePrevTop && prevTop >= best+1 && checkpointAhead
+
+	low := best + 1
+	if extended {
+		low = prevTop + 1
+	}
+
+	cached := top - low + 1
+
+	sm.logger.Infof("[fillHeaderCache] cached %d of %d headers from %s, heights %d to %d", cached, len(msg.Headers), peer, low, top)
+
+	if newProven := sm.headerCache.ProvenTo(); newProven > prevProven {
+		sm.logger.Infof("[fillHeaderCache][%s] header walk matched checkpoint at height %d", peer, newProven)
+	}
+
+	sm.continueCheckpointWalkIfNeeded(peer, best, top)
 
 	return true
+}
+
+// continueCheckpointWalkIfNeeded sends the next getheaders immediately when
+// the header list has not yet reached the checkpoint it is walking toward,
+// rather than waiting out headerCacheRefillInterval. That interval exists to
+// stop a dry cache being asked about again on every commit while a reply is
+// already in flight; a reply has just landed here, so there is nothing in
+// flight to duplicate, and at a flat 5 seconds per round trip a 28,000-height
+// gap between mainnet checkpoints would take roughly two minutes to walk
+// instead of however long the network actually takes.
+//
+// Asks the peer that just answered, not a rotated one: it has just proved it
+// holds this chain and is reachable, and asking anyone else here would be a
+// second request for the same range before the first has even had a chance to
+// answer again. Rotation on a stalled walk is still maybeRequestMoreHeaders'
+// job — see its own doc for how it now also owns this walk as a backstop.
+//
+// lastHeaderRequestAt is still updated on a successful send, so the periodic
+// path this same call chain reaches a moment later (fetchHeaderBlocks, called
+// unconditionally by handleHeadersMsg after this) does not also fire and send
+// a second, redundant request for the same range.
+//
+// Guarded on peer.Connected(): every production caller's peer is connected by
+// construction, but several of this package's tests fill the cache directly
+// through fillHeaderCache with a bare, unconnected test peer that was never
+// meant to receive a real getheaders, and this must not be the thing that
+// changes that.
+func (sm *SyncManager) continueCheckpointWalkIfNeeded(peer *peerpkg.Peer, best, top int32) {
+	if !sm.headersFirstMode.Load() || !peer.Connected() {
+		return
+	}
+
+	next, ok := sm.headerCache.NextCheckpointAbove(best)
+	if !ok || top >= next.Height {
+		return
+	}
+
+	topHash, ok := sm.headerCache.At(top)
+	if !ok {
+		return
+	}
+
+	locator, err := sm.extendingHeadersLocator(topHash)
+	if err != nil {
+		sm.logger.Warnf("[fillHeaderCache][%s] could not build a locator to continue the walk toward checkpoint height %d: %v", peer, next.Height, err)
+
+		return
+	}
+
+	peer.ForgetLastHeadersRequest()
+
+	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
+		sm.logger.Warnf("[fillHeaderCache][%s] failed to send the immediate continuation toward checkpoint height %d: %v", peer, next.Height, err)
+
+		return
+	}
+
+	sm.lastHeaderRequestAt.Store(time.Now().UnixNano())
+
+	sm.logger.Infof("[fillHeaderCache][%s] the walk has not yet reached checkpoint height %d, asked immediately for more", peer, next.Height)
+}
+
+// extendingHeadersLocator builds the locator for a request that continues a
+// below-checkpoint walk already under way: the current list top's hash first,
+// so a peer that has it answers immediately from where the walk left off,
+// followed by the ordinary committed-tip locator so an honest peer that has
+// fallen behind the walk — or one that never had the top hash at all — still
+// finds a shared ancestor rather than replying about a point it has moved
+// past.
+//
+// See docs/superpowers/specs/2026-09-11-legacy-sync-stall-800128.md: a locator
+// anchored ONLY above the committed tip, with a non-zero stop hash, produced a
+// truthful empty reply that stalled the node for seven hours, because the
+// range asked about was one the peer had already answered in full. Keeping the
+// tip's own locator entries after the top hash, and leaving the stop hash at
+// the zero hash exactly as every other getheaders in this package does, is
+// what keeps this request safe in the same way: a peer that cannot place the
+// top hash at all still has every reason to answer from the tip instead of
+// answering "nothing" about a range it considers already closed.
+func (sm *SyncManager) extendingHeadersLocator(topHash chainhash.Hash) (blockchain.BlockLocator, error) {
+	best, tipHash, ok := sm.committedTip()
+	if !ok {
+		return nil, errors.NewProcessingError("no committed tip recorded yet")
+	}
+
+	tipLocator, err := sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+	if err != nil {
+		return nil, err
+	}
+
+	locator := make(blockchain.BlockLocator, 0, len(tipLocator)+1)
+	locator = append(locator, &topHash)
+	locator = append(locator, tipLocator...)
+
+	return locator, nil
 }
 
 // contradictedCheckpoint returns the checkpoint a headers batch disagrees with, or

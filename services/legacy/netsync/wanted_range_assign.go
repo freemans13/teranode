@@ -43,6 +43,14 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// for one made while the header lock is held.
 	best, _, _ := sm.committedTip()
 
+	// Below the last checkpoint a fill only ever appends (headerCache.Fill,
+	// extendLocked), so nothing else shrinks the list as the tip advances past
+	// what it already names. Pruned on every pass, not only after a fill,
+	// because most passes here are driven by a commit, not a headers reply —
+	// see headerCache.Prune for why height itself, not merely below it, is
+	// safe to drop.
+	sm.headerCache.Prune(best)
+
 	wanted := sm.wantedBlocks(best)
 
 	// Ahead of the assigner and its budget cap on purpose: whether the cache has
