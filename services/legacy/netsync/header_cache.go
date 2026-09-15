@@ -602,8 +602,21 @@ func (c *headerCache) Prune(height int32) {
 		return
 	}
 
-	for h, hash := range c.byHeight {
-		if h <= height {
+	// Walk up from the lowest height held rather than ranging over the map.
+	// This runs on every assignment pass, which is once per committed block on
+	// the serial commit path, and below a checkpoint the list holds up to a
+	// whole checkpoint interval, about 43,000 heights at the widest mainnet
+	// gap. Ranging over all of that on every pass, under the cache lock that
+	// block delivery reads Proven through, is exactly the per-block bookkeeping
+	// already crowding that path. The list is always one contiguous run of
+	// heights: replaceLocked writes baseHeight up to top, extendLocked appends
+	// from top+1, and this only ever removes a prefix. So the lowest height held
+	// is top minus the count plus one, and the work is proportional to what
+	// actually fell below the tip, usually a single height.
+	low := c.top - int32(len(c.byHeight)) + 1 //nolint:gosec // bounded by one checkpoint interval
+
+	for h := low; h <= height && h <= c.top; h++ {
+		if hash, ok := c.byHeight[h]; ok {
 			delete(c.byHeight, h)
 			delete(c.byHash, hash)
 		}

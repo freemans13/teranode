@@ -100,6 +100,13 @@ func TestCheckpointWalk_WrongHashAtCheckpointDropsWholeListAndDisconnects(t *tes
 	require.True(t, sm.fillHeaderCache(peer, headersMsgOf(t, good[:6])))
 	require.False(t, sm.headerCache.Proven(goodHashes[0]), "sanity: nothing is proven yet")
 
+	// The continuation lands on the peer's outbound queue asynchronously, so
+	// wait for it before taking the baseline. Sampling straight away read zero
+	// whenever the send had not landed yet, most often under -race, and then
+	// counted that same legitimate request against the disconnected sender.
+	require.Eventually(t, func() bool { return headers.count() == 1 }, 5*time.Second, 5*time.Millisecond,
+		"a successful fill short of the checkpoint must ask for the next batch")
+
 	sentBeforeContradiction := headers.count()
 
 	// Second reply: an honest, internally linked run extending from the list's
@@ -119,7 +126,8 @@ func TestCheckpointWalk_WrongHashAtCheckpointDropsWholeListAndDisconnects(t *tes
 	require.False(t, sm.headerCache.Proven(forgedHashes[0]))
 
 	require.False(t, peer.Connected(), "a peer whose run contradicts a pinned checkpoint hash must be disconnected")
-	require.Equal(t, sentBeforeContradiction, headers.count(), "a dropped, disconnected sender is not asked for anything more")
+	require.Never(t, func() bool { return headers.count() != sentBeforeContradiction }, 300*time.Millisecond, 10*time.Millisecond,
+		"a dropped, disconnected sender is not asked for anything more")
 }
 
 // Test 3: a reply connecting to neither the list top nor the committed tip is
@@ -139,6 +147,17 @@ func TestCheckpointWalk_ReplyMeetingNeitherAnchorIsRefusedWithoutDisconnect(t *t
 
 	require.True(t, sm.fillHeaderCache(peer, headersMsgOf(t, good)))
 	require.Equal(t, 6, sm.headerCache.Len())
+
+	// That fill was a success short of the checkpoint at height 20, so it
+	// correctly sends the walk's next request to this peer. The send lands on
+	// the peer's outbound queue asynchronously, so wait for it and take it as
+	// the baseline. Asserting zero at the end instead counted this legitimate
+	// request whenever it happened to land first, which made the test fail
+	// about one run in six for a reason that had nothing to do with refusal.
+	require.Eventually(t, func() bool { return headers.count() == 1 }, 5*time.Second, 5*time.Millisecond,
+		"a successful fill short of the checkpoint must ask for the next batch")
+
+	baseline := headers.count()
 
 	// Neither the committed tip (still height 0) nor the list's own top
 	// (goodHashes[5]) is this batch's parent, and neither hash appears inside
@@ -161,7 +180,10 @@ func TestCheckpointWalk_ReplyMeetingNeitherAnchorIsRefusedWithoutDisconnect(t *t
 	}
 
 	require.True(t, peer.Connected(), "an honest reply about a point already passed must not cost the connection")
-	require.Zero(t, headers.count(), "a refusal that names no contradiction sends nothing back")
+	// "Must not happen" needs a real window to happen in, not a single sample
+	// taken before an asynchronous send could have landed.
+	require.Never(t, func() bool { return headers.count() != baseline }, 300*time.Millisecond, 10*time.Millisecond,
+		"a refusal that names no contradiction sends nothing back")
 }
 
 // Test 4: an extending reply whose front overlaps the list top keeps exactly
@@ -227,6 +249,11 @@ func newExtendingWalkManager(t *testing.T, checkpointHeight int32) (sm *SyncMana
 	peer, _, headers = demotionPeer(t, sm, 232, 1000)
 
 	require.True(t, sm.fillHeaderCache(peer, headersMsgOf(t, full)))
+
+	// Make the promise in this helper's doc comment true rather than assumed:
+	// the continuation send is asynchronous.
+	require.True(t, WaitUntil(func() bool { return headers.count() == 1 }, 5*time.Second),
+		"harness check: the initial fill short of the checkpoint must send the walk's first continuation")
 
 	return sm, peer, headers, hashes
 }
