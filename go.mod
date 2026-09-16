@@ -38,7 +38,7 @@ require (
 	github.com/mrz1836/go-datastore v1.3.7
 	github.com/mrz1836/go-logger v1.0.6
 	github.com/multiformats/go-multiaddr v0.16.1
-	github.com/ordishs/gocore v1.0.82
+	github.com/ordishs/gocore v1.1.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/rs/zerolog v1.33.0
 	github.com/segmentio/encoding v0.4.0 // indirect

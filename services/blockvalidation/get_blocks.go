@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -242,11 +243,30 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 			if optimistic {
 				contributingPeers, freshlyWritten, err = nil, nil, nil
 			} else {
-				fetchFn := u.fetchSubtreeDataForBlockFn
-				if fetchFn == nil {
-					fetchFn = u.fetchSubtreeDataForBlock
+				// Reserve before the prewarm: fetchSubtreeDataForBlock parses every transaction of every
+				// subtree of this block into memory concurrently, and the sum of a block's subtree_data
+				// is ~block.SizeInBytes when the payload is in standard transaction format
+				// (bsv-blockchain/teranode#1139). The declared size is a HEURISTIC, not a bound: a peer may
+				// serve extended-format transactions, which the parser accepts and which carry an extra
+				// PreviousTxScript per input. See boundSubtreeConcurrencyByBudget.
+				//
+				// The release must run on EVERY exit of the fetch, including error. It is written
+				// inline rather than deferred on purpose: a bare defer here is scoped to the whole
+				// for loop, not to this iteration, so it would hold every reservation until the
+				// worker exits and permanently wedge catch-up.
+				var weight int64
+
+				weight, err = u.acquireCatchupPrefetch(ctx, work.block)
+				if err == nil {
+					fetchFn := u.fetchSubtreeDataForBlockFn
+					if fetchFn == nil {
+						fetchFn = u.fetchSubtreeDataForBlock
+					}
+
+					contributingPeers, freshlyWritten, err = fetchFn(ctx, work.block, peerID, baseURL)
+
+					u.releaseCatchupPrefetch(weight)
 				}
-				contributingPeers, freshlyWritten, err = fetchFn(ctx, work.block, peerID, baseURL)
 			}
 
 			if err != nil {
@@ -393,10 +413,13 @@ func (u *Server) fetchSubtreeDataForBlock(gCtx context.Context, block *model.Blo
 	g, ctx := errgroup.WithContext(ctx)
 	// Limit concurrency to avoid overwhelming the peer
 	// This can be adjusted based on peer capabilities and network conditions
-	subtreeConcurrency := 8 // Default value
+	subtreeConcurrency := 8 // fail-safe when the setting is unset or non-positive; the real default is 32 (settings.go)
 	if u.settings.BlockValidation.SubtreeFetchConcurrency > 0 {
 		subtreeConcurrency = u.settings.BlockValidation.SubtreeFetchConcurrency
 	}
+
+	subtreeConcurrency = u.boundSubtreeConcurrencyByBudget(subtreeConcurrency, block)
+
 	g.SetLimit(subtreeConcurrency)
 
 	// Get peer assignments for subtrees if parallel fetching is enabled
@@ -624,6 +647,201 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 	return subtree, nil
 }
 
+// minCatchupPrefetchWeight is the floor charged for one block. Without it a run of tiny
+// blocks admits an unbounded number of concurrent prewarms within the byte budget; with it
+// the in-flight count can never exceed budget/floor. FetchNumWorkers already caps that at 16
+// today, so this is insurance against a raised worker count. Same value and reasoning as
+// netsync's minInFlightBlockWeight.
+const minCatchupPrefetchWeight = 64 * 1024
+
+// acquireCatchupPrefetch reserves capacity for one block's subtree-data prewarm and returns
+// the weight to hand back. A nil budget (disabled) is a no-op returning (0, nil). An
+// already-cancelled context returns ctx.Err() with nothing reserved, BEFORE the fast path,
+// so the cancellation contract holds whether or not capacity happens to be free. The weight
+// is the block's declared size, floored at minCatchupPrefetchWeight and clamped to the whole
+// budget, so an oversized block is admitted alone rather than deadlocking against a budget it
+// cannot fit in. On error nothing was reserved and the caller must not release.
+func (u *Server) acquireCatchupPrefetch(ctx context.Context, block *model.Block) (int64, error) {
+	if u.catchupPrefetchBudget == nil {
+		return 0, nil
+	}
+
+	// Before the fast path, not after: semaphore.Weighted.TryAcquire does not consult the
+	// context, so a cancelled caller would otherwise walk away holding a live reservation
+	// whenever capacity happened to be free.
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	var size uint64
+	if block != nil {
+		size = block.SizeInBytes
+	}
+
+	// block.SizeInBytes is peer-supplied. A plain cast of a hostile value can go negative,
+	// and semaphore.Acquire with a negative weight is undefined, so an unrepresentable size
+	// is treated as at least the whole budget and clamped below.
+	weight, convErr := safeconversion.Uint64ToInt64(size)
+	if convErr != nil {
+		weight = u.catchupPrefetchBudgetBytes
+	}
+
+	if weight < minCatchupPrefetchWeight {
+		weight = minCatchupPrefetchWeight
+	}
+
+	if weight > u.catchupPrefetchBudgetBytes {
+		weight = u.catchupPrefetchBudgetBytes
+	}
+
+	// Fast path: capacity available right now.
+	if u.catchupPrefetchBudget.TryAcquire(weight) {
+		return weight, nil
+	}
+
+	// Warn, not debug: a parked worker stops draining the work queue, so a sustained rate here
+	// is catch-up being throttled by blockvalidation_catchup_prefetch_budget_bytes and is the
+	// operator's signal to size it against measured headroom.
+	u.logger.Warnf("[catchup:acquireCatchupPrefetch][%s] parked waiting for %d bytes of prefetch budget (blockvalidation_catchup_prefetch_budget_bytes=%d)", catchupPrefetchBlockName(block), weight, u.catchupPrefetchBudgetBytes)
+
+	if prometheusCatchupPrefetchBudgetParked != nil {
+		prometheusCatchupPrefetchBudgetParked.Inc()
+	}
+
+	if err := u.catchupPrefetchBudget.Acquire(ctx, weight); err != nil {
+		return 0, err
+	}
+
+	return weight, nil
+}
+
+// catchupPrefetchBlockName renders a block hash for the budget-park log line without
+// assuming a header is present. Block.Hash() dereferences Header, and several tests drive
+// this path with header-less blocks, so a log line must never be the thing that panics.
+func catchupPrefetchBlockName(block *model.Block) string {
+	if block == nil || block.Header == nil {
+		return "unknown"
+	}
+
+	return block.Hash().String()
+}
+
+// releaseCatchupPrefetch returns a weight from acquireCatchupPrefetch. Zero weight or a nil
+// budget is a no-op.
+func (u *Server) releaseCatchupPrefetch(weight int64) {
+	if u.catchupPrefetchBudget == nil || weight <= 0 {
+		return
+	}
+
+	u.catchupPrefetchBudget.Release(weight)
+}
+
+// boundSubtreeConcurrencyByBudget drops the per-block subtree parse concurrency to 1 when a
+// block's declared size exceeds the catch-up prefetch budget.
+//
+// The block-level reservation clamps such a block to the whole budget and admits it alone.
+// That bounds how many BLOCKS parse at once but not how many BYTES one block parses at once:
+// SubtreeFetchConcurrency subtrees of a multi-gigabyte block would still materialise
+// together. Dropping to 1 bounds it at a single subtree_data payload.
+//
+// Deliberately NOT an average-based divisor (budget / (SizeInBytes/len(Subtrees))). An
+// average says nothing about the worst case under skew: a 4 GiB block with 1024 subtrees
+// averages 4 MiB, so an average rule would permit the full 32-way concurrency, yet if two of
+// those subtrees hold ~2 GiB each both can be in flight and ~4 GiB is retained. The
+// fits/does-not-fit predicate below is skew-independent for the block that does NOT fit: "1"
+// depends on no size estimate at all. For a block that DOES fit, the argument is that its
+// total subtree_data is ~its declared size, so no distribution of that total across its
+// subtrees can exceed the reservation already held for it.
+//
+// That fitting-block argument is a HEURISTIC, not a bound, and three things can break it:
+//   - Format expansion. subtree_data may carry EXTENDED transactions. Tx.ReadFrom auto-detects
+//     the 0xEF extended marker and parses a PreviousTxScript per input, and the only check
+//     serializeFromReader applies is the txid, which is computed over the STANDARD bytes and
+//     so cannot tell the two apart. Teranode's own producers emit standard format (the asset
+//     server's on-demand generation and the block persister both write non-extended bytes),
+//     but nothing on the receive side enforces it.
+//   - SizeInBytes is peer-declared and may be understated.
+//   - One subtree_data payload is irreducible: it must be fully materialised before it can be
+//     checked against the subtree.
+//
+// None of the three is detectable cheaply from the bytes alone, so this is a heuristic that
+// removes the unbounded case rather than a bound (bsv-blockchain/teranode#1139).
+//
+// This applies to RevalidateBlock too, which calls fetchSubtreeDataForBlock directly. That is
+// deliberate: unlike the semaphore, this rule never makes an operator operation WAIT on
+// catch-up — it only lowers its own internal parallelism — and an oversized block revalidated
+// inline has exactly the same memory shape as one in catch-up. Scoping it to catch-up would
+// mean threading a flag through the fetchSubtreeDataForBlockFn seam, a wider diff than the fix
+// itself.
+//
+// A block that declares NO size is treated the same way, because an undeclared size is the one
+// value a hostile peer pays nothing to supply: it is the cheapest way to claim the configured
+// 32-way fan-out while promising nothing. It costs honest work nothing in practice — a block
+// taken from the blockchain store always carries a real SizeInBytes, which is what
+// RevalidateBlock passes — and it leaves the catch-up receive path, where the declaration comes
+// off the wire, as the only place the case arises.
+//
+// The asymmetry with acquireCatchupPrefetch is deliberate, not drift. That function charges a
+// capacity RESERVATION, so an undeclared size is floored rather than maximised: a reservation
+// must be finite and over-charging an undeclared block would park legitimate work. This function
+// applies a TRUST PREDICATE, where the same undeclared size is least worth trusting. The
+// residual is real: several blocks declaring 0 are still all admitted by the semaphore, but each
+// then parses one subtree at a time instead of blockvalidation_subtree_fetch_concurrency
+// (bsv-blockchain/teranode#1139).
+func (u *Server) boundSubtreeConcurrencyByBudget(configured int, block *model.Block) int {
+	if u.catchupPrefetchBudgetBytes <= 0 || block == nil {
+		return configured
+	}
+
+	size, err := safeconversion.Uint64ToInt64(block.SizeInBytes)
+
+	switch {
+	case err != nil:
+		// A declaration that does not fit an int64 exceeds every positive budget, so it is
+		// oversized; only its diagnostic text differs from the over-budget case.
+		u.warnSubtreeConcurrencyClamped(block, "declared a size too large to represent, which exceeds any budget")
+
+		if prometheusCatchupPrefetchOversizedBlocks != nil {
+			prometheusCatchupPrefetchOversizedBlocks.Inc()
+		}
+
+		return 1
+
+	case size == 0:
+		u.warnSubtreeConcurrencyClamped(block, "declared no size; an undeclared size is not trusted with the configured concurrency")
+
+		if prometheusCatchupPrefetchUndeclaredSizeBlocks != nil {
+			prometheusCatchupPrefetchUndeclaredSizeBlocks.Inc()
+		}
+
+		return 1
+
+	case size > u.catchupPrefetchBudgetBytes:
+		u.warnSubtreeConcurrencyClamped(block, fmt.Sprintf("declared %d bytes, which exceeds the catch-up prefetch budget", size))
+
+		if prometheusCatchupPrefetchOversizedBlocks != nil {
+			prometheusCatchupPrefetchOversizedBlocks.Inc()
+		}
+
+		return 1
+	}
+
+	return configured
+}
+
+// warnSubtreeConcurrencyClamped emits the single log line for a block whose subtree parse
+// concurrency has been dropped to 1. It is only called from the clamping branches, so it never
+// claims a change that did not happen. The logger can be nil on the bare &Server{...} several
+// tests build, and a log line must never be the thing that panics.
+func (u *Server) warnSubtreeConcurrencyClamped(block *model.Block, reason string) {
+	if u.logger == nil {
+		return
+	}
+
+	u.logger.Warnf("[catchup:boundSubtreeConcurrencyByBudget][%s] block %s; parsing its subtrees one at a time (blockvalidation_catchup_prefetch_budget_bytes=%d)",
+		catchupPrefetchBlockName(block), reason, u.catchupPrefetchBudgetBytes)
+}
+
 // subtreeDataFetchTimeout resolves the bound for one detached subtree_data fetch.
 //
 // It fails closed: a nil settings object, or a non-positive configured value, yields the
@@ -761,21 +979,76 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 		return newPoisonedSubtreeDataError(peerID, baseURL, subtreeHash, missing, subtree.Length(), bytesRead)
 	}
 
-	// Try to serialize the subtreeData to validate it's complete
-	subtreeDataBytes, err := subtreeData.Serialize()
-	if err != nil {
-		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Peer %s (%s) provided incomplete subtree data for %s", peerID, baseURL, subtreeHash.String(), err)
-	}
+	// Stream the transactions straight into the store instead of building a second complete
+	// in-memory copy with Serialize() and handing that to Set: the parsed []*bt.Tx is already
+	// resident, and one more full serialized copy per in-flight subtree_data is exactly the
+	// amplifier #1139 is about. WriteTransactionsToWriter(w, 0, subtree.Length()) emits the
+	// same byte stream Serialize() would — both skip index 0 when Nodes[0] is the coinbase
+	// placeholder and both write SerializeBytes/SerializeTo, which branch identically on
+	// IsExtended() — and it is stricter: it returns ErrTransactionNil where Serialize would
+	// dereference a nil tx at index 0.
+	//
+	// The second full copy is avoided on the FILE store only. The memory and batcher stores
+	// io.ReadAll the body and S3 copies it into a bytes.Buffer before upload
+	// (stores/blob/s3/s3.go:253-264), so on those the streamed reader is materialised anyway.
+	// The subtree store is file-backed in production, which is the deployment this is for.
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
 
-	// Store subtreeData (raw data) in subtreeStore
-	if err = u.subtreeStore.Set(ctx,
+	// writeErr is written by the producer goroutine below and read after <-done. close(done)
+	// and the receive on it are the happens-before edge, so the post-join read is race-free
+	// and needs no mutex.
+	var writeErr error
+
+	go func() {
+		defer close(done)
+
+		// bufio is mandatory, not cosmetic: bt.Tx.SerializeTo delegates to WriteTo, which
+		// emits many 4-byte and varint-sized writes, and every write to an unbuffered
+		// io.Pipe is a synchronous rendezvous with the reader. The buffer is pooled and
+		// 64 KiB rather than a fresh 1 MiB per call, because up to
+		// blockvalidation_fetch_num_workers x blockvalidation_subtree_fetch_concurrency of
+		// them are live at once and collapsing the rendezvous does not need a megabyte
+		// (bsv-blockchain/teranode#1139).
+		bw := bufioWriterPool.Get().(*bufio.Writer)
+		bw.Reset(pw)
+
+		defer func() {
+			// Mandatory: without it a pooled writer holds a live *io.PipeWriter and any
+			// residual bytes for as long as it sits in the pool.
+			bw.Reset(nil)
+			bufioWriterPool.Put(bw)
+		}()
+
+		writeErr = subtreeData.WriteTransactionsToWriter(bw, 0, subtree.Length())
+		if writeErr == nil {
+			writeErr = bw.Flush()
+		}
+
+		_ = pw.CloseWithError(writeErr)
+	}()
+
+	storeErr := u.subtreeStore.SetFromReader(ctx,
 		subtreeHash[:],
 		fileformat.FileTypeSubtreeData,
-		subtreeDataBytes,
+		pr,
 		options.WithAllowOverwrite(true),
 		options.WithDeleteAt(dah),
-	); err != nil {
-		return errors.NewStorageError("[catchup:fetchAndStoreSubtreeData] Failed to store subtreeData for %s", subtreeHash.String(), err)
+	)
+
+	// Order matters. Close the read side FIRST: if SetFromReader returned before draining the
+	// pipe, the producer is parked in Write and <-done would deadlock. io.PipeReader.Close is
+	// idempotent and makes the producer's next Write/Flush return io.ErrClosedPipe, so it
+	// always reaches close(done). The Store.SetFromReader contract on closing its input reader
+	// is inconsistent across implementations, which is why this close is ours to make.
+	//
+	// Joining the producer before returning is what keeps the parsed transactions it holds
+	// from outliving this block's prefetch-budget reservation.
+	_ = pr.Close()
+	<-done
+
+	if err = subtreeDataWriteFailure(peerID, baseURL, subtreeHash, writeErr, storeErr); err != nil {
+		return err
 	}
 
 	// This attempt itself just wrote FileTypeSubtreeData for this hash — eligible for
@@ -785,6 +1058,46 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	freshness.markFresh(*subtreeHash, fileformat.FileTypeSubtreeData)
 
 	return nil
+}
+
+// subtreeDataWriteFailure decides who is at fault when the streamed store write fails.
+//
+// Check order matters and is NOT interchangeable. Data.WriteTransactionsToWriter wraps writer
+// failures with TWO %w verbs (go-subtree subtree_data.go), so an error raised because the store
+// aborted and fetchAndStoreSubtreeData then closed the read side satisfies errors.Is for
+// ErrTransactionWrite AND for io.ErrClosedPipe at the same time. io.ErrClosedPipe can only come
+// from that function's own pr.Close(), which runs after SetFromReader has already returned — so it
+// is always a store-first failure and must be tested FIRST, with errors.Is and never with
+// equality. Matching the producer sentinels first would charge an innocent peer for our own
+// storage failure.
+//
+// A genuine producer error means the body the PEER served parsed but cannot be re-serialized, and
+// must stay peer-attributable: errors.IsLocalError treats ErrStorageError as ours, and a local
+// error makes fetchAndStoreSubtreeAndSubtreeData skip alternative-peer failover and
+// recordCatchupPeerFailure decline to charge the peer (bsv-blockchain/teranode#1139).
+func subtreeDataWriteFailure(peerID, baseURL string, subtreeHash *chainhash.Hash,
+	writeErr, storeErr error) error {
+	if writeErr == nil && storeErr == nil {
+		return nil
+	}
+
+	// The nil guard is not redundant: errors.Is normalises its argument through the gRPC
+	// unwrapper, which turns a nil error into a typed-nil *Error.
+	if writeErr != nil && errors.Is(writeErr, io.ErrClosedPipe) {
+		if storeErr != nil {
+			return errors.NewStorageError("[catchup:fetchAndStoreSubtreeData] Failed to store subtreeData for %s", subtreeHash.String(), storeErr)
+		}
+
+		// The store reported success without draining the body. Still ours, not the peer's.
+		return errors.NewStorageError("[catchup:fetchAndStoreSubtreeData] Store stopped reading subtreeData for %s before the body was fully written", subtreeHash.String(), writeErr)
+	}
+
+	if writeErr != nil {
+		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Peer %s (%s) provided unusable subtree data for %s",
+			peerID, baseURL, subtreeHash.String(), writeErr)
+	}
+
+	return errors.NewStorageError("[catchup:fetchAndStoreSubtreeData] Failed to store subtreeData for %s", subtreeHash.String(), storeErr)
 }
 
 // fetchSubtreeAndDataFromPeer fetches the subtree and then its subtreeData from a
