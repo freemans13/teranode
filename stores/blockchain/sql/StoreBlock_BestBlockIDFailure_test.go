@@ -205,10 +205,10 @@ func newFaultingStore(t *testing.T) (*SQL, *queryFault) {
 	return s, fault
 }
 
-// TestStoreBlockWhoseBestBlockLookupFailsLeavesTheChainCheckAnswerable covers the gap
-// icellan found at StoreBlock.go:223: when the post-insert getBestBlockID errors, the
-// bestErr branch used to log and fall off the end of the if/else chain, so none of Cases
-// 1-3 ran for a block that is already committed.
+// TestStoreBlockWhoseBestBlockLookupFailsLeavesTheChainCheckAnswerable covers StoreBlock's
+// bestErr branch: when the post-insert getBestBlockID errors, that branch used to log and
+// fall off the end of the if/else chain, so none of Cases 1-3 ran for a block that is
+// already committed.
 //
 // Both subtests fail the pre-insert and post-insert getBestBlockID calls and let the
 // rebuild's own call through. Failing the pre-insert call is what makes the post-insert
