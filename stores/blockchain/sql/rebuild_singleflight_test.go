@@ -72,6 +72,10 @@ func (p *rebuildProbe) count() int {
 // The joiner is the whole point of the test. Without one the leader sees shared == false and
 // both the old and the new code do the right thing, which is how the first version of this
 // test passed against the bug it was written for.
+//
+// This is the ordering icellan measured at starts == 2, the full-chain recursive CTE run
+// twice back to back under the guard. Restore the shared-flag condition in
+// runRebuildObservingWrite and this test reports exactly that.
 func TestAMutatorThatLedItsOwnRebuildDoesNotRunASecondOne(t *testing.T) {
 	s := &SQL{}
 	p := newProbe(s, 1)
