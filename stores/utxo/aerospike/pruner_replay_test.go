@@ -224,6 +224,14 @@ func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, uns
 	exists, err := client.Exists(nil, childKey)
 	require.NoError(t, err)
 	require.False(t, exists)
+
+	// Rejecting the replay must not consume the marker. Nothing clears one, and
+	// a rejection that ate it would let the very next attempt through, so the
+	// end state is "rejected AND still protected", not just "rejected once".
+	afterRejection, err := client.Get(nil, parentKeyForOutput(t, store, parent.TxIDChainHash(), outputIndex, s.UtxoStore.UtxoBatchSize))
+	require.NoError(t, err)
+	require.Contains(t, afterRejection.Bins[fields.DeletedChildren.String()], child.TxID(),
+		"the marker must survive the rejection it caused")
 }
 
 // TestPrunerUnresolvableRecordDoesNotBlockCycle proves that a record whose
@@ -667,4 +675,130 @@ func TestPrunerSkipDeletionsWritesNoMarkers(t *testing.T) {
 
 	_, err = store.Spend(ctx, child, 1200)
 	require.NoError(t, err, "the retained child's idempotent re-spend must still be accepted")
+}
+
+// TestPrunerMarkersStayOnTheOutputPageThatHoldsTheChild bounds the growth a
+// reviewer flagged: with defensive mode on, the pruner used to copy every
+// pruned child's marker onto the parent's MASTER record as well as onto the
+// output page, so a high fan-out parent that keeps one unspent output
+// accumulated one entry per child there for ever and eventually crossed the
+// record size limit, after which every later marker write to it failed and its
+// children were held back on every cycle.
+//
+// The end state asserted here is the bound itself, on a real store: each record
+// carries markers only for the outputs it actually holds. The master holds
+// outputs 0 and 1 (utxoBatchSize 2), so it may name at most the one child of
+// output 1; output 0 is deliberately left unspent so the parent survives the
+// cycle. Every other page names exactly its own children.
+//
+// This measures the per-record bound, not the RECORD_TOO_BIG failure the
+// reviewer reproduced at roughly 15k children on a 16k-output parent, which
+// needs a record two orders of magnitude larger than is reasonable here. The
+// bound is what that failure was the consequence of breaking.
+func TestPrunerMarkersStayOnTheOutputPageThatHoldsTheChild(t *testing.T) {
+	const (
+		outputs   = 20
+		batchSize = 2
+	)
+
+	logger := ulogger.New("pruner-marker-bound-test")
+	s := test.CreateBaseTestSettings(t)
+	s.UtxoStore.DisableDAHCleaner = false
+	s.UtxoStore.UtxoBatchSize = batchSize
+	// Defensive mode is the setting under which the master copy was written.
+	s.Pruner.UTXODefensiveEnabled = true
+	s.Aerospike.EnableSpendFilterExpressions = true
+
+	client, store, ctx, cleanup := initAerospike(t, s, logger)
+	t.Cleanup(cleanup)
+	require.NoError(t, store.SetBlockHeight(1000))
+
+	parent := bt.NewTx()
+	require.NoError(t, parent.From("3333333333333333333333333333333333333333333333333333333333333333", 0, "51", 30000))
+
+	for i := 0; i < outputs; i++ {
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+	}
+
+	_, err := store.Create(ctx, parent, 1000)
+	require.NoError(t, err)
+
+	// One child per output except output 0, which stays unspent so the parent
+	// itself survives the prune and keeps the markers.
+	childOf := make(map[uint32]*bt.Tx, outputs-1)
+
+	for vout := uint32(1); vout < outputs; vout++ {
+		child := bt.NewTx()
+		require.NoError(t, child.From(parent.TxID(), vout, parent.Outputs[vout].LockingScript.String(), parent.Outputs[vout].Satoshis))
+		require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 900))
+		_, _, err = store.SpendAndCreate(ctx, child, 1000)
+		require.NoError(t, err)
+		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{child.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+		require.NoError(t, err)
+
+		// A grandchild takes the child's only output, so the child is fully
+		// spent, mined and eligible for pruning.
+		grandchild := bt.NewTx()
+		require.NoError(t, grandchild.From(child.TxID(), 0, child.Outputs[0].LockingScript.String(), child.Outputs[0].Satoshis))
+		require.NoError(t, grandchild.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 800))
+		_, _, err = store.SpendAndCreate(ctx, grandchild, 1001)
+		require.NoError(t, err)
+		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchild.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+		require.NoError(t, err)
+
+		childOf[vout] = child
+	}
+
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+	require.NoError(t, err)
+
+	astore.ResetPrunerServiceForTests()
+	t.Cleanup(astore.ResetPrunerServiceForTests)
+	require.NoError(t, store.CreateIndexIfNotExists(ctx, apruner.IndexName, fields.DeleteAtHeight.String(), aerospike.NUMERIC))
+	require.NoError(t, store.WaitForIndexReady(ctx, apruner.IndexName))
+
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+
+	n, err := svc.(*apruner.Service).PruneWithPartitions(ctx, 1300, "marker-bound", 1)
+	require.NoError(t, err)
+	require.Equal(t, int64(outputs-1), n, "fixture: every child is pruned in one cycle")
+
+	// Each record must name exactly the children of the outputs it holds.
+	for firstVout := uint32(0); firstVout < outputs; firstVout += batchSize {
+		record, getErr := client.Get(nil, parentKeyForOutput(t, store, parent.TxIDChainHash(), firstVout, batchSize))
+		require.NoError(t, getErr)
+
+		markers, _ := record.Bins[fields.DeletedChildren.String()].(map[interface{}]interface{})
+
+		expected := make([]string, 0, batchSize)
+
+		for vout := firstVout; vout < firstVout+batchSize && vout < outputs; vout++ {
+			if child, ok := childOf[vout]; ok {
+				expected = append(expected, child.TxID())
+			}
+		}
+
+		require.Lenf(t, markers, len(expected),
+			"the record holding outputs %d..%d must carry markers only for its own children", firstVout, firstVout+batchSize-1)
+
+		for _, txID := range expected {
+			require.Contains(t, markers, txID)
+		}
+	}
+
+	// Said plainly for the master, which is the record the copy grew.
+	masterKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), parent.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+	master, err := client.Get(nil, masterKey)
+	require.NoError(t, err)
+
+	masterMarkers, _ := master.Bins[fields.DeletedChildren.String()].(map[interface{}]interface{})
+	require.Len(t, masterMarkers, 1, "the master holds outputs 0 and 1, so it may name one child and no more")
+	require.Contains(t, masterMarkers, childOf[1].TxID())
+
+	// The bound is worth nothing if the markers stopped working: a child of a
+	// higher output must still be rejected as a replay.
+	_, _, err = store.SpendAndCreate(ctx, childOf[outputs-1], 1200)
+	require.ErrorIs(t, err, errors.ErrUtxoSpendingTxPruned, "page-only markers must still reject a pruned child's replay")
 }

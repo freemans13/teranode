@@ -264,6 +264,112 @@ func TestLegacyLeftoverOfFullyPrunedChainIsNotBlessedOnRetry(t *testing.T) {
 	require.Error(t, spendErr, "C:0 was consumed by a mined grandchild and must not be spendable again")
 }
 
+// TestLegacyRemovesRecreatedDescendantsOfPrunedReplay is the legacy twin of the
+// quick path's TestQuickValidateRemovesRecreatedDescendantsOfPrunedReplay. A
+// reviewer found the descendant defect on the quick path only; both paths
+// create every transaction of a block first and spend afterwards, and both hand
+// the same list to utxo.PrunedReplayGhosts, so the scenario has to be pinned
+// here too.
+//
+// History: P (two outputs, only the first ever spent, so P survives pruning and
+// keeps the marker) -> C -> D -> E. The pruner removes C and D. A block then
+// replays C and D. C is rejected on P's marker. D is not rejected at all,
+// because it spends the C this very attempt recreated, so only the dependency
+// walk can catch it, and E already consumed D:0.
+func TestLegacyRemovesRecreatedDescendantsOfPrunedReplay(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings, params := newOutpointOnlySettings(t, true, true, 1000)
+
+	storeURL, err := url.Parse("sqlitememory:///legacy_pruned_descendant")
+	require.NoError(t, err)
+
+	store, err := sql.New(ctx, logger, tSettings, storeURL)
+	require.NoError(t, err)
+	require.NoError(t, store.SetBlockHeight(103))
+	require.NoError(t, store.SetMedianBlockTime(1700000000))
+
+	sql.ResetPrunerServiceForTests()
+	t.Cleanup(sql.ResetPrunerServiceForTests)
+
+	script, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+
+	onLongestChain := func(height uint32, txs ...*bt.Tx) {
+		t.Helper()
+
+		hashes := make([]*chainhash.Hash, 0, len(txs))
+		for _, tx := range txs {
+			hashes = append(hashes, tx.TxIDChainHash())
+		}
+
+		_, minedErr := store.SetMinedMulti(ctx, hashes, utxostore.MinedBlockInfo{BlockID: height, BlockHeight: height, OnLongestChain: true})
+		require.NoError(t, minedErr)
+	}
+
+	parent := bt.NewTx()
+	fundingHash := chainhash.HashH([]byte("funding for the pruned descendant case"))
+	fundingInput := &bt.Input{PreviousTxOutIndex: 0, SequenceNumber: 0xffffffff, UnlockingScript: bscript.NewFromBytes([]byte{0x00})}
+	require.NoError(t, fundingInput.PreviousTxIDAdd(&fundingHash))
+	parent.Inputs = append(parent.Inputs, fundingInput)
+	parent.Outputs = append(parent.Outputs,
+		&bt.Output{Satoshis: 500, LockingScript: script},
+		&bt.Output{Satoshis: 500, LockingScript: script})
+	_, err = store.Create(ctx, parent, 100, utxostore.WithSkipExtendedInputs(true),
+		utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 100, BlockHeight: 100}))
+	require.NoError(t, err)
+
+	child := spendOutput(t, parent, 0, 400, script)
+	mineLikeLegacy(t, ctx, store, child, 101)
+
+	dependent := spendOutput(t, child, 0, 300, script)
+	mineLikeLegacy(t, ctx, store, dependent, 102)
+
+	last := spendOutput(t, dependent, 0, 200, script)
+	mineLikeLegacy(t, ctx, store, last, 103)
+
+	onLongestChain(100, parent)
+	onLongestChain(101, child)
+	onLongestChain(102, dependent)
+	onLongestChain(103, last)
+
+	prunerService, err := store.GetPrunerService()
+	require.NoError(t, err)
+
+	pruned, err := prunerService.Prune(ctx, 1300, "legacy-pruned-descendant")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), pruned, "fixture: the pruner removes C and D and leaves P holding C's marker")
+
+	v, err := validator.New(ctx, logger, tSettings, store, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+
+	sm := &SyncManager{ctx: ctx, settings: tSettings, chainParams: params, logger: logger, utxoStore: store, validationClient: v}
+
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper]()
+	txMap.Set(*child.TxIDChainHash(), &TxMapWrapper{Tx: child})
+	txMap.Set(*dependent.TxIDChainHash(), &TxMapWrapper{Tx: dependent})
+
+	bi := blockIdent{hash: chainhash.HashH([]byte("replayed block 101, descendant")), prevBlock: chainhash.HashH([]byte("block 100")), height: 101, timestamp: time.Unix(1700000000, 0), origin: blockRequestOrigin{headerProven: true}}
+
+	blockErr := sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, 101)
+	require.Error(t, blockErr, "a block replaying a pruned transaction must not validate")
+
+	for name, hash := range map[string]*chainhash.Hash{
+		"the rejected replay":     child.TxIDChainHash(),
+		"its recreated dependent": dependent.TxIDChainHash(),
+	} {
+		_, getErr := store.Get(ctx, hash)
+		require.ErrorIsf(t, getErr, errors.ErrTxNotFound, "%s must not survive the rejected block", name)
+	}
+
+	respend := spendOutput(t, dependent, 0, 100, script)
+	_, _, spendErr := store.SpendAndCreate(ctx, respend, 104, utxostore.WithSpendOnly(),
+		utxostore.WithSkipUTXOHashCheck(true), utxostore.WithIgnoreLocked(true))
+	require.Error(t, spendErr, "D:0 was consumed by a mined transaction and must not be spendable again")
+}
+
 // retryableReplayStore is the real store with one difference: a spend it
 // rejects as a pruned replay comes back wrapped in a transient storage error,
 // the shape the aggregate takes when a sibling input of the same transaction

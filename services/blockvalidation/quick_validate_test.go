@@ -1471,6 +1471,46 @@ func TestQuickValidateRemovesRecreatedDescendantsOfPrunedReplay(t *testing.T) {
 	require.NotNil(t, meta)
 }
 
+// TestQuickValidateUnlockedReplayLeavesNoRespendableDescendant asserts the
+// money-level end state of the same P -> C -> D scenario, under the condition a
+// reviewer used: the catch-up unlock setting on
+// (blockvalidation_quick_validate_skip_utxo_lock) and the block below the
+// highest checkpoint, so phase 1 writes every record unlocked and nothing about
+// the lock can hide a surviving D.
+//
+// E consumed D:0 before the prune. If D's recreated record survives the
+// rejected block, D:0 reads as unspent again and a brand new transaction takes
+// an output that a mined transaction already spent. The record test above is
+// the mechanism; this is the consequence.
+func TestQuickValidateUnlockedReplayLeavesNoRespendableDescendant(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	bv.settings.BlockValidation.QuickValidateSkipUtxoLock = true
+	setCheckpointsOnBV(t, bv, 2000)
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	block, batch := replayBatch(f.child, f.grandchild)
+	require.True(t, bv.quickValidateSkipsUtxoLock(block),
+		"fixture: the replayed records must be created unlocked, which is the reviewer's condition")
+
+	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err, "a block replaying a pruned transaction must not validate")
+	require.Contains(t, err.Error(), "spending transaction was pruned")
+
+	respend := transactions.Create(t,
+		transactions.WithPrivateKey(f.privateKey),
+		transactions.WithInput(f.grandchild, 0),
+		transactions.WithP2PKHOutputs(1, 1999, f.publicKey),
+	)
+
+	_, _, err = store.SpendAndCreate(ctx, respend, 1401)
+	require.Error(t, err, "D:0 was consumed by a mined transaction; rejecting the replay must not make it spendable again")
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "D's record must be gone, so its outputs cannot be found at all")
+}
+
 // mineTxs spends and creates each transaction at height, then marks them mined.
 func mineTxs(t *testing.T, store utxo.Store, height uint32, txs ...*bt.Tx) {
 	t.Helper()
