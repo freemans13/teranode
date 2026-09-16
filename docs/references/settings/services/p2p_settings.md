@@ -212,6 +212,12 @@ block/subtree fetches alike - resolves the hostname and checks each address:
   is refused. This stops a peer's DNS rebinding a public name onto an internal service
   between two requests.
 
+A node started with the default `false` logs one warning naming this setting, because a
+deployment whose peers are reachable only over a private network will find no sync peer:
+every availability probe is refused, those peers are dropped from selection, and the node
+stops catching up. Each refused probe is logged at warning level as well, so the cause is
+visible in the log rather than only in a stalled height.
+
 Redirects from a peer may not leave the origin of the requested URL (an http to https upgrade
 on the same host is allowed), and a POST is never redirected. The probe applies the same
 policy as the fetch path, so it never rejects a peer that catchup could have used.
