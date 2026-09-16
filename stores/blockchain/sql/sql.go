@@ -1422,6 +1422,12 @@ func (s *SQL) needsFullOnMainChainRebuild(ctx context.Context) (bool, error) {
 // Idempotent: a no-op when on_main_chain already matches the chain_work
 // best's lineage within the walked window.
 func (s *SQL) reconcileOnMainChain(ctx context.Context) error {
+	return s.reconcileOnMainChainExec(ctx, s.db)
+}
+
+// reconcileOnMainChainExec is reconcileOnMainChain against a caller-supplied executor,
+// so StoreBlock can run it inside the same transaction as the INSERT.
+func (s *SQL) reconcileOnMainChainExec(ctx context.Context, exec execQuerier) error {
 	maxDepth := int64(s.chainParams.CoinbaseMaturity) * 2
 	if maxDepth < 100 {
 		maxDepth = 100
@@ -1461,7 +1467,7 @@ func (s *SQL) reconcileOnMainChain(ctx context.Context) error {
 					AND id NOT IN (SELECT id FROM new_path))
 			  )
 	`
-	if _, err := s.db.ExecContext(ctx, q, maxDepth); err != nil {
+	if _, err := exec.ExecContext(ctx, q, maxDepth); err != nil {
 		return errors.NewStorageError("reconcileOnMainChain: failed to apply diff", err)
 	}
 	return nil
