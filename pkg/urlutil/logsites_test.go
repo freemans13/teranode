@@ -31,7 +31,12 @@ import (
 // loggingCalls are the call names whose arguments reach an operator: log
 // methods, the fmt printers, and the teranode error constructors, whose
 // messages are logged and can reach an API response.
-var loggingCalls = regexp.MustCompile(`^(Debugf|Infof|Warnf|Errorf|Fatalf|Panicf|Printf|New[A-Za-z]*Error)$`)
+//
+// Sprintf, Sprint and Sprintln are here because formatting a URL into a string
+// and logging that string is the common laundering path: the URL reaches the
+// operator just the same, but the logging call it reaches them through only
+// sees an already-built string.
+var loggingCalls = regexp.MustCompile(`^(Debugf|Infof|Warnf|Errorf|Fatalf|Panicf|Print|Printf|Println|Sprint|Sprintf|Sprintln|Fprint|Fprintf|Fprintln|New[A-Za-z]*Error)$`)
 
 // urlish matches an argument expression that names itself as a URL.
 var urlish = regexp.MustCompile(`(?i)(url|dsn|connstr)`)
@@ -158,12 +163,14 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 				return true
 			}
 
+			formatIdx := formatArgIndex(callName)
+
 			for i, arg := range call.Args {
-				// Argument 0 is the format string. A literal one names no
-				// variable, but one built by concatenation, as in
+				// The format string names no variable when it is a literal, so
+				// skip it. One built by concatenation, as in
 				// errors.NewConfigurationError("bad URL "+u.String(), err),
 				// carries its operands into the message and is policed.
-				if _, literal := arg.(*ast.BasicLit); i == 0 && literal {
+				if _, literal := arg.(*ast.BasicLit); i == formatIdx && literal {
 					continue
 				}
 
@@ -195,10 +202,12 @@ func TestNoUnredactedURLsInLogCalls(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// The repo has well over a thousand non-test .go files outside the exempt
-	// trees. The floor only has to be high enough that a broken walk cannot
-	// clear it.
-	require.Greater(t, scanned, 500, "the guard scanned almost nothing, so it proves nothing")
+	// The guard reaches roughly 830 non-test .go files outside the exempt
+	// trees. A floor of 500 was too slack to bite: services/ alone is about
+	// 370 files, so the guard could stop seeing every service in the repo and
+	// still clear it. 700 leaves headroom for the tree shrinking a little
+	// without letting a whole subtree drop out unnoticed.
+	require.Greater(t, scanned, 700, "the guard scanned almost nothing, so it proves nothing")
 
 	sort.Slice(violations, func(i, j int) bool { return violations[i].pos < violations[j].pos })
 
@@ -236,6 +245,21 @@ func loggingCallName(fun ast.Expr, boundLoggers map[string]string) (string, bool
 	}
 
 	return "", false
+}
+
+// fprintCalls write to an io.Writer, so their first argument is the writer and
+// the format string is the second.
+var fprintCalls = regexp.MustCompile(`^Fprint(f|ln)?$`)
+
+// formatArgIndex reports which argument holds the format string, so a literal
+// one can be skipped without also skipping a real argument. The name may carry
+// the " (bound to X)" suffix loggingCallName adds for a function value.
+func formatArgIndex(callName string) int {
+	if fprintCalls.MatchString(strings.SplitN(callName, " ", 2)[0]) {
+		return 1
+	}
+
+	return 0
 }
 
 // loggingFuncVars collects the names of variables in a file that are assigned
@@ -345,6 +369,14 @@ func exprText(e ast.Expr) string {
 		return exprText(v.X)
 	case *ast.ParenExpr:
 		return exprText(v.X)
+	case *ast.BasicLit:
+		// A literal's own text counts. Without this, the message in
+		// logger.Infof("store URL " + storeCfg.String()) is dropped and the
+		// word that identifies it as a URL goes with it. Argument 0 of a call
+		// is the format string and is skipped by the caller, so the false
+		// positives this can add are literals in later argument positions,
+		// which the "// urlsafe:" escape already covers.
+		return v.Value
 	case *ast.BinaryExpr:
 		return exprText(v.X) + "+" + exprText(v.Y)
 	default:

@@ -31,7 +31,14 @@ func TestRunRejectsUnparseableSeedURLWithoutEchoingIt(t *testing.T) {
 	require.NotContains(t, err.Error(), password, "the seed URL password reached the error message")
 	require.NotContains(t, err.Error(), "teranode:", "the seed URL userinfo reached the error message")
 
-	// The operator still learns why it was rejected.
+	// The operator still learns why it was rejected. Asserting only the prefix
+	// let this test pass on "invalid --seed-url: %v -> ...", where the verb
+	// survived unrendered because errors.NewConfigurationError takes a trailing
+	// error as the wrapped error and then never reaches fmt.Errorf. Pin the
+	// reason and the absence of a verb, not the prefix.
 	require.True(t, strings.Contains(err.Error(), "invalid --seed-url"),
 		"expected the parse failure to be reported, got: %v", err)
+	require.Contains(t, strings.ToLower(err.Error()), "invalid character",
+		"expected url.Parse's own reason to survive, got: %v", err)
+	require.NotContains(t, err.Error(), "%", "the message renders a format verb literally")
 }

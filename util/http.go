@@ -468,7 +468,21 @@ func ValidateURL(rawURL string) error {
 
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return errors.NewInvalidArgumentError("invalid URL: %s", err)
+		// url.Parse embeds the string it was given verbatim in its error, so
+		// the reason is unwrapped from it rather than wrapped whole. No
+		// credential reaches here today (callers pass peer base URLs, and the
+		// userinfo check below rejects the rest), but this is the one message
+		// in this file still shaped like the leak the file was swept for.
+		//
+		// The "%s" is dropped for the reason in the 503 message above:
+		// errors.New* takes the trailing error as the wrapped error, leaving no
+		// parameters, so fmt.Errorf never runs and the verb survives.
+		var parseErr *url.Error
+		if errors.As(err, &parseErr) {
+			return errors.NewInvalidArgumentError("invalid URL", parseErr.Err)
+		}
+
+		return errors.NewInvalidArgumentError("invalid URL")
 	}
 
 	scheme := strings.ToLower(parsed.Scheme)
@@ -840,7 +854,11 @@ func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retry
 		}
 	}
 
-	return nil, errors.NewServiceUnavailableError("http request [%s] still 503 after %d attempts: %v", urlutil.RedactString(url), cfg.maxAttempts, lastErr)
+	// The trailing ": %v" is dropped deliberately. errors.New* takes lastErr as
+	// the wrapped error and removes it from the parameters, so the format
+	// string had three verbs and two arguments and rendered "%!v(MISSING)".
+	// lastErr still renders after " -> ".
+	return nil, errors.NewServiceUnavailableError("http request [%s] still 503 after %d attempts", urlutil.RedactString(url), cfg.maxAttempts, lastErr)
 }
 
 // doHTTPRequestForStreamingWithRetryAfter is doHTTPRequestForStreaming + extracts

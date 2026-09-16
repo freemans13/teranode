@@ -771,7 +771,7 @@ func checkObservability(s *settings.Settings) []ConfigResult {
 		results = append(results, ConfigResult{
 			Severity: SeverityINFO,
 			Check:    "Tracing",
-			Value:    fmt.Sprintf("enabled, sample_rate=%.2f, collector=%s", s.TracingSampleRate, collectorURL),
+			Value:    fmt.Sprintf("enabled, sample_rate=%.2f, collector=%s", s.TracingSampleRate, collectorURL), // urlsafe: collectorURL is urlutil.Redact output, six lines up
 		})
 	} else {
 		results = append(results, ConfigResult{

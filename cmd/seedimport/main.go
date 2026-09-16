@@ -89,7 +89,11 @@ func run(ctx context.Context, logger ulogger.Logger, s *settings.Settings, block
 		// it was given verbatim in its error. Report the parse reason alone.
 		var parseErr *url.Error
 		if errors.As(err, &parseErr) {
-			return errors.NewConfigurationError("invalid --seed-url: %v", parseErr.Err)
+			// No format verb: errors.New* strips a trailing error parameter as
+			// the wrapped error and only calls fmt.Errorf when parameters
+			// remain, so a "%v" here would survive into the message unrendered.
+			// The wrapped reason renders after " -> " on its own.
+			return errors.NewConfigurationError("invalid --seed-url", parseErr.Err)
 		}
 
 		return errors.NewConfigurationError("invalid --seed-url")
