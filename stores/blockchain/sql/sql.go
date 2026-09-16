@@ -95,6 +95,11 @@ const migrationFullRebuildTimeout = 30 * time.Minute
 type SQL struct {
 	// db is the underlying SQL database connection pool
 	db *usql.DB
+	// reconcileHook, when set by a test, replaces the result of the on_main_chain
+	// reconciliation that StoreBlock runs inside the fork-path transaction. It is
+	// per store rather than package-global, so tests cannot leak it into each other.
+	// Always nil in production.
+	reconcileHook func() error
 	// engine identifies which SQL engine is being used (PostgreSQL, SQLite, etc.)
 	engine util.SQLEngine
 	// logger provides structured logging capabilities

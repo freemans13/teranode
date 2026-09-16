@@ -2,11 +2,15 @@ package sql
 
 import (
 	"context"
+	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/bsv-blockchain/teranode/test/utils/postgres"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,12 +42,16 @@ func TestStoreBlockRollsBackWhenTheFlagReconciliationFails(t *testing.T) {
 
 	storeBlocks(t, s, block1, block2, block3)
 
-	reconcileFailHook = func() error { return errors.NewStorageError("injected reconciliation failure") }
-	t.Cleanup(func() { reconcileFailHook = nil })
+	calls := 0
+	s.reconcileHook = func() error {
+		calls++
+		return errors.NewStorageError("injected reconciliation failure")
+	}
 
 	// blockAlternative2 forks from block1, so it takes the fork path.
 	_, _, err := s.StoreBlock(context.Background(), blockAlternative2, "peer")
 	require.Error(t, err, "a failed reconciliation must fail the store, not be logged and swallowed")
+	require.Equal(t, 1, calls, "a non-retriable failure is returned at once, not retried")
 
 	require.False(t, blockRowExists(t, s, blockAlternative2.Hash().CloneBytes()),
 		"the rolled-back block must leave no row behind")
@@ -61,12 +69,14 @@ func TestStoreBlockRetryAfterAFailedReconciliationSucceeds(t *testing.T) {
 
 	storeBlocks(t, s, block1, block2, block3)
 
-	reconcileFailHook = func() error { return errors.NewStorageError("injected reconciliation failure") }
+	// The hook lives on this store, not in a package global, so a failure below
+	// cannot leak it into other tests.
+	s.reconcileHook = func() error { return errors.NewStorageError("injected reconciliation failure") }
 
 	_, _, err := s.StoreBlock(context.Background(), blockAlternative2, "peer")
 	require.Error(t, err)
 
-	reconcileFailHook = nil
+	s.reconcileHook = nil
 
 	_, _, err = s.StoreBlock(context.Background(), blockAlternative2, "peer")
 	require.NoError(t, err, "the retry must succeed once the reconciliation works")
@@ -74,6 +84,43 @@ func TestStoreBlockRetryAfterAFailedReconciliationSucceeds(t *testing.T) {
 	require.True(t, blockRowExists(t, s, blockAlternative2.Hash().CloneBytes()))
 	require.False(t, getOnMainChain(t, s, blockAlternative2.Hash().CloneBytes()),
 		"a fork that is not the best chain is flagged off-chain")
+	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()), "the longer chain keeps the flag")
+}
+
+// TestStoreBlockRetriesTheWholeTransactionOnATransientFailure: the fork path runs on
+// a transaction, which the pool's per-statement retry cannot reach. A transient
+// failure must roll the attempt back and re-run BEGIN, INSERT and the reconciliation,
+// so the caller sees one clean success and exactly one block row with the right flag.
+//
+// The injected error is a lock timeout as it reaches RetryTx in production: already
+// wrapped in a teranode error, which keeps the driver's message but not its type, so
+// classification rests on the message. The sqlitememory store has retry enabled by
+// default; PostgreSQL has it off unless postgres_retryEnabled is set.
+func TestStoreBlockRetriesTheWholeTransactionOnATransientFailure(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+
+	storeBlocks(t, s, block1, block2, block3)
+
+	calls := 0
+	s.reconcileHook = func() error {
+		calls++
+		if calls == 1 {
+			return errors.NewStorageError("reconcileOnMainChain: failed to apply diff: database is locked")
+		}
+
+		return nil
+	}
+
+	_, _, err := s.StoreBlock(context.Background(), blockAlternative2, "peer")
+	require.NoError(t, err, "a transient failure is retried inside StoreBlock")
+	require.Equal(t, 2, calls, "the whole transaction ran twice")
+
+	var rows int
+	require.NoError(t, s.db.QueryRow(`SELECT count(*) FROM blocks WHERE hash = $1`,
+		blockAlternative2.Hash().CloneBytes()).Scan(&rows))
+	require.Equal(t, 1, rows, "the rolled-back attempt left nothing behind")
+
+	require.False(t, getOnMainChain(t, s, blockAlternative2.Hash().CloneBytes()), "the fork is off-chain")
 	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()), "the longer chain keeps the flag")
 }
 
@@ -144,4 +191,72 @@ func TestLegacySequenceLeavesACommittedBlockBehind(t *testing.T) {
 	// The reconciliation that would have followed fails here.
 	require.True(t, blockRowExists(t, s, blockAlternative2.Hash().CloneBytes()),
 		"the old ordering commits the block before the flag is reconciled")
+}
+
+// TestStoreBlockFlagAtomicity_PostgreSQL runs the rollback and reorg expectations
+// against PostgreSQL, the engine production uses, because transaction and
+// recursive-CTE semantics there are what the fix actually depends on.
+func TestStoreBlockFlagAtomicity_PostgreSQL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping PostgreSQL tests in short mode")
+	}
+
+	newPostgresStore := func(t *testing.T) *SQL {
+		t.Helper()
+
+		connStr, teardown, err := postgres.SetupTestPostgresContainer()
+		if err != nil {
+			t.Skipf("PostgreSQL container not available: %v", err)
+		}
+
+		t.Cleanup(func() { _ = teardown() })
+
+		storeURL, err := url.Parse(connStr)
+		require.NoError(t, err)
+
+		s, err := New(ulogger.TestLogger{}, storeURL, test.CreateBaseTestSettings(t))
+		require.NoError(t, err)
+
+		t.Cleanup(func() { _ = s.Close(context.Background()) })
+		waitForStartupRebuild(t, s)
+
+		return s
+	}
+
+	t.Run("failed reconciliation leaves no block row", func(t *testing.T) {
+		s := newPostgresStore(t)
+		storeBlocks(t, s, block1, block2, block3)
+
+		s.reconcileHook = func() error { return errors.NewStorageError("injected reconciliation failure") }
+
+		_, _, err := s.StoreBlock(context.Background(), blockAlternative2, "peer")
+		require.Error(t, err)
+		require.False(t, blockRowExists(t, s, blockAlternative2.Hash().CloneBytes()))
+		require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
+
+		s.reconcileHook = nil
+
+		_, _, err = s.StoreBlock(context.Background(), blockAlternative2, "peer")
+		require.NoError(t, err)
+		require.True(t, blockRowExists(t, s, blockAlternative2.Hash().CloneBytes()))
+		require.False(t, getOnMainChain(t, s, blockAlternative2.Hash().CloneBytes()))
+	})
+
+	t.Run("reorg flags are reconciled inside the transaction", func(t *testing.T) {
+		s := newPostgresStore(t)
+		storeBlocks(t, s, block1, block2, block3)
+
+		forkBlock3 := createBlock3OnFork(blockAlternative2)
+		forkBlock4 := createBlock3OnFork(forkBlock3)
+		storeBlocks(t, s, blockAlternative2, forkBlock3, forkBlock4)
+
+		require.True(t, getOnMainChain(t, s, block1.Hash().CloneBytes()))
+		require.False(t, getOnMainChain(t, s, block2.Hash().CloneBytes()))
+		require.False(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
+		require.True(t, getOnMainChain(t, s, forkBlock4.Hash().CloneBytes()))
+
+		var flagged int
+		require.NoError(t, s.db.QueryRow(`SELECT count(*) FROM blocks WHERE on_main_chain = true`).Scan(&flagged))
+		require.Equal(t, 5, flagged)
+	})
 }
