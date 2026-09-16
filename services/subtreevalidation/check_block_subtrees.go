@@ -280,7 +280,14 @@ func (u *Server) loadSubtreeBatch(ctx, fetchCtx context.Context, request *subtre
 
 				if !subtreeDataExists {
 					// get the subtree data from the peer and process it directly
-					url, subtreeDataErr := util.JoinPeerURL(request.BaseUrl, "subtree_data", subtreeHash.String())
+					url, joinErr := util.JoinPeerURL(request.BaseUrl, "subtree_data", subtreeHash.String())
+					if joinErr != nil {
+						// Reported on its own rather than through the fetch failure below: there
+						// is no target URL when the join is what failed, so "from <empty>" reads
+						// like a formatting bug rather than an unusable peer base URL. The base
+						// itself is not echoed, because it may carry credentials.
+						return errors.NewServiceError("[CheckBlockSubtrees][%s] invalid peer base URL", subtreeHash.String(), joinErr)
+					}
 
 					// Retry on 503 — peer's asset service may reject under admission control
 					// while it generates the file on-demand from Aerospike.
@@ -299,10 +306,7 @@ func (u *Server) loadSubtreeBatch(ctx, fetchCtx context.Context, request *subtre
 					// pre-warmed cache for the next retry. The trade-off is that abort
 					// detection waits for in-flight peers instead of cancelling early;
 					// acceptable here because the per-fetch streaming timeout still bounds it.
-					var body io.ReadCloser
-					if subtreeDataErr == nil {
-						body, subtreeDataErr = util.DoHTTPRequestBodyReaderWithRetry(fetchCtx, url)
-					}
+					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(fetchCtx, url)
 					if subtreeDataErr != nil {
 						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
 					}

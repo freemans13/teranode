@@ -1346,7 +1346,16 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 			if subtreeDataErr != nil {
 				// Peer cannot provide subtree data - report as invalid subtree
 				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "peer_cannot_provide_subtree_data")
-				u.logger.Errorf("[validateSubtree][%s] failed to get subtree data from %s: %v", subtreeHash.String(), url, subtreeDataErr)
+
+				if url == "" {
+					// The join failed, so there is no target to name. Saying "from " with
+					// nothing after it reads like a formatting bug rather than a peer whose
+					// announced base URL is unusable. The base is not echoed: it may carry
+					// credentials, which is one of the shapes JoinPeerURL refuses.
+					u.logger.Errorf("[validateSubtree][%s] invalid peer base URL for subtree data: %v", subtreeHash.String(), subtreeDataErr)
+				} else {
+					u.logger.Errorf("[validateSubtree][%s] failed to get subtree data from %s: %v", subtreeHash.String(), url, subtreeDataErr)
+				}
 			} else {
 				// Build subtree structure from allTxs for deserialization
 				// We cannot use the empty 'subtree' parameter as it has no nodes yet

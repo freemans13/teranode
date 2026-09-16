@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -182,6 +183,70 @@ func TestPeerHealthCheck_ProbesReachablePeer(t *testing.T) {
 	require.False(t, healthy)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "500")
+}
+
+// TestPeerProbe_QueryBaseSendsNothing is the probe's half of the audit finding. A base URL
+// ending in "?x=" used to turn the appended health path into query data, so the probe would
+// GET whatever path the peer named. The catch-all responder counts every request, so the
+// assertion is that nothing was sent at all, not merely that the path differed.
+func TestPeerProbe_QueryBaseSendsNothing(t *testing.T) {
+	allowLoopbackProbes(t)
+
+	var hits atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ps := newSelectorWithPrivateIPs(t, false)
+
+	for _, base := range []string{
+		"http://localhost:" + serverPort(t, server) + "/v1/debug/bundle?x=",
+		"http://localhost:" + serverPort(t, server) + "/v1/debug/bundle?",
+		"http://localhost:" + serverPort(t, server) + "/api/v1#frag",
+		"http://user:pass@localhost:" + serverPort(t, server) + "/api/v1",
+	} {
+		t.Run(base, func(t *testing.T) {
+			healthy, err := ps.checkPeerAvailability(context.Background(), base)
+			require.False(t, healthy)
+			require.Error(t, err)
+			require.Zero(t, hits.Load(), "the probe must send nothing when the base URL is unusable")
+		})
+	}
+}
+
+// TestPeerProbeRefusalIsInvalidArgument pins what the selector logs at warning level. A peer
+// refused before any packet leaves - unusable base URL, or an address this node's own policy
+// bars - is a local configuration cause that silently drops the peer from selection, so the
+// probe loop raises it above debug. An unreachable peer must not match, or every dead peer in
+// the registry would warn on every round.
+func TestPeerProbeRefusalIsInvalidArgument(t *testing.T) {
+	origAllowPrivate := util.SSRFAllowPrivateNetworks()
+	t.Cleanup(func() { util.SetSSRFAllowPrivateNetworks(origAllowPrivate) })
+
+	util.SetSSRFAllowPrivateNetworks(false)
+
+	ps := newSelectorWithPrivateIPs(t, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	_, err := ps.checkPeerAvailability(ctx, "http://10.255.255.1:1/api/v1")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrInvalidArgument), "policy refusal must classify as invalid argument, got %v", err)
+
+	_, err = ps.checkPeerAvailability(ctx, "http://localhost:1/v1/debug/bundle?x=")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrInvalidArgument), "unusable base URL must classify as invalid argument, got %v", err)
+
+	// A reachable-but-dead public address is an ordinary network failure and stays at debug.
+	allowLoopbackProbes(t)
+
+	_, err = ps.checkPeerAvailability(ctx, "http://localhost:1/api/v1")
+	require.Error(t, err)
+	require.False(t, errors.Is(err, errors.ErrInvalidArgument), "an unreachable peer must not warn, got %v", err)
 }
 
 func TestPeerHealthCheck_EmptyAndMalformedURLs(t *testing.T) {

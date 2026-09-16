@@ -273,8 +273,10 @@ func TestSSRFDialContext_RebindGuardRunsBeforeDial(t *testing.T) {
 }
 
 func TestSSRFCheckRedirect_StaysOnOrigin(t *testing.T) {
+	origProtection := SSRFProtectionEnabled()
+
 	SetSSRFProtection(true)
-	defer SetSSRFProtection(false)
+	defer SetSSRFProtection(origProtection)
 
 	check := ssrfCheckRedirect(DefaultSSRFDialPolicy)
 
