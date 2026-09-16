@@ -244,6 +244,44 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	postBestID, _, bestErr := s.getBestBlockID(postBestCtx)
 	if bestErr != nil {
 		s.logger.Errorf("StoreBlock: failed to get best block ID: %v", bestErr)
+
+		// The row is committed whatever this query did. Falling off the end of the chain
+		// here left maxBlockID below the id just written, and CheckBlockIsInCurrentChain
+		// drops an id above that bound as allocated-but-uncommitted. That is a FALSE
+		// NEGATIVE on a committed block, and checkOldBlockIDs escalates a negative into a
+		// PERMANENT ValidateBlock invalidation; nothing undoes it until the two-minute
+		// background refresh happens to run.
+		//
+		// Advancing the bound alone would trade that for the opposite defect. Without
+		// postBestID we cannot tell which of Cases 1-3 applies, so the committed block may
+		// be a fork block, and the installed forked set was read before this INSERT and
+		// cannot contain it. An id at or below maxBlockID and absent from that set is read
+		// as positive proof of main-chain membership, so the bound on its own would make a
+		// fork block answer true with no query at all. The after-write rebuild is what
+		// makes advancing it safe: it bumps chainStateEpoch before this call's deferred
+		// guard release, so a reader either gets a set that observed this INSERT or, if the
+		// rebuild cannot be made to observe it, a de-trusted set and the SQL route.
+		//
+		// The on_main_chain reconcile Cases 1 and 2 would have done is deliberately not
+		// attempted. Which flag to write depends on the classification we could not read,
+		// and the rebuild does not need the flag: mainChainRebuilding is still held for the
+		// whole call, so rebuildOffChainSet takes its flag-free parent_id CTE branch. The
+		// column itself self-heals on the next reconcile, invalidation or startup rebuild.
+		s.updateMaxBlockID(newBlockID)
+
+		if s.useInMemoryChainCheck {
+			s.blockTimestampCache.Clear()
+			s.resetChainWalkCache()
+
+			rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+			defer rebuildCancel()
+
+			if rebuildErr := s.triggerRebuildOffChainSetAfterWrite(rebuildCtx); rebuildErr != nil {
+				s.logger.Errorf("StoreBlock: %v", rebuildErr)
+			} else {
+				s.lastSuccessfulRebuild.Store(time.Now().Unix())
+			}
+		}
 	} else if uint64(postBestID) != newBlockID {
 		// Case 1: fork — new block is not the best. The INSERT wrote
 		// on_main_chain=false when onMainChain was false at compute time, so
