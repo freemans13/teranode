@@ -41,6 +41,9 @@ const (
 // Genesis is enabled from params.GenesisActivationHeight onwards, the same boundary bitcoin-sv's
 // IsGenesisEnabled and the validator use.
 //
+// The caller must guarantee a non-nil coinbaseTx: Inputs and Outputs are read unconditionally.
+// Valid's step 4 and both quick-validation entry points nil-check before calling.
+//
 // Deliberately a reason rather than an error, for the same reason CoinbaseScriptSigLengthInBounds
 // is a predicate: the verdict depends on whether the body is bound to its header, which only the
 // caller knows. Valid turns a violation into bindErr's binding-aware verdict, and the
