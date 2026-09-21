@@ -19,26 +19,39 @@ import (
 // The rule every test checks: once the window holding a transaction's membership rows is gone,
 // whatever still answers for that transaction must name the block that is on the longest chain.
 //
-// They are skipped by default so the suite stays green and a red run always means a
-// regression. The design that fixes them is docs/superpowers/specs/
-// 2026-09-16-utxoset-block-facts-spec.md, whose test plan requires all four to pass
-// unmodified; three should pass once containment lands, before the new stamp exists. Remove
-// the skip from each as its fix lands.
+// They are EXPECTED FAILURES, not plain skips, so they cannot be forgotten. Each test runs its
+// scenario every time. While the defect is present the test reports itself as a known defect
+// and the suite stays green. The moment a fix makes the correct behaviour appear, the test
+// FAILS and says so, and it keeps failing until its knownDefect guard is replaced by the plain
+// assertion. So a fix cannot merge while its proof is still switched off.
+//
+// The design that fixes them is docs/superpowers/specs/2026-09-16-utxoset-block-facts-spec.md,
+// whose test plan requires all four to pass unmodified; three should pass once containment
+// lands, before the new stamp exists.
 
-// knownDefectEnv, when set to any value, runs the known-defect tests instead of skipping them,
-// which is how they are driven while the fix is being built.
+// knownDefectEnv, when set to any value, runs the real assertions instead, which is how these
+// tests are driven while a fix is being built: they fail with the full expected-versus-actual
+// output rather than reporting a known defect.
 const knownDefectEnv = "UTXOSET_RUN_KNOWN_DEFECTS"
 
-// skipKnownDefect skips a test that reproduces a defect the store still has.
-func skipKnownDefect(t *testing.T, defect string) {
+// knownDefect is the expected-failure guard. fixed reports whether the store already gives the
+// correct answer; assert holds the real assertions.
+func knownDefect(t *testing.T, defect string, fixed bool, assert func()) {
 	t.Helper()
 
 	if os.Getenv(knownDefectEnv) != "" {
+		assert()
+
 		return
 	}
 
-	t.Skipf("known defect, not a regression: %s. Fixed by the design in "+
-		"docs/superpowers/specs/2026-09-16-utxoset-block-facts-spec.md; set %s=1 to run it",
+	if fixed {
+		t.Fatalf("known defect appears FIXED: %s. Replace the knownDefect guard in this test with "+
+			"its plain assertions, so the test guards the fix from now on", defect)
+	}
+
+	t.Skipf("known defect still present, not a regression: %s. See "+
+		"docs/superpowers/specs/2026-09-16-utxoset-block-facts-spec.md; set %s=1 for the full failure",
 		defect, knownDefectEnv)
 }
 
@@ -54,8 +67,6 @@ func skipKnownDefect(t *testing.T, defect string) {
 // the UTXO is stamped with M, the losing block. After the window drops, a child spending this
 // UTXO asks for a parent in a block that is not on the chain.
 func TestRetiringWindowStampsTheBlockThatWonTheReorg(t *testing.T) {
-	skipKnownDefect(t, "the retirement stamp takes the earliest membership row, so a reorg loser is stamped onto the UTXO")
-
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -76,8 +87,12 @@ func TestRetiringWindowStampsTheBlockThatWonTheReorg(t *testing.T) {
 	require.NoError(t, err)
 
 	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(100), h)
-	require.Equal(t, int32(8), b, "the block that won the reorg, not the first block that stamped the transaction")
+
+	knownDefect(t, "the retirement stamp takes the earliest membership row, so a reorg loser is stamped onto the UTXO",
+		h == 100 && b == 8, func() {
+			require.Equal(t, int32(100), h)
+			require.Equal(t, int32(8), b, "the block that won the reorg, not the first block that stamped the transaction")
+		})
 }
 
 // TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt: a fork block F is applied first
@@ -88,8 +103,6 @@ func TestRetiringWindowStampsTheBlockThatWonTheReorg(t *testing.T) {
 // the store only appends a membership row. The retirement stamp touches only UTXOs still at
 // height 0, so these UTXOs keep F's facts for good.
 func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
-	skipKnownDefect(t, "a side-chain block-path create writes its own block onto the UTXO, and the stamp only touches UTXOs at height 0")
-
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -104,8 +117,12 @@ func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
 	require.NoError(t, err)
 
 	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(100), h)
-	require.Equal(t, int32(7), b, "the main chain block, not the side-chain block that created the UTXO")
+
+	knownDefect(t, "a side-chain block-path create writes its own block onto the UTXO, and the stamp only touches UTXOs at height 0",
+		h == 100 && b == 7, func() {
+			require.Equal(t, int32(100), h)
+			require.Equal(t, int32(7), b, "the main chain block, not the side-chain block that created the UTXO")
+		})
 }
 
 // TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires: a transaction seen before its block
@@ -117,8 +134,6 @@ func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
 // window is gone, the lookup's last step reads the journal but skips rows at height 0, so the
 // parent answers "not found". Validating a block that contains the child then retries forever.
 func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *testing.T) {
-	skipKnownDefect(t, "a UTXO spent before it is stamped leaves an undo copy at height 0 that nothing stamps, so the parent is not found once its window retires")
-
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 1, 5_000)
@@ -134,8 +149,12 @@ func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *te
 	require.NoError(t, err)
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
-	require.NoError(t, err, "a mined parent whose last UTXO was spent must still be found after its window retires")
-	require.Equal(t, []uint32{7}, got.BlockIDs)
+
+	knownDefect(t, "a UTXO spent before it is stamped leaves an undo copy at height 0 that nothing stamps, so the parent is not found once its window retires",
+		err == nil && got != nil && len(got.BlockIDs) == 1 && got.BlockIDs[0] == 7, func() {
+			require.NoError(t, err, "a mined parent whose last UTXO was spent must still be found after its window retires")
+			require.Equal(t, []uint32{7}, got.BlockIDs)
+		})
 }
 
 // TestUnspendOfAnUnminedParentRestoresAnUnconfirmedUTXO: a parent is mined in M, a child spends
@@ -149,8 +168,6 @@ func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *te
 // the UTXO alone and the retirement stamp skips it because it is not at height 0, so it names M
 // for good.
 func TestUnspendOfAnUnminedParentRestoresAnUnconfirmedUTXO(t *testing.T) {
-	skipKnownDefect(t, "unspend restores the undo copy's stale block onto a UTXO whose transaction is unmined again")
-
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 2, 5_000)
@@ -182,6 +199,10 @@ func TestUnspendOfAnUnminedParentRestoresAnUnconfirmedUTXO(t *testing.T) {
 	require.NoError(t, s.Unspend(ctx, spends, false))
 
 	h, b := utxoFacts(t, s, ctx, parent)
-	require.Equal(t, int32(0), h, "a restored UTXO of an unmined transaction is unconfirmed")
-	require.Equal(t, int32(0), b)
+
+	knownDefect(t, "unspend restores the undo copy's stale block onto a UTXO whose transaction is unmined again",
+		h == 0 && b == 0, func() {
+			require.Equal(t, int32(0), h, "a restored UTXO of an unmined transaction is unconfirmed")
+			require.Equal(t, int32(0), b)
+		})
 }
