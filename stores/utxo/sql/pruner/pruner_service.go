@@ -159,7 +159,11 @@ const (
 // ground for statements that go through usql, but this transaction does not,
 // and its SQLite branch matches only the primary SQLITE_BUSY code, never the
 // extended SQLITE_BUSY_SNAPSHOT a WAL writer-upgrade raises.
-func isPruneRetryable(err error) bool {
+//
+// engine is the store's URL scheme. The message fallback at the end applies to
+// SQLite only: on Postgres a conflict always arrives with its SQLSTATE, and a
+// wrapped error whose text merely contains "database is locked" is not one.
+func isPruneRetryable(err error, engine string) bool {
 	if err == nil {
 		return false
 	}
@@ -184,6 +188,10 @@ func isPruneRetryable(err error) bool {
 		}
 	}
 
+	if engine == "postgres" {
+		return false
+	}
+
 	msg := strings.ToLower(err.Error())
 
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
@@ -206,7 +214,7 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 			return count, nil
 		}
 
-		if !isPruneRetryable(err) {
+		if !isPruneRetryable(err, s.engine) {
 			return 0, errors.NewStorageError("pruning transaction failed", err)
 		}
 
@@ -221,7 +229,7 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 
 		select {
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return 0, errors.NewContextCanceledError("[pruner] cancelled while waiting to retry the pruning transaction", ctx.Err())
 		case <-time.After(backoff):
 		}
 	}
@@ -349,6 +357,18 @@ func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
 	return count, nil
 }
 
+// unverifiedClaim selects an input of the transaction row in scope (aliased
+// as the table name, transactions) whose parent record is present but whose
+// output does not carry well-formed spending data: no such output row, NULL
+// spending data, or fewer than the 36 bytes of txid and vin. Used as a NOT
+// EXISTS hold-back on both pruning paths.
+const unverifiedClaim = `SELECT 1
+      FROM inputs hi
+      JOIN transactions hp ON hp.hash = hi.previous_transaction_hash
+      LEFT JOIN outputs ho ON ho.transaction_id = hp.id AND ho.idx = hi.previous_tx_idx
+      WHERE hi.transaction_id = transactions.id
+        AND (ho.transaction_id IS NULL OR ho.spending_data IS NULL OR length(ho.spending_data) < 36)`
+
 // pruneWithoutDefensiveCheck marks and deletes every transaction past its
 // expiration, with no child-stability verification.
 func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight uint32) (int64, error) {
@@ -374,9 +394,17 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
     AND child.delete_at_height <= $1
   ON CONFLICT (parent_id, child_hash) DO NOTHING`
 
+	// A candidate whose claimed parent output is present but unspent, or
+	// malformed, is held back: it would get no marker, and a replay of it would
+	// then be recreated and spend that output cleanly. That is what a
+	// rolled-back spend leaves. A parent output naming a different, well-formed
+	// spender (a conflicting loser) does not hold the child back, and a parent
+	// that is gone needs no marker. The Aerospike pruner applies the same rule
+	// in keepSpendHolders.
 	const deleteQuery = `DELETE FROM transactions
   WHERE delete_at_height IS NOT NULL
-    AND delete_at_height <= $1`
+    AND delete_at_height <= $1
+    AND NOT EXISTS (` + unverifiedClaim + `)`
 
 	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
@@ -475,7 +503,8 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
     AND substr(o.spending_data, 1, 32) = child.hash
   ON CONFLICT (parent_id, child_hash) DO NOTHING`
 
-	const deleteQuery = `DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)`
+	const deleteQuery = `DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)
+    AND NOT EXISTS (` + unverifiedClaim + `)`
 
 	createCandidates := createCandidatesPortable
 	if s.engine == "postgres" {

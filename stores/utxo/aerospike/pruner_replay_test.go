@@ -354,9 +354,11 @@ func parentKeyForOutput(t *testing.T, store *astore.Store, txID *chainhash.Hash,
 
 // TestPrunedReplayRollbackKeepsSiblingHistoricalSpend pins the store state
 // after a pruned child's replay is rejected on one parent's marker while a
-// sibling parent carries no marker for it. The state is produced with this
-// PR's own hold-back path: Q's marker write fails, P's lands in the same batch,
-// and C is retained. Q:0 still records C as its spender, the confirmed spend.
+// sibling parent carries no marker for it. The pruner first produced this state
+// itself (Q's marker write failed, P's landed, C was retained); it now
+// withdraws P's marker in that case (withdrawMarkers), so the state is only left
+// behind when that withdrawal fails too, and the fixture writes P's marker
+// directly. Q:0 still records C as its spender, the confirmed spend.
 // A rebroadcast of C is rejected on P's marker, and Q:0 must STILL be spent by
 // C afterwards: that spend was never made by the replay, and releasing it hands
 // a confirmed output to any new transaction. Reproduced by review.
@@ -423,21 +425,10 @@ func TestPrunedReplayRollbackKeepsSiblingHistoricalSpend(t *testing.T) {
 	qKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), uaerospike.CalculateKeySource(q.TxIDChainHash(), 0, s.UtxoStore.UtxoBatchSize))
 	require.NoError(t, err)
 
-	astore.ResetPrunerServiceForTests()
-	t.Cleanup(astore.ResetPrunerServiceForTests)
-	require.NoError(t, store.CreateIndexIfNotExists(ctx, apruner.IndexName, fields.DeleteAtHeight.String(), aerospike.NUMERIC))
-	require.NoError(t, store.WaitForIndexReady(ctx, apruner.IndexName))
-
-	svc, err := store.GetPrunerService()
-	require.NoError(t, err)
-	require.NotNil(t, svc)
-
-	// Q's marker write fails, P's lands, C is held back.
-	require.NoError(t, client.Put(nil, qKey, aerospike.BinMap{fields.DeletedChildren.String(): "invalid-map"}))
-	pruned, err := svc.(*apruner.Service).PruneWithPartitions(ctx, 1300, "sibling-marker-failure", 1)
-	require.NoError(t, err, "fixture: a per-record marker failure must not fail the cycle")
-	require.Equal(t, int64(0), pruned, "fixture: C must be held back")
-	require.NoError(t, client.Put(nil, qKey, aerospike.BinMap{fields.DeletedChildren.String(): nil}))
+	// P carries C's marker, Q does not, and C is still present.
+	require.NoError(t, client.Put(nil, pKey, aerospike.BinMap{
+		fields.DeletedChildren.String(): map[interface{}]interface{}{c.TxID(): true},
+	}))
 
 	pRecord, err := client.Get(nil, pKey)
 	require.NoError(t, err)

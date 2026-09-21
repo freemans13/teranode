@@ -90,6 +90,9 @@ var (
 	prometheusUtxoRecordsDeletedSkipped       prometheus.Counter
 	prometheusUtxoParentsUpdated              prometheus.Counter
 	prometheusUtxoParentsUpdatedSkipped       prometheus.Counter
+	prometheusUtxoChildrenHeldUnverified      prometheus.Counter
+	prometheusUtxoMarkersSuperseded           prometheus.Counter
+	prometheusUtxoMarkerWithdrawFailures      prometheus.Counter
 	prometheusUtxoExternalFilesDeleted        prometheus.Counter
 	prometheusUtxoExternalFilesDeletedSkipped prometheus.Counter
 	prometheusUtxoRetryAttempts               prometheus.Counter
@@ -243,6 +246,9 @@ type parentUpdateInfo struct {
 	// the child's inputs name. A child may be marked only when at least one of
 	// those outputs still records it as the spender: see keepSpendHolders.
 	offsets map[chainhash.Hash][]uint32
+	// markerFailed records that this record's marker write did not land, or
+	// that its outcome could not be read. Set by tallyParentUpdateResults.
+	markerFailed bool
 }
 
 // add appends childHash unless this parent record already has it queued, and
@@ -350,6 +356,18 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		prometheusUtxoParentsUpdatedSkipped = promauto.NewCounter(prometheus.CounterOpts{
 			Name: "utxo_pruner_parents_updated_skipped_total",
 			Help: "Total number of parent records skipped during pruning (updated incrementally)",
+		})
+		prometheusUtxoChildrenHeldUnverified = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_children_held_unverified_total",
+			Help: "Total number of (child, parent record) pairs held back from deletion because the parent output the child claims is unspent, missing or malformed, so no marker can be justified",
+		})
+		prometheusUtxoMarkersSuperseded = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_markers_superseded_total",
+			Help: "Total number of (child, parent record) pairs left unmarked because the parent output names a different spender (a conflicting loser)",
+		})
+		prometheusUtxoMarkerWithdrawFailures = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_marker_withdraw_failures_total",
+			Help: "Total number of parent records from which the replay markers of a held-back child could not be withdrawn; retried next cycle",
 		})
 		prometheusUtxoExternalFilesDeleted = promauto.NewCounter(prometheus.CounterOpts{
 			Name: "utxo_pruner_external_files_deleted_total",
@@ -1646,33 +1664,76 @@ func (s *Service) addParentUpdatesForInput(updates map[string]*parentUpdateInfo,
 	return s.addParentUpdate(updates, uaerospike.CalculateKeySource(parentTxID, vout, s.utxoBatchSize), childHash, vout%uint32(s.utxoBatchSize))
 }
 
+// spendHolderVerdict is what one parent record says about one queued child.
+type spendHolderVerdict int
+
+const (
+	// holderNamesChild: an output the child's input names records the child as
+	// its spender. The child is marked on this record.
+	holderNamesChild spendHolderVerdict = iota
+	// holderNamesOther: every output the child's input names is spent by a
+	// well-formed element naming a different transaction. That is what a
+	// conflicting loser looks like, and it needs no marker here.
+	holderNamesOther
+	// holderUnverified: at least one named output is unspent, missing or
+	// malformed, and none names the child. Nothing can be said about the
+	// child's claim to it, so the child is held back rather than deleted
+	// unmarked.
+	holderUnverified
+)
+
+// markingPlan is the outcome of keepSpendHolders for one batch of parent records.
+type markingPlan struct {
+	// blocked holds every child that must not be deleted this cycle.
+	blocked map[chainhash.Hash]struct{}
+	// superseded counts, per child, the parent records dropped because their
+	// output names a different spender.
+	superseded map[chainhash.Hash]int
+	// existing is the number of queued parent records that were present.
+	existing int
+}
+
+func (p *markingPlan) block(childHash chainhash.Hash) {
+	if p.blocked == nil {
+		p.blocked = make(map[chainhash.Hash]struct{})
+	}
+
+	p.blocked[childHash] = struct{}{}
+}
+
 // keepSpendHolders reads every queued parent record and keeps, per record, only
-// the children that record's outputs actually name as their spender. It returns
-// the children whose parent record could not be read, which must be held back
-// rather than deleted unmarked.
+// the children that record's outputs actually name as their spender. The
+// returned plan lists the children that must be held back rather than deleted
+// unmarked.
 //
 // The spend path consults a marker for the transaction ASKING to spend and
-// ahead of every other answer, and nothing ever clears a marker. A marker for a
-// child that never held the output is therefore not inert: a conflicting loser
-// names the winner's outpoint in its inputs, is a pruning candidate like any
-// other tombstoned record, and once the winner's spend is released (a reorg,
-// ReverseProcessConflicting) the loser's genuinely fresh spend would be refused
-// forever. The SQL pruner applies the same rule in its marker INSERT, which joins
-// to the parent output and requires its spending data to name the child.
+// ahead of every other answer, and nothing in the spend path ever clears a
+// marker. A marker for a child that never held the output is therefore not
+// inert: a conflicting loser names the winner's outpoint in its inputs, is a
+// pruning candidate like any other tombstoned record, and once the winner's
+// spend is released (a reorg, ReverseProcessConflicting) the loser's genuinely
+// fresh spend would be refused forever. The SQL pruner applies the same rule in
+// its marker INSERT, which joins to the parent output and requires its spending
+// data to name the child.
 //
-// An output that no longer names the child cannot happen for a child that really
-// is pruned: it was mined and buried, so nothing unspends its inputs. Reading
-// before writing leaves a window in which the output can change, and in that
-// window the answer only ever errs towards a marker for a child that held the
-// spend when it was read, never towards one for a child that did not.
+// Only a well-formed element naming a different spender drops a child without
+// a marker. Everything else that fails to name the child holds it back: an
+// unspent output (which is what a rolled-back spend leaves, the bare 32-byte
+// utxo hash), an offset past the page, an element that is not bytes, and a
+// record whose utxos bin is absent or not a list. A child deleted in any of
+// those states would carry no marker, and a replay of it would be recreated and
+// spend cleanly. Held-back children are counted, so a record that stays held
+// back is visible rather than silently retained.
 //
 // A parent record that is gone needs no marker and is dropped. Any other read
 // failure, including a record the batch never answered, holds back that record's
 // children. A transport failure fails the call, because nothing is known about
 // any record.
-func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*parentUpdateInfo) (map[chainhash.Hash]struct{}, error) {
+func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*parentUpdateInfo) (*markingPlan, error) {
+	plan := &markingPlan{}
+
 	if len(updates) == 0 {
-		return nil, nil
+		return plan, nil
 	}
 
 	select {
@@ -1694,9 +1755,9 @@ func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*pare
 		return nil, errors.NewStorageError("batch read of parent records before marking failed", err)
 	}
 
-	var blocked map[chainhash.Hash]struct{}
-
 	notFound := 0
+	unverified := 0
+	supersededCount := 0
 
 	for i, rec := range records {
 		source := sources[i]
@@ -1711,13 +1772,11 @@ func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*pare
 			continue
 		}
 
-		if batchRec.Err != nil || batchRec.ResultCode != types.OK || batchRec.Record == nil {
-			if blocked == nil {
-				blocked = make(map[chainhash.Hash]struct{})
-			}
+		plan.existing++
 
+		if batchRec.Err != nil || batchRec.ResultCode != types.OK || batchRec.Record == nil {
 			for _, childHash := range info.childHashes {
-				blocked[*childHash] = struct{}{}
+				plan.block(*childHash)
 			}
 
 			delete(updates, source)
@@ -1725,12 +1784,30 @@ func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*pare
 			continue
 		}
 
-		utxos, _ := batchRec.Record.Bins[s.fieldUtxos].([]interface{})
+		utxos, isList := batchRec.Record.Bins[s.fieldUtxos].([]interface{})
 		holders := make([]*chainhash.Hash, 0, len(info.childHashes))
 
 		for _, childHash := range info.childHashes {
-			if namesSpender(utxos, info.offsets[*childHash], childHash) {
+			verdict := holderUnverified
+			if isList {
+				verdict = spendHolder(utxos, info.offsets[*childHash], childHash)
+			}
+
+			switch verdict {
+			case holderNamesChild:
 				holders = append(holders, childHash)
+			case holderNamesOther:
+				supersededCount++
+
+				if plan.superseded == nil {
+					plan.superseded = make(map[chainhash.Hash]int)
+				}
+
+				plan.superseded[*childHash]++
+			default:
+				unverified++
+
+				plan.block(*childHash)
 			}
 		}
 
@@ -1747,30 +1824,57 @@ func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*pare
 		prometheusUtxoParentsUpdatedSkipped.Add(float64(notFound))
 	}
 
-	return blocked, nil
+	if unverified > 0 && prometheusUtxoChildrenHeldUnverified != nil {
+		prometheusUtxoChildrenHeldUnverified.Add(float64(unverified))
+	}
+
+	if supersededCount > 0 && prometheusUtxoMarkersSuperseded != nil {
+		prometheusUtxoMarkersSuperseded.Add(float64(supersededCount))
+	}
+
+	return plan, nil
 }
 
-// namesSpender reports whether any of the given utxos-bin offsets records
-// childHash as its spending transaction. Each spent element is the 32-byte utxo
-// hash followed by 36 bytes of spending data whose first 32 bytes are the
-// spender's txid (see extractSpendingChildren).
-func namesSpender(utxos []interface{}, offsets []uint32, childHash *chainhash.Hash) bool {
+// spendHolder reports what the given utxos-bin offsets say about childHash.
+// Each spent element is the 32-byte utxo hash followed by 36 bytes of spending
+// data whose first 32 bytes are the spender's txid (see extractSpendingChildren).
+func spendHolder(utxos []interface{}, offsets []uint32, childHash *chainhash.Hash) spendHolderVerdict {
+	if len(offsets) == 0 {
+		return holderUnverified
+	}
+
+	namesOther := true
+
 	for _, offset := range offsets {
 		if int(offset) >= len(utxos) {
+			namesOther = false
+
 			continue
 		}
 
 		utxoBytes, ok := utxos[offset].([]byte)
 		if !ok || len(utxoBytes) < 68 {
+			namesOther = false
+
 			continue
 		}
 
 		if bytes.Equal(utxoBytes[32:64], childHash[:]) {
-			return true
+			return holderNamesChild
 		}
 	}
 
-	return false
+	if namesOther {
+		return holderNamesOther
+	}
+
+	return holderUnverified
+}
+
+// namesSpender reports whether any of the given utxos-bin offsets records
+// childHash as its spending transaction.
+func namesSpender(utxos []interface{}, offsets []uint32, childHash *chainhash.Hash) bool {
+	return spendHolder(utxos, offsets, childHash) == holderNamesChild
 }
 
 // flushCleanupBatches persists replay protection before removing children, and
@@ -1805,10 +1909,12 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 		return 0, nil
 	}
 
-	blocked, err := s.markParents(ctx, parentUpdates)
+	plan, err := s.markParents(ctx, parentUpdates)
 	if err != nil {
 		return 0, err
 	}
+
+	blocked := plan.blocked
 
 	keys := make([]*aerospike.Key, 0, len(deletions))
 
@@ -1855,32 +1961,177 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 
 // markParents writes the replay markers for the queued parent records, keeping
 // only the children each record really names as a spender (keepSpendHolders),
-// and returns every child that must not be deleted this cycle: those whose
-// parent could not be read, and those whose marker did not land.
-func (s *Service) markParents(ctx context.Context, parentUpdates map[string]*parentUpdateInfo) (map[chainhash.Hash]struct{}, error) {
+// and returns every child that must not be deleted this cycle: those a parent
+// could not vouch for, and those whose marker did not land on every parent.
+//
+// Markers are all-or-nothing per child. A marker on a child that then stays in
+// place is not inert: the spend path answers it ahead of every other check, so
+// a later re-validation of the block holding that live child would be refused
+// as a pruned replay, and the block paths would not compensate because the
+// record was not created by that attempt. So a child held back before the write
+// is stripped from every parent first, and a child whose write failed on one
+// parent has its markers withdrawn from the others (withdrawMarkers).
+func (s *Service) markParents(ctx context.Context, parentUpdates map[string]*parentUpdateInfo) (*markingPlan, error) {
 	if len(parentUpdates) == 0 {
-		return nil, nil
+		return &markingPlan{}, nil
 	}
 
-	blocked, err := s.keepSpendHolders(ctx, parentUpdates)
+	plan, err := s.keepSpendHolders(ctx, parentUpdates)
 	if err != nil {
 		return nil, err
 	}
+
+	stripChildren(parentUpdates, plan.blocked)
 
 	failed, err := s.executeBatchParentUpdates(ctx, parentUpdates)
 	if err != nil {
+		// Nothing is known about which records took the write, so withdraw
+		// every child's marker. Best effort: a withdrawal that fails leaves a
+		// marker on a child that is still present, and the next cycle, which
+		// reconsiders that child, withdraws it again.
+		all := make(map[chainhash.Hash]struct{})
+
+		for _, info := range parentUpdates {
+			for _, childHash := range info.childHashes {
+				all[*childHash] = struct{}{}
+			}
+		}
+
+		s.withdrawMarkers(parentUpdates, all)
+
 		return nil, err
 	}
 
-	for childHash := range failed {
-		if blocked == nil {
-			blocked = make(map[chainhash.Hash]struct{}, len(failed))
-		}
+	if len(failed) > 0 {
+		s.withdrawMarkers(parentUpdates, failed)
 
-		blocked[childHash] = struct{}{}
+		for childHash := range failed {
+			plan.block(childHash)
+		}
 	}
 
-	return blocked, nil
+	return plan, nil
+}
+
+// stripChildren removes every blocked child from the queued parent updates, and
+// drops a parent entry that is left with no child.
+func stripChildren(updates map[string]*parentUpdateInfo, blocked map[chainhash.Hash]struct{}) {
+	if len(blocked) == 0 {
+		return
+	}
+
+	for source, info := range updates {
+		kept := info.childHashes[:0]
+
+		for _, childHash := range info.childHashes {
+			if _, held := blocked[*childHash]; !held {
+				kept = append(kept, childHash)
+			}
+		}
+
+		if len(kept) == 0 {
+			delete(updates, source)
+
+			continue
+		}
+
+		info.childHashes = kept
+	}
+}
+
+// withdrawMarkers removes the markers of the given children from every queued
+// parent that lists them. It is the compensation for a marker set that landed
+// on some parents of a child and not on others: that child is held back, so it
+// stays present, and a marker naming a present transaction would refuse its
+// own re-spend.
+//
+// It uses a plain map remove rather than the Lua module, so it works the same
+// on every marking path, and UPDATE_ONLY so it never creates a record. It does
+// not take the cycle's context: it runs precisely when that context may have
+// failed the write, and a cancelled compensation leaves the poison in place. A
+// parent that is gone has lost its markers with it. Any other failure is
+// counted and logged, never returned: the child is already held back, and the
+// next cycle reconsiders it and withdraws again.
+func (s *Service) withdrawMarkers(updates map[string]*parentUpdateInfo, children map[chainhash.Hash]struct{}) {
+	if len(children) == 0 {
+		return
+	}
+
+	policy := aerospike.NewBatchWritePolicy()
+	policy.RecordExistsAction = aerospike.UPDATE_ONLY
+
+	records := make([]aerospike.BatchRecordIfc, 0, len(updates))
+	ownWriteFailed := make([]bool, 0, len(updates))
+
+	for _, info := range updates {
+		keys := make([]interface{}, 0, len(info.childHashes))
+
+		for _, childHash := range info.childHashes {
+			if _, withdraw := children[*childHash]; withdraw {
+				keys = append(keys, childHash.String())
+			}
+		}
+
+		if len(keys) == 0 {
+			continue
+		}
+
+		op := aerospike.MapRemoveByKeyListOp(s.fieldDeletedChildren, keys, aerospike.MapReturnType.NONE)
+		records = append(records, aerospike.NewBatchWrite(policy, info.key, op))
+		ownWriteFailed = append(ownWriteFailed, info.markerFailed)
+	}
+
+	if len(records) == 0 {
+		return
+	}
+
+	if err := s.client.BatchOperate(s.batchPolicy, records); err != nil && isBatchTransportError(err) {
+		if prometheusUtxoMarkerWithdrawFailures != nil {
+			prometheusUtxoMarkerWithdrawFailures.Add(float64(len(records)))
+		}
+
+		s.logger.Errorf("Withdrawing replay markers of %d held-back children from %d parents failed at the transport; the next cycle withdraws again: %v",
+			len(children), len(records), err)
+
+		return
+	}
+
+	failures := 0
+
+	var firstErr error
+
+	for i, rec := range records {
+		batchRec := rec.BatchRec()
+		if batchRec.Err == nil && batchRec.ResultCode == types.OK {
+			continue
+		}
+
+		if batchRec.Err != nil && batchRec.Err.Matches(types.KEY_NOT_FOUND_ERROR) {
+			continue
+		}
+
+		// A parent whose own marker write failed usually cannot take this write
+		// either (a bin that is not a map, a record too big), and its marker did
+		// not land there, so there is nothing to withdraw.
+		if ownWriteFailed[i] {
+			continue
+		}
+
+		failures++
+
+		if firstErr == nil {
+			firstErr = batchRec.Err
+		}
+	}
+
+	if failures > 0 {
+		if prometheusUtxoMarkerWithdrawFailures != nil {
+			prometheusUtxoMarkerWithdrawFailures.Add(float64(failures))
+		}
+
+		s.logger.Errorf("Withdrawing replay markers of held-back children failed on %d of %d parents; the next cycle withdraws again (first: %v)",
+			failures, len(records), firstErr)
+	}
 }
 
 // buildParentUpdateRecords builds the addDeletedChildren parent-update batch
@@ -2176,6 +2427,8 @@ func tallyParentUpdateResults(batchRecords []aerospike.BatchRecordIfc, infos []*
 			}
 
 			if infos != nil && i < len(infos) {
+				infos[i].markerFailed = true
+
 				if tally.blocked == nil {
 					tally.blocked = make(map[chainhash.Hash]struct{})
 				}
@@ -2476,7 +2729,7 @@ func (s *Service) ProcessSingleRecord(txHash *chainhash.Hash, inputs []*bt.Input
 		ctx = context.Background()
 	}
 
-	blocked, err := s.markParents(ctx, parentUpdates)
+	plan, err := s.markParents(ctx, parentUpdates)
 	if err != nil {
 		return err
 	}
@@ -2484,8 +2737,18 @@ func (s *Service) ProcessSingleRecord(txHash *chainhash.Hash, inputs []*bt.Input
 	// ProcessSingleRecord is the manual entry point an operator reaches for
 	// after an incident, so a per-record marker failure has to surface here
 	// rather than being isolated the way the batch pruner isolates it.
-	if _, held := blocked[*txHash]; held {
+	if _, held := plan.blocked[*txHash]; held {
 		return errors.NewStorageError("parent replay markers for %s could not be written", txHash.String())
+	}
+
+	// "No marker was needed" and "no parent could be marked" must not look the
+	// same to the operator. A parent that is gone needs no marker; a parent that
+	// is present but whose output names a different spender is left unmarked,
+	// and the operator has to know that nothing was written for this
+	// transaction.
+	if plan.existing > 0 && len(parentUpdates) == 0 {
+		return errors.NewProcessingError("no replay marker was written for %s: %d of its parent records are present and %d name a different spender for the outputs it claims",
+			txHash.String(), plan.existing, plan.superseded[*txHash])
 	}
 
 	return nil
