@@ -709,12 +709,17 @@ func (repo *Repository) GetBlocksByHeight(ctx context.Context, startHeight, endH
 // before it writes them, so the file is no longer arbitrary attacker-supplied content, but
 // a route that promises a validated subtree still must not answer with an unvalidated one.
 //
-// The cost is bounded and intended: between fetching a subtree and validating it, this node
-// answers 404 for that subtree. Every path that accepts a block then writes FileTypeSubtree
-// -- quick validation in services/blockvalidation/quick_validate.go, full validation in
-// services/subtreevalidation/SubtreeValidation.go -- so a node that has caught up serves
-// exactly what it served before. What it no longer does is act as a subtree source while it
-// is itself behind, and a node that is behind is the worst available source anyway.
+// The cost: between fetching a subtree and validating it, this node answers 404 for that
+// subtree. That window is not confined to catch-up. A fully synced node receiving a tip
+// block writes FileTypeSubtreeToCheck for every subtree of that block it does not already
+// hold (services/subtreevalidation/check_block_subtrees.go), and only promotes it to
+// FileTypeSubtree once ValidateSubtreeInternal finishes, so for the seconds to minutes a
+// large tip block takes to validate, this node 404s on those subtrees. Every path that
+// accepts a block writes FileTypeSubtree first -- quick validation in
+// services/blockvalidation/quick_validate.go, full validation in
+// services/subtreevalidation/SubtreeValidation.go -- so once a block is accepted its
+// subtrees are served exactly as before; the 404 only covers blocks this node has fetched
+// and not yet accepted.
 //
 // Every read of a subtree file in this package goes through here, so the rule lives in one
 // place rather than being restated at each call site, which is how the fallback came to be

@@ -110,11 +110,13 @@ func (repo *Repository) GetSubtreeDataReader(ctx context.Context, subtreeHash *c
 	// report as ErrSubtreeLengthMismatch. Surface a NotFound instead so the handler
 	// returns 404 and callers can attempt another peer.
 	//
-	// Only FileTypeSubtree counts, never FileTypeSubtreeToCheck: regeneration reads the
-	// transaction ids out of whichever subtree file it finds, so admitting the pending
-	// peer-fetched copy here would put unvalidated content behind a public route by the
-	// back door, which is the same hole openValidatedSubtree closes on the direct reads
-	// (bitcoin-sv/teranode#4842).
+	// Only FileTypeSubtree counts, never FileTypeSubtreeToCheck, because regeneration can
+	// only read FileTypeSubtree: it goes through writeTransactionsViaSubtreeStoreStreaming
+	// to GetSubtreeTxIDsReader, which reads through openValidatedSubtree. Checking for the
+	// pending file here would commit the handler to 200 OK for a regeneration that is then
+	// certain to fail, which is the "200 OK + empty body" this check exists to prevent. If
+	// someone re-adds a FileTypeSubtreeToCheck fallback here, it must be re-added on
+	// openValidatedSubtree too, and that would reopen bitcoin-sv/teranode#4842.
 	subtreeExists, existsErr := repo.SubtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
 	if existsErr != nil {
 		releaseSemaphorePermit(repo.semGetSubtreeDataReader)
