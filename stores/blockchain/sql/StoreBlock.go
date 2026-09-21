@@ -183,32 +183,38 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 			return 0, height, err
 		}
 	} else {
-		// No retry here: a statement that fails inside a transaction aborts it, and the
-		// blockchain store's other transactions do not retry either. A transient failure
-		// fails the call and the block is retried by the caller (re-queue or catchup).
-		tx, beginErr := s.db.BeginTx(ctx, nil)
-		if beginErr != nil {
-			return 0, 0, errors.NewStorageError("StoreBlock: begin transaction", beginErr)
-		}
+		// RetryTx keeps the pool's retry and circuit-breaker behaviour, but retries
+		// the whole transaction rather than one statement: a statement that fails
+		// inside a PostgreSQL transaction aborts it, so only a fresh BEGIN can retry.
+		err = s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
+			var storeErr error
 
-		newBlockID, height, _, _, err = s.storeBlock(ctx, tx, block, peerID, storeBlockOptions, onMainChain)
+			newBlockID, height, _, _, storeErr = s.storeBlock(ctx, tx, block, peerID, storeBlockOptions, onMainChain)
+			if storeErr != nil {
+				return storeErr
+			}
+
+			reconcileErr := s.reconcileOnMainChain(ctx, tx)
+			if s.reconcileHook != nil {
+				reconcileErr = s.reconcileHook()
+			}
+
+			if reconcileErr != nil {
+				return errors.NewStorageError("StoreBlock: reconcileOnMainChain", reconcileErr)
+			}
+
+			return nil
+		})
 		if err != nil {
-			_ = tx.Rollback()
-			return 0, height, err
-		}
+			// storeBlock and the reconciliation already return typed errors, which
+			// callers match on (block exists, invalid argument). Only a raw driver
+			// error from BEGIN or COMMIT needs wrapping here.
+			var typedErr *errors.Error
+			if errors.As(err, &typedErr) {
+				return 0, height, err
+			}
 
-		reconcileErr := s.reconcileOnMainChain(ctx, tx)
-		if s.reconcileHook != nil {
-			reconcileErr = s.reconcileHook()
-		}
-
-		if reconcileErr != nil {
-			_ = tx.Rollback()
-			return 0, height, errors.NewStorageError("StoreBlock: reconcileOnMainChain", reconcileErr)
-		}
-
-		if commitErr := tx.Commit(); commitErr != nil {
-			return 0, height, errors.NewStorageError("StoreBlock: commit block and on_main_chain reconciliation", commitErr)
+			return 0, height, errors.NewStorageError("StoreBlock: commit block and on_main_chain reconciliation", err)
 		}
 	}
 

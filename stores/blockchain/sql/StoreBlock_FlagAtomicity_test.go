@@ -51,7 +51,7 @@ func TestStoreBlockRollsBackWhenTheFlagReconciliationFails(t *testing.T) {
 	// blockAlternative2 forks from block1, so it takes the fork path.
 	_, _, err := s.StoreBlock(context.Background(), blockAlternative2, "peer")
 	require.Error(t, err, "a failed reconciliation must fail the store, not be logged and swallowed")
-	require.Equal(t, 1, calls, "the failure is returned at once; StoreBlock does not retry the transaction")
+	require.Equal(t, 1, calls, "a non-retriable failure is returned at once, not retried")
 
 	require.False(t, blockRowExists(t, s, blockAlternative2.Hash().CloneBytes()),
 		"the rolled-back block must leave no row behind")
@@ -84,6 +84,43 @@ func TestStoreBlockRetryAfterAFailedReconciliationSucceeds(t *testing.T) {
 	require.True(t, blockRowExists(t, s, blockAlternative2.Hash().CloneBytes()))
 	require.False(t, getOnMainChain(t, s, blockAlternative2.Hash().CloneBytes()),
 		"a fork that is not the best chain is flagged off-chain")
+	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()), "the longer chain keeps the flag")
+}
+
+// TestStoreBlockRetriesTheWholeTransactionOnATransientFailure: the fork path runs on
+// a transaction, which the pool's per-statement retry cannot reach. A transient
+// failure must roll the attempt back and re-run BEGIN, INSERT and the reconciliation,
+// so the caller sees one clean success and exactly one block row with the right flag.
+//
+// The injected error is a lock timeout as it reaches RetryTx in production: already
+// wrapped in a teranode error, which keeps the driver's message but not its type, so
+// classification rests on the message. The sqlitememory store has retry enabled by
+// default; PostgreSQL has it off unless postgres_retryEnabled is set.
+func TestStoreBlockRetriesTheWholeTransactionOnATransientFailure(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+
+	storeBlocks(t, s, block1, block2, block3)
+
+	calls := 0
+	s.reconcileHook = func() error {
+		calls++
+		if calls == 1 {
+			return errors.NewStorageError("reconcileOnMainChain: failed to apply diff: database is locked")
+		}
+
+		return nil
+	}
+
+	_, _, err := s.StoreBlock(context.Background(), blockAlternative2, "peer")
+	require.NoError(t, err, "a transient failure is retried inside StoreBlock")
+	require.Equal(t, 2, calls, "the whole transaction ran twice")
+
+	var rows int
+	require.NoError(t, s.db.QueryRow(`SELECT count(*) FROM blocks WHERE hash = $1`,
+		blockAlternative2.Hash().CloneBytes()).Scan(&rows))
+	require.Equal(t, 1, rows, "the rolled-back attempt left nothing behind")
+
+	require.False(t, getOnMainChain(t, s, blockAlternative2.Hash().CloneBytes()), "the fork is off-chain")
 	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()), "the longer chain keeps the flag")
 }
 
