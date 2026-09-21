@@ -52,7 +52,7 @@ type spendAndCreateResult struct {
 	err    error
 }
 
-// inputClaim is what an input said about the coin it spends when the call arrived.
+// inputClaim is what an input said about the UTXO it spends when the call arrived.
 //
 // The spend statement is also the decorate fetch: for every input it takes it overwrites the
 // caller's claimed satoshis and script with the store's, after comparing the two. A transaction
@@ -90,7 +90,7 @@ func newSpendAndCreateItem(tx *bt.Tx, blockHeight uint32, options *utxo.CreateOp
 	}
 }
 
-// captureClaims records what every input of tx claims about its coin.
+// captureClaims records what every input of tx claims about its UTXO.
 func captureClaims(tx *bt.Tx) []inputClaim {
 	if tx == nil {
 		return nil
@@ -254,13 +254,13 @@ func (s *Store) applyChunk(chunk []*spendAndCreateItem, delivered []bool) {
 	}
 
 	// Whatever the batch could not settle is settled by the single path. After a successful
-	// commit that is only the items that lost a coin to a sibling, whose verdict had to wait
+	// commit that is only the items that lost a UTXO to a sibling, whose verdict had to wait
 	// for the sibling's fate. After a failure it is everything except the items the batch had
 	// already rejected outright.
 	//
 	// A rejected item is never re-run and its verdict stands in both cases. It was reached
-	// against committed state: a claim that did not match the coin, a frozen or conflicting or
-	// immature coin, or a coin taken by a transaction outside this batch. Whatever ended the
+	// against committed state: a claim that did not match the UTXO, a frozen or conflicting or
+	// immature UTXO, or a UTXO taken by a transaction outside this batch. Whatever ended the
 	// batch, that answer is the one the single path would give.
 	//
 	// Every item that IS re-run goes back with the claims it arrived with. That, and not any
@@ -330,7 +330,7 @@ func has(m map[uint32]struct{}, k uint32) bool {
 // runSpendAndCreateBatch applies the batch in one transaction.
 //
 // It returns one result per item and, alongside, which of those results are final. After a
-// commit every result is final except those of items that lost a coin to a sibling, which the
+// commit every result is final except those of items that lost a UTXO to a sibling, which the
 // caller must judge again once the batch is durable. After an error the only final results are
 // outright rejections reached in an earlier round; nothing else was answered, and the caller
 // must redo those items some other way.
@@ -343,9 +343,9 @@ func has(m map[uint32]struct{}, k uint32) bool {
 //
 // Rolling back the whole transaction rather than compensating inside it is a correctness
 // requirement, not a shortcut. Deleting the failed item's journal rows and re-inserting its
-// coins would look equivalent, and under READ COMMITTED it is not: a competing spend that
+// UTXOs would look equivalent, and under READ COMMITTED it is not: a competing spend that
 // blocked on our deleted row would, once we committed, find that row version deleted and never
-// see the re-inserted one, and would report a live coin as spent. A rollback makes it re-read
+// see the re-inserted one, and would report a live UTXO as spent. A rollback makes it re-read
 // the row that never went away. The spend phase is the first thing the transaction does, so a
 // whole rollback loses nothing over a savepoint and costs nothing on the round that succeeds.
 //
@@ -358,7 +358,7 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 	results := make([]spendAndCreateResult, len(batch))
 
 	// rejected marks an item whose verdict is fixed: it failed the spend phase and nothing it
-	// failed on depends on a sibling. deferred marks one that lost at least one coin to a
+	// failed on depends on a sibling. deferred marks one that lost at least one UTXO to a
 	// sibling, whose verdict waits for the commit. Both are out of every later phase; only
 	// rejected survives an error as a final answer.
 	rejected := make([]bool, len(batch))
@@ -487,7 +487,7 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 		// released at the end of its own statement and would guard nothing. This used to run
 		// on the pool to save the BEGIN and COMMIT round trips, which is a real cost on the
 		// block-application path and a smaller one than two creates of the same transaction
-		// each writing a full set of coins.
+		// each writing a full set of UTXOs.
 		if dbTx == nil {
 			dbTx, err = s.pool.Begin(ctx)
 			if err != nil {
@@ -531,7 +531,7 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 	return results, final, nil
 }
 
-// lostToASibling reports whether any failure on an item is a coin taken by another item of the
+// lostToASibling reports whether any failure on an item is a UTXO taken by another item of the
 // same batch.
 //
 // Such an item's verdict was reached against its sibling's UNCOMMITTED delete, in the same
@@ -542,12 +542,12 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 // row lock and the loser reads committed state. So the item is judged again by the single path
 // once the batch has committed, with its claims restored, which reproduces exactly that.
 //
-// Any sibling loss is enough, whatever else the item failed on. An item that lost a coin to a
-// sibling AND made a false claim about another coin is still rejected on the re-run, for the
+// Any sibling loss is enough, whatever else the item failed on. An item that lost a UTXO to a
+// sibling AND made a false claim about another UTXO is still rejected on the re-run, for the
 // false claim, and reports only the failures that are true against committed state. Settling it
 // in-round would hand the caller a spend record naming a sibling that may never have spent.
 //
-// A missing coin the journal cannot attribute to anyone, or attributes to a transaction outside
+// A missing UTXO the journal cannot attribute to anyone, or attributes to a transaction outside
 // this batch, is a verdict about committed state and stands. So is every other error class.
 func lostToASibling(tx *bt.Tx, spends []*utxo.Spend, siblings map[chainhash.Hash]struct{}) bool {
 	own := tx.TxIDChainHash()

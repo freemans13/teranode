@@ -29,10 +29,10 @@ func TestGetServesAMinedTransactionFromTheMembershipTable(t *testing.T) {
 	require.Equal(t, uint32(0), got.UnminedSince)
 }
 
-// TestGetServesAnOldParentFromItsCoinOnceTheWindowIsGone: the membership window was dropped,
-// the transaction still has a live coin, and the coin's block facts are the answer. Fee,
+// TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone: the membership window was dropped,
+// the transaction still has a live UTXO, and the UTXO's block facts are the answer. Fee,
 // size, inputs and subtree index are zero, which is what a pruned SV Node can say too.
-func TestGetServesAnOldParentFromItsCoinOnceTheWindowIsGone(t *testing.T) {
+func TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -52,10 +52,10 @@ func TestGetServesAnOldParentFromItsCoinOnceTheWindowIsGone(t *testing.T) {
 	require.Nil(t, got.TxInpoints.ParentTxHashes)
 }
 
-// TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists pins the read order. A
-// coin holds one block id; a transaction stamped into two blocks must report both while
+// TestGetNeverAnswersBlockIdsFromTheUTXOWhileAMembershipRowExists pins the read order. A
+// UTXO holds one block id; a transaction stamped into two blocks must report both while
 // the window lives, which only the membership table can do.
-func TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists(t *testing.T) {
+func TestGetNeverAnswersBlockIdsFromTheUTXOWhileAMembershipRowExists(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -77,7 +77,7 @@ func TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists(t *testing.
 //
 // This test used to assert ErrTxNotFound for exactly this state, and that was wrong by design:
 // membership retires 1440 blocks after the parent was MINED and the journal 1440 blocks after
-// the coin was SPENT, so the two are counted from different clocks and a parent can lose its
+// the UTXO was SPENT, so the two are counted from different clocks and a parent can lose its
 // window while its journal row still stands. During that window the store CAN answer, and it
 // must: the alternative is a BlockIncompleteError the caller retries forever. Both the base
 // branch and aerospike keep a fully-spent parent answerable for a window after the spend.
@@ -111,7 +111,7 @@ func TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives(t 
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 }
 
-// TestBatchDecorateFollowsTheSameOrder: one mempool row, one membership row, one coin-only
+// TestBatchDecorateFollowsTheSameOrder: one mempool row, one membership row, one UTXO-only
 // parent and one unknown, in a single call.
 func TestBatchDecorateFollowsTheSameOrder(t *testing.T) {
 	s, ctx := newTestStore(t)

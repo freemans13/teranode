@@ -124,7 +124,7 @@ type lockItem struct {
 // The release is the two-phase commit path: every mempool transaction is created locked and
 // unlocked when it commits, one call per transaction. The sql store batches exactly this.
 //
-// background is false. The update touches the coin rows of whichever transactions are in the
+// background is false. The update touches the UTXO rows of whichever transactions are in the
 // batch, and two batches can name the same transaction, so concurrent batches could lock the
 // same rows in different orders.
 //

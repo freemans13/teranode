@@ -20,7 +20,7 @@ func liveRows(t *testing.T, s *Store, ctx context.Context, txid []byte) int {
 	return n
 }
 
-// TestApplyBlockReplayDoesNotDuplicateOutputs is the coin-inflation guard.
+// TestApplyBlockReplayDoesNotDuplicateOutputs is the UTXO-inflation guard.
 //
 // The UTXO table's ukey is a 96-bit prefix and is deliberately NON-UNIQUE, so createSQL
 // has no ON CONFLICT to make an insert idempotent. Replay is routine — catchup, a

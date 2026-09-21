@@ -10,8 +10,8 @@ import (
 // TestGetNamesWhoSpentEachOutputWhenAsked.
 //
 // The shared conflict walks ask a parent "who took each of your outputs" through the metadata
-// read, and act on the answer. This store deletes the coin row on spend, so the answer is not
-// in the coin table at all: it is in the journal, which recorded the spender at the moment of
+// read, and act on the answer. This store deletes the UTXO row on spend, so the answer is not
+// in the UTXO table at all: it is in the journal, which recorded the spender at the moment of
 // the delete. Without this the walks see an empty answer for every parent and fail on every
 // input, which is what stopped conflict handling working here at all.
 func TestGetNamesWhoSpentEachOutputWhenAsked(t *testing.T) {
@@ -65,7 +65,7 @@ func TestGetLeavesSpendingDataAloneWhenNotAsked(t *testing.T) {
 // Outputs are located by a packed key whose first 12 bytes are the transaction id prefix. That
 // prefix is 96 bits and NON-UNIQUE by design, so it can locate a row but must never authorise
 // using one. Here the consequence of getting it wrong is naming a stranger as the spender of
-// this transaction's coin, which the conflict walk would then mark conflicting along with
+// this transaction's UTXO, which the conflict walk would then mark conflicting along with
 // everything descended from it.
 //
 // The colliding row is planted directly, since a 12-byte collision will not arise by chance.

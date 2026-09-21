@@ -371,9 +371,9 @@ func TestCreateRejectsATransactionTheStoreAlreadyHolds(t *testing.T) {
 	require.Equal(t, int32(700_000), readIdent(t, s, ctx, h[:]).createdHeight,
 		"the first sighting wins; created_height is immutable because tx_body is filed by it")
 
-	var coins int
-	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, h[:]).Scan(&coins))
-	require.Equal(t, 2, coins, "the outputs must not be created a second time")
+	var utxoRows int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, h[:]).Scan(&utxoRows))
+	require.Equal(t, 2, utxoRows, "the outputs must not be created a second time")
 }
 
 // TestSpendAndCreateKeepsTheSpendsWhenTheTransactionExists is the contract that all three
@@ -385,7 +385,7 @@ func TestCreateRejectsATransactionTheStoreAlreadyHolds(t *testing.T) {
 // application paths create every transaction in one pass and spend the inputs in a separate
 // pass, so a transaction can genuinely be present while its own inputs are still unspent.
 // Abandon the database transaction at that point and the caller is told "already have it,
-// nothing to do" while the parent coins are still sitting there, spendable by anyone else.
+// nothing to do" while the parent UTXOs are still sitting there, spendable by anyone else.
 // A double spend becomes mineable by our own node.
 func TestSpendAndCreateKeepsTheSpendsWhenTheTransactionExists(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -420,17 +420,17 @@ func TestSpendAndCreateKeepsTheSpendsWhenTheTransactionExists(t *testing.T) {
 		"the parent output must be SPENT: rolling back here leaves it live and spendable by someone else, which makes a double spend mineable")
 }
 
-// TestDoubleSpendNamesTheTransactionThatTookTheCoin.
+// TestDoubleSpendNamesTheTransactionThatTookTheUTXO.
 //
-// A delete-on-spend store destroys the coin row, so absence is how it rejects a double
+// A delete-on-spend store destroys the UTXO row, so absence is how it rejects a double
 // spend. That answers "no" but not "who", and the caller needs "who" to mark the loser as
 // conflicting and to walk its descendants.
 //
 // The spend journal already holds the answer. It records the spending transaction against
-// every coin it destroys, precisely so a reorg can match the spender that actually took it.
+// every UTXO it destroys, precisely so a reorg can match the spender that actually took it.
 // So within the journal's retention the store can name the winner, and beyond it cannot,
 // which is a real and stated limit rather than a gap.
-func TestDoubleSpendNamesTheTransactionThatTookTheCoin(t *testing.T) {
+func TestDoubleSpendNamesTheTransactionThatTookTheUTXO(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 1, 5_000)
@@ -447,7 +447,7 @@ func TestDoubleSpendNamesTheTransactionThatTookTheCoin(t *testing.T) {
 	_, err = spendOnly(ctx, s, winner, 100)
 	require.NoError(t, err)
 
-	// A different transaction reaching for the same coin.
+	// A different transaction reaching for the same UTXO.
 	loser := bt.NewTx()
 	require.NoError(t, loser.FromUTXOs(&bt.UTXO{
 		TxIDHash: parent.TxIDChainHash(), Vout: 0,
@@ -459,7 +459,7 @@ func TestDoubleSpendNamesTheTransactionThatTookTheCoin(t *testing.T) {
 	require.Error(t, err, "a rejected spend is now a returned error, and rolled back")
 	require.Len(t, spends, 1)
 
-	require.True(t, errors.Is(spends[0].Err, errors.ErrSpent), "the coin is gone, so this is a double spend")
+	require.True(t, errors.Is(spends[0].Err, errors.ErrSpent), "the UTXO is gone, so this is a double spend")
 	require.NotNil(t, spends[0].ConflictingTxID,
 		"and the caller needs to know WHICH transaction took it, to mark this one conflicting and walk its children")
 	require.Equal(t, winner.TxID(), spends[0].ConflictingTxID.String())

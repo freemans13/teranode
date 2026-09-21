@@ -300,7 +300,7 @@ func TestForkStampTwiceRecordsTheBlockOnce(t *testing.T) {
 
 // TestUnMineMovesAMembershipRowBackToTheMempool: the block is taken back; the transaction
 // returns to the identity table with the unconfirmed marker at the CURRENT tip, its other
-// blocks as fork triples, and its coins reset to the unconfirmed sentinel.
+// blocks as fork triples, and its UTXOs reset to the unconfirmed sentinel.
 func TestUnMineMovesAMembershipRowBackToTheMempool(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_150))
@@ -323,7 +323,7 @@ func TestUnMineMovesAMembershipRowBackToTheMempool(t *testing.T) {
 	require.Empty(t, got.BlockIDs)
 	require.Equal(t, uint32(700_150), got.UnminedSince, "a fresh clock from the current tip, not the creation height")
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(0), h)
 	require.Equal(t, int32(0), b)
 }
@@ -333,17 +333,17 @@ func TestUnMineMovesAMembershipRowBackToTheMempool(t *testing.T) {
 // transaction back to the mempool table. The block that was not un-mined survives as a FORK
 // TRIPLE on the identity row, not as a membership row.
 //
-// A double home would break more than tidiness. The lazy coin stamp at window retirement reads
-// membership rows, so a surviving row would stamp this transaction's coins into a block it no
+// A double home would break more than tidiness. The lazy UTXO stamp at window retirement reads
+// membership rows, so a surviving row would stamp this transaction's UTXOs into a block it no
 // longer settles under, and the read path's identity-then-membership order assumes one home.
 //
-// Every coin goes back to the sentinel, including one stamped with the SURVIVING block's id: a
+// Every UTXO goes back to the sentinel, including one stamped with the SURVIVING block's id: a
 // transaction in the mempool table settles under no block at all.
 func TestUnMineMovesTheWholeTransactionBack(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_150))
 
-	// Created by the block path, so its coins carry real block facts to reset.
+	// Created by the block path, so its UTXOs carry real block facts to reset.
 	tx := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
@@ -367,19 +367,19 @@ func TestUnMineMovesTheWholeTransactionBack(t *testing.T) {
 		"the un-mined block's triple is dropped, the sibling's is remembered as a fork triple")
 	require.Equal(t, uint32(700_150), got.UnminedSince)
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(0), h, "back at the sentinel, sibling block or not")
 	require.Equal(t, int32(0), b)
 }
 
-// TestUnMineDoesNotResetAnotherTransactionsCoin: the coin reset must recheck the full
+// TestUnMineDoesNotResetAnotherTransactionsUTXO: the UTXO reset must recheck the full
 // transaction id, not just the packed key it found the row by.
 //
 // ukey is a 96-bit prefix and non-unique by design, so two transactions in the same leaf can
-// share one. Matching an UPDATE on (leaf, ukey) alone would reset a stranger's coin to the
-// unconfirmed sentinel -- a coin that is spendable now reading as immature, or a mined coin
+// share one. Matching an UPDATE on (leaf, ukey) alone would reset a stranger's UTXO to the
+// unconfirmed sentinel -- a UTXO that is spendable now reading as immature, or a mined UTXO
 // reading as mempool -- which is why every other by-key write in this store rechecks txid.
-func TestUnMineDoesNotResetAnotherTransactionsCoin(t *testing.T) {
+func TestUnMineDoesNotResetAnotherTransactionsUTXO(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_150))
 
@@ -388,18 +388,18 @@ func TestUnMineDoesNotResetAnotherTransactionsCoin(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	other := insertCollidingCoin(t, s, ctx, tx, 600_000, 99)
+	other := insertCollidingUTXO(t, s, ctx, tx, 600_000, 99)
 
 	_, err = s.SetMinedMulti(ctx, hashes(tx),
 		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, UnsetMined: true})
 	require.NoError(t, err)
 
-	h, b := coinFacts(t, s, ctx, tx)
-	require.Equal(t, int32(0), h, "the un-mined transaction's own coin is reset")
+	h, b := utxoFacts(t, s, ctx, tx)
+	require.Equal(t, int32(0), h, "the un-mined transaction's own UTXO is reset")
 	require.Equal(t, int32(0), b)
 
-	oh, ob := coinFactsOf(t, s, ctx, other)
-	require.Equal(t, int32(600_000), oh, "a coin sharing the packed key must be untouched")
+	oh, ob := utxoFactsOf(t, s, ctx, other)
+	require.Equal(t, int32(600_000), oh, "a UTXO sharing the packed key must be untouched")
 	require.Equal(t, int32(99), ob)
 }
 
@@ -423,7 +423,7 @@ func TestUnMineOfABlockTheTransactionDoesNotNameIsANoOp(t *testing.T) {
 	require.Equal(t, 1, minedRows(t, s, ctx, tx), "block 42's membership row stays")
 	require.False(t, identExists(t, s, ctx, tx), "and the transaction stays settled")
 
-	h, b := coinFacts(t, s, ctx, tx)
-	require.Equal(t, int32(700_100), h, "its coin keeps block 42's facts")
+	h, b := utxoFacts(t, s, ctx, tx)
+	require.Equal(t, int32(700_100), h, "its UTXO keeps block 42's facts")
 	require.Equal(t, int32(42), b)
 }

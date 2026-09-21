@@ -143,7 +143,7 @@ func TestUTXOTableCreateSpendRoundTrip(t *testing.T) {
 	require.NotNil(t, child.Inputs[0].PreviousTxScript,
 		"Spend must return the locking script via RETURNING")
 
-	// A DIFFERENT transaction reaching for the same coin: the row is gone, and absence IS the
+	// A DIFFERENT transaction reaching for the same UTXO: the row is gone, and absence IS the
 	// rejection.
 	//
 	// The extra output is what makes it different, and it is load-bearing rather than
@@ -316,7 +316,7 @@ func TestSpendAndCreateRejectsContradictoryOptions(t *testing.T) {
 }
 
 // TestSpendWritesJournal is the property that makes a delete-on-spend store
-// recoverable at all: the coin's payload must be captured at the instant it is
+// recoverable at all: the UTXO's payload must be captured at the instant it is
 // destroyed, in the same statement, or a reorg and ProcessConflicting have nothing to
 // restore from. It cannot be re-derived -- the node keeps almost no blocks, and the
 // subtree data it does keep carries outpoints without satoshis or scripts.
@@ -494,7 +494,7 @@ func spendOne(t *testing.T, s *Store, ctx context.Context, sats uint64, h uint32
 	return parent, child, spends
 }
 
-// TestUnspendRestoresFromJournal is the round trip that makes a reorg survivable: a coin
+// TestUnspendRestoresFromJournal is the round trip that makes a reorg survivable: a UTXO
 // destroyed by a spend must come back byte-identical, and the journal row must be
 // CONSUMED so a second restore cannot duplicate it.
 func TestUnspendRestoresFromJournal(t *testing.T) {
@@ -523,12 +523,12 @@ func TestUnspendRestoresFromJournal(t *testing.T) {
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal WHERE txid = $1`, parentHash[:]).Scan(&remaining))
 	require.Equal(t, 0, remaining, "the journal row must be consumed by the restore")
 
-	// so a second restore's DELETE finds nothing to consume -- but the coin it would have
+	// so a second restore's DELETE finds nothing to consume -- but the UTXO it would have
 	// restored is already live, and Unspend must recognise that and say so as success, not
 	// error: this is the shape a crashed-and-replayed WAL intent produces (see unspend.go's
 	// live_before), and BlockAssembler's conflict-intent replay depends on Unspend
 	// tolerating it.
-	require.NoError(t, s.Unspend(ctx, spends), "a second restore of an already-live coin must be a no-op, not an error")
+	require.NoError(t, s.Unspend(ctx, spends), "a second restore of an already-live UTXO must be a no-op, not an error")
 
 	var live int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
@@ -536,7 +536,7 @@ func TestUnspendRestoresFromJournal(t *testing.T) {
 }
 
 // TestUnspendRefusesWrongSpender is the ownership token doing its job. A stale reorg
-// record must never resurrect a coin that a DIFFERENT transaction has since taken.
+// record must never resurrect a UTXO that a DIFFERENT transaction has since taken.
 func TestUnspendRefusesWrongSpender(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -547,13 +547,13 @@ func TestUnspendRefusesWrongSpender(t *testing.T) {
 	spends[0].SpendingData = spend.NewSpendingData(other.TxIDChainHash(), 0)
 
 	require.Error(t, s.Unspend(ctx, spends),
-		"a restore naming the wrong spender must fail, not resurrect the coin")
+		"a restore naming the wrong spender must fail, not resurrect the UTXO")
 
 	parentHash := parent.TxIDChainHash()
 
 	var live int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
-	require.Equal(t, 0, live, "the coin must stay spent")
+	require.Equal(t, 0, live, "the UTXO must stay spent")
 
 	var journalled int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal WHERE txid = $1`, parentHash[:]).Scan(&journalled))
@@ -561,7 +561,7 @@ func TestUnspendRefusesWrongSpender(t *testing.T) {
 }
 
 // TestUnspendRequiresSpender refuses to guess. Restoring on the outpoint alone could
-// resurrect a coin a different transaction now owns.
+// resurrect a UTXO a different transaction now owns.
 func TestUnspendRequiresSpender(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -640,7 +640,7 @@ func TestCreateDoesNotGateOrdinaryOutputsOnHeight(t *testing.T) {
 	var live int
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
-	require.Equal(t, 0, live, "the coin must actually be gone, not merely reported as spent")
+	require.Equal(t, 0, live, "the UTXO must actually be gone, not merely reported as spent")
 }
 
 // spendOnly is what the tests used to get from Store.Spend, which no longer exists.
@@ -648,7 +648,7 @@ func TestCreateDoesNotGateOrdinaryOutputsOnHeight(t *testing.T) {
 // SpendAndCreate with the spend-only option is now the only way to consume inputs, so this
 // wrapper keeps the call sites readable. The difference from the old method is deliberate and
 // is the whole point of deleting it: a per-input failure now surfaces as a returned error AND
-// rolls the whole transaction back, so a sibling coin is no longer destroyed by a transaction
+// rolls the whole transaction back, so a sibling UTXO is no longer destroyed by a transaction
 // that was rejected.
 func spendOnly(ctx context.Context, s *Store, tx *bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) ([]*utxo.Spend, error) {

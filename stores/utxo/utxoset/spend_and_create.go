@@ -37,7 +37,7 @@ import (
 // spends row carrying spending_data, so a duplicate arrives as per-input ErrSpent from a
 // DELETE affecting zero rows, which is indistinguishable from a genuine double spend.
 // Identity answers it instead: the claim in createIn either inserts the row or reports
-// that someone already holds this txid, and it does so without writing a coin row. One
+// that someone already holds this txid, and it does so without writing a UTXO row. One
 // mechanism covers both arrival paths, the re-applied block and the duplicate mempool
 // submission, which is what retires the applied_block ledger.
 func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
@@ -188,7 +188,7 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 	// application paths create every transaction in one pass and spend the inputs in a
 	// separate pass, so a transaction can genuinely be present while its own inputs are
 	// still unspent. Rolling back here would tell the caller "already have it, nothing to
-	// do" while the parent coins stayed live and spendable by anyone else, which makes a
+	// do" while the parent UTXOs stayed live and spendable by anyone else, which makes a
 	// double spend mineable by this node. The claim itself wrote nothing, so committing
 	// keeps the spends and nothing else.
 	txExists := errors.Is(err, errors.ErrTxExists)

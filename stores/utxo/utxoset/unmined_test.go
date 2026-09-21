@@ -89,7 +89,7 @@ func preservedRows(t *testing.T, s *Store, ctx context.Context) int {
 
 // TestPreservedParentOutlivesItsMembershipWindow: the pruner's parent-preservation phase names
 // the parents of old unmined transactions; a preserved parent still answers a lookup after
-// its membership window has been dropped and its coins are gone.
+// its membership window has been dropped and its UTXOs are gone.
 func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 	s, ctx := newTestStore(t)
 

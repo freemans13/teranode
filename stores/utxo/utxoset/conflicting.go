@@ -62,11 +62,11 @@ SELECT k.txid, m.tx_inpoints
     LIMIT 1 OFFSET 0
  ) AS m`
 
-// noteConflictingChildrenSQL records the contest on every parent whose coin is wanted.
+// noteConflictingChildrenSQL records the contest on every parent whose UTXO is wanted.
 //
 // A transaction that loses a double-spend race is kept rather than discarded, because
-// resolving the race later has to find it, and finding it means asking the PARENT whose coin
-// was contested. Without this there is no route from a contested coin back to the transactions
+// resolving the race later has to find it, and finding it means asking the PARENT whose UTXO
+// was contested. Without this there is no route from a contested UTXO back to the transactions
 // competing for it.
 //
 // It writes to conflict_children, keyed on the parent's txid alone, and that is what lets a
@@ -96,12 +96,12 @@ ON CONFLICT DO NOTHING`
 // setConflictingSQL flips the flag on both rows and reports both answers the caller needs.
 //
 // BOTH rows, for the reason setLockedSQL gives: the identity row is what a metadata read
-// shows, the coin row is what the spend path reads, and the spend path never looks at the
+// shows, the UTXO row is what the spend path reads, and the spend path never looks at the
 // identity row. Moving only one leaves a transaction reporting itself conflicting while its
-// coins stay spendable. The coin bit is what makes the spend statement's flag mask refuse the
+// UTXOs stay spendable. The UTXO bit is what makes the spend statement's flag mask refuse the
 // delete.
 //
-// The coin update is bounded by a key RANGE rather than by transaction id alone. The packed key
+// The UTXO update is bounded by a key RANGE rather than by transaction id alone. The packed key
 // carries the id prefix first precisely so this is an index range scan, and the full 32-byte id
 // is still rechecked because the prefix is non-unique by design.
 //
@@ -110,44 +110,44 @@ ON CONFLICT DO NOTHING`
 //
 // The journal row is what makes a spend undoable, so an input that still has one is reported
 // with its full undo payload. An input with NO journal row is reported too, but only when the
-// parent coin is currently LIVE at that outpoint. That case is not hypothetical bookkeeping:
+// parent UTXO is currently LIVE at that outpoint. That case is not hypothetical bookkeeping:
 // it is what a crash between the unspend and the unlock leaves behind, and the shared
 // conflict-resolution replay depends on seeing it. The driver takes the parents named here as
-// the set to unlock at the end of the run, so an input omitted because its coin was already
+// the set to unlock at the end of the run, so an input omitted because its UTXO was already
 // restored is a parent left LOCKED FOREVER with no operator signal. Both reference stores
 // report every input unconditionally for exactly this reason.
 //
-// Handing back a record for a coin that is already live is safe here because Unspend counts it:
-// its live_before arm makes a restore of an already-restored coin a no-op success rather than a
-// missing-coin failure, and its held arm puts the caller's hold on such a coin, so the record
+// Handing back a record for a UTXO that is already live is safe here because Unspend counts it:
+// its live_before arm makes a restore of an already-restored UTXO a no-op success rather than a
+// missing-UTXO failure, and its held arm puts the caller's hold on such a UTXO, so the record
 // costs one probe and is acted on exactly as one with a journal row would be.
 //
 // The probe is a LATERAL with an OFFSET 0 fence rather than a plain EXISTS, and the fence is
 // the whole difference. Written as `OR EXISTS (SELECT 1 FROM utxo ...)` the planner is free to
-// pull the subquery up and hash it, and it does: measured on this schema at 40,000 coins across
+// pull the subquery up and hash it, and it does: measured on this schema at 40,000 UTXOs across
 // all eight partitions with 500 keys, the plan carried a hashed SubPlan over a Seq Scan of
-// every one of utxo_p0..p7, 30.6 ms, and its cost grows with the coin table rather than with
+// every one of utxo_p0..p7, 30.6 ms, and its cost grows with the UTXO table rather than with
 // the batch. Fenced, it is one index descent per key on the leaf partition's ukey index with
 // the full 32-byte txid rechecked on the heap -- the bound schema.go requires of every by-txid
-// coin access, because the packed key is a non-unique 96-bit prefix that can find a row but
+// UTXO access, because the packed key is a non-unique 96-bit prefix that can find a row but
 // must never justify acting on one.
 //
-// An input with neither a journal row nor a live coin is still omitted, and that is the half of
-// the old rule that was right. Its undo payload has aged out of the journal, or the coin was
+// An input with neither a journal row nor a live UTXO is still omitted, and that is the half of
+// the old rule that was right. Its undo payload has aged out of the journal, or the UTXO was
 // re-spent by a different transaction since; either way this store cannot restore it, and
 // Unspend FAILS the whole restore if a single record it is given cannot be accounted for. A
 // cascade rooted on a transaction older than journal retention therefore still stops early,
 // which is a real limit of delete-on-spend rather than something to paper over.
 //
 // The 'child' rows are the next level of the cascade. The journal is the only place this store
-// can answer "who took this coin", because the coin row is destroyed the moment it is spent.
+// can answer "who took this UTXO", because the UTXO row is destroyed the moment it is spent.
 //
 // The flag is flipped on THREE things, not two, for the same reason setLockedSQL flips three.
 // A transaction lives in exactly one of tx_ident and tx_mined and this statement does not know
 // which; a contested parent is very often mined, which is the whole reason the note itself
 // became a side table. minedRow.toMeta reads Conflicting straight off tx_mined.flags, copied
 // once by the move and updated by nothing afterwards, so without the membership arm marking a
-// mined transaction conflicting set the coin bit and not the bit Get reports -- the mirror
+// mined transaction conflicting set the UTXO bit and not the bit Get reports -- the mirror
 // image of the failure setLockedSQL's own comment warns about. The membership arm is a plain
 // txid equality because tx_mined's primary key leads with txid.
 const setConflictingSQL = `
@@ -173,7 +173,7 @@ mined AS (
       FROM k
      WHERE m.txid = k.txid
 ),
-coins AS (
+UTXOs AS (
     UPDATE utxo u
        SET flags = CASE WHEN $12::boolean THEN u.flags |  $13::smallint
                                           ELSE u.flags & ~$13::smallint END
@@ -210,13 +210,13 @@ ORDER BY 1 DESC, 2`
 // spent THESE transactions' outputs, which is the next level of the walk that demotes a loser's
 // whole descendant tree.
 //
-// The spender recorded on each returned record is the transaction that took the coin. Its input
+// The spender recorded on each returned record is the transaction that took the UTXO. Its input
 // index is the position in the flattened inpoint list, which is parent-major and therefore NOT
 // the transaction's original input order, because the stored inpoints deduplicate parents.
 // Nothing reads it today; it is stated here so a later reader does not assume otherwise.
 //
 // Both answers are bounded by the journal's retention. Beyond that this store cannot say who
-// took a coin, so a cascade rooted on an older transaction stops early. That is a real limit of
+// took a UTXO, so a cascade rooted on an older transaction stops early. That is a real limit of
 // delete-on-spend rather than a gap to paper over.
 func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
 	value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
@@ -548,10 +548,10 @@ func (p *conflictingPlan) spendFor(ref int32, ptxid []byte, pvout *int32, satosh
 		}
 	}
 
-	// No journal row means the coin is already live, so there is no captured amount or script
-	// to compute the coin's identity from and the record carries none. Nothing in this store
+	// No journal row means the UTXO is already live, so there is no captured amount or script
+	// to compute the UTXO's identity from and the record carries none. Nothing in this store
 	// reads it -- Unspend restores on the outpoint and the spender, and that is all the driver
-	// does with these -- and inventing one from a coin row would be a second, unverified
+	// does with these -- and inventing one from a UTXO row would be a second, unverified
 	// opinion about a value the journal is the record for.
 	if satoshis == nil {
 		return sp, nil

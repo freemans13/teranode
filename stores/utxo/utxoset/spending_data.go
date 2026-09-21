@@ -14,7 +14,7 @@ import (
 // spendingDataSQL reports, for one transaction, which of its outputs still exist and which were
 // taken and by whom.
 //
-// Both halves are needed, and neither alone would do. A live coin proves an output exists and
+// Both halves are needed, and neither alone would do. A live UTXO proves an output exists and
 // is unspent. A journal row proves one existed and names the transaction that destroyed it. An
 // output that appears in neither is one this store cannot speak for: either it never existed,
 // because a provably unspendable output never gets a row, or its spend is older than the
@@ -23,7 +23,7 @@ import (
 // Located by a key RANGE and authorised by the full 32-byte transaction id. The packed key
 // leads with the id prefix so that "every output of this transaction" is an index range scan,
 // but that prefix is 96 bits and non-unique by design. Without the recheck a prefix collision
-// would name a stranger as the spender of this transaction's coin, and the conflict walk would
+// would name a stranger as the spender of this transaction's UTXO, and the conflict walk would
 // then mark that stranger conflicting along with everything descended from it.
 const spendingDataSQL = `
 SELECT 'live'::text AS kind, u.ukey, NULL::bytea AS spender
@@ -52,7 +52,7 @@ func wantsSpendingData(fieldNames []fields.FieldName) bool {
 }
 
 // wantsConflictingChildren reports whether the caller asked which losing transactions contest
-// this one's coins.
+// this one's UTXOs.
 //
 // It is the second field this store does not answer for free, and for a different reason than
 // the first: the answer is in conflict_children, keyed on the txid rather than carried on
@@ -73,7 +73,7 @@ func wantsConflictingChildren(fieldNames []fields.FieldName) bool {
 //
 // The shared conflict walks ask this question of every parent they reach and act on the answer,
 // and they ask it through the metadata read rather than through any store method. This store
-// deletes the coin row on spend, so the answer is not in the coin table: it is in the journal,
+// deletes the UTXO row on spend, so the answer is not in the UTXO table: it is in the journal,
 // which recorded the spender at the moment of the delete. Until this existed the walks saw an
 // empty answer for every parent, failed on the first input, and conflict handling could not run
 // here at all.
@@ -84,7 +84,7 @@ func wantsConflictingChildren(fieldNames []fields.FieldName) bool {
 // unspent, which is the answer that would let a double spend through.
 //
 // The input index on each entry is left at zero. The journal does not record which input of the
-// spending transaction consumed the coin, and nothing that reads this field uses it: the two
+// spending transaction consumed the UTXO, and nothing that reads this field uses it: the two
 // places that read an input index take it from the single-outpoint spend lookup instead. It is
 // stated here so a later reader does not mistake the zero for a fact.
 //
@@ -139,7 +139,7 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 
 	for _, e := range found {
 		if len(e.spender) == 0 {
-			continue // a live coin: still unspent, so no entry
+			continue // a live UTXO: still unspent, so no entry
 		}
 
 		h, herr := chainhash.NewHash(e.spender)

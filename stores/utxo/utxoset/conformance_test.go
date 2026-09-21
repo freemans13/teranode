@@ -35,8 +35,8 @@ func TestConformance(t *testing.T) {
 		tests.Freeze(t, db)
 	})
 
-	// Reassigning a frozen coin, the alert system's confiscation path. It is the one place a
-	// coin's spending rules change under it, and this store holds the rules themselves rather
+	// Reassigning a frozen UTXO, the alert system's confiscation path. It is the one place a
+	// UTXO's spending rules change under it, and this store holds the rules themselves rather
 	// than a digest of them, so it needs hash_override to carry what the new output hashes to.
 	t.Run("ReAssign", func(t *testing.T) {
 		db, _ := newTestStore(t)
@@ -80,7 +80,7 @@ func TestConformance(t *testing.T) {
 	// The delete-at-height lifecycle: a mempool-created tx stamped mined on the longest
 	// chain moves into tx_mined, every output gets spent, and Prune(1_000_000) at that
 	// height drops every membership window below the journal-retention cutoff wholesale
-	// (there is no per-row DAH sweep in this design — see pruner.go). The coins are
+	// (there is no per-row DAH sweep in this design — see pruner.go). The UTXOs are
 	// already gone from the spend, so once the window holding the tx's identity is
 	// dropped, a lookup misses.
 	t.Run("MinedThenSpendAllPrunes", func(t *testing.T) {
@@ -93,7 +93,7 @@ func TestConformance(t *testing.T) {
 	})
 
 	// The six SpendAndCreate entry points. The spec named them as ones this design should
-	// enable, and they are the cross-store contract for the option C1's own-output coin guard
+	// enable, and they are the cross-store contract for the option C1's own-output UTXO guard
 	// turns on: WithCreateOnly skips the spend phase, which is the path a mempool create takes
 	// when the validator's CreateConflicting branch fires.
 	//
@@ -148,8 +148,8 @@ func TestConformance(t *testing.T) {
 		tests.ConflictWALCrashRecovery(t, db)
 	})
 
-	// The conflicting flag from the outside: GetSpend reports CONFLICTING on the coin, Get
-	// reports it on the metadata, a spend of that coin fails with ErrTxConflicting, and the
+	// The conflicting flag from the outside: GetSpend reports CONFLICTING on the UTXO, Get
+	// reports it on the metadata, a spend of that UTXO fails with ErrTxConflicting, and the
 	// contested parent names the child without becoming conflicting itself.
 	t.Run("SetConflictingBehavior", func(t *testing.T) {
 		db, _ := newTestStore(t)
@@ -163,7 +163,7 @@ func TestConformance(t *testing.T) {
 		tests.SetLockedBehavior(t, db)
 	})
 
-	// Re-spending a coin with the SAME spending transaction is a no-op success, not a double
+	// Re-spending a UTXO with the SAME spending transaction is a no-op success, not a double
 	// spend. Block validation replays a block it has already applied, and a store that raised
 	// there could never re-apply one.
 	t.Run("SpendIdempotent", func(t *testing.T) {
@@ -172,8 +172,8 @@ func TestConformance(t *testing.T) {
 	})
 
 	// The four ways a spend is refused, each with its own error, because the validator
-	// behaves differently for each: a parent it has never seen, a claim about the coin that
-	// does not match, a coinbase inside its maturity window, and a coin some other
+	// behaves differently for each: a parent it has never seen, a claim about the UTXO that
+	// does not match, a coinbase inside its maturity window, and a UTXO some other
 	// transaction already took -- which must also name the transaction that took it.
 	t.Run("SpendErrorTypes", func(t *testing.T) {
 		db, _ := newTestStore(t)

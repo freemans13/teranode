@@ -68,7 +68,7 @@ SELECT DISTINCT ((get_byte(i.membership, 4)::bigint << 24)
 // $3 is the LOWEST HEIGHT still covered by a membership window, and a row naming anything
 // below it is left exactly where it is. Its window has been dropped and cannot be recreated:
 // the floor exists to stop a retired window claiming its transactions afresh and doubling every
-// coin still live in it. A single-block row that old is ordinary fork residue -- roughly 300
+// UTXO still live in it. A single-block row that old is ordinary fork residue -- roughly 300
 // blocks of it is what block assembly's startup reload hands this call -- so refusing to settle
 // it must not refuse the marker clear for every other hash in the batch. See markOnAndSettle.
 //
@@ -348,10 +348,10 @@ func (s *Store) markOffAndMoveBack(ctx context.Context, txids [][]byte) ([]chain
 	}
 
 	// Only the transactions that actually MOVED, and with no block id: each is back in the
-	// mempool table and settles under nothing at all, so every one of its stamped coins goes to
-	// the sentinel. A hash that held no membership row moved nothing and keeps its coins.
+	// mempool table and settles under nothing at all, so every one of its stamped UTXOs goes to
+	// the sentinel. A hash that held no membership row moved nothing and keeps its UTXOs.
 	if len(moved) > 0 {
-		if err := resetCoins(ctx, dbTx, txidsOf(moved), nil); err != nil {
+		if err := resetUTXOs(ctx, dbTx, txidsOf(moved), nil); err != nil {
 			_ = dbTx.Rollback(ctx)
 
 			return nil, err

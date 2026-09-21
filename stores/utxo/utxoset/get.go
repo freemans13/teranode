@@ -47,9 +47,9 @@ func unpackMembership(m []byte) (blockIDs, heights []uint32, subtreeIdxs []int) 
 // it carefully.
 //
 // The exceptions are the two fields that do NOT arrive on that row. The per-output spend state
-// costs a second query across two tables, because this store destroys the coin row on spend
+// costs a second query across two tables, because this store destroys the UTXO row on spend
 // and keeps the spender in its journal (see decorateSpendingData). The contest -- which losing
-// transactions want this one's coins -- costs a second statement against conflict_children,
+// transactions want this one's UTXOs -- costs a second statement against conflict_children,
 // because a contested parent is usually mined and a mined transaction's row is in a different
 // table (see attachConflictingChildren). Both are answered only when asked for.
 //
@@ -57,7 +57,7 @@ func unpackMembership(m []byte) (blockIDs, heights []uint32, subtreeIdxs []int) 
 // whose body window has aged out, and, when utxostore_skipTxBodyBelowCheckpoint is on, for
 // every transaction mined at or below the hardcoded checkpoint, whose bytes were never written
 // (see bodyFloor on Store). Both cases return the metadata with Tx nil and NO error: the
-// transaction exists and its coins are live, so ErrTxNotFound would be a lie, and a caller
+// transaction exists and its UTXOs are live, so ErrTxNotFound would be a lie, and a caller
 // reading it as a missing parent would reject that transaction's children. A caller that
 // genuinely needs the bytes has to check for a nil Tx and go to the subtree data file.
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fields.FieldName) (*meta.Data, error) {
@@ -96,7 +96,7 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fie
 // getDirect is the unbatched read: the shared read order, asked about one transaction.
 //
 // It is a lookupMany of one rather than a statement of its own. The order identity ->
-// membership -> preserved parent -> coin is a correctness rule (see lookup.go), and a second
+// membership -> preserved parent -> UTXO is a correctness rule (see lookup.go), and a second
 // copy of it here is a defect waiting for one copy to be fixed and the other forgotten.
 func (s *Store) getDirect(ctx context.Context, hash *chainhash.Hash,
 	wantChildren bool) (*meta.Data, error) {

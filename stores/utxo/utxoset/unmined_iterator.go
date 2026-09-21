@@ -166,8 +166,8 @@ func (it *unminedIterator) Close() error {
 //
 // This is what block assembly rebuilds its whole mempool from, at startup and on every reset,
 // and a reorg triggers a reset. A transaction missing from the answer never gets mined, and
-// on a delete-on-spend store that is unrecoverable: the coin rows its inputs pointed at were
-// deleted when it was first accepted, and an absent coin row reads as already spent.
+// on a delete-on-spend store that is unrecoverable: the UTXO rows its inputs pointed at were
+// deleted when it was first accepted, and an absent UTXO row reads as already spent.
 func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 	rows, err := s.pool.Query(context.Background(), unminedSQL, FlagConflicting)
 	if err != nil {
@@ -181,7 +181,7 @@ func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 // cutoffHeight, which is the preservation pass's narrower question.
 //
 // The pass never deletes anything. It extends the lifetime of these transactions' parents, so
-// that a transaction still waiting after a long time does not lose the coins it intends to
+// that a transaction still waiting after a long time does not lose the UTXOs it intends to
 // spend.
 func (s *Store) GetPrunableUnminedTxIterator(cutoffHeight uint32) (utxo.UnminedTxIterator, error) {
 	rows, err := s.pool.Query(context.Background(), unminedBelowSQL,
@@ -206,7 +206,7 @@ func (s *Store) GetPrunableUnminedTxIterator(cutoffHeight uint32) (utxo.UnminedT
 // exists to purge, and neither reference store filters on it either.
 //
 // Coinbases are excluded here rather than emitted and skipped later. A coinbase spends nothing,
-// so it can never lose a race for a coin, and excluding it in the statement keeps the shared
+// so it can never lose a race for a UTXO, and excluding it in the statement keeps the shared
 // Next free of a branch only this caller would use.
 //
 // No index serves this predicate and none is added. It is a sequential scan of every partition,

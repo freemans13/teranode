@@ -8,11 +8,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestCoinRowsCarryTheirParentsBlockFacts pins the two columns the read path relies on once
+// TestUTXORowsCarryTheirParentsBlockFacts pins the two columns the read path relies on once
 // a transaction's membership window has been dropped: the height and block of the
-// transaction that made the coin. Both fixed width, placed before the variable-length
+// transaction that made the UTXO. Both fixed width, placed before the variable-length
 // script so alignment costs nothing.
-func TestCoinRowsCarryTheirParentsBlockFacts(t *testing.T) {
+func TestUTXORowsCarryTheirParentsBlockFacts(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	var names []string
@@ -81,15 +81,15 @@ func TestDroppedMembershipWindowsCannotComeBack(t *testing.T) {
 	require.Equal(t, uint32(1), floor, "window 0 (heights 0-287) was dropped, so the floor is window 1")
 
 	err = s.ensureTxMinedPartition(ctx, 100)
-	require.Error(t, err, "recreating a dropped window would let a stale block double its coins")
+	require.Error(t, err, "recreating a dropped window would let a stale block double its UTXOs")
 
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 1_000), "a live window is still fine")
 }
 
-// TestRetiringWindowStampsItsLiveCoins: a mempool-created transaction's coins carry the
-// sentinel until its membership window retires, when the surviving coins learn their block
-// from the window's own list. Only then can the coin be the answer for an old parent.
-func TestRetiringWindowStampsItsLiveCoins(t *testing.T) {
+// TestRetiringWindowStampsItsLiveUTXOs: a mempool-created transaction's UTXOs carry the
+// sentinel until its membership window retires, when the surviving UTXOs learn their block
+// from the window's own list. Only then can the UTXO be the answer for an old parent.
+func TestRetiringWindowStampsItsLiveUTXOs(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 2, 5_000)
@@ -98,26 +98,26 @@ func TestRetiringWindowStampsItsLiveCoins(t *testing.T) {
 	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
 	require.NoError(t, err)
 
-	h, _ := coinFacts(t, s, ctx, tx)
+	h, _ := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(0), h, "not stamped at mining")
 
 	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(100), h)
 	require.Equal(t, int32(7), b)
 
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
-	require.Equal(t, []uint32{7}, got.BlockIDs, "served from the coin now the window is gone")
+	require.Equal(t, []uint32{7}, got.BlockIDs, "served from the UTXO now the window is gone")
 }
 
 // TestRetiringWindowStampsFromTheFirstRow: a transaction that ends up with two tx_mined rows
 // in the same window -- a longest-chain stamp naming block 7, then a fork stamp naming block 8
 // at the same height -- must be stamped with the FIRST row's block after the drop. Since
 // Task 10 a transaction with a surviving tx_mined row settled under it, and the first (lowest
-// seq) is the earliest stamp: a coin naming the second (fork) row's block would be wrong.
+// seq) is the earliest stamp: a UTXO naming the second (fork) row's block would be wrong.
 func TestRetiringWindowStampsFromTheFirstRow(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -136,19 +136,19 @@ func TestRetiringWindowStampsFromTheFirstRow(t *testing.T) {
 	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(100), h)
 	require.Equal(t, int32(7), b, "the first row's block, not the second")
 }
 
-// TestRetiringWindowDoesNotStampAnotherTransactionsCoin is the coin stamp's half of the rule
-// TestUnMineDoesNotResetAnotherTransactionsCoin pins for the reset: a by-key write must recheck
+// TestRetiringWindowDoesNotStampAnotherTransactionsUTXO is the UTXO stamp's half of the rule
+// TestUnMineDoesNotResetAnotherTransactionsUTXO pins for the reset: a by-key write must recheck
 // the full transaction id.
 //
 // The colliding row is at the SENTINEL, which is exactly the row the stamp is looking for, so
-// an UPDATE matching on (leaf, ukey) alone stamps a stranger's coin with a block that does not
+// an UPDATE matching on (leaf, ukey) alone stamps a stranger's UTXO with a block that does not
 // contain it -- and after the window is dropped there is nothing left to correct it from.
-func TestRetiringWindowDoesNotStampAnotherTransactionsCoin(t *testing.T) {
+func TestRetiringWindowDoesNotStampAnotherTransactionsUTXO(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -157,17 +157,17 @@ func TestRetiringWindowDoesNotStampAnotherTransactionsCoin(t *testing.T) {
 	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
 	require.NoError(t, err)
 
-	other := insertCollidingCoin(t, s, ctx, tx, 0, 0)
+	other := insertCollidingUTXO(t, s, ctx, tx, 0, 0)
 
 	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(100), h, "the window's own transaction is stamped")
 	require.Equal(t, int32(7), b)
 
-	oh, ob := coinFactsOf(t, s, ctx, other)
-	require.Equal(t, int32(0), oh, "a coin sharing the packed key stays unconfirmed")
+	oh, ob := utxoFactsOf(t, s, ctx, other)
+	require.Equal(t, int32(0), oh, "a UTXO sharing the packed key stays unconfirmed")
 	require.Equal(t, int32(0), ob)
 }
 
@@ -176,10 +176,10 @@ func TestRetiringWindowDoesNotStampAnotherTransactionsCoin(t *testing.T) {
 //
 // A window is keyed by mined_height, so a transaction mined at height h and fork-stamped at
 // h+/-1 across a 288 boundary has a row in each of two windows. The older window retires first,
-// and if it stamped from the row IT happens to hold, the coin would take that row's block --
-// and here that row is the FORK stamp, appended later but at the lower height. The coin would
+// and if it stamped from the row IT happens to hold, the UTXO would take that row's block --
+// and here that row is the FORK stamp, appended later but at the lower height. The UTXO would
 // then name a block that is not on the chain, for good: when the other window retires the
-// mined_height = 0 guard skips the coin, and once both windows are gone nothing can correct it.
+// mined_height = 0 guard skips the UTXO, and once both windows are gone nothing can correct it.
 //
 // The earliest row by seq across every live window is the right answer, and under Task 9's
 // rules it is the transaction's longest-chain stamp: a fork stamp can only be APPENDED to a
@@ -187,7 +187,7 @@ func TestRetiringWindowDoesNotStampAnotherTransactionsCoin(t *testing.T) {
 func TestRetiringWindowStampsFromTheFirstRowAcrossWindows(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	// A MEMPOOL create, so the coin sits at the sentinel and is a candidate for the stamp; a
+	// A MEMPOOL create, so the UTXO sits at the sentinel and is a candidate for the stamp; a
 	// block-path create would already carry its facts and be skipped either way.
 	tx := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, tx, 287)
@@ -208,7 +208,7 @@ func TestRetiringWindowStampsFromTheFirstRowAcrossWindows(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, dropped, "window 0 goes, window 1 stays")
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(288), h, "the earliest row across windows, not the retiring window's own")
 	require.Equal(t, int32(7), b, "the longest-chain block, not the fork block")
 }
@@ -236,7 +236,7 @@ func TestRetiringWindowStampsWhenTheEarliestRowIsInTheRetiringWindow(t *testing.
 	require.NoError(t, err)
 	require.Equal(t, 1, dropped)
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(287), h)
 	require.Equal(t, int32(7), b)
 }

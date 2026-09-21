@@ -15,12 +15,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// noteConflictSQL records the contesting transaction on every parent whose coin it wants.
+// noteConflictSQL records the contesting transaction on every parent whose UTXO it wants.
 //
 // A transaction that loses a double-spend race is stored as conflicting rather than
 // discarded, because resolving the conflict later has to find it. Finding it means asking the
-// PARENT whose coin was contested, so the route runs from the parent, and this statement is
-// what writes it. Without it, conflict resolution has no route from a contested coin to the
+// PARENT whose UTXO was contested, so the route runs from the parent, and this statement is
+// what writes it. Without it, conflict resolution has no route from a contested UTXO to the
 // transactions competing for it.
 //
 // It writes to conflict_children rather than to a column on tx_ident, and that is the fix for
@@ -37,7 +37,7 @@ import (
 // same losing transaction free. See the schema comment for why that index is per window and
 // why the reader still has to say DISTINCT.
 //
-// One ARRAY of parents, so a transaction reaching for coins of twenty parents is one
+// One ARRAY of parents, so a transaction reaching for UTXOs of twenty parents is one
 // statement. $1 is the height, $2 the parents, $3 the one child.
 const noteConflictSQL = `
 INSERT INTO conflict_children (noted_height, parent_txid, child_txid)
@@ -110,9 +110,9 @@ func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
 // at all.
 //
 // A create carrying mined-block information is a block-path create: below the checkpoint every
-// create, at the tip only block assembly's coinbase. It claims on tx_mined and its coins know
+// create, at the tip only block assembly's coinbase. It claims on tx_mined and its UTXOs know
 // their block. Anything else is a mempool create and claims on tx_ident with the unconfirmed
-// sentinel on its coins.
+// sentinel on its UTXOs.
 //
 // An explicit un-mine is the one kind of block information that does NOT mean mined, which is
 // the same exemption offChainSinceAt makes, and for the same reason.
@@ -220,7 +220,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// transaction the store already holds, so the two are equivalent for the claim itself --
 	// but the conflicting path also notes the contest on the incoming transaction's PARENTS,
 	// and that note has to survive, because conflict resolution's only route from a contested
-	// coin to the transactions competing for it is the parent's list.
+	// UTXO to the transactions competing for it is the parent's list.
 	if cerr != nil && !errors.Is(cerr, errors.ErrTxExists) {
 		return nil, cerr
 	}
@@ -235,7 +235,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 }
 
 // appendCreate adds one transaction to the plan: its identity row, its serialized bytes, and
-// one coin row per spendable output.
+// one UTXO row per spendable output.
 //
 // Shared by the single and the batched path so the two cannot drift apart on what they store.
 // Nothing is appended until every failure is behind us, so a transaction this rejects leaves
@@ -301,9 +301,9 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 
 	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
 
-	// Which of the two claims this create takes, and the block facts that go on its coins.
+	// Which of the two claims this create takes, and the block facts that go on its UTXOs.
 	// Both heights and the block id are 0 for a mempool create, and mined_height 0 is the
-	// unconfirmed sentinel the coin carries until something stamps it.
+	// unconfirmed sentinel the UTXO carries until something stamps it.
 	var (
 		minedHeight int32
 		blockID     int32
@@ -374,7 +374,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		}
 
 		if out.LockingScript != nil && !utxo.ShouldStoreOutputAsUTXO(out, blockHeight, genesisHeight) {
-			continue // provably unspendable: no coin row, ever
+			continue // provably unspendable: no UTXO row, ever
 		}
 
 		var script []byte
@@ -382,16 +382,16 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 			script = *out.LockingScript
 		}
 
-		p.coinSats = append(p.coinSats, int64(out.Satoshis))
-		p.coinHeights = append(p.coinHeights, int32(blockHeight))
-		p.coinSpendable = append(p.coinSpendable, spendableFrom)
-		p.coinLeaves = append(p.coinLeaves, leaf)
-		p.coinFlags = append(p.coinFlags, flags)
-		p.coinUkeys = append(p.coinUkeys, Pack(txHash[:], uint32(vout)))
-		p.coinTxids = append(p.coinTxids, txHash[:])
-		p.coinScripts = append(p.coinScripts, script)
-		p.coinMined = append(p.coinMined, minedHeight)
-		p.coinBlockIDs = append(p.coinBlockIDs, blockID)
+		p.utxoSats = append(p.utxoSats, int64(out.Satoshis))
+		p.utxoHeights = append(p.utxoHeights, int32(blockHeight))
+		p.utxoSpendable = append(p.utxoSpendable, spendableFrom)
+		p.utxoLeaves = append(p.utxoLeaves, leaf)
+		p.utxoFlags = append(p.utxoFlags, flags)
+		p.utxoUkeys = append(p.utxoUkeys, Pack(txHash[:], uint32(vout)))
+		p.utxoTxids = append(p.utxoTxids, txHash[:])
+		p.utxoScripts = append(p.utxoScripts, script)
+		p.utxoMined = append(p.utxoMined, minedHeight)
+		p.utxoBlockIDs = append(p.utxoBlockIDs, blockID)
 	}
 
 	return &meta.Data{

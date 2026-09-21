@@ -7,7 +7,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-// GetCounterConflicting names the transactions that actually took the coins a losing
+// GetCounterConflicting names the transactions that actually took the UTXOs a losing
 // transaction wanted, plus everything descended from them.
 //
 // It delegates to the shared walk rather than answering with a statement of its own, and both
@@ -30,7 +30,7 @@ func (s *Store) GetCounterConflicting(ctx context.Context, txHash chainhash.Hash
 	return utxo.GetCounterConflictingTxHashes(ctx, s, txHash, 0)
 }
 
-// GetConflictingChildren returns the transactions recorded as contesting this one's coins, and
+// GetConflictingChildren returns the transactions recorded as contesting this one's UTXOs, and
 // everything descended from them.
 //
 // Delegated for the same reason as above. Bounded by the configured node budget, matching both

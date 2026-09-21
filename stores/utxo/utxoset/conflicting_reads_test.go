@@ -10,8 +10,8 @@ import (
 
 // TestGetConflictingChildrenWalksTheNotedCone.
 //
-// A transaction that loses a double-spend race is recorded on the PARENT whose coin it wanted,
-// because that is the only route from a contested coin back to the transactions competing for
+// A transaction that loses a double-spend race is recorded on the PARENT whose UTXO it wanted,
+// because that is the only route from a contested UTXO back to the transactions competing for
 // it. This walks that route.
 func TestGetConflictingChildrenWalksTheNotedCone(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -33,14 +33,14 @@ func TestGetConflictingChildrenWalksTheNotedCone(t *testing.T) {
 	}
 
 	require.True(t, names[loser.TxIDChainHash().String()],
-		"the parent must name the transaction contesting its coin")
+		"the parent must name the transaction contesting its UTXO")
 }
 
 // TestGetCounterConflictingNamesTheWinner.
 //
 // When conflict resolution demotes a loser it has to find the transaction that actually took
-// the coin, so it can promote it. On this store that answer is only in the journal, because the
-// coin row was destroyed by the winning spend, and it reaches the walk through the per-output
+// the UTXO, so it can promote it. On this store that answer is only in the journal, because the
+// UTXO row was destroyed by the winning spend, and it reaches the walk through the per-output
 // spend state on a metadata read.
 func TestGetCounterConflictingNamesTheWinner(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -74,7 +74,7 @@ func TestGetCounterConflictingNamesTheWinner(t *testing.T) {
 	}
 
 	require.True(t, names[winner.TxIDChainHash().String()],
-		"the transaction that actually took the coin must be named, or it can never be promoted")
+		"the transaction that actually took the UTXO must be named, or it can never be promoted")
 }
 
 // TestGetCounterConflictingReportsATransactionItDoesNotHold, matching both reference stores,
@@ -93,7 +93,7 @@ func TestGetCounterConflictingReportsATransactionItDoesNotHold(t *testing.T) {
 // tx_ident.
 //
 // Both reads the walk makes have to survive the move: what the loser spends, which the stamp
-// carried onto the membership row, and who took each of those coins, which comes off the
+// carried onto the membership row, and who took each of those UTXOs, which comes off the
 // parent's per-output spend state. Neither of the two reads here is identity-only, and this
 // pins that -- the walk answered from tx_ident alone would report no counter-spender at all,
 // which is the answer that lets the double spend stand.
@@ -133,7 +133,7 @@ func TestGetCounterConflictingNamesTheWinnerForAMinedLoser(t *testing.T) {
 	}
 
 	require.True(t, names[winner.TxIDChainHash().String()],
-		"the transaction that actually took the coin must be named for a mined loser too")
+		"the transaction that actually took the UTXO must be named for a mined loser too")
 }
 
 // TestGetConflictingChildrenWalksTheNotedConeFromAMinedParent. The contest is noted against the
@@ -168,5 +168,5 @@ func TestGetConflictingChildrenWalksTheNotedConeFromAMinedParent(t *testing.T) {
 	}
 
 	require.True(t, names[loser.TxIDChainHash().String()],
-		"a mined parent must still name the transaction contesting its coin")
+		"a mined parent must still name the transaction contesting its UTXO")
 }

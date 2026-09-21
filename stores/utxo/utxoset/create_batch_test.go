@@ -51,7 +51,7 @@ func countRows(t *testing.T, s *Store, ctx context.Context, table string) int {
 //
 // Only the first offer may store anything. The second must come back as ErrTxExists, exactly
 // as it would had the two arrived in separate batches, and it must not write a second body
-// row or a second set of coins.
+// row or a second set of UTXOs.
 func TestCreateBatchClaimsARepeatedTransactionOnce(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -72,7 +72,7 @@ func TestCreateBatchClaimsARepeatedTransactionOnce(t *testing.T) {
 
 // TestCreateBatchReportsATransactionTheStoreAlreadyHolds is the same rule across flushes:
 // one item already stored must not spoil the rest of its batch, and must not duplicate its
-// own coins.
+// own UTXOs.
 func TestCreateBatchReportsATransactionTheStoreAlreadyHolds(t *testing.T) {
 	s, ctx := newTestStore(t)
 

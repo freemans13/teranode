@@ -18,7 +18,7 @@ import (
 // spendItem is one transaction's worth of spend within a plan.
 //
 // It is not a queue entry. This store has no spend batcher: the only way in is SpendAndCreate,
-// which runs inside one database transaction so a rejected transaction leaves no coin
+// which runs inside one database transaction so a rejected transaction leaves no UTXO
 // destroyed. The struct survives because planSpends is multi-item by design, which is the
 // shape a batched SpendAndCreate would need.
 type spendItem struct {
@@ -43,24 +43,24 @@ type spendPlan struct {
 	ownerVin []int // global index -> which input of that item
 	perItem  [][]*utxo.Spend
 	itemTxs  []*bt.Tx
-	// masks[k] is the set of coin flags that refuse row k's spend, derived from the option
+	// masks[k] is the set of UTXO flags that refuse row k's spend, derived from the option
 	// its own caller passed. Per row rather than per plan, because a batch can mix a conflict
 	// resolution's waived spend with an ordinary one.
 	masks []int16
 	// skipClaim[i] suppresses the previous-output comparison for item i. Set only by the
 	// gated below-checkpoint outpoint-only path, which is the one caller entitled to it. It
-	// does not reach a reassigned coin: claimMismatch refuses that combination outright,
-	// because a coin whose only stored authentication is a digest cannot also waive the claim
+	// does not reach a reassigned UTXO: claimMismatch refuses that combination outright,
+	// because a UTXO whose only stored authentication is a digest cannot also waive the claim
 	// the digest is computed from.
 	skipClaim []bool
 }
 
-// spendGuardMask is the set of coin flags that refuse a spend for one caller's options.
+// spendGuardMask is the set of UTXO flags that refuse a spend for one caller's options.
 //
 // Frozen is never waivable: no store offers an option for it, because the alert system's
 // immobilisation is not something a caller may talk its way past. The other two are, and the
 // waiver exists for exactly one caller. Conflict resolution marks a loser conflicting, locks
-// the contested parent, and then has to spend that parent's coin on behalf of the winner --
+// the contested parent, and then has to spend that parent's UTXO on behalf of the winner --
 // through both of its own marks. Every other caller gets the full mask.
 func spendGuardMask(f utxo.IgnoreFlags) int16 {
 	mask := FlagFrozen | FlagLocked | FlagConflicting
@@ -136,11 +136,11 @@ func planSpends(items []*spendItem) *spendPlan {
 			// The spender belongs on the record from the moment the record exists. Conflict
 			// resolution hands these same records straight back to this store's Unspend,
 			// which restores on the spender and REFUSES a record that cannot name the
-			// transaction that took the coin. Handing out records without one turned every
+			// transaction that took the UTXO. Handing out records without one turned every
 			// conflict-resolution failure into the manual-intervention escalation, whatever
 			// had actually gone wrong, because the rollback itself could never succeed.
 			//
-			// The coin hash is deliberately left unset. Computing it is a double hash per
+			// The UTXO hash is deliberately left unset. Computing it is a double hash per
 			// input, which is a real cost on this path, and nothing that reads these records
 			// uses it: this store's Unspend restores on the outpoint and the spender.
 			spenders[vin] = spendpkg.SpendingData{TxID: spendingTxID, Vin: vin}
@@ -160,15 +160,15 @@ func planSpends(items []*spendItem) *spendPlan {
 	return p
 }
 
-// sortRows puts the plan's rows in one global order, by leaf, coin key and txid, so every
+// sortRows puts the plan's rows in one global order, by leaf, UTXO key and txid, so every
 // statement built from a plan asks for its rows in the same order as every other.
 //
-// Two batches that spend overlapping coins take their row locks in statement order. In array
+// Two batches that spend overlapping UTXOs take their row locks in statement order. In array
 // order that is submission order, which a submitter controls, so two batches carrying the same
-// pair of coins the other way round would deadlock and both be redone as singles after the
+// pair of UTXOs the other way round would deadlock and both be redone as singles after the
 // deadlock timeout. In one global order there is no cycle to form. It costs a sort of the
 // batch and nothing else: k is reassigned after the sort, so the RETURNING mapping is exact,
-// and the sort is stable, so of two rows for one coin the earlier item still comes first.
+// and the sort is stable, so of two rows for one UTXO the earlier item still comes first.
 func (p *spendPlan) sortRows() {
 	n := len(p.owner)
 	if n < 2 {
@@ -217,12 +217,12 @@ func permute[T any](xs []T, order []int) []T {
 	return out
 }
 
-// claimMismatch compares what a spending transaction CLAIMED about the coin against what the
+// claimMismatch compares what a spending transaction CLAIMED about the UTXO against what the
 // store has just handed back for it, and returns the rejection when they differ.
 //
 // This is the control the other two stores get from the UTXO hash, and the reason that hash
 // has content. A transaction may be submitted in EXTENDED FORMAT, meaning it carries its own
-// copy of every coin it spends -- the coin's value in satoshis and its locking script, the
+// copy of every UTXO it spends -- the UTXO's value in satoshis and its locking script, the
 // rules for who may move it. The validator deliberately does not re-derive those when they
 // arrive; it validates against whatever the transaction brought. So the no-inflation check
 // sums the submitter's satoshis and script verification runs against the submitter's script.
@@ -230,7 +230,7 @@ func permute[T any](xs []T, order []int) []T {
 // which is what makes it an authentication of the SUBMITTER rather than a consistency check on
 // the store.
 //
-// This store needs no hash to do the same job. Its DELETE returns the coin's real satoshis and
+// This store needs no hash to do the same job. Its DELETE returns the UTXO's real satoshis and
 // script in the same round trip, because the spend is also the decorate fetch, so it holds the
 // truth at exactly the moment the other two are comparing digests. Comparing the values
 // directly is cheaper -- a byte comparison instead of a double hash per input, on the hottest
@@ -257,11 +257,11 @@ func permute[T any](xs []T, order []int) []T {
 // The skipClaim decision is a PARAMETER rather than a gate at the call site, and that is the
 // point of it being here. It used to be an if around the whole call, written independently of
 // the reassignment check inside; the two then interacted silently, and an outpoint-only spend
-// of a reassigned coin was authenticated by nothing at all. One function decides now, so the
+// of a reassigned UTXO was authenticated by nothing at all. One function decides now, so the
 // exemption cannot be granted without the exception to it being considered in the same breath.
 func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte, hashOverride []byte,
 	skipClaim bool) error {
-	// A REASSIGNED coin is the one case with no way out. There is nothing on the row to
+	// A REASSIGNED UTXO is the one case with no way out. There is nothing on the row to
 	// compare a claim against -- the satoshis and the script are the confiscated owner's,
 	// since ReAssignUTXO is handed a hash and nothing else -- so the digest is the only
 	// authentication available, and a spend that presents no claim, or is excused from
@@ -306,14 +306,14 @@ func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte, 
 // reassignedClaimMismatch is the one case where this store has to fall back on a digest.
 //
 // ReAssignUTXO is handed a utxo.Spend, which carries a UTXO hash and no room for a locking
-// script or an amount, so a reassigned coin's row still holds the OLD owner's script and
+// script or an amount, so a reassigned UTXO's row still holds the OLD owner's script and
 // satoshis and there is nothing to compare a claim against. hash_override is what the store
 // does hold about the new output, so the claim is hashed and matched to it. That is exactly
 // the check the aerospike and sql stores run on every spend; here it applies only to the
-// coins an alert has moved, which are vanishingly few.
+// UTXOs an alert has moved, which are vanishingly few.
 //
 // It inverts the outcome for both parties, which is the point. The old owner's claim -- the
-// script the coin still literally carries -- now hashes to something else and is refused,
+// script the UTXO still literally carries -- now hashes to something else and is refused,
 // while the new owner's, which matches nothing on the row, is accepted.
 func reassignedClaimMismatch(in *bt.Input, sp *utxo.Spend, hashOverride []byte) error {
 	claimed, err := util.UTXOHashFromInput(in)
@@ -331,11 +331,11 @@ func reassignedClaimMismatch(in *bt.Input, sp *utxo.Spend, hashOverride []byte) 
 		sp.TxID, sp.Vout, in.PreviousTxSatoshis, len(*in.PreviousTxScript), claimed[:], hashOverride)
 }
 
-// decorateInput writes the coin's real satoshis and locking script onto the input, which is
+// decorateInput writes the UTXO's real satoshis and locking script onto the input, which is
 // how the spend doubles as the decorate fetch: script validation reads them straight off the
 // input and never fetches a parent transaction.
 //
-// A REASSIGNED coin is left alone, and it has to be. The row's satoshis and script are the old
+// A REASSIGNED UTXO is left alone, and it has to be. The row's satoshis and script are the old
 // owner's -- ReAssignUTXO was given a hash and nothing else -- so overwriting would replace
 // the new owner's correct output with the confiscated one, and script validation would then
 // run the old locking script against the new owner's unlocking script and fail every time.
@@ -442,13 +442,13 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 		sp := p.perItem[p.owner[k]][p.ownerVin[k]]
 
 		// Only the flags THIS caller's mask actually refuses on. A conflict resolution that
-		// waived the lock and then found the coin immature must be told it is immature, not
+		// waived the lock and then found the UTXO immature must be told it is immature, not
 		// handed back the flag it already said to ignore.
 		//
 		// The order is terminal before transient, which is the opposite of the precedence
 		// GetSpend reports and deliberately so. Frozen and conflicting are settled facts about
-		// the coin; ErrTxLocked means "held by an operation in flight", and the validator and
-		// legacy netsync both READ IT AS RETRYABLE. Reporting the transient error for a coin
+		// the UTXO; ErrTxLocked means "held by an operation in flight", and the validator and
+		// legacy netsync both READ IT AS RETRYABLE. Reporting the transient error for a UTXO
 		// that is also permanently refused would send the caller round a retry loop that can
 		// never come out. GetSpend has no retry to mislead, so it reports the most specific
 		// state instead, matching both reference stores.
@@ -476,13 +476,13 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 			// a test pinning the classification (spendable_in_frozen_test.go).
 			//
 			// hash_override is what identifies the hold as a reassignment's. reassignSQL is
-			// the only writer of it on a live coin, and it writes hash_override and
-			// spendable_from in the same statement, overwriting whatever maturity the coin
-			// carried before. So on a coin with an override the surviving hold IS the reassign
-			// delay, whether or not the coin began life as a coinbase.
+			// the only writer of it on a live UTXO, and it writes hash_override and
+			// spendable_from in the same statement, overwriting whatever maturity the UTXO
+			// carried before. So on a UTXO with an override the surviving hold IS the reassign
+			// delay, whether or not the UTXO began life as a coinbase.
 			//
 			// Everything left is a coinbase inside its maturity window, which is
-			// ErrTxCoinbaseImmature: the coin becomes spendable at a known height and nothing
+			// ErrTxCoinbaseImmature: the UTXO becomes spendable at a known height and nothing
 			// is wrong with it.
 			switch {
 			case len(hashOverride) > 0:
@@ -499,9 +499,9 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 			// Present, eligible, and yet not deleted. The DELETE and this lookup run under
 			// different snapshots, so the only way here is a row that appeared between them:
 			// a create or an unspend that committed a moment ago. Leaving the record without
-			// an error would report the input as spent while its coin sits live in the table,
-			// and the caller would go on to store a child whose parent coin nobody consumed.
-			// A storage error is what callers retry on, and a retry finds the coin.
+			// an error would report the input as spent while its UTXO sits live in the table,
+			// and the caller would go on to store a child whose parent UTXO nobody consumed.
+			// A storage error is what callers retry on, and a retry finds the UTXO.
 			sp.Err = errors.NewStorageError("[utxoset] utxo %s:%d appeared after the spend's snapshot, retry",
 				sp.TxID, sp.Vout)
 		}
@@ -513,8 +513,8 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 		return errors.NewStorageError("[utxoset][Spend] classify rows", err)
 	}
 
-	// Anything neither deleted nor present is gone from the coin table: already spent, or
-	// never there at all. The coin table cannot tell those apart on its own, so ErrSpent is
+	// Anything neither deleted nor present is gone from the UTXO table: already spent, or
+	// never there at all. The UTXO table cannot tell those apart on its own, so ErrSpent is
 	// the provisional answer and the journal is asked next for who took it. An input the
 	// journal cannot explain either goes on to nameUnknownParents, which decides between
 	// "spent" and "never seen".
@@ -538,12 +538,12 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 	return s.namePlanSpenders(ctx, q, p, done)
 }
 
-// namePlanSpenders reads the journal for every coin that is no longer there, and does two
+// namePlanSpenders reads the journal for every UTXO that is no longer there, and does two
 // different jobs with the answer.
 //
 // If the transaction the journal names is the one now spending, this is a REPLAY of our own
 // earlier work rather than a competing spend, and it must succeed. Delete-on-spend destroys
-// the coin row, so a block interrupted part-way through application leaves its coins already
+// the UTXO row, so a block interrupted part-way through application leaves its UTXOs already
 // gone; re-offering that block asks the store to take them again. Calling that a double spend
 // is not merely unhelpful, it is fatal: the block can never be applied, the tip never
 // advances, and no restart helps. Mainnet wedged at height 97389 exactly this way, with all
@@ -567,7 +567,7 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 
 	defer rows.Close()
 
-	// A coin can appear in the journal more than once, having been spent, restored by an
+	// A UTXO can appear in the journal more than once, having been spent, restored by an
 	// unspend, and spent again. One matching row is enough to make this a replay, so once an
 	// input is settled that way no later row may unsettle it.
 	replayed := make(map[int32]struct{})
@@ -589,7 +589,7 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 		// work. The journal row naming this spender is the one the same statement wrote a
 		// moment ago, so without this guard the replay branch below reads its own writes,
 		// declares a replay, and clears whatever verdict runSpendPlan reached -- including a
-		// rejected false claim about the coin, which is then committed.
+		// rejected false claim about the UTXO, which is then committed.
 		if _, taken := done[k]; taken {
 			continue
 		}
@@ -606,7 +606,7 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 		if bytes.Equal(spender, p.spenders[k]) {
 			replayed[k] = struct{}{}
 
-			// The replay decorates from the journal rather than from the coin row, which
+			// The replay decorates from the journal rather than from the UTXO row, which
 			// makes this the SECOND place the store hands a caller's claim back
 			// unexamined. It gets the same comparison as the first, against the payload
 			// the journal captured at the moment of the delete.
@@ -649,13 +649,13 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 // Each probe sits inside a LATERAL with an OFFSET 0 fence, the shape minedByTxidSQL and
 // firstMinedRowSQL use, so each is one index descent per key rather than a subquery the
 // planner is free to pull up and hash against the whole table. Written as four ORed EXISTS
-// clauses the planner does exactly that: measured elsewhere in this store on 40,000 coins, an
-// unfenced EXISTS over the coin table planned as a hashed SubPlan across every leaf partition.
+// clauses the planner does exactly that: measured elsewhere in this store on 40,000 UTXOs, an
+// unfenced EXISTS over the UTXO table planned as a hashed SubPlan across every leaf partition.
 //
-// The coin probe is bounded by the packed-key RANGE and rechecked on the full 32-byte txid,
-// which schema.go requires of every by-txid coin access, and it asks about ANY output of the
+// The UTXO probe is bounded by the packed-key RANGE and rechecked on the full 32-byte txid,
+// which schema.go requires of every by-txid UTXO access, and it asks about ANY output of the
 // parent rather than the one being spent: a parent whose membership window has retired is
-// known to this store only through a surviving coin, which is exactly what a pruned SV Node
+// known to this store only through a surviving UTXO, which is exactly what a pruned SV Node
 // can say about one.
 const parentKnownSQL = `
 SELECT k.vin
@@ -680,19 +680,19 @@ SELECT k.vin
 // store has never held.
 //
 // The two are not interchangeable to the caller. ErrSpent means a competing transaction took
-// the coin, and the validator answers it by marking the loser conflicting and walking its
+// the UTXO, and the validator answers it by marking the loser conflicting and walking its
 // descendants. ErrTxNotFound means the parent has not arrived, and the validator answers it by
 // fetching the parent and retrying. Reporting the first for an outpoint the store has never
 // seen makes the node declare a double spend against a transaction that does not exist, which
 // is both wrong and unrecoverable without operator action. Both reference stores distinguish
-// them, because both read the parent's record before they touch a coin.
+// them, because both read the parent's record before they touch a UTXO.
 //
 // This store does not read the parent's record on the spend path, deliberately -- the spend IS
-// the read, straight off the coin, and that is where its speed comes from. So the question is
-// asked only here, for the inputs nothing else could explain: no live coin, and no journal row
+// the read, straight off the UTXO, and that is where its speed comes from. So the question is
+// asked only here, for the inputs nothing else could explain: no live UTXO, and no journal row
 // naming a spender. That is the error path, never the hot one.
 //
-// ONE CASE STAYS AMBIGUOUS. A parent whose membership window has retired, whose coins are all
+// ONE CASE STAYS AMBIGUOUS. A parent whose membership window has retired, whose UTXOs are all
 // gone, and whose spend is older than journal retention leaves no trace here at all, so it is
 // indistinguishable from one that never arrived, and it is reported as NOT FOUND like the rest.
 // That is the conservative choice: it asks the caller to fetch a parent rather than to condemn a

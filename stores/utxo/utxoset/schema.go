@@ -46,7 +46,7 @@
 // The journal is undo insurance and nothing else. It once doubled as the prune engine --
 // a retiring partition was the list of parents to re-examine -- which made it load-bearing
 // from genesis even below the hardcoded checkpoint, where a reorg is impossible by rule.
-// It no longer is: a mined transaction claims on tx_mined, its coins carry the height and
+// It no longer is: a mined transaction claims on tx_mined, its UTXOs carry the height and
 // block that made them, and retiring its identity is dropping the window it lives in. See
 // the spend_journal DDL comment below for what that leaves the journal doing.
 package utxoset
@@ -116,9 +116,9 @@ const schemaSQL = `
 -- ---------------------------------------------------------------------------
 -- THE UTXO TABLE. One row per spendable output. Inserted once, deleted once.
 --
--- The coin carries the height and block of the transaction that created it, exactly as
--- SV Node's coin carries nHeight. mined_height = 0 is the unconfirmed sentinel because no
--- spendable coin exists at height 0 -- genesis pays nobody -- so a mempool create can use
+-- The UTXO carries the height and block of the transaction that created it, exactly as
+-- SV Node's UTXO carries nHeight. mined_height = 0 is the unconfirmed sentinel because no
+-- spendable UTXO exists at height 0 -- genesis pays nobody -- so a mempool create can use
 -- it without colliding with a real block. block_id = 0 must stay legitimate rather than
 -- becoming a second sentinel: the seed tool writes it (cmd/seeder/seeder.go:674-681) and
 -- block validation treats it as the genesis block's id (model/Block.go:47).
@@ -164,9 +164,9 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- court-ordered reassignment.
 --
 -- spending_txid is an ownership token, deliberately NOT indexed: a restore must match
--- the spender that actually took the coin, so a stale reorg record whose output has
+-- the spender that actually took the UTXO, so a stale reorg record whose output has
 -- since been re-spent by a different transaction matches nothing and is a no-op rather
--- than resurrecting a coin someone else now owns.
+-- than resurrecting a UTXO someone else now owns.
 --
 -- RANGE partitioned by spent_height so retiring it is DROP TABLE -- O(1), no scan, no
 -- vacuum, no background job that can fall behind. Age clusters by insert time by
@@ -177,7 +177,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- IT IS UNDO INSURANCE, AND ONLY THAT.
 --
 -- It used to be the PRUNE ENGINE as well, and that is why it had no off-switch. A spend
--- deletes one coin row and signals nothing, so "that transaction's last output has now
+-- deletes one UTXO row and signals nothing, so "that transaction's last output has now
 -- gone" was a fact about absence recorded nowhere else, and the journal recorded it for
 -- free: every spend writes a row, rows are grouped by height, and a retiring partition
 -- therefore WAS the list of transactions to re-examine. Retiring an identity needed that
@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- is impossible by rule.
 --
 -- It is not any more. A mined transaction claims on tx_mined, in 288-block windows, and its
--- coins carry the height and block of the transaction that made them, so retiring its
+-- UTXOs carry the height and block of the transaction that made them, so retiring its
 -- identity is dropping a window and nothing has to be re-examined at all. What is left here
 -- is a restore, by outpoint, of a spend inside the retention window. Measured cost of
 -- keeping it: 354.8 bytes of WAL and 12.9 microseconds per spend, about 6% of the per-block
@@ -194,25 +194,25 @@ CREATE TABLE IF NOT EXISTS utxo (
 --
 -- IT IS ALSO THE LAST RECORD OF A FULLY-SPENT OLD PARENT.
 --
--- mined_height and block_id are copied off the coin at the moment the spend destroys it. The
+-- mined_height and block_id are copied off the UTXO at the moment the spend destroys it. The
 -- rule the design started from was that nothing mutable goes into the journal payload, and
 -- that rule is about the RESTORE, which must keep re-resolving block facts at restore time
 -- because a reorg can move a still-live parent to a different block. It is not about the
--- READ. These two columns are settled facts by the time anything reads them: a coin carries
+-- READ. These two columns are settled facts by the time anything reads them: a UTXO carries
 -- them only once the block path wrote them or window retirement stamped them, and the only
--- reader is the lookup step that runs when identity, membership, preservation and the coin
+-- reader is the lookup step that runs when identity, membership, preservation and the UTXO
 -- have ALL missed. That is exactly the fully-spent parent older than the membership
 -- retention, whose block is at least 1440 deep and cannot change.
 --
 -- Without them that parent is in no table at all, and model/Block.go's checkParentTransactions
 -- asks about it on most blocks above the highest checkpoint: 96 percent of a block's
--- out-of-block parents have no coin left by the time block validation asks. getParentTxMetaBlockIDs
+-- out-of-block parents have no UTXO left by the time block validation asks. getParentTxMetaBlockIDs
 -- turns not-found into BlockIncompleteError, which callers retry rather than persist, so the
 -- block retries forever. Both the base branch and aerospike keep a fully-spent parent
 -- answerable for a window AFTER the spend; this is how that property comes back.
 --
 -- The two retentions are counted from DIFFERENT clocks and the sets are not nested: membership
--- retires 1440 blocks after the parent was MINED, the journal 1440 blocks after the coin was
+-- retires 1440 blocks after the parent was MINED, the journal 1440 blocks after the UTXO was
 -- SPENT. A parent mined at 500,000 and spent at 900,001 lost its window at 501,440 and keeps
 -- its journal row until 901,441.
 --
@@ -239,7 +239,7 @@ CREATE TABLE IF NOT EXISTS spend_journal (
 -- CONFLICT BOOKKEEPING. One row per (contested parent, losing child).
 --
 -- A transaction that loses a double-spend race is kept rather than discarded, because
--- resolving the race later has to find it, and finding it means asking the PARENT whose coin
+-- resolving the race later has to find it, and finding it means asking the PARENT whose UTXO
 -- was contested. This table IS that route.
 --
 -- It is a side table rather than a column on tx_ident, and that is a correctness requirement
@@ -375,7 +375,7 @@ CREATE TABLE IF NOT EXISTS tx_mined (
 -- The highest membership window ever dropped, plus one. ensureTxMinedPartition refuses to
 -- create a window at or below it: a block re-offered more than 1440 blocks after its first
 -- application would otherwise recreate its window and claim every transaction in it afresh,
--- and the coin table has no uniqueness on the outpoint to stop the coins doubling.
+-- and the UTXO table has no uniqueness on the outpoint to stop the UTXOs doubling.
 CREATE TABLE IF NOT EXISTS tx_mined_floor (
     id      SMALLINT PRIMARY KEY CHECK (id = 0),
     floor   INTEGER  NOT NULL
@@ -387,7 +387,7 @@ INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
 -- membership window that would otherwise have retired it.
 --
 -- It exists for one case, the lingering unmined child. A parent whose window has been dropped
--- and whose coins are all spent is GONE, and that is right: nothing on the consensus path can
+-- and whose UTXOs are all spent is GONE, and that is right: nothing on the consensus path can
 -- ask about a transaction that is 1440 blocks buried and has no live output. The exception is
 -- an unmined child still sitting in block assembly, which will be validated again the day it
 -- is finally mined and needs its parent's facts to be validated against. The pruner names
@@ -461,7 +461,7 @@ CREATE TABLE IF NOT EXISTS preserved_parent (
 --      highest-volume ones have no height field in their argument type, so they could
 --      not supply one even after an interface change.
 --   3. Height only ever bought a partition drop, and a partition holds transactions whose
---      coins are still unspent, so it could never fire.
+--      UTXOs are still unspent, so it could never fire.
 --
 -- leaf is a REAL stored column. PARTITION BY LIST ((get_byte(txid,0) & 7)) is accepted
 -- but then postgres bans every unique constraint on the table, and a GENERATED column
@@ -502,7 +502,7 @@ CREATE TABLE IF NOT EXISTS tx_ident (
 -- THE BODY. Serialized transaction bytes, and nothing else.
 --
 -- This is the ONE part of a transaction whose life is bounded by a horizon rather
--- than by its coins. Everything on tx_ident is pinned while any output is unspent,
+-- than by its UTXOs. Everything on tx_ident is pinned while any output is unspent,
 -- at any age, because the validator reads the parent's block ids and heights for
 -- every input it spends. Keeping the bytes there too would make the transaction
 -- archive permanent for that whole population: measured at 136 GB of out-of-line
@@ -562,10 +562,10 @@ CREATE TABLE IF NOT EXISTS utxo_p%[1]d PARTITION OF utxo FOR VALUES IN (%[1]d)
 -- txid without a ukey range bound is a review failure.
 CREATE INDEX IF NOT EXISTS utxo_p%[1]d_ukey ON utxo_p%[1]d (ukey);
 
--- The identity partitions take the coin table's autovacuum block, for the same reason. This is
+-- The identity partitions take the UTXO table's autovacuum block, for the same reason. This is
 -- the MEMPOOL table now, and the ordinary mempool row is deleted at row level the moment a
 -- longest-chain stamp moves it to tx_mined, so the dead-row rate here tracks block production
--- exactly as the coin table's does. The rows that stay behind on a stamp -- the ones naming
+-- exactly as the UTXO table's does. The rows that stay behind on a stamp -- the ones naming
 -- two blocks, and the ones carrying conflicting children -- are the fork and conflict
 -- residue, a rounding error against a block's worth of ordinary transactions, so they do not
 -- change that rate. The shipped default (20 percent dead tuples,

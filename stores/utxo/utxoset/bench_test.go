@@ -113,7 +113,7 @@ func wipe(b *testing.B, s *Store, ctx context.Context) {
 }
 
 // BenchmarkCreate measures storing a transaction: the identity row, the serialized body, and
-// one coin row per spendable output.
+// one UTXO row per spendable output.
 //
 // "Plain" is a mempool arrival, which is left in the waiting set. "Mined" carries block
 // information, which additionally packs the membership and clears the waiting marker. The

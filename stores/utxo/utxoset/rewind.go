@@ -34,7 +34,7 @@ DELETE FROM conflict_children c
 // removeBlockIDsSQL strips named blocks from the transactions that claim them.
 //
 // The arrays are FLATTENED to one element per transaction and block pair, the same shape the
-// create statement uses for its coin arrays, because a SQL array is rectangular and each
+// create statement uses for its UTXO arrays, because a SQL array is rectangular and each
 // removal carries a ragged list. The grouping folds them back into one list per transaction
 // before the update runs, for the same one-update-per-row reason as above.
 //
@@ -83,7 +83,7 @@ UPDATE tx_ident i
 // statement and another shape to the other.
 //
 // If this leaves a transaction with no membership row and no identity row, the transaction is
-// then answered by its own coin -- one block id, from the coin's stamp -- or by the journal
+// then answered by its own UTXO -- one block id, from the UTXO's stamp -- or by the journal
 // step, or not at all. That is the tool's caller's decision to make: the rewind is being told
 // which blocks to stop believing in, and it is not this store's place to decide what the
 // transaction becomes afterwards. It is the same silence the identity arm already keeps about
@@ -94,7 +94,7 @@ DELETE FROM tx_mined m
  WHERE m.txid = k.txid
    AND m.block_id = k.block_id`
 
-// RemoveFromConflictingChildren takes transactions off their parents' contested-coin lists.
+// RemoveFromConflictingChildren takes transactions off their parents' contested-UTXO lists.
 //
 // Called only by the offline rewind tool, which runs with the node stopped. A pair naming a
 // parent the store does not hold, or a child that was never noted, is a silent no-op rather

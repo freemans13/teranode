@@ -28,7 +28,7 @@ ON CONFLICT (block_hash) DO NOTHING`
 //
 // This gate is not an optimisation, it is what keeps the store from inflating the money
 // supply. The UTXO table's ukey is a 96-bit prefix and deliberately NON-UNIQUE, so
-// the coin insert in createPlanSQL has no ON CONFLICT that could make it idempotent, and re-applying a
+// the UTXO insert in createPlanSQL has no ON CONFLICT that could make it idempotent, and re-applying a
 // block would insert every output a second time as independently spendable rows. Replay
 // is routine rather than exotic: catchup, a restart mid-window, and the documented
 // post-restart unrequested-block storm all re-offer blocks. The ledger is therefore
@@ -104,7 +104,7 @@ const completeApplySQL = `UPDATE applied_block SET completed = TRUE WHERE block_
 // whole value of the call, and getting it backwards is worse than not having it:
 //
 //   - Completed, so skip. Re-applying would insert every output a second time as an
-//     independently spendable row, because the coin insert in createPlanSQL has no ON CONFLICT to
+//     independently spendable row, because the UTXO insert in createPlanSQL has no ON CONFLICT to
 //     protect it.
 //     That is money-supply inflation.
 //   - Claimed but never completed, so RE-APPLY. The previous attempt died part-way. If we

@@ -14,7 +14,7 @@ import (
 // spent-set to consult. It is the DECORATE FETCH: RETURNING hands back satoshis and the
 // locking script, so script validation never fetches or deserialises a parent
 // transaction. It CAPTURES THE UNDO PAYLOAD, in the same statement rather than merely the
-// same transaction. It is the RECLAIM: the coin row is gone. And it is the write.
+// same transaction. It is the RECLAIM: the UTXO row is gone. And it is the write.
 //
 // There used to be a second, journal-free variant of it here for below-checkpoint sync.
 // It is gone rather than kept behind a flag, because two copies of a consensus predicate
@@ -28,13 +28,13 @@ import (
 // behaves differently for each. Note the deliberate absence of the flag and maturity
 // predicates here — this asks "does the row exist at all", precisely so a row excluded
 // by the DELETE's eligibility tests surfaces as frozen or immature rather than as spent.
-// spenderSQL asks the journal WHO took a coin that is no longer there.
+// spenderSQL asks the journal WHO took a UTXO that is no longer there.
 //
-// The coin row is destroyed by the spend, so absence is how a double spend is rejected. That
+// The UTXO row is destroyed by the spend, so absence is how a double spend is rejected. That
 // answers "no" but not "who", and the caller needs "who": it marks the losing transaction
 // conflicting and walks its descendants.
 //
-// The journal already recorded the spending transaction against every coin it destroyed, so
+// The journal already recorded the spending transaction against every UTXO it destroyed, so
 // a reorg could match the spender that actually took it. The same row answers this question.
 //
 // Matched on the full 32-byte parent txid as well as the ukey, for the same reason every
@@ -42,7 +42,7 @@ import (
 // never authorise one.
 //
 // Bounded by the journal's retention. Beyond it the store genuinely cannot say who took a
-// coin, and that is a stated limit of delete-on-spend rather than a gap to paper over.
+// UTXO, and that is a stated limit of delete-on-spend rather than a gap to paper over.
 const spenderSQL = `
 SELECT k.vin, j.spending_txid, j.satoshis, j.script, j.hash_override
   FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, vin)
@@ -51,7 +51,7 @@ SELECT k.vin, j.spending_txid, j.satoshis, j.script, j.hash_override
 // hash_override travels with the flags because the classifier needs it to tell one hold from
 // another. spendable_from carries both coinbase maturity and the alert system's reassignment
 // delay, and the two get different errors; reassignSQL is the only writer of an override on a
-// live coin and writes both columns together, so its presence is what says which hold this is.
+// live UTXO and writes both columns together, so its presence is what says which hold this is.
 // The column costs nothing: the index probe already reads the whole row.
 const classifySQL = `
 SELECT k.vin, u.flags, u.spendable_from, u.hash_override
@@ -62,7 +62,7 @@ SELECT k.vin, u.flags, u.spendable_from, u.hash_override
 //
 // It takes pgx.Tx rather than the package's querier interface, and that is the point. querier
 // is satisfied by the connection pool as well, so a spend issued through it would autocommit:
-// a transaction rejected on its third input would keep the first two inputs' coins destroyed,
+// a transaction rejected on its third input would keep the first two inputs' UTXOs destroyed,
 // with nothing left to roll back. This store used to export exactly that as Store.Spend. The
 // method is gone and the parameter type is what stops it coming back, because reintroducing it
 // is now a compile error rather than a review catch.

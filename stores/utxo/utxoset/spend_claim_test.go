@@ -10,21 +10,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A transaction can be submitted in extended format, carrying its own copy of every coin it
+// A transaction can be submitted in extended format, carrying its own copy of every UTXO it
 // spends: the satoshis and the locking script. The validator does NOT re-derive those when
 // they arrive, by design -- it validates against what the transaction brought. So the
 // submitter's claim is what the inflation check sums and what script verification runs
-// against, and nothing else contradicts it before the coin is consumed.
+// against, and nothing else contradicts it before the UTXO is consumed.
 //
 // The other two stores catch a false claim at the moment of the spend, by comparing a hash
-// derived from the carried copy against the hash stored on the coin. This store returns the
-// coin's real satoshis and script from the DELETE, in the same round trip, so it can compare
+// derived from the carried copy against the hash stored on the UTXO. This store returns the
+// UTXO's real satoshis and script from the DELETE, in the same round trip, so it can compare
 // the values themselves and needs no hash at all.
 //
-// These tests pin that comparison. Without it a submitter can assert what a coin is worth and
+// These tests pin that comparison. Without it a submitter can assert what a UTXO is worth and
 // who may move it, and be believed.
 
-// tamperedSatoshis: the claim inflates the coin's value.
+// tamperedSatoshis: the claim inflates the UTXO's value.
 func TestSpendRejectsAnInflatedSatoshiClaim(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -41,15 +41,15 @@ func TestSpendRejectsAnInflatedSatoshiClaim(t *testing.T) {
 	require.Len(t, spends, 1)
 	require.ErrorIs(t, spends[0].Err, errors.ErrUtxoHashMismatch)
 
-	// Nothing was committed, so the coin is still there for its rightful spender.
+	// Nothing was committed, so the UTXO is still there for its rightful spender.
 	honest := spendOutput(t, parent, 0, 2)
 
 	_, honestSpends, err := s.SpendAndCreate(ctx, honest, 101)
-	require.NoError(t, err, "the rejected claim must not have consumed the coin")
+	require.NoError(t, err, "the rejected claim must not have consumed the UTXO")
 	require.NoError(t, honestSpends[0].Err)
 }
 
-// tamperedScript: the claim rewrites who may move the coin.
+// tamperedScript: the claim rewrites who may move the UTXO.
 func TestSpendRejectsARewrittenLockingScriptClaim(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -72,7 +72,7 @@ func TestSpendRejectsARewrittenLockingScriptClaim(t *testing.T) {
 	honest := spendOutput(t, parent, 0, 2)
 
 	_, honestSpends, err := s.SpendAndCreate(ctx, honest, 101)
-	require.NoError(t, err, "the rejected claim must not have consumed the coin")
+	require.NoError(t, err, "the rejected claim must not have consumed the UTXO")
 	require.NoError(t, honestSpends[0].Err)
 }
 
@@ -154,7 +154,7 @@ func TestSkipUTXOHashCheckDisablesTheComparison(t *testing.T) {
 	require.NoError(t, spends[0].Err)
 }
 
-// The replay path decorates from the journal instead of the coin row, so it is a second place
+// The replay path decorates from the journal instead of the UTXO row, so it is a second place
 // the store hands a caller's claim back unexamined. A replay is by definition the same
 // transaction spending again, so an honest one must still succeed -- and a doctored one must
 // not slip through the second door.
@@ -171,7 +171,7 @@ func TestReplayedSpendRejectsAFalseClaim(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
-	// Same transaction, same coin: a replay, which must succeed.
+	// Same transaction, same UTXO: a replay, which must succeed.
 	replay, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, replay[0].Err, "a replay of our own spend must not be a double spend")
@@ -187,9 +187,9 @@ func TestReplayedSpendRejectsAFalseClaim(t *testing.T) {
 // One false input must not consume the honest ones. The comparison happens after the DELETE
 // has already taken every row it could, so the guarantee comes entirely from SpendAndCreate
 // running the whole thing in one database transaction and rolling back on any per-input error.
-// If that ever stopped being true, a submitter could burn coins it does not own by lying about
+// If that ever stopped being true, a submitter could burn UTXOs it does not own by lying about
 // only the last input.
-func TestOneFalseInputLeavesTheHonestCoinsUntouched(t *testing.T) {
+func TestOneFalseInputLeavesTheHonestUTXOsUntouched(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 3, 5_000)
@@ -218,7 +218,7 @@ func TestOneFalseInputLeavesTheHonestCoinsUntouched(t *testing.T) {
 	require.NoError(t, spends[1].Err)
 	require.ErrorIs(t, spends[2].Err, errors.ErrUtxoHashMismatch)
 
-	// All three coins are still live.
+	// All three UTXOs are still live.
 	for vout := uint32(0); vout < 3; vout++ {
 		resp, gErr := s.GetSpend(ctx, &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: vout})
 		require.NoError(t, gErr)
@@ -228,9 +228,9 @@ func TestOneFalseInputLeavesTheHonestCoinsUntouched(t *testing.T) {
 }
 
 // A false claim must survive a sibling input that misses, and this is the case that nearly got
-// away. The claim check runs in Go after the DELETE, so the coin it lied about IS taken and IS
+// away. The claim check runs in Go after the DELETE, so the UTXO it lied about IS taken and IS
 // written to the spend journal, named by this transaction. When any other input of the same
-// plan misses, the store asks the journal who took each coin that is no longer there, over the
+// plan misses, the store asks the journal who took each UTXO that is no longer there, over the
 // WHOLE plan rather than just the misses. It then finds the row its own statement wrote a
 // moment ago, reads it as a replay of earlier work, and clears the verdict.
 //

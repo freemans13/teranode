@@ -16,7 +16,7 @@ import (
 const stampRetiringWindowChunk = 20_000
 
 // retiringWindowRowsSQL lists a window's rows in (txid, seq) order, to name WHICH transactions
-// the coin stamp has to visit. It deliberately does not read mined_height or block_id: this
+// the UTXO stamp has to visit. It deliberately does not read mined_height or block_id: this
 // window's own row is not necessarily the transaction's earliest, so the block facts come from
 // firstMinedRowSQL instead.
 //
@@ -37,9 +37,9 @@ SELECT txid, seq FROM %[1]s
 // It has to look across windows because a transaction's rows do not all live in one. A window
 // is keyed by mined_height, and a transaction mined at height h can be fork-stamped at h-1 or
 // h+1 by appendMinedSQL, which straddles a 288 boundary about one block in 288. The older
-// window then retires first, and stamping from the row IT holds would hand the coin a FORK
+// window then retires first, and stamping from the row IT holds would hand the UTXO a FORK
 // block whenever that is the row it has -- permanently, because the mined_height = 0 guard
-// skips the coin when the other window retires and nothing survives to correct it from.
+// skips the UTXO when the other window retires and nothing survives to correct it from.
 //
 // The earliest row by seq is the transaction's LONGEST-CHAIN stamp, and that is a rule rather
 // than an ordering accident. Since task 9 a transaction only reaches the membership table by a
@@ -63,36 +63,36 @@ SELECT k.txid, m.mined_height, m.block_id
     LIMIT 1 OFFSET 0
  ) AS m`
 
-// stampCoinsSQL stamps every live (unconfirmed) coin of the listed transactions with the
-// block their FIRST surviving tx_mined row named. See liveCoinArgs for the leaf/lo/hi shape;
+// stampUTXOsSQL stamps every live (unconfirmed) UTXO of the listed transactions with the
+// block their FIRST surviving tx_mined row named. See liveUTXOArgs for the leaf/lo/hi shape;
 // $5 and $6 are the parallel height and block-id arrays keyed to the same transaction.
 //
-// mined_height = 0 is what makes this idempotent and leaves a block-path coin -- stamped with
-// its facts at create, never at the sentinel -- untouched. A coin that has already been
+// mined_height = 0 is what makes this idempotent and leaves a block-path UTXO -- stamped with
+// its facts at create, never at the sentinel -- untouched. A UTXO that has already been
 // stamped this way, or created directly by the block path, must not be touched a second time:
 // nothing here can tell "already correct" from "a later, wrong window" apart except that guard.
 //
 // The fenced read runs FIRST, in a CTE, and the UPDATE then matches on the exact (leaf, ukey)
-// it returns -- the same shape resetCoinsSQL uses, and for the identical reason. A plain
+// it returns -- the same shape resetUTXOsSQL uses, and for the identical reason. A plain
 // `UPDATE ... FROM unnest(...) AS k WHERE u.leaf = k.leaf AND u.ukey >= k.lo AND ...` was
-// measured first, on 40,000 seeded coins across all eight leaves with 500 keys: a Hash Join
-// against a Seq Scan of every one of the eight coin partitions, because the planner can build
+// measured first, on 40,000 seeded UTXOs across all eight leaves with 500 keys: a Hash Join
+// against a Seq Scan of every one of the eight UTXO partitions, because the planner can build
 // a hash on (leaf, txid) from the whole table more cheaply than it can cost 500 per-key index
 // probes, and the ukey range only applies as a post-join filter rather than an index
 // condition. The CROSS JOIN LATERAL with an OFFSET 0 fence is what forces an index scan per
 // key instead: an UPDATE cannot laterally reference its own target, so the read has to happen
 // in a CTE the UPDATE then joins on the row identity it found, not on the search predicate.
 //
-// EVERY live coin of the transaction is stamped, not just one, so the LATERAL carries no
-// LIMIT -- unlike coinFactsSQL, which only ever needs one.
+// EVERY live UTXO of the transaction is stamped, not just one, so the LATERAL carries no
+// LIMIT -- unlike utxoFactsSQL, which only ever needs one.
 //
 // The UPDATE rechecks the FULL TXID and not only the (leaf, ukey) the read found the row by.
-// ukey is a 96-bit prefix and NON-UNIQUE by design -- see Pack -- so a stranger's coin in the
-// same leaf can share it, and it is a coin at the SENTINEL that this statement is looking for,
-// which is exactly what a colliding row is most likely to be. Stamping it would hand a coin the
+// ukey is a 96-bit prefix and NON-UNIQUE by design -- see Pack -- so a stranger's UTXO in the
+// same leaf can share it, and it is a UTXO at the SENTINEL that this statement is looking for,
+// which is exactly what a colliding row is most likely to be. Stamping it would hand a UTXO the
 // facts of a block that does not contain its transaction, and once this window is dropped there
-// is nothing left to correct it from. resetCoinsSQL carries the identical recheck.
-const stampCoinsSQL = `
+// is nothing left to correct it from. resetUTXOsSQL carries the identical recheck.
+const stampUTXOsSQL = `
 WITH hit AS (
     SELECT c.leaf, c.ukey, k.txid, k.h, k.b
       FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[], $5::int[], $6::int[])
@@ -124,7 +124,7 @@ const TxMinedPartitionBlocks = 288
 // It REFUSES a window at or below the floor. The floor is the highest window ever dropped
 // plus one, and a create below it can only be a block re-offered after its window retired.
 // Recreating the window would claim every transaction in that block afresh and double every
-// coin that is still live. Failing loudly here is the guard.
+// UTXO that is still live. Failing loudly here is the guard.
 func (s *Store) ensureTxMinedPartition(ctx context.Context, height uint32) error {
 	window := height / TxMinedPartitionBlocks
 
@@ -192,8 +192,8 @@ SELECT c.relname,
 // cutoffHeight, oldest first, and advances the floor past each. Returns the count dropped.
 //
 // This IS identity reclaim in this design: no work list, no probes, no row deletes. The
-// coins of transactions in a retiring window are stamped from the window's list first in
-// stage 2; in stage 1 every coin was written with its block facts at create.
+// UTXOs of transactions in a retiring window are stamped from the window's list first in
+// stage 2; in stage 1 every UTXO was written with its block facts at create.
 func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32) (int, error) {
 	cutoff := cutoffHeight / TxMinedPartitionBlocks
 
@@ -240,18 +240,18 @@ func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32
 			continue
 		}
 
-		// The coin stamp runs BEFORE the detach, and a failure here returns without touching
+		// The UTXO stamp runs BEFORE the detach, and a failure here returns without touching
 		// the window at all. A window must never be dropped while any of its transactions'
-		// surviving coins still carry the sentinel: once the window is gone, its rows are the
-		// only place that block fact lived, and readCoinFacts would then answer with mined
+		// surviving UTXOs still carry the sentinel: once the window is gone, its rows are the
+		// only place that block fact lived, and readUTXOFacts would then answer with mined
 		// height 0 for a parent that really does have a block.
-		txCount, coinCount, err := s.stampRetiringWindowCoins(ctx, w.name)
+		txCount, utxoCount, err := s.stampRetiringWindowUTXOs(ctx, w.name)
 		if err != nil {
 			return dropped, err
 		}
 
-		s.logger.Infof("[utxoset] stamped %d live coins of %d transactions before dropping tx_mined window %s",
-			coinCount, txCount, w.name)
+		s.logger.Infof("[utxoset] stamped %d live UTXOs of %d transactions before dropping tx_mined window %s",
+			utxoCount, txCount, w.name)
 
 		switch {
 		case w.detachPending:
@@ -277,7 +277,7 @@ func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32
 		// between drop the window from the catalog for good -- gone, so it never resurfaces
 		// in txMinedWindowSQL's listing to retry -- while the floor stayed pointed below it,
 		// and ensureTxMinedPartition would then recreate the very window this loop just
-		// destroyed, doubling every coin still claimed by a transaction in it. window is a
+		// destroyed, doubling every UTXO still claimed by a transaction in it. window is a
 		// regex-filtered catalog name (^tx_mined_w[0-9]+$), so folding it into the literal
 		// with Sprintf carries no injection risk.
 		ddl := fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s;
@@ -299,10 +299,10 @@ UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name,
 	return dropped, nil
 }
 
-// stampRetiringWindowCoins is the lazy coin stamp: it reads the distinct transactions of the
-// window about to be detached and stamps each one's still-unconfirmed coins with the block its
+// stampRetiringWindowUTXOs is the lazy UTXO stamp: it reads the distinct transactions of the
+// window about to be detached and stamps each one's still-unconfirmed UTXOs with the block its
 // EARLIEST membership row names, resolved across every live window. Returns the number of
-// distinct transactions read and the number of coin rows the stamp touched.
+// distinct transactions read and the number of UTXO rows the stamp touched.
 //
 // It reads in pages of stampRetiringWindowChunk rows, oldest (txid, seq) first, rather than one
 // query for the whole window: a window can hold a full 288 blocks of mainnet membership, tens
@@ -315,7 +315,7 @@ UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name,
 //
 // The window's rows say WHICH transactions to stamp; firstMinedRowSQL says with WHAT. A
 // transaction's rows are NOT all in one window -- see firstMinedRowSQL -- so the block cannot be
-// taken from the retiring window's own row without risking a fork block on the coin. The two
+// taken from the retiring window's own row without risking a fork block on the UTXO. The two
 // reads are separate for that reason, not for tidiness.
 //
 // Within this window a transaction's rows still sort together, because the pages are ordered by
@@ -326,7 +326,7 @@ UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name,
 // cannot arise: a fork stamp on a transaction that still has an identity row rewrites that row
 // and stays in the mempool table, and a fork stamp on one that does not can only append to a
 // membership row that already exists. So there is nothing to test there, and nothing to guard.
-func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (txCount, coinCount int, err error) {
+func (s *Store) stampRetiringWindowUTXOs(ctx context.Context, window string) (txCount, utxoCount int, err error) {
 	var (
 		lastTxid       = []byte{}
 		lastSeq  int64 = -1
@@ -342,7 +342,7 @@ func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (tx
 	for {
 		rows, qerr := s.pool.Query(ctx, query, lastTxid, lastSeq, stampRetiringWindowChunk)
 		if qerr != nil {
-			return txCount, coinCount, errors.NewStorageError("[utxoset] read retiring window %s", window, qerr)
+			return txCount, utxoCount, errors.NewStorageError("[utxoset] read retiring window %s", window, qerr)
 		}
 
 		var (
@@ -358,7 +358,7 @@ func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (tx
 
 			if serr := rows.Scan(&txid, &seq); serr != nil {
 				rows.Close()
-				return txCount, coinCount, errors.NewStorageError("[utxoset] scan retiring window %s", window, serr)
+				return txCount, utxoCount, errors.NewStorageError("[utxoset] scan retiring window %s", window, serr)
 			}
 
 			n++
@@ -381,16 +381,16 @@ func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (tx
 		rows.Close()
 
 		if rerr != nil {
-			return txCount, coinCount, errors.NewStorageError("[utxoset] read retiring window %s", window, rerr)
+			return txCount, utxoCount, errors.NewStorageError("[utxoset] read retiring window %s", window, rerr)
 		}
 
 		if len(txids) > 0 {
-			stamped, serr := s.stampCoinsOf(ctx, txids)
+			stamped, serr := s.stampUTXOsOf(ctx, txids)
 			if serr != nil {
-				return txCount, coinCount, errors.NewStorageError("[utxoset] stamp coins for retiring window %s", window, serr)
+				return txCount, utxoCount, errors.NewStorageError("[utxoset] stamp UTXOs for retiring window %s", window, serr)
 			}
 
-			coinCount += stamped
+			utxoCount += stamped
 		}
 
 		if n < stampRetiringWindowChunk {
@@ -398,16 +398,16 @@ func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (tx
 		}
 	}
 
-	return txCount, coinCount, nil
+	return txCount, utxoCount, nil
 }
 
-// stampCoinsOf resolves each transaction's earliest membership row across every live window and
-// stamps its still-unconfirmed coins with that row's block.
+// stampUTXOsOf resolves each transaction's earliest membership row across every live window and
+// stamps its still-unconfirmed UTXOs with that row's block.
 //
 // A transaction whose rows have all gone -- nothing can produce that here, since the retiring
 // window has not been detached yet -- is simply absent from the resolve and is not stamped, the
 // CROSS JOIN LATERAL being an inner join.
-func (s *Store) stampCoinsOf(ctx context.Context, txids [][]byte) (int, error) {
+func (s *Store) stampUTXOsOf(ctx context.Context, txids [][]byte) (int, error) {
 	rows, err := s.pool.Query(ctx, firstMinedRowSQL, txids)
 	if err != nil {
 		return 0, err
@@ -449,9 +449,9 @@ func (s *Store) stampCoinsOf(ctx context.Context, txids [][]byte) (int, error) {
 		return 0, nil
 	}
 
-	leaves, ids, los, his := liveCoinArgs(found)
+	leaves, ids, los, his := liveUTXOArgs(found)
 
-	tag, err := s.pool.Exec(ctx, stampCoinsSQL, leaves, ids, los, his, heights, blockID)
+	tag, err := s.pool.Exec(ctx, stampUTXOsSQL, leaves, ids, los, his, heights, blockID)
 	if err != nil {
 		return 0, err
 	}

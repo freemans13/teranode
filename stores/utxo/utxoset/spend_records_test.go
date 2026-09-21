@@ -11,8 +11,8 @@ import (
 //
 // Conflict resolution undoes its own spends when it fails part way, and it does that by handing
 // the records this store returned straight back to this store's Unspend. Unspend refuses a
-// record that cannot name the transaction that took the coin, deliberately, because restoring
-// on the outpoint alone could resurrect a coin a different transaction now owns.
+// record that cannot name the transaction that took the UTXO, deliberately, because restoring
+// on the outpoint alone could resurrect a UTXO a different transaction now owns.
 //
 // So a record without a spender is not merely incomplete. It made every conflict-resolution
 // failure escalate to the manual-intervention message, whatever had actually gone wrong,
@@ -32,7 +32,7 @@ func TestSpendReturnsRecordsThisStoreCanRestore(t *testing.T) {
 	require.NoError(t, spends[0].Err)
 
 	require.NotNil(t, spends[0].SpendingData,
-		"the record must name the transaction that took the coin")
+		"the record must name the transaction that took the UTXO")
 	require.Equal(t, child.TxIDChainHash().String(), spends[0].SpendingData.TxID.String())
 
 	// The proof: hand them back unmodified, which is exactly what a rollback does.
@@ -64,7 +64,7 @@ func TestSpendAndCreateReturnsRecordsThisStoreCanRestore(t *testing.T) {
 
 // TestSpendNamesTheRightSpenderPerTransactionInOnePlan. One plan carries many transactions,
 // and each record must name ITS OWN spender. Naming the plan's first, or last, would restore
-// coins to the wrong owner on a rollback.
+// UTXOs to the wrong owner on a rollback.
 //
 // This drives planSpends and runSpendPlan directly, because the store no longer exposes a way
 // to put two transactions through one statement. It keeps the property under test because

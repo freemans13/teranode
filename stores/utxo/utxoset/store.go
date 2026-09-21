@@ -88,7 +88,7 @@ type Store struct {
 	// not, so the coinbase of the genesis block keeps its body under the shared rule and lost
 	// it under the local one.
 	//
-	// NIL MEANS OFF, and it means off for two reasons that coincide rather than one standing
+	// NIL MEANS OFF, and it means off for two reasons that utxocide rather than one standing
 	// in for the other: the setting being off leaves it nil, and a network with no checkpoints
 	// (regtest, teratestnet) has nothing to be below. BelowCheckpoint answers false for both,
 	// because it requires a highest checkpoint above 0, so one predicate covers both without a
@@ -96,15 +96,15 @@ type Store struct {
 	//
 	// See the setting's longdesc for why below the checkpoint the bytes are not needed: the
 	// subtree data files hold them, the outpoint-only spend route reads no parent body, and
-	// this store's decorate reads the coin row.
+	// this store's decorate reads the UTXO row.
 	bodyCheckpoints []chaincfg.Checkpoint
 
-	// coinIndexDecider decides whether a utxo_pN_ukey index has bloated past the point
-	// worth a REINDEX CONCURRENTLY. New sets it to coinIndexNeedsRebuild; it exists as a
+	// utxoIndexDecider decides whether a utxo_pN_ukey index has bloated past the point
+	// worth a REINDEX CONCURRENTLY. New sets it to utxoIndexNeedsRebuild; it exists as a
 	// field, rather than the pruner calling that function directly, so a test can swap in a
 	// stub and observe that the pruner consulted it, without needing a real index bloated
 	// past the threshold or a real REINDEX to complete.
-	coinIndexDecider func(indexBytes, rows int64) bool
+	utxoIndexDecider func(indexBytes, rows int64) bool
 
 	// createBatcher collects Create calls arriving from many goroutines and sends them as
 	// one pipelined round trip.
@@ -146,7 +146,7 @@ type Store struct {
 
 	// lockBatcher collects the single-hash lock changes that two-phase commit produces, one
 	// per mempool transaction. Serialised, because two batches can name the same transaction
-	// and the update touches its coin rows.
+	// and the update touches its UTXO rows.
 	lockBatcher  *batcher.Batcher[lockItem]
 	lockInFlight sync.WaitGroup
 }
@@ -176,7 +176,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Every hot statement here hands its batch over as an array and unpacks it with unnest, so
 	// the planner has no statistics for the values it will be given. It guesses, and because
 	// every table is partitioned the guess is then multiplied by the partition count. On the
-	// mainnet soak box the live-coin probe reads about twenty index pages and is costed at
+	// mainnet soak box the live-UTXO probe reads about twenty index pages and is costed at
 	// 679,043, and the decorate read is costed at 1,465,539. Postgres compiles above 100,000 and inlines
 	// and optimises above 500,000, so both clear every threshold on every execution.
 	//
@@ -203,11 +203,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// is no worse than the custom plans were. For this store's statements the estimate is
 	// wrong in both places that matter. The batch arrives as arrays and is unpacked with
 	// unnest, so a generic plan has no idea whether it is joining one key or five hundred. And
-	// the eligibility tests on the coin row are bit masks on flags, which the planner cannot
+	// the eligibility tests on the UTXO row are bit masks on flags, which the planner cannot
 	// estimate at all and costs as if almost no row survives them. Put together, the generic
-	// plan can decide the coin table is a handful of rows worth rescanning per key.
+	// plan can decide the UTXO table is a handful of rows worth rescanning per key.
 	//
-	// Measured on a 40,000-row coin table with the 500-key spend statement: executions one to
+	// Measured on a 40,000-row UTXO table with the 500-key spend statement: executions one to
 	// five took 8 ms each and the sixth took 1,070 ms, as did every one after it. That is the
 	// generic plan taking over, and it turns a batch that should be linear in its width into
 	// one that is quadratic. The single-key statement never showed it because with one key a
@@ -232,7 +232,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
 		journalRetention: DefaultSpendJournalRetentionBlocks,
 		bodyRetention:    DefaultTxBodyRetentionBlocks,
-		coinIndexDecider: coinIndexNeedsRebuild}
+		utxoIndexDecider: utxoIndexNeedsRebuild}
 
 	// The SAME checkpoint list the outpoint-only spend gate tests against
 	// (model.OutpointOnlyEligible -> model.BelowCheckpoint), so the heights at which this store

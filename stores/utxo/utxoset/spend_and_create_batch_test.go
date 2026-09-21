@@ -51,8 +51,8 @@ func flush(t *testing.T, s *Store, items ...*spendAndCreateItem) []spendAndCreat
 	return out
 }
 
-// coinCount is how many coin rows the store holds for tx.
-func coinCount(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) int {
+// utxoCount is how many UTXO rows the store holds for tx.
+func utxoCount(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) int {
 	t.Helper()
 
 	h := tx.TxIDChainHash()
@@ -141,23 +141,23 @@ func TestSpendAndCreateBatchAppliesEveryModeInOneFlush(t *testing.T) {
 	require.NotNil(t, res[0].data)
 	require.Len(t, res[0].spends, 1)
 	require.NoError(t, res[0].spends[0].Err)
-	require.Equal(t, 2, coinCount(t, s, ctx, full))
-	require.Equal(t, 0, coinCount(t, s, ctx, ps[0]), "the parent coin was consumed")
+	require.Equal(t, 2, utxoCount(t, s, ctx, full))
+	require.Equal(t, 0, utxoCount(t, s, ctx, ps[0]), "the parent UTXO was consumed")
 
 	require.NoError(t, res[1].err)
 	require.NotNil(t, res[1].data)
 	require.Nil(t, res[1].spends, "create-only returns no spend records")
-	require.Equal(t, 1, coinCount(t, s, ctx, createOnly))
-	require.Equal(t, 1, coinCount(t, s, ctx, ps[1]), "create-only leaves the parent coin alone")
+	require.Equal(t, 1, utxoCount(t, s, ctx, createOnly))
+	require.Equal(t, 1, utxoCount(t, s, ctx, ps[1]), "create-only leaves the parent UTXO alone")
 
 	require.NoError(t, res[2].err)
 	require.Nil(t, res[2].data, "spend-only returns no record")
 	require.Len(t, res[2].spends, 1)
-	require.Equal(t, 0, coinCount(t, s, ctx, ps[2]))
+	require.Equal(t, 0, utxoCount(t, s, ctx, ps[2]))
 	require.Equal(t, 0, identityCount(t, s, ctx, spendOnly), "spend-only stores nothing of its own")
 
 	require.NoError(t, res[3].err)
-	require.Equal(t, 1, coinCount(t, s, ctx, full2))
+	require.Equal(t, 1, utxoCount(t, s, ctx, full2))
 
 	// The spend is still the decorate fetch.
 	require.Equal(t, uint64(5_000), full.Inputs[0].PreviousTxSatoshis)
@@ -165,7 +165,7 @@ func TestSpendAndCreateBatchAppliesEveryModeInOneFlush(t *testing.T) {
 }
 
 // TestSpendAndCreateBatchRejectsAFalseClaimWithoutTouchingItsSiblings is the security property.
-// A forged claim about a coin's value must be rejected, must consume nothing, must not be stored,
+// A forged claim about a UTXO's value must be rejected, must consume nothing, must not be stored,
 // and must not disturb the honest transactions that shared its batch.
 func TestSpendAndCreateBatchRejectsAFalseClaimWithoutTouchingItsSiblings(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -188,12 +188,12 @@ func TestSpendAndCreateBatchRejectsAFalseClaimWithoutTouchingItsSiblings(t *test
 	require.Nil(t, res[1].data)
 
 	require.Equal(t, 0, identityCount(t, s, ctx, forged), "a rejected transaction is not stored")
-	require.Equal(t, 0, coinCount(t, s, ctx, forged))
-	require.Equal(t, 1, coinCount(t, s, ctx, ps[1]), "the forged claim consumed nothing")
-	require.Equal(t, 0, coinCount(t, s, ctx, ps[0]))
-	require.Equal(t, 0, coinCount(t, s, ctx, ps[2]))
+	require.Equal(t, 0, utxoCount(t, s, ctx, forged))
+	require.Equal(t, 1, utxoCount(t, s, ctx, ps[1]), "the forged claim consumed nothing")
+	require.Equal(t, 0, utxoCount(t, s, ctx, ps[0]))
+	require.Equal(t, 0, utxoCount(t, s, ctx, ps[2]))
 
-	// And the coin is still there for its rightful spender.
+	// And the UTXO is still there for its rightful spender.
 	honest := spendOutput(t, ps[1], 0, 1)
 	_, spends, err := s.SpendAndCreate(ctx, honest, 101)
 	require.NoError(t, err)
@@ -201,7 +201,7 @@ func TestSpendAndCreateBatchRejectsAFalseClaimWithoutTouchingItsSiblings(t *test
 }
 
 // TestSpendAndCreateBatchArbitratesADoubleSpendBetweenSiblings: two transactions in ONE flush
-// want the same coin. Exactly one may have it, and the loser must be told who won, because
+// want the same UTXO. Exactly one may have it, and the loser must be told who won, because
 // conflict detection reads that name.
 func TestSpendAndCreateBatchArbitratesADoubleSpendBetweenSiblings(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -234,12 +234,12 @@ func TestSpendAndCreateBatchArbitratesADoubleSpendBetweenSiblings(t *testing.T) 
 
 	require.Equal(t, 1, identityCount(t, s, ctx, txs[winner]))
 	require.Equal(t, 0, identityCount(t, s, ctx, txs[loser]))
-	require.Equal(t, 0, coinCount(t, s, ctx, p))
+	require.Equal(t, 0, utxoCount(t, s, ctx, p))
 }
 
 // TestSpendAndCreateBatchLoserOfAnInvalidSiblingWins is the case the deferred re-judgement
-// exists for. W contests L's coin but W is itself invalid on another input. Whichever of them
-// the statement hands the contested coin to, the outcome must be the one the single path gives:
+// exists for. W contests L's UTXO but W is itself invalid on another input. Whichever of them
+// the statement hands the contested UTXO to, the outcome must be the one the single path gives:
 // W rejected, L accepted. If L is judged only against W's uncommitted delete, L is wrongly
 // rejected as a double spend of a transaction that never existed.
 func TestSpendAndCreateBatchLoserOfAnInvalidSiblingWins(t *testing.T) {
@@ -271,11 +271,11 @@ func TestSpendAndCreateBatchLoserOfAnInvalidSiblingWins(t *testing.T) {
 
 		require.ErrorIs(t, byTx[w].err, errors.ErrUtxoError, "wFirst=%v", wFirst)
 		require.Equal(t, 0, identityCount(t, s, ctx, w))
-		require.Equal(t, 1, coinCount(t, s, ctx, ps[1]), "the lied-about coin is untouched")
+		require.Equal(t, 1, utxoCount(t, s, ctx, ps[1]), "the lied-about UTXO is untouched")
 
 		require.NoError(t, byTx[l].err, "the honest contender must win (wFirst=%v)", wFirst)
 		require.Equal(t, 1, identityCount(t, s, ctx, l))
-		require.Equal(t, 0, coinCount(t, s, ctx, ps[0]))
+		require.Equal(t, 0, utxoCount(t, s, ctx, ps[0]))
 	}
 }
 
@@ -308,8 +308,8 @@ func TestSpendAndCreateBatchHoldsARepeatedTransactionOnce(t *testing.T) {
 	require.NoError(t, res[repeat].spends[0].Err, "a repeat is a replay of our own spend, not a double spend")
 
 	require.Equal(t, 1, identityCount(t, s, ctx, c))
-	require.Equal(t, 2, coinCount(t, s, ctx, c))
-	require.Equal(t, 0, coinCount(t, s, ctx, p))
+	require.Equal(t, 2, utxoCount(t, s, ctx, c))
+	require.Equal(t, 0, utxoCount(t, s, ctx, p))
 	var bodies int
 	h := c.TxIDChainHash()
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_body WHERE txid = $1`, h[:]).Scan(&bodies))
@@ -334,7 +334,7 @@ func TestSpendAndCreateBatchReplaysAnAppliedBatch(t *testing.T) {
 	}
 
 	bodies := countRows(t, s, ctx, "tx_body")
-	coins := countRows(t, s, ctx, "utxo")
+	utxoRows := countRows(t, s, ctx, "utxo")
 
 	again := make([]*spendAndCreateItem, 0, 3)
 	for _, p := range ps {
@@ -350,7 +350,7 @@ func TestSpendAndCreateBatchReplaysAnAppliedBatch(t *testing.T) {
 	}
 
 	require.Equal(t, bodies, countRows(t, s, ctx, "tx_body"))
-	require.Equal(t, coins, countRows(t, s, ctx, "utxo"))
+	require.Equal(t, utxoRows, countRows(t, s, ctx, "utxo"))
 }
 
 // TestSpendAndCreateBatchAnswersANilTransactionAlone: a nil transaction is a caller bug, and the
@@ -436,13 +436,13 @@ CREATE TRIGGER batchtest_one_identity_per_tx BEFORE INSERT ON tx_ident
 		require.NotNil(t, r.data)
 		require.Len(t, r.spends, 1)
 		require.Equal(t, 1, identityCount(t, s, ctx, items[i].tx))
-		require.Equal(t, 0, coinCount(t, s, ctx, ps[i]))
+		require.Equal(t, 0, utxoCount(t, s, ctx, ps[i]))
 	}
 }
 
 // TestSpendAndCreateBatchFallbackKeepsARejectedClaimRejected is the security property under
 // failure. A forged claim is rejected in the first spend round, and the statement has by then
-// overwritten the forged input with the coin's true values. If the batch then fails for an
+// overwritten the forged input with the UTXO's true values. If the batch then fails for an
 // unrelated reason and every item is redone alone, the forgery must NOT be among them: redone,
 // it would pass the comparison it just failed, and a transaction the validator checked against
 // forged values would be stored.
@@ -490,13 +490,13 @@ CREATE TRIGGER batchtest_one_identity_per_tx BEFORE INSERT ON tx_ident
 	require.ErrorIs(t, res[1].err, errors.ErrUtxoError)
 	require.ErrorIs(t, res[1].spends[0].Err, errors.ErrUtxoHashMismatch)
 	require.Equal(t, 0, identityCount(t, s, ctx, forged), "a forged claim must never be stored, however the batch ends")
-	require.Equal(t, 1, coinCount(t, s, ctx, ps[1]), "the coin it lied about is untouched")
+	require.Equal(t, 1, utxoCount(t, s, ctx, ps[1]), "the UTXO it lied about is untouched")
 }
 
 // TestStorePlansEveryStatementWithItsParameters pins the pool setting that keeps the wide
 // statements linear. PostgreSQL moves a prepared statement to a generic plan after five
 // executions, and a generic plan cannot see how long the arrays are or how selective the flag
-// masks are. Measured on a 40,000-row coin table, the 500-key spend statement went from 8 ms to
+// masks are. Measured on a 40,000-row UTXO table, the 500-key spend statement went from 8 ms to
 // 1,070 ms at exactly the sixth execution. The setting is what stops that, so its absence is a
 // regression even though every functional test would still pass.
 func TestStorePlansEveryStatementWithItsParameters(t *testing.T) {
@@ -512,8 +512,8 @@ func TestStorePlansEveryStatementWithItsParameters(t *testing.T) {
 }
 
 // TestSpendAndCreateBatchDeferredForgeryStaysRejected is the case the claim snapshot exists
-// for. W contests coin P0 with L and lies about coin P1. L is rejected outright for a frozen
-// coin. If L takes P0 in the first round, W has lost to a sibling and is judged again by the
+// for. W contests UTXO P0 with L and lies about UTXO P1. L is rejected outright for a frozen
+// UTXO. If L takes P0 in the first round, W has lost to a sibling and is judged again by the
 // single path after the batch, and by then the first round has overwritten W's lie about P1
 // with the truth. Without its claims restored, W would pass the comparison it failed and be
 // stored. Both orderings are tried because which item the DELETE serves first is not specified;
@@ -547,8 +547,8 @@ func TestSpendAndCreateBatchDeferredForgeryStaysRejected(t *testing.T) {
 
 		require.ErrorIs(t, byTx[w].err, errors.ErrUtxoError, "wFirst=%v", wFirst)
 		require.Equal(t, 0, identityCount(t, s, ctx, w), "the forgery must never be stored (wFirst=%v)", wFirst)
-		require.Equal(t, 1, coinCount(t, s, ctx, ps[1]), "the lied-about coin is untouched")
-		require.Equal(t, 1, coinCount(t, s, ctx, ps[0]), "nobody got the contested coin")
+		require.Equal(t, 1, utxoCount(t, s, ctx, ps[1]), "the lied-about UTXO is untouched")
+		require.Equal(t, 1, utxoCount(t, s, ctx, ps[0]), "nobody got the contested UTXO")
 
 		require.ErrorIs(t, byTx[l].err, errors.ErrUtxoError)
 		require.Equal(t, 0, identityCount(t, s, ctx, l))
@@ -593,7 +593,7 @@ func TestSpendAndCreateRefusesACancelledCallerBeforeQueueing(t *testing.T) {
 	_, _, err := s.SpendAndCreate(cancelled, c, 101)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 0, identityCount(t, s, ctx, c))
-	require.Equal(t, 1, coinCount(t, s, ctx, p))
+	require.Equal(t, 1, utxoCount(t, s, ctx, p))
 }
 
 // TestSpendAndCreateAfterCloseIsAnErrorNotAPanic: the batcher's channel is closed by Close, and a
@@ -638,7 +638,7 @@ func TestSpendPlanRowsAreSortedAndStillOwned(t *testing.T) {
 
 // TestSpendAndCreateThroughTheBatcherUnderContention goes through the public method with a real,
 // concurrent batcher and a population of competing spends spread across goroutines, so that
-// double spends land both inside one flush and across flushes running at once. Every coin must
+// double spends land both inside one flush and across flushes running at once. Every UTXO must
 // end up with exactly one spender and every loser must be told who it was.
 func TestSpendAndCreateThroughTheBatcherUnderContention(t *testing.T) {
 	s, ctx := newTestStoreWith(t, func(st *settings.Settings) {
@@ -651,11 +651,11 @@ func TestSpendAndCreateThroughTheBatcherUnderContention(t *testing.T) {
 	require.NotNil(t, s.spendAndCreateBatcher)
 
 	const (
-		coins      = 120
+		utxoRows   = 120
 		contenders = 3
 	)
 
-	ps := parents(t, s, ctx, coins, 100)
+	ps := parents(t, s, ctx, utxoRows, 100)
 
 	type outcome struct {
 		tx     *bt.Tx
@@ -663,7 +663,7 @@ func TestSpendAndCreateThroughTheBatcherUnderContention(t *testing.T) {
 		err    error
 	}
 
-	results := make([][]outcome, coins)
+	results := make([][]outcome, utxoRows)
 
 	var wg sync.WaitGroup
 
@@ -691,31 +691,31 @@ func TestSpendAndCreateThroughTheBatcherUnderContention(t *testing.T) {
 
 		for _, r := range rs {
 			if r.err == nil {
-				require.Nil(t, winner, "coin %d has two winners", i)
+				require.Nil(t, winner, "UTXO %d has two winners", i)
 				winner = r.tx
 			}
 		}
 
-		require.NotNil(t, winner, "coin %d has no winner", i)
+		require.NotNil(t, winner, "UTXO %d has no winner", i)
 
 		for _, r := range rs {
 			if r.err == nil {
 				continue
 			}
 
-			require.ErrorIs(t, r.err, errors.ErrUtxoError, "coin %d", i)
+			require.ErrorIs(t, r.err, errors.ErrUtxoError, "UTXO %d", i)
 			require.Len(t, r.spends, 1)
 			require.ErrorIs(t, r.spends[0].Err, errors.ErrSpent)
-			require.NotNil(t, r.spends[0].ConflictingTxID, "coin %d: the loser must be told who won", i)
-			require.Equal(t, *winner.TxIDChainHash(), *r.spends[0].ConflictingTxID, "coin %d", i)
+			require.NotNil(t, r.spends[0].ConflictingTxID, "UTXO %d: the loser must be told who won", i)
+			require.Equal(t, *winner.TxIDChainHash(), *r.spends[0].ConflictingTxID, "UTXO %d", i)
 			require.Equal(t, 0, identityCount(t, s, ctx, r.tx))
 		}
 
 		require.Equal(t, 1, identityCount(t, s, ctx, winner))
-		require.Equal(t, 0, coinCount(t, s, ctx, ps[i]))
+		require.Equal(t, 0, utxoCount(t, s, ctx, ps[i]))
 	}
 
-	require.Equal(t, coins, countRows(t, s, ctx, "tx_ident")-coins, "exactly one child stored per coin")
+	require.Equal(t, utxoRows, countRows(t, s, ctx, "tx_ident")-utxoRows, "exactly one child stored per UTXO")
 }
 
 // TestSpendAndCreateThroughTheBatcherPreservesDependencyOrdering: a caller that waits for the

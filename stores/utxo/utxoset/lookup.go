@@ -12,42 +12,42 @@ import (
 )
 
 // The read order is identity table, then membership by transaction id, then the preserved
-// parent, then the coin, and the order is a correctness rule rather than a tuning. A coin
+// parent, then the UTXO, and the order is a correctness rule rather than a tuning. A UTXO
 // holds ONE block id, and on the ordinary two-step reorg (a fork block stamped as not on the
-// longest chain, then a later block making it the main chain) nothing rewrites the coins of
-// transactions shared between the two blocks. A coin-first read would then hand block
+// longest chain, then a later block making it the main chain) nothing rewrites the UTXOs of
+// transactions shared between the two blocks. A UTXO-first read would then hand block
 // validation an id that lost, and the parent check stores a valid block as invalid. The
-// membership table holds every id while the window lives, so the coin is consulted only once
-// the window is gone, by which time its block is at least 1440 deep and its coin-carried id is
+// membership table holds every id while the window lives, so the UTXO is consulted only once
+// the window is gone, by which time its block is at least 1440 deep and its UTXO-carried id is
 // the settled one.
 //
-// The preserved-parent step sits between membership and coin, and its position is the same
+// The preserved-parent step sits between membership and UTXO, and its position is the same
 // kind of rule. It answers from a COPY of a membership row, taken while the row was still
 // there, so it must never be preferred to the row itself: while the window lives, the row is
 // the record that gets rewritten by a reorg and the copy is not. Once the window is gone the
-// copy is all there is, and it comes before the coin because it carries the whole payload
-// where the coin carries only a block.
+// copy is all there is, and it comes before the UTXO because it carries the whole payload
+// where the UTXO carries only a block.
 //
-// The spend journal is the FIFTH step, after the coin rather than before it, and that order is
-// the same rule again. A live coin is the settled record of a transaction that still exists;
-// the journal row is a copy taken off a coin that has since been destroyed. Ask the journal
+// The spend journal is the FIFTH step, after the UTXO rather than before it, and that order is
+// the same rule again. A live UTXO is the settled record of a transaction that still exists;
+// the journal row is a copy taken off a UTXO that has since been destroyed. Ask the journal
 // first and a transaction with one output spent and one still live would be answered from the
 // spent one, which is a copy where a record was available. Ask it last and it is reached only
-// for a transaction with no live coin at all, which is the case it exists for.
+// for a transaction with no live UTXO at all, which is the case it exists for.
 //
 // It exists because nothing else can answer for a FULLY-SPENT parent mined more than the
 // membership retention ago, and model/Block.go's checkParentTransactions asks about exactly
 // that on most blocks above the highest checkpoint. No identity row (it was mined), no
 // membership window (dropped 1440 blocks after it was mined), no preserved copy (preservation
 // names parents of children unmined for 144 blocks, and this child is mined in the next
-// block), and no coin (the last one was just spent). getParentTxMetaBlockIDs turns the
+// block), and no UTXO (the last one was just spent). getParentTxMetaBlockIDs turns the
 // resulting not-found into a BlockIncompleteError, which callers retry rather than persist, so
 // the block retries forever. Below the highest checkpoint skipOrderAndBlessedBelowCheckpoint
 // skips the whole check, which is why a from-genesis sync runs clean until it passes it.
 //
 // The spec's own version of this step could not have worked: it read the parent's block facts
 // from tx_mined by the spent height's partition, and for this parent tx_mined has no row at
-// any height. The journal now carries the facts itself, copied off the coin the spend
+// any height. The journal now carries the facts itself, copied off the UTXO the spend
 // destroyed. Trusting a copied block id here is not the mutability the restore rule forbids: a
 // parent reaching this step has had its window retired, so its block is at least 1440 deep and
 // cannot change. See the spend_journal comment in schema.go.
@@ -104,7 +104,7 @@ SELECT i.txid, i.created_height, i.off_chain_since, i.membership, i.fee, i.size_
 // which at 1440 blocks of mainnet is millions of rows, and this read is on the validator's
 // parent-resolution path.
 //
-// OFFSET 0 is the fence itself, the same one coinFactsSQL relies on: it stops the planner
+// OFFSET 0 is the fence itself, the same one utxoFactsSQL relies on: it stops the planner
 // pulling the subquery up into the outer join, which is what re-admits the hash join. The
 // inner ORDER BY walks the primary key in order; the outer one is what actually guarantees the
 // grouping the reader relies on, because the LEFT JOIN to the body may reorder rows.
@@ -152,13 +152,13 @@ SELECT k.txid, p.mined_height, p.block_id, p.subtree_idx, p.size_in_bytes, p.fee
  ) AS p
   LEFT JOIN tx_body b ON b.created_height = p.created_height AND b.txid = k.txid`
 
-// coinFactsSQL reads one live coin per transaction, for the transactions nothing else knows.
+// utxoFactsSQL reads one live UTXO per transaction, for the transactions nothing else knows.
 // The LATERAL with ORDER BY and LIMIT 1 OFFSET 0 is the fence the planner needs to walk the
-// packed-key index instead of scanning the coin table, and each half of it was measured:
+// packed-key index instead of scanning the UTXO table, and each half of it was measured:
 // without the packed-key range bound the planner reads every leaf partition, and without the
 // ORDER BY it materialises the whole range before the LIMIT can stop it. createMinedPlanSQL's
-// duplicate-coin guard carries the identical fence, for the identical reason.
-const coinFactsSQL = `
+// duplicate-UTXO guard carries the identical fence, for the identical reason.
+const utxoFactsSQL = `
 SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
   FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS k(leaf, txid, lo, hi)
  CROSS JOIN LATERAL (
@@ -173,7 +173,7 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
 // membership window has already retired. It is the last thing the store can say about a
 // transaction before not-found.
 //
-// The shape is coinFactsSQL's, and for the same reasons. The keys sit on the OUTSIDE of a
+// The shape is utxoFactsSQL's, and for the same reasons. The keys sit on the OUTSIDE of a
 // LATERAL with the ORDER BY / LIMIT 1 / OFFSET 0 fence: OFFSET 0 stops the planner pulling the
 // subquery up into the outer join, which is what would re-admit a hash join against every live
 // leaf; the packed-key range bound is what makes it a range scan rather than a read of the
@@ -231,8 +231,8 @@ func newLookupResult(n int) lookupResult {
 }
 
 // fail records a per-transaction fault. The hash counts as RESOLVED from here on, which is the
-// point: a corrupt identity row must not fall through to the membership table or the coin, or
-// the store would answer from a coin for a transaction whose real record it just refused to
+// point: a corrupt identity row must not fall through to the membership table or the UTXO, or
+// the store would answer from a UTXO for a transaction whose real record it just refused to
 // read, silently substituting a thinner answer for a fault.
 func (r *lookupResult) fail(h chainhash.Hash, err error) {
 	if r.failed == nil {
@@ -257,7 +257,7 @@ func (r *lookupResult) resolved(h chainhash.Hash) bool {
 // maps; a transaction whose stored row will not decode lands in failed rather than found.
 //
 // Each step asks only about the hashes the steps before it could not answer, so a batch of
-// ordinary mined parents costs one membership probe each and never touches the coin table,
+// ordinary mined parents costs one membership probe each and never touches the UTXO table,
 // a batch of mempool parents never leaves the identity table, and the journal is read only for
 // a transaction the four steps above it all missed.
 //
@@ -319,8 +319,8 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 	}
 
 	if len(rest) > 0 {
-		// Step 4: the coin.
-		if err := s.readCoinFacts(ctx, rest, &res); err != nil {
+		// Step 4: the UTXO.
+		if err := s.readUTXOFacts(ctx, rest, &res); err != nil {
 			return lookupResult{}, err
 		}
 
@@ -329,7 +329,7 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 
 	if len(rest) > 0 {
 		// Step 5: the spend journal, for a fully-spent parent whose membership window has
-		// already retired. Last, so a live coin is always preferred to a copy taken off a
+		// already retired. Last, so a live UTXO is always preferred to a copy taken off a
 		// destroyed one.
 		if err := s.readSpentParents(ctx, rest, &res); err != nil {
 			return lookupResult{}, err
@@ -349,12 +349,12 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 }
 
 // conflictChildrenSQL names the transactions recorded as contesting each of these
-// transactions' coins.
+// transactions' UTXOs.
 //
 // One statement for the whole batch, keyed on the parent's transaction id alone. That is what
 // makes it answer for a parent in the identity table, a parent in the membership table, a
 // parent whose membership row survives only as a preservation copy, and a parent this store
-// knows only from a live coin -- the packed column it replaces could only ever answer for the
+// knows only from a live UTXO -- the packed column it replaces could only ever answer for the
 // first of the four.
 //
 // DISTINCT because the uniqueness underneath is PER WINDOW: a unique index on a partitioned
@@ -746,41 +746,41 @@ func (s *Store) readPreserved(ctx context.Context, hashes []chainhash.Hash,
 	return nil
 }
 
-// readCoinFacts is the last step: a transaction nothing else knows about, answered from one of
-// its own live coins.
+// readUTXOFacts is the last step: a transaction nothing else knows about, answered from one of
+// its own live UTXOs.
 //
-// What comes back is deliberately thin. The coin carries its block and nothing about the
+// What comes back is deliberately thin. The UTXO carries its block and nothing about the
 // transaction's fee, size, inputs or subtree position, which is exactly what a pruned SV Node
 // can say about a parent whose block it no longer holds, and all the validator needs to check
 // a child's inputs.
-func (s *Store) readCoinFacts(ctx context.Context, hashes []chainhash.Hash,
+func (s *Store) readUTXOFacts(ctx context.Context, hashes []chainhash.Hash,
 	res *lookupResult) error {
 	txids := make([][]byte, 0, len(hashes))
 	for i := range hashes {
 		txids = append(txids, hashes[i][:])
 	}
 
-	leaves, ids, los, his := liveCoinArgs(txids)
+	leaves, ids, los, his := liveUTXOArgs(txids)
 
-	rows, err := s.pool.Query(ctx, coinFactsSQL, leaves, ids, los, his)
+	rows, err := s.pool.Query(ctx, utxoFactsSQL, leaves, ids, los, his)
 	if err != nil {
-		return errors.NewStorageError("[utxoset][lookup] coin facts", err)
+		return errors.NewStorageError("[utxoset][lookup] UTXO facts", err)
 	}
 
-	return scanBlockFacts(rows, "coin facts", res)
+	return scanBlockFacts(rows, "UTXO facts", res)
 }
 
 // readSpentParents is the step past the last one: a transaction with no identity row, no
-// membership window, no preserved copy and no live coin, answered from the journal row its
+// membership window, no preserved copy and no live UTXO, answered from the journal row its
 // last spend left behind.
 //
-// It answers exactly what readCoinFacts answers, and it has to, because the two are the same
+// It answers exactly what readUTXOFacts answers, and it has to, because the two are the same
 // claim from two sources: this transaction was mined in this block and the store no longer
 // holds the record that would say more. What comes back is thin -- a block, and the body if
 // its window happens to still hold it -- which is all the validator needs to check a child's
 // inputs, and all a pruned SV Node could say either.
 //
-// The packed-key arguments are built by the same liveCoinArgs the coin step uses, so the two
+// The packed-key arguments are built by the same liveUTXOArgs the UTXO step uses, so the two
 // statements are explained with identical inputs and neither can drift into pinning a plan
 // nothing runs. The journal has no leaf column, so the leaf array it returns is unused here:
 // the journal is partitioned by spent height, and the ukey range is what locates the row.
@@ -791,7 +791,7 @@ func (s *Store) readSpentParents(ctx context.Context, hashes []chainhash.Hash,
 		txids = append(txids, hashes[i][:])
 	}
 
-	_, ids, los, his := liveCoinArgs(txids)
+	_, ids, los, his := liveUTXOArgs(txids)
 
 	rows, err := s.pool.Query(ctx, spentParentFactsSQL, ids, los, his)
 	if err != nil {
@@ -804,7 +804,7 @@ func (s *Store) readSpentParents(ctx context.Context, hashes []chainhash.Hash,
 // scanBlockFacts reads the (txid, mined_height, block_id, flags, raw_tx) shape both thin steps
 // return, and it is shared rather than copied because the two are one answer from two sources:
 // a divergence between them would be a transaction reporting a different block depending on
-// whether its last coin had been spent yet.
+// whether its last UTXO had been spent yet.
 func scanBlockFacts(rows pgx.Rows, what string, res *lookupResult) error {
 	defer rows.Close()
 
@@ -831,7 +831,7 @@ func scanBlockFacts(rows pgx.Rows, what string, res *lookupResult) error {
 			Locked:      flags&FlagLocked != 0,
 		}
 
-		// mined_height 0 is the unconfirmed sentinel, and an unconfirmed coin means the
+		// mined_height 0 is the unconfirmed sentinel, and an unconfirmed UTXO means the
 		// transaction claims no block at all. Reporting block id 0 for it would be a lie
 		// that block validation cannot tell from genesis, whose id really is 0.
 		if minedHeight > 0 {
@@ -861,14 +861,14 @@ func scanBlockFacts(rows pgx.Rows, what string, res *lookupResult) error {
 	return nil
 }
 
-// liveCoinArgs expands transaction ids into the four parallel arrays coinFactsSQL takes: the
+// liveUTXOArgs expands transaction ids into the four parallel arrays utxoFactsSQL takes: the
 // partition key, the identity, and the packed-key range covering every output the transaction
 // could have created.
 //
 // It is a named function rather than four lines inline so the plan tests can build exactly the
 // arguments the production path builds. A test that explained a hand-written variant would be
 // pinning the plan of a statement nothing runs.
-func liveCoinArgs(txids [][]byte) (leaves []int16, ids [][]byte, los, his [][16]byte) {
+func liveUTXOArgs(txids [][]byte) (leaves []int16, ids [][]byte, los, his [][16]byte) {
 	leaves = make([]int16, 0, len(txids))
 	ids = make([][]byte, 0, len(txids))
 	los = make([][16]byte, 0, len(txids))

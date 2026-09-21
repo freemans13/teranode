@@ -24,7 +24,7 @@ import (
 // it.
 // The assertion now reads through Get rather than off tx_ident, because a create carrying
 // block information no longer writes an identity row at all: it claims a membership row and
-// coins that know their block. The waiting marker is a column on the row it does not have, so
+// UTXOs that know their block. The waiting marker is a column on the row it does not have, so
 // the state this test was written to forbid is now unreachable by construction, and what is
 // worth pinning is that the read path says the same thing -- in a block, not waiting.
 func TestCreateWithABlockIsNotAlsoWaitingToBeMined(t *testing.T) {

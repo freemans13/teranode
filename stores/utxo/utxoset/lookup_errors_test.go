@@ -82,27 +82,27 @@ func TestGetReportsACorruptRowAsAFaultNotAMiss(t *testing.T) {
 		"want the decode fault, not a miss: %v", err)
 }
 
-// TestGetDoesNotAnswerACorruptIdentityRowFromTheCoin pins the other half of the fix, and it is
+// TestGetDoesNotAnswerACorruptIdentityRowFromTheUTXO pins the other half of the fix, and it is
 // the half that could go wrong silently.
 //
 // The read order falls through to the next step for a transaction the current step did not
-// find. A transaction whose identity row is corrupt WAS found, and it still has live coins, so
-// treating the fault as "not found here" would send it to the coin step, which would answer
-// happily with the thin coin-derived record. The caller would then get a success carrying no
+// find. A transaction whose identity row is corrupt WAS found, and it still has live UTXOs, so
+// treating the fault as "not found here" would send it to the UTXO step, which would answer
+// happily with the thin UTXO-derived record. The caller would then get a success carrying no
 // inpoints and no size, with nothing anywhere saying the real record was unreadable.
-func TestGetDoesNotAnswerACorruptIdentityRowFromTheCoin(t *testing.T) {
+func TestGetDoesNotAnswerACorruptIdentityRowFromTheUTXO(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 2, 6_004)
 	_, err := s.Create(ctx, tx, 700_000)
 	require.NoError(t, err)
 
-	// The fall-through the fault must not take: the coins are there and would answer.
-	require.Equal(t, 2, coinCount(t, s, ctx, tx))
+	// The fall-through the fault must not take: the UTXOs are there and would answer.
+	require.Equal(t, 2, utxoCount(t, s, ctx, tx))
 
 	corruptInpoints(t, s, ctx, tx)
 
 	got, err := s.Get(ctx, tx.TxIDChainHash())
-	require.Error(t, err, "a corrupt identity row must not be answered from the coin")
+	require.Error(t, err, "a corrupt identity row must not be answered from the UTXO")
 	require.Nil(t, got)
 }

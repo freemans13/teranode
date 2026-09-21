@@ -79,7 +79,7 @@ func createDirect(s *Store, ctx context.Context, tx *bt.Tx, height uint32) error
 	return dbTx.Commit(ctx)
 }
 
-// insertCollidingCoin writes a coin row that SHARES another transaction's packed key: the same
+// insertCollidingUTXO writes a UTXO row that SHARES another transaction's packed key: the same
 // first twelve bytes of txid, so the same leaf and the same ukey, with a different full
 // 32-byte txid.
 //
@@ -87,7 +87,7 @@ func createDirect(s *Store, ctx context.Context, tx *bt.Tx, height uint32) error
 // is legal and this collision is the one an attacker can buy with 2^48 of work. Any by-key
 // write that does not recheck the full txid will hit it, which is what the tests using this
 // helper are for. It returns the other transaction id so the caller can read the row back.
-func insertCollidingCoin(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx,
+func insertCollidingUTXO(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx,
 	minedHeight, blockID int32) []byte {
 	t.Helper()
 
@@ -109,8 +109,8 @@ func insertCollidingCoin(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx,
 	return other
 }
 
-// coinFactsOf reads the block facts off the one coin row carrying this exact txid.
-func coinFactsOf(t *testing.T, s *Store, ctx context.Context, txid []byte) (minedHeight, blockID int32) {
+// utxoFactsOf reads the block facts off the one UTXO row carrying this exact txid.
+func utxoFactsOf(t *testing.T, s *Store, ctx context.Context, txid []byte) (minedHeight, blockID int32) {
 	t.Helper()
 
 	lo, hi := Pack(txid, 0), Pack(txid, ^uint32(0))

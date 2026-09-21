@@ -31,7 +31,7 @@ const DefaultSpendJournalRetentionBlocks = 1440
 //
 // One statement, not merely one transaction. A data-modifying CTE guarantees the delete
 // and the journal insert see the same rows and commit together -- there is no ordering,
-// no second round trip, and no window in which a coin is gone with nothing recording how
+// no second round trip, and no window in which a UTXO is gone with nothing recording how
 // to put it back. The outer SELECT still returns satoshis and script, so the spend
 // remains its own decorate fetch.
 //
@@ -50,11 +50,11 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // than as spent.
 //
 // THE FLAG MASK IS PER KEY, not a constant, because two of the three flags it tests are
-// waivable and the waiver belongs to the caller rather than to the coin. Conflict resolution
+// waivable and the waiver belongs to the caller rather than to the UTXO. Conflict resolution
 // spends the promoted winner through the very lock and conflicting mark it set a moment
 // earlier -- that is what WithIgnoreLocked and WithIgnoreConflicting are for -- while an
-// ordinary validator spend of the same coin must be refused. The mask used to be the literal 5
-// and neither option had any effect: a locked coin was spendable by anybody, which made the
+// ordinary validator spend of the same UTXO must be refused. The mask used to be the literal 5
+// and neither option had any effect: a locked UTXO was spendable by anybody, which made the
 // lock decorative, and an ignored conflicting flag still refused. Frozen has no waiver in any
 // store and is always in the mask. See spendGuardMask.
 //
@@ -62,8 +62,8 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // which it is equal to for every value a smallint can hold, because the planner can estimate
 // one and not the other. It has no statistics for a bit-mask expression, so an equality on
 // one is given the default selectivity of one row in two hundred, and two of them one in
-// forty thousand. That told the planner almost no coin survives the test, and with a batch
-// of keys on the other side it chose to walk the whole coin table once PER KEY, since a
+// forty thousand. That told the planner almost no UTXO survives the test, and with a batch
+// of keys on the other side it chose to walk the whole UTXO table once PER KEY, since a
 // table of one row is cheap to walk. Measured on a 40,000-row table: a 64-key batch took
 // 3 ms until the table crossed the size where that plan won, then 45 ms, and with
 // materialisation disabled 180 ms. An inequality on an expression without statistics is
@@ -72,13 +72,13 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // this statement never showed the problem, because with one key a walk per key is one walk.
 //
 // The outer SELECT carries hash_override out with the payload, and it costs nothing: the
-// DELETE's RETURNING already reads the whole row. It is non-NULL only on a coin ReAssignUTXO
-// has moved to a new owner, and on such a coin the satoshis and the script beside it are the
+// DELETE's RETURNING already reads the whole row. It is non-NULL only on a UTXO ReAssignUTXO
+// has moved to a new owner, and on such a UTXO the satoshis and the script beside it are the
 // OLD output's -- the reassign interface has no room for the new ones. claimMismatch reads it
 // to decide which of the two authentications applies, so it has to travel with them rather
-// than be fetched separately, or a coin could be reassigned between the delete and the check.
+// than be fetched separately, or a UTXO could be reassigned between the delete and the check.
 //
-// The journal row copies the coin's mined_height and block_id along with the rest of the
+// The journal row copies the UTXO's mined_height and block_id along with the rest of the
 // payload, and they cost nothing extra: the DELETE already carries the whole row, so this is
 // two more columns on a RETURNING that was already reading them. They are what makes a
 // fully-spent parent older than the membership retention still answerable -- see
@@ -244,7 +244,7 @@ SELECT c.relname,
 // cutoff, oldest first, in one pass.
 //
 // conflict_children is here rather than on a horizon of its own because its retention is not
-// an independent choice. It records which losing transactions contest a parent's coin, and
+// an independent choice. It records which losing transactions contest a parent's UTXO, and
 // what conflict resolution DOES with that answer is restore the losing spends out of the
 // journal. A note whose journal leaf has been dropped names a race that can no longer be
 // undone, so keeping it past the journal would be keeping an answer nothing can act on.

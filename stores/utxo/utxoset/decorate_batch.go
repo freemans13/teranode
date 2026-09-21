@@ -72,12 +72,12 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 	return nil
 }
 
-// setLockedSQL flips the locked bit on the transaction row AND on every coin it created.
+// setLockedSQL flips the locked bit on the transaction row AND on every UTXO it created.
 //
 // Both, because they are read by different things. The transaction row is what a caller sees
-// through Get; the coin row is what the spend path reads, and the spend path never looks at
+// through Get; the UTXO row is what the spend path reads, and the spend path never looks at
 // the transaction row. Setting only one would leave a transaction reporting itself locked
-// while its coins were still spendable, or the reverse.
+// while its UTXOs were still spendable, or the reverse.
 //
 // "The transaction row" is EITHER home, so there are three arms rather than two. A transaction
 // lives in exactly one of tx_ident and tx_mined, this call does not know which, and
@@ -91,26 +91,26 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 // so it is one descent per key per live window, and the update touches every membership row the
 // transaction has -- a transaction stamped into two blocks is one transaction and one flag.
 //
-// The coin UPDATE carries the packed-key range, AND it locates its rows through a fenced
+// The UTXO UPDATE carries the packed-key range, AND it locates its rows through a fenced
 // LATERAL first. schema.go states the rule in its own words: "There is deliberately no index on
 // txid: every by-txid access is a ukey range scan with a full-txid heap recheck. Any query
 // filtering on txid without a ukey range bound is a review failure." This was that query, on
 // the two-phase-commit path, one call per mempool transaction, and every sibling statement --
-// setConflictingSQL, deleteTxSQL, resetCoinsSQL, stampCoinsSQL, coinFactsSQL -- already carried
+// setConflictingSQL, deleteTxSQL, resetUTXOsSQL, stampUTXOsSQL, utxoFactsSQL -- already carried
 // lo/hi. The answer was never wrong, because the full txid was already rechecked.
 //
-// The bound alone does not buy the plan. Measured at 500 keys against 40,000 coin rows: with
+// The bound alone does not buy the plan. Measured at 500 keys against 40,000 UTXO rows: with
 // the range added straight to `UPDATE utxo u FROM k`, the planner still hash-joined the keys
 // against a Seq Scan of all eight leaf partitions and applied the range as a Join Filter --
-// 13.5-14.1 ms, the same plan as without it. That is exactly what resetCoinsSQL's comment
-// records ("the obvious UPDATE ... FROM unnest read all eight coin partitions for 98 ms of a
-// 108 ms statement"), so this takes resetCoinsSQL's shape: a CTE that locates the rows through
+// 13.5-14.1 ms, the same plan as without it. That is exactly what resetUTXOsSQL's comment
+// records ("the obvious UPDATE ... FROM unnest read all eight UTXO partitions for 98 ms of a
+// 108 ms statement"), so this takes resetUTXOsSQL's shape: a CTE that locates the rows through
 // a CROSS JOIN LATERAL with an OFFSET 0 fence, then an UPDATE keyed on what it found. The fence
 // is what stops the subquery being pulled up into the join, which is what re-admits the scan.
-// No LIMIT inside it, because a transaction has as many coins as it has unspent outputs and all
-// of them take the flag. Measured, eight runs at 500 keys against 40,000 coin rows: 13.2-14.5 ms
+// No LIMIT inside it, because a transaction has as many UTXOs as it has unspent outputs and all
+// of them take the flag. Measured, eight runs at 500 keys against 40,000 UTXO rows: 13.2-14.5 ms
 // with the bound as a Join Filter, 8.5-9.9 ms fenced, with a Bitmap Index Scan on each leaf's
-// ukey index and no Seq Scan on any coin partition.
+// ukey index and no Seq Scan on any UTXO partition.
 //
 // The ident arm used to live in here too, as the same paired-unnest join every other
 // identity statement was measured and rejected for: leafGroups (set_mined.go) found it
@@ -188,9 +188,9 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value 
 
 // setLockedDirect issues the update, and is what both the direct and the batched path end at.
 //
-// The ident arm runs first, once per leaf group (leafGroups), and the mined+coin statement
+// The ident arm runs first, once per leaf group (leafGroups), and the mined+UTXO statement
 // runs after it -- both inside ONE transaction, so a caller reading either row mid-flight
-// still sees them agree: never a transaction whose identity row is locked and whose coin or
+// still sees them agree: never a transaction whose identity row is locked and whose UTXO or
 // membership row is not, or the reverse.
 func (s *Store) setLockedDirect(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
 	leaves := make([]int16, 0, len(txHashes))

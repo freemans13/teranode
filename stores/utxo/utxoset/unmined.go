@@ -31,7 +31,7 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 // preservation table, or extends the life of a copy already there.
 //
 // The earliest row by seq is the transaction's longest-chain stamp rather than a fork one, and
-// that is the same rule firstMinedRowSQL relies on when it stamps a retiring window's coins:
+// that is the same rule firstMinedRowSQL relies on when it stamps a retiring window's UTXOs:
 // since task 9 a transaction only reaches the membership table by a longest-chain stamp or a
 // block-path create, and a fork stamp can only ever append to a row that already exists. So
 // the first row is the block this parent really was mined into, and preserving any other one
@@ -41,7 +41,7 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 // happen. A parent still in the mempool is held by its identity row, which stays for as long
 // as the transaction is unmined, so there is nothing to preserve and nothing to lose. A parent
 // whose window has already gone cannot be recovered from here -- the row this statement copies
-// is the only place those facts lived -- and inventing a row from a coin would put facts in a
+// is the only place those facts lived -- and inventing a row from a UTXO would put facts in a
 // table that promises to hold what membership held.
 //
 // ON CONFLICT takes the GREATEST of the two heights rather than the new one. The pruner names
@@ -76,9 +76,9 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.created_height,
 //
 // The old justification for doing nothing here was that this store's reclaim consults the
 // spender's status rather than racing a clock, so a parent with a live child could never be
-// deleted out from under it. That is still true of the COIN, and it is not enough. Membership
-// is dropped by height, whole windows at a time, and a parent whose coins are all spent has no
-// coin left to answer from either: 1440 blocks after its block, the parent is simply gone. That
+// deleted out from under it. That is still true of the UTXO, and it is not enough. Membership
+// is dropped by height, whole windows at a time, and a parent whose UTXOs are all spent has no
+// UTXO left to answer from either: 1440 blocks after its block, the parent is simply gone. That
 // is the right answer for every parent except the one whose child never got mined, and the
 // pruner names exactly those (PreserveParentsOfOldUnminedTransactions). This is where the
 // answer for them survives.

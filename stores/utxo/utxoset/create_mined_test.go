@@ -21,8 +21,8 @@ func minedRows(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) int {
 	return n
 }
 
-// coinFacts reads the block facts off the transaction's first coin.
-func coinFacts(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) (minedHeight, blockID int32) {
+// utxoFacts reads the block facts off the transaction's first UTXO.
+func utxoFacts(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) (minedHeight, blockID int32) {
 	t.Helper()
 
 	lo, hi := Pack(hashBytes(tx), 0), Pack(hashBytes(tx), ^uint32(0))
@@ -34,10 +34,10 @@ func coinFacts(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) (minedHei
 	return minedHeight, blockID
 }
 
-// TestBlockPathCreateWritesMembershipAndCoinFactsAndNoIdentityRow is the design in one test:
-// a create carrying mined-block information writes a membership row and coins that know their
+// TestBlockPathCreateWritesMembershipAndUTXOFactsAndNoIdentityRow is the design in one test:
+// a create carrying mined-block information writes a membership row and UTXOs that know their
 // block, and no identity row.
-func TestBlockPathCreateWritesMembershipAndCoinFactsAndNoIdentityRow(t *testing.T) {
+func TestBlockPathCreateWritesMembershipAndUTXOFactsAndNoIdentityRow(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 2, 5_000)
@@ -48,7 +48,7 @@ func TestBlockPathCreateWritesMembershipAndCoinFactsAndNoIdentityRow(t *testing.
 	require.False(t, identExists(t, s, ctx, tx), "a mined transaction has no identity row")
 	require.Equal(t, 1, minedRows(t, s, ctx, tx))
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(700_100), h)
 	require.Equal(t, int32(42), b)
 }
@@ -64,13 +64,13 @@ func TestMempoolCreateStillClaimsOnTheIdentityTable(t *testing.T) {
 	require.True(t, identExists(t, s, ctx, tx))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 
-	h, b := coinFacts(t, s, ctx, tx)
+	h, b := utxoFacts(t, s, ctx, tx)
 	require.Equal(t, int32(0), h, "unconfirmed sentinel")
 	require.Equal(t, int32(0), b)
 }
 
 // TestBlockPathCreateIsIdempotentForTheSameBlock: a re-applied block after a crash hits the
-// membership key and gets ErrTxExists, writing no second coin.
+// membership key and gets ErrTxExists, writing no second UTXO.
 func TestBlockPathCreateIsIdempotentForTheSameBlock(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -83,7 +83,7 @@ func TestBlockPathCreateIsIdempotentForTheSameBlock(t *testing.T) {
 	_, err = s.Create(ctx, tx, 700_100, info)
 	require.True(t, errors.Is(err, errors.ErrTxExists))
 
-	require.Equal(t, 1, coinCount(t, s, ctx, tx))
+	require.Equal(t, 1, utxoCount(t, s, ctx, tx))
 }
 
 // TestBlockPathCreateRefusesTheSameHeightUnderAnotherBlockId: block-id reuse failed on a
@@ -100,13 +100,13 @@ func TestBlockPathCreateRefusesTheSameHeightUnderAnotherBlockId(t *testing.T) {
 	_, err = s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100, OnLongestChain: true}))
 	require.True(t, errors.Is(err, errors.ErrTxExists))
-	require.Equal(t, 1, coinCount(t, s, ctx, tx))
+	require.Equal(t, 1, utxoCount(t, s, ctx, tx))
 }
 
-// TestBlockPathCreateRefusesATransactionThatStillHasACoin is SV Node's own duplicate check
+// TestBlockPathCreateRefusesATransactionThatStillHasAUTXO is SV Node's own duplicate check
 // and what catches the two historic duplicate coinbases: a re-offer at any height of a
-// transaction with a live coin creates nothing.
-func TestBlockPathCreateRefusesATransactionThatStillHasACoin(t *testing.T) {
+// transaction with a live UTXO creates nothing.
+func TestBlockPathCreateRefusesATransactionThatStillHasAUTXO(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -114,20 +114,20 @@ func TestBlockPathCreateRefusesATransactionThatStillHasACoin(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// Its window retires and is dropped; the coin stays because nobody spent it.
+	// Its window retires and is dropped; the UTXO stays because nobody spent it.
 	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 
 	_, err = s.Create(ctx, tx, 5_000, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 5_000, OnLongestChain: true}))
-	require.True(t, errors.Is(err, errors.ErrTxExists), "a live coin proves the transaction exists")
-	require.Equal(t, 1, coinCount(t, s, ctx, tx))
+	require.True(t, errors.Is(err, errors.ErrTxExists), "a live UTXO proves the transaction exists")
+	require.Equal(t, 1, utxoCount(t, s, ctx, tx))
 }
 
 // TestBlockPathCreateRefusesAMempoolStray: the same transaction already claimed on the
 // identity table (a mempool arrival) must answer ErrTxExists to the block path, so the
-// caller stamps it rather than creating its coins twice.
+// caller stamps it rather than creating its UTXOs twice.
 func TestBlockPathCreateRefusesAMempoolStray(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -138,7 +138,7 @@ func TestBlockPathCreateRefusesAMempoolStray(t *testing.T) {
 	_, err = s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
 	require.True(t, errors.Is(err, errors.ErrTxExists))
-	require.Equal(t, 1, coinCount(t, s, ctx, tx))
+	require.Equal(t, 1, utxoCount(t, s, ctx, tx))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 }
 
@@ -148,8 +148,8 @@ func TestBlockPathCreateRefusesAMempoolStray(t *testing.T) {
 //
 // Without a membership guard on the mempool claim, a create of an already-settled transaction
 // takes a fresh identity row -- the transaction then has a home in both tables -- and, because
-// the coin insert is gated on that claim taking, writes every one of its outputs a SECOND
-// time. Duplicate coins are the failure the whole claim mechanism exists to prevent.
+// the UTXO insert is gated on that claim taking, writes every one of its outputs a SECOND
+// time. Duplicate UTXOs are the failure the whole claim mechanism exists to prevent.
 func TestMempoolCreateRefusesASettledTransaction(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -161,20 +161,20 @@ func TestMempoolCreateRefusesASettledTransaction(t *testing.T) {
 	_, err = s.Create(ctx, tx, 700_101)
 	require.True(t, errors.Is(err, errors.ErrTxExists), "a settled transaction already exists")
 
-	require.Equal(t, 1, coinCount(t, s, ctx, tx), "and its coins are not written twice")
+	require.Equal(t, 1, utxoCount(t, s, ctx, tx), "and its UTXOs are not written twice")
 	require.False(t, identExists(t, s, ctx, tx))
 	require.Equal(t, 1, minedRows(t, s, ctx, tx))
 }
 
-// TestMempoolCreateRefusesATransactionThatStillHasACoin is the mempool mirror of
-// TestBlockPathCreateRefusesATransactionThatStillHasACoin, and it closes the one hole the
+// TestMempoolCreateRefusesATransactionThatStillHasAUTXO is the mempool mirror of
+// TestBlockPathCreateRefusesATransactionThatStillHasAUTXO, and it closes the one hole the
 // membership guard alone leaves open.
 //
 // For a transaction mined more than the membership retention ago, both of the mempool claim's
 // original guards are empty: the identity row never existed, and the membership window has
-// been dropped. Its coins are still live, because window retirement stamped them on the way
-// out. So the claim took, and because the coin insert is gated on that same claim, every
-// output was written a SECOND row -- the coin key is a non-unique 96-bit prefix by design, so
+// been dropped. Its UTXOs are still live, because window retirement stamped them on the way
+// out. So the claim took, and because the UTXO insert is gated on that same claim, every
+// output was written a SECOND row -- the UTXO key is a non-unique 96-bit prefix by design, so
 // nothing downstream catches it. That is money-supply inflation.
 //
 // The reachable caller is the validator's CreateConflicting branch
@@ -182,7 +182,7 @@ func TestMempoolCreateRefusesASettledTransaction(t *testing.T) {
 // CreateInUtxoStore with markAsConflicting, which is SpendAndCreate + WithCreateOnly and no
 // mined-block info, so it lands on the mempool claim with the spend phase skipped. That option
 // is on for every subtree-validation entry point, which is the mainline block path at the tip.
-func TestMempoolCreateRefusesATransactionThatStillHasACoin(t *testing.T) {
+func TestMempoolCreateRefusesATransactionThatStillHasAUTXO(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -190,7 +190,7 @@ func TestMempoolCreateRefusesATransactionThatStillHasACoin(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// Its window retires and is dropped; the coin stays because nobody spent it.
+	// Its window retires and is dropped; the UTXO stays because nobody spent it.
 	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
@@ -199,6 +199,6 @@ func TestMempoolCreateRefusesATransactionThatStillHasACoin(t *testing.T) {
 	// WithCreateOnly skips the spend phase, so the "the mempool path spends before it creates"
 	// argument does not hold here: this create reaches the claim with nothing spent.
 	_, _, err = s.SpendAndCreate(ctx, tx, 5_000, utxo.WithCreateOnly())
-	require.True(t, errors.Is(err, errors.ErrTxExists), "a live coin proves the transaction exists")
-	require.Equal(t, 1, coinCount(t, s, ctx, tx), "and its coins are not written twice")
+	require.True(t, errors.Is(err, errors.ErrTxExists), "a live UTXO proves the transaction exists")
+	require.Equal(t, 1, utxoCount(t, s, ctx, tx), "and its UTXOs are not written twice")
 }

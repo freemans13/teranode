@@ -23,7 +23,7 @@ import (
 // Identity reclaim used to be the expensive half of this: a retiring journal partition read
 // as a work list, each parent judged on whether its spenders were settled, and its identity
 // row deleted. That is gone. A mined transaction claims on tx_mined instead of tx_ident, and
-// its coins carry the height and block that made them, so retiring its membership is dropping
+// its UTXOs carry the height and block that made them, so retiring its membership is dropping
 // the window it lives in.
 //
 // It runs HERE, rather than on the spend path where it used to, for three reasons. The
@@ -77,8 +77,8 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	}
 
 	// The window and spend-journal drops are gated on journalRetention: below it nothing has
-	// aged out yet, so there is nothing to drop. That gate does NOT extend to the coin-index
-	// rebuild below -- a coin index can already be bloated on a chain three blocks deep, and
+	// aged out yet, so there is nothing to drop. That gate does NOT extend to the UTXO-index
+	// rebuild below -- a UTXO index can already be bloated on a chain three blocks deep, and
 	// every dev/test net and every from-scratch sync spends most of its life below
 	// DefaultSpendJournalRetentionBlocks (1440). Gating the rebuild on it, as an earlier
 	// version of this did by putting the rebuild after this block's early return, meant the
@@ -89,7 +89,7 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 
 		// Identity reclaim is a partition drop. Nothing is read to decide it: a window whose
 		// upper bound is journalRetention below the pruner's height holds transactions whose
-		// blocks cannot be un-mined and whose coins carry their own block facts.
+		// blocks cannot be un-mined and whose UTXOs carry their own block facts.
 		windows, err := p.store.dropTxMinedWindowsBelow(ctx, cutoff)
 		if err != nil {
 			return 0, err
@@ -116,7 +116,7 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	// block's pruner call runs this again and finds whichever partition is now worst --
 	// including the one just finished, back near the 31.5-byte floor -- so the schedule
 	// catches up over a run of blocks rather than blocking this one.
-	if _, err := p.store.rebuildOneBloatedCoinIndex(ctx, p.store.coinIndexDecider); err != nil {
+	if _, err := p.store.rebuildOneBloatedUTXOIndex(ctx, p.store.utxoIndexDecider); err != nil {
 		return 0, err
 	}
 

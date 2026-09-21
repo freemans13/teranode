@@ -195,8 +195,8 @@ SELECT txid FROM moved`
 //
 // A transaction lives in EXACTLY ONE of the two tables at any time, so `gone` deletes EVERY
 // membership row of the txid and not just the un-mined block's. That is an invariant with
-// teeth rather than symmetry: the lazy coin stamp at window retirement reads membership rows,
-// so a row left behind here would later stamp this transaction's coins into a block it no
+// teeth rather than symmetry: the lazy UTXO stamp at window retirement reads membership rows,
+// so a row left behind here would later stamp this transaction's UTXOs into a block it no
 // longer settles under, and the read path's identity-then-membership order assumes one home.
 // Deleting only the named block's row and re-packing the others as fork triples would leave
 // the transaction in both tables at once, claiming the same block twice in two different
@@ -250,11 +250,11 @@ SELECT txid FROM moved`
 // The fee comes back with the row. tx_mined carries it precisely so that this move can return
 // it, because the transaction is handed to block assembly, which prices it.
 //
-// The COINS are reset by a separate statement in the same transaction, resetCoinsSQL, and not
+// The UTXOs are reset by a separate statement in the same transaction, resetUTXOsSQL, and not
 // by a further CTE here. A CTE cannot take the packed-key range as a plain array value -- it
 // would have to compute the bounds from the deleted rows -- and the planner then costs the
-// range as a join filter and reads all eight coin partitions instead: measured on this schema
-// at 400,000 coins, a Seq Scan on every partition and 98 ms of the statement's 108.
+// range as a join filter and reads all eight UTXO partitions instead: measured on this schema
+// at 400,000 UTXOs, a Seq Scan on every partition and 98 ms of the statement's 108.
 const moveBackSQL = `
 WITH named AS (
     SELECT DISTINCT m.txid
@@ -291,26 +291,26 @@ back AS (
 )
 SELECT txid FROM keys`
 
-// resetCoinsSQL puts a transaction's live coins back to the unconfirmed sentinel.
+// resetUTXOsSQL puts a transaction's live UTXOs back to the unconfirmed sentinel.
 //
-// The packed-key range comes in as PLAIN ARRAY VALUES built by liveCoinArgs and is used inside a
-// LATERAL with an OFFSET 0 fence, and BOTH halves of that are load-bearing. The coin table
+// The packed-key range comes in as PLAIN ARRAY VALUES built by liveUTXOArgs and is used inside a
+// LATERAL with an OFFSET 0 fence, and BOTH halves of that are load-bearing. The UTXO table
 // carries one index, on the packed key, and the schema says in its own words that a query
 // filtering on txid without a packed-key range bound is a review failure. Bounds computed
 // inside the statement from a CTE's rows satisfy the letter of that rule and not its point:
-// the planner costs them as a join filter and reads every coin partition whole. Bounds passed
+// the planner costs them as a join filter and reads every UTXO partition whole. Bounds passed
 // as arrays but joined directly are no better -- measured at 500 keys, a Hash Join against a
 // Seq Scan of all eight partitions -- because an UPDATE cannot laterally reference its own
-// target, which is the fence every other by-transaction coin read in this store relies on. So
+// target, which is the fence every other by-transaction UTXO read in this store relies on. So
 // the fenced read runs first, in a CTE, and the UPDATE then matches on the exact (leaf, ukey)
 // it returns.
 //
-// mined_height > 0 is what selects the coins that need resetting and what leaves a coin already
+// mined_height > 0 is what selects the UTXOs that need resetting and what leaves a UTXO already
 // at the sentinel untouched. It is the right test where block_id = 0 would not be: block id 0 is
 // a legitimate id, and it is mined_height that carries the "unconfirmed" fact.
 //
-// EVERY stamped coin of the transaction is reset, not only those naming the un-mined block, and
-// that follows from the move being whole. A coin stamped with a SIBLING block's id would
+// EVERY stamped UTXO of the transaction is reset, not only those naming the un-mined block, and
+// that follows from the move being whole. A UTXO stamped with a SIBLING block's id would
 // otherwise go on claiming a block the transaction no longer settles under, because after the
 // move the transaction is in the mempool table and settles under nothing at all. $5 narrows the
 // reset to one block for a caller that has reason to; no caller has today.
@@ -318,13 +318,13 @@ SELECT txid FROM keys`
 // The UPDATE rechecks the FULL TXID and not only the (leaf, ukey) the read found the row by,
 // and that is a correctness rule rather than a repeated predicate. ukey is a 96-bit prefix and
 // NON-UNIQUE by design -- see Pack -- so two transactions in one leaf can share it, and an
-// UPDATE keyed on it alone would reset a stranger's coin to the unconfirmed sentinel: a
-// spendable coin reading as immature, or a mined coin reading as mempool. Every other by-key
+// UPDATE keyed on it alone would reset a stranger's UTXO to the unconfirmed sentinel: a
+// spendable UTXO reading as immature, or a mined UTXO reading as mempool. Every other by-key
 // write in this store rechecks txid for the same reason (spend.go, unspend.go, freeze.go).
 //
-// A coin that has been spent has no row and needs none: its restore resolves the block facts
+// A UTXO that has been spent has no row and needs none: its restore resolves the block facts
 // from membership at restore time.
-const resetCoinsSQL = `
+const resetUTXOsSQL = `
 WITH hit AS (
     SELECT c.leaf, c.ukey, k.txid
       FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS k(leaf, txid, lo, hi)
@@ -622,15 +622,15 @@ func (s *Store) unstampAndMoveBack(ctx context.Context, txids [][]byte,
 		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] move back to the mempool", err)
 	}
 
-	// The coins that are reset are the ones of the transactions that actually MOVED, not of
+	// The UTXOs that are reset are the ones of the transactions that actually MOVED, not of
 	// every hash named. An un-mine of a block a transaction was never in moves nothing, and
-	// resetting its coins would un-confirm a coin whose block still contains it.
+	// resetting its UTXOs would un-confirm a UTXO whose block still contains it.
 	//
 	// No block id is passed, because a transaction that moved is back in the mempool table and
 	// settles under no block at all -- not even a sibling that still names it. See
-	// resetCoinsSQL.
+	// resetUTXOsSQL.
 	if len(moved) > 0 {
-		if err := resetCoins(ctx, dbTx, txidsOf(moved), nil); err != nil {
+		if err := resetUTXOs(ctx, dbTx, txidsOf(moved), nil); err != nil {
 			_ = dbTx.Rollback(ctx)
 
 			return nil, err
@@ -663,13 +663,13 @@ func txidsOf(hashes []chainhash.Hash) [][]byte {
 	return out
 }
 
-// resetCoins puts the listed transactions' stamped coins back to the unconfirmed sentinel.
-// blockID confines it to the coins of one block; nil resets every stamped coin they hold.
-func resetCoins(ctx context.Context, q querier, txids [][]byte, blockID *int32) error {
-	leaves, ids, los, his := liveCoinArgs(txids)
+// resetUTXOs puts the listed transactions' stamped UTXOs back to the unconfirmed sentinel.
+// blockID confines it to the UTXOs of one block; nil resets every stamped UTXO they hold.
+func resetUTXOs(ctx context.Context, q querier, txids [][]byte, blockID *int32) error {
+	leaves, ids, los, his := liveUTXOArgs(txids)
 
-	if _, err := q.Exec(ctx, resetCoinsSQL, leaves, ids, los, his, blockID); err != nil {
-		return errors.NewStorageError("[utxoset] reset coins to the unconfirmed sentinel", err)
+	if _, err := q.Exec(ctx, resetUTXOsSQL, leaves, ids, los, his, blockID); err != nil {
+		return errors.NewStorageError("[utxoset] reset UTXOs to the unconfirmed sentinel", err)
 	}
 
 	return nil

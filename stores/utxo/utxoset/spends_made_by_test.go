@@ -9,13 +9,13 @@ import (
 
 // TestSpendsMadeByAnswersWithoutTheTransaction is the whole point of the method on this store.
 //
-// Undoing a conflict has to put back the coins a transaction took, and it identifies each coin
+// Undoing a conflict has to put back the UTXOs a transaction took, and it identifies each UTXO
 // partly by the amount and the spending rules of the output being consumed. A transaction only
 // records those when it is written in the longer form, and this store writes the short one, so
 // the answer cannot come from the transaction here.
 //
 // It comes from two things this store keeps for far longer than it keeps transactions: the list
-// of what each transaction spends, and the undo journal, which copied down each coin's amount
+// of what each transaction spends, and the undo journal, which copied down each UTXO's amount
 // and rules at the moment it was destroyed.
 func TestSpendsMadeByAnswersWithoutTheTransaction(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -34,7 +34,7 @@ func TestSpendsMadeByAnswersWithoutTheTransaction(t *testing.T) {
 
 	got, err := s.SpendsMadeBy(ctx, *child.TxIDChainHash())
 	require.NoError(t, err)
-	require.Len(t, got, 1, "it took exactly one coin")
+	require.Len(t, got, 1, "it took exactly one UTXO")
 
 	require.Equal(t, parent.TxIDChainHash().String(), got[0].TxID.String(), "from its parent")
 	require.Equal(t, uint32(0), got[0].Vout, "output zero")
@@ -87,7 +87,7 @@ func TestSpendsMadeByStillAnswersOnceTheTransactionHasAgedOut(t *testing.T) {
 
 // TestSpendsMadeByOmitsWhatItCannotRestore.
 //
-// A transaction that never actually took a coin has nothing to put back for that input. This
+// A transaction that never actually took a UTXO has nothing to put back for that input. This
 // store's Unspend refuses the whole batch if any record it is given cannot be restored, so
 // reporting an input that was never spent would break the undo rather than pad it.
 func TestSpendsMadeByOmitsWhatItCannotRestore(t *testing.T) {
@@ -122,7 +122,7 @@ func TestSpendsMadeByReportsATransactionItDoesNotHold(t *testing.T) {
 
 // TestSpendsMadeByMatchesWhatSetConflictingReturns. Both answer the same question from the same
 // place, and undoing a conflict uses them one after the other, so a disagreement between them
-// would restore a different set of coins than the one that was marked.
+// would restore a different set of UTXOs than the one that was marked.
 func TestSpendsMadeByMatchesWhatSetConflictingReturns(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -146,11 +146,11 @@ func TestSpendsMadeByMatchesWhatSetConflictingReturns(t *testing.T) {
 	viaConflicting, _, err := s.SetConflicting(ctx, []chainhash.Hash{*ch}, true)
 	require.NoError(t, err)
 
-	require.Len(t, viaMethod, len(viaConflicting), "both must report the same number of coins")
+	require.Len(t, viaMethod, len(viaConflicting), "both must report the same number of UTXOs")
 
 	for i := range viaMethod {
 		require.Equal(t, viaConflicting[i].TxID.String(), viaMethod[i].TxID.String(),
-			"coin %d must come from the same transaction", i)
+			"UTXO %d must come from the same transaction", i)
 		require.Equal(t, viaConflicting[i].Vout, viaMethod[i].Vout,
 			"and the same output", i)
 	}

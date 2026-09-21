@@ -34,12 +34,12 @@ func spendOutput(t *testing.T, parent *bt.Tx, vout uint32, nOut int) *bt.Tx {
 	return tx
 }
 
-// TestSetConflictingStopsTheCoinsBeingSpent is the whole point of the flag.
+// TestSetConflictingStopsTheUTXOsBeingSpent is the whole point of the flag.
 //
-// It has to reach BOTH rows. The identity row is what a metadata read shows; the coin row is
+// It has to reach BOTH rows. The identity row is what a metadata read shows; the UTXO row is
 // what the spend path reads, and the spend path never looks at the identity row. Setting only
-// one leaves a transaction reporting itself conflicting while its coins stay spendable.
-func TestSetConflictingStopsTheCoinsBeingSpent(t *testing.T) {
+// one leaves a transaction reporting itself conflicting while its UTXOs stay spendable.
+func TestSetConflictingStopsTheUTXOsBeingSpent(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 2, 5_000)
@@ -60,7 +60,7 @@ func TestSetConflictingStopsTheCoinsBeingSpent(t *testing.T) {
 	spends, err := spendOnly(ctx, s, child, 200)
 	require.Error(t, err, "a rejected spend is now a returned error, and rolled back")
 	require.True(t, errors.Is(spends[0].Err, errors.ErrTxConflicting),
-		"the coin row must refuse the spend, got %v", spends[0].Err)
+		"the UTXO row must refuse the spend, got %v", spends[0].Err)
 }
 
 // TestClearingConflictingRestoresSpendability. Conflict resolution promotes a winner by
@@ -88,15 +88,15 @@ func TestClearingConflictingRestoresSpendability(t *testing.T) {
 
 	spends, err := spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
-	require.NoError(t, spends[0].Err, "and on the coin row, or the winner can never be spent")
+	require.NoError(t, spends[0].Err, "and on the UTXO row, or the winner can never be spent")
 }
 
 // TestSetConflictingNotesTheContestOnItsParents.
 //
 // A transaction that loses a double-spend race is kept rather than discarded, because
-// resolving the race later has to find it. Finding it means asking the PARENT whose coin was
+// resolving the race later has to find it. Finding it means asking the PARENT whose UTXO was
 // contested, so the parent carries the list. Without it there is no route from a contested
-// coin to the transactions competing for it.
+// UTXO to the transactions competing for it.
 func TestSetConflictingNotesTheContestOnItsParents(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -117,7 +117,7 @@ func TestSetConflictingNotesTheContestOnItsParents(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pmeta.ConflictingChildren, 1)
 	require.Equal(t, ch.String(), pmeta.ConflictingChildren[0].String(),
-		"the parent must name the transaction contesting its coin")
+		"the parent must name the transaction contesting its UTXO")
 
 	// Offering the same transaction again must not grow the list.
 	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*ch}, true)
@@ -146,7 +146,7 @@ func TestSetConflictingReturnsOnlySpendsItsOwnUnspendCanRestore(t *testing.T) {
 	_, err = s.Create(ctx, child, 101)
 	require.NoError(t, err)
 
-	// Only now is the coin actually taken, so only now is there anything to restore.
+	// Only now is the UTXO actually taken, so only now is there anything to restore.
 	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
@@ -164,17 +164,17 @@ func TestSetConflictingReturnsOnlySpendsItsOwnUnspendCanRestore(t *testing.T) {
 		"every record returned must be one this store can restore")
 }
 
-// TestSetConflictingStillNamesAParentWhoseCoinWasNeverTaken. The same rule from the other
+// TestSetConflictingStillNamesAParentWhoseUTXOWasNeverTaken. The same rule from the other
 // side, and it used to say the opposite: a transaction whose inputs were never taken reported
 // NO spends at all, on the argument that a record which is not a spend makes the restore fail.
 //
-// It does not. Unspend counts an already-live coin as work someone else has done and returns
+// It does not. Unspend counts an already-live UTXO as work someone else has done and returns
 // success, so the record costs a probe and nothing else. Omitting it is what actually breaks,
 // because the shared conflict-resolution driver takes the parents named here as the set to
-// unlock when it finishes: a parent locked by a crashed run, whose coin was restored before the
+// unlock when it finishes: a parent locked by a crashed run, whose UTXO was restored before the
 // crash, would be left locked forever with nothing to say so. That is the state
 // ConflictWALCrashRecovery's forward_after_step2_unspend_lock case reconstructs.
-func TestSetConflictingStillNamesAParentWhoseCoinWasNeverTaken(t *testing.T) {
+func TestSetConflictingStillNamesAParentWhoseUTXOWasNeverTaken(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 2, 5_000)
@@ -187,21 +187,21 @@ func TestSetConflictingStillNamesAParentWhoseCoinWasNeverTaken(t *testing.T) {
 
 	affected, _, err := s.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
 	require.NoError(t, err)
-	require.Len(t, affected, 1, "the parent whose coin is still live must be named")
+	require.Len(t, affected, 1, "the parent whose UTXO is still live must be named")
 	require.Equal(t, parent.TxIDChainHash().String(), affected[0].TxID.String())
 	require.Equal(t, uint32(0), affected[0].Vout)
 	require.Nil(t, affected[0].UTXOHash,
-		"no journal row means no captured amount or script, so no coin identity is invented")
+		"no journal row means no captured amount or script, so no UTXO identity is invented")
 
 	// The proof that the extra record is harmless: it goes straight back to Unspend, which is
 	// what conflict resolution does with it.
 	require.NoError(t, s.Unspend(ctx, affected, false),
-		"an already-live coin is a no-op success, not a missing-coin failure")
+		"an already-live UTXO is a no-op success, not a missing-UTXO failure")
 }
 
 // TestSetConflictingReportsNothingBeyondJournalRetention is the half of the old rule that
-// stands. An input with no journal row AND no live coin cannot be restored by this store: the
-// undo payload has aged out, or a different transaction re-spent the coin since. Reporting it
+// stands. An input with no journal row AND no live UTXO cannot be restored by this store: the
+// undo payload has aged out, or a different transaction re-spent the UTXO since. Reporting it
 // would make Unspend fail the whole restore rather than complete it, so it is omitted.
 func TestSetConflictingReportsNothingBeyondJournalRetention(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -218,20 +218,20 @@ func TestSetConflictingReportsNothingBeyondJournalRetention(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
-	// The coin is gone, destroyed by the spend, and now the undo record goes too.
+	// The UTXO is gone, destroyed by the spend, and now the undo record goes too.
 	_, err = s.pool.Exec(ctx, `DELETE FROM spend_journal`)
 	require.NoError(t, err)
 
 	affected, _, err := s.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
 	require.NoError(t, err)
-	require.Empty(t, affected, "a coin this store cannot restore must not be offered as one")
+	require.Empty(t, affected, "a UTXO this store cannot restore must not be offered as one")
 }
 
 // TestSetConflictingCascadesDownTheChain exercises the second return value, which drives the
 // walk that marks a loser's descendants.
 //
-// The coin row is destroyed the moment it is spent, so the undo journal is the only place this
-// store can answer "who took this coin". This is the test that fails if the key range bound or
+// The UTXO row is destroyed the moment it is spent, so the undo journal is the only place this
+// store can answer "who took this UTXO". This is the test that fails if the key range bound or
 // the full-id recheck is wrong.
 func TestSetConflictingCascadesDownTheChain(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -351,7 +351,7 @@ func TestNotingTheSameContestTwiceRecordsItOnce(t *testing.T) {
 // A contested parent is very often a MINED transaction, and a mined transaction has no
 // identity row: the longest-chain stamp moved it into the membership table. Bookkeeping kept
 // on the identity row therefore has nowhere to land, and the note becomes a zero-row update.
-// The route from a contested coin to the transactions competing for it is the only route
+// The route from a contested UTXO to the transactions competing for it is the only route
 // conflict resolution has, so losing it loses the conflict.
 func TestConflictingChildrenSurviveTheParentLeavingTheIdentityTable(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -375,7 +375,7 @@ func TestConflictingChildrenSurviveTheParentLeavingTheIdentityTable(t *testing.T
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
 	require.NoError(t, err)
 	require.Equal(t, []chainhash.Hash{*loser.TxIDChainHash()}, got.ConflictingChildren,
-		"a mined parent must still name the transaction contesting its coin")
+		"a mined parent must still name the transaction contesting its UTXO")
 }
 
 // TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp is the same requirement on the
@@ -416,19 +416,19 @@ func TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp(t *testing.T) 
 	require.Equal(t, []chainhash.Hash{*loser.TxIDChainHash()}, got.ConflictingChildren)
 }
 
-// TestConflictingChildrenAnswerForAParentKnownOnlyFromItsCoin is the third read step.
+// TestConflictingChildrenAnswerForAParentKnownOnlyFromItsUTXO is the third read step.
 //
 // A transaction whose membership window has been dropped is known to this store only through
-// one of its own live coins -- which is exactly what a pruned SV Node can say about a parent
+// one of its own live UTXOs -- which is exactly what a pruned SV Node can say about a parent
 // whose block it no longer holds. The contest is keyed on the txid rather than on whichever
 // row answered, so it must attach to that answer too. Folding it into the identity read, or
 // into the membership read, would have lost it here.
-func TestConflictingChildrenAnswerForAParentKnownOnlyFromItsCoin(t *testing.T) {
+func TestConflictingChildrenAnswerForAParentKnownOnlyFromItsUTXO(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_101))
 
 	// The block path, so the parent never has an identity row at all. TWO outputs, because the
-	// coin the read answers from has to survive the spend below.
+	// UTXO the read answers from has to survive the spend below.
 	parent := mkTx(t, 2, 5_000)
 	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
@@ -443,14 +443,14 @@ func TestConflictingChildrenAnswerForAParentKnownOnlyFromItsCoin(t *testing.T) {
 	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*loser.TxIDChainHash()}, true)
 	require.NoError(t, err)
 
-	// Neither of the first two steps can answer now, so the coin is the only source left.
+	// Neither of the first two steps can answer now, so the UTXO is the only source left.
 	require.False(t, identExists(t, s, ctx, parent))
 	require.Equal(t, 0, minedRows(t, s, ctx, parent))
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
 	require.NoError(t, err)
-	require.Equal(t, []uint32{7}, got.BlockIDs, "the block came off the coin row")
-	require.Nil(t, got.TxInpoints.ParentTxHashes, "and the coin answer is thin, as it is for a pruned parent")
+	require.Equal(t, []uint32{7}, got.BlockIDs, "the block came off the UTXO row")
+	require.Nil(t, got.TxInpoints.ParentTxHashes, "and the UTXO answer is thin, as it is for a pruned parent")
 	require.Equal(t, []chainhash.Hash{*loser.TxIDChainHash()}, got.ConflictingChildren)
 }
 

@@ -76,7 +76,7 @@ func TestGetUnpacksBlockMembershipInInsertionOrder(t *testing.T) {
 
 // TestGetReportsWhetherTheTransactionIsWaitingToBeMined. Block assembly reads this to decide
 // whether a transaction belongs in the mempool, and a wrong answer here loses funds: on a
-// delete-on-spend store the parents' coin rows are already gone, and an absent coin row
+// delete-on-spend store the parents' UTXO rows are already gone, and an absent UTXO row
 // reads as spent, so a transaction dropped from the mempool can never be mined and its
 // inputs can never be spent again.
 func TestGetReportsWhetherTheTransactionIsWaitingToBeMined(t *testing.T) {
@@ -127,9 +127,9 @@ func TestGetSurvivesABodyThatHasAgedOut(t *testing.T) {
 //
 // When a transaction loses a double-spend race it is stored as conflicting rather than
 // discarded, because resolving the conflict later needs to find it. Finding it means asking
-// the PARENT whose coin was contested, so the parent has to carry the list.
+// the PARENT whose UTXO was contested, so the parent has to carry the list.
 //
-// Without this, conflict resolution has no way to walk from a contested coin to the
+// Without this, conflict resolution has no way to walk from a contested UTXO to the
 // transactions competing for it.
 func TestCreatingAConflictingTransactionRecordsItOnItsParents(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -157,6 +157,6 @@ func TestCreatingAConflictingTransactionRecordsItOnItsParents(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, gotParent.Conflicting, "the parent did nothing wrong")
 	require.Len(t, gotParent.ConflictingChildren, 1,
-		"but it must name the transaction contesting its coin, or conflict resolution cannot find it")
+		"but it must name the transaction contesting its UTXO, or conflict resolution cannot find it")
 	require.Equal(t, loser.TxID(), gotParent.ConflictingChildren[0].String())
 }

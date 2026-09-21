@@ -12,18 +12,18 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 )
 
-// spendsMadeBySQL finds the coins one transaction took, and what each was worth.
+// spendsMadeBySQL finds the UTXOs one transaction took, and what each was worth.
 //
 // The caller supplies the outpoints, read from the permanent record of what the transaction
-// spends. This asks the journal what it captured when each of those coins was destroyed, and
-// requires the destroyer to be the transaction being asked about. A coin that some OTHER
+// spends. This asks the journal what it captured when each of those UTXOs was destroyed, and
+// requires the destroyer to be the transaction being asked about. A UTXO that some OTHER
 // transaction took is not this one's to give back.
 //
 // Located by a key range and authorised by the full 32-byte transaction id, like every other
-// coin lookup here, because the packed key is a non-unique 96-bit prefix that can find a row
-// but must never justify acting on one. Getting that wrong would hand back a stranger's coin.
+// UTXO lookup here, because the packed key is a non-unique 96-bit prefix that can find a row
+// but must never justify acting on one. Getting that wrong would hand back a stranger's UTXO.
 //
-// A coin this transaction never took returns no row, and one whose record has aged out of the
+// A UTXO this transaction never took returns no row, and one whose record has aged out of the
 // journal returns no row either. Both are omitted rather than guessed at. That is deliberate:
 // Unspend fails the entire restore if a single record it is given cannot be restored, so
 // padding the answer would break the undo rather than complete it.
@@ -33,10 +33,10 @@ SELECT k.vin, j.satoshis, j.script, j.hash_override
   JOIN spend_journal j
     ON j.ukey = k.ukey AND j.txid = k.txid AND j.spending_txid = $4::bytea`
 
-// SpendsMadeBy returns the coins this transaction consumed, as records this store's own Unspend
+// SpendsMadeBy returns the UTXOs this transaction consumed, as records this store's own Unspend
 // can restore.
 //
-// It deliberately does NOT read the transaction. A coin's identity is computed partly from the
+// It deliberately does NOT read the transaction. A UTXO's identity is computed partly from the
 // amount and locking script of the output being spent, and a transaction only carries those when
 // it is stored in extended form, which this store does not do. More importantly the transaction
 // itself is not permanent here: its bytes are dropped once past their retention window, while a
@@ -46,7 +46,7 @@ SELECT k.vin, j.satoshis, j.script, j.hash_override
 //
 // The two sources it uses instead both outlive that. The list of what a transaction spends is on
 // the identity row and lasts as long as the transaction does. The journal copied down each
-// coin's amount and locking script at the moment it was destroyed, and keeps them for the
+// UTXO's amount and locking script at the moment it was destroyed, and keeps them for the
 // resubmission window the rest of the system promises.
 //
 // Called only when undoing a conflict resolution, so a chain reorganisation or a crash replay,
@@ -67,7 +67,7 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 	vouts := make([]uint32, 0, len(flat))
 
 	for _, in := range flat {
-		// The coinbase placeholder is not a real parent and took no coin.
+		// The coinbase placeholder is not a real parent and took no UTXO.
 		if in.Hash == subtree.CoinbasePlaceholderHashValue {
 			continue
 		}
@@ -117,7 +117,7 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 			SpendingData: spendpkg.NewSpendingData(&spender, int(vin)),
 		}
 
-		// A reassigned coin carries its new identity, which wins over the computed one.
+		// A reassigned UTXO carries its new identity, which wins over the computed one.
 		if len(hashOverride) > 0 {
 			if h, herr := chainhash.NewHash(hashOverride); herr == nil {
 				sp.UTXOHash = h
@@ -127,7 +127,7 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 			}
 		}
 
-		// The other two stores put the coin's computed identity on these records, so this one
+		// The other two stores put the UTXO's computed identity on these records, so this one
 		// does too. Nothing in this store reads it, since Unspend restores on the outpoint and
 		// the spender, but a record that travels to shared code should not be the odd one out.
 		if h, herr := util.UTXOHash(&parent, vouts[vin], bscript.NewFromBytes(script), uint64(satoshis)); herr == nil { //nolint:gosec // satoshis are never negative

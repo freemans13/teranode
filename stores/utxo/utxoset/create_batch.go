@@ -19,7 +19,7 @@ import (
 // createIdentPlanSQL stores a whole BATCH of MEMPOOL transactions in ONE statement.
 //
 // It is the claim for a create that carries no mined-block information: a transaction seen
-// before any block contains it. Such a transaction claims on tx_ident, and its coins carry the
+// before any block contains it. Such a transaction claims on tx_ident, and its UTXOs carry the
 // unconfirmed sentinel — mined_height 0, block_id 0 — until something stamps them. The
 // block-path counterpart is createMinedPlanSQL.
 //
@@ -36,7 +36,7 @@ import (
 //
 // Folding them into one statement fixes both at once. Data-modifying common table expressions
 // run in a single snapshot, so either all three land or none do, and both the body and the
-// coin inserts are gated on the claim having actually inserted that transaction's row. A
+// UTXO inserts are gated on the claim having actually inserted that transaction's row. A
 // transaction the store already holds therefore writes nothing at all and is absent from the
 // result.
 //
@@ -44,25 +44,25 @@ import (
 // between this and the per-transaction statement it replaces. EXISTS asks "did anything in
 // this statement claim", which is the right question only when the statement carries one
 // transaction. The join asks it per transaction, so a batch mixing fresh transactions with
-// ones the store already holds writes bodies and coins for exactly the fresh ones.
+// ones the store already holds writes bodies and UTXOs for exactly the fresh ones.
 //
 // claim RETURNING gives back leaf and txid rather than the caller's index k, because
 // PostgreSQL only lets INSERT ... RETURNING name columns of the target table. The join back
 // onto (leaf, txid) recovers k, and it is exact rather than approximate: txid is the full 32
 // bytes, and (leaf, txid) is tx_ident's primary key.
 //
-// The coin insert has no conflict clause and needs none. The coin key is a non-unique 96-bit
+// The UTXO insert has no conflict clause and needs none. The UTXO key is a non-unique 96-bit
 // prefix by design and has nothing to conflict on, so idempotence here comes from the claim
 // gate. Without that gate a re-applied block would create every output a second time, which
 // is the failure this mechanism exists to prevent.
 //
 // The claim carries THREE guards, and all three are needed. Its own conflict clause catches a
 // transaction the mempool already holds. The tx_mined probe keeps a transaction in exactly one
-// of the two tables. The own-output coin probe catches the case neither of the other two can
+// of the two tables. The own-output UTXO probe catches the case neither of the other two can
 // see: a transaction mined longer ago than the membership retention has no identity row and no
-// membership window, and its coins are still live because window retirement stamped them on the
-// way out. Without that third guard the claim takes, and because the coin insert is gated on
-// the same claim, every output is written a SECOND row -- the coin key is a non-unique 96-bit
+// membership window, and its UTXOs are still live because window retirement stamped them on the
+// way out. Without that third guard the claim takes, and because the UTXO insert is gated on
+// the same claim, every output is written a SECOND row -- the UTXO key is a non-unique 96-bit
 // prefix by design, so nothing downstream catches it. That is money-supply inflation.
 //
 // The spec argued this could not arise because the mempool path spends before it creates, so an
@@ -76,14 +76,14 @@ import (
 //
 // The guard is the identical statement createMinedPlanSQL carries, LIMIT 1 OFFSET 0 fence and
 // all, for the identical reason: a bare NOT EXISTS is flattened into an anti-join, and the
-// fence keeps it a per-row subplan on the coin's packed-key range.
+// fence keeps it a per-row subplan on the UTXO's packed-key range.
 //
 // The tx_mined guard is what keeps a transaction in EXACTLY ONE of the two tables. A transaction the longest-chain stamp
 // has settled has no identity row at all, so ON CONFLICT sees nothing to conflict with: without
 // the guard, a mempool create of an already-settled transaction takes a fresh identity row --
-// two homes, and every read-order argument in this store assumes one -- and, because the coin
+// two homes, and every read-order argument in this store assumes one -- and, because the UTXO
 // insert is gated on that same claim taking, writes every one of its outputs a SECOND time.
-// Duplicate coins are the failure the claim mechanism exists to prevent. With the guard such a
+// Duplicate UTXOs are the failure the claim mechanism exists to prevent. With the guard such a
 // create claims nothing and settle reports it as ErrTxExists, which is exactly what the block
 // path already answers for a mempool stray, in the other direction.
 //
@@ -129,7 +129,7 @@ body AS (
       FROM t
       JOIN claim c ON c.leaf = t.leaf AND c.txid = t.txid
 ),
-coins AS (
+UTXOs AS (
     INSERT INTO utxo (satoshis, created_height, spendable_from, mined_height, block_id,
                       leaf, flags, ukey, txid, script)
     SELECT o.satoshis, o.created_height, o.spendable_from, 0, 0,
@@ -154,10 +154,10 @@ SELECT t.k
 //   - ON CONFLICT on (txid, mined_height, block_id): the same block re-applied.
 //   - NOT EXISTS tx_mined (txid, mined_height): the same height under another block id, which
 //     is a retry whose block-id reuse failed or a stale sibling block; the caller's
-//     ErrTxExists branch stamps the second id instead of recreating coins.
+//     ErrTxExists branch stamps the second id instead of recreating UTXOs.
 //   - NOT EXISTS tx_ident (leaf, txid): a mempool stray already holds the transaction.
 //   - NOT EXISTS utxo in the transaction's own packed-key range: the transaction still has a
-//     live coin, at any age. This is SV Node's duplicate check and what refuses the two
+//     live UTXO, at any age. This is SV Node's duplicate check and what refuses the two
 //     historic duplicate coinbases. Written with the LIMIT 1 OFFSET 0 fence so the planner
 //     cannot swap the range scan for a scan of the whole leaf partition.
 //
@@ -217,7 +217,7 @@ body AS (
       FROM t JOIN claim c ON c.txid = t.txid
      WHERE t.raw_tx IS NOT NULL
 ),
-coins AS (
+UTXOs AS (
     INSERT INTO utxo (satoshis, created_height, spendable_from, mined_height, block_id,
                       leaf, flags, ukey, txid, script)
     SELECT o.satoshis, o.created_height, o.spendable_from, o.mined_height, o.block_id,
@@ -249,7 +249,7 @@ type createItem struct {
 // Building it in one place is what stops the batched and unbatched paths carrying separate
 // copies of the same statement. The single-transaction path is a plan of one.
 //
-// Two array widths live here. The identity fields carry one element per transaction. The coin
+// Two array widths live here. The identity fields carry one element per transaction. The UTXO
 // fields carry one element per SPENDABLE output, flattened across every transaction in the
 // batch, and they are tied back to their transaction by the leaf and txid they already carry
 // rather than by a separate mapping.
@@ -275,22 +275,22 @@ type createPlan struct {
 	blockID     []int32
 	subtreeIdx  []int32
 	// The packed-key range of the transaction's own outputs, so the block path can ask
-	// whether it still has a live coin without scanning its leaf partition.
+	// whether it still has a live UTXO without scanning its leaf partition.
 	lo, hi [][16]byte
 
 	// One element per spendable output, across the whole batch.
-	coinSats      []int64
-	coinHeights   []int32
-	coinSpendable []int32
-	coinLeaves    []int16
-	coinFlags     []int16
-	coinUkeys     [][16]byte
-	coinTxids     [][]byte
-	coinScripts   [][]byte
-	// The block facts, repeated per coin, so the coin row knows its block without a join.
+	utxoSats      []int64
+	utxoHeights   []int32
+	utxoSpendable []int32
+	utxoLeaves    []int16
+	utxoFlags     []int16
+	utxoUkeys     [][16]byte
+	utxoTxids     [][]byte
+	utxoScripts   [][]byte
+	// The block facts, repeated per UTXO, so the UTXO row knows its block without a join.
 	// Both are 0 for a mempool create: mined_height 0 is the unconfirmed sentinel.
-	coinMined    []int32
-	coinBlockIDs []int32
+	utxoMined    []int32
+	utxoBlockIDs []int32
 
 	owner   []int        // plan row -> which item in the batch
 	txs     []*bt.Tx     // plan row -> its transaction, for error messages
@@ -346,7 +346,7 @@ func (s *Store) planCreates(items []*createItem) *createPlan {
 
 // sortRows puts the identity rows in one global order, by leaf and txid, for the same reason
 // spendPlan.sortRows does: two batches claiming the same transactions in opposite orders would
-// wait on each other's speculative inserts and deadlock, and in one order they cannot. The coin
+// wait on each other's speculative inserts and deadlock, and in one order they cannot. The UTXO
 // rows are left as built; nothing about them is unique, so nothing about them can wait.
 func (p *createPlan) sortRows() {
 	n := len(p.owner)
@@ -393,7 +393,7 @@ func (p *createPlan) sortRows() {
 	}
 }
 
-// subset projects the plan onto the given transaction rows, carrying each row's coins with it.
+// subset projects the plan onto the given transaction rows, carrying each row's UTXOs with it.
 //
 // The two claim statements take disjoint halves of one batch, and each needs contiguous arrays
 // of its own: k is a position in the arrays the statement is handed, so the rows going to one
@@ -434,24 +434,24 @@ func (p *createPlan) subset(idx []int) *createPlan {
 		keep[string(p.txids[i])] = struct{}{}
 	}
 
-	// The coin arrays are flattened across the batch and tied to their transaction by the
-	// txid they already carry, so the projection is a filter on that txid. Every coin of a
-	// selected transaction comes across, and no coin of any other.
-	for c, id := range p.coinTxids {
+	// The UTXO arrays are flattened across the batch and tied to their transaction by the
+	// txid they already carry, so the projection is a filter on that txid. Every UTXO of a
+	// selected transaction comes across, and no UTXO of any other.
+	for c, id := range p.utxoTxids {
 		if _, ok := keep[string(id)]; !ok {
 			continue
 		}
 
-		q.coinSats = append(q.coinSats, p.coinSats[c])
-		q.coinHeights = append(q.coinHeights, p.coinHeights[c])
-		q.coinSpendable = append(q.coinSpendable, p.coinSpendable[c])
-		q.coinLeaves = append(q.coinLeaves, p.coinLeaves[c])
-		q.coinFlags = append(q.coinFlags, p.coinFlags[c])
-		q.coinUkeys = append(q.coinUkeys, p.coinUkeys[c])
-		q.coinTxids = append(q.coinTxids, p.coinTxids[c])
-		q.coinScripts = append(q.coinScripts, p.coinScripts[c])
-		q.coinMined = append(q.coinMined, p.coinMined[c])
-		q.coinBlockIDs = append(q.coinBlockIDs, p.coinBlockIDs[c])
+		q.utxoSats = append(q.utxoSats, p.utxoSats[c])
+		q.utxoHeights = append(q.utxoHeights, p.utxoHeights[c])
+		q.utxoSpendable = append(q.utxoSpendable, p.utxoSpendable[c])
+		q.utxoLeaves = append(q.utxoLeaves, p.utxoLeaves[c])
+		q.utxoFlags = append(q.utxoFlags, p.utxoFlags[c])
+		q.utxoUkeys = append(q.utxoUkeys, p.utxoUkeys[c])
+		q.utxoTxids = append(q.utxoTxids, p.utxoTxids[c])
+		q.utxoScripts = append(q.utxoScripts, p.utxoScripts[c])
+		q.utxoMined = append(q.utxoMined, p.utxoMined[c])
+		q.utxoBlockIDs = append(q.utxoBlockIDs, p.utxoBlockIDs[c])
 	}
 
 	return q
@@ -498,8 +498,8 @@ func (s *Store) runIdentPlan(ctx context.Context, q querier, p *createPlan) erro
 	rows, err := q.Query(ctx, createIdentPlanSQL,
 		p.idx, p.leaves, p.txids, p.heights, p.offChain, p.membership, p.sizes,
 		p.inpoints, p.locktimes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
-		p.coinSats, p.coinHeights, p.coinSpendable, p.coinLeaves, p.coinFlags,
-		p.coinUkeys, p.coinTxids, p.coinScripts)
+		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoLeaves, p.utxoFlags,
+		p.utxoUkeys, p.utxoTxids, p.utxoScripts)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Create] store", err)
 	}
@@ -512,8 +512,8 @@ func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) erro
 	rows, err := q.Query(ctx, createMinedPlanSQL,
 		p.idx, p.leaves, p.txids, p.heights, p.minedHeight, p.blockID, p.subtreeIdx,
 		p.sizes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
-		p.coinSats, p.coinHeights, p.coinSpendable, p.coinMined, p.coinBlockIDs,
-		p.coinLeaves, p.coinFlags, p.coinUkeys, p.coinTxids, p.coinScripts)
+		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoMined, p.utxoBlockIDs,
+		p.utxoLeaves, p.utxoFlags, p.utxoUkeys, p.utxoTxids, p.utxoScripts)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Create] store mined", err)
 	}
@@ -550,7 +550,7 @@ func (p *createPlan) settle(rows pgx.Rows) error {
 	}
 
 	// A transaction the claim did not insert is one the store already holds. The statement
-	// wrote nothing at all for it, because its body and its coins were gated on that same
+	// wrote nothing at all for it, because its body and its UTXOs were gated on that same
 	// claim, so there is nothing to undo.
 	for k := range p.owner {
 		if _, ok := claimed[int32(k)]; ok { //nolint:gosec // bounded by batch size
@@ -575,7 +575,7 @@ func (p *createPlan) settle(rows pgx.Rows) error {
 //
 // The lock is what makes the block path's three NOT EXISTS guards trustworthy. They read
 // tx_mined, tx_ident and utxo, and none of those reads takes a row lock, so two creates of the
-// same transaction could each find nothing and each write a full set of coins. The membership
+// same transaction could each find nothing and each write a full set of UTXOs. The membership
 // key catches that only when both name the same block.
 func (s *Store) lockTxids(ctx context.Context, q pgx.Tx, txids [][]byte) error {
 	if len(txids) == 0 {

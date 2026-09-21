@@ -49,8 +49,8 @@ func bodyRows(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) int {
 	return n
 }
 
-// coinAt reads the satoshis and locking script off one named output.
-func coinAt(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx, vout uint32) (int64, []byte) {
+// utxoAt reads the satoshis and locking script off one named output.
+func utxoAt(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx, vout uint32) (int64, []byte) {
 	t.Helper()
 
 	var (
@@ -111,12 +111,12 @@ func minedItem(tx *bt.Tx, height uint32, blockID uint32) *createItem {
 	return &createItem{tx: tx, blockHeight: height, options: options}
 }
 
-// TestSkipTxBodyBelowCheckpointWritesNoBodyButKeepsTheCoins is the change in one test.
+// TestSkipTxBodyBelowCheckpointWritesNoBodyButKeepsTheUTXOs is the change in one test.
 //
 // Below the checkpoint the body is dead weight: the subtree data file holds the same bytes,
-// the spend path reads coin rows, and no spend on the outpoint-only route reads a parent body.
+// the spend path reads UTXO rows, and no spend on the outpoint-only route reads a parent body.
 // So the row is not written -- and everything that does not depend on it must be unaffected.
-func TestSkipTxBodyBelowCheckpointWritesNoBodyButKeepsTheCoins(t *testing.T) {
+func TestSkipTxBodyBelowCheckpointWritesNoBodyButKeepsTheUTXOs(t *testing.T) {
 	s, ctx := newCheckpointStore(t, true)
 
 	tx := mkTx(t, 2, 5_000)
@@ -124,14 +124,14 @@ func TestSkipTxBodyBelowCheckpointWritesNoBodyButKeepsTheCoins(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 0, bodyRows(t, s, ctx, tx), "at the floor is below the checkpoint, so no body")
-	require.Equal(t, 2, coinCount(t, s, ctx, tx), "both outputs still have coins")
+	require.Equal(t, 2, utxoCount(t, s, ctx, tx), "both outputs still have UTXOs")
 
-	sats, script := coinAt(t, s, ctx, tx, 0)
+	sats, script := utxoAt(t, s, ctx, tx, 0)
 	require.Equal(t, int64(5_000), sats)
 	require.Equal(t, []byte(*tx.Outputs[0].LockingScript), script)
 
 	// The transaction EXISTS. A body-less read is a record with no bytes, never a miss: its
-	// coins are live and a caller told "not found" would reject its children.
+	// UTXOs are live and a caller told "not found" would reject its children.
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.Tx)
 	require.NoError(t, err)
 	require.Nil(t, got.Tx, "the bytes were never written, so there is nothing to decode")
@@ -147,7 +147,7 @@ func TestSkipTxBodyBelowCheckpointWritesNoBodyButKeepsTheCoins(t *testing.T) {
 		utxo.WithSkipUTXOHashCheck(true), utxo.WithSkipExtendedInputs(true))
 	require.NoError(t, err)
 
-	// And the ordinary spend, hash check and all, on an input decorated from the coin row
+	// And the ordinary spend, hash check and all, on an input decorated from the UTXO row
 	// rather than from the parent's body.
 	normal := spendOutput(t, tx, 1, 1)
 	normal.Inputs[0].PreviousTxSatoshis = 0
@@ -161,9 +161,9 @@ func TestSkipTxBodyBelowCheckpointWritesNoBodyButKeepsTheCoins(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestSkipTxBodyBelowCheckpointBatchDecoratesFromTheCoinRow is the batched half of the
+// TestSkipTxBodyBelowCheckpointBatchDecoratesFromTheUTXORow is the batched half of the
 // decorate check, because BatchPreviousOutputsDecorate is the call the validator actually makes.
-func TestSkipTxBodyBelowCheckpointBatchDecoratesFromTheCoinRow(t *testing.T) {
+func TestSkipTxBodyBelowCheckpointBatchDecoratesFromTheUTXORow(t *testing.T) {
 	s, ctx := newCheckpointStore(t, true)
 
 	tx := mkTx(t, 2, 5_000)
@@ -251,9 +251,9 @@ func TestSkipTxBodyBatchMixesHeightsAroundTheFloor(t *testing.T) {
 	require.Equal(t, 0, bodyRows(t, s, ctx, atFloor), "the floor itself is below the checkpoint")
 	require.Equal(t, 1, bodyRows(t, s, ctx, above))
 
-	// Every one of them still has its coin, whichever side of the floor it fell.
+	// Every one of them still has its UTXO, whichever side of the floor it fell.
 	for _, tx := range []*bt.Tx{below, atFloor, above} {
-		require.Equal(t, 1, coinCount(t, s, ctx, tx))
+		require.Equal(t, 1, utxoCount(t, s, ctx, tx))
 	}
 }
 
@@ -272,7 +272,7 @@ func TestSkipTxBodyReplayStillReportsTxExistsAndWritesNoBody(t *testing.T) {
 	require.True(t, errors.Is(err, errors.ErrTxExists))
 
 	require.Equal(t, 0, bodyRows(t, s, ctx, tx))
-	require.Equal(t, 1, coinCount(t, s, ctx, tx))
+	require.Equal(t, 1, utxoCount(t, s, ctx, tx))
 }
 
 // TestGenesisKeepsItsBodyBelowTheCheckpoint pins the one height the shared boundary excludes.
@@ -314,15 +314,15 @@ func TestSkipTxBodyBelowCheckpointThroughSpendAndCreate(t *testing.T) {
 	require.NoError(t, spends[0].Err)
 
 	require.Equal(t, 0, bodyRows(t, s, ctx, child), "the create half of the call skips the body too")
-	require.Equal(t, 2, coinCount(t, s, ctx, child), "and both its outputs still have coins")
+	require.Equal(t, 2, utxoCount(t, s, ctx, child), "and both its outputs still have UTXOs")
 
-	// The parent's spent coin is gone, which is what proves the spend half ran.
-	require.Equal(t, 1, coinCount(t, s, ctx, parent))
+	// The parent's spent UTXO is gone, which is what proves the spend half ran.
+	require.Equal(t, 1, utxoCount(t, s, ctx, parent))
 
 	// A body-less transaction's own outputs stay spendable.
 	grandchild := spendOutput(t, child, 0, 1)
 
 	_, err = spendOnly(ctx, s, grandchild, checkpointFloor)
 	require.NoError(t, err)
-	require.Equal(t, 1, coinCount(t, s, ctx, child))
+	require.Equal(t, 1, utxoCount(t, s, ctx, child))
 }

@@ -13,8 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestValidatorFillsBodylessParentFromCoinTable is the one cross-package proof in this
-// change: everything else exercising getUtxoBlockHeightAndExtendForParentTx's coin-table
+// TestValidatorFillsBodylessParentFromUTXOTable is the one cross-package proof in this
+// change: everything else exercising getUtxoBlockHeightAndExtendForParentTx's UTXO-table
 // fallback (services/validator package) does so against utxo.MockUtxostore, asserting only
 // that the validator calls PreviousOutputsDecorate correctly. This test instead runs a REAL
 // *validator.Validator against a REAL *utxoset.Store backed by the Postgres testcontainer
@@ -26,10 +26,10 @@ import (
 // The parent is mined below the store's checkpoint floor with
 // utxostore_skipTxBodyBelowCheckpoint on, so s.Get answers Tx: nil for it, exactly as it does
 // on mainnet below the real 945,000 checkpoint — the case this whole change exists for.
-func TestValidatorFillsBodylessParentFromCoinTable(t *testing.T) {
+func TestValidatorFillsBodylessParentFromUTXOTable(t *testing.T) {
 	s, ctx := newCheckpointStore(t, true)
 
-	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("utxoset bodyless coin-table fallback test key32"))
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("utxoset bodyless UTXO-table fallback test key32"))
 
 	parent := transactions.Create(t,
 		transactions.WithCoinbaseData(1, "/utxoset bodyless fallback/"),
@@ -50,7 +50,7 @@ func TestValidatorFillsBodylessParentFromCoinTable(t *testing.T) {
 		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1, BlockHeight: parentHeight, OnLongestChain: true}))
 	require.NoError(t, err)
 	require.Equal(t, 0, bodyRows(t, s, ctx, parent),
-		"the parent must be body-less for this test to actually exercise the coin-table fallback")
+		"the parent must be body-less for this test to actually exercise the UTXO-table fallback")
 
 	child := transactions.Create(t,
 		transactions.WithPrivateKey(privateKey),
@@ -68,5 +68,5 @@ func TestValidatorFillsBodylessParentFromCoinTable(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = v.ValidateWithOptions(ctx, child, spendHeight, &validator.Options{AddTXToBlockAssembly: false})
-	require.NoError(t, err, "an honest spend of a body-less parent must validate via the real store's coin-table fallback")
+	require.NoError(t, err, "an honest spend of a body-less parent must validate via the real store's UTXO-table fallback")
 }
