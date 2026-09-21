@@ -283,8 +283,21 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// The block is committed; release the two-phase lock createUtxos put on its
 	// transactions. Only the non-unified legacy route creates them here (the
 	// unified route defers to quick validation, which has its own unlock pass).
-	if err = sm.unlockBlockTransactions(ctx, origin, blockHeight, txHashes); err != nil {
-		return err
+	//
+	// A failure here is logged and counted, not returned. The block is already in
+	// the chain, and returning an error from this point made the caller treat a
+	// stored block as a failed one: it was marked recently failed (which
+	// suppresses its queued descendants), rejected to the peer as invalid when the
+	// error was not classed transient, and the acceptance footer (orphan
+	// processing, peer height, FSM RUN) was skipped. None of that re-runs the
+	// unlock, so returning bought nothing.
+	if unlockErr := sm.unlockBlockTransactions(ctx, origin, blockHeight, txHashes); unlockErr != nil {
+		if prometheusLegacyNetsyncUnlockFailures != nil {
+			prometheusLegacyNetsyncUnlockFailures.Inc()
+		}
+
+		sm.logger.Errorf("[HandleBlockDirect][%s] block %d is committed but releasing the create-phase lock on its transactions failed; the affected records stay locked: %v",
+			block.Hash().String(), blockHeight, unlockErr)
 	}
 
 	// process any orphan transactions that are now valid in background
@@ -741,7 +754,8 @@ func (sm *SyncManager) catchupLocksUTXOs() bool {
 // The block is already committed and nothing re-runs it, so a chunk that fails
 // here leaves its records locked for good. Each chunk therefore runs detached
 // from the caller's context, with its own retries, and one chunk's failure does
-// not cancel the others; the error is still returned so the operator sees it.
+// not cancel the others. The error is returned for the caller to log and count;
+// HandleBlockDirect does not fail the committed block on it.
 func (sm *SyncManager) unlockBlockTransactions(ctx context.Context, origin blockRequestOrigin, height uint32, txHashes []chainhash.Hash) error {
 	if !sm.quickValidationAllowed(origin, height) || sm.legacyUnified(origin, height) || !sm.catchupLocksUTXOs() || len(txHashes) <= 1 {
 		return nil
