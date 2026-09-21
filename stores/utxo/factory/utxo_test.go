@@ -83,6 +83,10 @@ func (m *MockUTXOStore) Delete(ctx context.Context, hash *chainhash.Hash) error 
 	return nil
 }
 
+func (m *MockUTXOStore) DeleteComplete(ctx context.Context, hash *chainhash.Hash) error {
+	return nil
+}
+
 func (m *MockUTXOStore) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
 	return nil, nil
 }

@@ -41,3 +41,12 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 
 	return nil
 }
+
+// DeleteComplete removes a transaction and every record it owns. This store never
+// paginates a transaction across records, and Delete already removes the txs row,
+// every spend row and every side-table row in one transaction, so a successful
+// Delete leaves nothing behind. DeleteComplete is therefore equivalent to Delete
+// here, as it is on the SQL store.
+func (s *Store) DeleteComplete(ctx context.Context, hash *chainhash.Hash) error {
+	return s.Delete(ctx, hash)
+}
