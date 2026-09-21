@@ -19,26 +19,44 @@ import (
 // spender, so it writes no marker for C there; deleting C anyway left a replay
 // of C free to be recreated and spend P:0 cleanly. C must be held back, in both
 // pruning modes. The Aerospike pruner applies the same rule.
+//
+// C also spends Q:0, which still records C's spend. The marker INSERT would
+// mark (Q, C), and a marker on a child that stays refuses that live child's
+// own re-spend, so a held-back child must get no marker on any parent.
 func TestPrunerHoldsBackChildWhoseParentOutputIsUnspent(t *testing.T) {
 	for _, defensive := range []bool{false, true} {
 		forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
 			store.settings.Pruner.UTXODefensiveEnabled = defensive
 
-			parent := bt.NewTx()
-			require.NoError(t, parent.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
-			parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
-			require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
-			require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
-			_, err := store.Create(ctx, parent, 1000)
-			require.NoError(t, err)
+			newParent := func(seed string) *bt.Tx {
+				parent := bt.NewTx()
+				require.NoError(t, parent.From(seed, 0, "51", 30000))
+				parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+				// Output 1 stays unspent so the parent survives the prune.
+				require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+				require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+				_, err := store.Create(ctx, parent, 1000)
+				require.NoError(t, err)
+
+				return parent
+			}
+
+			parent := newParent("1111111111111111111111111111111111111111111111111111111111111111")
+			sibling := newParent("2222222222222222222222222222222222222222222222222222222222222222")
 
 			child := bt.NewTx()
-			require.NoError(t, child.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
-			child.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
-			require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
-			_, _, err = store.SpendAndCreate(ctx, child, 1000)
+			for _, p := range []*bt.Tx{parent, sibling} {
+				require.NoError(t, child.From(p.TxID(), 0, p.Outputs[0].LockingScript.String(), p.Outputs[0].Satoshis))
+			}
+
+			for i := range child.Inputs {
+				child.Inputs[i].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+			}
+
+			require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 7000))
+			_, _, err := store.SpendAndCreate(ctx, child, 1000)
 			require.NoError(t, err)
-			_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash(), child.TxIDChainHash()},
+			_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash(), sibling.TxIDChainHash(), child.TxIDChainHash()},
 				utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
 			require.NoError(t, err)
 
@@ -72,7 +90,7 @@ func TestPrunerHoldsBackChildWhoseParentOutputIsUnspent(t *testing.T) {
 
 			require.NoError(t, store.db.QueryRowContext(ctx,
 				"SELECT EXISTS(SELECT 1 FROM deleted_children WHERE child_hash = $1)", child.TxIDChainHash()[:]).Scan(&marked))
-			require.False(t, marked, "a held-back child carries no marker")
+			require.False(t, marked, "a held-back child carries no marker on any parent, including the sibling that still records its spend")
 		})
 	}
 }

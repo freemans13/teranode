@@ -357,17 +357,21 @@ func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
 	return count, nil
 }
 
-// unverifiedClaim selects an input of the transaction row in scope (aliased
-// as the table name, transactions) whose parent record is present but whose
-// output does not carry well-formed spending data: no such output row, NULL
-// spending data, or fewer than the 36 bytes of txid and vin. Used as a NOT
-// EXISTS hold-back on both pruning paths.
-const unverifiedClaim = `SELECT 1
+// unverifiedClaim selects an input of the transaction row in scope, named by
+// alias, whose parent record is present but whose output does not carry
+// well-formed spending data: no such output row, NULL spending data, or fewer
+// than the 36 bytes of txid and vin. It gates the marker INSERT and the DELETE
+// alike on both pruning paths, so a held-back child gets no marker anywhere:
+// the spend path answers a marker ahead of everything else, and a marker on a
+// child that stays would refuse that live child's own re-spend.
+func unverifiedClaim(alias string) string {
+	return `SELECT 1
       FROM inputs hi
       JOIN transactions hp ON hp.hash = hi.previous_transaction_hash
       LEFT JOIN outputs ho ON ho.transaction_id = hp.id AND ho.idx = hi.previous_tx_idx
-      WHERE hi.transaction_id = transactions.id
+      WHERE hi.transaction_id = ` + alias + `.id
         AND (ho.transaction_id IS NULL OR ho.spending_data IS NULL OR length(ho.spending_data) < 36)`
+}
 
 // pruneWithoutDefensiveCheck marks and deletes every transaction past its
 // expiration, with no child-stability verification.
@@ -382,7 +386,7 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
 	// would reject that loser's genuinely fresh spend of the output forever, once
 	// the winner's spend is released. Only the child the output actually records
 	// as its spender gets a marker.
-	const markerQuery = `INSERT INTO deleted_children (parent_id, child_hash)
+	markerQuery := `INSERT INTO deleted_children (parent_id, child_hash)
   SELECT DISTINCT parent.id, child.hash
   FROM transactions child
   JOIN inputs i ON i.transaction_id = child.id
@@ -392,6 +396,7 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
     AND substr(o.spending_data, 1, 32) = child.hash
   WHERE child.delete_at_height IS NOT NULL
     AND child.delete_at_height <= $1
+    AND NOT EXISTS (` + unverifiedClaim("child") + `)
   ON CONFLICT (parent_id, child_hash) DO NOTHING`
 
 	// A candidate whose claimed parent output is present but unspent, or
@@ -401,10 +406,10 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
 	// spender (a conflicting loser) does not hold the child back, and a parent
 	// that is gone needs no marker. The Aerospike pruner applies the same rule
 	// in keepSpendHolders.
-	const deleteQuery = `DELETE FROM transactions
+	deleteQuery := `DELETE FROM transactions
   WHERE delete_at_height IS NOT NULL
     AND delete_at_height <= $1
-    AND NOT EXISTS (` + unverifiedClaim + `)`
+    AND NOT EXISTS (` + unverifiedClaim("transactions") + `)`
 
 	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
@@ -492,7 +497,7 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 			      )
 			  )`
 
-	const markerQuery = `INSERT INTO deleted_children (parent_id, child_hash)
+	markerQuery := `INSERT INTO deleted_children (parent_id, child_hash)
   SELECT DISTINCT parent.id, child.hash
   FROM utxo_prune_candidates candidate
   JOIN transactions child ON child.id = candidate.id
@@ -501,10 +506,11 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
   JOIN outputs o ON o.transaction_id = parent.id
     AND o.idx = i.previous_tx_idx
     AND substr(o.spending_data, 1, 32) = child.hash
+  WHERE NOT EXISTS (` + unverifiedClaim("child") + `)
   ON CONFLICT (parent_id, child_hash) DO NOTHING`
 
-	const deleteQuery = `DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)
-    AND NOT EXISTS (` + unverifiedClaim + `)`
+	deleteQuery := `DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)
+    AND NOT EXISTS (` + unverifiedClaim("transactions") + `)`
 
 	createCandidates := createCandidatesPortable
 	if s.engine == "postgres" {
