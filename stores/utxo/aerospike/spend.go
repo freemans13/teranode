@@ -650,7 +650,7 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 				result.rollbackNeeded = true
 			}
 
-			if errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) {
+			if utxo.IsReplayAnswer(spend.Err) {
 				result.prunedRejection = true
 			}
 
@@ -683,7 +683,15 @@ func isSpendRollbackError(err error) bool {
 		errors.Is(err, errors.ErrTxConflicting) ||
 		errors.Is(err, errors.ErrFrozen) ||
 		errors.Is(err, errors.ErrUtxoHashMismatch) ||
-		errors.Is(err, errors.ErrUtxoSpendingTxPruned)
+		errors.Is(err, errors.ErrUtxoSpendingTxPruned) ||
+		// A missing parent is the other pruned-replay answer (see
+		// utxo.IsPrunedReplayRejection). Without it here a ghost with one parent
+		// pruned and another surviving kept its fresh spend of the survivor, and
+		// DeleteCreated then removed the ghost with that spend still in place:
+		// an output spent by a transaction the store no longer holds. Reaching
+		// here means the "already blessed" fallback did not clear the error, so
+		// the call genuinely failed.
+		errors.Is(err, errors.ErrTxNotFound)
 }
 
 // needsSpendRollback returns true if any spend failed due to a validation error
@@ -1174,6 +1182,22 @@ func (s *Store) createSpendError(errMsg LuaErrorInfo, batchItem *batchSpend, txI
 		// instead of leaving them recorded against a transaction that will
 		// never exist.
 		return errors.NewUtxoSpendingTxPrunedError("[SPEND_BATCH_LUA][%s] invalid spend for vout %d: spending transaction was pruned: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+
+	// The three record-level answers arrive here too. When one spend in a Lua
+	// call hits a replay marker, spendMulti answers every other spend of that
+	// record per index rather than for the whole record (teranode.lua, the
+	// recordErrorCode block), so they must keep the typed errors
+	// createGeneralError gives them: the validator matches ErrTxConflicting, the
+	// legacy block path swallows it, and ErrTxLocked is what the validator
+	// retries on. A bare StorageError hard-failed a block that used to validate.
+	case LuaErrorCodeConflicting:
+		return errors.NewTxConflictingError("[SPEND_BATCH_LUA][%s] transaction is conflicting, vout %d - %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+
+	case LuaErrorCodeLocked:
+		return errors.NewTxLockedError("[SPEND_BATCH_LUA][%s] transaction is locked, vout %d - %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+
+	case LuaErrorCodeCoinbaseImmature:
+		return errors.NewTxCoinbaseImmatureError("[SPEND_BATCH_LUA][%s] coinbase is locked, vout %d - %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
 
 	case LuaErrorCodeFrozen:
 		return errors.NewUtxoFrozenError("[SPEND_BATCH_LUA][%s] UTXO is frozen, vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)

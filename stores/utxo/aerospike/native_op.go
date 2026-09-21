@@ -139,6 +139,10 @@ func (s *Store) demoteNativeOnUnsupported(err error) {
 
 	var aerr aerospike.Error
 	if errors.As(err, &aerr) && aerr.Matches(types.PARAMETER_ERROR) && s.useNativeTeranodeOps.CompareAndSwap(true, false) {
+		// Clear the replay-protection verdict too. useNativeForSubOp checks
+		// useNativeTeranodeOps first, so this is not load-bearing today, but a
+		// stale true would re-arm the fenced sub-ops if that order ever changed.
+		s.nativeReplayProtection.Store(false)
 		s.logger.Errorf("[teranode-native-op] server rejected a native op with PARAMETER_ERROR; demoting to the UDF path for the rest of this process")
 	}
 }

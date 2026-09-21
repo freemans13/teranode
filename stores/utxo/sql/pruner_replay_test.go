@@ -737,8 +737,7 @@ func TestOrphanedSpendIsReversedOnTheNextAttempt(t *testing.T) {
 		_, err := store.Create(ctx, p, 1000)
 		require.NoError(t, err)
 
-		// Q is NOT created yet, so the first attempt fails on a missing record,
-		// which is not a rollback-class error.
+		// Q is NOT created yet.
 		q := bt.NewTx()
 		require.NoError(t, q.From("2222222222222222222222222222222222222222222222222222222222222222", 0, "51", 30000))
 		q.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
@@ -755,8 +754,13 @@ func TestOrphanedSpendIsReversedOnTheNextAttempt(t *testing.T) {
 
 		require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 7000))
 
-		_, err = store.Spend(ctx, child, 1000)
-		require.Error(t, err, "fixture: the call fails on the missing parent")
+		// The orphan: an earlier attempt wrote P:0 and then failed on an error
+		// that does not roll back (a transient one). A missing parent used to be
+		// such an error; it now rolls back, so the orphan is written directly.
+		_, err = store.db.ExecContext(ctx,
+			"UPDATE outputs SET spending_data = $2 WHERE idx = 0 AND transaction_id IN (SELECT id FROM transactions WHERE hash = $1)",
+			p.TxIDChainHash()[:], spendpkg.NewSpendingData(child.TxIDChainHash(), 0).Bytes())
+		require.NoError(t, err)
 
 		require.Equal(t, spendpkg.NewSpendingData(child.TxIDChainHash(), 0).Bytes(),
 			outputSpendingData(t, ctx, store, p, 0),

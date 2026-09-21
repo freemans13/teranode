@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -151,7 +152,10 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 // error) in that item's Err and returns nil overall, and reading such an item as
 // "not locked" filed an unknown record as pre-existing, which switched the
 // "already blessed" fallback back on for it. An unreadable record is not an
-// answer; the block is retried instead.
+// answer; the block is retried instead. A record that is gone is an answer: it
+// cannot be a leftover, so it is skipped rather than failing the block, which
+// matters because the pruner may delete a record between its create answering
+// ErrTxExists and this read.
 //
 // Two limits, stated rather than hidden. With the catch-up lock switched off
 // (blockvalidation_quick_validate_skip_utxo_lock) nothing writes the mark, and a
@@ -177,6 +181,20 @@ func LeftoversAmong(ctx context.Context, store Store, existing []*chainhash.Hash
 	leftovers := make(map[chainhash.Hash]struct{})
 
 	for _, item := range unresolved {
+		// The coinbase placeholder is never a stored record, and the Aerospike
+		// store answers it with neither data nor an error.
+		if item.Hash.Equal(subtree.CoinbasePlaceholderHashValue) {
+			continue
+		}
+
+		// A record that is gone is unambiguously not a leftover. The concurrent
+		// pruner can delete a record between its create answering ErrTxExists
+		// and this read; failing the block on that turned a benign race into a
+		// block failure that only a retry cleared.
+		if item.Err != nil && errors.Is(item.Err, errors.ErrTxNotFound) {
+			continue
+		}
+
 		if item.Err != nil {
 			return nil, errors.NewStorageError("[LeftoversAmong] could not read the lock state of existing transaction %s", item.Hash.String(), item.Err)
 		}
@@ -257,7 +275,8 @@ const (
 //
 //   - A rejected transaction's spend of the markered output never committed,
 //     and the store rolls back whatever fresh sibling spends it made in the
-//     same call (needsSpendRollback). What its inputs still record is the
+//     same call (needsSpendRollback), on the marker answer and on the missing
+//     parent answer alike. What its inputs still record is the
 //     original, confirmed spend, which the marker protects; clearing it would
 //     hand a confirmed output to any new spender, and the marker would not
 //     object because it names only the original child.
@@ -347,12 +366,13 @@ func retryStoreCall(ctx context.Context, fn func() error) error {
 // the record cannot tell the two apart and the answer has to come from why the
 // call is failing now.
 //
-// Exactly one rejection makes the match historical: the pruned-replay marker.
-// It fires only for a transaction this store pruned, which happens only once
-// that transaction was mined, fully spent and buried, so any output recording
-// it as spender is recording a confirmed spend. Reversing that would hand a
-// confirmed output to the next spender, which is the double-spend this
-// exclusion was added to prevent.
+// Two rejections make the match historical, the two a pruned replay gets
+// (IsReplayAnswer). The marker fires only for a transaction this store pruned,
+// which happens only once that transaction was mined, fully spent and buried,
+// so any output recording it as spender is recording a confirmed spend. A
+// missing parent is the same answer for a chain the pruner removed end to end,
+// marker and all. Reversing either would hand a confirmed output to the next
+// spender, which is the double-spend this exclusion was added to prevent.
 //
 // Every other rejection leaves the match reversible, and reversing it is what
 // keeps the store self-healing. The store leaves partial spends committed when
@@ -363,8 +383,8 @@ func retryStoreCall(ctx context.Context, fn func() error) error {
 // a transaction the store does not hold, and its next legitimate spender was
 // refused with a txid this node has never seen.
 //
-// historical is the caller's answer to "might this call have been rejected on a
-// pruned-replay marker?". It must be true when any input was, and also whenever
+// historical is the caller's answer to "might this call have been rejected as a
+// pruned replay?". It must be true when any input was, and also whenever
 // the caller does not know every input's answer, as on a spend call aborted
 // while some inputs were still in flight: an input not yet answered may be the
 // marker hit, and reading an in-flight slot is a data race besides. Holding an
@@ -379,16 +399,27 @@ func RollbackSet(written, idempotent []*Spend, historical bool) []*Spend {
 	return append(written, idempotent...)
 }
 
-// AnyPrunedReplay reports whether any spend failed on a pruned-replay marker.
-// Only for spends whose Err slot is safe to read.
+// AnyPrunedReplay reports whether any spend failed with an answer that can mean
+// a pruned replay (IsReplayAnswer). Only for spends whose Err slot is safe to
+// read.
 func AnyPrunedReplay(spends []*Spend) bool {
 	for _, spend := range spends {
-		if spend != nil && spend.Err != nil && errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) {
+		if spend != nil && IsReplayAnswer(spend.Err) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// IsReplayAnswer reports whether a per-input spend error is one of the two
+// answers a replay of a pruned transaction gets: the marker rejection, or a
+// parent record that is gone. The stores use it to decide that an idempotent
+// match in the same call is historical and must not be reversed (RollbackSet).
+// Whether the call really was a replay is the block paths' question, answered
+// with IsPrunedReplayRejection.
+func IsReplayAnswer(err error) bool {
+	return err != nil && (errors.Is(err, errors.ErrUtxoSpendingTxPruned) || errors.Is(err, errors.ErrTxNotFound))
 }
 
 // ReplayRejectionsFirst reorders per-input spend errors so the ones that

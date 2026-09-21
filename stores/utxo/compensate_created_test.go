@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -313,6 +314,29 @@ func TestLeftoversAmong(t *testing.T) {
 		missing := chainhash.HashH([]byte("missing"))
 		_, err := LeftoversAmong(ctx, store, []*chainhash.Hash{&missing}, thisBlock)
 		require.Error(t, err)
+	})
+
+	t.Run("a record that is gone is not a leftover and does not fail the call", func(t *testing.T) {
+		// The pruner can delete a record between its create answering
+		// ErrTxExists and this read. Gone is an answer, not an unreadable record.
+		gone := chainhash.HashH([]byte("gone"))
+		goneStore := &decorateStore{
+			data: store.data,
+			errs: map[chainhash.Hash]error{gone: errors.NewTxNotFoundError("%v not found", gone)},
+		}
+
+		leftovers, err := LeftoversAmong(ctx, goneStore, []*chainhash.Hash{&ours, &gone}, thisBlock)
+		require.NoError(t, err)
+		require.Equal(t, map[chainhash.Hash]struct{}{ours: {}}, leftovers)
+	})
+
+	t.Run("the coinbase placeholder is skipped", func(t *testing.T) {
+		// The Aerospike store answers the placeholder with neither data nor an
+		// error, which the no-data check would otherwise read as a failure.
+		placeholder := subtree.CoinbasePlaceholderHashValue
+		leftovers, err := LeftoversAmong(ctx, store, []*chainhash.Hash{&ours, &placeholder}, thisBlock)
+		require.NoError(t, err)
+		require.Equal(t, map[chainhash.Hash]struct{}{ours: {}}, leftovers)
 	})
 }
 
