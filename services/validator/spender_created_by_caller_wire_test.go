@@ -1,9 +1,9 @@
 package validator
 
 import (
+	"context"
 	"testing"
 
-	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,17 +23,6 @@ func TestOptionsFromValidateRequest_SpenderCreatedByCallerRoundTrip(t *testing.T
 	require.False(t, got.SpenderCreatedByCaller, "SpenderCreatedByCaller must default to false")
 }
 
-func TestHTTPHandlerPath_SpenderCreatedByCaller(t *testing.T) {
-	q := buildValidateTxHTTPQuery(&Options{SpenderCreatedByCaller: true}, 620000)
-
-	e := echo.New()
-	ctx, err := echoRequestWithQuery(e, q.Encode())
-	require.NoError(t, err)
-
-	_, opts := extractValidationParams(ctx)
-	require.True(t, opts.SpenderCreatedByCaller, "SpenderCreatedByCaller must survive the HTTP query string")
-}
-
 // IgnoreLocked became load-bearing on the legacy catchup path this round: the
 // create phase writes every transaction of a block locked, so a child spending
 // an in-block parent must be allowed past that lock. Without the field a remote
@@ -51,13 +40,29 @@ func TestOptionsFromValidateRequest_IgnoreLockedRoundTrip(t *testing.T) {
 	require.False(t, got.IgnoreLocked, "IgnoreLocked must default to false: a mempool submitter must never bypass a lock")
 }
 
-func TestHTTPHandlerPath_IgnoreLocked(t *testing.T) {
-	q := buildValidateTxHTTPQuery(&Options{IgnoreLocked: true}, 620000)
+// The HTTP fallback carries transaction bytes only, so a block-path request that
+// sets either flag must be refused before anything is sent. Stripping the flag
+// would be worse than failing: without SpenderCreatedByCaller a remote validator
+// blesses a replay on the strength of the record the block path just wrote.
+func TestValidateTransactionViaHTTP_RefusesBlockPathFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*Options)
+	}{
+		{"spenderCreatedByCaller", func(o *Options) { o.SpenderCreatedByCaller = true }},
+		{"ignoreLocked", func(o *Options) { o.IgnoreLocked = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, calls, _ := countingValidatorStub(t)
+			client := &Client{validatorHTTPAddr: addr, logger: &testLogger{t: t}}
 
-	e := echo.New()
-	ctx, err := echoRequestWithQuery(e, q.Encode())
-	require.NoError(t, err)
+			opts := NewDefaultOptions()
+			tc.set(opts)
 
-	_, opts := extractValidationParams(ctx)
-	require.True(t, opts.IgnoreLocked, "IgnoreLocked must survive the HTTP query string")
+			err := client.validateTransactionViaHTTP(context.Background(), createTestTransaction(t), 0, opts)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.name, "the error must name the field that cannot be carried")
+			require.Equal(t, int64(0), calls.Load(), "the refusal must happen before the request is sent")
+		})
+	}
 }
