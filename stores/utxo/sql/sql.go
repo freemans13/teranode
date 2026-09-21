@@ -2500,6 +2500,11 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				JOIN outputs o
 				  ON o.transaction_id = v.transaction_id AND o.idx = v.idx
 				WHERE o.spending_data = v.spending_data
+				  -- A marker-bearing row falls through to the re-check below,
+				  -- which answers it as a pruned replay.
+				  AND NOT EXISTS (SELECT 1 FROM deleted_children d
+				                  WHERE d.parent_id = o.transaction_id
+				                    AND d.child_hash = substring(v.spending_data from 1 for 32))
 			),
 			parents AS (
 				SELECT transaction_id, count(*) AS spent_in_batch FROM upd_spent GROUP BY transaction_id
@@ -2557,6 +2562,11 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				JOIN outputs o
 				  ON o.transaction_id = v.transaction_id AND o.idx = v.idx
 				WHERE o.spending_data = v.spending_data
+				  -- A marker-bearing row falls through to the re-check below,
+				  -- which answers it as a pruned replay.
+				  AND NOT EXISTS (SELECT 1 FROM deleted_children d
+				                  WHERE d.parent_id = o.transaction_id
+				                    AND d.child_hash = substring(v.spending_data from 1 for 32))
 			)
 			SELECT batch_idx, false AS idempotent FROM upd_spent
 			UNION ALL
