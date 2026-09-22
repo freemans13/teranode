@@ -1428,7 +1428,8 @@ func (s *SQL) needsFullOnMainChainRebuild(ctx context.Context) (bool, error) {
 // best's lineage within the walked window.
 //
 // exec is the pool or an open transaction; StoreBlock passes its transaction so the
-// reconciliation commits or rolls back together with the INSERT.
+// reconciliation commits or rolls back together with the INSERT. The error is the
+// driver's own, unwrapped, and the caller types it.
 func (s *SQL) reconcileOnMainChain(ctx context.Context, exec execQuerier) error {
 	maxDepth := int64(s.chainParams.CoinbaseMaturity) * 2
 	if maxDepth < 100 {
@@ -1469,10 +1470,11 @@ func (s *SQL) reconcileOnMainChain(ctx context.Context, exec execQuerier) error 
 					AND id NOT IN (SELECT id FROM new_path))
 			  )
 	`
-	if _, err := exec.ExecContext(ctx, q, maxDepth); err != nil {
-		return errors.NewStorageError("reconcileOnMainChain: failed to apply diff", err)
-	}
-	return nil
+	// The error is returned raw: StoreBlock runs this inside RetryTx, which needs the
+	// driver's concrete type to classify it, and types it once RetryTx returns.
+	_, err := exec.ExecContext(ctx, q, maxDepth)
+
+	return err
 }
 
 // rebuildOnMainChainFlag updates the on_main_chain column to accurately reflect the

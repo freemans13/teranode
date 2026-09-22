@@ -21,7 +21,7 @@ import (
 // newOnMainChainTestStore creates a *SQL backed by an sqlitememory DB, waits
 // for the background startup rebuild to complete, and returns the store ready
 // for use. The caller is responsible for s.Close(context.Background()) (via t.Cleanup).
-func newOnMainChainTestStore(t *testing.T) *SQL {
+func newOnMainChainTestStore(t testing.TB) *SQL {
 	t.Helper()
 	return newOnMainChainTestStoreWith(t, nil)
 }
@@ -29,7 +29,7 @@ func newOnMainChainTestStore(t *testing.T) *SQL {
 // newOnMainChainTestStoreWith is the same as newOnMainChainTestStore but lets
 // the caller mutate settings before the store is created (e.g. to tweak
 // CoinbaseMaturity or enable UseInMemoryChainCheck).
-func newOnMainChainTestStoreWith(t *testing.T, mutate func(*settings.Settings)) *SQL {
+func newOnMainChainTestStoreWith(t testing.TB, mutate func(*settings.Settings)) *SQL {
 	t.Helper()
 	tSettings := test.CreateBaseTestSettings(t)
 	if mutate != nil {
@@ -47,7 +47,7 @@ func newOnMainChainTestStoreWith(t *testing.T, mutate func(*settings.Settings)) 
 
 // storeBlocks stores a sequence of blocks via StoreBlock, failing the test on
 // any error. Returns the list for convenience.
-func storeBlocks(t *testing.T, s *SQL, blocks ...*model.Block) {
+func storeBlocks(t testing.TB, s *SQL, blocks ...*model.Block) {
 	t.Helper()
 	for i, b := range blocks {
 		_, _, err := s.StoreBlock(context.Background(), b, "peer")
@@ -57,7 +57,7 @@ func storeBlocks(t *testing.T, s *SQL, blocks ...*model.Block) {
 
 // getOnMainChain reads the on_main_chain flag directly from the database for the block
 // with the given hash. Returns false if the block does not exist.
-func getOnMainChain(t *testing.T, s *SQL, hashBytes []byte) bool {
+func getOnMainChain(t testing.TB, s *SQL, hashBytes []byte) bool {
 	t.Helper()
 	var v bool
 	err := s.db.QueryRow(`SELECT on_main_chain FROM blocks WHERE hash = $1`, hashBytes).Scan(&v)

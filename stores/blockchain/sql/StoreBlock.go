@@ -172,50 +172,79 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	// The common extend keeps its single auto-committed INSERT, which already writes
 	// the correct flag and needs no repair.
 	var (
-		newBlockID uint64
-		height     uint32
-		err        error
+		newBlockID     uint64
+		height         uint32
+		storedInvalid  bool
+		reconcileStage bool
+		err            error
 	)
 
 	if onMainChain {
-		newBlockID, height, _, _, err = s.storeBlock(ctx, s.db, block, peerID, storeBlockOptions, onMainChain)
+		newBlockID, height, _, storedInvalid, err = s.storeBlock(ctx, s.db, block, peerID, storeBlockOptions, onMainChain)
 		if err != nil {
-			return 0, height, err
+			return 0, height, s.typedStoreBlockError(err, block)
 		}
 	} else {
 		// RetryTx keeps the pool's retry and circuit-breaker behaviour, but retries
 		// the whole transaction rather than one statement: a statement that fails
 		// inside a PostgreSQL transaction aborts it, so only a fresh BEGIN can retry.
+		//
+		// The closure returns driver errors unwrapped. RetryTx classifies them by
+		// concrete type (SQLSTATE, SQLite result code), and a teranode error keeps
+		// only the message, so wrapping first would hide SQLITE_LOCKED or a 40001
+		// from it. The errors are typed after RetryTx returns.
 		err = s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
 			var storeErr error
 
-			newBlockID, height, _, _, storeErr = s.storeBlock(ctx, tx, block, peerID, storeBlockOptions, onMainChain)
+			reconcileStage = false
+
+			newBlockID, height, _, storedInvalid, storeErr = s.storeBlock(ctx, tx, block, peerID, storeBlockOptions, onMainChain)
 			if storeErr != nil {
 				return storeErr
 			}
 
-			reconcileErr := s.reconcileOnMainChain(ctx, tx)
-			if s.reconcileHook != nil {
-				reconcileErr = s.reconcileHook()
+			// An invalid row is written with on_main_chain=false and best_block only
+			// selects valid rows, so the reconciliation can neither fix nor be fixed
+			// by it. Skipping it keeps the invalid record from depending on a
+			// statement that could only fail it.
+			if storedInvalid {
+				return nil
 			}
 
-			if reconcileErr != nil {
-				return errors.NewStorageError("StoreBlock: reconcileOnMainChain", reconcileErr)
+			reconcileStage = true
+
+			reconcile := func() error { return s.reconcileOnMainChain(ctx, tx) }
+			if s.reconcileHook != nil {
+				reconcile = s.reconcileHook
 			}
+
+			if reconcileErr := reconcile(); reconcileErr != nil {
+				return reconcileErr
+			}
+
+			reconcileStage = false
 
 			return nil
 		})
 		if err != nil {
-			// storeBlock and the reconciliation already return typed errors, which
-			// callers match on (block exists, invalid argument). Only a raw driver
-			// error from BEGIN or COMMIT needs wrapping here.
-			var typedErr *errors.Error
-			if errors.As(err, &typedErr) {
-				return 0, height, err
+			if reconcileStage {
+				var typedErr *errors.Error
+				if errors.As(err, &typedErr) {
+					return 0, height, err
+				}
+
+				return 0, height, errors.NewStorageError("StoreBlock: reconcileOnMainChain", err)
 			}
 
-			return 0, height, errors.NewStorageError("StoreBlock: commit block and on_main_chain reconciliation", err)
+			return 0, height, s.typedStoreBlockError(err, block)
 		}
+	}
+
+	// Cache the timestamp only once the row is committed. Doing it inside storeBlock
+	// let a rolled-back fork attempt leave an entry with no row behind it, which the
+	// next block's median-time-past would then read.
+	if !storedInvalid {
+		s.blockTimestampCache.Add(height, block.Header.Timestamp)
 	}
 
 	// Reset response cache to invalidate cached best block ID and headers
@@ -377,6 +406,15 @@ func (s *SQL) getPreviousBlockInfo(ctx context.Context, prevBlockHash chainhash.
 	return id, chainWork, height, invalid, nil
 }
 
+// execQuerier is the subset of database calls storeBlock needs. Both *usql.DB and
+// *sql.Tx satisfy it, so the INSERT can run on the pool (fast path) or inside a
+// transaction that also carries the on_main_chain reconciliation (fork path).
+type execQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
 // storeBlock is the internal implementation that performs the actual database operations
 // to persist a block. It handles both genesis and regular blocks differently, with special
 // processing for the initial block in the chain.
@@ -426,17 +464,9 @@ func (s *SQL) getPreviousBlockInfo(ctx context.Context, prevBlockHash chainhash.
 //   - uint64: The unique database ID assigned to the stored block
 //   - uint32: The height of the block in the blockchain
 //   - []byte: The calculated cumulative chain work for this block as a byte array
-//   - error: Any error encountered during the operation, including validation failures
-//
-// execQuerier is the subset of database calls storeBlock needs. Both *usql.DB and
-// *sql.Tx satisfy it, so the INSERT can run on the pool (fast path) or inside a
-// transaction that also carries the on_main_chain reconciliation (fork path).
-type execQuerier interface {
-	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-}
-
+//   - bool: Whether the row was written invalid, by request or inherited from an invalid parent
+//   - error: Any error encountered during the operation, including validation failures. A
+//     failed INSERT returns the driver's error unwrapped; StoreBlock types it
 func (s *SQL) storeBlock(ctx context.Context, exec execQuerier, block *model.Block, peerID string, storeBlockOptions options.StoreBlockOptions, onMainChain bool) (uint64, uint32, []byte, bool, error) {
 	var (
 		coinbaseTxID string
@@ -719,7 +749,10 @@ RETURNING id
 	}
 
 	if err != nil {
-		return 0, 0, nil, false, s.parseSQLError(err, block)
+		// Returned raw: the fork path runs this inside RetryTx, which classifies a
+		// driver error by its concrete type. StoreBlock types it afterwards through
+		// typedStoreBlockError.
+		return 0, 0, nil, false, err
 	}
 
 	defer rows.Close()
@@ -734,13 +767,24 @@ RETURNING id
 		return 0, 0, nil, false, errors.NewStorageError("failed to scan new block id", err)
 	}
 
-	// Update MTP cache with this block's timestamp for future MTP calculations.
-	// Only cache valid blocks — invalid blocks are excluded from MTP queries.
-	if !storeAsInvalid {
-		s.blockTimestampCache.Add(height, block.Header.Timestamp)
-	}
+	// The MTP timestamp cache is updated by StoreBlock once the row has committed,
+	// never here: on the fork path this runs inside a transaction that may still
+	// roll back.
 
 	return newBlockID, height, cumulativeChainWorkBytes, storeAsInvalid, nil
+}
+
+// typedStoreBlockError turns an error from storeBlock, or from the BEGIN and COMMIT
+// around it, into the typed error StoreBlock returns. Errors storeBlock already typed
+// (block exists, invalid argument, storage) pass through; a raw driver error goes
+// through parseSQLError, so a unique violation still surfaces as BlockExists.
+func (s *SQL) typedStoreBlockError(err error, block *model.Block) error {
+	var typedErr *errors.Error
+	if errors.As(err, &typedErr) {
+		return err
+	}
+
+	return s.parseSQLError(err, block)
 }
 
 // parseSQLError unwraps and translates SQL-specific errors into domain-specific errors.
