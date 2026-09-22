@@ -68,6 +68,14 @@ func TestRedactString(t *testing.T) {
 			"aerospike://user:se@cret@h1:3000,h2:3000/ns?set=x",
 			"aerospike://user:xxxxx@h1:3000,h2:3000/ns?set=x",
 		},
+		// A raw "," inside the password used to start the host list inside
+		// the password, so the URL either failed to parse or parsed with the
+		// credential dropped.
+		{
+			"multi-host, raw comma in password",
+			"kafka://user:hun,ter2@h1:9092,h2:9092/t",
+			"kafka://user:xxxxx@h1:9092,h2:9092/t",
+		},
 		// The authority ends at the first "/", "?" or "#". Preferring "/" over
 		// "?" put the query string into the host here.
 		{
