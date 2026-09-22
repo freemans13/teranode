@@ -30,9 +30,9 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/felixge/fgprof"
-	"github.com/ordishs/gocore"
 )
 
 // RunUtxoPersister initializes and runs the UTXO persister service.
@@ -64,7 +64,7 @@ func RunUtxoPersister(logger ulogger.Logger, settings *settings.Settings) {
 	} else {
 		logger.Infof("Profiler available at http://%s/debug/pprof", profilerAddr)
 
-		gocore.RegisterStatsHandlers()
+		util.RegisterGocoreStatsHandlers(nil)
 
 		logger.Infof("StatsServer listening on http://%s/%s/stats", profilerAddr, settings.StatsPrefix)
 

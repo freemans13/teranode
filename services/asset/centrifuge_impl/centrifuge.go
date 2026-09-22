@@ -305,7 +305,7 @@ func (c *Centrifuge) Init(_ context.Context) (err error) {
 // Returns:
 //   - error: Any error encountered during server operation
 func (c *Centrifuge) Start(ctx context.Context, addr string) error {
-	c.logger.Infof("[AssetService] Centrifuge service starting, websocket served on Asset HTTP (%s) at /connection/websocket; asset_centrifugeListenAddress %q is not bound as a separate listener", c.settings.Asset.HTTPListenAddress, addr)
+	c.logger.Infof("[AssetService] Centrifuge service starting, websocket served on Asset HTTP (%s) at /connection/websocket; asset_centrifugeListenAddress %q is not bound as a separate listener", c.settings.Asset.HTTPListenAddress, addr) // urlsafe: a host:port listen address, no userinfo
 
 	err := c.startP2PListener(ctx)
 	if err != nil {

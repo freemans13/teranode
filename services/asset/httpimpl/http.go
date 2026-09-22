@@ -328,7 +328,14 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	if tSettings.Asset.PropagationProxyEnabled && tSettings.Asset.PropagationProxyAddress != "" {
 		proxyTarget, err := url.Parse(tSettings.Asset.PropagationProxyAddress)
 		if err != nil {
-			logger.Errorf("[Asset] failed to parse propagation proxy address %q: %v", tSettings.Asset.PropagationProxyAddress, err)
+			// url.Parse embeds the value it was given in its error, so log only
+			// the reason and never the configured address itself.
+			var parseErr *url.Error
+			if errors.As(err, &parseErr) {
+				logger.Errorf("[Asset] failed to parse asset_propagation_proxy_address: %v", parseErr.Err)
+			} else {
+				logger.Errorf("[Asset] failed to parse asset_propagation_proxy_address")
+			}
 		} else {
 			apiGroup.POST("/tx", h.ProxyPropagationTx(proxyTarget, "/tx"))
 			apiGroup.POST("/txs", h.ProxyPropagationTx(proxyTarget, "/txs"))

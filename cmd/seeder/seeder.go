@@ -52,6 +52,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxofactory "github.com/bsv-blockchain/teranode/stores/utxo/factory"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 )
@@ -104,7 +105,7 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 		go func() {
 			logger.Infof("Profiler listening on http://%s/debug/pprof", profilerAddr)
 
-			gocore.RegisterStatsHandlers()
+			util.RegisterGocoreStatsHandlers(nil)
 
 			prefix := appSettings.StatsPrefix
 			logger.Infof("StatsServer listening on http://%s/%s/stats", profilerAddr, prefix)

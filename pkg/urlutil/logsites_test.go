@@ -45,7 +45,12 @@ var urlish = regexp.MustCompile(`(?i)(url|dsn|connstr)`)
 // name does not say URL, such as appSettings.UtxoStore.UtxoStore or
 // tSettings.Kafka.InvalidBlocksConfig. Most configured store and Kafka URLs
 // are named for what they point at, so urlish alone cannot see them.
-var storeSetting = regexp.MustCompile(`(?i)settings\.[A-Za-z0-9_.]*(store|config)(\.String\(\))?$`)
+//
+// Address and Addresses are here because some settings that hold a full URL
+// are named for the address, such as asset_propagation_proxy_address and
+// propagation_httpAddresses, and userinfo in a URL is a working credential.
+// Listen addresses match too and carry a urlsafe escape.
+var storeSetting = regexp.MustCompile(`(?i)settings\.[A-Za-z0-9_.]*(store|config|address|addresses)(\.String\(\))?$`)
 
 // viaSettings matches an argument reached through a settings value, which is
 // this node's own configuration even inside a peer-URL package.
