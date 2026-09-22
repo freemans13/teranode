@@ -176,7 +176,7 @@ func TestSetMinedMultiKeepsTheMempoolMarkerOffTheLongestChain(t *testing.T) {
 // TestUnsetMinedMultiUnstampsEveryTransactionInOneCall is the reorg path at batch width: each
 // transaction loses the block's containment row and gets a clock from the CURRENT tip.
 func TestUnsetMinedMultiUnstampsEveryTransactionInOneCall(t *testing.T) {
-	s, ctx := newTestStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
 	txs := mkStoredTxs(t, s, 100, 1_000, 4)
 	info := utxo.MinedBlockInfo{BlockID: 5, BlockHeight: 100, SubtreeIdx: 0}

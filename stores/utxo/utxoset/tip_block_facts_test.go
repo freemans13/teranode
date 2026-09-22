@@ -107,14 +107,16 @@ func TestRetiringWindowStampsTheBlockThatWonTheReorg(t *testing.T) {
 // TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt: a fork block F is applied first
 // and creates the transaction on the block path, then the main chain block M includes it too.
 //
-// A block-path create writes the creating block's pair onto every UTXO. When M later records
-// the same transaction, the store only adds a containment row, and no stamp touches a UTXO
-// that already carries a pair, so these UTXOs keep F's pair for good. Inside the node's
-// services only header-proven blocks and the coinbase take the block path, so this is a hazard
-// of the store's contract rather than a live production bug; what the store should do with a
-// block-path create above the checkpoint is an open decision of the design.
+// The store applies the checkpoint test itself, so on a network with no checkpoints (this
+// store's) a block-carrying create takes the identity route: an identity row, a containment
+// row for F and UTXOs at (0,0). When M later records the same transaction it adds its own
+// containment row and clears the marker. Nothing stamps a UTXO until the chain-aware stamp of
+// build step 5, and the interim guard refuses to drop the window while the identity row
+// exists, so the UTXO stays at (0,0) and does not name M, the main-chain block. At step 5 the
+// stamp, told that M won, writes (100, 7) and deletes F's row, which is what the guard waits
+// for. Below the checkpoint this scenario cannot arise: a fork block cannot be header-proven.
 func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
-	s, ctx := newTestStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
 	tx := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(
@@ -129,7 +131,7 @@ func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
 
 	h, b := utxoFacts(t, s, ctx, tx)
 
-	knownDefect(t, "a side-chain block-path create writes its own block onto the UTXO, and nothing rewrites a non-zero pair",
+	knownDefect(t, "no stamp exists yet: a UTXO born above the checkpoint from a side-chain block stays at (0,0) until the stamp names the main-chain block",
 		h == 100 && b == 7, func() {
 			require.Equal(t, int32(100), h)
 			require.Equal(t, int32(7), b, "the main chain block, not the side-chain block that created the UTXO")
@@ -185,9 +187,10 @@ func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *te
 // and then the child's spend is undone.
 //
 // This is the fourth reproduction, and the containment change closes it, so its guard is a
-// plain assertion. The parent is created unmined rather than through the block path, because a
-// block-path create writes no identity row and the un-mine, now a point delete, produces none,
-// so the identity assertion below would have nothing to find. With an unmined create the
+// plain assertion. It runs on a store with no checkpoints, because an un-mine at or below the
+// checkpoint is refused. The parent is created unmined rather than through the block path,
+// because a block-path create writes no identity row and the un-mine, now a point delete,
+// produces none, so the identity assertion below would have nothing to find. With an unmined create the
 // identity row is there because it is kept alive until the stamp. The un-mine deletes the one
 // containment row and sets the marker; the undo copy holds (0,0) because recording mined never
 // touched the UTXO; and the restore, finding no containment row, falls back to that copy and
@@ -195,7 +198,7 @@ func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *te
 // stale pair from the copy, which is the hazard the block-born variant still carries and which
 // rests on the open decision about invalidation at or below the checkpoint.
 func TestUnspendOfAnUnminedParentRestoresAnUnconfirmedUTXO(t *testing.T) {
-	s, ctx := newTestStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
 	parent := mkTx(t, 2, 5_000)
 	_, err := s.Create(ctx, parent, 99)

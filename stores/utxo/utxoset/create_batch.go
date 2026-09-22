@@ -16,13 +16,15 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// createIdentPlanSQL stores a whole BATCH of MEMPOOL transactions in ONE statement.
+// createIdentPlanSQL stores a whole BATCH of transactions that take the identity claim in ONE
+// statement.
 //
-// It is the claim for a create that carries no mined-block information: a transaction seen
-// before any block contains it. Such a transaction claims on tx_ident, with the unmined marker
-// set and no block of its own (containment has one home, tx_mined, and is recorded later), and
-// its UTXOs carry the unconfirmed sentinel — mined_height 0, block_id 0 — until the deep stamp
-// writes their block. The block-path counterpart is createMinedPlanSQL.
+// It is the claim for a create that carries no mined-block information, a transaction seen
+// before any block contains it, and, since the store applies the checkpoint test itself, for a
+// create that carries a block ABOVE the highest checkpoint. Both claim on tx_ident, and their
+// UTXOs carry the unconfirmed sentinel, mined_height 0 and block_id 0, until the deep stamp of
+// build step 5 writes the block onto them. The block-path counterpart, for a create carrying a
+// block at or below the checkpoint, is createMinedPlanSQL.
 //
 // Every parameter is an array, so one statement serves one transaction or a thousand, exactly
 // as spendJournalSQL does on the other side. That is what lets the single-transaction path be
@@ -33,24 +35,14 @@ import (
 // serialized bytes, which is indistinguishable from a transaction whose bytes have aged out
 // of their window, so it read as normal forever. Worse, the retry was refused, because the
 // identity claim reported the transaction as already present, so the bytes were never
-// written.
+// written. Folding them into one statement fixes both at once: data-modifying common table
+// expressions run in a single snapshot, so either all land or none do, and both the body and
+// the UTXO inserts are gated on the claim having actually inserted that transaction's row.
 //
-// Folding them into one statement fixes both at once. Data-modifying common table expressions
-// run in a single snapshot, so either all three land or none do, and both the body and the
-// UTXO inserts are gated on the claim having actually inserted that transaction's row. A
-// transaction the store already holds therefore writes nothing at all and is absent from the
-// result.
-//
-// The gate is a JOIN against claim rather than an EXISTS, and that is the whole difference
-// between this and the per-transaction statement it replaces. EXISTS asks "did anything in
-// this statement claim", which is the right question only when the statement carries one
+// The gate is a JOIN against claim rather than an EXISTS. EXISTS asks "did anything in this
+// statement claim", which is the right question only when the statement carries one
 // transaction. The join asks it per transaction, so a batch mixing fresh transactions with
 // ones the store already holds writes bodies and UTXOs for exactly the fresh ones.
-//
-// claim RETURNING gives back leaf and txid rather than the caller's index k, because
-// PostgreSQL only lets INSERT ... RETURNING name columns of the target table. The join back
-// onto (leaf, txid) recovers k, and it is exact rather than approximate: txid is the full 32
-// bytes, and (leaf, txid) is tx_ident's primary key.
 //
 // The UTXO insert has no conflict clause and needs none. The UTXO key is a non-unique 96-bit
 // prefix by design and has nothing to conflict on, so idempotence here comes from the claim
@@ -58,47 +50,37 @@ import (
 // is the failure this mechanism exists to prevent.
 //
 // The claim carries THREE guards, and all three are needed. Its own conflict clause catches a
-// transaction the mempool already holds. The tx_mined probe keeps a transaction in exactly one
-// of the two tables. The own-output UTXO probe catches the case neither of the other two can
-// see: a transaction mined longer ago than the membership retention has no identity row and no
-// membership window, and its UTXOs are still live because window retirement stamped them on the
-// way out. Without that third guard the claim takes, and because the UTXO insert is gated on
-// the same claim, every output is written a SECOND row -- the UTXO key is a non-unique 96-bit
-// prefix by design, so nothing downstream catches it. That is money-supply inflation.
+// transaction the identity table already holds; while the identity row exists that is the
+// whole answer, because identity and containment coexist on purpose now and the row stays
+// through mining until the stamp deletes it. After the stamp two guards are left against
+// writing every output a second time: the tx_mined probe and the own-output UTXO probe. The
+// schema comment calls a second set of outputs money-supply inflation, because the UTXO key is
+// a non-unique prefix and nothing downstream would catch it.
 //
-// The spec argued this could not arise because the mempool path spends before it creates, so an
-// old transaction's inputs would fail as already-spent and the create would never run. That is
-// true of SpendAndCreate in its default mode and false with WithCreateOnly, which skips the
-// spend phase entirely. The reachable caller is the validator's CreateConflicting branch
-// (services/validator/Validator.go): when every input fails as already-spent it calls
-// CreateInUtxoStore with markAsConflicting, which is SpendAndCreate + WithCreateOnly and no
-// mined-block info. CreateConflicting is off on the p2p path and ON for every
-// subtree-validation entry point, which is the mainline block path at the tip.
+// The tx_mined probe is bounded below by $25, claim_floor, a SCALAR bind parameter, and the
+// bound is what keeps the probe's cost flat as the stamp falls behind: without it the probe
+// takes one index descent in every attached window for every key, and attached windows grow by
+// one for every 288 blocks of stamp lag. Under force_custom_plan the planner sees the scalar as
+// a constant and prunes every window below it before taking a lock. See claimFloor for the
+// value and why it is deep enough, and why the lookup floor is NOT safe here.
 //
-// The guard is the identical statement createMinedPlanSQL carries, LIMIT 1 OFFSET 0 fence and
-// all, for the identical reason: a bare NOT EXISTS is flattened into an anti-join, and the
-// fence keeps it a per-row subplan on the UTXO's packed-key range.
+// The own-output UTXO probe is the identical statement createMinedPlanSQL carries, LIMIT 1
+// OFFSET 0 fence and all, for the identical reason: a bare NOT EXISTS is flattened into an
+// anti-join, and the fence keeps it a per-row subplan on the UTXO's packed-key range. The
+// tx_mined probe has the same OFFSET 0 fence, because tx_mined's primary key LEADS with txid
+// and a hash anti-join over a whole window is the plan the planner otherwise reaches for at
+// batch widths: measured at 500 keys against 40,000 containment rows, 9.4 ms.
 //
-// The tx_mined guard is what keeps a transaction in EXACTLY ONE of the two tables. A transaction the longest-chain stamp
-// has settled has no identity row at all, so ON CONFLICT sees nothing to conflict with: without
-// the guard, a mempool create of an already-settled transaction takes a fresh identity row --
-// two homes, and every read-order argument in this store assumes one -- and, because the UTXO
-// insert is gated on that same claim taking, writes every one of its outputs a SECOND time.
-// Duplicate UTXOs are the failure the claim mechanism exists to prevent. With the guard such a
-// create claims nothing and settle reports it as ErrTxExists, which is exactly what the block
-// path already answers for a mempool stray, in the other direction.
+// The mined CTE is the containment row for a block-carrying create above the checkpoint. It is
+// UNCONDITIONAL and does nothing on conflict, exactly as the block path's is: whether or not
+// the claim takes, the block does contain the transaction, and the caller's follow-up
+// record-mined call would insert the same row anyway. It copies its payload from an existing
+// identity row when there is one, for the reason createMinedPlanSQL gives. Rows with no block
+// have mined_height 0 and insert nothing. A data-modifying CTE runs to completion whether or
+// not the outer query reads it.
 //
-// It costs one index descent per live window, and the OFFSET 0 inside it is what buys that.
-// tx_mined's primary key LEADS with txid, so the probe is cheap, but a bare NOT EXISTS is
-// flattened into an anti-join and the planner then costs a hash of the whole window below 500
-// per-key probes: measured at 500 keys against 40,000 membership rows, a Hash Anti Join over a
-// Seq Scan of the window, 9.4 ms. OFFSET 0 fences the subquery so it stays a per-row subplan on
-// the primary key -- the same fence minedByTxidSQL and appendMinedSQL need, for the same
-// reason. At 400,000 rows the planner reaches for the index either way, which is exactly why
-// the fence has to be written down rather than left to the estimate.
-//
-// The lock lockTxids takes before this statement is what makes the guard trustworthy, exactly
-// as it does for createMinedPlanSQL's three: the read takes no row lock of its own, so two
+// The lock lockTxids takes before this statement is what makes the guards trustworthy, exactly
+// as it does for createMinedPlanSQL's: the reads take no row lock of their own, so two
 // concurrent creates of one transaction could otherwise both find nothing.
 //
 // fee is written as NULL deliberately. The store does not compute it, and block assembly
@@ -107,9 +89,11 @@ const createIdentPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
                          $6::int[], $7::bytea[], $8::int[], $9::bigint[],
-                         $10::smallint[], $11::bytea[], $12::uuid[], $13::uuid[])
+                         $10::smallint[], $11::bytea[], $12::uuid[], $13::uuid[],
+                         $14::int[], $15::int[], $16::int[])
         AS t(k, leaf, txid, created_height, off_chain_since, size_in_bytes,
-             tx_inpoints, locktime, created_at, flags, raw_tx, lo, hi)
+             tx_inpoints, locktime, created_at, flags, raw_tx, lo, hi,
+             mined_height, block_id, subtree_idx)
 ),
 claim AS (
     INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since,
@@ -117,12 +101,31 @@ claim AS (
     SELECT t.leaf, t.txid, t.created_height, t.off_chain_since,
            NULL::bigint, t.size_in_bytes, t.tx_inpoints, t.locktime, t.created_at, t.flags
       FROM t
-     WHERE NOT EXISTS (SELECT 1 FROM tx_mined m WHERE m.txid = t.txid LIMIT 1 OFFSET 0)
+     WHERE NOT EXISTS (SELECT 1 FROM tx_mined m
+                        WHERE m.txid = t.txid
+                          AND m.mined_height >= $25::int
+                        LIMIT 1 OFFSET 0)
        AND NOT EXISTS (SELECT 1 FROM utxo u
                         WHERE u.leaf = t.leaf AND u.ukey >= t.lo AND u.ukey <= t.hi AND u.txid = t.txid
                         ORDER BY u.ukey LIMIT 1 OFFSET 0)
     ON CONFLICT (leaf, txid) DO NOTHING
     RETURNING leaf, txid
+),
+mined AS (
+    INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
+                          size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
+    SELECT t.txid, t.mined_height, t.block_id, t.subtree_idx,
+           COALESCE(i.created_height, t.created_height), t.size_in_bytes,
+           i.fee, COALESCE(i.tx_inpoints, t.tx_inpoints), COALESCE(i.locktime, t.locktime),
+           COALESCE(i.created_at, t.created_at), COALESCE(i.flags, t.flags)
+      FROM t
+      LEFT JOIN LATERAL (
+        SELECT i.created_height, i.fee, i.tx_inpoints, i.locktime, i.created_at, i.flags
+          FROM tx_ident i
+         WHERE i.leaf = t.leaf AND i.txid = t.txid
+        OFFSET 0 ) AS i ON TRUE
+     WHERE t.mined_height > 0
+    ON CONFLICT (txid, mined_height, block_id) DO NOTHING
 ),
 body AS (
     INSERT INTO tx_body (created_height, txid, raw_tx)
@@ -135,8 +138,8 @@ UTXOs AS (
                       leaf, flags, ukey, txid, script)
     SELECT o.satoshis, o.created_height, o.spendable_from, 0, 0,
            o.leaf, o.flags, o.ukey, o.txid, o.script
-      FROM unnest($14::bigint[], $15::int[], $16::int[], $17::smallint[], $18::smallint[],
-                  $19::uuid[], $20::bytea[], $21::bytea[])
+      FROM unnest($17::bigint[], $18::int[], $19::int[], $20::smallint[], $21::smallint[],
+                  $22::uuid[], $23::bytea[], $24::bytea[])
         AS o(satoshis, created_height, spendable_from, leaf, flags, ukey, txid, script)
       JOIN claim c ON c.leaf = o.leaf AND c.txid = o.txid
 )
@@ -144,52 +147,65 @@ SELECT t.k
   FROM t
   JOIN claim c ON c.leaf = t.leaf AND c.txid = t.txid`
 
-// createMinedPlanSQL is the claim for a create that carries mined-block information: every
-// block-application create below the checkpoint, and block assembly's coinbase at the tip.
+// createMinedPlanSQL is the block-path claim: a create that carries a block at or below the
+// highest checkpoint, where the chain is header-proven and the pair written onto the UTXOs at
+// birth is final. That is every block-application create during sync, and the seeding tools.
 //
-// It claims on tx_mined, not tx_ident, so a mined transaction never has an identity row.
-// Three of the four idempotence guards live in this statement; the fourth, the advisory
-// lock, is taken in a separate statement first (see lockTxids) so that this statement's
-// snapshot postdates any competitor's commit.
+// It is SPLIT into two effects with different conditions, because identity and containment
+// coexist now.
 //
-//   - ON CONFLICT on (txid, mined_height, block_id): the same block re-applied.
-//   - NOT EXISTS tx_mined (txid, mined_height): the same height under another block id, which
-//     is a retry whose block-id reuse failed or a stale sibling block; the caller's
-//     ErrTxExists branch stamps the second id instead of recreating UTXOs.
-//   - NOT EXISTS tx_ident (leaf, txid): a mempool stray already holds the transaction.
+// The containment insert, mined, is UNCONDITIONAL and does nothing on conflict. A transaction
+// that already has an identity row still gets its containment row; only the body and the UTXOs
+// are held back. When there is an identity row the containment row copies its payload, its
+// created_height and its flags from it. The reason is the caller's follow-up: a refused claim
+// makes the caller record the transaction mined in a second call, and that call's insert names
+// the same key, so it does nothing. If the first insert were thin, the thin row would be the one
+// that survives the stamp, and the transaction would lose its fee, its inpoints and the
+// created_height that finds its body. The copy is one identity probe per transaction, which the
+// claim makes anyway, and below the checkpoint tx_ident is empty so the probe finds nothing.
+//
+// The claim itself is the join of t against what mined actually inserted, further refused by
+// three checks, and all four parts are needed.
+//
+//   - JOIN mined: the same block re-applied inserts nothing, so it claims nothing.
+//   - NOT EXISTS tx_ident (leaf, txid): a transaction seen before its block already holds the
+//     UTXOs; the caller's ErrTxExists branch records the block instead of recreating them.
 //   - NOT EXISTS utxo in the transaction's own packed-key range: the transaction still has a
 //     live UTXO, at any age. This is SV Node's duplicate check and what refuses the two
 //     historic duplicate coinbases. Written with the LIMIT 1 OFFSET 0 fence so the planner
 //     cannot swap the range scan for a scan of the whole leaf partition.
+//   - NOT EXISTS tx_mined at or above $24, claim_floor: another block already contains the
+//     transaction and every output has since been spent, so there is no identity row and no
+//     live UTXO, and a second block's insert succeeds because the block id differs. Without
+//     this the claim takes and the spent outputs are created again. It is ANY height at or
+//     above the floor, not the same height, and it needs no self-exclusion: every part of one
+//     statement reads the same snapshot, and that snapshot does not contain the row mined has
+//     just inserted. See claimFloor for why the floor is deep enough here.
+//
+// It stays ONE statement and stays behind lockTxids. None of the checks takes a row lock, so
+// two concurrent creates of one transaction from two blocks would each find nothing and each
+// write a full set of UTXOs, and the containment key no longer stops them because both inserts
+// succeed. lockTxids takes a per-txid advisory lock as its own statement first, so the claim's
+// snapshot postdates any competitor's commit. It must be one statement because a second
+// statement would see the containment row the first one wrote and would never create a UTXO.
 //
 // tx_inpoints is written NULL, deliberately and for every transaction this statement creates,
-// not just for coinbases. Below the checkpoint quick validation routes EVERY transaction in a
-// block through this path, so "the block path only creates coinbases" -- which an earlier
-// version of this comment claimed -- is false: it holds at the tip, where a block's ordinary
-// transactions already exist as mempool records and are stamped rather than created, and not
-// below it, where they are created here for the first time.
+// not just for coinbases, when there is no identity row to copy from. Below the checkpoint quick
+// validation routes EVERY transaction in a block through this path, so "the block path only
+// creates coinbases" is false there. The readers that resolve a transaction's parents from the
+// identity record get nothing from a record created here and fall through to the body; with
+// utxostore_skipTxBodyBelowCheckpoint on there is no body either, and those readers then fail
+// loudly rather than treating a transaction that spends something as one that spends nothing.
+// Neither reader runs for a checkpointed block. Storing the inpoints would cost the WAL bytes
+// this store is being shaped to avoid, so the trade is intentional.
 //
-// The consequence is worth stating, because it is not local to this statement. The readers that
-// resolve a transaction's parents from the identity record -- counterConflictingInpoints in the
-// store's own conflict handling, and block assembly's unlockConflictParents and
-// validateUnminedTxInputs through spentOutpoints -- get nothing from a record created here,
-// and fall through to the body. With utxostore_skipTxBodyBelowCheckpoint on there is no body
-// either, and those readers then fail loudly rather than treating a transaction that spends
-// something as one that spends nothing. Neither reader runs for a checkpointed block: nothing
-// below the checkpoint can un-mine, and its transactions are mined rather than unmined. Storing
-// the inpoints would cost the WAL bytes this store is being shaped to avoid, so the trade is
-// intentional -- but a reader that assumes inpoints are always there is wrong on this path.
-//
-// fee is written NULL for the same reason createIdentPlanSQL writes it NULL -- the store never
+// fee is written NULL for the same reason createIdentPlanSQL writes it NULL: the store never
 // computes one, and a coinbase has none to compute.
 //
-// The body CTE's `raw_tx IS NOT NULL` is how utxostore_skipTxBodyBelowCheckpoint is applied,
-// and it is a filter on the ROW rather than a second statement on purpose. Block application
-// below the checkpoint and the tip's own writes reach the same batcher, so one statement
-// routinely carries transactions from both sides of the floor; and a second statement would be
-// a second plan, which on this store means a second set of estimates to keep honest. The
-// caller decides per transaction by handing NULL instead of the bytes (see appendCreate),
-// so this statement needs no knowledge of checkpoints at all.
+// The body CTE's raw_tx IS NOT NULL is how utxostore_skipTxBodyBelowCheckpoint is applied, and
+// it is a filter on the ROW rather than a second statement on purpose. The caller decides per
+// transaction by handing NULL instead of the bytes (see appendCreate), so this statement needs
+// no knowledge of checkpoints at all.
 const createMinedPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
@@ -198,19 +214,34 @@ WITH t AS (
         AS t(k, leaf, txid, created_height, mined_height, block_id, subtree_idx,
              size_in_bytes, created_at, flags, raw_tx, lo, hi)
 ),
-claim AS (
+mined AS (
     INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
                           size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
-    SELECT t.txid, t.mined_height, t.block_id, t.subtree_idx, t.created_height,
-           t.size_in_bytes, NULL::bigint, NULL::bytea, NULL::int, t.created_at, t.flags
+    SELECT t.txid, t.mined_height, t.block_id, t.subtree_idx,
+           COALESCE(i.created_height, t.created_height), t.size_in_bytes,
+           i.fee, i.tx_inpoints, i.locktime,
+           COALESCE(i.created_at, t.created_at), COALESCE(i.flags, t.flags)
       FROM t
-     WHERE NOT EXISTS (SELECT 1 FROM tx_mined m WHERE m.txid = t.txid AND m.mined_height = t.mined_height)
-       AND NOT EXISTS (SELECT 1 FROM tx_ident i WHERE i.leaf = t.leaf AND i.txid = t.txid)
+      LEFT JOIN LATERAL (
+        SELECT i.created_height, i.fee, i.tx_inpoints, i.locktime, i.created_at, i.flags
+          FROM tx_ident i
+         WHERE i.leaf = t.leaf AND i.txid = t.txid
+        OFFSET 0 ) AS i ON TRUE
+    ON CONFLICT (txid, mined_height, block_id) DO NOTHING
+    RETURNING txid
+),
+claim AS (
+    SELECT t.k, t.txid
+      FROM t
+      JOIN mined x ON x.txid = t.txid
+     WHERE NOT EXISTS (SELECT 1 FROM tx_ident i WHERE i.leaf = t.leaf AND i.txid = t.txid)
        AND NOT EXISTS (SELECT 1 FROM utxo u
                         WHERE u.leaf = t.leaf AND u.ukey >= t.lo AND u.ukey <= t.hi AND u.txid = t.txid
                         ORDER BY u.ukey LIMIT 1 OFFSET 0)
-    ON CONFLICT (txid, mined_height, block_id) DO NOTHING
-    RETURNING txid
+       AND NOT EXISTS (SELECT 1 FROM tx_mined m
+                        WHERE m.txid = t.txid
+                          AND m.mined_height >= $24::int
+                        LIMIT 1 OFFSET 0)
 ),
 body AS (
     INSERT INTO tx_body (created_height, txid, raw_tx)
@@ -228,7 +259,49 @@ UTXOs AS (
         AS o(satoshis, created_height, spendable_from, mined_height, block_id, leaf, flags, ukey, txid, script)
       JOIN claim c ON c.txid = o.txid
 )
-SELECT t.k FROM t JOIN claim c ON c.txid = t.txid`
+SELECT k FROM claim`
+
+// claimReach is how far below the store's height the create claims' containment probe reads,
+// in blocks: 2,016, which is seven 288-block windows.
+//
+// The danger the probe guards against is a fully spent transaction being re-offered as
+// unmined and created a second time. For that its spend phase has to pass as a replay of its
+// own spends, which needs the undo copies of the outputs it spent to still exist; those are
+// due to drop 1,728 blocks after the spend, and the spend is at or after the height the
+// transaction was mined at. So a transaction mined more than 2,016 blocks ago has had its undo
+// copies due for at least 288 blocks. The lookup floor of 576 is NOT safe here: a transaction
+// mined between 576 and 1,727 blocks ago, fully spent since, would pass the spend phase as a
+// self-replay and be out of the lookup floor's sight, so the claim would take.
+const claimReach = 2_016
+
+// claimFloor is the lower bound, a height, of the create claims' containment probe: a scalar
+// bind parameter, never a join variable, so the planner prunes every window below it at plan
+// time.
+//
+// It is the lower of two values. The first is the store's height less claimReach, aligned
+// down to a window edge; H is the height the node last gave the store, and a stale H only
+// lowers the floor, which reads more windows and never fewer. The second is the window edge at
+// or below the first height of the oldest attached undo partition. That second bound is what
+// makes the guard sound however late the undo drops run: a replay needs its undo copies, the
+// undo copies live in the attached undo partitions, so a containment row the probe must see
+// can be no lower than the oldest of them. With no undo partition attached there is nothing to
+// replay and the fixed reach alone stands. A floor below zero is held at zero.
+func (s *Store) claimFloor() int32 {
+	var floor uint32
+
+	if h := s.GetBlockHeight(); h > claimReach {
+		floor = (h - claimReach) / TxMinedPartitionBlocks * TxMinedPartitionBlocks
+	}
+
+	if oldest := s.oldestUndoLeaf.Load(); oldest > 0 {
+		edge := (oldest - 1) * SpendJournalPartitionBlocks / TxMinedPartitionBlocks * TxMinedPartitionBlocks
+		if edge < floor {
+			floor = edge
+		}
+	}
+
+	return int32(floor) //nolint:gosec // a height fits int32
+}
 
 // createResult is what one queued Create gets back.
 type createResult struct {
@@ -267,9 +340,10 @@ type createPlan struct {
 	createdAt []int64
 	txFlags   []int16
 	bodies    [][]byte
-	// minedRows is true for a transaction that carries mined-block information, which is
-	// what sends it to createMinedPlanSQL instead of createIdentPlanSQL. The three fields
-	// below carry that block's facts, and are 0 for a mempool create.
+	// minedRows is true for a transaction that carries a block at or below the highest
+	// checkpoint, which is what sends it to createMinedPlanSQL instead of createIdentPlanSQL.
+	// The three fields below carry the block for every transaction that carries one, whichever
+	// claim it takes, and are 0 for a create with no block.
 	minedRows   []bool
 	minedHeight []int32
 	blockID     []int32
@@ -491,13 +565,14 @@ func (s *Store) runCreatePlan(ctx context.Context, q querier, p *createPlan) err
 	return nil
 }
 
-// runIdentPlan claims the mempool half of a plan on the identity table.
+// runIdentPlan claims the identity half of a plan on the identity table.
 func (s *Store) runIdentPlan(ctx context.Context, q querier, p *createPlan) error {
 	rows, err := q.Query(ctx, createIdentPlanSQL,
 		p.idx, p.leaves, p.txids, p.heights, p.offChain, p.sizes,
 		p.inpoints, p.locktimes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
+		p.minedHeight, p.blockID, p.subtreeIdx,
 		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoLeaves, p.utxoFlags,
-		p.utxoUkeys, p.utxoTxids, p.utxoScripts)
+		p.utxoUkeys, p.utxoTxids, p.utxoScripts, s.claimFloor())
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Create] store", err)
 	}
@@ -505,13 +580,13 @@ func (s *Store) runIdentPlan(ctx context.Context, q querier, p *createPlan) erro
 	return p.settle(rows)
 }
 
-// runMinedPlan claims the block half of a plan on the membership table.
+// runMinedPlan claims the block-path half of a plan on the containment table.
 func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) error {
 	rows, err := q.Query(ctx, createMinedPlanSQL,
 		p.idx, p.leaves, p.txids, p.heights, p.minedHeight, p.blockID, p.subtreeIdx,
 		p.sizes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
 		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoMined, p.utxoBlockIDs,
-		p.utxoLeaves, p.utxoFlags, p.utxoUkeys, p.utxoTxids, p.utxoScripts)
+		p.utxoLeaves, p.utxoFlags, p.utxoUkeys, p.utxoTxids, p.utxoScripts, s.claimFloor())
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Create] store mined", err)
 	}
@@ -573,7 +648,7 @@ func (p *createPlan) settle(rows pgx.Rows) error {
 //
 // The lock is what makes the block path's three NOT EXISTS guards trustworthy. They read
 // tx_mined, tx_ident and utxo, and none of those reads takes a row lock, so two creates of the
-// same transaction could each find nothing and each write a full set of UTXOs. The membership
+// same transaction could each find nothing and each write a full set of UTXOs. The containment
 // key catches that only when both name the same block.
 func (s *Store) lockTxids(ctx context.Context, q pgx.Tx, txids [][]byte) error {
 	if len(txids) == 0 {
@@ -667,12 +742,12 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 		}
 	}
 
-	// The membership window of every distinct block height the batch claims at, for the same
-	// reason and with the same before-the-transaction rule.
+	// The containment window of every distinct block height the batch records, whichever
+	// claim the row takes, for the same reason and with the same before-the-transaction rule.
 	minedSeen := make(map[int32]struct{}, 4)
 
-	for i, m := range plan.minedRows {
-		if !m {
+	for i, h := range plan.minedHeight {
+		if h == 0 {
 			continue
 		}
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -20,6 +21,36 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 
 	return newTestStoreWith(t, nil)
+}
+
+// testCheckpointHeight is the highest checkpoint every test store carries: mainnet's, at
+// 945,000. Heights the tests use for block-path creates, 100 to 700,100, are all at or below
+// it, and 1,000,000 is the height they use for "above the checkpoint".
+const testCheckpointHeight = 945_000
+
+// newUncheckpointedStore is newTestStore on a network with NO chain checkpoints, so every
+// height is "above the checkpoint": a block-carrying create takes the identity route, with an
+// identity row, a containment row and UTXOs at (0,0), and an un-mine is never refused. It is
+// the store for a test of tip behaviour, and for the shared conformance suite, which un-mines
+// blocks at heights the mainnet checkpoint list puts below the checkpoint.
+func newUncheckpointedStore(t *testing.T) (*Store, context.Context) {
+	t.Helper()
+
+	return newTestStoreWith(t, func(ts *settings.Settings) { withCheckpoints(ts, nil) })
+}
+
+// withCheckpoints sets the checkpoint list of the settings' chain parameters, on a copy, so the
+// parameters shared with other tests are not changed under them.
+//
+// Every test store gets an EXPLICIT list rather than the ambient network's. The settings
+// context a developer or CI runs the tests under decides the network, and only mainnet has
+// checkpoints, so a test that relied on the ambient list would pass on one box and take the
+// other create route on the next. newTestStore pins mainnet's list; newUncheckpointedStore
+// pins none.
+func withCheckpoints(ts *settings.Settings, checkpoints []chaincfg.Checkpoint) {
+	params := *ts.ChainCfgParams
+	params.Checkpoints = checkpoints
+	ts.ChainCfgParams = &params
 }
 
 // newTestStoreWith is newTestStore with the settings adjusted by tune before the store is
@@ -80,6 +111,8 @@ func newTestStoreWith(t *testing.T, tune func(*settings.Settings)) (*Store, cont
 	require.NoError(t, err)
 
 	tSettings := settings.NewSettings()
+	withCheckpoints(tSettings, chaincfg.MainNetParams.Checkpoints)
+
 	if tune != nil {
 		tune(tSettings)
 	}

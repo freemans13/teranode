@@ -98,9 +98,10 @@ func TestSetMinedReportsATransactionItDoesNotHold(t *testing.T) {
 // tip, not its creation height. That is why the marker cannot be derived from created_height.
 //
 // The un-mine is a point delete of the one containment row named, and the marker is written on
-// the identity row, which was there all along.
+// the identity row, which was there all along. On a store with no checkpoints, because an
+// un-mine at or below the checkpoint is refused.
 func TestUnsetMinedGivesTheTransactionAFreshClock(t *testing.T) {
-	s, ctx := newTestStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
 	tx := mkTx(t, 1, 1_000)
 	_, err := s.Create(ctx, tx, 100)
@@ -130,7 +131,7 @@ func TestUnsetMinedGivesTheTransactionAFreshClock(t *testing.T) {
 
 // TestUnsetMinedToleratesATransactionItDoesNotHold, which the interface states explicitly.
 func TestUnsetMinedToleratesATransactionItDoesNotHold(t *testing.T) {
-	s, ctx := newTestStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
 	gone := mkTx(t, 1, 1_000)
 
@@ -304,7 +305,7 @@ func TestForkRecordTwiceRecordsTheBlockOnce(t *testing.T) {
 // goes, the identity row that was there all along gets the unmined marker at the CURRENT tip,
 // and the UTXOs, which were at the sentinel from birth, are still there.
 func TestUnMineDeletesTheOneRowAndSetsTheMarker(t *testing.T) {
-	s, ctx := newTestStore(t)
+	s, ctx := newUncheckpointedStore(t)
 	require.NoError(t, s.SetBlockHeight(700_150))
 
 	tx := mkTx(t, 1, 5_000)
@@ -333,117 +334,55 @@ func TestUnMineDeletesTheOneRowAndSetsTheMarker(t *testing.T) {
 // TestUnMineIsAPointDeleteOnTheFullKey: un-mining ONE of the two blocks that contain a
 // transaction removes that block's row and nothing else. The sibling block's row survives,
 // because "block 43 contains this transaction" is still true and a chain switch cannot make it
-// false.
+// false. No UTXO is touched.
 //
 // This reverses the earlier rule that an un-mine deleted every containment row so that the
-// transaction lived in exactly one table. Containment has one home now and the identity row
-// stays put through mining, so there is no second home to keep clear.
+// transaction lived in exactly one table, and it drops the UTXO reset that went with it.
+// Containment has one home now and the identity row stays put through mining, so there is no
+// second home to keep clear; and above the checkpoint, which is the only place an un-mine is
+// allowed, no UTXO carries a pair a reorg could leave stale, because the store applies the
+// checkpoint test to creates itself and a block-carrying create there writes (0,0).
 //
-// The transaction was created by the block path, so its UTXOs carry block 42's pair from
-// birth, and block 42 is the block being un-mined. Through build steps 2 to 4 the un-mine
-// still runs the UTXO reset, NARROWED to UTXOs naming the un-mined block, so they go back to
-// the sentinel: below the checkpoint every UTXO is born from a block, and leaving a stale pair
-// on them with nothing to correct it would be worse than today. The design's test list says
-// "no UTXO touched" for this test; its build order for step 2 says the narrowed reset stays,
-// and the build order is what this step builds. A UTXO naming a SIBLING block would be left
-// alone, which TestUnMineDoesNotResetAnotherTransactionsUTXO's colliding-row variant and the
-// $5 narrowing in resetUTXOsSQL cover.
+// The transaction is created by the block path ABOVE the highest checkpoint, so it has an
+// identity row, a containment row for block 42 and UTXOs at (0,0), which is what every
+// transaction at the tip looks like.
 func TestUnMineIsAPointDeleteOnTheFullKey(t *testing.T) {
 	s, ctx := newTestStore(t)
-	require.NoError(t, s.SetBlockHeight(700_150))
+	require.NoError(t, s.SetBlockHeight(1_000_150))
 
 	tx := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
-		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	_, err := s.Create(ctx, tx, 1_000_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 1_000_100, OnLongestChain: true}))
 	require.NoError(t, err)
+	require.True(t, identExists(t, s, ctx, tx), "above the checkpoint a block-carrying create writes an identity row")
 
 	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100, OnLongestChain: true})
+		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 1_000_100, OnLongestChain: true})
 	require.NoError(t, err)
 	require.Equal(t, 2, minedRows(t, s, ctx, tx))
 
 	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, UnsetMined: true})
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 1_000_100, UnsetMined: true})
 	require.NoError(t, err)
 
-	require.False(t, identExists(t, s, ctx, tx), "an un-mine recreates no identity row")
 	require.Equal(t, 1, minedRows(t, s, ctx, tx), "the sibling's row survives the un-mine")
 
 	got, err := s.Get(ctx, tx.TxIDChainHash())
 	require.NoError(t, err)
 	require.Equal(t, []uint32{43}, got.BlockIDs, "the un-mined block's row is gone, the sibling's stands")
-	require.Zero(t, got.UnminedSince, "there is no identity row to carry a marker")
+	require.Equal(t, uint32(1_000_150), got.UnminedSince,
+		"the un-mine always sets the marker, even on a transaction a sibling block still contains")
 
 	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(0), h, "the narrowed reset reaches a UTXO naming the un-mined block")
+	require.Equal(t, int32(0), h, "no UTXO is touched")
 	require.Equal(t, int32(0), b)
 }
 
-// TestUnMineLeavesAUTXONamingASiblingBlockAlone is the other half of the narrowing: the reset
-// is confined to UTXOs that name the un-mined block, so a UTXO born from the sibling keeps its
-// pair.
-func TestUnMineLeavesAUTXONamingASiblingBlockAlone(t *testing.T) {
-	s, ctx := newTestStore(t)
-	require.NoError(t, s.SetBlockHeight(700_150))
-
-	tx := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
-		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100, OnLongestChain: true}))
-	require.NoError(t, err)
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
-	require.NoError(t, err)
-	require.Equal(t, 2, minedRows(t, s, ctx, tx))
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, UnsetMined: true})
-	require.NoError(t, err)
-
-	require.Equal(t, 1, minedRows(t, s, ctx, tx))
-
-	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(700_100), h, "the UTXO names block 43, which was not un-mined")
-	require.Equal(t, int32(43), b)
-}
-
-// TestUnMineDoesNotResetAnotherTransactionsUTXO: the UTXO reset must recheck the full
-// transaction id, not just the packed key it found the row by.
-//
-// ukey is a 96-bit prefix and non-unique by design, so two transactions in the same leaf can
-// share one. Matching an UPDATE on (leaf, ukey) alone would reset a stranger's UTXO to the
-// unconfirmed sentinel -- a UTXO that is spendable now reading as immature, or a mined UTXO
-// reading as unmined -- which is why every other by-key write in this store rechecks txid.
-func TestUnMineDoesNotResetAnotherTransactionsUTXO(t *testing.T) {
-	s, ctx := newTestStore(t)
-	require.NoError(t, s.SetBlockHeight(700_150))
-
-	tx := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
-		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
-	require.NoError(t, err)
-
-	// The stranger names the SAME block, so only the txid recheck can keep it out of the reset.
-	other := insertCollidingUTXO(t, s, ctx, tx, 700_100, 42)
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, UnsetMined: true})
-	require.NoError(t, err)
-
-	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(0), h, "the un-mined transaction's own UTXO is reset")
-	require.Equal(t, int32(0), b)
-
-	oh, ob := utxoFactsOf(t, s, ctx, other)
-	require.Equal(t, int32(700_100), oh, "a UTXO sharing the packed key must be untouched")
-	require.Equal(t, int32(42), ob)
-}
-
-// TestUnMineOfABlockTheTransactionDoesNotNameIsANoOp. An un-mine names a block, and a
-// transaction with no containment row for THAT block was never mined into it, so there is
-// nothing to take back. The interface tolerates the absence; it must not turn it into an
-// un-settling of the block the transaction actually is in.
-func TestUnMineOfABlockTheTransactionDoesNotNameIsANoOp(t *testing.T) {
+// TestUnMineRefusesABlockAtOrBelowTheCheckpoint: below the highest checkpoint every UTXO is
+// born from a block-path create with its pair written at birth, and "final at birth" is only
+// true if nothing un-mines a checkpoint-certified block. So the store refuses, and every row is
+// unchanged. An invalidation there is a resync, not an un-mine.
+func TestUnMineRefusesABlockAtOrBelowTheCheckpoint(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_150))
 
@@ -453,13 +392,61 @@ func TestUnMineOfABlockTheTransactionDoesNotNameIsANoOp(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100, UnsetMined: true})
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, UnsetMined: true})
+	require.True(t, errors.Is(err, errors.ErrProcessing), "refused: %v", err)
+	require.Contains(t, err.Error(), "at or below the highest checkpoint")
+
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "the containment row stands")
+	require.False(t, identExists(t, s, ctx, tx), "no identity row appears")
+
+	h, b := utxoFacts(t, s, ctx, tx)
+	require.Equal(t, int32(700_100), h, "and the UTXO keeps its pair")
+	require.Equal(t, int32(42), b)
+
+	// The height exactly AT the checkpoint is refused too; one above it is not.
+	at := mkTx(t, 1, 6_000)
+	_, err = s.Create(ctx, at, 945_000, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 50, BlockHeight: 945_000, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(at),
+		utxo.MinedBlockInfo{BlockID: 50, BlockHeight: 945_000, UnsetMined: true})
+	require.True(t, errors.Is(err, errors.ErrProcessing), "the checkpoint height itself counts as below: %v", err)
+
+	above := mkTx(t, 1, 7_000)
+	_, err = s.Create(ctx, above, 945_001, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 51, BlockHeight: 945_001, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(above),
+		utxo.MinedBlockInfo{BlockID: 51, BlockHeight: 945_001, UnsetMined: true})
+	require.NoError(t, err, "one block above the checkpoint is a reorg's territory")
+	require.Equal(t, 0, minedRows(t, s, ctx, above))
+}
+
+// TestUnMineOfABlockTheTransactionDoesNotNameDeletesNothing. An un-mine names a block, and a
+// transaction with no containment row for THAT block was never mined into it, so there is no
+// row to take back and the interface tolerates the absence. The marker IS still set: the
+// un-mine always sets it on every listed identity row, because leaving it wrongly NULL would
+// lose the transaction from block assembly for good while setting it wrongly costs a mined
+// transaction reloaded as unmined, which the consistency scan repairs.
+func TestUnMineOfABlockTheTransactionDoesNotNameDeletesNothing(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(1_000_150))
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 1_000_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 1_000_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 1_000_100, UnsetMined: true})
 	require.NoError(t, err)
 
 	require.Equal(t, 1, minedRows(t, s, ctx, tx), "block 42's containment row stays")
-	require.False(t, identExists(t, s, ctx, tx), "and no identity row appears")
+	require.Equal(t, uint32(1_000_150), uint32(*markerOf(t, s, ctx, tx)), "and the marker is set all the same") //nolint:gosec // a stored height is never negative
 
-	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(700_100), h, "its UTXO keeps block 42's pair")
-	require.Equal(t, int32(42), b)
+	got, err := s.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, got.BlockIDs, "block 42 still contains it")
 }

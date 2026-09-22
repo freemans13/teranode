@@ -187,6 +187,14 @@ func (s *Store) ensureSpendJournalPartition(ctx context.Context, height uint32) 
 	// Both windows are built standalone and attached, so the spend path never takes either
 	// parent's strongest lock at a leaf boundary. See ensureAttachedPartition.
 	journal := fmt.Sprintf("spend_journal_%d", leaf)
+
+	// A leaf created below the oldest known, or on an empty table, becomes the oldest. Leaves
+	// are created in ascending height order, so on the block path this fires once, for the
+	// first leaf of a fresh store; the drop is what normally moves it. See oldestUndoLeaf.
+	if oldest := s.oldestUndoLeaf.Load(); oldest == 0 || leaf+1 < oldest {
+		defer s.oldestUndoLeaf.CompareAndSwap(oldest, leaf+1)
+	}
+
 	if err := s.ensureAttachedPartition(ctx, partitionSpec{
 		parent: "spend_journal",
 		child:  journal,
@@ -418,5 +426,49 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 		dropped++
 	}
 
+	// The oldest surviving journal leaf, for the create claims' floor. Recomputed from the
+	// listing this pass started with rather than re-read, so it costs no catalog query; a
+	// leaf created during the pass is newer than every survivor here and cannot be the
+	// oldest. Zero when nothing survives.
+	var oldest uint32
+
+	for _, l := range leaves {
+		if l.parent != "spend_journal" || l.leaf < cutoff {
+			continue
+		}
+
+		if oldest == 0 || l.leaf+1 < oldest {
+			oldest = l.leaf + 1
+		}
+	}
+
+	s.oldestUndoLeaf.Store(oldest)
+
 	return dropped, nil
+}
+
+// loadOldestUndoLeaf seeds oldestUndoLeaf from the catalog when the store opens. It is the one
+// catalog read the floor ever needs; the leaf creation and the leaf drop keep it in step from
+// then on.
+func (s *Store) loadOldestUndoLeaf(ctx context.Context) error {
+	leaves, err := s.listPartitionLeaves(ctx, "spend_journal")
+	if err != nil {
+		return err
+	}
+
+	var oldest uint32
+
+	for _, l := range leaves {
+		if !l.attached {
+			continue
+		}
+
+		if oldest == 0 || l.leaf+1 < oldest {
+			oldest = l.leaf + 1
+		}
+	}
+
+	s.oldestUndoLeaf.Store(oldest)
+
+	return nil
 }

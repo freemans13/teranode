@@ -76,6 +76,26 @@ type Store struct {
 	// bodyRetention is how long the serialized transaction bytes are kept, in blocks.
 	bodyRetention uint32
 
+	// checkpoints is the active network's chain checkpoint list, the store's own copy of the
+	// boundary two rules test against. A create that carries a block writes the pair onto its
+	// UTXOs at birth only at or below the highest checkpoint, where the chain is header-proven
+	// and the value is final; above it such a create writes an identity row and a containment
+	// row and leaves the UTXOs at (0,0) for the deep stamp, exactly as a create that carries no
+	// block does. And an un-mine of a block at or below the highest checkpoint is refused,
+	// because "final at birth" is only true if nothing un-mines a checkpoint-certified block.
+	// Nil on a network with no checkpoints, where BelowCheckpoint is false at every height, so
+	// every block-carrying create there takes the identity route and no un-mine is refused.
+	checkpoints []chaincfg.Checkpoint
+
+	// oldestUndoLeaf is the lowest attached spend_journal partition, plus one, so zero means
+	// "none attached". The create claims' containment probe is bounded below by the first
+	// height of that partition as well as by the fixed 2,016-block reach (see claimFloor): a
+	// fully spent transaction can be re-offered as itself only while the undo copies of its
+	// inputs live, and those live in the attached undo partitions. It is kept in step by the
+	// two paths that change the set, the leaf creation and the leaf drop, so the block path
+	// never reads the catalog to compute a floor.
+	oldestUndoLeaf atomic.Uint32
+
 	// bodyCheckpoints is the checkpoint list a MINED create's height is tested against to
 	// decide whether it writes serialized bytes at all: the active network's list, when
 	// utxostore_skipTxBodyBelowCheckpoint is on, and nil otherwise.
@@ -244,9 +264,18 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		logger.Infof("[utxoset] skipping the tx_body write for transactions mined below the highest hardcoded checkpoint, at height %d; block persister and the asset service need the subtree data files for those blocks, and no body is ever written retroactively", model.HighestCheckpointHeight(s.bodyCheckpoints))
 	}
 
+	if tSettings.ChainCfgParams != nil {
+		s.checkpoints = tSettings.ChainCfgParams.Checkpoints
+	}
+
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)
+	}
+
+	if err := s.loadOldestUndoLeaf(ctx); err != nil {
+		pool.Close()
+		return nil, err
 	}
 
 	// The create batcher, sized from the same settings the sql and aerospike stores use, so

@@ -84,10 +84,12 @@ func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
 // minedBlock returns the block a create says contains the transaction, and whether it says so
 // at all.
 //
-// A create carrying mined-block information is a block-path create: below the checkpoint every
-// create, at the tip only block assembly's coinbase. It claims on tx_mined and its UTXOs know
-// their block. Anything else is a mempool create and claims on tx_ident with the unconfirmed
-// sentinel on its UTXOs.
+// A create carrying mined-block information is a block-carrying create: below the checkpoint
+// every create, at the tip only block assembly's coinbase. Whether it takes the block-path
+// claim, writing the pair onto its UTXOs at birth, or the identity claim with a containment
+// row beside it, is decided by appendCreate against the store's checkpoint list, not here.
+// A create with no block information takes the identity claim with the unconfirmed sentinel
+// on its UTXOs.
 //
 // An explicit un-mine is the one kind of block information that does NOT mean mined, which is
 // the same exemption offChainSinceAt makes, and for the same reason.
@@ -276,13 +278,26 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 
 	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
 
-	// Which of the two claims this create takes, and the block facts that go on its UTXOs.
-	// Both heights and the block id are 0 for a mempool create, and mined_height 0 is the
-	// unconfirmed sentinel the UTXO carries until something stamps it.
+	// The block this create says contains the transaction, if it says so at all, and which of
+	// the two claims it takes. The store applies the checkpoint test ITSELF, so a caller
+	// cannot write a pair onto a UTXO the chain has not proven.
+	//
+	// At or below the highest checkpoint the chain is header-proven, so a block-carrying
+	// create takes the block-path claim and writes the pair onto its UTXOs at birth; the
+	// value is final from the first moment and the deep stamp never has to visit it. Above
+	// the checkpoint the same create takes the identity claim like a create that carries no
+	// block: an identity row with a NULL marker (the call has no longest-chain input to say
+	// otherwise), a containment row for the block, and UTXOs at (0,0) for the stamp to fill
+	// 288 blocks later, at a depth a reorg cannot reach. The coinbase at the tip goes this way
+	// too. So above the checkpoint every UTXO at (0,0) has an identity row and every non-zero
+	// pair was written by the stamp, and a chain switch can never leave a losing block's pair
+	// on a live UTXO. Both heights and the block id are 0 for a create with no block, and
+	// mined_height 0 is the unconfirmed sentinel the UTXO carries until the stamp writes it.
 	var (
 		minedHeight int32
 		blockID     int32
 		subtreeIdx  int32
+		atBirth     bool
 	)
 
 	mi, mined := minedBlock(options.MinedBlockInfos)
@@ -290,6 +305,14 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		minedHeight = int32(mi.BlockHeight) //nolint:gosec // a height fits int32 for any reachable chain
 		blockID = int32(mi.BlockID)         //nolint:gosec // a block id fits int32
 		subtreeIdx = int32(mi.SubtreeIdx)   //nolint:gosec // a subtree index fits int32
+		atBirth = model.BelowCheckpoint(s.checkpoints, mi.BlockHeight)
+	}
+
+	// What the UTXOs carry from birth: the block's pair when the store lets the create write
+	// it, the sentinel otherwise.
+	var utxoMinedHeight, utxoBlockID int32
+	if atBirth {
+		utxoMinedHeight, utxoBlockID = minedHeight, blockID
 	}
 
 	// The serialized bytes, or nothing at all for a transaction mined below the hardcoded
@@ -335,7 +358,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.createdAt = append(p.createdAt, time.Now().UnixMilli())
 	p.txFlags = append(p.txFlags, flags)
 	p.bodies = append(p.bodies, body)
-	p.minedRows = append(p.minedRows, mined)
+	p.minedRows = append(p.minedRows, atBirth)
 	p.minedHeight = append(p.minedHeight, minedHeight)
 	p.blockID = append(p.blockID, blockID)
 	p.subtreeIdx = append(p.subtreeIdx, subtreeIdx)
@@ -364,8 +387,8 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		p.utxoUkeys = append(p.utxoUkeys, Pack(txHash[:], uint32(vout)))
 		p.utxoTxids = append(p.utxoTxids, txHash[:])
 		p.utxoScripts = append(p.utxoScripts, script)
-		p.utxoMined = append(p.utxoMined, minedHeight)
-		p.utxoBlockIDs = append(p.utxoBlockIDs, blockID)
+		p.utxoMined = append(p.utxoMined, utxoMinedHeight)
+		p.utxoBlockIDs = append(p.utxoBlockIDs, utxoBlockID)
 	}
 
 	return &meta.Data{

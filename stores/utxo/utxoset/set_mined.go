@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
@@ -102,58 +103,6 @@ UPDATE tx_ident i
  WHERE i.leaf = $1::smallint
    AND i.txid = ANY($2::bytea[])
 RETURNING i.txid`
-
-// resetUTXOsSQL puts a transaction's live UTXOs back to the unconfirmed sentinel.
-//
-// It survives the containment change in a NARROWED form, and only until the deep stamp of
-// build step 5 exists. Below the checkpoint every UTXO is born from a block and carries its
-// pair from birth; if the un-mine deleted the containment row and left those UTXOs alone, an
-// un-mine of a checkpoint-certified block would leave a stale pair on them with nothing to
-// correct it. So the un-mine still resets, and it passes the un-mined block's id as $5, which
-// confines the reset to UTXOs that name that one block. That is today's behaviour narrowed,
-// so it is no worse than before, and it prejudges neither answer to the open question of what
-// an invalidation at or below the checkpoint should do. A UTXO reset this way sits at (0,0)
-// with no identity row, which the stamp's invariant will forbid, which is why this form cannot
-// outlive step 5.
-//
-// The packed-key range comes in as PLAIN ARRAY VALUES built by liveUTXOArgs and is used inside a
-// LATERAL with an OFFSET 0 fence, and BOTH halves of that are load-bearing. The UTXO table
-// carries one index, on the packed key, and the schema says in its own words that a query
-// filtering on txid without a packed-key range bound is a review failure. Bounds computed
-// inside the statement from a CTE's rows satisfy the letter of that rule and not its point:
-// the planner costs them as a join filter and reads every UTXO partition whole. Bounds passed
-// as arrays but joined directly are no better -- measured at 500 keys, a Hash Join against a
-// Seq Scan of all eight partitions -- because an UPDATE cannot laterally reference its own
-// target, which is the fence every other by-transaction UTXO read in this store relies on. So
-// the fenced read runs first, in a CTE, and the UPDATE then matches on the exact (leaf, ukey)
-// it returns.
-//
-// mined_height > 0 is what selects the UTXOs that need resetting and what leaves a UTXO already
-// at the sentinel untouched. It is the right test where block_id = 0 would not be: block id 0 is
-// a legitimate id, and it is mined_height that carries the "unconfirmed" fact.
-//
-// The UPDATE rechecks the FULL TXID and not only the (leaf, ukey) the read found the row by,
-// and that is a correctness rule rather than a repeated predicate. ukey is a 96-bit prefix and
-// NON-UNIQUE by design -- see Pack -- so two transactions in one leaf can share it, and an
-// UPDATE keyed on it alone would reset a stranger's UTXO to the unconfirmed sentinel: a
-// spendable UTXO reading as immature, or a mined UTXO reading as unmined. Every other by-key
-// write in this store rechecks txid for the same reason (spend.go, unspend.go, freeze.go).
-const resetUTXOsSQL = `
-WITH hit AS (
-    SELECT c.leaf, c.ukey, k.txid
-      FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS k(leaf, txid, lo, hi)
-     CROSS JOIN LATERAL (
-       SELECT u.leaf, u.ukey
-         FROM utxo u
-        WHERE u.leaf = k.leaf AND u.ukey >= k.lo AND u.ukey <= k.hi AND u.txid = k.txid
-          AND u.mined_height > 0
-          AND ($5::int IS NULL OR u.block_id = $5::int)
-       OFFSET 0
-     ) AS c
-)
-UPDATE utxo u SET mined_height = 0, block_id = 0
-  FROM hit
- WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey AND u.txid = hit.txid`
 
 // SetMinedMulti records the block described by info against the listed transactions, or takes
 // it back off them when info.UnsetMined is set.
@@ -274,8 +223,18 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 }
 
 // unMine takes one block back off the listed transactions: a point delete of that block's
-// containment rows, a fresh unmined clock on every listed identity row, and the narrowed UTXO
-// reset for the transactions whose row was deleted.
+// containment rows and a fresh unmined clock on every listed identity row. No UTXO is touched.
+//
+// A block at or below the highest checkpoint is REFUSED. Below the checkpoint every UTXO is
+// born from a block-path create with its pair written at birth, and "final at birth" is only
+// true if nothing un-mines a checkpoint-certified block. The point delete would remove the
+// containment row and leave those UTXOs carrying a pair for a block that is no longer on the
+// chain, with no identity row to write a marker on and nothing to correct the pair from. So
+// the store refuses, every row unchanged, rather than handling it with a UTXO reset. Above the
+// checkpoint the store applies the checkpoint test to creates itself, so no UTXO there has a
+// pair a reorg could leave stale: a block-carrying create above the checkpoint writes (0,0)
+// and an identity row, and only the deep stamp, 288 blocks down, writes a pair. That is why the
+// UTXO reset the un-mine used to run is gone rather than narrowed.
 //
 // No ensureTxMinedPartition, and that is not an omission. The un-mine only DELETES from
 // tx_mined; the window it deletes from either exists, or the block was never recorded at that
@@ -295,6 +254,11 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 // of them. The delete has destroyed that transaction's only payload, which is why the counter
 // must stay at zero and why it is an abort criterion of the soak.
 func (s *Store) unMine(ctx context.Context, txids [][]byte, info utxo.MinedBlockInfo) error {
+	if model.BelowCheckpoint(s.checkpoints, info.BlockHeight) {
+		return errors.NewProcessingError("[utxoset][SetMinedMulti] refusing to un-mine block %d at height %d: the height is at or below the highest checkpoint %d, where every UTXO carries its block from birth and nothing could correct it; an invalidation there needs a resync, not an un-mine",
+			info.BlockID, info.BlockHeight, model.HighestCheckpointHeight(s.checkpoints))
+	}
+
 	// A fresh clock from the current tip. See setMarkerSQL.
 	height := int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
 
@@ -326,25 +290,6 @@ func (s *Store) unMine(ctx context.Context, txids [][]byte, info utxo.MinedBlock
 		}
 	}
 
-	// The UTXOs that are reset are the ones of the transactions whose row was actually
-	// DELETED, and only those naming the un-mined block. An un-mine of a block a transaction
-	// was never in deletes nothing, and resetting its UTXOs would un-confirm a UTXO whose block
-	// still contains it. See resetUTXOsSQL for why the reset stays at all.
-	if len(deleted) > 0 {
-		gone := make([][]byte, 0, len(deleted))
-		for i := range deleted {
-			gone = append(gone, deleted[i].txid[:])
-		}
-
-		blockID := int32(info.BlockID) //nolint:gosec // a block id fits int32
-
-		if err := resetUTXOs(ctx, dbTx, gone, &blockID); err != nil {
-			_ = dbTx.Rollback(ctx)
-
-			return err
-		}
-	}
-
 	if err := dbTx.Commit(ctx); err != nil {
 		return errors.NewStorageError("[utxoset][SetMinedMulti] commit un-mine", err)
 	}
@@ -359,18 +304,6 @@ func (s *Store) unMine(ctx context.Context, txids [][]byte, info utxo.MinedBlock
 		}
 
 		noIdentityReached.WithLabelValues("un_mine").Inc()
-	}
-
-	return nil
-}
-
-// resetUTXOs puts the listed transactions' stamped UTXOs back to the unconfirmed sentinel.
-// blockID confines it to the UTXOs of one block; nil resets every stamped UTXO they hold.
-func resetUTXOs(ctx context.Context, q querier, txids [][]byte, blockID *int32) error {
-	leaves, ids, los, his := liveUTXOArgs(txids)
-
-	if _, err := q.Exec(ctx, resetUTXOsSQL, leaves, ids, los, his, blockID); err != nil {
-		return errors.NewStorageError("[utxoset] reset UTXOs to the unconfirmed sentinel", err)
 	}
 
 	return nil

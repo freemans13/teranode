@@ -24,19 +24,26 @@ import (
 // Each subtest is named for the capability it pins, so a failure says what is missing rather
 // than merely that something is. They all pass; a suite not listed here is one this store does
 // not implement the entry point for, not one that is failing quietly.
+//
+// Every subtest runs on a store whose network has NO chain checkpoints. The suite describes
+// tip behaviour through the interface: it records and un-mines blocks at heights like 101 and
+// 300, which the default mainnet parameters put at or below the highest checkpoint, where this
+// store refuses an un-mine by design and writes the pair onto a block-carrying create's UTXOs
+// at birth. With no checkpoint every height is the tip's regime, which is the one the suite is
+// written for.
 func TestConformance(t *testing.T) {
 	t.Run("Store", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Store(t, db)
 	})
 
 	t.Run("Spend", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Spend(t, db)
 	})
 
 	t.Run("Freeze", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Freeze(t, db)
 	})
 
@@ -44,32 +51,32 @@ func TestConformance(t *testing.T) {
 	// UTXO's spending rules change under it, and this store holds the rules themselves rather
 	// than a digest of them, so it needs hash_override to carry what the new output hashes to.
 	t.Run("ReAssign", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.ReAssign(t, db)
 	})
 
 	t.Run("SetMined", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetMined(t, db)
 	})
 
 	t.Run("Conflicting", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Conflicting(t, db)
 	})
 
 	t.Run("Restore", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Restore(t, db)
 	})
 
 	t.Run("UnspendIdempotent", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.UnspendIdempotent(t, db)
 	})
 
 	t.Run("SetMinedWithSpent", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetMinedWithSpent(t, db)
 	})
 
@@ -78,7 +85,7 @@ func TestConformance(t *testing.T) {
 	// back out with the mempool marker at the current tip, and (true) settles it again. It was
 	// parked while only the outward move existed.
 	t.Run("SetMinedUnminedSince", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetMinedUnminedSince(t, db)
 	})
 
@@ -94,7 +101,7 @@ func TestConformance(t *testing.T) {
 	// wrapper gains the stamp drain, the helper returns true, and the guard fails this subtest
 	// until it is replaced by the plain call and the helper is deleted.
 	t.Run("MinedThenSpendAllPrunes", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 
 		svc, err := db.GetPrunerService()
 		require.NoError(t, err)
@@ -116,32 +123,32 @@ func TestConformance(t *testing.T) {
 	// against this store's internals. These are written against the interface, which is what
 	// makes them a contract rather than a second opinion.
 	t.Run("SpendAndCreate", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreate(t, db)
 	})
 
 	t.Run("SpendAndCreateCreateOnly", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateCreateOnly(t, db)
 	})
 
 	t.Run("SpendAndCreateSpendOnly", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateSpendOnly(t, db)
 	})
 
 	t.Run("SpendAndCreateTxExistsKeepsSpends", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateTxExistsKeepsSpends(t, db)
 	})
 
 	t.Run("SpendAndCreateSpendErrorSurfacesPerInput", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateSpendErrorSurfacesPerInput(t, db)
 	})
 
 	t.Run("SpendAndCreateInvalidOptions", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateInvalidOptions(t, db)
 	})
 
@@ -149,7 +156,7 @@ func TestConformance(t *testing.T) {
 	// replays whatever a crash left half-finished, so an intent that does not survive is a
 	// conflict resolution that silently never completes.
 	t.Run("ConflictWAL", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.ConflictWAL(t, db)
 	})
 
@@ -159,7 +166,7 @@ func TestConformance(t *testing.T) {
 	// read the driver makes on it -- its inputs, its spenders, its locked flag -- has to reach
 	// tx_mined rather than the identity table.
 	t.Run("ConflictWALCrashRecovery", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.ConflictWALCrashRecovery(t, db)
 	})
 
@@ -167,14 +174,14 @@ func TestConformance(t *testing.T) {
 	// reports it on the metadata, a spend of that UTXO fails with ErrTxConflicting, and the
 	// contested parent names the child without becoming conflicting itself.
 	t.Run("SetConflictingBehavior", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetConflictingBehavior(t, db)
 	})
 
 	// The lock from the outside, and the round trip: OK, locked, a spend refused with
 	// ErrTxLocked, unlocked, OK, and the same spend now accepted.
 	t.Run("SetLockedBehavior", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetLockedBehavior(t, db)
 	})
 
@@ -182,7 +189,7 @@ func TestConformance(t *testing.T) {
 	// spend. Block validation replays a block it has already applied, and a store that raised
 	// there could never re-apply one.
 	t.Run("SpendIdempotent", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendIdempotent(t, db)
 	})
 
@@ -191,21 +198,21 @@ func TestConformance(t *testing.T) {
 	// does not match, a coinbase inside its maturity window, and a UTXO some other
 	// transaction already took -- which must also name the transaction that took it.
 	t.Run("SpendErrorTypes", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendErrorTypes(t, db)
 	})
 
 	// Not-found is a STATUS from GetSpend, never an error. A caller asking about an outpoint
 	// the store does not hold is asking a legitimate question.
 	t.Run("GetSpendNotFound", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.GetSpendNotFound(t, db)
 	})
 
 	// Height zero is refused, because it is the unconfirmed sentinel throughout this store and
 	// accepting it would make every maturity and retention test read true.
 	t.Run("SetBlockHeightZero", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetBlockHeightZero(t, db)
 	})
 
@@ -215,12 +222,12 @@ func TestConformance(t *testing.T) {
 	// side: a pair some single writer actually published, never one assembled from two loads,
 	// which only shows up while a writer is mid-update.
 	t.Run("SetBlockStateContract", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetBlockStateContract(t, db)
 	})
 
 	t.Run("SetBlockStateSnapshotUnderConcurrency", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetBlockStateSnapshotUnderConcurrency(t, db)
 	})
 
@@ -234,7 +241,7 @@ func TestConformance(t *testing.T) {
 	// the suite at which a statement whose cost is a function of the table rather than the
 	// batch would show up as a stall rather than as a wrong answer.
 	t.Run("Sanity", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Sanity(t, db)
 	})
 }
@@ -257,7 +264,7 @@ type interimPruner struct {
 func minedThenSpendAllIsPruned(t *testing.T, wrapped interimPruner) bool {
 	t.Helper()
 
-	db, ctx := newTestStore(t)
+	db, ctx := newUncheckpointedStore(t)
 
 	svc, err := db.GetPrunerService()
 	require.NoError(t, err)
