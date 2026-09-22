@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -15,12 +16,35 @@ import (
 	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Ensure Store implements the Pruner Service interface
 var _ pruner.Service = (*Service)(nil)
+
+var (
+	// prometheusSQLPrunerChildrenHeldBack counts, per prune, the transactions
+	// past their delete-at-height that the DELETE refused because a parent
+	// output they claim is present but unspent or malformed. The same rows are
+	// refused every cycle until that output records their spend, so a count
+	// that keeps rising means a held-back set that is not draining: nothing is
+	// pruned there and the UTXO set grows by those rows.
+	prometheusSQLPrunerChildrenHeldBack prometheus.Counter
+
+	prometheusMetricsInitOnce sync.Once
+)
+
+func initPrometheusMetrics() {
+	prometheusMetricsInitOnce.Do(func() {
+		prometheusSQLPrunerChildrenHeldBack = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_sql_pruner_children_held_back_total",
+			Help: "Transactions past their delete-at-height left in place by a prune because a parent output they claim is present but unspent or malformed, so no replay marker can be justified; counted again on every prune that refuses them",
+		})
+	})
+}
 
 // Service implements the utxo.CleanupService interface for SQL-based UTXO stores
 type Service struct {
@@ -74,6 +98,8 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		safetyWindow = tSettings.GlobalBlockHeightRetention
 	}
 
+	initPrometheusMetrics()
+
 	service := &Service{
 		safetyWindow:     safetyWindow,
 		defensiveEnabled: tSettings.Pruner.UTXODefensiveEnabled,
@@ -113,10 +139,17 @@ func (s *Service) Prune(ctx context.Context, blockHeight uint32, blockHashStr st
 		blockHashStr, blockHeight, blockHeight)
 
 	// Execute the cleanup
-	deletedCount, err := s.deleteTombstoned(ctx, blockHeight)
+	deletedCount, heldBack, err := s.deleteTombstoned(ctx, blockHeight)
 	if err != nil {
 		s.logger.Errorf("[pruner][%s:%d] phase 2: cleanup failed: %v", blockHashStr, blockHeight, err)
 		return 0, err
+	}
+
+	if heldBack > 0 {
+		prometheusSQLPrunerChildrenHeldBack.Add(float64(heldBack))
+
+		s.logger.Warnf("[pruner][%s:%d] phase 2: held back %s transactions past their delete-at-height because a parent output they claim is unspent or malformed; they are retried on every prune",
+			blockHashStr, blockHeight, util.FormatComma(heldBack))
 	}
 
 	// Calculate throughput
@@ -202,20 +235,15 @@ func isPruneRetryable(err error, engine string) bool {
 //
 // Only deletes parent transactions if their last spending child is mined and
 // stable (defensive mode only).
-func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int64, error) {
-	var (
-		count int64
-		err   error
-	)
-
+func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (deleted, heldBack int64, err error) {
 	for attempt := 0; attempt < maxPruneAttempts; attempt++ {
-		count, err = s.deleteTombstonedTx(ctx, blockHeight)
+		deleted, heldBack, err = s.deleteTombstonedTx(ctx, blockHeight)
 		if err == nil {
-			return count, nil
+			return deleted, heldBack, nil
 		}
 
 		if !isPruneRetryable(err, s.engine) {
-			return 0, errors.NewStorageError("pruning transaction failed", err)
+			return 0, 0, errors.NewStorageError("pruning transaction failed", err)
 		}
 
 		if attempt == maxPruneAttempts-1 {
@@ -229,14 +257,14 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 
 		select {
 		case <-ctx.Done():
-			return 0, errors.NewContextCanceledError("[pruner] cancelled while waiting to retry the pruning transaction", ctx.Err())
+			return 0, 0, errors.NewContextCanceledError("[pruner] cancelled while waiting to retry the pruning transaction", ctx.Err())
 		case <-time.After(backoff):
 		}
 	}
 
 	s.logger.Warnf("[pruner] serialization/lock conflict persisted after %d attempts: %v", maxPruneAttempts, err)
 
-	return 0, errors.NewStorageError("pruning transaction failed after %d attempts", maxPruneAttempts, err)
+	return 0, 0, errors.NewStorageError("pruning transaction failed after %d attempts", maxPruneAttempts, err)
 }
 
 // pruneStepError is how one attempt of the pruning transaction reports a
@@ -306,7 +334,7 @@ func (e *pruneStepError) Unwrap() error { return e.err }
 // re-sync the affected store, which rebuilds both the records and their markers
 // from the chain. Anything narrower needs a source of truth this table does not
 // have: whether the absent spender was mined and pruned, or merely lost.
-func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (int64, error) {
+func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (deleted, heldBack int64, err error) {
 	// Every statement below is a complete literal. Nothing is concatenated at
 	// runtime and no part of the SQL is ever built from data.
 	//
@@ -343,18 +371,25 @@ func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (i
 // whole transaction.
 var pruneTxOptions = &sql.TxOptions{Isolation: sql.LevelSerializable}
 
-// finishPrune reads the delete's row count and commits.
-func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
-	count, err := result.RowsAffected()
+// finishPrune reads the delete's row count, counts the candidates the delete
+// held back, and commits. heldBackQuery runs in the same transaction after the
+// DELETE, so every candidate it still finds is one the DELETE refused: without
+// it a held-back row is indistinguishable from there being nothing to prune.
+func finishPrune(ctx context.Context, txn *sql.Tx, result sql.Result, heldBackQuery string, args ...interface{}) (deleted, heldBack int64, err error) {
+	deleted, err = result.RowsAffected()
 	if err != nil {
-		return 0, &pruneStepError{step: "failed to get rows affected", err: err}
+		return 0, 0, &pruneStepError{step: "failed to get rows affected", err: err}
+	}
+
+	if err := txn.QueryRowContext(ctx, heldBackQuery, args...).Scan(&heldBack); err != nil {
+		return 0, 0, &pruneStepError{step: "failed to count held-back candidates", err: err}
 	}
 
 	if err := txn.Commit(); err != nil {
-		return 0, &pruneStepError{step: "failed to commit pruning transaction", err: err}
+		return 0, 0, &pruneStepError{step: "failed to commit pruning transaction", err: err}
 	}
 
-	return count, nil
+	return deleted, heldBack, nil
 }
 
 // unverifiedClaimFrom / unverifiedClaimCondition together select an input of
@@ -383,7 +418,7 @@ const (
 
 // pruneWithoutDefensiveCheck marks and deletes every transaction past its
 // expiration, with no child-stability verification.
-func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight uint32) (int64, error) {
+func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight uint32) (deleted, heldBack int64, err error) {
 	// The join to outputs is load-bearing, not a tidier way to reach the parent.
 	// An input naming a parent outpoint proves only that this child ASKED for it;
 	// a conflicting loser references the same outpoint and never won it, and
@@ -419,23 +454,29 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
     AND delete_at_height <= $1
     AND NOT EXISTS (` + unverifiedClaimTransactions + `)`
 
+	// After the DELETE, a row still past its delete-at-height is one the
+	// hold-back clause refused.
+	const heldBackQuery = `SELECT count(*) FROM transactions
+  WHERE delete_at_height IS NOT NULL
+    AND delete_at_height <= $1`
+
 	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
-		return 0, &pruneStepError{step: "failed to begin pruning transaction", err: err}
+		return 0, 0, &pruneStepError{step: "failed to begin pruning transaction", err: err}
 	}
 
 	defer func() { _ = txn.Rollback() }()
 
 	if _, err := txn.ExecContext(ctx, markerQuery, blockHeight); err != nil {
-		return 0, &pruneStepError{step: "failed to mark pruned children", err: err}
+		return 0, 0, &pruneStepError{step: "failed to mark pruned children", err: err}
 	}
 
 	result, err := txn.ExecContext(ctx, deleteQuery, blockHeight)
 	if err != nil {
-		return 0, &pruneStepError{step: "failed to delete transactions", err: err}
+		return 0, 0, &pruneStepError{step: "failed to delete transactions", err: err}
 	}
 
-	return finishPrune(txn, result)
+	return finishPrune(ctx, txn, result, heldBackQuery, blockHeight)
 }
 
 // pruneWithDefensiveCheck verifies that every spending child of a candidate is
@@ -448,7 +489,7 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
 // DROP TABLE IF EXISTS clears any leftover. Neither adds a failure path AFTER
 // the delete has already happened, which is the point: an explicit DROP running
 // after RowsAffected throws away a completed prune if it errors.
-func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint32) (int64, error) {
+func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint32) (deleted, heldBack int64, err error) {
 	const dropStale = `DROP TABLE IF EXISTS utxo_prune_candidates`
 
 	const createCandidatesPostgres = `CREATE TEMP TABLE utxo_prune_candidates ON COMMIT DROP AS
@@ -520,6 +561,12 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 	const deleteQuery = `DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)
     AND NOT EXISTS (` + unverifiedClaimTransactions + `)`
 
+	// After the DELETE, a candidate whose row is still there is one the
+	// hold-back clause refused. A candidate the stability test excluded is not
+	// counted: it never made the candidates table.
+	const heldBackQuery = `SELECT count(*) FROM utxo_prune_candidates candidate
+  WHERE EXISTS (SELECT 1 FROM transactions t WHERE t.id = candidate.id)`
+
 	createCandidates := createCandidatesPortable
 	if s.engine == "postgres" {
 		createCandidates = createCandidatesPostgres
@@ -527,27 +574,27 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 
 	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
-		return 0, &pruneStepError{step: "failed to begin pruning transaction", err: err}
+		return 0, 0, &pruneStepError{step: "failed to begin pruning transaction", err: err}
 	}
 
 	defer func() { _ = txn.Rollback() }()
 
 	if _, err := txn.ExecContext(ctx, dropStale); err != nil {
-		return 0, &pruneStepError{step: "failed to clear stale pruning candidates", err: err}
+		return 0, 0, &pruneStepError{step: "failed to clear stale pruning candidates", err: err}
 	}
 
 	if _, err := txn.ExecContext(ctx, createCandidates, blockHeight, s.safetyWindow); err != nil {
-		return 0, &pruneStepError{step: "failed to select pruning candidates", err: err}
+		return 0, 0, &pruneStepError{step: "failed to select pruning candidates", err: err}
 	}
 
 	if _, err := txn.ExecContext(ctx, markerQuery); err != nil {
-		return 0, &pruneStepError{step: "failed to mark pruned children", err: err}
+		return 0, 0, &pruneStepError{step: "failed to mark pruned children", err: err}
 	}
 
 	result, err := txn.ExecContext(ctx, deleteQuery)
 	if err != nil {
-		return 0, &pruneStepError{step: "failed to delete transactions", err: err}
+		return 0, 0, &pruneStepError{step: "failed to delete transactions", err: err}
 	}
 
-	return finishPrune(txn, result)
+	return finishPrune(ctx, txn, result, heldBackQuery)
 }

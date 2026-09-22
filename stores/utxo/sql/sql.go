@@ -117,6 +117,15 @@ type Store struct {
 	createBatcher *batcher.Batcher[batchCreateItem]
 	unlockBatcher *batcher.Batcher[batchUnlockItem]
 
+	// afterSpendSelect, when set, runs between a spend batch's marker-reading
+	// SELECT and its UPDATE, on the batcher goroutine with the spend
+	// transaction open. It is nil outside tests, which use it to commit a
+	// pruner marker inside that window. It is a field rather than a package
+	// variable so a test sets it on its own store only; the write happens
+	// before the Spend call that hands the batch to the batcher goroutine, so
+	// that hand-off orders it before the read.
+	afterSpendSelect func()
+
 	// utxo.BlockStateFields supplies the chain-tip height and median block time
 	// as one atomic snapshot, and with them the Store interface's six
 	// block-state methods. SetBlockHeight, SetMedianBlockTime and SetBlockState
@@ -2043,9 +2052,16 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// Rollback successful spends when the transaction has genuine validation failures
 		// (double-spend, frozen, conflicting, hash mismatch). For transient errors, skip
 		// rollback — the optimistic locking makes spends idempotent for the same spender.
+		//
+		// The guard is on the set actually reversed, as on Aerospike. Unspend
+		// opens a database transaction even for an empty set, so without it a
+		// call that failed with nothing to reverse, such as a transaction none of
+		// whose parents is present, paid a round trip for nothing.
 		if needsSpendRollback(spends) {
-			if unspendErr := s.Unspend(context.Background(), utxo.RollbackSet(spentSpends, idempotentSpends, utxo.AnyPrunedReplay(spends))); unspendErr != nil {
-				s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
+			if rollback := utxo.RollbackSet(spentSpends, idempotentSpends, utxo.AnyPrunedReplay(spends)); len(rollback) > 0 {
+				if unspendErr := s.Unspend(context.Background(), rollback); unspendErr != nil {
+					s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
+				}
 			}
 		}
 
@@ -2165,12 +2181,6 @@ func (s *Store) trySendSpendBatch(batch []*batchSpend) (retryable bool) {
 	return s.trySendSpendBatchPerRow(batch)
 }
 
-// afterSpendSelect, when set, runs between a spend batch's marker-reading SELECT
-// and its UPDATE, on the batcher goroutine with the spend transaction open. It
-// is nil outside tests, which use it to commit a pruner marker inside that
-// window.
-var afterSpendSelect func()
-
 // spendSelectResult holds the result of a bulk SELECT for a single spend item.
 type spendSelectResult struct {
 	batchIdx               int
@@ -2273,8 +2283,8 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		return false
 	}
 
-	if afterSpendSelect != nil {
-		afterSpendSelect()
+	if s.afterSpendSelect != nil {
+		s.afterSpendSelect()
 	}
 
 	// Phase 2: Validate each item and build the bulk UPDATE set
@@ -2914,8 +2924,8 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 			&transactionID, &coinbaseSpendingHeight, &utxoHash,
 			&spendingDataBytes, &frozen, &conflicting, &locked, &spendableIn, &childPruned,
 		)
-		if afterSpendSelect != nil {
-			afterSpendSelect()
+		if s.afterSpendSelect != nil {
+			s.afterSpendSelect()
 		}
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {

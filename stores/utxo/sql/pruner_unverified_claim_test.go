@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -80,8 +81,12 @@ func TestPrunerHoldsBackChildWhoseParentOutputIsUnspent(t *testing.T) {
 
 			svc, err := store.GetPrunerService()
 			require.NoError(t, err)
+
+			heldBefore := heldBackCounter(t)
 			_, err = svc.Prune(ctx, 1300, "unverified-claim")
 			require.NoError(t, err)
+			require.Equal(t, float64(1), heldBackCounter(t)-heldBefore,
+				"the held-back child must be counted, or it cannot be told apart from nothing to prune (defensive=%v)", defensive)
 
 			var childExists, marked bool
 			require.NoError(t, store.db.QueryRowContext(ctx,
@@ -93,4 +98,23 @@ func TestPrunerHoldsBackChildWhoseParentOutputIsUnspent(t *testing.T) {
 			require.False(t, marked, "a held-back child carries no marker on any parent, including the sibling that still records its spend")
 		})
 	}
+}
+
+// heldBackCounter reads utxo_sql_pruner_children_held_back_total from the
+// default registry, where the SQL pruner registers it.
+func heldBackCounter(t *testing.T) float64 {
+	t.Helper()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	for _, family := range families {
+		if family.GetName() == "utxo_sql_pruner_children_held_back_total" {
+			return family.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+
+	t.Fatal("utxo_sql_pruner_children_held_back_total is not registered")
+
+	return 0
 }

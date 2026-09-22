@@ -63,7 +63,7 @@ func TestSpendRefusesMarkerCommittedAfterSelect(t *testing.T) {
 			// window on its own connection.
 			var once sync.Once
 
-			afterSpendSelect = func() {
+			store.afterSpendSelect = func() {
 				once.Do(func() {
 					_, insertErr := store.db.ExecContext(context.Background(),
 						`INSERT INTO deleted_children (parent_id, child_hash) SELECT id, $2 FROM transactions WHERE hash = $1`,
@@ -78,10 +78,10 @@ func TestSpendRefusesMarkerCommittedAfterSelect(t *testing.T) {
 					}
 				})
 			}
-			t.Cleanup(func() { afterSpendSelect = nil })
+			t.Cleanup(func() { store.afterSpendSelect = nil })
 
 			spends, err := store.Spend(ctx, child, 1000)
-			afterSpendSelect = nil
+			store.afterSpendSelect = nil
 
 			require.Error(t, err, "a spend by a transaction the pruner just removed must be refused")
 			require.Len(t, spends, 1)

@@ -524,8 +524,21 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	}
 
 	// Unlock all UTXOs - final commit point (no-op when the lock was never taken; #1103).
+	//
+	// A failure here is logged and counted, not returned. AddBlock above has
+	// already committed the block, so returning made the caller treat a stored
+	// block as a failed one, and it also skipped the two steps below: the
+	// subtree DAH update (so BlockSubtreesSet never fired and the subtrees were
+	// never given a DAH) and the block-exists cache. None of that re-runs the
+	// unlock, so returning bought nothing. The legacy route handles its own
+	// post-commit unlock the same way (HandleBlockDirect).
 	if err := u.unlockSubtreeTransactionsIfNeeded(ctx, block, caller); err != nil {
-		return err
+		if prometheusQuickValidatePostCommitUnlockFailures != nil {
+			prometheusQuickValidatePostCommitUnlockFailures.Inc()
+		}
+
+		u.logger.Errorf("[%s][%s] block is committed but releasing the create-phase lock on its transactions failed; the affected records stay locked: %v",
+			caller, block.Hash().String(), err)
 	}
 
 	// Update subtrees DAH and send BlockSubtreesSet notification.

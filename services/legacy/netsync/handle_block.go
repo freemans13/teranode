@@ -282,7 +282,8 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 
 	// The block is committed; release the two-phase lock createUtxos put on its
 	// transactions. Only the non-unified legacy route creates them here (the
-	// unified route defers to quick validation, which has its own unlock pass).
+	// unified route defers to quick validation, whose commitBlock runs its own
+	// unlock pass under the same log-and-count rule as below).
 	//
 	// A failure here is logged and counted, not returned. The block is already in
 	// the chain, and returning an error from this point made the caller treat a

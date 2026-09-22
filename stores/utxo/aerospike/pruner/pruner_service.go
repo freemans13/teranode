@@ -1916,7 +1916,7 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 
 	blocked := plan.blocked
 
-	keys := make([]*aerospike.Key, 0, len(deletions))
+	toDelete := make([]*pendingDeletion, 0, len(deletions))
 
 	for _, deletion := range deletions {
 		if _, held := blocked[*deletion.txHash]; held {
@@ -1925,12 +1925,25 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 			continue
 		}
 
-		keys = append(keys, deletion.keys...)
+		toDelete = append(toDelete, deletion)
 	}
 
-	if len(keys) > 0 {
-		if err := s.executeBatchDeletions(ctx, keys); err != nil {
-			return heldBack, err
+	if len(toDelete) > 0 {
+		survivors, err := s.executeBatchDeletions(ctx, toDelete)
+
+		// A child whose delete definitely did not happen is still present with
+		// its markers already on every parent, which is the same poison as a
+		// marker set that landed on only some parents: the spend path answers
+		// the marker first, so a re-validation of the block holding that live
+		// child is refused, and the block paths do not compensate a record they
+		// did not create. So its markers are withdrawn, exactly as markParents
+		// does for a failed marker write, and the next cycle marks it again.
+		if len(survivors) > 0 {
+			s.withdrawMarkers(parentUpdates, survivors)
+		}
+
+		if err != nil {
+			return heldBack + len(survivors), err
 		}
 	}
 
@@ -1985,6 +1998,14 @@ func (s *Service) markParents(ctx context.Context, parentUpdates map[string]*par
 
 	failed, err := s.executeBatchParentUpdates(ctx, parentUpdates)
 	if err != nil {
+		// A context error is returned only by the check made before the batch
+		// is sent, so no marker was written and there is nothing to withdraw.
+		// Withdrawing anyway on every mid-cycle shutdown would send removes to
+		// parents that never had the bin and count each one as a failure.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+
 		// Nothing is known about which records took the write, so withdraw
 		// every child's marker. Best effort: a withdrawal that fails leaves a
 		// marker on a child that is still present, and the next cycle, which
@@ -2594,9 +2615,37 @@ func (s *Service) executeBatchParentUpdatesBatchWrite(ctx context.Context, updat
 // - Partial batch failures can be retried without side effects
 //
 // Parents must be updated first (Phase 2a) before calling this function.
-func (s *Service) executeBatchDeletions(ctx context.Context, keys []*aerospike.Key) error {
+//
+// It returns the children whose master record definitely survived: nothing was
+// sent because the context was already done, or the server refused the master
+// record's delete. Their parent markers must be withdrawn by the caller. A
+// master record whose outcome is unknown (no response, or an in-doubt error) is
+// not returned: withdrawing its markers after a delete that did land would
+// leave exactly the unmarked deletion this package exists to prevent, so the
+// marker stays and the next cycle, which re-finds the child if it is still
+// present, marks and deletes it again. A failed pagination-record delete does
+// not keep its child: the master is what the spend path and the next scan see.
+func (s *Service) executeBatchDeletions(ctx context.Context, deletions []*pendingDeletion) (map[chainhash.Hash]struct{}, error) {
+	if len(deletions) == 0 {
+		return nil, nil
+	}
+
+	keys := make([]*aerospike.Key, 0, len(deletions))
+	// masters maps the index of each child's master record in the batch to the
+	// child. keys[0] of a pendingDeletion is always the master record.
+	masters := make(map[int]*chainhash.Hash, len(deletions))
+
+	for _, deletion := range deletions {
+		if len(deletion.keys) == 0 {
+			continue
+		}
+
+		masters[len(keys)] = deletion.txHash
+		keys = append(keys, deletion.keys...)
+	}
+
 	if len(keys) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	batchRecords := buildDeletionBatchRecords(keys, s.utxoSetTTL, s.removalCommitLevel)
@@ -2605,42 +2654,76 @@ func (s *Service) executeBatchDeletions(ctx context.Context, keys []*aerospike.K
 	select {
 	case <-ctx.Done():
 		s.logger.Infof("Context cancelled, skipping deletion batch")
-		return ctx.Err()
+
+		survivors := make(map[chainhash.Hash]struct{}, len(masters))
+		for _, txHash := range masters {
+			survivors[*txHash] = struct{}{}
+		}
+
+		return survivors, ctx.Err()
 	default:
 	}
 
-	// Execute batch
-	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
-		s.logger.Errorf("Batch deletion failed for %d records: %v", len(keys), err)
-		return errors.NewStorageError("batch deletion failed", err)
+	// Execute batch. A whole-batch error still leaves the per-record results
+	// the server did answer, so the survivors are classified either way.
+	batchErr := s.client.BatchOperate(s.batchPolicy, batchRecords)
+	if batchErr != nil {
+		s.logger.Errorf("Batch deletion failed for %d records: %v", len(keys), batchErr)
+	}
+
+	survivors := make(map[chainhash.Hash]struct{})
+
+	for i, txHash := range masters {
+		if deleteRefused(batchRecords[i].BatchRec()) {
+			survivors[*txHash] = struct{}{}
+		}
 	}
 
 	// Check for errors and count successes
-	successCount := 0
-	alreadyDeletedCount := 0
 	errorCount := 0
 
 	for _, rec := range batchRecords {
-		if rec.BatchRec().Err != nil {
-			if rec.BatchRec().Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
-				// Idempotent: Record already deleted by concurrent pruning or previous run
-				// This operation is safely re-runnable - treat as success
-				alreadyDeletedCount++
-			} else {
-				s.logger.Errorf("Deletion error for key %v: %v", rec.BatchRec().Key, rec.BatchRec().Err)
-				errorCount++
+		batchRec := rec.BatchRec()
+
+		if batchRec.Err != nil && !batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
+			if batchErr == nil {
+				s.logger.Errorf("Deletion error for key %v: %v", batchRec.Key, batchRec.Err)
 			}
-		} else {
-			successCount++
+
+			errorCount++
 		}
+	}
+
+	if batchErr != nil {
+		return survivors, errors.NewStorageError("batch deletion failed", batchErr)
 	}
 
 	// Return error if any individual record operations failed
 	if errorCount > 0 {
-		return errors.NewStorageError("%d deletion operations failed", errorCount)
+		return survivors, errors.NewStorageError("%d deletion operations failed", errorCount)
 	}
 
-	return nil
+	return survivors, nil
+}
+
+// deleteRefused reports whether the server definitely did not remove the
+// record: it answered with an error other than KEY_NOT_FOUND, and the error is
+// not in doubt. A record the server never answered (NO_RESPONSE) or answered
+// in doubt may have been removed, so it is not reported.
+func deleteRefused(rec *aerospike.BatchRecord) bool {
+	if rec.Err == nil {
+		return false
+	}
+
+	if rec.Err.Matches(types.KEY_NOT_FOUND_ERROR) {
+		return false
+	}
+
+	if rec.InDoubt || rec.Err.IsInDoubt() {
+		return false
+	}
+
+	return !rec.Err.Matches(types.NO_RESPONSE)
 }
 
 // executeBatchExternalFileDeletions performs Phase 3: removes external blob files

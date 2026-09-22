@@ -881,6 +881,14 @@ func (s *Store) validateSpendItem(bItem *batchSpend) error {
 	if bItem.spend.SpendingData == nil {
 		return errors.NewProcessingError("[SPEND_BATCH_LUA][%s] spending data is nil", bItem.spend.TxID.String())
 	}
+
+	// The replay-marker check is keyed on the spender's txid. The expression
+	// path adds that clause only when it has one, so a spend without it would
+	// write through with no marker check at all; refuse it on both paths.
+	if bItem.spend.SpendingData.TxID == nil {
+		return errors.NewProcessingError("[SPEND_BATCH_LUA][%s] spending data has no spending txid", bItem.spend.TxID.String())
+	}
+
 	return nil
 }
 

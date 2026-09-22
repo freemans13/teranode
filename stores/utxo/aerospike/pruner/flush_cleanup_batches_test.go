@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
@@ -170,6 +171,86 @@ func TestFlushCleanupBatches_MarkersAreAllOrNothingPerChild(t *testing.T) {
 			if tc.p2 != nil {
 				require.Equal(t, tc.p2Marked, hasMarker(t, client, p2Key, &child), "P2 marker")
 			}
+		})
+	}
+}
+
+// TestFlushCleanupBatches_FailedDeleteWithdrawsMarkers pins the phase after
+// the marker write: the markers landed on both parents, and then the delete of
+// the child's own record was refused. That child is still present, so its
+// markers must be withdrawn, or the spend path refuses the live child's own
+// re-spend as a pruned replay. A refused pagination-record delete does not keep
+// the child: its master record is gone, so the markers stay.
+//
+// A key in a namespace the server does not have is the refusal: the server
+// answers that one record with INVALID_NAMESPACE, not in doubt, and the rest of
+// the batch goes through.
+func TestFlushCleanupBatches_FailedDeleteWithdrawsMarkers(t *testing.T) {
+	s, client := newFlushTestService(t)
+
+	for i, tc := range []struct {
+		name string
+		// refuseMaster puts the refused key first, where the master record is.
+		refuseMaster bool
+		wantMarked   bool
+	}{
+		{name: "a refused master delete withdraws the markers", refuseMaster: true},
+		{name: "a refused pagination delete keeps the markers", wantMarked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p1 := chainhash.HashH([]byte{byte(i), 5, 1})
+			p2 := chainhash.HashH([]byte{byte(i), 5, 2})
+			child := chainhash.HashH([]byte{byte(i), 5, 3})
+
+			p1Key := putRecord(t, client, &p1, spentBy(&child))
+			p2Key := putRecord(t, client, &p2, spentBy(&child))
+			childKey := putRecord(t, client, &child, aerospike.BinMap{fields.TxID.String(): child.CloneBytes()})
+
+			refused, err := aerospike.NewKey("nosuchnamespace", "test", child.String())
+			require.NoError(t, err)
+
+			// The refused key stands in for the child's own master record, which
+			// then stays present; as a pagination key it follows a master that is
+			// deleted.
+			keys := []*aerospike.Key{childKey, refused}
+			if tc.refuseMaster {
+				keys = []*aerospike.Key{refused}
+			}
+
+			updates := make(map[string]*parentUpdateInfo)
+			require.NoError(t, s.addParentUpdatesForInput(updates, &p1, 0, &child))
+			require.NoError(t, s.addParentUpdatesForInput(updates, &p2, 0, &child))
+
+			_, flushErr := s.flushCleanupBatches(context.Background(), updates,
+				[]*pendingDeletion{{txHash: &child, keys: keys}}, nil)
+			require.Error(t, flushErr, "a refused delete is still reported")
+
+			require.Equal(t, tc.wantMarked, hasMarker(t, client, p1Key, &child), "P1 marker")
+			require.Equal(t, tc.wantMarked, hasMarker(t, client, p2Key, &child), "P2 marker")
+		})
+	}
+}
+
+// TestDeleteRefused pins which per-record answers count as a delete that
+// definitely did not happen. Only those withdraw markers: a delete that may
+// have landed keeps them, because withdrawing after a landed delete is the
+// unmarked deletion this package exists to prevent.
+func TestDeleteRefused(t *testing.T) {
+	refusal := aerospike.ErrInvalidUser
+
+	for _, tc := range []struct {
+		name string
+		rec  *aerospike.BatchRecord
+		want bool
+	}{
+		{name: "deleted", rec: &aerospike.BatchRecord{ResultCode: types.OK}},
+		{name: "already gone", rec: &aerospike.BatchRecord{ResultCode: types.KEY_NOT_FOUND_ERROR, Err: aerospike.ErrKeyNotFound}},
+		{name: "never answered", rec: &aerospike.BatchRecord{ResultCode: types.NO_RESPONSE}},
+		{name: "timed out in doubt", rec: &aerospike.BatchRecord{ResultCode: types.TIMEOUT, Err: aerospike.ErrTimeout, InDoubt: true}},
+		{name: "refused", rec: &aerospike.BatchRecord{ResultCode: types.INVALID_USER, Err: refusal}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, deleteRefused(tc.rec))
 		})
 	}
 }
