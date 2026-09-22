@@ -1,6 +1,6 @@
 # 🖥 Developer Setup - Pre-requisites and Installation
 
-This guide assists you in setting up the Teranode project on your machine. The below assumes you are running a recent version of Mac OS.
+This guide assists you in setting up the Teranode project on your machine. The below assumes you are running a recent version of Mac OS on Apple Silicon (arm64). GoBDK ships prebuilt static libraries for `darwin/arm64`, `linux/amd64` and `linux/arm64` only — Intel Macs (`darwin/amd64`) are not a supported build target.
 
 ## Index
 
@@ -27,7 +27,7 @@ This guide assists you in setting up the Teranode project on your machine. The b
 
 ## 1. Install Go
 
-Download and install the latest version of Go. As of February 2026, it's `1.26.0`.
+Download and install the latest version of Go. As of September 2026, it's `1.27.0`.
 
 [Go Installation Guide](https://go.dev/doc/install)
 
@@ -39,7 +39,7 @@ Open a new terminal and execute:
 go version
 ```
 
-It should display `go1.26.0` or above.
+It should display `go1.27.0` or above.
 
 ## 2. Set Go Environment Variables
 
