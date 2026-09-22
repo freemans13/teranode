@@ -202,6 +202,9 @@ func TestPreservingASecondTimeKeepsTheLongerPromise(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
+	// Preservation copies only from a window the stamp has completed.
+	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
+
 	preserved := []chainhash.Hash{*parent.TxIDChainHash()}
 
 	require.NoError(t, s.PreserveTransactions(ctx, preserved, 5_000))

@@ -16,13 +16,8 @@ import (
 // against real postgres in the design cycle of 2026-09-16 and had no committed test until this
 // file. Each is written here as the assertion section 14 gives it.
 //
-// The containment build closes two and a half of them, and those are plain assertions. The rest
-// wait for the deep stamp, the preservation source rule and the read order of build step 5, and
-// they sit behind the knownDefect guard from tip_block_facts_test.go: while the defect is
-// present the test reports itself as a known defect, and the moment a fix makes the correct
-// behaviour appear the test fails until the guard is replaced by its plain assertions. Each
-// test computes its own fixed boolean from what the store answers, which is what the guard
-// needs and what the shared conformance case in conformance_test.go cannot do.
+// The containment build closed two and a half of them; the stamp, the unspend repair, the
+// preservation source rule and the read order closed the rest. All five are plain assertions.
 
 // pairsOf reads the (mined_height, block_id) pair off every live UTXO of a transaction, in
 // output order.
@@ -160,10 +155,9 @@ func TestForkThenMainChainRecordClearsTheMarkerAndIsStamped(t *testing.T) {
 // was written by different statements at different moments -- the create, the reset, the
 // retirement stamp and the unspend restore -- so two UTXOs of one transaction could disagree.
 //
-// It cannot hold at the containment build, because the interim unspend rule takes the first
-// containment row in (mined_height, block_id) order and writes that pair onto a restored UTXO
-// while its siblings stay at (0,0). Build step 5 replaces the re-resolution with a repair that
-// writes exactly what the stamp would have written, so the two agree.
+// The unspend repair writes onto a restored UTXO exactly what the stamp wrote or would write:
+// below the fence, the one surviving row's pair; above it, (0,0), and the stamp reaches the
+// restored UTXO through the identity row like any other. Either way the siblings agree.
 func TestEveryLiveUTXOOfOneTransactionCarriesTheSamePair(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -193,19 +187,19 @@ func TestEveryLiveUTXOOfOneTransactionCarriesTheSamePair(t *testing.T) {
 
 	pairs := pairsOf(t, s, ctx, parent)
 	require.Len(t, pairs, 2)
+	require.Equal(t, [2]int32{0, 0}, pairs[0], "unstamped: the restore keeps (0,0) and the stamp will reach it")
+	require.Equal(t, pairs[1], pairs[0], "every live UTXO of one transaction carries an identical pair")
 
-	knownDefect(t, "the interim unspend rule writes a pair onto the restored UTXO while its sibling stays at (0,0)",
-		pairs[0] == pairs[1], func() {
-			require.Equal(t, pairs[1], pairs[0], "every live UTXO of one transaction carries an identical pair")
-		})
+	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
+	require.Equal(t, [][2]int32{{100, 7}, {100, 7}}, pairsOf(t, s, ctx, parent), "and after the stamp, both carry the winner")
 }
 
 // TestPreservedCopyNamesTheBlockThatWon is measured failure 4, decision site 3 of the design's
-// earliest-row rule. The preserve pass copies one containment row of the parent, and the
-// interim rule takes the first in (mined_height, block_id) order, which here is the fork block
-// with the lower id rather than the block the caller said is on the longest chain. Build step 5
-// gives preservation a source rule that reads only windows the stamp has completed, where the
-// losing rows are already deleted.
+// earliest-row rule. The preserve pass used to copy the parent's first containment row in
+// (mined_height, block_id) order, which here is the fork block with the lower id rather than
+// the block the caller said is on the longest chain. Preservation now reads only windows the
+// stamp has completed, where the losing rows are already deleted, and skips the parent until
+// then.
 func TestPreservedCopyNamesTheBlockThatWon(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -221,40 +215,39 @@ func TestPreservedCopyNamesTheBlockThatWon(t *testing.T) {
 
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
-	pair, ok := preservedPairOf(t, s, ctx, parent)
-	require.True(t, ok, "a parent with containment is preserved")
+	_, ok := preservedPairOf(t, s, ctx, parent)
+	require.False(t, ok, "not yet: the window is not completed, so either row could still be the loser")
 
-	knownDefect(t, "the interim preservation rule copies the first containment row by key, which is the fork block here",
-		pair == [2]int32{100, 8}, func() {
-			require.Equal(t, [2]int32{100, 8}, pair, "the block on the longest chain, not the loser")
-		})
+	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 8})
+
+	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
+
+	pair, ok := preservedPairOf(t, s, ctx, parent)
+	require.True(t, ok, "a parent with containment in a completed window is preserved")
+	require.Equal(t, [2]int32{100, 8}, pair, "the block on the longest chain, not the loser")
 }
 
-// TestPreservedCopyNeverOutranksACorrectUTXO is measured failure 5. Today's read order tries the
-// identity row and containment, then the preserved copy, then the UTXO, then the undo copy. A
-// preserved copy taken under the interim rule can name a loser, and once the window is gone it
-// then answers ahead of a UTXO that carries the correct pair. Build step 5 reads the preserved
-// copy LAST, behind the UTXO and the undo copy, which removes the failure even if a wrong copy is
-// ever written.
+// TestPreservedCopyNeverOutranksACorrectUTXO is measured failure 5. The read order used to try
+// the identity row and containment, then the preserved copy, then the UTXO, then the undo
+// copy. A preserved copy taken under the interim rule could name a loser, and once the window
+// was gone it then answered ahead of a UTXO that carries the correct pair. The preserved copy
+// is now read LAST, behind the UTXO and the undo copy, which removes the failure even if a
+// wrong copy is ever written. The store's own preservation can no longer write one, so the
+// wrong copy is planted by raw SQL.
 func TestPreservedCopyNeverOutranksACorrectUTXO(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	// Born from the main-chain block below the checkpoint, so the UTXO carries (100, 8) from
-	// birth and there is no identity row to hold the window drop back.
+	// birth and there is no identity row.
 	parent := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 8, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// A fork block with a lower id records it too, so the interim rule preserves the loser.
-	_, err = s.SetMinedMulti(ctx, hashes(parent), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100})
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO preserved_parent (txid, mined_height, block_id, subtree_idx, created_height, preserve_until)
+		VALUES ($1, 100, 7, 0, 100, 5000)`, hashBytes(parent))
 	require.NoError(t, err)
-
-	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
-
-	pair, ok := preservedPairOf(t, s, ctx, parent)
-	require.True(t, ok)
-	require.Equal(t, [2]int32{100, 7}, pair, "the interim rule preserved the loser, which is what the read order then has to survive")
 
 	dropped := retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 8})
 	require.Equal(t, 1, dropped, "the window has to be gone for the preserved copy to be consulted at all")
@@ -265,9 +258,12 @@ func TestPreservedCopyNeverOutranksACorrectUTXO(t *testing.T) {
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
+	require.Equal(t, []uint32{8}, got.BlockIDs, "the UTXO's pair, not the preserved loser")
 
-	knownDefect(t, "the preserved copy is read before the UTXO, so a wrong copy outranks a correct pair",
-		len(got.BlockIDs) == 1 && got.BlockIDs[0] == 8, func() {
-			require.Equal(t, []uint32{8}, got.BlockIDs, "the UTXO's pair, not the preserved loser")
-		})
+	// With the UTXO spent, its undo copy still outranks the preserved row.
+	spendOneOutput(t, s, ctx, parent, 0, 3_000)
+
+	got, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{8}, got.BlockIDs, "the undo copy's pair, not the preserved loser")
 }

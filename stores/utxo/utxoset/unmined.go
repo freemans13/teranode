@@ -27,23 +27,24 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 	return nil, nil
 }
 
-// preserveParentSQL copies each named transaction's first containment row, in (mined_height,
-// block_id) order, into the preservation table, or extends the life of a copy already there.
+// preserveParentSQL copies each named parent's block facts into the preservation table, from the
+// first of four sources that has them, or extends the life of a copy already there.
 //
-// That order is the INTERIM rule of the containment build, and it is right only where a
-// transaction has exactly one containment row: a mainnet sync below the checkpoint, where the
-// node has never stored a fork. Where a transaction is contained by competing blocks this can
-// preserve the loser, which is one of the measured failures the design records, and build
-// step 5 replaces it with a source rule that reads only windows the stamp has completed, where
-// the losing rows are already deleted. Nothing may rank rows by arrival in the meantime; the
-// insertion counter this used to order by is gone.
+// The sources, in order, are what makes a preserved row never name a loser. First, the parent's
+// surviving containment row in a window the stamp has COMPLETED, below $7: the stamp deleted
+// that window's losers, so the row left is the winner, and it carries the full payload. Second,
+// a containment row at or above $7 means the parent's window is not yet completed: the parent is
+// SKIPPED this cycle, not preserved, and retried next cycle, because a row there can still be a
+// loser and a thin copy written first would never be upgraded (the conflict clause updates only
+// the expiry). Third and fourth, only when no attached window holds a row for the parent at all:
+// a live UTXO with a non-zero pair, then an undo copy with one. Those two give a thin row, the
+// pair and the flags with no fee, size or inputs, which is what the read path was answering for
+// this parent the moment before anyway. The locked bit is masked with $8, because a row this
+// deep never supplies it.
 //
-// A hash with NO containment row copies nothing, and that is right in both of the ways it can
-// happen. An unmined parent is held by its identity row, which stays for as long as the
-// transaction is unmined, so there is nothing to preserve and nothing to lose. A parent whose
-// window has already gone cannot be recovered from here -- the row this statement copies is
-// the only place those facts lived -- and inventing a row from a UTXO would put facts in a
-// table that promises to hold what containment held.
+// $6 is the dropped floor. Skipping a parent is safe only until its window drops, and a window
+// cannot drop without a completion record, which the stamp writes only after it has run; after
+// that the window lives at least 1,728 more blocks and this pass runs every cycle.
 //
 // ON CONFLICT takes the GREATEST of the two heights rather than the new one. The pruner names
 // a parent again on every cycle its child is still waiting, each time with a further-out
@@ -51,25 +52,66 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 // expiry over the longer one would retire the parent while the older child still needed it.
 //
 // The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the shape minedByTxidSQL
-// uses and for the identical reason: one primary-key descent per key per live window rather
-// than a hash join against every window read whole.
+// uses and for the identical reason: one primary-key descent per key per attached window
+// rather than a hash join against every window read whole.
 const preserveParentSQL = `
 INSERT INTO preserved_parent (txid, mined_height, block_id, subtree_idx, created_height,
                               fee, size_in_bytes, tx_inpoints, locktime, created_at, flags,
                               preserve_until)
-SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.created_height,
-       m.fee, m.size_in_bytes, m.tx_inpoints, m.locktime, m.created_at, m.flags, $2::int
-  FROM unnest($1::bytea[]) AS k(txid)
+SELECT k.txid, s.mined_height, s.block_id, s.subtree_idx, s.created_height,
+       s.fee, s.size_in_bytes, s.tx_inpoints, s.locktime, s.created_at,
+       s.flags & ~$8::smallint, $5::int
+  FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS k(leaf, txid, lo, hi)
  CROSS JOIN LATERAL (
-   SELECT m.mined_height, m.block_id, m.subtree_idx, m.created_height, m.size_in_bytes,
-          m.fee, m.tx_inpoints, m.locktime, m.created_at, m.flags
-     FROM tx_mined m
-    WHERE m.txid = k.txid
-    ORDER BY m.mined_height, m.block_id
-    LIMIT 1 OFFSET 0
- ) AS m
+   (SELECT 1 AS pri, m.mined_height, m.block_id, m.subtree_idx, m.created_height,
+           m.fee, m.size_in_bytes, m.tx_inpoints, m.locktime, m.created_at, m.flags
+      FROM tx_mined m
+     WHERE m.txid = k.txid
+       AND m.mined_height >= $6::int
+       AND m.mined_height <  $7::int
+     ORDER BY (m.tx_inpoints IS NULL), m.mined_height, m.block_id LIMIT 1)
+   UNION ALL
+   (SELECT 2, m.mined_height, m.block_id, m.subtree_idx, m.created_height,
+           NULL, NULL, NULL, NULL, NULL, m.flags
+      FROM tx_mined m
+     WHERE m.txid = k.txid
+       AND m.mined_height >= $7::int
+     LIMIT 1)
+   UNION ALL
+   (SELECT 3, u.mined_height, u.block_id, 0, u.created_height,
+           NULL, NULL, NULL, NULL, NULL, u.flags
+      FROM utxo u
+     WHERE u.leaf = k.leaf AND u.ukey >= k.lo AND u.ukey <= k.hi AND u.txid = k.txid
+       AND u.mined_height > 0
+     ORDER BY u.ukey LIMIT 1)
+   UNION ALL
+   (SELECT 4, j.mined_height, j.block_id, 0, j.created_height,
+           NULL, NULL, NULL, NULL, NULL, j.flags
+      FROM spend_journal j
+     WHERE j.ukey >= k.lo AND j.ukey <= k.hi AND j.txid = k.txid
+       AND j.mined_height > 0
+     ORDER BY j.ukey LIMIT 1)
+   ORDER BY pri LIMIT 1 OFFSET 0
+ ) AS s
+ WHERE s.pri <> 2
     ON CONFLICT (txid) DO UPDATE
    SET preserve_until = GREATEST(preserved_parent.preserve_until, EXCLUDED.preserve_until)`
+
+// preserveClassifySQL sorts the parents that still have no preserved row after the insert into
+// the ones that are held elsewhere or will be reached, and the ones with no source at all. It
+// runs once per leaf group with the leaf as a scalar. A parent with an identity row is held by
+// it; a parent with a containment row at or above the completion floor, $3, will be reached
+// when its window completes. Any other is a hole in the retention arithmetic, and counted.
+const preserveClassifySQL = `
+SELECT k.txid,
+       EXISTS (SELECT 1 FROM tx_ident i
+                WHERE i.leaf = $1::smallint AND i.txid = k.txid) AS has_ident,
+       EXISTS (SELECT 1 FROM tx_mined m
+                WHERE m.txid = k.txid
+                  AND m.mined_height >= $3::int
+                LIMIT 1 OFFSET 0) AS waiting
+  FROM unnest($2::bytea[]) AS k(txid)
+ WHERE NOT EXISTS (SELECT 1 FROM preserved_parent p WHERE p.txid = k.txid)`
 
 // PreserveTransactions keeps a parent answerable past the containment window that would
 // otherwise have retired it, because a still-unmined child needs its facts to be validated
@@ -113,9 +155,61 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	// this store is written through.
 	until := int32(preserveUntilHeight) //nolint:gosec // a height fits an int32
 
-	if _, err := s.pool.Exec(ctx, preserveParentSQL, txids, until); err != nil {
+	floors, err := s.Floors(ctx)
+	if err != nil {
+		return err
+	}
+
+	leaves, ids, los, his := liveUTXOArgs(txids)
+
+	if _, err := s.pool.Exec(ctx, preserveParentSQL, leaves, ids, los, his, until,
+		int32(floors.DroppedFloor), int32(floors.StampCompleteFloor), FlagLocked); err != nil { //nolint:gosec // heights fit int32
 		return errors.NewStorageError("[utxoset][PreserveTransactions] preserve %d parents until %d",
 			len(txids), preserveUntilHeight, err)
+	}
+
+	// The classification of what was not preserved is off the block path and exists for the
+	// two counters; a failure there is logged and does not fail the pass.
+	for _, g := range leafGroups(txids) {
+		rows, err := s.pool.Query(ctx, preserveClassifySQL, g.leaf, g.txids, int32(floors.StampCompleteFloor)) //nolint:gosec // a height fits int32
+		if err != nil {
+			s.logger.Warnf("[utxoset][PreserveTransactions] classify unpreserved parents: %v", err)
+
+			return nil
+		}
+
+		var waiting, noSource int
+
+		for rows.Next() {
+			var (
+				txid          []byte
+				hasIdent, due bool
+			)
+
+			if err := rows.Scan(&txid, &hasIdent, &due); err != nil {
+				rows.Close()
+				s.logger.Warnf("[utxoset][PreserveTransactions] classify scan: %v", err)
+
+				return nil
+			}
+
+			if hasIdent || due {
+				waiting++
+			} else {
+				noSource++
+			}
+		}
+
+		rows.Close()
+
+		if waiting > 0 {
+			preserveWaiting.Add(float64(waiting))
+		}
+
+		if noSource > 0 {
+			preserveNoSource.Add(float64(noSource))
+			s.logger.Errorf("[utxoset][PreserveTransactions] %d parents named for preservation have no containment row, no identity row, no live UTXO and no undo copy", noSource)
+		}
 	}
 
 	return nil

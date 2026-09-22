@@ -69,25 +69,20 @@ import (
 // pre-statement snapshot, so the rows this arm can see are precisely the ones `restored`
 // excluded itself from touching.
 //
-// The restored UTXO's block facts are RE-RESOLVED, in three preferences, and this is the
-// INTERIM rule of the containment build, not the final one.
-//
-// tx_mined first, taking the transaction's first containment row in (mined_height, block_id)
-// order. That is right only where a transaction has exactly one containment row, which holds
-// for the one deployment the interim build gets -- a mainnet sync below the checkpoint, where
-// the node has never stored a fork -- and is not claimed to be right anywhere else. Where a
-// transaction has rows for competing blocks this can write a loser's pair onto the restored
-// UTXO, and the design's build step 5 replaces the whole re-resolution with a repair that
-// reads only below the stamp fence, where the stamp has already deleted the losing rows. Until
-// then the insertion counter this used to order by is gone, and nothing may rank rows by
-// arrival in its place.
-//
-// Then the journal's own copy, gated on mined_height > 0. A non-zero pair in the copy was
-// final when it was copied and stays final, so it is trusted where tx_mined has no row.
-//
-// Then 0, which is the unconfirmed sentinel and the correct answer for a parent that was
-// genuinely unconfirmed when it was spent. Both columns move together in every branch, because
-// each pair comes from one row.
+// The restored UTXO's pair is the copy's own, verbatim, whenever it is non-zero: a non-zero
+// pair was final when it was copied and stays final. A copy at (0,0) is the REPAIR's case. The
+// UTXO was spent while still unstamped, and if its window has since been stamped, the stamp
+// found no live UTXO to write onto and has deleted the identity row, so nothing would ever
+// come back for it. The repair reads the copy's containment rows below the stamp fence ($6),
+// at or above the dropped floor ($5). Below the fence every row left names a winner, because
+// the stamp deleted the losers in the same transaction that raised the fence, so exactly one
+// row means its pair is written onto the restored UTXO here, with no chain access. No row and
+// an identity row means the transaction is unmined, or its window is not yet stamped: (0,0) is
+// kept and the stamp will reach it through the identity row. No row and no identity row, or
+// more than one row, are the two failures the wrapper turns into a rolled-back storage error.
+// The fence itself is read after the shared fence lock, in the same transaction, so it cannot
+// move under this statement. Both floors are scalars, so the planner reads only the windows
+// between them.
 const unspendSQL = `
 WITH items AS (
     SELECT * FROM unnest($1::uuid[], $2::bytea[], $3::bytea[]) AS t(ukey, ptxid, stxid)
@@ -100,18 +95,33 @@ taken AS (
     RETURNING j.ukey, j.txid, j.satoshis, j.script, j.created_height,
               j.spendable_from, j.flags, j.hash_override, j.mined_height, j.block_id
 ),
+won AS (
+    SELECT t.ukey, t.txid, c.n, c.mined_height, c.block_id,
+           EXISTS (SELECT 1 FROM tx_ident i
+                    WHERE i.leaf = (get_byte(t.txid, 0) & 7)::smallint
+                      AND i.txid = t.txid) AS has_ident
+      FROM taken t
+     CROSS JOIN LATERAL (
+       SELECT count(*) AS n, min(m.mined_height) AS mined_height, min(m.block_id) AS block_id
+         FROM tx_mined m
+        WHERE m.txid = t.txid
+          AND m.mined_height >= $5::int
+          AND m.mined_height <  $6::int
+       OFFSET 0
+     ) AS c
+     WHERE t.mined_height = 0
+),
 restored AS (
     INSERT INTO utxo (leaf, txid, ukey, satoshis, script, created_height,
                       spendable_from, flags, hash_override, mined_height, block_id)
     SELECT (get_byte(t.txid, 0) & 7)::smallint, t.txid, t.ukey, t.satoshis, t.script,
            t.created_height, t.spendable_from, t.flags | $4::smallint, t.hash_override,
-           COALESCE((SELECT m.mined_height FROM tx_mined m WHERE m.txid = t.txid
-                      ORDER BY m.mined_height, m.block_id LIMIT 1),
-                    CASE WHEN t.mined_height > 0 THEN t.mined_height END, 0),
-           COALESCE((SELECT m.block_id     FROM tx_mined m WHERE m.txid = t.txid
-                      ORDER BY m.mined_height, m.block_id LIMIT 1),
-                    CASE WHEN t.mined_height > 0 THEN t.block_id END, 0)
+           CASE WHEN t.mined_height > 0 THEN t.mined_height
+                WHEN w.n = 1 THEN w.mined_height ELSE 0 END,
+           CASE WHEN t.mined_height > 0 THEN t.block_id
+                WHEN w.n = 1 THEN w.block_id ELSE 0 END
       FROM taken t
+      LEFT JOIN won w ON w.ukey = t.ukey AND w.txid = t.txid
      WHERE NOT EXISTS (
            SELECT 1 FROM utxo u
             WHERE u.leaf = (get_byte(t.txid, 0) & 7)::smallint
@@ -158,7 +168,14 @@ held AS (
        AND u.ukey = b.ukey
        AND u.txid = b.ptxid
 )
-SELECT (SELECT count(*) FROM restored), (SELECT count(*) FROM items), (SELECT count(*) FROM live_before)`
+SELECT (SELECT count(*) FROM restored),
+       (SELECT count(*) FROM items),
+       (SELECT count(*) FROM live_before),
+       (SELECT count(*) FROM won WHERE n = 1),
+       (SELECT count(*) FROM won WHERE n = 0 AND NOT has_ident),
+       (SELECT count(*) FROM won WHERE n > 1),
+       (SELECT string_agg(encode(txid, 'hex'), ',')
+          FROM (SELECT DISTINCT txid FROM won WHERE (n = 0 AND NOT has_ident) OR n > 1 LIMIT 10) AS bad)`
 
 // Unspend restores previously spent UTXOs from the spend journal.
 //
@@ -202,11 +219,60 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		return nil
 	}
 
-	var restored, requested, alreadyLive int
+	// One short transaction of three statements: the shared fence lock first and on its own,
+	// because whether a restored pair is (0,0) is not known until the undo row has been read;
+	// the fence, read after the lock so it cannot move under the restore; then the restore.
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][Unspend] begin", err)
+	}
 
-	if err := s.pool.QueryRow(ctx, unspendSQL, ukeys, ptxids, stxids, extraFlags).
-		Scan(&restored, &requested, &alreadyLive); err != nil {
+	defer func() { _ = dbTx.Rollback(ctx) }()
+
+	fence, err := s.takeFenceShared(ctx, dbTx)
+	if err != nil {
+		return err
+	}
+
+	var (
+		restored, requested, alreadyLive int
+		repaired, noSource, ambiguous    int
+		offending                        *string
+	)
+
+	if err := dbTx.QueryRow(ctx, unspendSQL, ukeys, ptxids, stxids, extraFlags,
+		int32(fence.droppedFloor), int32(fence.fence)). //nolint:gosec // heights fit int32
+		Scan(&restored, &requested, &alreadyLive, &repaired, &noSource, &ambiguous, &offending); err != nil {
 		return errors.NewStorageError("[utxoset][Unspend] restore", err)
+	}
+
+	// One bad UTXO fails the whole call, before the commit, so no UTXO of the call is restored
+	// and no undo copy is consumed. That matches how the accounting failure below behaves.
+	if noSource > 0 || ambiguous > 0 {
+		names := ""
+		if offending != nil {
+			names = *offending
+		}
+
+		if noSource > 0 {
+			unspendRepairNoSource.Inc()
+
+			return errors.NewStorageError("[utxoset][Unspend] %d UTXOs restored at (0,0) have no containment row below the stamp fence %d and no identity row, so nothing could ever stamp them; the call is rolled back (%s)",
+				noSource, fence.fence, names)
+		}
+
+		unspendRepairAmbiguous.Inc()
+
+		return errors.NewStorageError("[utxoset][Unspend] %d UTXOs restored at (0,0) have more than one containment row below the stamp fence %d, where every row should name a winner; the call is rolled back (%s)",
+			ambiguous, fence.fence, names)
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return errors.NewStorageError("[utxoset][Unspend] commit", err)
+	}
+
+	if repaired > 0 {
+		unspendRepaired.Add(float64(repaired))
 	}
 
 	if restored+alreadyLive != requested {

@@ -129,6 +129,7 @@ mined AS (
                                        THEN m.flags | $6::smallint
                                        ELSE m.flags & ~$6::smallint END
       FROM k WHERE m.txid = k.txid
+       AND m.mined_height >= $7::int
 ),
 hit AS (
     SELECT c.leaf, c.ukey, k.txid
@@ -218,7 +219,10 @@ func (s *Store) setLockedDirect(ctx context.Context, txHashes []chainhash.Hash, 
 		}
 	}
 
-	if _, err := dbTx.Exec(ctx, setLockedSQL, leaves, txids, los, his, value, FlagLocked); err != nil {
+	// The containment arm carries the lookup floor, so it plans and locks the same partitions
+	// at any stamp lag. A row below the floor never supplies the locked bit to a reader (see
+	// the tier-2 read, which masks it), so a copy of the bit left stale there loses nothing.
+	if _, err := dbTx.Exec(ctx, setLockedSQL, leaves, txids, los, his, value, FlagLocked, s.lookupFloor()); err != nil {
 		_ = dbTx.Rollback(ctx)
 
 		return errors.NewStorageError("[utxoset][SetLocked]", err)

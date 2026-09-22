@@ -1,13 +1,13 @@
 package utxoset
 
 import (
-	"os"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -20,43 +20,15 @@ import (
 // The rule every test checks: once the window holding a transaction's containment rows is gone,
 // whatever still answers for that transaction must name the block that is on the longest chain.
 //
-// All four pass as plain assertions now. The knownDefect guard below is the expected-failure
-// wrapper the measured-failure tests in measured_failures_test.go still use for the two of
-// theirs that wait on the read path's preservation rule and read order: while a defect is
-// present the test reports itself as a known defect and the suite stays green, and the moment a
-// fix makes the correct behaviour appear the test FAILS until the guard is replaced by the
-// plain assertion. So a fix cannot merge while its proof is still switched off.
+// All four pass as plain assertions now. Until the stamp existed three of them sat behind an
+// expected-failure guard that failed the test the moment its defect was fixed, so a fix could
+// not merge while its proof was still switched off; the last guard went with the read path's
+// second tier and the preservation source rule.
 //
 // The design that fixes them is
 // docs/superpowers/specs/2026-09-21-utxoset-block-facts-spec-rebuilt.md. Reproduction 4 was
 // closed by the containment build, which made the un-mine a point delete. Reproductions 1 and 2
 // are closed by the chain-aware stamp, and reproduction 3 by its drop rule.
-
-// knownDefectEnv, when set to any value, runs the real assertions instead, which is how these
-// tests are driven while a fix is being built: they fail with the full expected-versus-actual
-// output rather than reporting a known defect.
-const knownDefectEnv = "UTXOSET_RUN_KNOWN_DEFECTS"
-
-// knownDefect is the expected-failure guard. fixed reports whether the store already gives the
-// correct answer; assert holds the real assertions.
-func knownDefect(t *testing.T, defect string, fixed bool, assert func()) {
-	t.Helper()
-
-	if os.Getenv(knownDefectEnv) != "" {
-		assert()
-
-		return
-	}
-
-	if fixed {
-		t.Fatalf("known defect appears FIXED: %s. Replace the knownDefect guard in this test with "+
-			"its plain assertions, so the test guards the fix from now on", defect)
-	}
-
-	t.Skipf("known defect still present, not a regression: %s. See "+
-		"docs/superpowers/specs/2026-09-21-utxoset-block-facts-spec-rebuilt.md; set %s=1 for the full failure",
-		defect, knownDefectEnv)
-}
 
 // TestRetiringWindowStampsTheBlockThatWonTheReorg is reproduction 1: the transaction is mined
 // in M, a competing block F also includes it, and F's chain then wins.
@@ -154,12 +126,11 @@ func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
 // stamped_at, and never while an undo partition covering a height below stamped_at is
 // attached.
 //
-// Two states here. While the undo copy lives, the parent answers. Once the window is gone too,
-// nothing names block 7 and not found is the correct answer, because nothing can spend or
-// unspend this parent any more. The first state is answered today by the read path's first
-// containment read, which carries no height floor; once it does, the same answer comes through
-// the second tier, triggered by the (0,0) undo copy, and a third state joins this test: with the
-// undo copy gone and the window still attached, not found.
+// Three states. While the undo copy lives, the parent answers: its window is below the lookup
+// floor by then, so the answer comes through the second tier, triggered by the (0,0) undo copy.
+// Once the undo copy's partition has dropped, nothing triggers a read of the window even though
+// it is still attached, and not found is the correct answer, because nothing can spend or
+// unspend this parent any more. Once the window is gone too, the same.
 func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -179,9 +150,24 @@ func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *te
 	// The undo copy's partition drops at tip 1,728; the window cannot drop before 2,591.
 	require.NoError(t, s.SetBlockHeight(1727))
 
+	require.Equal(t, int32(864), s.lookupFloor(), "window 0 is out of the first tier")
+
+	tier2Before := testutil.ToFloat64(lookupTier2Keys.WithLabelValues("undo_zero"))
+
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err, "a mined parent whose last UTXO was spent must still be found while its undo copy lives")
 	require.Equal(t, []uint32{7}, got.BlockIDs)
+	require.Equal(t, tier2Before+1, testutil.ToFloat64(lookupTier2Keys.WithLabelValues("undo_zero")), "through the second tier")
+
+	// The undo copy's partition drops at 1,728. The window is still attached, and nothing
+	// triggers a read of it.
+	require.NoError(t, s.SetBlockHeight(1728))
+	_, err = s.dropSpendJournalPartitionsBelow(ctx, 1728-s.journalRetention)
+	require.NoError(t, err)
+	require.True(t, windowAttached(t, s, ctx, 0))
+
+	_, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "no trigger is left, and nothing can ask")
 
 	require.Equal(t, 1, dropStamped(t, s, ctx, tip), "the window drops once every undo copy of its UTXOs is gone")
 

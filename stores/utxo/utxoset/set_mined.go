@@ -23,12 +23,14 @@ import (
 // The payload -- size, fee, inpoints, locktime, created_at, created_height and flags -- is what
 // a lookup needs to answer from the row alone once the identity row is gone, and it is copied
 // from the identity row when there is one. Otherwise it is copied from an existing containment
-// row of the same transaction, which is the coinbase's case on the reorg path and the case of a
-// block re-offered under a fresh id: the row that carries tx_inpoints is preferred, then the
-// lowest (mined_height, block_id), so the choice is deterministic and a thin block-path row
-// never outranks a full one. A transaction with neither has no payload to copy and is not
-// inserted, which is what lets the postcondition still catch a transaction the store does not
-// hold.
+// row of the same transaction at or above the lookup floor ($6), which is the coinbase's case on
+// the reorg path and the case of a block re-offered under a fresh id: the row that carries
+// tx_inpoints is preferred, then the lowest (mined_height, block_id), so the choice is
+// deterministic and a thin block-path row never outranks a full one. A transaction with neither
+// has no payload to copy and is not inserted, which is what lets the postcondition still catch a
+// transaction the store does not hold. The floor keeps the probe to the same partitions at any
+// stamp lag; every existing row this read must find is near the tip (a re-offered block is at
+// its first attempt's height, and the two duplicate coinbases are 158 and 30 blocks apart).
 //
 // THE LEAF IS A SCALAR AND THE TXIDS AN ARRAY, so this runs once per leaf group. See leafGroups
 // for the measurements: it is the only one of the three key shapes whose cost is a function of
@@ -52,6 +54,7 @@ SELECT k.txid, $3::int, $4::int, $5::int, p.created_height, p.size_in_bytes, p.f
            m.created_at, m.flags
       FROM tx_mined m
      WHERE m.txid = k.txid
+       AND m.mined_height >= $6::int
      ORDER BY (m.tx_inpoints IS NULL), m.mined_height, m.block_id
      LIMIT 1)
    ORDER BY pri LIMIT 1 OFFSET 0
@@ -141,6 +144,14 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		return map[chainhash.Hash][]uint32{}, nil
 	}
 
+	// The read-back's floor is the lower of the lookup floor and the start of the window
+	// holding this block, so the call always sees the row it has just written, or the row a
+	// fenced replay found, even when the stamp is more than a window late.
+	floor := s.lookupFloor()
+	if w := int32(info.BlockHeight / TxMinedPartitionBlocks * TxMinedPartitionBlocks); w < floor { //nolint:gosec // a height fits int32
+		floor = w
+	}
+
 	if info.UnsetMined {
 		if err := s.unMine(ctx, txids, info); err != nil {
 			return nil, err
@@ -151,16 +162,46 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		// discarded. Tolerated means it does not error, NOT that the answer is empty.
 		// Transactions that DO still exist must still appear, which the conformance suite
 		// checks, and they answer from whatever containment they have left.
-		return s.minedIDsByTxid(ctx, txids)
+		return s.minedIDsByTxid(ctx, txids, floor)
 	}
 
-	if err := s.recordMined(ctx, txids, info); err != nil {
-		return nil, err
-	}
-
-	out, err := s.minedIDsByTxid(ctx, txids)
+	quiet, err := s.recordMined(ctx, txids, info)
 	if err != nil {
 		return nil, err
+	}
+
+	out, err := s.minedIDsByTxid(ctx, txids, floor)
+	if err != nil {
+		return nil, err
+	}
+
+	// A success below the fence that inserted nothing reports the submitted block id for every
+	// hash, or the caller's coverage check (model/update-tx-mined.go) would count a gap and the
+	// retry loop the quiet outcome exists to end would run anyway.
+	if quiet {
+		for _, h := range hashes {
+			if h == nil {
+				continue
+			}
+
+			ids := out[*h]
+
+			found := false
+
+			for _, id := range ids {
+				if id == info.BlockID {
+					found = true
+
+					break
+				}
+			}
+
+			if !found {
+				out[*h] = append(ids, info.BlockID)
+			}
+		}
+
+		return out, nil
 	}
 
 	for _, h := range hashes {
@@ -176,32 +217,86 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	return out, nil
 }
 
-// recordMined inserts the containment rows and, on the longest chain, clears the markers.
+// recordMined inserts the containment rows and, on the longest chain, clears the markers. It
+// reports quiet = true when it wrote no containment row on purpose, below the fence.
 //
 // ensureTxMinedPartition runs BEFORE the transaction opens, because the DDL needs its own pool
-// connection; the same rule the create path follows.
+// connection; the same rule the create path follows. It refuses a dropped window, so a call
+// that names one never reaches the fence.
+//
+// The fence lock is the transaction's first statement, and the fence is read as its second.
+// Below the fence the rule is: a block off the longest chain inserts nothing and returns
+// success, counted, because a valid fork block deeper than 288 that cannot win is still
+// recorded by block validation and must settle; a block on the longest chain whose rows all
+// exist is a replay, which skips the insert and still writes the markers; a block on the
+// longest chain with any row absent is the boundary error, because the main chain cannot run
+// 288 blocks past a block whose containment is unwritten, so that state means a refusal was
+// bypassed.
 //
 // The insert and the marker write are ONE TRANSACTION so a reader never sees a transaction
 // whose marker is clear before its containment row exists. The reverse order of exposure --
 // containment present, marker still set -- is a state the store already tolerates, because a
 // fork block followed by a main-chain block produces it, and block assembly's load fix-up
 // repairs it.
-func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.MinedBlockInfo) error {
+func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.MinedBlockInfo) (quiet bool, err error) {
 	if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
-		return err
+		return false, err
 	}
 
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return errors.NewStorageError("[utxoset][SetMinedMulti] begin", err)
+		return false, errors.NewStorageError("[utxoset][SetMinedMulti] begin", err)
 	}
 
-	for _, g := range leafGroups(txids) {
-		if _, err := dbTx.Exec(ctx, recordMinedSQL, g.leaf, g.txids,
-			int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx)); err != nil { //nolint:gosec // heights and ids fit
-			_ = dbTx.Rollback(ctx)
+	defer func() { _ = dbTx.Rollback(ctx) }()
 
-			return errors.NewStorageError("[utxoset][SetMinedMulti] record mined", err)
+	fence, err := s.takeFenceShared(ctx, dbTx)
+	if err != nil {
+		return false, err
+	}
+
+	insert := true
+
+	if fence.dropped(info.BlockHeight) {
+		if info.OnLongestChain {
+			return false, boundaryError("record_mined", "block %d at height %d is on the longest chain and its window is dropped; its mined status was never written, so a refusal above was bypassed",
+				info.BlockID, info.BlockHeight)
+		}
+
+		fenceNoops.WithLabelValues("dropped_skip").Inc()
+
+		return true, nil
+	}
+
+	if fence.fenced(info.BlockHeight) {
+		n, err := fencedRowCount(ctx, dbTx, txids, info.BlockHeight, info.BlockID)
+		if err != nil {
+			return false, err
+		}
+
+		switch {
+		case n == int64(len(txids)):
+			// A replay of a write that already happened. The insert is skipped; the marker
+			// write goes ahead as on any replay.
+		case info.OnLongestChain:
+			return false, boundaryError("record_mined", "block %d at height %d is on the longest chain, below the stamp fence %d, and %d of its %d transactions have no containment row",
+				info.BlockID, info.BlockHeight, fence.fence, int64(len(txids))-n, len(txids))
+		default:
+			fenceNoops.WithLabelValues("off_chain_insert").Inc()
+		}
+
+		insert = false
+		quiet = true
+	}
+
+	floor := s.lookupFloor()
+
+	for _, g := range leafGroups(txids) {
+		if insert {
+			if _, err := dbTx.Exec(ctx, recordMinedSQL, g.leaf, g.txids,
+				int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx), floor); err != nil { //nolint:gosec // heights and ids fit
+				return false, errors.NewStorageError("[utxoset][SetMinedMulti] record mined", err)
+			}
 		}
 
 		if !info.OnLongestChain {
@@ -209,17 +304,15 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 		}
 
 		if _, err := dbTx.Exec(ctx, clearMarkerSQL, g.leaf, g.txids); err != nil {
-			_ = dbTx.Rollback(ctx)
-
-			return errors.NewStorageError("[utxoset][SetMinedMulti] clear marker", err)
+			return false, errors.NewStorageError("[utxoset][SetMinedMulti] clear marker", err)
 		}
 	}
 
 	if err := dbTx.Commit(ctx); err != nil {
-		return errors.NewStorageError("[utxoset][SetMinedMulti] commit record mined", err)
+		return false, errors.NewStorageError("[utxoset][SetMinedMulti] commit record mined", err)
 	}
 
-	return nil
+	return quiet, nil
 }
 
 // unMine takes one block back off the listed transactions: a point delete of that block's
@@ -267,12 +360,48 @@ func (s *Store) unMine(ctx context.Context, txids [][]byte, info utxo.MinedBlock
 		return errors.NewStorageError("[utxoset][SetMinedMulti] begin", err)
 	}
 
-	deleted, err := queryTxidFlags(ctx, dbTx, unMineSQL, txids,
-		int32(info.BlockHeight), int32(info.BlockID)) //nolint:gosec // heights and ids fit
-	if err != nil {
-		_ = dbTx.Rollback(ctx)
+	defer func() { _ = dbTx.Rollback(ctx) }()
 
-		return errors.NewStorageError("[utxoset][SetMinedMulti] un-mine", err)
+	// Below the fence a row that exists is a winner, and deleting it would take the chain
+	// out from under a stamped UTXO: the boundary error. An un-mine that finds no row there
+	// is an invalid deep fork block whose row was a loser and is already gone: allowed and
+	// counted, so its mined status can settle. A dropped window is skipped the same way.
+	fence, err := s.takeFenceShared(ctx, dbTx)
+	if err != nil {
+		return err
+	}
+
+	del := true
+
+	switch {
+	case fence.dropped(info.BlockHeight):
+		fenceNoops.WithLabelValues("dropped_skip").Inc()
+
+		return nil
+	case fence.fenced(info.BlockHeight):
+		n, err := fencedRowCount(ctx, dbTx, txids, info.BlockHeight, info.BlockID)
+		if err != nil {
+			return err
+		}
+
+		if n > 0 {
+			return boundaryError("un_mine", "block %d at height %d is below the stamp fence %d and %d of its transactions still have a containment row there; every row below the fence names a winner",
+				info.BlockID, info.BlockHeight, fence.fence, n)
+		}
+
+		fenceNoops.WithLabelValues("unmine_absent").Inc()
+
+		del = false
+	}
+
+	var deleted []txidFlags
+
+	if del {
+		deleted, err = queryTxidFlags(ctx, dbTx, unMineSQL, txids,
+			int32(info.BlockHeight), int32(info.BlockID)) //nolint:gosec // heights and ids fit
+		if err != nil {
+			return errors.NewStorageError("[utxoset][SetMinedMulti] un-mine", err)
+		}
 	}
 
 	reached := make(map[chainhash.Hash]struct{}, len(txids))
@@ -280,8 +409,6 @@ func (s *Store) unMine(ctx context.Context, txids [][]byte, info utxo.MinedBlock
 	for _, g := range leafGroups(txids) {
 		marked, err := queryTxids(ctx, dbTx, setMarkerSQL, g.leaf, g.txids, height)
 		if err != nil {
-			_ = dbTx.Rollback(ctx)
-
 			return errors.NewStorageError("[utxoset][SetMinedMulti] set marker", err)
 		}
 
@@ -436,7 +563,7 @@ func leafGroups(txids [][]byte) []leafBatch {
 // recoverable, quietly recording nothing is not. That is why the per-transaction failures are
 // collected and returned instead of being handed back alongside the answers, as they are on
 // the BatchDecorate path this result type was written for.
-func (s *Store) minedIDsByTxid(ctx context.Context, txids [][]byte) (map[chainhash.Hash][]uint32, error) {
+func (s *Store) minedIDsByTxid(ctx context.Context, txids [][]byte, floor int32) (map[chainhash.Hash][]uint32, error) {
 	hashes := make([]chainhash.Hash, 0, len(txids))
 
 	for _, txid := range txids {
@@ -448,7 +575,7 @@ func (s *Store) minedIDsByTxid(ctx context.Context, txids [][]byte) (map[chainha
 	}
 
 	res := newLookupResult(len(hashes))
-	if err := s.readMinedInto(ctx, hashes, &res); err != nil {
+	if err := s.readMinedInto(ctx, hashes, &res, floor); err != nil {
 		return nil, err
 	}
 

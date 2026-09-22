@@ -581,7 +581,29 @@ func (s *Store) runIdentPlan(ctx context.Context, q querier, p *createPlan) erro
 }
 
 // runMinedPlan claims the block-path half of a plan on the containment table.
+//
+// It takes the fence lock shared first. The per-transaction locks of lockTxids are already
+// held by then, and that order cannot deadlock: the stamp's exclusive holder takes no
+// per-transaction lock, and shared holders do not block each other. Below the fence the batch
+// is judged per block by the fenced rule before the claim runs: every row present means a
+// re-offered block, which the claim then refuses with ErrTxExists as it does above the fence;
+// any row absent is the boundary error, because a create there would add a row where every
+// row is a winner. A dropped window is refused as it always was.
 func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) error {
+	dbTx, ok := q.(pgx.Tx)
+	if !ok {
+		return errors.NewProcessingError("[utxoset][Create] the block-path claim needs a transaction for the fence lock")
+	}
+
+	fence, err := s.takeFenceShared(ctx, dbTx)
+	if err != nil {
+		return err
+	}
+
+	if err := s.judgeFencedCreates(ctx, dbTx, p, fence); err != nil {
+		return err
+	}
+
 	rows, err := q.Query(ctx, createMinedPlanSQL,
 		p.idx, p.leaves, p.txids, p.heights, p.minedHeight, p.blockID, p.subtreeIdx,
 		p.sizes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
@@ -592,6 +614,43 @@ func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) erro
 	}
 
 	return p.settle(rows)
+}
+
+// judgeFencedCreates applies the fenced rule to every block of the plan whose height is below
+// the fence. A batch can carry several blocks, so the count is taken per (height, block id).
+func (s *Store) judgeFencedCreates(ctx context.Context, q querier, p *createPlan, fence fenceState) error {
+	type blockKey struct{ height, block int32 }
+
+	groups := map[blockKey][][]byte{}
+
+	for i := range p.txids {
+		h := uint32(p.minedHeight[i]) //nolint:gosec // a height is never negative
+		if h >= fence.fence {
+			continue
+		}
+
+		if fence.dropped(h) {
+			return boundaryError("create", "block %d at height %d is in a dropped window; re-creating it would claim every transaction in it afresh",
+				p.blockID[i], p.minedHeight[i])
+		}
+
+		k := blockKey{p.minedHeight[i], p.blockID[i]}
+		groups[k] = append(groups[k], p.txids[i])
+	}
+
+	for k, txids := range groups {
+		n, err := fencedRowCount(ctx, q, txids, uint32(k.height), uint32(k.block)) //nolint:gosec // heights and ids fit
+		if err != nil {
+			return err
+		}
+
+		if n != int64(len(txids)) {
+			return boundaryError("create", "block %d at height %d is below the stamp fence %d and %d of its %d transactions have no containment row; a create there would add a row where every row is a winner",
+				k.block, k.height, fence.fence, int64(len(txids))-n, len(txids))
+		}
+	}
+
+	return nil
 }
 
 // settle reads back which claims took and reports the rest as transactions the store holds.
