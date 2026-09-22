@@ -121,10 +121,11 @@ func inpointsFromTx(t *testing.T, tx *bt.Tx) subtree.TxInpoints {
 // of the field-set trim above: a store that is asked for fields.TxInpoints hands
 // back a nil Tx, so nothing in the walk may read txMeta.Tx.
 //
-// This is the real SQL shape, not a contrived one. sql.Store.getUnbatched
-// assigns meta.Data.Tx only when fields.Tx was requested, and
-// utxostore_getBatcherSize defaults to 1, which leaves sql.Store.getBatcher nil
-// and routes every Get down that unbatched path. Aerospike hides the problem
+// This is the real SQL shape, not a contrived one. Both SQL read paths attach
+// meta.Data.Tx only for fields.Tx or fields.Outputs. settings.conf sets
+// utxostore_getBatcherSize to 4096, so a Get normally takes the batched path,
+// and sendGetBatch decorates each field set on its own, so a batch-mate's
+// fields.Tx cannot hand this call a Tx either. Aerospike hides the problem
 // because addAbstractedBins pulls fields.Inputs in behind fields.TxInpoints and
 // the fields.Inputs case builds a Tx.
 func TestGetCounterConflictingTxHashesWithoutTransactionBody(t *testing.T) {
@@ -188,4 +189,41 @@ func TestGetCounterConflictingTxHashesErrorsOnMissingParentRecord(t *testing.T) 
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 	mockStore.AssertExpectations(t)
+}
+
+// TestSelectCountersForDemotedTxAsksForOutpointsNotTheWholeTx pins the field
+// set selectCountersForDemotedTx asks for on each candidate counter, and that it
+// picks the counter from the inpoints alone. The candidate record carries no
+// Tx, so a walk that fell back to Tx.Inputs would select nothing, and a future
+// edit that widens the request back to fields.Tx fails here.
+func TestSelectCountersForDemotedTxAsksForOutpointsNotTheWholeTx(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	parentHash := createTestHash("parent-tx")
+	candidateHash := createTestHash("counter-tx")
+	demotedTx := createTestTransactionWithInputs(parentHash, 2)
+
+	mockStore.On("Get", mock.Anything, &parentHash, mock.Anything).
+		Return(&meta.Data{ConflictingChildren: []chainhash.Hash{candidateHash}}, nil)
+
+	var askedFor []fields.FieldName
+
+	mockStore.On("Get", mock.Anything, &candidateHash, mock.Anything).
+		Run(func(args mock.Arguments) {
+			askedFor = requestedFields(args)
+		}).
+		Return(&meta.Data{
+			TxInpoints:  inpointsFromTx(t, createTestTransactionWithInputs(parentHash, 2)),
+			Conflicting: true,
+		}, nil)
+
+	result, err := selectCountersForDemotedTx(ctx, mockStore, demotedTx, map[chainhash.Hash]struct{}{})
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{candidateHash}, result)
+
+	require.Contains(t, askedFor, fields.TxInpoints)
+	require.NotContains(t, askedFor, fields.Tx,
+		"selectCountersForDemotedTx compares outpoints only and must not pull the candidate's transaction body")
+	require.NotContains(t, askedFor, fields.Inputs)
 }

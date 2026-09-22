@@ -3276,8 +3276,8 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 	// markAsConflicting branch below, which writes to the store while
 	// loadUnminedTransactions still holds the unmined iterator open, and on
 	// SQLite that deadlocks. Fixing it means restructuring who writes during the
-	// reload, so it is tracked separately rather than smuggled into a field-set
-	// trim.
+	// reload, so it is tracked separately, in bsv-blockchain/teranode issue 1657
+	// section 1, rather than smuggled into a field-set trim.
 	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.Inputs, fields.Conflicting)
 	if err != nil || txMeta == nil || txMeta.Tx == nil || txMeta.Tx.Inputs == nil {
 		return false

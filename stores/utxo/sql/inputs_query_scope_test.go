@@ -1,10 +1,15 @@
 package sql
 
 import (
+	"bytes"
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
@@ -84,10 +89,11 @@ func TestInputsQuerySQLOmitsBodyColumnsForOutpointScope(t *testing.T) {
 	}
 }
 
-// TestScanTargetsForInputScopeMatchesColumnCount pins the two halves together. A
+// TestInputScanRowTargetsMatchColumnCount pins the two halves together. A
 // column list and a Scan target list that disagree is a runtime error on every
-// row, so count them against each other here instead.
-func TestScanTargetsForInputScopeMatchesColumnCount(t *testing.T) {
+// row, so count them against each other here instead, with and without the
+// leading transaction_id target the batch read adds.
+func TestInputScanRowTargetsMatchColumnCount(t *testing.T) {
 	for _, tc := range []struct {
 		scope inputsQueryScope
 		cols  int
@@ -95,36 +101,107 @@ func TestScanTargetsForInputScopeMatchesColumnCount(t *testing.T) {
 		{inputsQueryOutpoints, 2},
 		{inputsQueryFull, 6},
 	} {
-		var (
-			hashBytes  []byte
-			prevTxIdx  int64
-			input      = &bt.Input{}
-			selectPart = strings.SplitN(inputsQuerySQL(tc.scope, "transaction_id = $1"), " FROM ", 2)[0]
-		)
+		var row inputScanRow
 
-		targets := scanTargetsForInputScope(tc.scope, &hashBytes, &prevTxIdx, input)
-		require.Len(t, targets, tc.cols)
+		selectPart := strings.SplitN(inputsQuerySQL(tc.scope, "transaction_id = $1"), " FROM ", 2)[0]
 		require.Len(t, strings.Split(strings.TrimPrefix(selectPart, "SELECT "), ","), tc.cols)
+
+		require.Len(t, row.scanTargets(tc.scope), tc.cols)
+
+		var txID int
+
+		targets := row.scanTargets(tc.scope, &txID)
+		require.Len(t, targets, tc.cols+1)
+		require.Same(t, &txID, targets[0])
 	}
 }
 
-// TestScanTargetsForOutpointScopeIgnoresInput pins the property the unmined
-// iterator relies on to build its Scan targets once per transaction instead of
-// once per input row: in the outpoint scope the input argument is never touched,
-// so passing nil is safe and the targets can be reused across rows.
-func TestScanTargetsForOutpointScopeIgnoresInput(t *testing.T) {
-	var (
-		hashBytes []byte
-		prevTxIdx int64
-	)
+// TestInputScanRowReuseKeepsEveryInput reads a multi-input transaction back
+// through both read paths and checks every input field by field. Both paths
+// scan all rows into one reused inputScanRow, so this is what shows that no
+// row's scripts, sequence number or outpoint leak into another on the real
+// driver.
+func TestInputScanRowReuseKeepsEveryInput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	var targets []interface{}
+	store, _ := setup(ctx, t)
 
-	require.NotPanics(t, func() {
-		targets = scanTargetsForInputScope(inputsQueryOutpoints, &hashBytes, &prevTxIdx, nil)
+	tx := bt.NewTx()
+
+	for i := 0; i < 3; i++ {
+		parent := chainhash.HashH([]byte{byte(i)})
+
+		input := &bt.Input{
+			PreviousTxOutIndex: uint32(i + 1),
+			PreviousTxSatoshis: uint64(1000 * (i + 1)),
+			PreviousTxScript:   bscript.NewFromBytes(bytes.Repeat([]byte{byte(0x70 + i)}, 20+i)),
+			UnlockingScript:    bscript.NewFromBytes(bytes.Repeat([]byte{byte(0x51 + i)}, 10+i)),
+			SequenceNumber:     uint32(0xfffffff0 + i),
+		}
+		require.NoError(t, input.PreviousTxIDAdd(&parent))
+
+		tx.Inputs = append(tx.Inputs, input)
+	}
+
+	tx.Outputs = append(tx.Outputs, &bt.Output{
+		Satoshis:      500,
+		LockingScript: bscript.NewFromBytes(bytes.Repeat([]byte{0xab}, 25)),
 	})
 
-	require.Len(t, targets, 2)
-	require.Same(t, &hashBytes, targets[0])
-	require.Same(t, &prevTxIdx, targets[1])
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	hash := tx.TxIDChainHash()
+
+	check := func(t *testing.T, got *bt.Tx) {
+		t.Helper()
+
+		require.NotNil(t, got)
+		require.Len(t, got.Inputs, len(tx.Inputs))
+
+		for i, want := range tx.Inputs {
+			in := got.Inputs[i]
+			require.Equal(t, want.PreviousTxID(), in.PreviousTxID(), "input %d parent", i)
+			require.Equal(t, want.PreviousTxOutIndex, in.PreviousTxOutIndex, "input %d vout", i)
+			require.Equal(t, want.PreviousTxSatoshis, in.PreviousTxSatoshis, "input %d satoshis", i)
+			require.Equal(t, want.PreviousTxScript.Bytes(), in.PreviousTxScript.Bytes(), "input %d previous script", i)
+			require.Equal(t, want.UnlockingScript.Bytes(), in.UnlockingScript.Bytes(), "input %d unlocking script", i)
+			require.Equal(t, want.SequenceNumber, in.SequenceNumber, "input %d sequence", i)
+		}
+
+		for i := 1; i < len(got.Inputs); i++ {
+			require.NotSame(t, got.Inputs[0].UnlockingScript, got.Inputs[i].UnlockingScript)
+			require.NotSame(t, got.Inputs[0].PreviousTxScript, got.Inputs[i].PreviousTxScript)
+		}
+
+		require.Equal(t, tx.ExtendedBytes(), got.ExtendedBytes())
+	}
+
+	t.Run("unbatched", func(t *testing.T) {
+		data, err := store.getUnbatched(ctx, hash, []fields.FieldName{fields.Tx})
+		require.NoError(t, err)
+		check(t, data.Tx)
+	})
+
+	t.Run("batched", func(t *testing.T) {
+		items := []*utxo.UnresolvedMetaData{{Hash: *hash, Idx: 0}}
+		require.NoError(t, store.BatchDecorate(ctx, items, fields.Tx))
+		require.NoError(t, items[0].Err)
+		check(t, items[0].Data.Tx)
+	})
+
+	t.Run("outpoint scope", func(t *testing.T) {
+		want, err := subtree.NewTxInpointsFromInputs(tx.Inputs)
+		require.NoError(t, err)
+
+		data, err := store.getUnbatched(ctx, hash, []fields.FieldName{fields.TxInpoints})
+		require.NoError(t, err)
+		require.Equal(t, want.GetTxInpoints(), data.TxInpoints.GetTxInpoints())
+
+		items := []*utxo.UnresolvedMetaData{{Hash: *hash, Idx: 0}}
+		require.NoError(t, store.BatchDecorate(ctx, items, fields.TxInpoints))
+		require.NoError(t, items[0].Err)
+		require.Equal(t, want.GetTxInpoints(), items[0].Data.TxInpoints.GetTxInpoints())
+	})
 }

@@ -18,8 +18,9 @@ import (
 // output. Attaching those inputs to Data.Tx produced a transaction that
 // meta.Data.TxIsSerializable accepts (it has inputs, and any outputs present are
 // non-nil) but whose bytes are not the transaction's. The batch path did that
-// for fields.TxInpoints alone, so the answer also depended on
-// utxostore_getBatcherSize: nil Tx at the default of 1, hollow Tx above it.
+// for fields.TxInpoints alone, so the answer also depended on which path served
+// the Get: nil Tx unbatched, hollow Tx batched. settings.conf sets
+// utxostore_getBatcherSize to 4096, so the batched path is the live one.
 //
 // The end state asserted is the value a caller receives from each path, for
 // each field set, and that the two paths agree.

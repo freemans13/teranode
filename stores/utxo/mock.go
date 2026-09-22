@@ -92,7 +92,10 @@ func (m *MockUtxostore) Get(ctx context.Context, hash *chainhash.Hash, fieldName
 //
 // The derived value goes on a shallow copy, never on the fixture itself. Writing
 // through the fixture pointer would make the gate hold only for the first call,
-// and concurrent Gets on one hash would race on the shared struct.
+// and concurrent Gets on one hash would race on the shared struct. Only
+// TxInpoints is protected by the copy: slice fields such as BlockIDs,
+// SpendingDatas and ConflictingChildren still share their backing arrays with
+// the fixture, so a caller must not write through them.
 func withDerivedTxInpoints(data *meta.Data, fieldNames []fields.FieldName) *meta.Data {
 	if data == nil || data.Tx == nil || len(data.Tx.Inputs) == 0 {
 		return data

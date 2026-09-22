@@ -50,6 +50,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1421,9 +1422,12 @@ func (s *Store) updateParentConflictingChildren(ctx context.Context, transaction
 }
 
 func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
-	// Always use unbatched path for GetMeta — it's called infrequently
-	// and batchDecorateChunk has a known issue where TxInpoints in MetaFields
-	// causes data.Tx to be set when it shouldn't be.
+	// GetMeta reads one transaction and is called infrequently, so it goes
+	// straight to the unbatched path rather than waiting out a batcher window.
+	// The two paths now return the same shape for utxo.MetaFields: neither
+	// attaches Data.Tx for fields.TxInpoints. The one difference left is that
+	// getUnbatched returns a NewTxInpointsFromInputs error where
+	// batchDecorateChunk discards it.
 	result, err := s.getUnbatched(ctx, hash, utxo.MetaFields)
 	if err != nil {
 		return err
@@ -1484,40 +1488,64 @@ func (s *Store) getBatched(ctx context.Context, hash *chainhash.Hash, bins []fie
 
 // sendGetBatch is the batcher callback that processes a batch of get operations
 // in bulk SQL queries via BatchDecorate.
+//
+// The batch is split by field set and each group is decorated with its own
+// fields. BatchDecorate applies one field set to every item it is handed, so
+// decorating the whole batch with the union of its field sets let one caller's
+// fields.Tx widen every batch-mate's read: a fields.TxInpoints Get sharing a
+// window with a fields.Tx Get read all six inputs columns and came back with a
+// Data.Tx it never asked for. Grouping makes the batched answer the same as the
+// unbatched one for a given field set, whoever else is in the window. A window
+// usually carries a handful of distinct field sets, so the cost is that many
+// extra round trips per window, not per item.
 func (s *Store) sendGetBatch(batch []*batchGetItem) {
-	items := make([]*utxo.UnresolvedMetaData, 0, len(batch))
+	groups := make(map[string][]*utxo.UnresolvedMetaData)
+	groupFields := make(map[string][]fields.FieldName)
 
-	// Collect union of all requested fields across the batch
-	fieldSet := make(map[fields.FieldName]struct{})
 	for idx, item := range batch {
-		items = append(items, &utxo.UnresolvedMetaData{
+		key := fieldSetKey(item.fields)
+
+		groups[key] = append(groups[key], &utxo.UnresolvedMetaData{
 			Hash:   item.hash,
 			Idx:    idx,
 			Fields: item.fields,
 		})
-		for _, f := range item.fields {
-			fieldSet[f] = struct{}{}
+
+		if _, ok := groupFields[key]; !ok {
+			groupFields[key] = item.fields
 		}
 	}
 
-	allFields := make([]fields.FieldName, 0, len(fieldSet))
-	for f := range fieldSet {
-		allFields = append(allFields, f)
-	}
+	for key, items := range groups {
+		if err := s.BatchDecorate(s.ctx, items, groupFields[key]...); err != nil {
+			for _, item := range items {
+				batch[item.Idx].done <- batchGetItemData{Err: err}
+			}
 
-	if err := s.BatchDecorate(s.ctx, items, allFields...); err != nil {
-		for _, bItem := range batch {
-			bItem.done <- batchGetItemData{Err: err}
+			continue
 		}
-		return
-	}
 
-	for _, item := range items {
-		batch[item.Idx].done <- batchGetItemData{
-			Data: item.Data,
-			Err:  item.Err,
+		for _, item := range items {
+			batch[item.Idx].done <- batchGetItemData{
+				Data: item.Data,
+				Err:  item.Err,
+			}
 		}
 	}
+}
+
+// fieldSetKey returns a key that is equal for two field lists naming the same
+// fields, whatever their order or repetition.
+func fieldSetKey(bins []fields.FieldName) string {
+	names := make([]string, 0, len(bins))
+	for _, f := range bins {
+		names = append(names, string(f))
+	}
+
+	sort.Strings(names)
+	names = slices.Compact(names)
+
+	return strings.Join(names, ",")
 }
 
 func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
@@ -1594,23 +1622,17 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		}
 		defer rows.Close()
 
+		var scanRow inputScanRow
+
+		scanTargets := scanRow.scanTargets(inputsScope)
+
 		for rows.Next() {
-			input := &bt.Input{}
-
-			var previousTxHashBytes []byte
-			var previousTxIdx int64
-
-			if err := rows.Scan(scanTargetsForInputScope(inputsScope, &previousTxHashBytes, &previousTxIdx, input)...); err != nil {
+			if err := rows.Scan(scanTargets...); err != nil {
 				return nil, err
 			}
-			input.PreviousTxOutIndex = uint32(previousTxIdx)
 
-			previousTxHash, err := chainhash.NewHash(previousTxHashBytes)
+			input, err := scanRow.toInput(inputsScope)
 			if err != nil {
-				return nil, err
-			}
-
-			if err := input.PreviousTxIDAdd(previousTxHash); err != nil {
 				return nil, err
 			}
 
@@ -1803,13 +1825,6 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		}
 	}
 
-	// fields.Outputs is a projection in its own right: the outputs query above
-	// already ran for it, and the validator's re-extension path reads nothing but
-	// Outputs[vout] (GHSA-v76m-6vc7-g7c7). Without this the decoded outputs were
-	// built and then dropped, and Data.Tx came back nil.
-	//
-	// fields.Inputs deliberately not included: it has never attached here, and
-	// widening it would change what existing callers of that projection see.
 	if contains(bins, fields.TxInpoints) {
 		data.TxInpoints, err = subtree.NewTxInpointsFromInputs(tx.Inputs)
 		if err != nil {
@@ -1817,6 +1832,13 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		}
 	}
 
+	// fields.Outputs is a projection in its own right: the outputs query above
+	// already ran for it, and the validator's re-extension path reads nothing but
+	// Outputs[vout] (GHSA-v76m-6vc7-g7c7). Without this the decoded outputs were
+	// built and then dropped, and Data.Tx came back nil.
+	//
+	// fields.Inputs deliberately not included: it has never attached here, and
+	// widening it would change what existing callers of that projection see.
 	if contains(bins, fields.Tx) || contains(bins, fields.Outputs) {
 		// Outpoint-scope inputs carry no unlocking script, sequence number or
 		// previous output. Attached to Data.Tx they would make a transaction that
@@ -1900,23 +1922,61 @@ func inputsQuerySQL(scope inputsQueryScope, whereClause string) string {
 	return "SELECT " + cols + " FROM inputs WHERE " + whereClause + " ORDER BY idx"
 }
 
-// scanTargetsForInputScope returns the Scan destinations matching the column list
-// inputsQuerySQL emitted for the same scope. In the outpoint scope the extended
-// and unlocking fields are left at their zero values, which is what every
-// fields.TxInpoints consumer already expects to be handed.
-func scanTargetsForInputScope(scope inputsQueryScope, hashBytes *[]byte, prevTxIdx *int64, input *bt.Input) []interface{} {
-	targets := []interface{}{hashBytes, prevTxIdx}
+// inputScanRow holds the Scan destinations for one row of the inputs table. A
+// read builds one, and its target list, once per query and scans every row into
+// the same fields, rather than allocating a fresh target slice per input row.
+//
+// Reuse is safe because database/sql never lets one row's values alias the
+// next: a *[]byte destination receives a copy, and a **bscript.Script
+// destination receives a newly allocated Script on every Scan (or nil for a NULL
+// column). toInput hands those per-row values to a new bt.Input.
+type inputScanRow struct {
+	prevTxHash   []byte
+	prevTxIdx    int64
+	prevSatoshis uint64
+	prevScript   *bscript.Script
+	unlocking    *bscript.Script
+	sequence     uint32
+}
+
+// scanTargets returns the Scan destinations matching the column list
+// inputsQuerySQL emits for the scope, after any leading targets the query
+// selects first (the batch read leads with transaction_id).
+func (r *inputScanRow) scanTargets(scope inputsQueryScope, leading ...interface{}) []interface{} {
+	targets := make([]interface{}, 0, len(leading)+6)
+	targets = append(targets, leading...)
+	targets = append(targets, &r.prevTxHash, &r.prevTxIdx)
 
 	if scope == inputsQueryFull {
-		targets = append(targets,
-			&input.PreviousTxSatoshis,
-			&input.PreviousTxScript,
-			&input.UnlockingScript,
-			&input.SequenceNumber,
-		)
+		targets = append(targets, &r.prevSatoshis, &r.prevScript, &r.unlocking, &r.sequence)
 	}
 
 	return targets
+}
+
+// toInput builds the input for the row just scanned. In the outpoint scope the
+// extended and unlocking fields are left at their zero values, which is what
+// every fields.TxInpoints consumer already expects to be handed.
+func (r *inputScanRow) toInput(scope inputsQueryScope) (*bt.Input, error) {
+	input := &bt.Input{PreviousTxOutIndex: uint32(r.prevTxIdx)}
+
+	if scope == inputsQueryFull {
+		input.PreviousTxSatoshis = r.prevSatoshis
+		input.PreviousTxScript = r.prevScript
+		input.UnlockingScript = r.unlocking
+		input.SequenceNumber = r.sequence
+	}
+
+	previousTxHash, err := chainhash.NewHash(r.prevTxHash)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := input.PreviousTxIDAdd(previousTxHash); err != nil {
+		return nil, err
+	}
+
+	return input, nil
 }
 
 // needsOutputsQuery reports whether the outputs read is required. fields.Utxos is
@@ -3951,32 +4011,25 @@ func (s *Store) batchDecorateInputs(ctx context.Context, ids []int, idToTx map[i
 	}
 	defer rows.Close()
 
+	var (
+		txID    int
+		scanRow inputScanRow
+	)
+
+	scanTargets := scanRow.scanTargets(scope, &txID)
+
 	for rows.Next() {
-		var (
-			txID            int
-			prevTxHashBytes []byte
-		)
-		input := &bt.Input{}
-		var previousTxIdx int64
-
-		scanTargets := append([]interface{}{&txID},
-			scanTargetsForInputScope(scope, &prevTxHashBytes, &previousTxIdx, input)...)
-
 		if err := rows.Scan(scanTargets...); err != nil {
 			return err
 		}
-		input.PreviousTxOutIndex = uint32(previousTxIdx)
 
 		row := idToTx[txID]
 		if row == nil {
 			continue
 		}
 
-		previousTxHash, err := chainhash.NewHash(prevTxHashBytes)
+		input, err := scanRow.toInput(scope)
 		if err != nil {
-			return err
-		}
-		if err := input.PreviousTxIDAdd(previousTxHash); err != nil {
 			return err
 		}
 

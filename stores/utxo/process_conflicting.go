@@ -1289,10 +1289,12 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 	}
 
 	// Walk the inpoints, not txMeta.Tx.Inputs. The Get above asks for
-	// fields.TxInpoints only, so txMeta.Tx is nil on the SQL store: getUnbatched
-	// assigns meta.Data.Tx only when fields.Tx was requested, and
-	// utxostore_getBatcherSize defaults to 1, which leaves the get batcher nil and
-	// sends every Get down that unbatched path.
+	// fields.TxInpoints only, so txMeta.Tx is nil on the SQL store on both read
+	// paths. getUnbatched and batchDecorateChunk attach meta.Data.Tx only for
+	// fields.Tx or fields.Outputs. settings.conf sets utxostore_getBatcherSize to
+	// 4096, so the batched path is the live one, and sendGetBatch decorates each
+	// field set separately, so a batch-mate asking for fields.Tx does not widen
+	// this read.
 	//
 	// GetTxInpoints returns the outpoints grouped parent-then-vout rather than in
 	// input order. Only the order of the descendant walks below changes with it,

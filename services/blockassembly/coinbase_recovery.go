@@ -134,6 +134,10 @@ func (b *BlockAssembler) canonicalCoinbaseAt(ctx context.Context, height uint32)
 	// refuse such a record. Reporting it absent sends it to the repair, whose
 	// create tolerates ErrTxExists and clears the flag on aerospike.
 	//
+	// Only aerospike populates Data.Creating. The SQL store never sets it, so on
+	// SQL this probe is a plain existence check, which is no weaker than the
+	// fields.Tx probe it replaced there.
+	//
 	// An external blob that has gone missing under a record is not probed. The
 	// aerospike create writes the blob before any record, so an interrupted
 	// create cannot leave a record without one.

@@ -144,20 +144,13 @@ func (it *unminedTxIterator) readOne(ctx context.Context) (*utxo.UnminedTransact
 
 	tx := bt.Tx{}
 
-	var (
-		previousTxHashBytes []byte
-		previousTxHash      *chainhash.Hash
-		previousTxIdx       int64
-	)
-
 	// Built once per transaction rather than once per input row: this runs for
 	// every input of every unmined transaction at each block assembly restart.
-	// The outpoint scope never writes through the input argument, so nil is safe.
-	scanTargets := scanTargetsForInputScope(inputsQueryOutpoints, &previousTxHashBytes, &previousTxIdx, nil)
+	var scanRow inputScanRow
+
+	scanTargets := scanRow.scanTargets(inputsQueryOutpoints)
 
 	for rows.Next() {
-		input := &bt.Input{}
-
 		if err = rows.Scan(scanTargets...); err != nil {
 			if err = it.Close(); err != nil {
 				it.store.logger.Warnf(errFailedCloseIterator, err)
@@ -165,23 +158,14 @@ func (it *unminedTxIterator) readOne(ctx context.Context) (*utxo.UnminedTransact
 
 			return nil, err
 		}
-		input.PreviousTxOutIndex = uint32(previousTxIdx)
 
-		previousTxHash, err = chainhash.NewHash(previousTxHashBytes)
-		if err != nil {
+		input, inputErr := scanRow.toInput(inputsQueryOutpoints)
+		if inputErr != nil {
 			if err = it.Close(); err != nil {
 				it.store.logger.Warnf(errFailedCloseIterator, err)
 			}
 
-			return nil, err
-		}
-
-		if err = input.PreviousTxIDAdd(previousTxHash); err != nil {
-			if err = it.Close(); err != nil {
-				it.store.logger.Warnf(errFailedCloseIterator, err)
-			}
-
-			return nil, err
+			return nil, inputErr
 		}
 
 		tx.Inputs = append(tx.Inputs, input)
