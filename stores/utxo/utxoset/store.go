@@ -268,6 +268,21 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.checkpoints = tSettings.ChainCfgParams.Checkpoints
 	}
 
+	// Refused BEFORE the schema is installed and before any write, beside the schema gate. On
+	// this store the pruner is not only the drop: under the block-facts design it also runs
+	// the deep stamp, the pass that writes each block onto the UTXOs of transactions seen
+	// before their block and deletes their identity rows. Skipping the pruner during catch-up
+	// would switch off both the stamp and every window drop for the whole of catch-up, and
+	// the disk would fill in silence. The stamp always runs on this store and has no off
+	// switch. An operator who wants to keep every window has a different lever coming: the
+	// explicit retain-indefinitely setting for drops that build step 5 adds.
+	if tSettings.Pruner.SkipDuringCatchup {
+		pool.Close()
+
+		return nil, errors.NewConfigurationError(
+			"[utxoset] pruner_skipDuringCatchup is true, and the utxoset store refuses to start with it: on this store the pruner also runs the stamp, so skipping it during catch-up switches off the stamp and every window drop for the whole catch-up and fills the disk in silence. The stamp always runs and has no off switch. To keep windows past their retention use the explicit retain-indefinitely setting for drops instead of skipping the pruner")
+	}
+
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)
