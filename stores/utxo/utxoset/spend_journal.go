@@ -9,9 +9,19 @@ import (
 )
 
 // SpendJournalPartitionBlocks is the width of one journal leaf. The pruner drops whole leaves,
-// so retention is granular to this. At the measured frontier (~20,000 spends/block) a leaf
-// holds roughly 960,000 rows.
-const SpendJournalPartitionBlocks = 48
+// so retention is granular to this. At MEASURED mainnet rates near height 945,000, about
+// 55,000 transactions a block, a leaf holds on the order of 16 million rows.
+//
+// 288, not the 48 it was. Every statement that has no height to prune on plans and locks
+// every live leaf, and the store re-plans every execution, so the live leaf count is a
+// direct cost on the block path: MEASURED on mainnet 2026-09-16, the spent-parent lookup
+// planned in 59 ms and took 2,023 locks across 850 leaves. At 288 the steady state is six
+// live leaves against 31, the same cadence as the membership windows, and a conflict note's
+// window always exists whenever its journal leaf does, exactly as before. The price is that
+// a spend stays undoable for up to 287 blocks longer than retention, INFERRED at about
+// 2.2 GB at tip rates. A wider leaf is also more rows for one autovacuum to clear; the
+// per-leaf autovacuum threshold below was sized for 48 blocks and is a soak-set value.
+const SpendJournalPartitionBlocks = 288
 
 // DefaultSpendJournalRetentionBlocks is how far back a spend stays undoable.
 //
@@ -23,7 +33,7 @@ const SpendJournalPartitionBlocks = 48
 // assumed) leaves the budget at roughly 60-66% even at this depth, so the correct number
 // is affordable.
 //
-// Steady-state leaf count is retention/SpendJournalPartitionBlocks + 1 = 31 tables. Bounded, and
+// Steady-state leaf count is retention/SpendJournalPartitionBlocks + 1 = 6 tables. Bounded, and
 // dropped as the chain advances.
 const DefaultSpendJournalRetentionBlocks = 1440
 
@@ -347,7 +357,7 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	//
 	// The listing query has no ORDER BY, so without this the catalog hands leaves back in
 	// whatever order it scanned them, which shifts as tables are created and dropped. With
-	// one leaf retiring every 48 blocks and nothing behind, order is irrelevant. With
+	// one leaf retiring every 288 blocks and nothing behind, order is irrelevant. With
 	// thousands outstanding it decides which work gets done before the session ends, and a
 	// session ends when the daemon is restarted rather than when the work runs out.
 	//

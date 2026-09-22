@@ -419,7 +419,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 // than a read of s.GetBlockHeight() here so that it cannot differ from the height whose
 // window the caller ensured. The note lands in a height-partitioned window that only the
 // caller can create -- the DDL needs its own pool connection, and this function already holds
-// a transaction from the same pool -- so a second read of the tip that crossed a 48-block
+// a transaction from the same pool -- so a second read of the tip that crossed a leaf
 // boundary in between would insert into a partition that does not exist. It is ignored unless
 // the create is conflicting.
 func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeight, notedHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {

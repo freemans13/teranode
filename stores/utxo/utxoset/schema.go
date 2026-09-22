@@ -250,7 +250,7 @@ CREATE TABLE IF NOT EXISTS spend_journal (
 -- any row carrying the column, pinning contested transactions in the mempool table forever.
 -- Keyed on the txid alone, this answers for a parent in either table, or in neither.
 --
--- RANGE partitioned on noted_height, in the SAME 48-block windows as the spend journal and
+-- RANGE partitioned on noted_height, in the SAME 288-block windows as the spend journal and
 -- created by the same DDL statement, so a window exists whenever its journal leaf does. It is
 -- dropped in the same pass and on the same cutoff, which is the honest retention: the journal
 -- is what conflict resolution restores the losing spends FROM, so a note whose journal leaf

@@ -247,7 +247,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
 	plan := s.planConflicting(named, inpoints)
 
 	// The height is read ONCE and used for both the window and the row, because a second read
-	// that crossed a 48-block boundary would insert into a partition that does not exist.
+	// that crossed a leaf boundary would insert into a partition that does not exist.
 	notedHeight := s.GetBlockHeight()
 
 	// The note's window BEFORE the transaction is opened, never inside it: the DDL needs its

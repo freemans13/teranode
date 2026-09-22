@@ -183,10 +183,11 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
 //
 // The spend height is not known to the reader -- that is the whole point of the step, the
 // caller is asking about a parent it has lost track of -- so there is no partition bound and
-// every live leaf is probed. At the journal's 1440-block retention in 48-block leaves that is
-// 30 leaves, and 500 keys is therefore 15,000 index descents. Measured on this schema at 500
-// keys against 39,990 journal rows across 30 leaves, eight runs: 7.4-9.2 ms, an Index Scan on
-// every leaf's ukey index and no Seq Scan on any of them, flat across all eight. That is the
+// every live leaf is probed. At the journal's 1440-block retention in 288-block leaves that is
+// 6 leaves, and 500 keys is therefore 3,000 index descents. Measured on this schema when the
+// leaves were 48 blocks wide, 500 keys against 39,990 journal rows across 30 leaves, eight
+// runs: 7.4-9.2 ms, an Index Scan on every leaf's ukey index and no Seq Scan on any of them,
+// flat across all eight; at six leaves the same shape does a fifth of the descents. That is the
 // price of the step and it is worth knowing before the soak, because above the highest
 // checkpoint most out-of-block parents reach it.
 //

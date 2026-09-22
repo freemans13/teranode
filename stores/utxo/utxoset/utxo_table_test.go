@@ -381,10 +381,11 @@ func TestSpendWritesJournal(t *testing.T) {
 func TestSpendJournalReclaimIsDrivenByThePruner(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	s.journalRetention = 96 // 2 leaves, so the test does not need 1440 blocks
+	s.journalRetention = 96 // under one leaf, so the test does not need 1440 blocks
 
-	// spend across a span wide enough to roll several leaves over
-	for h := uint32(100); h <= 500; h += 40 {
+	// spend across a span wide enough to roll several leaves over: five leaves, three spends each
+	top := uint32(100 + 4*SpendJournalPartitionBlocks)
+	for h := uint32(100); h <= top; h += SpendJournalPartitionBlocks / 3 {
 		parent := mkTx(t, 1, uint64(1000+h))
 		_, err := s.Create(ctx, parent, h)
 		require.NoError(t, err)
@@ -399,19 +400,19 @@ func TestSpendJournalReclaimIsDrivenByThePruner(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Heights 100..500 at 48 per leaf touch leaves 2,3,4,5,6,7,8,9,10.
-	require.Equal(t, 9, journalLeaves(t, s, ctx),
+	// Heights 100 to 100 + 4 leaves, a third of a leaf apart, touch leaves 0 to 4.
+	require.Equal(t, 5, journalLeaves(t, s, ctx),
 		"the spend path must create leaves and reclaim NOTHING: DETACH CONCURRENTLY waits on every open transaction on the parent")
 
 	svc, err := s.GetPrunerService()
 	require.NoError(t, err)
 
-	n, err := svc.Prune(ctx, 500, "deadbeef")
+	n, err := svc.Prune(ctx, top, "deadbeef")
 	require.NoError(t, err)
 	require.Zero(t, n, "no transaction records are deleted yet, and reporting journal rows in a children-deleted counter would be a lie")
 
-	// retention 96 / 48 per leaf = 2, plus the one being filled, plus at most one not
-	// yet crossed. The point is that it is bounded, not that it is exact.
+	// retention 96 is under one leaf, so the leaf being filled survives, plus at most one
+	// not yet crossed. The point is that it is bounded, not that it is exact.
 	require.LessOrEqual(t, journalLeaves(t, s, ctx), 4,
 		"journal leaves must be reclaimed as the chain advances, not accumulate")
 	require.Positive(t, journalLeaves(t, s, ctx), "recent history must still be retained")
@@ -431,8 +432,10 @@ func TestSpendJournalReclaimRecoversOrphanedPartitions(t *testing.T) {
 
 	s.journalRetention = 96
 
-	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2
-	require.NoError(t, s.ensureSpendJournalPartition(ctx, 500)) // leaf 10
+	// Heights inside leaves 2 and 10, whatever the leaf width is.
+	const leafW = SpendJournalPartitionBlocks
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 2*leafW+4))   // leaf 2
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 10*leafW+20)) // leaf 10
 
 	// Simulate the crash: detach leaf 2 and stop, exactly as a kill between the two
 	// statements would leave it.
@@ -446,7 +449,7 @@ func TestSpendJournalReclaimRecoversOrphanedPartitions(t *testing.T) {
 
 	svc, err := s.GetPrunerService()
 	require.NoError(t, err)
-	_, err = svc.Prune(ctx, 500, "deadbeef")
+	_, err = svc.Prune(ctx, 10*leafW+20, "deadbeef")
 	require.NoError(t, err)
 
 	var stillThere bool
@@ -678,8 +681,10 @@ func spendOnly(ctx context.Context, s *Store, tx *bt.Tx, blockHeight uint32,
 func TestSpendJournalDropTakesTheOldestLeafFirst(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	// Deliberately scrambled: leaves 10, 2, 7, 4 in creation order.
-	for _, h := range []uint32{500, 100, 350, 200} {
+	// Deliberately scrambled: leaves 10, 2, 7, 4 in creation order, at heights inside each
+	// leaf whatever the leaf width is.
+	const leafW = SpendJournalPartitionBlocks
+	for _, h := range []uint32{10*leafW + 20, 2*leafW + 4, 7*leafW + 14, 4*leafW + 8} {
 		require.NoError(t, s.ensureSpendJournalPartition(ctx, h))
 	}
 
