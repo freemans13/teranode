@@ -110,6 +110,10 @@ var _ pruner.Stamper = (*Store)(nil)
 // floorsSQL reads the three floors. floor is a window number and the other two are heights.
 const floorsSQL = `SELECT floor, stamp_fence, stamp_complete_floor FROM tx_mined_floor WHERE id = 0`
 
+// StampDepth is the depth, in blocks, below the tip at which this store's UTXOs get their block
+// written permanently. Nothing may change the chain below it; the rewind tool asks.
+func (s *Store) StampDepth() uint32 { return s.stampDepth }
+
 // Floors is one read of the tx_mined_floor row, as heights.
 func (s *Store) Floors(ctx context.Context) (pruner.StampFloors, error) {
 	return readFloors(ctx, s.pool)

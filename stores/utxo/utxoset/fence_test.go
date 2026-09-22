@@ -382,3 +382,26 @@ func mkSpender(t *testing.T, parent *bt.Tx, vout uint32) *bt.Tx {
 
 	return child
 }
+
+// TestBlockPathCreateAheadOfTheTipIsCounted is decision 1: the window drop rule assumes no block
+// is applied more than 287 heights ahead of the store's height, and the block-path create counts
+// every block that breaks the assumption rather than enforcing it.
+func TestBlockPathCreateAheadOfTheTipIsCounted(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(100))
+
+	before := testutil.ToFloat64(createAheadOfTip)
+
+	inside := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, inside, 387, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 3, BlockHeight: 387, OnLongestChain: true}))
+	require.NoError(t, err)
+	require.Equal(t, before, testutil.ToFloat64(createAheadOfTip), "287 ahead is inside the premise")
+
+	beyond := mkTx(t, 1, 6_000)
+	_, err = s.Create(ctx, beyond, 388, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 4, BlockHeight: 388, OnLongestChain: true}))
+	require.NoError(t, err)
+	require.Equal(t, before+1, testutil.ToFloat64(createAheadOfTip), "288 ahead is counted, and the create still lands")
+	require.Equal(t, 1, utxoCount(t, s, ctx, beyond))
+}

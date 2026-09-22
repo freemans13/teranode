@@ -604,6 +604,8 @@ func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) erro
 		return err
 	}
 
+	s.countCreatesAheadOfTip(p)
+
 	rows, err := q.Query(ctx, createMinedPlanSQL,
 		p.idx, p.leaves, p.txids, p.heights, p.minedHeight, p.blockID, p.subtreeIdx,
 		p.sizes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
@@ -614,6 +616,41 @@ func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) erro
 	}
 
 	return p.settle(rows)
+}
+
+// lookaheadBlocks is how far above the store's own height a block may be applied under the drop
+// rule's premise. The window drop waits one undo partition, 288 blocks, of margin past the tip
+// the stamp completed at, so that a spend journalled above that tip cannot leave a (0,0) undo
+// copy the window no longer covers. The margin holds while no block is applied more than 287
+// heights ahead of the tip the store was last told. A store instance cannot see a block another
+// process is applying, so the premise is not enforced; it is counted, and a non-zero count is
+// the signal that the margin needs revisiting.
+const lookaheadBlocks = 287
+
+// countCreatesAheadOfTip is decision 1's counter: every block-path create whose block is more
+// than lookaheadBlocks above the store's height, counted once per block in the plan and logged.
+func (s *Store) countCreatesAheadOfTip(p *createPlan) {
+	h := s.GetBlockHeight()
+	if h == 0 {
+		return
+	}
+
+	seen := map[int32]struct{}{}
+
+	for i := range p.minedHeight {
+		mh := uint32(p.minedHeight[i]) //nolint:gosec // a height is never negative
+		if mh <= h+lookaheadBlocks {
+			continue
+		}
+
+		if _, dup := seen[p.minedHeight[i]]; dup {
+			continue
+		}
+
+		seen[p.minedHeight[i]] = struct{}{}
+		createAheadOfTip.Inc()
+		s.logger.Warnf("[utxoset][Create] block %d at height %d is being applied %d heights ahead of the store's height %d, past the %d the window drop rule assumes", p.blockID[i], mh, mh-h, h, lookaheadBlocks)
+	}
 }
 
 // judgeFencedCreates applies the fenced rule to every block of the plan whose height is below

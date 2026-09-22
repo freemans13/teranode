@@ -104,6 +104,11 @@ var (
 		Help: "Containment writes below the fence that were skipped and returned success, by kind",
 	}, []string{"kind"})
 
+	createAheadOfTip = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "utxoset_create_ahead_of_tip_total",
+		Help: "Block-path creates applying a block more than 287 heights above the store's height, which the window drop rule assumes never happens",
+	})
+
 	unspendRepaired = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_unspend_repaired_total",
 		Help: "UTXOs restored from a (0,0) undo copy with the pair of their one surviving containment row below the fence",
