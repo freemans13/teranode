@@ -225,6 +225,10 @@ func (c *LocalClient) GetBestBlockHeader(ctx context.Context) (*model.BlockHeade
 	return c.store.GetBestBlockHeader(ctx)
 }
 
+func (c *LocalClient) GetBestBlockHeaderUncached(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	return c.store.GetBestBlockHeaderUncached(ctx)
+}
+
 func (c *LocalClient) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
 	return c.store.GetBlockHeader(ctx, blockHash)
 }

@@ -1670,6 +1670,38 @@ func (b *Blockchain) GetBestBlockHeader(ctx context.Context, empty *emptypb.Empt
 	}, nil
 }
 
+// GetBestBlockHeaderUncached is GetBestBlockHeader with the store's response cache left out,
+// and with the block id and mined flag carried on the response.
+func (b *Blockchain) GetBestBlockHeaderUncached(ctx context.Context, _ *emptypb.Empty) (*blockchain_api.GetBlockHeaderResponse, error) {
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBestBlockHeaderUncached",
+		tracing.WithParentStat(b.stats),
+		tracing.WithHistogram(prometheusBlockchainGetBestBlockHeader),
+	)
+	defer deferFn()
+
+	chainTip, meta, err := b.store.GetBestBlockHeaderUncached(ctx)
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	return &blockchain_api.GetBlockHeaderResponse{
+		BlockHeader:    chainTip.Bytes(),
+		Id:             meta.ID,
+		Height:         meta.Height,
+		TxCount:        meta.TxCount,
+		SizeInBytes:    meta.SizeInBytes,
+		Miner:          meta.Miner,
+		PeerId:         meta.PeerID,
+		BlockTime:      meta.BlockTime,
+		Timestamp:      meta.Timestamp,
+		ChainWork:      meta.ChainWork,
+		MinedSet:       meta.MinedSet,
+		SubtreesSet:    meta.SubtreesSet,
+		Invalid:        meta.Invalid,
+		MedianTimePast: meta.MedianTimePast,
+	}, nil
+}
+
 // CheckBlockIsInCurrentChain verifies if a block is part of the current main chain.
 func (b *Blockchain) CheckBlockIsInCurrentChain(ctx context.Context, req *blockchain_api.CheckBlockIsCurrentChainRequest) (*blockchain_api.CheckBlockIsCurrentChainResponse, error) {
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "CheckBlockIsInCurrentChain",

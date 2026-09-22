@@ -102,8 +102,9 @@ const (
 	stampAuditSampleRuns = 8
 )
 
-// ErrStampDrainBusy is returned by OpenDrain while another drain holds the session lock.
-var ErrStampDrainBusy = errors.NewProcessingError("[utxoset][stamp] another drain holds the session lock")
+// ErrStampDrainBusy is returned by OpenDrain while another drain holds the session lock. It is
+// the interface's error, named here so the package's own tests read naturally.
+var ErrStampDrainBusy = pruner.ErrStampDrainBusy
 
 var _ pruner.Stamper = (*Store)(nil)
 
@@ -113,6 +114,9 @@ const floorsSQL = `SELECT floor, stamp_fence, stamp_complete_floor FROM tx_mined
 // StampDepth is the depth, in blocks, below the tip at which this store's UTXOs get their block
 // written permanently. Nothing may change the chain below it; the rewind tool asks.
 func (s *Store) StampDepth() uint32 { return s.stampDepth }
+
+// WindowBlocks is the containment window width.
+func (s *Store) WindowBlocks() uint32 { return TxMinedPartitionBlocks }
 
 // Floors is one read of the tx_mined_floor row, as heights.
 func (s *Store) Floors(ctx context.Context) (pruner.StampFloors, error) {

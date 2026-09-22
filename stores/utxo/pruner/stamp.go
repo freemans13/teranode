@@ -3,8 +3,14 @@ package pruner
 import (
 	"context"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/util/chainancestry"
 )
+
+// ErrStampDrainBusy is returned by OpenDrain while another drain holds the session lock. The
+// pruner service tests for it with errors.Is, so it lives here, beside the interface, rather
+// than in any one store.
+var ErrStampDrainBusy = errors.NewProcessingError("[stamp] another drain holds the session lock")
 
 // StampFloors are the three stored values of the single tx_mined_floor row, all as heights.
 //
@@ -39,6 +45,14 @@ const (
 // service finds it by type assertion, exactly as it finds the pruner provider. The SQL and
 // aerospike stores do not implement it and get no stamp.
 type Stamper interface {
+	// StampDepth is the depth, in blocks, below the tip at which a window may be stamped. The
+	// pruner service uses it to count the windows still stampable when a drain exits.
+	StampDepth() uint32
+
+	// WindowBlocks is the width of one containment window in blocks. Every floor is a multiple
+	// of it, and the pruner service steps from one window to the next by it.
+	WindowBlocks() uint32
+
 	// Floors is one read of the tx_mined_floor row.
 	Floors(ctx context.Context) (StampFloors, error)
 

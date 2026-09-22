@@ -736,6 +736,38 @@ func (c *Client) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *m
 	return header, meta, nil
 }
 
+// GetBestBlockHeaderUncached retrieves the best block header past the store's response cache,
+// with the block id on the meta. See the interface for why it exists beside GetBestBlockHeader.
+func (c *Client) GetBestBlockHeaderUncached(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	resp, err := c.client.GetBestBlockHeaderUncached(ctx, &emptypb.Empty{})
+	if err != nil {
+		return nil, nil, errors.UnwrapGRPC(err)
+	}
+
+	header, err := model.NewBlockHeaderFromBytes(resp.BlockHeader)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	meta := &model.BlockHeaderMeta{
+		ID:             resp.Id,
+		Height:         resp.Height,
+		TxCount:        resp.TxCount,
+		SizeInBytes:    resp.SizeInBytes,
+		Miner:          resp.Miner,
+		PeerID:         resp.PeerId,
+		BlockTime:      resp.BlockTime,
+		Timestamp:      resp.Timestamp,
+		ChainWork:      resp.ChainWork,
+		MinedSet:       resp.MinedSet,
+		SubtreesSet:    resp.SubtreesSet,
+		Invalid:        resp.Invalid,
+		MedianTimePast: resp.MedianTimePast,
+	}
+
+	return header, meta, nil
+}
+
 // CheckBlockIsInCurrentChain checks if ANY of the given blockIDs is in the current chain.
 // It will return true if at least of the blockIDs is in the current chain.
 // It will return false if none of the blockIDs is in the current chain.

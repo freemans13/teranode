@@ -567,6 +567,12 @@ func (m *MockStore) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader,
 	return m.BestBlock.Header, &model.BlockHeaderMeta{Height: m.BestBlock.Height}, nil
 }
 
+// GetBestBlockHeaderUncached answers exactly as GetBestBlockHeader does here, because the mock
+// has no cache to skip.
+func (m *MockStore) GetBestBlockHeaderUncached(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	return m.GetBestBlockHeader(ctx)
+}
+
 // GetBlockHeader retrieves a block header and its metadata by the block's hash.
 func (m *MockStore) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
 	m.mu.RLock()

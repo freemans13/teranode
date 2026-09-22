@@ -308,6 +308,14 @@ type ClientI interface {
 	// - Error if the retrieval fails
 	GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error)
 
+	// GetBestBlockHeaderUncached is GetBestBlockHeader with the blockchain store's response cache
+	// left out on both sides, and with the block id filled in on the meta. The cached call can
+	// be one block stale in the moment between a block's commit and the cache clear that
+	// follows it. The pruner's stamp reads the tip between every store call of a drain, hands
+	// the height to a permanent completion record, and asks whether its anchor is still an
+	// ancestor of the tip by id, so it takes this call.
+	GetBestBlockHeaderUncached(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error)
+
 	// GetBlockHeader retrieves a specific block header.
 	//
 	// This method fetches just the header portion of a block identified by its hash, without

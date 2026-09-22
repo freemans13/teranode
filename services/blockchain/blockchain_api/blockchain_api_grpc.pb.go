@@ -42,6 +42,7 @@ const (
 	BlockchainAPI_GetNextWorkRequired_FullMethodName                  = "/blockchain_api.BlockchainAPI/GetNextWorkRequired"
 	BlockchainAPI_GetBlockExists_FullMethodName                       = "/blockchain_api.BlockchainAPI/GetBlockExists"
 	BlockchainAPI_GetBlockHeaders_FullMethodName                      = "/blockchain_api.BlockchainAPI/GetBlockHeaders"
+	BlockchainAPI_GetBestBlockHeaderUncached_FullMethodName           = "/blockchain_api.BlockchainAPI/GetBestBlockHeaderUncached"
 	BlockchainAPI_GetBlockHeadersByParentLinks_FullMethodName         = "/blockchain_api.BlockchainAPI/GetBlockHeadersByParentLinks"
 	BlockchainAPI_GetBlockHeadersToCommonAncestor_FullMethodName      = "/blockchain_api.BlockchainAPI/GetBlockHeadersToCommonAncestor"
 	BlockchainAPI_GetBlockHeadersFromCommonAncestor_FullMethodName    = "/blockchain_api.BlockchainAPI/GetBlockHeadersFromCommonAncestor"
@@ -141,6 +142,11 @@ type BlockchainAPIClient interface {
 	GetBlockExists(ctx context.Context, in *GetBlockRequest, opts ...grpc.CallOption) (*GetBlockExistsResponse, error)
 	// GetBlockHeaders retrieves headers for multiple blocks.
 	GetBlockHeaders(ctx context.Context, in *GetBlockHeadersRequest, opts ...grpc.CallOption) (*GetBlockHeadersResponse, error)
+	// GetBestBlockHeaderUncached is GetBestBlockHeader with the response cache left out on both
+	// sides, and with the block id filled in. A block store clears the cache only after its own
+	// commit, so the cached call can be one block stale; a caller that writes the tip into
+	// permanent state reads it here.
+	GetBestBlockHeaderUncached(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetBlockHeaderResponse, error)
 	// GetBlockHeadersByParentLinks retrieves headers by walking parent links back from a hash.
 	// It never selects rows by the on_main_chain flag and never reads or writes a cache, so it
 	// is the fetch a chain answer is proven against.
@@ -442,6 +448,16 @@ func (c *blockchainAPIClient) GetBlockHeaders(ctx context.Context, in *GetBlockH
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetBlockHeadersResponse)
 	err := c.cc.Invoke(ctx, BlockchainAPI_GetBlockHeaders_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *blockchainAPIClient) GetBestBlockHeaderUncached(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetBlockHeaderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetBlockHeaderResponse)
+	err := c.cc.Invoke(ctx, BlockchainAPI_GetBestBlockHeaderUncached_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1004,6 +1020,11 @@ type BlockchainAPIServer interface {
 	GetBlockExists(context.Context, *GetBlockRequest) (*GetBlockExistsResponse, error)
 	// GetBlockHeaders retrieves headers for multiple blocks.
 	GetBlockHeaders(context.Context, *GetBlockHeadersRequest) (*GetBlockHeadersResponse, error)
+	// GetBestBlockHeaderUncached is GetBestBlockHeader with the response cache left out on both
+	// sides, and with the block id filled in. A block store clears the cache only after its own
+	// commit, so the cached call can be one block stale; a caller that writes the tip into
+	// permanent state reads it here.
+	GetBestBlockHeaderUncached(context.Context, *emptypb.Empty) (*GetBlockHeaderResponse, error)
 	// GetBlockHeadersByParentLinks retrieves headers by walking parent links back from a hash.
 	// It never selects rows by the on_main_chain flag and never reads or writes a cache, so it
 	// is the fetch a chain answer is proven against.
@@ -1177,6 +1198,9 @@ func (UnimplementedBlockchainAPIServer) GetBlockExists(context.Context, *GetBloc
 }
 func (UnimplementedBlockchainAPIServer) GetBlockHeaders(context.Context, *GetBlockHeadersRequest) (*GetBlockHeadersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetBlockHeaders not implemented")
+}
+func (UnimplementedBlockchainAPIServer) GetBestBlockHeaderUncached(context.Context, *emptypb.Empty) (*GetBlockHeaderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetBestBlockHeaderUncached not implemented")
 }
 func (UnimplementedBlockchainAPIServer) GetBlockHeadersByParentLinks(context.Context, *GetBlockHeadersRequest) (*GetBlockHeadersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetBlockHeadersByParentLinks not implemented")
@@ -1687,6 +1711,24 @@ func _BlockchainAPI_GetBlockHeaders_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(BlockchainAPIServer).GetBlockHeaders(ctx, req.(*GetBlockHeadersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BlockchainAPI_GetBestBlockHeaderUncached_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BlockchainAPIServer).GetBestBlockHeaderUncached(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BlockchainAPI_GetBestBlockHeaderUncached_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BlockchainAPIServer).GetBestBlockHeaderUncached(ctx, req.(*emptypb.Empty))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2666,6 +2708,10 @@ var BlockchainAPI_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetBlockHeaders",
 			Handler:    _BlockchainAPI_GetBlockHeaders_Handler,
+		},
+		{
+			MethodName: "GetBestBlockHeaderUncached",
+			Handler:    _BlockchainAPI_GetBestBlockHeaderUncached_Handler,
 		},
 		{
 			MethodName: "GetBlockHeadersByParentLinks",
