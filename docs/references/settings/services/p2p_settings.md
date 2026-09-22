@@ -6,6 +6,7 @@
 
 | Setting | Type | Default | Environment Variable | Usage |
 |---------|------|---------|---------------------|-------|
+| AllowedPublisherIDs | []string | [] | p2p_allowed_publisher_ids | Opt-in allowlist of peer IDs whose pubsub messages this node acts on; empty (default) accepts all. Bare peer IDs, not multiaddrs. Applies to every subscribed topic, so filtered peers also stop refreshing the peer registry and the monitoring feed |
 | BootstrapPeers | []string | [] (settings.conf ships with `/dnsaddr/${network}.bootstrap.teranode.bsvb.tech`) | p2p_bootstrap_peers | Peer discovery entry points (required for dht_mode "off" and "client") |
 | GRPCAddress | string | "" | p2p_grpcAddress | gRPC client connections |
 | GRPCListenAddress | string | "localhost:9906" (Go default; overridden to `localhost:9904` by `settings.conf` via `P2P_GRPC_PORT`, and widened to `:9904` in the `docker.m`, `docker.ss` and `operator` contexts, plus the generated split-mode compose contexts) | p2p_grpcListenAddress | **CRITICAL** - gRPC server binding; loopback by default |
