@@ -96,7 +96,7 @@ func benchStore(b *testing.B) (*Store, context.Context) {
 //
 // EVERY table, and the list is here once rather than spelled out at each call site because it
 // has already cost a measurement. tx_mined, conflict_children and preserved_parent were added
-// by the reshape and not added here, so a benchmark's later iterations ran against a membership
+// by the reshape and not added here, so a benchmark's later iterations ran against a containment
 // table carrying every earlier iteration's rows -- and the block-path create probes tx_mined
 // twice per transaction. Attributing a measured slowdown found that the missing truncate
 // accounted for two thirds of it. A benchmark whose setup leaks state is measuring the leak.
@@ -113,11 +113,11 @@ func wipe(b *testing.B, s *Store, ctx context.Context) {
 }
 
 // BenchmarkCreate measures storing a transaction: the identity row, the serialized body, and
-// one coin row per spendable output.
+// one UTXO row per spendable output.
 //
-// "Plain" is a mempool arrival, which is left in the waiting set. "Mined" carries block
-// information, which additionally packs the membership and clears the waiting marker. The
-// two should be close, because the difference is one more column on the same insert.
+// "Plain" is an unmined arrival, which is left in the waiting set. "Mined" carries block
+// information and claims on tx_mined with the pair written onto its UTXOs. The two should be
+// close, because each is one claim plus the same UTXO insert.
 func BenchmarkCreate(b *testing.B) {
 	s, ctx := benchStore(b)
 
@@ -274,12 +274,12 @@ func BenchmarkGet(b *testing.B) {
 	wipe(b, s, ctx)
 }
 
-// BenchmarkSetMined measures the stamp that records which block mined a transaction.
+// BenchmarkSetMined measures the record-mined call that says which block contains a transaction.
 //
-// This is the update that must stay off the index. It appends twelve bytes to the packed
-// membership and clears the waiting marker, and at the configured page packing it should be
-// done in place without writing an index entry. If that stops being true the cost here
-// rises sharply.
+// It is one containment insert per transaction, copying the payload off the identity row, plus
+// a marker clear that must stay off the index: the marker update changes no indexed column, so
+// at the configured page packing it should be done in place without writing an index entry. If
+// that stops being true the cost here rises sharply.
 func BenchmarkSetMined(b *testing.B) {
 	s, ctx := benchStore(b)
 

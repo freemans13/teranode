@@ -20,7 +20,7 @@ import (
 // and the page it lands on is the same one the imminent DELETE will touch, so the read
 // warms it rather than competing with it.
 //
-// hash_override comes with them because on a REASSIGNED coin those two fields are stale and
+// hash_override comes with them because on a REASSIGNED UTXO those two fields are stale and
 // must not be handed out. ReAssignUTXO is given the new output's hash and nothing else, so the
 // row keeps the confiscated owner's satoshis and script; decorating from them would write the
 // old output onto the new owner's input, and the spend would then hash exactly those stale
@@ -118,7 +118,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		r := refs[ref]
 		in := txs[r.txIdx].Inputs[r.inpIdx]
 
-		// The coin was found, so it counts as resolved -- it is neither missing nor spent, and
+		// The UTXO was found, so it counts as resolved -- it is neither missing nor spent, and
 		// reporting it as a missing parent would send the caller looking for a transaction that
 		// is right there. But it is left UNDECORATED, because this store does not hold the
 		// output it was reassigned to. Only the new owner has that script, so only they can
@@ -145,7 +145,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 
 	// Reported before the missing-parent tally, and as a processing error rather than a
 	// not-found one, because the two need opposite handling. A missing parent is something the
-	// caller can go and fetch; a reassigned coin never becomes decoratable, however long anyone
+	// caller can go and fetch; a reassigned UTXO never becomes decoratable, however long anyone
 	// waits, so the validator must turn it into "can't extend" rather than into a parent hunt.
 	//
 	// Silence is the one thing this must not be. The validator marks a transaction extended the

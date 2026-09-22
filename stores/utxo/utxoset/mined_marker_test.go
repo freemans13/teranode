@@ -23,8 +23,8 @@ import (
 // The sql store keys on whether any block information was supplied at all, and this now matches
 // it.
 // The assertion now reads through Get rather than off tx_ident, because a create carrying
-// block information no longer writes an identity row at all: it claims a membership row and
-// coins that know their block. The waiting marker is a column on the row it does not have, so
+// block information no longer writes an identity row at all: it claims a containment row and
+// UTXOs that know their block. The waiting marker is a column on the row it does not have, so
 // the state this test was written to forbid is now unreachable by construction, and what is
 // worth pinning is that the read path says the same thing -- in a block, not waiting.
 func TestCreateWithABlockIsNotAlsoWaitingToBeMined(t *testing.T) {
@@ -63,7 +63,7 @@ func TestCreateWithoutABlockIsWaitingToBeMined(t *testing.T) {
 	h := tx.TxIDChainHash()
 	r := readIdent(t, s, ctx, h[:])
 
-	require.Empty(t, r.membership, "it is in no block")
+	require.Equal(t, 0, minedRows(t, s, ctx, tx), "it is in no block")
 	require.NotNil(t, r.offChainSince, "so it waits")
 	require.Equal(t, int32(700_000), *r.offChainSince, "from the height it arrived at")
 }

@@ -39,7 +39,7 @@ func TestAutovacuumThresholdIsSizedToTheIndex(t *testing.T) {
 // storage parameters at all, so it vacuumed at the default 20 percent dead-tuple threshold with
 // default throttling. With the reclaimer deleting several hundred thousand rows a minute that
 // is a pass every twenty minutes or so per partition, each a full scan of its primary key, and
-// between passes the key drifts toward the measured 2x bloat plateau. The coin table's block
+// between passes the key drifts toward the measured 2x bloat plateau. The UTXO table's block
 // applies here for the same reason it applies there.
 func TestIdentityPartitionsCarryTheReclaimerSizedAutovacuum(t *testing.T) {
 	s, ctx := newTestStore(t)

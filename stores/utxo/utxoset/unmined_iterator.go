@@ -20,36 +20,54 @@ const unminedBatchSize = 1_000
 // unminedSQL lists every transaction that is waiting to be mined.
 //
 // "Waiting" means the marker is set, and the marker means nobody has told us a MAIN-CHAIN
-// block contains this transaction. It is deliberately NOT "has no block membership": a
-// transaction mined only into a block that lost carries membership and is still waiting.
-// Measured on a 20 million row table, the weaker membership test returned 25,000 of 25,499
-// waiting transactions, and the 499 it dropped were exactly the fork-mined ones.
+// block contains this transaction. It is deliberately NOT "has no containment": a transaction
+// mined only into a block that lost has a containment row and is still waiting. Measured on a
+// 20 million row table, the weaker containment test returned 25,000 of 25,499 waiting
+// transactions, and the 499 it dropped were exactly the fork-mined ones.
+//
+// The block ids come from tx_mined, in (mined_height, block_id) order, one probe per row per
+// live window. They used to be unpacked from a column on the identity row; that column is gone
+// so that containment has one home. Block assembly's load fix-up depends on them: on the reset
+// route of a reorg it is the only thing that clears the marker of a transaction mined in a
+// move-forward block that first arrived as a fork, so this is load-bearing and not a backstop.
 //
 // Served by the partial index on the marker, which only carries entries for waiting
 // transactions and is therefore tiny: 524,288 bytes against a 43 million row table, which is
 // 0.0122 bytes per row.
 //
-// There is deliberately no ORDER BY. The consumer sorts on creation time in Go, so ordering
-// here would be work thrown away.
+// There is deliberately no ORDER BY on the rows. The consumer sorts on creation time in Go, so
+// ordering here would be work thrown away.
 const unminedSQL = `
-SELECT txid, fee, size_in_bytes, tx_inpoints, created_at, off_chain_since, membership, flags
-  FROM tx_ident
- WHERE off_chain_since IS NOT NULL
-   AND (flags & $1::smallint) = 0`
+SELECT i.txid, i.fee, i.size_in_bytes, i.tx_inpoints, i.created_at, i.off_chain_since, b.ids,
+       i.flags
+  FROM tx_ident i
+ CROSS JOIN LATERAL (
+   SELECT array_agg(m.block_id ORDER BY m.mined_height, m.block_id) AS ids
+     FROM tx_mined m
+    WHERE m.txid = i.txid
+ ) AS b
+ WHERE i.off_chain_since IS NOT NULL
+   AND (i.flags & $1::smallint) = 0`
 
 // unminedBelowSQL is the same question with an age bound, for the preservation pass: which
 // transactions have been waiting longer than the retention window, so their parents need
 // their lifetime extended.
 const unminedBelowSQL = `
-SELECT txid, fee, size_in_bytes, tx_inpoints, created_at, off_chain_since, membership, flags
-  FROM tx_ident
- WHERE off_chain_since IS NOT NULL
-   AND off_chain_since <= $2
-   AND (flags & $1::smallint) = 0`
+SELECT i.txid, i.fee, i.size_in_bytes, i.tx_inpoints, i.created_at, i.off_chain_since, b.ids,
+       i.flags
+  FROM tx_ident i
+ CROSS JOIN LATERAL (
+   SELECT array_agg(m.block_id ORDER BY m.mined_height, m.block_id) AS ids
+     FROM tx_mined m
+    WHERE m.txid = i.txid
+ ) AS b
+ WHERE i.off_chain_since IS NOT NULL
+   AND i.off_chain_since <= $2
+   AND (i.flags & $1::smallint) = 0`
 
 // unminedIterator streams the answer rather than materialising it.
 //
-// Block assembly rebuilds its entire mempool from this at startup and after every reorg, so
+// Block assembly rebuilds its entire unmined set from this at startup and after every reorg, so
 // the result set is the whole waiting population and holding it in one slice would be a
 // needless peak.
 type unminedIterator struct {
@@ -72,12 +90,12 @@ func (it *unminedIterator) Next(_ context.Context) ([]*utxo.UnminedTransaction, 
 			inpoints      []byte
 			createdAt     *int64
 			offChainSince *int32
-			membership    []byte
+			blockIDs      []int32
 			flags         int16
 		)
 
 		if err := it.rows.Scan(&txid, &fee, &sizeInBytes, &inpoints, &createdAt,
-			&offChainSince, &membership, &flags); err != nil {
+			&offChainSince, &blockIDs, &flags); err != nil {
 			it.err = errors.NewStorageError("[utxoset][unmined] scan", err)
 			return nil, it.err
 		}
@@ -106,7 +124,9 @@ func (it *unminedIterator) Next(_ context.Context) ([]*utxo.UnminedTransaction, 
 			u.UnminedSince = int(*offChainSince)
 		}
 
-		u.BlockIDs, _, _ = unpackMembership(membership)
+		for _, id := range blockIDs {
+			u.BlockIDs = append(u.BlockIDs, uint32(id)) //nolint:gosec // a block id is never negative
+		}
 
 		// A transaction with no stored inputs is a coinbase, which has none to store. Any
 		// other empty value would be a store defect, and handing back a nil here would make
@@ -164,10 +184,10 @@ func (it *unminedIterator) Close() error {
 
 // GetUnminedTxIterator lists every transaction waiting to be mined.
 //
-// This is what block assembly rebuilds its whole mempool from, at startup and on every reset,
+// This is what block assembly rebuilds its whole unmined set from, at startup and on every reset,
 // and a reorg triggers a reset. A transaction missing from the answer never gets mined, and
-// on a delete-on-spend store that is unrecoverable: the coin rows its inputs pointed at were
-// deleted when it was first accepted, and an absent coin row reads as already spent.
+// on a delete-on-spend store that is unrecoverable: the UTXO rows its inputs pointed at were
+// deleted when it was first accepted, and an absent UTXO row reads as already spent.
 func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 	rows, err := s.pool.Query(context.Background(), unminedSQL, FlagConflicting)
 	if err != nil {
@@ -181,7 +201,7 @@ func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 // cutoffHeight, which is the preservation pass's narrower question.
 //
 // The pass never deletes anything. It extends the lifetime of these transactions' parents, so
-// that a transaction still waiting after a long time does not lose the coins it intends to
+// that a transaction still waiting after a long time does not lose the UTXOs it intends to
 // spend.
 func (s *Store) GetPrunableUnminedTxIterator(cutoffHeight uint32) (utxo.UnminedTxIterator, error) {
 	rows, err := s.pool.Query(context.Background(), unminedBelowSQL,
@@ -200,23 +220,29 @@ func (s *Store) GetPrunableUnminedTxIterator(cutoffHeight uint32) (utxo.UnminedT
 // added to one statement and not the others is a runtime scan failure rather than a compile
 // error, which is why this lives beside them.
 //
-// There is deliberately no test on the mempool marker. A transaction that lost a race can have
-// been mined into a block that later lost, so it carries membership and no marker, and it is
+// There is deliberately no test on the unmined marker. A transaction that lost a race can have
+// been mined into a block that later lost, so it has containment and no marker, and it is
 // still conflicting. Filtering on the marker would hide exactly the transactions a rewind
 // exists to purge, and neither reference store filters on it either.
 //
 // Coinbases are excluded here rather than emitted and skipped later. A coinbase spends nothing,
-// so it can never lose a race for a coin, and excluding it in the statement keeps the shared
+// so it can never lose a race for a UTXO, and excluding it in the statement keeps the shared
 // Next free of a branch only this caller would use.
 //
 // No index serves this predicate and none is added. It is a sequential scan of every partition,
 // which is what the aerospike store does too, and the only caller is an offline repair tool run
 // by hand with the node stopped.
 const conflictingSQL = `
-SELECT txid, fee, size_in_bytes, tx_inpoints, created_at, off_chain_since, membership, flags
-  FROM tx_ident
- WHERE (flags & $1::smallint) <> 0
-   AND (flags & $2::smallint) = 0`
+SELECT i.txid, i.fee, i.size_in_bytes, i.tx_inpoints, i.created_at, i.off_chain_since, b.ids,
+       i.flags
+  FROM tx_ident i
+ CROSS JOIN LATERAL (
+   SELECT array_agg(m.block_id ORDER BY m.mined_height, m.block_id) AS ids
+     FROM tx_mined m
+    WHERE m.txid = i.txid
+ ) AS b
+ WHERE (i.flags & $1::smallint) <> 0
+   AND (i.flags & $2::smallint) = 0`
 
 // GetConflictingTxIterator lists the transactions recorded as having lost a double-spend race.
 //

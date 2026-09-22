@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -20,6 +21,36 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 
 	return newTestStoreWith(t, nil)
+}
+
+// testCheckpointHeight is the highest checkpoint every test store carries: mainnet's, at
+// 945,000. Heights the tests use for block-path creates, 100 to 700,100, are all at or below
+// it, and 1,000,000 is the height they use for "above the checkpoint".
+const testCheckpointHeight = 945_000
+
+// newUncheckpointedStore is newTestStore on a network with NO chain checkpoints, so every
+// height is "above the checkpoint": a block-carrying create takes the identity route, with an
+// identity row, a containment row and UTXOs at (0,0), and an un-mine is never refused. It is
+// the store for a test of tip behaviour, and for the shared conformance suite, which un-mines
+// blocks at heights the mainnet checkpoint list puts below the checkpoint.
+func newUncheckpointedStore(t *testing.T) (*Store, context.Context) {
+	t.Helper()
+
+	return newTestStoreWith(t, func(ts *settings.Settings) { withCheckpoints(ts, nil) })
+}
+
+// withCheckpoints sets the checkpoint list of the settings' chain parameters, on a copy, so the
+// parameters shared with other tests are not changed under them.
+//
+// Every test store gets an EXPLICIT list rather than the ambient network's. The settings
+// context a developer or CI runs the tests under decides the network, and only mainnet has
+// checkpoints, so a test that relied on the ambient list would pass on one box and take the
+// other create route on the next. newTestStore pins mainnet's list; newUncheckpointedStore
+// pins none.
+func withCheckpoints(ts *settings.Settings, checkpoints []chaincfg.Checkpoint) {
+	params := *ts.ChainCfgParams
+	params.Checkpoints = checkpoints
+	ts.ChainCfgParams = &params
 }
 
 // newTestStoreWith is newTestStore with the settings adjusted by tune before the store is
@@ -43,6 +74,7 @@ func newTestStoreWith(t *testing.T, tune func(*settings.Settings)) (*Store, cont
 	                       DROP TABLE IF EXISTS tx_body CASCADE;
 	                       DROP TABLE IF EXISTS tx_mined CASCADE;
 	                       DROP TABLE IF EXISTS tx_mined_floor CASCADE;
+	                       DROP TABLE IF EXISTS tx_mined_stamped CASCADE;
 	                       DROP TABLE IF EXISTS conflict_children CASCADE;
 	                       DROP TABLE IF EXISTS conflict_intents CASCADE;
 	                       DROP TABLE IF EXISTS preserved_parent CASCADE;`)
@@ -79,6 +111,8 @@ func newTestStoreWith(t *testing.T, tune func(*settings.Settings)) (*Store, cont
 	require.NoError(t, err)
 
 	tSettings := settings.NewSettings()
+	withCheckpoints(tSettings, chaincfg.MainNetParams.Checkpoints)
+
 	if tune != nil {
 		tune(tSettings)
 	}
@@ -143,7 +177,7 @@ func TestUTXOTableCreateSpendRoundTrip(t *testing.T) {
 	require.NotNil(t, child.Inputs[0].PreviousTxScript,
 		"Spend must return the locking script via RETURNING")
 
-	// A DIFFERENT transaction reaching for the same coin: the row is gone, and absence IS the
+	// A DIFFERENT transaction reaching for the same UTXO: the row is gone, and absence IS the
 	// rejection.
 	//
 	// The extra output is what makes it different, and it is load-bearing rather than
@@ -316,7 +350,7 @@ func TestSpendAndCreateRejectsContradictoryOptions(t *testing.T) {
 }
 
 // TestSpendWritesJournal is the property that makes a delete-on-spend store
-// recoverable at all: the coin's payload must be captured at the instant it is
+// recoverable at all: the UTXO's payload must be captured at the instant it is
 // destroyed, in the same statement, or a reorg and ProcessConflicting have nothing to
 // restore from. It cannot be re-derived -- the node keeps almost no blocks, and the
 // subtree data it does keep carries outpoints without satoshis or scripts.
@@ -381,10 +415,11 @@ func TestSpendWritesJournal(t *testing.T) {
 func TestSpendJournalReclaimIsDrivenByThePruner(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	s.journalRetention = 96 // 2 leaves, so the test does not need 1440 blocks
+	s.journalRetention = 96 // under one leaf, so the test does not need 1440 blocks
 
-	// spend across a span wide enough to roll several leaves over
-	for h := uint32(100); h <= 500; h += 40 {
+	// spend across a span wide enough to roll several leaves over: five leaves, three spends each
+	top := uint32(100 + 4*SpendJournalPartitionBlocks)
+	for h := uint32(100); h <= top; h += SpendJournalPartitionBlocks / 3 {
 		parent := mkTx(t, 1, uint64(1000+h))
 		_, err := s.Create(ctx, parent, h)
 		require.NoError(t, err)
@@ -399,19 +434,19 @@ func TestSpendJournalReclaimIsDrivenByThePruner(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Heights 100..500 at 48 per leaf touch leaves 2,3,4,5,6,7,8,9,10.
-	require.Equal(t, 9, journalLeaves(t, s, ctx),
+	// Heights 100 to 100 + 4 leaves, a third of a leaf apart, touch leaves 0 to 4.
+	require.Equal(t, 5, journalLeaves(t, s, ctx),
 		"the spend path must create leaves and reclaim NOTHING: DETACH CONCURRENTLY waits on every open transaction on the parent")
 
 	svc, err := s.GetPrunerService()
 	require.NoError(t, err)
 
-	n, err := svc.Prune(ctx, 500, "deadbeef")
+	n, err := svc.Prune(ctx, top, "deadbeef")
 	require.NoError(t, err)
 	require.Zero(t, n, "no transaction records are deleted yet, and reporting journal rows in a children-deleted counter would be a lie")
 
-	// retention 96 / 48 per leaf = 2, plus the one being filled, plus at most one not
-	// yet crossed. The point is that it is bounded, not that it is exact.
+	// retention 96 is under one leaf, so the leaf being filled survives, plus at most one
+	// not yet crossed. The point is that it is bounded, not that it is exact.
 	require.LessOrEqual(t, journalLeaves(t, s, ctx), 4,
 		"journal leaves must be reclaimed as the chain advances, not accumulate")
 	require.Positive(t, journalLeaves(t, s, ctx), "recent history must still be retained")
@@ -431,8 +466,10 @@ func TestSpendJournalReclaimRecoversOrphanedPartitions(t *testing.T) {
 
 	s.journalRetention = 96
 
-	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2
-	require.NoError(t, s.ensureSpendJournalPartition(ctx, 500)) // leaf 10
+	// Heights inside leaves 2 and 10, whatever the leaf width is.
+	const leafW = SpendJournalPartitionBlocks
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 2*leafW+4))   // leaf 2
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 10*leafW+20)) // leaf 10
 
 	// Simulate the crash: detach leaf 2 and stop, exactly as a kill between the two
 	// statements would leave it.
@@ -446,7 +483,7 @@ func TestSpendJournalReclaimRecoversOrphanedPartitions(t *testing.T) {
 
 	svc, err := s.GetPrunerService()
 	require.NoError(t, err)
-	_, err = svc.Prune(ctx, 500, "deadbeef")
+	_, err = svc.Prune(ctx, 10*leafW+20, "deadbeef")
 	require.NoError(t, err)
 
 	var stillThere bool
@@ -494,7 +531,7 @@ func spendOne(t *testing.T, s *Store, ctx context.Context, sats uint64, h uint32
 	return parent, child, spends
 }
 
-// TestUnspendRestoresFromJournal is the round trip that makes a reorg survivable: a coin
+// TestUnspendRestoresFromJournal is the round trip that makes a reorg survivable: a UTXO
 // destroyed by a spend must come back byte-identical, and the journal row must be
 // CONSUMED so a second restore cannot duplicate it.
 func TestUnspendRestoresFromJournal(t *testing.T) {
@@ -523,12 +560,12 @@ func TestUnspendRestoresFromJournal(t *testing.T) {
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal WHERE txid = $1`, parentHash[:]).Scan(&remaining))
 	require.Equal(t, 0, remaining, "the journal row must be consumed by the restore")
 
-	// so a second restore's DELETE finds nothing to consume -- but the coin it would have
+	// so a second restore's DELETE finds nothing to consume -- but the UTXO it would have
 	// restored is already live, and Unspend must recognise that and say so as success, not
 	// error: this is the shape a crashed-and-replayed WAL intent produces (see unspend.go's
 	// live_before), and BlockAssembler's conflict-intent replay depends on Unspend
 	// tolerating it.
-	require.NoError(t, s.Unspend(ctx, spends), "a second restore of an already-live coin must be a no-op, not an error")
+	require.NoError(t, s.Unspend(ctx, spends), "a second restore of an already-live UTXO must be a no-op, not an error")
 
 	var live int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
@@ -536,7 +573,7 @@ func TestUnspendRestoresFromJournal(t *testing.T) {
 }
 
 // TestUnspendRefusesWrongSpender is the ownership token doing its job. A stale reorg
-// record must never resurrect a coin that a DIFFERENT transaction has since taken.
+// record must never resurrect a UTXO that a DIFFERENT transaction has since taken.
 func TestUnspendRefusesWrongSpender(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -547,13 +584,13 @@ func TestUnspendRefusesWrongSpender(t *testing.T) {
 	spends[0].SpendingData = spend.NewSpendingData(other.TxIDChainHash(), 0)
 
 	require.Error(t, s.Unspend(ctx, spends),
-		"a restore naming the wrong spender must fail, not resurrect the coin")
+		"a restore naming the wrong spender must fail, not resurrect the UTXO")
 
 	parentHash := parent.TxIDChainHash()
 
 	var live int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
-	require.Equal(t, 0, live, "the coin must stay spent")
+	require.Equal(t, 0, live, "the UTXO must stay spent")
 
 	var journalled int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal WHERE txid = $1`, parentHash[:]).Scan(&journalled))
@@ -561,7 +598,7 @@ func TestUnspendRefusesWrongSpender(t *testing.T) {
 }
 
 // TestUnspendRequiresSpender refuses to guess. Restoring on the outpoint alone could
-// resurrect a coin a different transaction now owns.
+// resurrect a UTXO a different transaction now owns.
 func TestUnspendRequiresSpender(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -640,7 +677,7 @@ func TestCreateDoesNotGateOrdinaryOutputsOnHeight(t *testing.T) {
 	var live int
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
-	require.Equal(t, 0, live, "the coin must actually be gone, not merely reported as spent")
+	require.Equal(t, 0, live, "the UTXO must actually be gone, not merely reported as spent")
 }
 
 // spendOnly is what the tests used to get from Store.Spend, which no longer exists.
@@ -648,7 +685,7 @@ func TestCreateDoesNotGateOrdinaryOutputsOnHeight(t *testing.T) {
 // SpendAndCreate with the spend-only option is now the only way to consume inputs, so this
 // wrapper keeps the call sites readable. The difference from the old method is deliberate and
 // is the whole point of deleting it: a per-input failure now surfaces as a returned error AND
-// rolls the whole transaction back, so a sibling coin is no longer destroyed by a transaction
+// rolls the whole transaction back, so a sibling UTXO is no longer destroyed by a transaction
 // that was rejected.
 func spendOnly(ctx context.Context, s *Store, tx *bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) ([]*utxo.Spend, error) {
@@ -678,8 +715,10 @@ func spendOnly(ctx context.Context, s *Store, tx *bt.Tx, blockHeight uint32,
 func TestSpendJournalDropTakesTheOldestLeafFirst(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	// Deliberately scrambled: leaves 10, 2, 7, 4 in creation order.
-	for _, h := range []uint32{500, 100, 350, 200} {
+	// Deliberately scrambled: leaves 10, 2, 7, 4 in creation order, at heights inside each
+	// leaf whatever the leaf width is.
+	const leafW = SpendJournalPartitionBlocks
+	for _, h := range []uint32{10*leafW + 20, 2*leafW + 4, 7*leafW + 14, 4*leafW + 8} {
 		require.NoError(t, s.ensureSpendJournalPartition(ctx, h))
 	}
 

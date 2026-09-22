@@ -22,8 +22,8 @@ func countWhere(t *testing.T, s *Store, ctx context.Context, sql string, args ..
 }
 
 // TestDeleteRemovesEveryTraceOfATransaction. Deleting has to reach all four tables at once.
-// An identity row removed while its coins survive is a live output nothing can ever reclaim,
-// because reclaim finds coins through their identity row.
+// An identity row removed while its UTXOs survive is a live output nothing can ever reclaim,
+// because reclaim finds UTXOs through their identity row.
 func TestDeleteRemovesEveryTraceOfATransaction(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -39,7 +39,7 @@ func TestDeleteRemovesEveryTraceOfATransaction(t *testing.T) {
 	require.NoError(t, s.Delete(ctx, h))
 
 	require.Equal(t, 0, countWhere(t, s, ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, h[:]),
-		"every coin must go")
+		"every UTXO must go")
 	require.Equal(t, 0, countWhere(t, s, ctx, `SELECT count(*) FROM tx_ident WHERE txid = $1`, h[:]),
 		"the identity row must go")
 	require.Equal(t, 0, countWhere(t, s, ctx, `SELECT count(*) FROM tx_body WHERE txid = $1`, h[:]),
@@ -77,7 +77,7 @@ func TestDeleteIsIdempotent(t *testing.T) {
 
 // TestDeleteRemovesTheUndoRecordsItOwns. The journal rows where the deleted transaction is the
 // PARENT are the undo payloads for its already-spent outputs. Left behind, a later unspend
-// would restore a coin whose identity row no longer exists: spendable, invisible to reclaim,
+// would restore a UTXO whose identity row no longer exists: spendable, invisible to reclaim,
 // and permanent.
 func TestDeleteRemovesTheUndoRecordsItOwns(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -110,8 +110,8 @@ func TestDeleteRemovesTheUndoRecordsItOwns(t *testing.T) {
 }
 
 // TestDeleteLeavesTheUndoRecordsWhereItWasTheSpender. Those rows authorise restoring OTHER
-// transactions' coins, and the offline rewind tool unspends BEFORE it deletes. Destroying them
-// here would turn an ordering mistake into unrecoverable coin loss.
+// transactions' UTXOs, and the offline rewind tool unspends BEFORE it deletes. Destroying them
+// here would turn an ordering mistake into unrecoverable UTXO loss.
 func TestDeleteLeavesTheUndoRecordsWhereItWasTheSpender(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -152,7 +152,7 @@ func TestDeleteLeavesTheUndoRecordsWhereItWasTheSpender(t *testing.T) {
 // TestDeleteDoesNotReachATransactionSharingItsKeyPrefix is the case the full 32-byte recheck
 // exists for.
 //
-// Coins are found by a range over the packed key, whose first 12 bytes are the transaction id
+// UTXOs are found by a range over the packed key, whose first 12 bytes are the transaction id
 // prefix, because that is the only index on the table. The prefix is 96 bits and NON-UNIQUE by
 // design, so it can locate a row but never authorise deleting one. The colliding row is planted
 // directly, since no amount of test data will produce a 12-byte collision by chance.
@@ -225,7 +225,7 @@ func TestDeleteRemovesMembershipRows(t *testing.T) {
 
 	require.NoError(t, s.Delete(ctx, tx.TxIDChainHash()))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
-	require.Equal(t, 0, coinCount(t, s, ctx, tx))
+	require.Equal(t, 0, utxoCount(t, s, ctx, tx))
 	h := tx.TxIDChainHash()
 	require.Equal(t, 0, countWhere(t, s, ctx, `SELECT count(*) FROM tx_body WHERE txid = $1`, h[:]),
 		"a mined-only transaction's body must not survive Delete")

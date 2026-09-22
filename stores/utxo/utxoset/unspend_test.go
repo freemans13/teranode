@@ -11,11 +11,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestUnspendRestoresACoinWithItsParentsBlockFactsFromMembership: the journal carries no
+// TestUnspendRestoresAUTXOWithItsParentsBlockFactsFromMembership: the journal carries no
 // block facts (they are mutable, and the journal payload is not); the restore reads them
 // from tx_mined, where the parent's row is present for as long as any of its spends can be
 // undone.
-func TestUnspendRestoresACoinWithItsParentsBlockFactsFromMembership(t *testing.T) {
+func TestUnspendRestoresAUTXOWithItsParentsBlockFactsFromMembership(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 1, 5_000)
@@ -29,21 +29,21 @@ func TestUnspendRestoresACoinWithItsParentsBlockFactsFromMembership(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, s.Unspend(ctx, spends))
 
-	h, b := coinFacts(t, s, ctx, parent)
+	h, b := utxoFacts(t, s, ctx, parent)
 	require.Equal(t, int32(700_100), h)
 	require.Equal(t, int32(42), b)
 }
 
-// TestUnspendOfAnAlreadyRestoredCoinIsANoOp pins the fix for the idempotent-replay gap: a
+// TestUnspendOfAnAlreadyRestoredUTXOIsANoOp pins the fix for the idempotent-replay gap: a
 // second Unspend on an outpoint the first call already restored must succeed without
-// creating a duplicate coin, even when the replayed request names a different spender than
+// creating a duplicate UTXO, even when the replayed request names a different spender than
 // whatever actually did the restoring. This is exactly the shape BlockAssembler's
 // conflict-intent WAL replay can produce -- a crash between a successful Unspend and its
 // intent's completion record means replay calls Unspend again, and it may not remember (or
 // may misremember) which spending transaction the original call used. Ownership only gates
-// consuming the journal row; once the coin is live, the coin being unspent is the fact that
+// consuming the journal row; once the UTXO is live, the UTXO being unspent is the fact that
 // matters, not who put it there.
-func TestUnspendOfAnAlreadyRestoredCoinIsANoOp(t *testing.T) {
+func TestUnspendOfAnAlreadyRestoredUTXOIsANoOp(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 1, 5_000)
@@ -56,7 +56,7 @@ func TestUnspendOfAnAlreadyRestoredCoinIsANoOp(t *testing.T) {
 	realSpends, err := utxo.GetSpends(child)
 	require.NoError(t, err)
 	require.NoError(t, s.Unspend(ctx, realSpends))
-	require.Equal(t, 1, coinCount(t, s, ctx, parent), "the coin must be restored exactly once")
+	require.Equal(t, 1, utxoCount(t, s, ctx, parent), "the UTXO must be restored exactly once")
 
 	// A replayed Unspend naming a spender that never actually spent this outpoint.
 	fakeSpender := chainhash.HashH([]byte("not-the-real-spender"))
@@ -67,12 +67,12 @@ func TestUnspendOfAnAlreadyRestoredCoinIsANoOp(t *testing.T) {
 	}}
 
 	require.NoError(t, s.Unspend(ctx, fakeSpends),
-		"re-unspending an already-restored coin must be a no-op even under a different claimed spender")
-	require.Equal(t, 1, coinCount(t, s, ctx, parent), "a replayed restore must not create a second coin")
+		"re-unspending an already-restored UTXO must be a no-op even under a different claimed spender")
+	require.Equal(t, 1, utxoCount(t, s, ctx, parent), "a replayed restore must not create a second UTXO")
 }
 
-// coinFlagsOf reads the flag byte off one live coin, located exactly.
-func coinFlagsOf(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx, vout uint32) int16 {
+// utxoFlagsOf reads the flag byte off one live UTXO, located exactly.
+func utxoFlagsOf(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx, vout uint32) int16 {
 	t.Helper()
 
 	h := tx.TxIDChainHash()
@@ -85,12 +85,12 @@ func coinFlagsOf(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx, vout ui
 	return flags
 }
 
-// TestUnspendLocksACoinItFoundAlreadyLive is the hold half of the restore, and it was missing
-// for exactly the coins conflict resolution needs it for.
+// TestUnspendLocksAUTXOItFoundAlreadyLive is the hold half of the restore, and it was missing
+// for exactly the UTXOs conflict resolution needs it for.
 //
-// Unspend(spends, true) means "put these coins back AND hold them", and the hold is what stops
+// Unspend(spends, true) means "put these UTXOs back AND hold them", and the hold is what stops
 // anyone else spending a contested parent while the resolution decides which child gets it. The
-// flag was ORed only into rows the restore INSERTED, so a parent whose coin was already live --
+// flag was ORed only into rows the restore INSERTED, so a parent whose UTXO was already live --
 // which is what a crash between the unspend and the lock leaves, and exactly the case
 // SetConflicting now reports -- came back from step 2 unheld, stayed spendable for the whole of
 // steps 2 to 5, and then had step 5's SetLocked(false) applied to it anyway. If it had been
@@ -98,10 +98,10 @@ func coinFlagsOf(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx, vout ui
 //
 // The sql reference locks the transaction row unconditionally, which is why it has never had
 // this gap.
-func TestUnspendLocksACoinItFoundAlreadyLive(t *testing.T) {
+func TestUnspendLocksAUTXOItFoundAlreadyLive(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	// A block-path parent: its coin is live and nothing has ever spent it, so there is no
+	// A block-path parent: its UTXO is live and nothing has ever spent it, so there is no
 	// journal row for the restore to consume.
 	parent := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, parent, 700_100, utxo.WithMinedBlockInfo(
@@ -109,7 +109,7 @@ func TestUnspendLocksACoinItFoundAlreadyLive(t *testing.T) {
 	require.NoError(t, err)
 
 	// The child that contests it, marked conflicting. SetConflicting names the parent because
-	// its coin is live, which is the record ProcessConflicting hands to Unspend at step 2.
+	// its UTXO is live, which is the record ProcessConflicting hands to Unspend at step 2.
 	child := spendOutput(t, parent, 0, 1)
 	_, err = s.Create(ctx, child, 700_101)
 	require.NoError(t, err)
@@ -120,18 +120,18 @@ func TestUnspendLocksACoinItFoundAlreadyLive(t *testing.T) {
 
 	require.NoError(t, s.Unspend(ctx, affected, true))
 
-	require.Equal(t, 1, coinCount(t, s, ctx, parent), "nothing was restored, and nothing duplicated")
-	require.NotZero(t, coinFlagsOf(t, s, ctx, parent, 0)&FlagLocked,
-		"a coin the restore found already live must still be held")
+	require.Equal(t, 1, utxoCount(t, s, ctx, parent), "nothing was restored, and nothing duplicated")
+	require.NotZero(t, utxoFlagsOf(t, s, ctx, parent, 0)&FlagLocked,
+		"a UTXO the restore found already live must still be held")
 
 	// And the driver's step 5 releases it, which is the whole point of naming it.
 	require.NoError(t, s.SetLocked(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, false))
-	require.Zero(t, coinFlagsOf(t, s, ctx, parent, 0)&FlagLocked)
+	require.Zero(t, utxoFlagsOf(t, s, ctx, parent, 0)&FlagLocked)
 }
 
-// TestUnspendWithoutTheHoldLeavesALiveCoinAlone is the other half: Unspend(spends) with no hold
+// TestUnspendWithoutTheHoldLeavesALiveUTXOAlone is the other half: Unspend(spends) with no hold
 // asked for must not invent one. A reorg restore has no business locking anything.
-func TestUnspendWithoutTheHoldLeavesALiveCoinAlone(t *testing.T) {
+func TestUnspendWithoutTheHoldLeavesALiveUTXOAlone(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 1, 5_000)
@@ -148,7 +148,7 @@ func TestUnspendWithoutTheHoldLeavesALiveCoinAlone(t *testing.T) {
 	require.Len(t, affected, 1)
 
 	require.NoError(t, s.Unspend(ctx, affected, false))
-	require.Zero(t, coinFlagsOf(t, s, ctx, parent, 0)&FlagLocked)
+	require.Zero(t, utxoFlagsOf(t, s, ctx, parent, 0)&FlagLocked)
 }
 
 // TestUnspendGatesTheJournalsBlockFactsOnASingleSharedCondition pins the fact that
@@ -162,7 +162,7 @@ func TestUnspendWithoutTheHoldLeavesALiveCoinAlone(t *testing.T) {
 // INTEGER, no CHECK), and NULLIF only tests "not exactly zero" while the CASE tests
 // "greater than zero" -- they diverge on a negative value. A journal row that got there
 // some other way than the paired write the comments assume -- mined_height negative,
-// block_id still carrying whatever it last held -- must restore the coin as fully
+// block_id still carrying whatever it last held -- must restore the UTXO as fully
 // unconfirmed, not as a height with no matching block.
 func TestUnspendGatesTheJournalsBlockFactsOnASingleSharedCondition(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -174,7 +174,7 @@ func TestUnspendGatesTheJournalsBlockFactsOnASingleSharedCondition(t *testing.T)
 	ph := parent.TxIDChainHash()
 	spender := chainhash.HashH([]byte("spender"))
 
-	// The coin is spent by hand, outside the normal spend path, so the journal row below is
+	// The UTXO is spent by hand, outside the normal spend path, so the journal row below is
 	// the only fact the restore has to work from -- there is no tx_mined row to prefer it
 	// over either.
 	_, err = s.pool.Exec(ctx, `DELETE FROM utxo WHERE leaf = $1 AND ukey = $2 AND txid = $3`,
@@ -197,7 +197,7 @@ func TestUnspendGatesTheJournalsBlockFactsOnASingleSharedCondition(t *testing.T)
 		SpendingData: spend.NewSpendingData(&spender, 0),
 	}}))
 
-	h, b := coinFacts(t, s, ctx, parent)
-	require.Zero(t, h, "a negative journal height must never surface as this coin's mined height")
+	h, b := utxoFacts(t, s, ctx, parent)
+	require.Zero(t, h, "a negative journal height must never surface as this UTXO's mined height")
 	require.Zero(t, b, "and its paired block id must be zeroed with it, not restored on its own")
 }

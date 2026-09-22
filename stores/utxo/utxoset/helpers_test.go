@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,6 +30,19 @@ func identExists(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) bool {
 		`SELECT count(*) FROM tx_ident WHERE txid = $1`, hashBytes(tx)).Scan(&n))
 
 	return n > 0
+}
+
+// dropIdentityRow deletes a transaction's identity row by raw SQL.
+//
+// The stamp is the one thing in the store that deletes an identity row after mining, and it
+// runs 288 blocks deep. A test of the containment-only reads -- the inputs read, the
+// counter-conflicting walk -- wants a transaction whose identity row is gone so that the
+// tx_mined arm is what answers, without driving a whole stamp to get there; this is that.
+func dropIdentityRow(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) {
+	t.Helper()
+
+	_, err := s.pool.Exec(ctx, `DELETE FROM tx_ident WHERE txid = $1`, hashBytes(tx))
+	require.NoError(t, err)
 }
 
 // spendOneOutput builds a transaction taking one of parent's outputs and applies the spend at
@@ -58,6 +72,61 @@ func spendOneOutput(t *testing.T, s *Store, ctx context.Context, parent *bt.Tx, 
 	return child
 }
 
+// spendOneOutputInBlock is spendOneOutput with the spender created through the block path, so
+// it carries blockID from birth and writes no identity row.
+func spendOneOutputInBlock(t *testing.T, s *Store, ctx context.Context, parent *bt.Tx, vout uint32,
+	height, blockID uint32) *bt.Tx {
+	t.Helper()
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash:      parent.TxIDChainHash(),
+		Vout:          vout,
+		LockingScript: parent.Outputs[vout].LockingScript,
+		Satoshis:      parent.Outputs[vout].Satoshis,
+	}))
+	child.AddOutput(&bt.Output{
+		Satoshis:      parent.Outputs[vout].Satoshis - 1_000,
+		LockingScript: parent.Outputs[vout].LockingScript,
+	})
+
+	_, err := s.Create(ctx, child, height, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: blockID, BlockHeight: height, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = spendOnly(ctx, s, child, height)
+	require.NoError(t, err)
+
+	return child
+}
+
+// plantMined inserts one containment row directly, creating its window first, so a test can
+// build the exact combination of identity row and containment it needs without driving the
+// whole write path. The payload columns are left NULL, as a block-path row's are.
+func plantMined(t *testing.T, s *Store, ctx context.Context, txid []byte, blockID, height, subtreeIdx uint32) {
+	t.Helper()
+
+	require.NoError(t, s.ensureTxMinedPartition(ctx, height))
+
+	_, err := s.pool.Exec(ctx, `
+        INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height)
+        VALUES ($1, $2, $3, $4, $2) ON CONFLICT DO NOTHING`,
+		txid, int32(height), int32(blockID), int32(subtreeIdx))
+	require.NoError(t, err)
+}
+
+// markerOf reads a transaction's unmined marker off its identity row; nil when the marker is
+// clear. The row must exist.
+func markerOf(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) *int32 {
+	t.Helper()
+
+	var marker *int32
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT off_chain_since FROM tx_ident WHERE txid = $1`, hashBytes(tx)).Scan(&marker))
+
+	return marker
+}
+
 // createDirect writes one transaction through the single create path, in a transaction of its
 // own, whatever batcher the store is configured with.
 //
@@ -79,7 +148,7 @@ func createDirect(s *Store, ctx context.Context, tx *bt.Tx, height uint32) error
 	return dbTx.Commit(ctx)
 }
 
-// insertCollidingCoin writes a coin row that SHARES another transaction's packed key: the same
+// insertCollidingUTXO writes a UTXO row that SHARES another transaction's packed key: the same
 // first twelve bytes of txid, so the same leaf and the same ukey, with a different full
 // 32-byte txid.
 //
@@ -87,7 +156,7 @@ func createDirect(s *Store, ctx context.Context, tx *bt.Tx, height uint32) error
 // is legal and this collision is the one an attacker can buy with 2^48 of work. Any by-key
 // write that does not recheck the full txid will hit it, which is what the tests using this
 // helper are for. It returns the other transaction id so the caller can read the row back.
-func insertCollidingCoin(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx,
+func insertCollidingUTXO(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx,
 	minedHeight, blockID int32) []byte {
 	t.Helper()
 
@@ -109,8 +178,8 @@ func insertCollidingCoin(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx,
 	return other
 }
 
-// coinFactsOf reads the block facts off the one coin row carrying this exact txid.
-func coinFactsOf(t *testing.T, s *Store, ctx context.Context, txid []byte) (minedHeight, blockID int32) {
+// utxoFactsOf reads the block facts off the one UTXO row carrying this exact txid.
+func utxoFactsOf(t *testing.T, s *Store, ctx context.Context, txid []byte) (minedHeight, blockID int32) {
 	t.Helper()
 
 	lo, hi := Pack(txid, 0), Pack(txid, ^uint32(0))

@@ -60,9 +60,9 @@ func newSmallPoolStore(t *testing.T, maxConns int) (*Store, context.Context) {
 // that cannot be released until it makes progress. Nothing times out on its own.
 //
 // It has not fired on mainnet only because early blocks carry one or two transactions.
-// The partition cache hides it for 47 of every 48 heights and resets to zero on every
+// The partition cache hides it for all but one height per leaf and resets to zero on every
 // restart, so the trigger is the first large block after a restart, or any large block on
-// a 48-height boundary. Block validation runs the spend phase at
+// a leaf boundary. Block validation runs the spend phase at
 // spendBatcherSize x spendBatcherConcurrency x 2 goroutines against one shared pool.
 func TestConcurrentSpendsDoNotDeadlockThePool(t *testing.T) {
 	s, ctx := newSmallPoolStore(t, 4)

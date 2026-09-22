@@ -76,6 +76,26 @@ type Store struct {
 	// bodyRetention is how long the serialized transaction bytes are kept, in blocks.
 	bodyRetention uint32
 
+	// checkpoints is the active network's chain checkpoint list, the store's own copy of the
+	// boundary two rules test against. A create that carries a block writes the pair onto its
+	// UTXOs at birth only at or below the highest checkpoint, where the chain is header-proven
+	// and the value is final; above it such a create writes an identity row and a containment
+	// row and leaves the UTXOs at (0,0) for the deep stamp, exactly as a create that carries no
+	// block does. And an un-mine of a block at or below the highest checkpoint is refused,
+	// because "final at birth" is only true if nothing un-mines a checkpoint-certified block.
+	// Nil on a network with no checkpoints, where BelowCheckpoint is false at every height, so
+	// every block-carrying create there takes the identity route and no un-mine is refused.
+	checkpoints []chaincfg.Checkpoint
+
+	// oldestUndoLeaf is the lowest attached spend_journal partition, plus one, so zero means
+	// "none attached". The create claims' containment probe is bounded below by the first
+	// height of that partition as well as by the fixed 2,016-block reach (see claimFloor): a
+	// fully spent transaction can be re-offered as itself only while the undo copies of its
+	// inputs live, and those live in the attached undo partitions. It is kept in step by the
+	// two paths that change the set, the leaf creation and the leaf drop, so the block path
+	// never reads the catalog to compute a floor.
+	oldestUndoLeaf atomic.Uint32
+
 	// bodyCheckpoints is the checkpoint list a MINED create's height is tested against to
 	// decide whether it writes serialized bytes at all: the active network's list, when
 	// utxostore_skipTxBodyBelowCheckpoint is on, and nil otherwise.
@@ -88,7 +108,7 @@ type Store struct {
 	// not, so the coinbase of the genesis block keeps its body under the shared rule and lost
 	// it under the local one.
 	//
-	// NIL MEANS OFF, and it means off for two reasons that coincide rather than one standing
+	// NIL MEANS OFF, and it means off for two reasons that utxocide rather than one standing
 	// in for the other: the setting being off leaves it nil, and a network with no checkpoints
 	// (regtest, teratestnet) has nothing to be below. BelowCheckpoint answers false for both,
 	// because it requires a highest checkpoint above 0, so one predicate covers both without a
@@ -96,15 +116,35 @@ type Store struct {
 	//
 	// See the setting's longdesc for why below the checkpoint the bytes are not needed: the
 	// subtree data files hold them, the outpoint-only spend route reads no parent body, and
-	// this store's decorate reads the coin row.
+	// this store's decorate reads the UTXO row.
 	bodyCheckpoints []chaincfg.Checkpoint
 
-	// coinIndexDecider decides whether a utxo_pN_ukey index has bloated past the point
-	// worth a REINDEX CONCURRENTLY. New sets it to coinIndexNeedsRebuild; it exists as a
+	// stampDepth is how many blocks deep a containment window must be before the stamp writes
+	// its blocks onto UTXOs: twice the network's coinbase maturity, rounded up to a whole
+	// window. See StampDepthFor.
+	stampDepth uint32
+
+	// retainIndefinitely is the operator's explicit request to keep every containment window
+	// and undo partition. The stamp still runs; only the drops are skipped, and a gauge shows
+	// the request so the growth is visible.
+	retainIndefinitely bool
+
+	// stampPageHook, when set by a test in this package, is called after each stamp page
+	// commits with the page number, and once more after the last page and before the
+	// completion transaction with page -1. Returning an error abandons the pass as a crash
+	// would. It performs no write.
+	stampPageHook func(wLo uint32, page int) error
+
+	// dropHook, when set by a test in this package, is called between a containment window's
+	// detach and its drop, so a test can record the order of drops or stand in for a crash.
+	dropHook func(window string)
+
+	// utxoIndexDecider decides whether a utxo_pN_ukey index has bloated past the point
+	// worth a REINDEX CONCURRENTLY. New sets it to utxoIndexNeedsRebuild; it exists as a
 	// field, rather than the pruner calling that function directly, so a test can swap in a
 	// stub and observe that the pruner consulted it, without needing a real index bloated
 	// past the threshold or a real REINDEX to complete.
-	coinIndexDecider func(indexBytes, rows int64) bool
+	utxoIndexDecider func(indexBytes, rows int64) bool
 
 	// createBatcher collects Create calls arriving from many goroutines and sends them as
 	// one pipelined round trip.
@@ -146,7 +186,7 @@ type Store struct {
 
 	// lockBatcher collects the single-hash lock changes that two-phase commit produces, one
 	// per mempool transaction. Serialised, because two batches can name the same transaction
-	// and the update touches its coin rows.
+	// and the update touches its UTXO rows.
 	lockBatcher  *batcher.Batcher[lockItem]
 	lockInFlight sync.WaitGroup
 }
@@ -176,7 +216,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Every hot statement here hands its batch over as an array and unpacks it with unnest, so
 	// the planner has no statistics for the values it will be given. It guesses, and because
 	// every table is partitioned the guess is then multiplied by the partition count. On the
-	// mainnet soak box the live-coin probe reads about twenty index pages and is costed at
+	// mainnet soak box the live-UTXO probe reads about twenty index pages and is costed at
 	// 679,043, and the decorate read is costed at 1,465,539. Postgres compiles above 100,000 and inlines
 	// and optimises above 500,000, so both clear every threshold on every execution.
 	//
@@ -203,11 +243,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// is no worse than the custom plans were. For this store's statements the estimate is
 	// wrong in both places that matter. The batch arrives as arrays and is unpacked with
 	// unnest, so a generic plan has no idea whether it is joining one key or five hundred. And
-	// the eligibility tests on the coin row are bit masks on flags, which the planner cannot
+	// the eligibility tests on the UTXO row are bit masks on flags, which the planner cannot
 	// estimate at all and costs as if almost no row survives them. Put together, the generic
-	// plan can decide the coin table is a handful of rows worth rescanning per key.
+	// plan can decide the UTXO table is a handful of rows worth rescanning per key.
 	//
-	// Measured on a 40,000-row coin table with the 500-key spend statement: executions one to
+	// Measured on a 40,000-row UTXO table with the 500-key spend statement: executions one to
 	// five took 8 ms each and the sixth took 1,070 ms, as did every one after it. That is the
 	// generic plan taking over, and it turns a batch that should be linear in its width into
 	// one that is quadratic. The single-key statement never showed it because with one key a
@@ -232,7 +272,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
 		journalRetention: DefaultSpendJournalRetentionBlocks,
 		bodyRetention:    DefaultTxBodyRetentionBlocks,
-		coinIndexDecider: coinIndexNeedsRebuild}
+		utxoIndexDecider: utxoIndexNeedsRebuild}
 
 	// The SAME checkpoint list the outpoint-only spend gate tests against
 	// (model.OutpointOnlyEligible -> model.BelowCheckpoint), so the heights at which this store
@@ -244,9 +284,49 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		logger.Infof("[utxoset] skipping the tx_body write for transactions mined below the highest hardcoded checkpoint, at height %d; block persister and the asset service need the subtree data files for those blocks, and no body is ever written retroactively", model.HighestCheckpointHeight(s.bodyCheckpoints))
 	}
 
+	// The stamp depth follows the network's coinbase maturity; 100 on every network today,
+	// which makes it 288.
+	maturity := uint32(100)
+
+	if tSettings.ChainCfgParams != nil {
+		s.checkpoints = tSettings.ChainCfgParams.Checkpoints
+		maturity = uint32(tSettings.ChainCfgParams.CoinbaseMaturity)
+	}
+
+	s.stampDepth = StampDepthFor(maturity)
+
+	if tSettings.UtxoStore.RetainWindowsIndefinitely {
+		s.retainIndefinitely = true
+		retainIndefinitelyGauge.Set(1)
+
+		logger.Warnf("[utxoset] utxostore_retainWindowsIndefinitely is on: no containment window and no undo partition will be dropped; the stamp still runs and the disk grows without bound")
+	} else {
+		retainIndefinitelyGauge.Set(0)
+	}
+
+	// Refused BEFORE the schema is installed and before any write, beside the schema gate. On
+	// this store the pruner is not only the drop: under the block-facts design it also runs
+	// the deep stamp, the pass that writes each block onto the UTXOs of transactions seen
+	// before their block and deletes their identity rows. Skipping the pruner during catch-up
+	// would switch off both the stamp and every window drop for the whole of catch-up, and
+	// the disk would fill in silence. The stamp always runs on this store and has no off
+	// switch. An operator who wants to keep every window has a different lever:
+	// utxostore_retainWindowsIndefinitely, which skips the drops and nothing else.
+	if tSettings.Pruner.SkipDuringCatchup {
+		pool.Close()
+
+		return nil, errors.NewConfigurationError(
+			"[utxoset] pruner_skipDuringCatchup is true, and the utxoset store refuses to start with it: on this store the pruner also runs the stamp, so skipping it during catch-up switches off the stamp and every window drop for the whole catch-up and fills the disk in silence. The stamp always runs and has no off switch. To keep windows past their retention set utxostore_retainWindowsIndefinitely instead of skipping the pruner")
+	}
+
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)
+	}
+
+	if err := s.loadOldestUndoLeaf(ctx); err != nil {
+		pool.Close()
+		return nil, err
 	}
 
 	// The create batcher, sized from the same settings the sql and aerospike stores use, so

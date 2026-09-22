@@ -1,8 +1,10 @@
 package utxoset
 
 import (
+	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
 	"github.com/stretchr/testify/require"
 )
@@ -19,52 +21,59 @@ import (
 // Each subtest is named for the capability it pins, so a failure says what is missing rather
 // than merely that something is. They all pass; a suite not listed here is one this store does
 // not implement the entry point for, not one that is failing quietly.
+//
+// Every subtest runs on a store whose network has NO chain checkpoints. The suite describes
+// tip behaviour through the interface: it records and un-mines blocks at heights like 101 and
+// 300, which the default mainnet parameters put at or below the highest checkpoint, where this
+// store refuses an un-mine by design and writes the pair onto a block-carrying create's UTXOs
+// at birth. With no checkpoint every height is the tip's regime, which is the one the suite is
+// written for.
 func TestConformance(t *testing.T) {
 	t.Run("Store", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Store(t, db)
 	})
 
 	t.Run("Spend", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Spend(t, db)
 	})
 
 	t.Run("Freeze", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Freeze(t, db)
 	})
 
-	// Reassigning a frozen coin, the alert system's confiscation path. It is the one place a
-	// coin's spending rules change under it, and this store holds the rules themselves rather
+	// Reassigning a frozen UTXO, the alert system's confiscation path. It is the one place a
+	// UTXO's spending rules change under it, and this store holds the rules themselves rather
 	// than a digest of them, so it needs hash_override to carry what the new output hashes to.
 	t.Run("ReAssign", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.ReAssign(t, db)
 	})
 
 	t.Run("SetMined", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetMined(t, db)
 	})
 
 	t.Run("Conflicting", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Conflicting(t, db)
 	})
 
 	t.Run("Restore", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Restore(t, db)
 	})
 
 	t.Run("UnspendIdempotent", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.UnspendIdempotent(t, db)
 	})
 
 	t.Run("SetMinedWithSpent", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetMinedWithSpent(t, db)
 	})
 
@@ -73,27 +82,29 @@ func TestConformance(t *testing.T) {
 	// back out with the mempool marker at the current tip, and (true) settles it again. It was
 	// parked while only the outward move existed.
 	t.Run("SetMinedUnminedSince", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetMinedUnminedSince(t, db)
 	})
 
-	// The delete-at-height lifecycle: a mempool-created tx stamped mined on the longest
-	// chain moves into tx_mined, every output gets spent, and Prune(1_000_000) at that
-	// height drops every membership window below the journal-retention cutoff wholesale
-	// (there is no per-row DAH sweep in this design — see pruner.go). The coins are
-	// already gone from the spend, so once the window holding the tx's identity is
-	// dropped, a lookup misses.
+	// The delete-at-height lifecycle: a transaction created unmined is recorded mined on the
+	// longest chain, every output gets spent, and one Prune call at a far tip is expected to
+	// make it unfindable. On this store that takes the stamp, which the pruner service drives
+	// on its own worker through the Stamper interface, and which the shared case knows nothing
+	// about. stampingPruner is the harness's stand-in for that worker: on Prune it drains every
+	// stampable window with a hand-built chain answer, moves the tip past stamped_at + 1,728
+	// and then runs the real Prune, which is how one call comes to satisfy a case whose drop
+	// rule needs two conditions.
 	t.Run("MinedThenSpendAllPrunes", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 
 		svc, err := db.GetPrunerService()
 		require.NoError(t, err)
 
-		tests.MinedThenSpendAllPrunes(t, db, svc)
+		tests.MinedThenSpendAllPrunes(t, db, stampingPruner{Service: svc, store: db, t: t})
 	})
 
 	// The six SpendAndCreate entry points. The spec named them as ones this design should
-	// enable, and they are the cross-store contract for the option C1's own-output coin guard
+	// enable, and they are the cross-store contract for the option C1's own-output UTXO guard
 	// turns on: WithCreateOnly skips the spend phase, which is the path a mempool create takes
 	// when the validator's CreateConflicting branch fires.
 	//
@@ -101,32 +112,32 @@ func TestConformance(t *testing.T) {
 	// against this store's internals. These are written against the interface, which is what
 	// makes them a contract rather than a second opinion.
 	t.Run("SpendAndCreate", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreate(t, db)
 	})
 
 	t.Run("SpendAndCreateCreateOnly", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateCreateOnly(t, db)
 	})
 
 	t.Run("SpendAndCreateSpendOnly", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateSpendOnly(t, db)
 	})
 
 	t.Run("SpendAndCreateTxExistsKeepsSpends", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateTxExistsKeepsSpends(t, db)
 	})
 
 	t.Run("SpendAndCreateSpendErrorSurfacesPerInput", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateSpendErrorSurfacesPerInput(t, db)
 	})
 
 	t.Run("SpendAndCreateInvalidOptions", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateInvalidOptions(t, db)
 	})
 
@@ -134,7 +145,7 @@ func TestConformance(t *testing.T) {
 	// replays whatever a crash left half-finished, so an intent that does not survive is a
 	// conflict resolution that silently never completes.
 	t.Run("ConflictWAL", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.ConflictWAL(t, db)
 	})
 
@@ -144,53 +155,53 @@ func TestConformance(t *testing.T) {
 	// read the driver makes on it -- its inputs, its spenders, its locked flag -- has to reach
 	// tx_mined rather than the identity table.
 	t.Run("ConflictWALCrashRecovery", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.ConflictWALCrashRecovery(t, db)
 	})
 
-	// The conflicting flag from the outside: GetSpend reports CONFLICTING on the coin, Get
-	// reports it on the metadata, a spend of that coin fails with ErrTxConflicting, and the
+	// The conflicting flag from the outside: GetSpend reports CONFLICTING on the UTXO, Get
+	// reports it on the metadata, a spend of that UTXO fails with ErrTxConflicting, and the
 	// contested parent names the child without becoming conflicting itself.
 	t.Run("SetConflictingBehavior", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetConflictingBehavior(t, db)
 	})
 
 	// The lock from the outside, and the round trip: OK, locked, a spend refused with
 	// ErrTxLocked, unlocked, OK, and the same spend now accepted.
 	t.Run("SetLockedBehavior", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetLockedBehavior(t, db)
 	})
 
-	// Re-spending a coin with the SAME spending transaction is a no-op success, not a double
+	// Re-spending a UTXO with the SAME spending transaction is a no-op success, not a double
 	// spend. Block validation replays a block it has already applied, and a store that raised
 	// there could never re-apply one.
 	t.Run("SpendIdempotent", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendIdempotent(t, db)
 	})
 
 	// The four ways a spend is refused, each with its own error, because the validator
-	// behaves differently for each: a parent it has never seen, a claim about the coin that
-	// does not match, a coinbase inside its maturity window, and a coin some other
+	// behaves differently for each: a parent it has never seen, a claim about the UTXO that
+	// does not match, a coinbase inside its maturity window, and a UTXO some other
 	// transaction already took -- which must also name the transaction that took it.
 	t.Run("SpendErrorTypes", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SpendErrorTypes(t, db)
 	})
 
 	// Not-found is a STATUS from GetSpend, never an error. A caller asking about an outpoint
 	// the store does not hold is asking a legitimate question.
 	t.Run("GetSpendNotFound", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.GetSpendNotFound(t, db)
 	})
 
 	// Height zero is refused, because it is the unconfirmed sentinel throughout this store and
 	// accepting it would make every maturity and retention test read true.
 	t.Run("SetBlockHeightZero", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetBlockHeightZero(t, db)
 	})
 
@@ -200,12 +211,12 @@ func TestConformance(t *testing.T) {
 	// side: a pair some single writer actually published, never one assembled from two loads,
 	// which only shows up while a writer is mid-update.
 	t.Run("SetBlockStateContract", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetBlockStateContract(t, db)
 	})
 
 	t.Run("SetBlockStateSnapshotUnderConcurrency", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.SetBlockStateSnapshotUnderConcurrency(t, db)
 	})
 
@@ -219,9 +230,36 @@ func TestConformance(t *testing.T) {
 	// the suite at which a statement whose cost is a function of the table rather than the
 	// batch would show up as a stall rather than as a wrong answer.
 	t.Run("Sanity", func(t *testing.T) {
-		db, _ := newTestStore(t)
+		db, _ := newUncheckpointedStore(t)
 		tests.Sanity(t, db)
 	})
+}
+
+// stampingPruner is the harness's stand-in for the pruner service's stamp worker, for the
+// shared MinedThenSpendAllPrunes case. It lives in the harness rather than as a hook in the
+// shared test, because a hook there would put a stamp concept into a file that aerospike and
+// sql also run, and neither has one.
+//
+// The chain answer names block 100 at height 1000, which is what the shared case records; every
+// other height gets a filler id, which no row names.
+type stampingPruner struct {
+	pruner.Service
+
+	store *Store
+	t     *testing.T
+}
+
+func (p stampingPruner) Prune(ctx context.Context, _ uint32, hash string) (int64, error) {
+	windows, err := p.store.listTxMinedWindows(ctx)
+	require.NoError(p.t, err)
+	require.NotEmpty(p.t, windows)
+
+	tip := stampThrough(p.t, p.store, ctx, windows[len(windows)-1].window, map[uint32]uint32{1000: 100})
+
+	dropAt := tip + stampMarginBlocks + undoMaxLifeBlocks
+	require.NoError(p.t, p.store.SetBlockHeight(dropAt))
+
+	return p.Service.Prune(ctx, dropAt, hash)
 }
 
 // BenchmarkConformance is the shared suite's own benchmark: create, spend, unspend, delete,

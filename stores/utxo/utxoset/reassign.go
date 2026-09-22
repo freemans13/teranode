@@ -8,25 +8,25 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-// reassignSQL moves ONE frozen coin to a new output AND reports why it could not, in one
+// reassignSQL moves ONE frozen UTXO to a new output AND reports why it could not, in one
 // statement.
 //
 // The frozen bit is a predicate rather than a prior read, and that is the whole safety
 // property. A read-then-write would leave a window in which an UnFreezeUTXOs, or a spend
-// that becomes legal the moment the freeze lifts, lands between the two; here the coin is
+// that becomes legal the moment the freeze lifts, lands between the two; here the UTXO is
 // either frozen at the instant of the update or the update takes nothing and the caller is
 // told. It is the same reason FreezeUTXOs enforces on the row rather than beside it.
 //
 // The probe branch is in the SAME statement for the same class of reason, one level down. It
 // was a second query at first, and a second query cannot say what was true when the update
-// ran: a coin spent in between would be reported as "not frozen" when it was gone, and a coin
+// ran: a UTXO spent in between would be reported as "not frozen" when it was gone, and a UTXO
 // frozen in between as "not frozen" when it had just become frozen. Here both branches read
 // one snapshot, so the diagnosis describes the state the update actually saw. It costs nothing
 // on the success path -- the same index probe serves both.
 //
 // The full 32-byte txid recheck is present for the reason it is present everywhere in this
 // store: the ukey is a non-unique 96-bit prefix, so it can locate a row but never authorise
-// acting on one. Reassigning a coin is handing someone else's money to a new owner, which is
+// acting on one. Reassigning a UTXO is handing someone else's money to a new owner, which is
 // the last place to trust a prefix.
 //
 // hash_override is the only thing written about the new output, because it is the only thing
@@ -35,10 +35,10 @@ import (
 // on the row stay as they were, and every path that reads them stops trusting them the moment
 // hash_override is non-NULL -- see claimMismatch and decorateSQL.
 //
-// The frozen bit is cleared in the same statement. Leaving it set would make the coin
+// The frozen bit is cleared in the same statement. Leaving it set would make the UTXO
 // permanently unspendable by its new owner, since the spend's own predicate excludes a frozen
 // row, and clearing it separately would expose a moment in which the old owner's claim is
-// live again against a coin that is no longer theirs.
+// live again against a UTXO that is no longer theirs.
 const reassignSQL = `
 WITH probe AS (
     SELECT 1 FROM utxo u
@@ -55,17 +55,17 @@ upd AS (
 )
 SELECT (SELECT count(*) FROM upd), (SELECT count(*) FROM probe)`
 
-// ReAssignUTXO hands a frozen coin to a new output.
+// ReAssignUTXO hands a frozen UTXO to a new output.
 //
 // This is the alert system's confiscation path: a court order freezes an output and then
 // reassigns it to a new owner, who may spend it once the delay has passed. The delay is not
 // cosmetic -- it is the window in which the reassignment can itself be challenged and undone
-// before the coin moves again -- so it is enforced on the row by spendable_from, the same
+// before the UTXO moves again -- so it is enforced on the row by spendable_from, the same
 // column coinbase maturity uses, which means the spend statement already honours it and no
 // second check can drift out of step with the first.
 //
 // The interface gives this store a hash of the new output and nothing else. Every other store
-// keeps a UTXO hash as the coin's identity and simply overwrites it. This one keeps the
+// keeps a UTXO hash as the UTXO's identity and simply overwrites it. This one keeps the
 // satoshis and the locking script themselves, because its spend is also its decorate fetch, so
 // there is nothing here to overwrite with: the new script is not in the argument. What it can
 // do is record what the new output must hash to and refuse anything else, which is what
@@ -102,9 +102,9 @@ func (s *Store) ReAssignUTXO(ctx context.Context, old *utxo.Spend, newUtxo *utxo
 		return nil
 	}
 
-	// Zero rows is never silence, and the two causes need opposite responses. A coin that is
+	// Zero rows is never silence, and the two causes need opposite responses. A UTXO that is
 	// there but unfrozen means the alert system skipped the freeze the protocol requires; a
-	// coin that is absent was spent or never created, and saying "not frozen" about it would
+	// UTXO that is absent was spent or never created, and saying "not frozen" about it would
 	// be a claim this store cannot support. Either way the caller must not be left believing
 	// a court-ordered confiscation was applied when nothing was written.
 	if present > 0 {

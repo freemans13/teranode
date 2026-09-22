@@ -43,15 +43,15 @@ func TestGetReportsAMissingTransactionAsNotFound(t *testing.T) {
 	require.True(t, errors.Is(err, errors.ErrTxNotFound), "want ErrTxNotFound, got %v", err)
 }
 
-// TestGetUnpacksBlockMembershipInInsertionOrder pins the ordering the shared conformance
-// suite asserts: subtree indexes come back in the order they were written, never sorted.
+// TestGetReturnsBlocksInHeightThenBlockIDOrder pins the order that replaced the insertion
+// counter: a transaction's blocks come back sorted by (mined_height, block_id), never by the
+// order they were recorded in. Nothing may rank containment rows by arrival, because more than
+// one caller records the same blocks with no ordering between them, and the old counter was
+// read as "the earliest row is the winner" and stamped reorg losers onto UTXOs.
 //
-// The two blocks are now reached by two stamps rather than by one create carrying two
-// MinedBlockInfos. A create that carries block information takes the block path, which claims
-// a single membership row for the block it was given, so two blocks can only ever be two
-// separate acts. At the tip that is what happens anyway: the transaction arrives from the
-// mempool and each block that contains it stamps it in turn.
-func TestGetUnpacksBlockMembershipInInsertionOrder(t *testing.T) {
+// The shared conformance suite only ever records in ascending order, so it cannot tell the two
+// apart; this test records the higher block first so that it can.
+func TestGetReturnsBlocksInHeightThenBlockIDOrder(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 1_000)
@@ -69,14 +69,14 @@ func TestGetUnpacksBlockMembershipInInsertionOrder(t *testing.T) {
 	got, err := s.Get(ctx, tx.TxIDChainHash())
 	require.NoError(t, err)
 
-	require.Equal(t, []uint32{9, 4}, got.BlockIDs)
-	require.Equal(t, []uint32{700_002, 700_001}, got.BlockHeights)
-	require.Equal(t, []int{7, 2}, got.SubtreeIdxs, "insertion order, not sorted")
+	require.Equal(t, []uint32{4, 9}, got.BlockIDs)
+	require.Equal(t, []uint32{700_001, 700_002}, got.BlockHeights)
+	require.Equal(t, []int{2, 7}, got.SubtreeIdxs, "(mined_height, block_id) order, not arrival order")
 }
 
 // TestGetReportsWhetherTheTransactionIsWaitingToBeMined. Block assembly reads this to decide
 // whether a transaction belongs in the mempool, and a wrong answer here loses funds: on a
-// delete-on-spend store the parents' coin rows are already gone, and an absent coin row
+// delete-on-spend store the parents' UTXO rows are already gone, and an absent UTXO row
 // reads as spent, so a transaction dropped from the mempool can never be mined and its
 // inputs can never be spent again.
 func TestGetReportsWhetherTheTransactionIsWaitingToBeMined(t *testing.T) {
@@ -127,9 +127,9 @@ func TestGetSurvivesABodyThatHasAgedOut(t *testing.T) {
 //
 // When a transaction loses a double-spend race it is stored as conflicting rather than
 // discarded, because resolving the conflict later needs to find it. Finding it means asking
-// the PARENT whose coin was contested, so the parent has to carry the list.
+// the PARENT whose UTXO was contested, so the parent has to carry the list.
 //
-// Without this, conflict resolution has no way to walk from a contested coin to the
+// Without this, conflict resolution has no way to walk from a contested UTXO to the
 // transactions competing for it.
 func TestCreatingAConflictingTransactionRecordsItOnItsParents(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -157,6 +157,6 @@ func TestCreatingAConflictingTransactionRecordsItOnItsParents(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, gotParent.Conflicting, "the parent did nothing wrong")
 	require.Len(t, gotParent.ConflictingChildren, 1,
-		"but it must name the transaction contesting its coin, or conflict resolution cannot find it")
+		"but it must name the transaction contesting its UTXO, or conflict resolution cannot find it")
 	require.Equal(t, loser.TxID(), gotParent.ConflictingChildren[0].String())
 }

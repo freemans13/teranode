@@ -15,16 +15,14 @@ import (
 // statement write-ahead log volume, with the watermark thousands of blocks behind the tip.
 //
 // What is left is catalog operations on two horizons. Transaction bodies retire on
-// DefaultTxBodyRetentionBlocks; membership windows, the spend journal and the
+// DefaultTxBodyRetentionBlocks; containment windows, the spend journal and the
 // conflict-bookkeeping windows created alongside its leaves retire on
 // DefaultSpendJournalRetentionBlocks. Each is a DROP TABLE of partitions that have aged out,
 // so there is no work list, no probe and no per-row cost that can fall behind.
 //
-// Identity reclaim used to be the expensive half of this: a retiring journal partition read
-// as a work list, each parent judged on whether its spenders were settled, and its identity
-// row deleted. That is gone. A mined transaction claims on tx_mined instead of tx_ident, and
-// its coins carry the height and block that made them, so retiring its membership is dropping
-// the window it lives in.
+// A containment window drops on the four-part rule of dropStampedTxMinedWindows, which needs
+// the completion record the stamp writes. The stamp itself runs on the pruner service's own
+// worker through the Stamper interface in stamp.go, never in front of a drop.
 //
 // It runs HERE, rather than on the spend path where it used to, for three reasons. The
 // spend path had to swallow the error to avoid failing a spend over old history, and it
@@ -52,10 +50,20 @@ func (journalPruner) Start(_ context.Context) {
 	// goroutine, so there is nothing for this store to start and nothing to stop.
 }
 
-// Prune drops the bodies, membership windows and journal leaves that have aged out at this
-// height.
+// Prune drops the bodies, undo partitions and containment windows that are due at this height,
+// then rebuilds at most one bloated UTXO index.
 //
 // The height is the tip, not a retention-adjusted one, so the retention is applied here.
+//
+// The steps do not gate each other. Each runs even when an earlier one failed; the errors are
+// logged, counted by step, and the first one is returned at the end. Deferring reclaim is the
+// shape that filled the volume in September. The one ordering that matters is undo before
+// containment: the window drop's third condition reads which undo partitions are still attached,
+// so the undo drop in the same pass is what lets a containment drop succeed.
+//
+// The stamp is NOT here. It runs on the pruner service's own worker through the Stamper
+// interface, beside this pass rather than in front of it, so a long drain never holds back a
+// drop.
 //
 // It reports ZERO records processed, and that is exact rather than evasive. The caller adds
 // the return value to a counter of child transaction records deleted by a delete-at-height
@@ -63,50 +71,48 @@ func (journalPruner) Start(_ context.Context) {
 // partitions. Reporting dropped partitions in that counter would put two different units in
 // one metric, so they are logged instead.
 func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int64, error) {
+	var first error
+
+	fail := func(step string, err error) {
+		pruneStepErrors.WithLabelValues(step).Inc()
+		p.store.logger.Errorf("[utxoset] pruner step %s at height %d: %v", step, height, err)
+
+		if first == nil {
+			first = err
+		}
+	}
+
 	// The body horizon and the journal horizon are DIFFERENT numbers, 288 against 1440, so
 	// the two reclaims must not be gated behind one another. Doing so left the bodies
 	// unreclaimed for the whole of early sync, which is exactly when the disk is tightest.
 	bodies, err := p.store.dropTxBodyWindowsBelow(ctx, height)
 	if err != nil {
-		return 0, err
-	}
-
-	if bodies > 0 {
+		fail("bodies", err)
+	} else if bodies > 0 {
 		p.store.logger.Infof("[utxoset] pruner dropped %d transaction-body windows past the %d-block horizon",
 			bodies, p.store.bodyRetention)
 	}
 
-	// The window and spend-journal drops are gated on journalRetention: below it nothing has
-	// aged out yet, so there is nothing to drop. That gate does NOT extend to the coin-index
-	// rebuild below -- a coin index can already be bloated on a chain three blocks deep, and
-	// every dev/test net and every from-scratch sync spends most of its life below
-	// DefaultSpendJournalRetentionBlocks (1440). Gating the rebuild on it, as an earlier
-	// version of this did by putting the rebuild after this block's early return, meant the
-	// rebuild never ran anywhere that mattered for testing it and would not have run during
-	// the early, most write-heavy part of a real sync either.
-	if height > p.store.journalRetention {
-		cutoff := height - p.store.journalRetention
-
-		// Identity reclaim is a partition drop. Nothing is read to decide it: a window whose
-		// upper bound is journalRetention below the pruner's height holds transactions whose
-		// blocks cannot be un-mined and whose coins carry their own block facts.
-		windows, err := p.store.dropTxMinedWindowsBelow(ctx, cutoff)
+	// Undo partitions first, then containment windows, for the reason above. The undo drop is
+	// gated on journalRetention: below it nothing has aged out. That gate does NOT extend to
+	// the UTXO-index rebuild -- a UTXO index can already be bloated on a chain three blocks
+	// deep, and every dev/test net and every from-scratch sync spends most of its life below
+	// DefaultSpendJournalRetentionBlocks (1440).
+	if !p.store.retainIndefinitely && height > p.store.journalRetention {
+		leaves, err := p.store.dropSpendJournalPartitionsBelow(ctx, height-p.store.journalRetention)
 		if err != nil {
-			return 0, err
+			fail("undo", err)
+		} else if leaves > 0 {
+			p.store.logger.Infof("[utxoset] pruner dropped %d spend-journal and conflict partitions below height %d",
+				leaves, height-p.store.journalRetention)
 		}
+	}
 
-		// The journal's leaves and the conflict-bookkeeping windows that retire with them, in
-		// one pass: a note names a race whose losing spends are restored out of the journal,
-		// so keeping it past its journal leaf would keep an answer nothing can act on.
-		leaves, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff)
-		if err != nil {
-			return 0, err
-		}
-
-		if windows > 0 || leaves > 0 {
-			p.store.logger.Infof("[utxoset] pruner dropped %d membership windows and %d spend-journal and conflict partitions below height %d",
-				windows, leaves, cutoff)
-		}
+	windows, err := p.store.dropStampedTxMinedWindows(ctx, height)
+	if err != nil {
+		fail("containment", err)
+	} else if windows > 0 {
+		p.store.logger.Infof("[utxoset] pruner dropped %d containment windows at height %d", windows, height)
 	}
 
 	// LAST, and unconditional: every session reaches this, regardless of height or
@@ -116,11 +122,11 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	// block's pruner call runs this again and finds whichever partition is now worst --
 	// including the one just finished, back near the 31.5-byte floor -- so the schedule
 	// catches up over a run of blocks rather than blocking this one.
-	if _, err := p.store.rebuildOneBloatedCoinIndex(ctx, p.store.coinIndexDecider); err != nil {
-		return 0, err
+	if _, err := p.store.rebuildOneBloatedUTXOIndex(ctx, p.store.utxoIndexDecider); err != nil {
+		fail("reindex", err)
 	}
 
-	return 0, nil
+	return 0, first
 }
 
 // AddObserver accepts and discards. Observers are notified when a pruning cycle completes,

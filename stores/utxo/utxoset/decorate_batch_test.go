@@ -102,12 +102,12 @@ func TestSetLockedMarksAndClears(t *testing.T) {
 	require.True(t, got.Locked, "and it can be set again")
 }
 
-// TestSetLockedReachesTheCoinRowsToo.
+// TestSetLockedReachesTheUTXORowsToo.
 //
-// The flag lives on the transaction row AND on every coin the transaction created, because
-// the spend path reads the coin row and never the transaction row. Setting only one of them
-// would leave a transaction that reports itself locked while its coins are spendable.
-func TestSetLockedReachesTheCoinRowsToo(t *testing.T) {
+// The flag lives on the transaction row AND on every UTXO the transaction created, because
+// the spend path reads the UTXO row and never the transaction row. Setting only one of them
+// would leave a transaction that reports itself locked while its UTXOs are spendable.
+func TestSetLockedReachesTheUTXORowsToo(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 3, 1_000)
@@ -117,11 +117,11 @@ func TestSetLockedReachesTheCoinRowsToo(t *testing.T) {
 	h := *tx.TxIDChainHash()
 	require.NoError(t, s.SetLocked(ctx, []chainhash.Hash{h}, true))
 
-	var lockedCoins int
+	var lockedUTXOs int
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM utxo WHERE txid = $1 AND (flags & $2::smallint) <> 0`,
-		h[:], FlagLocked).Scan(&lockedCoins))
+		h[:], FlagLocked).Scan(&lockedUTXOs))
 
-	require.Equal(t, 3, lockedCoins,
-		"every coin must carry it: the spend path reads the coin row, never the transaction row")
+	require.Equal(t, 3, lockedUTXOs,
+		"every UTXO must carry it: the spend path reads the UTXO row, never the transaction row")
 }

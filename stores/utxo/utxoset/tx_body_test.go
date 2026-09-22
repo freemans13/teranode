@@ -13,7 +13,7 @@ import (
 // droppable.
 //
 // The body is the only part of a transaction whose life is bounded by a horizon rather than
-// by its coins. Everything else on tx_ident is pinned for as long as any output is unspent,
+// by its UTXOs. Everything else on tx_ident is pinned for as long as any output is unspent,
 // at any age, because the validator reads the parent's block ids and heights for every input.
 // Keeping the body there too would make the transaction archive permanent for the whole
 // pinned population, measured at 136 GB of out-of-line storage today against roughly 95 GB of
@@ -109,7 +109,7 @@ func TestCreateDoesNotWriteASecondBodyForADuplicate(t *testing.T) {
 // TestCreateIsAtomicAcrossItsThreeWrites pins that a Create either lands completely or not
 // at all.
 //
-// Create writes three things: the identity row, the serialized bytes, and one coin row per
+// Create writes three things: the identity row, the serialized bytes, and one UTXO row per
 // spendable output. Run them on the connection pool rather than inside one transaction and
 // each commits separately, so a failure partway leaves the earlier writes standing.
 //
@@ -151,15 +151,15 @@ func TestCreateIsAtomicAcrossItsThreeWrites(t *testing.T) {
 
 	h := tx.TxIDChainHash()
 
-	var idents, coins int
+	var idents, utxoRows int
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM tx_ident WHERE txid = $1`, h[:]).Scan(&idents))
 	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM utxo WHERE txid = $1`, h[:]).Scan(&coins))
+		`SELECT count(*) FROM utxo WHERE txid = $1`, h[:]).Scan(&utxoRows))
 
 	require.Zero(t, idents,
 		"a failed create must leave no identity row: one without its bytes reads as aged-out forever, and the retry is refused as a duplicate")
-	require.Zero(t, coins, "and no coins")
+	require.Zero(t, utxoRows, "and no UTXOs")
 }
 
 // itoa keeps the partition name readable at the call site.
@@ -324,5 +324,5 @@ func TestBodyWindowsBelowRetentionAreDropped(t *testing.T) {
 	require.True(t, bodyExists(t, s, ctx, recent), "filed at 900, still inside it")
 
 	require.True(t, identExists(t, s, ctx, old),
-		"and the identity row survives its body: it is still needed while its coin is unspent")
+		"and the identity row survives its body: it is still needed while its UTXO is unspent")
 }

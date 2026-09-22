@@ -508,6 +508,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BatchSQLOperations:                      getBool("utxostore_batch_sql_operations", true, alternativeContext...),
 			DisableDAHCleaner:                       getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 			SkipTxBodyBelowCheckpoint:               getBool("utxostore_skipTxBodyBelowCheckpoint", false, alternativeContext...),
+			RetainWindowsIndefinitely:               getBool("utxostore_retainWindowsIndefinitely", false, alternativeContext...),
 			ReAssignedUtxoSpendableAfterBlocks:      getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
 			BatcherMaxConcurrent:                    getInt("utxostore_batcherMaxConcurrent", 64, alternativeContext...),
 			OutpointBatcherMaxConcurrent:            getInt("utxostore_outpointBatcherMaxConcurrent", 0, alternativeContext...),

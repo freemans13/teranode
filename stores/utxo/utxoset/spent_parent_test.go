@@ -14,10 +14,10 @@ import (
 // most blocks above the highest checkpoint, and the one no other step can answer.
 //
 // The parent was mined longer ago than the membership retention, so its window is gone. Its
-// last output has been spent, so there is no coin. Nothing preserved it, because preservation
+// last output has been spent, so there is no UTXO. Nothing preserved it, because preservation
 // names parents of children that have been UNMINED for 144 blocks, and this child is mined in
-// the next block. Identity, membership, preservation and coin all miss. The journal row from
-// the spend is the only record left, and it carries the block facts copied off the coin the
+// the next block. Identity, membership, preservation and UTXO all miss. The journal row from
+// the spend is the only record left, and it carries the block facts copied off the UTXO the
 // delete destroyed.
 func TestGetServesAFullySpentOldParentFromTheJournal(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -27,14 +27,13 @@ func TestGetServesAFullySpentOldParentFromTheJournal(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// The membership window retires while the coin is still live, so the coin -- and only the
-	// coin -- carries the block facts by the time the spend happens.
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	// The membership window retires while the UTXO is still live, so the UTXO -- and only the
+	// UTXO -- carries the block facts by the time the spend happens.
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 	require.Equal(t, 0, minedRows(t, s, ctx, parent))
 
 	spendOneOutput(t, s, ctx, parent, 0, 2_000)
-	require.Equal(t, 0, coinCount(t, s, ctx, parent))
+	require.Equal(t, 0, utxoCount(t, s, ctx, parent))
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
 	require.NoError(t, err)
@@ -44,7 +43,7 @@ func TestGetServesAFullySpentOldParentFromTheJournal(t *testing.T) {
 }
 
 // TestUnspendRestoresBlockFactsFromTheJournalCopy: with the membership window gone, tx_mined
-// has nothing to re-resolve the restored coin's block from. The journal's copy is the
+// has nothing to re-resolve the restored UTXO's block from. The journal's copy is the
 // fallback, and it is preferred to the unconfirmed sentinel.
 func TestUnspendRestoresBlockFactsFromTheJournalCopy(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -54,11 +53,10 @@ func TestUnspendRestoresBlockFactsFromTheJournalCopy(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 
 	child := spendOneOutput(t, s, ctx, parent, 0, 2_000)
-	require.Equal(t, 0, coinCount(t, s, ctx, parent))
+	require.Equal(t, 0, utxoCount(t, s, ctx, parent))
 
 	require.NoError(t, s.Unspend(ctx, []*utxo.Spend{{
 		TxID:         parent.TxIDChainHash(),
@@ -66,16 +64,16 @@ func TestUnspendRestoresBlockFactsFromTheJournalCopy(t *testing.T) {
 		SpendingData: spend.NewSpendingData(child.TxIDChainHash(), 0),
 	}}))
 
-	require.Equal(t, 1, coinCount(t, s, ctx, parent))
+	require.Equal(t, 1, utxoCount(t, s, ctx, parent))
 
-	h, b := coinFactsOf(t, s, ctx, hashBytes(parent))
+	h, b := utxoFactsOf(t, s, ctx, hashBytes(parent))
 	require.Equal(t, int32(100), h, "restored from the journal copy, not the sentinel")
 	require.Equal(t, int32(7), b)
 }
 
 // TestTheJournalStepIsNotConsultedForAMempoolParent: the identity row answers at step 1, and
 // the journal copy for a mempool spend is the unconfirmed sentinel anyway, which the journal
-// step filters out. A mempool parent whose coin is spent must not start claiming a block.
+// step filters out. A mempool parent whose UTXO is spent must not start claiming a block.
 func TestTheJournalStepIsNotConsultedForAMempoolParent(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -84,7 +82,7 @@ func TestTheJournalStepIsNotConsultedForAMempoolParent(t *testing.T) {
 	require.NoError(t, err)
 
 	spendOneOutput(t, s, ctx, parent, 0, 100)
-	require.Equal(t, 0, coinCount(t, s, ctx, parent))
+	require.Equal(t, 0, utxoCount(t, s, ctx, parent))
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
 	require.NoError(t, err)
@@ -105,10 +103,11 @@ func TestGetStillReportsNotFoundOnceTheJournalLeafIsGoneToo(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	spendOneOutput(t, s, ctx, parent, 0, 100)
+	// The child spends at 900, past the height window 0 is stamped at, so the undo copy sits
+	// in a partition the window drop does not have to wait for.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 8)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 
 	_, err = s.dropSpendJournalPartitionsBelow(ctx, 2_000)
 	require.NoError(t, err)

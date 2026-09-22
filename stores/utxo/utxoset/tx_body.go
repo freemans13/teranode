@@ -55,12 +55,18 @@ func (s *Store) ensureTxBodyPartition(ctx context.Context, height uint32) error 
 	// update of another column, because postgres writes only what changed working in from
 	// both ends of the row. Do not set toast_tuple_target to force more of it out -- at 128
 	// the toaster does not stop at raw_tx, it keeps going and externalises txid too.
-	ddl := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS tx_body_w%[1]d PARTITION OF tx_body
-  FOR VALUES FROM (%[2]d) TO (%[3]d);
-ALTER TABLE tx_body_w%[1]d ALTER COLUMN raw_tx SET STORAGE EXTERNAL;`, window, lo, hi)
-
-	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+	//
+	// Built standalone and attached, so the block path never takes the parent's strongest
+	// lock at a window boundary. See ensureAttachedPartition.
+	child := fmt.Sprintf("tx_body_w%d", window)
+	if err := s.ensureAttachedPartition(ctx, partitionSpec{
+		parent: "tx_body",
+		child:  child,
+		key:    "created_height",
+		lo:     lo,
+		hi:     hi,
+		after:  []string{fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN raw_tx SET STORAGE EXTERNAL`, child)},
+	}); err != nil {
 		return errors.NewStorageError("[utxoset] create tx_body window %d", window, err)
 	}
 

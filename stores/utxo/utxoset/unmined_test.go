@@ -89,7 +89,7 @@ func preservedRows(t *testing.T, s *Store, ctx context.Context) int {
 
 // TestPreservedParentOutlivesItsMembershipWindow: the pruner's parent-preservation phase names
 // the parents of old unmined transactions; a preserved parent still answers a lookup after
-// its membership window has been dropped and its coins are gone.
+// its membership window has been dropped and its UTXOs are gone.
 func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -98,12 +98,17 @@ func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	spendOneOutput(t, s, ctx, parent, 0, 150) // the child stays unmined
+	// The child of the story stays unmined, and the store does not check that: preservation is
+	// keyed on the list the pruner hands over. The spend is at 900, past the height window 0
+	// is stamped at, so its undo copy does not hold the window drop back.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 9)
+
+	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
 
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	dropped := dropStamped(t, s, ctx, tip)
+	require.Equal(t, 1, dropped, "the window has to be gone for this test to mean anything")
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
@@ -165,13 +170,16 @@ func TestPreservedParentStillAnswersItsContest(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	child := spendOneOutput(t, s, ctx, parent, 0, 150)
-	plantConflictNote(t, s, ctx, 150, hashBytes(parent), hashBytes(child))
+	// The spend is at 900 for the reason TestPreservedParentOutlivesItsMembershipWindow gives.
+	child := spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 9)
+	plantConflictNote(t, s, ctx, 900, hashBytes(parent), hashBytes(child))
+
+	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
 
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	dropped := dropStamped(t, s, ctx, tip)
+	require.Equal(t, 1, dropped)
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
 	require.NoError(t, err)
@@ -193,6 +201,9 @@ func TestPreservingASecondTimeKeepsTheLongerPromise(t *testing.T) {
 	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
+
+	// Preservation copies only from a window the stamp has completed.
+	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
 
 	preserved := []chainhash.Hash{*parent.TxIDChainHash()}
 

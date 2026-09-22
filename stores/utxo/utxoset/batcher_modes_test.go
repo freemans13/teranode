@@ -201,7 +201,7 @@ func TestBatcherModeGreedyAccumulateBoundsFlushCount(t *testing.T) {
 // is free with whatever has queued, but nothing stops it from also draining a full 500-item
 // batch when 2,000 callers all land inside the same instant -- a slow or contended CI box
 // stretches exactly that window, so a count-based assertion can converge on the greedy shape by
-// coincidence and either flake red on a fast box or pass green while hiding a real regression
+// utxocidence and either flake red on a fast box or pass green while hiding a real regression
 // on a slow one. The two properties that are true of drain mode REGARDLESS of timing are: every
 // flush it makes is stamped reason=drain (see the drain branch in go-batcher's worker loop,
 // which never falls through to the size- or timeout-triggered paths), and because it fires on

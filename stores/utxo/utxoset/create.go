@@ -2,7 +2,6 @@ package utxoset
 
 import (
 	"context"
-	"encoding/binary"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -15,12 +14,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// noteConflictSQL records the contesting transaction on every parent whose coin it wants.
+// noteConflictSQL records the contesting transaction on every parent whose UTXO it wants.
 //
 // A transaction that loses a double-spend race is stored as conflicting rather than
 // discarded, because resolving the conflict later has to find it. Finding it means asking the
-// PARENT whose coin was contested, so the route runs from the parent, and this statement is
-// what writes it. Without it, conflict resolution has no route from a contested coin to the
+// PARENT whose UTXO was contested, so the route runs from the parent, and this statement is
+// what writes it. Without it, conflict resolution has no route from a contested UTXO to the
 // transactions competing for it.
 //
 // It writes to conflict_children rather than to a column on tx_ident, and that is the fix for
@@ -37,37 +36,13 @@ import (
 // same losing transaction free. See the schema comment for why that index is per window and
 // why the reader still has to say DISTINCT.
 //
-// One ARRAY of parents, so a transaction reaching for coins of twenty parents is one
+// One ARRAY of parents, so a transaction reaching for UTXOs of twenty parents is one
 // statement. $1 is the height, $2 the parents, $3 the one child.
 const noteConflictSQL = `
 INSERT INTO conflict_children (noted_height, parent_txid, child_txid)
 SELECT $1::int, p.parent, $3::bytea
   FROM unnest($2::bytea[]) AS p(parent)
 ON CONFLICT DO NOTHING`
-
-// packMembership renders mined-block information into the packed form tx_ident carries:
-// 12-byte triples of block id, block height and subtree index, big-endian, in the order the
-// caller supplied. Insertion order is load-bearing -- the conformance suite requires subtree
-// indexes to come back in the order they were written rather than sorted.
-func packMembership(infos []utxo.MinedBlockInfo) []byte {
-	if len(infos) == 0 {
-		return nil
-	}
-
-	b := make([]byte, 0, len(infos)*12)
-
-	for _, mi := range infos {
-		var e [12]byte
-
-		binary.BigEndian.PutUint32(e[0:4], mi.BlockID)
-		binary.BigEndian.PutUint32(e[4:8], mi.BlockHeight)
-		binary.BigEndian.PutUint32(e[8:12], uint32(mi.SubtreeIdx)) //nolint:gosec // subtree index is never negative
-
-		b = append(b, e[:]...)
-	}
-
-	return b
-}
 
 // offChainSinceAt decides whether a newly created transaction belongs in the mempool set.
 //
@@ -109,10 +84,12 @@ func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
 // minedBlock returns the block a create says contains the transaction, and whether it says so
 // at all.
 //
-// A create carrying mined-block information is a block-path create: below the checkpoint every
-// create, at the tip only block assembly's coinbase. It claims on tx_mined and its coins know
-// their block. Anything else is a mempool create and claims on tx_ident with the unconfirmed
-// sentinel on its coins.
+// A create carrying mined-block information is a block-carrying create: below the checkpoint
+// every create, at the tip only block assembly's coinbase. Whether it takes the block-path
+// claim, writing the pair onto its UTXOs at birth, or the identity claim with a containment
+// row beside it, is decided by appendCreate against the store's checkpoint list, not here.
+// A create with no block information takes the identity claim with the unconfirmed sentinel
+// on its UTXOs.
 //
 // An explicit un-mine is the one kind of block information that does NOT mean mined, which is
 // the same exemption offChainSinceAt makes, and for the same reason.
@@ -220,7 +197,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// transaction the store already holds, so the two are equivalent for the claim itself --
 	// but the conflicting path also notes the contest on the incoming transaction's PARENTS,
 	// and that note has to survive, because conflict resolution's only route from a contested
-	// coin to the transactions competing for it is the parent's list.
+	// UTXO to the transactions competing for it is the parent's list.
 	if cerr != nil && !errors.Is(cerr, errors.ErrTxExists) {
 		return nil, cerr
 	}
@@ -235,7 +212,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 }
 
 // appendCreate adds one transaction to the plan: its identity row, its serialized bytes, and
-// one coin row per spendable output.
+// one UTXO row per spendable output.
 //
 // Shared by the single and the batched path so the two cannot drift apart on what they store.
 // Nothing is appended until every failure is behind us, so a transaction this rejects leaves
@@ -301,13 +278,26 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 
 	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
 
-	// Which of the two claims this create takes, and the block facts that go on its coins.
-	// Both heights and the block id are 0 for a mempool create, and mined_height 0 is the
-	// unconfirmed sentinel the coin carries until something stamps it.
+	// The block this create says contains the transaction, if it says so at all, and which of
+	// the two claims it takes. The store applies the checkpoint test ITSELF, so a caller
+	// cannot write a pair onto a UTXO the chain has not proven.
+	//
+	// At or below the highest checkpoint the chain is header-proven, so a block-carrying
+	// create takes the block-path claim and writes the pair onto its UTXOs at birth; the
+	// value is final from the first moment and the deep stamp never has to visit it. Above
+	// the checkpoint the same create takes the identity claim like a create that carries no
+	// block: an identity row with a NULL marker (the call has no longest-chain input to say
+	// otherwise), a containment row for the block, and UTXOs at (0,0) for the stamp to fill
+	// 288 blocks later, at a depth a reorg cannot reach. The coinbase at the tip goes this way
+	// too. So above the checkpoint every UTXO at (0,0) has an identity row and every non-zero
+	// pair was written by the stamp, and a chain switch can never leave a losing block's pair
+	// on a live UTXO. Both heights and the block id are 0 for a create with no block, and
+	// mined_height 0 is the unconfirmed sentinel the UTXO carries until the stamp writes it.
 	var (
 		minedHeight int32
 		blockID     int32
 		subtreeIdx  int32
+		atBirth     bool
 	)
 
 	mi, mined := minedBlock(options.MinedBlockInfos)
@@ -315,6 +305,14 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		minedHeight = int32(mi.BlockHeight) //nolint:gosec // a height fits int32 for any reachable chain
 		blockID = int32(mi.BlockID)         //nolint:gosec // a block id fits int32
 		subtreeIdx = int32(mi.SubtreeIdx)   //nolint:gosec // a subtree index fits int32
+		atBirth = model.BelowCheckpoint(s.checkpoints, mi.BlockHeight)
+	}
+
+	// What the UTXOs carry from birth: the block's pair when the store lets the create write
+	// it, the sentinel otherwise.
+	var utxoMinedHeight, utxoBlockID int32
+	if atBirth {
+		utxoMinedHeight, utxoBlockID = minedHeight, blockID
 	}
 
 	// The serialized bytes, or nothing at all for a transaction mined below the hardcoded
@@ -354,14 +352,13 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.txids = append(p.txids, txHash[:])
 	p.heights = append(p.heights, int32(blockHeight))
 	p.offChain = append(p.offChain, offChainSinceAt(options.MinedBlockInfos, blockHeight))
-	p.membership = append(p.membership, packMembership(options.MinedBlockInfos))
 	p.sizes = append(p.sizes, int32(tx.Size()))
 	p.inpoints = append(p.inpoints, inpoints)
 	p.locktimes = append(p.locktimes, int32(tx.LockTime))
 	p.createdAt = append(p.createdAt, time.Now().UnixMilli())
 	p.txFlags = append(p.txFlags, flags)
 	p.bodies = append(p.bodies, body)
-	p.minedRows = append(p.minedRows, mined)
+	p.minedRows = append(p.minedRows, atBirth)
 	p.minedHeight = append(p.minedHeight, minedHeight)
 	p.blockID = append(p.blockID, blockID)
 	p.subtreeIdx = append(p.subtreeIdx, subtreeIdx)
@@ -374,7 +371,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		}
 
 		if out.LockingScript != nil && !utxo.ShouldStoreOutputAsUTXO(out, blockHeight, genesisHeight) {
-			continue // provably unspendable: no coin row, ever
+			continue // provably unspendable: no UTXO row, ever
 		}
 
 		var script []byte
@@ -382,16 +379,16 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 			script = *out.LockingScript
 		}
 
-		p.coinSats = append(p.coinSats, int64(out.Satoshis))
-		p.coinHeights = append(p.coinHeights, int32(blockHeight))
-		p.coinSpendable = append(p.coinSpendable, spendableFrom)
-		p.coinLeaves = append(p.coinLeaves, leaf)
-		p.coinFlags = append(p.coinFlags, flags)
-		p.coinUkeys = append(p.coinUkeys, Pack(txHash[:], uint32(vout)))
-		p.coinTxids = append(p.coinTxids, txHash[:])
-		p.coinScripts = append(p.coinScripts, script)
-		p.coinMined = append(p.coinMined, minedHeight)
-		p.coinBlockIDs = append(p.coinBlockIDs, blockID)
+		p.utxoSats = append(p.utxoSats, int64(out.Satoshis))
+		p.utxoHeights = append(p.utxoHeights, int32(blockHeight))
+		p.utxoSpendable = append(p.utxoSpendable, spendableFrom)
+		p.utxoLeaves = append(p.utxoLeaves, leaf)
+		p.utxoFlags = append(p.utxoFlags, flags)
+		p.utxoUkeys = append(p.utxoUkeys, Pack(txHash[:], uint32(vout)))
+		p.utxoTxids = append(p.utxoTxids, txHash[:])
+		p.utxoScripts = append(p.utxoScripts, script)
+		p.utxoMined = append(p.utxoMined, utxoMinedHeight)
+		p.utxoBlockIDs = append(p.utxoBlockIDs, utxoBlockID)
 	}
 
 	return &meta.Data{
@@ -419,7 +416,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 // than a read of s.GetBlockHeight() here so that it cannot differ from the height whose
 // window the caller ensured. The note lands in a height-partitioned window that only the
 // caller can create -- the DDL needs its own pool connection, and this function already holds
-// a transaction from the same pool -- so a second read of the tip that crossed a 48-block
+// a transaction from the same pool -- so a second read of the tip that crossed a leaf
 // boundary in between would insert into a partition that does not exist. It is ignored unless
 // the create is conflicting.
 func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeight, notedHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {

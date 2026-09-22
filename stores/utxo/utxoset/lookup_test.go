@@ -29,10 +29,10 @@ func TestGetServesAMinedTransactionFromTheMembershipTable(t *testing.T) {
 	require.Equal(t, uint32(0), got.UnminedSince)
 }
 
-// TestGetServesAnOldParentFromItsCoinOnceTheWindowIsGone: the membership window was dropped,
-// the transaction still has a live coin, and the coin's block facts are the answer. Fee,
+// TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone: the membership window was dropped,
+// the transaction still has a live UTXO, and the UTXO's block facts are the answer. Fee,
 // size, inputs and subtree index are zero, which is what a pruned SV Node can say too.
-func TestGetServesAnOldParentFromItsCoinOnceTheWindowIsGone(t *testing.T) {
+func TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -40,8 +40,7 @@ func TestGetServesAnOldParentFromItsCoinOnceTheWindowIsGone(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
 	require.NoError(t, err)
@@ -52,10 +51,10 @@ func TestGetServesAnOldParentFromItsCoinOnceTheWindowIsGone(t *testing.T) {
 	require.Nil(t, got.TxInpoints.ParentTxHashes)
 }
 
-// TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists pins the read order. A
-// coin holds one block id; a transaction stamped into two blocks must report both while
+// TestGetNeverAnswersBlockIdsFromTheUTXOWhileAMembershipRowExists pins the read order. A
+// UTXO holds one block id; a transaction stamped into two blocks must report both while
 // the window lives, which only the membership table can do.
-func TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists(t *testing.T) {
+func TestGetNeverAnswersBlockIdsFromTheUTXOWhileAMembershipRowExists(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 5_000)
@@ -69,7 +68,7 @@ func TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists(t *testing.
 
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
-	require.Equal(t, []uint32{42, 43}, got.BlockIDs, "both blocks, in insertion order")
+	require.Equal(t, []uint32{42, 43}, got.BlockIDs, "both blocks, in (mined_height, block_id) order")
 }
 
 // TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives is the case block
@@ -77,7 +76,7 @@ func TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists(t *testing.
 //
 // This test used to assert ErrTxNotFound for exactly this state, and that was wrong by design:
 // membership retires 1440 blocks after the parent was MINED and the journal 1440 blocks after
-// the coin was SPENT, so the two are counted from different clocks and a parent can lose its
+// the UTXO was SPENT, so the two are counted from different clocks and a parent can lose its
 // window while its journal row still stands. During that window the store CAN answer, and it
 // must: the alternative is a BlockIncompleteError the caller retries forever. Both the base
 // branch and aerospike keep a fully-spent parent answerable for a window after the spend.
@@ -93,10 +92,14 @@ func TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives(t 
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	spendOneOutput(t, s, ctx, parent, 0, 100)
+	// The child is mined at 900, past the height window 0 will be stamped at (863): a window
+	// cannot drop while an undo partition covering a height below its stamped_at is attached,
+	// so a spend inside window 0 would keep the window alive for as long as the journal row,
+	// and this test needs the window gone with the journal row still there.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 8)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	dropped := retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7})
+	require.Equal(t, 1, dropped, "the window has to be gone for this test to mean anything")
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
 	require.NoError(t, err)
@@ -111,7 +114,7 @@ func TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives(t 
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 }
 
-// TestBatchDecorateFollowsTheSameOrder: one mempool row, one membership row, one coin-only
+// TestBatchDecorateFollowsTheSameOrder: one mempool row, one membership row, one UTXO-only
 // parent and one unknown, in a single call.
 func TestBatchDecorateFollowsTheSameOrder(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -129,8 +132,7 @@ func TestBatchDecorateFollowsTheSameOrder(t *testing.T) {
 	_, err = s.Create(ctx, old, 100, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 
 	unknown := mkTx(t, 1, 5_004)
 
@@ -201,11 +203,12 @@ func TestBatchDecorateResolvesEveryLeafOfAMultiLeafBatch(t *testing.T) {
 	}
 }
 
-// TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch is the same proof on the stamp path,
-// where provePresentSQL is what has to name every transaction the caller asked about. The
-// interface says every hash appears in the answer or the call fails, and a leaf grouping that
-// lost a group would fail the whole batch rather than answer wrongly -- which is the right
-// direction, and still worth pinning.
+// TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch is the same proof on the record-mined
+// path, where the per-leaf-group insert copies each transaction's payload from its identity
+// row and the read-back has to name every transaction the caller asked about. The interface
+// says every hash appears in the answer or the call fails, and a leaf grouping that lost a
+// group would fail the whole batch rather than answer wrongly -- which is the right direction,
+// and still worth pinning.
 func TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -224,7 +227,8 @@ func TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch(t *testing.T) {
 
 	require.Len(t, seen, NumLeaves)
 
-	// A fork stamp, so the rows stay in the identity table and provePresentSQL is what answers.
+	// Off the longest chain, so the markers stay set and the identity rows are provably what
+	// the insert copied from.
 	got, err := s.SetMinedMulti(ctx, hashList, utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
 	require.NoError(t, err)
 	require.Len(t, got, len(hashList))

@@ -17,8 +17,8 @@ import (
 // what this iterator exists to avoid.
 const consistencyBatchSize = 1_000
 
-// inconsistentUnminedSQL asks the one question the caller acts on: which transactions carry
-// block membership AND are still marked as waiting to be mined.
+// inconsistentUnminedSQL asks the one question the caller acts on: which transactions have a
+// containment row AND are still marked as waiting to be mined.
 //
 // The store cannot decide whether those blocks are on the main chain, and has never been able
 // to see the chain, which is why the mempool marker is a cached answer written down by the
@@ -38,11 +38,11 @@ const consistencyBatchSize = 1_000
 // so the planner can always prove the index applies. Without it this reads the whole identity
 // table, which is hundreds of millions of rows on the mainnet box, to return the same answer.
 //
-// The membership length test is octet_length >= 12 rather than IS NOT NULL. The check
-// constraint admits a ZERO-length membership, since zero is a multiple of twelve, and such a
-// row names no block and can never be repaired, so it is excluded here rather than sent over
-// the wire for the caller to drop. octet_length of NULL is NULL and NULL >= 12 is not true, so
-// the same clause excludes an absent membership without a second test.
+// The block ids come from tx_mined, aggregated per identity row in (mined_height, block_id)
+// order, one probe per waiting row per live window. They used to be unpacked from a column on
+// the identity row; that column is gone so that containment has one home. A waiting row with
+// no containment row at all aggregates to NULL and is excluded, because it names no block and
+// there is nothing for the caller to repair.
 //
 // Conflicting rows are deliberately NOT excluded. They are the one class this finds that the
 // ordinary waiting-transaction iterator cannot, because that one masks them out, and a
@@ -52,10 +52,15 @@ const consistencyBatchSize = 1_000
 // There is deliberately no ORDER BY. Nothing downstream depends on the order, so a sort here
 // would be work thrown away.
 const inconsistentUnminedSQL = `
-SELECT txid, membership, off_chain_since
-  FROM tx_ident
- WHERE off_chain_since IS NOT NULL
-   AND octet_length(membership) >= 12`
+SELECT i.txid, b.ids, i.off_chain_since
+  FROM tx_ident i
+ CROSS JOIN LATERAL (
+   SELECT array_agg(m.block_id ORDER BY m.mined_height, m.block_id) AS ids
+     FROM tx_mined m
+    WHERE m.txid = i.txid
+ ) AS b
+ WHERE i.off_chain_since IS NOT NULL
+   AND b.ids IS NOT NULL`
 
 // consistencyScanIterator streams the answer rather than materialising it.
 //
@@ -73,7 +78,7 @@ type consistencyScanIterator struct {
 	scanned   atomic.Int64
 }
 
-// ScanInconsistentUnminedTxs returns the transactions that carry block membership while still
+// ScanInconsistentUnminedTxs returns the transactions that have a containment row while still
 // marked as waiting to be mined.
 //
 // Block assembly runs this on an operator-requested full reset, then intersects each record's
@@ -132,11 +137,11 @@ func (it *consistencyScanIterator) Next(ctx context.Context) ([]*utxo.Inconsiste
 	for len(batch) < size && it.rows.Next() {
 		var (
 			txid          []byte
-			membership    []byte
+			ids           []int32
 			offChainSince int32
 		)
 
-		if err := it.rows.Scan(&txid, &membership, &offChainSince); err != nil {
+		if err := it.rows.Scan(&txid, &ids, &offChainSince); err != nil {
 			it.err = errors.NewStorageError("[utxoset][ScanInconsistentUnminedTxs] row", err)
 			return nil, it.err
 		}
@@ -145,9 +150,12 @@ func (it *consistencyScanIterator) Next(ctx context.Context) ([]*utxo.Inconsiste
 
 		copy(hash[:], txid)
 
-		// Every block the transaction claims, not the first one. The caller walks the whole
-		// slice looking for a main-chain hit, so dropping any would make it miss a repair.
-		blockIDs, _, _ := unpackMembership(membership)
+		// Every block that contains the transaction, not the first one. The caller walks the
+		// whole slice looking for a main-chain hit, so dropping any would make it miss a repair.
+		blockIDs := make([]uint32, 0, len(ids))
+		for _, id := range ids {
+			blockIDs = append(blockIDs, uint32(id)) //nolint:gosec // a block id is never negative
+		}
 
 		batch = append(batch, &utxo.InconsistentTxRecord{
 			Hash:     hash,

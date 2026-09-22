@@ -41,12 +41,11 @@ func TestPrunerServiceContract(t *testing.T) {
 	require.Zero(t, n, "no transaction records are deleted yet, and journal rows do not belong in that counter")
 }
 
-// TestPrunerDropsMembershipWindowsOnTheJournalCutoff: identity reclaim in this design is a
-// catalog drop. A window whose upper bound is 1440 blocks below the pruner's height goes,
-// a younger one stays, and the floor advances.
-func TestPrunerDropsMembershipWindowsOnTheJournalCutoff(t *testing.T) {
+// TestPrunerDropsAContainmentWindowOnlyOnceStamped: the prune pass drops a containment window
+// on the stamp's rule and never on the journal cutoff. A window with no completion record is
+// not due however old it is; a stamped one drops once the tip is 1,728 past its stamped_at.
+func TestPrunerDropsAContainmentWindowOnlyOnceStamped(t *testing.T) {
 	s, ctx := newTestStore(t)
-	s.journalRetention = 96
 
 	old := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, old, 100, utxo.WithMinedBlockInfo(
@@ -61,36 +60,52 @@ func TestPrunerDropsMembershipWindowsOnTheJournalCutoff(t *testing.T) {
 	svc, err := s.GetPrunerService()
 	require.NoError(t, err)
 
-	_, err = svc.Prune(ctx, 1_000, "deadbeef")
+	// Far past any age rule, and nothing drops: no window has been stamped.
+	require.NoError(t, s.SetBlockHeight(100_000))
+	_, err = svc.Prune(ctx, 100_000, "deadbeef")
 	require.NoError(t, err)
+	require.Equal(t, 1, minedRows(t, s, ctx, old), "unstamped, so not due")
+	require.Equal(t, 1, minedRows(t, s, ctx, young))
 
-	require.Equal(t, 0, minedRows(t, s, ctx, old), "window 0 retired at 1000 - 96")
-	require.Equal(t, 1, minedRows(t, s, ctx, young), "window 3 is inside retention")
+	// Window 0 stamped at tip 575: stamped_at 863, due at 2,591. Window 3 is not deep enough.
+	// The chain answer names both blocks, or the stamp would delete their rows as fork losers.
+	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 1, 900: 2})
+
+	require.NoError(t, s.SetBlockHeight(2_590))
+	_, err = svc.Prune(ctx, 2_590, "deadbeef")
+	require.NoError(t, err)
+	require.Equal(t, 1, minedRows(t, s, ctx, old), "one block short")
+
+	require.NoError(t, s.SetBlockHeight(2_591))
+	_, err = svc.Prune(ctx, 2_591, "deadbeef")
+	require.NoError(t, err)
+	require.Equal(t, 0, minedRows(t, s, ctx, old), "window 0 dropped at stamped_at + 1,728")
+	require.Equal(t, 1, minedRows(t, s, ctx, young), "window 3 has no completion record")
 
 	floor, err := s.txMinedFloor(ctx)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), floor)
 }
 
-// TestPrunerRebuildsCoinIndexBelowJournalRetention pins a review finding: the coin-index
+// TestPrunerRebuildsUTXOIndexBelowJournalRetention pins a review finding: the UTXO-index
 // rebuild step must not sit inside the "height > journalRetention" gate that guards the
 // window and spend-journal drops. That gate exists because there is nothing aged out to
-// drop below it; it has no bearing on the coin index, which can already be churned on a
+// drop below it; it has no bearing on the UTXO index, which can already be churned on a
 // chain three blocks deep. Every dev/test net and every from-scratch sync spends most of
 // its life below DefaultSpendJournalRetentionBlocks (1440), so a rebuild gated on it would
 // never run there.
 //
-// s.coinIndexDecider is the injection point: New sets it to the real coinIndexNeedsRebuild,
+// s.utxoIndexDecider is the injection point: New sets it to the real utxoIndexNeedsRebuild,
 // and this test swaps in a stub that just counts calls, so the assertion is "the pruner
 // consulted the decider exactly once" rather than depending on a real index actually being
 // bloated. Whether the decider says yes and a REINDEX CONCURRENTLY then runs is already
-// covered by TestRebuildCoinIndexRunsConcurrentlyAndOnce; returning false here keeps this
+// covered by TestRebuildUTXOIndexRunsConcurrentlyAndOnce; returning false here keeps this
 // test to the one thing it is pinning, and fast.
-func TestPrunerRebuildsCoinIndexBelowJournalRetention(t *testing.T) {
+func TestPrunerRebuildsUTXOIndexBelowJournalRetention(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	calls := 0
-	s.coinIndexDecider = func(_, _ int64) bool {
+	s.utxoIndexDecider = func(_, _ int64) bool {
 		calls++
 		return false
 	}
@@ -101,5 +116,5 @@ func TestPrunerRebuildsCoinIndexBelowJournalRetention(t *testing.T) {
 	_, err = svc.Prune(ctx, 100, "deadbeef")
 	require.NoError(t, err)
 	require.Equal(t, 1, calls,
-		"the coin-index rebuild must run on every pruner session, not only past journal retention")
+		"the UTXO-index rebuild must run on every pruner session, not only past journal retention")
 }

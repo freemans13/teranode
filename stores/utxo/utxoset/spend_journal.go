@@ -9,9 +9,19 @@ import (
 )
 
 // SpendJournalPartitionBlocks is the width of one journal leaf. The pruner drops whole leaves,
-// so retention is granular to this. At the measured frontier (~20,000 spends/block) a leaf
-// holds roughly 960,000 rows.
-const SpendJournalPartitionBlocks = 48
+// so retention is granular to this. At MEASURED mainnet rates near height 945,000, about
+// 55,000 transactions a block, a leaf holds on the order of 16 million rows.
+//
+// 288, not the 48 it was. Every statement that has no height to prune on plans and locks
+// every live leaf, and the store re-plans every execution, so the live leaf count is a
+// direct cost on the block path: MEASURED on mainnet 2026-09-16, the spent-parent lookup
+// planned in 59 ms and took 2,023 locks across 850 leaves. At 288 the steady state is six
+// live leaves against 31, the same cadence as the membership windows, and a conflict note's
+// window always exists whenever its journal leaf does, exactly as before. The price is that
+// a spend stays undoable for up to 287 blocks longer than retention, INFERRED at about
+// 2.2 GB at tip rates. A wider leaf is also more rows for one autovacuum to clear; the
+// per-leaf autovacuum threshold below was sized for 48 blocks and is a soak-set value.
+const SpendJournalPartitionBlocks = 288
 
 // DefaultSpendJournalRetentionBlocks is how far back a spend stays undoable.
 //
@@ -23,7 +33,7 @@ const SpendJournalPartitionBlocks = 48
 // assumed) leaves the budget at roughly 60-66% even at this depth, so the correct number
 // is affordable.
 //
-// Steady-state leaf count is retention/SpendJournalPartitionBlocks + 1 = 31 tables. Bounded, and
+// Steady-state leaf count is retention/SpendJournalPartitionBlocks + 1 = 6 tables. Bounded, and
 // dropped as the chain advances.
 const DefaultSpendJournalRetentionBlocks = 1440
 
@@ -31,7 +41,7 @@ const DefaultSpendJournalRetentionBlocks = 1440
 //
 // One statement, not merely one transaction. A data-modifying CTE guarantees the delete
 // and the journal insert see the same rows and commit together -- there is no ordering,
-// no second round trip, and no window in which a coin is gone with nothing recording how
+// no second round trip, and no window in which a UTXO is gone with nothing recording how
 // to put it back. The outer SELECT still returns satoshis and script, so the spend
 // remains its own decorate fetch.
 //
@@ -50,11 +60,11 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // than as spent.
 //
 // THE FLAG MASK IS PER KEY, not a constant, because two of the three flags it tests are
-// waivable and the waiver belongs to the caller rather than to the coin. Conflict resolution
+// waivable and the waiver belongs to the caller rather than to the UTXO. Conflict resolution
 // spends the promoted winner through the very lock and conflicting mark it set a moment
 // earlier -- that is what WithIgnoreLocked and WithIgnoreConflicting are for -- while an
-// ordinary validator spend of the same coin must be refused. The mask used to be the literal 5
-// and neither option had any effect: a locked coin was spendable by anybody, which made the
+// ordinary validator spend of the same UTXO must be refused. The mask used to be the literal 5
+// and neither option had any effect: a locked UTXO was spendable by anybody, which made the
 // lock decorative, and an ignored conflicting flag still refused. Frozen has no waiver in any
 // store and is always in the mask. See spendGuardMask.
 //
@@ -62,8 +72,8 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // which it is equal to for every value a smallint can hold, because the planner can estimate
 // one and not the other. It has no statistics for a bit-mask expression, so an equality on
 // one is given the default selectivity of one row in two hundred, and two of them one in
-// forty thousand. That told the planner almost no coin survives the test, and with a batch
-// of keys on the other side it chose to walk the whole coin table once PER KEY, since a
+// forty thousand. That told the planner almost no UTXO survives the test, and with a batch
+// of keys on the other side it chose to walk the whole UTXO table once PER KEY, since a
 // table of one row is cheap to walk. Measured on a 40,000-row table: a 64-key batch took
 // 3 ms until the table crossed the size where that plan won, then 45 ms, and with
 // materialisation disabled 180 ms. An inequality on an expression without statistics is
@@ -72,13 +82,13 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // this statement never showed the problem, because with one key a walk per key is one walk.
 //
 // The outer SELECT carries hash_override out with the payload, and it costs nothing: the
-// DELETE's RETURNING already reads the whole row. It is non-NULL only on a coin ReAssignUTXO
-// has moved to a new owner, and on such a coin the satoshis and the script beside it are the
+// DELETE's RETURNING already reads the whole row. It is non-NULL only on a UTXO ReAssignUTXO
+// has moved to a new owner, and on such a UTXO the satoshis and the script beside it are the
 // OLD output's -- the reassign interface has no room for the new ones. claimMismatch reads it
 // to decide which of the two authentications applies, so it has to travel with them rather
-// than be fetched separately, or a coin could be reassigned between the delete and the check.
+// than be fetched separately, or a UTXO could be reassigned between the delete and the check.
 //
-// The journal row copies the coin's mined_height and block_id along with the rest of the
+// The journal row copies the UTXO's mined_height and block_id along with the rest of the
 // payload, and they cost nothing extra: the DELETE already carries the whole row, so this is
 // two more columns on a RETURNING that was already reading them. They are what makes a
 // fully-spent parent older than the membership retention still answerable -- see
@@ -174,20 +184,39 @@ func (s *Store) ensureSpendJournalPartition(ctx context.Context, height uint32) 
 	// against 40,000 rows in six windows, with both indexes present, the read and the removal
 	// both chose the pair index and neither touched the parent-only one. A second index on a
 	// table written on every double-spend is write amplification for nothing.
-	ddl := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS spend_journal_%[1]d PARTITION OF spend_journal
-  FOR VALUES FROM (%[2]d) TO (%[3]d)
-  WITH (fillfactor = 100,
-        autovacuum_vacuum_scale_factor = 0,
-        autovacuum_vacuum_threshold    = 50000);
-CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey);
-CREATE TABLE IF NOT EXISTS conflict_children_%[1]d PARTITION OF conflict_children
-  FOR VALUES FROM (%[2]d) TO (%[3]d);
-CREATE UNIQUE INDEX IF NOT EXISTS conflict_children_%[1]d_pair
-    ON conflict_children_%[1]d (parent_txid, child_txid);`, leaf, lo, hi)
+	// Both windows are built standalone and attached, so the spend path never takes either
+	// parent's strongest lock at a leaf boundary. See ensureAttachedPartition.
+	journal := fmt.Sprintf("spend_journal_%d", leaf)
 
-	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+	// A leaf created below the oldest known, or on an empty table, becomes the oldest. Leaves
+	// are created in ascending height order, so on the block path this fires once, for the
+	// first leaf of a fresh store; the drop is what normally moves it. See oldestUndoLeaf.
+	if oldest := s.oldestUndoLeaf.Load(); oldest == 0 || leaf+1 < oldest {
+		defer s.oldestUndoLeaf.CompareAndSwap(oldest, leaf+1)
+	}
+
+	if err := s.ensureAttachedPartition(ctx, partitionSpec{
+		parent: "spend_journal",
+		child:  journal,
+		key:    "spent_height",
+		lo:     lo,
+		hi:     hi,
+		with:   "fillfactor = 100, autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 50000",
+		after:  []string{fmt.Sprintf(`CREATE INDEX %s_ukey ON %s (ukey)`, journal, journal)},
+	}); err != nil {
 		return errors.NewStorageError("[utxoset] create spend-journal partition %d", leaf, err)
+	}
+
+	notes := fmt.Sprintf("conflict_children_%d", leaf)
+	if err := s.ensureAttachedPartition(ctx, partitionSpec{
+		parent: "conflict_children",
+		child:  notes,
+		key:    "noted_height",
+		lo:     lo,
+		hi:     hi,
+		after:  []string{fmt.Sprintf(`CREATE UNIQUE INDEX %s_pair ON %s (parent_txid, child_txid)`, notes, notes)},
+	}); err != nil {
+		return errors.NewStorageError("[utxoset] create conflict-children partition %d", leaf, err)
 	}
 
 	// Only record the leaf once the DDL has actually succeeded. Marking it up front would
@@ -244,7 +273,7 @@ SELECT c.relname,
 // cutoff, oldest first, in one pass.
 //
 // conflict_children is here rather than on a horizon of its own because its retention is not
-// an independent choice. It records which losing transactions contest a parent's coin, and
+// an independent choice. It records which losing transactions contest a parent's UTXO, and
 // what conflict resolution DOES with that answer is restore the losing spends out of the
 // journal. A note whose journal leaf has been dropped names a race that can no longer be
 // undone, so keeping it past the journal would be keeping an answer nothing can act on.
@@ -336,7 +365,7 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	//
 	// The listing query has no ORDER BY, so without this the catalog hands leaves back in
 	// whatever order it scanned them, which shifts as tables are created and dropped. With
-	// one leaf retiring every 48 blocks and nothing behind, order is irrelevant. With
+	// one leaf retiring every 288 blocks and nothing behind, order is irrelevant. With
 	// thousands outstanding it decides which work gets done before the session ends, and a
 	// session ends when the daemon is restarted rather than when the work runs out.
 	//
@@ -397,5 +426,49 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 		dropped++
 	}
 
+	// The oldest surviving journal leaf, for the create claims' floor. Recomputed from the
+	// listing this pass started with rather than re-read, so it costs no catalog query; a
+	// leaf created during the pass is newer than every survivor here and cannot be the
+	// oldest. Zero when nothing survives.
+	var oldest uint32
+
+	for _, l := range leaves {
+		if l.parent != "spend_journal" || l.leaf < cutoff {
+			continue
+		}
+
+		if oldest == 0 || l.leaf+1 < oldest {
+			oldest = l.leaf + 1
+		}
+	}
+
+	s.oldestUndoLeaf.Store(oldest)
+
 	return dropped, nil
+}
+
+// loadOldestUndoLeaf seeds oldestUndoLeaf from the catalog when the store opens. It is the one
+// catalog read the floor ever needs; the leaf creation and the leaf drop keep it in step from
+// then on.
+func (s *Store) loadOldestUndoLeaf(ctx context.Context) error {
+	leaves, err := s.listPartitionLeaves(ctx, "spend_journal")
+	if err != nil {
+		return err
+	}
+
+	var oldest uint32
+
+	for _, l := range leaves {
+		if !l.attached {
+			continue
+		}
+
+		if oldest == 0 || l.leaf+1 < oldest {
+			oldest = l.leaf + 1
+		}
+	}
+
+	s.oldestUndoLeaf.Store(oldest)
+
+	return nil
 }

@@ -6,13 +6,14 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
 // TestMarkOnLongestChainClearsTheMempoolMarker is the repair block assembly runs at startup.
 //
-// It finds transactions that carry main-chain block membership while still marked as waiting
-// to be mined, and this call is how it fixes them. Until it existed the node could not start
+// It finds transactions that have main-chain containment while still marked as waiting to be
+// mined, and this call is how it fixes them. Until it existed the node could not start
 // at all once any such transaction was in the store.
 func TestMarkOnLongestChainClearsTheMempoolMarker(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -97,9 +98,11 @@ func TestMarkOnLongestChainOnAnEmptyListIsANoOp(t *testing.T) {
 	require.NoError(t, errors.Join())
 }
 
-// TestMarkOffLongestChainIsAnUnMine: the mark call with false carries no block, so every
-// membership row of the transaction comes back as a fork triple and the marker is set.
-func TestMarkOffLongestChainIsAnUnMine(t *testing.T) {
+// TestMarkOffLongestChainSetsTheMarkerAndLeavesContainmentAlone: the mark call with false
+// carries no block, so it cannot say which containment row to doubt, and it does not try. It
+// writes the marker and nothing else; the rows recording which blocks contain the transaction
+// stay, because a chain switch cannot make "block 42 contains this transaction" false.
+func TestMarkOffLongestChainSetsTheMarkerAndLeavesContainmentAlone(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_150))
 
@@ -112,31 +115,35 @@ func TestMarkOffLongestChainIsAnUnMine(t *testing.T) {
 	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, false))
 
 	require.True(t, identExists(t, s, ctx, tx))
-	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "containment is not a mark-off's business")
 
 	got, err := s.Get(ctx, tx.TxIDChainHash())
 	require.NoError(t, err)
-	require.Equal(t, []uint32{42}, got.BlockIDs, "the block is remembered as a fork triple")
+	require.Equal(t, []uint32{42}, got.BlockIDs, "the block that contains it is still reported")
 	require.Equal(t, uint32(700_150), got.UnminedSince)
+
+	h, b := utxoFacts(t, s, ctx, tx)
+	require.Equal(t, int32(0), h, "and no UTXO is touched")
+	require.Equal(t, int32(0), b)
 }
 
-// TestMarkOnLongestChainMovesASingleBlockRow: the mark call with true on a row naming one
-// block moves it into membership; on a row naming two it only clears the marker.
-func TestMarkOnLongestChainMovesASingleBlockRow(t *testing.T) {
+// TestMarkOnLongestChainOnlyClearsTheMarker: the mark call with true writes one nullable
+// integer, whether the transaction is in one block or two. Nothing moves between tables any
+// more, so there is no single-block special case.
+func TestMarkOnLongestChainOnlyClearsTheMarker(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	tx := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, tx, 700_099)
+	one := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, one, 700_099)
 	require.NoError(t, err)
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
+	_, err = s.SetMinedMulti(ctx, hashes(one), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
 	require.NoError(t, err)
 
-	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true))
-	require.False(t, identExists(t, s, ctx, tx))
-	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*one.TxIDChainHash()}, true))
+	require.True(t, identExists(t, s, ctx, one), "the identity row stays until the stamp")
+	require.Nil(t, markerOf(t, s, ctx, one))
+	require.Equal(t, 1, minedRows(t, s, ctx, one))
 
-	// A row naming two blocks stays: the call carries no block id, so it cannot say which of
-	// them is main.
 	two := mkTx(t, 1, 6_000)
 	_, err = s.Create(ctx, two, 700_099)
 	require.NoError(t, err)
@@ -147,45 +154,56 @@ func TestMarkOnLongestChainMovesASingleBlockRow(t *testing.T) {
 
 	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*two.TxIDChainHash()}, true))
 	require.True(t, identExists(t, s, ctx, two))
-	require.Equal(t, 0, minedRows(t, s, ctx, two))
-	require.Nil(t, readIdent(t, s, ctx, two.TxIDChainHash()[:]).offChainSince)
+	require.Nil(t, markerOf(t, s, ctx, two))
+	require.Equal(t, 2, minedRows(t, s, ctx, two), "both rows stay; the call does not choose between them")
 }
 
-// TestMarkOnLongestChainSkipsADroppedWindow. A single-block identity row can name a height
-// whose membership window has already been dropped -- roughly 300 blocks of fork residue is
-// exactly what block assembly's startup reload hands this call -- and the window cannot be
-// recreated, because the floor exists to stop a retired window claiming its transactions
-// afresh.
-//
-// The repair must still happen for every hash. Refusing the whole call because one stale fork
-// triple cannot be settled would leave the node unable to start, which is the failure this
-// method was written to fix in the first place. So a row naming a dropped window has its
-// marker cleared and stays in the mempool table.
-func TestMarkOnLongestChainSkipsADroppedWindow(t *testing.T) {
+// TestMarkOnLongestChainCountsAContainedTransactionWithNoIdentityRowAsReached. A block-path
+// transaction has containment and no identity row, and it is already in the state mark-on asks
+// for, so the call must count it as reached rather than report it missing. Without this block
+// assembly's startup repair could not be re-run after an interrupted one.
+func TestMarkOnLongestChainCountsAContainedTransactionWithNoIdentityRowAsReached(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	// A block-path create is what puts window 0 on the table, so that dropping it moves the
-	// floor past the height the fork triple below names.
-	filler := mkTx(t, 1, 1_111)
-	_, err := s.Create(ctx, filler, 100, utxo.WithMinedBlockInfo(
-		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 100, OnLongestChain: true}))
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
 	require.NoError(t, err)
+	require.False(t, identExists(t, s, ctx, tx))
+
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true))
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true),
+		"and again, because the repair is re-run after an interrupted start")
+}
+
+// TestMarkOffLongestChainReportsAndCountsAContainedTransactionWithNoIdentityRow. A transaction
+// with containment and no identity row was created through the block path at or below the
+// checkpoint, is a coinbase, was seeded or has been stamped, and no reorg the node admits should
+// mark any of them off. Mark-off has no row to write the marker on, so it reports the hash as
+// not found, as it always has, and every non-coinbase one moves the guard counter, which the
+// soak requires to stay at zero.
+func TestMarkOffLongestChainReportsAndCountsAContainedTransactionWithNoIdentityRow(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_150))
 
 	tx := mkTx(t, 1, 5_000)
-	_, err = s.Create(ctx, tx, 100)
-	require.NoError(t, err)
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 100})
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
+	// A real coinbase: the store reads the coinbase bit off the transaction itself.
+	coinbase := mkCoinbase(t, 6_000)
+	_, err = s.Create(ctx, coinbase, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
 	require.NoError(t, err)
-	require.Equal(t, 1, dropped, "window 0 has to be gone for this test to mean anything")
 
-	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
-		[]chainhash.Hash{*tx.TxIDChainHash()}, true))
+	before := testutil.ToFloat64(noIdentityReached.WithLabelValues("mark_off"))
 
-	require.True(t, identExists(t, s, ctx, tx), "it stays in the mempool table")
-	require.Equal(t, 0, minedRows(t, s, ctx, tx))
-	require.Nil(t, readIdent(t, s, ctx, tx.TxIDChainHash()[:]).offChainSince,
-		"the marker is cleared even though the row could not be settled")
+	err = s.MarkTransactionsOnLongestChain(ctx,
+		[]chainhash.Hash{*tx.TxIDChainHash(), *coinbase.TxIDChainHash()}, false)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "no identity row to mark: %v", err)
+
+	require.Equal(t, before+1, testutil.ToFloat64(noIdentityReached.WithLabelValues("mark_off")),
+		"the ordinary transaction is counted, the coinbase is not")
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "and containment is untouched either way")
 }

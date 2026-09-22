@@ -52,7 +52,7 @@ func TestCounterConflictingSurvivesABodyThatHasAgedOut(t *testing.T) {
 	// The call that used to panic here, and then could not answer at all.
 	//
 	// It works now because the metadata read names who took each of a parent's outputs, read
-	// from the journal since the coin row is gone. Both halves were needed: reading the
+	// from the journal since the UTXO row is gone. Both halves were needed: reading the
 	// transaction's own inputs from the stored inpoints, which survive the body ageing out, and
 	// reading its parents' spenders from the journal.
 	hashes, err := utxo.GetCounterConflictingTxHashes(ctx, s, *ch, 1_000)
@@ -112,10 +112,10 @@ func TestReverseConflictReachesATransactionWhoseBytesHaveGone(t *testing.T) {
 	require.Len(t, made, 1, "its one input is still findable without the transaction")
 	require.Equal(t, parent.TxIDChainHash().String(), made[0].TxID.String())
 
-	// And the coins can be put back, which is what the undo does with them.
+	// And the UTXOs can be put back, which is what the undo does with them.
 	require.NoError(t, s.Unspend(ctx, made, false))
 
 	resp, err := s.GetSpend(ctx, &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0})
 	require.NoError(t, err)
-	require.Equal(t, int(utxo.Status_OK), resp.Status, "the coin is spendable again")
+	require.Equal(t, int(utxo.Status_OK), resp.Status, "the UTXO is spendable again")
 }

@@ -47,8 +47,8 @@ func hashesOf(txs []*utxo.UnminedTransaction) map[string]*utxo.UnminedTransactio
 // rebuilds its whole mempool from, at startup and after every reorg, with no height bound.
 //
 // A transaction missing from this answer never gets mined. On a delete-on-spend store that
-// is unrecoverable rather than merely slow: its inputs' coin rows were deleted when it was
-// first accepted, and an absent coin row reads as already spent, so nobody can ever spend
+// is unrecoverable rather than merely slow: its inputs' UTXO rows were deleted when it was
+// first accepted, and an absent UTXO row reads as already spent, so nobody can ever spend
 // them again.
 func TestUnminedIteratorReturnsEveryTransactionWaitingToBeMined(t *testing.T) {
 	s, ctx := newTestStore(t)

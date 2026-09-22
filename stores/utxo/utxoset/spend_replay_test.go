@@ -10,14 +10,14 @@ import (
 // TestSpendReplayedByTheSameTransactionSucceeds is what keeps a half-applied block from
 // wedging the node forever.
 //
-// Delete-on-spend destroys the coin row, and absence IS the rejection. So a block interrupted
-// part-way through application leaves coins already gone, and re-offering that block asks the
+// Delete-on-spend destroys the UTXO row, and absence IS the rejection. So a block interrupted
+// part-way through application leaves UTXOs already gone, and re-offering that block asks the
 // store to spend them again. Reporting that as a double spend is wrong and it is fatal: the
 // block can never be applied, the tip never advances, and no restart helps. It happened on
 // mainnet at height 97389.
 //
-// The same transaction spending the same coin is the SAME spend, not a competing one. The
-// journal already records who took each coin, so the store can tell the two apart.
+// The same transaction spending the same UTXO is the SAME spend, not a competing one. The
+// journal already records who took each UTXO, so the store can tell the two apart.
 func TestSpendReplayedByTheSameTransactionSucceeds(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -35,7 +35,7 @@ func TestSpendReplayedByTheSameTransactionSucceeds(t *testing.T) {
 
 	spends, err := spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
-	require.NoError(t, spends[0].Err, "the first spend takes the coin")
+	require.NoError(t, spends[0].Err, "the first spend takes the UTXO")
 
 	// The same transaction, offered again, exactly as a re-applied block offers it.
 	replay := bt.NewTx()
@@ -52,7 +52,7 @@ func TestSpendReplayedByTheSameTransactionSucceeds(t *testing.T) {
 	spends2, err := spendOnly(ctx, s, replay, 200)
 	require.NoError(t, err)
 	require.NoError(t, spends2[0].Err,
-		"re-spending a coin THIS transaction already took is a replay, not a double spend")
+		"re-spending a UTXO THIS transaction already took is a replay, not a double spend")
 	require.Nil(t, spends2[0].ConflictingTxID,
 		"and it must not name itself as a competing spender")
 
@@ -85,7 +85,7 @@ func TestSpendByADifferentTransactionIsStillRejected(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
-	// A DIFFERENT transaction reaching for the same coin: it adds an output, so its id differs.
+	// A DIFFERENT transaction reaching for the same UTXO: it adds an output, so its id differs.
 	rival := bt.NewTx()
 	require.NoError(t, rival.FromUTXOs(&bt.UTXO{
 		TxIDHash:      parent.TxIDChainHash(),
@@ -100,6 +100,6 @@ func TestSpendByADifferentTransactionIsStillRejected(t *testing.T) {
 	spends2, err := spendOnly(ctx, s, rival, 200)
 	require.Error(t, err, "a rejected spend is now a returned error, and rolled back")
 	require.Error(t, spends2[0].Err, "a different transaction must still be rejected")
-	require.NotNil(t, spends2[0].ConflictingTxID, "and told who took the coin")
+	require.NotNil(t, spends2[0].ConflictingTxID, "and told who took the UTXO")
 	require.Equal(t, first.TxIDChainHash().String(), spends2[0].ConflictingTxID.String())
 }

@@ -7,8 +7,8 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// deleteTxSQL removes every trace of a transaction: its coins, the undo records for those
-// coins, its serialized bytes and its identity row.
+// deleteTxSQL removes every trace of a transaction: its UTXOs, the undo records for those
+// UTXOs, its serialized bytes and its identity row.
 //
 // One statement of arrays, so deleting one transaction and deleting a thousand run the same
 // code, exactly as spendJournalSQL and createIdentPlanSQL / createMinedPlanSQL do on the write
@@ -17,10 +17,10 @@ import (
 // Data-modifying common table expressions share one snapshot, so the five deletes commit
 // together. That matters for the same reason it mattered to createIdentPlanSQL and
 // createMinedPlanSQL: a half-deleted transaction, its identity or membership row gone and its
-// coins left, is a live output that nothing can ever reclaim, because reclaim finds coins
+// UTXOs left, is a live output that nothing can ever reclaim, because reclaim finds UTXOs
 // through their identity or membership row.
 //
-// Coins are found by a RANGE over the packed key rather than by transaction id. The one index
+// UTXOs are found by a RANGE over the packed key rather than by transaction id. The one index
 // on that table is on the key, and the key packs the transaction id prefix first precisely so
 // that "every output of parent P" is a range scan. See Pack in schema.go. The full 32-byte id
 // is still rechecked, because the 96-bit prefix is non-unique by design and can locate a row
@@ -28,12 +28,12 @@ import (
 //
 // The undo records this destroys are the ones where the deleted transaction is the PARENT,
 // meaning the payloads for its own already-spent outputs. They must go. Left behind, a later
-// unspend would restore a coin whose identity row no longer exists: spendable, invisible to
+// unspend would restore a UTXO whose identity row no longer exists: spendable, invisible to
 // reclaim, and permanent.
 //
 // Records where the deleted transaction is the SPENDER are deliberately left alone. They
-// authorise restoring OTHER transactions' coins, and the offline rewind tool unspends before
-// it deletes, so destroying them here would turn an ordering mistake into unrecoverable coin
+// authorise restoring OTHER transactions' UTXOs, and the offline rewind tool unspends before
+// it deletes, so destroying them here would turn an ordering mistake into unrecoverable UTXO
 // loss. They are inert anyway, and retire with their partition.
 //
 // The body is reached through created_height rather than by transaction id, because
@@ -64,7 +64,7 @@ import (
 // behind, it would keep answering lookups for a transaction Delete promised to remove every
 // trace of, which is the same resurrection the identity and membership deletes guard against.
 //
-// A transaction can hold several tx_mined rows -- one per window its coins are still claimed
+// A transaction can hold several tx_mined rows -- one per window its UTXOs are still claimed
 // through, or a coinbase re-org claiming it at more than one height -- all sharing the same
 // created_height, so gone runs them through UNION rather than a plain concatenation to collapse
 // them to one (created_height, txid) pair before the join.
@@ -73,7 +73,7 @@ WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[])
         AS t(leaf, txid, lo, hi)
 ),
-coins AS (
+UTXOs AS (
     DELETE FROM utxo u USING k
      WHERE u.leaf  = k.leaf
        AND u.ukey >= k.lo
