@@ -134,8 +134,9 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	//      (avoids a post-insert UPDATE for the common extend-chain case)
 	// getBestBlockID is cached, so this is essentially free. The reorg-case
 	// reconciliation does not depend on the caller's pre-best snapshot —
-	// reconcileOnMainChain re-reads the actual best inside its own transaction
-	// to avoid races against concurrent fast-path inserts.
+	// reconcileOnMainChain re-reads the actual best in the fork transaction,
+	// in the same statement that applies the diff, so it cannot race a
+	// concurrent fast-path insert.
 	var preBestHash *chainhash.Hash
 	{
 		var preBestErr error

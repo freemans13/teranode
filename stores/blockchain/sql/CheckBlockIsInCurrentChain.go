@@ -76,10 +76,9 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	// We deliberately do NOT use the in-memory off-chain set as a negative
 	// short-circuit. That set is rebuilt FROM the on_main_chain flags
 	// (rebuildOffChainSet), so a transiently-false flag on a block that IS on the
-	// best chain — a raced slow-path StoreBlock whose reconcileOnMainChain failed,
-	// or an exhausted startup rebuild — lands the block in the off-chain set and
-	// would make this a FALSE NEGATIVE. Because checkOldBlockIDs escalates a
-	// negative into a PERMANENT ValidateBlock invalidation, a transient flag must
+	// best chain (an exhausted startup rebuild leaves one) lands the block in the
+	// off-chain set and would make this a FALSE NEGATIVE. Because
+	// checkOldBlockIDs escalates a negative into a PERMANENT ValidateBlock invalidation, a transient flag must
 	// never be allowed to reject here. checkBlockIsInCurrentChainSQL confirms
 	// positives via the indexed on_main_chain flag and confirms negatives via the
 	// flag-free parent_id CTE, so it stays correct even while flags are mid-flux.
@@ -131,10 +130,10 @@ func (s *SQL) checkBlockIsInCurrentChainSQL(ctx context.Context, blockIDs []uint
 		}
 		// No on_main_chain=true row matched in any batch. Do NOT return false here:
 		// on_main_chain can be transiently false on a block that IS on the best
-		// chain — a slow-path StoreBlock whose reconcileOnMainChain failed
-		// (log-and-continue), or a startup rebuildOnMainChainFlag that exhausted
-		// its retries/timed out. A false negative is not cosmetic here: the caller
-		// (checkOldBlockIDs) escalates it into a PERMANENT ValidateBlock
+		// chain — a startup rebuildOnMainChainFlag that exhausted its
+		// retries/timed out. (A fork-path StoreBlock no longer leaves one: its
+		// reconciliation shares the INSERT's transaction.) A false negative is
+		// not cosmetic here: the caller (checkOldBlockIDs) escalates it into a PERMANENT ValidateBlock
 		// invalidation, which the transient flag never gets a chance to undo. Fall
 		// through to the authoritative, flag-free parent_id CTE walk below to
 		// confirm the block really is off the chain before rejecting. Positives
