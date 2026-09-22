@@ -174,20 +174,31 @@ func (s *Store) ensureSpendJournalPartition(ctx context.Context, height uint32) 
 	// against 40,000 rows in six windows, with both indexes present, the read and the removal
 	// both chose the pair index and neither touched the parent-only one. A second index on a
 	// table written on every double-spend is write amplification for nothing.
-	ddl := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS spend_journal_%[1]d PARTITION OF spend_journal
-  FOR VALUES FROM (%[2]d) TO (%[3]d)
-  WITH (fillfactor = 100,
-        autovacuum_vacuum_scale_factor = 0,
-        autovacuum_vacuum_threshold    = 50000);
-CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey);
-CREATE TABLE IF NOT EXISTS conflict_children_%[1]d PARTITION OF conflict_children
-  FOR VALUES FROM (%[2]d) TO (%[3]d);
-CREATE UNIQUE INDEX IF NOT EXISTS conflict_children_%[1]d_pair
-    ON conflict_children_%[1]d (parent_txid, child_txid);`, leaf, lo, hi)
-
-	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+	// Both windows are built standalone and attached, so the spend path never takes either
+	// parent's strongest lock at a leaf boundary. See ensureAttachedPartition.
+	journal := fmt.Sprintf("spend_journal_%d", leaf)
+	if err := s.ensureAttachedPartition(ctx, partitionSpec{
+		parent: "spend_journal",
+		child:  journal,
+		key:    "spent_height",
+		lo:     lo,
+		hi:     hi,
+		with:   "fillfactor = 100, autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 50000",
+		after:  []string{fmt.Sprintf(`CREATE INDEX %s_ukey ON %s (ukey)`, journal, journal)},
+	}); err != nil {
 		return errors.NewStorageError("[utxoset] create spend-journal partition %d", leaf, err)
+	}
+
+	notes := fmt.Sprintf("conflict_children_%d", leaf)
+	if err := s.ensureAttachedPartition(ctx, partitionSpec{
+		parent: "conflict_children",
+		child:  notes,
+		key:    "noted_height",
+		lo:     lo,
+		hi:     hi,
+		after:  []string{fmt.Sprintf(`CREATE UNIQUE INDEX %s_pair ON %s (parent_txid, child_txid)`, notes, notes)},
+	}); err != nil {
+		return errors.NewStorageError("[utxoset] create conflict-children partition %d", leaf, err)
 	}
 
 	// Only record the leaf once the DDL has actually succeeded. Marking it up front would

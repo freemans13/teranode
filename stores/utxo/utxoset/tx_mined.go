@@ -151,12 +151,17 @@ func (s *Store) ensureTxMinedPartition(ctx context.Context, height uint32) error
 	lo := window * TxMinedPartitionBlocks
 	hi := lo + TxMinedPartitionBlocks
 
-	ddl := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS tx_mined_w%[1]d PARTITION OF tx_mined
-  FOR VALUES FROM (%[2]d) TO (%[3]d);
-ALTER TABLE tx_mined_w%[1]d ALTER COLUMN tx_inpoints SET STORAGE EXTERNAL;`, window, lo, hi)
-
-	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+	// Built standalone and attached, so the block path never takes the parent's strongest
+	// lock at a window boundary. See ensureAttachedPartition for the measurement behind it.
+	child := fmt.Sprintf("tx_mined_w%d", window)
+	if err := s.ensureAttachedPartition(ctx, partitionSpec{
+		parent: "tx_mined",
+		child:  child,
+		key:    "mined_height",
+		lo:     lo,
+		hi:     hi,
+		after:  []string{fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN tx_inpoints SET STORAGE EXTERNAL`, child)},
+	}); err != nil {
 		return errors.NewStorageError("[utxoset] create tx_mined window %d", window, err)
 	}
 
