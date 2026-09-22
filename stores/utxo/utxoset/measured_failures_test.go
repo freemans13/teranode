@@ -121,8 +121,8 @@ func TestUnMiningAForkBlockLeavesTheMainChainRow(t *testing.T) {
 // way out. The containment build records both blocks as rows and clears the marker on the
 // main-chain record, and nobody has to decide which block is right.
 //
-// The second half waits for the deep stamp of build step 5: the transaction's UTXOs get the
-// main-chain pair and its identity row goes. Nothing stamps until then.
+// The second half is the stamp: told that block 8 won, it writes the main-chain pair onto the
+// transaction's UTXO, deletes block 7's row as a loser, and deletes the identity row.
 func TestForkThenMainChainRecordClearsTheMarkerAndIsStamped(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -146,16 +146,14 @@ func TestForkThenMainChainRecordClearsTheMarkerAndIsStamped(t *testing.T) {
 	require.Equal(t, []uint32{7, 8}, got.BlockIDs)
 	require.Zero(t, got.UnminedSince)
 
-	// The second half. The stamp would be driven here at step 5, at tip 575 with an ancestry
-	// naming block 8; until it exists nothing writes the pair or deletes the identity row.
-	h, b := utxoFacts(t, s, ctx, tx)
+	// The second half.
+	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 8})
 
-	knownDefect(t, "no stamp exists yet: the UTXO of a transaction recorded by a fork and then the main chain stays at (0,0) with its identity row",
-		h == 100 && b == 8 && !identExists(t, s, ctx, tx), func() {
-			require.Equal(t, int32(100), h)
-			require.Equal(t, int32(8), b, "the main-chain block")
-			require.False(t, identExists(t, s, ctx, tx), "and the stamp deletes the identity row")
-		})
+	h, b := utxoFacts(t, s, ctx, tx)
+	require.Equal(t, int32(100), h)
+	require.Equal(t, int32(8), b, "the main-chain block")
+	require.False(t, identExists(t, s, ctx, tx), "and the stamp deletes the identity row")
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "block 7's row went as a loser")
 }
 
 // TestEveryLiveUTXOOfOneTransactionCarriesTheSamePair is measured failure 3. Today the pair
@@ -258,8 +256,7 @@ func TestPreservedCopyNeverOutranksACorrectUTXO(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, [2]int32{100, 7}, pair, "the interim rule preserved the loser, which is what the read order then has to survive")
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	dropped := retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 8})
 	require.Equal(t, 1, dropped, "the window has to be gone for the preserved copy to be consulted at all")
 
 	h, b := utxoFacts(t, s, ctx, parent)

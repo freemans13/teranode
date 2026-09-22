@@ -119,6 +119,26 @@ type Store struct {
 	// this store's decorate reads the UTXO row.
 	bodyCheckpoints []chaincfg.Checkpoint
 
+	// stampDepth is how many blocks deep a containment window must be before the stamp writes
+	// its blocks onto UTXOs: twice the network's coinbase maturity, rounded up to a whole
+	// window. See StampDepthFor.
+	stampDepth uint32
+
+	// retainIndefinitely is the operator's explicit request to keep every containment window
+	// and undo partition. The stamp still runs; only the drops are skipped, and a gauge shows
+	// the request so the growth is visible.
+	retainIndefinitely bool
+
+	// stampPageHook, when set by a test in this package, is called after each stamp page
+	// commits with the page number, and once more after the last page and before the
+	// completion transaction with page -1. Returning an error abandons the pass as a crash
+	// would. It performs no write.
+	stampPageHook func(wLo uint32, page int) error
+
+	// dropHook, when set by a test in this package, is called between a containment window's
+	// detach and its drop, so a test can record the order of drops or stand in for a crash.
+	dropHook func(window string)
+
 	// utxoIndexDecider decides whether a utxo_pN_ukey index has bloated past the point
 	// worth a REINDEX CONCURRENTLY. New sets it to utxoIndexNeedsRebuild; it exists as a
 	// field, rather than the pruner calling that function directly, so a test can swap in a
@@ -264,8 +284,24 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		logger.Infof("[utxoset] skipping the tx_body write for transactions mined below the highest hardcoded checkpoint, at height %d; block persister and the asset service need the subtree data files for those blocks, and no body is ever written retroactively", model.HighestCheckpointHeight(s.bodyCheckpoints))
 	}
 
+	// The stamp depth follows the network's coinbase maturity; 100 on every network today,
+	// which makes it 288.
+	maturity := uint32(100)
+
 	if tSettings.ChainCfgParams != nil {
 		s.checkpoints = tSettings.ChainCfgParams.Checkpoints
+		maturity = uint32(tSettings.ChainCfgParams.CoinbaseMaturity)
+	}
+
+	s.stampDepth = StampDepthFor(maturity)
+
+	if tSettings.UtxoStore.RetainWindowsIndefinitely {
+		s.retainIndefinitely = true
+		retainIndefinitelyGauge.Set(1)
+
+		logger.Warnf("[utxoset] utxostore_retainWindowsIndefinitely is on: no containment window and no undo partition will be dropped; the stamp still runs and the disk grows without bound")
+	} else {
+		retainIndefinitelyGauge.Set(0)
 	}
 
 	// Refused BEFORE the schema is installed and before any write, beside the schema gate. On
@@ -274,13 +310,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// before their block and deletes their identity rows. Skipping the pruner during catch-up
 	// would switch off both the stamp and every window drop for the whole of catch-up, and
 	// the disk would fill in silence. The stamp always runs on this store and has no off
-	// switch. An operator who wants to keep every window has a different lever coming: the
-	// explicit retain-indefinitely setting for drops that build step 5 adds.
+	// switch. An operator who wants to keep every window has a different lever:
+	// utxostore_retainWindowsIndefinitely, which skips the drops and nothing else.
 	if tSettings.Pruner.SkipDuringCatchup {
 		pool.Close()
 
 		return nil, errors.NewConfigurationError(
-			"[utxoset] pruner_skipDuringCatchup is true, and the utxoset store refuses to start with it: on this store the pruner also runs the stamp, so skipping it during catch-up switches off the stamp and every window drop for the whole catch-up and fills the disk in silence. The stamp always runs and has no off switch. To keep windows past their retention use the explicit retain-indefinitely setting for drops instead of skipping the pruner")
+			"[utxoset] pruner_skipDuringCatchup is true, and the utxoset store refuses to start with it: on this store the pruner also runs the stamp, so skipping it during catch-up switches off the stamp and every window drop for the whole catch-up and fills the disk in silence. The stamp always runs and has no off switch. To keep windows past their retention set utxostore_retainWindowsIndefinitely instead of skipping the pruner")
 	}
 
 	if err := CreateSchema(ctx, pool); err != nil {

@@ -34,14 +34,10 @@ func identExists(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) bool {
 
 // dropIdentityRow deletes a transaction's identity row by raw SQL.
 //
-// It stands in for the deep stamp of build step 5, which is the one thing in the design that
-// deletes an identity row after mining, and which does not exist yet. Two kinds of test need
-// it. A test of the containment-only reads -- the inputs read, the counter-conflicting walk --
-// wants a transaction whose identity row is gone so that the tx_mined arm is what answers. A
-// test that drops a containment window needs tx_ident empty, because the interim guard refuses
-// a drop while it holds any row (see dropTxMinedWindowsBelow). Neither state can be reached
-// through the store's own API before the stamp exists, and both are ordinary states once it
-// does.
+// The stamp is the one thing in the store that deletes an identity row after mining, and it
+// runs 288 blocks deep. A test of the containment-only reads -- the inputs read, the
+// counter-conflicting walk -- wants a transaction whose identity row is gone so that the
+// tx_mined arm is what answers, without driving a whole stamp to get there; this is that.
 func dropIdentityRow(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) {
 	t.Helper()
 
@@ -77,9 +73,7 @@ func spendOneOutput(t *testing.T, s *Store, ctx context.Context, parent *bt.Tx, 
 }
 
 // spendOneOutputInBlock is spendOneOutput with the spender created through the block path, so
-// it carries blockID from birth and writes no identity row. A test that goes on to drop a
-// containment window uses it, because the interim guard refuses a drop while tx_ident holds
-// any row, and an unmined child would be such a row (see dropTxMinedWindowsBelow).
+// it carries blockID from birth and writes no identity row.
 func spendOneOutputInBlock(t *testing.T, s *Store, ctx context.Context, parent *bt.Tx, vout uint32,
 	height, blockID uint32) *bt.Tx {
 	t.Helper()

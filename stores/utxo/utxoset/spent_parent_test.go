@@ -29,8 +29,7 @@ func TestGetServesAFullySpentOldParentFromTheJournal(t *testing.T) {
 
 	// The membership window retires while the UTXO is still live, so the UTXO -- and only the
 	// UTXO -- carries the block facts by the time the spend happens.
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 	require.Equal(t, 0, minedRows(t, s, ctx, parent))
 
 	spendOneOutput(t, s, ctx, parent, 0, 2_000)
@@ -54,8 +53,7 @@ func TestUnspendRestoresBlockFactsFromTheJournalCopy(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 
 	child := spendOneOutput(t, s, ctx, parent, 0, 2_000)
 	require.Equal(t, 0, utxoCount(t, s, ctx, parent))
@@ -105,13 +103,11 @@ func TestGetStillReportsNotFoundOnceTheJournalLeafIsGoneToo(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// A mined child, because the interim guard refuses to drop a window while any identity
-	// row exists, and an unmined child would be one.
-	spendOneOutputInBlock(t, s, ctx, parent, 0, 101, 8)
+	// The child spends at 900, past the height window 0 is stamped at, so the undo copy sits
+	// in a partition the window drop does not have to wait for.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 8)
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
-	require.Equal(t, 1, dropped)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 
 	_, err = s.dropSpendJournalPartitionsBelow(ctx, 2_000)
 	require.NoError(t, err)

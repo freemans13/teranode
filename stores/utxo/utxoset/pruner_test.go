@@ -41,12 +41,11 @@ func TestPrunerServiceContract(t *testing.T) {
 	require.Zero(t, n, "no transaction records are deleted yet, and journal rows do not belong in that counter")
 }
 
-// TestPrunerDropsMembershipWindowsOnTheJournalCutoff: identity reclaim in this design is a
-// catalog drop. A window whose upper bound is 1440 blocks below the pruner's height goes,
-// a younger one stays, and the floor advances.
-func TestPrunerDropsMembershipWindowsOnTheJournalCutoff(t *testing.T) {
+// TestPrunerDropsAContainmentWindowOnlyOnceStamped: the prune pass drops a containment window
+// on the stamp's rule and never on the journal cutoff. A window with no completion record is
+// not due however old it is; a stamped one drops once the tip is 1,728 past its stamped_at.
+func TestPrunerDropsAContainmentWindowOnlyOnceStamped(t *testing.T) {
 	s, ctx := newTestStore(t)
-	s.journalRetention = 96
 
 	old := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, old, 100, utxo.WithMinedBlockInfo(
@@ -61,11 +60,27 @@ func TestPrunerDropsMembershipWindowsOnTheJournalCutoff(t *testing.T) {
 	svc, err := s.GetPrunerService()
 	require.NoError(t, err)
 
-	_, err = svc.Prune(ctx, 1_000, "deadbeef")
+	// Far past any age rule, and nothing drops: no window has been stamped.
+	require.NoError(t, s.SetBlockHeight(100_000))
+	_, err = svc.Prune(ctx, 100_000, "deadbeef")
 	require.NoError(t, err)
+	require.Equal(t, 1, minedRows(t, s, ctx, old), "unstamped, so not due")
+	require.Equal(t, 1, minedRows(t, s, ctx, young))
 
-	require.Equal(t, 0, minedRows(t, s, ctx, old), "window 0 retired at 1000 - 96")
-	require.Equal(t, 1, minedRows(t, s, ctx, young), "window 3 is inside retention")
+	// Window 0 stamped at tip 575: stamped_at 863, due at 2,591. Window 3 is not deep enough.
+	// The chain answer names both blocks, or the stamp would delete their rows as fork losers.
+	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 1, 900: 2})
+
+	require.NoError(t, s.SetBlockHeight(2_590))
+	_, err = svc.Prune(ctx, 2_590, "deadbeef")
+	require.NoError(t, err)
+	require.Equal(t, 1, minedRows(t, s, ctx, old), "one block short")
+
+	require.NoError(t, s.SetBlockHeight(2_591))
+	_, err = svc.Prune(ctx, 2_591, "deadbeef")
+	require.NoError(t, err)
+	require.Equal(t, 0, minedRows(t, s, ctx, old), "window 0 dropped at stamped_at + 1,728")
+	require.Equal(t, 1, minedRows(t, s, ctx, young), "window 3 has no completion record")
 
 	floor, err := s.txMinedFloor(ctx)
 	require.NoError(t, err)

@@ -3,8 +3,6 @@ package utxoset
 import (
 	"testing"
 
-	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,9 +70,7 @@ func TestDroppedMembershipWindowsCannotComeBack(t *testing.T) {
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 100))
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 1_000))
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 500)
-	require.NoError(t, err)
-	require.Equal(t, 1, dropped)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, nil))
 
 	floor, err := s.txMinedFloor(ctx)
 	require.NoError(t, err)
@@ -86,66 +82,17 @@ func TestDroppedMembershipWindowsCannotComeBack(t *testing.T) {
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 1_000), "a live window is still fine")
 }
 
-// TestInterimGuardRefusesADropWhileAnIdentityRowExists is the design's ST-29: on a build with
-// containment changed and no deep stamp yet, a window due to drop is refused while tx_ident
-// holds any row, the refusal is counted, and the partition stays attached. Delete the identity
-// row and the same window drops.
-//
-// The soak cannot show this, because below the checkpoint tx_ident is empty and the guard never
-// fires there, so this is what proves the guard works.
-func TestInterimGuardRefusesADropWhileAnIdentityRowExists(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	// A block-path transaction puts window 0 on the table.
-	filler := mkTx(t, 1, 1_111)
-	_, err := s.Create(ctx, filler, 100, utxo.WithMinedBlockInfo(
-		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 100, OnLongestChain: true}))
-	require.NoError(t, err)
-
-	// A transaction seen before its block, recorded in the same window. Its UTXO is at (0,0)
-	// and only the deep stamp will ever change that, so the window is the one place its
-	// block lives.
-	seen := mkTx(t, 1, 5_000)
-	_, err = s.Create(ctx, seen, 99)
-	require.NoError(t, err)
-	_, err = s.SetMinedMulti(ctx, hashes(seen), utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 100, OnLongestChain: true})
-	require.NoError(t, err)
-
-	before := testutil.ToFloat64(interimDropRefused)
-
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err, "a refusal is a logged skip, not an error the pruner would repeat every block")
-	require.Equal(t, 0, dropped)
-	require.Equal(t, before+1, testutil.ToFloat64(interimDropRefused), "and it is counted")
-	require.Equal(t, 1, minedRows(t, s, ctx, seen), "the window is still attached")
-
-	floor, err := s.txMinedFloor(ctx)
-	require.NoError(t, err)
-	require.Equal(t, uint32(0), floor, "and the floor has not moved")
-
-	dropIdentityRow(t, s, ctx, seen)
-
-	dropped, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
-	require.Equal(t, 1, dropped, "with tx_ident empty the same window drops")
-	require.Equal(t, 0, minedRows(t, s, ctx, seen))
-}
-
-// TestInterimDropRaisesAllThreeFloorsTogether: the floor row carries an ordering constraint,
-// 288 x floor <= stamp_complete_floor <= stamp_fence, and the interim drop has to satisfy it
-// on a database that has never had a stamp. So it raises all three. When the deep stamp of
-// build step 5 starts on such a database its pass begins at stamp_complete_floor, which is
-// exactly the dropped floor.
-func TestInterimDropRaisesAllThreeFloorsTogether(t *testing.T) {
+// TestDropWritesOnlyTheDroppedFloor: the drop's transaction advances the dropped floor alone.
+// The other two floors are already at or above the window's upper bound, because the drop's
+// first condition is the completion record the stamp wrote when it advanced them.
+func TestDropWritesOnlyTheDroppedFloor(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 100))
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 400))
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 5_000))
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
-	require.Equal(t, 2, dropped, "windows 0 and 1 go, window 17 stays")
+	require.Equal(t, 2, retireWindows(t, s, ctx, 1, nil), "windows 0 and 1 go, window 17 stays")
 
 	var floor, fence, complete int32
 	require.NoError(t, s.pool.QueryRow(ctx,
@@ -153,7 +100,7 @@ func TestInterimDropRaisesAllThreeFloorsTogether(t *testing.T) {
 		Scan(&floor, &fence, &complete))
 
 	require.Equal(t, int32(2), floor, "a window number: the highest dropped plus one")
-	require.Equal(t, int32(2*TxMinedPartitionBlocks), complete, "a height: the dropped windows' upper bound")
+	require.Equal(t, int32(2*TxMinedPartitionBlocks), complete, "a height: the stamped windows' upper bound")
 	require.Equal(t, int32(2*TxMinedPartitionBlocks), fence)
 }
 
@@ -180,9 +127,7 @@ func TestDroppingAWindowClearsTheEnsureCache(t *testing.T) {
 
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 100))
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
-	require.Equal(t, 1, dropped)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, nil))
 
 	require.Error(t, s.ensureTxMinedPartition(ctx, 100),
 		"the cached window is gone, so the floor has to be re-read and the create refused")

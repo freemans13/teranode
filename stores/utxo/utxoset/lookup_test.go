@@ -40,8 +40,7 @@ func TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
 	require.NoError(t, err)
@@ -93,12 +92,13 @@ func TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives(t 
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// The child is mined in the next block, which is the case this test describes, and it has
-	// to be: the interim guard refuses to drop a window while any identity row exists.
-	spendOneOutputInBlock(t, s, ctx, parent, 0, 101, 8)
+	// The child is mined at 900, past the height window 0 will be stamped at (863): a window
+	// cannot drop while an undo partition covering a height below its stamped_at is attached,
+	// so a spend inside window 0 would keep the window alive for as long as the journal row,
+	// and this test needs the window gone with the journal row still there.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 8)
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	dropped := retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7})
 	require.Equal(t, 1, dropped, "the window has to be gone for this test to mean anything")
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
@@ -132,8 +132,7 @@ func TestBatchDecorateFollowsTheSameOrder(t *testing.T) {
 	_, err = s.Create(ctx, old, 100, utxo.WithMinedBlockInfo(
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 
 	unknown := mkTx(t, 1, 5_004)
 

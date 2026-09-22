@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
@@ -19,21 +20,17 @@ import (
 // The rule every test checks: once the window holding a transaction's containment rows is gone,
 // whatever still answers for that transaction must name the block that is on the longest chain.
 //
-// Three of the four are EXPECTED FAILURES, not plain skips, so they cannot be forgotten. Each
-// test runs its scenario every time. While the defect is present the test reports itself as a
-// known defect and the suite stays green. The moment a fix makes the correct behaviour appear,
-// the test FAILS and says so, and it keeps failing until its knownDefect guard is replaced by
-// the plain assertion. So a fix cannot merge while its proof is still switched off.
+// All four pass as plain assertions now. The knownDefect guard below is the expected-failure
+// wrapper the measured-failure tests in measured_failures_test.go still use for the two of
+// theirs that wait on the read path's preservation rule and read order: while a defect is
+// present the test reports itself as a known defect and the suite stays green, and the moment a
+// fix makes the correct behaviour appear the test FAILS until the guard is replaced by the
+// plain assertion. So a fix cannot merge while its proof is still switched off.
 //
 // The design that fixes them is
-// docs/superpowers/specs/2026-09-21-utxoset-block-facts-spec-rebuilt.md. Its build order puts
-// the fixes in two steps, and only ONE of the four passes at the first. Step 2, containment,
-// makes the un-mine a point delete and stops anything writing a block onto a UTXO from
-// containment rows ranked by arrival, which is what closes reproduction 4; its guard is
-// replaced by plain assertions below. Reproductions 1 and 2 need the chain-aware stamp and
-// reproduction 3 needs the new drop rule, both of which are step 5, so their guards stay. An
-// earlier version of this comment said three of the four should pass once containment lands;
-// that was wrong, and section 13 of the design says why.
+// docs/superpowers/specs/2026-09-21-utxoset-block-facts-spec-rebuilt.md. Reproduction 4 was
+// closed by the containment build, which made the un-mine a point delete. Reproductions 1 and 2
+// are closed by the chain-aware stamp, and reproduction 3 by its drop rule.
 
 // knownDefectEnv, when set to any value, runs the real assertions instead, which is how these
 // tests are driven while a fix is being built: they fail with the full expected-versus-actual
@@ -61,8 +58,8 @@ func knownDefect(t *testing.T, defect string, fixed bool, assert func()) {
 		defect, knownDefectEnv)
 }
 
-// TestRetiringWindowStampsTheBlockThatWonTheReorg: the transaction is mined in M, a competing
-// block F also includes it, and F's chain then wins.
+// TestRetiringWindowStampsTheBlockThatWonTheReorg is reproduction 1: the transaction is mined
+// in M, a competing block F also includes it, and F's chain then wins.
 //
 // This is the call sequence block assembly makes. F arrives as a fork, so recording it adds a
 // containment row. When F's branch becomes the longest chain, Reset keeps the transaction out
@@ -71,10 +68,8 @@ func knownDefect(t *testing.T, defect string, fixed bool, assert func()) {
 // un-mines it.
 //
 // The retirement stamp that used to take the earliest row, and so stamped M onto the UTXO, is
-// deleted with the containment change. Nothing stamps at all until the chain-aware stamp of
-// build step 5 exists: the UTXO stays at (0,0), and the interim guard refuses to drop the
-// window while the transaction's identity row exists. Either way the UTXO does not name the
-// block that won, which is the defect this guards until step 5.
+// gone. The stamp is told which block won by the chain answer the pruner service builds, and
+// it deletes M's row as a loser before it writes F onto the UTXO.
 func TestRetiringWindowStampsTheBlockThatWonTheReorg(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -92,29 +87,35 @@ func TestRetiringWindowStampsTheBlockThatWonTheReorg(t *testing.T) {
 	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 8, BlockHeight: 100, OnLongestChain: true})
 	require.NoError(t, err)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 8})
 
 	h, b := utxoFacts(t, s, ctx, tx)
+	require.Equal(t, int32(100), h)
+	require.Equal(t, int32(8), b, "the block that won the reorg, not the first block that recorded the transaction")
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "block 7's containment row is gone")
+	require.False(t, identExists(t, s, ctx, tx), "the identity row is gone")
 
-	knownDefect(t, "no stamp exists yet: the UTXO of a transaction seen before its block never learns the block that won",
-		h == 100 && b == 8, func() {
-			require.Equal(t, int32(100), h)
-			require.Equal(t, int32(8), b, "the block that won the reorg, not the first block that stamped the transaction")
-		})
+	require.Equal(t, 1, dropStamped(t, s, ctx, tip))
+
+	h, b = utxoFacts(t, s, ctx, tx)
+	require.Equal(t, int32(100), h)
+	require.Equal(t, int32(8), b, "still, once the window is gone")
+
+	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{8}, got.BlockIDs)
 }
 
-// TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt: a fork block F is applied first
-// and creates the transaction on the block path, then the main chain block M includes it too.
+// TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt is reproduction 2: a fork block F
+// is applied first and creates the transaction on the block path, then the main chain block M
+// includes it too.
 //
 // The store applies the checkpoint test itself, so on a network with no checkpoints (this
 // store's) a block-carrying create takes the identity route: an identity row, a containment
 // row for F and UTXOs at (0,0). When M later records the same transaction it adds its own
-// containment row and clears the marker. Nothing stamps a UTXO until the chain-aware stamp of
-// build step 5, and the interim guard refuses to drop the window while the identity row
-// exists, so the UTXO stays at (0,0) and does not name M, the main-chain block. At step 5 the
-// stamp, told that M won, writes (100, 7) and deletes F's row, which is what the guard waits
-// for. Below the checkpoint this scenario cannot arise: a fork block cannot be header-proven.
+// containment row and clears the marker. The stamp, told that M won, writes (100, 7) and
+// deletes F's row. Below the checkpoint this scenario cannot arise: a fork block cannot be
+// header-proven.
 func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
@@ -126,34 +127,39 @@ func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
 	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
 	require.NoError(t, err)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
 
 	h, b := utxoFacts(t, s, ctx, tx)
+	require.Equal(t, int32(100), h)
+	require.Equal(t, int32(7), b, "the main chain block, not the side-chain block that created the UTXO")
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "block 8's containment row is gone")
+	require.False(t, identExists(t, s, ctx, tx))
 
-	knownDefect(t, "no stamp exists yet: a UTXO born above the checkpoint from a side-chain block stays at (0,0) until the stamp names the main-chain block",
-		h == 100 && b == 7, func() {
-			require.Equal(t, int32(100), h)
-			require.Equal(t, int32(7), b, "the main chain block, not the side-chain block that created the UTXO")
-		})
+	require.Equal(t, 1, dropStamped(t, s, ctx, tip))
+
+	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{7}, got.BlockIDs)
 }
 
-// TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires: a transaction seen
-// before its block is mined, and a child spends its only UTXO before the containment window
-// retires.
+// TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires is reproduction 3: a
+// transaction seen before its block is mined, and a child spends its only UTXO before the
+// stamp reaches the window.
 //
 // The spend copies the UTXO into the journal with the UTXO's pair, and a UTXO created before its
 // block still carries (0,0) at that point, because recording mined does not touch UTXOs. The
-// stamp finds no live UTXO, so it stamps nothing, and nothing ever stamps journal rows. Once the
-// window is gone, the lookup's last step reads the journal but skips rows at height 0, so the
-// parent answers "not found". Validating a block that contains the child then retries forever.
+// stamp finds no live UTXO, so it stamps nothing, and nothing ever stamps journal rows. The
+// containment window is then the parent's only home, and the drop rule keeps it attached past
+// every undo copy of its UTXOs: the window drops no earlier than 1,728 blocks after its
+// stamped_at, and never while an undo partition covering a height below stamped_at is
+// attached.
 //
-// The identity rows are deleted by hand before the drop, standing in for the stamp of build
-// step 5, which is the one thing that deletes an identity row after mining: the window drop this
-// reproduction needs is refused while any identity row exists, and after the stamp a fully
-// spent parent has exactly this shape, no identity row, no UTXO, an undo copy at (0,0) and its
-// containment window as its only home. What closes the defect is the drop rule of step 5, which
-// keeps the window attached past every undo copy of its UTXOs.
+// Two states here. While the undo copy lives, the parent answers. Once the window is gone too,
+// nothing names block 7 and not found is the correct answer, because nothing can spend or
+// unspend this parent any more. The first state is answered today by the read path's first
+// containment read, which carries no height floor; once it does, the same answer comes through
+// the second tier, triggered by the (0,0) undo copy, and a third state joins this test: with the
+// undo copy gone and the window still attached, not found.
 func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -164,22 +170,23 @@ func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *te
 	_, err = s.SetMinedMulti(ctx, hashes(parent), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
 	require.NoError(t, err)
 
-	child := spendOneOutput(t, s, ctx, parent, 0, 101)
+	spendOneOutput(t, s, ctx, parent, 0, 101)
 
-	dropIdentityRow(t, s, ctx, parent)
-	dropIdentityRow(t, s, ctx, child)
+	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
+	require.Equal(t, uint32(575), tip)
+	require.False(t, identExists(t, s, ctx, parent), "the stamp deletes the identity row even with no UTXO to stamp")
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
-	require.Equal(t, 1, dropped, "the window has to be gone for this reproduction to mean anything")
+	// The undo copy's partition drops at tip 1,728; the window cannot drop before 2,591.
+	require.NoError(t, s.SetBlockHeight(1727))
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err, "a mined parent whose last UTXO was spent must still be found while its undo copy lives")
+	require.Equal(t, []uint32{7}, got.BlockIDs)
 
-	knownDefect(t, "a UTXO spent before it is stamped leaves an undo copy at height 0 that nothing stamps, so the parent is not found once its window retires",
-		err == nil && got != nil && len(got.BlockIDs) == 1 && got.BlockIDs[0] == 7, func() {
-			require.NoError(t, err, "a mined parent whose last UTXO was spent must still be found after its window retires")
-			require.Equal(t, []uint32{7}, got.BlockIDs)
-		})
+	require.Equal(t, 1, dropStamped(t, s, ctx, tip), "the window drops once every undo copy of its UTXOs is gone")
+
+	_, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "nothing names block 7 any more, and nothing can ask")
 }
 
 // TestUnspendOfAnUnminedParentRestoresAnUnconfirmedUTXO: a parent seen before its block is

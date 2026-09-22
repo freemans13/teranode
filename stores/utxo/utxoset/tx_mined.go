@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
 )
@@ -130,7 +131,7 @@ func (s *Store) txMinedFloor(ctx context.Context) (uint32, error) {
 	return uint32(floor), nil //nolint:gosec // a window index is never negative
 }
 
-// txMinedWindowSQL lists the membership windows in whichever of the three crash states they
+// txMinedWindowSQL lists the containment windows in whichever of the three crash states they
 // are in; see txBodyWindowSQL for the states and why the join is LEFT.
 const txMinedWindowSQL = `
 SELECT c.relname,
@@ -143,45 +144,19 @@ SELECT c.relname,
    AND c.relkind  = 'r'
    AND c.relname ~ '^tx_mined_w[0-9]+$'`
 
-// identityRowsExistSQL is the interim guard's one read: does tx_ident hold any row at all.
-const identityRowsExistSQL = `SELECT EXISTS (SELECT 1 FROM tx_ident LIMIT 1)`
+// windowState is one containment window's table and which crash state it is in.
+type windowState struct {
+	name          string
+	window        uint32
+	attached      bool
+	detachPending bool
+}
 
-// dropTxMinedWindowsBelow drops every containment window whose upper bound is below
-// cutoffHeight, oldest first, and advances the floors past each. Returns the count dropped.
-//
-// This is the INTERIM drop of the containment build, which runs on the old rule -- a window
-// goes once its upper bound is journalRetention below the pruner's height -- and it is guarded:
-// it refuses to drop anything while tx_ident holds a row. A transaction seen before its block
-// keeps its identity row through mining, its UTXOs stay at (0,0), and nothing writes its block
-// onto them until the deep stamp of build step 5 exists. Dropping its window before then would
-// take the only place its block facts live. Below the checkpoint every create carries its
-// block, so tx_ident is empty there and the guard never fires. Where it does fire it is counted
-// in utxoset_interim_drop_refused_total and every drop stops; the disk then grows, which is an
-// abort criterion of the soak, and the remedy is the stamp, not a relaxed guard.
-//
-// The refusal is a logged skip and not an error, because the pruner calls this once per block
-// and an error every block would drown the log while changing nothing.
-//
-// Because the guard holds, every window this drops had nothing to stamp, and the drop can
-// honestly raise all three floor values together (see the statement below).
-func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32) (int, error) {
-	cutoff := cutoffHeight / TxMinedPartitionBlocks
-
-	var identityRows bool
-	if err := s.pool.QueryRow(ctx, identityRowsExistSQL).Scan(&identityRows); err != nil {
-		return 0, errors.NewStorageError("[utxoset] check tx_ident before dropping windows", err)
-	}
-
+// listTxMinedWindows reads every containment window's table, in ascending window order.
+func (s *Store) listTxMinedWindows(ctx context.Context) ([]windowState, error) {
 	rows, err := s.pool.Query(ctx, txMinedWindowSQL)
 	if err != nil {
-		return 0, errors.NewStorageError("[utxoset] list tx_mined windows", err)
-	}
-
-	type windowState struct {
-		name          string
-		window        uint32
-		attached      bool
-		detachPending bool
+		return nil, errors.NewStorageError("[utxoset] list tx_mined windows", err)
 	}
 
 	var windows []windowState
@@ -190,7 +165,7 @@ func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32
 		var w windowState
 		if err := rows.Scan(&w.name, &w.attached, &w.detachPending); err != nil {
 			rows.Close()
-			return 0, errors.NewStorageError("[utxoset] scan tx_mined window", err)
+			return nil, errors.NewStorageError("[utxoset] scan tx_mined window", err)
 		}
 
 		if _, err := fmt.Sscanf(w.name, "tx_mined_w%d", &w.window); err != nil {
@@ -203,23 +178,116 @@ func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32
 	rows.Close()
 
 	if err := rows.Err(); err != nil {
-		return 0, errors.NewStorageError("[utxoset] list tx_mined windows", err)
+		return nil, errors.NewStorageError("[utxoset] list tx_mined windows", err)
 	}
 
 	sort.Slice(windows, func(i, j int) bool { return windows[i].window < windows[j].window })
 
+	return windows, nil
+}
+
+// txMinedWindowState is one window's state, or nil when no table of its name exists.
+func (s *Store) txMinedWindowState(ctx context.Context, window uint32) (*windowState, error) {
+	windows, err := s.listTxMinedWindows(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range windows {
+		if windows[i].window == window {
+			return &windows[i], nil
+		}
+	}
+
+	return nil, nil
+}
+
+// preDropCheckSQL is the last of the four drop conditions: no identity row may still be joined to
+// a containment row of the window. After the stamp every row of the window with a non-zero block
+// id is a winner, so any row is the right test, and a loser that survived step 1 also blocks the
+// drop, loudly. The window is addressed by name so the answer is the same whether it is
+// attached, pending detach or already detached.
+const preDropCheckSQL = `
+SELECT 1
+  FROM tx_ident i
+ WHERE EXISTS (SELECT 1 FROM %s m WHERE m.txid = i.txid AND m.block_id <> 0 OFFSET 0)
+ LIMIT 1`
+
+// detachTimeout bounds the wait for DETACH CONCURRENTLY, which waits for every open transaction
+// on the parent. A stamp page is such a transaction, so a drop can wait for at most one page;
+// past the timeout the pass stops dropping containment windows and tries again next block. A
+// judgement, not a measurement.
+const detachTimeout = 10 * time.Second
+
+// dropStampedTxMinedWindows drops every containment window the four-part rule allows at height,
+// oldest first, and returns how many. It stops at the first window that fails, because the
+// dropped floor is one number and a hole below it must not exist.
+//
+// Window W drops when all four hold. (a) W has a completion record, written by the stamp when
+// it finished W. (b) height is at least stamped_at(W) plus the longest an undo copy can live,
+// 1,728 blocks: a UTXO of W spent before its stamp left an undo copy at (0,0), and the window is
+// the only thing that can answer for it while that copy lives. (c) No attached undo partition
+// covers any height below stamped_at(W), read from the catalog rather than inferred from the
+// height, because an undo drop can fail or be skipped; this is what keeps (b) true with a late
+// pruner. (d) The pre-drop check finds no identity row joined to a row of W.
+//
+// A window already detached, or pending detach, passed the rule in an earlier pass that was
+// interrupted; it is finished without judging the rule again, because none of the four
+// conditions can become false once it held.
+//
+// The retain-indefinitely setting skips every containment drop. The stamp still runs.
+func (s *Store) dropStampedTxMinedWindows(ctx context.Context, height uint32) (int, error) {
+	if s.retainIndefinitely {
+		return 0, nil
+	}
+
+	windows, err := s.listTxMinedWindows(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	records, err := s.completionRecords(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	undoFloor, err := s.oldestUndoPartitionStart(ctx)
+	if err != nil {
+		return 0, err
+	}
+
 	dropped := 0
 
 	for _, w := range windows {
-		if w.window >= cutoff {
-			continue
-		}
+		wLo := w.window * TxMinedPartitionBlocks
 
-		if identityRows {
-			interimDropRefused.Inc()
-			s.logger.Warnf("[utxoset] refusing to drop tx_mined window %s: tx_ident holds rows and nothing stamps their UTXOs until the deep stamp exists", w.name)
+		if w.attached && !w.detachPending {
+			stampedAt, ok := records[wLo]
+			if !ok {
+				return dropped, nil
+			}
 
-			return dropped, nil
+			if height < stampedAt+undoMaxLifeBlocks {
+				return dropped, nil
+			}
+
+			if undoFloor.attached && undoFloor.start < stampedAt {
+				dropHeldByUndo.Inc()
+
+				return dropped, nil
+			}
+
+			refused, err := s.preDropCheck(ctx, w.name)
+			if err != nil {
+				return dropped, err
+			}
+
+			if refused {
+				dropRefused.Inc()
+				s.logger.Errorf("[utxoset] refusing to drop window %s: an identity row is still joined to one of its containment rows, so the stamp missed it", w.name)
+
+				return dropped, nil
+			}
 		}
 
 		switch {
@@ -229,43 +297,49 @@ func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32
 				return dropped, errors.NewStorageError("[utxoset] finalize detach of tx_mined window %s", w.name, err)
 			}
 
+			dropDetachRecovered.Inc()
+
 		case w.attached:
-			if _, err := s.pool.Exec(ctx,
-				fmt.Sprintf(`ALTER TABLE tx_mined DETACH PARTITION %s CONCURRENTLY`, w.name)); err != nil {
+			// On its own connection with its own deadline, because it waits for every open
+			// transaction on the parent. A timeout is a skip, not an error of the session.
+			dctx, cancel := context.WithTimeout(ctx, detachTimeout)
+			_, err := s.pool.Exec(dctx,
+				fmt.Sprintf(`ALTER TABLE tx_mined DETACH PARTITION %s CONCURRENTLY`, w.name))
+			cancel()
+
+			if err != nil {
+				if errors.Is(dctx.Err(), context.DeadlineExceeded) {
+					dropDetachWaits.Inc()
+					s.logger.Warnf("[utxoset] detach of window %s did not finish within %s; it is retried next block", w.name, detachTimeout)
+
+					return dropped, nil
+				}
+
 				return dropped, errors.NewStorageError("[utxoset] detach tx_mined window %s", w.name, err)
 			}
 
 		default:
 			// Already standalone after an interrupted session: finish the job.
+			dropDetachRecovered.Inc()
 		}
 
-		// The drop and the floor advance are ONE statement, not two Execs. Both run inside
-		// postgres's implicit transaction for a multi-statement Exec, and DROP TABLE is
-		// fully transactional, so a crash or connection drop between them cannot happen: it
-		// either lands with both effects or neither. Two separate calls would let a crash in
-		// between drop the window from the catalog for good -- gone, so it never resurfaces
-		// in txMinedWindowSQL's listing to retry -- while the floor stayed pointed below it,
-		// and ensureTxMinedPartition would then recreate the very window this loop just
-		// destroyed, doubling every UTXO still claimed by a transaction in it. window is a
-		// regex-filtered catalog name (^tx_mined_w[0-9]+$), so folding it into the literal
-		// with Sprintf carries no injection risk.
-		//
-		// ALL THREE floor values rise together. floor is a window number; stamp_fence and
-		// stamp_complete_floor are heights, and the ordering constraint on the row requires
-		// 288 x floor <= stamp_complete_floor <= stamp_fence, so an interim drop that raised
-		// floor alone would be refused by the constraint. Raising the other two is honest here
-		// because the guard above means every window dropped had nothing to stamp, and it adds
-		// no refusal: a write below the raised fence is a write below the dropped floor, which
-		// the store refuses already. When the stamp of build step 5 starts on such a database
-		// its pass begins at stamp_complete_floor, exactly at the dropped floor. In the full
-		// design the drop writes only floor, because its first condition already requires the
-		// completion record.
+		if s.dropHook != nil {
+			s.dropHook(w.name)
+		}
+
+		// The drop, the completion record's delete and the floor advance are ONE statement,
+		// not three Execs. All three run inside postgres's implicit transaction for a
+		// multi-statement Exec, and DROP TABLE is fully transactional, so a crash between them
+		// cannot happen. Two separate calls would let a crash drop the window for good while
+		// the floor stayed pointed below it, and ensureTxMinedPartition would then recreate
+		// the very window this loop just destroyed, doubling every UTXO still claimed by a
+		// transaction in it. Every statement is idempotent, and the delete tolerates a
+		// completion record that is already gone, which is what lets an interrupted drop be
+		// finished without judging the rule again. window is a regex-filtered catalog name, so
+		// folding it into the literal carries no injection risk.
 		ddl := fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s;
-UPDATE tx_mined_floor
-   SET floor                = GREATEST(floor, %[2]d),
-       stamp_complete_floor = GREATEST(stamp_complete_floor, %[2]d * %[3]d),
-       stamp_fence          = GREATEST(stamp_fence, %[2]d * %[3]d)
- WHERE id = 0;`, w.name, w.window+1, TxMinedPartitionBlocks)
+DELETE FROM tx_mined_stamped WHERE window_start = %[2]d;
+UPDATE tx_mined_floor SET floor = GREATEST(floor, %[3]d) WHERE id = 0;`, w.name, wLo, w.window+1)
 
 		if _, err := s.pool.Exec(ctx, ddl); err != nil {
 			return dropped, errors.NewStorageError("[utxoset] drop tx_mined window %s and advance its floor", w.name, err)
@@ -281,4 +355,49 @@ UPDATE tx_mined_floor
 	}
 
 	return dropped, nil
+}
+
+// preDropCheck reports whether any identity row is still joined to a containment row of the
+// named window.
+func (s *Store) preDropCheck(ctx context.Context, window string) (bool, error) {
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(preDropCheckSQL, window))
+	if err != nil {
+		return false, errors.NewStorageError("[utxoset] pre-drop check of %s", window, err)
+	}
+
+	defer rows.Close()
+
+	found := rows.Next()
+
+	return found, rows.Err()
+}
+
+// undoPartitionFloor is the first height of the oldest undo partition that is attached or
+// pending detach, and whether there is one. A partition already fully detached and waiting for
+// its DROP is ignored: Unspend reads undo copies through the parent table and cannot see it.
+type undoPartitionFloor struct {
+	attached bool
+	start    uint32
+}
+
+func (s *Store) oldestUndoPartitionStart(ctx context.Context) (undoPartitionFloor, error) {
+	leaves, err := s.listPartitionLeaves(ctx, "spend_journal")
+	if err != nil {
+		return undoPartitionFloor{}, err
+	}
+
+	var out undoPartitionFloor
+
+	for _, l := range leaves {
+		if !l.attached && !l.detachPending {
+			continue
+		}
+
+		start := l.leaf * SpendJournalPartitionBlocks
+		if !out.attached || start < out.start {
+			out = undoPartitionFloor{attached: true, start: start}
+		}
+	}
+
+	return out, nil
 }

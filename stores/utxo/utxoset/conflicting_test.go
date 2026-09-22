@@ -435,8 +435,7 @@ func TestConflictingChildrenAnswerForAParentKnownOnlyFromItsUTXO(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	dropped := retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7})
 	require.Equal(t, 1, dropped, "the membership window has to be gone for this test to mean anything")
 
 	loser := spendOneOutput(t, s, ctx, parent, 0, 700_101)

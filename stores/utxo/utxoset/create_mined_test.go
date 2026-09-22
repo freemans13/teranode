@@ -114,9 +114,8 @@ func TestBlockPathCreateRefusesATransactionThatStillHasAUTXO(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// Its window retires and is dropped; the UTXO stays because nobody spent it.
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	// Its window is stamped and dropped; the UTXO stays because nobody spent it.
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 1}))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 
 	_, err = s.Create(ctx, tx, 5_000, utxo.WithMinedBlockInfo(
@@ -357,9 +356,8 @@ func TestMempoolCreateRefusesATransactionThatStillHasAUTXO(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// Its window retires and is dropped; the UTXO stays because nobody spent it.
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	// Its window is stamped and dropped; the UTXO stays because nobody spent it.
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 1}))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 	require.False(t, identExists(t, s, ctx, tx))
 

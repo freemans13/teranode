@@ -99,15 +99,15 @@ func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 	require.NoError(t, err)
 
 	// The child of the story stays unmined, and the store does not check that: preservation is
-	// keyed on the list the pruner hands over. The spender here is created through the block
-	// path only because the interim guard refuses to drop a window while any identity row
-	// exists, and an unmined child would be one.
-	spendOneOutputInBlock(t, s, ctx, parent, 0, 150, 9)
+	// keyed on the list the pruner hands over. The spend is at 900, past the height window 0
+	// is stamped at, so its undo copy does not hold the window drop back.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 9)
+
+	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
 
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	dropped := dropStamped(t, s, ctx, tip)
 	require.Equal(t, 1, dropped, "the window has to be gone for this test to mean anything")
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
@@ -170,15 +170,15 @@ func TestPreservedParentStillAnswersItsContest(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// Created through the block path for the reason TestPreservedParentOutlivesItsMembershipWindow
-	// gives: the interim guard refuses a drop while any identity row exists.
-	child := spendOneOutputInBlock(t, s, ctx, parent, 0, 150, 9)
-	plantConflictNote(t, s, ctx, 150, hashBytes(parent), hashBytes(child))
+	// The spend is at 900 for the reason TestPreservedParentOutlivesItsMembershipWindow gives.
+	child := spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 9)
+	plantConflictNote(t, s, ctx, 900, hashBytes(parent), hashBytes(child))
+
+	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
 
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
+	dropped := dropStamped(t, s, ctx, tip)
 	require.Equal(t, 1, dropped)
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)

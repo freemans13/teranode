@@ -31,7 +31,7 @@ func TestStoreRefusesToStartWithThePrunerSkippingCatchup(t *testing.T) {
 	require.True(t, errors.Is(err, errors.ErrConfiguration), "a configuration refusal, not a storage fault: %v", err)
 	require.Contains(t, err.Error(), "pruner_skipDuringCatchup")
 	require.Contains(t, err.Error(), "has no off switch")
-	require.Contains(t, err.Error(), "retain-indefinitely")
+	require.Contains(t, err.Error(), "utxostore_retainWindowsIndefinitely")
 
 	// The same settings with the flag off open normally, so the refusal is the flag's alone.
 	tSettings.Pruner.SkipDuringCatchup = false

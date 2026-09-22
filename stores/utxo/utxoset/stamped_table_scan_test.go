@@ -16,11 +16,13 @@ import (
 // deletes it. No reorg, un-mine, invalidation or unspend path may name it, because a table that
 // every chain switch had to keep consistent would be the rejected design under a new name.
 //
-// Today only schema.go names it, because the stamp of build step 5 does not exist yet. When the
-// stamp and the drop arrive, their files join the allow list and nothing else does.
+// The schema declares it, stamp.go writes it and reads it back for the completion check, and
+// tx_mined.go's drop reads and deletes it. Nothing else may.
 func TestOnlyTheSchemaAndTheStampNameTheStampedTable(t *testing.T) {
 	allowed := map[string]bool{
-		"schema.go": true,
+		"schema.go":   true,
+		"stamp.go":    true,
+		"tx_mined.go": true,
 	}
 
 	entries, err := os.ReadDir(".")
