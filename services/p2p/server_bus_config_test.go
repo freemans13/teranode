@@ -199,6 +199,27 @@ func TestBuildP2PMessageBusConfig_MeshProtection(t *testing.T) {
 			require.Empty(t, conf.AnnounceAddrs)
 		}
 	})
+
+	// AllowedPublisherIDs must reach the bus config unmodified: the bus, not
+	// this wiring, is responsible for augmenting it with the node's own peer ID
+	// and StaticPeers' publisher IDs. If this line were dropped, the setting
+	// would be fully plumbed through settings.go and documented, yet silently
+	// have no effect - every peer's pubsub messages would keep being accepted.
+	t.Run("allowed publisher IDs pass through to the bus config", func(t *testing.T) {
+		s := build(true, true, false)
+		s.P2P.AllowedPublisherIDs = []string{"12D3KooWA1b2C3", "12D3KooWD4e5F6"}
+		conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, s, privKey, "proto", "off", nil)
+		require.NoError(t, err)
+		require.Equal(t, []string{"12D3KooWA1b2C3", "12D3KooWD4e5F6"}, conf.AllowedPublisherIDs)
+	})
+
+	// The default (empty) allowlist must reach the bus as empty too, since an
+	// empty Config.AllowedPublisherIDs is what disables the bus-side filter.
+	t.Run("empty allowed publisher IDs default reaches the bus config", func(t *testing.T) {
+		conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, build(true, true, false), privKey, "proto", "off", nil)
+		require.NoError(t, err)
+		require.Empty(t, conf.AllowedPublisherIDs)
+	})
 }
 
 // TestPrivateIPColocationWhitelist pins the whitelist contents: dual-stack local
