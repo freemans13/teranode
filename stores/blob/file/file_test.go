@@ -99,6 +99,42 @@ func TestFileGetWithRelativePath(t *testing.T) {
 	f.Close(ctx)
 }
 
+// TestFileRelativeBasePathIsResolvedOnce pins a store built from a relative URL to the
+// directory it was created in. Reads after a change of working directory must still find
+// the blob, and the filenames the store builds must be absolute, so ConstructFilename never
+// has to ask the operating system for the working directory on a read or write.
+func TestFileRelativeBasePathIsResolvedOnce(t *testing.T) {
+	ctx := context.Background()
+
+	origin := t.TempDir()
+	t.Chdir(origin)
+
+	u, err := url.Parse("file://./blobs")
+	require.NoError(t, err)
+
+	f, err := New(ulogger.TestLogger{}, u)
+	require.NoError(t, err)
+
+	defer f.Close(ctx)
+
+	key := []byte("key")
+
+	require.NoError(t, f.Set(ctx, key, fileformat.FileTypeTesting, []byte("value")))
+
+	// Move away from the directory the store was created in.
+	t.Chdir(t.TempDir())
+
+	value, err := f.Get(ctx, key, fileformat.FileTypeTesting)
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), value)
+
+	filename, err := f.options.ConstructFilename(f.path, key, fileformat.FileTypeTesting)
+	require.NoError(t, err)
+	require.True(t, filepath.IsAbs(filename), "constructed filename %q is not absolute", filename)
+	require.True(t, strings.HasPrefix(filename, filepath.Join(origin, "blobs")+string(os.PathSeparator)),
+		"constructed filename %q is outside the original base %q", filename, origin)
+}
+
 func TestFileAbsoluteAndRelativePath(t *testing.T) {
 	absoluteURL, err := url.ParseRequestURI("file:///absolute/path/to/file")
 	require.NoError(t, err)
