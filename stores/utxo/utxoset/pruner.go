@@ -15,16 +15,16 @@ import (
 // statement write-ahead log volume, with the watermark thousands of blocks behind the tip.
 //
 // What is left is catalog operations on two horizons. Transaction bodies retire on
-// DefaultTxBodyRetentionBlocks; membership windows, the spend journal and the
+// DefaultTxBodyRetentionBlocks; containment windows, the spend journal and the
 // conflict-bookkeeping windows created alongside its leaves retire on
 // DefaultSpendJournalRetentionBlocks. Each is a DROP TABLE of partitions that have aged out,
 // so there is no work list, no probe and no per-row cost that can fall behind.
 //
-// Identity reclaim used to be the expensive half of this: a retiring journal partition read
-// as a work list, each parent judged on whether its spenders were settled, and its identity
-// row deleted. That is gone. A mined transaction claims on tx_mined instead of tx_ident, and
-// its UTXOs carry the height and block that made them, so retiring its membership is dropping
-// the window it lives in.
+// The containment drop is the INTERIM one of the design's containment build: it runs on the
+// old age rule and refuses while tx_ident holds a row, because nothing writes a block onto the
+// UTXOs of a transaction seen before its block until the deep stamp of build step 5 exists.
+// See dropTxMinedWindowsBelow. The retirement stamp that used to run in front of every drop,
+// and whose cost grew with the number of live windows, is deleted.
 //
 // It runs HERE, rather than on the spend path where it used to, for three reasons. The
 // spend path had to swallow the error to avoid failing a spend over old history, and it
@@ -52,7 +52,7 @@ func (journalPruner) Start(_ context.Context) {
 	// goroutine, so there is nothing for this store to start and nothing to stop.
 }
 
-// Prune drops the bodies, membership windows and journal leaves that have aged out at this
+// Prune drops the bodies, containment windows and journal leaves that have aged out at this
 // height.
 //
 // The height is the tip, not a retention-adjusted one, so the retention is applied here.

@@ -69,7 +69,7 @@ func TestGetNeverAnswersBlockIdsFromTheUTXOWhileAMembershipRowExists(t *testing.
 
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
-	require.Equal(t, []uint32{42, 43}, got.BlockIDs, "both blocks, in insertion order")
+	require.Equal(t, []uint32{42, 43}, got.BlockIDs, "both blocks, in (mined_height, block_id) order")
 }
 
 // TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives is the case block
@@ -93,10 +93,13 @@ func TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives(t 
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	spendOneOutput(t, s, ctx, parent, 0, 100)
+	// The child is mined in the next block, which is the case this test describes, and it has
+	// to be: the interim guard refuses to drop a window while any identity row exists.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 101, 8)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
+	require.Equal(t, 1, dropped, "the window has to be gone for this test to mean anything")
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
 	require.NoError(t, err)
@@ -201,11 +204,12 @@ func TestBatchDecorateResolvesEveryLeafOfAMultiLeafBatch(t *testing.T) {
 	}
 }
 
-// TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch is the same proof on the stamp path,
-// where provePresentSQL is what has to name every transaction the caller asked about. The
-// interface says every hash appears in the answer or the call fails, and a leaf grouping that
-// lost a group would fail the whole batch rather than answer wrongly -- which is the right
-// direction, and still worth pinning.
+// TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch is the same proof on the record-mined
+// path, where the per-leaf-group insert copies each transaction's payload from its identity
+// row and the read-back has to name every transaction the caller asked about. The interface
+// says every hash appears in the answer or the call fails, and a leaf grouping that lost a
+// group would fail the whole batch rather than answer wrongly -- which is the right direction,
+// and still worth pinning.
 func TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -224,7 +228,8 @@ func TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch(t *testing.T) {
 
 	require.Len(t, seen, NumLeaves)
 
-	// A fork stamp, so the rows stay in the identity table and provePresentSQL is what answers.
+	// Off the longest chain, so the markers stay set and the identity rows are provably what
+	// the insert copied from.
 	got, err := s.SetMinedMulti(ctx, hashList, utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
 	require.NoError(t, err)
 	require.Len(t, got, len(hashList))

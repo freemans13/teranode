@@ -330,27 +330,37 @@ CREATE TABLE IF NOT EXISTS applied_chunk (
 );
 
 -- ---------------------------------------------------------------------------
--- BLOCK MEMBERSHIP. One row per (transaction, block) that stamped it, for the reorg window.
+-- CONTAINMENT. One row says that block B at height h contains transaction T.
 --
--- This replaces the identity row for a MINED transaction. Below the checkpoint it is written
--- once at create and read by nothing on the consensus path; at the tip a mempool row moves
--- here when its block is stamped on the longest chain (stage 2). It is RANGE partitioned by
--- mined_height in 288-block windows and dropped whole once a window's upper bound is 1440
--- blocks below the pruner's height, so reclaim is a catalog operation with nothing to fall
--- behind on.
+-- Several competing blocks can each have a row for the same transaction, and no row says
+-- which of them won: a chain switch cannot make "block B contains T" false, so the rows are
+-- never rewritten, only inserted (ON CONFLICT DO NOTHING, so any number of writers in any
+-- order leave identical contents) and point-deleted by an un-mine of the one block named.
+-- The identity row of a transaction seen before its block is NOT moved here when a block
+-- records it; the two coexist until the deep stamp of build step 5 writes the block onto the
+-- transaction's UTXOs and deletes the identity row.
+--
+-- It is RANGE partitioned by mined_height in 288-block windows and dropped whole, so reclaim
+-- is a catalog operation with nothing to fall behind on. Until the stamp exists a window
+-- drops on the old rule (upper bound 1440 blocks below the pruner's height) and only while
+-- tx_ident is empty; see dropTxMinedWindowsBelow.
 --
 -- The primary key LEADS with txid. PostgreSQL requires the partition key inside a partitioned
 -- table's primary key but not at its head, and a height-leading key cannot be probed by
 -- transaction id: on 18 it becomes a skip scan over every distinct height in the partition.
 -- Every by-id lookup here is one descent per live window, six at 288-block windows.
 --
--- seq keeps insertion order, which the shared conformance suite requires of BlockIDs.
--- The payload columns are what a transaction needs if it is un-mined back into the mempool
--- (stage 2); below the checkpoint tx_inpoints is written NULL because nothing there can
--- un-mine.
+-- There is deliberately NO insertion counter. Reads return a transaction's rows in
+-- (mined_height, block_id) order, which for one transaction id is the primary key's own order.
+-- Nothing may rank rows by arrival, because more than one caller records the same blocks with
+-- no ordering between them, and the old counter was read as "the earliest row is the winner"
+-- at three sites, each of which stamped a reorg loser onto a UTXO.
 --
--- fee is carried because tx_ident carries one and the tip's stamp MOVES that row here. A
--- transaction un-mined back into the mempool is handed to block assembly, which prices it,
+-- The payload columns are what a transaction needs if it is un-mined; below the checkpoint
+-- tx_inpoints is written NULL because nothing there can un-mine.
+--
+-- fee is carried because tx_ident carries one and record-mined copies that row's payload here.
+-- A transaction un-mined back to the unmined set is handed to block assembly, which prices it,
 -- so dropping the column would silently zero the fee of every reorged transaction. It is
 -- nullable because the block path has no fee to carry: a create below the checkpoint writes
 -- NULL, exactly as the identity claim does.
@@ -360,7 +370,6 @@ CREATE TABLE IF NOT EXISTS tx_mined (
     mined_height    INTEGER  NOT NULL,
     block_id        INTEGER  NOT NULL,
     subtree_idx     INTEGER  NOT NULL,
-    seq             BIGINT   GENERATED ALWAYS AS IDENTITY,
     created_height  INTEGER  NOT NULL,
     size_in_bytes   INTEGER,
     fee             BIGINT,
@@ -372,15 +381,40 @@ CREATE TABLE IF NOT EXISTS tx_mined (
     PRIMARY KEY (txid, mined_height, block_id)
 ) PARTITION BY RANGE (mined_height);
 
--- The highest membership window ever dropped, plus one. ensureTxMinedPartition refuses to
--- create a window at or below it: a block re-offered more than 1440 blocks after its first
--- application would otherwise recreate its window and claim every transaction in it afresh,
--- and the UTXO table has no uniqueness on the outpoint to stop the UTXOs doubling.
+-- The three floors of the containment table, on one row held to one by CHECK (id = 0).
+--
+-- floor is the highest containment window ever dropped, plus one, and it is a WINDOW NUMBER.
+-- ensureTxMinedPartition refuses to create a window at or below it: a block re-offered more
+-- than 1440 blocks after its first application would otherwise recreate its window and claim
+-- every transaction in it afresh, and the UTXO table has no uniqueness on the outpoint to
+-- stop the UTXOs doubling.
+--
+-- stamp_fence and stamp_complete_floor are HEIGHTS, the exclusive upper bound of the highest
+-- window whose deep stamp has started and completed respectively. They are created now and
+-- written by nothing until the stamp of build step 5 exists, except by the interim drop, which
+-- raises all three together so that the ordering constraint holds on a database the interim
+-- build made: 288 x floor <= stamp_complete_floor <= stamp_fence. The constraint is in the DDL
+-- from the first build that has the columns because there is no migration, so a constraint
+-- added later would never reach a database an earlier build created.
 CREATE TABLE IF NOT EXISTS tx_mined_floor (
-    id      SMALLINT PRIMARY KEY CHECK (id = 0),
-    floor   INTEGER  NOT NULL
+    id                    SMALLINT PRIMARY KEY CHECK (id = 0),
+    floor                 INTEGER  NOT NULL,
+    stamp_fence           INTEGER  NOT NULL DEFAULT 0,
+    stamp_complete_floor  INTEGER  NOT NULL DEFAULT 0,
+    CONSTRAINT tx_mined_floor_order
+        CHECK (floor * 288 <= stamp_complete_floor AND stamp_complete_floor <= stamp_fence)
 );
 INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
+
+-- One row per containment window that has been stamped and not yet dropped: the tip height
+-- at which the window's stamp completed, plus the margin section 6 of the design defines.
+-- Only the stamp writes it and only the drop reads and deletes it; no reorg, un-mine,
+-- invalidation or unspend path touches it, which is what keeps it from being the per-window
+-- marker table that was rejected. Created now, unused until the stamp of build step 5.
+CREATE TABLE IF NOT EXISTS tx_mined_stamped (
+    window_start  INTEGER PRIMARY KEY CHECK (window_start >= 0 AND window_start % 288 = 0),
+    stamped_at    INTEGER NOT NULL
+);
 
 -- ---------------------------------------------------------------------------
 -- THE PRESERVED PARENT. One row per transaction the pruner asked to keep alive past the
@@ -434,20 +468,22 @@ CREATE TABLE IF NOT EXISTS preserved_parent (
 );
 
 -- ---------------------------------------------------------------------------
--- THE IDENTITY TABLE. One row per MEMPOOL transaction, from first sight until the block
--- that settles it.
+-- THE IDENTITY TABLE. One row per transaction the store saw BEFORE any block contained it.
 --
--- "Settles" rather than "contains", because the two are not the same fact and the difference
--- decides whether the row leaves. A stamp naming a block ON THE LONGEST CHAIN moves the row
--- into tx_mined and deletes it here, but only when the row then names exactly ONE block. A row
--- naming two blocks stays, with its mempool marker cleared: the id-less mark-on-longest-chain
--- call cannot later say which of them is main, so the row waits for an un-mine or a further
--- stamp to reduce it to one. A stamp for a block NOT on the longest chain moves nothing at
--- all; it only appends the block.
+-- A row here does not mean the transaction is unmined. The marker, off_chain_since, says
+-- that: NULL means the last thing the store was told is that a main-chain block contains the
+-- transaction. A row with a NULL marker is a mined transaction waiting for the deep stamp.
+--
+-- Recording a block against a transaction does NOT move the row anywhere. Containment is one
+-- row per (transaction, block) in tx_mined and has that one home; the identity row stays
+-- until the stamp of build step 5 writes the block onto the transaction's UTXOs and deletes
+-- it, or until Delete removes the transaction outright. Nothing else deletes an identity row,
+-- and nothing but the unmined create inserts one. The packed block list this table used to
+-- carry is gone with the move it drove.
 --
 -- Conflict bookkeeping used to pin a row here too, because it lived in a column of this table
 -- and tx_mined had nowhere to put it. It is a side table now (see conflict_children above),
--- keyed on the txid alone, so a contested row settles like any other.
+-- keyed on the txid alone.
 --
 -- Partitioned BY LIST (leaf), the same eight-way split as utxo, and never by
 -- created_height. Three reasons, worst first:
@@ -472,7 +508,6 @@ CREATE TABLE IF NOT EXISTS tx_ident (
     leaf                 SMALLINT NOT NULL,   -- txid[0] & 7; the partition key
     txid                 BYTEA    NOT NULL,   -- full 32 bytes: THE identity
     created_height       INTEGER  NOT NULL,   -- first sight; immutable
-    membership           BYTEA,               -- packed 12-byte triples: blockID, height, subtreeIdx
     off_chain_since      INTEGER,             -- see the comment on the index below
     fee                  BIGINT,
     size_in_bytes        INTEGER,
@@ -493,8 +528,6 @@ CREATE TABLE IF NOT EXISTS tx_ident (
     -- divergence into a clean constraint violation instead of an error from inside the
     -- expression.
     CONSTRAINT tx_ident_ck CHECK (length(txid) = 32 AND leaf = (get_byte(txid, 0) & 7)),
-    CONSTRAINT tx_ident_membership_triples
-        CHECK (membership IS NULL OR length(membership) % 12 = 0),
     PRIMARY KEY (leaf, txid)
 ) PARTITION BY LIST (leaf);
 
@@ -586,8 +619,7 @@ ALTER TABLE tx_ident_l%[1]d
        autovacuum_analyze_scale_factor = 0.02);
 `
 
-// txIdentIndexSQL is the ONE secondary index tx_ident should ever carry, plus the reducer
-// the settled predicate needs.
+// txIdentIndexSQL is the ONE secondary index tx_ident should ever carry.
 //
 // off_chain_since is a CACHED ANSWER TO A CHAIN QUESTION, not a timer, and it can never be
 // derived here. An index only answers questions about columns on the row it indexes, and
@@ -610,79 +642,6 @@ const txIdentIndexSQL = `
 CREATE INDEX IF NOT EXISTS tx_ident_off_chain_idx ON tx_ident (off_chain_since)
     WHERE off_chain_since IS NOT NULL;
 
--- Highest block height named by a packed membership, NULL if there is none.
---
--- The casts MUST be bigint. In postgres 255::int << 24 wraps to -16777216, SILENTLY, so an
--- int4 version returns negative heights and every "<= cutoff" test comes back true, which
--- would settle every transaction in the store. Verified on 18.6.
---
--- The MAXIMUM is what makes the settled predicate sound: it is at least the main-chain
--- height, so if the maximum is 288 deep the main-chain block is too. Taking the first or
--- the most favourable height instead lets a child mined low on a fork and re-mined recently
--- read as stable, which is what the incumbent SQL pruner does.
-CREATE OR REPLACE FUNCTION mh_max(m bytea) RETURNS bigint
-    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $fn$
-  SELECT max( (get_byte(m, i*12+4)::bigint << 24)
-            | (get_byte(m, i*12+5)::bigint << 16)
-            | (get_byte(m, i*12+6)::bigint <<  8)
-            |  get_byte(m, i*12+7)::bigint )
-    FROM generate_series(0, octet_length(m)/12 - 1) i
-$fn$;
-
--- mh_strip returns the membership with every triple naming one of ids removed, in insertion
--- order.
---
--- The casts MUST be bigint, for exactly the reason mh_max's must. In PostgreSQL 255::int << 24
--- wraps to a negative number, silently, so an int4 version would compare a negative value
--- against a positive block id and strip nothing at all.
---
--- EVERY matching triple goes, not the first. One block can be stamped against a transaction
--- twice under different subtree indexes, so a first-match removal would leave it still claiming
--- a block the caller asked it to forget.
---
--- Stripping the last triple yields NULL rather than an empty value, which is what a transaction
--- no block has ever named already carries, so the two spellings of "no block" stay one. STRICT
--- keeps a NULL membership NULL rather than turning it into a value.
-CREATE OR REPLACE FUNCTION mh_strip(m bytea, ids bigint[]) RETURNS bytea
-    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $fn$
-  SELECT string_agg(substring(m from i*12 + 1 for 12), ''::bytea ORDER BY i)
-    FROM generate_series(0, octet_length(m)/12 - 1) i
-   WHERE NOT ( ( (get_byte(m, i*12+0)::bigint << 24)
-               | (get_byte(m, i*12+1)::bigint << 16)
-               | (get_byte(m, i*12+2)::bigint <<  8)
-               |  get_byte(m, i*12+3)::bigint ) = ANY (ids) )
-$fn$;
-
--- mh_triple packs ONE membership entry: block id, height, subtree index, each a big-endian
--- uint32 in that order, which is the layout packMembership writes and mh_max and mh_strip
--- read.
---
--- It exists because the un-mine has to REBUILD a membership from tx_mined rows, and written
--- inline that is twelve nested set_byte calls inside a string_agg -- unreadable, and
--- impossible to check by eye against the Go packer. One function, one place to compare.
---
--- The casts MUST be bigint, for exactly the reason mh_max's must. In PostgreSQL
--- 255::int << 24 wraps to a negative number, silently, and set_byte then raises on a value
--- outside 0..255 instead of storing the byte the caller meant.
-CREATE OR REPLACE FUNCTION mh_triple(block_id int, height int, subtree int) RETURNS bytea
-    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $fn$
-  SELECT set_byte(set_byte(set_byte(set_byte(
-         set_byte(set_byte(set_byte(set_byte(
-         set_byte(set_byte(set_byte(set_byte(
-             '\x000000000000000000000000'::bytea,
-              0, ((block_id::bigint >> 24) & 255)::int),
-              1, ((block_id::bigint >> 16) & 255)::int),
-              2, ((block_id::bigint >>  8) & 255)::int),
-              3, ( block_id::bigint        & 255)::int),
-              4, ((height::bigint   >> 24) & 255)::int),
-              5, ((height::bigint   >> 16) & 255)::int),
-              6, ((height::bigint   >>  8) & 255)::int),
-              7, ( height::bigint          & 255)::int),
-              8, ((subtree::bigint  >> 24) & 255)::int),
-              9, ((subtree::bigint  >> 16) & 255)::int),
-             10, ((subtree::bigint  >>  8) & 255)::int),
-             11, ( subtree::bigint         & 255)::int)
-$fn$;
 `
 
 // CreateSchema installs the M1 schema. Idempotent.
@@ -717,9 +676,26 @@ var requiredColumns = []struct{ table, column string }{
 	{"utxo", "mined_height"},
 	{"utxo", "block_id"},
 	{"tx_mined", ""},
+	{"tx_mined_floor", "stamp_fence"},
+	{"tx_mined_floor", "stamp_complete_floor"},
+	{"tx_mined_stamped", ""},
 	{"spend_journal", "mined_height"},
 	{"spend_journal", "block_id"},
 	{"conflict_intents", ""},
+}
+
+// forbiddenColumns are the facts that distinguish this schema from the one before it the
+// other way round: columns the containment change DELETED. A database that still has one was
+// written by the older schema, and every one of this binary's containment statements would
+// fail against it at run time, not at startup.
+//
+// The distinguishing change of the containment build is mostly deletion, so without this list
+// an unreset database would pass the required-columns loop above and fail on its first
+// by-txid read instead. The insertion counter on tx_mined and the packed block list on
+// tx_ident are the two columns that went.
+var forbiddenColumns = []struct{ table, column string }{
+	{"tx_mined", "seq"},
+	{"tx_ident", "membership"},
 }
 
 // assertSchemaShape refuses to start against a database written by the previous schema.
@@ -733,28 +709,12 @@ var requiredColumns = []struct{ table, column string }{
 // exist`. Every batch after it fails the same way, forever, and the columns the reshape
 // removed are all nullable or defaulted, so nothing fails earlier or louder.
 //
-// One query converts that flood into a single startup refusal naming what is missing. It runs
-// as part of CreateSchema rather than beside it so that no caller can install the schema and
-// skip the check.
+// One query converts that flood into a single startup refusal naming what is missing, and a
+// second names what is still present when it should be gone. Both run as part of CreateSchema
+// rather than beside it so that no caller can install the schema and skip the check.
 func assertSchemaShape(ctx context.Context, pool *pgxpool.Pool) error {
 	for _, req := range requiredColumns {
-		var found bool
-
-		var err error
-
-		if req.column == "" {
-			err = pool.QueryRow(ctx, `
-				SELECT EXISTS (SELECT 1 FROM information_schema.tables
-				                WHERE table_schema = current_schema() AND table_name = $1)`,
-				req.table).Scan(&found)
-		} else {
-			err = pool.QueryRow(ctx, `
-				SELECT EXISTS (SELECT 1 FROM information_schema.columns
-				                WHERE table_schema = current_schema() AND table_name = $1
-				                  AND column_name = $2)`,
-				req.table, req.column).Scan(&found)
-		}
-
+		found, err := schemaHas(ctx, pool, req.table, req.column)
 		if err != nil {
 			return errors.NewStorageError("[utxoset] check schema shape for %s", req.table, err)
 		}
@@ -763,15 +723,57 @@ func assertSchemaShape(ctx context.Context, pool *pgxpool.Pool) error {
 			continue
 		}
 
-		what := req.table
-		if req.column != "" {
-			what = req.table + "." + req.column
+		return errors.NewConfigurationError(
+			"[utxoset] this database was written by an older schema: %s is missing. There is no migration by design -- the store needs a fresh database, and the chain has to be re-synced into it",
+			schemaName(req.table, req.column))
+	}
+
+	for _, gone := range forbiddenColumns {
+		found, err := schemaHas(ctx, pool, gone.table, gone.column)
+		if err != nil {
+			return errors.NewStorageError("[utxoset] check schema shape for %s", gone.table, err)
+		}
+
+		if !found {
+			continue
 		}
 
 		return errors.NewConfigurationError(
-			"[utxoset] this database was written by an older schema: %s is missing. There is no migration by design -- the store needs a fresh database, and the chain has to be re-synced into it",
-			what)
+			"[utxoset] this database was written by an older schema: %s is still present. There is no migration by design -- the store needs a fresh database, and the chain has to be re-synced into it",
+			schemaName(gone.table, gone.column))
 	}
 
 	return nil
+}
+
+// schemaHas reports whether the current schema holds the table, or the column of the table
+// when column is not empty.
+func schemaHas(ctx context.Context, pool *pgxpool.Pool, table, column string) (bool, error) {
+	var found bool
+
+	if column == "" {
+		err := pool.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM information_schema.tables
+			                WHERE table_schema = current_schema() AND table_name = $1)`,
+			table).Scan(&found)
+
+		return found, err
+	}
+
+	err := pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.columns
+		                WHERE table_schema = current_schema() AND table_name = $1
+		                  AND column_name = $2)`,
+		table, column).Scan(&found)
+
+	return found, err
+}
+
+// schemaName is the operator-facing name of a table or a column of it.
+func schemaName(table, column string) string {
+	if column == "" {
+		return table
+	}
+
+	return table + "." + column
 }

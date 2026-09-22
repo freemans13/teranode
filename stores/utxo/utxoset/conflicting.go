@@ -20,22 +20,23 @@ import (
 // in plain rather than extended form, meaning its inputs carry no value or locking script, so
 // even a body that is still present could not answer this.
 //
-// BOTH HOMES, because a transaction lives in exactly one of them and this statement does not
-// know which. A transaction that lost a double-spend race is very often mined -- it arrives in
-// a block on the fork being abandoned, and conflict resolution has to read what it spent so
-// those spends can be undone -- and the longest-chain stamp moved its inpoints out of tx_ident
-// and onto its membership row. Reading the identity table alone reported exactly those
-// transactions as not held at all, so SetConflicting failed instead of resolving the race.
+// BOTH HOMES, because this statement does not know which of them still holds the transaction.
+// A transaction that lost a double-spend race is very often mined -- it arrives in a block on
+// the fork being abandoned, and conflict resolution has to read what it spent so those spends
+// can be undone. Its identity row carries the inpoints until the deep stamp deletes it, and
+// its containment row carries a copy from then on. Reading the identity table alone reported
+// a stamped transaction as not held at all, so SetConflicting failed instead of resolving the
+// race.
 //
 // The identity arm has THE LEAF AS A SCALAR and the txids as an array, so it runs once per leaf
 // group: see leafGroups for the measurements that reject the other two key shapes. It replaced
 // the paired `unnest(l[],t[]) JOIN tx_ident` form, whose plan flips with statistics.
 //
-// The membership arm puts the keys on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the
-// shape minedByTxidSQL and firstMinedRowSQL use, so it is one primary-key descent per key per
-// live window rather than a hash join against every window read whole. The earliest row by seq
-// is the transaction's longest-chain stamp, which is the row whose payload was carried over by
-// the move; a later fork stamp only ever copies it.
+// The containment arm puts the keys on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the
+// shape minedByTxidSQL uses, so it is one primary-key descent per key per live window rather
+// than a hash join against every window read whole. Every containment row of one transaction
+// carries the same inpoints, copied from the identity row or from an earlier row, so which row
+// answers does not matter; the ORDER BY only makes the choice repeatable.
 //
 // tx_inpoints IS NOT NULL makes a BLOCK-PATH membership row a not-found here, deliberately.
 // Such a row records that a transaction is in a block, not what it spends, so it cannot be a
@@ -58,7 +59,7 @@ SELECT k.txid, m.tx_inpoints
      FROM tx_mined m
     WHERE m.txid = k.txid
       AND m.tx_inpoints IS NOT NULL
-    ORDER BY m.seq
+    ORDER BY m.mined_height, m.block_id
     LIMIT 1 OFFSET 0
  ) AS m`
 

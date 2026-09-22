@@ -99,23 +99,3 @@ func TestPartitionCreationIsIdempotentAcrossACacheLoss(t *testing.T) {
 		})
 	}
 }
-
-// TestAttachedWindowContinuesTheIdentitySequence: tx_mined's seq column is an identity
-// owned by the parent. A window built standalone and attached must keep drawing from it,
-// or two windows could hand out the same seq.
-func TestAttachedWindowContinuesTheIdentitySequence(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	first := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, first, 100, withMined(7, 100))
-	require.NoError(t, err)
-
-	second := mkTx(t, 1, 6_000)
-	_, err = s.Create(ctx, second, 100+TxMinedPartitionBlocks, withMined(8, 100+TxMinedPartitionBlocks))
-	require.NoError(t, err)
-
-	var seqFirst, seqSecond int64
-	require.NoError(t, s.pool.QueryRow(ctx, `SELECT seq FROM tx_mined WHERE txid = $1`, hashBytes(first)).Scan(&seqFirst))
-	require.NoError(t, s.pool.QueryRow(ctx, `SELECT seq FROM tx_mined WHERE txid = $1`, hashBytes(second)).Scan(&seqSecond))
-	require.Greater(t, seqSecond, seqFirst, "the identity sequence is shared across windows")
-}

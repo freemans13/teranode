@@ -27,22 +27,23 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 	return nil, nil
 }
 
-// preserveParentSQL copies each named transaction's EARLIEST membership row into the
-// preservation table, or extends the life of a copy already there.
+// preserveParentSQL copies each named transaction's first containment row, in (mined_height,
+// block_id) order, into the preservation table, or extends the life of a copy already there.
 //
-// The earliest row by seq is the transaction's longest-chain stamp rather than a fork one, and
-// that is the same rule firstMinedRowSQL relies on when it stamps a retiring window's UTXOs:
-// since task 9 a transaction only reaches the membership table by a longest-chain stamp or a
-// block-path create, and a fork stamp can only ever append to a row that already exists. So
-// the first row is the block this parent really was mined into, and preserving any other one
-// would keep a loser alive as the answer.
+// That order is the INTERIM rule of the containment build, and it is right only where a
+// transaction has exactly one containment row: a mainnet sync below the checkpoint, where the
+// node has never stored a fork. Where a transaction is contained by competing blocks this can
+// preserve the loser, which is one of the measured failures the design records, and build
+// step 5 replaces it with a source rule that reads only windows the stamp has completed, where
+// the losing rows are already deleted. Nothing may rank rows by arrival in the meantime; the
+// insertion counter this used to order by is gone.
 //
-// A hash with NO membership row copies nothing, and that is right in both of the ways it can
-// happen. A parent still in the mempool is held by its identity row, which stays for as long
-// as the transaction is unmined, so there is nothing to preserve and nothing to lose. A parent
-// whose window has already gone cannot be recovered from here -- the row this statement copies
-// is the only place those facts lived -- and inventing a row from a UTXO would put facts in a
-// table that promises to hold what membership held.
+// A hash with NO containment row copies nothing, and that is right in both of the ways it can
+// happen. An unmined parent is held by its identity row, which stays for as long as the
+// transaction is unmined, so there is nothing to preserve and nothing to lose. A parent whose
+// window has already gone cannot be recovered from here -- the row this statement copies is
+// the only place those facts lived -- and inventing a row from a UTXO would put facts in a
+// table that promises to hold what containment held.
 //
 // ON CONFLICT takes the GREATEST of the two heights rather than the new one. The pruner names
 // a parent again on every cycle its child is still waiting, each time with a further-out
@@ -50,8 +51,8 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 // expiry over the longer one would retire the parent while the older child still needed it.
 //
 // The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the shape minedByTxidSQL
-// and firstMinedRowSQL use and for the identical reason: one primary-key descent per key per
-// live window rather than a hash join against every window read whole.
+// uses and for the identical reason: one primary-key descent per key per live window rather
+// than a hash join against every window read whole.
 const preserveParentSQL = `
 INSERT INTO preserved_parent (txid, mined_height, block_id, subtree_idx, created_height,
                               fee, size_in_bytes, tx_inpoints, locktime, created_at, flags,
@@ -64,19 +65,19 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.created_height,
           m.fee, m.tx_inpoints, m.locktime, m.created_at, m.flags
      FROM tx_mined m
     WHERE m.txid = k.txid
-    ORDER BY m.seq
+    ORDER BY m.mined_height, m.block_id
     LIMIT 1 OFFSET 0
  ) AS m
     ON CONFLICT (txid) DO UPDATE
    SET preserve_until = GREATEST(preserved_parent.preserve_until, EXCLUDED.preserve_until)`
 
-// PreserveTransactions keeps a parent answerable past the membership window that would
+// PreserveTransactions keeps a parent answerable past the containment window that would
 // otherwise have retired it, because a still-unmined child needs its facts to be validated
 // against on the day it is finally mined.
 //
 // The old justification for doing nothing here was that this store's reclaim consults the
 // spender's status rather than racing a clock, so a parent with a live child could never be
-// deleted out from under it. That is still true of the UTXO, and it is not enough. Membership
+// deleted out from under it. That is still true of the UTXO, and it is not enough. Containment
 // is dropped by height, whole windows at a time, and a parent whose UTXOs are all spent has no
 // UTXO left to answer from either: 1440 blocks after its block, the parent is simply gone. That
 // is the right answer for every parent except the one whose child never got mined, and the

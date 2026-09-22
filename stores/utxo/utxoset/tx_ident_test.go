@@ -2,7 +2,6 @@ package utxoset
 
 import (
 	"context"
-	"encoding/binary"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -25,23 +24,6 @@ func requireCheckViolation(t *testing.T, err error, msgAndArgs ...any) {
 	require.True(t, errors.As(err, &pgErr), "want a postgres error, got %T: %v", err, err)
 	require.Equal(t, "23514", pgErr.Code,
 		"want SQLSTATE 23514 check_violation, got %s: %s", pgErr.Code, pgErr.Message)
-}
-
-// packTriples builds the packed form tx_ident.membership carries: 12-byte triples of
-// blockID, height and subtree index, all big-endian.
-func packTriples(t *testing.T, triples ...[3]uint32) []byte {
-	t.Helper()
-
-	b := make([]byte, 0, len(triples)*12)
-	for _, tr := range triples {
-		var e [12]byte
-		binary.BigEndian.PutUint32(e[0:4], tr[0])
-		binary.BigEndian.PutUint32(e[4:8], tr[1])
-		binary.BigEndian.PutUint32(e[8:12], tr[2])
-		b = append(b, e[:]...)
-	}
-
-	return b
 }
 
 // TestTxIdentRejectsAWrongLeaf is the constraint that makes the primary key mean what the
@@ -123,48 +105,10 @@ func TestMempoolReloadUsesThePartialIndex(t *testing.T) {
 		"the mempool reload must be served by a PARTIAL index on off_chain_since, not a full one: a full index would carry an entry for every transaction the store has ever held")
 }
 
-// TestMembershipMaxHeightTakesTheHighest pins the reducer the settled predicate depends on.
-//
-// A transaction is settled when its off-chain marker is NULL and the HIGHEST block height in
-// its membership is at or below the tip minus 288. Taking the highest is what makes it sound:
-// it is at least the main-chain height, so if the highest is 288 deep the main-chain block is
-// too. The incumbent SQL pruner takes the most favourable height instead, with no best-chain
-// filter, so a child mined low on a fork and re-mined recently reads as stable
-// (stores/utxo/sql/pruner/pruner_service.go:172-176). Do not copy that half.
-func TestMembershipMaxHeightTakesTheHighest(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	t.Run("takes the maximum rather than the first", func(t *testing.T) {
-		m := packTriples(t, [3]uint32{11, 2_000, 0}, [3]uint32{22, 1_000, 3})
-
-		var got int64
-		require.NoError(t, s.pool.QueryRow(ctx, `SELECT mh_max($1)`, m).Scan(&got))
-		require.Equal(t, int64(2_000), got,
-			"a fork entry listed first must not hide a later main-chain height")
-	})
-
-	t.Run("does not wrap on a height above the signed 32-bit boundary", func(t *testing.T) {
-		// 0xFF000000 shifted left 24 as int4 wraps to a NEGATIVE number in postgres, silently,
-		// which would make every "<= cutoff" test come back true and settle everything.
-		m := packTriples(t, [3]uint32{1, 0xFF00_0001, 0})
-
-		var got int64
-		require.NoError(t, s.pool.QueryRow(ctx, `SELECT mh_max($1)`, m).Scan(&got))
-		require.Equal(t, int64(0xFF00_0001), got, "the casts must be bigint, not int")
-	})
-
-	t.Run("is null for a transaction with no membership", func(t *testing.T) {
-		var got *int64
-		require.NoError(t, s.pool.QueryRow(ctx, `SELECT mh_max($1)`, []byte{}).Scan(&got))
-		require.Nil(t, got, "no membership means no height, which must not read as height zero")
-	})
-}
-
 // identRow is what tx_ident holds for one transaction, read back for assertions.
 type identRow struct {
 	createdHeight int32
 	offChainSince *int32
-	membership    []byte
 	fee           *int64
 	sizeInBytes   *int32
 	locktime      *int32
@@ -176,9 +120,9 @@ func readIdent(t *testing.T, s *Store, ctx context.Context, txid []byte) identRo
 
 	var r identRow
 	require.NoError(t, s.pool.QueryRow(ctx, `
-        SELECT created_height, off_chain_since, membership, fee, size_in_bytes, locktime, flags
+        SELECT created_height, off_chain_since, fee, size_in_bytes, locktime, flags
           FROM tx_ident WHERE leaf = $1 AND txid = $2`,
-		LeafFor(txid), txid).Scan(&r.createdHeight, &r.offChainSince, &r.membership,
+		LeafFor(txid), txid).Scan(&r.createdHeight, &r.offChainSince,
 		&r.fee, &r.sizeInBytes, &r.locktime, &r.flags))
 
 	return r
@@ -216,39 +160,22 @@ func TestCreateMarksAMempoolArrivalAsOffChain(t *testing.T) {
 	h := tx.TxIDChainHash()
 	r := readIdent(t, s, ctx, h[:])
 
-	require.NotNil(t, r.offChainSince, "a mempool arrival must be in the mempool set")
+	require.NotNil(t, r.offChainSince, "an unmined arrival must be in the unmined set")
 	require.Equal(t, int32(700_000), *r.offChainSince)
-	require.Empty(t, r.membership, "nothing has told us a block contains it")
+	require.Equal(t, 0, minedRows(t, s, ctx, tx), "nothing has told us a block contains it")
 }
 
-// TestAForkMinedTransactionCarriesBothMembershipAndTheWaitingMarker.
+// TestAForkMinedTransactionCarriesBothContainmentAndTheWaitingMarker.
 //
 // This state is real and has to work: a transaction mined only into a block that is NOT on the
 // main chain is in a block AND is still waiting to be mined. The waiting-set query keys on the
-// marker rather than on empty membership precisely so it finds these.
+// marker rather than on the absence of containment precisely so it finds these.
 //
-// What changed is how the state is REACHED. The store used to fake it at create time, marking
-// every transaction created by block application because the block's chain status was not yet
-// known. That treated "unknown" as "not mined", and since block application never claims the
-// longest chain, it applied to every transaction a sync created. On the mainnet box it reached
-// 3.8 million rows, 91% of the store, and stalled the reclaim behind it.
-//
-// The state is now reached the way production reaches it, by block assembly telling the store
-// the transaction is not on the longest chain. That is a fact someone has established, rather
-// than a guess made before anyone could know.
-// The mined state is now reached by a stamp rather than by a create carrying block
-// information. That create takes the block path, which writes no identity row at all, and
-// this test is about two columns of the identity row. At the tip the stamp IS the shape:
-// everything but the coinbase arrives from the mempool, is stamped by the block that mines
-// it, and only later learns whether that block won.
-//
-// It takes TWO blocks to reach a row that is both settled and still present, and that is the
-// rule rather than a trick to keep an old test alive. A longest-chain stamp on a row claiming
-// one block moves it into the membership table; a row claiming two stays, because the id-less
-// mark call cannot later say which of the two is main. So the row this test needs -- an
-// identity row carrying membership -- is a two-block row, and it is exactly the row a reorg
-// produces at the tip.
-func TestAForkMinedTransactionCarriesBothMembershipAndTheWaitingMarker(t *testing.T) {
+// The state is reached the way production reaches it, by block assembly telling the store the
+// transaction is not on the longest chain. That is a fact someone has established, rather than
+// a guess made before anyone could know. The containment rows stay through the mark-off: they
+// record which blocks contain the transaction, which a chain switch cannot make false.
+func TestAForkMinedTransactionCarriesBothContainmentAndTheWaitingMarker(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 1_000)
@@ -268,7 +195,7 @@ func TestAForkMinedTransactionCarriesBothMembershipAndTheWaitingMarker(t *testin
 	require.NoError(t, err)
 
 	require.Nil(t, readIdent(t, s, ctx, h[:]).offChainSince,
-		"stamped into a block on the longest chain, so not waiting")
+		"recorded in a block on the longest chain, so not waiting")
 
 	// Block assembly determines the block is not on the main chain.
 	require.NoError(t, s.SetBlockHeight(700_050))
@@ -277,18 +204,14 @@ func TestAForkMinedTransactionCarriesBothMembershipAndTheWaitingMarker(t *testin
 	r := readIdent(t, s, ctx, h[:])
 	require.NotNil(t, r.offChainSince, "now it is genuinely waiting again")
 	require.Equal(t, int32(700_050), *r.offChainSince, "with a clock from the current tip")
-	require.NotEmpty(t, r.membership,
-		"and the block it was in is still recorded, which is why the query cannot test for empty membership")
+	require.Equal(t, 2, minedRows(t, s, ctx, tx),
+		"and the blocks it was in are still recorded, which is why the query cannot test for missing containment")
 }
 
 // TestCreateLeavesAConfirmedBlockApplicationOnChain is the other half of the gate. Once a
 // caller states the block is on the longest chain, the transaction is mined and belongs
-// nowhere near the mempool set -- and now says so by leaving the mempool table, which is the
-// strongest form that statement can take.
-// Reached by a stamp on a mempool arrival, for the reason the test above it explains: a
-// create carrying block information writes no identity row, and these are its columns. What
-// the moved row carries once it is in the membership table is pinned in set_mined_test.go;
-// this is the tx_ident view of the same event.
+// nowhere near the unmined set. It says so by clearing its marker; its identity row stays until
+// the deep stamp deletes it, and its one block is recorded as containment.
 func TestCreateLeavesAConfirmedBlockApplicationOnChain(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -303,46 +226,9 @@ func TestCreateLeavesAConfirmedBlockApplicationOnChain(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.False(t, identExists(t, s, ctx, tx), "confirmed on the longest chain means mined")
+	require.True(t, identExists(t, s, ctx, tx), "the identity row stays until the stamp")
+	require.Nil(t, markerOf(t, s, ctx, tx), "confirmed on the longest chain means mined")
 	require.Equal(t, 1, minedRows(t, s, ctx, tx), "and its one block is recorded there")
-}
-
-// TestCreatePacksEveryBlockInInsertionOrder pins the packing, including the ordering the
-// conformance suite asserts: subtree indexes come back in insertion order, never sorted.
-// Two blocks are now two stamps. A create that carries block information takes the block
-// path, which claims one membership row for the one block it was handed, so a transaction in
-// two blocks can only get there by being stamped twice -- which is exactly what happens at the
-// tip, where each block that contains it stamps it in turn.
-//
-// The FORK stamp comes first and the longest-chain stamp second, which is the only order that
-// leaves two triples on an identity row to read. The other order settles the row on the first
-// stamp and moves it out, so the second stamp has no identity row to append to.
-func TestCreatePacksEveryBlockInInsertionOrder(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	tx := mkTx(t, 1, 1_000)
-	_, err := s.Create(ctx, tx, 700_000)
-	require.NoError(t, err)
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 700_002, SubtreeIdx: 7, OnLongestChain: false})
-	require.NoError(t, err)
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 4, BlockHeight: 700_001, SubtreeIdx: 2, OnLongestChain: true})
-	require.NoError(t, err)
-
-	h := tx.TxIDChainHash()
-	r := readIdent(t, s, ctx, h[:])
-
-	require.Equal(t,
-		packTriples(t, [3]uint32{9, 700_002, 7}, [3]uint32{4, 700_001, 2}),
-		r.membership, "insertion order, not sorted, and not deduplicated")
-
-	var mh *int64
-	require.NoError(t, s.pool.QueryRow(ctx, `SELECT mh_max(membership) FROM tx_ident WHERE txid = $1`, h[:]).Scan(&mh))
-	require.NotNil(t, mh)
-	require.Equal(t, int64(700_002), *mh, "the settled predicate reads the highest height, not the last written")
 }
 
 // TestCreateRejectsATransactionTheStoreAlreadyHolds is the contract nine production sites

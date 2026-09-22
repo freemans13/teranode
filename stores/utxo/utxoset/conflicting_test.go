@@ -348,11 +348,13 @@ func TestNotingTheSameContestTwiceRecordsItOnce(t *testing.T) {
 
 // TestConflictingChildrenSurviveTheParentLeavingTheIdentityTable.
 //
-// A contested parent is very often a MINED transaction, and a mined transaction has no
-// identity row: the longest-chain stamp moved it into the membership table. Bookkeeping kept
-// on the identity row therefore has nowhere to land, and the note becomes a zero-row update.
-// The route from a contested UTXO to the transactions competing for it is the only route
-// conflict resolution has, so losing it loses the conflict.
+// A contested parent is very often a MINED transaction, and a mined transaction can have no
+// identity row: one created through the block path never had one, and one seen before its
+// block loses it to the deep stamp. Bookkeeping kept on the identity row therefore has
+// nowhere to land, and the note becomes a zero-row update. The route from a contested UTXO to
+// the transactions competing for it is the only route conflict resolution has, so losing it
+// loses the conflict. The parent here is recorded mined and then has its identity row deleted
+// as the stamp would, so the note has only the side table to land in.
 func TestConflictingChildrenSurviveTheParentLeavingTheIdentityTable(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_101))
@@ -364,8 +366,10 @@ func TestConflictingChildrenSurviveTheParentLeavingTheIdentityTable(t *testing.T
 	_, err = s.SetMinedMulti(ctx, hashes(parent),
 		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true})
 	require.NoError(t, err)
+
+	dropIdentityRow(t, s, ctx, parent)
 	require.False(t, identExists(t, s, ctx, parent),
-		"the stamp must have moved the parent out of the identity table, or this test proves nothing")
+		"the parent must have no identity row, or this test proves nothing")
 
 	loser := spendOneOutput(t, s, ctx, parent, 0, 700_101)
 
@@ -378,14 +382,12 @@ func TestConflictingChildrenSurviveTheParentLeavingTheIdentityTable(t *testing.T
 		"a mined parent must still name the transaction contesting its UTXO")
 }
 
-// TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp is the same requirement on the
-// other move.
+// TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp is the same requirement across
+// a mark-on.
 //
-// A stamp for a block not yet known to be on the longest chain leaves the row in the identity
-// table carrying one triple; MarkTransactionsOnLongestChain then settles it and moves it out.
-// That move used to refuse a row carrying conflicting children, so the bookkeeping pinned the
-// transaction in the mempool table forever -- and the transaction stayed pinned whether or not
-// anything ever read the list.
+// A block not yet known to be on the longest chain records containment and leaves the marker
+// set; MarkTransactionsOnLongestChain then clears the marker. The contest is keyed on the
+// parent's txid in a side table, so nothing about the parent's own rows can pin or lose it.
 func TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_101))
@@ -407,8 +409,7 @@ func TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp(t *testing.T) 
 
 	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
 		[]chainhash.Hash{*parent.TxIDChainHash()}, true))
-	require.False(t, identExists(t, s, ctx, parent),
-		"a contested parent must settle like any other, not be pinned by its own bookkeeping")
+	require.Nil(t, markerOf(t, s, ctx, parent), "a contested parent is marked like any other")
 	require.Equal(t, 1, minedRows(t, s, ctx, parent))
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
@@ -458,9 +459,11 @@ func TestConflictingChildrenAnswerForAParentKnownOnlyFromItsUTXO(t *testing.T) {
 //
 // A transaction that lost a double-spend race is very often mined: it arrives in a block on the
 // fork being abandoned, and conflict resolution then has to mark it, read what it spent, and
-// hand those spends back so they can be undone. A longest-chain stamp moves it out of tx_ident
-// and into tx_mined, so an inputs read that looks only at the identity table reports the
-// transaction as not held at all -- and SetConflicting fails rather than resolving the race.
+// hand those spends back so they can be undone. Once the deep stamp has deleted its identity
+// row, its containment row is the only home of its inpoints, so an inputs read that looks only
+// at the identity table reports the transaction as not held at all -- and SetConflicting fails
+// rather than resolving the race. The identity row is deleted here as the stamp would delete
+// it, so the containment arm is what has to answer.
 func TestSetConflictingReadsInputsFromAMinedTransaction(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_100))
@@ -471,14 +474,14 @@ func TestSetConflictingReadsInputsFromAMinedTransaction(t *testing.T) {
 
 	child := spendOneOutput(t, s, ctx, parent, 0, 700_100)
 
-	// The move: stamped into a longest-chain block, so its identity row is gone and its
-	// inpoints live on the membership row.
+	// Recorded in a block, its inpoints copied onto the containment row, and then its identity
+	// row deleted as the stamp would delete it.
 	_, err = s.SetMinedMulti(ctx, hashes(child),
 		utxo.MinedBlockInfo{BlockID: 44, BlockHeight: 700_100})
 	require.NoError(t, err)
 	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
 		[]chainhash.Hash{*child.TxIDChainHash()}, true))
-	require.False(t, identExists(t, s, ctx, child))
+	dropIdentityRow(t, s, ctx, child)
 	require.Equal(t, 1, minedRows(t, s, ctx, child))
 
 	affected, _, err := s.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
@@ -516,6 +519,7 @@ func TestSpendsMadeByReachesAMinedTransaction(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
 		[]chainhash.Hash{*child.TxIDChainHash()}, true))
+	dropIdentityRow(t, s, ctx, child)
 
 	made, err := s.SpendsMadeBy(ctx, *child.TxIDChainHash())
 	require.NoError(t, err)
@@ -526,7 +530,7 @@ func TestSpendsMadeByReachesAMinedTransaction(t *testing.T) {
 
 // TestSetConflictingRefusesABlockPathMinedRow.
 //
-// A membership row written by the block path carries NULL inpoints: it records that a
+// A containment row written by the block path carries NULL inpoints: it records that a
 // transaction is in a block, not what the transaction spends. Only a coinbase takes that path
 // at the tip, and below the checkpoint nothing conflicts, so such a row can never be a conflict
 // participant. Reading it as "spends nothing" would be worse than refusing it -- an empty

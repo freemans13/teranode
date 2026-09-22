@@ -43,6 +43,7 @@ func newTestStoreWith(t *testing.T, tune func(*settings.Settings)) (*Store, cont
 	                       DROP TABLE IF EXISTS tx_body CASCADE;
 	                       DROP TABLE IF EXISTS tx_mined CASCADE;
 	                       DROP TABLE IF EXISTS tx_mined_floor CASCADE;
+	                       DROP TABLE IF EXISTS tx_mined_stamped CASCADE;
 	                       DROP TABLE IF EXISTS conflict_children CASCADE;
 	                       DROP TABLE IF EXISTS conflict_intents CASCADE;
 	                       DROP TABLE IF EXISTS preserved_parent CASCADE;`)

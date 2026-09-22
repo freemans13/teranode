@@ -98,12 +98,17 @@ func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	spendOneOutput(t, s, ctx, parent, 0, 150) // the child stays unmined
+	// The child of the story stays unmined, and the store does not check that: preservation is
+	// keyed on the list the pruner hands over. The spender here is created through the block
+	// path only because the interim guard refuses to drop a window while any identity row
+	// exists, and an unmined child would be one.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 150, 9)
 
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
+	require.Equal(t, 1, dropped, "the window has to be gone for this test to mean anything")
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
@@ -165,13 +170,16 @@ func TestPreservedParentStillAnswersItsContest(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	child := spendOneOutput(t, s, ctx, parent, 0, 150)
+	// Created through the block path for the reason TestPreservedParentOutlivesItsMembershipWindow
+	// gives: the interim guard refuses a drop while any identity row exists.
+	child := spendOneOutputInBlock(t, s, ctx, parent, 0, 150, 9)
 	plantConflictNote(t, s, ctx, 150, hashBytes(parent), hashBytes(child))
 
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
+	require.Equal(t, 1, dropped)
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
 	require.NoError(t, err)

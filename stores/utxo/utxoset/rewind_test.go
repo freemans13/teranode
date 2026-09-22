@@ -1,6 +1,7 @@
 package utxoset
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -97,70 +98,60 @@ func TestRemoveFromConflictingChildrenIsIdempotentAndSilent(t *testing.T) {
 
 // TestRemoveBlockIDsStripsEveryNamedBlock.
 //
-// Two transactions in one call losing different blocks, for the same reason as above, and one
-// of them carries the SAME block twice under different subtree indexes, which a first-match
-// removal would leave still claiming it.
+// Two transactions in one call losing different blocks, so that an implementation which built
+// one combined removal list and applied it to every named transaction would pass a
+// single-transaction test and fail this one. Containment is one row per (transaction, block),
+// so a removal is a point delete and nothing has to be re-packed. The identity rows are
+// untouched: a rewind names blocks the caller has stopped believing in, and the identity row
+// records only that the store saw the transaction before any block did.
 func TestRemoveBlockIDsStripsEveryNamedBlock(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	txA := idBytes(0xa1)
 	txB := idBytes(0xa2)
 
-	plantIdent(t, s, ctx, txA,
-		packTriples(t, [3]uint32{5, 500, 0}, [3]uint32{6, 600, 0}, [3]uint32{5, 500, 1}), ptrI32(100))
-	plantIdent(t, s, ctx, txB,
-		packTriples(t, [3]uint32{7, 700, 0}, [3]uint32{8, 800, 0}), ptrI32(100))
+	plantIdent(t, s, ctx, txA, ptrI32(100))
+	plantMined(t, s, ctx, txA, 5, 500, 0)
+	plantMined(t, s, ctx, txA, 6, 600, 0)
+	plantIdent(t, s, ctx, txB, ptrI32(100))
+	plantMined(t, s, ctx, txB, 7, 700, 0)
+	plantMined(t, s, ctx, txB, 8, 800, 0)
 
 	require.NoError(t, s.RemoveBlockIDs(ctx, []utxo.BlockIDsRemoval{
 		{TxHash: hashOf(txA), BlockIDs: []uint32{5}},
 		{TxHash: hashOf(txB), BlockIDs: []uint32{8}},
 	}))
 
-	require.Equal(t, packTriples(t, [3]uint32{6, 600, 0}), readIdent(t, s, ctx, txA).membership,
-		"every entry naming block 5 goes, including the repeat under another subtree index")
-	require.Equal(t, packTriples(t, [3]uint32{7, 700, 0}), readIdent(t, s, ctx, txB).membership,
-		"and B loses only what B was told to lose")
+	require.Equal(t, []int32{6}, minedBlockIDsOf(t, s, ctx, txA), "A loses block 5 and keeps 6")
+	require.Equal(t, []int32{7}, minedBlockIDsOf(t, s, ctx, txB), "and B loses only what B was told to lose")
+
+	var idents int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_ident`).Scan(&idents))
+	require.Equal(t, 2, idents, "the identity rows are not a rewind's business")
 }
 
-// TestRemoveBlockIDsIsIdempotentAndSilent, for the same crash-replay reason.
-func TestRemoveBlockIDsIsIdempotentAndSilent(t *testing.T) {
-	s, ctx := newTestStore(t)
+// minedBlockIDsOf reads the block ids of a transaction's containment rows, in the order every
+// reader returns them.
+func minedBlockIDsOf(t *testing.T, s *Store, ctx context.Context, txid []byte) []int32 {
+	t.Helper()
 
-	txid := idBytes(0xa3)
-	plantIdent(t, s, ctx, txid, packTriples(t, [3]uint32{5, 500, 0}), ptrI32(100))
+	rows, err := s.pool.Query(ctx,
+		`SELECT block_id FROM tx_mined WHERE txid = $1 ORDER BY mined_height, block_id`, txid)
+	require.NoError(t, err)
 
-	rm := []utxo.BlockIDsRemoval{{TxHash: hashOf(txid), BlockIDs: []uint32{5}}}
+	defer rows.Close()
 
-	require.NoError(t, s.RemoveBlockIDs(ctx, rm))
-	require.NoError(t, s.RemoveBlockIDs(ctx, rm), "stripping twice must not fail")
+	var out []int32
 
-	require.Empty(t, readIdent(t, s, ctx, txid).membership)
+	for rows.Next() {
+		var id int32
+		require.NoError(t, rows.Scan(&id))
+		out = append(out, id)
+	}
 
-	// A transaction the store does not hold, and a block it never claimed.
-	require.NoError(t, s.RemoveBlockIDs(ctx, []utxo.BlockIDsRemoval{
-		{TxHash: hashOf(idBytes(0xa4)), BlockIDs: []uint32{5}},
-		{TxHash: hashOf(txid), BlockIDs: []uint32{99}},
-	}))
-}
+	require.NoError(t, rows.Err())
 
-// TestRemoveBlockIDsHandlesAHighBlockID pins the one trap in unpacking the packed form. The
-// block id is four big-endian bytes, and shifting the top byte left through a 32-bit signed
-// type wraps to a negative number, silently, so a comparison against a positive id would strip
-// nothing at all.
-func TestRemoveBlockIDsHandlesAHighBlockID(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	txid := idBytes(0xa5)
-	const high = uint32(4_000_000_000)
-
-	plantIdent(t, s, ctx, txid, packTriples(t, [3]uint32{high, 900, 0}, [3]uint32{6, 600, 0}), ptrI32(100))
-
-	require.NoError(t, s.RemoveBlockIDs(ctx, []utxo.BlockIDsRemoval{
-		{TxHash: hashOf(txid), BlockIDs: []uint32{high}},
-	}))
-
-	require.Equal(t, packTriples(t, [3]uint32{6, 600, 0}), readIdent(t, s, ctx, txid).membership,
-		"a block id above the signed 32-bit range must still be found and stripped")
+	return out
 }
 
 // TestConflictingTxIteratorListsConflictingNonCoinbaseTransactions.
@@ -177,10 +168,11 @@ func TestConflictingTxIteratorListsConflictingNonCoinbaseTransactions(t *testing
 	ordinary := idBytes(0xb3)
 	conflictingCoinbase := idBytes(0xb4)
 
-	plantIdent(t, s, ctx, conflicting, nil, ptrI32(100))
-	plantIdent(t, s, ctx, minedConflicting, packTriples(t, [3]uint32{5, 500, 0}), nil)
-	plantIdent(t, s, ctx, ordinary, nil, ptrI32(100))
-	plantIdent(t, s, ctx, conflictingCoinbase, nil, ptrI32(100))
+	plantIdent(t, s, ctx, conflicting, ptrI32(100))
+	plantIdent(t, s, ctx, minedConflicting, nil)
+	plantMined(t, s, ctx, minedConflicting, 5, 500, 0)
+	plantIdent(t, s, ctx, ordinary, ptrI32(100))
+	plantIdent(t, s, ctx, conflictingCoinbase, ptrI32(100))
 
 	for _, id := range [][]byte{conflicting, minedConflicting, conflictingCoinbase} {
 		_, err := s.pool.Exec(ctx, `UPDATE tx_ident SET flags = flags | $2 WHERE txid = $1`,
@@ -210,11 +202,8 @@ func TestConflictingTxIteratorListsConflictingNonCoinbaseTransactions(t *testing
 		"and not a coinbase, which spends nothing so can never lose a race")
 }
 
-// TestRemoveBlockIDsReachesMembershipRows: a mined transaction's membership lives in tx_mined,
-// not in tx_ident, so a rewind that only touched the identity table reached mempool and
-// fork-limbo rows and silently missed every settled transaction. The tool exists to recover
-// from a bad chain state, and its documented contract is that a miss is a silent no-op, so an
-// operator got no signal that the rewind was partial.
+// TestRemoveBlockIDsReachesMembershipRows: a block-path transaction has no identity row at all,
+// and its containment is what the rewind removes.
 func TestRemoveBlockIDsReachesMembershipRows(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -259,8 +248,8 @@ func TestRemoveBlockIDsLeavesAMembershipRowNamingAnotherBlock(t *testing.T) {
 	require.Equal(t, int32(43), kept)
 }
 
-// TestRemoveBlockIDsIsIdempotentOnMembershipRows, for the same crash-replay reason the identity
-// arm is idempotent.
+// TestRemoveBlockIDsIsIdempotentOnMembershipRows, because a rewind re-run after a crash must
+// not fail on the work it already did.
 func TestRemoveBlockIDsIsIdempotentOnMembershipRows(t *testing.T) {
 	s, ctx := newTestStore(t)
 

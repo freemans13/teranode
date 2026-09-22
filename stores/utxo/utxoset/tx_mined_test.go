@@ -4,12 +4,12 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
 // TestUTXORowsCarryTheirParentsBlockFacts pins the two columns the read path relies on once
-// a transaction's membership window has been dropped: the height and block of the
+// a transaction's containment window has been dropped: the height and block of the
 // transaction that made the UTXO. Both fixed width, placed before the variable-length
 // script so alignment costs nothing.
 func TestUTXORowsCarryTheirParentsBlockFacts(t *testing.T) {
@@ -86,159 +86,85 @@ func TestDroppedMembershipWindowsCannotComeBack(t *testing.T) {
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 1_000), "a live window is still fine")
 }
 
-// TestRetiringWindowStampsItsLiveUTXOs: a mempool-created transaction's UTXOs carry the
-// sentinel until its membership window retires, when the surviving UTXOs learn their block
-// from the window's own list. Only then can the UTXO be the answer for an old parent.
-func TestRetiringWindowStampsItsLiveUTXOs(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	tx := mkTx(t, 2, 5_000)
-	_, err := s.Create(ctx, tx, 99)
-	require.NoError(t, err)
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
-	require.NoError(t, err)
-
-	h, _ := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(0), h, "not stamped at mining")
-
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
-
-	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(100), h)
-	require.Equal(t, int32(7), b)
-
-	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
-	require.NoError(t, err)
-	require.Equal(t, []uint32{7}, got.BlockIDs, "served from the UTXO now the window is gone")
-}
-
-// TestRetiringWindowStampsFromTheFirstRow: a transaction that ends up with two tx_mined rows
-// in the same window -- a longest-chain stamp naming block 7, then a fork stamp naming block 8
-// at the same height -- must be stamped with the FIRST row's block after the drop. Since
-// Task 10 a transaction with a surviving tx_mined row settled under it, and the first (lowest
-// seq) is the earliest stamp: a UTXO naming the second (fork) row's block would be wrong.
-func TestRetiringWindowStampsFromTheFirstRow(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	tx := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, tx, 99)
-	require.NoError(t, err)
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
-	require.NoError(t, err)
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 8, BlockHeight: 100, OnLongestChain: false})
-	require.NoError(t, err)
-
-	require.Equal(t, 2, minedRows(t, s, ctx, tx), "the fork stamp must append a second row, not replace the first")
-
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
-	require.NoError(t, err)
-
-	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(100), h)
-	require.Equal(t, int32(7), b, "the first row's block, not the second")
-}
-
-// TestRetiringWindowDoesNotStampAnotherTransactionsUTXO is the UTXO stamp's half of the rule
-// TestUnMineDoesNotResetAnotherTransactionsUTXO pins for the reset: a by-key write must recheck
-// the full transaction id.
+// TestInterimGuardRefusesADropWhileAnIdentityRowExists is the design's ST-29: on a build with
+// containment changed and no deep stamp yet, a window due to drop is refused while tx_ident
+// holds any row, the refusal is counted, and the partition stays attached. Delete the identity
+// row and the same window drops.
 //
-// The colliding row is at the SENTINEL, which is exactly the row the stamp is looking for, so
-// an UPDATE matching on (leaf, ukey) alone stamps a stranger's UTXO with a block that does not
-// contain it -- and after the window is dropped there is nothing left to correct it from.
-func TestRetiringWindowDoesNotStampAnotherTransactionsUTXO(t *testing.T) {
+// The soak cannot show this, because below the checkpoint tx_ident is empty and the guard never
+// fires there, so this is what proves the guard works.
+func TestInterimGuardRefusesADropWhileAnIdentityRowExists(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	tx := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, tx, 99)
-	require.NoError(t, err)
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
-	require.NoError(t, err)
-
-	other := insertCollidingUTXO(t, s, ctx, tx, 0, 0)
-
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	// A block-path transaction puts window 0 on the table.
+	filler := mkTx(t, 1, 1_111)
+	_, err := s.Create(ctx, filler, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(100), h, "the window's own transaction is stamped")
-	require.Equal(t, int32(7), b)
+	// A transaction seen before its block, recorded in the same window. Its UTXO is at (0,0)
+	// and only the deep stamp will ever change that, so the window is the one place its
+	// block lives.
+	seen := mkTx(t, 1, 5_000)
+	_, err = s.Create(ctx, seen, 99)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(seen), utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 100, OnLongestChain: true})
+	require.NoError(t, err)
 
-	oh, ob := utxoFactsOf(t, s, ctx, other)
-	require.Equal(t, int32(0), oh, "a UTXO sharing the packed key stays unconfirmed")
-	require.Equal(t, int32(0), ob)
+	before := testutil.ToFloat64(interimDropRefused)
+
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err, "a refusal is a logged skip, not an error the pruner would repeat every block")
+	require.Equal(t, 0, dropped)
+	require.Equal(t, before+1, testutil.ToFloat64(interimDropRefused), "and it is counted")
+	require.Equal(t, 1, minedRows(t, s, ctx, seen), "the window is still attached")
+
+	floor, err := s.txMinedFloor(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), floor, "and the floor has not moved")
+
+	dropIdentityRow(t, s, ctx, seen)
+
+	dropped, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+	require.Equal(t, 1, dropped, "with tx_ident empty the same window drops")
+	require.Equal(t, 0, minedRows(t, s, ctx, seen))
 }
 
-// TestRetiringWindowStampsFromTheFirstRowAcrossWindows: a transaction's membership rows do NOT
-// all live in one window, and the stamp has to resolve its block from all of them.
-//
-// A window is keyed by mined_height, so a transaction mined at height h and fork-stamped at
-// h+/-1 across a 288 boundary has a row in each of two windows. The older window retires first,
-// and if it stamped from the row IT happens to hold, the UTXO would take that row's block --
-// and here that row is the FORK stamp, appended later but at the lower height. The UTXO would
-// then name a block that is not on the chain, for good: when the other window retires the
-// mined_height = 0 guard skips the UTXO, and once both windows are gone nothing can correct it.
-//
-// The earliest row by seq across every live window is the right answer, and under Task 9's
-// rules it is the transaction's longest-chain stamp: a fork stamp can only be APPENDED to a
-// membership table row that already exists, so it can never be the first.
-func TestRetiringWindowStampsFromTheFirstRowAcrossWindows(t *testing.T) {
+// TestInterimDropRaisesAllThreeFloorsTogether: the floor row carries an ordering constraint,
+// 288 x floor <= stamp_complete_floor <= stamp_fence, and the interim drop has to satisfy it
+// on a database that has never had a stamp. So it raises all three. When the deep stamp of
+// build step 5 starts on such a database its pass begins at stamp_complete_floor, which is
+// exactly the dropped floor.
+func TestInterimDropRaisesAllThreeFloorsTogether(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	// A MEMPOOL create, so the UTXO sits at the sentinel and is a candidate for the stamp; a
-	// block-path create would already carry its facts and be skipped either way.
-	tx := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, tx, 287)
-	require.NoError(t, err)
+	require.NoError(t, s.ensureTxMinedPartition(ctx, 100))
+	require.NoError(t, s.ensureTxMinedPartition(ctx, 400))
+	require.NoError(t, s.ensureTxMinedPartition(ctx, 5_000))
 
-	// The main chain block, at height 288: window 1.
-	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 288, OnLongestChain: true})
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
+	require.Equal(t, 2, dropped, "windows 0 and 1 go, window 17 stays")
 
-	// A fork block naming it at height 287: window 0, appended later so its seq is higher.
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 8, BlockHeight: 287})
-	require.NoError(t, err)
-	require.Equal(t, 2, minedRows(t, s, ctx, tx))
+	var floor, fence, complete int32
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT floor, stamp_fence, stamp_complete_floor FROM tx_mined_floor WHERE id = 0`).
+		Scan(&floor, &fence, &complete))
 
-	// Retire window 0 only, so the row left behind is the main chain's.
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 300)
-	require.NoError(t, err)
-	require.Equal(t, 1, dropped, "window 0 goes, window 1 stays")
-
-	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(288), h, "the earliest row across windows, not the retiring window's own")
-	require.Equal(t, int32(7), b, "the longest-chain block, not the fork block")
+	require.Equal(t, int32(2), floor, "a window number: the highest dropped plus one")
+	require.Equal(t, int32(2*TxMinedPartitionBlocks), complete, "a height: the dropped windows' upper bound")
+	require.Equal(t, int32(2*TxMinedPartitionBlocks), fence)
 }
 
-// TestRetiringWindowStampsWhenTheEarliestRowIsInTheRetiringWindow is the same shape the other
-// way round, and it is the ordinary case: the transaction's first stamp is in the window that
-// is retiring, so resolving across all windows must give the same answer reading only this one
-// would have.
-func TestRetiringWindowStampsWhenTheEarliestRowIsInTheRetiringWindow(t *testing.T) {
+// TestFloorRowRefusesAFloorAboveTheFence pins the constraint itself, so that a later build which
+// raised floor alone would be refused by postgres rather than silently leaving the three values
+// out of order.
+func TestFloorRowRefusesAFloorAboveTheFence(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	tx := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, tx, 287)
-	require.NoError(t, err)
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx),
-		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 287, OnLongestChain: true})
-	require.NoError(t, err)
-
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 8, BlockHeight: 288})
-	require.NoError(t, err)
-	require.Equal(t, 2, minedRows(t, s, ctx, tx))
-
-	dropped, err := s.dropTxMinedWindowsBelow(ctx, 300)
-	require.NoError(t, err)
-	require.Equal(t, 1, dropped)
-
-	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(287), h)
-	require.Equal(t, int32(7), b)
+	_, err := s.pool.Exec(ctx, `UPDATE tx_mined_floor SET floor = 3 WHERE id = 0`)
+	requireCheckViolation(t, err, "288 x floor above stamp_complete_floor must be refused")
 }
 
 // TestDroppingAWindowClearsTheEnsureCache pins the interaction between the two halves of

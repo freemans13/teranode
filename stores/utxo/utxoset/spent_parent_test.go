@@ -105,10 +105,13 @@ func TestGetStillReportsNotFoundOnceTheJournalLeafIsGoneToo(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	spendOneOutput(t, s, ctx, parent, 0, 100)
+	// A mined child, because the interim guard refuses to drop a window while any identity
+	// row exists, and an unmined child would be one.
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 101, 8)
 
-	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
 	require.NoError(t, err)
+	require.Equal(t, 1, dropped)
 
 	_, err = s.dropSpendJournalPartitionsBelow(ctx, 2_000)
 	require.NoError(t, err)

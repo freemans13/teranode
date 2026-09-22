@@ -1,7 +1,6 @@
 package utxoset
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -9,68 +8,19 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// stampRetiringWindowChunk is the page size for reading a retiring window's rows. 20,000 keeps
-// one round trip's argument arrays and the chunk's own working set modest, while still being
-// far wider than an ordinary block, so a window with millions of transactions is read in a
-// bounded number of round trips rather than one per transaction.
-const stampRetiringWindowChunk = 20_000
-
-// retiringWindowRowsSQL lists a window's rows in (txid, seq) order, to name WHICH transactions
-// the UTXO stamp has to visit. It deliberately does not read mined_height or block_id: this
-// window's own row is not necessarily the transaction's earliest, so the block facts come from
-// firstMinedRowSQL instead.
+// stampUTXOsSQL writes a block onto every live UTXO of the listed transactions that is still at
+// the unconfirmed sentinel. See liveUTXOArgs for the leaf/lo/hi shape; $5 and $6 are the
+// parallel height and block-id arrays keyed to the same transaction.
 //
-// Paged by a KEYSET on (txid, seq) rather than OFFSET, so the plan stays an index scan at every
-// page rather than degrading as the offset grows: an OFFSET-based page has to skip every row
-// before it, which is O(rows read so far) per page over a window that can hold tens of millions
-// of rows. Ordering by txid also keeps one transaction's rows contiguous across page
-// boundaries, which is what makes the dedup below correct.
-const retiringWindowRowsSQL = `
-SELECT txid, seq FROM %[1]s
- WHERE (txid, seq) > ($1::bytea, $2::bigint)
- ORDER BY txid, seq
- LIMIT $3`
-
-// firstMinedRowSQL resolves, for each listed transaction, the block named by its EARLIEST
-// membership row across EVERY LIVE WINDOW -- not just the one that is retiring.
+// NOTHING RUNS IT YET. It is the write half of the deep stamp of build step 5, kept because
+// that stamp reuses it as it stands: the retirement stamp that used to drive it, which took a
+// transaction's earliest containment row by an insertion counter as the winner, is deleted
+// with the counter, because insertion order is not chain order and it stamped reorg losers
+// onto UTXOs. The stamp that replaces it is told the winner by the pruner service.
 //
-// It has to look across windows because a transaction's rows do not all live in one. A window
-// is keyed by mined_height, and a transaction mined at height h can be fork-stamped at h-1 or
-// h+1 by appendMinedSQL, which straddles a 288 boundary about one block in 288. The older
-// window then retires first, and stamping from the row IT holds would hand the UTXO a FORK
-// block whenever that is the row it has -- permanently, because the mined_height = 0 guard
-// skips the UTXO when the other window retires and nothing survives to correct it from.
-//
-// The earliest row by seq is the transaction's LONGEST-CHAIN stamp, and that is a rule rather
-// than an ordering accident. Since task 9 a transaction only reaches the membership table by a
-// longest-chain stamp or a block-path create; a fork stamp gets there only by appendMinedSQL,
-// which copies an EXISTING row's payload, so it can never be the first row. seq is a table-wide
-// identity, so "earliest" is well defined across windows without comparing heights -- which
-// would be the wrong test anyway, as this statement's own fork case shows.
-//
-// The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the shape minedByTxidSQL and
-// appendMinedSQL use: one primary-key descent per key per live window. A plain
-// `JOIN tx_mined m ON m.txid = ANY(...)` lets the planner hash the keys against the windows and
-// read them whole, which is what the measurements behind minedByTxidSQL found at 500 keys.
-const firstMinedRowSQL = `
-SELECT k.txid, m.mined_height, m.block_id
-  FROM unnest($1::bytea[]) AS k(txid)
- CROSS JOIN LATERAL (
-   SELECT m.mined_height, m.block_id
-     FROM tx_mined m
-    WHERE m.txid = k.txid
-    ORDER BY m.seq
-    LIMIT 1 OFFSET 0
- ) AS m`
-
-// stampUTXOsSQL stamps every live (unconfirmed) UTXO of the listed transactions with the
-// block their FIRST surviving tx_mined row named. See liveUTXOArgs for the leaf/lo/hi shape;
-// $5 and $6 are the parallel height and block-id arrays keyed to the same transaction.
-//
-// mined_height = 0 is what makes this idempotent and leaves a block-path UTXO -- stamped with
-// its facts at create, never at the sentinel -- untouched. A UTXO that has already been
-// stamped this way, or created directly by the block path, must not be touched a second time:
-// nothing here can tell "already correct" from "a later, wrong window" apart except that guard.
+// mined_height = 0 is what makes this idempotent and leaves a block-path UTXO -- written with
+// its pair at create, never at the sentinel -- untouched. A UTXO that already carries a pair
+// must not be touched a second time: a non-zero pair is final.
 //
 // The fenced read runs FIRST, in a CTE, and the UPDATE then matches on the exact (leaf, ukey)
 // it returns -- the same shape resetUTXOsSQL uses, and for the identical reason. A plain
@@ -193,14 +143,34 @@ SELECT c.relname,
    AND c.relkind  = 'r'
    AND c.relname ~ '^tx_mined_w[0-9]+$'`
 
-// dropTxMinedWindowsBelow drops every membership window whose upper bound is below
-// cutoffHeight, oldest first, and advances the floor past each. Returns the count dropped.
+// identityRowsExistSQL is the interim guard's one read: does tx_ident hold any row at all.
+const identityRowsExistSQL = `SELECT EXISTS (SELECT 1 FROM tx_ident LIMIT 1)`
+
+// dropTxMinedWindowsBelow drops every containment window whose upper bound is below
+// cutoffHeight, oldest first, and advances the floors past each. Returns the count dropped.
 //
-// This IS identity reclaim in this design: no work list, no probes, no row deletes. The
-// UTXOs of transactions in a retiring window are stamped from the window's list first in
-// stage 2; in stage 1 every UTXO was written with its block facts at create.
+// This is the INTERIM drop of the containment build, which runs on the old rule -- a window
+// goes once its upper bound is journalRetention below the pruner's height -- and it is guarded:
+// it refuses to drop anything while tx_ident holds a row. A transaction seen before its block
+// keeps its identity row through mining, its UTXOs stay at (0,0), and nothing writes its block
+// onto them until the deep stamp of build step 5 exists. Dropping its window before then would
+// take the only place its block facts live. Below the checkpoint every create carries its
+// block, so tx_ident is empty there and the guard never fires. Where it does fire it is counted
+// in utxoset_interim_drop_refused_total and every drop stops; the disk then grows, which is an
+// abort criterion of the soak, and the remedy is the stamp, not a relaxed guard.
+//
+// The refusal is a logged skip and not an error, because the pruner calls this once per block
+// and an error every block would drown the log while changing nothing.
+//
+// Because the guard holds, every window this drops had nothing to stamp, and the drop can
+// honestly raise all three floor values together (see the statement below).
 func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32) (int, error) {
 	cutoff := cutoffHeight / TxMinedPartitionBlocks
+
+	var identityRows bool
+	if err := s.pool.QueryRow(ctx, identityRowsExistSQL).Scan(&identityRows); err != nil {
+		return 0, errors.NewStorageError("[utxoset] check tx_ident before dropping windows", err)
+	}
 
 	rows, err := s.pool.Query(ctx, txMinedWindowSQL)
 	if err != nil {
@@ -245,18 +215,12 @@ func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32
 			continue
 		}
 
-		// The UTXO stamp runs BEFORE the detach, and a failure here returns without touching
-		// the window at all. A window must never be dropped while any of its transactions'
-		// surviving UTXOs still carry the sentinel: once the window is gone, its rows are the
-		// only place that block fact lived, and readUTXOFacts would then answer with mined
-		// height 0 for a parent that really does have a block.
-		txCount, utxoCount, err := s.stampRetiringWindowUTXOs(ctx, w.name)
-		if err != nil {
-			return dropped, err
-		}
+		if identityRows {
+			interimDropRefused.Inc()
+			s.logger.Warnf("[utxoset] refusing to drop tx_mined window %s: tx_ident holds rows and nothing stamps their UTXOs until the deep stamp exists", w.name)
 
-		s.logger.Infof("[utxoset] stamped %d live UTXOs of %d transactions before dropping tx_mined window %s",
-			utxoCount, txCount, w.name)
+			return dropped, nil
+		}
 
 		switch {
 		case w.detachPending:
@@ -285,8 +249,23 @@ func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32
 		// destroyed, doubling every UTXO still claimed by a transaction in it. window is a
 		// regex-filtered catalog name (^tx_mined_w[0-9]+$), so folding it into the literal
 		// with Sprintf carries no injection risk.
+		//
+		// ALL THREE floor values rise together. floor is a window number; stamp_fence and
+		// stamp_complete_floor are heights, and the ordering constraint on the row requires
+		// 288 x floor <= stamp_complete_floor <= stamp_fence, so an interim drop that raised
+		// floor alone would be refused by the constraint. Raising the other two is honest here
+		// because the guard above means every window dropped had nothing to stamp, and it adds
+		// no refusal: a write below the raised fence is a write below the dropped floor, which
+		// the store refuses already. When the stamp of build step 5 starts on such a database
+		// its pass begins at stamp_complete_floor, exactly at the dropped floor. In the full
+		// design the drop writes only floor, because its first condition already requires the
+		// completion record.
 		ddl := fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s;
-UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name, w.window+1)
+UPDATE tx_mined_floor
+   SET floor                = GREATEST(floor, %[2]d),
+       stamp_complete_floor = GREATEST(stamp_complete_floor, %[2]d * %[3]d),
+       stamp_fence          = GREATEST(stamp_fence, %[2]d * %[3]d)
+ WHERE id = 0;`, w.name, w.window+1, TxMinedPartitionBlocks)
 
 		if _, err := s.pool.Exec(ctx, ddl); err != nil {
 			return dropped, errors.NewStorageError("[utxoset] drop tx_mined window %s and advance its floor", w.name, err)
@@ -302,164 +281,4 @@ UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name,
 	}
 
 	return dropped, nil
-}
-
-// stampRetiringWindowUTXOs is the lazy UTXO stamp: it reads the distinct transactions of the
-// window about to be detached and stamps each one's still-unconfirmed UTXOs with the block its
-// EARLIEST membership row names, resolved across every live window. Returns the number of
-// distinct transactions read and the number of UTXO rows the stamp touched.
-//
-// It reads in pages of stampRetiringWindowChunk rows, oldest (txid, seq) first, rather than one
-// query for the whole window: a window can hold a full 288 blocks of mainnet membership, tens
-// of millions of rows, and a single unbounded read would hold that whole result set in memory
-// and in one round trip.
-//
-// Keyset pagination on (txid, seq) rather than OFFSET, so the plan is an index scan on every
-// page and does not degrade as the window is worked through: an OFFSET-based page N has to skip
-// the N-1 pages before it, at O(rows read so far) per page.
-//
-// The window's rows say WHICH transactions to stamp; firstMinedRowSQL says with WHAT. A
-// transaction's rows are NOT all in one window -- see firstMinedRowSQL -- so the block cannot be
-// taken from the retiring window's own row without risking a fork block on the UTXO. The two
-// reads are separate for that reason, not for tidiness.
-//
-// Within this window a transaction's rows still sort together, because the pages are ordered by
-// (txid, seq), so a transaction straddling a page boundary is deduplicated correctly:
-// lastStampedTxid carries across pages rather than resetting with each one.
-//
-// The one case this cannot get right is a transaction whose FIRST row is a fork stamp, and it
-// cannot arise: a fork stamp on a transaction that still has an identity row rewrites that row
-// and stays in the mempool table, and a fork stamp on one that does not can only append to a
-// membership row that already exists. So there is nothing to test there, and nothing to guard.
-func (s *Store) stampRetiringWindowUTXOs(ctx context.Context, window string) (txCount, utxoCount int, err error) {
-	var (
-		lastTxid       = []byte{}
-		lastSeq  int64 = -1
-		// lastStampedTxid is the most recent transaction id this window has already
-		// collected a stamp for. Rows for one transaction are contiguous in (txid, seq)
-		// order, so equality with the immediately preceding row's txid is enough to skip
-		// every row after its first.
-		lastStampedTxid []byte
-	)
-
-	query := fmt.Sprintf(retiringWindowRowsSQL, window)
-
-	for {
-		rows, qerr := s.pool.Query(ctx, query, lastTxid, lastSeq, stampRetiringWindowChunk)
-		if qerr != nil {
-			return txCount, utxoCount, errors.NewStorageError("[utxoset] read retiring window %s", window, qerr)
-		}
-
-		var (
-			txids [][]byte
-			n     int
-		)
-
-		for rows.Next() {
-			var (
-				txid []byte
-				seq  int64
-			)
-
-			if serr := rows.Scan(&txid, &seq); serr != nil {
-				rows.Close()
-				return txCount, utxoCount, errors.NewStorageError("[utxoset] scan retiring window %s", window, serr)
-			}
-
-			n++
-			lastTxid = txid
-			lastSeq = seq
-
-			// Only the first row seen for a transaction is its earliest stamp.
-			if lastStampedTxid != nil && bytes.Equal(txid, lastStampedTxid) {
-				continue
-			}
-
-			lastStampedTxid = txid
-			txCount++
-
-			txids = append(txids, txid)
-		}
-
-		rerr := rows.Err()
-
-		rows.Close()
-
-		if rerr != nil {
-			return txCount, utxoCount, errors.NewStorageError("[utxoset] read retiring window %s", window, rerr)
-		}
-
-		if len(txids) > 0 {
-			stamped, serr := s.stampUTXOsOf(ctx, txids)
-			if serr != nil {
-				return txCount, utxoCount, errors.NewStorageError("[utxoset] stamp UTXOs for retiring window %s", window, serr)
-			}
-
-			utxoCount += stamped
-		}
-
-		if n < stampRetiringWindowChunk {
-			break
-		}
-	}
-
-	return txCount, utxoCount, nil
-}
-
-// stampUTXOsOf resolves each transaction's earliest membership row across every live window and
-// stamps its still-unconfirmed UTXOs with that row's block.
-//
-// A transaction whose rows have all gone -- nothing can produce that here, since the retiring
-// window has not been detached yet -- is simply absent from the resolve and is not stamped, the
-// CROSS JOIN LATERAL being an inner join.
-func (s *Store) stampUTXOsOf(ctx context.Context, txids [][]byte) (int, error) {
-	rows, err := s.pool.Query(ctx, firstMinedRowSQL, txids)
-	if err != nil {
-		return 0, err
-	}
-
-	var (
-		found   [][]byte
-		heights []int32
-		blockID []int32
-	)
-
-	for rows.Next() {
-		var (
-			txid   []byte
-			height int32
-			block  int32
-		)
-
-		if serr := rows.Scan(&txid, &height, &block); serr != nil {
-			rows.Close()
-
-			return 0, serr
-		}
-
-		found = append(found, txid)
-		heights = append(heights, height)
-		blockID = append(blockID, block)
-	}
-
-	rerr := rows.Err()
-
-	rows.Close()
-
-	if rerr != nil {
-		return 0, rerr
-	}
-
-	if len(found) == 0 {
-		return 0, nil
-	}
-
-	leaves, ids, los, his := liveUTXOArgs(found)
-
-	tag, err := s.pool.Exec(ctx, stampUTXOsSQL, leaves, ids, los, his, heights, blockID)
-	if err != nil {
-		return 0, err
-	}
-
-	return int(tag.RowsAffected()), nil
 }

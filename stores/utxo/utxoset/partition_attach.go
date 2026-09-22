@@ -47,8 +47,7 @@ SELECT c.relispartition,
 // writers conflict with. So the child is built as a standalone table shaped like the parent,
 // given a CHECK constraint matching its range so the attach can skip scanning it, attached,
 // and relieved of the helper constraint. The parent's indexes are recreated on the child by
-// INCLUDING INDEXES; the parent's identity column is not copied, because an attached partition
-// draws from the parent's sequence, and that is what keeps seq unique across windows.
+// INCLUDING INDEXES.
 //
 // All of it is one transaction, so a crash leaves either nothing or an attached partition.
 //

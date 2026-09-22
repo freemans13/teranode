@@ -11,22 +11,32 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// The read order is identity table, then membership by transaction id, then the preserved
-// parent, then the UTXO, and the order is a correctness rule rather than a tuning. A UTXO
-// holds ONE block id, and on the ordinary two-step reorg (a fork block stamped as not on the
-// longest chain, then a later block making it the main chain) nothing rewrites the UTXOs of
-// transactions shared between the two blocks. A UTXO-first read would then hand block
-// validation an id that lost, and the parent check stores a valid block as invalid. The
-// membership table holds every id while the window lives, so the UTXO is consulted only once
-// the window is gone, by which time its block is at least 1440 deep and its UTXO-carried id is
-// the settled one.
+// The read order is the identity row AND containment by transaction id together, then the
+// preserved parent, then the UTXO, and the order is a correctness rule rather than a tuning.
 //
-// The preserved-parent step sits between membership and UTXO, and its position is the same
-// kind of rule. It answers from a COPY of a membership row, taken while the row was still
-// there, so it must never be preferred to the row itself: while the window lives, the row is
-// the record that gets rewritten by a reorg and the copy is not. Once the window is gone the
-// copy is all there is, and it comes before the UTXO because it carries the whole payload
-// where the UTXO carries only a block.
+// Identity and containment are read together, not one after the other, because they coexist:
+// a transaction seen before its block keeps its identity row through mining until the deep
+// stamp of build step 5 deletes it, and the identity row no longer carries a block list of its
+// own. So the identity row supplies the payload and the unmined marker, the containment rows
+// supply the block ids, heights and subtree indexes in (mined_height, block_id) order, and a
+// transaction that has both is answered from both. Stopping at an identity hit, as this read
+// once did, would report every mined-but-not-yet-stamped transaction as being in no block.
+//
+// A UTXO holds ONE block id, and on the ordinary two-step reorg (a fork block recorded as not
+// on the longest chain, then a later block making it the main chain) nothing rewrites the UTXOs
+// of transactions shared between the two blocks. A UTXO-first read would then hand block
+// validation an id that lost, and the parent check stores a valid block as invalid. The
+// containment table holds every id while the window lives, so the UTXO is consulted only once
+// the window is gone.
+//
+// The preserved-parent step sits between containment and UTXO, and its position is the same
+// kind of rule. It answers from a COPY of a containment row, taken while the row was still
+// there, so it must never be preferred to the row itself. Once the window is gone the copy is
+// all there is, and it comes before the UTXO because it carries the whole payload where the
+// UTXO carries only a block. The design moves this step LAST, behind the UTXO and the undo
+// copy, because a preserved copy taken under the interim rule can name a reorg loser and then
+// outrank a correct UTXO; that reorder lands with the preservation rewrite of build step 5, and
+// the measured-failure test for it is guarded until then.
 //
 // The spend journal is the FIFTH step, after the UTXO rather than before it, and that order is
 // the same rule again. A live UTXO is the settled record of a transaction that still exists;
@@ -82,16 +92,21 @@ import (
 // row can satisfy the txid qual under another leaf. What the scalar buys is partition pruning
 // to one leaf and a usable primary key, since txid is its second column.
 const identByTxidSQL = `
-SELECT i.txid, i.created_height, i.off_chain_since, i.membership, i.fee, i.size_in_bytes,
+SELECT i.txid, i.created_height, i.off_chain_since, i.fee, i.size_in_bytes,
        i.tx_inpoints, i.locktime, i.created_at, i.flags, b.raw_tx
   FROM tx_ident i
   LEFT JOIN tx_body b ON b.created_height = i.created_height AND b.txid = i.txid
  WHERE i.leaf = $1::smallint
    AND i.txid = ANY($2::bytea[])`
 
-// minedByTxidSQL reads every membership row for a set of transactions, across every live
-// window, in insertion order. The primary key leads with txid, so this is one descent per
-// window per transaction.
+// minedByTxidSQL reads every containment row for a set of transactions, across every live
+// window, in (mined_height, block_id) order. The primary key leads with txid, so this is one
+// descent per window per transaction, and for one transaction id that order is the key's own,
+// so no sort step is needed inside a window.
+//
+// The order replaces the insertion counter the table used to carry. No correctness rule rests
+// on it, because no reader may treat the first row as the winner; it exists so that results
+// are repeatable, and the shared conformance suite's two-entry assertions hold under it.
 //
 // The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, and that is the difference
 // between one descent per key and a read of every live window. Written as the plain
@@ -114,14 +129,14 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes, m.fee
   FROM unnest($1::bytea[]) AS k(txid)
  CROSS JOIN LATERAL (
    SELECT m.mined_height, m.block_id, m.subtree_idx, m.created_height, m.size_in_bytes,
-          m.fee, m.tx_inpoints, m.locktime, m.created_at, m.flags, m.seq
+          m.fee, m.tx_inpoints, m.locktime, m.created_at, m.flags
      FROM tx_mined m
     WHERE m.txid = k.txid
-    ORDER BY m.seq
+    ORDER BY m.mined_height, m.block_id
    OFFSET 0
  ) AS m
   LEFT JOIN tx_body b ON b.created_height = m.created_height AND b.txid = k.txid
- ORDER BY k.txid, m.seq`
+ ORDER BY k.txid, m.mined_height, m.block_id`
 
 // preservedByTxidSQL reads the preserved copies of a set of transactions' membership rows,
 // joining each body only if it is still inside its window.
@@ -257,10 +272,11 @@ func (r *lookupResult) resolved(h chainhash.Hash) bool {
 // lookupMany resolves a set of transactions in the read order. Misses are absent from both
 // maps; a transaction whose stored row will not decode lands in failed rather than found.
 //
-// Each step asks only about the hashes the steps before it could not answer, so a batch of
-// ordinary mined parents costs one membership probe each and never touches the UTXO table,
-// a batch of mempool parents never leaves the identity table, and the journal is read only for
-// a transaction the four steps above it all missed.
+// The identity read and the containment read are issued for EVERY distinct hash, because the
+// two coexist and each supplies half the answer (see the read order above). Every later step
+// asks only about the hashes nothing before it could answer, so the UTXO table is touched only
+// for a transaction with no identity row and no containment, and the journal only for one the
+// four steps above it all missed.
 //
 // The returned error is for faults that are NOT per-transaction: a dead connection, a syntax
 // error, a partition that vanished mid-read. Those really do fail every entry, because nothing
@@ -295,22 +311,19 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 		return lookupResult{}, err
 	}
 
+	// Step 1, second half: containment by transaction id, for EVERY hash. A hash the identity
+	// read answered gains its block list here; one it did not is built from its first row.
+	if err := s.readMinedInto(ctx, uniq, &res); err != nil {
+		return lookupResult{}, err
+	}
+
 	// The later steps are SKIPPED rather than returned from when nothing is left to ask
-	// about, because the contest read below has to run whether or not the identity table
-	// answered everything.
+	// about, because the contest read below has to run whether or not step 1 answered
+	// everything.
 	rest := stillMissing(uniq, &res)
 
 	if len(rest) > 0 {
-		// Step 2: membership by transaction id.
-		if err := s.readMinedInto(ctx, rest, &res); err != nil {
-			return lookupResult{}, err
-		}
-
-		rest = stillMissing(rest, &res)
-	}
-
-	if len(rest) > 0 {
-		// Step 3: the preserved parent, for a transaction whose membership window has been
+		// Step 3: the preserved parent, for a transaction whose containment window has been
 		// dropped while an unmined child still needed its facts.
 		if err := s.readPreserved(ctx, rest, &res); err != nil {
 			return lookupResult{}, err
@@ -492,7 +505,7 @@ func (s *Store) readIdentGroup(ctx context.Context, g leafBatch, res *lookupResu
 			r    metaRow
 		)
 
-		if err := rows.Scan(&txid, &r.createdHeight, &r.offChainSince, &r.membership,
+		if err := rows.Scan(&txid, &r.createdHeight, &r.offChainSince,
 			&r.fee, &r.sizeInBytes, &r.txInpoints, &r.locktime, &r.createdAt,
 			&r.flags, &r.rawTx); err != nil {
 			return errors.NewStorageError("[utxoset][lookup] identity scan", err)
@@ -520,13 +533,15 @@ func (s *Store) readIdentGroup(ctx context.Context, g leafBatch, res *lookupResu
 	return nil
 }
 
-// readMinedRows fills in every transaction a live membership window still names.
+// readMinedInto fills in the block lists of every transaction a live containment window names.
 //
 // One transaction can hold several rows -- one per block that contains it -- and they arrive
-// grouped and in insertion order, which is what the conformance suite asserts about
-// SubtreeIdxs. The scalars that describe the transaction rather than a block come off the
-// FIRST row; the rows are written by one statement per block application, so they agree, and
-// taking the first is the reading that does not depend on how many blocks claim it.
+// grouped and in (mined_height, block_id) order, which is the order every reader returns and
+// the shared conformance suite's assertions about SubtreeIdxs hold under. A transaction the
+// identity read already built keeps that record and gains only its blocks here. For one it did
+// not, the scalars that describe the transaction come off the FIRST row; every row of one
+// transaction carries the same payload, copied from the identity row or from an earlier row,
+// so taking the first is the reading that does not depend on how many blocks contain it.
 func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 	res *lookupResult) error {
 	txids := make([][]byte, 0, len(hashes))
@@ -595,13 +610,11 @@ func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 
 // minedRow is one membership row, or the preserved copy of one, as the read returns it.
 //
-// It exists so the membership read and the preservation read share one conversion, because
+// It exists so the containment read and the preservation read share one conversion, because
 // they read the same columns and have to answer with the same record: the preserved row is a
-// copy of the membership row, so a difference between the two readers would be a difference
+// copy of the containment row, so a difference between the two readers would be a difference
 // between what a parent said yesterday and what it says today. The identity read keeps its own
-// conversion (metaRow) because an identity row packs its blocks into one column rather than
-// arriving as one row per block. Three copies of "what a stored transaction means" is what this
-// store already carried; this is what stops the preservation read being a fourth.
+// conversion (metaRow) because an identity row carries the unmined marker and no block at all.
 //
 // Every scalar is a pointer where its column is nullable, because which columns are NULL says
 // which path wrote the row.
@@ -665,8 +678,9 @@ func (r *minedRow) toMeta(hash *chainhash.Hash) (*meta.Data, error) {
 // transaction, and decodes the body if the record does not have it yet.
 //
 // Appending rather than assigning is what the shared conformance suite asserts about
-// SubtreeIdxs: one transaction holds one membership row per block that stamped it, and they
-// arrive grouped and in insertion order, which is the order a caller reads them back in.
+// SubtreeIdxs: one transaction holds one containment row per block that contains it, and they
+// arrive grouped and in (mined_height, block_id) order, which is the order a caller reads them
+// back in.
 func (r *minedRow) mergeInto(data *meta.Data, hash *chainhash.Hash) error {
 	data.BlockIDs = append(data.BlockIDs, uint32(r.blockID))             //nolint:gosec // a block id is never negative
 	data.BlockHeights = append(data.BlockHeights, uint32(r.minedHeight)) //nolint:gosec // a height is never negative

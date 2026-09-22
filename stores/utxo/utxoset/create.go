@@ -2,7 +2,6 @@ package utxoset
 
 import (
 	"context"
-	"encoding/binary"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -44,30 +43,6 @@ INSERT INTO conflict_children (noted_height, parent_txid, child_txid)
 SELECT $1::int, p.parent, $3::bytea
   FROM unnest($2::bytea[]) AS p(parent)
 ON CONFLICT DO NOTHING`
-
-// packMembership renders mined-block information into the packed form tx_ident carries:
-// 12-byte triples of block id, block height and subtree index, big-endian, in the order the
-// caller supplied. Insertion order is load-bearing -- the conformance suite requires subtree
-// indexes to come back in the order they were written rather than sorted.
-func packMembership(infos []utxo.MinedBlockInfo) []byte {
-	if len(infos) == 0 {
-		return nil
-	}
-
-	b := make([]byte, 0, len(infos)*12)
-
-	for _, mi := range infos {
-		var e [12]byte
-
-		binary.BigEndian.PutUint32(e[0:4], mi.BlockID)
-		binary.BigEndian.PutUint32(e[4:8], mi.BlockHeight)
-		binary.BigEndian.PutUint32(e[8:12], uint32(mi.SubtreeIdx)) //nolint:gosec // subtree index is never negative
-
-		b = append(b, e[:]...)
-	}
-
-	return b
-}
 
 // offChainSinceAt decides whether a newly created transaction belongs in the mempool set.
 //
@@ -354,7 +329,6 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.txids = append(p.txids, txHash[:])
 	p.heights = append(p.heights, int32(blockHeight))
 	p.offChain = append(p.offChain, offChainSinceAt(options.MinedBlockInfos, blockHeight))
-	p.membership = append(p.membership, packMembership(options.MinedBlockInfos))
 	p.sizes = append(p.sizes, int32(tx.Size()))
 	p.inpoints = append(p.inpoints, inpoints)
 	p.locktimes = append(p.locktimes, int32(tx.LockTime))

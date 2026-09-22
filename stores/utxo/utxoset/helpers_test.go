@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,6 +30,23 @@ func identExists(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) bool {
 		`SELECT count(*) FROM tx_ident WHERE txid = $1`, hashBytes(tx)).Scan(&n))
 
 	return n > 0
+}
+
+// dropIdentityRow deletes a transaction's identity row by raw SQL.
+//
+// It stands in for the deep stamp of build step 5, which is the one thing in the design that
+// deletes an identity row after mining, and which does not exist yet. Two kinds of test need
+// it. A test of the containment-only reads -- the inputs read, the counter-conflicting walk --
+// wants a transaction whose identity row is gone so that the tx_mined arm is what answers. A
+// test that drops a containment window needs tx_ident empty, because the interim guard refuses
+// a drop while it holds any row (see dropTxMinedWindowsBelow). Neither state can be reached
+// through the store's own API before the stamp exists, and both are ordinary states once it
+// does.
+func dropIdentityRow(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) {
+	t.Helper()
+
+	_, err := s.pool.Exec(ctx, `DELETE FROM tx_ident WHERE txid = $1`, hashBytes(tx))
+	require.NoError(t, err)
 }
 
 // spendOneOutput builds a transaction taking one of parent's outputs and applies the spend at
@@ -56,6 +74,63 @@ func spendOneOutput(t *testing.T, s *Store, ctx context.Context, parent *bt.Tx, 
 	require.NoError(t, err)
 
 	return child
+}
+
+// spendOneOutputInBlock is spendOneOutput with the spender created through the block path, so
+// it carries blockID from birth and writes no identity row. A test that goes on to drop a
+// containment window uses it, because the interim guard refuses a drop while tx_ident holds
+// any row, and an unmined child would be such a row (see dropTxMinedWindowsBelow).
+func spendOneOutputInBlock(t *testing.T, s *Store, ctx context.Context, parent *bt.Tx, vout uint32,
+	height, blockID uint32) *bt.Tx {
+	t.Helper()
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash:      parent.TxIDChainHash(),
+		Vout:          vout,
+		LockingScript: parent.Outputs[vout].LockingScript,
+		Satoshis:      parent.Outputs[vout].Satoshis,
+	}))
+	child.AddOutput(&bt.Output{
+		Satoshis:      parent.Outputs[vout].Satoshis - 1_000,
+		LockingScript: parent.Outputs[vout].LockingScript,
+	})
+
+	_, err := s.Create(ctx, child, height, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: blockID, BlockHeight: height, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = spendOnly(ctx, s, child, height)
+	require.NoError(t, err)
+
+	return child
+}
+
+// plantMined inserts one containment row directly, creating its window first, so a test can
+// build the exact combination of identity row and containment it needs without driving the
+// whole write path. The payload columns are left NULL, as a block-path row's are.
+func plantMined(t *testing.T, s *Store, ctx context.Context, txid []byte, blockID, height, subtreeIdx uint32) {
+	t.Helper()
+
+	require.NoError(t, s.ensureTxMinedPartition(ctx, height))
+
+	_, err := s.pool.Exec(ctx, `
+        INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height)
+        VALUES ($1, $2, $3, $4, $2) ON CONFLICT DO NOTHING`,
+		txid, int32(height), int32(blockID), int32(subtreeIdx))
+	require.NoError(t, err)
+}
+
+// markerOf reads a transaction's unmined marker off its identity row; nil when the marker is
+// clear. The row must exist.
+func markerOf(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) *int32 {
+	t.Helper()
+
+	var marker *int32
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT off_chain_since FROM tx_ident WHERE txid = $1`, hashBytes(tx)).Scan(&marker))
+
+	return marker
 }
 
 // createDirect writes one transaction through the single create path, in a transaction of its

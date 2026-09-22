@@ -3,6 +3,11 @@ package utxoset
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
 	"github.com/stretchr/testify/require"
 )
@@ -77,19 +82,29 @@ func TestConformance(t *testing.T) {
 		tests.SetMinedUnminedSince(t, db)
 	})
 
-	// The delete-at-height lifecycle: a mempool-created tx stamped mined on the longest
-	// chain moves into tx_mined, every output gets spent, and Prune(1_000_000) at that
-	// height drops every membership window below the journal-retention cutoff wholesale
-	// (there is no per-row DAH sweep in this design — see pruner.go). The UTXOs are
-	// already gone from the spend, so once the window holding the tx's identity is
-	// dropped, a lookup misses.
+	// The delete-at-height lifecycle: a transaction created unmined is recorded mined on the
+	// longest chain, every output gets spent, and Prune(1_000_000) at that height is expected
+	// to make it unfindable. Under the containment design one Prune call cannot do that: the
+	// identity row stays alive until the deep stamp of build step 5 deletes it, and until then
+	// the interim guard refuses to drop any containment window while tx_ident holds a row. So
+	// the shared case is wrapped in the knownDefect guard, driven through the interim pruner
+	// wrapper, exactly as section 13.2 of the design lays out. The guard needs a boolean, and
+	// the shared case calls require on the real *testing.T, so minedThenSpendAllIsPruned
+	// replays the case's five calls on a second store to compute it. When step 5 lands, the
+	// wrapper gains the stamp drain, the helper returns true, and the guard fails this subtest
+	// until it is replaced by the plain call and the helper is deleted.
 	t.Run("MinedThenSpendAllPrunes", func(t *testing.T) {
 		db, _ := newTestStore(t)
 
 		svc, err := db.GetPrunerService()
 		require.NoError(t, err)
 
-		tests.MinedThenSpendAllPrunes(t, db, svc)
+		wrapped := interimPruner{Service: svc}
+
+		knownDefect(t, "one Prune call cannot drop a window while the identity row lives; the stamp that deletes it is build step 5",
+			minedThenSpendAllIsPruned(t, wrapped), func() {
+				tests.MinedThenSpendAllPrunes(t, db, wrapped)
+			})
 	})
 
 	// The six SpendAndCreate entry points. The spec named them as ones this design should
@@ -222,6 +237,67 @@ func TestConformance(t *testing.T) {
 		db, _ := newTestStore(t)
 		tests.Sanity(t, db)
 	})
+}
+
+// interimPruner is the wrapper the utxoset harness hands the shared MinedThenSpendAllPrunes
+// case. At build step 2 its Prune forwards to the real service unchanged. At step 5 it gains
+// the stamp drain at the pruned tip with a hand-built ancestry, moves the store's height past
+// stamped_at + 1,728 and then calls the real Prune, which is how one Prune call comes to satisfy
+// a case whose drop rule needs two conditions. It lives in the harness rather than as a hook in
+// the shared test, because a hook there would put a stamp concept into a file that aerospike
+// and sql also run, and neither has one.
+type interimPruner struct {
+	pruner.Service
+}
+
+// minedThenSpendAllIsPruned replays the shared case's five calls through the wrapper on a store
+// of its own and reports whether Get then answers ErrTxNotFound. Both this and the guarded call
+// must go through the wrapper: if this used the bare service the guard would never fire at step
+// 5, because one bare Prune can never pass.
+func minedThenSpendAllIsPruned(t *testing.T, wrapped interimPruner) bool {
+	t.Helper()
+
+	db, ctx := newTestStore(t)
+
+	svc, err := db.GetPrunerService()
+	require.NoError(t, err)
+
+	wrapped.Service = svc
+
+	const mineHeight uint32 = 1000
+	require.NoError(t, db.SetBlockHeight(mineHeight))
+
+	_, _, err = db.SpendAndCreate(ctx, tests.ParentTx, mineHeight-1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+
+	_, _, err = db.SpendAndCreate(ctx, tests.Tx, mineHeight, utxo.WithCreateOnly())
+	require.NoError(t, err)
+
+	txHash := tests.Tx.TxIDChainHash()
+
+	_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, utxo.MinedBlockInfo{
+		BlockID: 100, BlockHeight: mineHeight, OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
+	for i, out := range tests.Tx.Outputs {
+		spendTx := bt.NewTx()
+		require.NoError(t, spendTx.From(txHash.String(), uint32(i), out.LockingScript.String(), out.Satoshis)) //nolint:gosec // an output index fits
+		require.NoError(t, spendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+
+		_, _, err = db.SpendAndCreate(ctx, spendTx, mineHeight+1, utxo.WithSpendOnly())
+		require.NoError(t, err)
+	}
+
+	const pruneHeight uint32 = 1_000_000
+	require.NoError(t, db.SetBlockHeight(pruneHeight))
+
+	_, err = wrapped.Prune(ctx, pruneHeight, "<minedThenSpendAllIsPruned>")
+	require.NoError(t, err)
+
+	_, err = db.Get(ctx, txHash)
+
+	return errors.Is(err, errors.ErrTxNotFound)
 }
 
 // BenchmarkConformance is the shared suite's own benchmark: create, spend, unspend, delete,

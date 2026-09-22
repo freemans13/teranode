@@ -69,22 +69,21 @@ import (
 // pre-statement snapshot, so the rows this arm can see are precisely the ones `restored`
 // excluded itself from touching.
 //
-// The restored UTXO's block facts are RE-RESOLVED, in three preferences, and the order is the
-// immutability rule rather than a convenience.
+// The restored UTXO's block facts are RE-RESOLVED, in three preferences, and this is the
+// INTERIM rule of the containment build, not the final one.
 //
-// tx_mined first. Block facts can change after the spend was recorded -- a reorg can move a
-// still-live parent to a different block -- so while the membership row exists it is the
-// record that gets rewritten and the journal's copy is not. Reading it fresh by the parent's
-// txid is what keeps a restore honest. ORDER BY seq LIMIT 1 picks the earliest row on the rare
-// chance more than one exists (a coinbase re-org can leave a parent claimed at more than one
-// height); seq is a global identity so "earliest" is well defined without touching mined_height.
+// tx_mined first, taking the transaction's first containment row in (mined_height, block_id)
+// order. That is right only where a transaction has exactly one containment row, which holds
+// for the one deployment the interim build gets -- a mainnet sync below the checkpoint, where
+// the node has never stored a fork -- and is not claimed to be right anywhere else. Where a
+// transaction has rows for competing blocks this can write a loser's pair onto the restored
+// UTXO, and the design's build step 5 replaces the whole re-resolution with a repair that
+// reads only below the stamp fence, where the stamp has already deleted the losing rows. Until
+// then the insertion counter this used to order by is gone, and nothing may rank rows by
+// arrival in its place.
 //
-// Then the journal's own copy, gated on mined_height > 0. Once the membership window has
-// retired there is nothing left to re-resolve from, and before this the restore put back the
-// unconfirmed sentinel on a UTXO that was demonstrably mined -- a UTXO claiming no block at
-// all, which the read order would then answer from as if the transaction were in the mempool.
-// The copy is safe to trust in exactly this case for the same reason readSpentParents is: a
-// window that has retired is at least 1440 blocks deep and its block cannot change.
+// Then the journal's own copy, gated on mined_height > 0. A non-zero pair in the copy was
+// final when it was copied and stays final, so it is trusted where tx_mined has no row.
 //
 // Then 0, which is the unconfirmed sentinel and the correct answer for a parent that was
 // genuinely unconfirmed when it was spent. Both columns move together in every branch, because
@@ -106,9 +105,11 @@ restored AS (
                       spendable_from, flags, hash_override, mined_height, block_id)
     SELECT (get_byte(t.txid, 0) & 7)::smallint, t.txid, t.ukey, t.satoshis, t.script,
            t.created_height, t.spendable_from, t.flags | $4::smallint, t.hash_override,
-           COALESCE((SELECT m.mined_height FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1),
+           COALESCE((SELECT m.mined_height FROM tx_mined m WHERE m.txid = t.txid
+                      ORDER BY m.mined_height, m.block_id LIMIT 1),
                     CASE WHEN t.mined_height > 0 THEN t.mined_height END, 0),
-           COALESCE((SELECT m.block_id     FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1),
+           COALESCE((SELECT m.block_id     FROM tx_mined m WHERE m.txid = t.txid
+                      ORDER BY m.mined_height, m.block_id LIMIT 1),
                     CASE WHEN t.mined_height > 0 THEN t.block_id END, 0)
       FROM taken t
      WHERE NOT EXISTS (

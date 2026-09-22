@@ -19,9 +19,10 @@ import (
 // createIdentPlanSQL stores a whole BATCH of MEMPOOL transactions in ONE statement.
 //
 // It is the claim for a create that carries no mined-block information: a transaction seen
-// before any block contains it. Such a transaction claims on tx_ident, and its UTXOs carry the
-// unconfirmed sentinel — mined_height 0, block_id 0 — until something stamps them. The
-// block-path counterpart is createMinedPlanSQL.
+// before any block contains it. Such a transaction claims on tx_ident, with the unmined marker
+// set and no block of its own (containment has one home, tx_mined, and is recorded later), and
+// its UTXOs carry the unconfirmed sentinel — mined_height 0, block_id 0 — until the deep stamp
+// writes their block. The block-path counterpart is createMinedPlanSQL.
 //
 // Every parameter is an array, so one statement serves one transaction or a thousand, exactly
 // as spendJournalSQL does on the other side. That is what lets the single-transaction path be
@@ -105,15 +106,15 @@ import (
 const createIdentPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
-                         $6::bytea[], $7::int[], $8::bytea[], $9::int[], $10::bigint[],
-                         $11::smallint[], $12::bytea[], $13::uuid[], $14::uuid[])
-        AS t(k, leaf, txid, created_height, off_chain_since, membership, size_in_bytes,
+                         $6::int[], $7::bytea[], $8::int[], $9::bigint[],
+                         $10::smallint[], $11::bytea[], $12::uuid[], $13::uuid[])
+        AS t(k, leaf, txid, created_height, off_chain_since, size_in_bytes,
              tx_inpoints, locktime, created_at, flags, raw_tx, lo, hi)
 ),
 claim AS (
-    INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
+    INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since,
                           fee, size_in_bytes, tx_inpoints, locktime, created_at, flags)
-    SELECT t.leaf, t.txid, t.created_height, t.off_chain_since, t.membership,
+    SELECT t.leaf, t.txid, t.created_height, t.off_chain_since,
            NULL::bigint, t.size_in_bytes, t.tx_inpoints, t.locktime, t.created_at, t.flags
       FROM t
      WHERE NOT EXISTS (SELECT 1 FROM tx_mined m WHERE m.txid = t.txid LIMIT 1 OFFSET 0)
@@ -134,8 +135,8 @@ UTXOs AS (
                       leaf, flags, ukey, txid, script)
     SELECT o.satoshis, o.created_height, o.spendable_from, 0, 0,
            o.leaf, o.flags, o.ukey, o.txid, o.script
-      FROM unnest($15::bigint[], $16::int[], $17::int[], $18::smallint[], $19::smallint[],
-                  $20::uuid[], $21::bytea[], $22::bytea[])
+      FROM unnest($14::bigint[], $15::int[], $16::int[], $17::smallint[], $18::smallint[],
+                  $19::uuid[], $20::bytea[], $21::bytea[])
         AS o(satoshis, created_height, spendable_from, leaf, flags, ukey, txid, script)
       JOIN claim c ON c.leaf = o.leaf AND c.txid = o.txid
 )
@@ -255,18 +256,17 @@ type createItem struct {
 // rather than by a separate mapping.
 type createPlan struct {
 	// One element per transaction that made it into the statement.
-	idx        []int32
-	leaves     []int16
-	txids      [][]byte
-	heights    []int32
-	offChain   []*int32
-	membership [][]byte
-	sizes      []int32
-	inpoints   [][]byte
-	locktimes  []int32
-	createdAt  []int64
-	txFlags    []int16
-	bodies     [][]byte
+	idx       []int32
+	leaves    []int16
+	txids     [][]byte
+	heights   []int32
+	offChain  []*int32
+	sizes     []int32
+	inpoints  [][]byte
+	locktimes []int32
+	createdAt []int64
+	txFlags   []int16
+	bodies    [][]byte
 	// minedRows is true for a transaction that carries mined-block information, which is
 	// what sends it to createMinedPlanSQL instead of createIdentPlanSQL. The three fields
 	// below carry that block's facts, and are 0 for a mempool create.
@@ -372,7 +372,6 @@ func (p *createPlan) sortRows() {
 	p.txids = permute(p.txids, order)
 	p.heights = permute(p.heights, order)
 	p.offChain = permute(p.offChain, order)
-	p.membership = permute(p.membership, order)
 	p.sizes = permute(p.sizes, order)
 	p.inpoints = permute(p.inpoints, order)
 	p.locktimes = permute(p.locktimes, order)
@@ -415,7 +414,6 @@ func (p *createPlan) subset(idx []int) *createPlan {
 		q.txids = append(q.txids, p.txids[i])
 		q.heights = append(q.heights, p.heights[i])
 		q.offChain = append(q.offChain, p.offChain[i])
-		q.membership = append(q.membership, p.membership[i])
 		q.sizes = append(q.sizes, p.sizes[i])
 		q.inpoints = append(q.inpoints, p.inpoints[i])
 		q.locktimes = append(q.locktimes, p.locktimes[i])
@@ -496,7 +494,7 @@ func (s *Store) runCreatePlan(ctx context.Context, q querier, p *createPlan) err
 // runIdentPlan claims the mempool half of a plan on the identity table.
 func (s *Store) runIdentPlan(ctx context.Context, q querier, p *createPlan) error {
 	rows, err := q.Query(ctx, createIdentPlanSQL,
-		p.idx, p.leaves, p.txids, p.heights, p.offChain, p.membership, p.sizes,
+		p.idx, p.leaves, p.txids, p.heights, p.offChain, p.sizes,
 		p.inpoints, p.locktimes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
 		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoLeaves, p.utxoFlags,
 		p.utxoUkeys, p.utxoTxids, p.utxoScripts)

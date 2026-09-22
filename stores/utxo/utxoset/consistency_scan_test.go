@@ -32,13 +32,14 @@ func drainScan(t *testing.T, it utxo.ConsistencyScanIterator) []*utxo.Inconsiste
 }
 
 // plantIdent inserts an identity row directly, so a test can build the exact combination of
-// mempool marker and block membership it needs without driving the whole write path.
-func plantIdent(t *testing.T, s *Store, ctx context.Context, txid []byte, membership []byte, offChain *int32) {
+// unmined marker and containment it needs without driving the whole write path. Containment is
+// planted separately, with plantMined, because it has its own home.
+func plantIdent(t *testing.T, s *Store, ctx context.Context, txid []byte, offChain *int32) {
 	t.Helper()
 
 	_, err := s.pool.Exec(ctx, `
-        INSERT INTO tx_ident (leaf, txid, created_height, membership, off_chain_since)
-        VALUES ($1, $2, 100, $3, $4)`, LeafFor(txid), txid, membership, offChain)
+        INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since)
+        VALUES ($1, $2, 100, $3)`, LeafFor(txid), txid, offChain)
 	require.NoError(t, err)
 }
 
@@ -57,24 +58,22 @@ func ptrI32(v int32) *int32 { return &v }
 
 // TestConsistencyScanYieldsOnlyTheRowsWorthRepairing.
 //
-// The repair this feeds fixes transactions that carry block membership while still marked as
-// waiting to be mined. A row with no membership cannot be one, and a row with no marker is not
+// The repair this feeds fixes transactions that have a containment row while still marked as
+// waiting to be mined. A row with no containment cannot be one, and a row with no marker is not
 // waiting, so yielding either would put work on the wire for the caller to throw away.
-//
-// A zero-length membership is deliberately excluded too. The length constraint admits it,
-// because zero is a multiple of twelve, and it names no block, so it can never be repaired.
 func TestConsistencyScanYieldsOnlyTheRowsWorthRepairing(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	wanted := idBytes(0x11)
-	plantIdent(t, s, ctx, wanted, packTriples(t, [3]uint32{7, 700, 0}), ptrI32(100))
+	plantIdent(t, s, ctx, wanted, ptrI32(100))
+	plantMined(t, s, ctx, wanted, 7, 700, 0)
 
-	// Settled: mined and no longer waiting.
-	plantIdent(t, s, ctx, idBytes(0x12), packTriples(t, [3]uint32{7, 700, 0}), nil)
-	// Ordinary mempool transaction: waiting, but in no block.
-	plantIdent(t, s, ctx, idBytes(0x13), nil, ptrI32(100))
-	// Membership present but empty, which names no block and can never be repaired.
-	plantIdent(t, s, ctx, idBytes(0x14), []byte{}, ptrI32(100))
+	// Mined and no longer waiting.
+	mined := idBytes(0x12)
+	plantIdent(t, s, ctx, mined, nil)
+	plantMined(t, s, ctx, mined, 7, 700, 0)
+	// Ordinary unmined transaction: waiting, but in no block.
+	plantIdent(t, s, ctx, idBytes(0x13), ptrI32(100))
 
 	it, err := s.ScanInconsistentUnminedTxs()
 	require.NoError(t, err)
@@ -100,7 +99,8 @@ func TestConsistencyScanIncludesConflictingRows(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	txid := idBytes(0x21)
-	plantIdent(t, s, ctx, txid, packTriples(t, [3]uint32{9, 900, 1}), ptrI32(100))
+	plantIdent(t, s, ctx, txid, ptrI32(100))
+	plantMined(t, s, ctx, txid, 9, 900, 1)
 
 	_, err := s.pool.Exec(ctx, `UPDATE tx_ident SET flags = flags | $2 WHERE txid = $1`,
 		txid, FlagConflicting)
@@ -124,7 +124,8 @@ func TestConsistencyScanIncludesConflictingRows(t *testing.T) {
 func TestConsistencyScanYieldsAZeroMarker(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	plantIdent(t, s, ctx, idBytes(0x31), packTriples(t, [3]uint32{5, 500, 0}), ptrI32(0))
+	plantIdent(t, s, ctx, idBytes(0x31), ptrI32(0))
+	plantMined(t, s, ctx, idBytes(0x31), 5, 500, 0)
 
 	it, err := s.ScanInconsistentUnminedTxs()
 	require.NoError(t, err)
@@ -144,7 +145,8 @@ func TestConsistencyScanBatchesAtItsBound(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	for i := byte(0x41); i <= 0x43; i++ {
-		plantIdent(t, s, ctx, idBytes(i), packTriples(t, [3]uint32{7, 700, 0}), ptrI32(100))
+		plantIdent(t, s, ctx, idBytes(i), ptrI32(100))
+		plantMined(t, s, ctx, idBytes(i), 7, 700, 0)
 	}
 
 	it, err := s.ScanInconsistentUnminedTxs()
@@ -179,7 +181,8 @@ func TestConsistencyScanCountsWhatItYieldedUnderConcurrentReads(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	for i := byte(0x51); i <= 0x55; i++ {
-		plantIdent(t, s, ctx, idBytes(i), packTriples(t, [3]uint32{7, 700, 0}), ptrI32(100))
+		plantIdent(t, s, ctx, idBytes(i), ptrI32(100))
+		plantMined(t, s, ctx, idBytes(i), 7, 700, 0)
 	}
 
 	it, err := s.ScanInconsistentUnminedTxs()
@@ -219,7 +222,8 @@ func TestConsistencyScanStopsWhenItsContextIsCancelled(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	for i := byte(0x61); i <= 0x63; i++ {
-		plantIdent(t, s, ctx, idBytes(i), packTriples(t, [3]uint32{7, 700, 0}), ptrI32(100))
+		plantIdent(t, s, ctx, idBytes(i), ptrI32(100))
+		plantMined(t, s, ctx, idBytes(i), 7, 700, 0)
 	}
 
 	it, err := s.ScanInconsistentUnminedTxs()

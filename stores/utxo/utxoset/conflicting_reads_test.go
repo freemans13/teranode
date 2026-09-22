@@ -89,11 +89,11 @@ func TestGetCounterConflictingReportsATransactionItDoesNotHold(t *testing.T) {
 }
 
 // TestGetCounterConflictingNamesTheWinnerForAMinedLoser is the same walk when the loser has
-// been stamped into a block on the fork being abandoned, so it lives in tx_mined rather than
-// tx_ident.
+// been recorded in a block on the fork being abandoned and its identity row has since gone to
+// the deep stamp, so it lives in tx_mined alone.
 //
-// Both reads the walk makes have to survive the move: what the loser spends, which the stamp
-// carried onto the membership row, and who took each of those UTXOs, which comes off the
+// Both reads the walk makes have to survive that: what the loser spends, which record-mined
+// copied onto the containment row, and who took each of those UTXOs, which comes off the
 // parent's per-output spend state. Neither of the two reads here is identity-only, and this
 // pins that -- the walk answered from tx_ident alone would report no counter-spender at all,
 // which is the answer that lets the double spend stand.
@@ -122,7 +122,7 @@ func TestGetCounterConflictingNamesTheWinnerForAMinedLoser(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
 		[]chainhash.Hash{*loser.TxIDChainHash()}, true))
-	require.False(t, identExists(t, s, ctx, loser))
+	dropIdentityRow(t, s, ctx, loser)
 
 	got, err := s.GetCounterConflicting(ctx, *loser.TxIDChainHash())
 	require.NoError(t, err)
@@ -138,7 +138,7 @@ func TestGetCounterConflictingNamesTheWinnerForAMinedLoser(t *testing.T) {
 
 // TestGetConflictingChildrenWalksTheNotedConeFromAMinedParent. The contest is noted against the
 // parent's txid rather than against whichever row answers for it, so the note survives the
-// parent settling into a block. Without that the cone would empty out the moment the contested
+// parent being mined and losing its identity row to the stamp. Without that the cone would empty out the moment the contested
 // parent was mined, which is the ordinary case rather than a corner.
 func TestGetConflictingChildrenWalksTheNotedConeFromAMinedParent(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -157,7 +157,7 @@ func TestGetConflictingChildrenWalksTheNotedConeFromAMinedParent(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
 		[]chainhash.Hash{*parent.TxIDChainHash()}, true))
-	require.False(t, identExists(t, s, ctx, parent))
+	dropIdentityRow(t, s, ctx, parent)
 
 	got, err := s.GetConflictingChildren(ctx, *parent.TxIDChainHash())
 	require.NoError(t, err)
