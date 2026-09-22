@@ -215,6 +215,17 @@ func (m *Mock) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, n
 	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Error(2)
 }
 
+// GetBlockHeadersByParentLinks mocks the GetBlockHeadersByParentLinks method
+func (m *Mock) GetBlockHeadersByParentLinks(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	args := m.Called(ctx, blockHash, numberOfHeaders)
+
+	if args.Error(2) != nil {
+		return nil, nil, args.Error(2)
+	}
+
+	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Error(2)
+}
+
 // GetBlockHeadersToCommonAncestor mocks the GetBlockHeadersToCommonAncestor method
 func (m *Mock) GetBlockHeadersToCommonAncestor(ctx context.Context, hashTarget *chainhash.Hash, blockLocatorHashes []*chainhash.Hash, maxHeaders uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	args := m.Called(ctx, hashTarget, blockLocatorHashes, maxHeaders)

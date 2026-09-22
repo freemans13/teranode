@@ -609,6 +609,12 @@ func (m *MockStore) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Ha
 	return headers, metas, nil
 }
 
+// GetBlockHeadersByParentLinks walks parent links exactly as GetBlockHeaders does here, because
+// the mock has no main-chain flag to select by.
+func (m *MockStore) GetBlockHeadersByParentLinks(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	return m.GetBlockHeaders(ctx, blockHash, numberOfHeaders)
+}
+
 // GetBlockHeadersFromTill retrieves block headers between two specified blocks.
 func (m *MockStore) GetBlockHeadersFromTill(ctx context.Context, blockHashFrom *chainhash.Hash, blockHashTill *chainhash.Hash) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	return []*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil

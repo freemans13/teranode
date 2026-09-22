@@ -341,6 +341,12 @@ type ClientI interface {
 	// - Error if the header retrieval fails
 	GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
+	// GetBlockHeadersByParentLinks retrieves up to numberOfHeaders headers by walking parent links
+	// back from blockHash, newest first. It never selects rows by the main-chain flag and never
+	// reads or fills a cache. It is the fetch the pruner's stamp builds its chain answer from,
+	// because a stale flag must not be able to stall or steer a pass that writes permanent facts.
+	GetBlockHeadersByParentLinks(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
+
 	// GetBlockHeadersToCommonAncestor retrieves headers from target hash back to a common ancestor.
 	//
 	// This method fetches block headers starting from the target hash and moving backward

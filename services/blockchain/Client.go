@@ -844,6 +844,20 @@ func (c *Client) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash,
 	return c.returnBlockHeaders(resp)
 }
 
+// GetBlockHeadersByParentLinks retrieves headers by walking parent links back from a hash. See
+// the interface for why it exists beside GetBlockHeaders.
+func (c *Client) GetBlockHeadersByParentLinks(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	resp, err := c.client.GetBlockHeadersByParentLinks(ctx, &blockchain_api.GetBlockHeadersRequest{
+		StartHash:       blockHash.CloneBytes(),
+		NumberOfHeaders: numberOfHeaders,
+	})
+	if err != nil {
+		return nil, nil, errors.UnwrapGRPC(err)
+	}
+
+	return c.returnBlockHeaders(resp)
+}
+
 // GetBlockHeadersToCommonAncestor retrieves block headers from a target hash back to a common ancestor.
 // This method implements the Bitcoin protocol's block locator algorithm to find the common
 // ancestor between the local chain and a remote peer's chain, then returns the headers

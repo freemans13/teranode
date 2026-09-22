@@ -233,6 +233,10 @@ func (c *LocalClient) GetBlockHeaders(ctx context.Context, blockHash *chainhash.
 	return c.store.GetBlockHeaders(ctx, blockHash, numberOfHeaders)
 }
 
+func (c *LocalClient) GetBlockHeadersByParentLinks(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	return c.store.GetBlockHeadersByParentLinks(ctx, blockHash, numberOfHeaders)
+}
+
 func (c *LocalClient) GetBlockHeadersToCommonAncestor(ctx context.Context, hashTarget *chainhash.Hash, blockLocatorHashes []*chainhash.Hash, maxHeaders uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	return getBlockHeadersToCommonAncestor(ctx, c.store, hashTarget, blockLocatorHashes, maxHeaders)
 }

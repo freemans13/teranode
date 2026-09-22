@@ -71,6 +71,11 @@ service BlockchainAPI {
   // GetBlockHeaders retrieves headers for multiple blocks.
   rpc GetBlockHeaders(GetBlockHeadersRequest) returns (GetBlockHeadersResponse) {}
 
+  // GetBlockHeadersByParentLinks retrieves headers by walking parent links back from a hash.
+  // It never selects rows by the on_main_chain flag and never reads or writes a cache, so it
+  // is the fetch a chain answer is proven against.
+  rpc GetBlockHeadersByParentLinks(GetBlockHeadersRequest) returns (GetBlockHeadersResponse) {}
+
   // GetBlockHeadersToCommonAncestor retrieves headers from a block to its common ancestor.
   rpc GetBlockHeadersToCommonAncestor(GetBlockHeadersToCommonAncestorRequest) returns (GetBlockHeadersResponse) {}
 

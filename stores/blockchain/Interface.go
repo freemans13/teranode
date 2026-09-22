@@ -236,6 +236,17 @@ type Store interface {
 	// Returns: Slice of BlockHeaders, slice of BlockHeaderMetas, and any error encountered
 	GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
+	// GetBlockHeadersByParentLinks retrieves up to numberOfHeaders headers by walking parent links
+	// back from blockHash, newest first. Unlike GetBlockHeaders it never selects rows by the
+	// on_main_chain flag and never consults or fills a cache, so a stale flag cannot change its
+	// answer and a caller that proves the result by hash linkage proves the chain itself.
+	// Parameters:
+	//   - ctx: Context for the operation
+	//   - blockHash: Starting block hash
+	//   - numberOfHeaders: Number of headers to retrieve
+	// Returns: Slice of BlockHeaders, slice of BlockHeaderMetas, and any error encountered
+	GetBlockHeadersByParentLinks(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
+
 	// GetBlockHeadersFromTill retrieves block headers between two blocks.
 	// Parameters:
 	//   - ctx: Context for the operation
