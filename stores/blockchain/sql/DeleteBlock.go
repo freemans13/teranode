@@ -52,6 +52,13 @@ func (s *SQL) DeleteBlock(ctx context.Context, blockHash *chainhash.Hash) error 
 	// separate binary that never serves CheckBlockIsInCurrentChain, and it deletes in
 	// descending height order so the node restarts with maxBlockID back at the surviving
 	// MAX(id). An in-process caller would need maxBlockID recomputed rather than advanced.
+	//
+	// The guard has a cost on a forked-set node: the rebuild below sees it and takes the
+	// full-chain parent_id walk rather than the flat on_main_chain scan, so a rewind of N
+	// blocks with the toggle on pays N walks. That is deliberate. DeleteBlock reconciles no
+	// flags, so when the delete changes the best chain the flags the flat scan reads are
+	// the old chain's. With the toggle off there is no rebuild, and the guard only moves
+	// concurrent on_main_chain readers onto their flag-free walks for one DELETE.
 	s.mainChainRebuilding.Add(1)
 	defer s.mainChainRebuilding.Add(-1)
 

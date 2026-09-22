@@ -642,6 +642,9 @@ func TestCheckBlockIsInCurrentChain_ShadowCompare_CountsEveryComparison(t *testi
 	}
 
 	require.Equal(t, uint64(3), s.chainCheckShadowChecks.Load(), "every agreeing comparison must be counted too")
+	require.Equal(t, uint64(3), s.chainCheckShadowAcceptChecks.Load(),
+		"forked-set accepts must be counted apart from sampled rejects, or the totals line cannot say how many accepts the soak saw")
+	require.Zero(t, s.chainCheckShadowRejectChecks.Load(), "precondition: every call here was an accept")
 	require.Zero(t, s.chainCheckShadowMismatches.Load())
 }
 
@@ -906,7 +909,7 @@ func newStoreWithInvalidatedBlock2(t *testing.T) (*SQL, uint32, map[uint32]struc
 	return s, uint32(blockID2), staleSet, staleEpoch
 }
 
-// TestCheckBlockIsInCurrentChain_SetOlderThanTheLatestWriteIsNotTrusted is icellan's
+// TestCheckBlockIsInCurrentChain_SetOlderThanTheLatestWriteIsNotTrusted is the
 // reproduction of a post-write rebuild that fails after an earlier success. The rebuild
 // error is logged, lastSuccessfulRebuild is still set from the earlier success, and the
 // guard is released over a set that does not contain the block that just moved. Nothing

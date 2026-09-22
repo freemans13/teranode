@@ -102,6 +102,7 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 			// same call, and the comparison would then report agreement for a route that
 			// accepted a gap id. A tx's parent block ids are exactly that shape, so the
 			// whole-slice comparison could read clean on a node wrong on every call.
+			s.chainCheckShadowAcceptChecks.Add(1)
 			s.shadowCompareChainCheck(ctx, []uint32{acceptedID}, result)
 		case answeredByMaxBlockIDReject:
 			if s.chainCheckShadowRejectChecks.Add(1)%shadowRejectSampleRate == 0 {
@@ -176,7 +177,20 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 	// too, and the answer is simply the pre-write one. The same comparison covers a
 	// mutator whose rebuild failed after an earlier success: its bump stays ahead of the
 	// installed set until some rebuild reads past it.
-	if s.mainChainRebuilding.Load() > 0 || setEpoch < s.chainStateEpoch.Load() {
+	//
+	// The third comparison covers the opposite direction, a stale maxID beside a fresh set.
+	// The caller loaded maxID before the snapshot. A common extend that commits id N+1,
+	// advances maxBlockID and drops the guard entirely inside that gap bumps no epoch,
+	// because it moves no block off the chain, so the guard and epoch both pass. The reader
+	// would then drop N+1 as above maxID and return false for a committed on-chain block,
+	// and checkOldBlockIDs escalates that into a PERMANENT invalidation. Seeing maxBlockID
+	// move since the caller read it sends the call to SQL.
+	//
+	// Reloading maxID here instead would close that and open the dangerous direction: a
+	// fork block committed after the snapshot would sit at or below the fresh bound and
+	// absent from the older set, and be accepted with no query. Keeping the older bound
+	// and refusing to answer when it has moved gives up neither.
+	if s.mainChainRebuilding.Load() > 0 || setEpoch < s.chainStateEpoch.Load() || uint32(s.maxBlockID.Load()) != maxID {
 		result, err := s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
 
 		return result, answeredBySQL, 0, err

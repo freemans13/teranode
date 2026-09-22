@@ -170,6 +170,11 @@ type SQL struct {
 	// was sampled for comparison. It is the denominator that says how much traffic the
 	// sampled population represents.
 	chainCheckShadowRejectChecks atomic.Uint64
+	// chainCheckShadowAcceptChecks counts forked-set accepts seen while the comparison is
+	// on. chainCheckShadowChecks merges these with the sampled rejects, so without this a
+	// soak that exercised no accepts reads the same as one that exercised many and found
+	// nothing, and accepts are the population the soak exists to measure.
+	chainCheckShadowAcceptChecks atomic.Uint64
 	// chainStateEpoch counts writes to the main-chain classification. Every caller that
 	// has just changed on_main_chain bumps it, and a rebuild records the value it read
 	// when its own read BEGAN. Comparing the two is the only way a caller can tell that
@@ -2051,8 +2056,8 @@ func (s *SQL) logShadowCompareTotals() {
 	// Say what was compared, not just how much. Every forked-set accept is compared; the
 	// maxBlockID rejects are sampled, so quoting one number for both would read as full
 	// coverage of a population that is mostly unmeasured.
-	s.logger.Infof("[CheckBlockIsInCurrentChain] shadow comparison totals: %d comparisons run (every forked-set accept, plus 1 in %d of %d maxBlockID rejects), %d mismatches, %d comparisons could not run",
-		checks, shadowRejectSampleRate, s.chainCheckShadowRejectChecks.Load(), s.chainCheckShadowMismatches.Load(), failures)
+	s.logger.Infof("[CheckBlockIsInCurrentChain] shadow comparison totals: %d comparisons run (all %d forked-set accepts, plus 1 in %d of %d maxBlockID rejects), %d mismatches, %d comparisons could not run",
+		checks, s.chainCheckShadowAcceptChecks.Load(), shadowRejectSampleRate, s.chainCheckShadowRejectChecks.Load(), s.chainCheckShadowMismatches.Load(), failures)
 }
 
 // reservationSweepInterval is how often reservationSweepLoop reclaims abandoned

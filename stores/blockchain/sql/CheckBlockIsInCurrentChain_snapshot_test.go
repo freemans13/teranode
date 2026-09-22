@@ -8,7 +8,7 @@ import (
 )
 
 // TestAReaderThatSnapshottedBeforeAMutatorsRebuildDoesNotAnswerFromIt names the
-// interleaving icellan raised against CheckBlockIsInCurrentChain.go:38-42, where the guard
+// interleaving in CheckBlockIsInCurrentChain where the guard
 // is read before maxBlockID:
 //
 //	the reader loads mainChainRebuilding as 0
@@ -106,4 +106,37 @@ func TestAReaderThatSnapshottedBeforeAMutatorsRebuildDoesNotAnswerFromIt(t *test
 		require.Equal(t, answeredBySQL, route, "a snapshot whose epoch predates the latest write must not be answered from")
 		require.False(t, result, "the forked-set route accepted a fork block from a pre-rebuild snapshot")
 	})
+}
+
+// TestAReaderWithAStaleMaxBlockIDDoesNotRejectACommittedBlock pins the opposite window to
+// the one above. CheckBlockIsInCurrentChain loads maxBlockID before the snapshot. A common
+// extend that commits id N+1, advances maxBlockID and drops the guard entirely inside that
+// gap bumps no epoch, because it moves no block off the chain, so the guard and epoch
+// checks both pass and the reader still holds maxID == N. Without a third check the reader
+// drops N+1 as allocated-but-uncommitted and answers false for a committed on-chain block,
+// which checkOldBlockIDs turns into a permanent invalidation.
+//
+// It drives checkBlockIsInCurrentChainInMemory directly with the maxID the reader loaded
+// before the extend landed, which is exactly the state of a reader descheduled in that gap.
+func TestAReaderWithAStaleMaxBlockIDDoesNotRejectACommittedBlock(t *testing.T) {
+	s := newStoreWithInMemoryChainCheck(t)
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	storeBlocks(t, s, block1)
+
+	staleMaxID := uint32(s.maxBlockID.Load())
+
+	// The extend lands in full: committed, maxBlockID advanced, guard dropped, no epoch bump.
+	extendID, _, err := s.StoreBlock(context.Background(), block2, "peer")
+	require.NoError(t, err)
+
+	require.Greater(t, uint32(extendID), staleMaxID, "precondition: the extend's id is above the bound the reader holds")
+	require.Zero(t, s.mainChainRebuilding.Load(), "precondition: the extend has dropped the guard")
+	require.GreaterOrEqual(t, s.offChainSetEpoch.Load(), s.chainStateEpoch.Load(),
+		"precondition: a common extend bumps no epoch, so the epoch check cannot see this window")
+
+	result, route, _, err := s.checkBlockIsInCurrentChainInMemory(context.Background(), []uint32{uint32(extendID)}, staleMaxID)
+	require.NoError(t, err)
+	require.Equal(t, answeredBySQL, route, "a maxID that moved since the caller read it must not be answered from")
+	require.True(t, result, "a committed on-chain block was rejected as above a stale maxBlockID")
 }
