@@ -477,6 +477,15 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 			select {
 			case <-ctx.Done():
 				b.logger.Infof("Stopping blockassembler as ctx is done")
+
+				// A deliberate stop is not a wedge. On the OS-signal shutdown
+				// path the health server stays up through the whole drain, so
+				// without this the heartbeat would age past the timeout and the
+				// probe would report a node that is stopping on purpose as
+				// wedged. On Kubernetes that kills the container immediately
+				// instead of letting the grace period finish the drain.
+				b.heartbeat.Disable()
+
 				// Note: We don't close blockchainSubscriptionCh here because we don't own it -
 				// it's created by the blockchain client's Subscribe method
 				return

@@ -60,6 +60,19 @@ func (h *Heartbeat) BeatIfStarted() {
 	h.Beat()
 }
 
+// Disable returns the heartbeat to its never-beaten state, so it reports
+// healthy again and BeatIfStarted stops renewing it.
+//
+// A loop that exits deliberately, on shutdown, must call this on its way out.
+// Otherwise the heartbeat keeps ageing after the loop is gone, and a health
+// server that outlives the loop during a graceful drain reports a node that is
+// stopping on purpose as wedged. On Kubernetes a failed liveness probe during
+// termination kills the container at once instead of waiting out the grace
+// period, which cuts that drain short.
+func (h *Heartbeat) Disable() {
+	h.lastBeat.Store(nil)
+}
+
 // Age returns how long since the last beat. A Heartbeat that has never beaten
 // reports zero age: nothing has claimed responsibility for it yet, so it must
 // not be read as a stall.

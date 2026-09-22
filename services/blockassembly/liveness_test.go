@@ -3,6 +3,7 @@ package blockassembly
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -272,12 +273,77 @@ func TestLivenessStartsTheTickerOnANonPositiveInterval(t *testing.T) {
 	require.Equal(t, http.StatusOK, status, "a running loop must be healthy: %s", msg)
 }
 
-// TestLivenessReportsALoopThatHasStopped exercises the unhealthy path through
+// TestLivenessReportsAWedgedLoopAndRecovers exercises the unhealthy path through
 // the real loop instead of a backdated timestamp. Every other unhealthy test
 // fakes staleness with SetLastBeatForTest on an assembler whose loop never ran,
 // so none of them proves that the running loop is what keeps the probe healthy.
-// Here the loop starts, beats, and is then stopped, and the probe has to notice.
-func TestLivenessReportsALoopThatHasStopped(t *testing.T) {
+//
+// The loop is wedged the way a real handler wedges: inside a select case. A reset
+// request carries an unbuffered reply channel that nobody reads, so the reset case
+// blocks on its reply send and the loop stops being serviced. The probe has to
+// notice, name the state the loop is stuck in, and go back to 200 once the reply
+// is read and the loop runs again.
+func TestLivenessReportsAWedgedLoopAndRecovers(t *testing.T) {
+	server, _ := setupServer(t)
+
+	const tick = 50 * time.Millisecond
+
+	server.blockAssembler.heartbeatInterval = tick
+	server.settings.BlockAssembly.LivenessStallTimeout = 6 * tick
+
+	require.NoError(t, server.blockAssembler.Start(t.Context()))
+
+	require.Eventually(t, func() bool {
+		return server.blockAssembler.heartbeat.Age() > 0
+	}, 5*time.Second, 5*time.Millisecond, "loop must take ownership of the heartbeat")
+
+	status, msg, err := server.Health(t.Context(), true)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status, "a running loop must be healthy: %s", msg)
+
+	replyCh := make(chan error)
+
+	// Registered after setupServer, so it runs before setupServer's cleanup waits
+	// on the loop. An assertion failing below would otherwise leave the loop
+	// blocked on this send and hang the cleanup.
+	var released atomic.Bool
+
+	t.Cleanup(func() {
+		if released.CompareAndSwap(false, true) {
+			select {
+			case <-replyCh:
+			case <-time.After(10 * time.Second):
+			}
+		}
+	})
+
+	server.blockAssembler.resetCh <- resetRequest{ErrCh: replyCh}
+
+	require.Eventually(t, func() bool {
+		status, msg, err = server.Health(context.Background(), true)
+
+		return err == nil && status == http.StatusServiceUnavailable
+	}, 10*time.Second, 10*time.Millisecond, "a loop that has stopped being serviced must be reported as wedged")
+	require.Contains(t, msg, "state resetting", "the 503 must name the select case the loop is stuck in")
+
+	// Read the reply: the reset case finishes and the loop beats again.
+	released.Store(true)
+	<-replyCh
+
+	require.Eventually(t, func() bool {
+		status, _, err := server.Health(context.Background(), true)
+
+		return err == nil && status == http.StatusOK
+	}, 5*time.Second, 10*time.Millisecond, "the probe must recover once the loop is serviced again")
+}
+
+// TestLivenessStaysHealthyThroughShutdown pins the shutdown half. On the
+// OS-signal path the daemon cancels the services' context but keeps its health
+// server up through the drain, so a loop that returns on ctx.Done without
+// disabling its heartbeat would age past the timeout and be reported as wedged
+// while it is stopping on purpose. On Kubernetes that liveness failure kills the
+// container at once instead of letting the grace period finish the drain.
+func TestLivenessStaysHealthyThroughShutdown(t *testing.T) {
 	server, _ := setupServer(t)
 
 	const tick = 50 * time.Millisecond
@@ -294,19 +360,16 @@ func TestLivenessReportsALoopThatHasStopped(t *testing.T) {
 		return server.blockAssembler.heartbeat.Age() > 0
 	}, 5*time.Second, 5*time.Millisecond, "loop must take ownership of the heartbeat")
 
-	status, msg, err := server.Health(t.Context(), true)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, status, "a running loop must be healthy: %s", msg)
-
-	// Stop the loop. Nothing beats after this, which is what a wedge looks like
-	// from the probe's side.
 	cancel()
+	server.blockAssembler.Wait()
 
-	require.Eventually(t, func() bool {
+	// Well past the timeout: without Disable the heartbeat would be 3x stale by
+	// the end of this window.
+	require.Never(t, func() bool {
 		status, _, err := server.Health(context.Background(), true)
 
-		return err == nil && status == http.StatusServiceUnavailable
-	}, 5*time.Second, 10*time.Millisecond, "a loop that has stopped being serviced must be reported as wedged")
+		return err != nil || status != http.StatusOK
+	}, 20*tick, tick/2, "a loop stopped by its context is shutting down, not wedged")
 }
 
 // TestLivenessCatchUpFetchBeats pins the path review found still unbeaten after

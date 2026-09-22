@@ -200,9 +200,17 @@ func (ba *BlockAssembly) Health(ctx context.Context, checkLiveness bool) (int, s
 		if ba.blockAssembler != nil {
 			stallTimeout := ba.settings.BlockAssembly.LivenessStallTimeout
 			if age, stalled := ba.blockAssembler.heartbeat.Stalled(stallTimeout); stalled {
-				return http.StatusServiceUnavailable,
-					fmt.Sprintf("block assembly main loop has not made progress for %s (limit %s)", age, stallTimeout),
-					nil
+				// The state names the select case the loop is stuck in
+				// (resetting, reorging, reconciling, ...). The 503 body lands
+				// nested in the daemon's aggregate JSON, which the kubelet event
+				// truncates, so the same line goes to the log as well: it is the
+				// trace an operator reads after the restart.
+				state := StateStrings[ba.blockAssembler.GetCurrentRunningState()]
+				msg := fmt.Sprintf("block assembly main loop has not made progress for %s (limit %s, state %s)", age, stallTimeout, state)
+
+				ba.logger.Warnf("[BlockAssembly][Health] liveness failing: %s", msg)
+
+				return http.StatusServiceUnavailable, msg, nil
 			}
 		}
 
@@ -323,6 +331,11 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 				// stall-state computation, and its unit tests mock only the reads
 				// that computation makes.
 				prometheusBlockAssemblyQueueHeadAge.Set(ba.blockAssembler.QueueHeadAge().Seconds())
+
+				// Published whether or not the liveness timeout is set, so an
+				// operator can measure the worst case the documented rollout asks
+				// for before choosing a timeout.
+				prometheusBlockAssemblerLivenessHeartbeatAge.Set(ba.blockAssembler.heartbeat.Age().Seconds())
 			}
 		}
 	}()

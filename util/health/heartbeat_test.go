@@ -90,3 +90,23 @@ func TestBeatIfStartedIsSilentUntilTheLoopOwnsTheHeartbeat(t *testing.T) {
 	h.BeatIfStarted()
 	require.Zero(t, h.Age(), "once started, progress must refresh the heartbeat")
 }
+
+// TestDisableReportsHealthyAfterADeliberateStop pins the shutdown half: a loop
+// that exits on purpose disables its heartbeat, and from then on the probe must
+// read it as never beaten, not as a stall that keeps growing through the drain.
+func TestDisableReportsHealthyAfterADeliberateStop(t *testing.T) {
+	now := time.Now()
+	h := &Heartbeat{now: func() time.Time { return now }}
+	h.Beat()
+
+	now = now.Add(time.Hour)
+	require.True(t, stalled(h, time.Minute), "precondition: the heartbeat must be stale before Disable")
+
+	h.Disable()
+	require.False(t, stalled(h, time.Minute), "a disabled heartbeat must not report a stall")
+	require.Zero(t, h.Age())
+
+	// BeatIfStarted must not re-arm it: nothing owns the heartbeat any more.
+	h.BeatIfStarted()
+	require.Nil(t, h.lastBeat.Load(), "BeatIfStarted must not re-arm a disabled heartbeat")
+}
