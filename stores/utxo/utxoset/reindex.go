@@ -17,12 +17,22 @@ import (
 // qualifies, and comfortably below the plateau, so a churned one reliably does.
 const utxoIndexBloatThreshold = 55
 
+// utxoIndexRebuildMinBytes is the size below which an index is never judged. A btree carries
+// a metapage and a root whatever it holds, so on a partition of a few thousand rows those
+// fixed pages alone put it over the threshold: on the 2026-09-22 mainnet reset the pruner
+// rebuilt the eight 98 KB indexes 110 times in 13 minutes, each back to 72 KB. 64 MiB is
+// about two million entries at the bulk floor, sixteen million UTXOs across the eight
+// partitions, which mainnet passes in its first few hundred thousand blocks; below it the
+// whole index set is under half a gigabyte and a rebuild reclaims nothing that matters.
+const utxoIndexRebuildMinBytes = 64 << 20
+
 // utxoIndexNeedsRebuild decides whether one utxo_pN_ukey index has bloated past the point
 // worth paying a REINDEX CONCURRENTLY for. See utxoIndexBloatThreshold for where 55 comes
-// from. Zero rows means nothing to judge: reltuples can read 0 before the first ANALYZE, and
-// an empty partition is never the worst offender worth reindexing.
+// from and utxoIndexRebuildMinBytes for the size floor. Zero rows means nothing to judge:
+// reltuples can read 0 before the first ANALYZE, and an empty partition is never the worst
+// offender worth reindexing.
 func utxoIndexNeedsRebuild(indexBytes, rows int64) bool {
-	return rows > 0 && indexBytes/rows > utxoIndexBloatThreshold
+	return rows > 0 && indexBytes >= utxoIndexRebuildMinBytes && indexBytes/rows > utxoIndexBloatThreshold
 }
 
 // utxoIndexStatsSQL reads pg_relation_size of every utxo_pN_ukey index alongside
