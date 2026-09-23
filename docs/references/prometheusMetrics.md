@@ -63,6 +63,7 @@ All metrics are CounterVec type with labels: `function` (handler function name),
 | `teranode_blockassembly_queued_transactions`                  | Gauge     | Number of transactions currently queued in the block assembler subtree processor |
 | `teranode_blockassembly_subtrees`                             | Gauge     | Number of subtrees currently in the block assembler subtree processor            |
 | `teranode_blockassembly_dequeue_staleness_seconds`            | Gauge     | Seconds since the subtree processor's consumer goroutine last passed through its dequeue branch; growing alongside a non-zero `queued_transactions` means intake is queuing unboundedly because the consumer is stuck elsewhere |
+| `teranode_blockassembly_liveness_heartbeat_age_seconds`       | Gauge     | Seconds since the main select loop last beat its liveness heartbeat (0 before the loop starts and after it stops); the value `blockassembly_livenessStallTimeout` is compared against |
 | `teranode_blockassembly_tx_meta_get`                          | Histogram | Histogram of reading tx meta data from txmeta store in block assembler           |
 | `teranode_blockassembly_reorg`                                | Counter   | Number of reorgs in block assembler                                              |
 | `teranode_blockassembly_reorg_duration`                       | Histogram | Histogram of reorg in block assembler                                            |
