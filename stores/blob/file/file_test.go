@@ -135,6 +135,30 @@ func TestFileRelativeBasePathIsResolvedOnce(t *testing.T) {
 		"constructed filename %q is outside the original base %q", filename, origin)
 }
 
+// TestFileRejectsEmptyPath keeps a misconfigured store URL loud. An empty path would
+// otherwise resolve to the working directory, which newStore creates without complaint, so
+// blobs would land wherever the process happened to start.
+func TestFileRejectsEmptyPath(t *testing.T) {
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+
+	for _, raw := range []string{"file:", "file://", "file://.", "file://./"} {
+		t.Run(raw, func(t *testing.T) {
+			u, err := url.Parse(raw)
+			require.NoError(t, err)
+
+			f, err := New(ulogger.TestLogger{}, u)
+			require.Error(t, err)
+			require.Nil(t, f)
+			require.True(t, errors.Is(err, errors.ErrConfiguration), "want a configuration error, got %v", err)
+		})
+	}
+
+	entries, err := os.ReadDir(cwd)
+	require.NoError(t, err)
+	require.Empty(t, entries, "a rejected store must not create anything in the working directory")
+}
+
 func TestFileAbsoluteAndRelativePath(t *testing.T) {
 	absoluteURL, err := url.ParseRequestURI("file:///absolute/path/to/file")
 	require.NoError(t, err)

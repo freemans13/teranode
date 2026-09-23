@@ -549,9 +549,16 @@ func newStore(logger ulogger.Logger, storeURL *url.URL, opts ...options.StoreOpt
 
 	var path string
 	if storeURL.Host == "." {
-		path = storeURL.Path[1:] // relative path
+		path = strings.TrimPrefix(storeURL.Path, "/") // relative path
 	} else {
 		path = storeURL.Path // absolute path
+	}
+
+	// An empty path would resolve to the working directory below, and MkdirAll accepts that
+	// without complaint, so a misconfigured URL such as "file://./" or "file:" would quietly put
+	// blobs wherever the process started. Reject it instead.
+	if path == "" {
+		return nil, errors.NewConfigurationError("[File] store URL %q has no path", storeURL.String())
 	}
 
 	// Resolve the base path once, here, rather than on every read and write. ConstructFilename
