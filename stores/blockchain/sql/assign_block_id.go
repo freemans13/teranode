@@ -185,10 +185,13 @@ func (s *SQL) blockIDByHash(ctx context.Context, blockHash *chainhash.Hash) (uin
 // reservation row. Refusing it would leave that block unable to commit at all.
 //
 // The check runs under slowPathMu but outside the INSERT's transaction. That is
-// enough: a reservation is written once per hash and only ever deleted, and ids
-// come from a sequence, so nothing can make a refused id acceptable or an accepted
-// id taken between the check and the INSERT, other than the INSERT's own unique
-// constraints, which still apply.
+// enough to keep an accepted id free: ids come from a sequence and a reservation
+// never names an id the sequence already issued, so no other block can come to
+// hold the id between the check and the INSERT, and the INSERT's own unique
+// constraints still apply. It does not stop AssignBlockID re-reserving this hash
+// under a new id after the sweep while the check runs; that caller then gets an
+// id the committed row does not carry. That window needs a sweep and a concurrent
+// re-reservation of the same hash, and it existed before this check.
 func (s *SQL) checkCallerSuppliedBlockID(ctx context.Context, blockHash *chainhash.Hash, id uint64) error {
 	if _, committed, err := s.blockIDByHash(ctx, blockHash); err != nil {
 		return err
