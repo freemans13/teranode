@@ -4295,6 +4295,7 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	// which Fill itself is in a position to say: it has no logger, and on a
 	// wrong-hash drop it has already reset the state that would say so.
 	prevTop, havePrevTop := sm.headerCache.Top()
+	prevTopHash, _ := sm.headerCache.At(prevTop)
 	prevProven := sm.headerCache.ProvenTo()
 	_, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
 
@@ -4308,7 +4309,7 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 		// because upstream disconnects for the second (handleHeadersMsg's
 		// "does NOT match expected checkpoint hash") and this branch lost that
 		// defence along with the header list.
-		if cp := sm.contradictedCheckpoint(best+1, msg.Headers); cp != nil {
+		if cp := sm.contradictedCheckpoint(best+1, tipHash, msg.Headers); cp != nil {
 			peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash %s", cp.Height, cp.Hash))
 
 			return false
@@ -4323,7 +4324,7 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 		// just failed to agree; this block is purely the classification for the
 		// disconnect and the log, not the decision itself.
 		if havePrevTop && prevTop >= best+1 && checkpointAhead {
-			if cp := sm.contradictedCheckpoint(prevTop+1, msg.Headers); cp != nil {
+			if cp := sm.contradictedCheckpoint(prevTop+1, prevTopHash, msg.Headers); cp != nil {
 				sm.logger.Warnf("[fillHeaderCache][%s] header list dropped: the walk reached checkpoint height %d without the pinned hash %s", peer, cp.Height, cp.Hash)
 				peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash %s", cp.Height, cp.Hash))
 
@@ -4467,18 +4468,17 @@ func (sm *SyncManager) extendingHeadersLocator(topHash chainhash.Hash) (blockcha
 // nil if it disagrees with none.
 //
 // It walks the batch as delivered, so the height it assigns each header is
-// baseHeight plus its index — the same arithmetic Fill uses for the part of the
-// run it keeps. That is an over-approximation for a batch whose front has slipped
-// behind the committed tip, where Fill drops a prefix and re-bases: a header at a
-// checkpoint height by this arithmetic may not be at that height at all. It is the
-// safe over-approximation, though, and only on a batch Fill has ALREADY refused,
-// so the worst it can do is blame a peer for a batch that was going to be dropped
-// anyway. A batch whose front is behind the tip and whose linkage holds is never
-// refused by Fill, so it never reaches here.
+// baseHeight plus its index, and that is only true of a batch whose first header
+// names parent, the block at baseHeight-1. A batch that does not is a reply about
+// some other point in the chain, and its headers are not at those heights at all,
+// so it can contradict no checkpoint and answers nil. The answer decides a
+// disconnect: blaming an honest peer for a stale reply cost mainnet its sync peer
+// part way through a block on 2026-09-23, and the record that peer had just
+// written was stranded and stopped the chain.
 //
 // Nil checkpoints, or a batch reaching no checkpoint height, both answer nil.
-func (sm *SyncManager) contradictedCheckpoint(baseHeight int32, headers []*wire.BlockHeader) *chaincfg.Checkpoint {
-	if sm.chainParams == nil || len(headers) == 0 {
+func (sm *SyncManager) contradictedCheckpoint(baseHeight int32, parent chainhash.Hash, headers []*wire.BlockHeader) *chaincfg.Checkpoint {
+	if sm.chainParams == nil || len(headers) == 0 || headers[0].PrevBlock != parent {
 		return nil
 	}
 
