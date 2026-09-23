@@ -882,7 +882,9 @@ type SyncManager struct {
 	// nextHeaderRefillPeer's atomic Add, so concurrent callers never hand out
 	// the same slot twice.
 	headerRefillPeerIdx atomic.Uint64
-	blockSizeTracker    *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
+	blockSizeTracker    *blockSizeTracker  // tracks block sizes for dynamic in-flight adjustment
+	commitRate          *commitRateTracker // blocks a second joining the chain, for the read-ahead depth
+	streams             *streamRegistry    // block bodies arriving now and peers' delivery rates, for the frontier race
 
 	// dispatcher owns the quick window: it decides how many queued blocks may have
 	// their UTXO store work in flight at once and runs every chain-order step in
@@ -1687,6 +1689,10 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 
 	// Remove the peer from the list of candidate peers.
 	sm.peerStates.Delete(peer)
+
+	if sm.streams != nil {
+		sm.streams.forgetPeer(peer)
+	}
 
 	sm.logger.Infof("Lost peer %s (removed from peerStates)", peer)
 
@@ -4091,6 +4097,29 @@ func (sm *SyncManager) lookaheadCeilingLocked(best int32) (int64, bool) {
 		}
 	}
 
+	// And measured in time as well as in blocks. A count of blocks is a lead of
+	// whatever time those blocks take to commit, which on small blocks is
+	// seconds: 128 blocks at 4 a second is 32 seconds, and on 2026-09-23 a 309 MB
+	// block among sub-megabyte ones took 72 seconds to arrive from its one peer,
+	// so the chain waited 49 seconds with every block behind it already parked.
+	// The depth is therefore at least lookaheadLeadTarget of commits at the
+	// measured commit rate, so a block that is slow to download is asked for
+	// minutes before the chain needs it.
+	//
+	// The time depth is bounded by what the park can hold, judged from the
+	// average block size: it limits what is ASKED for, so unlike the byte budgets
+	// this replaced it never throws away a block already downloaded. It never
+	// makes the depth shallower than the ladder's, and the node-wide window below
+	// still clamps it. With no commits seen yet the rate is zero and the depth is
+	// exactly the ladder's.
+	if depth := sm.timeLookaheadDepth(); depth > lower {
+		lower = depth
+	}
+
+	if window := sm.settings.Legacy.BlockDownloadWindow; window > 0 && lower > window {
+		lower = window
+	}
+
 	// Anchored to the last COMMITTED block, and that is the whole rule: never ask
 	// for a block more than the read-ahead depth above what has been validated.
 	//
@@ -4979,6 +5008,10 @@ func (sm *SyncManager) blockHandler() {
 	// it posts those back to the consumer through parkCommits.
 	go sm.runParkSweep()
 
+	if sm.streams != nil {
+		go sm.runFrontierRace()
+	}
+
 out:
 	for {
 		select {
@@ -5471,7 +5504,44 @@ func (sm *SyncManager) committedTip() (height int32, hash chainhash.Hash, ok boo
 // of it; a peer that answers nothing for maxLastBlockTime is the one this
 // restores rotation for.
 func (sm *SyncManager) noteChainProgress() {
-	sm.lastChainProgress.Store(time.Now().UnixNano())
+	now := time.Now()
+	sm.lastChainProgress.Store(now.UnixNano())
+	sm.commitRate.note(now)
+}
+
+// lookaheadLeadTarget is how far ahead of the chain, in commit time, the node asks for blocks.
+// Long enough to cover one outlier block's download from a single peer at the sizes of the
+// mid-chain; the park-bytes cap is what keeps it honest at the top of the chain. A constant,
+// not a setting: an operator has no better information to set it by.
+const lookaheadLeadTarget = 5 * time.Minute
+
+// lookaheadParkBytes bounds the time depth by what the park may hold, judged from the rolling
+// average block size. It is about the 20 GB the scaled count was chosen to keep the park under.
+const lookaheadParkBytes = int64(20) << 30
+
+// timeLookaheadDepth is lookaheadLeadTarget of commits at the measured commit rate, capped at
+// lookaheadParkBytes of average-sized blocks. Zero while the rate is unknown.
+func (sm *SyncManager) timeLookaheadDepth() int {
+	rate := sm.commitRate.rate()
+	if rate <= 0 {
+		return 0
+	}
+
+	depth := int64(rate*lookaheadLeadTarget.Seconds() + 0.5)
+
+	if sm.blockSizeTracker != nil {
+		if avg := sm.blockSizeTracker.getAverageSize(); avg > 0 {
+			if byBytes := lookaheadParkBytes / avg; byBytes < depth {
+				depth = byBytes
+			}
+		}
+	}
+
+	if depth > int64(^uint32(0)>>1) {
+		depth = int64(^uint32(0) >> 1)
+	}
+
+	return int(depth)
 }
 
 // blockProcessingStallTimeout is how long a non-empty block backlog may go
@@ -5911,6 +5981,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		blockSizeTracker: newBlockSizeTracker(10), // track last 10 blocks for rolling average
+		commitRate:       newCommitRateTracker(),
+		streams:          newStreamRegistry(),
 		quit:             make(chan struct{}),
 		// feeEstimator:            config.FeeEstimator,
 		minSyncPeerNetworkSpeed: config.MinSyncPeerNetworkSpeed,
