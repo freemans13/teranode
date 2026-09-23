@@ -208,25 +208,6 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 			}
 		}
 
-		// A block already on disk is not wanted, whatever any index says. This
-		// is what makes a restart free: the files survive it, so a node comes
-		// back and asks only for what it genuinely lacks.
-		if sm.holdsBlock(sm.ctx, block.hash) {
-			// Held on disk but not in the park is a record nothing announced: its
-			// peer was dropped between the write and the on-disk message. Left like
-			// that it is skipped here forever and never drained, which stopped
-			// mainnet at 650,021 on 2026-09-23. Adopt it so the park sweep commits it.
-			// A block being committed has left the park but not the disk: that is in
-			// flight, not stranded, and putting it back would have it read again after
-			// its files are gone.
-			if !sm.blockPark.Has(block.hash) && !sm.dispatcher.inFlight(block.hash) &&
-				sm.blockPark.adoptStranded(sm.ctx, block.hash, sm.subtreeStore) {
-				sm.logger.Warnf("[unownedBlocks][%s] adopted a complete record at height %d that was on disk but not in the park", block.hash, block.height)
-			}
-
-			continue
-		}
-
 		// The park's own in-memory index, checked separately from holdsBlock:
 		// Admit registers a block there synchronously, before its blob write
 		// is handed to a worker, so a pass that lands in the gap between
@@ -268,6 +249,38 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 			}
 		}
 
+		// Already asked of a peer within the retry window: skipped from the ledger,
+		// a map read. Ahead of the disk and chain checks below, because in steady
+		// state almost every block in the range is parked or requested, and those
+		// checks read a file or make a round trip for each one: on mainnet the disk
+		// check alone was 4.2 s of a 54 s profile, on the serial path behind every
+		// commit. Every check before ForgiveOwners only skips, so the order changes
+		// the cost and never the answer; the one rule it keeps is that the disk and
+		// chain checks still come before ForgiveOwners, so a block already held is
+		// never handed to another peer.
+		if sm.blockDownloads.RequestedWithin(block.hash, blockRequestRetryInterval) {
+			continue
+		}
+
+		// A block already on disk is not wanted, whatever any index says. This
+		// is what makes a restart free: the files survive it, so a node comes
+		// back and asks only for what it genuinely lacks.
+		if sm.holdsBlock(sm.ctx, block.hash) {
+			// Held on disk but not in the park is a record nothing announced: its
+			// peer was dropped between the write and the on-disk message. Left like
+			// that it is skipped here forever and never drained, which stopped
+			// mainnet at 650,021 on 2026-09-23. Adopt it so the park sweep commits it.
+			// A block being committed has left the park but not the disk: that is in
+			// flight, not stranded, and putting it back would have it read again after
+			// its files are gone.
+			if !sm.blockPark.Has(block.hash) && !sm.dispatcher.inFlight(block.hash) &&
+				sm.blockPark.adoptStranded(sm.ctx, block.hash, sm.subtreeStore) {
+				sm.logger.Warnf("[unownedBlocks][%s] adopted a complete record at height %d that was on disk but not in the park", block.hash, block.height)
+			}
+
+			continue
+		}
+
 		// The blockchain fallback. Disk knows nothing about the chain, so a
 		// block that joined it through some route other than legacy's own
 		// commit path — the block persister, another service entirely — is
@@ -290,10 +303,6 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 			} else if haveInv {
 				continue
 			}
-		}
-
-		if sm.blockDownloads.RequestedWithin(block.hash, blockRequestRetryInterval) {
-			continue
 		}
 
 		sm.blockDownloads.ForgiveOwners(block.hash, blockRequestRetryInterval)
