@@ -1400,6 +1400,73 @@ func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, 
 //
 // The fast-path predicate this used to take as a second argument is gone: see
 // hasCompleteRecord for why the file type is no longer derived from it.
+// adoptRecord indexes a converted record that is already complete on disk, under its parent,
+// charged at its on-disk size. Startup recovery and the download pass's stranded-record
+// adoption share it, so the two cannot disagree about what an adopted entry looks like.
+// It reports false when the block is already indexed.
+func (p *blockPark) adoptRecord(hash chainhash.Hash, record *model.Block, size int64, parkedAt time.Time) bool {
+	recoveredHeight, heightErr := safeconversion.Uint32ToInt32(record.Height)
+	if heightErr != nil {
+		p.logger.Warnf("[blockPark][%s] converted record's height %d will not fit, adopting it without one", hash, record.Height)
+
+		recoveredHeight = 0
+	}
+
+	entry := parkedBlock{hash: hash, prevBlock: *record.Header.HashPrevBlock, height: recoveredHeight, size: size, parkedAt: parkedAt, converted: true}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, held := p.entries[hash]; held {
+		return false
+	}
+
+	stored := entry
+	p.entries[entry.hash] = &stored
+	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+	p.chargeLocked(entry.hash, size)
+	p.setGauges()
+
+	return true
+}
+
+// adoptStranded indexes a complete converted record that is on disk but not in the park. A
+// record can reach disk with nothing announcing it: the peer that wrote it can be disconnected
+// between the write and the on-disk message that admits it, and then only a restart's recovery
+// scan would ever find it. Until then the download pass saw the block as held and never asked
+// for it, and the drain never offered it, so the chain stopped at its parent for good. It
+// reports whether it adopted the record; a record that is unreadable or missing a subtree file
+// is left to holdsBlock, which then answers false so the block is downloaded again.
+func (p *blockPark) adoptStranded(ctx context.Context, hash chainhash.Hash, subtreeStore blob.Store) bool {
+	if p == nil || p.Has(hash) {
+		return false
+	}
+
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	record, err := p.ReadConverted(readCtx, hash)
+	if err != nil || !p.hasCompleteRecord(readCtx, hash, record, subtreeStore) {
+		return false
+	}
+
+	size := int64(0)
+	parkedAt := time.Now()
+
+	if info, statErr := os.Stat(filepath.Join(p.dir, hash.String()+"."+string(fileformat.FileTypeBlock))); statErr == nil {
+		size = info.Size() - int64(fileformat.Header{}.Size())
+		if size < 0 {
+			size = 0
+		}
+
+		if mod := info.ModTime(); !mod.IsZero() && !mod.After(parkedAt) {
+			parkedAt = mod
+		}
+	}
+
+	return p.adoptRecord(hash, record, size, parkedAt)
+}
+
 func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store) {
 	if p == nil {
 		return
@@ -1560,22 +1627,7 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store) {
 			// quick-validation test. Dropping it here is not cosmetic: it is the
 			// same height the drain logs and reasons about for every other entry,
 			// and a recovered entry that never got one would be the one exception.
-			recoveredHeight, heightErr := safeconversion.Uint32ToInt32(record.Height)
-			if heightErr != nil {
-				p.logger.Warnf("[blockPark][%s] converted record's height %d will not fit, adopting it without one", hash, record.Height)
-
-				recoveredHeight = 0
-			}
-
-			entry := parkedBlock{hash: *hash, prevBlock: *record.Header.HashPrevBlock, height: recoveredHeight, size: size, parkedAt: parkedAt, converted: true}
-
-			p.mu.Lock()
-			stored := entry
-			p.entries[entry.hash] = &stored
-			p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
-			p.chargeLocked(entry.hash, size)
-			p.setGauges()
-			p.mu.Unlock()
+			p.adoptRecord(*hash, record, size, parkedAt)
 
 			adopted++
 			adoptedBytes += size
