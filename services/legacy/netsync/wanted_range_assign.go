@@ -216,7 +216,11 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 			// peer was dropped between the write and the on-disk message. Left like
 			// that it is skipped here forever and never drained, which stopped
 			// mainnet at 650,021 on 2026-09-23. Adopt it so the park sweep commits it.
-			if !sm.blockPark.Has(block.hash) && sm.blockPark.adoptStranded(sm.ctx, block.hash, sm.subtreeStore) {
+			// A block being committed has left the park but not the disk: that is in
+			// flight, not stranded, and putting it back would have it read again after
+			// its files are gone.
+			if !sm.blockPark.Has(block.hash) && !sm.dispatcher.inFlight(block.hash) &&
+				sm.blockPark.adoptStranded(sm.ctx, block.hash, sm.subtreeStore) {
 				sm.logger.Warnf("[unownedBlocks][%s] adopted a complete record at height %d that was on disk but not in the park", block.hash, block.height)
 			}
 

@@ -1430,6 +1430,11 @@ func (p *blockPark) adoptRecord(hash chainhash.Hash, record *model.Block, size i
 	return true
 }
 
+// strandedRecordAge is how long a record must sit on disk unannounced before the download pass
+// treats it as stranded. A normal record is announced within milliseconds of being written, so
+// a minute is far past any honest gap and still recovers a stranded one within a minute.
+const strandedRecordAge = time.Minute
+
 // adoptStranded indexes a complete converted record that is on disk but not in the park. A
 // record can reach disk with nothing announcing it: the peer that wrote it can be disconnected
 // between the write and the on-disk message that admits it, and then only a restart's recovery
@@ -1445,24 +1450,25 @@ func (p *blockPark) adoptStranded(ctx context.Context, hash chainhash.Hash, subt
 	readCtx, cancel := p.storeCtx(ctx)
 	defer cancel()
 
+	// Only a record that has sat unannounced is stranded. One written a moment ago has its
+	// announcement on the way, and adopting it first makes the announcement skip scheduling the
+	// drain. A record whose file cannot be stat'ed is left alone for the same reason.
+	info, statErr := os.Stat(filepath.Join(p.dir, hash.String()+"."+string(fileformat.FileTypeBlock)))
+	if statErr != nil || time.Since(info.ModTime()) < strandedRecordAge {
+		return false
+	}
+
 	record, err := p.ReadConverted(readCtx, hash)
 	if err != nil || !p.hasCompleteRecord(readCtx, hash, record, subtreeStore) {
 		return false
 	}
 
-	size := int64(0)
-	parkedAt := time.Now()
-
-	if info, statErr := os.Stat(filepath.Join(p.dir, hash.String()+"."+string(fileformat.FileTypeBlock))); statErr == nil {
-		size = info.Size() - int64(fileformat.Header{}.Size())
-		if size < 0 {
-			size = 0
-		}
-
-		if mod := info.ModTime(); !mod.IsZero() && !mod.After(parkedAt) {
-			parkedAt = mod
-		}
+	size := info.Size() - int64(fileformat.Header{}.Size())
+	if size < 0 {
+		size = 0
 	}
+
+	parkedAt := info.ModTime()
 
 	return p.adoptRecord(hash, record, size, parkedAt)
 }
