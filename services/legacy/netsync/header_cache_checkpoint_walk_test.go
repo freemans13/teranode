@@ -500,3 +500,30 @@ func TestCheckpointWalk_MaybeRequestMoreHeadersRetriesAsABackstopWithRunwayToSpa
 	require.True(t, WaitUntil(func() bool { return headers.count() > 0 }, 5*time.Second),
 		"a below-checkpoint walk far short of its checkpoint must still be retried even with plenty of download runway already cached")
 }
+
+// A reply that links to neither anchor is not a statement about the heights it would occupy if
+// it did, so it can never contradict a checkpoint. The classification used to key every batch
+// as if it began at the committed tip plus one; a stale reply starting lower then had one of its
+// honest headers read as the header at a checkpoint height, and the peer was disconnected for
+// lying. On 2026-09-23 that disconnected mainnet's sync peer at height 650,000 mid-way through
+// delivering block 650,022, whose record was stranded on disk and stopped the chain.
+func TestCheckpointWalk_UnlinkedReplyOverAPinnedHeightIsNotALie(t *testing.T) {
+	sm := newRaceManager(t)
+
+	mockCommittedTip(t, sm, 0, 0)
+
+	// A pinned checkpoint at height 3, inside the range a four-header batch would occupy if it
+	// were keyed from the tip.
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = []chaincfg.Checkpoint{{Height: 3, Hash: &chainhash.Hash{0x99}}}
+	sm.chainParams = &params
+	sm.headerCache = newHeaderCache().WithCheckpoints(params.Checkpoints)
+
+	peer, _, _ := demotionPeer(t, sm, 232, 1000)
+
+	// Honest headers about some other point in the chain: their parent is not the tip.
+	stray, _ := linkedRun(chainhash.Hash{0x55}, 4)
+
+	require.False(t, sm.fillHeaderCache(peer, headersMsgOf(t, stray)))
+	require.True(t, peer.Connected(), "a reply that does not start at the tip says nothing about the checkpoint height")
+}
