@@ -213,7 +213,13 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 	tx.SetTxHash(txHash)
 
 	if b.dedup != nil {
-		if err := b.dedup.Put(*txHash, uint64(b.dedup.Length())); err != nil {
+		// The value is this transaction's position after the coinbase. It is b.seen-1 and not
+		// b.dedup.Length(): the two are always equal here, because the coinbase is counted in
+		// seen but never put, every put precedes the seen++ below, and a failure between them
+		// kills the builder so no later put can see them apart. Length() on the split map sums
+		// 1,025 bucket counts on every call, which is once per transaction; on mainnet that was
+		// a fifth of teranode's CPU.
+		if err := b.dedup.Put(*txHash, uint64(b.seen-1)); err != nil { //nolint:gosec // seen is at least 1 here
 			// go-tx-map's own in-memory implementations wrap their exported
 			// sentinel txmap.ErrHashAlreadyExists (tx_map.go:132) with %w, so
 			// errors.Is unwraps it correctly — confirmed against the pinned

@@ -256,3 +256,35 @@ func TestBlockStreamBuilder_DropsEachSubtreeAfterEmitting(t *testing.T) {
 	require.Nil(t, b.currentData, "and its transaction data with it")
 	require.Nil(t, b.currentMeta, "and its inpoint metadata with it")
 }
+
+// TestBlockStreamBuilder_RecordsEachTransactionAtItsPositionInTheBlock pins the value the
+// duplicate map stores for each transaction: its position after the coinbase, 0 for the first.
+// The builder used to read the map's size to get it, which for the split map sums 1,025 bucket
+// counts on every transaction and cost a fifth of teranode's CPU on mainnet; it now reads its own
+// count of transactions seen. The two must agree, and this is what says so.
+func TestBlockStreamBuilder_RecordsEachTransactionAtItsPositionInTheBlock(t *testing.T) {
+	const txCount = 40
+
+	dedup := newDedupMap(txCount)
+
+	b, err := newBlockStreamBuilder(txCount, 8, coinbaseTx(t), func(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) error {
+		return nil
+	}, dedup)
+	require.NoError(t, err)
+
+	hashes := make([]chainhash.Hash, 0, txCount-1)
+
+	for i := 1; i < txCount; i++ {
+		tx, hash := streamTx(t, i)
+		require.NoError(t, b.AddTx(tx, hash))
+		hashes = append(hashes, *hash)
+	}
+
+	require.Equal(t, txCount-1, dedup.Length(), "every transaction but the coinbase is recorded")
+
+	for i, h := range hashes {
+		got, ok := dedup.Get(h)
+		require.True(t, ok)
+		require.Equal(t, uint64(i), got, "transaction %d is recorded at its position after the coinbase", i+1)
+	}
+}
