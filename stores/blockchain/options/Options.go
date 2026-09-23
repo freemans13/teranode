@@ -105,7 +105,9 @@ func WithInvalid(b bool) StoreBlockOption {
 }
 
 // WithID creates an option that sets the ID field.
-// This option specifies the unique identifier for a block.
+// This option specifies the unique identifier for a block. For any block other
+// than genesis the id must be the one AssignBlockID reserved for the block's
+// hash; the store refuses any other id (see blockchain.Store.StoreBlock).
 //
 // Parameters:
 //   - id: Integer value to set for ID field

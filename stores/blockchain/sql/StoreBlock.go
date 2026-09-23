@@ -430,6 +430,15 @@ func (s *SQL) storeBlock(ctx context.Context, block *model.Block, peerID string,
 		return 0, 0, nil, false, errors.NewInvalidArgumentError("genesis block cannot have custom ID")
 	}
 
+	// A caller-chosen id must be the one reserved for this hash, because the
+	// block's transactions may already carry it in the UTXO store. See
+	// checkCallerSuppliedBlockID for the rules and the swept-reservation case.
+	if useCustomID && !genesis {
+		if err := s.checkCallerSuppliedBlockID(ctx, block.Hash(), storeBlockOptions.ID); err != nil {
+			return 0, 0, nil, false, err
+		}
+	}
+
 	if genesis {
 		// genesis block - use ID=0 if specified, otherwise auto-increment
 		if storeBlockOptions.ID == 0 {

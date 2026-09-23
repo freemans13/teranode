@@ -192,8 +192,16 @@ func TestCheckBlockIsInCurrentChain_InMemory_PhantomBelowMaxID(t *testing.T) {
 
 	// Commit block2 under a high explicit id, leaving a large gap of non-existent
 	// ids below maxBlockID (simulating an orphaned/phantom id-sequence gap).
+	// The gap stands for ids the sequence issued but no block kept. A
+	// caller-supplied id must be reserved, so move the sequence up and reserve.
 	const highID = 100000
-	committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(highID))
+	_, err = s.db.ExecContext(context.Background(), `UPDATE sqlite_sequence SET seq = $1 WHERE name = 'blocks'`, highID-1)
+	require.NoError(t, err)
+	reserved, err := s.AssignBlockID(context.Background(), block2.Hash())
+	require.NoError(t, err)
+	require.Equal(t, uint64(highID), reserved)
+
+	committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(reserved))
 	require.NoError(t, err)
 	require.Equal(t, uint64(highID), committed)
 

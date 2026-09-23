@@ -4253,6 +4253,12 @@ func TestBlockValidation_SetMined_UpdatesTxMeta(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	// A pre-assigned block id must be the one reserved for the hash; the store
+	// refuses any other. On a fresh store the first reservation is id 1.
+	reservedID, err := blockchainClient.AssignBlockID(ctx, block.Hash())
+	require.NoError(t, err)
+	require.Equal(t, uint64(block.ID), reservedID)
+
 	blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, subtreeStore, txStore, txMetaStore, nil, subtreeValidationClient)
 	err = blockValidation.ValidateBlock(context.Background(), block, "test")
 	require.NoError(t, err, "Block should be valid")

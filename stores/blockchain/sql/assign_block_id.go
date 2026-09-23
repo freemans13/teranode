@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -159,4 +160,134 @@ func (s *SQL) blockIDByHash(ctx context.Context, blockHash *chainhash.Hash) (uin
 		return 0, false, errors.NewStorageError("failed to look up block id by hash", err)
 	}
 	return id, true, nil
+}
+
+// checkCallerSuppliedBlockID decides whether StoreBlock may write a blocks row
+// under an id the caller chose (options.WithID) rather than one the INSERT
+// allocates. Quick validation reserves an id with AssignBlockID, stamps the
+// block's transactions with it in the UTXO store, and only then asks for the
+// blocks row. The UTXO store is a separate database, so nothing but this check
+// stops a row landing under an id that another block's transactions already
+// carry, or under an id the sequence will hand out later.
+//
+// The rules, in order:
+//   - The hash already has a blocks row: pass, so the INSERT fails with the
+//     same "block already exists" error it returned before this check existed.
+//     Callers that retry an AddBlock whose first attempt landed rely on that.
+//   - Another hash already has a blocks row under the id: refuse.
+//   - The hash has a reservation: the id must equal it.
+//   - The hash has no reservation: the id must not be reserved by another hash,
+//     and the sequence must already have issued it.
+//
+// The last rule exists because sweepStaleReservations deletes reservations older
+// than staleReservationSweepAge. A block retried after a long outage reads its id
+// back from its own transactions in the UTXO store and arrives with no
+// reservation row. Refusing it would leave that block unable to commit at all.
+//
+// The check runs under slowPathMu but outside the INSERT's transaction. That is
+// enough: a reservation is written once per hash and only ever deleted, and ids
+// come from a sequence, so nothing can make a refused id acceptable or an accepted
+// id taken between the check and the INSERT, other than the INSERT's own unique
+// constraints, which still apply.
+func (s *SQL) checkCallerSuppliedBlockID(ctx context.Context, blockHash *chainhash.Hash, id uint64) error {
+	if _, committed, err := s.blockIDByHash(ctx, blockHash); err != nil {
+		return err
+	} else if committed {
+		return nil
+	}
+
+	// Another block already committed under this id. The INSERT would fail on
+	// the primary key, but parseSQLError reports any unique violation as "block
+	// already exists", which legacy sync treats as success, so the block would be
+	// dropped with no row. Refuse it here with an error that says what happened.
+	var owner []byte
+
+	err := s.db.QueryRowContext(ctx, `SELECT hash FROM blocks WHERE id = $1`, id).Scan(&owner)
+	if err == nil {
+		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: block %s is already stored under it", blockHash.String(), id, hashString(owner))
+	}
+
+	if !errors.Is(err, sql.ErrNoRows) {
+		return errors.NewStorageError("[StoreBlock][%s] failed to look up the block stored under id %d", blockHash.String(), id, err)
+	}
+
+	reserved, ok, err := s.durableReservationID(ctx, blockHash)
+	if err != nil {
+		return err
+	}
+
+	if ok {
+		if reserved != id {
+			return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: the id reserved for this block is %d", blockHash.String(), id, reserved)
+		}
+
+		return nil
+	}
+
+	var holder []byte
+
+	err = s.db.QueryRowContext(ctx, `SELECT hash FROM block_id_reservations WHERE block_id = $1 LIMIT 1`, id).Scan(&holder)
+	if err == nil {
+		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: it is reserved for block %s", blockHash.String(), id, hashString(holder))
+	}
+
+	if !errors.Is(err, sql.ErrNoRows) {
+		return errors.NewStorageError("[StoreBlock][%s] failed to look up the reservation holding block id %d", blockHash.String(), id, err)
+	}
+
+	highest, err := s.highestIssuedBlockID(ctx)
+	if err != nil {
+		return err
+	}
+
+	if id > highest {
+		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: the id sequence has only issued up to %d and this block has no reservation", blockHash.String(), id, highest)
+	}
+
+	return nil
+}
+
+// hashString renders a hash column for an error message, falling back to hex
+// when the bytes are not a 32-byte hash.
+func hashString(b []byte) string {
+	h, err := chainhash.NewHash(b)
+	if err != nil {
+		return fmt.Sprintf("%x", b)
+	}
+
+	return h.String()
+}
+
+// highestIssuedBlockID returns the largest block id the id sequence has handed
+// out so far, whether through GetNextBlockID, AssignBlockID or an auto-increment
+// INSERT. Every honest caller-supplied id came from that sequence, so an id above
+// this value was never issued. It reads the sequence without advancing it.
+func (s *SQL) highestIssuedBlockID(ctx context.Context) (uint64, error) {
+	var (
+		q       string
+		highest sql.NullInt64
+	)
+
+	if s.engine == util.Postgres {
+		// pg_sequence_last_value returns NULL until the first nextval.
+		q = `SELECT pg_sequence_last_value(pg_get_serial_sequence('blocks', 'id')::regclass)`
+	} else {
+		// AUTOINCREMENT keeps seq at the largest rowid ever used, and
+		// getNextBlockIdFromSQLite advances it directly.
+		q = `SELECT seq FROM sqlite_sequence WHERE name = 'blocks'`
+	}
+
+	if err := s.db.QueryRowContext(ctx, q).Scan(&highest); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+
+		return 0, errors.NewStorageError("failed to read the highest issued block id", err)
+	}
+
+	if !highest.Valid || highest.Int64 < 0 {
+		return 0, nil
+	}
+
+	return uint64(highest.Int64), nil
 }

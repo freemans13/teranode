@@ -212,6 +212,10 @@ type Store interface {
 	//   - block: Block to store
 	//   - peerID: ID of the peer that provided the block
 	//   - opts: Optional store block options
+	// An id passed with options.WithID must be the one AssignBlockID reserved for
+	// the block's hash. If the reservation is gone (swept by age), the id must not
+	// be reserved for another hash and must already have been issued by the id
+	// sequence. Otherwise StoreBlock returns a StorageError and writes no row.
 	// Returns: Block ID, height, and any error encountered
 	StoreBlock(ctx context.Context, block *model.Block, peerID string, opts ...options.StoreBlockOption) (ID uint64, height uint32, err error)
 
