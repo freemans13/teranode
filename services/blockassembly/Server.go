@@ -192,9 +192,29 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, txStore blob.Store
 //   - error: Any error encountered during health check
 func (ba *BlockAssembly) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	if checkLiveness {
-		// Add liveness checks here. Don't include dependency checks.
-		// If the service is stuck return http.StatusServiceUnavailable
-		// to indicate a restart is needed
+		// Liveness answers one question: is this service WEDGED, such that a
+		// restart is the only way out? It must never fail for a dependency
+		// being down (that is readiness) nor for the node simply being idle —
+		// a spurious restart of a healthy node is worse than the stall this
+		// exists to catch, which is why the timeout is opt-in and defaults to
+		// disabled (issue 1447).
+		if ba.blockAssembler != nil {
+			stallTimeout := ba.settings.BlockAssembly.LivenessStallTimeout
+			if age, stalled := ba.blockAssembler.heartbeat.Stalled(stallTimeout); stalled {
+				// The state names the select case the loop is stuck in
+				// (resetting, reorging, reconciling, ...). The 503 body lands
+				// nested in the daemon's aggregate JSON, which the kubelet event
+				// truncates, so the same line goes to the log as well: it is the
+				// trace an operator reads after the restart.
+				state := StateStrings[ba.blockAssembler.GetCurrentRunningState()]
+				msg := fmt.Sprintf("block assembly main loop has not made progress for %s (limit %s, state %s)", age, stallTimeout, state)
+
+				ba.logger.Warnf("[BlockAssembly][Health] liveness failing: %s", msg)
+
+				return http.StatusServiceUnavailable, msg, nil
+			}
+		}
+
 		return http.StatusOK, "OK", nil
 	}
 
@@ -312,6 +332,11 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 				// stall-state computation, and its unit tests mock only the reads
 				// that computation makes.
 				prometheusBlockAssemblyQueueHeadAge.Set(ba.blockAssembler.QueueHeadAge().Seconds())
+
+				// Published whether or not the liveness timeout is set, so an
+				// operator can measure the worst case the documented rollout asks
+				// for before choosing a timeout.
+				prometheusBlockAssemblerLivenessHeartbeatAge.Set(ba.blockAssembler.heartbeat.Age().Seconds())
 			}
 		}
 	}()
