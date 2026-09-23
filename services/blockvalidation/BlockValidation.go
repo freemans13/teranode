@@ -1134,8 +1134,10 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 					// passes that point the DAH sweeper has already deleted the file and this
 					// block can never satisfy subtreeFilesReady - it is stuck, not merely slow,
 					// and Warn every minute forever for it would be noise. Below that height a
-					// missing file is still the expected, resolving case (e.g. optimistic-mining
-					// background validation still running), so Warn is right.
+					// missing file is unexpected (every path that reaches here writes its
+					// subtree files before the block itself is even added - see
+					// subtreeFilesReady), so it is still worth a Warn: most likely a transient
+					// storage error, or a write genuinely still in flight.
 					logf := u.logger.Warnf
 					if haveHeight && currentHeight > block.Height+u.subtreeBlockHeightRetention {
 						logf = u.logger.Debugf
@@ -1163,10 +1165,9 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 // callers that reach updateSubtreesDAH directly (ValidateBlock, its optimistic-mining background
 // goroutine, and quick-validation's commitBlock) do not need it because they call immediately
 // after their own validation has confirmed the subtrees - an extra Exists check there would cost
-// a syscall per subtree per block for no new information. The sweep has no such guarantee: a
-// block can sit at subtrees_set=false while optimistic-mining background validation is still
-// writing files, and the sweep runs on its own ticker, including after a restart that lost any
-// in-memory marker of validation-in-progress.
+// a syscall per subtree per block for no new information. The sweep has no such guarantee: it
+// runs on its own ticker, including after a restart, independently of whatever put the block at
+// subtrees_set=false.
 //
 // This restores a guarantee PR #506 ("make block persister the authority for permanent file
 // promotion") removed as a side effect: before that PR, updateSubtreesDAH looped over
@@ -1176,6 +1177,18 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 // subtrees_set=true is what setMined (and, soon, p2p block announcement) trust as proof the files
 // exist, so do not remove this on the assumption updateSubtreesDAH still guards it - it no longer
 // does.
+//
+// This is a defensive backstop, not a gate on background validation: every path that inserts a
+// non-invalid block with subtrees_set=false (ValidateBlock, both optimistic and not; the
+// legacy-sync route, which is always non-optimistic; block-assembly's own insert) writes the
+// subtree files synchronously, BEFORE the block is added, so they are normally already present
+// the instant the sweep would see the block. What optimistic mining defers to a background
+// goroutine is the later, heavier block.Valid() consensus check, not subtree file writing - so a
+// missing file here almost always means a genuine anomaly (crash mid-write, storage error,
+// expired retention), not "still validating." See the KNOWN LIMITATION note on updateSubtreesDAH
+// for the real, still-open gap this does NOT close: the sweep can still set subtrees_set true
+// while block.Valid() is running in the background, because the files it checks already exist by
+// then.
 func (u *BlockValidation) subtreeFilesReady(ctx context.Context, block *model.Block) (ready bool, missing int, err error) {
 	for _, hash := range block.Subtrees {
 		exists, existsErr := u.subtreeStore.Exists(ctx, hash[:], fileformat.FileTypeSubtree)
@@ -3307,6 +3320,18 @@ func (u *BlockValidation) quickValidateOutpointOnly(block *model.Block) bool {
 // PRECONDITION: the caller must already know every file the block's Subtrees hashes name
 // exists in subtreeStore - this function no longer checks that itself. See subtreeFilesReady
 // for why, and for the PR #506 history behind that precondition.
+//
+// KNOWN LIMITATION: "files exist" is not "block.Valid() has finished." Under optimistic mining
+// the subtree files are already on disk (written before the block is even added - see
+// subtreeFilesReady) while the heavier block.Valid() consensus check still runs in a background
+// goroutine, so the periodic sweep (processSubtreesNotSet) can satisfy subtreeFilesReady and call
+// in here - setting subtrees_set true and firing setMined - before that background check
+// completes, exactly as it could before PR #506. Neither existing in-memory tracking set covers
+// that window: blockHashesCurrentlyValidated only tracks setMined finalization, and
+// blocksCurrentlyValidating's entry for a block is deleted ~100ms after ValidateBlockWithOptions
+// returns, which under optimistic mining happens right after the block is added, well before
+// block.Valid() in the background goroutine returns. Closing this gap needs a new marker
+// spanning that goroutine's lifetime; this PR does not add one.
 //
 // Parameters:
 //   - ctx: Context for the operation

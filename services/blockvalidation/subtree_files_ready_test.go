@@ -26,9 +26,10 @@ import (
 // blockchain store and a real in-memory blob store (no mocks, per AGENTS.md), plus a
 // block chained from genesis with subtreeCount fake subtree hashes, added with
 // addBlockOpts (subtrees_set=false either way, since none of the tests below pass
-// WithSubtreesSet). With no options this mirrors an ordinary peer block landing in the
-// store before its background validation (optimistic mining) has finished writing
-// subtree files; WithInvalid(true) mirrors storeInvalidBlock's record of a rejected one.
+// WithSubtreesSet). With no options this mirrors an ordinary peer block the instant it
+// lands in the store - every path writes its subtree files before adding the block, so
+// this is the same state a real block is in whether or not its files happen to exist yet;
+// WithInvalid(true) mirrors storeInvalidBlock's record of a rejected one.
 //
 // The BlockValidation is built as a bare struct, not via NewBlockValidation, so that
 // start()'s background goroutines (setMined worker, periodic ticker) never run - this
@@ -158,8 +159,9 @@ func TestProcessSubtreesNotSet_SetsFlagOnceFilesExist(t *testing.T) {
 func TestProcessSubtreesNotSet_LeavesFlagFalseWhenOneFileMissing(t *testing.T) {
 	bv, block, subtreeStore, ctx := newSubtreesNotSetHarness(t, 2)
 
-	// Only the first subtree file is written; the second is still missing, as if the
-	// block's background validation goroutine had not finished writing it yet.
+	// Only the first subtree file is written; the second is missing, e.g. a partial write
+	// or a storage hiccup - see subtreeFilesReady for why a missing file is normally this
+	// kind of anomaly rather than "still validating."
 	require.NoError(t, subtreeStore.Set(ctx, block.Subtrees[0][:], fileformat.FileTypeSubtree, []byte("subtree-bytes")))
 
 	runSweep(ctx, bv)
@@ -176,7 +178,8 @@ func TestProcessSubtreesNotSet_SetsFlagOnLaterSweepOnceFileAppears(t *testing.T)
 	runSweep(ctx, bv)
 	require.False(t, subtreesSetFlag(t, ctx, bv, block.Hash()), "sanity: still false before the second file appears")
 
-	// The second file lands, as if the background validation goroutine finished.
+	// The second file lands, e.g. the earlier storage hiccup resolves or the file is
+	// rewritten.
 	require.NoError(t, subtreeStore.Set(ctx, block.Subtrees[1][:], fileformat.FileTypeSubtree, []byte("subtree-bytes")))
 
 	runSweep(ctx, bv)
