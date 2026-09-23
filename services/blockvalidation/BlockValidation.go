@@ -2446,8 +2446,17 @@ func (u *BlockValidation) markBlockAsInvalid(ctx context.Context, block *model.B
 func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Block, peerID string, peerURL string, reason string) {
 	u.logger.Warnf("[ValidateBlock][%s] storing block as invalid: %s", block.Hash().String(), reason)
 
-	// Store the block marked as invalid so we have a record of it
-	if storeErr := u.blockchainClient.AddBlock(ctx, block, peerID, blockchainoptions.WithInvalid(true)); storeErr != nil {
+	// Store the block marked as invalid so we have a record of it. A block that
+	// already had an id reserved (quick validation, or legacy sync handing one
+	// over) may have transactions stamped with that id in the UTXO store, so the
+	// row must be written under it. Without WithID the store would allocate a
+	// fresh id and those transactions would point at an id with no blocks row.
+	storeOpts := []blockchainoptions.StoreBlockOption{blockchainoptions.WithInvalid(true)}
+	if block.ID != 0 {
+		storeOpts = append(storeOpts, blockchainoptions.WithID(uint64(block.ID)))
+	}
+
+	if storeErr := u.blockchainClient.AddBlock(ctx, block, peerID, storeOpts...); storeErr != nil {
 		u.logger.Errorf("[ValidateBlock][%s] failed to store invalid block: %v", block.Hash().String(), storeErr)
 	} else {
 		// Update cache to reflect that block exists
