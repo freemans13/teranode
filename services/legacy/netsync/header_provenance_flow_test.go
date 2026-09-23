@@ -182,7 +182,7 @@ func TestHeaderProvenance_ContradictedCheckpointDisconnects(t *testing.T) {
 
 	require.False(t, sm.fillHeaderCache(p, msg))
 	require.Zero(t, sm.headerCache.Len(), "a refused batch must not be cached")
-	require.NotNil(t, sm.contradictedCheckpoint(1, forged), "the refusal must be attributable to the checkpoint, not to linkage")
+	require.NotNil(t, sm.contradictedCheckpoint(1, genesis, forged), "the refusal must be attributable to the checkpoint, not to linkage")
 }
 
 // The proof reaches HandleBlockDirect and changes the route the block takes, and
