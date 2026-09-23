@@ -189,16 +189,21 @@ func NewSettings(alternativeContext ...string) *Settings {
 			OverloadRetryMaxBackoff:         getDuration("aerospike_overload_retry_max_backoff", 5*time.Second, alternativeContext...),
 		},
 		Alert: AlertSettings{
-			GenesisKeys:   getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
-			P2PPrivateKey: getString("alert_p2p_private_key", "", alternativeContext...),
-			ProtocolID:    getString("alert_protocol_id", "/bitcoin/alert-system/1.0.0", alternativeContext...),
-			StoreURL:      getURL("alert_store", "sqlite:///alert", alternativeContext...),
-			TopicName:     getString("alert_topic_name", "bitcoin_alert_system", alternativeContext...),
-			P2PPort:       getPort("ALERT_P2P_PORT", 9908, alternativeContext...),
+			GenesisKeys:              getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
+			P2PPrivateKey:            getString("alert_p2p_private_key", "", alternativeContext...),
+			ProtocolID:               getString("alert_protocol_id", "/bitcoin/alert-system/1.0.0", alternativeContext...),
+			StoreURL:                 getURL("alert_store", "sqlite:///alert", alternativeContext...),
+			TopicName:                getString("alert_topic_name", "bitcoin_alert_system", alternativeContext...),
+			P2PPort:                  getPort("ALERT_P2P_PORT", 9908, alternativeContext...),
+			P2PBootstrapPeer:         getString("alert_p2p_bootstrap_peer", "", alternativeContext...),
+			P2PAllowPrivateIPs:       getBool("alert_p2p_allow_private_ips", false, alternativeContext...),
+			P2PPeerDiscoveryInterval: getDuration("alert_p2p_peer_discovery_interval", 10*time.Minute, alternativeContext...),
+			P2PDHTMode:               getString("alert_p2p_dht_mode", "client", alternativeContext...),
 		},
 		Asset: AssetSettings{
 			APIPrefix:               getString("asset_apiPrefix", "/api/v1", alternativeContext...),
 			CentrifugeListenAddress: getString("asset_centrifugeListenAddress", ":8892", alternativeContext...),
+			CentrifugeAllowOrigins:  getString("asset_centrifugeAllowOrigins", "", alternativeContext...),
 			CentrifugeDisable:       getBool("asset_centrifuge_disable", false, alternativeContext...),
 			HTTPAddress:             getString("asset_httpAddress", "http://localhost:8090/api/v1", alternativeContext...),
 			HTTPPublicAddress:       getString("asset_httpPublicAddress", "", alternativeContext...),
@@ -242,14 +247,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GetAndValidateSubtreesConcurrency:     getInt("block_getAndValidateSubtreesConcurrency", -1, alternativeContext...),
 			KafkaWorkers:                          getInt("block_kafkaWorkers", 0, alternativeContext...),
 			ValidOrderAndBlessedConcurrency:       getInt("block_validOrderAndBlessedConcurrency", -1, alternativeContext...),
-			MaxSize:                               getInt("blockmaxsize", 4294967296, alternativeContext...),
 			BlockStore:                            getURL("blockstore", "file://./data/blockstore", alternativeContext...),
 			FailFastValidation:                    getBool("blockvalidation_fail_fast_validation", true, alternativeContext...),
 			FinalizeBlockValidationConcurrency:    getInt("blockvalidation_finalizeBlockValidationConcurrency", 8, alternativeContext...),
 			GetMissingTransactions:                getInt("blockvalidation_getMissingTransactions", 32, alternativeContext...),
 			QuorumTimeout:                         getDuration("block_quorum_timeout", 10*time.Second, alternativeContext...),
 			ProcessTxMetaUsingStoreBatchSize:      getInt("blockvalidation_processTxMetaUsingStore_BatchSize", 1024, alternativeContext...),
-			UTXOPersisterBufferSize:               getString("utxoPersister_buffer_size", "64KB", alternativeContext...),
+			UTXOPersisterBufferSize:               getString("utxoPersister_buffer_size", "256KB", alternativeContext...),
 			UTXOPersisterDirect:                   getBool("direct", true, alternativeContext...),
 			TxStore:                               getURL("txstore", "", alternativeContext...),
 			UtxoStore:                             getURL("txmeta_store", "", alternativeContext...),
@@ -260,15 +264,15 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ParentSpendsCapacityMultiplier:        getUint64("block_parentSpendsCapacityMultiplier", 2, alternativeContext...),
 		},
 		BlockPersister: BlockPersisterSettings{
-			Store:                    getURL("blockpersister_store", "file://./data/blockstore", alternativeContext...),
-			HTTPListenAddress:        getString("blockpersister_httpListenAddress", ":8083", alternativeContext...),
-			Concurrency:              getInt("blockpersister_concurrency", 8, alternativeContext...),
-			BatchMissingTransactions: getBool("blockpersister_batchMissingTransactions", true, alternativeContext...),
-			SkipUTXODelete:           getBool("blockpersister_skipUTXODelete", false, alternativeContext...),
-			PersistSleep:             getDuration("blockpersister_persistSleep", 10*time.Second, alternativeContext...),
-			ProcessUTXOFiles:         getBool("blockpersister_processUTXOFiles", true, alternativeContext...),
+			Store:             getURL("blockpersister_store", "file://./data/blockstore", alternativeContext...),
+			HTTPListenAddress: getString("blockpersister_httpListenAddress", ":8083", alternativeContext...),
+			Concurrency:       getInt("blockpersister_concurrency", 8, alternativeContext...),
+			SkipUTXODelete:    getBool("blockpersister_skipUTXODelete", false, alternativeContext...),
+			PersistSleep:      getDuration("blockpersister_persistSleep", 10*time.Second, alternativeContext...),
+			ProcessUTXOFiles:  getBool("blockpersister_processUTXOFiles", true, alternativeContext...),
 		},
 		BlockAssembly: BlockAssemblySettings{
+			LivenessStallTimeout:                 getDuration("blockassembly_livenessStallTimeout", 0, alternativeContext...),
 			Disabled:                             getBool("blockassembly_disabled", false, alternativeContext...),
 			GenerateTipWaitTimeout:               getDuration("blockassembly_generateTipWaitTimeout", DefaultGenerateTipWaitTimeout, alternativeContext...),
 			GRPCAddress:                          getString("blockassembly_grpcAddress", "localhost:8085", alternativeContext...),
@@ -316,22 +320,27 @@ func NewSettings(alternativeContext ...string) *Settings {
 			IdleSleepDuration:                    getDuration("blockassembly_idle_sleep_duration", 10*time.Millisecond, alternativeContext...),
 			MaxQueueItems:                        getInt64("blockassembly_maxQueueItems", 0, alternativeContext...),
 			QueueFullWaitTimeout:                 getDuration("blockassembly_queueFullWaitTimeout", 100*time.Millisecond, alternativeContext...),
+			TxMapDirs:                            getMultiString("blockassembly_txMapDirs", "|", []string{}, alternativeContext...),
 		},
 
 		BlockChain: BlockChainSettings{
-			GRPCAddress:           getString("blockchain_grpcAddress", "localhost:8087", alternativeContext...),
-			GRPCListenAddress:     getString("blockchain_grpcListenAddress", ":8087", alternativeContext...),
-			HTTPListenAddress:     getString("blockchain_httpListenAddress", ":8082", alternativeContext...),
-			MaxRetries:            getInt("blockchain_maxRetries", 3, alternativeContext...),
-			RetrySleep:            getInt("blockchain_retrySleep", 1000, alternativeContext...),
-			StoreURL:              getURL("blockchain_store", "sqlite:///blockchain", alternativeContext...),
-			FSMStateRestore:       getBool("fsm_state_restore", false, alternativeContext...),
-			FSMStateChangeDelay:   getDuration("fsm_state_change_delay", 0, alternativeContext...),
-			StoreDBTimeoutMillis:  getInt("blockchain_store_dbTimeoutMillis", DefaultBlockchainStoreDBTimeoutMillis, alternativeContext...),
-			InitializeNodeInState: strings.TrimSpace(getString("blockchain_initializeNodeInState", "", alternativeContext...)),
-			PostgresPool:          getPostgresPoolSettings("blockchain", alternativeContext...),
-			UseInMemoryChainCheck: getBool("blockchain_use_in_memory_chain_check", false, alternativeContext...),
-			HeartbeatInterval:     getDuration("blockchain_heartbeat_interval", 10*time.Second, alternativeContext...),
+			GRPCAddress:              getString("blockchain_grpcAddress", "localhost:8087", alternativeContext...),
+			GRPCListenAddress:        getString("blockchain_grpcListenAddress", ":8087", alternativeContext...),
+			HTTPListenAddress:        getString("blockchain_httpListenAddress", ":8082", alternativeContext...),
+			MaxRetries:               getInt("blockchain_maxRetries", 3, alternativeContext...),
+			RetrySleep:               getInt("blockchain_retrySleep", 1000, alternativeContext...),
+			StoreURL:                 getURL("blockchain_store", "sqlite:///blockchain", alternativeContext...),
+			FSMStateRestore:          getBool("fsm_state_restore", false, alternativeContext...),
+			FSMStateChangeDelay:      getDuration("fsm_state_change_delay", 0, alternativeContext...),
+			StoreDBTimeoutMillis:     getInt("blockchain_store_dbTimeoutMillis", DefaultBlockchainStoreDBTimeoutMillis, alternativeContext...),
+			InitializeNodeInState:    strings.TrimSpace(getString("blockchain_initializeNodeInState", "", alternativeContext...)),
+			PostgresPool:             getPostgresPoolSettings("blockchain", alternativeContext...),
+			UseInMemoryChainCheck:    getBool("blockchain_use_in_memory_chain_check", false, alternativeContext...),
+			ChainCheckShadowCompare:  getBool("blockchain_chain_check_shadow_compare", true, alternativeContext...),
+			HeartbeatInterval:        getDuration("blockchain_heartbeat_interval", 10*time.Second, alternativeContext...),
+			RawMinerTag:              getBool("blockchain_raw_miner_tag", false, alternativeContext...),
+			PeerRegistryStore:        getURL("blockchain_peerRegistryStore", "", alternativeContext...),
+			PeerRegistrySaveInterval: getDuration("blockchain_peerRegistrySaveInterval", 60*time.Second, alternativeContext...),
 		},
 		BlockValidation: BlockValidationSettings{
 			MaxRetries:                                getInt("blockValidationMaxRetries", 3, alternativeContext...),
@@ -348,6 +357,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ProcessTxMetaUsingStoreBatchSize:          getInt("blockvalidation_processTxMetaUsingStore_BatchSize", 1024, alternativeContext...),
 			ProcessTxMetaUsingStoreConcurrency:        getInt("blockvalidation_processTxMetaUsingStore_Concurrency", max(4, runtime.NumCPU()/2), alternativeContext...),
 			ProcessTxMetaUsingStoreMissingTxThreshold: getInt("blockvalidation_processTxMetaUsingStore_MissingTxThreshold", 1, alternativeContext...),
+			ProcessTxMetaUsingStoreRetries:            getInt("blockvalidation_processTxMetaUsingStore_Retries", 3, alternativeContext...),
 			SkipCheckParentMined:                      getBool("blockvalidation_skipCheckParentMined", false, alternativeContext...),
 			SubtreeFoundChConcurrency:                 getInt("blockvalidation_subtreeFoundChConcurrency", 1, alternativeContext...),
 			SubtreeValidationAbandonThreshold:         getInt("blockvalidation_subtree_validation_abandon_threshold", 1, alternativeContext...),
@@ -401,9 +411,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CircuitBreakerTimeoutSeconds:   getInt("blockvalidation_circuit_breaker_timeout_seconds", 30, alternativeContext...),
 			// Block fetching configuration
 			FetchLargeBatchSize:             getInt("blockvalidation_fetch_large_batch_size", 100, alternativeContext...),
+			MaxIncomingBlockMessageBytes:    int64(getInt("blockvalidation_max_incoming_block_message_bytes", 128*1024*1024, alternativeContext...)),
 			FetchNumWorkers:                 getInt("blockvalidation_fetch_num_workers", 16, alternativeContext...),
 			FetchBufferSize:                 getInt("blockvalidation_fetch_buffer_size", 50, alternativeContext...),
 			SubtreeFetchConcurrency:         getInt("blockvalidation_subtree_fetch_concurrency", 32, alternativeContext...),
+			CatchupPrefetchBudgetBytes:      getInt64("blockvalidation_catchup_prefetch_budget_bytes", 256*1024*1024, alternativeContext...),
 			SubtreeBatchSize:                getInt("blockvalidation_subtree_batch_size", 16, alternativeContext...),
 			ExtendTransactionTimeout:        getDuration("blockvalidation_extend_transaction_timeout", 120*time.Second, alternativeContext...),
 			GetBlockTransactionsConcurrency: getInt("blockvalidation_get_block_transactions_concurrency", 64, alternativeContext...),
@@ -521,21 +533,22 @@ func NewSettings(alternativeContext ...string) *Settings {
 			LockedBatcherTickerIntervalMillis:       getInt("utxostore_lockedBatcherTickerIntervalMillis", 0, alternativeContext...),
 		},
 		P2P: P2PSettings{
-			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),
-			SubtreeTopic:       getString("p2p_subtree_topic", "", alternativeContext...),
-			GRPCAddress:        getString("p2p_grpcAddress", "", alternativeContext...),
-			GRPCListenAddress:  getString("p2p_grpcListenAddress", "localhost:9906", alternativeContext...),
-			HTTPAddress:        getString("p2p_httpAddress", "localhost:9906", alternativeContext...),
-			HTTPListenAddress:  getString("p2p_httpListenAddress", "", alternativeContext...),
-			ListenAddresses:    getMultiString("p2p_listen_addresses", "|", []string{}, alternativeContext...),
-			AdvertiseAddresses: getMultiString("p2p_advertise_addresses", "|", []string{}, alternativeContext...), // This is used to announce the node to the network on a different address than the listen address
-			Port:               getInt("p2p_port", 9905, alternativeContext...),                                   // This is the port that go-p2p-message-bus will listen on (0.0.0.0 and ::)
-			ListenMode:         getString("listen_mode", ListenModeFull, alternativeContext...),
-			PeerID:             getString("p2p_peer_id", "", alternativeContext...),
-			PrivateKey:         getString("p2p_private_key", "", alternativeContext...),
-			RejectedTxTopic:    getString("p2p_rejected_tx_topic", "", alternativeContext...),
-			StaticPeers:        getMultiString("p2p_static_peers", "|", []string{}, alternativeContext...),
-			BootstrapPeers:     getMultiString("p2p_bootstrap_peers", "|", []string{}, alternativeContext...),
+			BlockTopic:          getString("p2p_block_topic", "", alternativeContext...),
+			SubtreeTopic:        getString("p2p_subtree_topic", "", alternativeContext...),
+			GRPCAddress:         getString("p2p_grpcAddress", "", alternativeContext...),
+			GRPCListenAddress:   getString("p2p_grpcListenAddress", "localhost:9906", alternativeContext...),
+			HTTPAddress:         getString("p2p_httpAddress", "localhost:9906", alternativeContext...),
+			HTTPListenAddress:   getString("p2p_httpListenAddress", "", alternativeContext...),
+			ListenAddresses:     getMultiString("p2p_listen_addresses", "|", []string{}, alternativeContext...),
+			AdvertiseAddresses:  getMultiString("p2p_advertise_addresses", "|", []string{}, alternativeContext...), // This is used to announce the node to the network on a different address than the listen address
+			Port:                getInt("p2p_port", 9905, alternativeContext...),                                   // This is the port that go-p2p-message-bus will listen on (0.0.0.0 and ::)
+			ListenMode:          getString("listen_mode", ListenModeFull, alternativeContext...),
+			PeerID:              getString("p2p_peer_id", "", alternativeContext...),
+			PrivateKey:          getString("p2p_private_key", "", alternativeContext...),
+			RejectedTxTopic:     getString("p2p_rejected_tx_topic", "", alternativeContext...),
+			StaticPeers:         getMultiString("p2p_static_peers", "|", []string{}, alternativeContext...),
+			BootstrapPeers:      getMultiString("p2p_bootstrap_peers", "|", []string{}, alternativeContext...),
+			AllowedPublisherIDs: dropEmptyStrings(getMultiString("p2p_allowed_publisher_ids", "|", []string{}, alternativeContext...)),
 			// Peer persistence
 			PeerCacheDir: getString("p2p_peer_cache_dir", "", alternativeContext...), // Empty = binary directory
 			BanThreshold: getInt("p2p_ban_threshold", 100, alternativeContext...),
@@ -549,6 +562,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SeenHashMaxSize:        getInt("p2p_seen_hash_max_size", 10000, alternativeContext...),
 			SeenHashTTL:            getDuration("p2p_seen_hash_ttl", 2*time.Minute, alternativeContext...),
 			SeenHashMaxPublishers:  getInt("p2p_seen_hash_max_publishers", 3, alternativeContext...),
+			// Centralized peer registry (services/blockchain) TTL+LRU cleanup
+			// configuration. Defaults match the struct tag defaults, so wiring
+			// these keys does not change behaviour for a deployment that never
+			// set them.
+			PeerRegistryMaxSize:         getInt("p2p_peer_registry_max_size", 10000, alternativeContext...),
+			PeerRegistryTTL:             getDuration("p2p_peer_registry_ttl", 24*time.Hour, alternativeContext...),
+			PeerRegistryCleanupInterval: getDuration("p2p_peer_registry_cleanup_interval", time.Hour, alternativeContext...),
 			// Sync manager configuration
 			ForceSyncPeer:                         getString("p2p_force_sync_peer", "", alternativeContext...),
 			NodeStatusTopic:                       getString("p2p_node_status_topic", "", alternativeContext...),
@@ -734,6 +754,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ParkWorkers:              getInt("legacy_parkWorkers", 2, alternativeContext...),
 			PeerRegistryEnabled:      getBool("legacy_peerRegistryEnabled", true, alternativeContext...),
 			PeerRegistrySyncInterval: getDuration("legacy_peerRegistrySyncInterval", 10*time.Second, alternativeContext...),
+			Upnp:                     getBool("legacy_upnp", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
@@ -817,6 +838,26 @@ func (s *Settings) GetBlobStoreURL(storeType int32) (*url.URL, error) {
 	default:
 		return nil, errors.New("unknown blob store type: " + fmt.Sprintf("%d", storeType))
 	}
+}
+
+// dropEmptyStrings removes empty entries from a pipe-separated multi-value
+// setting. gocore's GetMulti trims whitespace but keeps empty items, so a
+// trailing or doubled separator (e.g. "12D3KooWA|") otherwise reaches the
+// consumer as a genuinely empty entry - not to be confused with a malformed
+// one, which must still reach the consumer and fail there. Used for
+// p2p_allowed_publisher_ids, where an empty entry fails peer-ID decoding and
+// stops the node from starting over what is usually a typo, not a genuinely
+// malformed entry.
+func dropEmptyStrings(values []string) []string {
+	out := values[:0:0]
+
+	for _, v := range values {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+
+	return out
 }
 
 func max(a, b int) int {

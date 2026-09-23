@@ -2399,25 +2399,6 @@ func (s *server) pushTxMsg(sp *serverPeer, hash *chainhash.Hash, doneChan chan<-
 	return nil
 }
 
-func (s *server) getTxFromStore(hash *chainhash.Hash) (*bsvutil.Tx, int64, error) {
-	txMeta, err := s.utxoStore.Get(s.ctx, hash, fields.Tx)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	fee, err := util.GetFees(txMeta.Tx)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	tx, err := bsvutil.NewTxFromBytes(txMeta.Tx.Bytes())
-	if err != nil {
-		return nil, 0, err
-	}
-
-	return tx, int64(fee), nil // nolint:gosec
-}
-
 // pushBlockMsg sends a block message for the provided block hash to the
 // connected peer.  An error is returned if the block hash is not known.
 func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash, doneChan chan<- struct{},
@@ -2428,7 +2409,9 @@ func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash, doneChan cha
 	// 1. Writing the entire block to disk (slow, causes context deadline exceeded)
 	// 2. Reading it back from disk (additional I/O overhead)
 	url := fmt.Sprintf("%s/block_legacy/%s?wire=1", s.assetHTTPAddress, hash.String())
-	reader, err := util.DoHTTPRequestBodyReader(s.ctx, url)
+	// asset_httpAddress is this node's own asset service, from settings, and is routinely
+	// localhost or a private container address. The peer-URL client refuses both.
+	reader, err := util.DoLocalServiceHTTPRequestBodyReader(s.ctx, url)
 	if err != nil {
 		sp.server.logger.Errorf("Unable to fetch requested block %v: %v", hash, err)
 
@@ -4053,8 +4036,6 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	if err != nil {
 		return nil, err
 	}
-	// c.Upnp = true // TODO set from settings
-
 	cfg = c
 
 	// This is normally only done from file in bsvd, but we need to do it here, also happens inside loadConfig
@@ -4068,7 +4049,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	}
 
 	// overwrite any config options from settings, if applicable
-	setConfigValuesFromSettings(logger, config.GetAll(), cfg)
+	setConfigValuesFromSettings(logger, config, cfg)
 
 	// If Port was set via settings, update activeNetParams
 	if cfg.Port != "" {

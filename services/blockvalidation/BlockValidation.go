@@ -29,6 +29,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	p2pconstants "github.com/bsv-blockchain/teranode/interfaces/p2p"
 	"github.com/bsv-blockchain/teranode/model"
@@ -1883,15 +1884,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] block does not meet target difficulty: %s", block.Header.Hash().String(), err)
 		}
 
-		// Skip the expected-nBits (DAA) check for blocks at or below the highest checkpoint:
-		// the difficulty schedule over that prefix is already certified by the pinned
-		// checkpoint hashes, and re-deriving it would require reproducing every historical
-		// retarget rule exactly. block.Height is settled against the parent before this
-		// function runs (Server.deriveBlockHeight on the peer route; catchup and the operator
-		// revalidation endpoint carry authoritative heights), and BelowCheckpoint applies the
-		// mandatory height > 0 guard, so a peer cannot obtain the skip by declaring height 0
-		// or a fabricated sub-checkpoint height. The checkpoint hash-match itself was
-		// asserted above.
+		// Historical targets are always checked here, including during initial sync.
+		// Later blocks retain the existing checkpoint-prefix shortcut. Height is settled
+		// against the parent before this function runs.
 		skipDifficultyCheck := u.skipExpectedDifficulty(ctx, block)
 
 		if skipDifficultyCheck {
@@ -2996,16 +2991,19 @@ func (u *BlockValidation) enqueueRevalidation(data revalidateBlockData) {
 	}
 }
 
-// skipExpectedDifficulty decides whether this block may skip the expected-nBits
-// (DAA) check. It requires proof that the node is still building the
-// checkpoint-certified prefix, not merely that the block's height falls inside
-// it — see model.SkipExpectedDifficulty for why height alone is forgeable.
+// skipExpectedDifficulty retains the checkpoint-prefix shortcut only after DAA
+// activation. Historical blocks must reach the calculator because the native
+// catchup precheck defers them to full-block validation.
 //
 // Fail-closed: if the best height cannot be read we cannot show we are still
 // building the prefix, so the real rule runs. That is the safe direction; on a
 // syncing node the block is re-fetched and retried, whereas skipping wrongly
 // hands a peer free proof-of-work.
 func (u *BlockValidation) skipExpectedDifficulty(ctx context.Context, block *model.Block) bool {
+	if block.Height <= u.settings.ChainCfgParams.DaaForkHeight && u.settings.ChainCfgParams.Net != wire.STN {
+		return false
+	}
+
 	checkpoints := u.settings.ChainCfgParams.Checkpoints
 
 	if !model.BelowCheckpoint(checkpoints, block.Height) {
@@ -3019,7 +3017,7 @@ func (u *BlockValidation) skipExpectedDifficulty(ctx context.Context, block *mod
 	}
 
 	// Invalidation removes descendants from the best chain, so reconsidering
-	// historical blocks is covered by the syncing arm as the prefix is rebuilt.
+	// post-DAA blocks within the checkpoint prefix retains the syncing shortcut.
 	return model.SkipExpectedDifficulty(checkpoints, block.Height, bestMeta.Height)
 }
 
@@ -3110,8 +3108,7 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 		return errors.NewBlockInvalidError("[reValidateBlock][%s] block does not meet target difficulty: %s", blockData.block.Header.Hash().String(), err)
 	}
 
-	// Skip the expected-nBits (DAA) check for blocks at or below the highest checkpoint:
-	// the difficulty schedule over that prefix is certified by the pinned checkpoint hashes.
+	// Apply the same historical and checkpoint policy as ordinary validation.
 	skipDifficultyCheck := u.skipExpectedDifficulty(ctx, blockData.block)
 
 	if skipDifficultyCheck {
@@ -3514,13 +3511,19 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 // absent from the off-chain set yet has no on_main_chain row, so a
 // useInMemoryChainCheck=on node ACCEPTED a dangling id the authoritative store
 // route (and an off node) REJECTS: a chain-split. The off-chain (negative) set
-// can never prove on-chain membership, so it cannot drive a sound local accept.
+// cannot drive a sound accept HERE, in this service, because a prefetched copy
+// of it is a snapshot with no guard over it.
 //
-// CheckBlockIsInCurrentChain is the single authority: it applies the store's
-// in-memory off-chain set + maxBlockID as a fast negative filter AND confirms
-// survivors against the on_main_chain flag in one self-consistent snapshot
-// (stores/blockchain/sql/CheckBlockIsInCurrentChain.go), so it cannot diverge
-// from the always-SQL route. Deferring every decision to it — rather than
+// CheckBlockIsInCurrentChain is the single authority. Note what that does and
+// does not buy: the store applies the same absence-means-on-chain rule, but it
+// applies it against a set and a maxBlockID from one self-consistent snapshot,
+// under mainChainRebuilding, and with the shadow comparison available to measure
+// it (stores/blockchain/sql/CheckBlockIsInCurrentChain.go). So the two routes CAN
+// still diverge on a gap id, an id at or below maxBlockID with no committed row.
+// That divergence is documented and measured at
+// TestCheckBlockIsInCurrentChain_GapIDDivergesBetweenRoutes; read that before
+// concluding anything about it. What deferring to the store removes is this
+// service holding a stale copy, not the underlying rule. Deferring every decision to it — rather than
 // caching a prefetched set in this service and deciding locally — also avoids
 // the snapshot-skew window a local decision would carry across a concurrent
 // reorg (a stale "off-chain" classification could wrongly reject, the more
