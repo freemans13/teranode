@@ -506,8 +506,8 @@ func (u *BlockValidation) checkQuickValidationCoinbase(block *model.Block, calle
 
 // commitBlock performs the shared final commit for the quick-validation path:
 // add the block to the blockchain (subtrees + mined already set), unlock any
-// locked UTXOs, update subtree DAH (which fires BlockSubtreesSet), and mark the
-// block present in cache. Extracted verbatim from quickValidateBlock /
+// locked UTXOs, and mark the block present in cache. It sends no
+// BlockSubtreesSet notification, because the insert already wrote subtrees_set. Extracted verbatim from quickValidateBlock /
 // quickValidateBlockAsync so both share one commit tail; it is also the per-block
 // commit unit the Step-8 parallel window's ordered committer calls in height order.
 // caller labels logs to preserve each call site's existing text.
