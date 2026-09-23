@@ -536,14 +536,14 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 							// IMPORTANT: We listen for BlockSubtreesSet, NOT NotificationType_Block.
 							//
 							// HOW THIS NOTIFICATION IS TRIGGERED:
-							// Both validation paths call updateSubtreesDAH() after validation completes:
+							// The full-validation paths call updateSubtreesDAH() after validation completes:
 							//
 							// Normal Validation (ValidateBlock):
 							//   ValidateBlock() → updateSubtreesDAH() → SetBlockSubtreesSet() → notification
 							//
-							// Quick Validation (Catchup):
-							//   quickValidateBlock() → goroutines complete via errgroup.Wait()
-							//   → updateSubtreesDAH() → SetBlockSubtreesSet() → notification
+							// Quick Validation (Catchup) sends no BlockSubtreesSet: its commitBlock inserts
+							// the block with subtrees_set and mined_set already true, so this worker would
+							// skip the block on its MinedSet guard anyway.
 							//
 							// TIMING GUARANTEES:
 							// BlockSubtreesSet is sent AFTER:
