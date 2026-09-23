@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
+	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	testutil "github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
@@ -23,16 +24,17 @@ import (
 
 // newSubtreesNotSetHarness builds a *BlockValidation wired to a real sqlitememory
 // blockchain store and a real in-memory blob store (no mocks, per AGENTS.md), plus a
-// block chained from genesis with subtreeCount fake subtree hashes stored with
-// subtrees_set=false. This mirrors the state a peer block is in the moment it lands in
-// the database but before its background validation (optimistic mining) has finished
-// writing subtree files.
+// block chained from genesis with subtreeCount fake subtree hashes, added with
+// addBlockOpts (subtrees_set=false either way, since none of the tests below pass
+// WithSubtreesSet). With no options this mirrors an ordinary peer block landing in the
+// store before its background validation (optimistic mining) has finished writing
+// subtree files; WithInvalid(true) mirrors storeInvalidBlock's record of a rejected one.
 //
 // The BlockValidation is built as a bare struct, not via NewBlockValidation, so that
 // start()'s background goroutines (setMined worker, periodic ticker) never run - this
 // test only exercises processSubtreesNotSet / subtreeFilesReady directly and does not
 // want a concurrent setMined pass trying to parse the placeholder subtree bytes below.
-func newSubtreesNotSetHarness(t *testing.T, subtreeCount int) (bv *BlockValidation, block *model.Block, subtreeStore *blobmemory.Memory, ctx context.Context) {
+func newSubtreesNotSetHarness(t *testing.T, subtreeCount int, addBlockOpts ...blockchainoptions.StoreBlockOption) (bv *BlockValidation, block *model.Block, subtreeStore *blobmemory.Memory, ctx context.Context) {
 	t.Helper()
 
 	ctx = context.Background()
@@ -112,9 +114,10 @@ func newSubtreesNotSetHarness(t *testing.T, subtreeCount int) (bv *BlockValidati
 	)
 	require.NoError(t, err)
 
-	// AddBlock with no WithSubtreesSet option leaves subtrees_set=false, matching how a
-	// peer block lands in the store before its subtrees are known to be validated.
-	require.NoError(t, blockchainClient.AddBlock(ctx, block, "test-peer"))
+	// No WithSubtreesSet option is ever passed here, so subtrees_set=false regardless of
+	// addBlockOpts, matching how a block (valid or invalid) lands in the store before its
+	// subtrees are known to be validated.
+	require.NoError(t, blockchainClient.AddBlock(ctx, block, "test-peer", addBlockOpts...))
 
 	return bv, block, subtreeStore, ctx
 }
@@ -180,4 +183,30 @@ func TestProcessSubtreesNotSet_SetsFlagOnLaterSweepOnceFileAppears(t *testing.T)
 
 	require.True(t, subtreesSetFlag(t, ctx, bv, block.Hash()),
 		"subtrees_set must be set on a later sweep once every file exists")
+}
+
+// TestProcessSubtreesNotSet_ExcludesInvalidBlocks pins the regression found in review of
+// this PR: storeInvalidBlock persists a rejected block with subtrees_set=false and
+// invalid=true, and its subtree files are usually never written. Before the
+// "invalid = false" filter in GetBlocksSubtreesNotSet, such a block could never satisfy
+// subtreeFilesReady, so it stayed in the sweep's result set and was re-fetched (and
+// re-warned about) every minute forever. Asserted via the store, not a log capture: the
+// block must never even be a candidate the sweep sees, which is what actually stops the
+// loop.
+func TestProcessSubtreesNotSet_ExcludesInvalidBlocks(t *testing.T) {
+	bv, block, _, ctx := newSubtreesNotSetHarness(t, 2, blockchainoptions.WithInvalid(true))
+	// No subtree files are written - storeInvalidBlock's block usually has none.
+
+	blocksBefore, err := bv.blockchainClient.GetBlocksSubtreesNotSet(ctx)
+	require.NoError(t, err)
+	require.Empty(t, blocksBefore, "an invalid block must never be a subtrees-not-set sweep candidate")
+
+	runSweep(ctx, bv)
+
+	require.False(t, subtreesSetFlag(t, ctx, bv, block.Hash()),
+		"subtrees_set must stay false for an invalid block with no subtree files")
+
+	blocksAfter, err := bv.blockchainClient.GetBlocksSubtreesNotSet(ctx)
+	require.NoError(t, err)
+	require.Empty(t, blocksAfter, "the invalid block must still not be a candidate after a sweep, so nothing loops")
 }
