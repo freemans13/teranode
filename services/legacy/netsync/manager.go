@@ -884,6 +884,7 @@ type SyncManager struct {
 	headerRefillPeerIdx atomic.Uint64
 	blockSizeTracker    *blockSizeTracker  // tracks block sizes for dynamic in-flight adjustment
 	commitRate          *commitRateTracker // blocks a second joining the chain, for the read-ahead depth
+	streams             *streamRegistry    // block bodies arriving now and peers' delivery rates, for the frontier race
 
 	// dispatcher owns the quick window: it decides how many queued blocks may have
 	// their UTXO store work in flight at once and runs every chain-order step in
@@ -1688,6 +1689,10 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 
 	// Remove the peer from the list of candidate peers.
 	sm.peerStates.Delete(peer)
+
+	if sm.streams != nil {
+		sm.streams.forgetPeer(peer)
+	}
 
 	sm.logger.Infof("Lost peer %s (removed from peerStates)", peer)
 
@@ -5003,6 +5008,10 @@ func (sm *SyncManager) blockHandler() {
 	// it posts those back to the consumer through parkCommits.
 	go sm.runParkSweep()
 
+	if sm.streams != nil {
+		go sm.runFrontierRace()
+	}
+
 out:
 	for {
 		select {
@@ -5973,6 +5982,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		blockSizeTracker: newBlockSizeTracker(10), // track last 10 blocks for rolling average
 		commitRate:       newCommitRateTracker(),
+		streams:          newStreamRegistry(),
 		quit:             make(chan struct{}),
 		// feeEstimator:            config.FeeEstimator,
 		minSyncPeerNetworkSpeed: config.MinSyncPeerNetworkSpeed,

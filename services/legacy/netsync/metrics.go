@@ -37,6 +37,10 @@ var (
 	// Class labels: tx_invalid, service, processing, policy, other.
 	prometheusLegacyNetsyncPrewarmErrors *prometheus.CounterVec
 
+	// prometheusLegacyNetsyncFrontierRaces counts blocks asked of a second peer because the
+	// chain was about to wait on them from a slow one. See frontier_race.go.
+	prometheusLegacyNetsyncFrontierRaces prometheus.Counter
+
 	prometheusMetricsInitOnce sync.Once
 )
 
@@ -45,6 +49,14 @@ func initPrometheusMetrics() {
 }
 
 func _initPrometheusMetrics() {
+	prometheusLegacyNetsyncFrontierRaces = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "legacy_netsync",
+		Name:      "frontier_races_total",
+		Help:      "Blocks asked of a second peer because the chain was about to wait on them from a slow one",
+	})
+	prometheus.MustRegister(prometheusLegacyNetsyncFrontierRaces)
+
 	prometheusLegacyNetsyncBlockHeight = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "teranode",
 		Subsystem: "legacy_netsync",
