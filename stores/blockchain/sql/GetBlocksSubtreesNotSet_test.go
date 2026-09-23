@@ -94,8 +94,8 @@ func TestGetBlocksSubtreesNotSet(t *testing.T) {
 
 		blocks, err := subStore.GetBlocksSubtreesNotSet(context.Background())
 		require.NoError(t, err)
-		assert.Len(t, blocks, 1)
-		assert.Equal(t, block1.Hash().String(), blocks[0].Hash().String())
+		require.Len(t, blocks, 1)
+		require.Equal(t, block1.Hash().String(), blocks[0].Hash().String())
 	})
 
 	t.Run("returns blocks ordered by height ascending", func(t *testing.T) {

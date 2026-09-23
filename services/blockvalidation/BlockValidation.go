@@ -1108,10 +1108,10 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 	if len(blocksSubtreesNotSet) > 0 {
 		u.logger.Infof("[BlockValidation:start] found %d blocks subtrees not set", len(blocksSubtreesNotSet))
 
-		// Best-effort current height, used only to tell a block that is merely mid-validation
-		// (Warn: expected, resolves on a later sweep) from one whose subtree files are certainly
-		// gone for good (Debug: see the comment at the Warnf/Debugf choice below). A failure here
-		// just leaves haveHeight false, so every miss stays at Warn - the safe default.
+		// Best-effort current height, used only to tell a block whose missing subtree file is an
+		// anomaly worth surfacing (Warn) from one whose files are certainly gone for good (Debug):
+		// see the comment at the Warnf/Debugf choice below. A failure here just leaves haveHeight
+		// false, so every miss stays at Warn - the safe default.
 		currentHeight, haveHeight := uint32(0), false
 		if _, meta, bhErr := u.blockchainClient.GetBestBlockHeader(ctx); bhErr == nil && meta != nil {
 			currentHeight, haveHeight = meta.Height, true
@@ -1129,11 +1129,16 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 				}
 
 				if !ready {
-					// quick_validate.go sets each subtree's DAH to block.Height +
-					// subtreeBlockHeightRetention when it is written, so once currentHeight
-					// passes that point the DAH sweeper has already deleted the file and this
-					// block can never satisfy subtreeFilesReady - it is stuck, not merely slow,
-					// and Warn every minute forever for it would be noise. Below that height a
+					// Subtree files are written with a DAH of block.Height +
+					// subtreeBlockHeightRetention (quick_validate.go) or of the UTXO store's
+					// height at write time + the same retention (subtreevalidation's
+					// storeSubtreeFiles, where that height is normally below block.Height), so
+					// once currentHeight passes block.Height + retention the DAH sweeper has
+					// normally already deleted the file and this block can never satisfy
+					// subtreeFilesReady - it is stuck, not merely slow, and Warn every minute
+					// forever for it would be noise. The one exception is a lower-height fork
+					// block validated while the UTXO store is ahead of it; its files expire a
+					// little later, so a miss there is logged at Debug slightly early. Below that height a
 					// missing file is unexpected (every path that reaches here writes its
 					// subtree files before the block itself is even added - see
 					// subtreeFilesReady), so it is still worth a Warn: most likely a transient

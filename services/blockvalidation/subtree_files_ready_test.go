@@ -10,10 +10,12 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -212,4 +214,38 @@ func TestProcessSubtreesNotSet_ExcludesInvalidBlocks(t *testing.T) {
 	blocksAfter, err := bv.blockchainClient.GetBlocksSubtreesNotSet(ctx)
 	require.NoError(t, err)
 	require.Empty(t, blocksAfter, "the invalid block must still not be a candidate after a sweep, so nothing loops")
+}
+
+// existsErrorStore is the real in-memory blob store with Exists forced to fail, standing in
+// for a storage backend that cannot answer (network blip, permission error).
+type existsErrorStore struct {
+	*blobmemory.Memory
+}
+
+func (s *existsErrorStore) Exists(context.Context, []byte, fileformat.FileType, ...bloboptions.FileOption) (bool, error) {
+	return false, errors.NewStorageError("simulated Exists failure")
+}
+
+// TestProcessSubtreesNotSet_LeavesFlagFalseWhenExistsFails pins the fail-closed side of
+// subtreeFilesReady: when the store cannot say whether a file exists, the sweep must not
+// set subtrees_set, even though every file is in fact present, and must leave the block
+// a candidate so a later sweep can retry.
+func TestProcessSubtreesNotSet_LeavesFlagFalseWhenExistsFails(t *testing.T) {
+	bv, block, subtreeStore, ctx := newSubtreesNotSetHarness(t, 2)
+
+	for _, h := range block.Subtrees {
+		require.NoError(t, subtreeStore.Set(ctx, h[:], fileformat.FileTypeSubtree, []byte("subtree-bytes")))
+	}
+
+	bv.subtreeStore = &existsErrorStore{Memory: subtreeStore}
+
+	runSweep(ctx, bv)
+
+	require.False(t, subtreesSetFlag(t, ctx, bv, block.Hash()),
+		"subtrees_set must stay false when the subtree store cannot confirm the files exist")
+
+	candidates, err := bv.blockchainClient.GetBlocksSubtreesNotSet(ctx)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1, "the block must stay a sweep candidate so a later sweep retries it")
+	require.Equal(t, block.Hash().String(), candidates[0].Hash().String())
 }
