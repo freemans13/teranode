@@ -212,6 +212,14 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 		// is what makes a restart free: the files survive it, so a node comes
 		// back and asks only for what it genuinely lacks.
 		if sm.holdsBlock(sm.ctx, block.hash) {
+			// Held on disk but not in the park is a record nothing announced: its
+			// peer was dropped between the write and the on-disk message. Left like
+			// that it is skipped here forever and never drained, which stopped
+			// mainnet at 650,021 on 2026-09-23. Adopt it so the park sweep commits it.
+			if !sm.blockPark.Has(block.hash) && sm.blockPark.adoptStranded(sm.ctx, block.hash, sm.subtreeStore) {
+				sm.logger.Warnf("[unownedBlocks][%s] adopted a complete record at height %d that was on disk but not in the park", block.hash, block.height)
+			}
+
 			continue
 		}
 
