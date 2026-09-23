@@ -572,13 +572,12 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	prometheusBlockValidationQuickCommitUnlock.Observe(time.Since(start).Seconds())
 	start = time.Now()
 
-	// Update subtrees DAH and send BlockSubtreesSet notification.
-	if err := u.updateSubtreesDAH(ctx, block); err != nil {
-		return errors.NewProcessingError("[%s][%s] failed to update subtrees DAH", caller, block.Hash().String(), err)
-	}
-
-	prometheusBlockValidationQuickCommitSubtreesSet.Observe(time.Since(start).Seconds())
-	start = time.Now()
+	// No updateSubtreesDAH here. The AddBlock above writes subtrees_set and mined_set in the
+	// insert itself, so a SetBlockSubtreesSet call would re-UPDATE a row that is already true,
+	// commit on its own, clear the blockchain response cache and notify every subscriber. The
+	// one subscriber that acts on BlockSubtreesSet, the setMined worker, skips a block whose
+	// mined_set is already true. The full-validation paths insert with subtrees_set false and
+	// still make the call.
 
 	// Mark block as existing in cache.
 	if err := u.SetBlockExists(block.Hash()); err != nil {
