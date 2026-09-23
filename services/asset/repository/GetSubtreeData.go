@@ -90,6 +90,18 @@ func (repo *Repository) GetSubtreeDataReader(ctx context.Context, subtreeHash *c
 		releaseSemaphorePermit(repo.semGetSubtreeDataReader)
 		return nil, err
 	}
+	// An existing FileTypeSubtreeData is served without asking whether the subtree has been
+	// validated, unlike the subtree routes, which refuse the pending FileTypeSubtreeToCheck copy
+	// (see openValidatedSubtree). Two writers store this file before the block is validated:
+	// catch-up (fetchAndStoreSubtreeData in services/blockvalidation/get_blocks.go) and
+	// CheckBlockSubtrees (processSubtreeDataStream in
+	// services/subtreevalidation/check_block_subtrees.go). Both parse the peer's stream against
+	// a subtree whose root they have already checked, and reject any transaction whose txid
+	// differs from the leaf at its index, so the file can only hold the transactions the subtree
+	// commits to. What it may hold early is transactions this node has not script-validated yet.
+	// Whether this route should also wait for FileTypeSubtree is tracked separately; gating it
+	// naively would 404 data served today, because the two files carry different delete-at
+	// heights and the data file can outlive the subtree file.
 	if subtreeDataExists {
 		reader, err := repo.SubtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 		if err != nil {
