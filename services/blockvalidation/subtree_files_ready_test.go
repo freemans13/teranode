@@ -1,0 +1,183 @@
+package blockvalidation
+
+import (
+	"context"
+	"net/url"
+	"testing"
+	"time"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	testutil "github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
+)
+
+// newSubtreesNotSetHarness builds a *BlockValidation wired to a real sqlitememory
+// blockchain store and a real in-memory blob store (no mocks, per AGENTS.md), plus a
+// block chained from genesis with subtreeCount fake subtree hashes stored with
+// subtrees_set=false. This mirrors the state a peer block is in the moment it lands in
+// the database but before its background validation (optimistic mining) has finished
+// writing subtree files.
+//
+// The BlockValidation is built as a bare struct, not via NewBlockValidation, so that
+// start()'s background goroutines (setMined worker, periodic ticker) never run - this
+// test only exercises processSubtreesNotSet / subtreeFilesReady directly and does not
+// want a concurrent setMined pass trying to parse the placeholder subtree bytes below.
+func newSubtreesNotSetHarness(t *testing.T, subtreeCount int) (bv *BlockValidation, block *model.Block, subtreeStore *blobmemory.Memory, ctx context.Context) {
+	t.Helper()
+
+	ctx = context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := testutil.CreateBaseTestSettings(t)
+
+	blockChainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+
+	blockchainClient, err := blockchain.NewLocalClient(logger, tSettings, blockChainStore, nil, nil)
+	require.NoError(t, err)
+
+	subtreeStore = blobmemory.New()
+
+	bv = &BlockValidation{
+		logger:           logger,
+		settings:         tSettings,
+		blockchainClient: blockchainClient,
+		subtreeStore:     subtreeStore,
+	}
+
+	privateKey, err := bec.NewPrivateKey()
+	require.NoError(t, err)
+	address, err := bscript.NewAddressFromPublicKey(privateKey.PubKey(), true)
+	require.NoError(t, err)
+
+	coinbaseTx := bt.NewTx()
+	require.NoError(t, coinbaseTx.From(
+		"0000000000000000000000000000000000000000000000000000000000000000",
+		0xffffffff, "", 0,
+	))
+	coinbaseTx.Inputs[0].UnlockingScript = bscript.NewFromBytes(
+		[]byte{0x03, 0x01, 0x00, 0x00, '/', 'T', 'e', 's', 't'},
+	)
+	require.NoError(t, coinbaseTx.AddP2PKHOutputFromAddress(address.AddressString, 50*100000000))
+
+	subtreeHashes := make([]*chainhash.Hash, subtreeCount)
+	for i := range subtreeHashes {
+		h := chainhash.HashH([]byte{byte(i + 1)})
+		subtreeHashes[i] = &h
+	}
+
+	nBits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+
+	// Block 1 chains from the genesis block already in the sqlitememory store.
+	blockHeader := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  tSettings.ChainCfgParams.GenesisHash,
+		HashMerkleRoot: coinbaseTx.TxIDChainHash(), // single coinbase is its own merkle root
+		Timestamp:      uint32(time.Now().Unix()),  //nolint:gosec
+		Bits:           *nBits,
+		Nonce:          0,
+	}
+	// Grind for a valid proof-of-work; the regression-net minimum difficulty
+	// (207fffff) converges in at most a few thousand iterations.
+	for {
+		if ok, _, _ := blockHeader.HasMetTargetDifficulty(); ok {
+			break
+		}
+		blockHeader.Nonce++
+		if blockHeader.Nonce > 2_000_000 {
+			t.Fatal("failed to find a valid nonce within iteration budget")
+		}
+	}
+
+	const blockHeight = uint32(1)
+
+	block, err = model.NewBlock(
+		blockHeader,
+		coinbaseTx,
+		subtreeHashes,
+		1,                         // transaction count (coinbase only; the fake subtree hashes are not decoded here)
+		uint64(coinbaseTx.Size()), //nolint:gosec
+		blockHeight,
+		0, // ID is auto-assigned by AddBlock below
+	)
+	require.NoError(t, err)
+
+	// AddBlock with no WithSubtreesSet option leaves subtrees_set=false, matching how a
+	// peer block lands in the store before its subtrees are known to be validated.
+	require.NoError(t, blockchainClient.AddBlock(ctx, block, "test-peer"))
+
+	return bv, block, subtreeStore, ctx
+}
+
+// subtreesSetFlag reads the persisted subtrees_set flag back from the blockchain store,
+// rather than trusting a call was made, so the tests below assert end state.
+func subtreesSetFlag(t *testing.T, ctx context.Context, bv *BlockValidation, hash *chainhash.Hash) bool {
+	t.Helper()
+
+	_, meta, err := bv.blockchainClient.GetBlockHeader(ctx, hash)
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+
+	return meta.SubtreesSet
+}
+
+// runSweep drives processSubtreesNotSet exactly as the periodic ticker in start() does:
+// a fresh errgroup per sweep, waited out before the caller inspects end state.
+func runSweep(ctx context.Context, bv *BlockValidation) {
+	g, gCtx := errgroup.WithContext(ctx)
+	bv.processSubtreesNotSet(gCtx, g)
+	_ = g.Wait()
+}
+
+func TestProcessSubtreesNotSet_SetsFlagOnceFilesExist(t *testing.T) {
+	bv, block, subtreeStore, ctx := newSubtreesNotSetHarness(t, 2)
+
+	for _, h := range block.Subtrees {
+		require.NoError(t, subtreeStore.Set(ctx, h[:], fileformat.FileTypeSubtree, []byte("subtree-bytes")))
+	}
+
+	runSweep(ctx, bv)
+
+	require.True(t, subtreesSetFlag(t, ctx, bv, block.Hash()),
+		"subtrees_set must become true once every referenced subtree file exists")
+}
+
+func TestProcessSubtreesNotSet_LeavesFlagFalseWhenOneFileMissing(t *testing.T) {
+	bv, block, subtreeStore, ctx := newSubtreesNotSetHarness(t, 2)
+
+	// Only the first subtree file is written; the second is still missing, as if the
+	// block's background validation goroutine had not finished writing it yet.
+	require.NoError(t, subtreeStore.Set(ctx, block.Subtrees[0][:], fileformat.FileTypeSubtree, []byte("subtree-bytes")))
+
+	runSweep(ctx, bv)
+
+	require.False(t, subtreesSetFlag(t, ctx, bv, block.Hash()),
+		"subtrees_set must stay false while a referenced subtree file is missing")
+}
+
+func TestProcessSubtreesNotSet_SetsFlagOnLaterSweepOnceFileAppears(t *testing.T) {
+	bv, block, subtreeStore, ctx := newSubtreesNotSetHarness(t, 2)
+
+	require.NoError(t, subtreeStore.Set(ctx, block.Subtrees[0][:], fileformat.FileTypeSubtree, []byte("subtree-bytes")))
+
+	runSweep(ctx, bv)
+	require.False(t, subtreesSetFlag(t, ctx, bv, block.Hash()), "sanity: still false before the second file appears")
+
+	// The second file lands, as if the background validation goroutine finished.
+	require.NoError(t, subtreeStore.Set(ctx, block.Subtrees[1][:], fileformat.FileTypeSubtree, []byte("subtree-bytes")))
+
+	runSweep(ctx, bv)
+
+	require.True(t, subtreesSetFlag(t, ctx, bv, block.Hash()),
+		"subtrees_set must be set on a later sweep once every file exists")
+}
