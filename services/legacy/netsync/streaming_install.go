@@ -84,7 +84,13 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 	// the bug this closes) — knows how to remove what was actually written.
 	sm.logger.Infof("[legacy] streaming block path installed")
 
-	set(sm.admitPipelineSink(sm.pipelineBlockSink), sm.streamingBlockGate, sm.pipelineBlockDelete)
+	sink := sm.admitPipelineSink(sm.pipelineBlockSink)
+	if sm.streams != nil {
+		// Measured outermost, so a block declined to the plain body-write path is timed too.
+		sink = sm.trackBlockStreams(sink)
+	}
+
+	set(sink, sm.streamingBlockGate, sm.pipelineBlockDelete)
 }
 
 // admitPipelineSink wraps inner (the pipeline sink) with the download-admission

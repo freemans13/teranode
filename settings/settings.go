@@ -721,9 +721,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 
 			BlockPrefetchBufferBytes: getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
 
-			MaxBlockParallelFetch: getInt("legacy_maxBlockParallelFetch", 2, alternativeContext...),
-			BlockSlowFetchTimeout: getDuration("legacy_blockSlowFetchTimeout", 20*time.Second, alternativeContext...),
-
 			MultiPeerBlockDownload:    getBool("legacy_multiPeerBlockDownload", true, alternativeContext...),
 			MaxBlocksInTransitPerPeer: getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
 			BlockDownloadWindow:       getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),

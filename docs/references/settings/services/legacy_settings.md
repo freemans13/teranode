@@ -44,8 +44,6 @@ and no loader line arrives as its zero value whatever an operator writes.
 | BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up. Also floored at 30 minutes, which the 600 default clears on a 10-minute chain |
 | BlockDownloadTimeoutPerPeerPercent | int64 | 50 | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling per other peer with a block download outstanding. The total is floored at 30 minutes, so this only adds patience |
 | BlockPrefetchBufferBytes | int64 | 268435456 | legacy_blockPrefetchBufferBytes | On/off switch for asynchronous block admission. 0 disables it. The byte value itself is used only when the block park is off; with the park on the budget is a count of block slots |
-| MaxBlockParallelFetch | int | 2 | legacy_maxBlockParallelFetch | Loaded but read by no code. The frontier racer it configured was deleted; re-asking a quiet peer's block is now part of every assignment pass |
-| BlockSlowFetchTimeout | time.Duration | 20s | legacy_blockSlowFetchTimeout | Loaded but read by no code, for the same reason as MaxBlockParallelFetch |
 | MultiPeerBlockDownload | bool | true | legacy_multiPeerBlockDownload | Spread block requests over every eligible peer. False assigns them all to the sync peer, disconnects a stalled sync peer instead of demoting it, and ignores notfound |
 | MaxBlocksInTransitPerPeer | int | 16 | legacy_maxBlocksInTransitPerPeer | Block bodies one peer may owe at once. The block-size ladder lowers it further for large blocks. Also sizes the pipeline's admission budget, at four slots per peer |
 | BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Block bodies the whole node may have outstanding, counting every peer together. A count, not svnode's per-peer height range |
@@ -155,9 +153,19 @@ and no loader line arrives as its zero value whatever an operator writes.
   the park, given up on, inside its failure backoff or already owed, then hand the
   rest to peers with budget. There is no header list and no download cursor, so
   nothing carries a position between passes.
+- The read-ahead depth is also measured in time: at least five minutes of commits at
+  the measured commit rate, capped at 20 GiB of park at the rolling average block
+  size, never shallower than the scaled `BlockDownloadLowerWindow`, and clamped to
+  `BlockDownloadWindow`. A count of blocks alone is seconds of lead on small blocks,
+  which cannot hide one much larger block's download from a single peer.
 - A block whose owner has gone quiet for longer than the 60-second retry window is
-  offered to another peer on the next pass. That is the general rule, which is why
-  `MaxBlockParallelFetch` and `BlockSlowFetchTimeout` no longer do anything.
+  offered to another peer on the next pass.
+- A block still arriving is asked of a second peer when two things hold: its
+  estimated finish, from its declared size and the bytes and rate so far, is later
+  than when the chain will reach it, and its peer's rate is under half the median
+  of the other peers'. One block is raced at a time, the first request keeps
+  running, and whichever copy lands first is used. There is no setting for it; the
+  metric is `teranode_legacy_netsync_frontier_races_total`.
 - `MultiPeerBlockDownload` set to false keeps the pass but gives every block to
   the sync peer, bounded by the block-size ladder alone.
 
