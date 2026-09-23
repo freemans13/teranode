@@ -286,6 +286,12 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 
 	b.setCurrentRunningState(StateStarting)
 
+	// MoveForwardBlock and Reorg block the main loop for the whole call, so the
+	// processor beats on the loop's behalf at each step that proves the work is
+	// advancing. BeatIfStarted, not Beat: WaitForPendingBlocks also runs from
+	// Start, before the loop owns the heartbeat (issue 1447).
+	subtreeProcessor.SetProgressHook(b.heartbeat.BeatIfStarted)
+
 	return b, nil
 }
 
@@ -450,27 +456,17 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 		// variables are defined here to prevent unnecessary allocations
 		b.setCurrentRunningState(StateRunning)
 
-		// Beat on every pass of the select, including the idle tick below: this
-		// records that the loop can still be SERVICED, not that work arrived.
-		// A node with no blocks is healthy — on mainnet the gap between blocks
-		// is routinely tens of minutes — but a deadlocked loop cannot service
-		// the tick either, which is the freeze the liveness probe must catch.
+		// Beat on every pass of the select, including the idle tick below, so an
+		// idle loop still beats. Why that is the right signal: health.Heartbeat.
 		heartbeatTicker := time.NewTicker(heartbeatInterval)
 		defer heartbeatTicker.Stop()
 
-		// First beat happens HERE, not at construction: everything before this
-		// point is startup work that is legitimately unbounded (waiting on
-		// pending block validation, reloading a large unmined set), and the
-		// heartbeat must not age through it. The beat is at the top of the loop
-		// body, so the first pass is what claims the heartbeat for this
-		// goroutine and every later pass renews it.
-		//
-		// The first pass is not necessarily idle: triggerReconcile above queued
-		// a reconcile before this goroutine existed, so on a node that restarts
-		// behind the tip the loop claims the heartbeat and immediately runs a
-		// catch-up. getReorgBlocks beats once per block through the fetch, but
-		// subtreeProcessor.Reorg applies the whole set in one call and is not
-		// beaten — see the setting's "What it cannot bound".
+		// First beat happens HERE, not at construction, so the heartbeat does
+		// not age through the startup work before this point (health.Heartbeat
+		// explains why). The first pass claims the heartbeat and every later
+		// pass renews it. Work inside a single pass beats as it advances; which
+		// steps beat is listed once, in the blockassembly_livenessStallTimeout
+		// long description.
 		for {
 			b.heartbeat.Beat()
 
@@ -962,6 +958,10 @@ func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *ch
 	var nonRetriableErr error
 
 	_, err := retry.Retry(retryCtx, b.logger, func() (bool, error) {
+		// Waiting on block validation is progress for liveness: see the
+		// blockassembly_livenessStallTimeout long description (issue 1447).
+		b.heartbeat.BeatIfStarted()
+
 		isMined, err := b.blockchainClient.GetBlockIsMined(retryCtx, blockHash)
 		if err != nil {
 			// Short-circuit on non-retriable errors (block doesn't exist in DB)
@@ -2163,19 +2163,11 @@ func (b *BlockAssembler) getReorgBlocks(ctx context.Context, header *model.Block
 	// moveBackBlocks will contain all blocks we need to move down to get to the common ancestor
 	moveBackBlocks := make([]blockWithMeta, 0, len(moveBackBlockHeadersWithMeta))
 
-	// Both loops below run one blockchainClient.GetBlock round trip per block, from
-	// inside a single pass of the main select, so without a beat a long-but-
-	// progressing catch-up is indistinguishable from a wedge. That is not a rare
-	// path: startChannelListeners queues an initial reconcile before the loop
-	// starts, so on any node that restarts behind the tip this is the FIRST thing
-	// the loop does after it claims the heartbeat, and a spurious restart would
-	// re-enter the same work (issue 1447).
-	//
-	// The beat sits at the top of the iteration, so for every block after the first
-	// it is proof the previous GetBlock returned: it tracks FORWARD PROGRESS, and a
-	// fetch that stops progressing still goes stale. BeatIfStarted, not Beat, for
-	// the same reason as validateParentChain — every caller today is inside the
-	// loop, but a future startup caller must not be able to arm the probe.
+	// Both loops below run one GetBlock round trip per block inside a single pass
+	// of the main select, so each iteration beats. The beat sits at the top, so for
+	// every block after the first it proves the previous fetch returned: a fetch
+	// that stops progressing still goes stale. BeatIfStarted so a future startup
+	// caller cannot arm the probe (issue 1447).
 	var block *model.Block
 	for _, headerWithMeta := range moveForwardBlockHeadersWithMeta {
 		b.heartbeat.BeatIfStarted()
@@ -2404,18 +2396,9 @@ func (b *BlockAssembler) validateParentChain(
 
 	// Process transactions in batches for performance
 	for i := 0; i < len(unminedTxs); i += batchSize {
-		// Beat once per batch: when this runs from the reset path it is inside a
-		// select case, so without it a large-but-progressing validation looks
-		// identical to a wedge. The beat sits at the top of the batch, which for
-		// every batch after the first is proof the previous one finished, so it
-		// tracks FORWARD PROGRESS: a run that stops progressing gets no further
-		// beats and still goes stale (issue 1447).
-		//
-		// BeatIfStarted, not Beat: this same code also runs from Start, before
-		// the main loop owns the heartbeat, and the rest of that startup path
-		// (bulk-loading the unmined set into the subtree processor) is
-		// legitimately unbounded. A plain Beat here would start the clock
-		// mid-startup and let the probe report a still-starting node as wedged.
+		// Beat once per batch, at the top, so for every batch after the first it
+		// proves the previous one finished (issue 1447). BeatIfStarted because
+		// this also runs from Start, before the main loop owns the heartbeat.
 		b.heartbeat.BeatIfStarted()
 
 		// Check for context cancellation at start of each batch
