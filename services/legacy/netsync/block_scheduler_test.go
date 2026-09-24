@@ -77,10 +77,9 @@ func nextCandidateHash(t *testing.T, sm *SyncManager) (chainhash.Hash, bool) {
 // has to leave the node down all three sockets rather than one.
 //
 // Each peer's queue is capped at four blocks, so twelve headers cannot be
-// carried by fewer than three peers. The slices are contiguous and ascending,
-// starting with the sync peer, because a peer answers a getdata roughly in the
-// order it was asked: a contiguous ascending run arrives in chain order and the
-// park drains it as one run.
+// carried by fewer than three peers. Each block goes to the peer owing the
+// fewest, the sync peer winning a tie, so the blocks deal out in turn and the
+// next blocks the chain needs sit at the top of separate peers' queues.
 func TestScheduler_SpreadsOneHeaderRunAcrossEveryEligiblePeer(t *testing.T) {
 	var nonce uint32
 
@@ -104,9 +103,18 @@ func TestScheduler_SpreadsOneHeaderRunAcrossEveryEligiblePeer(t *testing.T) {
 		return syncRec.count()+secondRec.count()+thirdRec.count() == len(hashes)
 	}, 5*time.Second), "every seeded header should have been asked of somebody")
 
-	require.Equal(t, hashes[0:4], syncRec.all(), "the sync peer takes the first contiguous run")
-	require.Equal(t, hashes[4:8], secondRec.all(), "the second peer takes the next contiguous run")
-	require.Equal(t, hashes[8:12], thirdRec.all(), "the third peer takes the last contiguous run")
+	dealt := func(from int) []chainhash.Hash {
+		var out []chainhash.Hash
+		for i := from; i < len(hashes); i += 3 {
+			out = append(out, hashes[i])
+		}
+
+		return out
+	}
+
+	require.Equal(t, dealt(0), syncRec.all(), "the sync peer takes every third block, starting with the lowest")
+	require.Equal(t, dealt(1), secondRec.all(), "the second peer the next")
+	require.Equal(t, dealt(2), thirdRec.all(), "and the third peer the next")
 
 	// The ledger has to agree with the wire, peer for peer, or a delivered block
 	// arrives with nothing vouching for it and costs an honest peer its
@@ -171,12 +179,15 @@ func TestScheduler_RespectsTheNodeWideWindow(t *testing.T) {
 
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return syncRec.count() == 3 }, 5*time.Second),
-		"the window's worth of blocks should have been requested")
+	require.True(t, WaitUntil(func() bool {
+		return syncRec.count()+secondRec.count()+thirdRec.count() == 3
+	}, 5*time.Second), "the window's worth of blocks should have been requested")
 
 	total := syncRec.count() + secondRec.count() + thirdRec.count() + fourthRec.count()
 	require.Equal(t, 3, total, "the node-wide window must bound the sum over all peers")
-	require.Equal(t, hashes[0:3], syncRec.all())
+	require.Equal(t, hashes[0:1], syncRec.all(), "one block each, lowest first")
+	require.Equal(t, hashes[1:2], secondRec.all())
+	require.Equal(t, hashes[2:3], thirdRec.all())
 	require.Equal(t, 3, sm.blockDownloads.Len())
 
 	// There is no fourth candidate to inspect here, and that is by design
@@ -376,7 +387,9 @@ func TestScheduler_NeverAsksASecondPeerForAHashSomebodyAlreadyOwes(t *testing.T)
 		require.NotEqual(t, hashes[0], h, "the in-flight block must never be handed to a second peer")
 	}
 
-	require.Equal(t, hashes[1:], syncRec.all(), "the pass carries on past the block it skipped")
+	require.ElementsMatch(t, hashes[1:], append(syncRec.all(), secondRec.all()...),
+		"the pass carries on past the block it skipped")
+	require.Equal(t, hashes[1], secondRec.all()[0], "the peer owing nothing takes the lowest block left")
 }
 
 // TestScheduler_LeavesTheHeaderNobodyCanTakeForTheNextPass pins the discipline
@@ -483,10 +496,10 @@ func TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked(t *testing.
 
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return shortRec.count() == len(hashes) }, 5*time.Second),
+	require.True(t, WaitUntil(func() bool { return shortRec.count()+otherRec.count() == len(hashes) }, 5*time.Second),
 		"with nobody claiming the height the pass must still ask somebody")
-	require.Equal(t, hashes, shortRec.all())
-	require.Zero(t, otherRec.count(), "and only the first peer with budget, not everybody")
+	require.ElementsMatch(t, hashes, append(shortRec.all(), otherRec.all()...), "each block exactly once")
+	require.Equal(t, hashes[0], shortRec.all()[0], "the lowest to the sync peer")
 }
 
 // TestScheduler_TheNodeWideWindowCountsWhatIsAlreadyInFlight is the other half
@@ -520,12 +533,13 @@ func TestScheduler_TheNodeWideWindowCountsWhatIsAlreadyInFlight(t *testing.T) {
 
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return syncRec.count() == 2 }, 5*time.Second),
+	require.True(t, WaitUntil(func() bool { return syncRec.count()+secondRec.count() == 2 }, 5*time.Second),
 		"the window's remaining two slots should have been requested")
 
 	require.Equal(t, 2, syncRec.count()+secondRec.count(),
 		"a node-wide window of 5 with 3 already in flight leaves 2, however many peers are available")
-	require.Equal(t, hashes[0:2], syncRec.all())
+	require.Equal(t, hashes[0:1], syncRec.all())
+	require.Equal(t, hashes[1:2], secondRec.all())
 	require.Equal(t, 5, sm.blockDownloads.Len(), "and the node is now at its window, not above it")
 
 	candidate, ok := nextCandidateHash(t, sm)

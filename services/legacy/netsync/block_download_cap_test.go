@@ -210,6 +210,7 @@ func TestFetchHeaderBlocks_NeverAsksForABlockTheLedgerWillNotTrack(t *testing.T)
 	// headers we held off on are asked for on the next pass — they were never
 	// skipped, only postponed.
 	sm.blockDownloads.ClearPeer(flooder)
+	sm.peerStates.Delete(flooder)
 
 	sm.fetchHeaderBlocks()
 

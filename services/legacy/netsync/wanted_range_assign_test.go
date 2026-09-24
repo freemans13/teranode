@@ -178,21 +178,17 @@ func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 	require.True(t, WaitUntil(func() bool { return first.count()+second.count() >= assignPassDepth }, 5*time.Second),
 		"the first pass must place the whole wanted range before anybody can go quiet on it")
 
-	// Runs are handed out contiguously, so one peer takes the lot. Which one
-	// depends on peer-id ordering, so read it off the recorders rather than
-	// assuming.
-	quiet, helper := first, second
-	if quiet.count() == 0 {
-		quiet, helper = second, first
-	}
+	// Blocks are dealt out in turn, so each peer owes half. Neither has sent a
+	// block byte, so once the retry window passes both are quiet, and each of
+	// their blocks must go to the other peer.
+	firstOwed := first.all()
+	secondOwed := second.all()
 
-	require.Equal(t, assignPassDepth, quiet.count(),
-		"the run goes to one peer in one piece")
-	require.Zero(t, helper.count(),
-		"which leaves the other peer owing nothing, and free to help")
+	require.NotEmpty(t, firstOwed)
+	require.NotEmpty(t, secondOwed)
 
-	quiet.reset()
-	helper.reset()
+	first.reset()
+	second.reset()
 
 	// The tracker's clock is already injectable; setting the field is how the
 	// package ages an assignment without sleeping a minute. Safe unsynchronised
@@ -204,10 +200,16 @@ func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 
 	sm.assignWantedBlocks()
 
-	require.True(t, WaitUntil(func() bool { return helper.count() > 0 }, 5*time.Second),
-		"a block whose owner has gone quiet past the retry window must be asked of the other peer")
-	require.False(t, WaitUntil(func() bool { return quiet.count() > 0 }, 2*time.Second),
-		"and never a second time of the peer that already owes it, whose duplicate copy would look unrequested")
+	require.True(t, WaitUntil(func() bool { return first.count()+second.count() == len(firstOwed)+len(secondOwed) }, 5*time.Second),
+		"every block whose owner has gone quiet past the retry window must be asked of the other peer")
+
+	for _, h := range first.all() {
+		require.Contains(t, secondOwed, h, "the first peer is only asked for the second peer's blocks")
+	}
+
+	for _, h := range second.all() {
+		require.Contains(t, firstOwed, h, "and never a second time for its own, whose duplicate copy would look unrequested")
+	}
 }
 
 // TestAssignWantedBlocks_TerminatesWhenEverythingIsOwed is the spin found in the

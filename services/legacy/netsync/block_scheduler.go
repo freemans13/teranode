@@ -28,21 +28,18 @@ type assignerPeer struct {
 // of, and collects one getdata per peer to be sent once the header lock is
 // released.
 //
-// Slices are handed out as contiguous runs rather than round-robin: the assigner
-// keeps offering the same peer until its budget is spent and then moves to the
-// next. A peer answers a getdata roughly in the order it was asked, so a
-// contiguous ascending run arrives in chain order — the park drains it as one
-// run, and the download frontier is owed by one peer for a whole run instead of
-// changing hands every block. Round-robin would spread the "slowest peer holds
-// the frontier" risk, but multiplies the number of gaps the park has to hold.
+// Each block, in height order, goes to the peer owing the fewest. A peer answers
+// a getdata in the order it was asked and nothing can reorder its queue, so the
+// assigner used to fill one peer with a contiguous run: the next block the chain
+// needed then sat behind others at that peer while other peers were idle. At
+// height 705,000, with blocks of hundreds of megabytes, its bytes began one and
+// a half to six minutes after it was asked for. Spreading puts the next blocks at
+// the top of separate peers' queues. The park holds the gaps this opens, which is
+// what it is for.
 type downloadAssigner struct {
 	peers []*assignerPeer
 	// remaining is the node-wide budget left in this pass.
 	remaining int
-	// idx is how far down the peer list the contiguous runs have got. It only
-	// ever moves forward: heights ascend through a pass, so a peer that cannot
-	// serve one header cannot serve any later one either.
-	idx int
 }
 
 // eligibleBlockPeers lists the peers that may be asked for a block body, sync
@@ -139,6 +136,14 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	perPeer := min(max(1, sm.settings.Legacy.MaxBlocksInTransitPerPeer), ladder)
 	fanout := min(len(eligible), ladder)
 
+	// With the park on, blocks stream straight to disk behind the admission
+	// budget and no read loop holds a decoded block, so the memory reason for
+	// narrowing the fan-out is gone. Every eligible peer then carries blocks, each
+	// up to the ladder's depth.
+	if sm.blockPark.Enabled() {
+		fanout = len(eligible)
+	}
+
 	peers := make([]*assignerPeer, 0, fanout)
 	assignable := 0
 
@@ -211,8 +216,8 @@ func (sm *SyncManager) singlePeerAssigner(ladder int) *downloadAssigner {
 // was asked for loses that block from the walk for good.
 //
 // The claimed-height test picks between peers; it is not a veto. When no peer
-// with budget claims a chain that reaches this block, the first peer with budget
-// is asked anyway. A claimed height is a lower bound that goes stale downward
+// with budget claims a chain that reaches this block, a peer with budget is
+// asked anyway. A claimed height is a lower bound that goes stale downward
 // (see canServe), so "nobody claims it" routinely means we simply have not been
 // told rather than that nobody has the block — and a scheduler that declines to
 // ask anybody stops sync dead, which is far worse than one wasted request. A
@@ -241,49 +246,38 @@ func (a *downloadAssigner) take(height int32) (*assignerPeer, bool) {
 // "has not claimed it" routinely means only that we have not been told, and
 // take's own reasoning already prefers one wasted request to asking nobody. A
 // marked peer, by contrast, can contribute nothing new however high it claims.
+//
+// Within each of those tiers the peer owing the fewest wins, which is the one
+// with the most budget left, since every peer's budget is the same cap less what
+// it owes. A tie goes to the earlier peer, the sync peer first.
 func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) bool) (*assignerPeer, bool) {
 	if a == nil || a.remaining <= 0 {
 		return nil, false
 	}
 
-	for a.idx < len(a.peers) && a.peers[a.idx].budget <= 0 {
-		a.idx++
-	}
+	// server, fallback, avoidedServer, avoidedFallback, in order of preference.
+	var tiers [4]*assignerPeer
 
-	var fallback, avoidedServer, avoidedFallback *assignerPeer
-
-	for i := a.idx; i < len(a.peers); i++ {
-		p := a.peers[i]
+	for _, p := range a.peers {
 		if p.budget <= 0 {
 			continue
 		}
 
-		if avoid == nil || !avoid(p.peer) {
-			if p.canServe(height) {
-				return p, true
-			}
-
-			if fallback == nil {
-				fallback = p
-			}
-
-			continue
+		tier := 0
+		if avoid != nil && avoid(p.peer) {
+			tier = 2
 		}
 
-		if p.canServe(height) {
-			if avoidedServer == nil {
-				avoidedServer = p
-			}
-
-			continue
+		if !p.canServe(height) {
+			tier++
 		}
 
-		if avoidedFallback == nil {
-			avoidedFallback = p
+		if tiers[tier] == nil || p.budget > tiers[tier].budget {
+			tiers[tier] = p
 		}
 	}
 
-	for _, p := range []*assignerPeer{fallback, avoidedServer, avoidedFallback} {
+	for _, p := range tiers {
 		if p != nil {
 			return p, true
 		}
