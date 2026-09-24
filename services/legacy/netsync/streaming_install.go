@@ -483,7 +483,6 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	}
 
 	sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
-	sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 
 	// The delivering peer has room again, so ask it for more now. Only a commit
 	// used to, and while download is the limit blocks arrive out of order and
@@ -493,10 +492,17 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	defer sm.topUpHeaderBlocks(nil)
 
 	if !msg.body.Converted && sm.takeDrainedDuplicate(msg.body.Hash) {
+		// Only the sending peer is let off. The other owners are not: the copy being
+		// converted is not here yet, and letting them off freed the block to be asked for
+		// again while it was still arriving.
 		sm.logger.Infof("[blockOnDisk][%s] a duplicate copy was drained unwritten while another copy converted", msg.body.Hash)
 
 		return
 	}
+
+	// The block is here, so whoever else was asked for it is let off; a copy still on the
+	// wire from them is admitted when it lands.
+	sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 
 	// A raw copy of a block another copy is converting, or has converted, is
 	// discarded. Taking it into the park while the other copy converts means

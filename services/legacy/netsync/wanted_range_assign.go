@@ -205,6 +205,15 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 			break
 		}
 
+		// A block in flight is never asked for again, as SV Node never asks for a block
+		// in mapBlocksInFlight: its bytes are arriving or it is being converted, whatever
+		// the ledger says about who owes it. The ledger can let every peer off a block
+		// that is still arriving, and on 2026-09-24 that asked for block 734,077
+		// seventeen times in thirteen seconds.
+		if sm.streams.arriving(block.hash) || sm.conversionInFlight(block.hash) {
+			continue
+		}
+
 		// #1333: a block that recently failed to store or validate, judged or
 		// merely unlucky, is not requested again while the mark stands. This is
 		// what actually bounds the cascade review measured: the descendants of
