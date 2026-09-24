@@ -62,8 +62,12 @@ func TestHandleBlockOnDiskMsg_ReleasesTheDownloadAssignment(t *testing.T) {
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: b, peer: h.peer})
 	}
 
-	require.Equal(t, 0, h.sm.blockDownloads.CountForPeer(h.peer),
-		"every delivered block must release its assignment, or CountForPeer sticks at MaxBlocksInTransitPerPeer and the scheduler stops asking this peer for anything else")
+	// Each delivered block's own assignment is released. The peer may owe others
+	// afterwards: a delivery refills the peer straight away.
+	for _, b := range bodies {
+		require.False(t, h.sm.blockDownloads.HasOwner(h.peer, b.Hash),
+			"every delivered block must release its assignment, or CountForPeer sticks at MaxBlocksInTransitPerPeer and the scheduler stops asking this peer for anything else")
+	}
 }
 
 // TestHandleBlockOnDiskMsg_ReleasesTheAssociationPrimarysAssignment is the
@@ -109,8 +113,6 @@ func TestHandleBlockOnDiskMsg_ReleasesTheAssociationPrimarysAssignment(t *testin
 	require.False(t, h.sm.blockDownloads.HasOwner(h.peer, body.Hash),
 		"RemoveOwner must actually delete the primary's record; a call keyed by the sub-peer instead leaves it in place and this would still (wrongly) read true")
 
-	require.Equal(t, 0, h.sm.blockDownloads.CountForPeer(h.peer),
-		"the delivery arrived via the association's sub-peer, so the release must resolve to the primary the ledger recorded ownership under, not stay a no-op keyed by the sub-peer identity")
 }
 
 // TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions is the regression
