@@ -133,19 +133,19 @@ func (r *streamRegistry) start(hash chainhash.Hash, height int32, owner *peerpkg
 	return s
 }
 
-// finish removes a stream. A complete one records its owner's rate and ends any race for the
-// block, since the block is now here.
+// finish removes a stream and ends any race for its block: a complete copy because the block is
+// here, a failed one so the block can be raced again rather than wait out the mark's expiry. A
+// complete one also records its owner's rate.
 func (r *streamRegistry) finish(s *blockStream, now time.Time, complete bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	delete(r.active, s)
+	delete(r.raced, s.hash)
 
 	if !complete {
 		return
 	}
-
-	delete(r.raced, s.hash)
 
 	if s.owner == nil {
 		return

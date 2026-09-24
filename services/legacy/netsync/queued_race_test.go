@@ -112,3 +112,19 @@ func TestAQueuedBlockIsNotRacedToAPeerOwingAsMuch(t *testing.T) {
 	sm.maybeRaceQueuedBlock(time.Now())
 	require.Zero(t, idleRec.count(), "its queue is as long as the owner's, so it would not be sooner")
 }
+
+// A copy that fails ends its race too. On 2026-09-24 the copy of block 707,315 died with its peer's
+// connection, the race mark stayed for its ten-minute expiry, and the block could not be raced
+// again while the one peer left owing it worked through the blocks queued ahead of it. The chain
+// waited on it.
+func TestAFailedCopyEndsItsRace(t *testing.T) {
+	r := newStreamRegistry()
+	now := time.Now()
+
+	s := r.start(hashN(7), 707315, newTestPeer(t, "10.0.0.2:8333"), 950<<20, now.Add(-time.Minute))
+	r.markRaced(s.hash, now)
+
+	r.finish(s, now, false)
+
+	require.False(t, r.racing(), "the block can be raced again")
+}
