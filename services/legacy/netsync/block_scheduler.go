@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"sort"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -22,13 +23,53 @@ type assignerPeer struct {
 	state   *peerSyncState
 	budget  int
 	getData *wire.MsgGetData
+	// queue is the estimated time before this peer would start sending one more block, and
+	// perBlock what an average block adds to it. Both are zero when there is nothing to estimate
+	// from, which leaves the choice to the block counts.
+	queue    time.Duration
+	perBlock time.Duration
+	// owed is how many blocks this peer owes, counting those asked of it in this pass.
+	owed int
+}
+
+// queueWorkCap is how much work, in time, a peer may have queued before it is given no more.
+// A peer sends blocks in the order it was asked and nothing can reorder its queue, so a block
+// queued behind minutes of work cannot arrive for minutes, however urgently the chain needs it.
+const queueWorkCap = time.Minute
+
+// defaultPeerRate is the delivery rate assumed when no peer has a measured one yet, in bytes a
+// second.
+const defaultPeerRate = 10 << 20
+
+// full reports whether this peer can be asked for nothing more in this pass. A peer owing
+// nothing always takes one block, however large, or blocks bigger than the cap could never be
+// asked for at all.
+func (p *assignerPeer) full() bool {
+	return p.budget <= 0 || (p.owed > 0 && p.queue >= queueWorkCap)
+}
+
+// charge records one more block asked of this peer.
+func (p *assignerPeer) charge() {
+	p.budget--
+	p.owed++
+	p.queue += p.perBlock
+}
+
+// soonerThan reports whether a block given to p would start arriving before one given to q, with
+// more budget left breaking a tie.
+func (p *assignerPeer) soonerThan(q *assignerPeer) bool {
+	if p.queue != q.queue {
+		return p.queue < q.queue
+	}
+
+	return p.budget > q.budget
 }
 
 // downloadAssigner decides which peer each header in a download pass is asked
 // of, and collects one getdata per peer to be sent once the header lock is
 // released.
 //
-// Each block, in height order, goes to the peer owing the fewest. A peer answers
+// Each block, in height order, goes to the peer expected to start sending it soonest. A peer answers
 // a getdata in the order it was asked and nothing can reorder its queue, so the
 // assigner used to fill one peer with a contiguous run: the next block the chain
 // needed then sat behind others at that peer while other peers were idle. At
@@ -147,17 +188,33 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	peers := make([]*assignerPeer, 0, fanout)
 	assignable := 0
 
+	avgSize := sm.blockSizeTracker.getAverageSize()
+	fallbackRate := sm.streams.medianRate()
+
+	if fallbackRate <= 0 {
+		fallbackRate = defaultPeerRate
+	}
+
 	for _, candidate := range eligible {
 		if len(peers) == fanout {
 			break
 		}
 
-		budget := perPeer - sm.blockDownloads.CountForPeer(candidate.peer)
+		owed := sm.blockDownloads.CountForPeer(candidate.peer)
+
+		budget := perPeer - owed
 		if budget <= 0 {
 			continue
 		}
 
-		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget})
+		p := &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, owed: owed}
+		sm.estimateQueue(p, avgSize, fallbackRate)
+
+		if p.full() {
+			continue
+		}
+
+		peers = append(peers, p)
 		assignable += budget
 	}
 
@@ -174,6 +231,28 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// able to take 16, sizing the round by the window would make 1024 round trips
 	// to place 16 blocks, on every arriving block.
 	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable)}
+}
+
+// estimateQueue sets how long p's queue will take: the bytes left on the blocks it is sending,
+// plus its other owed blocks at the average block size, over its measured rate or fallbackRate.
+// A block's size is not known before its bytes start, so the average stands in for the blocks
+// not yet started. Without a stream registry or an average there is nothing to estimate from.
+func (sm *SyncManager) estimateQueue(p *assignerPeer, avgSize int64, fallbackRate float64) {
+	if sm.streams == nil || avgSize <= 0 {
+		return
+	}
+
+	rate := sm.streams.peerRate(p.peer)
+	if rate <= 0 {
+		rate = fallbackRate
+	}
+
+	remaining, streaming := sm.streams.pending(p.peer)
+	waiting := max(0, p.owed-streaming)
+	bytes := float64(remaining) + float64(waiting)*float64(avgSize)
+
+	p.queue = time.Duration(bytes / rate * float64(time.Second))
+	p.perBlock = time.Duration(float64(avgSize) / rate * float64(time.Second))
 }
 
 // singlePeerAssigner is the behaviour the node had before the scheduler: one
@@ -247,9 +326,9 @@ func (a *downloadAssigner) take(height int32) (*assignerPeer, bool) {
 // take's own reasoning already prefers one wasted request to asking nobody. A
 // marked peer, by contrast, can contribute nothing new however high it claims.
 //
-// Within each of those tiers the peer owing the fewest wins, which is the one
-// with the most budget left, since every peer's budget is the same cap less what
-// it owes. A tie goes to the earlier peer, the sync peer first.
+// Within each of those tiers the peer expected to start sending the block soonest
+// wins, with more budget left breaking a tie, and then the earlier peer, the
+// sync peer first. A peer with queueWorkCap of work already queued is skipped.
 func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) bool) (*assignerPeer, bool) {
 	if a == nil || a.remaining <= 0 {
 		return nil, false
@@ -259,7 +338,7 @@ func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) 
 	var tiers [4]*assignerPeer
 
 	for _, p := range a.peers {
-		if p.budget <= 0 {
+		if p.full() {
 			continue
 		}
 
@@ -272,7 +351,7 @@ func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) 
 			tier++
 		}
 
-		if tiers[tier] == nil || p.budget > tiers[tier].budget {
+		if tiers[tier] == nil || p.soonerThan(tiers[tier]) {
 			tiers[tier] = p
 		}
 	}
@@ -327,7 +406,7 @@ func (a *downloadAssigner) recordRequest(p *assignerPeer, hash *chainhash.Hash) 
 		return err
 	}
 
-	p.budget--
+	p.charge()
 	a.remaining--
 
 	return nil
