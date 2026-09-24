@@ -35,6 +35,19 @@ func TestConfigStatsDumpNeverLogsStoreCredentials(t *testing.T) {
 	cfg.Set(storeKey, "postgres://teranode:"+dumpCanary+"@db.example:5432/blockchain")
 	t.Cleanup(func() { cfg.Unset(storeKey) })
 
+	// A password holding a raw "/" after an all-digit segment makes url.Parse
+	// succeed with the authority cut short: no userinfo, host "teranode:2024",
+	// and the rest of the password in the path, where plain Redacted() prints
+	// it.
+	const misreadKey = "utxostore_misread_redaction_canary"
+
+	misreadURL := "postgres://teranode:2024/" + dumpCanary + "@misread.example:5432/utxo"
+	cfg.Set(misreadKey, misreadURL)
+	t.Cleanup(func() { cfg.Unset(misreadKey) })
+
+	require.Contains(t, cfg.Stats(), misreadURL,
+		"gocore's own dump no longer carries the misread URL, so this case is not exercising a leak")
+
 	// Stats() renders os.Args as its CMDLINE section, one bare entry per line
 	// with no "key=" in front. A line-splitting redactor would miss the second
 	// of these two, which is why RedactText works on tokens.

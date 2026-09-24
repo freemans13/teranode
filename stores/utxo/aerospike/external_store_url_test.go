@@ -18,6 +18,14 @@ func TestParseExternalStoreURLNeverEchoesPassword(t *testing.T) {
 	require.NotContains(t, err.Error(), password, "the externalStore parse error echoes the blob store password")
 	require.Contains(t, err.Error(), "invalid externalStore URL in utxostore")
 
+	// A raw "/" in the password ends the authority there, and url.Parse's own
+	// reason quotes everything before it as an invalid port. The full password
+	// is never in that reason, so the assertion is on the part that used to be.
+	_, err = parseExternalStoreURL("http://teranode:canary-external/store-password@blobserver:8080/external")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "canary-external", "the externalStore parse error quotes the start of the password")
+	require.Contains(t, err.Error(), "invalid externalStore URL in utxostore")
+
 	u, err := parseExternalStoreURL("http://teranode:secret@blobserver:8080/external")
 	require.NoError(t, err)
 	require.Equal(t, "blobserver:8080", u.Host)

@@ -57,8 +57,9 @@ var storeSetting = regexp.MustCompile(`(?i)settings\.[A-Za-z0-9_.]*(store|config
 var viaSettings = regexp.MustCompile(`(?i)settings\.`)
 
 // redacted matches an argument that has already been through a redacting
-// helper, either this package's or the standard library's.
-var redacted = regexp.MustCompile(`urlutil\.Redact|\.Redacted\(\)`)
+// helper, either this package's or the standard library's, or that is
+// urlutil.ParseErrorReason, whose output is fixed text that quotes no input.
+var redacted = regexp.MustCompile(`urlutil\.Redact|urlutil\.ParseErrorReason\(|\.Redacted\(\)`)
 
 // safeAccessors are URL components that carry no credential, so logging them
 // raw is fine. Hostname and Port are methods; Scheme, Host, Path and Opaque

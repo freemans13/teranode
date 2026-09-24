@@ -1776,6 +1776,14 @@ func TestValidateURLRejectsUnparseableURLWithoutEchoingIt(t *testing.T) {
 
 	require.Contains(t, err.Error(), "invalid URL")
 	require.Contains(t, strings.ToLower(err.Error()), "invalid character",
-		"expected url.Parse's own reason to survive, got: %v", err)
+		"expected the parse failure reason to survive, got: %v", err)
 	require.NotContains(t, err.Error(), "%", "the message renders a format verb literally")
+
+	// A raw "#" in the password ends the authority there, and url.Parse's own
+	// reason quotes everything before it as an invalid port. The full password
+	// is never in that reason, so the assertion is on the part that used to be.
+	err = ValidateURL("http://teranode:canary-validate#url-password@blobserver:8080/subtree")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "canary-validate", "the start of the URL password reached the error message")
+	require.Contains(t, err.Error(), "invalid URL")
 }

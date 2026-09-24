@@ -26,7 +26,7 @@ func requireNoCredentialEcho(t *testing.T, err error, wantMessage string) {
 	// an unrendered format verb.
 	require.Contains(t, err.Error(), wantMessage)
 	require.Contains(t, strings.ToLower(err.Error()), "invalid character",
-		"expected url.Parse's own reason to survive, got: %v", err)
+		"expected the parse failure reason to survive, got: %v", err)
 	require.NotContains(t, err.Error(), "%", "the message renders a format verb literally")
 }
 
@@ -47,4 +47,31 @@ func TestLoadUnminedBenchRejectsUnparseableAerospikeURLWithoutEchoingIt(t *testi
 
 	err := runLoadUnminedBenchmark(1, "", "", aerospikeURL)
 	requireNoCredentialEcho(t, err, "failed to parse Aerospike URL")
+}
+
+// requireNoPasswordPrefix covers what the space-in-host canary cannot. A raw
+// "/", "#" or "%" in the password makes url.Parse's own reason quote part of
+// it: the text before a "/" or "#" as an invalid port, or the bytes after a
+// "%" as an invalid escape. The full password is never in the message, so the
+// assertion is on the part that used to be.
+func requireNoPasswordPrefix(t *testing.T, err error, leaked, wantMessage string) {
+	t.Helper()
+
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), leaked, "part of the DSN password reached the error message")
+	require.Contains(t, err.Error(), wantMessage)
+	require.Contains(t, err.Error(), "percent-encode", "expected the fixed reason, got: %v", err)
+}
+
+func TestFixChainworkRejectsDBURLWithDelimiterInPasswordWithoutQuotingIt(t *testing.T) {
+	err := fixChainwork("postgres://teranode:canary-cli/dsn-password@dbhost:5432/blockchain", true, 1, 0, 1)
+	requireNoPasswordPrefix(t, err, "canary-cli", "failed to parse database URL")
+
+	err = fixChainwork("postgres://teranode:canary%zzdsn@dbhost:5432/blockchain", true, 1, 0, 1)
+	requireNoPasswordPrefix(t, err, "%zz", "failed to parse database URL")
+}
+
+func TestLoadUnminedBenchRejectsAerospikeURLWithDelimiterInPasswordWithoutQuotingIt(t *testing.T) {
+	err := runLoadUnminedBenchmark(1, "", "", "aerospike://teranode:canary-cli#dsn-password@dbhost:3000/utxo")
+	requireNoPasswordPrefix(t, err, "canary-cli", "failed to parse Aerospike URL")
 }

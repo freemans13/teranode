@@ -34,6 +34,20 @@ func TestReadAerospikeKafkaRejectsUnparseableURLWithoutEchoingIt(t *testing.T) {
 	// carrying an unrendered format verb.
 	require.Contains(t, err.Error(), "failed to parse Kafka URL")
 	require.Contains(t, strings.ToLower(err.Error()), "invalid character",
-		"expected url.Parse's own reason to survive, got: %v", err)
+		"expected the parse failure reason to survive, got: %v", err)
 	require.NotContains(t, err.Error(), "%", "the message renders a format verb literally")
+}
+
+// TestReadAerospikeKafkaRejectsURLWithDelimiterInPasswordWithoutQuotingIt
+// covers what the space-in-host canary cannot: a raw "?" in the password ends
+// the authority there, and url.Parse's own reason quotes everything before it
+// as an invalid port.
+func TestReadAerospikeKafkaRejectsURLWithDelimiterInPasswordWithoutQuotingIt(t *testing.T) {
+	err := ReadAerospikeKafka(ulogger.TestLogger{}, &settings.Settings{},
+		"kafka://teranode:canary-kafka?url-password@broker:9092/txs", "", "", "", 0)
+	require.Error(t, err)
+
+	require.NotContains(t, err.Error(), "canary-kafka", "the start of the Kafka URL password reached the error message")
+	require.Contains(t, err.Error(), "failed to parse Kafka URL")
+	require.Contains(t, err.Error(), "percent-encode", "expected the fixed reason, got: %v", err)
 }

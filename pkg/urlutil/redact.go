@@ -3,6 +3,7 @@ package urlutil
 import (
 	"net/url"
 	"regexp"
+	"strings"
 )
 
 // nilURL is what Redact prints for a nil URL. An empty string would be
@@ -36,12 +37,59 @@ const unparseableURL = "<unparseable url>"
 //
 // Use this at every site where a URL reaches a log line, an error message, a
 // metric label or an API response.
+//
+// A URL with an "@" anywhere after its authority renders as
+// "<unparseable url>". net/url ends the authority at the first "/", "?" or "#"
+// before it looks for the "@", so a password holding one of those characters
+// unencoded is misread: with no "@" before the delimiter, url.Parse can succeed
+// with no userinfo at all and the host set to "user:2024" or "user:", and with
+// an "@" before it, the userinfo ends at that "@". Either way the rest of the
+// password, up to the real "@", lands in the path, query or fragment, where
+// Redacted() prints it. The real "@" is what gives it away. A legitimate "@" in
+// a path or query is also masked, which errs in the safe direction for a log
+// line.
 func Redact(u *url.URL) string {
 	if u == nil {
 		return nilURL
 	}
 
+	if strings.Contains(u.Path+u.RawQuery+u.Fragment, "@") {
+		return unparseableURL
+	}
+
 	return u.Redacted()
+}
+
+// ParseErrorReason says why url.Parse refused a string without quoting any of
+// it, for callers that want to report a parse failure of a URL that may carry
+// a credential.
+//
+// net/url's own reasons are not safe for that. A raw "/", "?" or "#" in a
+// password ends the authority early, and "invalid port %q after host" then
+// quotes the password up to that character. An EscapeError quotes the bytes
+// after a stray "%". Forwarding the *url.Error's Err field instead of the whole
+// error drops the URL but keeps those quotes, so the reason returned here is
+// fixed text that depends only on the kind of failure.
+func ParseErrorReason(err error) error {
+	if urlErr, ok := err.(*url.Error); ok {
+		err = urlErr.Err
+	}
+
+	if _, ok := err.(url.InvalidHostError); ok {
+		return parseReason("invalid character in host name")
+	}
+
+	return parseReason("malformed URL; percent-encode reserved characters in the userinfo")
+}
+
+// parseReason is a fixed, input-free parse failure reason. It is a type of its
+// own rather than a call to errors.New so that this package keeps importing only
+// the standard library without tripping the lint rule against the stdlib errors
+// package.
+type parseReason string
+
+func (r parseReason) Error() string {
+	return string(r)
 }
 
 // RedactString is Redact for a URL that is still in string form.

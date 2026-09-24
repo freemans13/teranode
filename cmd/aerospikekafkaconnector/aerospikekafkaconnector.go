@@ -79,13 +79,9 @@ func ReadAerospikeKafka(
 	if err != nil {
 		// url.Parse embeds the string it was given verbatim in its error, so
 		// wrapping err here would undo the redaction fourteen lines above.
-		// Report the parse reason on its own.
-		var parseErr *url.Error
-		if errors.As(err, &parseErr) {
-			return errors.NewProcessingError("failed to parse Kafka URL", parseErr.Err)
-		}
-
-		return errors.NewProcessingError("failed to parse Kafka URL")
+		// Report a fixed reason: even net/url's bare reason can quote part of a
+		// password.
+		return errors.NewProcessingError("failed to parse Kafka URL", urlutil.ParseErrorReason(err))
 	}
 
 	// Convert hex filter to bytes for comparison

@@ -39,6 +39,24 @@ func TestRunRejectsUnparseableSeedURLWithoutEchoingIt(t *testing.T) {
 	require.True(t, strings.Contains(err.Error(), "invalid --seed-url"),
 		"expected the parse failure to be reported, got: %v", err)
 	require.Contains(t, strings.ToLower(err.Error()), "invalid character",
-		"expected url.Parse's own reason to survive, got: %v", err)
+		"expected the parse failure reason to survive, got: %v", err)
 	require.NotContains(t, err.Error(), "%", "the message renders a format verb literally")
+}
+
+// TestRunRejectsSeedURLWithDelimiterInPasswordWithoutQuotingIt covers the case
+// the space-in-host canary above cannot see. A raw "/" in the password ends
+// the authority there, and url.Parse's own reason, `invalid port ":canary-seed"
+// after host`, quotes everything before it. The assertion is on that prefix,
+// because the full password is never in the message either way.
+func TestRunRejectsSeedURLWithDelimiterInPasswordWithoutQuotingIt(t *testing.T) {
+	const authorityPubKey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+
+	err := run(context.Background(), ulogger.TestLogger{}, &settings.Settings{},
+		"0000000000000000000000000000000000000000000000000000000000000001",
+		"http://teranode:canary-seed/url-password@blobserver:8080/seed", authorityPubKey)
+	require.Error(t, err)
+
+	require.NotContains(t, err.Error(), "canary-seed", "the start of the seed URL password reached the error message")
+	require.Contains(t, err.Error(), "invalid --seed-url")
+	require.Contains(t, err.Error(), "percent-encode", "expected the fixed reason, got: %v", err)
 }

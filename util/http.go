@@ -713,12 +713,7 @@ func ValidateURL(rawURL string) error {
 		// The "%s" is dropped for the reason in the 503 message above:
 		// errors.New* takes the trailing error as the wrapped error, leaving no
 		// parameters, so fmt.Errorf never runs and the verb survives.
-		var parseErr *url.Error
-		if errors.As(err, &parseErr) {
-			return errors.NewInvalidArgumentError("invalid URL", parseErr.Err)
-		}
-
-		return errors.NewInvalidArgumentError("invalid URL")
+		return errors.NewInvalidArgumentError("invalid URL", urlutil.ParseErrorReason(err))
 	}
 
 	scheme := strings.ToLower(parsed.Scheme)

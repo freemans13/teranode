@@ -168,7 +168,25 @@ func TestNew(t *testing.T) {
 
 		assert.Contains(t, err.Error(), "asset_httpAddress is not a valid URL")
 		assert.Contains(t, strings.ToLower(err.Error()), "invalid character",
-			"expected url.Parse's own reason to survive, got: %v", err)
+			"expected the parse failure reason to survive, got: %v", err)
+	})
+
+	// A raw "/" in the password ends the authority there, and url.Parse's own
+	// reason quotes everything before it as an invalid port. The full password
+	// is never in that reason, so the assertion is on the part that used to be.
+	t.Run("Invalid URL - does not quote a password prefix", func(t *testing.T) {
+		tSettings := &settings.Settings{
+			Asset: settings.AssetSettings{
+				HTTPAddress: "http://teranode:canary-asset/address-password@assethost:8080",
+			},
+		}
+
+		centrifuge, err := New(logger, tSettings, mockRepo, mockHTTP)
+		require.Error(t, err)
+		assert.Nil(t, centrifuge)
+
+		assert.NotContains(t, err.Error(), "canary-asset", "the start of the configured password reached the error message")
+		assert.Contains(t, err.Error(), "asset_httpAddress is not a valid URL")
 	})
 }
 
