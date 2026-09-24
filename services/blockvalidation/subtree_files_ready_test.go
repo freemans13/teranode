@@ -32,9 +32,9 @@ import (
 // lands in the store - every validation path writes its subtree files before adding the
 // block, so this is the same state a real block is in whether or not its files happen to
 // exist yet; WithInvalid(true) mirrors storeInvalidBlock's record of a rejected one. Neither
-// option models the blockchain service's raw /revalidate/:hash endpoint, which is the one
-// route that un-invalidates a block without writing its files - see the KNOWN LIMITATION
-// note on subtreeFilesReady in BlockValidation.go.
+// option models the blockchain service's raw RevalidateBlock (its /revalidate/:hash endpoint
+// or a direct gRPC call), which is the one route that un-invalidates a block without writing
+// its files - see the doc comment on subtreeFilesReady in BlockValidation.go.
 //
 // The BlockValidation is built as a bare struct, not via NewBlockValidation, so that
 // start()'s background goroutines (setMined worker, periodic ticker) never run - this
