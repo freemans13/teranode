@@ -1457,6 +1457,11 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// does: the owner's main loop is blocked on this call for its whole length,
 	// and a reset can move hundreds of blocks (issue 1447). The serial loops beat
 	// at the top of each block; the concurrent ones beat as each block finishes.
+	//
+	// These use plain reportProgress, not reportProgressUnlessDone like Reorg,
+	// because reset runs on context.Background() and has no cancellation to gate
+	// on. A beat that lands after shutdown is still safe: the installed hook is
+	// BeatIfStarted, which cannot re-arm a heartbeat that Disable has cleared.
 	for _, block := range moveBackBlocks {
 		stp.reportProgress()
 
