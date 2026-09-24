@@ -229,3 +229,30 @@ func TestTheBudgetNeverStopsAGapBelowParkedBlocksBeingFilled(t *testing.T) {
 	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 1 }, 300*time.Millisecond), "and nothing past what is parked")
 	require.Equal(t, []chainhash.Hash{hashes[0]}, append(aRec.all(), bRec.all()...))
 }
+
+// A peer is refilled the moment its block arrives, not at the next commit. While download is the
+// limit blocks arrive out of order and park behind a missing one, and nothing asked the delivering
+// peer for more until a later commit or the 30-second sweep: on 2026-09-24 four of eight peers
+// were idle in some reports with the byte budget half used.
+func TestAPeerIsRefilledWhenItsBlockArrivesAndParks(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xeb}
+	msg, hashes := linkedHeaders(anchor, 10, &nonce)
+
+	sm, a, aRec, _, _ := budgetManager(t)
+	recentBlocks(sm, 200*qMB)
+	sm.settings.Legacy.MultiPeerBlockDownload = true
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+
+	// a is asked for the second block, which will park: the first is still missing.
+	require.True(t, sm.blockDownloads.Add(a, hashes[1]))
+
+	body := peerpkg.BlockBody{Hash: hashes[1], Size: 200 * qMB, TxCount: 1, Converted: false}
+	body.Header.PrevBlock = hashes[0]
+
+	sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: a})
+
+	require.True(t, WaitUntil(func() bool { return aRec.count() > 0 }, 5*time.Second), "the delivering peer is asked for more straight away")
+}
