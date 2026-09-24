@@ -10,7 +10,7 @@ import (
 // How a block's bytes were admitted, recorded by admitPipelineSink on the block's stream.
 const (
 	admitConverted    = "converted as it arrived"
-	admitRawDuplicate = "raw: another copy was already being converted"
+	admitRawDuplicate = "drained unwritten: another copy was being converted"
 	admitRawTimedOut  = "raw: the wait for an admission slot timed out"
 )
 
