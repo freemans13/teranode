@@ -686,7 +686,15 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 		// transactions that appear in BOTH moveBack and moveForward as unmined
 		moveForwardTxMap := make(map[chainhash.Hash]struct{})
 		moveForwardMapComplete := true
+
+		// This loop and the moveBack one below run one GetSubtrees per block
+		// inside a single pass of the main select, so each iteration beats at the
+		// top, proving the previous block's read returned (issue 1447). A reset
+		// can move hundreds of blocks and persists state only at the end, so a
+		// probe kill part-way through would restart straight into the same reset.
 		for _, blockWithMeta := range moveForwardBlocksWithMeta {
+			b.heartbeat.BeatIfStarted()
+
 			if blockWithMeta.meta.Invalid {
 				continue
 			}
@@ -729,6 +737,8 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 			moveBackTxs := make([]chainhash.Hash, 0, len(moveBackBlocksWithMeta)*100)
 
 			for _, blockWithMeta := range moveBackBlocksWithMeta {
+				b.heartbeat.BeatIfStarted()
+
 				if blockWithMeta.meta.Invalid {
 					// Skip invalid blocks — BlockValidation has already handled them via
 					// setTxMinedStatus(unsetMined=true) which we waited for above.
@@ -756,6 +766,9 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 			// Mark net unmined transactions as NOT on longest chain (set unmined_since)
 			if len(moveBackTxs) > 0 {
+				// Proves the last moveBack read returned; the mark is one store call.
+				b.heartbeat.BeatIfStarted()
+
 				if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, moveBackTxs, false); err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error marking moveBack transactions as unmined: %v", err)
 				} else {
@@ -958,11 +971,14 @@ func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *ch
 	var nonRetriableErr error
 
 	_, err := retry.Retry(retryCtx, b.logger, func() (bool, error) {
-		// Waiting on block validation is progress for liveness: see the
-		// blockassembly_livenessStallTimeout long description (issue 1447).
-		b.heartbeat.BeatIfStarted()
-
 		isMined, err := b.blockchainClient.GetBlockIsMined(retryCtx, blockHash)
+
+		// An answered poll is progress for liveness, a failed call is not: see
+		// the blockassembly_livenessStallTimeout long description (issue 1447).
+		if err == nil {
+			b.heartbeat.BeatIfStarted()
+		}
+
 		if err != nil {
 			// Short-circuit on non-retriable errors (block doesn't exist in DB)
 			if errors.Is(err, errors.ErrBlockNotFound) {
@@ -3147,9 +3163,14 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 
 	b.logger.Infof("[loadUnminedTransactions] feeding unmined transactions to %d workers", numWorkers)
 
-	// Feed batches from the iterator to workers
+	// Feed batches from the iterator to workers. This runs inside reset's
+	// post-process step as well as at startup, and scales with the unmined set,
+	// so each batch beats (issue 1447). BeatIfStarted keeps the startup call
+	// from arming the probe.
 	lastLogTime := time.Now()
 	for {
+		b.heartbeat.BeatIfStarted()
+
 		batch, err := it.Next(ctx)
 		if err != nil {
 			close(workChan)
@@ -3289,6 +3310,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 				end = totalTxs
 			}
 
+			b.heartbeat.BeatIfStarted()
+
 			// Pass slice segment directly - no copy needed
 			batch := unminedTransactions[start:end]
 			if err = b.subtreeProcessor.AddNodesDirectly(batch, true); err != nil {
@@ -3317,6 +3340,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 
 			// add every 10_000 transactions log the time taken
 			if (idx+1)%10_000 == 0 {
+				b.heartbeat.BeatIfStarted()
+
 				prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
 				prometheusBlockAssemblerAddDirectlyTotal.Add(addTxs)
 				addStart = time.Now()
@@ -3627,8 +3652,11 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 
 	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] processing unmined transactions and writing to temp store")
 
-	// Process batches from iterator
+	// Process batches from iterator. Beats per batch for the same reason as
+	// loadUnminedTransactions: this also runs inside reset (issue 1447).
 	for {
+		b.heartbeat.BeatIfStarted()
+
 		batch, err := it.Next(ctx)
 		if err != nil {
 			writeBatch.Cancel()
@@ -3791,6 +3819,8 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 		}
 
 		if (idx+1)%10_000 == 0 {
+			b.heartbeat.BeatIfStarted()
+
 			prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
 			prometheusBlockAssemblerAddDirectlyTotal.Add(addTxs)
 			addStart = time.Now()

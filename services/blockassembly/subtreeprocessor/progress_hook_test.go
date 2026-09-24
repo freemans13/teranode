@@ -5,8 +5,10 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
@@ -238,4 +240,194 @@ func TestSetProgressHookNilRemovesTheHook(t *testing.T) {
 	stp.SetProgressHook(nil)
 	stp.reportProgress()
 	require.Equal(t, 1, calls, "a removed hook must not be called")
+}
+
+// countingHook is a concurrency-safe progress hook. Reset runs some of its
+// per-block steps on errgroup goroutines, so the hook is called concurrently.
+type countingHook struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingHook) hook() {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+}
+
+func (c *countingHook) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.calls
+}
+
+// resetFixture returns two blocks to move back and two to move forward, on the
+// coinbases the rest of this package's tests already use.
+func resetFixture() (moveBack, moveForward []*model.Block) {
+	back1 := childHeader(prevBlockHeader, 201)
+	back2 := childHeader(back1, 202)
+	fwd1 := childHeader(prevBlockHeader, 301)
+	fwd2 := childHeader(fwd1, 302)
+
+	moveBack = []*model.Block{
+		{Height: 2, CoinbaseTx: coinbaseTx2, Subtrees: []*chainhash.Hash{}, Header: back2},
+		{Height: 1, CoinbaseTx: coinbaseTx2, Subtrees: []*chainhash.Hash{}, Header: back1},
+	}
+	moveForward = []*model.Block{
+		{Height: 1, CoinbaseTx: coinbaseTx, Subtrees: []*chainhash.Hash{}, Header: fwd1},
+		{Height: 2, CoinbaseTx: coinbaseTx3, Subtrees: []*chainhash.Hash{}, Header: fwd2},
+	}
+
+	return moveBack, moveForward
+}
+
+func resetBlockchainMock() *blockchain.Mock {
+	blockchainClient := &blockchain.Mock{}
+	blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
+
+	return blockchainClient
+}
+
+// TestProgressHookBeatsThroughAReset pins that Reset reports progress per block,
+// like Reorg. The owner's main loop is blocked on Reset for its whole length,
+// and a reset can move hundreds of blocks and only persists state at the end,
+// so an unbeaten reset lets the probe kill the node part-way through and the
+// restart goes straight back into the same reset (issue 1447).
+//
+// The count is exact so removing any one beat fails it: two blocks each through
+// the moveBack loop, the concurrent processed_at clear, the moveForward loop
+// and the processed_at loop.
+func TestProgressHookBeatsThroughAReset(t *testing.T) {
+	stp, _ := newProgressTestProcessor(t, resetBlockchainMock())
+
+	counter := &countingHook{}
+	stp.SetProgressHook(counter.hook)
+
+	moveBack, moveForward := resetFixture()
+	stp.InitCurrentBlockHeader(moveBack[0].Header)
+
+	postProcessed := false
+
+	response := stp.Reset(moveBack[0].Header, moveBack, moveForward, false, func() error {
+		postProcessed = true
+		return nil
+	})
+	require.NoError(t, response.Err)
+
+	// End state first: the reset must have landed on the new tip, or the beats
+	// below prove nothing about a working reset.
+	require.True(t, postProcessed, "the reset must run to its post-process step")
+	require.Equal(t, moveForward[1].Header.Hash(), stp.GetCurrentBlockHeader().Hash(), "reset must land on the last moveForward block")
+
+	require.Equal(t, 4*len(moveBack), counter.count(),
+		"one beat per block in each of: moveBack, processed_at clear, moveForward, processed_at")
+}
+
+// TestProgressHookBeatsThroughAFastForwardReset covers the checkpoint-trusted
+// branch of Reset, which replaces the per-block moveForward loop with
+// concurrent coinbase processing. Two blocks each through the moveBack loop,
+// the processed_at clear, the coinbase goroutines and the processed_at loop.
+func TestProgressHookBeatsThroughAFastForwardReset(t *testing.T) {
+	stp, _ := newProgressTestProcessor(t, resetBlockchainMock())
+
+	counter := &countingHook{}
+	stp.SetProgressHook(counter.hook)
+
+	moveBack, moveForward := resetFixture()
+	stp.InitCurrentBlockHeader(moveBack[0].Header)
+
+	response := stp.Reset(moveBack[0].Header, moveBack, moveForward, true, func() error { return nil })
+	require.NoError(t, response.Err)
+	require.Equal(t, moveForward[1].Header.Hash(), stp.GetCurrentBlockHeader().Hash(), "reset must land on the last moveForward block")
+
+	require.Equal(t, 4*len(moveBack), counter.count(),
+		"one beat per block in each of: moveBack, processed_at clear, coinbase processing, processed_at")
+}
+
+// TestProgressHookSkipsReorgBeatsOnceCancelled pins the shutdown guard on the
+// reorg loops: once the context is done, a step that still runs must not beat.
+// The owner disables its heartbeat on the way out, and a beat landing after
+// that would be progress the probe should never hear about.
+//
+// The context is cancelled from inside the first beat, the catch-up's
+// mined-status poll, so cancellation lands mid-reorg. A context cancelled
+// before the call never reaches the loops at all, because that poll returns
+// on ctx.Done first.
+func TestProgressHookSkipsReorgBeatsOnceCancelled(t *testing.T) {
+	blockchainClient := &blockchain.Mock{}
+	blockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+	blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+
+	stp, _ := newProgressTestProcessor(t, blockchainClient)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	counter := &countingHook{}
+	stp.SetProgressHook(func() {
+		counter.hook()
+		cancel()
+	})
+
+	parent := prevBlockHeader
+	h1 := childHeader(parent, 41)
+	h2 := childHeader(h1, 42)
+
+	blocks := []*model.Block{
+		{Height: 1, CoinbaseTx: coinbaseTx, Subtrees: []*chainhash.Hash{}, Header: h1},
+		{Height: 2, CoinbaseTx: coinbaseTx2, Subtrees: []*chainhash.Hash{}, Header: h2},
+	}
+
+	stp.InitCurrentBlockHeader(parent)
+
+	// Whether the reorg completes on a context cancelled part-way is not what
+	// this pins, only that its per-block loops stay silent once it is done.
+	_ = stp.reorgBlocks(ctx, []*model.Block{}, blocks)
+
+	require.Equal(t, 1, counter.count(),
+		"only the poll before cancellation may beat; a per-block step after it must not")
+}
+
+// TestWaitForPendingBlocksDoesNotBeatWhenTheCallFails pins the other half of
+// counting a wait on block validation as progress: only an answer counts. The
+// wait retries forever, so a call that keeps failing must leave the heartbeat
+// to go stale, or liveness reports 200 on a node that can make no progress.
+func TestWaitForPendingBlocksDoesNotBeatWhenTheCallFails(t *testing.T) {
+	blockchainClient := &blockchain.Mock{}
+	blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return(nil, errors.NewServiceError("block validation unreachable"))
+
+	stp, _ := newProgressTestProcessor(t, blockchainClient)
+
+	counter := &countingHook{}
+	stp.SetProgressHook(counter.hook)
+
+	// Attempts land at 0s and 1s; the deadline ends the infinite retry after both.
+	ctx, cancel := context.WithTimeout(t.Context(), 2500*time.Millisecond)
+	defer cancel()
+
+	require.Error(t, stp.WaitForPendingBlocks(ctx))
+
+	blockchainClient.AssertNumberOfCalls(t, "GetBlocksMinedNotSet", 2)
+	require.Zero(t, counter.count(), "a failed check for pending blocks must not beat")
+}
+
+// TestWaitForBlockBeingMinedDoesNotBeatWhenTheCallFails is the same rule for
+// the per-block wait inside a block move.
+func TestWaitForBlockBeingMinedDoesNotBeatWhenTheCallFails(t *testing.T) {
+	blockchainClient := &blockchain.Mock{}
+	blockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(false, errors.NewServiceError("block validation unreachable"))
+
+	stp, _ := newProgressTestProcessor(t, blockchainClient)
+
+	counter := &countingHook{}
+	stp.SetProgressHook(counter.hook)
+
+	_, err := stp.waitForBlockBeingMined(t.Context(), blockHeader.Hash())
+	require.Error(t, err)
+
+	blockchainClient.AssertCalled(t, "GetBlockIsMined", mock.Anything, mock.Anything)
+	require.Zero(t, counter.count(), "a failed mined-status poll must not beat")
 }
