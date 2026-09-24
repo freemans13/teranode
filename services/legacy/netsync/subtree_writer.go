@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"context"
+	"io"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -116,11 +117,6 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 			structureType = fileformat.FileTypeSubtree
 		}
 
-		dataBytes, err := data.Serialize()
-		if err != nil {
-			return errors.NewStorageError("[subtreeWriter][%s] failed to serialize subtree data", root, err)
-		}
-
 		metaBytes, err := meta.Serialize()
 		if err != nil {
 			return errors.NewStorageError("[subtreeWriter][%s] failed to serialize subtree meta", root, err)
@@ -131,18 +127,28 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 			return errors.NewStorageError("[subtreeWriter][%s] failed to serialize subtree", root, err)
 		}
 
-		// Order is load-bearing, see the type comment. Serialisation happens first
-		// for all three so a serialisation failure cannot leave a partial set on
-		// disk.
+		// Order is load-bearing, see the type comment. The two small artefacts are
+		// serialised first so a failure there cannot leave a partial set on disk; the
+		// data file is streamed into the store transaction by transaction and never
+		// held in memory whole. A failure while streaming aborts that file, and
+		// nothing of this subtree has been written before it.
+		//
+		// It used to be built in one buffer that started at 32 KB and doubled as it
+		// grew, each transaction serialized into a fresh slice on the way: on mainnet
+		// on 2026-09-24 that was over a third of all the node's allocation.
+		writeData := func(dst io.Writer) error {
+			return data.WriteTransactionsToWriter(dst, 0, st.Length())
+		}
+
 		for _, artefact := range []struct {
 			fileType fileformat.FileType
-			payload  []byte
+			write    func(io.Writer) error
 		}{
-			{fileformat.FileTypeSubtreeData, dataBytes},
-			{fileformat.FileTypeSubtreeMeta, metaBytes},
-			{structureType, structureBytes},
+			{fileformat.FileTypeSubtreeData, writeData},
+			{fileformat.FileTypeSubtreeMeta, writeBytes(metaBytes)},
+			{structureType, writeBytes(structureBytes)},
 		} {
-			if err = w.put(ctx, *root, artefact.fileType, artefact.payload); err != nil {
+			if err = w.put(ctx, *root, artefact.fileType, artefact.write); err != nil {
 				return err
 			}
 
@@ -159,7 +165,16 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 // A blob that already exists is success, not failure: two peers can deliver blocks
 // sharing an identical run of transactions, which produces the same subtree under
 // the same key.
-func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType fileformat.FileType, payload []byte) error {
+// writeBytes is an artefact already serialised, written as it is.
+func writeBytes(payload []byte) func(io.Writer) error {
+	return func(dst io.Writer) error {
+		_, err := dst.Write(payload)
+
+		return err
+	}
+}
+
+func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType fileformat.FileType, write func(io.Writer) error) error {
 	dah := w.height + w.settings.GetSubtreeValidationBlockHeightRetention()
 	if w.heightUnknown {
 		dah = w.dahOverride
@@ -174,7 +189,7 @@ func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType f
 		return errors.NewStorageError("[subtreeWriter][%s] failed to create %s file", root, fileType, err)
 	}
 
-	if _, err = storer.Write(payload); err != nil {
+	if err = write(storer); err != nil {
 		storer.Abort(errors.NewProcessingError("[subtreeWriter][%s] write failed for %s", root, fileType))
 
 		return errors.NewStorageError("[subtreeWriter][%s] failed writing %s", root, fileType, err)

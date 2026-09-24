@@ -2,6 +2,8 @@ package netsync
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"hash"
 	"io"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -53,6 +55,25 @@ type blockTxStream struct {
 	r       *bufio.Reader
 	txCount uint64
 	read    uint64
+	// hashing feeds every byte a transaction is parsed from into a SHA-256, so its id comes
+	// from the bytes as they were read rather than from serializing it again.
+	hashing hashingReader
+	sum     [sha256.Size]byte
+}
+
+// hashingReader passes reads through from r and writes every byte read into h.
+type hashingReader struct {
+	r io.Reader
+	h hash.Hash
+}
+
+func (hr *hashingReader) Read(p []byte) (int, error) {
+	n, err := hr.r.Read(p)
+	if n > 0 {
+		hr.h.Write(p[:n])
+	}
+
+	return n, err
 }
 
 // newBlockTxStream reads the declared transaction count and positions the stream
@@ -93,7 +114,7 @@ func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
 		return nil, errors.NewBlockInvalidError("[blockTxStream] block declares %d transactions, above the %d limit", count, uint64(maxBlockTxCount))
 	}
 
-	return &blockTxStream{r: br, txCount: count}, nil
+	return &blockTxStream{r: br, txCount: count, hashing: hashingReader{r: br, h: sha256.New()}}, nil
 }
 
 // TxCount is the transaction count the peer declared, including the coinbase.
@@ -113,15 +134,21 @@ func (s *blockTxStream) Next() (*bt.Tx, *chainhash.Hash, error) {
 		return nil, nil, errBlockTxStreamDone
 	}
 
+	// The id is the double SHA-256 of the transaction's wire bytes, the same bytes
+	// go-bt would produce by serializing it again. Hashing them as they are read
+	// costs no allocation; serializing again cost a copy of every transaction.
+	s.hashing.h.Reset()
+
 	tx := &bt.Tx{}
-	if _, err := tx.ReadFrom(s.r); err != nil {
+	if _, err := tx.ReadFrom(&s.hashing); err != nil {
 		return nil, nil, errors.NewBlockInvalidError("[blockTxStream] failed reading transaction %d of the %d declared", s.read, s.txCount, err)
 	}
 
 	s.read++
 
-	hash := tx.TxIDChainHash()
-	tx.SetTxHash(hash)
+	first := s.hashing.h.Sum(s.sum[:0])
+	hash := chainhash.Hash(sha256.Sum256(first))
+	tx.SetTxHash(&hash)
 
-	return tx, hash, nil
+	return tx, &hash, nil
 }
