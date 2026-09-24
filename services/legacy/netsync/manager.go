@@ -5362,6 +5362,17 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 	return weight, nil
 }
 
+// conversionInFlight reports whether a copy of this block holds an admission,
+// which on the streaming path means it is being converted right now.
+func (sm *SyncManager) conversionInFlight(blockHash chainhash.Hash) bool {
+	sm.inFlightBlocksMu.Lock()
+	defer sm.inFlightBlocksMu.Unlock()
+
+	_, ok := sm.inFlightBlocks[blockHash]
+
+	return ok
+}
+
 // ReleaseBlockPrefetch returns budget reserved by AcquireBlockPrefetch and drops
 // the block's hash from the in-flight dedup set. The two are released together
 // (same lifetime as the reservation) so the dedup and byte halves of the
