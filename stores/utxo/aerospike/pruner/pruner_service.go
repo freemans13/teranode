@@ -1772,8 +1772,8 @@ func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*pare
 			continue
 		}
 
-		plan.existing++
-
+		// A record that failed to read is not known to be present, so it is
+		// not counted as existing: its children are held back instead.
 		if batchRec.Err != nil || batchRec.ResultCode != types.OK || batchRec.Record == nil {
 			for _, childHash := range info.childHashes {
 				plan.block(*childHash)
@@ -1783,6 +1783,8 @@ func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*pare
 
 			continue
 		}
+
+		plan.existing++
 
 		utxos, isList := batchRec.Record.Bins[s.fieldUtxos].([]interface{})
 		holders := make([]*chainhash.Hash, 0, len(info.childHashes))

@@ -192,7 +192,7 @@ func TestParseLuaMapResponse(t *testing.T) {
 				"blockIDs": []interface{}{100, "not an int", 102},
 			},
 			expectError:   true,
-			errorContains: "invalid blockID at index 1",
+			errorContains: "invalid blockIDs entry at index 1",
 		},
 		{
 			name: "invalid errors type",
