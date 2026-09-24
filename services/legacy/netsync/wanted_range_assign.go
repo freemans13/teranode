@@ -340,7 +340,22 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 			continue
 		}
 
-		sm.blockDownloads.ForgiveOwners(block.hash, blockRequestRetryInterval)
+		if quiet := sm.blockDownloads.ForgiveOwners(block.hash, blockRequestRetryInterval); len(quiet) > 0 {
+			// Logged per block because it is what lets a block be asked of a second peer, and
+			// a duplicate copy can then only be traced back through this line.
+			sm.waste.reAskedQuiet.Add(1)
+
+			for _, p := range quiet {
+				last := sm.streams.lastBlockBytes(p)
+				since := "never"
+
+				if !last.IsZero() {
+					since = time.Since(last).Round(time.Second).String()
+				}
+
+				sm.logger.Infof("[reRequest][%s] height %d: %s owed it and last sent block bytes %s ago; it may be asked of another peer", block.hash, block.height, p, since)
+			}
+		}
 
 		candidates = append(candidates, block)
 	}

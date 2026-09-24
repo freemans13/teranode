@@ -22,6 +22,9 @@ type downloadWaste struct {
 	// droppedOwing is peers that left while still owing blocks, and blocksOwedAtDrop how many.
 	droppedOwing     atomic.Int64
 	blocksOwedAtDrop atomic.Int64
+	// reAskedQuiet is blocks made askable of another peer because the peers owing them sent no
+	// block bytes for the retry window. It is the one routine way a block reaches a second peer.
+	reAskedQuiet atomic.Int64
 
 	// lastReceived and lastAt are the received total at the previous report, for its rate. Only
 	// the report reads and writes them, from one goroutine.

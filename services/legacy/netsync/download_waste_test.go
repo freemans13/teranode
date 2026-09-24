@@ -98,3 +98,20 @@ func TestADrainedDuplicateIsCounted(t *testing.T) {
 
 	require.Equal(t, int64(1), sm.waste.dupDrained.Load())
 }
+
+// A block asked of another peer because its owner went quiet is counted and logged with the
+// peer let off, so every duplicate copy can be traced to a reason. On 2026-09-24 three
+// duplicates arrived within twelve seconds and the log could not say why they were asked for.
+func TestAReRequestAfterAQuietOwnerIsCounted(t *testing.T) {
+	sm, _ := orderManager(t)
+	sm.streams = newStreamRegistry()
+	hash := chainhash.Hash{0x66}
+
+	past := time.Now().Add(-2 * blockRequestRetryInterval)
+	sm.blockDownloads.now = func() time.Time { return past }
+	require.True(t, sm.blockDownloads.Add(newTestPeer(t, "10.0.0.8:8333"), hash))
+	sm.blockDownloads.now = time.Now
+
+	require.Len(t, sm.unownedBlocks([]wantedBlock{{height: 100, hash: hash}}), 1, "the quiet owner is let off")
+	require.Equal(t, int64(1), sm.waste.reAskedQuiet.Load())
+}

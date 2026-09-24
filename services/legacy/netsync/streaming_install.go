@@ -495,7 +495,7 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		// Only the sending peer is let off. The other owners are not: the copy being
 		// converted is not here yet, and letting them off freed the block to be asked for
 		// again while it was still arriving.
-		sm.logger.Infof("[blockOnDisk][%s] a duplicate copy was drained unwritten while another copy converted", msg.body.Hash)
+		sm.logger.Infof("[blockOnDisk][%s] a duplicate copy from %s was drained unwritten while another copy converted", msg.body.Hash, msg.peer)
 
 		return
 	}
@@ -648,6 +648,7 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 			sm.blockPark.Delete(sm.ctx, entry)
 		} else if msg.body.Converted {
 			sm.waste.dupConverted.Add(1)
+			sm.logger.Infof("[blockOnDisk][%s] a duplicate copy from %s was converted in full for a block already parked", entry.hash, msg.peer)
 		}
 
 		return

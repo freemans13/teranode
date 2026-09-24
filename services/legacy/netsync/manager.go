@@ -1734,6 +1734,7 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 	if owed := sm.blockDownloads.CountForPeer(peer); owed > 0 {
 		sm.waste.droppedOwing.Add(1)
 		sm.waste.blocksOwedAtDrop.Add(int64(owed))
+		sm.logger.Infof("[reRequest] %s left owing %d blocks; they may be asked of other peers", peer, owed)
 	}
 
 	if sm.streams != nil {
