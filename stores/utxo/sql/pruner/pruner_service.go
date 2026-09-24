@@ -371,25 +371,23 @@ func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (d
 // whole transaction.
 var pruneTxOptions = &sql.TxOptions{Isolation: sql.LevelSerializable}
 
-// finishPrune reads the delete's row count, counts the candidates the delete
-// held back, and commits. heldBackQuery runs in the same transaction after the
-// DELETE, so every candidate it still finds is one the DELETE refused: without
-// it a held-back row is indistinguishable from there being nothing to prune.
-func finishPrune(ctx context.Context, txn *sql.Tx, result sql.Result, heldBackQuery string, args ...interface{}) (deleted, heldBack int64, err error) {
-	deleted, err = result.RowsAffected()
+// finishPrune reads the delete's row count and commits. Nothing runs between
+// the DELETE and the COMMIT except RowsAffected, which reads a value the driver
+// already holds: any statement placed there would throw away a completed prune
+// if it failed, and on Postgres a failed statement aborts the transaction, so
+// even ignoring its error would not save the DELETE. That is why the held-back
+// count runs before the DELETE, not after it.
+func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
+	deleted, err := result.RowsAffected()
 	if err != nil {
-		return 0, 0, &pruneStepError{step: "failed to get rows affected", err: err}
-	}
-
-	if err := txn.QueryRowContext(ctx, heldBackQuery, args...).Scan(&heldBack); err != nil {
-		return 0, 0, &pruneStepError{step: "failed to count held-back candidates", err: err}
+		return 0, &pruneStepError{step: "failed to get rows affected", err: err}
 	}
 
 	if err := txn.Commit(); err != nil {
-		return 0, 0, &pruneStepError{step: "failed to commit pruning transaction", err: err}
+		return 0, &pruneStepError{step: "failed to commit pruning transaction", err: err}
 	}
 
-	return deleted, heldBack, nil
+	return deleted, nil
 }
 
 // unverifiedClaimFrom / unverifiedClaimCondition together select an input of
@@ -454,11 +452,14 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
     AND delete_at_height <= $1
     AND NOT EXISTS (` + unverifiedClaimTransactions + `)`
 
-	// After the DELETE, a row still past its delete-at-height is one the
-	// hold-back clause refused.
+	// The rows the DELETE is about to refuse: its own predicate with the
+	// hold-back clause inverted. It runs before the DELETE, in the same
+	// transaction, so nothing can change the answer in between, and a failure
+	// here costs only the uncommitted marker INSERT, never a completed DELETE.
 	const heldBackQuery = `SELECT count(*) FROM transactions
   WHERE delete_at_height IS NOT NULL
-    AND delete_at_height <= $1`
+    AND delete_at_height <= $1
+    AND EXISTS (` + unverifiedClaimTransactions + `)`
 
 	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
@@ -471,12 +472,20 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
 		return 0, 0, &pruneStepError{step: "failed to mark pruned children", err: err}
 	}
 
+	if err := txn.QueryRowContext(ctx, heldBackQuery, blockHeight).Scan(&heldBack); err != nil {
+		return 0, 0, &pruneStepError{step: "failed to count held-back candidates", err: err}
+	}
+
 	result, err := txn.ExecContext(ctx, deleteQuery, blockHeight)
 	if err != nil {
 		return 0, 0, &pruneStepError{step: "failed to delete transactions", err: err}
 	}
 
-	return finishPrune(ctx, txn, result, heldBackQuery, blockHeight)
+	if deleted, err = finishPrune(txn, result); err != nil {
+		return 0, 0, err
+	}
+
+	return deleted, heldBack, nil
 }
 
 // pruneWithDefensiveCheck verifies that every spending child of a candidate is
@@ -561,11 +570,13 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 	const deleteQuery = `DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)
     AND NOT EXISTS (` + unverifiedClaimTransactions + `)`
 
-	// After the DELETE, a candidate whose row is still there is one the
-	// hold-back clause refused. A candidate the stability test excluded is not
+	// The candidates the DELETE is about to refuse: its own predicate with the
+	// hold-back clause inverted, run before it for the reason given in
+	// pruneWithoutDefensiveCheck. A candidate the stability test excluded is not
 	// counted: it never made the candidates table.
 	const heldBackQuery = `SELECT count(*) FROM utxo_prune_candidates candidate
-  WHERE EXISTS (SELECT 1 FROM transactions t WHERE t.id = candidate.id)`
+  JOIN transactions ON transactions.id = candidate.id
+  WHERE EXISTS (` + unverifiedClaimTransactions + `)`
 
 	createCandidates := createCandidatesPortable
 	if s.engine == "postgres" {
@@ -591,10 +602,18 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 		return 0, 0, &pruneStepError{step: "failed to mark pruned children", err: err}
 	}
 
+	if err := txn.QueryRowContext(ctx, heldBackQuery).Scan(&heldBack); err != nil {
+		return 0, 0, &pruneStepError{step: "failed to count held-back candidates", err: err}
+	}
+
 	result, err := txn.ExecContext(ctx, deleteQuery)
 	if err != nil {
 		return 0, 0, &pruneStepError{step: "failed to delete transactions", err: err}
 	}
 
-	return finishPrune(ctx, txn, result, heldBackQuery)
+	if deleted, err = finishPrune(txn, result); err != nil {
+		return 0, 0, err
+	}
+
+	return deleted, heldBack, nil
 }
