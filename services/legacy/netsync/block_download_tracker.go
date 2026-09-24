@@ -548,6 +548,27 @@ func (t *blockDownloadTracker) ForgetForRetryPeer(p *peerpkg.Peer, retryWindow t
 	return reopened
 }
 
+// RequestedAt is when a request for h was first recorded, across every peer that owes it, so a
+// race's later request does not hide how long ago the block was first asked for.
+func (t *blockDownloadTracker) RequestedAt(h chainhash.Hash) (time.Time, bool) {
+	if t == nil {
+		return time.Time{}, false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var first time.Time
+
+	for _, rec := range t.byHash[h] {
+		if first.IsZero() || rec.at.Before(first) {
+			first = rec.at
+		}
+	}
+
+	return first, !first.IsZero()
+}
+
 // Len returns how many distinct blocks are currently owed by somebody, ignoring
 // assignments that have aged out.
 func (t *blockDownloadTracker) Len() int {
