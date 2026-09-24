@@ -3379,7 +3379,13 @@ func (s *server) outboundPeerConnected(c *connmgr.ConnReq, conn net.Conn) {
 	addr := conn.RemoteAddr().String()
 	if s.banList.IsBanned(addr) {
 		s.logger.Infof("Rejecting banned outbound peer %s", addr)
-		conn.Close()
+
+		// Disconnect, not only close the socket: the connection manager recorded
+		// this request as established before calling here, and without Disconnect
+		// it stays counted forever. Four banned addresses dialled after a restart
+		// on 2026-09-24 held four of mainnet's eight outbound slots all night, and
+		// the node synced on four peers. Disconnect also closes the connection.
+		s.connManager.Disconnect(c.ID())
 
 		return
 	}
