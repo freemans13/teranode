@@ -305,6 +305,17 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 			}
 		}
 
+		// An owner still sending block bytes has not gone quiet, however long ago
+		// the block was asked for. With large blocks a peer can spend minutes on
+		// what was queued ahead of this one, and asking another peer then downloads
+		// it twice: 346 blocks in 11 hours at height 705,000, one of them 447 MB.
+		// SV Node does not re-ask a block from a peer that is still delivering.
+		if sm.blockDownloads.AnyOwner(block.hash, func(p *peerpkg.Peer) bool {
+			return time.Since(sm.streams.lastBlockBytes(p)) < blockRequestRetryInterval
+		}) {
+			continue
+		}
+
 		sm.blockDownloads.ForgiveOwners(block.hash, blockRequestRetryInterval)
 
 		candidates = append(candidates, block)
