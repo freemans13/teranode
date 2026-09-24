@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -211,28 +212,41 @@ func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 	subtreeBytes, err := st.Serialize()
 	require.NoError(t, err)
 
-	repo := createTestRepositoryWithSubtreeDataToCheck(t, subtreeHash, subtreeBytes)
 	ctx := context.Background()
 
+	// Every subtest builds its own repository, so none depends on another having run first or
+	// on the order they are declared in.
+	newPendingRepo := func(t *testing.T) *repository.Repository {
+		return createTestRepositoryWithSubtreeDataToCheck(t, subtreeHash, subtreeBytes)
+	}
+
 	t.Run("GetSubtreeBytes", func(t *testing.T) {
+		repo := newPendingRepo(t)
+
 		retrieved, err := repo.GetSubtreeBytes(ctx, subtreeHash)
 		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, retrieved)
 	})
 
 	t.Run("GetSubtreeTxIDsReader", func(t *testing.T) {
+		repo := newPendingRepo(t)
+
 		reader, err := repo.GetSubtreeTxIDsReader(ctx, subtreeHash)
 		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, reader)
 	})
 
 	t.Run("GetSubtree", func(t *testing.T) {
+		repo := newPendingRepo(t)
+
 		retrieved, err := repo.GetSubtree(ctx, subtreeHash)
 		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, retrieved)
 	})
 
 	t.Run("GetSubtreeHead", func(t *testing.T) {
+		repo := newPendingRepo(t)
+
 		retrieved, numNodes, err := repo.GetSubtreeHead(ctx, subtreeHash)
 		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, retrieved)
@@ -242,6 +256,8 @@ func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 	// GetSubtreeExists gates the public POST /subtree/:hash/txs and search routes, so a
 	// pending subtree must read as absent rather than merely fail to serve.
 	t.Run("GetSubtreeExists", func(t *testing.T) {
+		repo := newPendingRepo(t)
+
 		exists, err := repo.GetSubtreeExists(ctx, subtreeHash)
 		require.NoError(t, err)
 		require.False(t, exists)
@@ -250,6 +266,8 @@ func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 	// The subtree_data route regenerates from the subtree file on demand. A pending-only
 	// subtree must not be a regeneration source either, or the removal above is bypassed.
 	t.Run("GetSubtreeDataReader", func(t *testing.T) {
+		repo := newPendingRepo(t)
+
 		reader, err := repo.GetSubtreeDataReader(ctx, subtreeHash)
 		require.ErrorIs(t, err, errors.ErrNotFound)
 		require.Nil(t, reader)
@@ -259,6 +277,7 @@ func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 	// readers answer. Without this, every refusal above would also pass against a fixture
 	// that could not serve anything at all.
 	t.Run("ValidatedSubtreeIsServed", func(t *testing.T) {
+		repo := newPendingRepo(t)
 		require.NoError(t, repo.SubtreeStore.Set(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtree, subtreeBytes))
 
 		retrievedBytes, err := repo.GetSubtreeBytes(ctx, subtreeHash)
@@ -281,6 +300,31 @@ func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 		exists, err := repo.GetSubtreeExists(ctx, subtreeHash)
 		require.NoError(t, err)
 		require.True(t, exists)
+
+		// GetSubtreeDataReader refuses for either of two reasons: no data file, or no validated
+		// subtree to regenerate from. There is still no data file here, so getting a reader
+		// back proves the refusal above came from the missing validated subtree.
+		// Regeneration reads the transaction from the UTXO store, so store it, and drain the
+		// stream here so the regeneration goroutine finishes inside the test. Regeneration also
+		// takes the process-wide quorum (assetQuorumOnce in GetSubtreeData.go), which binds to
+		// the first repository's subtree store, so this subtest fails under -count greater
+		// than 1; that is the singleton, not the gate.
+		creator, ok := repo.UtxoStore.(interface {
+			Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error)
+		})
+		require.True(t, ok)
+
+		_, err = creator.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		dataReader, err := repo.GetSubtreeDataReader(ctx, subtreeHash)
+		require.NoError(t, err)
+		require.NotNil(t, dataReader)
+
+		data, err := io.ReadAll(dataReader)
+		require.NoError(t, err)
+		require.NotEmpty(t, data)
+		require.NoError(t, dataReader.Close())
 	})
 }
 

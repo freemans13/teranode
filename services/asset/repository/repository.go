@@ -849,6 +849,8 @@ func (repo *Repository) getSubtreeDataInternal(ctx context.Context, hash *chainh
 		return nil, err
 	}
 
+	// The GetSubtree call above goes through openValidatedSubtree, so a subtree that has not been
+	// validated is refused before its FileTypeSubtreeData is read.
 	r, err := repo.SubtreeStore.GetIoReader(ctx, hash.CloneBytes(), fileformat.FileTypeSubtreeData)
 	if err != nil {
 		return nil, errors.NewServiceError("[GetSubtreeData][%s] error in GetSubtreeData Get method", hash.String(), err)
