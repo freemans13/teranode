@@ -1930,8 +1930,14 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 		toDelete = append(toDelete, deletion)
 	}
 
+	// survivors are the children whose record delete the server refused. Their
+	// records are still present, so their external blobs must stay too.
+	var survivors map[chainhash.Hash]struct{}
+
 	if len(toDelete) > 0 {
-		survivors, err := s.executeBatchDeletions(ctx, toDelete)
+		var err error
+
+		survivors, err = s.executeBatchDeletions(ctx, toDelete)
 
 		// A child whose delete definitely did not happen is still present with
 		// its markers already on every parent, which is the same poison as a
@@ -1952,11 +1958,20 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 	if len(externalFiles) > 0 {
 		remaining := externalFiles
 
-		if len(blocked) > 0 {
+		// A blob goes only with its record: never for a held-back child, and
+		// never for a survivor. Today a survivor also makes executeBatchDeletions
+		// return an error, so the return above already skips this block, but
+		// that is a property of the error handling, not a rule about blobs, and
+		// relaxing the cycle-fails-on-refusal behaviour must not orphan a record.
+		if len(blocked) > 0 || len(survivors) > 0 {
 			remaining = make([]*externalFileInfo, 0, len(externalFiles))
 
 			for _, file := range externalFiles {
 				if _, held := blocked[*file.txHash]; held {
+					continue
+				}
+
+				if _, survived := survivors[*file.txHash]; survived {
 					continue
 				}
 
