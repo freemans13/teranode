@@ -853,6 +853,11 @@ type SyncManager struct {
 	// waste counts block bytes received and every way download bandwidth was lost.
 	waste downloadWaste
 
+	// assignMu runs download passes one at a time. Commits, arrivals, header replies and the
+	// park sweep each start one, and two running together could both find the same block
+	// unowned and both ask for it. It is taken before headerMu and never while holding it.
+	assignMu sync.Mutex
+
 	drainedDuplicatesMu sync.Mutex
 	drainedDuplicates   map[chainhash.Hash]int
 	inFlightBlocksMu    sync.Mutex

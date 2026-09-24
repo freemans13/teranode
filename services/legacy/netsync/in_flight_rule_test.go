@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -56,4 +57,42 @@ func TestADrainedDuplicateReleasesOnlyItsOwnPeer(t *testing.T) {
 	require.False(t, h.sm.blockDownloads.HasOwner(h.peer, hash), "the peer that sent the duplicate is let off")
 	require.True(t, h.sm.blockDownloads.RequestedWithin(hash, blockRequestRetryInterval),
 		"the peer whose copy is still converting still owes it, so nobody is asked again")
+}
+
+// Download passes run one at a time. Commits, arrivals, header replies and the park sweep each
+// start one, and two running together could both find the same block unowned and both ask for
+// it: the ledger lets a block have several owners, so neither noticed the other. On mainnet on
+// 2026-09-24 five duplicate copies arrived in ten minutes with no quiet peer, race or departure
+// behind any of them.
+func TestConcurrentDownloadPassesAskForEachBlockOnce(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0x73}
+	msg, hashes := linkedHeaders(anchor, 8, &nonce)
+
+	sm := schedulerManager(t)
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+
+	a, aRec := schedulerPeer(t, sm, 140, 1000)
+	sm.storeSyncPeer(a, &syncPeerState{})
+
+	_, bRec := schedulerPeer(t, sm, 141, 1000)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			sm.fetchHeaderBlocks()
+		}()
+	}
+
+	wg.Wait()
+
+	require.True(t, WaitUntil(func() bool { return aRec.count()+bRec.count() >= len(hashes) }, 5*time.Second))
+	require.Never(t, func() bool { return aRec.count()+bRec.count() > len(hashes) }, 300*time.Millisecond, 10*time.Millisecond,
+		"each block is asked for once, however many passes run at once")
 }
