@@ -520,6 +520,7 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		hash:      msg.body.Hash,
 		prevBlock: msg.body.Header.PrevBlock,
 		size:      msg.body.Size,
+		wireSize:  msg.body.Size,
 		peer:      msg.peer,
 		// Straight from the sink's own return value, the same source
 		// BlockBody.Converted itself documents as the only trustworthy one —

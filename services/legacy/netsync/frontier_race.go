@@ -172,6 +172,23 @@ func (r *streamRegistry) pending(p *peerpkg.Peer) (int64, int) {
 	return bytes, n
 }
 
+// arrivingBytes is the declared size of every block arriving now, and how many there are.
+func (r *streamRegistry) arrivingBytes() (int64, int) {
+	if r == nil {
+		return 0, 0
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var total int64
+	for s := range r.active {
+		total += s.total
+	}
+
+	return total, len(r.active)
+}
+
 // medianRate is the median of the peers' measured rates on completed blocks, or zero with none.
 func (r *streamRegistry) medianRate() float64 {
 	if r == nil {
@@ -490,35 +507,30 @@ func (sm *SyncManager) askRacer(racer *peerpkg.Peer, h chainhash.Hash, now time.
 // queueReportEvery is how many race checks pass between download queue reports: every 30 s.
 const queueReportEvery = 6
 
-// logDownloadQueues reports, for each eligible peer, what it owes and how long its queue is
-// estimated to take, so a running node shows whether blocks are spread across its peers.
+// logDownloadQueues reports, for each eligible peer, what it owes and what it is sending, and in
+// one summary line the bytes ahead of the chain against the read-ahead budget and how many peers
+// are idle. Design B is judged on that line: no peer idle while the budget has room.
 func (sm *SyncManager) logDownloadQueues() {
 	if sm.streams == nil || sm.blockSizeTracker == nil || sm.blockDownloads == nil {
 		return
 	}
 
-	blockSize := sm.blockSizeTracker.largestRecentSize()
-
-	fallbackRate := sm.streams.medianRate()
-	if fallbackRate <= 0 {
-		fallbackRate = defaultPeerRate
-	}
-
+	largest := sm.blockSizeTracker.largestRecentSize()
 	eligible := sm.eligibleBlockPeers()
-	total := 0.0
+	idle := 0
 
 	for _, bp := range eligible {
-		p := &assignerPeer{peer: bp.peer, owed: sm.blockDownloads.CountForPeer(bp.peer)}
-		sm.estimateQueue(p, blockSize, fallbackRate)
+		owed := sm.blockDownloads.CountForPeer(bp.peer)
+		remaining, sending := sm.streams.pending(bp.peer)
 
-		remaining, streaming := sm.streams.pending(bp.peer)
-		rate := sm.streams.peerRate(bp.peer)
-		total += rate
+		if owed == 0 && sending == 0 {
+			idle++
+		}
 
-		sm.logger.Infof("[downloadQueue] %s owes %d, sending %d with %.0f MB left, rate %.1f MB/s, queue %s",
-			bp.peer, p.owed, streaming, float64(remaining)/1e6, rate/1e6, p.queue.Round(time.Second))
+		sm.logger.Infof("[downloadQueue] %s owes %d, sending %d with %.0f MB left, rate %.1f MB/s",
+			bp.peer, owed, sending, float64(remaining)/1e6, sm.streams.peerRate(bp.peer)/1e6)
 	}
 
-	sm.logger.Infof("[downloadQueue] %d eligible peers, largest recent block %.0f MB, %d blocks owed in all, measured rates sum to %.1f MB/s",
-		len(eligible), float64(blockSize)/1e6, sm.blockDownloads.Len(), total/1e6)
+	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %.1f GB ahead of the chain against a %.1f GB budget; largest recent block %.0f MB; %d blocks owed",
+		len(eligible), idle, float64(sm.bytesAhead(largest))/1e9, float64(lookaheadParkBytes)/1e9, float64(largest)/1e6, sm.blockDownloads.Len())
 }
