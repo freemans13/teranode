@@ -1787,6 +1787,12 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 // handleBlockNotification — get announced at all, and it is when the normal
 // (non-optimistic) validation path first announces a peer block too, since it
 // also defers AddBlock's SubtreesSet option to after validation completes.
+//
+// There is deliberately no check that the block is still the tip or on the
+// main chain. Before this gate existed every added block was announced on
+// AddBlock, side-chain blocks included, so that is unchanged. What differs is
+// timing: a block whose flag the periodic sweep sets late is announced late,
+// possibly after the tip has moved on.
 func (s *Server) handleBlockSubtreesSetNotification(ctx context.Context, hash *chainhash.Hash) error {
 	return s.announceBlock(ctx, hash, true)
 }
@@ -1860,16 +1866,27 @@ func (s *Server) announceBlock(ctx context.Context, hash *chainhash.Hash, viaSub
 		return nil
 	}
 
-	// subtrees_set is not just about subtree data: updateSubtreesDAH sets it
-	// only after block.Valid's background block-level checks succeed (both the
-	// optimistic and normal validation paths defer it to there), so this is the
-	// signal that this node's own integrity check on the block has finished, not
-	// merely that its subtrees are servable (those are already valid and stored
-	// before AddBlock runs, in either path). The BlockSubtreesSet notification
-	// announces the block once that finishes. Defensively applied to both
-	// notification types, though a BlockSubtreesSet notification should never
-	// observe this false: the store update and cache invalidation in
-	// SetBlockSubtreesSet happen before it sends the notification.
+	// subtrees_set is not just about subtree data: on the validation paths,
+	// updateSubtreesDAH sets it only after block.Valid succeeds (both the
+	// optimistic and normal paths defer it to there), not merely once the
+	// subtrees are servable (those are already valid and stored before AddBlock
+	// runs, in either path). It is not a guarantee that the check passed,
+	// though. The periodic processSubtreesNotSet sweep also calls
+	// updateSubtreesDAH, on every block whose flag is still false, and that
+	// includes an optimistic block whose background check exited without
+	// success and is waiting for revalidation (a failed header-ID lookup, a
+	// non-invalid block.Valid error, or a failed attempt to record the block as
+	// invalid). If the sweep reaches such a block before its revalidation
+	// finishes, the block is announced. That is no worse than before this gate
+	// existed, when every block was announced on AddBlock. The sweep cannot
+	// simply skip these blocks: a successful reValidateBlock never calls
+	// updateSubtreesDAH, so after a transient failure the sweep is the only
+	// thing that sets the flag, and setMined depends on it. The BlockSubtreesSet
+	// notification announces the block once the flag is set. Defensively
+	// applied to both notification types, though a BlockSubtreesSet
+	// notification should never observe this false: the store update and cache
+	// invalidation in SetBlockSubtreesSet happen before it sends the
+	// notification.
 	if !meta.SubtreesSet {
 		ctxLogger.Debugf("[announceBlock] not yet announcing block %s, subtrees not set", hash.String())
 		return nil
