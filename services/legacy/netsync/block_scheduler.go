@@ -30,6 +30,8 @@ type assignerPeer struct {
 	perBlock time.Duration
 	// owed is how many blocks this peer owes, counting those asked of it in this pass.
 	owed int
+	// blind is set when streamed blocks have no average size to estimate a queue from yet.
+	blind bool
 }
 
 // queueWorkCap is how much work, in time, a peer may have queued before it is given no more.
@@ -43,9 +45,18 @@ const defaultPeerRate = 10 << 20
 
 // full reports whether this peer can be asked for nothing more in this pass. A peer owing
 // nothing always takes one block, however large, or blocks bigger than the cap could never be
-// asked for at all.
+// asked for at all. With no average block size yet, as after a restart, there is nothing to
+// estimate a queue from, so a peer owing a block is full.
 func (p *assignerPeer) full() bool {
-	return p.budget <= 0 || (p.owed > 0 && p.queue >= queueWorkCap)
+	if p.budget <= 0 {
+		return true
+	}
+
+	if p.blind {
+		return p.owed > 0
+	}
+
+	return p.owed > 0 && p.queue >= queueWorkCap
 }
 
 // charge records one more block asked of this peer.
@@ -238,7 +249,13 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 // A block's size is not known before its bytes start, so the average stands in for the blocks
 // not yet started. Without a stream registry or an average there is nothing to estimate from.
 func (sm *SyncManager) estimateQueue(p *assignerPeer, avgSize int64, fallbackRate float64) {
-	if sm.streams == nil || avgSize <= 0 {
+	if sm.streams == nil {
+		return
+	}
+
+	if avgSize <= 0 {
+		p.blind = true
+
 		return
 	}
 
