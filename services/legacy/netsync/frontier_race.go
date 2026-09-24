@@ -178,6 +178,24 @@ func (r *streamRegistry) pending(p *peerpkg.Peer) (int64, int) {
 	return bytes, n
 }
 
+// arriving reports whether bytes of block h are arriving now, from any peer.
+func (r *streamRegistry) arriving(h chainhash.Hash) bool {
+	if r == nil {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for s := range r.active {
+		if s.hash == h {
+			return true
+		}
+	}
+
+	return false
+}
+
 // arrivingBytes is the declared size of every block arriving now, and how many there are.
 func (r *streamRegistry) arrivingBytes() (int64, int) {
 	if r == nil {
