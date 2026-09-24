@@ -1763,6 +1763,9 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	skipUnspendable := outpointOnly && sm.settings.BlockValidation.SkipUnspendableTxStorageDuringCatchup
 	genesisHeight := sm.settings.ChainCfgParams.GenesisActivationHeight
 
+	// skipped are the transactions left out of the create wave. See the retry handling below.
+	var skipped []*chainhash.Hash
+
 	// create all the utxos first
 	for _, txHash := range txMap.Keys() {
 		txHash := txHash
@@ -1770,6 +1773,8 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 		if skipUnspendable {
 			if txWrapper, ok := txMap.Get(txHash); ok &&
 				utxo.HasNoSpendableOutputs(txWrapper.Tx, txWrapper.Tx.IsCoinbase(), blockHeightUint32, genesisHeight) {
+				skipped = append(skipped, &txHash)
+
 				continue // never spendable, never stored; its inputs are still spent below
 			}
 		}
@@ -1862,6 +1867,18 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 		if err = utxo.SetMinedMultiChunked(ctx, sm.logger, sm.utxoStore, existingTxHashes, minedBlockInfo,
 			sm.settings.UtxoStore.MaxMinedBatchSize, sm.settings.UtxoStore.MaxMinedRoutines); err != nil {
 			return err
+		}
+
+		// Transactions already stored mean an earlier attempt at this block got part way, and
+		// it may have stored the skipped ones as unmined too. Nothing else would ever mark
+		// those mined. A first attempt finds nothing stored and pays nothing here.
+		marked, markErr := utxo.SetMinedIfPresent(ctx, sm.utxoStore, skipped, minedBlockInfo, sm.settings.UtxoStore.MaxMinedRoutines)
+		if markErr != nil {
+			return markErr
+		}
+
+		if marked > 0 {
+			sm.logger.Infof("[createUtxos][%s] marked %d skipped transactions mined that an earlier attempt had stored", bi.hash.String(), marked)
 		}
 	}
 
