@@ -11,11 +11,14 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,6 +32,9 @@ type createSpyStore struct {
 	// how createUtxos is driven onto its follow-up SetMinedMulti merge path.
 	alreadyExists bool
 	stamps        []utxo.MinedBlockInfo
+	// stamped is every hash SetMinedMulti was asked about, and known the hashes it holds.
+	stamped []chainhash.Hash
+	known   map[chainhash.Hash]bool
 }
 
 func (s *createSpyStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
@@ -46,11 +52,18 @@ func (s *createSpyStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHei
 
 func (s *createSpyStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.stamps = append(s.stamps, info)
-	s.mu.Unlock()
 
 	out := make(map[chainhash.Hash][]uint32, len(hashes))
 	for _, hash := range hashes {
+		s.stamped = append(s.stamped, *hash)
+
+		if s.known != nil && !s.known[*hash] {
+			return nil, errors.NewTxNotFoundError("[createSpyStore] %s", hash.String())
+		}
+
 		out[*hash] = []uint32{info.BlockID}
 	}
 
@@ -145,4 +158,53 @@ func TestCreateUtxos_SkipsUnspendableTransactionsBelowTheCheckpointWhenAsked(t *
 		require.True(t, spy.was(normal))
 		require.True(t, spy.was(data), "at the tip the mempool, the stamp and the persister may all need the row")
 	})
+}
+
+// A skipped transaction can still be in the store: an earlier attempt at the same block that
+// failed in subtree validation stored it as unmined. On 2026-09-24 that left 352 mined data
+// transactions marked unmined for good on mainnet, and the pruner named their parents for
+// preservation on every block. When a create finds the block's transactions already stored,
+// which is what a retry looks like, the skipped ones are marked mined too, if the store holds
+// them. A first attempt pays nothing.
+func TestCreateUtxos_MarksSkippedTransactionsMinedOnARetry(t *testing.T) {
+	const checkpointHeight = int32(1000)
+
+	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1}})
+	block.SetHeight(500)
+
+	run := func(t *testing.T, retry bool) (*bt.Tx, *createSpyStore) {
+		t.Helper()
+
+		tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
+		tSettings.BlockValidation.SkipUnspendableTxStorageDuringCatchup = true
+
+		normal, data, m := twoTxMap(t)
+
+		spy := &createSpyStore{NullStore: &nullstore.NullStore{}, created: map[chainhash.Hash]bool{}, alreadyExists: retry,
+			known: map[chainhash.Hash]bool{*normal.TxIDChainHash(): true, *data.TxIDChainHash(): true}}
+		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{}, utxoStore: spy, blockchainClient: bestHeaderMock()}
+
+		require.NoError(t, sm.createUtxos(context.Background(), m, testBlockIdent(block), 7, true))
+
+		return data, spy
+	}
+
+	t.Run("a retry marks the skipped transaction mined", func(t *testing.T) {
+		data, spy := run(t, true)
+		require.Contains(t, spy.stamped, *data.TxIDChainHash())
+	})
+
+	t.Run("a first attempt does not ask about it", func(t *testing.T) {
+		data, spy := run(t, false)
+		require.NotContains(t, spy.stamped, *data.TxIDChainHash())
+	})
+}
+
+// bestHeaderMock answers the retry path's best-header question with an unrelated header.
+func bestHeaderMock() *blockchain.Mock {
+	best, _ := fakeBestHeader(1)
+	m := &blockchain.Mock{}
+	m.On("GetBestBlockHeader", mock.Anything).Return(best, &model.BlockHeaderMeta{}, nil)
+
+	return m
 }
