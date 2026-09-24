@@ -134,3 +134,26 @@ func TestAnIdlePeerStillTakesOneBlockLargerThanTheCap(t *testing.T) {
 	require.Equal(t, hashes[0:1], aRec.all(), "each idle peer takes one block, however big")
 	require.Equal(t, hashes[1:2], bRec.all())
 }
+
+// Before any block has completed there is no average to estimate from, and right after a restart
+// that is when every peer's queue is filled. On mainnet on 2026-09-24 that start handed one peer
+// 15 blocks and another almost four minutes of work. Until an average exists each peer is asked
+// for one block at a time.
+func TestWithNoAverageYetEachPeerIsAskedForOneBlock(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xf8}
+	msg, hashes := linkedHeaders(anchor, 6, &nonce)
+
+	sm, a, aRec, _, bRec := queueTimeManager(t)
+	sm.blockSizeTracker = newBlockSizeTracker(10)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return aRec.count()+bRec.count() == 2 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return aRec.count()+bRec.count() > 2 }, 300*time.Millisecond),
+		"one block each until an average block size exists")
+	require.Equal(t, hashes[0:1], aRec.all())
+	require.Equal(t, hashes[1:2], bRec.all())
+}
