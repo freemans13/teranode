@@ -548,6 +548,50 @@ func (t *blockDownloadTracker) ForgetForRetryPeer(p *peerpkg.Peer, retryWindow t
 	return reopened
 }
 
+// ActiveOwners lists the peers that owe h and have not been let off it, with the earliest time
+// any of them was asked.
+func (t *blockDownloadTracker) ActiveOwners(h chainhash.Hash) ([]*peerpkg.Peer, time.Time) {
+	if t == nil {
+		return nil, time.Time{}
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	owners := make([]*peerpkg.Peer, 0, len(t.byHash[h]))
+	now := t.clock()
+
+	var first time.Time
+
+	for p, rec := range t.byHash[h] {
+		if rec.forgiven || t.expiredAt(rec.at, now, t.ttl) {
+			continue
+		}
+
+		owners = append(owners, p)
+
+		if first.IsZero() || rec.at.Before(first) {
+			first = rec.at
+		}
+	}
+
+	return owners, first
+}
+
+// AnyOwner reports whether some peer that owes h, unforgiven, satisfies pred. pred runs outside
+// the ledger's lock.
+func (t *blockDownloadTracker) AnyOwner(h chainhash.Hash, pred func(*peerpkg.Peer) bool) bool {
+	owners, _ := t.ActiveOwners(h)
+
+	for _, p := range owners {
+		if pred(p) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // RequestedAt is when a request for h was first recorded, across every peer that owes it, so a
 // race's later request does not hide how long ago the block was first asked for.
 func (t *blockDownloadTracker) RequestedAt(h chainhash.Hash) (time.Time, bool) {
