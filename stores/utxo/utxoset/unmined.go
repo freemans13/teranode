@@ -97,6 +97,18 @@ SELECT k.txid, s.mined_height, s.block_id, s.subtree_idx, s.created_height,
     ON CONFLICT (txid) DO UPDATE
    SET preserve_until = GREATEST(preserved_parent.preserve_until, EXCLUDED.preserve_until)`
 
+// renewPreservedSQL extends the preservation of every named parent that already has one. The
+// insert above copies a parent only from its block window, a live UTXO or a spend-journal row,
+// and a parent fully spent in its block loses all three once its window and journal partitions
+// drop. Without this the row stopped renewing then, and lapsed while its child still waited:
+// on 2026-09-24 that left 283 parents unpreserved on mainnet. The row itself is the source for
+// its own renewal, as the preserveUntil on the protected record is on the other stores.
+const renewPreservedSQL = `
+UPDATE preserved_parent p
+   SET preserve_until = GREATEST(p.preserve_until, $2::int)
+ WHERE p.txid = ANY($1::bytea[])
+   AND p.preserve_until < $2::int`
+
 // preserveClassifySQL sorts the parents that still have no preserved row after the insert into
 // the ones that are held elsewhere or will be reached, and the ones with no source at all. It
 // runs once per leaf group with the leaf as a scalar. A parent with an identity row is held by
@@ -165,6 +177,11 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	if _, err := s.pool.Exec(ctx, preserveParentSQL, leaves, ids, los, his, until,
 		int32(floors.DroppedFloor), int32(floors.StampCompleteFloor), FlagLocked); err != nil { //nolint:gosec // heights fit int32
 		return errors.NewStorageError("[utxoset][PreserveTransactions] preserve %d parents until %d",
+			len(txids), preserveUntilHeight, err)
+	}
+
+	if _, err := s.pool.Exec(ctx, renewPreservedSQL, txids, until); err != nil {
+		return errors.NewStorageError("[utxoset][PreserveTransactions] renew %d preserved parents until %d",
 			len(txids), preserveUntilHeight, err)
 	}
 

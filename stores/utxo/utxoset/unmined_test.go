@@ -223,3 +223,65 @@ func TestPreservingASecondTimeKeepsTheLongerPromise(t *testing.T) {
 	require.Equal(t, 0, preservedRows(t, s, ctx),
 		"Delete promises to remove every trace, and a preservation copy is a trace")
 }
+
+// A preservation is renewed while the pruner keeps naming its parent, even after every other
+// copy of the parent is gone. It used to renew only while the parent's block window, a live
+// UTXO or a spend-journal copy still existed, so a parent fully spent in its block lapsed 1,440
+// blocks after its last copy went, while its child still waited: on 2026-09-24 that left 283
+// parents unpreserved on mainnet and the pruner logged it eight times a block. The spec
+// promises the row is renewed on every cycle.
+func TestAPreservationRenewsWithNoOtherCopyLeft(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 9)
+
+	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
+
+	named := []chainhash.Hash{*parent.TxIDChainHash()}
+	require.NoError(t, s.PreserveTransactions(ctx, named, 5_000))
+
+	require.Equal(t, 1, dropStamped(t, s, ctx, tip))
+
+	_, err = s.dropSpendJournalPartitionsBelow(ctx, 2_000)
+	require.NoError(t, err)
+
+	// Every other copy is gone. The child still waits, so the pruner names the parent again.
+	require.NoError(t, s.PreserveTransactions(ctx, named, 8_000))
+
+	var until int32
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT preserve_until FROM preserved_parent WHERE txid = $1`, hashBytes(parent)).Scan(&until))
+	require.Equal(t, int32(8_000), until, "the preservation is renewed")
+
+	require.NoError(t, s.ProcessExpiredPreservations(ctx, 6_000))
+
+	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err, "past the old expiry the parent is still answerable")
+	require.Equal(t, []uint32{7}, got.BlockIDs)
+}
+
+// A transaction an earlier failed attempt at a block stored as unmined is marked mined by the
+// block path's retry through utxo.SetMinedIfPresent, and one the store never saw is ignored.
+func TestSetMinedIfPresentOnTheUtxosetStore(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	stored := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, stored, 200)
+	require.NoError(t, err)
+
+	never := chainhash.Hash{0xee}
+
+	marked, err := utxo.SetMinedIfPresent(ctx, s, []*chainhash.Hash{stored.TxIDChainHash(), &never},
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 200}, 2)
+	require.NoError(t, err)
+	require.Equal(t, 1, marked)
+
+	got, err := s.Get(ctx, stored.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Contains(t, got.BlockIDs, uint32(9))
+}
