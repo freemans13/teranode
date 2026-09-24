@@ -509,7 +509,14 @@ type blockSizeTracker struct {
 	recentSizes []int64 // last N block sizes in bytes
 	avgSize     int64   // rolling average block size
 	maxSamples  int     // number of samples to track
+	// largestWindow is the last largestSizeSamples block sizes, for largestRecentSize.
+	largestWindow []int64
 }
+
+// largestSizeSamples is how many recent blocks largestRecentSize looks back over. Ten was too
+// few: small blocks finish quickly, and ten of them pushed a 1.8 GB block out of the window
+// within 90 seconds on mainnet, so the per-peer limit jumped from 2 to 16.
+const largestSizeSamples = 100
 
 // newBlockSizeTracker creates a new block size tracker.
 func newBlockSizeTracker(maxSamples int) *blockSizeTracker {
@@ -524,6 +531,11 @@ func newBlockSizeTracker(maxSamples int) *blockSizeTracker {
 func (bst *blockSizeTracker) addBlockSize(size int64) {
 	bst.mu.Lock()
 	defer bst.mu.Unlock()
+
+	bst.largestWindow = append(bst.largestWindow, size)
+	if len(bst.largestWindow) > largestSizeSamples {
+		bst.largestWindow = bst.largestWindow[1:]
+	}
 
 	bst.recentSizes = append(bst.recentSizes, size)
 	if len(bst.recentSizes) > bst.maxSamples {
@@ -548,7 +560,7 @@ func (bst *blockSizeTracker) largestRecentSize() int64 {
 	defer bst.mu.RUnlock()
 
 	var largest int64
-	for _, s := range bst.recentSizes {
+	for _, s := range bst.largestWindow {
 		largest = max(largest, s)
 	}
 
