@@ -11,11 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The race asks a second peer for a block only when the chain is about to wait on it: its
-// estimated finish is later than when the chain will reach it, AND the peer sending it is well
-// below the median rate of the other peers. A slow peer with enough lead is left alone, and so
-// is a fast peer on a huge block. On 2026-09-23 mainnet waited 49 seconds on block 634,643, a
-// 309 MB block arriving from one peer at 4.3 MB/s, with nothing to ask anyone else for it.
+// The race is SV Node's rule: one extra request for a block, only when the peer sending it is
+// struggling, under 100 KB/s after 30 seconds, and the chain reaches the block before it would
+// arrive. The struggling peer is dropped, so the extra copy converts.
 
 func hashN(n byte) chainhash.Hash { return chainhash.Hash{n} }
 
@@ -28,119 +26,94 @@ func streamAt(r *streamRegistry, n byte, height int32, owner *peerpkg.Peer, tota
 	return s
 }
 
-func TestRaceFiresWhenTheChainIsAboutToWaitOnASlowPeer(t *testing.T) {
+func TestRaceFiresOnAStrugglingPeer(t *testing.T) {
 	r := newStreamRegistry()
 	now := time.Now()
-	start := now.Add(-20 * time.Second)
 
-	slowPeer := newTestPeer(t, "10.0.0.1:8333")
-	fastA := newTestPeer(t, "10.0.0.2:8333")
-	fastB := newTestPeer(t, "10.0.0.3:8333")
+	// 2 MB of 300 MB in 40 s: 50 KB/s.
+	slow := streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 300_000_000, 2_000_000, now.Add(-40*time.Second))
 
-	// 309 MB at 4 MB/s after 20 s: 80 MB in, 229 MB left, about 57 s to go.
-	slow := streamAt(r, 1, 1001, slowPeer, 309_000_000, 80_000_000, start)
-	// Two other peers streaming at 20 MB/s.
-	streamAt(r, 2, 1003, fastA, 900_000_000, 400_000_000, start)
-	streamAt(r, 3, 1004, fastB, 900_000_000, 400_000_000, start)
-
-	// The chain is at 1000 and commits 4 blocks a second: it needs 1001 in a quarter of a second.
-	got, c, ok := r.pickRace(now, 1000, 4)
+	got, c, ok := r.pickRace(now, 1000, 1)
 	require.True(t, ok)
 	require.Same(t, slow, got)
-	require.Greater(t, c.eta, c.need)
-	require.Less(t, c.rate, raceSlowFraction*c.median)
+	require.Less(t, c.rate, float64(raceStallRate))
 }
 
-func TestRaceLeavesASlowPeerAloneWhenTheLeadCoversIt(t *testing.T) {
+// A peer delivering at a healthy rate is never raced, however large the block. On 2026-09-24 a
+// 13 MB/s peer on a 2 GB block was raced three times over.
+func TestRaceLeavesAHealthyPeerAlone(t *testing.T) {
 	r := newStreamRegistry()
 	now := time.Now()
-	start := now.Add(-20 * time.Second)
 
-	streamAt(r, 1, 1500, newTestPeer(t, "10.0.0.1:8333"), 309_000_000, 80_000_000, start)
-	streamAt(r, 2, 1003, newTestPeer(t, "10.0.0.2:8333"), 900_000_000, 400_000_000, start)
-	streamAt(r, 3, 1004, newTestPeer(t, "10.0.0.3:8333"), 900_000_000, 400_000_000, start)
+	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 2_000_000_000, 520_000_000, now.Add(-40*time.Second))
 
-	// 500 blocks ahead at 4 a second is 125 s of lead against about 57 s to finish.
-	_, _, ok := r.pickRace(now, 1000, 4)
+	_, _, ok := r.pickRace(now, 1000, 1)
+	require.False(t, ok, "13 MB/s is not struggling")
+}
+
+func TestRaceWaitsThirtySeconds(t *testing.T) {
+	r := newStreamRegistry()
+	now := time.Now()
+
+	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 300_000_000, 0, now.Add(-20*time.Second))
+
+	_, _, ok := r.pickRace(now, 1000, 1)
+	require.False(t, ok, "SV Node judges a fetch after 30 s")
+}
+
+func TestRaceLeavesABlockTheChainDoesNotNeedYet(t *testing.T) {
+	r := newStreamRegistry()
+	now := time.Now()
+
+	// 50 KB/s with 1 MB left: 20 s to go, and the chain reaches it in 500 s.
+	streamAt(r, 1, 1500, newTestPeer(t, "10.0.0.1:8333"), 3_000_000, 2_000_000, now.Add(-40*time.Second))
+
+	_, _, ok := r.pickRace(now, 1000, 1)
 	require.False(t, ok)
 }
 
-func TestRaceLeavesAPeerAtTheMedianRateAlone(t *testing.T) {
+// A block is raced once. Nothing clears its mark before it expires, not a finished copy and not a
+// drained one: clearing it on every finished copy is what let the race fire again and again.
+func TestABlockIsRacedOnce(t *testing.T) {
 	r := newStreamRegistry()
 	now := time.Now()
-	start := now.Add(-20 * time.Second)
 
-	// A huge block the chain needs now, arriving as fast as every other peer delivers.
-	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 4_000_000_000, 400_000_000, start)
-	streamAt(r, 2, 1003, newTestPeer(t, "10.0.0.2:8333"), 900_000_000, 400_000_000, start)
-	streamAt(r, 3, 1004, newTestPeer(t, "10.0.0.3:8333"), 900_000_000, 400_000_000, start)
+	first := streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 300_000_000, 2_000_000, now.Add(-40*time.Second))
+	r.markRaced(first.hash, now)
+	r.finish(first, now, true)
 
-	_, _, ok := r.pickRace(now, 1000, 4)
-	require.False(t, ok, "asking a second peer only helps when the first is the slow one")
+	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.2:8333"), 300_000_000, 1_000_000, now.Add(-40*time.Second))
+
+	_, _, ok := r.pickRace(now, 1000, 1)
+	require.False(t, ok, "the same block is not raced a second time")
+
+	_, _, ok = r.pickRace(now.Add(raceExpiry+time.Second), 1000, 1)
+	require.True(t, ok, "until its mark expires")
 }
 
-func TestRaceNeedsTwoOtherPeersToJudgeAgainst(t *testing.T) {
-	r := newStreamRegistry()
-	now := time.Now()
-	start := now.Add(-20 * time.Second)
+func TestRacingDropsTheStrugglingPeer(t *testing.T) {
+	sm := assignManager(t, 1, 120)
+	sm.streams = newStreamRegistry()
+	mockCommittedTip(t, sm, 10, 0)
 
-	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 309_000_000, 80_000_000, start)
-	streamAt(r, 2, 1003, newTestPeer(t, "10.0.0.2:8333"), 900_000_000, 400_000_000, start)
+	owner, _ := schedulerPeer(t, sm, 1, 2000)
+	_, racerRec := schedulerPeer(t, sm, 2, 2000)
 
-	_, _, ok := r.pickRace(now, 1000, 4)
-	require.False(t, ok, "one other peer is no median")
-}
-
-func TestRaceWaitsUntilAStreamHasBeenMeasured(t *testing.T) {
-	r := newStreamRegistry()
-	now := time.Now()
-
-	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 309_000_000, 1_000, now.Add(-time.Second))
-	streamAt(r, 2, 1003, newTestPeer(t, "10.0.0.2:8333"), 900_000_000, 400_000_000, now.Add(-20*time.Second))
-	streamAt(r, 3, 1004, newTestPeer(t, "10.0.0.3:8333"), 900_000_000, 400_000_000, now.Add(-20*time.Second))
-
-	_, _, ok := r.pickRace(now, 1000, 4)
-	require.False(t, ok, "a second of data is not a rate")
-}
-
-func TestRaceUsesCompletedPeerRatesAsTheMedian(t *testing.T) {
-	r := newStreamRegistry()
-	now := time.Now()
-
-	fastA := newTestPeer(t, "10.0.0.2:8333")
-	fastB := newTestPeer(t, "10.0.0.3:8333")
-
-	// Two peers finished blocks at 20 MB/s earlier; nothing else is in flight now.
-	for _, p := range []*peerpkg.Peer{fastA, fastB} {
-		s := streamAt(r, 9, 900, p, 200_000_000, 200_000_000, now.Add(-time.Minute))
-		r.finish(s, now.Add(-50*time.Second), true)
-	}
-
-	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 309_000_000, 80_000_000, now.Add(-20*time.Second))
-
-	_, _, ok := r.pickRace(now, 1000, 4)
+	next, ok := sm.headerCache.At(11)
 	require.True(t, ok)
-}
+	require.True(t, sm.blockDownloads.Add(owner, next))
 
-func TestRaceIsAskedOncePerBlockAndClearedWhenItLands(t *testing.T) {
-	r := newStreamRegistry()
-	now := time.Now()
-	start := now.Add(-20 * time.Second)
+	s := sm.streams.start(next, 11, owner, 300_000_000, time.Now().Add(-40*time.Second))
+	s.read.Store(1_000_000)
 
-	slow := streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 309_000_000, 80_000_000, start)
-	streamAt(r, 2, 1003, newTestPeer(t, "10.0.0.2:8333"), 900_000_000, 400_000_000, start)
-	streamAt(r, 3, 1004, newTestPeer(t, "10.0.0.3:8333"), 900_000_000, 400_000_000, start)
+	sm.maybeRaceSlowBlock(time.Now())
 
-	_, _, ok := r.pickRace(now, 1000, 4)
-	require.True(t, ok)
+	require.True(t, WaitUntil(func() bool { return racerRec.count() == 1 }, 5*time.Second), "one other peer is asked")
+	require.Equal(t, []chainhash.Hash{next}, racerRec.all())
+	require.True(t, WaitUntil(func() bool { return !owner.Connected() }, 5*time.Second), "and the struggling peer is dropped")
 
-	r.markRaced(slow.hash, now)
-
-	_, _, ok = r.pickRace(now, 1000, 4)
-	require.False(t, ok, "one race per block, and one race at a time")
-
-	r.finish(slow, now, true)
-	require.False(t, r.racing(), "the race clears when the block lands")
+	sm.maybeRaceSlowBlock(time.Now())
+	require.Equal(t, 1, racerRec.count(), "and nobody is asked again")
 }
 
 func TestFinishedStreamRecordsItsPeersRate(t *testing.T) {
@@ -195,20 +168,4 @@ func TestChooseRacerPrefersTheFastestPeerThatDoesNotOwnTheBlock(t *testing.T) {
 	counts := map[*peerpkg.Peer]int{slowOther: 9, fastOther: 3, unknown: 5}
 	got = fresh.chooseRacer([]*peerpkg.Peer{slowOther, fastOther, unknown}, nil, func(p *peerpkg.Peer) int { return counts[p] })
 	require.Same(t, fastOther, got)
-}
-
-// A copy that fails ends its race too. On 2026-09-24 the copy of block 707,315 died with its peer's
-// connection, the race mark stayed for its ten-minute expiry, and the block could not be raced
-// again while the one peer left owing it worked through the blocks queued ahead of it. The chain
-// waited on it.
-func TestAFailedCopyEndsItsRace(t *testing.T) {
-	r := newStreamRegistry()
-	now := time.Now()
-
-	s := r.start(hashN(7), 707315, newTestPeer(t, "10.0.0.2:8333"), 950<<20, now.Add(-time.Minute))
-	r.markRaced(s.hash, now)
-
-	r.finish(s, now, false)
-
-	require.False(t, r.racing(), "the block can be raced again")
 }
