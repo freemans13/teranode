@@ -99,18 +99,16 @@ func TestHandleBlockOnDiskMsg_ChargesTheRecordOnlyWhenConverted(t *testing.T) {
 	})
 }
 
-// TestHandleBlockOnDiskMsg_NeverChecksForARecordWhenNotConverted is the direct
-// regression test for fix-round item 1. Before this fix, handleBlockOnDiskMsg
-// asked the store whether a converted record existed for EVERY streamed
-// block, regardless of whether the pipeline was even on, which put an
-// unconditional blob-store round trip — and therefore an unconditional wait on
-// the store's shared permit pool — on the single goroutine that commits blocks
-// in order, a path that used to do no I/O at all. Gating the check on
-// msg.body.Converted must mean the check never RUNS when it is false, not
-// merely that its answer is discarded; this asserts on the store's own call
-// counters rather than on the outcome, because the outcome alone cannot tell
-// "never asked" apart from "asked and ignored".
-func TestHandleBlockOnDiskMsg_NeverChecksForARecordWhenNotConverted(t *testing.T) {
+// TestHandleBlockOnDiskMsg_ChecksOnceForARecordWhenNotConverted bounds the
+// store I/O an unconverted delivery costs on the goroutine that commits blocks.
+// Fix-round item 1 removed a converted-record lookup that ran for EVERY streamed
+// block. Every block on this path now converts, so an unconverted delivery is
+// only a raw fallback copy: a duplicate of a block another peer is converting,
+// or an admission that timed out. Those check once whether the block is already
+// converted, because taking a raw copy of a converted block into the park is what
+// stopped mainnet at 707,177 on 2026-09-24. Asserted on the store's own call
+// counters, so a second lookup creeping in is caught.
+func TestHandleBlockOnDiskMsg_ChecksOnceForARecordWhenNotConverted(t *testing.T) {
 	store := memory.New()
 	sm := newPipelineParkManager(t, store, 8)
 
@@ -129,6 +127,6 @@ func TestHandleBlockOnDiskMsg_NeverChecksForARecordWhenNotConverted(t *testing.T
 	sm.handleBlockOnDiskMsg(msg)
 
 	after := store.Counters["exists"] + store.Counters["get"]
-	require.Equal(t, before, after,
-		"an unconverted delivery must never touch the store looking for a converted record")
+	require.Equal(t, before+1, after,
+		"an unconverted delivery checks for a converted record once, and no more")
 }

@@ -1113,6 +1113,21 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	}
 }
 
+// deleteRawBody removes only the whole-body file written for a raw copy of a
+// block, leaving the park's entries and any converted record alone.
+func (p *blockPark) deleteRawBody(ctx context.Context, hash chainhash.Hash) {
+	if p == nil || p.store == nil {
+		return
+	}
+
+	delCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	if err := p.store.Del(delCtx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...); err != nil {
+		p.logger.Warnf("[blockPark][%s] failed to delete a discarded raw copy, leaving it for the next restart sweep: %v", hash, err)
+	}
+}
+
 // StuckCandidates returns up to limit blocks that have been parked longer than
 // parkStuckThreshold, without removing them. The caller asks the chain whether
 // their parent is present after all — ErrBlockNotFound has more than one cause,

@@ -496,6 +496,31 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
 	sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 
+	// A raw copy of a block another copy is converting, or has converted, is
+	// discarded. Taking it into the park while the other copy converts means
+	// processing the raw body writes the block's subtree files while the
+	// converting copy writes the same files in its own format: on 2026-09-24
+	// block 707,178 arrived from two peers within a second, validation read the
+	// mix, failed, and the chain stopped at 707,177. The converting copy holds
+	// the hash in the in-flight set until it returns and writes its record
+	// before returning, so the two checks leave no gap between them. Only the
+	// raw file is removed: the converted record is the copy being kept.
+	if !msg.body.Converted && sm.blockPark.store != nil {
+		if sm.conversionInFlight(msg.body.Hash) {
+			sm.logger.Infof("[blockOnDisk][%s] another copy of this block is being converted, discarding this raw copy", msg.body.Hash)
+			sm.blockPark.deleteRawBody(sm.ctx, msg.body.Hash)
+
+			return
+		}
+
+		if _, found, err := sm.blockPark.convertedRecordSize(sm.ctx, msg.body.Hash); err == nil && found {
+			sm.logger.Infof("[blockOnDisk][%s] this block is already converted, discarding this raw copy", msg.body.Hash)
+			sm.blockPark.deleteRawBody(sm.ctx, msg.body.Hash)
+
+			return
+		}
+	}
+
 	entry := parkedBlock{
 		hash:      msg.body.Hash,
 		prevBlock: msg.body.Header.PrevBlock,
