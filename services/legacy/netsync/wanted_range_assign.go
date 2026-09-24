@@ -59,6 +59,20 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// function makes, not only the ones that go on to place a block.
 	sm.maybeRequestMoreHeaders(wanted)
 
+	// The front first: the next blocks the chain needs, each at the top of its own peer. Until
+	// every one of them has such a peer, nothing further ahead is handed out, so peers drain and
+	// one comes free for the front. Multi-peer download with the park on only; see front_assign.go.
+	if sm.settings != nil && sm.settings.Legacy.MultiPeerBlockDownload && sm.blockPark.Enabled() {
+		eligible := sm.eligibleBlockPeers()
+		front := sm.frontBlocks(wanted, len(eligible))
+
+		if uncovered := sm.coverFront(front, eligible); uncovered > 0 {
+			sm.logger.Debugf("[assignWantedBlocks] %d of the next %d blocks have no peer to themselves yet, holding back the read-ahead", uncovered, len(front))
+
+			return
+		}
+	}
+
 	assigner := sm.newDownloadAssigner()
 	if assigner == nil {
 		return
@@ -303,6 +317,17 @@ func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
 			} else if haveInv {
 				continue
 			}
+		}
+
+		// An owner still sending block bytes has not gone quiet. With large blocks a
+		// peer can spend minutes sending what was queued ahead of this block, and
+		// asking another peer then downloads it twice: at height 705,000, 18 blocks
+		// in 15 minutes, one of them 447 MB. A front block stuck behind others is
+		// raced by coverFront instead, onto a peer where it is at the top.
+		if sm.blockDownloads.AnyOwner(block.hash, func(p *peerpkg.Peer) bool {
+			return time.Since(sm.streams.lastBlockBytes(p)) < blockRequestRetryInterval
+		}) {
+			continue
 		}
 
 		sm.blockDownloads.ForgiveOwners(block.hash, blockRequestRetryInterval)

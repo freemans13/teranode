@@ -548,6 +548,79 @@ func (t *blockDownloadTracker) ForgetForRetryPeer(p *peerpkg.Peer, retryWindow t
 	return reopened
 }
 
+// oldestForLocked is the block p was asked for longest ago among those it still owes and has not
+// been forgiven: the one at the top of its queue, since a peer sends in the order it was asked.
+func (t *blockDownloadTracker) oldestForLocked(p *peerpkg.Peer, now time.Time) (chainhash.Hash, bool) {
+	var (
+		oldest   chainhash.Hash
+		oldestAt time.Time
+		found    bool
+	)
+
+	for h := range t.byPeer[p] {
+		rec, ok := t.byHash[h][p]
+		if !ok || rec.forgiven || t.expiredAt(rec.at, now, t.ttl) {
+			continue
+		}
+
+		if !found || rec.at.Before(oldestAt) {
+			oldest, oldestAt, found = h, rec.at, true
+		}
+	}
+
+	return oldest, found
+}
+
+// TopOwner is a peer that owes h with h at the top of its queue, or nil if no owner has it there.
+func (t *blockDownloadTracker) TopOwner(h chainhash.Hash) *peerpkg.Peer {
+	if t == nil {
+		return nil
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := t.clock()
+
+	for p, rec := range t.byHash[h] {
+		if rec.forgiven || t.expiredAt(rec.at, now, t.ttl) {
+			continue
+		}
+
+		if oldest, ok := t.oldestForLocked(p, now); ok && oldest == h {
+			return p
+		}
+	}
+
+	return nil
+}
+
+// AnyOwner reports whether some peer that owes h, unforgiven, satisfies pred.
+func (t *blockDownloadTracker) AnyOwner(h chainhash.Hash, pred func(*peerpkg.Peer) bool) bool {
+	if t == nil {
+		return false
+	}
+
+	t.mu.Lock()
+	owners := make([]*peerpkg.Peer, 0, len(t.byHash[h]))
+	now := t.clock()
+
+	for p, rec := range t.byHash[h] {
+		if !rec.forgiven && !t.expiredAt(rec.at, now, t.ttl) {
+			owners = append(owners, p)
+		}
+	}
+	t.mu.Unlock()
+
+	for _, p := range owners {
+		if pred(p) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // RequestedAt is when a request for h was first recorded, across every peer that owes it, so a
 // race's later request does not hide how long ago the block was first asked for.
 func (t *blockDownloadTracker) RequestedAt(h chainhash.Hash) (time.Time, bool) {

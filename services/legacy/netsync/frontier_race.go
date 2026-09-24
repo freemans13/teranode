@@ -59,7 +59,9 @@ type blockStream struct {
 	owner *peerpkg.Peer
 	total int64
 	read  atomic.Int64
-	start time.Time
+	// lastRead is when bytes last arrived for this block, in unix nanoseconds.
+	lastRead atomic.Int64
+	start    time.Time
 	// requestedAt is when the ledger first recorded a request for this block, zero if none.
 	requestedAt time.Time
 	// admitWait and path are set by admitPipelineSink under the registry's lock: how long this
@@ -87,6 +89,7 @@ func (c countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	if n > 0 {
 		c.s.read.Add(int64(n))
+		c.s.lastRead.Store(time.Now().UnixNano())
 	}
 
 	return n, err
@@ -104,13 +107,16 @@ type streamRegistry struct {
 	active map[*blockStream]struct{}
 	rates  map[*peerpkg.Peer]float64
 	raced  map[chainhash.Hash]time.Time
+	// lastBlock is when each peer last finished delivering a block.
+	lastBlock map[*peerpkg.Peer]time.Time
 }
 
 func newStreamRegistry() *streamRegistry {
 	return &streamRegistry{
-		active: make(map[*blockStream]struct{}),
-		rates:  make(map[*peerpkg.Peer]float64),
-		raced:  make(map[chainhash.Hash]time.Time),
+		lastBlock: make(map[*peerpkg.Peer]time.Time),
+		active:    make(map[*blockStream]struct{}),
+		rates:     make(map[*peerpkg.Peer]float64),
+		raced:     make(map[chainhash.Hash]time.Time),
 	}
 }
 
@@ -142,6 +148,8 @@ func (r *streamRegistry) finish(s *blockStream, now time.Time, complete bool) {
 		return
 	}
 
+	r.lastBlock[s.owner] = now
+
 	if bps := s.rate(now); bps > 0 {
 		if prev, ok := r.rates[s.owner]; ok {
 			bps = peerRateWeight*bps + (1-peerRateWeight)*prev
@@ -171,11 +179,40 @@ func (r *streamRegistry) racing() bool {
 	return len(r.raced) > 0
 }
 
-// forgetPeer drops a departed peer's rate.
+// forgetPeer drops a departed peer's rate and activity.
 func (r *streamRegistry) forgetPeer(p *peerpkg.Peer) {
 	r.mu.Lock()
 	delete(r.rates, p)
+	delete(r.lastBlock, p)
 	r.mu.Unlock()
+}
+
+// lastBlockBytes is when block bytes last came from p: the latest byte of a block it is sending
+// now, or the moment it finished its last block. Any other traffic on the connection, pings and
+// announcements, does not count: a peer that has dropped our request still sends those.
+func (r *streamRegistry) lastBlockBytes(p *peerpkg.Peer) time.Time {
+	if r == nil || p == nil {
+		return time.Time{}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	latest := r.lastBlock[p]
+
+	for s := range r.active {
+		if s.owner != p {
+			continue
+		}
+
+		if at := s.lastRead.Load(); at > 0 {
+			if t := time.Unix(0, at); t.After(latest) {
+				latest = t
+			}
+		}
+	}
+
+	return latest
 }
 
 // pickRace returns the block the chain is most urgently about to wait on from a slow peer, if
