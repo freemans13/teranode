@@ -180,30 +180,19 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 
 		if err != nil {
 			if errors.Is(err, ErrDuplicateBlockInFlight) {
-				// A copy of this hash is already being converted (or waiting
-				// for budget) by another peer's read loop — the frontier
-				// race's own duplicate delivery, not a fault. It must not
-				// disconnect this peer or fail this message: decline the
-				// conversion and defer to the plain body-write path, exactly
-				// as pipelineBlockSink's own unresolvable-parent and
-				// not-legacyUnified declines already do (see that function's
-				// doc comment) — r is still untouched at this point, so
-				// handing it to streamingBlockSink is safe. The existing
-				// park/drain machinery (AdoptWritten's "already hold this
-				// block" branch) resolves the resulting duplicate body
-				// exactly as it always has.
-				//
-				// Recorded, not fixed here: under the frontier race this
-				// fallback body can win the race to handleBlockOnDiskMsg
-				// ahead of the copy that actually converts. That delivery's
-				// msg.body.Converted is false (streamingBlockSink never
-				// converts, see its own doc comment), so the park charges it
-				// the full wire size rather than the converted record's — the
-				// exact over-charge handleBlockOnDiskMsg's own comment on
-				// msg.body.Converted already warns about for a stale or
-				// foreign record, now reachable here too by a legitimate race
-				// rather than a fault.
-				return sm.streamingBlockSink(hash, header, r, n)
+				// Drained, not written. A raw copy of a block another copy is converting is
+				// never the copy wanted, and writing it let the park take it whenever the
+				// converting copy then failed: processing a raw copy after a conversion
+				// attempt failed subtree validation at 707,178 and 708,115 on 2026-09-24 and
+				// stopped the chain each time. If the converting copy fails, nobody owes the
+				// block any more and the next download pass asks for it again.
+				if _, derr := io.Copy(io.Discard, r); derr != nil {
+					return false, derr
+				}
+
+				sm.noteDrainedDuplicate(hash)
+
+				return false, nil
 			}
 
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -496,6 +485,12 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
 	sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 
+	if !msg.body.Converted && sm.takeDrainedDuplicate(msg.body.Hash) {
+		sm.logger.Infof("[blockOnDisk][%s] a duplicate copy was drained unwritten while another copy converted", msg.body.Hash)
+
+		return
+	}
+
 	// A raw copy of a block another copy is converting, or has converted, is
 	// discarded. Taking it into the park while the other copy converts means
 	// processing the raw body writes the block's subtree files while the
@@ -724,4 +719,35 @@ func (sm *SyncManager) parentIsReachable(parent chainhash.Hash) bool {
 	}
 
 	return !errors.Is(err, errors.ErrBlockNotFound) && !errors.Is(err, errors.ErrNotFound)
+}
+
+// noteDrainedDuplicate records one copy of hash drained off the wire unwritten.
+func (sm *SyncManager) noteDrainedDuplicate(hash chainhash.Hash) {
+	sm.drainedDuplicatesMu.Lock()
+	defer sm.drainedDuplicatesMu.Unlock()
+
+	if sm.drainedDuplicates == nil {
+		sm.drainedDuplicates = make(map[chainhash.Hash]int)
+	}
+
+	sm.drainedDuplicates[hash]++
+}
+
+// takeDrainedDuplicate consumes one drained copy of hash, reporting whether there was one.
+func (sm *SyncManager) takeDrainedDuplicate(hash chainhash.Hash) bool {
+	sm.drainedDuplicatesMu.Lock()
+	defer sm.drainedDuplicatesMu.Unlock()
+
+	n := sm.drainedDuplicates[hash]
+	if n == 0 {
+		return false
+	}
+
+	if n == 1 {
+		delete(sm.drainedDuplicates, hash)
+	} else {
+		sm.drainedDuplicates[hash] = n - 1
+	}
+
+	return true
 }
