@@ -165,7 +165,19 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 		acquireCtx, cancel := context.WithTimeout(sm.ctx, sm.pipelineAdmissionAcquireTimeout())
 		defer cancel()
 
+		acquireStart := time.Now()
 		weight, err := sm.AcquireBlockPrefetch(acquireCtx, nil, hash, n)
+		admitWait := time.Since(acquireStart)
+
+		switch {
+		case err == nil:
+			sm.streams.noteAdmission(hash, admitWait, admitConverted)
+		case errors.Is(err, ErrDuplicateBlockInFlight):
+			sm.streams.noteAdmission(hash, admitWait, admitRawDuplicate)
+		case errors.Is(err, context.DeadlineExceeded):
+			sm.streams.noteAdmission(hash, admitWait, admitRawTimedOut)
+		}
+
 		if err != nil {
 			if errors.Is(err, ErrDuplicateBlockInFlight) {
 				// A copy of this hash is already being converted (or waiting

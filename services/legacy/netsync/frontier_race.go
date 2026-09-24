@@ -60,6 +60,12 @@ type blockStream struct {
 	total int64
 	read  atomic.Int64
 	start time.Time
+	// requestedAt is when the ledger first recorded a request for this block, zero if none.
+	requestedAt time.Time
+	// admitWait and path are set by admitPipelineSink under the registry's lock: how long this
+	// block waited for an admission slot, and which path its bytes took.
+	admitWait time.Duration
+	path      string
 }
 
 func (s *blockStream) rate(now time.Time) float64 {
@@ -329,10 +335,30 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		}
 
 		s := sm.streams.start(hash, height, owner, n, time.Now())
+		if at, ok := sm.blockDownloads.RequestedAt(hash); ok {
+			s.requestedAt = at
+		}
 
 		converted, err := inner(hash, header, countingReader{r: r, s: s}, n)
 
-		sm.streams.finish(s, time.Now(), err == nil && s.read.Load() >= n)
+		now := time.Now()
+		sm.streams.finish(s, now, err == nil && s.read.Load() >= n)
+
+		// The committed tip is read only for a download worth reporting: it is a blockchain
+		// call, and this runs on the peer's read loop for every block.
+		sm.streams.mu.Lock()
+		_, worth := s.report(now, s.height)
+		sm.streams.mu.Unlock()
+
+		if worth {
+			tip, _, _ := sm.committedTip()
+
+			sm.streams.mu.Lock()
+			line, _ := s.report(now, tip)
+			sm.streams.mu.Unlock()
+
+			sm.logger.Infof("[blockDownload][%s] %s", hash, line)
+		}
 
 		return converted, err
 	}
