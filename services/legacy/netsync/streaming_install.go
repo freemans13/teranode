@@ -485,6 +485,13 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
 	sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 
+	// The delivering peer has room again, so ask it for more now. Only a commit
+	// used to, and while download is the limit blocks arrive out of order and
+	// park behind a missing one, so a peer whose block parked sat idle until a
+	// later commit or the 30-second sweep. Deferred so it runs after the block
+	// is parked or discarded, whichever path below is taken.
+	defer sm.topUpHeaderBlocks(nil)
+
 	if !msg.body.Converted && sm.takeDrainedDuplicate(msg.body.Hash) {
 		sm.logger.Infof("[blockOnDisk][%s] a duplicate copy was drained unwritten while another copy converted", msg.body.Hash)
 
