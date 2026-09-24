@@ -572,7 +572,7 @@ func (sm *SyncManager) logDownloadQueues() {
 		len(eligible), idle, float64(sm.bytesAhead(largest))/1e9, float64(lookaheadParkBytes)/1e9, float64(largest)/1e6, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
 
 	w := &sm.waste
-	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks)",
+	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",
 		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.streamsFailed.Load(),
-		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load())
+		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load())
 }
