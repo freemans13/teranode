@@ -199,7 +199,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	peers := make([]*assignerPeer, 0, fanout)
 	assignable := 0
 
-	avgSize := sm.blockSizeTracker.getAverageSize()
+	blockSize := sm.blockSizeTracker.largestRecentSize()
 	fallbackRate := sm.streams.medianRate()
 
 	if fallbackRate <= 0 {
@@ -219,7 +219,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		}
 
 		p := &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, owed: owed}
-		sm.estimateQueue(p, avgSize, fallbackRate)
+		sm.estimateQueue(p, blockSize, fallbackRate)
 
 		if p.full() {
 			continue
@@ -245,15 +245,15 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 }
 
 // estimateQueue sets how long p's queue will take: the bytes left on the blocks it is sending,
-// plus its other owed blocks at the average block size, over its measured rate or fallbackRate.
-// A block's size is not known before its bytes start, so the average stands in for the blocks
-// not yet started. Without a stream registry or an average there is nothing to estimate from.
-func (sm *SyncManager) estimateQueue(p *assignerPeer, avgSize int64, fallbackRate float64) {
+// plus its other owed blocks at blockSize, over its measured rate or fallbackRate. A block's size
+// is not known before its bytes start, so the largest recent block stands in for the blocks not
+// yet started. Without a stream registry or a recent block there is nothing to estimate from.
+func (sm *SyncManager) estimateQueue(p *assignerPeer, blockSize int64, fallbackRate float64) {
 	if sm.streams == nil {
 		return
 	}
 
-	if avgSize <= 0 {
+	if blockSize <= 0 {
 		p.blind = true
 
 		return
@@ -266,10 +266,10 @@ func (sm *SyncManager) estimateQueue(p *assignerPeer, avgSize int64, fallbackRat
 
 	remaining, streaming := sm.streams.pending(p.peer)
 	waiting := max(0, p.owed-streaming)
-	bytes := float64(remaining) + float64(waiting)*float64(avgSize)
+	bytes := float64(remaining) + float64(waiting)*float64(blockSize)
 
 	p.queue = time.Duration(bytes / rate * float64(time.Second))
-	p.perBlock = time.Duration(float64(avgSize) / rate * float64(time.Second))
+	p.perBlock = time.Duration(float64(blockSize) / rate * float64(time.Second))
 }
 
 // singlePeerAssigner is the behaviour the node had before the scheduler: one
