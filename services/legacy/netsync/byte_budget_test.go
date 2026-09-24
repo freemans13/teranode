@@ -157,23 +157,30 @@ func TestIdlePeersAreAskedForBlocksPastThoseAlreadyParkedOrOwed(t *testing.T) {
 	require.Zero(t, aRec.count())
 }
 
-// Right after a restart no block has completed, so nothing says how large blocks are. Each peer
-// is asked for one until one lands.
-func TestWithNoBlockSizeYetEachPeerIsAskedForOne(t *testing.T) {
-	var nonce uint32
+// A peer holds at most two blocks whatever their size. Any limit that depends on block size
+// fails when small blocks come first: after the 08:29Z restart on 2026-09-24 the first blocks to
+// complete were small, the limit rose to 16, and the sync peer was handed ten blocks up to 1 GB
+// while five peers sat idle.
+func TestAPeerHoldsAtMostTwoBlocksWhateverTheirSize(t *testing.T) {
+	for _, size := range []int64{0, 5 * qMB, 50 * qMB} {
+		var nonce uint32
 
-	anchor := chainhash.Hash{0xe9}
-	msg, hashes := linkedHeaders(anchor, 6, &nonce)
+		anchor := chainhash.Hash{0xe9, byte(size >> 20)}
+		msg, _ := linkedHeaders(anchor, 10, &nonce)
 
-	sm, a, aRec, _, bRec := budgetManager(t)
+		sm, a, aRec, _, bRec := budgetManager(t)
+		if size > 0 {
+			recentBlocks(sm, size)
+		}
 
-	seedFetchHeaders(t, sm, a, anchor, msg)
-	sm.fetchHeaderBlocks()
+		seedFetchHeaders(t, sm, a, anchor, msg)
+		sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 2 }, 5*time.Second))
-	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 2 }, 300*time.Millisecond))
-	require.Equal(t, hashes[0:1], aRec.all())
-	require.Equal(t, hashes[1:2], bRec.all())
+		require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second), "size %d", size)
+		require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 4 }, 300*time.Millisecond), "size %d", size)
+		require.Equal(t, 2, aRec.count())
+		require.Equal(t, 2, bRec.count())
+	}
 }
 
 // The largest recent block is taken over the last largestSizeSamples blocks, not the last ten.

@@ -27,14 +27,12 @@ type assignerPeer struct {
 	rate float64
 }
 
-// largeBlockSize is the recent block size at and above which a peer holds at most
-// largeBlockPeerDepth blocks. A peer sends blocks in the order it was asked and nothing can
-// reorder its queue, so with large blocks a deeper queue adds no parallelism and only buries the
-// blocks behind.
-const (
-	largeBlockSize      = int64(100) << 20
-	largeBlockPeerDepth = 2
-)
+// streamingPeerDepth is how many blocks a peer holds with the park on: one it is sending and one
+// queued behind it. A peer sends blocks in the order it was asked and nothing can reorder its
+// queue, so a deeper queue adds no parallelism and only buries the blocks behind. It does not
+// depend on block size: any limit that did failed when small blocks came first, as after every
+// restart, and a peer was handed ten blocks up to 1 GB while five others sat idle.
+const streamingPeerDepth = 2
 
 // charge records one more block asked of this peer.
 func (p *assignerPeer) charge() {
@@ -128,9 +126,8 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 
 	// The block-size ladder is the node's only reaction to block size: 20 blocks
 	// in flight below a 100MB average, stepping down to 1 above 2GB. With the
-	// park on it reads the largest recent block rather than the average: sizes
-	// vary a hundredfold at some heights, and an average of 8 MB minutes after a
-	// 2 GB block let one peer be handed nine large blocks.
+	// park on it does not apply: every peer holds streamingPeerDepth blocks, and
+	// the largest recent block feeds only the read-ahead byte budget.
 	streaming := sm.blockPark.Enabled() && sm.streams != nil
 	largest := sm.blockSizeTracker.largestRecentSize()
 
@@ -140,9 +137,6 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	)
 
 	ladder := sm.blockSizeTracker.calculateMaxInFlightBlocks()
-	if streaming && largest > 0 {
-		ladder = maxInFlightForSize(largest)
-	}
 
 	if !sm.settings.Legacy.MultiPeerBlockDownload {
 		return sm.singlePeerAssigner(ladder)
@@ -187,14 +181,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	}
 
 	if streaming {
-		switch {
-		case largest <= 0:
-			// No block has completed since the start, so nothing says how large
-			// blocks are. One each until one lands.
-			perPeer = 1
-		case largest >= largeBlockSize:
-			perPeer = min(perPeer, largeBlockPeerDepth)
-		}
+		perPeer = streamingPeerDepth
 
 		// The read-ahead limit is a byte budget: the node keeps asking while the
 		// bytes ahead of the chain stay under lookaheadParkBytes. While download
