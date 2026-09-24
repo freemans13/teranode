@@ -365,7 +365,7 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 			// caps. ReassertOwner clears the forgiven flag, so the block is back
 			// in CountForPeer and back in Len from here on, while both budgets
 			// were computed with the forgiven records excluded.
-			target.budget--
+			target.charge()
 			assigner.remaining--
 
 			continue

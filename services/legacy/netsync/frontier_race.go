@@ -49,8 +49,8 @@ const (
 	// ever completes, for example because both peers dropped. Without it one lost block would
 	// switch the race off for good.
 	raceExpiry = 10 * time.Minute
-	// maxConcurrentRaces is how many blocks may be raced at once, slow-peer and queued races
-	// together. SV Node allows three fetches of one block; this allows three raced blocks.
+	// maxConcurrentRaces is how many blocks may be raced at once. SV Node allows three fetches of
+	// one block; this allows three raced blocks.
 	maxConcurrentRaces = 3
 )
 
@@ -162,7 +162,61 @@ func (r *streamRegistry) finish(s *blockStream, now time.Time, complete bool) {
 	}
 }
 
+// pending is how many bytes are still to come on the blocks p is sending now, and how many
+// blocks that is.
+func (r *streamRegistry) pending(p *peerpkg.Peer) (int64, int) {
+	if r == nil || p == nil {
+		return 0, 0
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var (
+		bytes int64
+		n     int
+	)
+
+	for s := range r.active {
+		if s.owner != p {
+			continue
+		}
+
+		n++
+		bytes += max(0, s.total-s.read.Load())
+	}
+
+	return bytes, n
+}
+
+// medianRate is the median of the peers' measured rates on completed blocks, or zero with none.
+func (r *streamRegistry) medianRate() float64 {
+	if r == nil {
+		return 0
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	rates := make([]float64, 0, len(r.rates))
+	for _, bps := range r.rates {
+		rates = append(rates, bps)
+	}
+
+	if len(rates) == 0 {
+		return 0
+	}
+
+	sort.Float64s(rates)
+
+	return rates[len(rates)/2]
+}
+
 func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
+	if r == nil {
+		return 0
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -227,29 +281,6 @@ func (r *streamRegistry) raceSlotLocked(now time.Time) bool {
 	}
 
 	return len(r.raced) < maxConcurrentRaces
-}
-
-// queuedRaceAllowed reports whether h may be raced as a queued block: it is not arriving, not
-// already raced, and a race slot is free.
-func (r *streamRegistry) queuedRaceAllowed(h chainhash.Hash, now time.Time) bool {
-	if r == nil {
-		return false
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if _, raced := r.raced[h]; raced {
-		return false
-	}
-
-	for s := range r.active {
-		if s.hash == h {
-			return false
-		}
-	}
-
-	return r.raceSlotLocked(now)
 }
 
 // pickRace returns the block the chain is most urgently about to wait on from a slow peer, if
@@ -447,7 +478,6 @@ func (sm *SyncManager) runFrontierRace() {
 			return
 		case <-ticker.C:
 			sm.maybeRaceSlowBlock(time.Now())
-			sm.maybeRaceQueuedBlock(time.Now())
 		}
 	}
 }
