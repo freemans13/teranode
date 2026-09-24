@@ -278,7 +278,7 @@ func formatArgIndex(callName string) int {
 func loggingFuncVars(file *ast.File) map[string]string {
 	bound := map[string]string{}
 
-	record := func(lhs ast.Expr, rhs ast.Expr) {
+	record := func(lhs, rhs ast.Expr) {
 		id, ok := lhs.(*ast.Ident)
 		if !ok {
 			return
