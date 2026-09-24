@@ -540,6 +540,21 @@ func (bst *blockSizeTracker) addBlockSize(size int64) {
 	}
 }
 
+// largestRecentSize is the largest of the recent block sizes, or zero with none. The download
+// queue is estimated from it rather than the average: sizes vary a hundredfold at some heights,
+// and an average dragged down by a run of small blocks let one peer be handed nine large ones.
+func (bst *blockSizeTracker) largestRecentSize() int64 {
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
+
+	var largest int64
+	for _, s := range bst.recentSizes {
+		largest = max(largest, s)
+	}
+
+	return largest
+}
+
 // getAverageSize returns the current rolling average block size.
 func (bst *blockSizeTracker) getAverageSize() int64 {
 	bst.mu.RLock()

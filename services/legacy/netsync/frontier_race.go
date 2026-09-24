@@ -497,7 +497,7 @@ func (sm *SyncManager) logDownloadQueues() {
 		return
 	}
 
-	avgSize := sm.blockSizeTracker.getAverageSize()
+	blockSize := sm.blockSizeTracker.largestRecentSize()
 
 	fallbackRate := sm.streams.medianRate()
 	if fallbackRate <= 0 {
@@ -509,7 +509,7 @@ func (sm *SyncManager) logDownloadQueues() {
 
 	for _, bp := range eligible {
 		p := &assignerPeer{peer: bp.peer, owed: sm.blockDownloads.CountForPeer(bp.peer)}
-		sm.estimateQueue(p, avgSize, fallbackRate)
+		sm.estimateQueue(p, blockSize, fallbackRate)
 
 		remaining, streaming := sm.streams.pending(bp.peer)
 		rate := sm.streams.peerRate(bp.peer)
@@ -519,6 +519,6 @@ func (sm *SyncManager) logDownloadQueues() {
 			bp.peer, p.owed, streaming, float64(remaining)/1e6, rate/1e6, p.queue.Round(time.Second))
 	}
 
-	sm.logger.Infof("[downloadQueue] %d eligible peers, average block %.0f MB, %d blocks owed in all, measured rates sum to %.1f MB/s",
-		len(eligible), float64(avgSize)/1e6, sm.blockDownloads.Len(), total/1e6)
+	sm.logger.Infof("[downloadQueue] %d eligible peers, largest recent block %.0f MB, %d blocks owed in all, measured rates sum to %.1f MB/s",
+		len(eligible), float64(blockSize)/1e6, sm.blockDownloads.Len(), total/1e6)
 }

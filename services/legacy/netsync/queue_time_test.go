@@ -157,3 +157,35 @@ func TestWithNoAverageYetEachPeerIsAskedForOneBlock(t *testing.T) {
 	require.Equal(t, hashes[0:1], aRec.all())
 	require.Equal(t, hashes[1:2], bRec.all())
 }
+
+// Block sizes at height 708,000 run from a few megabytes to 2 GB, so the average of the last ten
+// said 8 MB right after a run of small ones, and a peer was handed nine of the next blocks the
+// chain needed: a one-minute queue looked like room for dozens. The queue is now estimated from
+// the largest recent block, so one big block in the window keeps every queue shallow.
+func TestTheLargestRecentBlockSetsTheQueueDepth(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xf9}
+	msg, hashes := linkedHeaders(anchor, 6, &nonce)
+
+	sm, a, aRec, b, bRec := queueTimeManager(t)
+
+	sm.blockSizeTracker = newBlockSizeTracker(10)
+	for i := 0; i < 9; i++ {
+		sm.blockSizeTracker.addBlockSize(8 * qMB)
+	}
+
+	sm.blockSizeTracker.addBlockSize(800 * qMB)
+
+	sm.streams.rates[a] = float64(10 * qMB)
+	sm.streams.rates[b] = float64(10 * qMB)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return aRec.count()+bRec.count() == 2 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return aRec.count()+bRec.count() > 2 }, 300*time.Millisecond),
+		"an 800 MB block at 10 MB/s is over a minute, so each peer takes one")
+	require.Equal(t, hashes[0:1], aRec.all())
+	require.Equal(t, hashes[1:2], bRec.all())
+}
