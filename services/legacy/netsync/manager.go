@@ -815,8 +815,14 @@ type SyncManager struct {
 	// property this gate exists to guarantee. nil (alongside a nil
 	// blockPrefetchBudget) when prefetch is disabled, so the synchronous/regtest
 	// path skips dedup entirely. inFlightBlocksMu guards the map.
-	inFlightBlocks   map[chainhash.Hash]*inFlightBlock
-	inFlightBlocksMu sync.Mutex
+	inFlightBlocks map[chainhash.Hash]*inFlightBlock
+
+	// drainedDuplicates counts, per block, copies drained off the wire unwritten because another
+	// copy was converting. Each drained copy still produces an on-disk message, which consumes
+	// one count and parks nothing. Guarded by drainedDuplicatesMu; the map is made on first use.
+	drainedDuplicatesMu sync.Mutex
+	drainedDuplicates   map[chainhash.Hash]int
+	inFlightBlocksMu    sync.Mutex
 
 	// blockPrefetchWaiters counts read-loops currently blocked acquiring
 	// prefetch budget (i.e. local processing cannot keep up). While > 0 the node

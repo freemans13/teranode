@@ -1835,6 +1835,14 @@ func responseStallBudget(cmd string) time.Duration {
 // deadline would otherwise fire mid-download and disconnect a perfectly healthy
 // sync peer. Liveness during a block fetch is gated instead by the block's own
 // (much longer) deadline.
+// shouldDeferQueuedResponse reports whether an expired non-block reply is queued behind blocks
+// rather than stalled. A getdata can ask for several blocks, and the first to arrive clears the
+// whole block-reply group, so the other deadlines count down again while the peer sends the rest.
+// A connection still receiving at a healthy rate is delivering; its reply is behind those bytes.
+func shouldDeferQueuedResponse(command string, healthyDownload bool) bool {
+	return healthyDownload && !isBlockResponseCommand(command)
+}
+
 func expiredStallResponse(pending map[string]time.Time, now time.Time, offset time.Duration) (string, bool) {
 	blockPending := blockResponsePending(pending)
 
@@ -2045,6 +2053,12 @@ out:
 
 					p.logger.Debugf("Extending block deadline for %s: downloading at %d B/s (%.0fs into fetch, cap %s)",
 						p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), budget)
+				} else if shouldDeferQueuedResponse(command, healthyDownload) {
+					// Bytes are still arriving at a healthy rate, so the reply is queued
+					// behind blocks the peer is sending, not stalled.
+					pendingResponses[command] = now.Add(stallResponseTimeout)
+
+					p.logger.Debugf("Deferring %s deadline for %s: still receiving at %d B/s", command, p, recvDelta/uint64(stallTickInterval.Seconds()))
 				} else {
 					reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout", command)
 					p.DisconnectWithInfo(reason)
