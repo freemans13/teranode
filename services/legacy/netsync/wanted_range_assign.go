@@ -38,6 +38,12 @@ import (
 // budget, or no peer to place a block with) — a node with nothing to place a
 // block on can still have every reason to ask for more headers.
 func (sm *SyncManager) assignWantedBlocks() {
+	// One pass at a time: two concurrent passes could both find a block unowned and both ask
+	// for it, since the ledger lets a block have several owners. Five duplicate copies on
+	// mainnet on 2026-09-24 had no other cause.
+	sm.assignMu.Lock()
+	defer sm.assignMu.Unlock()
+
 	// Read here, before wantedBlocks takes headerMu: committedTip makes a
 	// blocking blockchain call, and this package's lock rule has no exception
 	// for one made while the header lock is held.
