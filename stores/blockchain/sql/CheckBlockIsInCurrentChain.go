@@ -232,10 +232,12 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 	// against the authoritative SQL before doing so.
 	//
 	// The forked set is rebuilt FROM the on_main_chain flags (rebuildOffChainSet), so
-	// a transiently-false flag on a block that IS on the best chain, which an exhausted
-	// startup rebuild leaves, lands that block in the forked set. (A fork-path
-	// StoreBlock no longer leaves one: its reconciliation shares the INSERT's
-	// transaction.) Rejecting on it would be a FALSE NEGATIVE,
+	// a transiently-false flag on a block that IS on the best chain lands that block in
+	// the forked set. Two writers can still leave one: a startup rebuildOnMainChainFlag
+	// that exhausted its retries or timed out, and the full rebuild after InvalidateBlock
+	// or RevalidateBlock failing, since both log and continue once their UPDATE has
+	// committed. A fork-path StoreBlock no longer leaves one, because its reconciliation
+	// shares the INSERT's transaction. Rejecting on it would be a FALSE NEGATIVE,
 	// and checkOldBlockIDs escalates a negative into a PERMANENT ValidateBlock
 	// invalidation that the self-healing flag never gets to undo. That is the incident
 	// PR 1086 fixed and this path preserves.
@@ -349,8 +351,10 @@ func (s *SQL) checkBlockIsInCurrentChainSQL(ctx context.Context, blockIDs []uint
 		// No on_main_chain=true row matched in any batch. Do NOT return false here:
 		// on_main_chain can be transiently false on a block that IS on the best
 		// chain — a startup rebuildOnMainChainFlag that exhausted its
-		// retries/timed out. (A fork-path StoreBlock no longer leaves one: its
-		// reconciliation shares the INSERT's transaction.) A false negative is
+		// retries/timed out, or the full rebuild after InvalidateBlock /
+		// RevalidateBlock failing (both log and continue once their UPDATE has
+		// committed). A fork-path StoreBlock no longer leaves one: its
+		// reconciliation shares the INSERT's transaction. A false negative is
 		// not cosmetic here: the caller (checkOldBlockIDs) escalates it into a PERMANENT ValidateBlock
 		// invalidation, which the transient flag never gets a chance to undo. Fall
 		// through to the authoritative, flag-free parent_id CTE walk below to

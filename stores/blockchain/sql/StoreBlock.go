@@ -12,6 +12,7 @@ package sql
 import (
 	"context"
 	"database/sql"
+	"reflect"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -194,11 +195,11 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	// The common extend keeps its single auto-committed INSERT, which already writes
 	// the correct flag and needs no repair.
 	var (
-		newBlockID     uint64
-		height         uint32
-		storedInvalid  bool
-		reconcileStage bool
-		err            error
+		newBlockID    uint64
+		height        uint32
+		storedInvalid bool
+		reconcileErr  error
+		err           error
 	)
 
 	if onMainChain {
@@ -218,7 +219,7 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		err = s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
 			var storeErr error
 
-			reconcileStage = false
+			reconcileErr = nil
 
 			newBlockID, height, _, storedInvalid, storeErr = s.storeBlock(ctx, tx, block, peerID, storeBlockOptions, onMainChain)
 			if storeErr != nil {
@@ -233,23 +234,23 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 				return nil
 			}
 
-			reconcileStage = true
-
 			reconcile := func() error { return s.reconcileOnMainChain(ctx, tx) }
 			if s.reconcileHook != nil {
 				reconcile = s.reconcileHook
 			}
 
-			if reconcileErr := reconcile(); reconcileErr != nil {
-				return reconcileErr
-			}
+			reconcileErr = reconcile()
 
-			reconcileStage = false
-
-			return nil
+			return reconcileErr
 		})
 		if err != nil {
-			if reconcileStage {
+			// Label the error as the reconciliation's only when it is the very value the
+			// reconciliation returned. RetryTx hands back the closure's error unchanged, but
+			// it can also fail after a failed reconciliation attempt and before the next one
+			// runs: the next BEGIN can fail, or the context can be cancelled during the
+			// backoff. A flag set before the reconciliation would still be set then, and
+			// would send whoever chases a connection failure to the reconciliation query.
+			if reconcileErr != nil && sameError(err, reconcileErr) {
 				var typedErr *errors.Error
 				if errors.As(err, &typedErr) {
 					return 0, height, err
@@ -1289,4 +1290,17 @@ func getCumulativeChainWork(chainWork *chainhash.Hash, block *model.Block) (*cha
 	}
 
 	return newWork, nil
+}
+
+// sameError reports whether a and b are the same error value. It is an identity check,
+// not errors.Is: a teranode error matches every other error sharing its code, which
+// would make any storage error look like the reconciliation's. The dynamic types are
+// compared first because == on two values of one uncomparable type panics.
+func sameError(a, b error) bool {
+	ta := reflect.TypeOf(a)
+	if ta != reflect.TypeOf(b) || !ta.Comparable() {
+		return false
+	}
+
+	return a == b
 }

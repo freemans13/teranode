@@ -2,11 +2,13 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/test/utils/postgres"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -263,8 +265,24 @@ func competingChildOfBlock1(i uint32) *model.Block {
 // transaction and the reconciliation. Every block is a child of block1 while block3 is
 // the best, so each one is a fork and takes the transactional branch; the extend path
 // is not measured here.
+//
+// UseInMemoryChainCheck is pinned in both directions rather than read from local
+// settings, because it changes what a fork store does: with it on, every fork also
+// rebuilds the forked set after the write. Leaving it to the environment made the
+// numbers depend on whichever settings_local.conf the run happened to see.
 func BenchmarkStoreBlockForkPath(b *testing.B) {
-	s := newOnMainChainTestStore(b)
+	for _, inMemory := range []bool{false, true} {
+		b.Run(fmt.Sprintf("inMemoryChainCheck=%v", inMemory), func(b *testing.B) {
+			benchmarkStoreBlockForkPath(b, inMemory)
+		})
+	}
+}
+
+func benchmarkStoreBlockForkPath(b *testing.B, inMemoryChainCheck bool) {
+	s := newOnMainChainTestStoreWith(b, func(tSettings *settings.Settings) {
+		tSettings.BlockChain.UseInMemoryChainCheck = inMemoryChainCheck
+	})
+	require.Equal(b, inMemoryChainCheck, s.useInMemoryChainCheck, "the pinned setting must reach the store")
 	storeBlocks(b, s, block1, block2, block3)
 
 	forks := make([]*model.Block, 0, b.N)
@@ -380,3 +398,74 @@ func TestStoreBlockFlagAtomicity_PostgreSQL(t *testing.T) {
 		require.Equal(t, 5, flagged)
 	})
 }
+
+// TestStoreBlockLabelsAFailedReconciliation: an error the reconciliation itself returned
+// is reported as the reconciliation's, so whoever chases it starts at the right query.
+// The injected error is a raw, non-retriable driver error, so it reaches StoreBlock on
+// the first attempt with no teranode type of its own to pass through.
+func TestStoreBlockLabelsAFailedReconciliation(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+
+	storeBlocks(t, s, block1, block2, block3)
+
+	s.reconcileHook = func() error { return &pgconn.PgError{Code: "23505", Message: "injected"} }
+
+	_, _, err := s.StoreBlock(context.Background(), blockAlternative2, "peer")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "StoreBlock: reconcileOnMainChain")
+}
+
+// TestStoreBlockDoesNotBlameTheReconciliationForAFailureAfterIt is ChiR8 on PR 1763. A
+// retriable reconciliation failure sends RetryTx into its backoff, and a context
+// cancelled there ends the call before the reconciliation runs again. The error that
+// comes back is the context's, not the reconciliation's, so it must not carry the
+// reconciliation's label. A flag set before the reconciliation and reset only at the
+// start of the next attempt was still set here, and labelled it anyway.
+func TestStoreBlockDoesNotBlameTheReconciliationForAFailureAfterIt(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+
+	storeBlocks(t, s, block1, block2, block3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	calls := 0
+	s.reconcileHook = func() error {
+		calls++
+		cancel()
+
+		// SQLSTATE 40001 is retriable, so RetryTx waits out a backoff before the next
+		// attempt, and the cancelled context ends that wait.
+		return &pgconn.PgError{Code: "40001", Message: "injected serialization failure"}
+	}
+
+	_, _, err := s.StoreBlock(ctx, blockAlternative2, "peer")
+	require.Error(t, err)
+	require.Equal(t, 1, calls, "the cancelled backoff must stop the retry")
+	require.Contains(t, err.Error(), context.Canceled.Error(), "the context's error is what is returned")
+	require.NotContains(t, err.Error(), "StoreBlock: reconcileOnMainChain",
+		"a failure after the reconciliation attempt must not be labelled as the reconciliation's")
+
+	require.False(t, blockRowExists(t, s, blockAlternative2.Hash().CloneBytes()),
+		"the rolled-back attempt must leave no row behind")
+}
+
+// TestSameErrorIsIdentityAndNeverPanics: sameError must not match two distinct errors
+// that share a teranode code, which errors.Is would, and must not panic on a pair of
+// uncomparable values of one type, which == would.
+func TestSameErrorIsIdentityAndNeverPanics(t *testing.T) {
+	a := errors.NewStorageError("a")
+	b := errors.NewStorageError("b")
+
+	require.True(t, sameError(a, a))
+	require.False(t, sameError(a, b), "same code, different value")
+	require.False(t, sameError(a, context.Canceled), "different types")
+
+	require.NotPanics(t, func() {
+		require.False(t, sameError(uncomparableErr{"x"}, uncomparableErr{"x"}))
+	})
+}
+
+type uncomparableErr []string
+
+func (e uncomparableErr) Error() string { return "uncomparable" }
