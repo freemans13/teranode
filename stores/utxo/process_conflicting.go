@@ -761,7 +761,9 @@ func selectCountersForDemotedTx(ctx context.Context, s Store, inpoints []subtree
 				continue
 			}
 
-			candidateMeta, err := s.Get(ctx, &candidate, fields.Tx, fields.Conflicting, fields.CreatedAt)
+			// candidateSpendsOutput only compares outpoints, so the inpoints are
+			// enough; fields.Tx would rebuild the whole candidate transaction.
+			candidateMeta, err := s.Get(ctx, &candidate, fields.TxInpoints, fields.Conflicting, fields.CreatedAt)
 			if err != nil {
 				return nil, errors.NewProcessingError("[selectCountersForDemotedTx][%s] error getting candidate counter", candidate.String(), err)
 			}
@@ -1320,9 +1322,31 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 
 	defer deferFn()
 
-	txMeta, err := s.Get(ctx, &txHash, fields.Tx, fields.TxInpoints)
+	// Only what the transaction spends is read below, so ask for the inpoints
+	// rather than the whole transaction. The body is read only for a record that
+	// stores no inpoints, below.
+	txMeta, err := s.Get(ctx, &txHash, fields.TxInpoints)
 	if err != nil {
 		return nil, err
+	}
+
+	// A missing record surfaces as (nil, nil) on some backends (aerospike returns
+	// nil for a not-found tx), which previously dereferenced straight to a panic.
+	if txMeta == nil {
+		return nil, errors.NewTxNotFoundError("[GetCounterConflictingTxHashes][%s] tx not found", txHash.String())
+	}
+
+	// A record that stores no inpoints keeps what it spends only in its body, so
+	// read the body for that record alone.
+	if len(txMeta.TxInpoints.ParentTxHashes) == 0 && txMeta.Tx == nil {
+		bodyMeta, bErr := s.Get(ctx, &txHash, fields.Tx)
+		if bErr != nil {
+			return nil, bErr
+		}
+
+		if bodyMeta != nil {
+			txMeta.Tx = bodyMeta.Tx
+		}
 	}
 
 	inpoints, err := counterConflictingInpoints(txMeta)
@@ -1347,6 +1371,14 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 		parentTxMeta, err := s.Get(ctx, parentTxHash, fields.Utxos)
 		if err != nil {
 			return nil, err
+		}
+
+		// Same (nil, nil) contract as the lookup above. Report it as not found
+		// rather than skipping the parent: a parent the store does not hold says
+		// nothing about who spent its outputs, so skipping would silently shrink
+		// the counter-conflicting set.
+		if parentTxMeta == nil {
+			return nil, errors.NewTxNotFoundError("[GetCounterConflictingTxHashes][%s] parent tx %s not found", txHash.String(), parentTxHash.String())
 		}
 
 		spendingTxIDs := make([]*chainhash.Hash, len(parentTxMeta.SpendingDatas))

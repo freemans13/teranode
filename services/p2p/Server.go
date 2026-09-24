@@ -295,6 +295,18 @@ func privateIPColocationWhitelist() []*net.IPNet {
 // inverted here because the settings key is expressed as an enable flag while the bus
 // config expresses it as a disable flag. PX enabled without scoring is the
 // spec-violating state this wiring exists to eliminate, so it is a configuration error.
+//
+// AllowedPublisherIDs, when set, is passed straight through to the bus, which filters
+// pubsub message authorship against it. This is global across every subscribed topic
+// (block, subtree, node status, rejected tx), not just block and subtree: a
+// non-allowlisted peer's messages on all four are silently dropped before delivery.
+// Because node status is included, a filtered peer stops being registered or
+// refreshed by incoming messages. That only removes it from the peer registry and
+// the /p2p-ws monitoring feed immediately if it was never registered before the
+// allowlist took effect: a pre-existing entry stays, and reconcileConnectionStates
+// keeps it flagged connected off live libp2p connectivity regardless of pubsub
+// filtering, until p2p_peer_registry_ttl (default 24h) evicts it. That consequence
+// is accepted, not worked around here - see the field's settings doc.
 func buildP2PMessageBusConfig(logger ulogger.Logger, tSettings *settings.Settings, privKey crypto.PrivKey, protocolVersion, dhtMode string, advertiseAddresses []string) (p2pMessageBus.Config, error) {
 	if tSettings.P2P.EnablePeerExchange && !tSettings.P2P.EnablePeerScoring {
 		return p2pMessageBus.Config{}, errors.NewConfigurationError("p2p_enable_peer_exchange requires p2p_enable_peer_scoring (gossipsub v1.1 pairs PX with scoring); disable peer exchange or enable scoring")
@@ -307,6 +319,7 @@ func buildP2PMessageBusConfig(logger ulogger.Logger, tSettings *settings.Setting
 		PeerCacheFile:       p2pCacheFilePath(tSettings.P2P.PeerCacheDir),
 		BootstrapPeers:      tSettings.P2P.BootstrapPeers,
 		StaticPeers:         tSettings.P2P.StaticPeers,
+		AllowedPublisherIDs: tSettings.P2P.AllowedPublisherIDs,
 		ProtocolVersion:     protocolVersion,
 		DHTMode:             dhtMode,
 		DHTCleanupInterval:  tSettings.P2P.DHTCleanupInterval,
@@ -473,6 +486,8 @@ func NewServer(
 	blocksKafkaProducerClient kafka.KafkaAsyncProducerI,
 ) (*Server, error) {
 	logger.Debugf("Creating P2P service")
+
+	initPrometheusMetrics()
 
 	p2pPort := tSettings.P2P.Port
 	if p2pPort == 0 {
@@ -1031,6 +1046,10 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 			}
 		}
 	}()
+
+	// Keep the connected-peers gauge current on its own ticker, independent of
+	// the NAT-diagnostics logging goroutine above (see startConnectedPeersMonitor).
+	s.startConnectedPeersMonitor(ctx, connectedPeersPollInterval)
 
 	// Start the peer-registry batcher before the topic subscriptions that feed it
 	if s.registryBatcher != nil {
@@ -2745,6 +2764,11 @@ func (s *Server) BanPeer(ctx context.Context, peer *p2p_api.BanPeerRequest) (*p2
 		return nil, errors.WrapGRPCPublic(err)
 	}
 
+	// This RPC bypasses AddBanScore/onPeerBanned entirely, so it must
+	// increment prometheusP2PBanEvents itself or operator-issued bans would
+	// be invisible to the metric despite its name implying all ban events.
+	prometheusP2PBanEvents.WithLabelValues(ReasonOperatorBan).Inc()
+
 	return &p2p_api.BanPeerResponse{Ok: true}, nil
 }
 
@@ -2881,6 +2905,10 @@ func (s *Server) onPeerBanned(peerID, reason string) {
 	}
 	until := time.Now().Add(banDuration)
 	s.logger.Infof("[onPeerBanned] Peer %s banned until %s for reason: %s", peerID, until.Format(time.RFC3339), reason)
+	// The label is bounded to the known reason set; the unbounded value
+	// handed to peerRegistry.AddBanScore above is untouched so per-reason
+	// ban-score weights aren't affected.
+	prometheusP2PBanEvents.WithLabelValues(normalizeBanReasonLabel(reason)).Inc()
 
 	// Make the ban effective for gossip filtering immediately, without waiting
 	// for the cached IsPeerBanned=false entry to expire.

@@ -29,6 +29,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	p2pconstants "github.com/bsv-blockchain/teranode/interfaces/p2p"
 	"github.com/bsv-blockchain/teranode/model"
@@ -535,14 +536,14 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 							// IMPORTANT: We listen for BlockSubtreesSet, NOT NotificationType_Block.
 							//
 							// HOW THIS NOTIFICATION IS TRIGGERED:
-							// Both validation paths call updateSubtreesDAH() after validation completes:
+							// The full-validation paths call updateSubtreesDAH() after validation completes:
 							//
 							// Normal Validation (ValidateBlock):
 							//   ValidateBlock() → updateSubtreesDAH() → SetBlockSubtreesSet() → notification
 							//
-							// Quick Validation (Catchup):
-							//   quickValidateBlock() → goroutines complete via errgroup.Wait()
-							//   → updateSubtreesDAH() → SetBlockSubtreesSet() → notification
+							// Quick Validation (Catchup) sends no BlockSubtreesSet: its commitBlock inserts
+							// the block with subtrees_set and mined_set already true, so this worker would
+							// skip the block on its MinedSet guard anyway.
 							//
 							// TIMING GUARANTEES:
 							// BlockSubtreesSet is sent AFTER:
@@ -1107,10 +1108,51 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 	if len(blocksSubtreesNotSet) > 0 {
 		u.logger.Infof("[BlockValidation:start] found %d blocks subtrees not set", len(blocksSubtreesNotSet))
 
+		// Best-effort current height, used only to tell a block whose missing subtree file is an
+		// anomaly worth surfacing (Warn) from one whose files are certainly gone for good (Debug):
+		// see the comment at the Warnf/Debugf choice below. A failure here just leaves haveHeight
+		// false, so every miss stays at Warn - the safe default.
+		currentHeight, haveHeight := uint32(0), false
+		if _, meta, bhErr := u.blockchainClient.GetBestBlockHeader(ctx); bhErr == nil && meta != nil {
+			currentHeight, haveHeight = meta.Height, true
+		}
+
 		for _, block := range blocksSubtreesNotSet {
 			block := block
 
 			g.Go(func() error {
+				// See subtreeFilesReady for why the sweep, and only the sweep, needs this check.
+				ready, missing, err := u.subtreeFilesReady(ctx, block)
+				if err != nil {
+					u.logger.Errorf("[BlockValidation:start][%s] failed to check subtree files, leaving subtrees_set false: %s", block.Hash().String(), err)
+					return nil
+				}
+
+				if !ready {
+					// Subtree files are written with a DAH of block.Height +
+					// subtreeBlockHeightRetention (quick_validate.go) or of the UTXO store's
+					// height at write time + the same retention (subtreevalidation's
+					// storeSubtreeFiles, where that height is normally below block.Height), so
+					// once currentHeight passes block.Height + retention the DAH sweeper has
+					// normally already deleted the file and this block can never satisfy
+					// subtreeFilesReady - it is stuck, not merely slow, and Warn every minute
+					// forever for it would be noise. The one exception is a lower-height fork
+					// block validated while the UTXO store is ahead of it; its files expire a
+					// little later, so a miss there is logged at Debug slightly early. Below that height a
+					// missing file is unexpected (every path that reaches here writes its
+					// subtree files before the block itself is even added - see
+					// subtreeFilesReady), so it is still worth a Warn: most likely a transient
+					// storage error, or a write genuinely still in flight.
+					logf := u.logger.Warnf
+					if haveHeight && currentHeight > block.Height+u.subtreeBlockHeightRetention {
+						logf = u.logger.Debugf
+					}
+
+					logf("[BlockValidation:start][%s] %d of %d subtree files missing, leaving subtrees_set false for a later sweep", block.Hash().String(), missing, len(block.Subtrees))
+
+					return nil
+				}
+
 				u.logger.Infof("[BlockValidation:start] processing block subtrees DAH not set: %s", block.Hash().String())
 
 				if err := u.updateSubtreesDAH(ctx, block); err != nil {
@@ -1121,6 +1163,50 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 			})
 		}
 	}
+}
+
+// subtreeFilesReady reports whether every subtree file referenced by block already exists in
+// subtreeStore. processSubtreesNotSet calls this before calling updateSubtreesDAH; the three
+// callers that reach updateSubtreesDAH directly (ValidateBlock, its optimistic-mining background
+// goroutine, and quick-validation's commitBlock) do not need it because they call immediately
+// after their own validation has confirmed the subtrees - an extra Exists check there would cost
+// a syscall per subtree per block for no new information. The sweep has no such guarantee: it
+// runs on its own ticker, including after a restart, independently of whatever put the block at
+// subtrees_set=false.
+//
+// This restores a guarantee PR #506 ("make block persister the authority for permanent file
+// promotion") removed as a side effect: before that PR, updateSubtreesDAH looped over
+// block.Subtrees calling subtreeStore.SetDAH(..., 0), which failed with ErrNotFound for a missing
+// file and so implicitly blocked subtrees_set until every file existed. PR #506 removed that loop
+// (it was leaking permanent files for orphaned blocks) and, with it, the implicit check.
+// subtrees_set=true is what setMined (and, soon, p2p block announcement) trust as proof the files
+// exist, so do not remove this on the assumption updateSubtreesDAH still guards it - it no longer
+// does.
+//
+// This is a defensive backstop, not a gate on background validation: every path that inserts a
+// non-invalid block with subtrees_set=false (ValidateBlock, both optimistic and not; the
+// legacy-sync route, which is always non-optimistic; block-assembly's own insert) writes the
+// subtree files synchronously, BEFORE the block is added, so they are normally already present
+// the instant the sweep would see the block. What optimistic mining defers to a background
+// goroutine is the later, heavier block.Valid() consensus check, not subtree file writing - so a
+// missing file here almost always means a genuine anomaly (crash mid-write, storage error,
+// expired retention), not "still validating." See the KNOWN LIMITATION note on updateSubtreesDAH
+// for the real, still-open gap this does NOT close: the sweep can still set subtrees_set true
+// while block.Valid() is running in the background, because the files it checks already exist by
+// then.
+func (u *BlockValidation) subtreeFilesReady(ctx context.Context, block *model.Block) (ready bool, missing int, err error) {
+	for _, hash := range block.Subtrees {
+		exists, existsErr := u.subtreeStore.Exists(ctx, hash[:], fileformat.FileTypeSubtree)
+		if existsErr != nil {
+			return false, 0, errors.NewStorageError("[subtreeFilesReady][%s] failed to check subtree file %s", block.Hash().String(), hash.String(), existsErr)
+		}
+
+		if !exists {
+			missing++
+		}
+	}
+
+	return missing == 0, missing, nil
 }
 
 // SetBlockExists marks a block as existing in the validation system's cache.
@@ -1865,15 +1951,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] block does not meet target difficulty: %s", block.Header.Hash().String(), err)
 		}
 
-		// Skip the expected-nBits (DAA) check for blocks at or below the highest checkpoint:
-		// the difficulty schedule over that prefix is already certified by the pinned
-		// checkpoint hashes, and re-deriving it would require reproducing every historical
-		// retarget rule exactly. block.Height is settled against the parent before this
-		// function runs (Server.deriveBlockHeight on the peer route; catchup and the operator
-		// revalidation endpoint carry authoritative heights), and BelowCheckpoint applies the
-		// mandatory height > 0 guard, so a peer cannot obtain the skip by declaring height 0
-		// or a fabricated sub-checkpoint height. The checkpoint hash-match itself was
-		// asserted above.
+		// Historical targets are always checked here, including during initial sync.
+		// Later blocks retain the existing checkpoint-prefix shortcut. Height is settled
+		// against the parent before this function runs.
 		skipDifficultyCheck := u.skipExpectedDifficulty(ctx, block)
 
 		if skipDifficultyCheck {
@@ -2978,16 +3058,19 @@ func (u *BlockValidation) enqueueRevalidation(data revalidateBlockData) {
 	}
 }
 
-// skipExpectedDifficulty decides whether this block may skip the expected-nBits
-// (DAA) check. It requires proof that the node is still building the
-// checkpoint-certified prefix, not merely that the block's height falls inside
-// it — see model.SkipExpectedDifficulty for why height alone is forgeable.
+// skipExpectedDifficulty retains the checkpoint-prefix shortcut only after DAA
+// activation. Historical blocks must reach the calculator because the native
+// catchup precheck defers them to full-block validation.
 //
 // Fail-closed: if the best height cannot be read we cannot show we are still
 // building the prefix, so the real rule runs. That is the safe direction; on a
 // syncing node the block is re-fetched and retried, whereas skipping wrongly
 // hands a peer free proof-of-work.
 func (u *BlockValidation) skipExpectedDifficulty(ctx context.Context, block *model.Block) bool {
+	if block.Height <= u.settings.ChainCfgParams.DaaForkHeight && u.settings.ChainCfgParams.Net != wire.STN {
+		return false
+	}
+
 	checkpoints := u.settings.ChainCfgParams.Checkpoints
 
 	if !model.BelowCheckpoint(checkpoints, block.Height) {
@@ -3001,7 +3084,7 @@ func (u *BlockValidation) skipExpectedDifficulty(ctx context.Context, block *mod
 	}
 
 	// Invalidation removes descendants from the best chain, so reconsidering
-	// historical blocks is covered by the syncing arm as the prefix is rebuilt.
+	// post-DAA blocks within the checkpoint prefix retains the syncing shortcut.
 	return model.SkipExpectedDifficulty(checkpoints, block.Height, bestMeta.Height)
 }
 
@@ -3092,8 +3175,7 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 		return errors.NewBlockInvalidError("[reValidateBlock][%s] block does not meet target difficulty: %s", blockData.block.Header.Hash().String(), err)
 	}
 
-	// Skip the expected-nBits (DAA) check for blocks at or below the highest checkpoint:
-	// the difficulty schedule over that prefix is certified by the pinned checkpoint hashes.
+	// Apply the same historical and checkpoint policy as ordinary validation.
 	skipDifficultyCheck := u.skipExpectedDifficulty(ctx, blockData.block)
 
 	if skipDifficultyCheck {
@@ -3233,9 +3315,28 @@ func (u *BlockValidation) quickValidateOutpointOnly(block *model.Block) bool {
 	return model.OutpointOnlyEligible(u.settings, u.utxoStore, u.settings.ChainCfgParams, block.Height)
 }
 
-// updateSubtreesDAH marks block subtrees as properly set in the blockchain.
-// Subtrees retain their finite DAH from assembly/validation — the block persister
-// will promote them to permanent (DAH=0) when the block is confirmed on the main chain.
+// updateSubtreesDAH sets block.subtrees_set to true, which fires the BlockSubtreesSet
+// notification that setMined (and, soon, p2p block announcement) treat as proof the
+// block's subtree files are on disk. Subtrees themselves keep their finite DAH from
+// assembly/validation here - no DAH update happens in this function; the block
+// persister promotes them to permanent (DAH=0) when the block is confirmed on the main
+// chain.
+//
+// PRECONDITION: the caller must already know every file the block's Subtrees hashes name
+// exists in subtreeStore - this function no longer checks that itself. See subtreeFilesReady
+// for why, and for the PR #506 history behind that precondition.
+//
+// KNOWN LIMITATION: "files exist" is not "block.Valid() has finished." Under optimistic mining
+// the subtree files are already on disk (written before the block is even added - see
+// subtreeFilesReady) while the heavier block.Valid() consensus check still runs in a background
+// goroutine, so the periodic sweep (processSubtreesNotSet) can satisfy subtreeFilesReady and call
+// in here - setting subtrees_set true and firing setMined - before that background check
+// completes, exactly as it could before PR #506. Neither existing in-memory tracking set covers
+// that window: blockHashesCurrentlyValidated only tracks setMined finalization, and
+// blocksCurrentlyValidating's entry for a block is deleted ~100ms after ValidateBlockWithOptions
+// returns, which under optimistic mining happens right after the block is added, well before
+// block.Valid() in the background goroutine returns. Closing this gap needs a new marker
+// spanning that goroutine's lifetime; this PR does not add one.
 //
 // Parameters:
 //   - ctx: Context for the operation
@@ -3248,9 +3349,6 @@ func (u *BlockValidation) updateSubtreesDAH(ctx context.Context, block *model.Bl
 	)
 
 	defer deferFn()
-
-	// Subtrees already have finite DAH from assembly/validation — no DAH update needed.
-	// The block persister will promote to permanent (DAH=0) when the block is confirmed.
 
 	// update block subtrees_set to true
 	u.logger.Debugf("[updateSubtreesDAH][%s] setting block subtrees_set to true", block.Hash().String())
@@ -3496,13 +3594,19 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 // absent from the off-chain set yet has no on_main_chain row, so a
 // useInMemoryChainCheck=on node ACCEPTED a dangling id the authoritative store
 // route (and an off node) REJECTS: a chain-split. The off-chain (negative) set
-// can never prove on-chain membership, so it cannot drive a sound local accept.
+// cannot drive a sound accept HERE, in this service, because a prefetched copy
+// of it is a snapshot with no guard over it.
 //
-// CheckBlockIsInCurrentChain is the single authority: it applies the store's
-// in-memory off-chain set + maxBlockID as a fast negative filter AND confirms
-// survivors against the on_main_chain flag in one self-consistent snapshot
-// (stores/blockchain/sql/CheckBlockIsInCurrentChain.go), so it cannot diverge
-// from the always-SQL route. Deferring every decision to it — rather than
+// CheckBlockIsInCurrentChain is the single authority. Note what that does and
+// does not buy: the store applies the same absence-means-on-chain rule, but it
+// applies it against a set and a maxBlockID from one self-consistent snapshot,
+// under mainChainRebuilding, and with the shadow comparison available to measure
+// it (stores/blockchain/sql/CheckBlockIsInCurrentChain.go). So the two routes CAN
+// still diverge on a gap id, an id at or below maxBlockID with no committed row.
+// That divergence is documented and measured at
+// TestCheckBlockIsInCurrentChain_GapIDDivergesBetweenRoutes; read that before
+// concluding anything about it. What deferring to the store removes is this
+// service holding a stale copy, not the underlying rule. Deferring every decision to it — rather than
 // caching a prefetched set in this service and deciding locally — also avoids
 // the snapshot-skew window a local decision would carry across a concurrent
 // reorg (a stale "off-chain" classification could wrongly reject, the more
