@@ -640,6 +640,8 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		// it — so only the second case may delete.
 		if !sm.blockPark.Has(entry.hash) {
 			sm.blockPark.Delete(sm.ctx, entry)
+		} else if msg.body.Converted {
+			sm.waste.dupConverted.Add(1)
 		}
 
 		return
@@ -773,6 +775,7 @@ func (sm *SyncManager) noteDrainedDuplicate(hash chainhash.Hash) {
 	}
 
 	sm.drainedDuplicates[hash]++
+	sm.waste.dupDrained.Add(1)
 }
 
 // takeDrainedDuplicate consumes one drained copy of hash, reporting whether there was one.

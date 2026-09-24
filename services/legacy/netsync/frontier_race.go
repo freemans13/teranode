@@ -49,6 +49,8 @@ type blockStream struct {
 	read  atomic.Int64
 	// lastRead is when bytes last arrived for this block, in unix nanoseconds.
 	lastRead atomic.Int64
+	// received is the node-wide count of block bytes received, or nil.
+	received *atomic.Int64
 	start    time.Time
 	// requestedAt is when the ledger first recorded a request for this block, zero if none.
 	requestedAt time.Time
@@ -78,6 +80,10 @@ func (c countingReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		c.s.read.Add(int64(n))
 		c.s.lastRead.Store(time.Now().UnixNano())
+
+		if c.s.received != nil {
+			c.s.received.Add(int64(n))
+		}
 	}
 
 	return n, err
@@ -371,6 +377,7 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		}
 
 		s := sm.streams.start(hash, height, owner, n, time.Now())
+		s.received = &sm.waste.received
 		if at, ok := sm.blockDownloads.RequestedAt(hash); ok {
 			s.requestedAt = at
 		}
@@ -383,6 +390,18 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		// bytes counted never reach n, and a test against n counted no stream as complete.
 		complete := err == nil
 		sm.streams.finish(s, now, complete)
+
+		sm.streams.mu.Lock()
+		drained := s.path == admitRawDuplicate
+		sm.streams.mu.Unlock()
+
+		switch {
+		case !complete:
+			sm.waste.streamsFailed.Add(1)
+			sm.waste.bytesWasted.Add(s.read.Load())
+		case drained:
+			sm.waste.bytesWasted.Add(s.read.Load())
+		}
 
 		// The size ladder and the queue estimate read the average block size. Only the path
 		// that decodes a whole block used to feed it, and with the park on that path never
@@ -531,6 +550,11 @@ func (sm *SyncManager) logDownloadQueues() {
 			bp.peer, owed, sending, float64(remaining)/1e6, sm.streams.peerRate(bp.peer)/1e6)
 	}
 
-	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %.1f GB ahead of the chain against a %.1f GB budget; largest recent block %.0f MB; %d blocks owed",
-		len(eligible), idle, float64(sm.bytesAhead(largest))/1e9, float64(lookaheadParkBytes)/1e9, float64(largest)/1e6, sm.blockDownloads.Len())
+	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %.1f GB ahead of the chain against a %.1f GB budget; largest recent block %.0f MB; %d blocks owed; receiving %.1f MB/s",
+		len(eligible), idle, float64(sm.bytesAhead(largest))/1e9, float64(lookaheadParkBytes)/1e9, float64(largest)/1e6, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
+
+	w := &sm.waste
+	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks)",
+		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.streamsFailed.Load(),
+		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load())
 }
