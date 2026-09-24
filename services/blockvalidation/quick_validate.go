@@ -530,8 +530,10 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	// block as a failed one, and it also skipped the two steps below: the
 	// subtree DAH update (so BlockSubtreesSet never fired and the subtrees were
 	// never given a DAH) and the block-exists cache. None of that re-runs the
-	// unlock, so returning bought nothing. The legacy route handles its own
-	// post-commit unlock the same way (HandleBlockDirect).
+	// unlock, so returning bought nothing. Because nothing re-runs it,
+	// unlockSubtreeTransactions detaches from ctx and retries each subtree
+	// itself before giving up, as the legacy route's unlockBlockTransactions
+	// does for HandleBlockDirect.
 	if err := u.unlockSubtreeTransactionsIfNeeded(ctx, block, caller); err != nil {
 		if prometheusQuickValidatePostCommitUnlockFailures != nil {
 			prometheusQuickValidatePostCommitUnlockFailures.Inc()
@@ -1263,14 +1265,33 @@ func (u *BlockValidation) unlockSubtreeTransactionsIfNeeded(ctx context.Context,
 	return nil
 }
 
+// Post-commit unlock retry budget. The values match the legacy route's
+// unlockBlockTransactions (services/legacy/netsync), which faces the same
+// problem: the block is committed and nothing re-runs the unlock.
+const (
+	postCommitUnlockAttempts = 3
+	postCommitUnlockBackoff  = 100 * time.Millisecond
+	postCommitUnlockTimeout  = 2 * time.Minute
+)
+
 // unlockSubtreeTransactions unlocks all transactions in the given subtrees in parallel.
 // It skips the coinbase placeholder at index 0 of the first subtree.
+//
+// It runs after AddBlock has committed the block, and commitBlock logs a
+// failure rather than returning it, so nothing re-runs this pass: a subtree
+// that fails here leaves its records locked for good, and every later spend of
+// their outputs is refused. So each subtree runs on a context detached from the
+// caller's, bounded by its own timeout, with its own retries, and one subtree's
+// failure does not cancel the others.
 func (u *BlockValidation) unlockSubtreeTransactions(ctx context.Context, subtrees []*subtreepkg.Subtree) error {
 	if len(subtrees) == 0 {
 		return nil
 	}
 
-	g, gCtx := errgroup.WithContext(ctx)
+	unlockCtx, cancelUnlock := context.WithTimeout(context.WithoutCancel(ctx), postCommitUnlockTimeout)
+	defer cancelUnlock()
+
+	g := new(errgroup.Group)
 	util.SafeSetLimit(u.logger, g, 128)
 
 	for subtreeIdx, subtree := range subtrees {
@@ -1297,7 +1318,24 @@ func (u *BlockValidation) unlockSubtreeTransactions(ctx context.Context, subtree
 			for i := start; i < len(nodes); i++ {
 				txHashes[i-start] = nodes[i].Hash
 			}
-			return u.utxoStore.SetLocked(gCtx, txHashes, false)
+
+			var err error
+
+			for attempt := 0; attempt < postCommitUnlockAttempts; attempt++ {
+				if attempt > 0 {
+					select {
+					case <-unlockCtx.Done():
+						return errors.NewProcessingError("gave up unlocking %d transactions of a committed block", len(txHashes), err)
+					case <-time.After(postCommitUnlockBackoff * time.Duration(attempt)):
+					}
+				}
+
+				if err = u.utxoStore.SetLocked(unlockCtx, txHashes, false); err == nil {
+					return nil
+				}
+			}
+
+			return errors.NewProcessingError("failed to unlock %d transactions of a committed block after %d attempts", len(txHashes), postCommitUnlockAttempts, err)
 		})
 	}
 
