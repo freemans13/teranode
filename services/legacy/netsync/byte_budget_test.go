@@ -175,3 +175,23 @@ func TestWithNoBlockSizeYetEachPeerIsAskedForOne(t *testing.T) {
 	require.Equal(t, hashes[0:1], aRec.all())
 	require.Equal(t, hashes[1:2], bRec.all())
 }
+
+// The largest recent block is taken over the last largestSizeSamples blocks, not the last ten.
+// Small blocks finish quickly, so ten of them pushed a 1.8 GB block out of the window within 90
+// seconds on 2026-09-24, the per-peer limit jumped to 16, and the node owed 106 blocks.
+func TestOneLargeBlockStaysTheLargestThroughARunOfSmallOnes(t *testing.T) {
+	bst := newBlockSizeTracker(10)
+	bst.addBlockSize(1800 * qMB)
+
+	for i := 0; i < 50; i++ {
+		bst.addBlockSize(5 * qMB)
+	}
+
+	require.Equal(t, 1800*qMB, bst.largestRecentSize())
+
+	for i := 0; i < largestSizeSamples; i++ {
+		bst.addBlockSize(5 * qMB)
+	}
+
+	require.Equal(t, 5*qMB, bst.largestRecentSize(), "until it is further back than the window")
+}
