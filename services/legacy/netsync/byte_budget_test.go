@@ -195,3 +195,30 @@ func TestOneLargeBlockStaysTheLargestThroughARunOfSmallOnes(t *testing.T) {
 
 	require.Equal(t, 5*qMB, bst.largestRecentSize(), "until it is further back than the window")
 }
+
+// The budget bounds how far ahead the node reaches, never the filling of a gap below blocks it
+// already holds. On 2026-09-24 the park held about 42 blocks counted at 1 GB each after a restart,
+// bytes ahead read 45 GB against the 20 GiB budget, and nothing was requested: not even the one
+// missing block just above the tip that would have let the park drain. The chain stopped.
+func TestTheBudgetNeverStopsAGapBelowParkedBlocksBeingFilled(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xea}
+	msg, hashes := linkedHeaders(anchor, 10, &nonce)
+
+	sm, a, aRec, _, bRec := budgetManager(t)
+	recentBlocks(sm, 1<<30)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+
+	// Everything from the second block to the sixth is parked, far over the budget.
+	for i := 1; i < 6; i++ {
+		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hashes[i], prevBlock: hashes[i-1], converted: true, size: 300, wireSize: 19 << 30}))
+	}
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 1 }, 5*time.Second), "the missing block is asked for")
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 1 }, 300*time.Millisecond), "and nothing past what is parked")
+	require.Equal(t, []chainhash.Hash{hashes[0]}, append(aRec.all(), bRec.all()...))
+}

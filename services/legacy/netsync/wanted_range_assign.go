@@ -74,7 +74,7 @@ func (sm *SyncManager) assignWantedBlocks() {
 		return
 	}
 
-	sm.requestBlocks(assigner, candidates)
+	sm.requestBlocks(assigner, candidates, sm.highestHeld(wanted))
 
 	// One send per peer that got work, with headerMu released. This is the only
 	// place in the pass that talks to a peer at all.
@@ -362,8 +362,17 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 // the right answer rather than a gap: there is nobody to help, so the only thing
 // a second getdata could achieve is the disconnect above. Recovery is the peer's
 // own stall detection and the ledger's expiry.
-func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wantedBlock) {
+func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wantedBlock, highestHeld int32) {
 	for _, block := range candidates {
+		// The byte budget bounds how far ahead the node reaches, never a gap below
+		// blocks it already holds: on 2026-09-24 parked blocks over the budget
+		// stopped the one missing block above the tip being asked for, and the
+		// chain stopped with them.
+		extends := block.height > highestHeld
+		if assigner.byteLimited && extends && assigner.byteRoom <= 0 {
+			return
+		}
+
 		target, ok := assigner.takeAvoiding(block.height, func(p *peerpkg.Peer) bool {
 			return sm.blockDownloads.HasOwner(p, block.hash)
 		})
@@ -395,6 +404,10 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 			return
 		}
 
+		if extends {
+			assigner.byteRoom--
+		}
+
 		hash := block.hash
 		if err := assigner.recordRequest(target, &hash); err != nil {
 			// The ledger was told about a request that is not going to be sent,
@@ -408,4 +421,18 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 			return
 		}
 	}
+}
+
+// highestHeld is the height of the highest wanted block that is parked or already asked for, or
+// zero if none is.
+func (sm *SyncManager) highestHeld(wanted []wantedBlock) int32 {
+	var highest int32
+
+	for _, block := range wanted {
+		if sm.blockPark.Has(block.hash) || sm.blockDownloads.RequestedWithin(block.hash, blockRequestAssignmentTTL) {
+			highest = max(highest, block.height)
+		}
+	}
+
+	return highest
 }

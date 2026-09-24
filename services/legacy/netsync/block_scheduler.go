@@ -67,6 +67,11 @@ type downloadAssigner struct {
 	peers []*assignerPeer
 	// remaining is the node-wide budget left in this pass.
 	remaining int
+	// byteLimited says the read-ahead byte budget applies, and byteRoom is how many more blocks
+	// above the highest held block it allows. Blocks below the highest held block fill gaps and
+	// are never stopped by it: filling a gap is what lets the park drain.
+	byteLimited bool
+	byteRoom    int
 }
 
 // eligibleBlockPeers lists the peers that may be asked for a block body, sync
@@ -128,6 +133,11 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// 2 GB block let one peer be handed nine large blocks.
 	streaming := sm.blockPark.Enabled() && sm.streams != nil
 	largest := sm.blockSizeTracker.largestRecentSize()
+
+	var (
+		byteLimited bool
+		byteRoom    int
+	)
 
 	ladder := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 	if streaming && largest > 0 {
@@ -191,14 +201,8 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		// is the limit a wait on one slow block costs nothing if the other peers
 		// keep fetching, and this is what lets them.
 		if largest > 0 {
-			room := (lookaheadParkBytes - sm.bytesAhead(largest)) / largest
-			if room <= 0 {
-				sm.logger.Debugf("[fetchHeaderBlocks] %d bytes ahead of the chain, at the read-ahead budget", sm.bytesAhead(largest))
-
-				return nil
-			}
-
-			remaining = min(remaining, int(min(room, int64(remaining))))
+			byteLimited = true
+			byteRoom = int(max(0, min((lookaheadParkBytes-sm.bytesAhead(largest))/largest, int64(remaining))))
 		}
 	}
 
@@ -238,7 +242,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// not the whole node-wide window: at the default window of 1024 and one peer
 	// able to take 16, sizing the round by the window would make 1024 round trips
 	// to place 16 blocks, on every arriving block.
-	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable)}
+	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), byteLimited: byteLimited, byteRoom: byteRoom}
 }
 
 // bytesAhead is how many bytes of blocks the node holds or is fetching ahead of the chain: parked
