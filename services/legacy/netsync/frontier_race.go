@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"fmt"
 	"io"
 	"sort"
 	"sync"
@@ -12,46 +13,30 @@ import (
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
-// THE FRONTIER RACE. A block can only come from one peer at a time, so a block much larger than
-// its neighbours, arriving from a slow peer, takes its size divided by that one peer's bandwidth
-// however many other peers are idle. The time-based read-ahead asks for blocks minutes early so
-// that is usually hidden. When it is not, this asks a second peer for the same block and keeps
-// the first request running; whichever copy lands first is used, and the other is discarded
-// without either peer losing its connection, because the download ledger records both as owners.
+// THE FRONTIER RACE, SV Node's rule. A block comes from one peer at a time. When the peer sending
+// the block the chain needs is struggling, delivering under raceStallRate after raceSlowFetchAfter,
+// one other peer is asked for it and the struggling peer is disconnected, as SV Node drops a
+// staller. Disconnecting stops its half-converted copy, so the one extra copy converts instead of
+// being drained as a duplicate. A block is raced at most once: on 2026-09-24 a race that re-armed
+// whenever a copy finished asked three peers for the same 2 GB block and threw all three copies
+// away while a 13 MB/s peer, which was not struggling at all, finished the first.
 //
-// It fires only when both hold:
-//   - the chain is about to wait: the block's estimated finish, from its declared size, the bytes
-//     received and the rate so far, is later than when the chain will reach it at the measured
-//     commit rate;
-//   - the peer is the slow one: its rate is under raceSlowFraction of the median of the other
-//     peers', so a second peer can actually be expected to beat it.
-//
-// A slow peer with enough lead is left alone, and so is a fast peer on a huge block. One block is
-// raced at a time.
-//
-// It replaces the racer deleted in cac9c173a, which raced on a fixed 20-second timer and
-// deliberately skipped any peer still receiving bytes: exactly the case of a slow peer part way
-// through a big block, which is what stalled mainnet on 2026-09-23.
+// SV Node: DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT is 30 s, DEFAULT_MIN_BLOCK_STALLING_RATE is
+// 100 KB/s.
 
 const (
 	// raceCheckInterval is how often the race is considered. It runs on its own ticker because
 	// while the chain waits on a block no commit arrives to trigger anything else.
 	raceCheckInterval = 5 * time.Second
-	// raceMinElapsed is how long a stream must run before its rate is trusted.
-	raceMinElapsed = 5 * time.Second
-	// raceSlowFraction is how far below the other peers' median a peer must be to count as slow.
-	raceSlowFraction = 0.5
-	// raceMinSamples is how many other peers' rates a median needs.
-	raceMinSamples = 2
+	// raceSlowFetchAfter is how long a block must have been arriving before its peer is judged.
+	raceSlowFetchAfter = 30 * time.Second
+	// raceStallRate is the delivery rate, in bytes a second, below which a peer is struggling.
+	raceStallRate = 100_000
 	// peerRateWeight is the weight of a peer's newest completed block in its rolling rate.
 	peerRateWeight = 0.5
-	// raceExpiry is how long a race mark blocks another race when neither copy of the block
-	// ever completes, for example because both peers dropped. Without it one lost block would
-	// switch the race off for good.
+	// raceExpiry is how long a block's race mark lasts. It is never cleared sooner, so a block is
+	// raced at most once in that time.
 	raceExpiry = 10 * time.Minute
-	// maxConcurrentRaces is how many blocks may be raced at once. SV Node allows three fetches of
-	// one block; this allows three raced blocks.
-	maxConcurrentRaces = 3
 )
 
 // blockStream is one block body arriving from the wire.
@@ -100,8 +85,8 @@ func (c countingReader) Read(p []byte) (int, error) {
 
 // raceCandidate is why a block was picked, for the log line.
 type raceCandidate struct {
-	eta, need    time.Duration
-	rate, median float64
+	eta, need time.Duration
+	rate      float64
 }
 
 // streamRegistry holds the blocks arriving now and each peer's rate on completed blocks.
@@ -133,15 +118,13 @@ func (r *streamRegistry) start(hash chainhash.Hash, height int32, owner *peerpkg
 	return s
 }
 
-// finish removes a stream and ends any race for its block: a complete copy because the block is
-// here, a failed one so the block can be raced again rather than wait out the mark's expiry. A
-// complete one also records its owner's rate.
+// finish removes a stream. A complete one records its owner's rate. The block's race mark is left
+// alone, so it is never raced twice.
 func (r *streamRegistry) finish(s *blockStream, now time.Time, complete bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	delete(r.active, s)
-	delete(r.raced, s.hash)
 
 	if !complete {
 		return
@@ -229,13 +212,6 @@ func (r *streamRegistry) markRaced(h chainhash.Hash, now time.Time) {
 	r.mu.Unlock()
 }
 
-func (r *streamRegistry) racing() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return len(r.raced) > 0
-}
-
 // forgetPeer drops a departed peer's rate and activity.
 func (r *streamRegistry) forgetPeer(p *peerpkg.Peer) {
 	r.mu.Lock()
@@ -272,30 +248,23 @@ func (r *streamRegistry) lastBlockBytes(p *peerpkg.Peer) time.Time {
 	return latest
 }
 
-// raceSlotLocked drops race marks past their expiry and reports whether another race may start.
-func (r *streamRegistry) raceSlotLocked(now time.Time) bool {
+// expireRacesLocked drops race marks past their expiry.
+func (r *streamRegistry) expireRacesLocked(now time.Time) {
 	for h, at := range r.raced {
 		if now.Sub(at) > raceExpiry {
 			delete(r.raced, h)
 		}
 	}
-
-	return len(r.raced) < maxConcurrentRaces
 }
 
-// pickRace returns the block the chain is most urgently about to wait on from a slow peer, if
-// any. tip is the committed height and commitRate the blocks a second joining the chain.
+// pickRace returns the lowest block above the tip whose one peer is struggling, if the chain will
+// reach it before it arrives. tip is the committed height and commitRate the blocks a second
+// joining the chain; with no rate measured the chain is taken to need the block now.
 func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) (*blockStream, raceCandidate, bool) {
-	if commitRate <= 0 {
-		return nil, raceCandidate{}, false
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !r.raceSlotLocked(now) {
-		return nil, raceCandidate{}, false
-	}
+	r.expireRacesLocked(now)
 
 	var (
 		best     *blockStream
@@ -303,7 +272,7 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 	)
 
 	for s := range r.active {
-		if now.Sub(s.start) < raceMinElapsed || s.read.Load() <= 0 || s.height <= tip {
+		if s.height <= tip || s.owner == nil || now.Sub(s.start) < raceSlowFetchAfter {
 			continue
 		}
 
@@ -312,84 +281,31 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 		}
 
 		rate := s.rate(now)
-		if rate <= 0 {
+		if rate >= raceStallRate {
 			continue
 		}
 
-		median, ok := r.medianOfOthersLocked(s, now)
-		if !ok || rate >= raceSlowFraction*median {
-			continue
+		var need time.Duration
+		if commitRate > 0 {
+			need = time.Duration(float64(s.height-tip) / commitRate * float64(time.Second))
 		}
 
-		remaining := s.total - s.read.Load()
-		if remaining <= 0 {
-			continue
+		eta := time.Duration(1<<63 - 1)
+		if remaining := s.total - s.read.Load(); rate > 0 {
+			eta = time.Duration(float64(remaining) / rate * float64(time.Second))
 		}
-
-		eta := time.Duration(float64(remaining) / rate * float64(time.Second))
-		need := time.Duration(float64(s.height-tip) / commitRate * float64(time.Second))
 
 		if eta <= need {
 			continue
 		}
 
-		if best == nil || need < bestCand.need {
+		if best == nil || s.height < best.height {
 			best = s
-			bestCand = raceCandidate{eta: eta, need: need, rate: rate, median: median}
+			bestCand = raceCandidate{eta: eta, need: need, rate: rate}
 		}
 	}
 
 	return best, bestCand, best != nil
-}
-
-// medianOfOthersLocked is the median rate of every peer other than s's owner: each other active
-// stream that has been measured, and each other peer's rate on completed blocks, one value per
-// peer, the live stream preferred.
-func (r *streamRegistry) medianOfOthersLocked(s *blockStream, now time.Time) (float64, bool) {
-	byPeer := make(map[*peerpkg.Peer]float64)
-	var anonymous []float64
-
-	for o := range r.active {
-		if o == s || (o.owner != nil && o.owner == s.owner) || now.Sub(o.start) < raceMinElapsed {
-			continue
-		}
-
-		if bps := o.rate(now); bps > 0 {
-			if o.owner == nil {
-				anonymous = append(anonymous, bps)
-			} else {
-				byPeer[o.owner] = bps
-			}
-		}
-	}
-
-	for p, bps := range r.rates {
-		if p == s.owner {
-			continue
-		}
-
-		if _, live := byPeer[p]; !live {
-			byPeer[p] = bps
-		}
-	}
-
-	rates := anonymous
-	for _, bps := range byPeer {
-		rates = append(rates, bps)
-	}
-
-	if len(rates) < raceMinSamples {
-		return 0, false
-	}
-
-	sort.Float64s(rates)
-
-	mid := len(rates) / 2
-	if len(rates)%2 == 1 {
-		return rates[mid], true
-	}
-
-	return (rates[mid-1] + rates[mid]) / 2, true
 }
 
 // chooseRacer picks who to ask: never an owner, the fastest measured peer first, then the peer
@@ -529,8 +445,7 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 
 	racer := sm.streams.chooseRacer(candidates, sm.blockDownloads.OwnersOf(s.hash), sm.blockDownloads.CountForPeer)
 	if racer == nil {
-		sm.logger.Infof("[frontierRace][%s] chain reaches height %d in %s but the block needs %s more at %.1f MB/s against a median of %.1f MB/s; no other peer to ask",
-			s.hash, s.height, c.need.Round(time.Second), c.eta.Round(time.Second), c.rate/1e6, c.median/1e6)
+		sm.logger.Debugf("[frontierRace][%s] block %d is arriving at %.0f KB/s but there is no other peer to ask", s.hash, s.height, c.rate/1e3)
 
 		return
 	}
@@ -539,8 +454,13 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 		return
 	}
 
-	sm.logger.Infof("[frontierRace][%s] asked %s for block %d as well: the chain reaches it in %s, it needs %s more at %.1f MB/s against a median of %.1f MB/s",
-		s.hash, racer, s.height, c.need.Round(time.Second), c.eta.Round(time.Second), c.rate/1e6, c.median/1e6)
+	// Dropped as SV Node drops a staller. Its copy stops converting, which frees the block for
+	// the one extra copy; left connected, the extra copy would arrive as a duplicate and be
+	// drained unwritten.
+	s.owner.DisconnectWithInfo(fmt.Sprintf("stalling on block %d at %.0f KB/s", s.height, c.rate/1e3))
+
+	sm.logger.Infof("[frontierRace][%s] asked %s for block %d and dropped %s, which was sending it at %.0f KB/s after %s",
+		s.hash, racer, s.height, s.owner, c.rate/1e3, now.Sub(s.start).Round(time.Second))
 }
 
 // askRacer records racer as a second owner of h and sends it the getdata. Recording first means
