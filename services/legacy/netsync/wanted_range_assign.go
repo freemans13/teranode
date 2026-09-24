@@ -64,11 +64,12 @@ func (sm *SyncManager) assignWantedBlocks() {
 		return
 	}
 
-	if len(wanted) > assigner.remaining {
-		wanted = wanted[:assigner.remaining]
-	}
-
-	candidates := sm.unownedBlocks(wanted)
+	// Stop once there are as many candidates as the assigner can place, not after
+	// that many heights: the range starts at the block after the tip and runs
+	// through blocks already parked or owed. Trimming the range itself left only
+	// held blocks to look at, and on 2026-09-24 three peers sat idle with seven
+	// blocks parked and five owed.
+	candidates := sm.unownedBlocksUpTo(wanted, assigner.remaining)
 	if len(candidates) == 0 {
 		return
 	}
@@ -105,7 +106,12 @@ func (sm *SyncManager) wantedBlocks(best int32) []wantedBlock {
 	// is the point: two would disagree, and the disagreement would show up as a
 	// park that grows past the bound one of them believed in.
 	depth := int32(1)
-	if ceiling, limited := sm.lookaheadCeilingLocked(best); limited {
+	if sm.blockPark.Enabled() && sm.streams != nil && sm.settings != nil {
+		// With the park on, the byte budget in newDownloadAssigner is the
+		// read-ahead limit, so the range reaches the node-wide window and the
+		// budget decides how much of it is asked for.
+		depth = int32(max(1, sm.settings.Legacy.BlockDownloadWindow)) //nolint:gosec // a block count, not a size
+	} else if ceiling, limited := sm.lookaheadCeilingLocked(best); limited {
 		depth = int32(ceiling - int64(best)) //nolint:gosec // the ceiling is best plus a block count
 	} else if sm.settings != nil {
 		// No read-ahead limit configured. The node-wide download window is then
@@ -187,9 +193,18 @@ func (sm *SyncManager) wantedBlocks(best int32) []wantedBlock {
 // neither of which is headerMu, so it is safe with headerMu released and must
 // not be called with it held.
 func (sm *SyncManager) unownedBlocks(wanted []wantedBlock) []wantedBlock {
-	candidates := make([]wantedBlock, 0, len(wanted))
+	return sm.unownedBlocksUpTo(wanted, len(wanted))
+}
+
+// unownedBlocksUpTo is unownedBlocks stopping at limit candidates.
+func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []wantedBlock {
+	candidates := make([]wantedBlock, 0, min(limit, len(wanted)))
 
 	for _, block := range wanted {
+		if len(candidates) >= limit {
+			break
+		}
+
 		// #1333: a block that recently failed to store or validate, judged or
 		// merely unlucky, is not requested again while the mark stands. This is
 		// what actually bounds the cascade review measured: the descendants of

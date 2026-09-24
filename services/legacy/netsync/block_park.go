@@ -192,6 +192,11 @@ type parkedBlock struct {
 	// restart always have 0.
 	height int32
 	size   int64
+	// wireSize is the block's size on the wire, declared when it streamed. size is what the park
+	// charges, which for a converted block is its small record; the read-ahead budget needs the
+	// block's real size. Zero for a block recovered from disk, which is counted at the largest
+	// recent block size instead.
+	wireSize int64
 	// peer that delivered the block, or nil for a block recovered from disk.
 	// Both nil and disconnected are defined states; see livePeer.
 	peer     *peerpkg.Peer
@@ -379,6 +384,28 @@ func parkDirectory(storeURL *url.URL) string {
 // Enabled reports whether there is a park to put blocks in.
 func (p *blockPark) Enabled() bool {
 	return p != nil
+}
+
+// aheadBytes sums the parked blocks' wire sizes, counting a block with none recorded at unknown.
+func (p *blockPark) aheadBytes(unknown int64) int64 {
+	if p == nil {
+		return 0
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var total int64
+
+	for _, e := range p.entries {
+		if e.wireSize > 0 {
+			total += e.wireSize
+		} else {
+			total += unknown
+		}
+	}
+
+	return total
 }
 
 // Len returns how many blocks are parked.
