@@ -36,6 +36,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -2062,14 +2063,31 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	bestBlockHeader, _ = ba.blockAssembler.CurrentBlock()
 	ba.logger.Debugf("[BlockAssembly][%s][%s] time since previous block: %s", jobID, block.Header.Hash(), time.Since(time.Unix(int64(bestBlockHeader.Timestamp), 0)).String())
 
-	// add the new block to the blockchain
-	if err = ba.blockchainClient.AddBlock(callerCtx, block, ""); err != nil {
+	// Add the new block to the blockchain with subtrees_set already true:
+	// block.Valid() above already ran synchronously and passed, so — unlike a
+	// peer block accepted via optimistic mining, whose equivalent background
+	// integrity check (blockvalidation's block.Valid goroutine) has not run
+	// yet at AddBlock time — there is no outstanding validation this node
+	// still owes the network for this block. Without this, p2p would defer
+	// announcing a locally mined block until the SetBlockSubtreesSet call
+	// below fires its own notification, delaying the announcement by one
+	// extra RPC round trip for no reason.
+	if err = ba.blockchainClient.AddBlock(callerCtx, block, "", blockchainoptions.WithSubtreesSet(true)); err != nil {
 		return nil, errors.NewProcessingError("[BlockAssembly][%s][%s] failed to add block", jobID, block.Hash().String(), err)
 	}
 
-	// Mark subtrees as set — block assembly built and validated these subtrees,
-	// so they are ready for setTxMined processing. Without this, locally mined
-	// blocks would never complete the mining lifecycle.
+	// Still call SetBlockSubtreesSet even though subtrees_set is already true:
+	// it is the trigger blockvalidation's setMined listener waits on
+	// (BlockValidation.go's setMined subscription loop only acts on
+	// NotificationType_BlockSubtreesSet, never on NotificationType_Block), so
+	// without this call a locally mined block would never complete the mining
+	// lifecycle. The store update is idempotent on an already-true flag
+	// (SetBlockSubtreesSet.go: an UPDATE ... SET subtrees_set = true that
+	// matches the row still reports rows affected), so this costs one extra
+	// UPDATE and notification, not a second real state change. p2p's
+	// announceBlock dedupes the resulting second notification against the one
+	// already sent by AddBlock above, so this does not double-announce the
+	// block either.
 	if err = ba.blockchainClient.SetBlockSubtreesSet(callerCtx, block.Hash()); err != nil {
 		ba.logger.Errorf("[BlockAssembly][%s][%s] failed to set block subtrees_set: %v", jobID, block.Header.Hash(), err)
 	}
