@@ -112,7 +112,7 @@ func TestStoreBlock_CallerSuppliedIDMustMatchReservation(t *testing.T) {
 	t.Run("an id the sequence never issued is refused", func(t *testing.T) {
 		s := newReservedIDTestStore(t)
 
-		highest, err := s.highestIssuedBlockID(ctx)
+		highest, err := highestIssuedForTest(ctx, s)
 		require.NoError(t, err)
 
 		forged := highest + 1000

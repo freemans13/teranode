@@ -214,7 +214,7 @@ func TestStoreBlock_CallerSuppliedIDMustMatchReservation_Postgres(t *testing.T) 
 	reserved2, err := s.AssignBlockID(ctx, block2.Hash())
 	require.NoError(t, err)
 
-	highest, err := s.highestIssuedBlockID(ctx)
+	highest, err := highestIssuedForTest(ctx, s)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, highest, reserved2, "the sequence must report the ids it issued")
 

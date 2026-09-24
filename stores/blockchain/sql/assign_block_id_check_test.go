@@ -2,10 +2,10 @@ package sql
 
 import (
 	"context"
-	"database/sql"
 	"regexp"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
@@ -37,78 +37,52 @@ func TestCheckCallerSuppliedBlockID_ReservationLookupFails(t *testing.T) {
 
 	err = s.checkCallerSuppliedBlockID(ctx, block1.Hash(), 1)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "durable block-id reservation")
+	require.True(t, errors.Is(err, errors.ErrStorageError), "got %v", err)
+	require.Contains(t, err.Error(), "failed to look up what holds caller-supplied block id 1")
 
 	_, _, err = s.StoreBlock(ctx, block1, "", options.WithID(1))
 	require.Error(t, err)
 	requireNoBlockRow(t, s, "reservation lookup failed")
 }
 
-// The next three need one query to succeed and a later one to fail, which a real
-// database will not do on demand, so they script the driver.
+// A real database will not fail a single statement on demand for every cause, so
+// this one scripts the driver: whatever the lookup error, the check refuses.
+func TestCheckCallerSuppliedBlockID_InjectedLookupFailure(t *testing.T) {
+	s, mock, err := createMockSQL()
+	require.NoError(t, err)
 
-var (
-	sqlBlockIDByHash      = regexp.QuoteMeta(`SELECT id FROM blocks WHERE hash = $1`)
-	sqlBlockHashByID      = regexp.QuoteMeta(`SELECT hash FROM blocks WHERE id = $1`)
-	sqlReservationByHash  = regexp.QuoteMeta(`SELECT block_id FROM block_id_reservations WHERE hash = $1`)
-	sqlReservationByID    = regexp.QuoteMeta(`SELECT hash FROM block_id_reservations WHERE block_id = $1 LIMIT 1`)
-	sqlSQLiteSequenceSeq  = regexp.QuoteMeta(`SELECT seq FROM sqlite_sequence WHERE name = 'blocks'`)
-	errInjectedLookupFail = errors.NewProcessingError("injected lookup failure")
-)
-
-func TestCheckCallerSuppliedBlockID_InjectedFailures(t *testing.T) {
-	ctx := context.Background()
 	h := chainhash.HashH([]byte("check-caller-supplied-id"))
 
-	t.Run("blocks-by-id lookup fails", func(t *testing.T) {
-		s, mock, err := createMockSQL()
-		require.NoError(t, err)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT`)).WillReturnError(errors.NewProcessingError("injected lookup failure"))
 
-		mock.ExpectQuery(sqlBlockIDByHash).WillReturnError(sql.ErrNoRows)
-		mock.ExpectQuery(sqlBlockHashByID).WillReturnError(errInjectedLookupFail)
-
-		err = s.checkCallerSuppliedBlockID(ctx, &h, 7)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to look up the block stored under id 7")
-		require.NoError(t, mock.ExpectationsWereMet())
-	})
-
-	t.Run("reservation-by-id lookup fails", func(t *testing.T) {
-		s, mock, err := createMockSQL()
-		require.NoError(t, err)
-
-		mock.ExpectQuery(sqlBlockIDByHash).WillReturnError(sql.ErrNoRows)
-		mock.ExpectQuery(sqlBlockHashByID).WillReturnError(sql.ErrNoRows)
-		mock.ExpectQuery(sqlReservationByHash).WillReturnError(sql.ErrNoRows)
-		mock.ExpectQuery(sqlReservationByID).WillReturnError(errInjectedLookupFail)
-
-		err = s.checkCallerSuppliedBlockID(ctx, &h, 7)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to look up the reservation holding block id 7")
-		require.NoError(t, mock.ExpectationsWereMet())
-	})
-
-	t.Run("sequence read fails", func(t *testing.T) {
-		s, mock, err := createMockSQL()
-		require.NoError(t, err)
-
-		mock.ExpectQuery(sqlBlockIDByHash).WillReturnError(sql.ErrNoRows)
-		mock.ExpectQuery(sqlBlockHashByID).WillReturnError(sql.ErrNoRows)
-		mock.ExpectQuery(sqlReservationByHash).WillReturnError(sql.ErrNoRows)
-		mock.ExpectQuery(sqlReservationByID).WillReturnError(sql.ErrNoRows)
-		mock.ExpectQuery(sqlSQLiteSequenceSeq).WillReturnError(errInjectedLookupFail)
-
-		err = s.checkCallerSuppliedBlockID(ctx, &h, 7)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to read the highest issued block id")
-		require.NoError(t, mock.ExpectationsWereMet())
-	})
+	err = s.checkCallerSuppliedBlockID(context.Background(), &h, 7)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrStorageError), "got %v", err)
+	require.Contains(t, err.Error(), "failed to look up what holds caller-supplied block id 7")
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// highestIssuedBlockID must read as zero, never as an error, when the sequence
+// The check reads everything in one statement. Each rule's refusal is pinned in
+// StoreBlock_ReservedID_test.go; this pins that it really is one round trip, which
+// is the point of reading them together (slowPathMu serialises every block insert).
+func TestCheckCallerSuppliedBlockID_OneRoundTrip(t *testing.T) {
+	s, mock, err := createMockSQL()
+	require.NoError(t, err)
+
+	h := chainhash.HashH([]byte("check-caller-supplied-id"))
+
+	rows := sqlmock.NewRows([]string{"committed", "owner", "reserved", "holder", "highest"}).
+		AddRow(false, nil, nil, nil, int64(9))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT`)).WillReturnRows(rows)
+
+	require.NoError(t, s.checkCallerSuppliedBlockID(context.Background(), &h, 7))
+	require.NoError(t, mock.ExpectationsWereMet(), "the check must issue exactly one statement")
+}
+
+// The highest issued id must read as zero, never as an error, when the sequence
 // has nothing to report: then every caller-supplied id without a reservation is
 // refused as never issued, which is the safe direction.
-func TestHighestIssuedBlockID_NothingIssued(t *testing.T) {
+func TestCallerSuppliedBlockIDFacts_NothingIssued(t *testing.T) {
 	ctx := context.Background()
 
 	cases := []struct {
@@ -127,7 +101,7 @@ func TestHighestIssuedBlockID_NothingIssued(t *testing.T) {
 			_, err := s.db.ExecContext(ctx, tc.stmt)
 			require.NoError(t, err)
 
-			highest, err := s.highestIssuedBlockID(ctx)
+			highest, err := highestIssuedForTest(ctx, s)
 			require.NoError(t, err)
 			require.Zero(t, highest)
 
@@ -139,13 +113,14 @@ func TestHighestIssuedBlockID_NothingIssued(t *testing.T) {
 	}
 }
 
-func TestHighestIssuedBlockID_ClosedDB(t *testing.T) {
-	s := newReservedIDTestStore(t)
-	require.NoError(t, s.db.Close()) // the cleanup still closes the store once
+// highestIssuedForTest reads the id sequence the way checkCallerSuppliedBlockID
+// does. The hash and id are ones no test stores, so only the sequence matters.
+func highestIssuedForTest(ctx context.Context, s *SQL) (uint64, error) {
+	h := chainhash.HashH([]byte("highest-issued-probe"))
 
-	_, err := s.highestIssuedBlockID(context.Background())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to read the highest issued block id")
+	f, err := s.callerSuppliedBlockIDFacts(ctx, &h, 0)
+
+	return f.highestIssued, err
 }
 
 func TestHashString(t *testing.T) {

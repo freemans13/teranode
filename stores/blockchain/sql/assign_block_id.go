@@ -193,9 +193,12 @@ func (s *SQL) blockIDByHash(ctx context.Context, blockHash *chainhash.Hash) (uin
 // id the committed row does not carry. That window needs a sweep and a concurrent
 // re-reservation of the same hash, and it existed before this check.
 func (s *SQL) checkCallerSuppliedBlockID(ctx context.Context, blockHash *chainhash.Hash, id uint64) error {
-	if _, committed, err := s.blockIDByHash(ctx, blockHash); err != nil {
-		return err
-	} else if committed {
+	facts, err := s.callerSuppliedBlockIDFacts(ctx, blockHash, id)
+	if err != nil {
+		return errors.NewStorageError("[StoreBlock][%s] failed to look up what holds caller-supplied block id %d", blockHash.String(), id, err)
+	}
+
+	if facts.committed {
 		return nil
 	}
 
@@ -203,51 +206,77 @@ func (s *SQL) checkCallerSuppliedBlockID(ctx context.Context, blockHash *chainha
 	// the primary key, but parseSQLError reports any unique violation as "block
 	// already exists", which legacy sync treats as success, so the block would be
 	// dropped with no row. Refuse it here with an error that says what happened.
-	var owner []byte
-
-	err := s.db.QueryRowContext(ctx, `SELECT hash FROM blocks WHERE id = $1`, id).Scan(&owner)
-	if err == nil {
-		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: block %s is already stored under it", blockHash.String(), id, hashString(owner))
+	if facts.owner != nil {
+		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: block %s is already stored under it", blockHash.String(), id, hashString(facts.owner))
 	}
 
-	if !errors.Is(err, sql.ErrNoRows) {
-		return errors.NewStorageError("[StoreBlock][%s] failed to look up the block stored under id %d", blockHash.String(), id, err)
-	}
-
-	reserved, ok, err := s.durableReservationID(ctx, blockHash)
-	if err != nil {
-		return err
-	}
-
-	if ok {
-		if reserved != id {
-			return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: the id reserved for this block is %d", blockHash.String(), id, reserved)
+	if facts.reserved.Valid {
+		if uint64(facts.reserved.Int64) != id {
+			return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: the id reserved for this block is %d", blockHash.String(), id, facts.reserved.Int64)
 		}
 
 		return nil
 	}
 
-	var holder []byte
-
-	err = s.db.QueryRowContext(ctx, `SELECT hash FROM block_id_reservations WHERE block_id = $1 LIMIT 1`, id).Scan(&holder)
-	if err == nil {
-		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: it is reserved for block %s", blockHash.String(), id, hashString(holder))
+	if facts.holder != nil {
+		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: it is reserved for block %s", blockHash.String(), id, hashString(facts.holder))
 	}
 
-	if !errors.Is(err, sql.ErrNoRows) {
-		return errors.NewStorageError("[StoreBlock][%s] failed to look up the reservation holding block id %d", blockHash.String(), id, err)
-	}
-
-	highest, err := s.highestIssuedBlockID(ctx)
-	if err != nil {
-		return err
-	}
-
-	if id > highest {
-		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: the id sequence has only issued up to %d and this block has no reservation", blockHash.String(), id, highest)
+	if id > facts.highestIssued {
+		return errors.NewStorageError("[StoreBlock][%s] refusing caller-supplied block id %d: the id sequence has only issued up to %d and this block has no reservation", blockHash.String(), id, facts.highestIssued)
 	}
 
 	return nil
+}
+
+// callerSuppliedBlockIDFacts is everything checkCallerSuppliedBlockID decides on.
+type callerSuppliedBlockIDFacts struct {
+	committed     bool          // the hash already has a blocks row
+	owner         []byte        // hash of the block stored under the id, nil if none
+	reserved      sql.NullInt64 // the id reserved for the hash, if any
+	holder        []byte        // hash holding a reservation for the id, nil if none
+	highestIssued uint64        // largest id the sequence has handed out, 0 if none
+}
+
+// callerSuppliedBlockIDFacts reads the facts in one statement, so the check costs
+// one round trip rather than one per rule. It runs under slowPathMu, which every
+// block insert waits on, and quick validation supplies an id for every block it
+// commits, so during catch-up each extra round trip is paid once per block.
+//
+// highestIssued comes from the id sequence without advancing it. Every id handed
+// out through GetNextBlockID, AssignBlockID or an auto-increment INSERT came from
+// that sequence, so an id above it was never issued. On Postgres
+// pg_sequence_last_value is NULL until the first nextval; on SQLite, AUTOINCREMENT
+// keeps sqlite_sequence.seq at the largest rowid ever used and
+// getNextBlockIdFromSQLite advances it directly. A missing, NULL or negative value
+// reads as 0, which refuses every unreserved id: the safe direction.
+func (s *SQL) callerSuppliedBlockIDFacts(ctx context.Context, blockHash *chainhash.Hash, id uint64) (callerSuppliedBlockIDFacts, error) {
+	highestIssued := `(SELECT seq FROM sqlite_sequence WHERE name = 'blocks')`
+	if s.engine == util.Postgres {
+		highestIssued = `pg_sequence_last_value(pg_get_serial_sequence('blocks', 'id')::regclass)`
+	}
+
+	q := `SELECT
+		EXISTS (SELECT 1 FROM blocks WHERE hash = $1),
+		(SELECT hash FROM blocks WHERE id = $2),
+		(SELECT block_id FROM block_id_reservations WHERE hash = $1),
+		(SELECT hash FROM block_id_reservations WHERE block_id = $2 LIMIT 1),
+		` + highestIssued
+
+	var (
+		f       callerSuppliedBlockIDFacts
+		highest sql.NullInt64
+	)
+
+	if err := s.db.QueryRowContext(ctx, q, blockHash[:], id).Scan(&f.committed, &f.owner, &f.reserved, &f.holder, &highest); err != nil {
+		return callerSuppliedBlockIDFacts{}, err
+	}
+
+	if highest.Valid && highest.Int64 > 0 {
+		f.highestIssued = uint64(highest.Int64)
+	}
+
+	return f, nil
 }
 
 // hashString renders a hash column for an error message, falling back to hex
@@ -259,38 +288,4 @@ func hashString(b []byte) string {
 	}
 
 	return h.String()
-}
-
-// highestIssuedBlockID returns the largest block id the id sequence has handed
-// out so far, whether through GetNextBlockID, AssignBlockID or an auto-increment
-// INSERT. Every honest caller-supplied id came from that sequence, so an id above
-// this value was never issued. It reads the sequence without advancing it.
-func (s *SQL) highestIssuedBlockID(ctx context.Context) (uint64, error) {
-	var (
-		q       string
-		highest sql.NullInt64
-	)
-
-	if s.engine == util.Postgres {
-		// pg_sequence_last_value returns NULL until the first nextval.
-		q = `SELECT pg_sequence_last_value(pg_get_serial_sequence('blocks', 'id')::regclass)`
-	} else {
-		// AUTOINCREMENT keeps seq at the largest rowid ever used, and
-		// getNextBlockIdFromSQLite advances it directly.
-		q = `SELECT seq FROM sqlite_sequence WHERE name = 'blocks'`
-	}
-
-	if err := s.db.QueryRowContext(ctx, q).Scan(&highest); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, nil
-		}
-
-		return 0, errors.NewStorageError("failed to read the highest issued block id", err)
-	}
-
-	if !highest.Valid || highest.Int64 < 0 {
-		return 0, nil
-	}
-
-	return uint64(highest.Int64), nil
 }
