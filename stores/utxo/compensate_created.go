@@ -396,7 +396,12 @@ func RollbackSet(written, idempotent []*Spend, historical bool) []*Spend {
 		return written
 	}
 
-	return append(written, idempotent...)
+	// A fresh slice, not append(written, ...): with spare capacity, append would
+	// write the idempotent matches into the caller's backing array.
+	rollback := make([]*Spend, 0, len(written)+len(idempotent))
+	rollback = append(rollback, written...)
+
+	return append(rollback, idempotent...)
 }
 
 // AnyPrunedReplay reports whether any spend failed with an answer that can mean

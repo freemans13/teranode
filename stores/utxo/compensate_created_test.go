@@ -361,3 +361,19 @@ func TestDeleteCreatedNeverTouchesSpends(t *testing.T) {
 	require.Empty(t, store.decorated)
 	require.ElementsMatch(t, []chainhash.Hash{*f.child.TxIDChainHash(), *descendant.TxIDChainHash()}, store.deleted)
 }
+
+// TestRollbackSetLeavesCallerSliceUntouched pins that RollbackSet never writes
+// into the caller's backing array. With spare capacity, append(written, ...)
+// would put the idempotent matches into memory the caller still owns.
+func TestRollbackSetLeavesCallerSliceUntouched(t *testing.T) {
+	fresh := &Spend{Vout: 1}
+	idem := &Spend{Vout: 2}
+
+	backing := make([]*Spend, 1, 4)
+	backing[0] = fresh
+
+	rollback := RollbackSet(backing, []*Spend{idem}, false)
+
+	require.Equal(t, []*Spend{fresh, idem}, rollback)
+	require.Nil(t, backing[:2][1], "the caller's spare capacity must not receive the idempotent match")
+}
