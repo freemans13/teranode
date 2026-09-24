@@ -2,7 +2,6 @@ package netsync
 
 import (
 	"sort"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -23,54 +22,30 @@ type assignerPeer struct {
 	state   *peerSyncState
 	budget  int
 	getData *wire.MsgGetData
-	// queue is the estimated time before this peer would start sending one more block, and
-	// perBlock what an average block adds to it. Both are zero when there is nothing to estimate
-	// from, which leaves the choice to the block counts.
-	queue    time.Duration
-	perBlock time.Duration
-	// owed is how many blocks this peer owes, counting those asked of it in this pass.
-	owed int
-	// blind is set when streamed blocks have no average size to estimate a queue from yet.
-	blind bool
+	// rate is the peer's measured delivery rate in bytes a second, or the median of the measured
+	// peers when it has none. The lowest block goes to the fastest peer with room.
+	rate float64
 }
 
-// queueWorkCap is how much work, in time, a peer may have queued before it is given no more.
-// A peer sends blocks in the order it was asked and nothing can reorder its queue, so a block
-// queued behind minutes of work cannot arrive for minutes, however urgently the chain needs it.
-const queueWorkCap = time.Minute
-
-// defaultPeerRate is the delivery rate assumed when no peer has a measured one yet, in bytes a
-// second.
-const defaultPeerRate = 10 << 20
-
-// full reports whether this peer can be asked for nothing more in this pass. A peer owing
-// nothing always takes one block, however large, or blocks bigger than the cap could never be
-// asked for at all. With no average block size yet, as after a restart, there is nothing to
-// estimate a queue from, so a peer owing a block is full.
-func (p *assignerPeer) full() bool {
-	if p.budget <= 0 {
-		return true
-	}
-
-	if p.blind {
-		return p.owed > 0
-	}
-
-	return p.owed > 0 && p.queue >= queueWorkCap
-}
+// largeBlockSize is the recent block size at and above which a peer holds at most
+// largeBlockPeerDepth blocks. A peer sends blocks in the order it was asked and nothing can
+// reorder its queue, so with large blocks a deeper queue adds no parallelism and only buries the
+// blocks behind.
+const (
+	largeBlockSize      = int64(100) << 20
+	largeBlockPeerDepth = 2
+)
 
 // charge records one more block asked of this peer.
 func (p *assignerPeer) charge() {
 	p.budget--
-	p.owed++
-	p.queue += p.perBlock
 }
 
-// soonerThan reports whether a block given to p would start arriving before one given to q, with
-// more budget left breaking a tie.
-func (p *assignerPeer) soonerThan(q *assignerPeer) bool {
-	if p.queue != q.queue {
-		return p.queue < q.queue
+// before reports whether p should be offered a block ahead of q: faster first, then more room,
+// then the earlier peer.
+func (p *assignerPeer) before(q *assignerPeer) bool {
+	if p.rate != q.rate {
+		return p.rate > q.rate
 	}
 
 	return p.budget > q.budget
@@ -80,7 +55,7 @@ func (p *assignerPeer) soonerThan(q *assignerPeer) bool {
 // of, and collects one getdata per peer to be sent once the header lock is
 // released.
 //
-// Each block, in height order, goes to the peer expected to start sending it soonest. A peer answers
+// Each block, in height order, goes to the fastest peer with room. A peer answers
 // a getdata in the order it was asked and nothing can reorder its queue, so the
 // assigner used to fill one peer with a contiguous run: the next block the chain
 // needed then sat behind others at that peer while other peers were idle. At
@@ -147,11 +122,17 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	}
 
 	// The block-size ladder is the node's only reaction to block size: 20 blocks
-	// in flight below a 100MB average, stepping down to 1 above 2GB. Nothing
-	// about downloading from several peers makes that judgement wrong, so it
-	// still governs — as a ceiling on each peer's queue depth, and at its lower
-	// rungs on the fan-out itself.
+	// in flight below a 100MB average, stepping down to 1 above 2GB. With the
+	// park on it reads the largest recent block rather than the average: sizes
+	// vary a hundredfold at some heights, and an average of 8 MB minutes after a
+	// 2 GB block let one peer be handed nine large blocks.
+	streaming := sm.blockPark.Enabled() && sm.streams != nil
+	largest := sm.blockSizeTracker.largestRecentSize()
+
 	ladder := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	if streaming && largest > 0 {
+		ladder = maxInFlightForSize(largest)
+	}
 
 	if !sm.settings.Legacy.MultiPeerBlockDownload {
 		return sm.singlePeerAssigner(ladder)
@@ -190,42 +171,58 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 
 	// With the park on, blocks stream straight to disk behind the admission
 	// budget and no read loop holds a decoded block, so the memory reason for
-	// narrowing the fan-out is gone. Every eligible peer then carries blocks, each
-	// up to the ladder's depth.
+	// narrowing the fan-out is gone. Every eligible peer then carries blocks.
 	if sm.blockPark.Enabled() {
 		fanout = len(eligible)
+	}
+
+	if streaming {
+		switch {
+		case largest <= 0:
+			// No block has completed since the start, so nothing says how large
+			// blocks are. One each until one lands.
+			perPeer = 1
+		case largest >= largeBlockSize:
+			perPeer = min(perPeer, largeBlockPeerDepth)
+		}
+
+		// The read-ahead limit is a byte budget: the node keeps asking while the
+		// bytes ahead of the chain stay under lookaheadParkBytes. While download
+		// is the limit a wait on one slow block costs nothing if the other peers
+		// keep fetching, and this is what lets them.
+		if largest > 0 {
+			room := (lookaheadParkBytes - sm.bytesAhead(largest)) / largest
+			if room <= 0 {
+				sm.logger.Debugf("[fetchHeaderBlocks] %d bytes ahead of the chain, at the read-ahead budget", sm.bytesAhead(largest))
+
+				return nil
+			}
+
+			remaining = min(remaining, int(min(room, int64(remaining))))
+		}
 	}
 
 	peers := make([]*assignerPeer, 0, fanout)
 	assignable := 0
 
-	blockSize := sm.blockSizeTracker.largestRecentSize()
 	fallbackRate := sm.streams.medianRate()
-
-	if fallbackRate <= 0 {
-		fallbackRate = defaultPeerRate
-	}
 
 	for _, candidate := range eligible {
 		if len(peers) == fanout {
 			break
 		}
 
-		owed := sm.blockDownloads.CountForPeer(candidate.peer)
-
-		budget := perPeer - owed
+		budget := perPeer - sm.blockDownloads.CountForPeer(candidate.peer)
 		if budget <= 0 {
 			continue
 		}
 
-		p := &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, owed: owed}
-		sm.estimateQueue(p, blockSize, fallbackRate)
-
-		if p.full() {
-			continue
+		rate := sm.streams.peerRate(candidate.peer)
+		if rate <= 0 {
+			rate = fallbackRate
 		}
 
-		peers = append(peers, p)
+		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, rate: rate})
 		assignable += budget
 	}
 
@@ -244,32 +241,15 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable)}
 }
 
-// estimateQueue sets how long p's queue will take: the bytes left on the blocks it is sending,
-// plus its other owed blocks at blockSize, over its measured rate or fallbackRate. A block's size
-// is not known before its bytes start, so the largest recent block stands in for the blocks not
-// yet started. Without a stream registry or a recent block there is nothing to estimate from.
-func (sm *SyncManager) estimateQueue(p *assignerPeer, blockSize int64, fallbackRate float64) {
-	if sm.streams == nil {
-		return
-	}
+// bytesAhead is how many bytes of blocks the node holds or is fetching ahead of the chain: parked
+// blocks at their wire size, blocks arriving now at their declared size, and blocks asked for but
+// not started at unknownSize, since their size is not known until their bytes begin.
+func (sm *SyncManager) bytesAhead(unknownSize int64) int64 {
+	parked := sm.blockPark.aheadBytes(unknownSize)
+	arriving, streams := sm.streams.arrivingBytes()
+	notStarted := max(0, sm.blockDownloads.Len()-streams)
 
-	if blockSize <= 0 {
-		p.blind = true
-
-		return
-	}
-
-	rate := sm.streams.peerRate(p.peer)
-	if rate <= 0 {
-		rate = fallbackRate
-	}
-
-	remaining, streaming := sm.streams.pending(p.peer)
-	waiting := max(0, p.owed-streaming)
-	bytes := float64(remaining) + float64(waiting)*float64(blockSize)
-
-	p.queue = time.Duration(bytes / rate * float64(time.Second))
-	p.perBlock = time.Duration(float64(blockSize) / rate * float64(time.Second))
+	return parked + arriving + int64(notStarted)*unknownSize
 }
 
 // singlePeerAssigner is the behaviour the node had before the scheduler: one
@@ -343,9 +323,8 @@ func (a *downloadAssigner) take(height int32) (*assignerPeer, bool) {
 // take's own reasoning already prefers one wasted request to asking nobody. A
 // marked peer, by contrast, can contribute nothing new however high it claims.
 //
-// Within each of those tiers the peer expected to start sending the block soonest
-// wins, with more budget left breaking a tie, and then the earlier peer, the
-// sync peer first. A peer with queueWorkCap of work already queued is skipped.
+// Within each of those tiers the fastest peer wins, with more room left breaking
+// a tie, and then the earlier peer, the sync peer first.
 func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) bool) (*assignerPeer, bool) {
 	if a == nil || a.remaining <= 0 {
 		return nil, false
@@ -355,7 +334,7 @@ func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) 
 	var tiers [4]*assignerPeer
 
 	for _, p := range a.peers {
-		if p.full() {
+		if p.budget <= 0 {
 			continue
 		}
 
@@ -368,7 +347,7 @@ func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) 
 			tier++
 		}
 
-		if tiers[tier] == nil || p.soonerThan(tiers[tier]) {
+		if tiers[tier] == nil || p.before(tiers[tier]) {
 			tiers[tier] = p
 		}
 	}

@@ -570,8 +570,11 @@ const maxInFlightLadderTop = 20
 // calculateMaxInFlightBlocks returns the recommended max in-flight blocks
 // based on average block size. Scales from 20 (small blocks) down to 1 (huge blocks).
 func (bst *blockSizeTracker) calculateMaxInFlightBlocks() int {
-	avgSize := bst.getAverageSize()
+	return maxInFlightForSize(bst.getAverageSize())
+}
 
+// maxInFlightForSize is the block-size ladder for a block size.
+func maxInFlightForSize(avgSize int64) int {
 	const (
 		MB = 1024 * 1024
 		GB = 1024 * MB
