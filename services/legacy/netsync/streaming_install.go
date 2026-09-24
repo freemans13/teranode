@@ -607,6 +607,20 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 
 		sm.blockPark.Delete(sm.ctx, entry)
 
+		// Dropping the body is not the same as dropping the gap. Past the last
+		// checkpoint the header cache is empty, and a peer that mined several
+		// blocks at once announces only the newest, so this orphan is the only
+		// sign that the blocks under it exist. The getblocks is what fetches
+		// them, and it is the legacy protocol's batch-continuation signal as
+		// well. parkOrphanBlock, the decoded path's twin of this branch, has
+		// always sent it whether it parked the block or dropped it; leaving it
+		// out here stalled every tip that moved by more than one block.
+		// PushGetBlocksMsg drops a repeat of the same locator, so a run of
+		// orphans behind one tip costs one request.
+		if primary != nil && sm.blockchainClient != nil {
+			sm.requestMissingBlocks(primary, entry.hash)
+		}
+
 		return
 	}
 
@@ -626,6 +640,8 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		// it — so only the second case may delete.
 		if !sm.blockPark.Has(entry.hash) {
 			sm.blockPark.Delete(sm.ctx, entry)
+		} else if msg.body.Converted {
+			sm.waste.dupConverted.Add(1)
 		}
 
 		return
@@ -708,6 +724,26 @@ func (sm *SyncManager) parentIsReachable(parent chainhash.Hash) bool {
 		return true
 	}
 
+	// A parent the dispatcher is committing right now. The drain takes a block
+	// out of the park when it dispatches it, and the chain only has it once its
+	// run settles, so for the whole of that run the parent is in neither place.
+	// On a node with no checkpoints ahead, regtest being the everyday case, sync
+	// runs on getblocks, the header cache stays empty, and the next block
+	// arrives in exactly that window: discarding it left the node at height 1
+	// for good, because nothing re-derives a block the cache never held.
+	//
+	// This closes the window for the dispatcher path because, short of the
+	// shutdown drain, a frontier entry is popped only in complete, on this same
+	// consumer goroutine, after its run has settled: a successful parent is in
+	// the chain by then. A parent that fails leaves its already-kept child in the
+	// park, which is the same position as a child of any parked block whose
+	// parent never arrives, and the park's own reclaim handles it. Without a
+	// dispatcher the drain commits on this goroutine, so no such window exists.
+	// inFlight is nil-safe.
+	if sm.dispatcher.inFlight(parent) {
+		return true
+	}
+
 	if _, inCache := sm.headerCache.HeightOf(parent); inCache {
 		return true
 	}
@@ -739,6 +775,7 @@ func (sm *SyncManager) noteDrainedDuplicate(hash chainhash.Hash) {
 	}
 
 	sm.drainedDuplicates[hash]++
+	sm.waste.dupDrained.Add(1)
 }
 
 // takeDrainedDuplicate consumes one drained copy of hash, reporting whether there was one.

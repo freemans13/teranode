@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -147,6 +148,26 @@ func TestHandleBlockOnDiskMsg_RefusesAnUnreachableParent(t *testing.T) {
 			"and nothing should be handed to the consumer on its behalf")
 	})
 
+	// The refusal drops the body, but the gap under it still has to be fetched.
+	// Past the last checkpoint the header cache is empty and a peer announces
+	// only its new tip, so an SV Node that mines five blocks at once sends one
+	// inv for the fifth. Without a getblocks nothing ever asks for the four
+	// under it, and the node sits one block below that for good: the BIP68
+	// smoketests on PR 1699 stopped at 122 of 126 exactly this way. The decoded
+	// path's parkOrphanBlock has always sent it, parked or dropped.
+	t.Run("a refused block still asks the peer for the gap under it", func(t *testing.T) {
+		h := newParkWiringHarness(t, true)
+		h.sm.drainAsync.Store(true)
+		h.sm.headersFirstMode.Store(false)
+
+		before := h.rec.getBlocksCount()
+
+		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: bodyFor(chainhash.Hash{0x9d}), peer: h.peer})
+
+		require.True(t, WaitUntil(func() bool { return h.rec.getBlocksCount() > before }, 5*time.Second),
+			"dropping an orphan without a getblocks leaves the blocks under it unrequested for ever")
+	})
+
 	t.Run("a parent still ahead of us in the header list is accepted", func(t *testing.T) {
 		h := newParkWiringHarness(t, true)
 		h.sm.drainAsync.Store(true)
@@ -209,6 +230,43 @@ func TestParentIsReachable_ParkedParentCounts(t *testing.T) {
 		require.False(t, h.sm.parentIsReachable(chainhash.Hash{0x9e}),
 			"the gate must still refuse a body whose parent is in neither the park, the header list nor the chain")
 	})
+}
+
+// TestHandleBlockOnDiskMsg_ParentInFlightIsKept is the regression test for the
+// legacy-sync and smoketest CI failures on PR 1699, where teranode syncing from a
+// regtest SV Node stopped at height 1 and never moved.
+//
+// Regtest has no checkpoints, so sync runs on getblocks and the header cache stays
+// empty. The drain claims block 1 out of the park and dispatches it; while it is
+// in the dispatcher's frontier it is in neither the park nor the chain. Block 2
+// arrives in exactly that window, the gate called its parent unreachable and
+// deleted the body, and every later block then failed the same way behind it.
+// Nothing asks for block 2 again, because there is no header cache to re-derive
+// it from.
+//
+// This asserts the end state, the body kept in the park, not just the predicate.
+func TestHandleBlockOnDiskMsg_ParentInFlightIsKept(t *testing.T) {
+	h := newParkWiringHarness(t, true)
+	h.sm.drainAsync.Store(true)
+	h.sm.parkCommits = make(chan parkCommit, 4)
+
+	inFlightParent := chainhash.Hash{0xb1}
+
+	require.False(t, h.sm.parentIsReachable(inFlightParent),
+		"precondition: the parent is in no park, header cache or chain")
+
+	h.sm.dispatcher = newBlockDispatcher(h.sm)
+	h.sm.dispatcher.frontier = append(h.sm.dispatcher.frontier, &frontierEntry{hash: inFlightParent, height: 1})
+
+	header := wire.BlockHeader{Version: 1, PrevBlock: inFlightParent}
+	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 183, Hash: header.BlockHash()}
+
+	h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
+
+	require.True(t, h.sm.blockPark.Has(body.Hash),
+		"the parent is being committed right now; discarding its child leaves a hole nothing re-requests")
+	require.Empty(t, h.sm.parkCommits,
+		"the parent is not in the chain yet, so this block must wait for the parent's own drain rather than ask for one")
 }
 
 // TestHandleBlockOnDiskMsg_DrainsOnlyWhenTheParentIsCommitted separates the two

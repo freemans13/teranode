@@ -850,6 +850,9 @@ type SyncManager struct {
 	// drainedDuplicates counts, per block, copies drained off the wire unwritten because another
 	// copy was converting. Each drained copy still produces an on-disk message, which consumes
 	// one count and parks nothing. Guarded by drainedDuplicatesMu; the map is made on first use.
+	// waste counts block bytes received and every way download bandwidth was lost.
+	waste downloadWaste
+
 	drainedDuplicatesMu sync.Mutex
 	drainedDuplicates   map[chainhash.Hash]int
 	inFlightBlocksMu    sync.Mutex
@@ -1725,6 +1728,13 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 
 	// Remove the peer from the list of candidate peers.
 	sm.peerStates.Delete(peer)
+
+	// A peer leaving with blocks owed costs whatever of them was already on the
+	// wire, and the blocks must be asked of someone else.
+	if owed := sm.blockDownloads.CountForPeer(peer); owed > 0 {
+		sm.waste.droppedOwing.Add(1)
+		sm.waste.blocksOwedAtDrop.Add(int64(owed))
+	}
 
 	if sm.streams != nil {
 		sm.streams.forgetPeer(peer)

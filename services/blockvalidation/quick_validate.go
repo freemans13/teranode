@@ -635,6 +635,9 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	// mined_set is already true. The full-validation paths insert with subtrees_set false and
 	// still make the call.
 
+	prometheusBlockValidationQuickCommitSubtreesSet.Observe(time.Since(start).Seconds())
+	start = time.Now()
+
 	// Mark block as existing in cache.
 	if err := u.SetBlockExists(block.Hash()); err != nil {
 		u.logger.Errorf("[%s][%s] failed to set block exists cache: %s", caller, block.Hash().String(), err)
