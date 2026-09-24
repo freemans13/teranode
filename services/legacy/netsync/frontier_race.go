@@ -445,7 +445,18 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		converted, err := inner(hash, header, countingReader{r: r, s: s}, n)
 
 		now := time.Now()
-		sm.streams.finish(s, now, err == nil && s.read.Load() >= n)
+
+		// Complete when the sink succeeded. The reader starts after the 80-byte header, so the
+		// bytes counted never reach n, and a test against n counted no stream as complete.
+		complete := err == nil
+		sm.streams.finish(s, now, complete)
+
+		// The size ladder and the queue estimate read the average block size. Only the path
+		// that decodes a whole block used to feed it, and with the park on that path never
+		// runs, so every block has to feed it here.
+		if complete && sm.blockSizeTracker != nil {
+			sm.blockSizeTracker.addBlockSize(n)
+		}
 
 		// The committed tip is read only for a download worth reporting: it is a blockchain
 		// call, and this runs on the peer's read loop for every block.
