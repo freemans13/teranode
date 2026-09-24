@@ -472,12 +472,18 @@ func (sm *SyncManager) runFrontierRace() {
 	ticker := time.NewTicker(raceCheckInterval)
 	defer ticker.Stop()
 
+	ticks := 0
+
 	for {
 		select {
 		case <-sm.quit:
 			return
 		case <-ticker.C:
 			sm.maybeRaceSlowBlock(time.Now())
+
+			if ticks++; ticks%queueReportEvery == 0 {
+				sm.logDownloadQueues()
+			}
 		}
 	}
 }
@@ -548,4 +554,40 @@ func (sm *SyncManager) askRacer(racer *peerpkg.Peer, h chainhash.Hash, now time.
 	}
 
 	return true
+}
+
+// queueReportEvery is how many race checks pass between download queue reports: every 30 s.
+const queueReportEvery = 6
+
+// logDownloadQueues reports, for each eligible peer, what it owes and how long its queue is
+// estimated to take, so a running node shows whether blocks are spread across its peers.
+func (sm *SyncManager) logDownloadQueues() {
+	if sm.streams == nil || sm.blockSizeTracker == nil || sm.blockDownloads == nil {
+		return
+	}
+
+	avgSize := sm.blockSizeTracker.getAverageSize()
+
+	fallbackRate := sm.streams.medianRate()
+	if fallbackRate <= 0 {
+		fallbackRate = defaultPeerRate
+	}
+
+	eligible := sm.eligibleBlockPeers()
+	total := 0.0
+
+	for _, bp := range eligible {
+		p := &assignerPeer{peer: bp.peer, owed: sm.blockDownloads.CountForPeer(bp.peer)}
+		sm.estimateQueue(p, avgSize, fallbackRate)
+
+		remaining, streaming := sm.streams.pending(bp.peer)
+		rate := sm.streams.peerRate(bp.peer)
+		total += rate
+
+		sm.logger.Infof("[downloadQueue] %s owes %d, sending %d with %.0f MB left, rate %.1f MB/s, queue %s",
+			bp.peer, p.owed, streaming, float64(remaining)/1e6, rate/1e6, p.queue.Round(time.Second))
+	}
+
+	sm.logger.Infof("[downloadQueue] %d eligible peers, average block %.0f MB, %d blocks owed in all, measured rates sum to %.1f MB/s",
+		len(eligible), float64(avgSize)/1e6, sm.blockDownloads.Len(), total/1e6)
 }
