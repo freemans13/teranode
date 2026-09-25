@@ -545,8 +545,9 @@ func (sm *SyncManager) askRacer(racer *peerpkg.Peer, h chainhash.Hash, now time.
 const queueReportEvery = 6
 
 // logDownloadQueues reports, for each eligible peer, what it owes and what it is sending, and in
-// one summary line the bytes ahead of the chain against the read-ahead budget and how many peers
-// are idle. Design B is judged on that line: no peer idle while the budget has room.
+// one summary line how many peers are idle or below streamingPeerDepth requests, and the bytes
+// really held ahead of the chain against the disk backstop. The download is judged on that line:
+// no peer below two requests unless the backstop is reached.
 func (sm *SyncManager) logDownloadQueues() {
 	if sm.streams == nil || sm.blockSizeTracker == nil || sm.blockDownloads == nil {
 		return
@@ -554,7 +555,7 @@ func (sm *SyncManager) logDownloadQueues() {
 
 	largest := sm.blockSizeTracker.largestRecentSize()
 	eligible := sm.eligibleBlockPeers()
-	idle := 0
+	idle, short := 0, 0
 
 	for _, bp := range eligible {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
@@ -564,12 +565,16 @@ func (sm *SyncManager) logDownloadQueues() {
 			idle++
 		}
 
+		if owed < streamingPeerDepth {
+			short++
+		}
+
 		sm.logger.Infof("[downloadQueue] %s owes %d, sending %d with %.0f MB left, rate %.1f MB/s",
 			bp.peer, owed, sending, float64(remaining)/1e6, sm.streams.peerRate(bp.peer)/1e6)
 	}
 
-	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %.1f GB ahead of the chain against a %.1f GB budget; largest recent block %.0f MB; %d blocks owed; receiving %.1f MB/s",
-		len(eligible), idle, float64(sm.bytesAhead(largest))/1e9, float64(lookaheadParkBytes)/1e9, float64(largest)/1e6, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
+	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below %d requests; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
+		len(eligible), idle, short, streamingPeerDepth, float64(sm.bytesAhead(largest))/1e9, float64(lookaheadParkBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
 
 	w := &sm.waste
 	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",

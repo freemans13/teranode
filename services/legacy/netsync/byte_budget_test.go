@@ -50,7 +50,9 @@ func requested(recs ...*getDataRecorder) int {
 	return n
 }
 
-func TestTheByteBudgetStopsRequestsAtTwentyGiB(t *testing.T) {
+// Every peer is kept at two requests while the bytes really held ahead of the chain, parked and
+// arriving, are under 20 GiB. The budget is a backstop for the disk, not a pacing rule.
+func TestEveryPeerHoldsTwoRequestsUnderTheBackstop(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xe1}
@@ -59,15 +61,60 @@ func TestTheByteBudgetStopsRequestsAtTwentyGiB(t *testing.T) {
 	sm, a, aRec, _, bRec := budgetManager(t)
 	recentBlocks(sm, 1<<30)
 
-	// 19 GiB is arriving from a third peer already, so there is room for one more 1 GiB block.
+	// 19 GiB is arriving from a third peer already: under the backstop.
 	sm.streams.start(chainhash.Hash{0xe2}, 0, newTestPeer(t, "10.0.0.9:8333"), 19<<30, time.Now())
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 1 }, 5*time.Second))
-	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 1 }, 300*time.Millisecond),
-		"one more 1 GiB block fits under the 20 GiB budget, and no more")
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second), "both peers are filled")
+	require.Equal(t, 2, aRec.count())
+	require.Equal(t, 2, bRec.count())
+}
+
+// At 20 GiB really held ahead of the chain, nothing further ahead is asked for.
+func TestTheBackstopStopsRequestsAtTwentyGiBHeld(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xe1}
+	msg, _ := linkedHeaders(anchor, 10, &nonce)
+
+	sm, a, aRec, _, bRec := budgetManager(t)
+	recentBlocks(sm, 1<<30)
+
+	sm.streams.start(chainhash.Hash{0xe2}, 0, newTestPeer(t, "10.0.0.9:8333"), 21<<30, time.Now())
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 0 }, 300*time.Millisecond))
+}
+
+// A block asked for but not yet arriving holds no bytes, so it does not count, however large the
+// recent blocks were. It used to count at the largest recent block: after a 2.3 GB block on
+// 2026-09-25 a few unstarted requests filled the budget with bytes that did not exist, and four
+// of eight peers sat idle.
+func TestAnUnstartedRequestIsNotCountedAsBytes(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xe7}
+	msg, _ := linkedHeaders(anchor, 10, &nonce)
+
+	sm, a, aRec, _, bRec := budgetManager(t)
+	recentBlocks(sm, 2300*qMB)
+
+	// 12 GiB parked, and five requests owed by another peer that have not started arriving.
+	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe8}, prevBlock: chainhash.Hash{0xe9}, converted: true, size: 300, wireSize: 12 << 30}))
+
+	other := newTestPeer(t, "10.0.0.8:8333")
+	for i := byte(0); i < 5; i++ {
+		require.True(t, sm.blockDownloads.Add(other, chainhash.Hash{0xf0, i}))
+	}
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second), "12 GiB held is under 20 GiB, so both peers are filled")
 }
 
 func TestAParkedBlockCountsAtItsWireSize(t *testing.T) {
@@ -79,15 +126,14 @@ func TestAParkedBlockCountsAtItsWireSize(t *testing.T) {
 	sm, a, aRec, _, bRec := budgetManager(t)
 	recentBlocks(sm, 1<<30)
 
-	// Converted, so the park charges its few-hundred-byte record, but the block is 19 GiB.
-	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe4}, prevBlock: chainhash.Hash{0xe5}, converted: true, size: 300, wireSize: 19 << 30}))
+	// Converted, so the park charges its few-hundred-byte record, but the block is 21 GiB.
+	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe4}, prevBlock: chainhash.Hash{0xe5}, converted: true, size: 300, wireSize: 21 << 30}))
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 1 }, 5*time.Second))
-	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 1 }, 300*time.Millisecond),
-		"the parked block's 19 GiB counts, not its record")
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 0 }, 300*time.Millisecond),
+		"the parked block's 21 GiB counts, not its record")
 }
 
 func TestAPeerHoldsAtMostTwoLargeBlocks(t *testing.T) {
