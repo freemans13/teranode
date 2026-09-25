@@ -145,6 +145,12 @@ const (
 	// maxLastBlockTime is the longest time in seconds that we will
 	// stay with a sync peer while below the current blockchain height.
 	// Set to 3 minutes.
+	//
+	// A sync peer that delivers nothing for this long may simply be busy: an SV
+	// Node peer can spend many minutes on blocks queued ahead of ours, or reading
+	// a multi-GB block from disk before its first byte. Rotating the sync role is
+	// fine; treating the peer as broken is not. See blockRequestRetryInterval in
+	// block_download_tracker.go.
 	maxLastBlockTime = 60 * 3 * time.Second
 
 	// maxMsgQueuePerPeer is the maximum number of messages that can be

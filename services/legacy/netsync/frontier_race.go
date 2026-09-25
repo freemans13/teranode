@@ -23,6 +23,12 @@ import (
 //
 // SV Node: DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT is 30 s, DEFAULT_MIN_BLOCK_STALLING_RATE is
 // 100 KB/s.
+//
+// The race judges only a block whose bytes have started. A peer that has not started sending a
+// block is not struggling with it: it may be sending blocks queued ahead of it, or reading it from
+// disk before its first byte. That case is handled by letting another peer be asked after
+// blockRequestRetryInterval, whose comment explains what an SV Node peer is doing while it is
+// quiet. Do not extend the race to it.
 
 const (
 	// raceCheckInterval is how often the race is considered. It runs on its own ticker because

@@ -76,6 +76,17 @@ const (
 	// stallResponseTimeoutBlocks is the maximum amount of time a peer will
 	// wait for a block message to be received after sending a getdata
 	// message.
+	//
+	// Do not shorten this on the belief that a peer silent this long is broken.
+	// An SV Node peer can send nothing for many minutes while it serves blocks
+	// queued ahead of ours, or reads a multi-GB block from disk to compute its
+	// checksum before the first byte, holding the one thread that serves all its
+	// peers. On mainnet on 2026-09-25 a peer sent nothing for about 22 minutes and
+	// then delivered a 4 GB block at 38 MB/s. The full account, with SV Node
+	// source references, is on blockRequestRetryInterval in
+	// services/legacy/netsync/block_download_tracker.go. SV Node's own limit for
+	// a block in flight is far longer: two block intervals plus half an interval
+	// per other downloading peer.
 	stallResponseTimeoutBlocks = 5 * time.Minute
 
 	// minBlockDownloadBytesPerSec is the association-wide read throughput, in
@@ -2130,6 +2141,13 @@ func shouldArmProcessingTimer(cmd string, prefetchBudgetBytes int64, net wire.Bi
 // inHandler handles all incoming messages for the peer.  It must be run as a goroutine.
 func (p *Peer) inHandler() {
 	// The timer is stopped when a new message is received and reset after it is processed.
+	//
+	// An SV Node peer answers pings on the same single thread that serves every
+	// peer's getdata, and that thread can be held for minutes while it reads a
+	// multi-GB block from disk before sending it. A peer that goes quiet here is
+	// often busy, not gone; see blockRequestRetryInterval in
+	// services/legacy/netsync/block_download_tracker.go before shortening
+	// legacy_peerIdleTimeout.
 	var idleTimer *time.Timer
 	idleTimer = time.AfterFunc(p.settings.Legacy.PeerIdleTimeout, func() {
 		// For multistream associations, check if any other stream has

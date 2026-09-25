@@ -23,6 +23,40 @@ const (
 	// ceiling: after a minute we are willing to ask somebody else, but the
 	// original peer is still not punished if its copy turns up. Inherited from
 	// the global map this replaced.
+	//
+	// A QUIET PEER IS USUALLY A BUSY ONE. Read this before making any rule that
+	// times out, disconnects or marks unhealthy a peer that has sent no block
+	// bytes for a while.
+	//
+	// On mainnet on 2026-09-25 peer 135.125.170.182 sent no block bytes from
+	// about 10:51 to 11:13 UTC while owing us 11 blocks, then sent the 4 GB block
+	// 760,331 in 1m44s at 38 MB/s. Nothing was wrong with it. What an SV Node
+	// peer can be doing while it sends us nothing, from its source
+	// (github.com/bitcoin-sv/bitcoin-sv):
+	//
+	//   - Serving our requests in order. It answers getdata one block at a time,
+	//     first asked first sent (ProcessGetData, src/net/net_processing.cpp:1163
+	//     and 1430-1433). Every block ahead of ours in its queue is sent first, and
+	//     at recent heights those can be several GB each.
+	//   - Preparing a block before its first byte. For a block it has not served
+	//     since loading it by reindex or -loadblock, it reads the whole block from
+	//     disk to compute the checksum the message needs before sending anything
+	//     (PopulateBlockIndexBlockDiskMetaDataNL, src/block_index.cpp:322-373). For
+	//     a 4 GB block that is a 4 GB read. It does this holding cs_main on the one
+	//     thread that handles every peer's messages (src/net/net.cpp:2152-2196), so
+	//     its other peers stall too.
+	//   - Waiting on its own chain work. Connecting a block or flushing its UTXO
+	//     cache also holds cs_main (src/validation.cpp:3740), which getdata needs.
+	//   - Waiting for us. If this node stops reading the socket, the peer's sends
+	//     block and it looks exactly like the cases above from here.
+	//
+	// So silence alone is not failure. The right response is the one this
+	// interval drives: let another peer be asked for the block and keep the
+	// connection, since a peer that is dropped loses everything it was working on
+	// for us, including its other queued blocks. SV Node itself drops a block
+	// peer only when its whole download window cannot move and the peer is below
+	// 100 KB/s (DEFAULT_BLOCK_STALLING_TIMEOUT and DEFAULT_MIN_BLOCK_STALLING_RATE,
+	// src/validation.h:124 and 129; the check at src/net/net_processing.cpp:5453).
 	blockRequestRetryInterval = 60 * time.Second
 
 	// maxTrackedBlockDownloads bounds how many distinct blocks the ledger will
