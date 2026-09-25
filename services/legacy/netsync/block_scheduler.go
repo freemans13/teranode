@@ -27,6 +27,16 @@ type assignerPeer struct {
 	rate float64
 }
 
+// parkBackstopBytes is the most block bytes the node holds ahead of the chain, parked and
+// arriving, before it stops asking for blocks further ahead. It guards the disk and is not meant to
+// pace the download: SV Node has no byte limit, only its 1,024-block window.
+//
+// It was 20 GiB until 2026-09-25, which is about five minutes of lead at height 754,000, and a
+// block the chain needs must be asked for at least its own download time ahead. Block 754,562 is
+// 4.0 GB and took 8 minutes 48 seconds from one peer at 7.6 MB/s, and the chain waited on it with
+// 27.9 GB parked and six of eight peers idle.
+const parkBackstopBytes = int64(100) << 30
+
 // streamingPeerDepth is how many blocks a peer holds with the park on: legacy_maxBlocksInTransitPerPeer,
 // 16 by default, as SV Node's MAX_BLOCKS_IN_TRANSIT_PER_PEER. It does not depend on block size.
 //
@@ -195,7 +205,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		// arriving holds nothing and is not counted. It used to count at the
 		// largest recent block, and after a 2.3 GB block on 2026-09-25 that filled
 		// the budget with bytes that did not exist while four of eight peers idled.
-		overBackstop = sm.bytesAhead(largest) >= lookaheadParkBytes
+		overBackstop = sm.bytesAhead(largest) >= parkBackstopBytes
 	}
 
 	peers := make([]*assignerPeer, 0, fanout)
