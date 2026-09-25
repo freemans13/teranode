@@ -45,6 +45,22 @@ func speedScaledDepth(depth int, rate, fastest float64) int {
 	return max(1, int(math.Round(float64(depth)*rate/fastest)))
 }
 
+// unmeasuredPeerDepth is the most blocks a peer is given before its speed is known, as every peer
+// is straight after a restart. On 2026-09-25 after a restart every peer was given 16 before any
+// speed was known, and peers at 4 MB/s held 13 blocks against a speed-scaled depth of two or three.
+const unmeasuredPeerDepth = 2
+
+// peerQueueDepth is how many blocks p may be asked for at once with the park on: its speed-scaled
+// share of depth once its speed is measured, and at most unmeasuredPeerDepth until then.
+func (sm *SyncManager) peerQueueDepth(p *peerpkg.Peer, depth int, fastest float64) int {
+	rate := sm.streams.peerRate(p)
+	if rate <= 0 {
+		return min(depth, unmeasuredPeerDepth)
+	}
+
+	return speedScaledDepth(depth, rate, fastest)
+}
+
 // parkBackstopBytes is the most block bytes the node holds ahead of the chain, parked and
 // arriving, before it stops asking for blocks further ahead. It guards the disk and is not meant to
 // pace the download: SV Node has no byte limit, only its 1,024-block window.
@@ -250,7 +266,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 
 		depth := perPeer
 		if streaming {
-			depth = speedScaledDepth(perPeer, rate, fastest)
+			depth = sm.peerQueueDepth(candidate.peer, perPeer, fastest)
 		}
 
 		budget := depth - sm.blockDownloads.CountForPeer(candidate.peer)

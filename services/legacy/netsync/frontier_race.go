@@ -557,8 +557,6 @@ func (sm *SyncManager) logDownloadQueues() {
 	eligible := sm.eligibleBlockPeers()
 	idle, short := 0, 0
 	depth := sm.streamingPeerDepth()
-	fallbackRate := sm.streams.medianRate()
-
 	var fastest float64
 	for _, bp := range eligible {
 		fastest = max(fastest, sm.streams.peerRate(bp.peer))
@@ -568,12 +566,7 @@ func (sm *SyncManager) logDownloadQueues() {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
 		remaining, sending := sm.streams.pending(bp.peer)
 
-		rate := sm.streams.peerRate(bp.peer)
-		if rate <= 0 {
-			rate = fallbackRate
-		}
-
-		peerDepth := speedScaledDepth(depth, rate, fastest)
+		peerDepth := sm.peerQueueDepth(bp.peer, depth, fastest)
 
 		if owed == 0 && sending == 0 {
 			idle++
