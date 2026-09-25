@@ -121,6 +121,9 @@ type downloadAssigner struct {
 	// so nothing above the highest held block is asked for in this pass. Blocks below it fill
 	// gaps and are never stopped: filling a gap is what lets the park drain.
 	overBackstop bool
+	// full holds the eligible peers with no room left, for fastestAvoiding: a block re-asked
+	// because its owner went quiet may go to one of them.
+	full []*assignerPeer
 }
 
 // eligibleBlockPeers lists the peers that may be asked for a block body, sync
@@ -245,6 +248,8 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	peers := make([]*assignerPeer, 0, fanout)
 	assignable := 0
 
+	var full []*assignerPeer
+
 	fallbackRate := sm.streams.medianRate()
 
 	var fastest float64
@@ -271,6 +276,10 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 
 		budget := depth - sm.blockDownloads.CountForPeer(candidate.peer)
 		if budget <= 0 {
+			if streaming {
+				full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate})
+			}
+
 			continue
 		}
 
@@ -290,7 +299,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// not the whole node-wide window: at the default window of 1024 and one peer
 	// able to take 16, sizing the round by the window would make 1024 round trips
 	// to place 16 blocks, on every arriving block.
-	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), overBackstop: overBackstop}
+	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), overBackstop: overBackstop, full: full}
 }
 
 // bytesAhead is how many bytes of blocks the node really holds ahead of the chain: parked blocks
@@ -413,6 +422,40 @@ func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) 
 	return nil, false
 }
 
+// fastestAvoiding is takeAvoiding for a block re-asked because its owner went quiet: it offers the
+// block to every eligible peer, full queue or not, in the same tiers, fastest first. The chain may
+// be waiting on the block, and the peers with room are the slow ones.
+func (a *downloadAssigner) fastestAvoiding(height int32, avoid func(*peerpkg.Peer) bool) (*assignerPeer, bool) {
+	if a == nil {
+		return nil, false
+	}
+
+	var tiers [4]*assignerPeer
+
+	for _, p := range append(append([]*assignerPeer(nil), a.peers...), a.full...) {
+		tier := 0
+		if avoid != nil && avoid(p.peer) {
+			tier = 2
+		}
+
+		if !p.canServe(height) {
+			tier++
+		}
+
+		if tiers[tier] == nil || p.rate > tiers[tier].rate {
+			tiers[tier] = p
+		}
+	}
+
+	for _, p := range tiers {
+		if p != nil {
+			return p, true
+		}
+	}
+
+	return nil, false
+}
+
 // canServe reports whether this peer has told us about a chain that reaches the
 // given height.
 //
@@ -443,7 +486,7 @@ func (p *assignerPeer) canServe(height int32) bool {
 // recordRequest adds a block to this peer's getdata and spends a unit of both
 // its own budget and the pass's. It is called under headerMu, straight after the
 // download ledger has taken the assignment: pure memory, no lock, no send.
-func (a *downloadAssigner) recordRequest(p *assignerPeer, hash *chainhash.Hash) error {
+func (a *downloadAssigner) recordRequest(p *assignerPeer, hash *chainhash.Hash, overDepth bool) error {
 	if p.getData == nil {
 		// Sized to what this peer may still be asked for, not to the header
 		// list, which is often 2000 entries for a handful of used slots.
@@ -455,7 +498,11 @@ func (a *downloadAssigner) recordRequest(p *assignerPeer, hash *chainhash.Hash) 
 	}
 
 	p.charge()
-	a.remaining--
+
+	// A re-ask placed over a full peer's depth does not use the pass's room.
+	if !overDepth {
+		a.remaining--
+	}
 
 	return nil
 }
@@ -468,7 +515,7 @@ func (a *downloadAssigner) send(sm *SyncManager) {
 		return
 	}
 
-	for _, p := range a.peers {
+	for _, p := range append(a.peers, a.full...) {
 		if p.getData == nil || len(p.getData.InvList) == 0 {
 			continue
 		}

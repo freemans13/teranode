@@ -241,3 +241,31 @@ func TestAssignWantedBlocks_TerminatesWhenEverythingIsOwed(t *testing.T) {
 		t.Fatal("the assignment pass did not finish: it has no loop to spin in, so this means one was added")
 	}
 }
+
+// A block re-asked because its owner went quiet goes to the fastest peer, even one whose queue is
+// full. Only a peer with room used to be offered it, and fast peers are the ones whose queues are
+// full: on 2026-09-25 the 4 GB block 760,331 was re-asked of a peer at 2.7 MB/s and took 22 minutes,
+// while peers at 40 to 50 MB/s were busy. The chain was waiting on it the whole time.
+func TestAReAskedBlockGoesToTheFastestPeerEvenWithAFullQueue(t *testing.T) {
+	sm := schedulerManager(t)
+
+	slowPeer, _ := schedulerPeer(t, sm, 140, 1000)
+	fastPeer, _ := schedulerPeer(t, sm, 141, 1000)
+
+	slow := &assignerPeer{peer: slowPeer, budget: 1, rate: float64(5 << 20)}
+	fast := &assignerPeer{peer: fastPeer, budget: 0, rate: float64(50 << 20)}
+	assigner := &downloadAssigner{peers: []*assignerPeer{slow}, full: []*assignerPeer{fast}, remaining: 1}
+
+	reAsked := wantedBlock{height: 5, hash: chainhash.Hash{0x61}, reAsked: true}
+	ordinary := wantedBlock{height: 6, hash: chainhash.Hash{0x62}}
+
+	sm.requestBlocks(assigner, []wantedBlock{reAsked, ordinary}, 0)
+
+	require.NotNil(t, fast.getData, "the re-asked block goes to the fastest peer")
+	require.Len(t, fast.getData.InvList, 1)
+	require.Equal(t, reAsked.hash, fast.getData.InvList[0].Hash)
+
+	require.NotNil(t, slow.getData, "an ordinary block still needs a peer with room")
+	require.Len(t, slow.getData.InvList, 1)
+	require.Equal(t, ordinary.hash, slow.getData.InvList[0].Hash)
+}

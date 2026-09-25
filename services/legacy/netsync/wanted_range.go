@@ -6,6 +6,9 @@ import "github.com/bsv-blockchain/go-bt/v2/chainhash"
 type wantedBlock struct {
 	height int32
 	hash   chainhash.Hash
+	// reAsked is set when the block's owner went quiet and was let off: the block then goes to
+	// the fastest peer, even one whose queue is full.
+	reAsked bool
 }
 
 // wantedBlocksFromCache returns the blocks the node wants next: the contiguous

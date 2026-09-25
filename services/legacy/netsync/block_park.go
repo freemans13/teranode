@@ -1694,6 +1694,15 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store) {
 
 			continue
 
+		case isDuplicateCopyFile(name):
+			// A second copy of a block a crash left half-written (conversion_race.go). Nothing
+			// reads it back.
+			p.removeParkFile(name)
+
+			discarded++
+
+			continue
+
 		case !strings.HasSuffix(name, "."+string(fileformat.FileTypeMsgBlock)):
 			// Checksum sidecars and anything else. A sidecar whose block is gone
 			// is dead weight; anything we do not recognise is left alone.

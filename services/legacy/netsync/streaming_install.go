@@ -180,19 +180,13 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 
 		if err != nil {
 			if errors.Is(err, ErrDuplicateBlockInFlight) {
-				// Drained, not written. A raw copy of a block another copy is converting is
-				// never the copy wanted, and writing it let the park take it whenever the
-				// converting copy then failed: processing a raw copy after a conversion
-				// attempt failed subtree validation at 707,178 and 708,115 on 2026-09-24 and
-				// stopped the chain each time. If the converting copy fails, nobody owes the
-				// block any more and the next download pass asks for it again.
-				if _, derr := io.Copy(io.Discard, r); derr != nil {
-					return false, derr
-				}
-
-				sm.noteDrainedDuplicate(hash)
-
-				return false, nil
+				// Never written as a raw block. A raw copy of a block another copy is
+				// converting let the park take it whenever the converting copy then failed:
+				// processing a raw copy after a conversion attempt failed subtree validation
+				// at 707,178 and 708,115 on 2026-09-24 and stopped the chain each time. It is
+				// kept in a side file instead, and converted only if it completes before the
+				// copy converting now, after that copy has stopped and cleaned up.
+				return sm.raceDuplicateCopy(hash, header, r, n, inner)
 			}
 
 			if errors.Is(err, context.DeadlineExceeded) {

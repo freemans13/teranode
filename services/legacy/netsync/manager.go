@@ -860,7 +860,11 @@ type SyncManager struct {
 
 	drainedDuplicatesMu sync.Mutex
 	drainedDuplicates   map[chainhash.Hash]int
-	inFlightBlocksMu    sync.Mutex
+	// conversions is the conversion in progress for each block, so a faster copy can take it
+	// over (conversion_race.go).
+	conversionsMu    sync.Mutex
+	conversions      map[chainhash.Hash]*conversionCtl
+	inFlightBlocksMu sync.Mutex
 
 	// blockPrefetchWaiters counts read-loops currently blocked acquiring
 	// prefetch budget (i.e. local processing cannot keep up). While > 0 the node
