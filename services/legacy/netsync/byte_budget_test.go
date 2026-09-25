@@ -343,9 +343,12 @@ func TestAPeerHoldsTheConfiguredDepthWhateverTheBlockSize(t *testing.T) {
 		anchor := chainhash.Hash{0xec, byte(size >> 20)}
 		msg, _ := linkedHeaders(anchor, 40, &nonce)
 
-		sm, a, aRec, _, bRec := budgetManager(t)
+		sm, a, aRec, b, bRec := budgetManager(t)
 		sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
 		recentBlocks(sm, size)
+
+		sm.streams.rates[a] = float64(20 * qMB)
+		sm.streams.rates[b] = float64(20 * qMB)
 
 		seedFetchHeaders(t, sm, a, anchor, msg)
 		sm.fetchHeaderBlocks()
@@ -389,4 +392,48 @@ func TestSpeedScaledDepth(t *testing.T) {
 	require.Equal(t, 1, speedScaledDepth(16, 1, 50), "never below one")
 	require.Equal(t, 16, speedScaledDepth(16, 5, 0), "no measured rates, full depth")
 	require.Equal(t, 16, speedScaledDepth(16, 0, 50), "an unmeasured peer is scaled by the caller's fallback, not here")
+}
+
+// A peer whose speed is not yet measured, as every peer is straight after a restart, gets at most
+// two blocks until it has delivered one. On 2026-09-25 after a restart every peer was given 16
+// before any speed was known, and peers at 4 MB/s held 13 blocks against a speed-scaled depth of
+// two or three.
+func TestAnUnmeasuredPeerGetsAtMostTwoBlocks(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xee}
+	msg, _ := linkedHeaders(anchor, 40, &nonce)
+
+	sm, a, aRec, b, bRec := budgetManager(t)
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+	recentBlocks(sm, 200*qMB)
+
+	// b is measured and fast; a has not delivered anything yet.
+	sm.streams.rates[b] = float64(50 * qMB)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 18 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 18 }, 300*time.Millisecond))
+	require.Equal(t, 16, bRec.count())
+	require.Equal(t, 2, aRec.count(), "unmeasured, so two until its speed is known")
+}
+
+// Straight after a restart no peer is measured, so every peer starts at two.
+func TestEveryPeerStartsAtTwoWhenNoneIsMeasured(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xef}
+	msg, _ := linkedHeaders(anchor, 40, &nonce)
+
+	sm, a, aRec, _, bRec := budgetManager(t)
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+	recentBlocks(sm, 200*qMB)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 4 }, 300*time.Millisecond))
 }
