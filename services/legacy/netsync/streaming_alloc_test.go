@@ -390,3 +390,36 @@ func (w writeCounter) Write(p []byte) (int, error) {
 
 	return len(p), nil
 }
+
+// BeginTx writes a transaction's start into a buffer the builder keeps, not into a fresh slice per
+// input. On mainnet on 2026-09-25 the per-input slices were 3.9 GB in ten minutes.
+func TestBeginTxReusesItsBuffer(t *testing.T) {
+	ctx := context.Background()
+	w, _ := streamingWriter(t)
+	t.Cleanup(func() { _ = w.DeleteAll(ctx) })
+
+	const inputs = 200
+
+	tx := bt.NewTx()
+
+	for i := 0; i < inputs; i++ {
+		prev := chainhash.Hash{byte(i), byte(i >> 8), 9}
+		require.NoError(t, tx.FromUTXOs(&bt.UTXO{TxIDHash: &prev, Vout: uint32(i), Satoshis: 1000}))
+		tx.Inputs[i].UnlockingScript = bscript.NewFromBytes(bytes.Repeat([]byte{0x51}, 70))
+	}
+
+	b, err := newBlockStreamBuilder(3, 1024, coinbaseTx(t), w.Emit(ctx), newDedupMap(3), withSubtreeDataSink(w.OpenData(ctx)))
+	require.NoError(t, err)
+
+	// The first call grows the buffer to size; after that it is reused.
+	_, err = b.BeginTx(tx)
+	require.NoError(t, err)
+
+	allocated := allocatedBytes(func() {
+		_, err = b.BeginTx(tx)
+	})
+	require.NoError(t, err)
+
+	// go-bt still copies each input's 32-byte parent id once. Anything beyond that is a new slice.
+	require.Less(t, allocated, uint64(inputs*48), "no fresh slice per input")
+}

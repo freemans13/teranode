@@ -276,11 +276,13 @@ func (b *blockStreamBuilder) BeginTx(tx *bt.Tx) (io.Writer, error) {
 
 	prefix = append(prefix, bt.VarInt(uint64(len(tx.Inputs))).Bytes()...)
 
+	// Appended straight into the buffer the builder keeps. Called without it, go-bt builds a
+	// fresh slice per input for this to copy: 3.9 GB in ten minutes on mainnet on 2026-09-25.
 	for _, in := range tx.Inputs {
 		if extended {
-			prefix = append(prefix, in.ExtendedBytes(false)...)
+			prefix = in.ExtendedBytes(false, prefix)
 		} else {
-			prefix = append(prefix, in.Bytes(false)...)
+			prefix = in.Bytes(false, prefix)
 		}
 	}
 
