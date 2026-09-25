@@ -113,11 +113,11 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		// below, on the same path every other block's root is checked on.
 		root = coinbaseHash
 	} else {
-		// dedup is never sized from stream.TxCount(). See newPipelineDedupMap's
-		// doc comment for why: that count is the peer's own declared transaction
-		// count, and sizing a map from it is what let a peer make this node
-		// allocate roughly 19 GB by declaring a number.
-		dedup := newPipelineDedupMap()
+		// dedup is sized from stream.TxCount() but never past dedupInitialCapacity.
+		// See newPipelineDedupMap's doc comment for why: that count is the peer's
+		// own declared transaction count, and sizing a map from it without a cap is
+		// what let a peer make this node allocate roughly 19 GB by declaring a number.
+		dedup := newPipelineDedupMap(stream.TxCount())
 
 		builder, buildErr := newBlockStreamBuilder(int(stream.TxCount()), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup,
 			withSubtreeDataSink(writer.OpenData(sm.ctx)))
@@ -430,9 +430,9 @@ func (sm *SyncManager) fallbackSubtreeDAH() uint32 {
 	return uint32(tip) + uint32(depth) + retention
 }
 
-// dedupInitialCapacity bounds the pipeline dedup map's pre-sizing hint. It is a
-// fixed constant rather than the peer's declared transaction count on purpose
-// — see newPipelineDedupMap.
+// dedupInitialCapacity caps the pipeline dedup map's pre-sizing hint, so a
+// peer's declared transaction count can never size it past this — see
+// newPipelineDedupMap.
 //
 // ~1,048,576 slots costs roughly 50 MB with NewSplitSwissMapUint64's own 20%
 // per-bucket headroom (go-tx-map tx_map.go). A block larger than this still
@@ -443,10 +443,17 @@ func (sm *SyncManager) fallbackSubtreeDAH() uint32 {
 const dedupInitialCapacity uint32 = 1 << 20
 
 // newPipelineDedupMap returns a fresh duplicate-transaction map for the
-// pipeline sink, pre-sized at dedupInitialCapacity regardless of what a peer
-// declared for the block's transaction count.
+// pipeline sink, pre-sized for the block's declared transaction count but never
+// past dedupInitialCapacity.
 //
-// The declared count is never trusted for this because it is checked only
+// Sizing for the declared count is what keeps an ordinary block cheap. Every
+// block used to get the full dedupInitialCapacity map, about 48 MB: on mainnet
+// on 2026-09-25 that was 16 GB of every 90 GB the node allocated, for blocks
+// of a few thousand transactions. It cannot undersize the map for an honest
+// block, because the stream stops at the declared count, and a map smaller
+// than its block would still only grow.
+//
+// The declared count is never trusted beyond the cap because it is checked only
 // against the wire payload ceiling (services/legacy/config.go
 // maxWireBlockPayload, 4,000,000,000 bytes) against a 10-byte minimum
 // transaction size — so a peer may declare up to 400,000,000 transactions in
@@ -456,8 +463,8 @@ const dedupInitialCapacity uint32 = 1 << 20
 // allocate roughly 19 GB before a single transaction byte arrives — gated by
 // nothing but a hash and a proof-of-work check that any sync peer already
 // passes.
-func newPipelineDedupMap() txmap.TxMap {
-	return txmap.NewSplitSwissMapUint64(dedupInitialCapacity)
+func newPipelineDedupMap(declared uint64) txmap.TxMap {
+	return txmap.NewSplitSwissMapUint64(uint32(min(declared, uint64(dedupInitialCapacity)))) //nolint:gosec // capped at dedupInitialCapacity, which fits uint32
 }
 
 // deleteWrittenOnFailure calls writer.DeleteAll and, if the delete itself
