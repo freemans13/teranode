@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
@@ -301,4 +302,29 @@ func TestAPeerIsRefilledWhenItsBlockArrivesAndParks(t *testing.T) {
 	sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: a})
 
 	require.True(t, WaitUntil(func() bool { return aRec.count() > 0 }, 5*time.Second), "the delivering peer is asked for more straight away")
+}
+
+// A block recovered from the park after a restart counts at its real size, not a guess. Its
+// converted record carries the size the block had on the wire. Counting each at the largest recent
+// block made about 28 recovered blocks read as 61.7 GB after a restart on 2026-09-25, far over the
+// backstop, and three of four peers sat idle until the park drained.
+func TestARecoveredBlockCountsAtTheSizeItsRecordCarries(t *testing.T) {
+	park, _ := newTestPark(t, "")
+
+	prev := chainhash.Hash{0x51}
+	header := &model.BlockHeader{Version: 1, HashPrevBlock: &prev, HashMerkleRoot: &chainhash.Hash{}}
+	record := &model.Block{Header: header, SizeInBytes: 300 * uint64(qMB), Height: 753000}
+
+	require.True(t, park.adoptRecord(chainhash.Hash{0x52}, record, 400, time.Now()))
+
+	require.Equal(t, 300*qMB, park.aheadBytes(2<<30), "the record's own size, not the 2 GiB guess")
+}
+
+// A whole block recovered from the park is its file, so its file size is what it holds.
+func TestARecoveredWholeBlockCountsAtItsFileSize(t *testing.T) {
+	park, _ := newTestPark(t, "")
+
+	require.True(t, park.AdoptWritten(parkedBlock{hash: chainhash.Hash{0x53}, prevBlock: chainhash.Hash{0x54}, size: 700 * qMB}))
+
+	require.Equal(t, 700*qMB, park.aheadBytes(2<<30))
 }

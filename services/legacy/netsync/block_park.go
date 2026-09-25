@@ -194,8 +194,8 @@ type parkedBlock struct {
 	size   int64
 	// wireSize is the block's size on the wire, declared when it streamed. size is what the park
 	// charges, which for a converted block is its small record; the read-ahead budget needs the
-	// block's real size. Zero for a block recovered from disk, which is counted at the largest
-	// recent block size instead.
+	// block's real size. A converted block recovered from disk takes it from its record; a whole
+	// block needs none, since its file is its size.
 	wireSize int64
 	// peer that delivered the block, or nil for a block recovered from disk.
 	// Both nil and disconnected are defined states; see livePeer.
@@ -398,9 +398,13 @@ func (p *blockPark) aheadBytes(unknown int64) int64 {
 	var total int64
 
 	for _, e := range p.entries {
-		if e.wireSize > 0 {
+		switch {
+		case e.wireSize > 0:
 			total += e.wireSize
-		} else {
+		case !e.converted:
+			// A whole block is its file: what the park charges is what it holds.
+			total += e.size
+		default:
 			total += unknown
 		}
 	}
@@ -1454,7 +1458,15 @@ func (p *blockPark) adoptRecord(hash chainhash.Hash, record *model.Block, size i
 		recoveredHeight = 0
 	}
 
-	entry := parkedBlock{hash: hash, prevBlock: *record.Header.HashPrevBlock, height: recoveredHeight, size: size, parkedAt: parkedAt, converted: true}
+	// The record carries the size the block had on the wire, which is what the download backstop
+	// counts. Without it a recovered block counted at the largest recent block, and after a
+	// restart on 2026-09-25 about 28 of them read as 61.7 GB and idled three of four peers.
+	wireSize, sizeErr := safeconversion.Uint64ToInt64(record.SizeInBytes)
+	if sizeErr != nil {
+		wireSize = 0
+	}
+
+	entry := parkedBlock{hash: hash, prevBlock: *record.Header.HashPrevBlock, height: recoveredHeight, size: size, wireSize: wireSize, parkedAt: parkedAt, converted: true}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
