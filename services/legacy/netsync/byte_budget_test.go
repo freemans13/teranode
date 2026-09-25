@@ -172,9 +172,11 @@ func TestTheLowestBlockGoesToTheFastestPeerWithRoom(t *testing.T) {
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second))
+	// The slower peer runs at a fifth of the speed, so its queue is a fifth of the depth of two,
+	// which rounds to the floor of one.
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 3 }, 5*time.Second))
 	require.Equal(t, hashes[0:2], bRec.all(), "the faster peer takes the lowest blocks until it is full")
-	require.Equal(t, hashes[2:4], aRec.all())
+	require.Equal(t, hashes[2:3], aRec.all())
 }
 
 // At 07:35Z on 2026-09-24 three peers sat idle with 7 blocks parked and 5 owed: the pass trimmed
@@ -352,4 +354,39 @@ func TestAPeerHoldsTheConfiguredDepthWhateverTheBlockSize(t *testing.T) {
 		require.Equal(t, 16, aRec.count(), "size %d", size)
 		require.Equal(t, 16, bRec.count(), "size %d", size)
 	}
+}
+
+// A peer's queue is its share of the depth by speed: 16 times its rate over the fastest peer's,
+// never below one. A peer sends its queue in order, so a slow peer with a full queue buries blocks
+// the chain will soon need: on 2026-09-25 blocks 755,236 and 755,244 started 11 and 22 minutes
+// after they were asked for, behind multi-GB blocks at peers delivering 5 to 10 MB/s, while
+// peers at 50 MB/s had fetched 800 blocks further ahead.
+func TestASlowPeersQueueIsShorterInProportionToItsSpeed(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xed}
+	msg, _ := linkedHeaders(anchor, 40, &nonce)
+
+	sm, a, aRec, b, bRec := budgetManager(t)
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+	recentBlocks(sm, 200*qMB)
+
+	sm.streams.rates[a] = float64(5 * qMB)
+	sm.streams.rates[b] = float64(50 * qMB)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 18 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 18 }, 300*time.Millisecond))
+	require.Equal(t, 16, bRec.count(), "the fastest peer keeps the full depth")
+	require.Equal(t, 2, aRec.count(), "a tenth of the speed, a tenth of the depth, rounded")
+}
+
+func TestSpeedScaledDepth(t *testing.T) {
+	require.Equal(t, 16, speedScaledDepth(16, 50, 50))
+	require.Equal(t, 2, speedScaledDepth(16, 5, 50))
+	require.Equal(t, 1, speedScaledDepth(16, 1, 50), "never below one")
+	require.Equal(t, 16, speedScaledDepth(16, 5, 0), "no measured rates, full depth")
+	require.Equal(t, 16, speedScaledDepth(16, 0, 50), "an unmeasured peer is scaled by the caller's fallback, not here")
 }
