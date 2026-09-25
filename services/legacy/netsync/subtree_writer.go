@@ -77,6 +77,10 @@ type pendingDataSink struct {
 	file *blobfile.PendingFile
 }
 
+func (s pendingDataSink) Write(p []byte) (int, error) {
+	return s.file.Write(p)
+}
+
 func (s pendingDataSink) WriteTx(tx *bt.Tx) error {
 	// SerializeTo, as the buffered data file does, so both write the same bytes.
 	_, err := tx.SerializeTo(s.file)

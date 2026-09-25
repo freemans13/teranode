@@ -3,6 +3,7 @@ package netsync
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/url"
 	"runtime"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -246,4 +248,145 @@ func TestAnUnspendableOutputIsNotRemembered(t *testing.T) {
 	require.Len(t, outs, len(tx.Outputs), "positions are kept, so a child's output index still lines up")
 	require.NotNil(t, outs[0], "the spendable output is remembered")
 	require.Nil(t, outs[len(outs)-1], "the OP_FALSE OP_RETURN output is not")
+}
+
+// A block read off the wire through the stream, with each transaction's outputs copied from the
+// socket into the data file, writes the same subtree files as the builder given parsed transactions.
+// The block has children of earlier transactions, so some are written in extended form, and data
+// outputs, whose scripts the stream does not keep.
+func TestABlockStreamedFromTheWireWritesTheSameSubtreeFiles(t *testing.T) {
+	ctx := context.Background()
+
+	const txs = 40
+	const maxItems = 16
+
+	block := make([]*bt.Tx, 0, txs)
+
+	for i := 1; i <= txs; i++ {
+		switch {
+		case i%5 == 0:
+			parent := block[len(block)-1]
+			child := bt.NewTx()
+			require.NoError(t, child.FromUTXOs(&bt.UTXO{TxIDHash: parent.TxIDChainHash(), Vout: 0, Satoshis: parent.Outputs[0].Satoshis}))
+			require.NoError(t, child.PayToAddress("1BitcoinEaterAddressDontSendf59kuE", 100))
+			data := bscript.Script(append([]byte{0x00, 0x6a}, bytes.Repeat([]byte{byte(i)}, 3000)...))
+			child.AddOutput(&bt.Output{LockingScript: &data})
+			block = append(block, child)
+		case i%3 == 0:
+			block = append(block, bigTx(t, byte(i), 2048))
+		default:
+			tx, _ := streamTx(t, i)
+			block = append(block, tx)
+		}
+	}
+
+	cb := coinbaseTx(t)
+
+	var wireBlock bytes.Buffer
+	require.NoError(t, wire.WriteVarInt(&wireBlock, wire.ProtocolVersion, txs+1))
+	wireBlock.Write(cb.Bytes())
+
+	for _, tx := range block {
+		wireBlock.Write(tx.Bytes())
+	}
+
+	streamed, fileStore := streamingWriter(t)
+
+	stream, err := newBlockTxStream(bytes.NewReader(wireBlock.Bytes()), int64(wireBlock.Len()))
+	require.NoError(t, err)
+
+	streamCB, _, err := stream.Next()
+	require.NoError(t, err)
+
+	sb, err := newBlockStreamBuilder(txs+1, maxItems, streamCB, streamed.Emit(ctx), newDedupMap(txs+1), withSubtreeDataSink(streamed.OpenData(ctx)))
+	require.NoError(t, err)
+
+	for {
+		tx, hash, size, nextErr := stream.NextStreamed(sb.BeginTx)
+		if errors.Is(nextErr, errBlockTxStreamDone) {
+			break
+		}
+
+		require.NoError(t, nextErr)
+		require.NoError(t, sb.AddStreamedTx(tx, hash, uint64(size)))
+	}
+
+	gotRoot, got, err := sb.Finish()
+	require.NoError(t, err)
+
+	buffered, memStore := writerFixture(t, true)
+
+	bb, err := newBlockStreamBuilder(txs+1, maxItems, cb, buffered.Emit(ctx), newDedupMap(txs+1))
+	require.NoError(t, err)
+
+	for _, tx := range block {
+		require.NoError(t, bb.AddTx(tx, tx.TxIDChainHash()))
+	}
+
+	wantRoot, want, err := bb.Finish()
+	require.NoError(t, err)
+
+	extended := 0
+
+	for _, tx := range block {
+		if tx.IsExtended() {
+			extended++
+		}
+	}
+
+	require.Positive(t, extended, "some transactions are written extended")
+	require.Equal(t, wantRoot, gotRoot)
+	require.Equal(t, want, got)
+	require.Greater(t, len(got), 1, "several subtrees")
+
+	for _, root := range got {
+		for _, fileType := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtree} {
+			a, err := memStore.Get(ctx, root[:], fileType)
+			require.NoError(t, err, "%s %s", root, fileType)
+
+			b, err := fileStore.Get(ctx, root[:], fileType)
+			require.NoError(t, err, "%s %s", root, fileType)
+
+			require.Equal(t, a, b, "subtree %s %s", root, fileType)
+		}
+	}
+}
+
+// Streamed into a data file, a data output's script is copied from the stream to the file and never
+// allocated. At these heights such scripts are most of every block's bytes.
+func TestAStreamedDataScriptIsNeverAllocated(t *testing.T) {
+	const size = 2 << 20
+
+	tx := bigTx(t, 9, size)
+
+	var buf bytes.Buffer
+	require.NoError(t, wire.WriteVarInt(&buf, wire.ProtocolVersion, 1))
+	buf.Write(tx.Bytes())
+
+	s, err := newBlockTxStream(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	var (
+		got     *chainhash.Hash
+		written int64
+	)
+
+	counter := writeCounter{n: &written}
+
+	allocated := allocatedBytes(func() {
+		_, got, _, err = s.NextStreamed(func(*bt.Tx) (io.Writer, error) { return counter, nil })
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, *tx.TxIDChainHash(), *got)
+	require.Greater(t, written, int64(size), "the script went to the writer")
+	require.Less(t, allocated, uint64(size/8), "and was not allocated on the way")
+}
+
+type writeCounter struct{ n *int64 }
+
+func (w writeCounter) Write(p []byte) (int, error) {
+	*w.n += int64(len(p))
+
+	return len(p), nil
 }

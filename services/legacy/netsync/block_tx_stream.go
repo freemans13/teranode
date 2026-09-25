@@ -2,14 +2,13 @@ package netsync
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"hash"
 	"io"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/txstream"
 )
 
 // errBlockTxStreamDone reports that every declared transaction has been read. It
@@ -55,25 +54,9 @@ type blockTxStream struct {
 	r       *bufio.Reader
 	txCount uint64
 	read    uint64
-	// hashing feeds every byte a transaction is parsed from into a SHA-256, so its id comes
-	// from the bytes as they were read rather than from serializing it again.
-	hashing hashingReader
-	sum     [sha256.Size]byte
-}
-
-// hashingReader passes reads through from r and writes every byte read into h.
-type hashingReader struct {
-	r io.Reader
-	h hash.Hash
-}
-
-func (hr *hashingReader) Read(p []byte) (int, error) {
-	n, err := hr.r.Read(p)
-	if n > 0 {
-		hr.h.Write(p[:n])
-	}
-
-	return n, err
+	// txs parses each transaction and computes its id from the bytes as they are read, rather
+	// than serializing it again.
+	txs *txstream.Reader
 }
 
 // newBlockTxStream reads the declared transaction count and positions the stream
@@ -114,7 +97,7 @@ func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
 		return nil, errors.NewBlockInvalidError("[blockTxStream] block declares %d transactions, above the %d limit", count, uint64(maxBlockTxCount))
 	}
 
-	return &blockTxStream{r: br, txCount: count, hashing: hashingReader{r: br, h: sha256.New()}}, nil
+	return &blockTxStream{r: br, txCount: count, txs: txstream.NewReader(br)}, nil
 }
 
 // TxCount is the transaction count the peer declared, including the coinbase.
@@ -130,25 +113,79 @@ func (s *blockTxStream) TxCount() uint64 {
 // miss and does not populate its own cache, so a second caller asking for it pays
 // the full cost again.
 func (s *blockTxStream) Next() (*bt.Tx, *chainhash.Hash, error) {
+	tx, hash, _, err := s.NextStreamed(nil)
+
+	return tx, hash, err
+}
+
+// NextStreamed is Next with the transaction's outputs streamed as they are read. Once a
+// transaction's inputs are read, beforeOutputs is called with it; when it returns a writer, every
+// byte of the outputs and the lock time is copied to that writer as it is read, and the script of
+// an OP_FALSE OP_RETURN output goes only there and is not kept (txstream.DataOutputScript stands
+// in for it). It also returns the transaction's size on the wire.
+//
+// A failure of beforeOutputs, or of the writer, is returned as it is: it is this node's fault, not
+// the peer's, so it must not read as an invalid block.
+func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.Tx, *chainhash.Hash, int64, error) {
 	if s.read >= s.txCount {
-		return nil, nil, errBlockTxStreamDone
+		return nil, nil, 0, errBlockTxStreamDone
 	}
 
-	// The id is the double SHA-256 of the transaction's wire bytes, the same bytes
-	// go-bt would produce by serializing it again. Hashing them as they are read
-	// costs no allocation; serializing again cost a copy of every transaction.
-	s.hashing.h.Reset()
+	var (
+		localErr error
+		sink     *errRecordingWriter
+	)
 
-	tx := &bt.Tx{}
-	if _, err := tx.ReadFrom(&s.hashing); err != nil {
-		return nil, nil, errors.NewBlockInvalidError("[blockTxStream] failed reading transaction %d of the %d declared", s.read, s.txCount, err)
+	opts := txstream.Options{SkipDataScripts: true}
+	if beforeOutputs != nil {
+		opts.BeforeOutputs = func(tx *bt.Tx) (io.Writer, error) {
+			w, err := beforeOutputs(tx)
+			if err != nil {
+				localErr = err
+
+				return nil, err
+			}
+
+			if w == nil {
+				return nil, nil
+			}
+
+			sink = &errRecordingWriter{w: w}
+
+			return sink, nil
+		}
+	}
+
+	tx, hash, size, err := s.txs.Next(opts)
+	if err != nil {
+		if localErr != nil {
+			return nil, nil, 0, localErr
+		}
+
+		if sink != nil && sink.err != nil {
+			return nil, nil, 0, errors.NewStorageError("[blockTxStream] failed writing transaction %d of the %d declared", s.read, s.txCount, sink.err)
+		}
+
+		return nil, nil, 0, errors.NewBlockInvalidError("[blockTxStream] failed reading transaction %d of the %d declared", s.read, s.txCount, err)
 	}
 
 	s.read++
 
-	first := s.hashing.h.Sum(s.sum[:0])
-	hash := chainhash.Hash(sha256.Sum256(first))
-	tx.SetTxHash(&hash)
+	return tx, hash, size, nil
+}
 
-	return tx, &hash, nil
+// errRecordingWriter remembers the first error its writer returned, so a failed write can be told
+// apart from a failed read.
+type errRecordingWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errRecordingWriter) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if err != nil && e.err == nil {
+		e.err = err
+	}
+
+	return n, err
 }

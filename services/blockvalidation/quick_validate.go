@@ -1294,8 +1294,9 @@ func (u *BlockValidation) readSubtree(ctx context.Context, block *model.Block, s
 	// Reuse the same pooled reader for subtree data
 	bufferedReader.Reset(subtreeDataReader)
 
-	// the subtree data reader will make sure the data matches the transaction ids from the subtree
-	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, bufferedReader)
+	// the subtree data reader will make sure the data matches the transaction ids from the subtree.
+	// It hashes each transaction as it reads it, rather than serializing it again to hash it.
+	subtreeData, err := model.ReadSubtreeData(subtree, bufferedReader)
 	if err != nil {
 		return subtreeResult{err: errors.NewProcessingError("[getBlockTransactions][%s] failed to deserialize subtree data %s: %v", block.Hash().String(), subtreeHash.String(), err)}
 	}

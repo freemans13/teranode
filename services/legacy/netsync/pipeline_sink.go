@@ -133,7 +133,7 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		}
 
 		for {
-			tx, txHash, streamErr := stream.Next()
+			tx, txHash, size, streamErr := stream.NextStreamed(builder.BeginTx)
 			if streamErr != nil {
 				if errors.Is(streamErr, errBlockTxStreamDone) {
 					break
@@ -144,7 +144,7 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 				return false, streamErr
 			}
 
-			if addErr := builder.AddTx(tx, txHash); addErr != nil {
+			if addErr := builder.AddStreamedTx(tx, txHash, uint64(size)); addErr != nil { //nolint:gosec // a size read off the wire is never negative
 				sm.deleteWrittenOnFailure(hash, writer)
 
 				return false, addErr

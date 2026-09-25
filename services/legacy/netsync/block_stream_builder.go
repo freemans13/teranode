@@ -1,6 +1,9 @@
 package netsync
 
 import (
+	"encoding/binary"
+	"io"
+
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -18,6 +21,9 @@ type subtreeEmitFunc func(index int, st *subtreepkg.Subtree, data *subtreepkg.Da
 // each transaction go once it is written instead of holding the whole subtree's until it is full.
 // Abort discards what was written; it is safe to call more than once.
 type subtreeDataSink interface {
+	// Write takes raw bytes of the data file: BeginTx writes a transaction's start through it and
+	// the block stream copies the rest.
+	io.Writer
 	WriteTx(tx *bt.Tx) error
 	Abort()
 }
@@ -62,8 +68,13 @@ type blockStreamBuilder struct {
 	// currentSink streams the current subtree's data when openData supplied one.
 	currentSink subtreeDataSink
 	openData    func(index int) (subtreeDataSink, error)
-	currentMeta *subtreepkg.Meta
-	currentCap  int
+	// begun is set by BeginTx and read by the AddStreamedTx that follows: the transaction's start
+	// is already in the data file, and begunExtended says in which form.
+	begun         bool
+	begunExtended bool
+	prefix        []byte
+	currentMeta   *subtreepkg.Meta
+	currentCap    int
 
 	subtreeHashes []chainhash.Hash
 	emitted       int
@@ -227,6 +238,79 @@ func (b *blockStreamBuilder) startSubtree() error {
 // becomes full. txHash is passed in rather than recomputed because the caller has
 // already hashed the transaction to know what it is.
 func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
+	if tx == nil {
+		return b.addTx(tx, txHash, 0)
+	}
+
+	return b.addTx(tx, txHash, uint64(tx.Size()))
+}
+
+// BeginTx is called by the block stream once a transaction's version and inputs are read and
+// before any output. It extends the inputs from this block, writes the transaction's start to the
+// current subtree's data file in the form that gives, and returns the file so the stream copies the
+// outputs straight into it. The transaction is then finished with AddStreamedTx.
+//
+// This is what lets the file be written from the bytes as they arrive: the outputs, which at these
+// heights are nearly all of a block's bytes, go from the socket to the file once, and are never
+// serialized again. The inputs are written from the parsed transaction because extended form puts
+// each spent output's value and script after its input, and whether every input can be extended is
+// known only once all of them are read.
+//
+// It returns no writer when there is no data file to stream into, and the transaction is then
+// held and written as AddTx does.
+func (b *blockStreamBuilder) BeginTx(tx *bt.Tx) (io.Writer, error) {
+	if b.failed != nil {
+		return nil, b.failed
+	}
+
+	if b.currentSink == nil || tx == nil {
+		return nil, nil
+	}
+
+	extended := b.extendFromBlock(tx)
+
+	prefix := binary.LittleEndian.AppendUint32(b.prefix[:0], tx.Version)
+	if extended {
+		prefix = append(prefix, extendedMarker...)
+	}
+
+	prefix = append(prefix, bt.VarInt(uint64(len(tx.Inputs))).Bytes()...)
+
+	for _, in := range tx.Inputs {
+		if extended {
+			prefix = append(prefix, in.ExtendedBytes(false)...)
+		} else {
+			prefix = append(prefix, in.Bytes(false)...)
+		}
+	}
+
+	b.prefix = prefix
+
+	if _, err := b.currentSink.Write(prefix); err != nil {
+		return nil, b.fail(errors.NewStorageError("[blockStreamBuilder] failed writing a transaction to subtree data", err))
+	}
+
+	b.begun = true
+	b.begunExtended = extended
+
+	return b.currentSink, nil
+}
+
+// extendedMarker follows the version in an extended transaction.
+var extendedMarker = []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0xEF}
+
+// AddStreamedTx finishes a transaction the block stream read, with its size on the wire. When
+// BeginTx returned a writer the transaction is already in the data file, and some of its output
+// scripts may be placeholders, so its size must come from the wire rather than from the
+// transaction itself.
+func (b *blockStreamBuilder) AddStreamedTx(tx *bt.Tx, txHash *chainhash.Hash, size uint64) error {
+	return b.addTx(tx, txHash, size)
+}
+
+func (b *blockStreamBuilder) addTx(tx *bt.Tx, txHash *chainhash.Hash, size uint64) error {
+	streamed := b.begun
+	b.begun = false
+
 	if b.failed != nil {
 		return b.failed
 	}
@@ -288,8 +372,12 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 	// went past earlier in this same block is filled in here, for the cost of a
 	// map lookup: the parent's outputs are already in hand and no store is
 	// touched. Anything else is left standard, and the reader re-extends it on
-	// demand the way it already does for an out-of-block parent.
-	extended := b.extendFromBlock(tx)
+	// demand the way it already does for an out-of-block parent. A streamed
+	// transaction was extended by BeginTx, before its outputs were read.
+	extended := b.begunExtended
+	if !streamed {
+		extended = b.extendFromBlock(tx)
+	}
 
 	// A fee is only real when every input is extended: a partial extension
 	// cannot produce one, and a wrong fee is worse than no fee. Zero stays the
@@ -323,15 +411,19 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 		}
 	}
 
-	if err := b.current.AddNode(*txHash, fee, uint64(tx.Size())); err != nil {
+	if err := b.current.AddNode(*txHash, fee, size); err != nil {
 		return b.fail(errors.NewSubtreeError("[blockStreamBuilder] failed adding transaction %s to subtree %d", txHash, b.emitted, err))
 	}
 
 	// Streamed when there is a sink: written now and let go, not held until the subtree
 	// fills. Holding them kept gigabytes of parsed scripts live on mainnet.
 	if b.currentSink != nil {
-		if err := b.currentSink.WriteTx(tx); err != nil {
-			return b.fail(errors.NewStorageError("[blockStreamBuilder] failed writing transaction %s to subtree data", txHash, err))
+		// A streamed transaction is already in the file: BeginTx wrote its start and the
+		// stream copied the rest.
+		if !streamed {
+			if err := b.currentSink.WriteTx(tx); err != nil {
+				return b.fail(errors.NewStorageError("[blockStreamBuilder] failed writing transaction %s to subtree data", txHash, err))
+			}
 		}
 	} else if err := b.currentData.AddTx(tx, nodeIdx); err != nil {
 		return b.fail(errors.NewTxError("[blockStreamBuilder] failed adding transaction %s to subtree data", txHash, err))
