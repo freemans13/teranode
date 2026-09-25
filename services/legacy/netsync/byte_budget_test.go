@@ -54,7 +54,7 @@ func requested(recs ...*getDataRecorder) int {
 }
 
 // Every peer is kept at two requests while the bytes really held ahead of the chain, parked and
-// arriving, are under 20 GiB. The budget is a backstop for the disk, not a pacing rule.
+// arriving, are under 100 GiB. The budget is a backstop for the disk, not a pacing rule.
 func TestEveryPeerHoldsTwoRequestsUnderTheBackstop(t *testing.T) {
 	var nonce uint32
 
@@ -64,8 +64,8 @@ func TestEveryPeerHoldsTwoRequestsUnderTheBackstop(t *testing.T) {
 	sm, a, aRec, _, bRec := budgetManager(t)
 	recentBlocks(sm, 1<<30)
 
-	// 19 GiB is arriving from a third peer already: under the backstop.
-	sm.streams.start(chainhash.Hash{0xe2}, 0, newTestPeer(t, "10.0.0.9:8333"), 19<<30, time.Now())
+	// 99 GiB is arriving from a third peer already: under the backstop.
+	sm.streams.start(chainhash.Hash{0xe2}, 0, newTestPeer(t, "10.0.0.9:8333"), 99<<30, time.Now())
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
@@ -75,8 +75,8 @@ func TestEveryPeerHoldsTwoRequestsUnderTheBackstop(t *testing.T) {
 	require.Equal(t, 2, bRec.count())
 }
 
-// At 20 GiB really held ahead of the chain, nothing further ahead is asked for.
-func TestTheBackstopStopsRequestsAtTwentyGiBHeld(t *testing.T) {
+// At 100 GiB really held ahead of the chain, nothing further ahead is asked for.
+func TestTheBackstopStopsRequestsAtOneHundredGiBHeld(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xe1}
@@ -85,7 +85,7 @@ func TestTheBackstopStopsRequestsAtTwentyGiBHeld(t *testing.T) {
 	sm, a, aRec, _, bRec := budgetManager(t)
 	recentBlocks(sm, 1<<30)
 
-	sm.streams.start(chainhash.Hash{0xe2}, 0, newTestPeer(t, "10.0.0.9:8333"), 21<<30, time.Now())
+	sm.streams.start(chainhash.Hash{0xe2}, 0, newTestPeer(t, "10.0.0.9:8333"), 101<<30, time.Now())
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
@@ -117,7 +117,7 @@ func TestAnUnstartedRequestIsNotCountedAsBytes(t *testing.T) {
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second), "12 GiB held is under 20 GiB, so both peers are filled")
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second), "12 GiB held is under 100 GiB, so both peers are filled")
 }
 
 func TestAParkedBlockCountsAtItsWireSize(t *testing.T) {
@@ -129,14 +129,14 @@ func TestAParkedBlockCountsAtItsWireSize(t *testing.T) {
 	sm, a, aRec, _, bRec := budgetManager(t)
 	recentBlocks(sm, 1<<30)
 
-	// Converted, so the park charges its few-hundred-byte record, but the block is 21 GiB.
-	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe4}, prevBlock: chainhash.Hash{0xe5}, converted: true, size: 300, wireSize: 21 << 30}))
+	// Converted, so the park charges its few-hundred-byte record, but the block is 101 GiB.
+	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe4}, prevBlock: chainhash.Hash{0xe5}, converted: true, size: 300, wireSize: 101 << 30}))
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
 	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 0 }, 300*time.Millisecond),
-		"the parked block's 21 GiB counts, not its record")
+		"the parked block's 101 GiB counts, not its record")
 }
 
 func TestAPeerHoldsAtMostTwoLargeBlocks(t *testing.T) {
@@ -269,7 +269,7 @@ func TestTheBudgetNeverStopsAGapBelowParkedBlocksBeingFilled(t *testing.T) {
 
 	// Everything from the second block to the sixth is parked, far over the budget.
 	for i := 1; i < 6; i++ {
-		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hashes[i], prevBlock: hashes[i-1], converted: true, size: 300, wireSize: 19 << 30}))
+		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hashes[i], prevBlock: hashes[i-1], converted: true, size: 300, wireSize: 21 << 30}))
 	}
 
 	sm.fetchHeaderBlocks()
