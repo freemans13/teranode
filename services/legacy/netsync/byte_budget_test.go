@@ -27,7 +27,9 @@ func budgetManager(t *testing.T) (*SyncManager, *peerpkg.Peer, *getDataRecorder,
 	sm.ctx = context.Background()
 	sm.blockPark, _ = newTestPark(t, "")
 	sm.streams = newStreamRegistry()
-	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+	// Two per peer keeps these tests small; the depth itself follows the setting, which
+	// TestAPeerHoldsTheConfiguredDepthWhateverTheBlockSize checks.
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 2
 
 	a, aRec := schedulerPeer(t, sm, 130, 1000)
 	sm.storeSyncPeer(a, &syncPeerState{})
@@ -327,4 +329,27 @@ func TestARecoveredWholeBlockCountsAtItsFileSize(t *testing.T) {
 	require.True(t, park.AdoptWritten(parkedBlock{hash: chainhash.Hash{0x53}, prevBlock: chainhash.Hash{0x54}, size: 700 * qMB}))
 
 	require.Equal(t, 700*qMB, park.aheadBytes(2<<30))
+}
+
+// A peer is asked for legacy_maxBlocksInTransitPerPeer blocks, 16 by default as SV Node's
+// MAX_BLOCKS_IN_TRANSIT_PER_PEER, whatever the size of the recent blocks. It was fixed at 2, which
+// left a peer idle for a round trip after every pair of small blocks.
+func TestAPeerHoldsTheConfiguredDepthWhateverTheBlockSize(t *testing.T) {
+	for _, size := range []int64{200 << 10, 2 << 30} {
+		var nonce uint32
+
+		anchor := chainhash.Hash{0xec, byte(size >> 20)}
+		msg, _ := linkedHeaders(anchor, 40, &nonce)
+
+		sm, a, aRec, _, bRec := budgetManager(t)
+		sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+		recentBlocks(sm, size)
+
+		seedFetchHeaders(t, sm, a, anchor, msg)
+		sm.fetchHeaderBlocks()
+
+		require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 32 }, 5*time.Second), "size %d", size)
+		require.Equal(t, 16, aRec.count(), "size %d", size)
+		require.Equal(t, 16, bRec.count(), "size %d", size)
+	}
 }
