@@ -2,9 +2,11 @@ package netsync
 
 import (
 	"bytes"
+	"encoding/binary"
 	"runtime"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/stretchr/testify/require"
 )
@@ -52,7 +54,7 @@ func TestNewPipelineDedupMap_BoundedRegardlessOfDeclaredTxCount(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&before)
 
-	dedup := newPipelineDedupMap()
+	dedup := newPipelineDedupMap(stream.TxCount())
 
 	runtime.ReadMemStats(&after)
 
@@ -72,4 +74,36 @@ func TestNewPipelineDedupMap_BoundedRegardlessOfDeclaredTxCount(t *testing.T) {
 	require.Lessf(t, allocated, uint64(bound),
 		"constructing the pipeline dedup map allocated %d bytes while the stream declared %d transactions: it must be bounded by a constant, never by what a peer declared",
 		allocated, declaredCount)
+}
+
+// A block's duplicate map is sized for the transactions the block declares, not for a million. On
+// mainnet on 2026-09-25 every block got the million-slot map, about 48 MB, whatever its size: that
+// was 16 GB of every 90 GB the node allocated, for blocks of a few thousand transactions.
+func TestNewPipelineDedupMap_SizedForASmallBlock(t *testing.T) {
+	var before, after runtime.MemStats
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	dedup := newPipelineDedupMap(5_000)
+
+	runtime.ReadMemStats(&after)
+
+	require.NotNil(t, dedup)
+	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(4<<20), "a 5,000-transaction block needs well under 4 MB of map")
+}
+
+// A map sized for a small declaration still takes every transaction a block brings, growing as it
+// goes, and still catches a duplicate.
+func TestNewPipelineDedupMap_GrowsPastItsSize(t *testing.T) {
+	dedup := newPipelineDedupMap(2)
+
+	for i := uint64(0); i < 50_000; i++ {
+		var h chainhash.Hash
+		binary.LittleEndian.PutUint64(h[:], i)
+		require.NoError(t, dedup.Put(h, i))
+	}
+
+	var first chainhash.Hash
+	require.Error(t, dedup.Put(first, 0), "the first hash again is a duplicate")
 }
