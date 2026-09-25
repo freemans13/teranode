@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"math"
 	"sort"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -25,6 +26,23 @@ type assignerPeer struct {
 	// rate is the peer's measured delivery rate in bytes a second, or the median of the measured
 	// peers when it has none. The lowest block goes to the fastest peer with room.
 	rate float64
+}
+
+// speedScaledDepth is a peer's share of depth by speed: depth times its rate over the fastest
+// peer's, rounded, never below one. With no measured rate to compare against, the peer gets the full
+// depth; an unmeasured peer is given the median rate by the caller.
+//
+// A peer sends its queue in order and nothing can reorder it, so a slow peer with a full queue buries
+// blocks the chain will soon need. On 2026-09-25, with every peer at 16, blocks 755,236 and 755,244
+// started 11 and 22 minutes after they were asked for, behind multi-GB blocks at peers delivering 5
+// to 10 MB/s, while peers at 50 MB/s had fetched 800 blocks further ahead. This is not an SV Node
+// rule: SV Node gives every peer 16 and drops a peer only below 100 KB/s.
+func speedScaledDepth(depth int, rate, fastest float64) int {
+	if fastest <= 0 || rate <= 0 || rate >= fastest {
+		return depth
+	}
+
+	return max(1, int(math.Round(float64(depth)*rate/fastest)))
 }
 
 // parkBackstopBytes is the most block bytes the node holds ahead of the chain, parked and
@@ -213,19 +231,31 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 
 	fallbackRate := sm.streams.medianRate()
 
+	var fastest float64
+	if streaming {
+		for _, candidate := range eligible {
+			fastest = max(fastest, sm.streams.peerRate(candidate.peer))
+		}
+	}
+
 	for _, candidate := range eligible {
 		if len(peers) == fanout {
 			break
 		}
 
-		budget := perPeer - sm.blockDownloads.CountForPeer(candidate.peer)
-		if budget <= 0 {
-			continue
-		}
-
 		rate := sm.streams.peerRate(candidate.peer)
 		if rate <= 0 {
 			rate = fallbackRate
+		}
+
+		depth := perPeer
+		if streaming {
+			depth = speedScaledDepth(perPeer, rate, fastest)
+		}
+
+		budget := depth - sm.blockDownloads.CountForPeer(candidate.peer)
+		if budget <= 0 {
+			continue
 		}
 
 		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, rate: rate})

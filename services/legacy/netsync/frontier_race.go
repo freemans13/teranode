@@ -557,24 +557,37 @@ func (sm *SyncManager) logDownloadQueues() {
 	eligible := sm.eligibleBlockPeers()
 	idle, short := 0, 0
 	depth := sm.streamingPeerDepth()
+	fallbackRate := sm.streams.medianRate()
+
+	var fastest float64
+	for _, bp := range eligible {
+		fastest = max(fastest, sm.streams.peerRate(bp.peer))
+	}
 
 	for _, bp := range eligible {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
 		remaining, sending := sm.streams.pending(bp.peer)
 
+		rate := sm.streams.peerRate(bp.peer)
+		if rate <= 0 {
+			rate = fallbackRate
+		}
+
+		peerDepth := speedScaledDepth(depth, rate, fastest)
+
 		if owed == 0 && sending == 0 {
 			idle++
 		}
 
-		if owed < depth {
+		if owed < peerDepth {
 			short++
 		}
 
-		sm.logger.Infof("[downloadQueue] %s owes %d, sending %d with %.0f MB left, rate %.1f MB/s",
-			bp.peer, owed, sending, float64(remaining)/1e6, sm.streams.peerRate(bp.peer)/1e6)
+		sm.logger.Infof("[downloadQueue] %s owes %d of %d, sending %d with %.0f MB left, rate %.1f MB/s",
+			bp.peer, owed, peerDepth, sending, float64(remaining)/1e6, sm.streams.peerRate(bp.peer)/1e6)
 	}
 
-	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below %d requests; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
+	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below their speed-scaled depth of up to %d requests; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
 		len(eligible), idle, short, depth, float64(sm.bytesAhead(largest))/1e9, float64(parkBackstopBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
 
 	w := &sm.waste
