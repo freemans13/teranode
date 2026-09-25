@@ -132,7 +132,15 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 			return false, buildErr
 		}
 
+		// A faster copy of this block may complete first and take over (conversion_race.go).
+		ctl := sm.startConversion(hash)
+		defer sm.endConversion(hash, ctl)
+
 		for {
+			if ctl.yielding() {
+				return sm.yieldToFasterCopy(hash, writer, stream.r, ctl, r)
+			}
+
 			tx, txHash, size, streamErr := stream.NextStreamed(builder.BeginTx)
 			if streamErr != nil {
 				if errors.Is(streamErr, errBlockTxStreamDone) {
@@ -149,6 +157,10 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 				return false, addErr
 			}
+		}
+
+		if !ctl.finish() {
+			return sm.yieldToFasterCopy(hash, writer, stream.r, ctl, r)
 		}
 
 		var finishErr error

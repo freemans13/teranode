@@ -361,6 +361,8 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 
 				sm.logger.Infof("[reRequest][%s] height %d: %s owed it and last sent block bytes %s ago; it may be asked of another peer", block.hash, block.height, p, since)
 			}
+
+			block.reAsked = true
 		}
 
 		candidates = append(candidates, block)
@@ -403,12 +405,32 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 			return
 		}
 
-		target, ok := assigner.takeAvoiding(block.height, func(p *peerpkg.Peer) bool {
+		owes := func(p *peerpkg.Peer) bool {
 			return sm.blockDownloads.HasOwner(p, block.hash)
-		})
+		}
+
+		// A re-asked block goes to the fastest peer, full queue or not: the chain may be waiting
+		// on it, and the peers with room are the slow ones. On 2026-09-25 the 4 GB block 760,331
+		// was re-asked of a peer at 2.7 MB/s and took 22 minutes while peers at 40 to 50 MB/s
+		// were busy.
+		var (
+			target *assignerPeer
+			ok     bool
+		)
+
+		if block.reAsked {
+			target, ok = assigner.fastestAvoiding(block.height, owes)
+		} else {
+			target, ok = assigner.takeAvoiding(block.height, owes)
+		}
+
 		if !ok {
 			return
 		}
+
+		// A re-ask placed on a peer whose queue was already full goes over that peer's depth, and
+		// must not use up the pass's room, which belongs to the peers that have some.
+		overDepth := block.reAsked && target.budget <= 0
 
 		// The assigner had nobody but the peer that already holds our request
 		// for this block. Re-arm what we hold instead of asking twice: this
@@ -420,7 +442,10 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 			// in CountForPeer and back in Len from here on, while both budgets
 			// were computed with the forgiven records excluded.
 			target.charge()
-			assigner.remaining--
+
+			if !overDepth {
+				assigner.remaining--
+			}
 
 			continue
 		}
@@ -435,7 +460,7 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 		}
 
 		hash := block.hash
-		if err := assigner.recordRequest(target, &hash); err != nil {
+		if err := assigner.recordRequest(target, &hash, overDepth); err != nil {
 			// The ledger was told about a request that is not going to be sent,
 			// so take it back. Left in place the hash is owned by a peer that
 			// was never asked, which answers RequestedWithin for the whole
