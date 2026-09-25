@@ -3757,9 +3757,19 @@ func (sm *SyncManager) processQueuedBlock(msg *blockQueueMsg) error {
 // The sweep ticker's resume does NOT come through here, because the per-peer
 // question this asks is the wrong one for it — it calls fetchHeaderBlocks
 // directly instead.
+// perPeerDepth is how many blocks one peer may be asked for at once: streamingPeerDepth with the
+// park on, whatever the block size, and the block-size ladder without it.
+func (sm *SyncManager) perPeerDepth() int {
+	if sm.blockPark.Enabled() && sm.streams != nil {
+		return sm.streamingPeerDepth()
+	}
+
+	return sm.blockSizeTracker.calculateMaxInFlightBlocks()
+}
+
 func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
 	sm.topUpHeaderBlocks(func() bool {
-		return sm.blockDownloads.CountForPeer(peer) < sm.blockSizeTracker.calculateMaxInFlightBlocks()
+		return sm.blockDownloads.CountForPeer(peer) < sm.perPeerDepth()
 	})
 }
 

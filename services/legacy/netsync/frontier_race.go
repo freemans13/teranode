@@ -556,6 +556,7 @@ func (sm *SyncManager) logDownloadQueues() {
 	largest := sm.blockSizeTracker.largestRecentSize()
 	eligible := sm.eligibleBlockPeers()
 	idle, short := 0, 0
+	depth := sm.streamingPeerDepth()
 
 	for _, bp := range eligible {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
@@ -565,7 +566,7 @@ func (sm *SyncManager) logDownloadQueues() {
 			idle++
 		}
 
-		if owed < streamingPeerDepth {
+		if owed < depth {
 			short++
 		}
 
@@ -574,7 +575,7 @@ func (sm *SyncManager) logDownloadQueues() {
 	}
 
 	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below %d requests; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
-		len(eligible), idle, short, streamingPeerDepth, float64(sm.bytesAhead(largest))/1e9, float64(lookaheadParkBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
+		len(eligible), idle, short, depth, float64(sm.bytesAhead(largest))/1e9, float64(lookaheadParkBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
 
 	w := &sm.waste
 	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",

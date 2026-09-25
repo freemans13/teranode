@@ -27,12 +27,20 @@ type assignerPeer struct {
 	rate float64
 }
 
-// streamingPeerDepth is how many blocks a peer holds with the park on: one it is sending and one
-// queued behind it. A peer sends blocks in the order it was asked and nothing can reorder its
-// queue, so a deeper queue adds no parallelism and only buries the blocks behind. It does not
-// depend on block size: any limit that did failed when small blocks came first, as after every
-// restart, and a peer was handed ten blocks up to 1 GB while five others sat idle.
-const streamingPeerDepth = 2
+// streamingPeerDepth is how many blocks a peer holds with the park on: legacy_maxBlocksInTransitPerPeer,
+// 16 by default, as SV Node's MAX_BLOCKS_IN_TRANSIT_PER_PEER. It does not depend on block size.
+//
+// It was 2 until 2026-09-25, on the reasoning that a peer sends blocks in order so a deeper queue
+// adds no speed. That holds for large blocks, which take longer to send than the next request takes
+// to arrive. It fails for small ones: a peer sends two 200 KB blocks in milliseconds and then waits
+// a round trip, plus a download pass, for the next request. SV Node keeps 16 queued at every size.
+func (sm *SyncManager) streamingPeerDepth() int {
+	if sm.settings == nil {
+		return 1
+	}
+
+	return max(1, sm.settings.Legacy.MaxBlocksInTransitPerPeer)
+}
 
 // charge records one more block asked of this peer.
 func (p *assignerPeer) charge() {
@@ -177,7 +185,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	}
 
 	if streaming {
-		perPeer = streamingPeerDepth
+		perPeer = sm.streamingPeerDepth()
 
 		// Every peer is kept at streamingPeerDepth requests. Blocks are processed
 		// faster than they arrive, so the park grows only while the chain waits on
