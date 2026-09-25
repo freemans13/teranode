@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -11,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	blobfile "github.com/bsv-blockchain/teranode/stores/blob/file"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
@@ -56,6 +58,34 @@ type subtreeWriter struct {
 	heightUnknown bool
 	dahOverride   uint32
 	written       []writtenSubtree
+	// pending holds each subtree's data file while the builder streams transactions
+	// into it, by subtree index. Its name is the subtree root hash, which is unknown
+	// until the subtree is complete, so it is written under a temporary name and
+	// committed in Emit.
+	pending map[int]*blobfile.PendingFile
+}
+
+// pendingFileStore is a blob store that can take a file before its key is known. The
+// local file store can; a store that cannot gets the subtree data buffered in memory
+// and written whole in Emit, as before.
+type pendingFileStore interface {
+	NewPendingFile(ctx context.Context, fileType fileformat.FileType, opts ...options.FileOption) (*blobfile.PendingFile, error)
+}
+
+// pendingDataSink writes a subtree's transactions straight into its pending data file.
+type pendingDataSink struct {
+	file *blobfile.PendingFile
+}
+
+func (s pendingDataSink) WriteTx(tx *bt.Tx) error {
+	// SerializeTo, as the buffered data file does, so both write the same bytes.
+	_, err := tx.SerializeTo(s.file)
+
+	return err
+}
+
+func (s pendingDataSink) Abort() {
+	s.file.Abort()
 }
 
 func newSubtreeWriter(logger ulogger.Logger, tSettings *settings.Settings, store blob.Store, height uint32, quickValidation bool) *subtreeWriter {
@@ -104,6 +134,31 @@ func newSubtreeWriterUnresolvedHeight(logger ulogger.Logger, tSettings *settings
 	}
 }
 
+// OpenData returns the function the stream builder calls to open each subtree's data
+// file, for withSubtreeDataSink. It returns a nil sink when the store cannot take a
+// file before its key is known, and the builder then holds the data as before.
+func (w *subtreeWriter) OpenData(ctx context.Context) func(index int) (subtreeDataSink, error) {
+	return func(index int) (subtreeDataSink, error) {
+		store, ok := w.store.(pendingFileStore)
+		if !ok {
+			return nil, nil
+		}
+
+		file, err := store.NewPendingFile(ctx, fileformat.FileTypeSubtreeData)
+		if err != nil {
+			return nil, err
+		}
+
+		if w.pending == nil {
+			w.pending = make(map[int]*blobfile.PendingFile)
+		}
+
+		w.pending[index] = file
+
+		return pendingDataSink{file: file}, nil
+	}
+}
+
 // Emit returns the function the stream builder calls for each completed subtree.
 func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 	return func(index int, st *subtreepkg.Subtree, data *subtreepkg.Data, meta *subtreepkg.Meta) error {
@@ -140,14 +195,31 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 			return data.WriteTransactionsToWriter(dst, 0, st.Length())
 		}
 
-		for _, artefact := range []struct {
+		artefacts := []struct {
 			fileType fileformat.FileType
 			write    func(io.Writer) error
 		}{
-			{fileformat.FileTypeSubtreeData, writeData},
 			{fileformat.FileTypeSubtreeMeta, writeBytes(metaBytes)},
 			{structureType, writeBytes(structureBytes)},
-		} {
+		}
+
+		// The data file was streamed in as the transactions arrived; it only needs its name.
+		if file, ok := w.pending[index]; ok {
+			delete(w.pending, index)
+
+			if err = file.Commit(ctx, root[:], options.WithDeleteAt(w.deleteAt())); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
+				return errors.NewStorageError("[subtreeWriter][%s] failed committing %s", root, fileformat.FileTypeSubtreeData, err)
+			}
+
+			w.written = append(w.written, writtenSubtree{Hash: *root, FileType: fileformat.FileTypeSubtreeData})
+		} else {
+			artefacts = append([]struct {
+				fileType fileformat.FileType
+				write    func(io.Writer) error
+			}{{fileformat.FileTypeSubtreeData, writeData}}, artefacts...)
+		}
+
+		for _, artefact := range artefacts {
 			if err = w.put(ctx, *root, artefact.fileType, artefact.write); err != nil {
 				return err
 			}
@@ -175,12 +247,7 @@ func writeBytes(payload []byte) func(io.Writer) error {
 }
 
 func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType fileformat.FileType, write func(io.Writer) error) error {
-	dah := w.height + w.settings.GetSubtreeValidationBlockHeightRetention()
-	if w.heightUnknown {
-		dah = w.dahOverride
-	}
-
-	storer, err := filestorer.NewFileStorer(ctx, w.logger, w.settings, w.store, root[:], fileType, options.WithDeleteAt(dah))
+	storer, err := filestorer.NewFileStorer(ctx, w.logger, w.settings, w.store, root[:], fileType, options.WithDeleteAt(w.deleteAt()))
 	if err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
 			return nil
@@ -202,6 +269,15 @@ func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType f
 	return nil
 }
 
+// deleteAt is the height at which this block's subtree files may be removed.
+func (w *subtreeWriter) deleteAt() uint32 {
+	if w.heightUnknown {
+		return w.dahOverride
+	}
+
+	return w.height + w.settings.GetSubtreeValidationBlockHeightRetention()
+}
+
 // Written lists every artefact this writer has put in the store, in write order.
 func (w *subtreeWriter) Written() []writtenSubtree {
 	return w.written
@@ -218,6 +294,12 @@ func (w *subtreeWriter) Written() []writtenSubtree {
 // and it is recorded here so it is not a surprise.
 func (w *subtreeWriter) DeleteAll(ctx context.Context) error {
 	var firstErr error
+
+	// A data file still being streamed was never named, so nothing can read it.
+	for index, file := range w.pending {
+		file.Abort()
+		delete(w.pending, index)
+	}
 
 	for _, entry := range w.written {
 		if err := w.store.Del(ctx, entry.Hash[:], entry.FileType); err != nil && firstErr == nil {

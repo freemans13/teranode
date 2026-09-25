@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	blobfile "github.com/bsv-blockchain/teranode/stores/blob/file"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
@@ -122,4 +123,127 @@ func TestTheSubtreeDataFileIsWrittenAsAStream(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want, got, "the same bytes as the whole-buffer serialization")
 	require.Less(t, n, uint64(len(want))/2, "streamed to the file, never assembled in memory")
+}
+
+// streamingWriter is a subtree writer over a real file store, which is what lets the builder
+// stream each subtree's data file instead of holding its transactions.
+func streamingWriter(t *testing.T) (*subtreeWriter, blob.Store) {
+	t.Helper()
+
+	storeURL, err := url.Parse("file://" + t.TempDir())
+	require.NoError(t, err)
+
+	store, err := blobfile.New(ulogger.TestLogger{}, storeURL,
+		options.WithBlobDeletionScheduler(&recordingDeletionScheduler{}),
+		options.WithStoreType(storetypes.TEMPSTORE),
+	)
+	require.NoError(t, err)
+
+	return newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000, true), store
+}
+
+func heapInUse() uint64 {
+	var m runtime.MemStats
+
+	runtime.GC()
+	runtime.ReadMemStats(&m)
+
+	return m.HeapInuse
+}
+
+// The builder writes each transaction to its subtree's data file as it arrives and keeps none of
+// them. It used to hold every transaction of the current subtree until the subtree was full: on
+// mainnet on 2026-09-24 that was 3.65 GB of parsed scripts live at once, and garbage collection
+// took over two thirds of the CPU scanning it.
+func TestTheBuilderHoldsNoTransactionItHasWritten(t *testing.T) {
+	ctx := context.Background()
+	w, _ := streamingWriter(t)
+	t.Cleanup(func() { _ = w.DeleteAll(ctx) })
+
+	const txs = 20
+	const size = 1 << 20
+
+	b, err := newBlockStreamBuilder(txs+1, 1024, coinbaseTx(t), w.Emit(ctx), newDedupMap(txs+1), withSubtreeDataSink(w.OpenData(ctx)))
+	require.NoError(t, err)
+
+	before := heapInUse()
+
+	for i := 1; i <= txs; i++ {
+		tx := bigTx(t, byte(i), size)
+		require.NoError(t, b.AddTx(tx, tx.TxIDChainHash()))
+	}
+
+	grew := int64(heapInUse()) - int64(before)
+	// Without this the builder is dead once the loop ends, and the collector frees whatever it
+	// held before the heap is read.
+	runtime.KeepAlive(b)
+	require.Less(t, grew, int64(txs*size/4), "20 MB of transactions went to disk, not to the heap")
+}
+
+// The streamed data files hold exactly the bytes the buffered path writes, across several
+// subtrees, for spendable and data-only transactions alike.
+func TestStreamedAndBufferedSubtreeDataFilesMatch(t *testing.T) {
+	ctx := context.Background()
+
+	const txs = 40
+	const maxItems = 16
+
+	block := make([]*bt.Tx, 0, txs)
+	for i := 1; i <= txs; i++ {
+		if i%3 == 0 {
+			block = append(block, bigTx(t, byte(i), 2048))
+		} else {
+			tx, _ := streamTx(t, i)
+			block = append(block, tx)
+		}
+	}
+
+	cb := coinbaseTx(t)
+
+	run := func(w *subtreeWriter, opts ...builderOption) []chainhash.Hash {
+		b, err := newBlockStreamBuilder(txs+1, maxItems, cb, w.Emit(ctx), newDedupMap(txs+1), opts...)
+		require.NoError(t, err)
+
+		for _, tx := range block {
+			require.NoError(t, b.AddTx(tx, tx.TxIDChainHash()))
+		}
+
+		_, hashes, err := b.Finish()
+		require.NoError(t, err)
+
+		return hashes
+	}
+
+	buffered, memStore := writerFixture(t, true)
+	streamed, fileStore := streamingWriter(t)
+
+	want := run(buffered)
+	got := run(streamed, withSubtreeDataSink(streamed.OpenData(ctx)))
+	require.Equal(t, want, got)
+	require.Greater(t, len(got), 1, "several subtrees")
+
+	for _, root := range got {
+		a, err := memStore.Get(ctx, root[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, err)
+
+		b, err := fileStore.Get(ctx, root[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, err)
+
+		require.Equal(t, a, b, "subtree %s", root)
+	}
+}
+
+// An output that can never be spent is not remembered for extending in-block children: at these
+// heights such outputs carry most of a block's bytes, and remembering them kept them live.
+func TestAnUnspendableOutputIsNotRemembered(t *testing.T) {
+	b, err := newBlockStreamBuilder(3, 1024, coinbaseTx(t), func(int, *subtreepkg.Subtree, *subtreepkg.Data, *subtreepkg.Meta) error { return nil }, newDedupMap(3))
+	require.NoError(t, err)
+
+	tx := bigTx(t, 9, 4096)
+	require.NoError(t, b.AddTx(tx, tx.TxIDChainHash()))
+
+	outs := b.recentOutputs[*tx.TxIDChainHash()]
+	require.Len(t, outs, len(tx.Outputs), "positions are kept, so a child's output index still lines up")
+	require.NotNil(t, outs[0], "the spendable output is remembered")
+	require.Nil(t, outs[len(outs)-1], "the OP_FALSE OP_RETURN output is not")
 }
