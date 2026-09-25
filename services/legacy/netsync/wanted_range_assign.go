@@ -394,12 +394,12 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 // own stall detection and the ledger's expiry.
 func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wantedBlock, highestHeld int32) {
 	for _, block := range candidates {
-		// The byte budget bounds how far ahead the node reaches, never a gap below
+		// The disk backstop bounds how far ahead the node reaches, never a gap below
 		// blocks it already holds: on 2026-09-24 parked blocks over the budget
 		// stopped the one missing block above the tip being asked for, and the
 		// chain stopped with them.
 		extends := block.height > highestHeld
-		if assigner.byteLimited && extends && assigner.byteRoom <= 0 {
+		if assigner.overBackstop && extends {
 			return
 		}
 
@@ -432,10 +432,6 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 			sm.logger.Warnf("[assignWantedBlocks] block download ledger full at %d blocks, holding off on %s", maxTrackedBlockDownloads, block.hash)
 
 			return
-		}
-
-		if extends {
-			assigner.byteRoom--
 		}
 
 		hash := block.hash

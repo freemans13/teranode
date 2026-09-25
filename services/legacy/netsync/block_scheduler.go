@@ -65,11 +65,10 @@ type downloadAssigner struct {
 	peers []*assignerPeer
 	// remaining is the node-wide budget left in this pass.
 	remaining int
-	// byteLimited says the read-ahead byte budget applies, and byteRoom is how many more blocks
-	// above the highest held block it allows. Blocks below the highest held block fill gaps and
-	// are never stopped by it: filling a gap is what lets the park drain.
-	byteLimited bool
-	byteRoom    int
+	// overBackstop says the bytes really held ahead of the chain have reached lookaheadParkBytes,
+	// so nothing above the highest held block is asked for in this pass. Blocks below it fill
+	// gaps and are never stopped: filling a gap is what lets the park drain.
+	overBackstop bool
 }
 
 // eligibleBlockPeers lists the peers that may be asked for a block body, sync
@@ -131,10 +130,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	streaming := sm.blockPark.Enabled() && sm.streams != nil
 	largest := sm.blockSizeTracker.largestRecentSize()
 
-	var (
-		byteLimited bool
-		byteRoom    int
-	)
+	var overBackstop bool
 
 	ladder := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 
@@ -183,14 +179,15 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	if streaming {
 		perPeer = streamingPeerDepth
 
-		// The read-ahead limit is a byte budget: the node keeps asking while the
-		// bytes ahead of the chain stay under lookaheadParkBytes. While download
-		// is the limit a wait on one slow block costs nothing if the other peers
-		// keep fetching, and this is what lets them.
-		if largest > 0 {
-			byteLimited = true
-			byteRoom = int(max(0, min((lookaheadParkBytes-sm.bytesAhead(largest))/largest, int64(remaining))))
-		}
+		// Every peer is kept at streamingPeerDepth requests. Blocks are processed
+		// faster than they arrive, so the park grows only while the chain waits on
+		// one slow block, and no peer should ever be idle. The one brake is a
+		// backstop for the disk: the bytes really held ahead of the chain, parked
+		// and arriving, reaching lookaheadParkBytes. A block asked for but not yet
+		// arriving holds nothing and is not counted. It used to count at the
+		// largest recent block, and after a 2.3 GB block on 2026-09-25 that filled
+		// the budget with bytes that did not exist while four of eight peers idled.
+		overBackstop = sm.bytesAhead(largest) >= lookaheadParkBytes
 	}
 
 	peers := make([]*assignerPeer, 0, fanout)
@@ -229,18 +226,18 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// not the whole node-wide window: at the default window of 1024 and one peer
 	// able to take 16, sizing the round by the window would make 1024 round trips
 	// to place 16 blocks, on every arriving block.
-	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), byteLimited: byteLimited, byteRoom: byteRoom}
+	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), overBackstop: overBackstop}
 }
 
-// bytesAhead is how many bytes of blocks the node holds or is fetching ahead of the chain: parked
-// blocks at their wire size, blocks arriving now at their declared size, and blocks asked for but
-// not started at unknownSize, since their size is not known until their bytes begin.
+// bytesAhead is how many bytes of blocks the node really holds ahead of the chain: parked blocks
+// at their wire size and blocks arriving now at their declared size. A block asked for but not yet
+// arriving holds nothing and is not counted. A parked block recovered from disk after a restart has
+// no recorded wire size and counts at unknownSize.
 func (sm *SyncManager) bytesAhead(unknownSize int64) int64 {
 	parked := sm.blockPark.aheadBytes(unknownSize)
-	arriving, streams := sm.streams.arrivingBytes()
-	notStarted := max(0, sm.blockDownloads.Len()-streams)
+	arriving, _ := sm.streams.arrivingBytes()
 
-	return parked + arriving + int64(notStarted)*unknownSize
+	return parked + arriving
 }
 
 // singlePeerAssigner is the behaviour the node had before the scheduler: one
