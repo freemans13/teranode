@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
@@ -12,6 +13,27 @@ import (
 // builder drops its reference to all three artefacts as soon as this returns, so
 // an implementation that needs them beyond the call must take its own copy.
 type subtreeEmitFunc func(index int, st *subtreepkg.Subtree, data *subtreepkg.Data, meta *subtreepkg.Meta) error
+
+// subtreeDataSink receives one subtree's data file a transaction at a time, so the builder can let
+// each transaction go once it is written instead of holding the whole subtree's until it is full.
+// Abort discards what was written; it is safe to call more than once.
+type subtreeDataSink interface {
+	WriteTx(tx *bt.Tx) error
+	Abort()
+}
+
+// builderOption configures a blockStreamBuilder.
+type builderOption func(*blockStreamBuilder)
+
+// withSubtreeDataSink has the builder stream each subtree's data through a sink from open, called
+// once per subtree with its index. When open returns a nil sink, that subtree's transactions are
+// held in a subtreepkg.Data as before, and the emit function gets it; with a sink, emit gets nil
+// data and whoever opened the sink commits it.
+func withSubtreeDataSink(open func(index int) (subtreeDataSink, error)) builderOption {
+	return func(b *blockStreamBuilder) {
+		b.openData = open
+	}
+}
 
 // blockStreamBuilder turns a stream of a block's transactions into subtrees,
 // emitting each one as it fills and keeping only its root hash afterwards.
@@ -37,6 +59,9 @@ type blockStreamBuilder struct {
 
 	current     *subtreepkg.Subtree
 	currentData *subtreepkg.Data
+	// currentSink streams the current subtree's data when openData supplied one.
+	currentSink subtreeDataSink
+	openData    func(index int) (subtreeDataSink, error)
 	currentMeta *subtreepkg.Meta
 	currentCap  int
 
@@ -95,7 +120,7 @@ const streamExtendWindow = 4096
 // nil: a nil map would silently disable the CVE-2012-2459 duplicate-transaction
 // check, so the constructor refuses it outright instead of letting a hurried
 // caller reach for nil.
-func newBlockStreamBuilder(txCount, maxItems int, coinbase *bt.Tx, emit subtreeEmitFunc, dedup txmap.TxMap) (*blockStreamBuilder, error) {
+func newBlockStreamBuilder(txCount, maxItems int, coinbase *bt.Tx, emit subtreeEmitFunc, dedup txmap.TxMap, opts ...builderOption) (*blockStreamBuilder, error) {
 	if coinbase == nil {
 		return nil, errors.NewProcessingError("[blockStreamBuilder] no coinbase transaction")
 	}
@@ -143,6 +168,10 @@ func newBlockStreamBuilder(txCount, maxItems int, coinbase *bt.Tx, emit subtreeE
 		recentLimit:   streamExtendWindow,
 	}
 
+	for _, opt := range opts {
+		opt(b)
+	}
+
 	if err = b.startSubtree(); err != nil {
 		return nil, err
 	}
@@ -173,9 +202,23 @@ func (b *blockStreamBuilder) startSubtree() error {
 	}
 
 	b.current = st
-	b.currentData = subtreepkg.NewSubtreeData(st)
+	b.currentData = nil
+	b.currentSink = nil
 	b.currentMeta = subtreepkg.NewSubtreeMeta(st)
 	b.currentCap = capacity
+
+	if b.openData != nil {
+		sink, err := b.openData(b.emitted)
+		if err != nil {
+			return errors.NewStorageError("[blockStreamBuilder] failed opening the data file for subtree %d", b.emitted, err)
+		}
+
+		b.currentSink = sink
+	}
+
+	if b.currentSink == nil {
+		b.currentData = subtreepkg.NewSubtreeData(st)
+	}
 
 	return nil
 }
@@ -284,7 +327,13 @@ func (b *blockStreamBuilder) AddTx(tx *bt.Tx, txHash *chainhash.Hash) error {
 		return b.fail(errors.NewSubtreeError("[blockStreamBuilder] failed adding transaction %s to subtree %d", txHash, b.emitted, err))
 	}
 
-	if err := b.currentData.AddTx(tx, nodeIdx); err != nil {
+	// Streamed when there is a sink: written now and let go, not held until the subtree
+	// fills. Holding them kept gigabytes of parsed scripts live on mainnet.
+	if b.currentSink != nil {
+		if err := b.currentSink.WriteTx(tx); err != nil {
+			return b.fail(errors.NewStorageError("[blockStreamBuilder] failed writing transaction %s to subtree data", txHash, err))
+		}
+	} else if err := b.currentData.AddTx(tx, nodeIdx); err != nil {
 		return b.fail(errors.NewTxError("[blockStreamBuilder] failed adding transaction %s to subtree data", txHash, err))
 	}
 
@@ -341,6 +390,14 @@ func (b *blockStreamBuilder) extendFromBlock(tx *bt.Tx) bool {
 		}
 
 		parent := outputs[in.PreviousTxOutIndex]
+		if parent == nil {
+			// An output that can never be spent is not remembered; a child spending it
+			// is invalid and is left for validation to refuse.
+			full = false
+
+			continue
+		}
+
 		in.PreviousTxScript = parent.LockingScript
 		in.PreviousTxSatoshis = parent.Satoshis
 	}
@@ -355,7 +412,7 @@ func (b *blockStreamBuilder) rememberOutputs(txHash chainhash.Hash, tx *bt.Tx) {
 		b.recentOutputs = make(map[chainhash.Hash][]*bt.Output, b.recentLimit)
 	}
 
-	b.recentOutputs[txHash] = tx.Outputs
+	b.recentOutputs[txHash] = spendableOutputs(tx.Outputs)
 	b.recentOrder = append(b.recentOrder, txHash)
 
 	for len(b.recentOrder) > b.recentLimit {
@@ -388,6 +445,7 @@ func (b *blockStreamBuilder) emitCurrent() error {
 
 	b.current = nil
 	b.currentData = nil
+	b.currentSink = nil
 	b.currentMeta = nil
 
 	if b.emitted < b.subtreeCount {
@@ -433,10 +491,36 @@ func (b *blockStreamBuilder) SubtreeHashes() []chainhash.Hash {
 func (b *blockStreamBuilder) fail(err error) error {
 	if b.failed == nil {
 		b.failed = err
+
+		if b.currentSink != nil {
+			b.currentSink.Abort()
+		}
+
 		b.current = nil
 		b.currentData = nil
+		b.currentSink = nil
 		b.currentMeta = nil
 	}
 
 	return b.failed
+}
+
+// spendableOutputs returns outputs with every OP_FALSE OP_RETURN output replaced by nil, keeping
+// positions so a child's output index still lines up. Such an output can never be spent in any
+// era, so no child can extend from it, and at these heights they carry most of a block's bytes:
+// remembering them kept their scripts live for the whole extension window. The slice is new, so
+// the transaction's own outputs are not changed.
+func spendableOutputs(outputs []*bt.Output) []*bt.Output {
+	kept := make([]*bt.Output, len(outputs))
+
+	for i, out := range outputs {
+		if out != nil && out.LockingScript != nil && len(*out.LockingScript) >= 2 &&
+			(*out.LockingScript)[0] == bscript.OpFALSE && (*out.LockingScript)[1] == bscript.OpRETURN {
+			continue
+		}
+
+		kept[i] = out
+	}
+
+	return kept
 }

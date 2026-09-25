@@ -119,7 +119,8 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		// allocate roughly 19 GB by declaring a number.
 		dedup := newPipelineDedupMap()
 
-		builder, buildErr := newBlockStreamBuilder(int(stream.TxCount()), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup)
+		builder, buildErr := newBlockStreamBuilder(int(stream.TxCount()), sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree, coinbase, writer.Emit(sm.ctx), dedup,
+			withSubtreeDataSink(writer.OpenData(sm.ctx)))
 		if buildErr != nil {
 			// newBlockStreamBuilder itself never calls Emit, so writer has written
 			// nothing yet: this call is a no-op today. It is here anyway because the
