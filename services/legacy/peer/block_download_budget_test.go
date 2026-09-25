@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -153,4 +154,33 @@ func TestBlockDownloadBudgetNeverNarrowsTheShippedCeiling(t *testing.T) {
 				"base %d%%, catchingUp %v: the ceiling must never fall below the value it shipped with", base, catchingUp)
 		}
 	}
+}
+
+// A getdata gives the peer SV Node's whole block download budget to answer, not five minutes. An
+// SV Node peer can send nothing for many minutes while it serves blocks queued ahead of ours or
+// reads a multi-GB block from disk before its first byte: on mainnet on 2026-09-25 one sent nothing
+// for about 22 minutes, then delivered a 4 GB block at 38 MB/s. SV Node disconnects a peer for a
+// block in flight only after base + per-peer percent of the block interval, 95 minutes while
+// catching up with eight peers (src/net/net_processing.cpp:5474-5500).
+func TestAGetDataGivesTheBlockDownloadBudgetToAnswer(t *testing.T) {
+	p := budgetPeer(t, 10*time.Minute, true, 8)
+	pending := make(map[string]time.Time)
+
+	before := time.Now()
+	p.maybeAddDeadline(pending, wire.CmdGetData)
+
+	for _, cmd := range []string{wire.CmdBlock, wire.CmdMerkleBlock, wire.CmdTx, wire.CmdNotFound} {
+		require.WithinDuration(t, before.Add(95*time.Minute), pending[cmd], 5*time.Second, cmd)
+	}
+}
+
+// Never less than the five minutes it was, whatever the budget works out at.
+func TestAGetDataDeadlineIsNeverShorterThanBefore(t *testing.T) {
+	p := budgetPeer(t, time.Second, false, 1)
+	pending := make(map[string]time.Time)
+
+	before := time.Now()
+	p.maybeAddDeadline(pending, wire.CmdGetData)
+
+	require.False(t, pending[wire.CmdBlock].Before(before.Add(stallResponseTimeoutBlocks)))
 }

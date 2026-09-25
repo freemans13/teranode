@@ -76,6 +76,19 @@ const (
 	// stallResponseTimeoutBlocks is the maximum amount of time a peer will
 	// wait for a block message to be received after sending a getdata
 	// message.
+	//
+	// Do not shorten this on the belief that a peer silent this long is broken.
+	// An SV Node peer can send nothing for many minutes while it serves blocks
+	// queued ahead of ours, or reads a multi-GB block from disk to compute its
+	// checksum before the first byte, holding the one thread that serves all its
+	// peers. On mainnet on 2026-09-25 a peer sent nothing for about 22 minutes and
+	// then delivered a 4 GB block at 38 MB/s. The full account, with SV Node
+	// source references, is on blockRequestRetryInterval in
+	// services/legacy/netsync/block_download_tracker.go.
+	//
+	// A getdata is not held to this: it arms blockDownloadBudget, SV Node's own
+	// limit for a block in flight, with this as the floor (maybeAddDeadline).
+	// This is still the deadline for the inv answering a getblocks.
 	stallResponseTimeoutBlocks = 5 * time.Minute
 
 	// minBlockDownloadBytesPerSec is the association-wide read throughput, in
@@ -1508,10 +1521,18 @@ func (p *Peer) maybeAddDeadline(pendingResponses map[string]time.Time, msgCmd st
 
 	case wire.CmdGetData:
 		// Expects a block, merkleblock, tx, or notfound message.
-		pendingResponses[wire.CmdBlock] = blockDeadline
-		pendingResponses[wire.CmdMerkleBlock] = blockDeadline
-		pendingResponses[wire.CmdTx] = blockDeadline
-		pendingResponses[wire.CmdNotFound] = blockDeadline
+		//
+		// The peer gets SV Node's whole block download budget to answer, never less than
+		// stallResponseTimeoutBlocks: base plus per-peer percent of the block interval, 95
+		// minutes while catching up with eight peers (src/net/net_processing.cpp:5474-5500 in
+		// SV Node). It used to get five minutes, and an SV Node peer can send nothing for far
+		// longer while it serves blocks queued ahead of ours or reads a multi-GB block from
+		// disk before its first byte; see stallResponseTimeoutBlocks.
+		getDataDeadline := time.Now().Add(max(stallResponseTimeoutBlocks, p.blockDownloadBudget()))
+		pendingResponses[wire.CmdBlock] = getDataDeadline
+		pendingResponses[wire.CmdMerkleBlock] = getDataDeadline
+		pendingResponses[wire.CmdTx] = getDataDeadline
+		pendingResponses[wire.CmdNotFound] = getDataDeadline
 
 	case wire.CmdGetHeaders:
 		// Expects a headers message.  Use a longer deadline since it
@@ -1627,6 +1648,10 @@ func blockResponsePending(pending map[string]time.Time) bool {
 // imply. At shipped settings the cap never binds: it is 375 minutes against a
 // realistic catch-up budget of 95.
 func (p *Peer) blockDownloadBudget() time.Duration {
+	if p.cfg.ChainParams == nil || p.settings == nil {
+		return MaxBlockDownloadTime
+	}
+
 	interval := p.cfg.ChainParams.TargetTimePerBlock
 	if interval <= 0 {
 		return MaxBlockDownloadTime
@@ -2130,6 +2155,13 @@ func shouldArmProcessingTimer(cmd string, prefetchBudgetBytes int64, net wire.Bi
 // inHandler handles all incoming messages for the peer.  It must be run as a goroutine.
 func (p *Peer) inHandler() {
 	// The timer is stopped when a new message is received and reset after it is processed.
+	//
+	// An SV Node peer answers pings on the same single thread that serves every
+	// peer's getdata, and that thread can be held for minutes while it reads a
+	// multi-GB block from disk before sending it. A peer that goes quiet here is
+	// often busy, not gone; see blockRequestRetryInterval in
+	// services/legacy/netsync/block_download_tracker.go before shortening
+	// legacy_peerIdleTimeout.
 	var idleTimer *time.Timer
 	idleTimer = time.AfterFunc(p.settings.Legacy.PeerIdleTimeout, func() {
 		// For multistream associations, check if any other stream has
