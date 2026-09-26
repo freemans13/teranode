@@ -179,7 +179,7 @@ func TestProcessInvMsg_BlocksAreNotGatedOnTheRunningState(t *testing.T) {
 			ctx:              context.Background(),
 			peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 			blockchainClient: client,
-			blockPark:        newBlockPark(ulogger.TestLogger{}, tSettings, nil),
+			blockPark:        nil,
 			rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](10),
 		}
 		// Headers-first off is the state this matters in: past the last

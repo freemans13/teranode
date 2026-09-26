@@ -68,7 +68,7 @@ func newTestPark(t *testing.T, query string) (*blockPark, string) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.TempStore = storeURL
 
-	park := newBlockPark(ulogger.TestLogger{}, tSettings, store)
+	park := mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, park, "the park must be built for a file store")
 
 	return park, filepath.Join(root, parkSubDirectory)
@@ -404,7 +404,7 @@ func TestBlockPark_RecoveryAdoptsEverythingAPreviousRunParked(t *testing.T) {
 // switches and the store it refuses to run on. A store whose contents cannot be
 // listed would leak every parked blob on every restart, so the park declines
 // rather than leaking.
-func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
+func TestBlockPark_RefusesAStoreItCannotRecover(t *testing.T) {
 	base := func(t *testing.T) *settings.Settings {
 		t.Helper()
 
@@ -416,13 +416,6 @@ func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
 		return tSettings
 	}
 
-	t.Run("legacy_parkOutOfOrderBlocks false", func(t *testing.T) {
-		tSettings := base(t)
-		tSettings.Legacy.ParkOutOfOrderBlocks = false
-
-		require.Nil(t, newBlockPark(ulogger.TestLogger{}, tSettings, blob_memory.New()))
-	})
-
 	t.Run("a store that cannot be scanned", func(t *testing.T) {
 		tSettings := base(t)
 
@@ -430,8 +423,15 @@ func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
 		require.NoError(t, err)
 		tSettings.Legacy.TempStore = memURL
 
-		require.Nil(t, newBlockPark(ulogger.TestLogger{}, tSettings, blob_memory.New()),
-			"a store the restart scan cannot enumerate must disable the park, not leak into it")
+		park, err := newBlockPark(ulogger.TestLogger{}, tSettings, blob_memory.New())
+		require.Error(t, err, "a store the restart scan cannot enumerate must stop the node, not leak into the park")
+		require.Nil(t, park)
+	})
+
+	t.Run("no temp store", func(t *testing.T) {
+		park, err := newBlockPark(ulogger.TestLogger{}, base(t), nil)
+		require.Error(t, err, "the park is not optional, so no temp store is a configuration error")
+		require.Nil(t, park)
 	})
 
 	t.Run("a nil park behaves as no park", func(t *testing.T) {
@@ -470,7 +470,7 @@ func TestBlockPark_ParkStoreDeadlineIsTheOneThatCounts(t *testing.T) {
 	store, err := blob.NewStore(ulogger.TestLogger{}, storeURL)
 	require.NoError(t, err)
 
-	park := newBlockPark(ulogger.TestLogger{}, tSettings, store)
+	park := mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, park)
 	require.Equal(t, parkMinStoreTimeout, park.storeTimeout)
 
@@ -561,4 +561,27 @@ func TestBlockPark_DeleteAlsoRemovesAConvertedRecord(t *testing.T) {
 	names = parkDirEntries(t, dir)
 	require.NotContains(t, names, hash.String()+".block",
 		"Delete must remove the converted record too, or every path that retires an entry through it -- commit, eviction, discard -- leaks the record")
+}
+
+// mustNewBlockPark builds a park for a test, failing it if the settings or store cannot have one.
+func mustNewBlockPark(t *testing.T, logger ulogger.Logger, tSettings *settings.Settings, store blob.Store) *blockPark {
+	t.Helper()
+
+	park, err := newBlockPark(logger, tSettings, store)
+	require.NoError(t, err)
+
+	return park
+}
+
+// parkTempStore gives a test's settings the file:// temp store the park needs, since New refuses to
+// start without one, and returns the store to pass New.
+func parkTempStore(t *testing.T, tSettings *settings.Settings) blob.Store {
+	t.Helper()
+
+	storeURL, err := url.Parse("file://" + t.TempDir())
+	require.NoError(t, err)
+
+	tSettings.Legacy.TempStore = storeURL
+
+	return blob_memory.New()
 }

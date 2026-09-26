@@ -90,7 +90,6 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.TempStore = storeURL
-	tSettings.Legacy.ParkOutOfOrderBlocks = parkOn
 
 	sm := newRaceManager(t)
 	sm.ctx = context.Background()
@@ -99,7 +98,9 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 	sm.rejectedTxns = txmap.NewSyncedMap[chainhash.Hash, struct{}](100)
 	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Minute)
-	sm.blockPark = newBlockPark(ulogger.TestLogger{}, tSettings, store)
+	if parkOn {
+		sm.blockPark = mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
+	}
 
 	t.Cleanup(func() { sm.recentlyFailedBlocks.Stop() })
 

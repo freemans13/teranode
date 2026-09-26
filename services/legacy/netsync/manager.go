@@ -6081,11 +6081,14 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		blockAssembly:     blockAssembly,
 	}
 
-	// Where a block whose parent is not stored yet waits instead of being thrown
-	// away. nil when the park is switched off or the temp store is one whose
-	// contents a restart could not enumerate; every call site reads nil as
-	// "discard the block", which is what the node did before the park existed.
-	sm.blockPark = newBlockPark(logger, tSettings, tempStore)
+	// Where every downloaded block is converted to and committed from. Not
+	// optional: a node without a usable park refuses to start.
+	park, err := newBlockPark(logger, tSettings, tempStore)
+	if err != nil {
+		return nil, err
+	}
+
+	sm.blockPark = park
 
 	// Now the park exists, the wire layer can be told where to put a block body
 	// it reads straight off the socket. Before this call the streaming handler

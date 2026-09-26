@@ -76,7 +76,7 @@ func TestBlockPark_NeverSchedulesAParkedBlobForDeletion(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.TempStore = storeURL
 
-	park := newBlockPark(ulogger.TestLogger{}, tSettings, store)
+	park := mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, park)
 
 	blocks := minedBlocks(t, 1)

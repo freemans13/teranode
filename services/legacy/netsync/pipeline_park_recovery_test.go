@@ -97,7 +97,7 @@ func TestBlockPark_RecoveryAdoptsAConvertedRecord(t *testing.T) {
 		utxoStore: &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}},
 	}
 
-	sm.blockPark = newBlockPark(sm.logger, tSettings, store)
+	sm.blockPark = mustNewBlockPark(t, sm.logger, tSettings, store)
 	require.NotNil(t, sm.blockPark, "the park must actually be enabled, or this test proves nothing about Recover")
 
 	blk := wireBlockWithTxs(t, 20, false)
@@ -123,7 +123,7 @@ func TestBlockPark_RecoveryAdoptsAConvertedRecord(t *testing.T) {
 	// The restart. A fresh blockPark over the same store and directory,
 	// standing in for the process that comes back up and finds this file
 	// already there.
-	restarted := newBlockPark(sm.logger, tSettings, store)
+	restarted := mustNewBlockPark(t, sm.logger, tSettings, store)
 	require.NotNil(t, restarted)
 
 	restarted.Recover(ctx, sm.subtreeStore)
@@ -201,7 +201,7 @@ func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *t
 		utxoStore:        &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}},
 	}
 
-	sm.blockPark = newBlockPark(sm.logger, tSettings, store)
+	sm.blockPark = mustNewBlockPark(t, sm.logger, tSettings, store)
 	require.NotNil(t, sm.blockPark, "the park must actually be enabled, or this test proves nothing about Recover")
 
 	blk := wireBlockWithTxs(t, 20, false)
@@ -240,7 +240,7 @@ func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *t
 
 	warnings := &warnCaptureLogger{}
 
-	restarted := newBlockPark(warnings, tSettings, store)
+	restarted := mustNewBlockPark(t, warnings, tSettings, store)
 	require.NotNil(t, restarted)
 
 	restarted.Recover(ctx, sm.subtreeStore)
