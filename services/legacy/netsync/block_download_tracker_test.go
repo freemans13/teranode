@@ -1,19 +1,15 @@
 package netsync
 
 import (
-	"context"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
-	"github.com/bsv-blockchain/teranode/errors"
-	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -243,82 +239,6 @@ func TestPeersWithBlockDownloads_ExpiredAssignmentDoesNotInflateTheCount(t *test
 	advance(2 * blockRequestAssignmentTTL)
 
 	require.Equal(t, 0, sm.PeersWithBlockDownloads(), "an assignment past its lifetime must not count as a live download")
-}
-
-// TestHandleBlockMsg_UnrequestedBlockStillDisconnects is the parity check that
-// matters most in this change: the ledger now answers the question the
-// disconnect decision asks, so getting the identity wrong would either punish
-// honest peers or admit blocks nobody asked for. A block from a peer we asked is
-// admitted; the same block from a peer we did not ask costs that peer its
-// connection.
-func TestHandleBlockMsg_UnrequestedBlockStillDisconnects(t *testing.T) {
-	running := blockchain2.FSMStateRUNNING
-	blockchainClient := &blockchain2.Mock{}
-	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
-
-	sm := newRaceManager(t)
-	sm.ctx = context.Background()
-	sm.blockchainClient = blockchainClient
-
-	asked, _, _ := connectRacePeer(t, 40, 1000)
-	stranger, _, _ := connectRacePeer(t, 41, 1000)
-
-	registerRacePeer(sm, asked)
-	registerRacePeer(sm, stranger)
-
-	h := chainhash.Hash{0x66}
-	sm.blockDownloads.Add(asked, h)
-
-	// Carrying no block makes handleBlockMsg bail straight after the check under
-	// test, so the error only tells us whether it got past the disconnect.
-	err := sm.handleBlockMsg(&blockQueueMsg{blockHash: h, peer: asked})
-	require.Error(t, err)
-	require.True(t, asked.Connected(), "a peer answering our own request must keep its connection")
-
-	err = sm.handleBlockMsg(&blockQueueMsg{blockHash: h, peer: stranger})
-	require.Error(t, err)
-	require.True(t, errors.Is(err, errors.ErrServiceError))
-	require.True(t, WaitUntil(func() bool { return !stranger.Connected() }, 2*time.Second),
-		"a peer we never asked must be disconnected for an unrequested block")
-}
-
-// TestHandleBlockMsg_DeliveryDoesNotCancelTheOtherPeersWeAsked pins which
-// obligations a delivered block clears. The two maps this replaced cleared
-// different things — the global record went, the delivering peer's own record
-// went, and any other peer we had also asked kept its record and so kept its
-// pass on the late copy still travelling towards us. Collapsing that into
-// "forget the block entirely" would disconnect a peer for answering a question
-// we asked it.
-func TestHandleBlockMsg_DeliveryDoesNotCancelTheOtherPeersWeAsked(t *testing.T) {
-	running := blockchain2.FSMStateRUNNING
-	blockchainClient := &blockchain2.Mock{}
-	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
-
-	sm := newRaceManager(t)
-	sm.ctx = context.Background()
-	sm.blockchainClient = blockchainClient
-
-	first, _, _ := connectRacePeer(t, 42, 1000)
-	second, _, _ := connectRacePeer(t, 43, 1000)
-
-	registerRacePeer(sm, first)
-	registerRacePeer(sm, second)
-
-	h := chainhash.Hash{0x67}
-	sm.blockDownloads.Add(first, h)
-	sm.blockDownloads.Add(second, h)
-
-	err := sm.handleBlockMsg(&blockQueueMsg{blockHash: h, peer: first})
-	require.Error(t, err)
-
-	require.False(t, sm.blockDownloads.HasOwner(first, h), "the peer that delivered no longer owes us the block")
-	require.True(t, sm.blockDownloads.HasOwner(second, h), "the other peer we asked keeps its pass on the copy already on the way")
-
-	// And that pass is real: the second copy arriving must not cost that peer
-	// its connection.
-	err = sm.handleBlockMsg(&blockQueueMsg{blockHash: h, peer: second})
-	require.Error(t, err)
-	require.True(t, second.Connected(), "a second copy from a peer we also asked must not be treated as unrequested")
 }
 
 // TestBlockDownloadTracker_ForgetForRetryPeerMovesOnlyTheRetryWindow pins the two

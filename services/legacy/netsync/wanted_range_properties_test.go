@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"bytes"
 	"context"
 	"net/url"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -344,12 +346,20 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	sm := newRaceManager(t)
 	sm.ctx = context.Background()
 	sm.settings = tSettings
+	// minedBlocks solves against RegressionNetParams; blockOrigin and
+	// quickValidationAllowed read sm.chainParams.Checkpoints, so this must
+	// agree with what the header cache below is filled from.
+	sm.chainParams = &chaincfg.RegressionNetParams
 	sm.blockchainClient = client
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 	sm.rejectedTxns = txmap.NewSyncedMap[chainhash.Hash, struct{}](100)
 	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Minute)
 	sm.blockPark = mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, sm.blockPark, "the park must be built or this test measures nothing")
+	// The pipeline sink writes a block's subtree files to this store before the
+	// park ever sees it (deliverPropertyBlock below), same store as the park's
+	// own — see newPipelineParkManager's "one store, not two" note.
+	sm.subtreeStore = store
 
 	t.Cleanup(func() { sm.recentlyFailedBlocks.Stop() })
 
@@ -367,8 +377,9 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	// The wanted-range pass reads the header cache, so that is what has to name
 	// the same run — from the blocks' own real headers, which really
 	// do link from genesis, rather than a synthetic chain: this harness delivers
-	// the blocks themselves through processQueuedBlock, and a hash the cache
-	// named that did not match a delivered block's real hash would test nothing.
+	// the blocks themselves through the streaming pipeline (deliverPropertyBlock),
+	// and a hash the cache named that did not match a delivered block's real hash
+	// would test nothing.
 	headers := make([]*wire.BlockHeader, 0, len(blocks))
 
 	for _, b := range blocks {
@@ -385,6 +396,38 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	sm.headersFirstMode.Store(true)
 
 	return sm, rec
+}
+
+// deliverPropertyBlock streams one block through the pipeline sink and the
+// on-disk consumer path — the same route block_park_wiring_test.go's
+// parkWiringHarness.deliver drives — since processQueuedBlock and the decoded
+// blockQueueMsg it took no longer exist; every arrival now goes through
+// pipelineBlockSink and handleBlockOnDiskMsg (streaming_install.go).
+func deliverPropertyBlock(t *testing.T, sm *SyncManager, peer *peerpkg.Peer, blk *bsvutil.Block, hash chainhash.Hash) error {
+	t.Helper()
+
+	msgBlock := blk.MsgBlock()
+	body := blockBodyBytes(t, blk)
+
+	sm.blockDownloads.Add(peer, hash)
+
+	converted, err := sm.pipelineBlockSink(hash, &msgBlock.Header, bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		return err
+	}
+
+	sm.handleBlockOnDiskMsg(&blockOnDiskMsg{
+		body: peerpkg.BlockBody{
+			Header:    msgBlock.Header,
+			TxCount:   uint64(len(msgBlock.Transactions)),
+			Size:      int64(len(body)),
+			Hash:      hash,
+			Converted: converted,
+		},
+		peer: peer,
+	})
+
+	return nil
 }
 
 // TestWantedRange_TheParkNeverExceedsTheReadAheadDepth pins the consequence. A
@@ -463,14 +506,8 @@ func TestWantedRange_TheParkNeverExceedsTheReadAheadDepth(t *testing.T) {
 			index, known := byHash[fresh[i]]
 			require.True(t, known, "pass %d asked for a block the harness never mined", pass)
 
-			msgBlock := blocks[index].MsgBlock()
-
-			require.NoError(t, sm.processQueuedBlock(&blockQueueMsg{
-				block:       msgBlock,
-				blockHash:   fresh[i],
-				blockHeight: int32(index + 1),
-				peer:        sm.loadSyncPeer(),
-			}), "pass %d: delivering block %d", pass, index+1)
+			require.NoError(t, deliverPropertyBlock(t, sm, sm.loadSyncPeer(), blocks[index], fresh[i]),
+				"pass %d: delivering block %d", pass, index+1)
 		}
 
 		require.LessOrEqual(t, sm.blockPark.Len(), propertyDepth,

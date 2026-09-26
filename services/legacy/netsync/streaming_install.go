@@ -591,6 +591,19 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// The sweep already applies this rule before it posts, which is why it does
 	// not produce them.
 	if !sm.parentIsInChain(entry.prevBlock) {
+		// The parent still has to be asked for, and the getblocks is not an
+		// alternative to keeping the block: it is the only thing that fetches the
+		// gap, and the batch-continuation signal the legacy protocol runs on. A
+		// peer pushes its tip after a batch and then sends nothing until the next
+		// getblocks. Sent in both modes, as the decoded route always sent it:
+		// inside headers-first mode the reply is dropped by processInvMsg and costs
+		// one message, and outside it, on every node past the final checkpoint, it
+		// is the whole of the recovery, because fetchMoreHeaderBlocks does nothing
+		// there.
+		if primary != nil {
+			sm.requestMissingBlocks(primary, entry.hash)
+		}
+
 		return
 	}
 

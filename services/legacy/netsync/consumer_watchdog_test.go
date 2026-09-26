@@ -32,48 +32,13 @@ func TestReportConsumerStallStaysQuietBeforeTheThreshold(t *testing.T) {
 	now := time.Now()
 
 	sm.noteConsumerAdmitted(now)
-	sm.publishConsumerWait(now, true, nil)
+	sm.publishConsumerWait(now)
 
 	// One second short of the threshold. A loop that has just admitted a block is
 	// not stuck, and a watchdog that says so on every tick is noise.
 	sm.reportConsumerStall(now.Add(consumerStallAfter - time.Second))
 
 	require.Empty(t, log.warns)
-}
-
-func TestReportConsumerStallNamesTheBlockHoldingTheQueueArmShut(t *testing.T) {
-	log := &captureLogger{Logger: ulogger.TestLogger{}}
-
-	hash := chainhash.HashH([]byte("pending"))
-
-	sm := &SyncManager{
-		logger:     log,
-		dispatcher: &blockDispatcher{budget: 4096},
-	}
-
-	now := time.Now()
-
-	sm.noteConsumerAdmitted(now)
-
-	// The wedge this exists for: a head-processed block the window will not take,
-	// so the queue arm is shut and nothing else is head-processed behind it.
-	sm.publishConsumerWait(now, false, &blockDispatch{
-		msg:      &blockQueueMsg{blockHash: hash},
-		height:   754896,
-		windowed: true,
-	})
-
-	sm.reportConsumerStall(now.Add(consumerStallAfter + time.Second))
-
-	require.Len(t, log.warns, 1)
-
-	line := log.warns[0]
-
-	require.Contains(t, line, "no block admitted")
-	require.Contains(t, line, "queue arm shut")
-	require.Contains(t, line, hash.String()[:8])
-	require.Contains(t, line, "754896")
-	require.Contains(t, line, "the window is empty")
 }
 
 func TestReportConsumerStallReportsOnceAnInterval(t *testing.T) {
@@ -83,7 +48,7 @@ func TestReportConsumerStallReportsOnceAnInterval(t *testing.T) {
 	now := time.Now()
 
 	sm.noteConsumerAdmitted(now)
-	sm.publishConsumerWait(now, true, nil)
+	sm.publishConsumerWait(now)
 
 	stalled := now.Add(consumerStallAfter + time.Second)
 
@@ -156,7 +121,7 @@ func TestPublishConsumerWaitDescribesTheWindowAndTheBarrier(t *testing.T) {
 	now := time.Now()
 
 	sm.noteConsumerAdmitted(now)
-	sm.publishConsumerWait(now, false, nil)
+	sm.publishConsumerWait(now)
 	sm.reportConsumerStall(now.Add(consumerStallAfter + time.Second))
 
 	require.Len(t, log.warns, 1)
@@ -190,7 +155,7 @@ func TestPublishConsumerWaitIsSafeToReadFromAnotherGoroutine(t *testing.T) {
 		defer close(done)
 
 		for i := 0; !stop.Load(); i++ {
-			sm.publishConsumerWait(time.Now(), i%2 == 0, nil)
+			sm.publishConsumerWait(time.Now())
 		}
 	}()
 
@@ -227,7 +192,7 @@ func TestConsumerStallLineIsOneLine(t *testing.T) {
 	now := time.Now()
 
 	sm.noteConsumerAdmitted(now)
-	sm.publishConsumerWait(now, false, nil)
+	sm.publishConsumerWait(now)
 	sm.reportConsumerStall(now.Add(consumerStallAfter + time.Second))
 
 	require.Len(t, log.warns, 1)
@@ -270,7 +235,7 @@ func stallReport(t *testing.T, sm *SyncManager, log *captureLogger) string {
 	now := time.Now()
 
 	sm.noteConsumerAdmitted(now)
-	sm.publishConsumerWait(now, true, nil)
+	sm.publishConsumerWait(now)
 	sm.reportConsumerStall(now.Add(consumerStallAfter + time.Second))
 
 	require.Len(t, log.warns, 1)
@@ -340,14 +305,14 @@ func TestConsumerWatchdog_ANilHeaderCacheStillProducesAReport(t *testing.T) {
 func TestConsumerWait_Describe_NamesDeclinedDrainTurns(t *testing.T) {
 	now := time.Now()
 
-	w := &consumerWait{at: now, queueArmOpen: true, parked: 113, drainDeclines: 41}
+	w := &consumerWait{at: now, parked: 113, drainDeclines: 41}
 
 	line := w.describe(now)
 
 	require.Contains(t, line, "the drain has declined 41 turns",
 		"a report that collects the count and prints nothing is the diagnostic stopping where it gets interesting")
 
-	quiet := (&consumerWait{at: now, queueArmOpen: true}).describe(now)
+	quiet := (&consumerWait{at: now}).describe(now)
 	require.False(t, strings.Contains(quiet, "declined"),
 		"a drain that has never declined a turn must not add a clause saying so")
 }

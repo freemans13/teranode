@@ -9,6 +9,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// seedBlockFailure reproduces the bookkeeping the deleted
+// recordBlockFailureBackoff used to do on every failed HandleBlockDirect
+// attempt: the ramp these tests pin lives on in blockGivenUpOn's read side
+// (still called from wanted_range_assign.go), but the write side was only ever
+// invoked from the decoded-block consumer that step 3 removed, so there is no
+// production call left to drive it. Tests exercise blockGivenUpOn directly by
+// writing the same *blockFailureState a real caller would have written.
+func seedBlockFailure(sm *SyncManager, hash chainhash.Hash) {
+	attempts := 1
+	if fs, ok := sm.blockFailureBackoff.Get(hash); ok {
+		attempts = fs.attempts + 1
+	}
+
+	backoff := time.Duration(attempts) * sm.settings.Legacy.BlockFailureBackoffBase
+	if maxBackoff := sm.settings.Legacy.BlockFailureBackoffMaxDuration; backoff > maxBackoff {
+		backoff = maxBackoff
+	}
+
+	sm.blockFailureBackoff.Set(hash, &blockFailureState{
+		attempts:  attempts,
+		nextRetry: time.Now().Add(backoff),
+	})
+}
+
 func ceilingManager(t *testing.T, ceiling int) *SyncManager {
 	t.Helper()
 
@@ -34,7 +58,7 @@ func TestBlockGivenUpOn_StopsAtTheCeiling(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		require.False(t, sm.blockGivenUpOn(hash),
 			"attempt %d is inside the ceiling and must still be retried", i+1)
-		sm.recordBlockFailureBackoff(hash)
+		seedBlockFailure(sm, hash)
 	}
 
 	require.True(t, sm.blockGivenUpOn(hash),
@@ -46,7 +70,7 @@ func TestBlockGivenUpOn_ACeilingOfZeroNeverGivesUp(t *testing.T) {
 	hash := chainhash.Hash{0x02}
 
 	for i := 0; i < 50; i++ {
-		sm.recordBlockFailureBackoff(hash)
+		seedBlockFailure(sm, hash)
 	}
 
 	require.False(t, sm.blockGivenUpOn(hash),
@@ -58,7 +82,7 @@ func TestBlockGivenUpOn_ASuccessfulBlockStartsFresh(t *testing.T) {
 	hash := chainhash.Hash{0x03}
 
 	for i := 0; i < 5; i++ {
-		sm.recordBlockFailureBackoff(hash)
+		seedBlockFailure(sm, hash)
 	}
 
 	require.True(t, sm.blockGivenUpOn(hash))
@@ -112,7 +136,7 @@ func TestFetchHeaderBlocks_NeverAsksAgainForABlockPastItsGivenUpCeiling(t *testi
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 
 	// The front header failed once already, past a ceiling of one.
-	sm.recordBlockFailureBackoff(hashes[0])
+	seedBlockFailure(sm, hashes[0])
 	require.True(t, sm.blockGivenUpOn(hashes[0]), "sanity: past the ceiling")
 	require.False(t, sm.blockDownloads.RequestedWithin(hashes[0], blockRequestRetryInterval),
 		"sanity: nothing else is holding the block back, so blockGivenUpOn has to be the one doing it")

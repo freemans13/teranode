@@ -122,19 +122,35 @@ func TestParkedDispatchMayBeWindowed(t *testing.T) {
 // fix. Relaxing the dispatch guard alone changes nothing in production, because
 // the loop would not choose the drain in the first place while the window held
 // anything.
+//
+// The loop no longer computes a drainOpen boolean at all — dispatchBlocks
+// (manager.go) tries the drain whenever anything is queued, full stop, and
+// leaves capacity (an empty window vs an unwindowed dispatch, a windowed one
+// with room) entirely to drainStep/canDispatch. So the property this pins is
+// now the absence of any window-emptiness precondition gating the ATTEMPT,
+// which is what the deleted admissionChoice/nextAdmission machinery used to
+// add back in.
 func TestDrainOpenDoesNotRequireAnEmptyWindow(t *testing.T) {
 	src := readManagerSource(t)
 
-	i := strings.Index(src, "drainOpen :=")
-	require.Positive(t, i, "the loop no longer computes drainOpen, so this test needs rewriting rather than deleting")
+	marker := "if len(sm.drainQueue) > 0 {"
+	i := strings.Index(src, marker)
+	require.Positive(t, i, "the loop no longer gates a drain attempt on the queue alone, so this test needs rewriting rather than deleting")
 
 	line := src[i:]
 	if cut := strings.Index(line, "\n"); cut > 0 {
 		line = line[:cut]
 	}
 
+	// The gate's own condition line must name only the queue — no
+	// frontier/window-emptiness clause riding alongside it.
 	require.False(t, strings.Contains(line, "frontierEmpty"),
 		"requiring an empty window here restates the rule a windowed drained block was just freed from, and would keep the validator idle between every parked block")
-	require.Contains(t, line, "len(sm.drainQueue) > 0",
-		"something queued is what makes the drain a candidate; capacity is drainStep's own test")
+
+	// And nothing else in the loop attempts the drain from a DIFFERENT,
+	// narrower condition instead of this one — the marker itself must be the
+	// only gate; readManagerSource concatenates the whole file, so a second
+	// occurrence would mean a rewrite added a competing check.
+	require.Equal(t, i, strings.LastIndex(src, marker),
+		"the drain must be attempted from exactly one gate, not a second one added elsewhere")
 }

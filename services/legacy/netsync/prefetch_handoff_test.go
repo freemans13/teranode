@@ -3,11 +3,9 @@ package netsync
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/semaphore"
 )
@@ -111,133 +109,19 @@ func TestPrefetch_TheBytesAreGivenBackAtHandOffAndTheHashAtTheReply(t *testing.T
 	require.NoError(t, err, "once the block has left the pipeline its hash is free again")
 }
 
-// TestPrefetch_ADispatchedBlockGivesItsDownloadBytesBack is the wiring, driven
-// through the consumer loop rather than by calling the release directly.
-//
-// A dispatched block's memory is charged to the window's byte budget in
-// bd.dispatch, so that is the moment the download bytes are owed back.
-func TestPrefetch_ADispatchedBlockGivesItsDownloadBytesBack(t *testing.T) {
-	h := newParkWiringHarness(t, true)
-	bd := h.withDispatcher(t)
-
-	h.sm.settings.BlockValidation.QuickWindowBlocks = 1
-	h.sm.settings.BlockValidation.QuickValidateSkipUtxoLock = true
-	h.sm.quit = make(chan struct{})
-
-	block := h.blocks[0].MsgBlock()
-
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-	h.chainHolds(t, block.Header.PrevBlock)
-
-	// The validation is held open, so every assertion below is made while the
-	// block is still in flight and its memory still live.
-	release := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	})
-
-	bd.run = func(context.Context, *blockDispatch, *inflightParent) error {
-		<-release
-
-		return nil
-	}
-
-	handedOff := make(chan struct{})
-
-	queue := make(chan *blockQueueMsg, 1)
-
-	go h.sm.dispatchBlocks(queue)
-
-	t.Cleanup(func() { close(h.sm.quit) })
-
-	h.sm.blockDownloads.Add(h.peer, block.BlockHash())
-	h.sm.blockBacklog.Add(1)
-
-	reply := make(chan error, 1)
-
-	queue <- &blockQueueMsg{
-		block:       block,
-		blockHash:   block.BlockHash(),
-		blockHeight: 1,
-		peer:        h.peer,
-		reply:       reply,
-		handedOff:   handedOff,
-	}
-
-	select {
-	case <-handedOff:
-	case <-time.After(10 * time.Second):
-		t.Fatal("a dispatched block must signal its hand-off, or its download bytes are held for the whole validation")
-	}
-
-	require.Len(t, bd.frontier, 1, "and it must still be in flight when it does, or the signal is worth nothing")
-
-	select {
-	case <-reply:
-		t.Fatal("the hand-off is not the reply; the dedup hash is held until the reply")
-	default:
-	}
-
-	close(release)
-
-	select {
-	case err := <-reply:
-		require.NoError(t, err)
-	case <-time.After(10 * time.Second):
-		t.Fatal("the block never finished")
-	}
-}
-
-// TestPrefetch_AParkedBlockGivesItsDownloadBytesBack is the same for the other
-// route, and it is the common one: in the measured regime most arrivals park.
-//
-// A parked block's memory is charged to the park's own byte budget by Admit, so
-// that is when the download bytes are owed back. The park worker still holds the
-// decoded block while it writes, and the park's budget is what accounts for it.
-func TestPrefetch_AParkedBlockGivesItsDownloadBytesBack(t *testing.T) {
-	h := newParkWiringHarness(t, true)
-	h.withDispatcher(t)
-
-	h.sm.settings.BlockValidation.QuickWindowBlocks = 1
-	h.sm.settings.BlockValidation.QuickValidateSkipUtxoLock = true
-	h.sm.quit = make(chan struct{})
-
-	block := h.blocks[1].MsgBlock()
-
-	// Nothing is stored, so this block is an orphan and parks.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-
-	handedOff := make(chan struct{})
-
-	queue := make(chan *blockQueueMsg, 1)
-
-	go h.sm.dispatchBlocks(queue)
-
-	t.Cleanup(func() { close(h.sm.quit) })
-
-	h.sm.blockDownloads.Add(h.peer, block.BlockHash())
-	h.sm.blockBacklog.Add(1)
-
-	queue <- &blockQueueMsg{
-		block:       block,
-		blockHash:   block.BlockHash(),
-		blockHeight: 2,
-		peer:        h.peer,
-		reply:       make(chan error, 1),
-		handedOff:   handedOff,
-	}
-
-	select {
-	case <-handedOff:
-	case <-time.After(10 * time.Second):
-		t.Fatal("a parked block must signal its hand-off once the park has charged it")
-	}
-
-	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 1 }, 10*time.Second),
-		"and the park is what accounts for it from then on")
-	require.Positive(t, h.sm.blockPark.Bytes(), "with its bytes charged there")
-}
+// TestPrefetch_ADispatchedBlockGivesItsDownloadBytesBack and
+// TestPrefetch_AParkedBlockGivesItsDownloadBytesBack used to drive this split
+// through the consumer loop: a decoded blockQueueMsg carrying its own
+// handedOff channel, released early at dispatch or at park admission while its
+// dedup hash was held until the reply. Both are gone. The park is now
+// mandatory, and admitPipelineSink's own doc comment (streaming_install.go)
+// says why AcquireBlockPrefetch is no longer reachable from that route at
+// all: with the park enabled every block arrives as *peer.MsgBlockOnDisk, not
+// a *wire.MsgBlock, so OnBlock's decode-in-memory admission check — the one
+// blockQueueMsg.handedOff signalled an early release from — never runs. The
+// pipeline's own admission (admitPipelineSink) acquires the whole budget
+// around the ENTIRE conversion and releases it once, combined
+// (sm.ReleaseBlockPrefetch), only after pipelineBlockSink returns — there is
+// no early hand-off moment on this route to pin. TestPrefetch_TheBytesAreGivenBackAtHandOffAndTheHashAtTheReply
+// above still exercises the split release primitives directly, which remain
+// live API even though nothing currently calls them apart from each other.

@@ -1,14 +1,11 @@
 package netsync
 
 import (
-	"context"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -64,50 +61,6 @@ func TestBlockDownloadTracker_FloodMustNotDisplaceTheBlockWeAreWaitingOn(t *test
 		"an announcement arriving at a full ledger must be refused, not admitted at the frontier's expense")
 	require.LessOrEqual(t, tr.Len(), maxTrackedBlockDownloads,
 		"the ledger must stay within its cap")
-}
-
-// TestHandleBlockMsg_FloodMustNotCostTheFrontierPeerItsConnection is the same
-// defect at the end of the path it damages. A peer we asked for the frontier
-// block delivers it, exactly as asked, after a burst of announcements has filled
-// the ledger. Whether its record survived the burst is the whole question: the
-// disconnect decision reads that record, and a peer whose record is gone is
-// treated as having sent a block nobody wanted.
-func TestHandleBlockMsg_FloodMustNotCostTheFrontierPeerItsConnection(t *testing.T) {
-	running := blockchain2.FSMStateRUNNING
-	blockchainClient := &blockchain2.Mock{}
-	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
-	// handleBlockMsgTail's top-up can reach maybeRequestMoreHeaders once the
-	// header cache (empty here) is found to have nothing past the committed
-	// height, which is every call on a manager this bare.
-	blockchainClient.Mock.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
-		Return([]*chainhash.Hash{{}}, nil)
-
-	sm := newRaceManager(t)
-	sm.ctx = context.Background()
-	sm.blockchainClient = blockchainClient
-
-	asked, _, _ := connectRacePeer(t, 60, 1000)
-	registerRacePeer(sm, asked)
-
-	frontier := chainhash.Hash{}
-	frontier[31] = 0xfe
-	sm.blockDownloads.Add(asked, frontier)
-
-	// A second peer announces enough blocks to take the ledger past its cap.
-	flooder, _, _ := connectRacePeer(t, 61, 1000)
-	registerRacePeer(sm, flooder)
-	fillLedger(sm.blockDownloads, flooder, maxTrackedBlockDownloads+1)
-
-	require.True(t, sm.blockDownloads.HasOwner(asked, frontier),
-		"the ledger must still vouch for the block we asked this peer for")
-
-	// Carrying no block makes handleBlockMsg bail straight after the check under
-	// test, so the error only tells us whether it got past the disconnect.
-	err := sm.handleBlockMsg(&blockQueueMsg{blockHash: frontier, peer: asked})
-	require.Error(t, err)
-
-	require.False(t, WaitUntil(func() bool { return !asked.Connected() }, time.Second),
-		"a peer delivering the block we asked it for must not lose its connection to somebody else's announcement burst")
 }
 
 // TestBlockDownloadTracker_FullLedgerStillTakesAnotherOwnerForABlockItHas pins

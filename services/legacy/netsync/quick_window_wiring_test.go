@@ -4,7 +4,6 @@ import (
 	"context"
 	"math"
 	"runtime/debug"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -132,98 +131,61 @@ func TestWindowBudgetBytes(t *testing.T) {
 	})
 }
 
-// serialProbeClient records when a block's head ran (the FSM state call, which only
-// handleBlockMsgHead makes) and every block-exists call, and parks each of those until the
-// test releases it. The head makes one block-exists call of its own now, HandleBlockDirect's
-// opening question asked ahead of dispatch, and HandleBlockDirect makes the other; returning
-// true from both makes HandleBlockDirect return immediately, so each block is one head event
-// followed by two work events, and a head that ran early would show up between them.
-type serialProbeClient struct {
-	*blockchain.Mock
-
-	mu     sync.Mutex
-	events []string
-	gate   chan struct{}
-}
-
-func (c *serialProbeClient) record(what string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.events = append(c.events, what)
-}
-
-func (c *serialProbeClient) seen() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return append([]string(nil), c.events...)
-}
-
-func (c *serialProbeClient) GetFSMCurrentState(_ context.Context) (*blockchain.FSMStateType, error) {
-	c.record("head")
-
-	state := blockchain.FSMStateCATCHINGBLOCKS
-
-	return &state, nil
-}
-
-func (c *serialProbeClient) GetBlockExists(_ context.Context, _ *chainhash.Hash) (bool, error) {
-	c.record("work")
-	<-c.gate
-
-	return true, nil
-}
-
 // TestDispatchBlocks_SettingZeroIsATrueBypass proves that at
-// blockvalidation_quick_window_blocks=0 the consumer is the pre-window one: block N+1's head
-// (the FSM state call, the requestedBlocks and header-cache bookkeeping, the size sampling, the
-// cascade marks) does not run until block N's work and tail have finished. At depth 1 the
-// dispatcher would have split those apart and run N+1's head alongside N's work, which is why
-// 0 has to bypass the dispatcher rather than configure it.
+// blockvalidation_quick_window_blocks=0 dispatchBlocks routes straight to
+// consumeBlocksSerially: every commit comes off sm.parkCommits, one block at a
+// time, and the dispatcher — which the windowed route alone uses — is never
+// touched. There is no decoded block queue left to bypass; the routing itself,
+// not a head/work ordering on it, is what this setting now controls (see
+// dispatchBlocks, manager.go).
 func TestDispatchBlocks_SettingZeroIsATrueBypass(t *testing.T) {
-	h := newLoopHarness(t, 2)
+	h := newParkWiringHarness(t, true)
 	h.sm.settings.BlockValidation.QuickWindowBlocks = 0
+	// New() builds this channel unconditionally; a struct-literal harness needs
+	// it wired by hand so submitParkCommit posts to it instead of committing
+	// inline, which would make this test pass without ever exercising the
+	// routing it is about.
+	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+	h.sm.quit = make(chan struct{})
+	t.Cleanup(func() { close(h.sm.quit) })
 
-	probe := &serialProbeClient{Mock: h.client, gate: make(chan struct{})}
-	h.sm.blockchainClient = probe
+	// A dispatcher is wired only so a call into it is observable; the assertion
+	// is that this path never makes one.
+	h.sm.dispatcher = newBlockDispatcher(h.sm)
 
-	t.Cleanup(func() {
-		select {
-		case <-probe.gate:
-		default:
-			close(probe.gate)
-		}
-	})
-
-	// Nothing may reach the dispatcher on this path.
 	var dispatched atomic.Bool
 
-	h.sm.dispatcher.run = func(context.Context, *blockDispatch, *inflightParent) error {
+	h.sm.dispatcher.parkedRun = func(context.Context, *blockDispatch) error {
 		dispatched.Store(true)
 
 		return nil
 	}
 
-	go h.sm.dispatchBlocks(h.queue)
+	child := h.blocks[1].MsgBlock().BlockHash()
 
-	first := h.enqueue(0)
-	second := h.enqueue(1)
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len(), "the child parks behind its missing parent")
 
-	// The first block is parked inside its own work.
-	require.Eventually(t, func() bool { return len(probe.seen()) == 2 }, 5*time.Second, 5*time.Millisecond)
-	time.Sleep(100 * time.Millisecond)
-	require.Equal(t, []string{"head", "work"}, probe.seen(), "the second block's head must not run while the first is in flight")
+	go h.sm.dispatchBlocks()
 
-	close(probe.gate)
+	// The parent arrives and, with QuickWindowBlocks 0, is committed by
+	// consumeBlocksSerially reading sm.parkCommits — see submitParkCommit.
+	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
+	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
-	require.NoError(t, requireReply(t, first, "the first block"))
-	require.NoError(t, requireReply(t, second, "the second block"))
+	require.NoError(t, h.deliver(t, 0))
 
-	require.Equal(t, []string{"head", "work", "work", "head", "work", "work"}, probe.seen(), "blocks run strictly one at a time, head to tail")
+	// Both blocks leave the park. The parent's own entry is still in the index
+	// when the on-disk handler posts it, and consumeBlocksSerially used to commit
+	// it directly and leave it there; it now puts it back and drains it, as the
+	// windowed consumer does, so nothing stale is left.
+	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 0 }, 5*time.Second),
+		"both blocks must be committed off sm.parkCommits by consumeBlocksSerially, leaving nothing in the park")
+
+	_, failed := h.sm.recentlyFailedBlocks.Get(child)
+	require.False(t, failed, "the child was committed, not given up on")
+
 	require.False(t, dispatched.Load(), "the dispatcher is not used when the window is off")
-	require.True(t, h.sm.dispatcher.frontierEmpty())
-	require.Equal(t, int64(0), h.sm.blockBacklog.Load())
 }
 
 // processBlockRecorder counts ProcessBlock calls so the hand-shake tests can tell "the child

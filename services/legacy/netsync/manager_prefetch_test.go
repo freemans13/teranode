@@ -6,10 +6,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
-	"github.com/bsv-blockchain/go-wire"
-	"github.com/bsv-blockchain/teranode/errors"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -76,43 +73,6 @@ func TestPeerStateResolvingPrimary(t *testing.T) {
 		require.False(t, exists)
 		require.Same(t, peer, resolved)
 		require.Nil(t, state)
-	})
-}
-
-// TestUsePrefetchIngestion proves OnBlock's gate across the full budget {0,
-// positive} × net {mainnet, testnet, regtest} matrix: prefetch ingestion is used
-// only with a configured budget and off regression net, so regtest keeps the
-// synchronous submit-then-query ordering the acceptance tooling depends on. It
-// asserts the gate tracks the shared peerpkg.UseBlockPrefetchIngestion predicate
-// so the sync manager and the read-loop's shouldArmProcessingTimer cannot drift.
-func TestUsePrefetchIngestion(t *testing.T) {
-	budgets := []int64{0, 100}
-	params := []*chaincfg.Params{&chaincfg.MainNetParams, &chaincfg.TestNetParams, &chaincfg.RegressionNetParams}
-
-	for _, budget := range budgets {
-		for _, p := range params {
-			sm := &SyncManager{chainParams: p}
-			if budget > 0 {
-				sm.blockPrefetchBudgetBytes = budget
-				sm.blockPrefetchBudget = semaphore.NewWeighted(budget)
-			}
-
-			want := budget > 0 && p.Net != wire.RegTestNet
-
-			// The shared predicate is true exactly for a positive budget off regtest.
-			require.Equal(t, want, peerpkg.UseBlockPrefetchIngestion(budget, p.Net))
-
-			// The gate tracks the shared predicate for the manager's own budget/net.
-			require.Equal(t, peerpkg.UseBlockPrefetchIngestion(budget, p.Net), sm.UsePrefetchIngestion())
-		}
-	}
-
-	// A nil chainParams fails closed to the synchronous path — no panic, prefetch
-	// off — even with a configured budget. Regression guard for #1279: the deref
-	// used to happen as a call argument, before the budget short-circuit.
-	t.Run("nil chainParams fails closed", func(t *testing.T) {
-		sm := &SyncManager{blockPrefetchBudgetBytes: 100, blockPrefetchBudget: semaphore.NewWeighted(100)}
-		require.NotPanics(t, func() { require.False(t, sm.UsePrefetchIngestion()) })
 	})
 }
 
@@ -373,58 +333,26 @@ func TestAcquireBlockPrefetch_DisabledSkipsDedup(t *testing.T) {
 	require.NotPanics(t, func() { sm.ReleaseBlockPrefetch(h, 0) })
 }
 
+// TestLocalReadBackpressured now covers only the waiter half of the old test.
+// The backlog half (a queued / mid-validation blockQueueMsg backlog also
+// counting as self-backpressure, gated on a lastChainProgress staleness check)
+// is gone along with blockBacklog and lastChainProgress themselves: there is no
+// decoded block queue left to accumulate a backlog on. localReadBackpressured
+// (manager.go) is now exactly "a budget is configured and something is parked
+// on it".
 func TestLocalReadBackpressured(t *testing.T) {
-	// stale backdates the progress stamp well past the stall timeout so a
-	// non-empty backlog reads as a hung pipeline rather than progressing work.
-	stale := func(sm *SyncManager) {
-		sm.lastChainProgress.Store(time.Now().Add(-time.Hour).UnixNano())
-	}
-
-	t.Run("kill switch (budget nil): suppression is unconditional on any backlog", func(t *testing.T) {
+	t.Run("kill switch (budget nil): never backpressured", func(t *testing.T) {
 		sm := newPrefetchManager(0)
 		require.False(t, sm.localReadBackpressured())
 
-		// A queued / mid-validation backlog is self-backpressure: suppress the stall
-		// check. On the kill-switch path the per-message watchdog is still armed for
-		// blocks and owns processing-stall liveness, so suppression here stays
-		// UNCONDITIONAL — exactly as pre-prefetch.
-		sm.blockBacklog.Add(1)
-		sm.noteChainProgress()
-		require.True(t, sm.localReadBackpressured())
-
-		// Even a stale progress stamp must NOT lift suppression on the kill switch:
-		// timeout-gating would rotate a healthy sync peer on a legitimately slow
-		// block, churn the "proven synchronous" path never produced.
-		stale(sm)
-		require.True(t, sm.localReadBackpressured())
-
-		sm.blockBacklog.Add(-1)
-		require.False(t, sm.localReadBackpressured())
+		sm.blockPrefetchWaiters.Add(1)
+		require.False(t, sm.localReadBackpressured(), "a nil budget has no waiter semaphore of its own to report on")
 	})
 
-	t.Run("enabled: suppresses on a progressing backlog or a budget waiter", func(t *testing.T) {
+	t.Run("enabled: suppresses exactly while a read-loop is parked on the budget", func(t *testing.T) {
 		sm := newPrefetchManager(100)
 		require.False(t, sm.localReadBackpressured())
 
-		// A progressing backlog is self-backpressure: a stale last-block-time
-		// then reflects our validation speed, not the peer.
-		sm.blockBacklog.Add(5)
-		sm.noteChainProgress()
-		require.True(t, sm.localReadBackpressured())
-
-		// Progress has stalled past the timeout — a genuine hang. Deliberately do
-		// NOT fall through to the waiter signal: a hung pipeline with a full budget
-		// accumulates waiters, and we WANT rotation then.
-		stale(sm)
-		require.False(t, sm.localReadBackpressured())
-		sm.blockPrefetchWaiters.Add(1)
-		require.False(t, sm.localReadBackpressured())
-		sm.blockPrefetchWaiters.Add(-1)
-
-		sm.blockBacklog.Add(-5)
-		require.False(t, sm.localReadBackpressured())
-
-		// A read-loop parked in AcquireBlockPrefetch is also self-backpressure.
 		sm.blockPrefetchWaiters.Add(1)
 		require.True(t, sm.localReadBackpressured())
 
@@ -435,10 +363,14 @@ func TestLocalReadBackpressured(t *testing.T) {
 
 // TestHandleCheckSyncPeer_PrefetchBackpressure proves the stall detector
 // suppresses rotation while the node is backpressured by its own block
-// processing — either a read-loop parked on the prefetch budget OR any queued /
-// mid-validation backlog — so a healthy peer is not rotated merely because a
-// block is slow to validate. It still rotates a genuinely idle stalled peer once
-// that self-backpressure clears.
+// processing — a read-loop parked on the prefetch budget — so a healthy peer is
+// not rotated merely because a block is slow to validate. It still rotates a
+// genuinely idle stalled peer once that self-backpressure clears.
+//
+// This used to also cover a queued / mid-validation backlog suppressing
+// rotation on its own, gated on a lastChainProgress staleness check; both are
+// gone with the decoded block queue (blockBacklog, lastChainProgress), so the
+// only self-backpressure signal left is the prefetch waiter count.
 func TestHandleCheckSyncPeer_PrefetchBackpressure(t *testing.T) {
 	newStalledState := func() *syncPeerState {
 		return &syncPeerState{
@@ -473,36 +405,7 @@ func TestHandleCheckSyncPeer_PrefetchBackpressure(t *testing.T) {
 		require.Equal(t, sp, sm.loadSyncPeer())
 	})
 
-	t.Run("keeps sync peer while a backlog is draining (slow but progressing validation)", func(t *testing.T) {
-		sp := &peerpkg.Peer{}
-		sm := newSyncManager(sp, newStalledState())
-
-		// Blocks queued / mid-validation with a fresh progress stamp and no
-		// read-loop parked: the backlog is advancing, so a stale last-block-time
-		// reflects our validation speed, not the peer. The healthy peer must be
-		// kept (rotation would panic in this minimal SyncManager).
-		sm.blockBacklog.Add(3)
-		sm.noteChainProgress()
-
-		require.NotPanics(t, func() { sm.handleCheckSyncPeer() })
-		require.Equal(t, sp, sm.loadSyncPeer())
-	})
-
-	t.Run("rotates when the backlog has stalled past the processing timeout", func(t *testing.T) {
-		sp := &peerpkg.Peer{}
-		sm := newSyncManager(sp, newStalledState())
-
-		// A non-empty backlog whose progress stamp predates the stall timeout is a
-		// hung pipeline, not slow-but-progressing validation: suppression lifts and
-		// the rotation path runs (panicking in this minimal SyncManager, which
-		// proves it ran rather than being suppressed).
-		sm.blockBacklog.Add(3)
-		sm.lastChainProgress.Store(time.Now().Add(-time.Hour).UnixNano())
-
-		require.Panics(t, func() { sm.handleCheckSyncPeer() })
-	})
-
-	t.Run("rotates a genuinely idle stalled peer (no backlog, no waiters)", func(t *testing.T) {
+	t.Run("rotates a genuinely idle stalled peer (no waiters)", func(t *testing.T) {
 		sp := &peerpkg.Peer{}
 		sm := newSyncManager(sp, newStalledState())
 
@@ -511,39 +414,4 @@ func TestHandleCheckSyncPeer_PrefetchBackpressure(t *testing.T) {
 		// which proves it ran rather than being suppressed).
 		require.Panics(t, func() { sm.handleCheckSyncPeer() })
 	})
-}
-
-// TestHandleBlockMsg_SkipsDisconnectedPeer proves the async prefetch path stops
-// validating a peer's queued blocks once that peer is disconnected: after
-// awaitBlockResult disconnects on the first bad block, the remaining FIFO tail
-// must be skipped rather than fully validated. The skip must be a benign
-// ServiceError (not disconnect-worthy) so it only releases budget and logs, and
-// it must return before any FSM/blockchain work (blockchainClient is nil here,
-// so reaching that code would panic).
-func TestHandleBlockMsg_SkipsDisconnectedPeer(t *testing.T) {
-	sm := &SyncManager{
-		logger:                   ulogger.TestLogger{},
-		chainParams:              &chaincfg.MainNetParams,
-		peerStates:               txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-		blockPrefetchBudgetBytes: 100,
-		blockPrefetchBudget:      semaphore.NewWeighted(100),
-	}
-
-	// A zero-value Peer has never been marked connected, so Connected() is false,
-	// standing in for a peer awaitBlockResult has just disconnected.
-	p := &peerpkg.Peer{}
-	require.False(t, p.Connected())
-	sm.peerStates.Set(p, &peerSyncState{})
-
-	err := sm.handleBlockMsg(&blockQueueMsg{
-		blockHash: chainhash.Hash{0x01},
-		peer:      p,
-	})
-
-	require.Error(t, err)
-	require.True(t, errors.Is(err, errors.ErrServiceError), "skip must be benign to shouldDisconnectOnBlockErr")
-
-	// Sanity: the skip is only reached because prefetch ingestion is active; the
-	// synchronous/regtest path is gated out and would proceed toward validation.
-	require.True(t, sm.UsePrefetchIngestion())
 }

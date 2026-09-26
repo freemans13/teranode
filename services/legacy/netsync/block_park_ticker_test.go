@@ -50,15 +50,15 @@ func TestSyncManager_TheBlockHandlerRunsTheParkSweep(t *testing.T) {
 
 	child := h.blocks[1].MsgBlock().BlockHash()
 
-	// The child arrives before its parent and parks.
-	h.client.On("GetBlockExists", mock.Anything, &child).Return(false, nil).Once()
+	// The child arrives before its parent and parks. The streaming route
+	// (handleBlockOnDiskMsg) never calls GetBlockExists while parking — only a
+	// real commit attempt does — so nothing needs scripting for the arrival
+	// itself; the parent is in the chain, but nothing in this node committed
+	// it, so no drain was ever triggered — the state a restart leaves behind.
+	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
-
-	// The parent is in the chain, but nothing in this node committed it, so no
-	// drain was ever triggered — the state a restart leaves behind.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
 	// And usable, not merely present: the sweep asks that as one question now,
 	// because invalidation is a flag on the row rather than a delete, so a
