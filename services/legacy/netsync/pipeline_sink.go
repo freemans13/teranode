@@ -28,7 +28,7 @@ import (
 //
 // The bool it returns is the ONLY honest source of "did this delivery convert
 // the block" anywhere in the system: true only on the path that actually wrote
-// a converted record, false on every other return including the fallback.
+// a converted record, false on every other return.
 // handleBlockOnDiskMsg reads it off BlockBody.Converted rather than inferring
 // conversion by asking whether some blob happens to exist for this hash — see
 // that field's doc comment for why a blob's mere existence is the wrong
@@ -252,17 +252,10 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 }
 
 // pipelineBlockDelete is the pipeline path's orphan-delete callback, installed
-// alongside pipelineBlockSink for the same reason streamingBlockDelete is
-// installed alongside streamingBlockSink: a body can be written successfully
-// and only then found unusable by the wire layer's own post-sink checks (the
-// short-body check or the transaction-count read in readBlockMessage,
+// alongside pipelineBlockSink: a body can be converted successfully and only
+// then found unusable by the wire layer's own post-sink checks (the short-body
+// check or the transaction-count read in readBlockMessage,
 // services/legacy/peer/wire_streaming.go).
-//
-// Before FIX 3, installStreamingBlockPath installed streamingBlockDelete
-// unconditionally, whichever sink was active. That deletes from the park's
-// blob store; the pipeline sink never writes there, so that delete found
-// nothing to remove while the subtree files the pipeline sink actually wrote
-// were left behind forever.
 //
 // converted is THIS call's own answer to "did the delivery that just failed
 // actually convert anything" — blockBodySink's own return value for that one
@@ -302,58 +295,51 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // clause moving later, matching subtreeWriter's own belt-and-braces choice,
 // not because removing it would delete the wrong file today.
 //
-// The converted record itself is NOT deleted here. It is deleted inside
-// blockPark.Delete, which streamingBlockDelete below calls unconditionally, so
-// that every path that retires a park entry — not only this discard path —
-// retires the record with it. Deleting it a second time here would only race
-// that call harmlessly, so there is nothing to gain by keeping a second delete
-// site, and something to lose: two call sites making the same decision drift
-// apart the moment only one of them is updated.
+// The converted record itself is deleted by blockPark.Delete, which every path
+// that retires a park entry goes through, not only this discard path.
 func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) error {
+	// A delivery that converted nothing wrote nothing: it was a drained copy of a block
+	// another copy is converting or has converted. Deleting anything under the hash here
+	// used to remove that other copy's record, and the block was then downloaded again.
+	if !converted {
+		return nil
+	}
+
 	var firstErr error
 
-	if converted {
-		record, err := sm.blockPark.ReadConverted(sm.ctx, hash)
+	record, err := sm.blockPark.ReadConverted(sm.ctx, hash)
 
-		switch {
-		case err == nil && record != nil:
-			structureType := fileformat.FileTypeSubtreeToCheck
-			if record.Height != 0 && sm.quickValidationAllowed(sm.blockOrigin(hash), record.Height) {
-				structureType = fileformat.FileTypeSubtree
-			}
+	switch {
+	case err == nil && record != nil:
+		structureType := fileformat.FileTypeSubtreeToCheck
+		if record.Height != 0 && sm.quickValidationAllowed(sm.blockOrigin(hash), record.Height) {
+			structureType = fileformat.FileTypeSubtree
+		}
 
-			for _, root := range record.Subtrees {
-				for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, structureType} {
-					if delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft); delErr != nil && firstErr == nil {
-						firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
-					}
+		for _, root := range record.Subtrees {
+			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, structureType} {
+				if delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft); delErr != nil && firstErr == nil {
+					firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
 				}
 			}
-
-		case err != nil && !errors.Is(err, errors.ErrNotFound):
-			// converted being true means THIS call's own sink wrote a record,
-			// so a not-found error here is not the ordinary case it would be
-			// otherwise — it means the write this call just made cannot be
-			// read back. Either way, this is a store timeout, a permit-pool
-			// wait that ran out, or ReadConverted's own hash-mismatch refusal
-			// — every one of which means the subtree files this block's sink
-			// actually wrote are NOT being deleted here, exactly the failure
-			// mode deleteWrittenOnFailure's own comment warns about for the
-			// same reason: an unlogged cleanup failure is indistinguishable
-			// from a cleanup that never needed to run.
-			sm.logger.Warnf("[pipelineBlockDelete][%s] could not read back the record this delivery just converted, so its subtree files were not deleted: %v", hash, err)
 		}
+
+	case err != nil && !errors.Is(err, errors.ErrNotFound):
+		// converted being true means THIS call's own sink wrote a record,
+		// so a not-found error here is not the ordinary case it would be
+		// otherwise — it means the write this call just made cannot be
+		// read back. Either way, this is a store timeout, a permit-pool
+		// wait that ran out, or ReadConverted's own hash-mismatch refusal
+		// — every one of which means the subtree files this block's sink
+		// actually wrote are NOT being deleted here, exactly the failure
+		// mode deleteWrittenOnFailure's own comment warns about for the
+		// same reason: an unlogged cleanup failure is indistinguishable
+		// from a cleanup that never needed to run.
+		sm.logger.Warnf("[pipelineBlockDelete][%s] could not read back the record this delivery just converted, so its subtree files were not deleted: %v", hash, err)
 	}
 
-	// Unconditional regardless of converted: on the admission-budget fallback
-	// (admitPipelineSink's duplicate-in-flight and acquire-timeout cases) this
-	// call's own sink wrote a raw body here (streamingBlockSink, converted
-	// false), and on every path this also retires whatever the park holds for
-	// hash — see blockPark.Delete's own comment on why attempting both file
-	// types is safe even though only one of them is ever this call's own.
-	if err := sm.streamingBlockDelete(hash, converted); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	// This delivery's own record, and the park's entry for it if it has one.
+	sm.blockPark.Delete(sm.ctx, parkedBlock{hash: hash})
 
 	return firstErr
 }

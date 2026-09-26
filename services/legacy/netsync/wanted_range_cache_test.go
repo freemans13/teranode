@@ -70,10 +70,8 @@ func TestUnownedBlocks_DropsBlocksAlreadyOnDisk(t *testing.T) {
 	park, _ := newTestPark(t, "")
 	sm.blockPark = park
 
-	held := chainhash.Hash{0x01}
+	held := heldRecord(t, sm, 0x01)
 	wanted := chainhash.Hash{0x02}
-
-	require.NoError(t, sm.blockPark.store.Set(context.Background(), held[:], parkFileType, []byte("body"), parkOpts...))
 
 	got := sm.unownedBlocks([]wantedBlock{
 		{height: 101, hash: held},

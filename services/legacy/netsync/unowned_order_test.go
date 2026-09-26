@@ -80,15 +80,13 @@ func TestDownloadPassDoesNotReadTheDiskForABlockAlreadyRequested(t *testing.T) {
 // between it and a re-request.
 func TestDownloadPassNeverRequestsABlockItHoldsOnDisk(t *testing.T) {
 	sm, _ := orderManager(t)
-	hash := chainhash.Hash{0x13}
+	hash := heldRecord(t, sm, 0x13)
 
 	past := time.Now().Add(-2 * blockRequestRetryInterval)
 	sm.blockDownloads.now = func() time.Time { return past }
 	owner := newTestPeer(t, "10.0.0.1:8333")
 	require.True(t, sm.blockDownloads.Add(owner, hash))
 	sm.blockDownloads.now = time.Now
-
-	require.NoError(t, sm.blockPark.store.Set(context.Background(), hash[:], parkFileType, []byte("body"), parkOpts...))
 
 	require.Empty(t, sm.unownedBlocks([]wantedBlock{{height: 100, hash: hash}}), "held on disk, so not requested")
 	require.Equal(t, 1, sm.blockDownloads.CountForPeer(owner), "and its owner is not forgiven on another peer's behalf")

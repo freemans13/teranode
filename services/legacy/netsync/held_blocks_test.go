@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/file"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -26,20 +27,6 @@ import (
 // convertedRecordWithSubtrees is the package's existing helper
 // (block_park_recover_subtrees_test.go) for building a converted record whose
 // hash is its own header hash, which is what ReadConverted checks against.
-
-func TestHoldsBlock_FindsAWholeBlockOnDisk(t *testing.T) {
-	park, _ := newTestPark(t, "")
-	sm := &SyncManager{logger: ulogger.TestLogger{}, blockPark: park}
-	hash := chainhash.Hash{0x01}
-
-	require.False(t, sm.holdsBlock(context.Background(), hash),
-		"nothing has been written, so nothing is held")
-
-	require.NoError(t, sm.blockPark.store.Set(context.Background(), hash[:], parkFileType, []byte("body"), parkOpts...))
-
-	require.True(t, sm.holdsBlock(context.Background(), hash),
-		"a whole block written by the streaming path must be found")
-}
 
 // TestHoldsBlock_FindsACompleteConvertedRecordOnDisk is the reverse of
 // TestHoldsBlock_ExcludesARecordWithAMissingSubtreeFile: a record whose
@@ -63,8 +50,9 @@ func TestHoldsBlock_FindsACompleteConvertedRecordOnDisk(t *testing.T) {
 	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
 
+	require.False(t, park.Has(hash), "the entry map knows nothing about it, which is the state a restart is in")
 	require.True(t, sm.holdsBlock(ctx, hash),
-		"a converted record written by the pipeline path, with its subtree file present, must be found too, or every pipelined block is downloaded twice")
+		"a converted record written by the pipeline path, with its subtree file present, must be found from the files, or every pipelined block is downloaded twice")
 }
 
 // TestHoldsBlock_ExcludesARecordWithAMissingSubtreeFile is the test that would
@@ -94,25 +82,29 @@ func TestHoldsBlock_ExcludesARecordWithAMissingSubtreeFile(t *testing.T) {
 		"the record exists but its subtree file does not, so this is not a block the node can commit and must be requested again")
 }
 
-// TestHoldsBlock_DoesNotConsultTheEntryMap is the point of the whole task. The
-// park's own Has() reads the in-memory map, which is empty on a restarting node
-// before recovery and cannot answer for a block on disk.
-func TestHoldsBlock_DoesNotConsultTheEntryMap(t *testing.T) {
-	park, _ := newTestPark(t, "")
-	sm := &SyncManager{logger: ulogger.TestLogger{}, blockPark: park}
-	hash := chainhash.Hash{0x03}
-
-	require.NoError(t, sm.blockPark.store.Set(context.Background(), hash[:], parkFileType, []byte("body"), parkOpts...))
-
-	require.False(t, sm.blockPark.Has(hash),
-		"the entry map knows nothing about it, which is the state a restart is in")
-	require.True(t, sm.holdsBlock(context.Background(), hash),
-		"and the files must answer anyway")
-}
-
 func TestHoldsBlock_IsSafeWithNoPark(t *testing.T) {
 	sm := &SyncManager{logger: ulogger.TestLogger{}}
 
 	require.False(t, sm.holdsBlock(context.Background(), chainhash.Hash{0x04}),
 		"no park means nothing is held, which is the safe direction: we re-ask rather than skip")
+}
+
+// heldRecord puts a complete converted block on disk for sm, as the pipeline sink leaves one: its
+// record in the park's store and its subtree file in the subtree store. It returns the block's hash.
+func heldRecord(t *testing.T, sm *SyncManager, seed byte) chainhash.Hash {
+	t.Helper()
+
+	if sm.subtreeStore == nil {
+		sm.subtreeStore = memory.New()
+	}
+
+	hash := parkedRecord(t, sm.blockPark, chainhash.Hash{0x0e, seed}, seed)
+	record, err := sm.blockPark.ReadConverted(context.Background(), hash)
+	require.NoError(t, err)
+
+	for _, root := range record.Subtrees {
+		require.NoError(t, sm.subtreeStore.Set(context.Background(), root[:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	}
+
+	return hash
 }

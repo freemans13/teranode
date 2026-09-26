@@ -5,6 +5,9 @@ import (
 	"crypto/rand"
 	"io"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,6 +42,17 @@ func (s *parkStallingStore) GetIoReader(ctx context.Context, key []byte, fileTyp
 	}
 
 	return s.Store.GetIoReader(ctx, key, fileType, opts...)
+}
+
+func (s *parkStallingStore) Get(ctx context.Context, key []byte, fileType fileformat.FileType,
+	opts ...options.FileOption) ([]byte, error) {
+	if s.stalling.Load() {
+		<-ctx.Done()
+
+		return nil, errors.NewServiceUnavailableError("no read permit available")
+	}
+
+	return s.Store.Get(ctx, key, fileType, opts...)
 }
 
 // TestBlockPark_RecoveryGivesUpRatherThanHoldingUpTheStart is about how long a
@@ -89,7 +103,7 @@ func TestBlockPark_RecoveryGivesUpRatherThanHoldingUpTheStart(t *testing.T) {
 		_, err = rand.Read(body)
 		require.NoError(t, err)
 
-		require.NoError(t, store.Set(ctx, hash[:], fileformat.FileTypeMsgBlock, body, parkOpts...))
+		require.NoError(t, store.Set(ctx, hash[:], fileformat.FileTypeBlock, body, parkOpts...))
 	}
 
 	require.GreaterOrEqual(t, len(parkDirEntries(t, park.dir)), files, "the previous run's files should all be there")
@@ -158,7 +172,7 @@ func TestBlockPark_RecoveryKeepsABlockItCouldNotRead(t *testing.T) {
 		_, err = rand.Read(body)
 		require.NoError(t, err)
 
-		require.NoError(t, store.Set(ctx, hash[:], fileformat.FileTypeMsgBlock, body, parkOpts...))
+		require.NoError(t, store.Set(ctx, hash[:], fileformat.FileTypeBlock, body, parkOpts...))
 	}
 
 	before := parkDirEntries(t, park.dir)
@@ -173,4 +187,44 @@ func TestBlockPark_RecoveryKeepsABlockItCouldNotRead(t *testing.T) {
 
 	require.ElementsMatch(t, before, parkDirEntries(t, park.dir),
 		"a read that could not get a permit says nothing about the block, so every file must still be there")
+}
+
+// A whole raw block an older build parked is deleted on restart, with its checksum sidecar, and
+// not adopted: nothing commits a raw block any more, and the block is simply downloaded again.
+func TestBlockPark_RecoveryDeletesARawBlockAnOlderBuildLeft(t *testing.T) {
+	root := t.TempDir()
+
+	storeURL, err := url.Parse("file://" + root)
+	require.NoError(t, err)
+
+	store, err := blob.NewStore(ulogger.TestLogger{}, storeURL)
+	require.NoError(t, err)
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.TempStore = storeURL
+
+	park := mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
+	ctx := context.Background()
+
+	var hash chainhash.Hash
+
+	_, err = rand.Read(hash[:])
+	require.NoError(t, err)
+	require.NoError(t, store.Set(ctx, hash[:], fileformat.FileTypeMsgBlock, []byte("an old raw block"), parkOpts...))
+
+	var raw string
+
+	for _, name := range parkDirEntries(t, park.dir) {
+		if strings.HasSuffix(name, "."+string(fileformat.FileTypeMsgBlock)) {
+			raw = name
+		}
+	}
+
+	require.NotEmpty(t, raw, "sanity: the raw block file is in the park directory")
+	require.NoError(t, os.WriteFile(filepath.Join(park.dir, raw+".sha256"), []byte("sum"), 0o600))
+
+	park.Recover(ctx, nil)
+
+	require.Zero(t, park.Len(), "a raw block is not adopted")
+	require.Empty(t, parkDirEntries(t, park.dir), "the raw block and its sidecar are gone")
 }

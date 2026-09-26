@@ -11,7 +11,7 @@ import (
 const (
 	admitConverted    = "converted as it arrived"
 	admitRawDuplicate = "drained unwritten: another copy was being converted"
-	admitRawTimedOut  = "raw: the wait for an admission slot timed out"
+	admitRawTimedOut  = "drained: the wait for an admission slot timed out"
 )
 
 // Thresholds for reporting a block's download. Below them a download says nothing new.

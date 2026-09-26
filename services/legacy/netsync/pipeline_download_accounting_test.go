@@ -195,21 +195,21 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 	require.True(t, converted, "a well-formed block below the checkpoint must convert, not merely be accepted")
 }
 
-// TestAdmitPipelineSink_FallsBackWhenAcquireTimesOut is the regression test for
+// TestAdmitPipelineSink_DrainsWhenAcquireTimesOut is the regression test for
 // fix-round item 1: a park in AcquireBlockPrefetch runs INSIDE readMessageStreaming
 // (services/legacy/peer/peer.go), and peer.inHandler only stops the peer's idle
 // timer AFTER that call returns, so an unbounded park here could trip that timer
 // and disconnect a perfectly healthy peer over this node's own admission
 // backpressure. admitPipelineSink now bounds the acquire strictly below
-// legacy_peerIdleTimeout and falls back to the plain body-write path rather
-// than erroring (an error here would disconnect the peer just as surely as the
-// idle timer would) or parking further.
+// legacy_peerIdleTimeout and drains the copy, so the block is asked for again,
+// rather than erroring (an error here would disconnect the peer just as surely as
+// the idle timer would) or parking further.
 //
 // legacy_peerIdleTimeout is set small so the bound (half of it) is reached in
 // well under a second rather than the real default's ~62.5s, keeping this test
 // fast without weakening what it proves: the held slot is never released, so
-// the only way the second call can return is by falling back.
-func TestAdmitPipelineSink_FallsBackWhenAcquireTimesOut(t *testing.T) {
+// the only way the second call can return is by draining.
+func TestAdmitPipelineSink_DrainsWhenAcquireTimesOut(t *testing.T) {
 	store := memory.New()
 	sm := newPipelineParkManager(t, store, 8)
 	sm.settings.Legacy.PeerIdleTimeout = 200 * time.Millisecond
@@ -261,10 +261,10 @@ func TestAdmitPipelineSink_FallsBackWhenAcquireTimesOut(t *testing.T) {
 		t.Fatal("the acquire must fall back once its bound expires, not park indefinitely on a slot that is never released")
 	}
 
-	require.NoError(t, sinkErr, "a timed-out acquire must fall back to the plain body-write path, not return an error that would cost the peer its connection")
-	require.False(t, converted, "the fallback path never converts, it only writes the whole body")
+	require.NoError(t, sinkErr, "a timed-out acquire must drain the copy, not return an error that would cost the peer its connection")
+	require.False(t, converted, "a drained copy converts nothing")
+	require.True(t, sm.takeDrainedDuplicate(hash), "the copy is accounted as drained, so the block is asked for again")
 
-	exists, err := sm.blockPark.store.Exists(context.Background(), hash[:], parkFileType)
-	require.NoError(t, err)
-	require.True(t, exists, "the fallback must have actually written the whole body via streamingBlockSink, not silently dropped it")
+	_, err = sm.blockPark.ReadConverted(context.Background(), hash)
+	require.Error(t, err, "nothing was written for the drained copy")
 }

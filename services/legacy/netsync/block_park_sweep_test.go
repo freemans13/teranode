@@ -128,12 +128,7 @@ func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
 func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T) {
 	park, dir := newTestPark(t, "")
 
-	blocks := minedBlocks(t, 1)
-	msgBlock := blocks[0].MsgBlock()
-	hash := msgBlock.BlockHash()
-
-	require.Equal(t, parkAccepted,
-		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	hash := parkedRecord(t, park, chainhash.Hash{0x0d}, 1)
 
 	// The node ran for a while, then restarted.
 	aged := time.Now().Add(-parkStuckThreshold - time.Minute)
