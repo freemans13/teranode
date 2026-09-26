@@ -25,8 +25,6 @@ func TestLegacyBlockPark_Defaults(t *testing.T) {
 	tSettings := NewSettings()
 
 	require.NotNil(t, tSettings)
-	require.True(t, tSettings.Legacy.ParkOutOfOrderBlocks,
-		"default must be on; false restores the old discard-the-block behaviour")
 	require.Equal(t, 10*time.Second, tSettings.Legacy.ParkStoreTimeout,
 		"default must be 10s, well under the blob store's own 25s permit deadline")
 	require.Less(t, tSettings.Legacy.ParkStoreTimeout, 25*time.Second,
@@ -37,16 +35,13 @@ func TestLegacyBlockPark_Defaults(t *testing.T) {
 // loader-never-reads-it mistake: distinctive configured values must come back
 // out of the loaded settings.
 func TestLegacyBlockPark_LoaderReadsOverrides(t *testing.T) {
-	gocore.Config().Set("legacy_parkOutOfOrderBlocks", "false")
 	gocore.Config().Set("legacy_parkStoreTimeout", "45s")
 
 	t.Cleanup(func() {
-		gocore.Config().Set("legacy_parkOutOfOrderBlocks", "")
 		gocore.Config().Set("legacy_parkStoreTimeout", "")
 	})
 
 	tSettings := NewSettings()
 
-	require.False(t, tSettings.Legacy.ParkOutOfOrderBlocks)
 	require.Equal(t, 45*time.Second, tSettings.Legacy.ParkStoreTimeout)
 }

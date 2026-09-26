@@ -308,17 +308,16 @@ type blockPark struct {
 	bytes    int64
 }
 
-// newBlockPark builds the park, or returns nil when there is not going to be
-// one. Every reason to refuse is logged, at WARN when it is a configuration the
-// operator may not have meant.
-func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blob.Store) *blockPark {
-	if tSettings == nil || !tSettings.Legacy.ParkOutOfOrderBlocks {
-		return nil
+// newBlockPark builds the park. It is not optional: every block legacy sync
+// downloads streams into it and is committed from it, so a node that cannot build
+// one refuses to start rather than running a route nothing uses any more.
+func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blob.Store) (*blockPark, error) {
+	if tSettings == nil {
+		return nil, errors.NewConfigurationError("[blockPark] no settings")
 	}
 
 	if store == nil {
-		logger.Warnf("[blockPark] out-of-order block parking is on but there is no temp store; blocks whose parent is missing will be discarded")
-		return nil
+		return nil, errors.NewConfigurationError("[blockPark] there is no temp store (temp_store) for the block park")
 	}
 
 	dir := parkDirectory(tSettings.Legacy.TempStore)
@@ -329,11 +328,8 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		}
 
 		// Not a directory we can enumerate, so a restart could never adopt or
-		// clean up what a previous run parked, and every blob would leak. Off is
-		// the only honest answer.
-		logger.Warnf("[blockPark] temp_store scheme %q cannot be scanned on restart, so out-of-order blocks will be discarded instead of parked", scheme)
-
-		return nil
+		// clean up what a previous run parked, and every blob would leak.
+		return nil, errors.NewConfigurationError("[blockPark] temp_store scheme %q cannot be scanned on restart; the block park needs a file:// temp store", scheme)
 	}
 
 	storeTimeout := tSettings.Legacy.ParkStoreTimeout
@@ -351,7 +347,7 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		entries:      make(map[chainhash.Hash]*parkedBlock),
 		children:     make(map[chainhash.Hash][]chainhash.Hash),
 		charged:      make(map[chainhash.Hash]int64),
-	}
+	}, nil
 }
 
 // parkDirectory works out where the park's blobs land, using the file store's

@@ -82,15 +82,17 @@ func TestNew_BuildsAHeaderCache(t *testing.T) {
 		DisableCheckpoints: true,
 	}
 
+	tSettings := &settings.Settings{}
+
 	sm, err := New(
 		ctx,
 		ulogger.TestLogger{},
-		&settings.Settings{},
+		tSettings,
 		client,
 		&validator.MockValidator{},
 		&utxo.MockUtxostore{},
 		blob_memory.New(),
-		nil,
+		parkTempStore(t, tSettings),
 		&subtreevalidation.MockSubtreeValidation{},
 		&blockvalidation.MockBlockValidation{},
 		blockassembly.NewMock(),

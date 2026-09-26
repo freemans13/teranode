@@ -748,7 +748,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockDownloadWindow:       getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
 			BlockDownloadLowerWindow:  getInt("legacy_blockDownloadLowerWindow", 128, alternativeContext...),
 
-			ParkOutOfOrderBlocks:     getBool("legacy_parkOutOfOrderBlocks", true, alternativeContext...),
 			ParkStoreTimeout:         getDuration("legacy_parkStoreTimeout", 10*time.Second, alternativeContext...),
 			ParkWorkers:              getInt("legacy_parkWorkers", 2, alternativeContext...),
 			PeerRegistryEnabled:      getBool("legacy_peerRegistryEnabled", true, alternativeContext...),

@@ -265,15 +265,17 @@ func TestNew_CommittedTipReadsTheChainThroughTheConstructor(t *testing.T) {
 		DisableCheckpoints: true,
 	}
 
+	tSettings := &settings.Settings{}
+
 	sm, err := New(
 		ctx,
 		ulogger.TestLogger{},
-		&settings.Settings{},
+		tSettings,
 		client,
 		&validator.MockValidator{},
 		&utxo.MockUtxostore{},
 		blob_memory.New(),
-		nil,
+		parkTempStore(t, tSettings),
 		&subtreevalidation.MockSubtreeValidation{},
 		&blockvalidation.MockBlockValidation{},
 		blockassembly.NewMock(),
@@ -326,7 +328,6 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.TempStore = storeURL
-	tSettings.Legacy.ParkOutOfOrderBlocks = true
 	tSettings.Legacy.BlockDownloadLowerWindow = propertyDepth
 
 	// BlockDownloadWindow stays at its real default here too, for the same
@@ -347,7 +348,7 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 	sm.rejectedTxns = txmap.NewSyncedMap[chainhash.Hash, struct{}](100)
 	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Minute)
-	sm.blockPark = newBlockPark(ulogger.TestLogger{}, tSettings, store)
+	sm.blockPark = mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, sm.blockPark, "the park must be built or this test measures nothing")
 
 	t.Cleanup(func() { sm.recentlyFailedBlocks.Stop() })

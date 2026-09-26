@@ -124,7 +124,7 @@ func Test_HandleBlockDirect(t *testing.T) {
 		validatorClient,
 		utxoStore,
 		subtreeStore,
-		nil,
+		parkTempStore(t, tSettings),
 		subtreeValidation,
 		blockValidation,
 		blockAssemblyClient,

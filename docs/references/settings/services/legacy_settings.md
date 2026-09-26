@@ -48,7 +48,6 @@ and no loader line arrives as its zero value whatever an operator writes.
 | MaxBlocksInTransitPerPeer | int | 16 | legacy_maxBlocksInTransitPerPeer | Block bodies one peer may owe at once. The block-size ladder lowers it further for large blocks. Also sizes the pipeline's admission budget, at four slots per peer |
 | BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Block bodies the whole node may have outstanding, counting every peer together. A count, not svnode's per-peer height range |
 | BlockDownloadLowerWindow | int | 128 | legacy_blockDownloadLowerWindow | How far above the committed tip a block may be asked for, scaled down by the block-size ladder and clamped to BlockDownloadWindow. 0 leaves BlockDownloadWindow as the only bound |
-| ParkOutOfOrderBlocks | bool | true | legacy_parkOutOfOrderBlocks | Write a block whose parent is not committed yet to the temp store and commit it when the parent lands, instead of discarding it |
 | ParkStoreTimeout | time.Duration | 10s | legacy_parkStoreTimeout | Deadline on each park blob store operation, bounding the wait for the file store's shared permits. Values below 1s are raised to 1s |
 | ParkWorkers | int | 2 | legacy_parkWorkers | Workers that check and write parked blocks, keeping that work off the in-order commit goroutine. 0 or less becomes 1 |
 | PeerRegistryEnabled | bool | true | legacy_peerRegistryEnabled | Mirror connected legacy peers into the centralized peer registry so the dashboard can show them |
@@ -248,7 +247,6 @@ peer-selection decision, and the legacy service's own sync engine
 | GRPCAddress | Must not be empty | Client creation returns a configuration error | During client initialization |
 | TempStore | Must be set | Daemon returns "temp_store config not found" | During store construction |
 | ListenAddresses | Falls back to the outbound interface IP and the network's default port if empty | Network connectivity | During server start |
-| ParkOutOfOrderBlocks | Needs a file:// temp store that can be scanned on restart | The park switches itself off with a warning and out-of-order blocks are discarded | During sync manager construction |
 | ParkStoreTimeout | Raised to 1s if lower | A zero deadline would fail every store operation instantly | During sync manager construction |
 | ParkWorkers | Raised to 1 if 0 or less | The pool always has at least one worker | During sync manager construction |
 | BlockDownloadLowerWindow | Clamped to BlockDownloadWindow; 0 or less means no read-ahead limit | Decides how far above the committed tip blocks are fetched | On every assignment pass |

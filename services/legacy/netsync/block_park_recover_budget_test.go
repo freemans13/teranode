@@ -72,7 +72,7 @@ func TestBlockPark_RecoveryGivesUpRatherThanHoldingUpTheStart(t *testing.T) {
 	// between bounded and unbounded is twenty seconds against three.
 	tSettings.Legacy.ParkStoreTimeout = time.Second
 
-	park := newBlockPark(ulogger.TestLogger{}, tSettings, store)
+	park := mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, park)
 
 	// What a previous run left behind. The contents do not matter: recovery
@@ -143,7 +143,7 @@ func TestBlockPark_RecoveryKeepsABlockItCouldNotRead(t *testing.T) {
 	tSettings.Legacy.TempStore = storeURL
 	tSettings.Legacy.ParkStoreTimeout = time.Second
 
-	park := newBlockPark(ulogger.TestLogger{}, tSettings, store)
+	park := mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, park)
 
 	ctx := context.Background()
