@@ -29,58 +29,6 @@ func newPrefetchManager(budget int64) *SyncManager {
 	return sm
 }
 
-// TestBlockRequested covers the pre-admission gate that stops a misbehaving
-// peer from flooding unrequested blocks into the prefetch budget: only blocks we
-// actually have an outstanding getdata for are admitted (regtest excepted).
-func TestBlockRequested(t *testing.T) {
-	hash := chainhash.Hash{0x01}
-
-	newSM := func(params *chaincfg.Params) *SyncManager {
-		return &SyncManager{
-			logger:         ulogger.TestLogger{},
-			chainParams:    params,
-			peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-			blockDownloads: newBlockDownloadTracker(blockRequestAssignmentTTL),
-		}
-	}
-
-	t.Run("regtest admits any block", func(t *testing.T) {
-		sm := newSM(&chaincfg.RegressionNetParams)
-		require.True(t, sm.BlockRequested(&peerpkg.Peer{}, &hash))
-	})
-
-	t.Run("copied regtest params admit any block", func(t *testing.T) {
-		// #1279: detection is by network magic, so a value copy of
-		// RegressionNetParams (distinct pointer) is still recognized as regtest —
-		// matching UsePrefetchIngestion so the two siblings cannot drift.
-		params := chaincfg.RegressionNetParams
-		sm := newSM(&params)
-		require.True(t, sm.BlockRequested(&peerpkg.Peer{}, &hash))
-	})
-
-	t.Run("requested block is admitted", func(t *testing.T) {
-		sm := newSM(&chaincfg.MainNetParams)
-		p := &peerpkg.Peer{}
-		sm.peerStates.Set(p, &peerSyncState{})
-		sm.blockDownloads.Add(p, hash)
-
-		require.True(t, sm.BlockRequested(p, &hash))
-	})
-
-	t.Run("unrequested block from a known peer is rejected", func(t *testing.T) {
-		sm := newSM(&chaincfg.MainNetParams)
-		p := &peerpkg.Peer{}
-		sm.peerStates.Set(p, &peerSyncState{})
-
-		require.False(t, sm.BlockRequested(p, &hash))
-	})
-
-	t.Run("block from an unknown peer is rejected", func(t *testing.T) {
-		sm := newSM(&chaincfg.MainNetParams)
-		require.False(t, sm.BlockRequested(&peerpkg.Peer{}, &hash))
-	})
-}
-
 // TestPeerStateResolvingPrimary covers the stream→primary resolution walk shared
 // by handleBlockMsg/handleHeadersMsg/handleInvMsg/BlockRequested: a registered
 // peer resolves to itself, an unregistered stream sub-peer resolves to its
@@ -166,32 +114,6 @@ func TestUsePrefetchIngestion(t *testing.T) {
 		sm := &SyncManager{blockPrefetchBudgetBytes: 100, blockPrefetchBudget: semaphore.NewWeighted(100)}
 		require.NotPanics(t, func() { require.False(t, sm.UsePrefetchIngestion()) })
 	})
-}
-
-// TestIsRegtest pins the value semantics of the sync manager's single regtest
-// predicate: regtest is detected by network magic, not pointer identity with
-// chaincfg.RegressionNetParams, so a copied Params value (as some tests
-// construct) still counts; mainnet does not; and a nil chainParams fails closed.
-func TestIsRegtest(t *testing.T) {
-	regtestCopy := chaincfg.RegressionNetParams // value copy: pointer differs, .Net matches
-
-	tests := []struct {
-		name   string
-		params *chaincfg.Params
-		want   bool
-	}{
-		{name: "nil chain params", params: nil, want: false},
-		{name: "global regtest pointer", params: &chaincfg.RegressionNetParams, want: true},
-		{name: "copied regtest params", params: &regtestCopy, want: true},
-		{name: "mainnet", params: &chaincfg.MainNetParams, want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sm := &SyncManager{chainParams: tt.params}
-			require.Equal(t, tt.want, sm.isRegtest())
-		})
-	}
 }
 
 func TestAcquireBlockPrefetch_Disabled(t *testing.T) {

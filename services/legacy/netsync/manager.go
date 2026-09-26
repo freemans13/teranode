@@ -1407,25 +1407,6 @@ func (sm *SyncManager) IsHeadersFirstMode() bool {
 	return sm.headersFirstMode.Load()
 }
 
-// isRegtest reports whether the active chain params are regression net by
-// network magic rather than pointer identity with chaincfg.RegressionNetParams,
-// so a copied Params value (as some tests construct) is still recognized, and a
-// nil chainParams is safely not-regtest. It exists to give BlockRequested the
-// SAME value semantics as peerpkg.UseBlockPrefetchIngestion (.Net != RegTestNet)
-// so those two prefetch-path siblings cannot drift on a copied-params manager.
-//
-// It deliberately does NOT replace the pointer-equality regtest checks
-// elsewhere in this file (startSync's headers-first gate, isSyncCandidate,
-// handleBlockMsg's unrequested-block disconnect). Those run on the synchronous
-// (non-prefetch) path that regtest always takes, and the E2E harness builds
-// chainParams as a *copy* of RegressionNetParams — so switching them to value
-// semantics flips real behavior (e.g. isSyncCandidate would apply the regtest
-// localhost restriction, and startSync would drop headers-first) and breaks
-// legacy-sync/smoketest. Pointer equality there is load-bearing; leave it.
-func (sm *SyncManager) isRegtest() bool {
-	return sm.chainParams != nil && sm.chainParams.Net == wire.RegTestNet
-}
-
 // isSyncCandidate returns whether or not the peer is a candidate to consider
 // syncing from.
 func (sm *SyncManager) isSyncCandidate(peer *peerpkg.Peer) bool {
@@ -5236,27 +5217,6 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 	sm.msgChan <- &txMsg{tx: tx, peer: peer, reply: done}
 }
 
-// QueueBlock adds the passed block message and peer to the block handling
-// queue. Responds to the done channel argument after the block message is
-// processed.
-func (sm *SyncManager) QueueBlock(block *bsvutil.Block, peer *peerpkg.Peer, done chan error, handedOff ...chan struct{}) {
-	// Don't accept more blocks if we're shutting down.
-	if atomic.LoadInt32(&sm.shutdown) != 0 {
-		done <- nil
-		return
-	}
-
-	msg := &blockMsg{block: block, peer: peer, reply: done}
-
-	// Variadic so the many callers that do not run under the prefetch path, the
-	// regtest tooling and this package's tests among them, are unchanged.
-	if len(handedOff) > 0 {
-		msg.handedOff = handedOff[0]
-	}
-
-	sm.msgChan <- msg
-}
-
 // UsePrefetchIngestion reports whether OnBlock should take the bounded async
 // prefetch path. It requires a configured budget AND that we are not on
 // regression net: the block-acceptance tooling depends on submit-then-query
@@ -5277,31 +5237,6 @@ func (sm *SyncManager) UsePrefetchIngestion() bool {
 	}
 
 	return peerpkg.UseBlockPrefetchIngestion(sm.blockPrefetchBudgetBytes, sm.chainParams.Net)
-}
-
-// BlockRequested reports whether blockHash is one we have an outstanding
-// getdata request for from the given peer (resolving stream peers to their
-// association primary, as handleBlockMsg does). It lets the read-loop reject
-// unrequested blocks BEFORE they consume prefetch budget, mirroring the
-// unrequested-block check in handleBlockMsg. Under async prefetch this is what
-// preserves the original backpressure: without it a misbehaving peer could
-// admit a flood of unrequested blocks against the shared budget — starving the
-// real sync peer and inflating buffered-block memory — before the downstream
-// per-block disconnect fires. On regtest it always returns true; the regression
-// harness intentionally feeds unrequested/duplicate blocks.
-func (sm *SyncManager) BlockRequested(peer *peerpkg.Peer, blockHash *chainhash.Hash) bool {
-	if sm.isRegtest() {
-		return true
-	}
-
-	// Resolve stream sub-peers to their association primary, as handleBlockMsg
-	// does; the ledger records the primary, so that is the identity to ask about.
-	_, primary, exists := sm.peerStateResolvingPrimary(peer)
-	if !exists {
-		return false
-	}
-
-	return sm.blockDownloads.HasOwner(primary, *blockHash)
 }
 
 // AcquireBlockPrefetch reserves prefetch budget for a block of the given
