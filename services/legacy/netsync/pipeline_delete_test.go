@@ -134,17 +134,10 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 	require.False(t, isConverted, "the converted record must be cleared too, not just the subtree files")
 }
 
-// TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite covers FIX 2's
-// out-of-order fallback. pipelineBlockSink itself no longer has an
-// unresolvable-parent fallback — it converts every block, resolved or not
-// (task 13) — but admitPipelineSink's own admission-budget fallback (a
-// duplicate hash already in flight, or the acquire timing out) still defers to
-// streamingBlockSink, which writes the raw body to the park under the
-// pipeline path's own name for what "the active sink wrote". The delete
-// callback installed for the pipeline path must still clean that up. This
-// calls streamingBlockSink directly to stand in for that fallback without
-// needing to reproduce the admission race that reaches it.
-func TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite(t *testing.T) {
+// A delivery that converted nothing wrote nothing, so deleting for it removes nothing. It is a
+// drained copy of a block another copy is converting or has converted, and deleting under the
+// hash used to remove that other copy's record, so the block was downloaded again.
+func TestPipelineBlockDelete_ADrainedCopyDeletesNothing(t *testing.T) {
 	ctx := t.Context()
 
 	subtreeStore := memory.New()
@@ -155,23 +148,25 @@ func TestPipelineBlockDelete_AlsoCleansUpTheFallbackParkWrite(t *testing.T) {
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, sinkErr := sm.streamingBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
-	require.NoError(t, sinkErr, "the fallback body write must succeed")
-	require.False(t, converted, "the fallback never converts, it only writes the raw body")
-
-	exists, err := parkStore.Exists(ctx, blk.Hash()[:], parkFileType)
+	// The other copy converts the block.
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err)
-	require.True(t, exists, "sanity: the fallback must have written the body to the park, or this test asserts nothing")
+	require.True(t, converted)
 
-	// converted: false — the fallback never converts (asserted above), so this
-	// is what the sink's own return value would actually be for this delivery.
-	// The raw body must still be cleaned up unconditionally, regardless of
-	// converted.
+	record, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err)
+
+	// A drained copy of the same block ends badly.
 	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), false))
 
-	exists, err = parkStore.Exists(ctx, blk.Hash()[:], parkFileType)
-	require.NoError(t, err)
-	require.False(t, exists, "the pipeline delete callback must also remove a body the fallback wrote to the park, not just subtree files")
+	_, err = sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err, "the other copy's record is still there")
+
+	for _, root := range record.Subtrees {
+		exists, err := subtreeStore.Exists(ctx, root[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, err)
+		require.True(t, exists, "and so are its subtree files")
+	}
 }
 
 // TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint is
@@ -305,7 +300,7 @@ func TestPipelineBlockDelete_LogsARealReadFailureInsteadOfSwallowingIt(t *testin
 	// block's bytes under blk's key) must still be treated as THIS call's own
 	// record having gone bad, not silently ignored.
 	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), true),
-		"pipelineBlockDelete's own return is unaffected by a read failure here: it still runs streamingBlockDelete, which is what owns the fallback park write")
+		"pipelineBlockDelete's own return is unaffected by a read failure here: it still runs the park delete for this delivery's own record")
 
 	require.NotEmpty(t, warnings.warnings, "a read failure that is not \"not found\" must be logged, not swallowed in silence")
 	require.Contains(t, warnings.warnings[0], "pipelineBlockDelete", "the warning must name where it came from")

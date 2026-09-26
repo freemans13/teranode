@@ -22,56 +22,6 @@ import (
 // both files deleted. The chain stopped at 707,177. A raw copy is now discarded whenever another
 // copy of the block is converting or has already been converted, and only the raw file goes.
 
-func TestARawCopyIsDiscardedWhileAnotherCopyIsConverting(t *testing.T) {
-	ctx := context.Background()
-	h := newParkWiringHarness(t, true)
-	h.sm.drainAsync.Store(true)
-	h.sm.parkCommits = make(chan parkCommit, 4)
-
-	header := wire.BlockHeader{Version: 1, PrevBlock: h.blocks[1].MsgBlock().BlockHash()}
-	body := peerpkg.BlockBody{Header: header, TxCount: 3, Size: 4096, Hash: header.BlockHash()}
-
-	require.NoError(t, h.sm.blockPark.store.Set(ctx, body.Hash[:], fileformat.FileTypeMsgBlock, []byte("raw"), parkOpts...))
-
-	h.sm.inFlightBlocksMu.Lock()
-	h.sm.inFlightBlocks = map[chainhash.Hash]*inFlightBlock{body.Hash: {}}
-	h.sm.inFlightBlocksMu.Unlock()
-
-	h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
-
-	require.False(t, h.sm.blockPark.Has(body.Hash), "the converting copy is the one the park takes")
-
-	exists, err := h.sm.blockPark.store.Exists(ctx, body.Hash[:], fileformat.FileTypeMsgBlock, parkOpts...)
-	require.NoError(t, err)
-	require.False(t, exists, "the raw copy's bytes are removed")
-}
-
-func TestARawCopyIsDiscardedWhenTheBlockIsAlreadyConverted(t *testing.T) {
-	ctx := context.Background()
-	h := newParkWiringHarness(t, true)
-	h.sm.drainAsync.Store(true)
-	h.sm.parkCommits = make(chan parkCommit, 4)
-
-	blk, hash := convertedRecordWithSubtrees(t, 1, 707178)
-	require.NoError(t, h.sm.blockPark.WriteConvertedBlock(ctx, hash, blk))
-	require.NoError(t, h.sm.blockPark.store.Set(ctx, hash[:], fileformat.FileTypeMsgBlock, []byte("raw"), parkOpts...))
-
-	body := peerpkg.BlockBody{TxCount: 1, Size: 4096, Hash: hash}
-	body.Header.PrevBlock = *blk.Header.HashPrevBlock
-
-	h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
-
-	require.False(t, h.sm.blockPark.Has(hash), "the raw copy is not taken")
-
-	exists, err := h.sm.blockPark.store.Exists(ctx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...)
-	require.NoError(t, err)
-	require.False(t, exists, "its bytes are removed")
-
-	exists, err = h.sm.blockPark.store.Exists(ctx, hash[:], fileformat.FileTypeBlock, parkOpts...)
-	require.NoError(t, err)
-	require.True(t, exists, "and the converted record is left alone")
-}
-
 // A copy refused a second conversion, because another copy of the block is converting, is not
 // written at all. Writing it raw is what let the park take it whenever the converting copy then
 // failed, and processing a raw copy after a conversion attempt failed subtree validation twice on

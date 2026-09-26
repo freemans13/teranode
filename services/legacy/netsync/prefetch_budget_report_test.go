@@ -31,7 +31,6 @@ func TestConsumerWait_Describe_NamesTheDownloadBudget(t *testing.T) {
 	t.Run("a full budget with blocked read loops is named", func(t *testing.T) {
 		w := &consumerWait{
 			at:              now,
-			queueArmOpen:    true,
 			parked:          113,
 			downloadBudget:  268435456,
 			downloadHeld:    251658240,
@@ -47,7 +46,7 @@ func TestConsumerWait_Describe_NamesTheDownloadBudget(t *testing.T) {
 	})
 
 	t.Run("a quiet budget still reports, so a healthy reading is distinguishable from no reading", func(t *testing.T) {
-		w := &consumerWait{at: now, queueArmOpen: true, downloadBudget: 268435456}
+		w := &consumerWait{at: now, downloadBudget: 268435456}
 
 		line := w.describe(now)
 
@@ -58,7 +57,7 @@ func TestConsumerWait_Describe_NamesTheDownloadBudget(t *testing.T) {
 	})
 
 	t.Run("prefetch disabled prints nothing about a budget that does not exist", func(t *testing.T) {
-		w := &consumerWait{at: now, queueArmOpen: true}
+		w := &consumerWait{at: now}
 
 		require.False(t, strings.Contains(w.describe(now), "download budget"),
 			"a nil budget means synchronous ingestion, and reporting 0 of 0 would invent a constraint")
@@ -152,7 +151,7 @@ func TestPublishConsumerWait_CarriesTheDownloadBudget(t *testing.T) {
 
 		sm.blockPrefetchWaiters.Add(2)
 
-		sm.publishConsumerWait(time.Now(), true, nil)
+		sm.publishConsumerWait(time.Now())
 
 		w, _ := sm.consumerWaitState.Load().(*consumerWait)
 		require.NotNil(t, w)
@@ -164,7 +163,7 @@ func TestPublishConsumerWait_CarriesTheDownloadBudget(t *testing.T) {
 	t.Run("prefetch disabled leaves the fields alone", func(t *testing.T) {
 		sm := &SyncManager{}
 
-		sm.publishConsumerWait(time.Now(), true, nil)
+		sm.publishConsumerWait(time.Now())
 
 		w, _ := sm.consumerWaitState.Load().(*consumerWait)
 		require.NotNil(t, w)

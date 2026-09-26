@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,21 +209,17 @@ func TestBlockPark_RefusesABlockThatDoesNotMeetItsTarget(t *testing.T) {
 func TestBlockPark_RoundTripsThroughAShardedStore(t *testing.T) {
 	park, dir := newTestPark(t, "?hashPrefix=2")
 
-	blocks := minedBlocks(t, 1)
-	msgBlock := blocks[0].MsgBlock()
-	hash := msgBlock.BlockHash()
+	prev := chainhash.Hash{0x0a}
+	hash := parkedRecord(t, park, prev, 1)
 
-	require.Equal(t, parkAccepted,
-		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	for _, name := range parkDirEntries(t, dir) {
+		require.True(t, strings.HasPrefix(name, hash.String()),
+			"the park layout must be flat whatever the store URL says, not %s", name)
+	}
 
-	require.Equal(t, []string{hash.String() + "." + string(fileformat.FileTypeMsgBlock), hash.String() + "." + string(fileformat.FileTypeMsgBlock) + ".sha256"},
-		parkDirEntries(t, dir), "the park layout must be flat whatever the store URL says")
-
-	got, err := park.Read(context.Background(), hash)
+	got, err := park.ReadConverted(context.Background(), hash)
 	require.NoError(t, err)
-	require.Equal(t, msgBlock.SerializeSize(), got.SerializeSize())
-	gotHash := got.BlockHash()
-	require.True(t, gotHash.IsEqual(&hash))
+	require.True(t, got.Header.Hash().IsEqual(&hash))
 
 	// And the recovery scan finds it.
 	fresh, _ := newTestPark(t, "?hashPrefix=2")
@@ -232,12 +229,11 @@ func TestBlockPark_RoundTripsThroughAShardedStore(t *testing.T) {
 
 	require.Equal(t, 1, fresh.Len(), "a sharded store must not hide parked blocks from the restart scan")
 
-	taken := fresh.TakeChildren(msgBlock.Header.PrevBlock)
+	taken := fresh.TakeChildren(prev)
 	require.Len(t, taken, 1)
 	require.True(t, taken[0].hash.IsEqual(&hash))
-	prev := msgBlock.Header.PrevBlock
 	require.True(t, taken[0].prevBlock.IsEqual(&prev),
-		"the parent must be read back out of the stored block header")
+		"the parent must be read back out of the stored record")
 }
 
 // TestBlockPark_AFailedWriteLeavesNoGoroutineBehind. The blob store never
@@ -305,99 +301,73 @@ func TestBlockPark_SizeAloneNeverRefuses(t *testing.T) {
 func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 	park, dir := newTestPark(t, "")
 
-	blocks := minedBlocks(t, 2)
+	prevs := []chainhash.Hash{{0x0b}, {0x0c}}
+	hashes := make([]chainhash.Hash, len(prevs))
 
-	for _, b := range blocks {
-		msgBlock := b.MsgBlock()
-		hash := msgBlock.BlockHash()
+	for i, prev := range prevs {
+		hashes[i] = parkedRecord(t, park, prev, byte(i+1))
+	}
 
-		require.Equal(t, parkAccepted,
-			park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	recordFile := func(h chainhash.Hash) string {
+		return h.String() + "." + string(fileformat.FileTypeBlock)
 	}
 
 	// The wreckage a crash leaves.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, ".abcdef.4711.tmp"), []byte("half a block"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "0000000000000000000000000000000000000000000000000000000000000009.msgBlock.sha256"), []byte("orphaned"), 0o600))
 
-	// A blob that reads back perfectly and is somebody else's block. That is
+	// A record that reads back perfectly and is somebody else's block. That is
 	// evidence about the file, so it must be deleted and the block asked for
 	// again.
 	wrongBlock := chainhash.Hash{0x11, 0x22}
-	firstBlob, err := os.ReadFile(filepath.Join(dir, blocks[0].MsgBlock().BlockHash().String()+".msgBlock"))
+	firstRecord, err := os.ReadFile(filepath.Join(dir, recordFile(hashes[0])))
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(dir, wrongBlock.String()+".msgBlock"), firstBlob, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, recordFile(wrongBlock)), firstRecord, 0o600))
 
 	// A file the store itself will not open — a torn store header, an unreadable
 	// disk. The store reports both of those the same way, and the park's error
 	// policy reads that as "says nothing about the block", so this one is left
 	// where it is rather than deleted. See parkReadFailure.
 	unreadable := chainhash.Hash{0x33, 0x44}
-	require.NoError(t, os.WriteFile(filepath.Join(dir, unreadable.String()+".msgBlock"), make([]byte, 200), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, recordFile(unreadable)), make([]byte, 200), 0o600))
 
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
 	fresh.store = park.store
 	fresh.Recover(context.Background(), nil)
 
-	require.Equal(t, 2, fresh.Len(), "both good blocks must be adopted, whatever else is in the directory")
+	require.Equal(t, 2, fresh.Len(), "both good records must be adopted, whatever else is in the directory")
 
-	for _, b := range blocks {
-		msgBlock := b.MsgBlock()
-		hash := msgBlock.BlockHash()
-
-		taken := fresh.TakeChildren(msgBlock.Header.PrevBlock)
+	for i, prev := range prevs {
+		taken := fresh.TakeChildren(prev)
 		require.Len(t, taken, 1)
-		require.True(t, taken[0].hash.IsEqual(&hash))
+		require.True(t, taken[0].hash.IsEqual(&hashes[i]))
 		require.Nil(t, taken[0].peer, "a recovered block has no delivering peer")
-		require.Zero(t, taken[0].height, "a recovered block has no reported height; the parent supplies it")
-		require.False(t, taken[0].converted,
-			"fix-round item 1: a recovered whole block must not set entry.converted, or commitParkedBlock/parkedRun would try ReadConverted against a record that was never written")
+		require.True(t, taken[0].converted, "a recovered record is a converted block")
 	}
 
 	names := parkDirEntries(t, dir)
 	require.NotContains(t, names, ".abcdef.4711.tmp", "a crash's half-written temp file must be swept")
 	require.NotContains(t, names, "0000000000000000000000000000000000000000000000000000000000000009.msgBlock.sha256", "a sidecar whose block is gone must be swept")
-	require.NotContains(t, names, wrongBlock.String()+".msgBlock", "a file that is not the block its name claims must be deleted")
-	require.Contains(t, names, unreadable.String()+".msgBlock",
-		"a blob the store could not open says nothing about the block, so recovery must leave it for the next start")
+	require.NotContains(t, names, recordFile(wrongBlock), "a file that is not the block its name claims must be deleted")
+	require.Contains(t, names, recordFile(unreadable),
+		"a record the store could not open says nothing about the block, so recovery must leave it for the next start")
 }
 
-// TestBlockPark_RecoveryAdoptsEverythingAPreviousRunParked: recovery used to
-// stop at a byte budget and delete whatever it could not afford, which threw
-// away fully downloaded blocks on every restart for no gain. With the byte
-// budget gone it adopts the lot, and the only thing that can still stop it is
-// the cap on how many blocks the park holds.
-func TestBlockPark_RecoveryAdoptsEverythingAPreviousRunParked(t *testing.T) {
-	park, dir := newTestPark(t, "")
+// parkedRecord writes a converted record for a block whose parent is prev into the park's store,
+// as the pipeline sink does, and returns the block's hash. seed keeps two records in one test apart.
+func parkedRecord(t *testing.T, park *blockPark, prev chainhash.Hash, seed byte) chainhash.Hash {
+	t.Helper()
 
-	blocks := minedBlocks(t, 3)
+	header := &model.BlockHeader{Version: 1, HashPrevBlock: &prev, HashMerkleRoot: &chainhash.Hash{seed}}
 
-	for _, b := range blocks {
-		msgBlock := b.MsgBlock()
-		require.Equal(t, parkAccepted,
-			park.Park(context.Background(), parkedBlock{hash: msgBlock.BlockHash(), prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
-	}
+	blk, err := model.NewBlock(header, coinbaseTx(t), []*chainhash.Hash{{0x50, seed}}, 1, 0, 100, 0)
+	require.NoError(t, err)
 
-	require.Len(t, parkDirEntries(t, dir), 6, "three blocks and their checksum sidecars")
+	hash := *blk.Header.Hash()
+	require.NoError(t, park.WriteConvertedBlock(context.Background(), hash, blk))
 
-	fresh, _ := newTestPark(t, "")
-	fresh.dir = dir
-	fresh.store = park.store
-	fresh.Recover(context.Background(), nil)
-
-	require.Equal(t, 3, fresh.Len(),
-		"every block a previous run parked is adopted; there is no byte budget to stop at")
-
-	blobs := 0
-
-	for _, name := range parkDirEntries(t, dir) {
-		if filepath.Ext(name) == "."+string(fileformat.FileTypeMsgBlock) {
-			blobs++
-		}
-	}
-
-	require.Equal(t, 3, blobs,
-		"a restart must not delete blocks it has already paid to download")
+	return hash
 }
 
 // TestBlockPark_IsOffWhenItCannotBeRecovered covers the two settings-only kill

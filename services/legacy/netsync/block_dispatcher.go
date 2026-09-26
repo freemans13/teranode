@@ -9,9 +9,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
-	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
 const (
@@ -138,21 +136,8 @@ type inflightParent struct {
 // stored nor in flight never becomes a dispatch at all; the head parks it while it
 // still holds the bytes.
 type blockDispatch struct {
-	msg            *blockQueueMsg
-	peer           *peerpkg.Peer
-	state          *peerSyncState
-	msgBlock       *wire.MsgBlock
-	prevHash       chainhash.Hash
-	catchingBlocks bool
-	isCheckpoint   bool
-	height         uint32
-	parent         *inflightParent
-
-	// origin is the block's ancestry proof, read from the header cache by
-	// handleBlockMsgHead before anything else touches the block, and carried here
-	// so the worker and the head cannot disagree about it. The zero value denies
-	// every below-checkpoint fast path; see blockRequestOrigin.
-	origin blockRequestOrigin
+	isCheckpoint bool
+	height       uint32
 
 	windowed bool
 	bytes    int64
@@ -229,42 +214,11 @@ type blockDispatcher struct {
 	completions chan *blockCompletion
 	baState     cachedBAState
 
-	// run does one block's work (HandleBlockDirect by default) and tail runs the
-	// chain-order bookkeeping (handleBlockMsgTail plus the backlog/reply pairing).
-	// Both are fields so the dispatcher tests can drive it without a peer or a store.
-	run  func(ctx context.Context, d *blockDispatch, parent *inflightParent) error
-	tail func(d *blockDispatch, err error) error
-
-	// parkedRun and parkedTail are the same two steps for a dispatch that commits
-	// a parked block off disk. They are separate fields rather than branches
-	// inside run and tail because a test that swaps run must not silently take
-	// over the blob read as well, and because a parked dispatch must never be
-	// able to reach handleBlockMsgTail or finishBlockMsg: it has no queue
-	// message, so a reply would send on a nil channel and a backlog decrement
-	// would underflow the counter that suppresses the sync-peer stall check.
+	// parkedRun does one parked block's work and parkedTail runs its chain-order
+	// bookkeeping. They are fields so the dispatcher tests can drive it without a
+	// peer or a store.
 	parkedRun  func(ctx context.Context, d *blockDispatch) error
 	parkedTail func(d *blockDispatch, err error) error
-}
-
-// runFor picks the work step for one dispatch, and tailFor picks its bookkeeping
-// step. The parked field is the only discriminator, in one place, so the two kinds
-// of dispatch cannot drift apart.
-func (bd *blockDispatcher) runFor(d *blockDispatch) func(context.Context, *blockDispatch, *inflightParent) error {
-	if d.parked != nil {
-		return func(ctx context.Context, d *blockDispatch, _ *inflightParent) error {
-			return bd.parkedRun(ctx, d)
-		}
-	}
-
-	return bd.run
-}
-
-func (bd *blockDispatcher) tailFor(d *blockDispatch) func(*blockDispatch, error) error {
-	if d.parked != nil {
-		return bd.parkedTail
-	}
-
-	return bd.tail
 }
 
 func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
@@ -302,39 +256,6 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 
 			sm.logger.Infof("[blockDispatcher] blockvalidation_quick_window_blocks=%d resolved to depth %d", sm.settings.BlockValidation.QuickWindowBlocks, bd.depth)
 		}
-	}
-
-	// d.msg.peer, not d.peer: HandleBlockDirect has always been handed the peer that
-	// delivered the block (a stream sub-peer on an association), and its tracing tags
-	// and log lines name it. d.peer is that peer resolved to its association's primary,
-	// which is what the tail's own bookkeeping needs — the two must not be swapped.
-	bd.run = func(ctx context.Context, d *blockDispatch, parent *inflightParent) error {
-		return sm.HandleBlockDirect(ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, parent, d.origin)
-	}
-
-	// The default tail is the pre-window consumer's whole turn after the block's own
-	// work: the chain-order tail, then the drain of whatever was parked behind a block
-	// that committed, then the backlog accounting and the reply through finishBlockMsg,
-	// so both consumers settle a block by the same rule. The committed guard is
-	// load-bearing: the tail returns nil from paths that did NOT put the block in the
-	// chain, and draining after one of those would try to commit the children of a
-	// block that is not there.
-	//
-	// scheduleDrain rather than drainParkedDescendants, and that is the whole of
-	// this change from the consumer's point of view: with a loop to admit into,
-	// the parked children become dispatches of their own, and the reply below
-	// lands microseconds after this block's own tail work instead of after every
-	// block parked behind it has been read off disk and validated.
-	bd.tail = func(d *blockDispatch, err error) error {
-		terr := sm.handleBlockMsgTail(d, err)
-
-		if terr == nil && d.msg.committed {
-			sm.scheduleDrain(d.msg.blockHash, d.height)
-		}
-
-		sm.finishBlockMsg(d.msg, terr)
-
-		return terr
 	}
 
 	// The parked run: read the blob (or the converted record) on the worker, then
@@ -550,44 +471,6 @@ func (bd *blockDispatcher) tailHeight() uint32 {
 	return 0
 }
 
-// parentFor returns the frontier tail as the in-flight parent for a block whose prevHash
-// matches it, else nil. Only the tail can be a parent: the frontier is a chain, so any
-// earlier entry is an ancestor of a block already admitted.
-//
-// A tail whose height is 0 is refused. Height 0 means "not resolved", not "the genesis
-// block": two arms of resolveParent dispatch a block without resolving its height, the
-// one for a block already in the chain and the one for a block whose parent is in the
-// frontier but is not its tail, and dispatch stamps that zero onto the entry. Handing it
-// over as a parent gives the child height 1, and nothing downstream on this side catches
-// it, because HandleBlockDirect's mismatch guard needs a height the block claims and a
-// legacy wire block claims none. Block validation does catch it, in deriveBlockHeight,
-// and answers BlockInvalidError, which is not a transient fault: the block is rejected to
-// the peer, the peer's whole association is evicted as misbehaving, and every descendant
-// is suppressed for the cascade TTL. So the answer here is no parent, which sends the
-// child down the nil-parent route where the worker looks the parent up in the chain.
-func (bd *blockDispatcher) parentFor(prevHash *chainhash.Hash) *inflightParent {
-	if bd == nil {
-		return nil
-	}
-
-	bd.frontierMu.Lock()
-	defer bd.frontierMu.Unlock()
-
-	if n := len(bd.frontier); n > 0 && bd.frontier[n-1].hash.IsEqual(prevHash) {
-		e := bd.frontier[n-1]
-
-		if e.height == 0 {
-			bd.sm.logger.Warnf("[blockDispatcher][%s] the block in flight has no resolved height, so it is not offered as a parent; its child will look the parent up in the chain", e.hash.String())
-
-			return nil
-		}
-
-		return &inflightParent{height: e.height, entry: e}
-	}
-
-	return nil
-}
-
 // inFlight reports whether this hash is a block the dispatcher is working on right now.
 // The recently-failed-parent check consults it first: a parent that is being retried is
 // not a failed parent, so its child must not be short-circuited as part of a cascade.
@@ -647,11 +530,7 @@ func (bd *blockDispatcher) canDispatch(d *blockDispatch) bool {
 // message at all, so every read of d.msg on a path both kinds reach goes through
 // here.
 func (d *blockDispatch) msgHash() chainhash.Hash {
-	if d.parked != nil {
-		return d.parked.hash
-	}
-
-	return d.msg.blockHash
+	return d.parked.hash
 }
 
 // dispatch charges the budget, appends the frontier entry and starts the worker.
@@ -672,16 +551,13 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 	// The condition that used to demand an empty window was a consequence of
 	// never being windowed rather than a rule of its own, and it is what kept the
 	// validator idle between every block drained from the park.
-	if d.parked != nil && (d.parent != nil || (!d.windowed && !bd.frontierEmpty())) {
-		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch in the wrong shape: parent=%v windowed=%v frontier=%d", d.parked.hash.String(), d.parent != nil, d.windowed, bd.frontierLen())
+	if !d.windowed && !bd.frontierEmpty() {
+		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch in the wrong shape: windowed=%v frontier=%d", d.parked.hash.String(), d.windowed, bd.frontierLen())
 		bd.sm.blockPark.Restore(*d.parked)
 
 		return
 	}
 
-	// The parked kind carries no queue message, so its hash comes off the entry.
-	// Reading d.msg unconditionally would dereference nil for exactly the dispatch
-	// this function was just taught to accept.
 	hash := d.msgHash()
 
 	e := &frontierEntry{
@@ -698,24 +574,10 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 
 	bd.inflight += d.bytes * windowBytesPerWireByte
 
-	// The window now accounts for this block's memory, so the download budget
-	// does not have to. A parked dispatch has no queue message and never held
-	// download bytes in the first place.
-	noteHandedOff(d.msg)
-
 	if d.isCheckpoint {
 		bd.barrier = true
 	}
 
-	// A block that waited for capacity while its in-flight parent failed is aborted
-	// before it starts: its own attempt could only fail in the ordering hand-shake,
-	// and the abort path replies with a service error and records no failure backoff.
-	// An in-frontier successor gets the same mark from failFrom instead.
-	if d.parent != nil && d.parent.entry != nil && d.parent.entry.failed.Load() {
-		e.aborted.Store(true)
-	}
-
-	run := bd.runFor(d)
 	ctx := contextWithFrontierEntry(bd.sm.ctx, e)
 
 	go func() {
@@ -724,16 +586,8 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 		if e.aborted.Load() {
 			err = errors.NewServiceError("[blockDispatcher][%s] not started at height %d: a predecessor failed", e.hash.String(), e.height)
 		} else {
-			err = run(ctx, d, d.parent)
+			err = bd.parkedRun(ctx, d)
 		}
-
-		// Nothing after this point reads the decoded block — the tail works from the
-		// dispatch's own fields — and this entry can outlive the frontier as a child's
-		// resolved parent, so drop the reference here rather than pinning a multi-GB
-		// block (and its decode arena) until that child settles. Safe to write from
-		// this goroutine: the consumer never touches msgBlock after dispatch, and the
-		// completion send below is the happens-before edge for everything that does.
-		d.msgBlock = nil
 
 		// settle after run returns, so rpcStarted (closed inside HandleBlockDirect)
 		// always closes strictly before settled in program order.
@@ -823,7 +677,7 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 
 		bd.frontierMu.Unlock()
 
-		_ = bd.tailFor(head.d)(head.d, err)
+		_ = bd.parkedTail(head.d, err)
 	}
 }
 

@@ -151,32 +151,6 @@ var (
 		blamePeer:  true,
 		markFailed: true,
 	}
-
-	// parkDispositionBlockRefused — the block failed the park's own stateless
-	// checks, so nothing was written. A peer fault, and the block is still
-	// wanted and unowed, so the next wanted-range pass asks for it again.
-	parkDispositionBlockRefused = parkDisposition{
-		reason: "the block failed its stateless checks",
-		blob:   parkBlobLeaveAlone,
-
-		blamePeer: true,
-	}
-
-	// parkDispositionNotKept — we could not keep the block: the budget is full,
-	// the write failed or timed out, or there is no park at all. Nothing reached
-	// the disk, so there is no blob and no budget to release, and a local fault
-	// is not the peer's fault.
-	parkDispositionNotKept = parkDisposition{
-		reason: "there was no room to keep the block",
-		blob:   parkBlobLeaveAlone,
-	}
-
-	// parkDispositionParked — the block is on disk and in the index, waiting for
-	// its parent. Nothing to undo.
-	parkDispositionParked = parkDisposition{
-		reason: "waiting for its parent",
-		blob:   parkBlobLeaveAlone,
-	}
 )
 
 // parkReadFailure classifies an error from reading a parked block back off
@@ -241,25 +215,6 @@ func parkCommitFailure(err error) parkDisposition {
 
 	default:
 		return parkDispositionBlockRejected
-	}
-}
-
-// parkWriteOutcome maps what the park did with an offered block onto what the
-// caller now has to do about it, so the offer path answers the same three
-// questions from the same table as every other path.
-func parkWriteOutcome(result parkResult) parkDisposition {
-	switch result {
-	case parkAccepted:
-		return parkDispositionParked
-
-	case parkRejected:
-		return parkDispositionBlockRefused
-
-	case parkUnavailable, parkDisabled:
-		return parkDispositionNotKept
-
-	default:
-		return parkDispositionNotKept
 	}
 }
 

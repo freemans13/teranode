@@ -27,7 +27,6 @@ func TestConsumerWait_Describe_NamesADrainShutByTheWindow(t *testing.T) {
 	t.Run("queued and shut says so, and says why", func(t *testing.T) {
 		w := &consumerWait{
 			at:                now,
-			queueArmOpen:      true,
 			parked:            128,
 			drainQueued:       1,
 			drainShutByWindow: true,
@@ -42,7 +41,7 @@ func TestConsumerWait_Describe_NamesADrainShutByTheWindow(t *testing.T) {
 	})
 
 	t.Run("queued and open does not claim a wedge", func(t *testing.T) {
-		w := &consumerWait{at: now, queueArmOpen: true, drainQueued: 1}
+		w := &consumerWait{at: now, drainQueued: 1}
 
 		line := w.describe(now)
 
@@ -52,7 +51,7 @@ func TestConsumerWait_Describe_NamesADrainShutByTheWindow(t *testing.T) {
 	})
 
 	t.Run("nothing queued says nothing about the drain", func(t *testing.T) {
-		w := &consumerWait{at: now, queueArmOpen: true, drainShutByWindow: true}
+		w := &consumerWait{at: now, drainShutByWindow: true}
 
 		require.False(t, strings.Contains(w.describe(now), "queued for a drain"),
 			"with no parents queued there is no drain to be shut")
@@ -68,19 +67,31 @@ func TestConsumerWait_Describe_NamesADrainShutByTheWindow(t *testing.T) {
 // and parked, and each of those stamped the "loop placed work" clock, so a node
 // committing nothing for minutes reported itself healthy.
 //
+// The decoded-block consumer this originally guarded (a queue receive and two
+// park-job hand-off sites) is gone; every arrival streams straight to disk and
+// dispatchBlocks' only two wait arms now are a worker completion and a posted
+// parkCommit, neither of which is new work being PLACED — a completion is the
+// result of work placed earlier, and a parkCommit only restores an entry and
+// re-queues a drain request for the next iteration to try. The property is the
+// same: only a successful drain step (which dispatches a block) may count as
+// progress.
+//
 // Asserted by counting the stamps in the source rather than by running the loop,
-// because the loop needs a dispatcher, park workers and a live block queue, and a
-// test that built all three would be testing those instead of this.
+// because the loop needs a dispatcher and a real park, and a test that built
+// both would be testing those instead of this.
 func TestBlockHandlerAdmission_ParkWorkIsNotProgress(t *testing.T) {
 	src := readManagerSource(t)
 
-	// The two park hand-off sites and the queue receive must not stamp.
+	// Neither wait arm may stamp. consumeBlocksSerially, the depth-0 bypass
+	// consumer, has its own "case commit := <-sm.parkCommits:" earlier in the
+	// file that commits directly and never stamps either, but LastIndex is used
+	// throughout so each marker names the windowed dispatchBlocks loop's own
+	// arm specifically rather than accidentally reading the other consumer's.
 	for _, marker := range []string{
-		"case sm.parkJobs <- *sm.parkJobHeld:",
-		"case parkArm <- parkWork:",
-		"case msg := <-queueArm:",
+		"case c := <-bd.completions:",
+		"case commit := <-sm.parkCommits:",
 	} {
-		idx := strings.Index(src, marker)
+		idx := strings.LastIndex(src, marker)
 		require.Positive(t, idx, "the loop no longer has %q, so this test needs rewriting rather than deleting", marker)
 
 		// Look only at the lines that belong to this arm: everything up to the
@@ -96,10 +107,10 @@ func TestBlockHandlerAdmission_ParkWorkIsNotProgress(t *testing.T) {
 		// function to explain why they deliberately do not call it, and matching
 		// the bare name would match that explanation.
 		require.False(t, strings.Contains(window, "sm.noteConsumerAdmitted("),
-			"%q must not count as placing work: parking a block moves it to disk and commits nothing, and receiving one decides nothing", marker)
+			"%q must not count as placing work: a completion is work placed earlier, and a parkCommit only re-queues a drain request", marker)
 	}
 
-	// And the two that genuinely place work must still stamp, so this test cannot
+	// And the one that genuinely places work must still stamp, so this test cannot
 	// pass by the clock never being stamped at all.
 	require.Contains(t, src, "if sm.drainStep(bd) {",
 		"the drained-commit path is where a stamp belongs")
@@ -136,7 +147,7 @@ func TestPublishConsumerWait_CarriesTheShutDrain(t *testing.T) {
 
 		h.sm.drainQueue = []drainRequest{{parent: h.blocks[0].MsgBlock().BlockHash()}}
 
-		h.sm.publishConsumerWait(time.Now(), true, nil)
+		h.sm.publishConsumerWait(time.Now())
 
 		w, _ := h.sm.consumerWaitState.Load().(*consumerWait)
 		require.NotNil(t, w)
@@ -152,7 +163,7 @@ func TestPublishConsumerWait_CarriesTheShutDrain(t *testing.T) {
 		require.True(t, h.sm.dispatcher.frontierEmpty(), "precondition: a fresh window holds nothing")
 
 		h.sm.drainQueue = []drainRequest{{parent: h.blocks[0].MsgBlock().BlockHash()}}
-		h.sm.publishConsumerWait(time.Now(), true, nil)
+		h.sm.publishConsumerWait(time.Now())
 
 		w, _ := h.sm.consumerWaitState.Load().(*consumerWait)
 		require.NotNil(t, w)

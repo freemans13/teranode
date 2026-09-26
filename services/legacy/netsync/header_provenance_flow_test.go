@@ -11,13 +11,11 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
-	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/stretchr/testify/require"
@@ -183,81 +181,6 @@ func TestHeaderProvenance_ContradictedCheckpointDisconnects(t *testing.T) {
 	require.False(t, sm.fillHeaderCache(p, msg))
 	require.Zero(t, sm.headerCache.Len(), "a refused batch must not be cached")
 	require.NotNil(t, sm.contradictedCheckpoint(1, genesis, forged), "the refusal must be attributable to the checkpoint, not to linkage")
-}
-
-// The proof reaches HandleBlockDirect and changes the route the block takes, and
-// the absence of it denies that route. This is upstream's
-// TestHandleBlockMsg_UsesPeerProvenance, re-aimed at the header cache: on this
-// branch the provenance is not stamped into a per-peer request record, it is read
-// from the cache at delivery (see blockOrigin).
-func TestHandleBlockMsg_UsesCacheProvenance(t *testing.T) {
-	for _, proven := range []bool{true, false} {
-		name := "unproven"
-		if proven {
-			name = "proven"
-		}
-
-		t.Run(name, func(t *testing.T) {
-			sm, p, _ := newHeaderProvenanceManager(t)
-			sm.headersFirstMode.Store(false)
-			sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
-			sm.settings.BlockValidation.IsParentMinedRetryMaxRetry = 0
-			// Stop immediately after the mined-set gate, before UTXO work.
-			sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree = 0
-
-			parentWire := makeDuplicateTxidBlock(1).MsgBlock()
-			parentWire.Header.PrevBlock = *sm.chainParams.GenesisHash
-			parent, err := model.NewBlockFromMsgBlock(parentWire, nil)
-			require.NoError(t, err)
-			require.NoError(t, sm.blockchainClient.AddBlock(sm.ctx, parent, "test"))
-
-			mined, err := sm.blockchainClient.GetBlockIsMined(sm.ctx, parent.Hash())
-			require.NoError(t, err)
-			require.False(t, mined)
-
-			block := makeDuplicateTxidBlock(2).MsgBlock()
-			block.Header.PrevBlock = *parent.Hash()
-			block.Header.Bits = 0x207fffff
-
-			for {
-				candidate, err := model.NewBlockFromMsgBlock(block, nil)
-				require.NoError(t, err)
-
-				if ok, _, _ := candidate.Header.HasMetTargetDifficulty(); ok {
-					break
-				}
-
-				block.Header.Nonce++
-			}
-
-			hash := block.Header.BlockHash()
-
-			// The cache is the only source of provenance, so the proven case is set up
-			// by filling it with a run that reaches a pinned hash naming this block.
-			if proven {
-				pinCheckpoint(sm, 2, &hash)
-
-				headers := wire.NewMsgHeaders()
-				require.NoError(t, headers.AddBlockHeader(&block.Header))
-				require.True(t, sm.headerCache.Fill(*parent.Hash(), 2, headers.Headers))
-			}
-
-			require.Equal(t, proven, sm.blockOrigin(hash).headerProven)
-
-			sm.blockDownloads.Add(p, hash)
-
-			initPrometheusMetrics()
-
-			err = sm.handleBlockMsg(&blockQueueMsg{block: block, blockHash: hash, peer: p})
-			require.Error(t, err)
-
-			if proven {
-				require.ErrorContains(t, err, "failed to partition block", "the proof must reach HandleBlockDirect and skip the parent wait")
-			} else {
-				require.True(t, errors.Is(err, errors.ErrBlockParentNotMined), "%v", err)
-			}
-		})
-	}
 }
 
 func TestHandleBlockDirect_RejectsPoWBeforeAssemblyWait(t *testing.T) {

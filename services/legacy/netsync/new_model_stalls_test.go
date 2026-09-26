@@ -6,9 +6,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -116,13 +114,22 @@ func TestNewModel_LeavingHeadersFirstModeLosesNothing(t *testing.T) {
 // changes what the chain reports as its tip. This pins that property directly
 // rather than trusting it did not regress.
 //
-// handleBlockMsg here returns a single error, not the three values the
-// original brief called it with — that draft predates the head/tail split this
-// package's handleBlockMsgHead/handleBlockMsgTail division introduced.
+// The decoded blockQueueMsg path (handleBlockMsg) this originally drove through
+// is gone; every arrival now streams to handleBlockOnDiskMsg
+// (streaming_install.go) instead. Its own analogue of "an arrival that never
+// commits" is a body that never converted (BlockBody.Converted false) and was
+// never a drained duplicate either: that combination logs a warning and
+// returns without ever touching the park or the chain, which is the same
+// "arrived, nothing joined the chain" state the original test drove through a
+// deliberately bodyless queue message.
 func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	const depth = int32(4)
 
 	sm, peer, rec := cacheManager(t, 500, depth)
+	// Present only so handleBlockOnDiskMsg's nil guard passes; the path this
+	// test drives (Converted: false, no drained duplicate) never calls a
+	// method on it.
+	sm.blockPark = &blockPark{}
 
 	sm.fetchHeaderBlocks()
 	require.True(t, WaitUntil(func() bool { return rec.count() > 0 }, 5*time.Second),
@@ -139,23 +146,6 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 
 	require.True(t, limitedBefore, "the ceiling must be engaged, or this test proves nothing")
 
-	// An arrival with no body: handleBlockMsg's own pre-checks (FSM state, then
-	// ownership) have to be satisfied for the call to reach the "no block"
-	// return this test wants to drive, rather than bailing out earlier at
-	// "unknown peer" — which would exercise nothing.
-	//
-	// Added to the mock cacheManager already installed via mockCommittedTip,
-	// not a fresh replacement for it: committedTip's own GetBestBlockHeader
-	// stub has to stay in place for the "after" read below to answer at all.
-	running := blockchain2.FSMStateRUNNING
-	blockchainClient, ok := sm.blockchainClient.(*blockchain2.Mock)
-	require.True(t, ok, "harness check: cacheManager must install a *blockchain2.Mock")
-	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
-	// maybeRequestMoreHeaders reaches this once the cache runs past what
-	// cacheManager seeded, which this test's own arrival does not commit past —
-	// harmless if never called, needed if the ceiling ever moves.
-	blockchainClient.Mock.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
-		Return([]*chainhash.Hash{{}}, nil)
 	sm.ctx = context.Background()
 
 	hash, ok := sm.headerCache.At(501)
@@ -163,8 +153,10 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 
 	sm.blockDownloads.Add(peer, hash)
 
-	err := sm.handleBlockMsg(&blockQueueMsg{blockHash: hash, peer: peer})
-	require.Error(t, err, "a queue message carrying no block is a programming fault, not a sync one, and handleBlockMsg says so")
+	sm.handleBlockOnDiskMsg(&blockOnDiskMsg{
+		body: peerpkg.BlockBody{Hash: hash, Converted: false},
+		peer: peer,
+	})
 
 	// Read fresh again, the same way assignWantedBlocks would on the next pass:
 	// the point under test is that this SECOND read of the real chain still

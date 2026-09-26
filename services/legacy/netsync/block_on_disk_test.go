@@ -24,10 +24,11 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 		header := wire.BlockHeader{Version: 1, PrevBlock: prev}
 
 		return peerpkg.BlockBody{
-			Header:  header,
-			TxCount: 3,
-			Size:    size,
-			Hash:    header.BlockHash(),
+			Header:    header,
+			TxCount:   3,
+			Size:      size,
+			Hash:      header.BlockHash(),
+			Converted: true,
 		}
 	}
 
@@ -128,7 +129,7 @@ func TestHandleBlockOnDiskMsg_RefusesAnUnreachableParent(t *testing.T) {
 	bodyFor := func(prev chainhash.Hash) peerpkg.BlockBody {
 		header := wire.BlockHeader{Version: 1, PrevBlock: prev}
 
-		return peerpkg.BlockBody{Header: header, TxCount: 1, Size: 4096, Hash: header.BlockHash()}
+		return peerpkg.BlockBody{Header: header, TxCount: 1, Size: 4096, Hash: header.BlockHash(), Converted: true}
 	}
 
 	t.Run("a parent in neither the chain nor the header list is refused", func(t *testing.T) {
@@ -259,7 +260,7 @@ func TestHandleBlockOnDiskMsg_ParentInFlightIsKept(t *testing.T) {
 	h.sm.dispatcher.frontier = append(h.sm.dispatcher.frontier, &frontierEntry{hash: inFlightParent, height: 1})
 
 	header := wire.BlockHeader{Version: 1, PrevBlock: inFlightParent}
-	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 183, Hash: header.BlockHash()}
+	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 183, Hash: header.BlockHash(), Converted: true}
 
 	h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
 
@@ -279,7 +280,7 @@ func TestHandleBlockOnDiskMsg_ParentInFlightIsKept(t *testing.T) {
 // six parent-missing failures inside one 45-second window with nothing committing.
 func TestHandleBlockOnDiskMsg_DrainsOnlyWhenTheParentIsCommitted(t *testing.T) {
 	header := wire.BlockHeader{Version: 1, PrevBlock: chainhash.Hash{0xc1}}
-	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 2048, Hash: header.BlockHash()}
+	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 2048, Hash: header.BlockHash(), Converted: true}
 
 	t.Run("a committed parent asks for a drain", func(t *testing.T) {
 		h := newParkWiringHarness(t, true)

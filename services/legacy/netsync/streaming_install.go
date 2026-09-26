@@ -75,18 +75,15 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 	// the sink itself rather than being charged in the on-disk message
 	// handler that runs after the sink has already finished.
 	//
-	// del is pipelineBlockDelete, never streamingBlockDelete: the pipeline
-	// sink writes subtree files, not a whole-body blob, so only
-	// pipelineBlockDelete's cleanup — gated on the converted argument the wire
+	// del is pipelineBlockDelete, gated on the converted argument the wire
 	// layer passes through from THIS delivery's own blockBodySink return,
 	// never on whether a converted record merely exists for the hash (see
-	// pipelineBlockDelete's own doc comment for why that inference is exactly
-	// the bug this closes) — knows how to remove what was actually written.
+	// pipelineBlockDelete's own doc comment).
 	sm.logger.Infof("[legacy] streaming block path installed")
 
 	sink := sm.admitPipelineSink(sm.pipelineBlockSink)
 	if sm.streams != nil {
-		// Measured outermost, so a block declined to the plain body-write path is timed too.
+		// Measured outermost, so a drained copy is timed too.
 		sink = sm.trackBlockStreams(sink)
 	}
 
@@ -153,13 +150,10 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 // consistent with this codebase's own rule of fixing a dependency rather than
 // working around it in the wrapper, and out of scope for a same-branch fix.
 //
-// So: bounded fallback instead of an unbounded park. pipelineAdmissionAcquireTimeout
+// So: a bounded wait instead of an unbounded park. pipelineAdmissionAcquireTimeout
 // keeps the wait strictly below legacy_peerIdleTimeout; on that bound expiring,
-// this declines the conversion and defers to the plain body-write path exactly
-// as the duplicate case below does, rather than parking indefinitely into the
-// idle timer's path. That trades a slot's worth of admission control for
-// connection safety under sustained pressure — the same trade every other
-// decline in this function already makes.
+// the copy is drained and the block is asked for again, rather than parking
+// indefinitely into the idle timer's path.
 func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)) func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 	return func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 		acquireCtx, cancel := context.WithTimeout(sm.ctx, sm.pipelineAdmissionAcquireTimeout())
@@ -200,7 +194,12 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 				// erroring here would turn OUR admission pressure into a
 				// disconnect blamed on the peer, exactly the failure mode
 				// this bound exists to avoid.
-				return sm.streamingBlockSink(hash, header, r, n)
+				//
+				// The copy is drained and the block is asked for again. It
+				// used to be written whole to the park as a raw block, a
+				// second route that nothing else used; at shipped settings the
+				// wait cannot run out (pipelineBlockSlotPeerAllowance).
+				return sm.drainDuplicate(hash, r)
 			}
 
 			// sm.ctx cancelled (daemon shutdown): nothing was reserved and
@@ -322,65 +321,6 @@ func describeTarget(t *big.Int) string {
 	return t.String()
 }
 
-// streamingBlockSink writes a streamed body to the park's store, in exactly the
-// form the park writes a decoded block: header, transaction count, transactions,
-// under the block's own hash.
-//
-// Byte-identical is the whole point. The park reads a body back with the same
-// deserializer whichever path put it there, so a streamed block needs no second
-// read path, no second file type and no flag distinguishing the two. The wire
-// layer hands in the parsed header rather than header bytes now, because the
-// pipeline sink that follows this one needs it as structure; this sink's own job
-// is bytes, so it re-serializes the header back onto the front of the body.
-//
-// The bool it returns is always false: this path never converts a block, it
-// only ever writes the whole body byte-for-byte under FileTypeMsgBlock, so
-// nothing downstream may treat what it wrote as a converted record — see
-// BlockBody.Converted.
-func (sm *SyncManager) streamingBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
-	if sm.blockPark == nil {
-		return false, errors.NewProcessingError("[streamingBlockSink][%s] no park to write to", hash)
-	}
-
-	// The park's file format is a whole serialized block, so this path puts the
-	// header back in front of the body. The wire layer stopped doing that when the
-	// sink contract began carrying the header as structure, because the pipeline
-	// sink wants the structure and this one wants the bytes.
-	var headerBytes bytes.Buffer
-	if err := header.Serialize(&headerBytes); err != nil {
-		return false, errors.NewProcessingError("[streamingBlockSink][%s] could not re-serialize the header", hash, err)
-	}
-
-	return false, sm.blockPark.WriteStreamedBody(sm.ctx, hash, io.MultiReader(bytes.NewReader(headerBytes.Bytes()), r), n)
-}
-
-// streamingBlockDelete removes a body already written under hash, for the case
-// where the write succeeded and the block only then turned out unusable — a
-// stream ending short of what it declared, or a transaction count that will not
-// parse.
-//
-// An orphaned body is worse than a failed download. A failed download is simply
-// asked for again by the walk, while bytes sitting on disk under a well-formed
-// hash look legitimate to everything downstream, and nothing there knows to
-// distrust them.
-//
-// converted is unused here: this path only ever writes a whole body under
-// FileTypeMsgBlock, never a converted record, whether it is running as the
-// plain non-pipeline delete or as pipelineBlockDelete's own unconditional tail
-// call for the fallback-to-raw-body case. It is part of the signature only so
-// this satisfies the same function type pipelineBlockDelete does, which is
-// what lets installStreamingBlockPath assign either one to del without a
-// wrapper closure.
-func (sm *SyncManager) streamingBlockDelete(hash chainhash.Hash, _ bool) error {
-	if sm.blockPark == nil {
-		return nil
-	}
-
-	sm.blockPark.Delete(context.Background(), parkedBlock{hash: hash})
-
-	return nil
-}
-
 // parkFileType is the one file type a parked block is stored under, named here
 // so the streaming sink and the park's own writer cannot drift apart.
 var parkFileType = fileformat.FileTypeMsgBlock
@@ -498,29 +438,13 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// wire from them is admitted when it lands.
 	sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 
-	// A raw copy of a block another copy is converting, or has converted, is
-	// discarded. Taking it into the park while the other copy converts means
-	// processing the raw body writes the block's subtree files while the
-	// converting copy writes the same files in its own format: on 2026-09-24
-	// block 707,178 arrived from two peers within a second, validation read the
-	// mix, failed, and the chain stopped at 707,177. The converting copy holds
-	// the hash in the in-flight set until it returns and writes its record
-	// before returning, so the two checks leave no gap between them. Only the
-	// raw file is removed: the converted record is the copy being kept.
-	if !msg.body.Converted && sm.blockPark.store != nil {
-		if sm.conversionInFlight(msg.body.Hash) {
-			sm.logger.Infof("[blockOnDisk][%s] another copy of this block is being converted, discarding this raw copy", msg.body.Hash)
-			sm.blockPark.deleteRawBody(sm.ctx, msg.body.Hash)
+	// Every delivery that wrote nothing is a drained copy, noted and consumed above. Anything
+	// else unconverted cannot happen: the pipeline sink is the only sink, and the raw-body
+	// route that once wrote whole blocks here is gone.
+	if !msg.body.Converted {
+		sm.logger.Warnf("[blockOnDisk][%s] a delivery from %s wrote no converted record and was not a drained copy; ignoring it", msg.body.Hash, msg.peer)
 
-			return
-		}
-
-		if _, found, err := sm.blockPark.convertedRecordSize(sm.ctx, msg.body.Hash); err == nil && found {
-			sm.logger.Infof("[blockOnDisk][%s] this block is already converted, discarding this raw copy", msg.body.Hash)
-			sm.blockPark.deleteRawBody(sm.ctx, msg.body.Hash)
-
-			return
-		}
+		return
 	}
 
 	entry := parkedBlock{
@@ -544,18 +468,7 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// same hash, would look identical to one this delivery produced, and
 	// charging by that inference once misattributed a stale or foreign
 	// record's size to a delivery that never wrote it.
-	//
-	// Gating the store lookup on this flag also means the lookup itself never
-	// runs unless the pipeline actually converted something on THIS call: the
-	// admission-budget fallback inside admitPipelineSink (a duplicate hash
-	// already in flight, or the acquire timing out) calls streamingBlockSink
-	// directly, which always reports converted=false (see its own doc
-	// comment), so this whole block below is skipped and handleBlockOnDiskMsg
-	// does exactly the store I/O it always did on that path — none. Before
-	// this gate existed, the lookup ran for every streamed block regardless,
-	// which meant an extra blob-store round trip, and therefore an extra wait
-	// on the store's shared read-permit pool, on the single goroutine that
-	// commits blocks in order — a path that used to do no I/O at all.
+
 	if msg.body.Converted {
 		// The pipeline sink, when it is the one active, has already written
 		// this hash's body as a converted record — a few hundred bytes under
@@ -563,11 +476,8 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		// nothing on disk shaped like the whole block msg.body.Size describes.
 		// Charging that size against the park's budget would over-charge a
 		// pipelined block by orders of magnitude and starve the park into
-		// believing it is nearly full when it holds almost nothing, so the two
-		// paths deliberately charge different numbers: the plain streaming
-		// path charges the whole block's wire size because that is what
-		// write/WriteStreamedBody put on disk, and this charges the record's
-		// own length instead.
+		// believing it is nearly full when it holds almost nothing, so this
+		// charges the record's own length instead.
 		if size, found, err := sm.blockPark.convertedRecordSize(sm.ctx, entry.hash); err != nil {
 			sm.logger.Warnf("[blockOnDisk][%s] failed to check for a converted record, charging the whole block's wire size instead: %v", entry.hash, err)
 		} else if found {
@@ -681,6 +591,19 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// The sweep already applies this rule before it posts, which is why it does
 	// not produce them.
 	if !sm.parentIsInChain(entry.prevBlock) {
+		// The parent still has to be asked for, and the getblocks is not an
+		// alternative to keeping the block: it is the only thing that fetches the
+		// gap, and the batch-continuation signal the legacy protocol runs on. A
+		// peer pushes its tip after a batch and then sends nothing until the next
+		// getblocks. Sent in both modes, as the decoded route always sent it:
+		// inside headers-first mode the reply is dropped by processInvMsg and costs
+		// one message, and outside it, on every node past the final checkpoint, it
+		// is the whole of the recovery, because fetchMoreHeaderBlocks does nothing
+		// there.
+		if primary != nil {
+			sm.requestMissingBlocks(primary, entry.hash)
+		}
+
 		return
 	}
 

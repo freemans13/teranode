@@ -441,7 +441,12 @@ func (sm *SyncManager) runParkSweep() {
 // goroutine of its own. A send on a nil channel would block forever.
 func (sm *SyncManager) submitParkCommit(commit parkCommit) {
 	if sm.parkCommits == nil {
-		sm.commitParkedBlockAndDrain(commit.entry)
+		// Put back, then drained here and now, for the reason the consumers give: an
+		// entry the on-disk handler posts is still in the index, and committing it
+		// directly left it there. The drain walks synchronously, because the caller
+		// may be the sweep's own goroutine, and the consumer's queue is not its to touch.
+		sm.blockPark.Restore(commit.entry)
+		sm.drainParkedDescendants(commit.entry.prevBlock)
 
 		return
 	}

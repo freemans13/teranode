@@ -50,24 +50,12 @@ func (sm *SyncManager) holdsBlock(ctx context.Context, hash chainhash.Hash) bool
 	readCtx, cancel := sm.blockPark.storeCtx(ctx)
 	defer cancel()
 
-	// The pipeline record first. It is a few hundred bytes against the whole
-	// block's gigabytes, it is the shape the new model writes, and on a node
-	// running the pipeline path it is the one that will be there. A read
-	// failure here — absent, undecodable, or hashing to the wrong key — falls
-	// through to the whole-block check below rather than answering false
-	// outright, since the two shapes are otherwise mutually exclusive.
-	if record, err := sm.blockPark.ReadConverted(readCtx, hash); err == nil {
-		if sm.blockPark.hasCompleteRecord(readCtx, hash, record, sm.subtreeStore) {
-			return true
-		}
-	}
-
-	exists, err := sm.blockPark.store.Exists(readCtx, hash[:], parkFileType, parkOpts...)
+	// A converted record is the only shape a held block takes; the whole raw blocks an older
+	// build wrote are deleted on restart.
+	record, err := sm.blockPark.ReadConverted(readCtx, hash)
 	if err != nil {
-		sm.logger.Warnf("[holdsBlock][%s] could not ask the store whether the block is on disk, assuming it is not: %v", hash, err)
-
 		return false
 	}
 
-	return exists
+	return sm.blockPark.hasCompleteRecord(readCtx, hash, record, sm.subtreeStore)
 }

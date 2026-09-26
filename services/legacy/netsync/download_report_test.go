@@ -34,7 +34,7 @@ func TestDownloadReportOnlyForBlocksWorthReading(t *testing.T) {
 	raw := &blockStream{height: 100, total: 1_000, start: now.Add(-time.Second), path: admitRawTimedOut}
 	raw.read.Store(1_000)
 	_, interesting = raw.report(now, 90)
-	require.True(t, interesting, "a block that fell back to the raw path is always reported")
+	require.True(t, interesting, "a block drained because its admission timed out is always reported")
 }
 
 func TestDownloadReportSaysWhatHappened(t *testing.T) {
@@ -58,7 +58,7 @@ func TestDownloadReportSaysWhatHappened(t *testing.T) {
 	require.Contains(t, line, "in 20s")
 	require.Contains(t, line, "bytes began 30s after it was requested")
 	require.Contains(t, line, "waited 18s for an admission slot")
-	require.Contains(t, line, "raw: the wait for an admission slot timed out")
+	require.Contains(t, line, "drained: the wait for an admission slot timed out")
 }
 
 func TestAdmissionIsRecordedOnTheBlocksStream(t *testing.T) {

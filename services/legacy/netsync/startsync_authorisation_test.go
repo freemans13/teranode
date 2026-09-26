@@ -89,14 +89,23 @@ func registerSyncPeerChangePeer(t *testing.T, sm *SyncManager, p *peerpkg.Peer, 
 // ledger, that same clear started wiping the very record the disconnect gate
 // consults, and the honest peer lost its whole association for answering a
 // question we asked it.
+//
+// The gate that consults the ledger moved. There is no decoded handleBlockMsg
+// left to disconnect a sender post hoc; streamingBlockGate (streaming_install.go)
+// is what now refuses an unrequested body, ahead of the streaming sink, by the
+// same RequestedWithin question against the same ledger — so this drives that
+// gate directly rather than a whole peer connection through it.
 func TestStartSync_HonestPeerKeepsItsAuthorisationAcrossASyncPeerChange(t *testing.T) {
 	sm := newSyncPeerChangeManager(t)
+	// streamingBlockGate demands the header actually meet its own target
+	// difficulty, which a mainnet floor makes infeasible to solve in a test;
+	// regtest's is the one every other fixture in this package mines against.
+	sm.chainParams = &chaincfg.RegressionNetParams
 
-	// A block whose parent we do not know, so handleBlockMsg treats it as an
-	// orphan once it is past the gate.
 	prevHash := chainhash.Hash{0x7f}
-	msgBlock := wire.NewMsgBlock(wire.NewBlockHeader(1, &prevHash, &chainhash.Hash{}, 0, 0))
-	frontier := msgBlock.Header.BlockHash()
+	header := wire.NewBlockHeader(1, &prevHash, &chainhash.Hash{}, 0x207fffff, 0)
+	require.True(t, solveBlock(header, sm.chainParams.PowLimit))
+	frontier := header.BlockHash()
 
 	// The peer startSync will elect: a connected sync candidate ahead of us.
 	newSyncPeer, _, _ := connectRacePeer(t, 21, 1000)
@@ -116,21 +125,10 @@ func TestStartSync_HonestPeerKeepsItsAuthorisationAcrossASyncPeerChange(t *testi
 	require.Equal(t, newSyncPeer, sm.loadSyncPeer(),
 		"sanity: startSync must have run to completion, so the ledger-wide clear was reached")
 
-	// The honest peer's copy turns up.
-	err := sm.handleBlockMsg(&blockQueueMsg{
-		block:       msgBlock,
-		blockHash:   frontier,
-		blockHeight: 501,
-		peer:        honest,
-	})
-
-	require.True(t, honest.Connected(),
-		"an honest peer delivering a block we asked it for must keep its connection across a sync-peer change")
-
-	if err != nil {
-		require.NotContains(t, err.Error(), "unrequested",
-			"the block was requested, so it must never be judged unrequested")
-	}
+	// The honest peer's copy turns up on the streaming route.
+	err := sm.streamingBlockGate(frontier, header)
+	require.NoError(t, err,
+		"the block was requested, so the streaming gate must not treat the honest peer's delivery as unrequested")
 }
 
 // TestStartSync_DoesNotReopenBlocksOwedByPeersStillOnTheJob pins the deletion of

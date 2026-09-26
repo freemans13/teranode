@@ -8,10 +8,8 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/stretchr/testify/mock"
@@ -52,6 +50,23 @@ func (s *parkReadFaultStore) GetIoReader(ctx context.Context, key []byte, fileTy
 	return s.Store.GetIoReader(ctx, key, fileType, opts...)
 }
 
+// Get is the converted-record read path (blockPark.ReadConverted), unlike the
+// raw whole-block path (blockPark.Read), which streams through GetIoReader
+// above. Every block parks as a converted record now that the pipeline sink is
+// the only sink, so a test arming only GetIoReader would silently stop
+// faulting anything: this must fail the same way for the same reason.
+func (s *parkReadFaultStore) Get(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) ([]byte, error) {
+	s.mu.Lock()
+	err := s.err
+	s.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+
+	return s.Store.Get(ctx, key, fileType, opts...)
+}
+
 // requireStillParked asserts the end state a block that was NOT judged must
 // reach: still in the index, still on disk, still charged, not re-requested and
 // the peer unblamed.
@@ -60,7 +75,7 @@ func (h *parkWiringHarness) requireStillParked(t *testing.T, hash chainhash.Hash
 
 	require.Equal(t, 1, h.sm.blockPark.Len(), "the block must still be parked")
 	require.Equal(t, bytesBefore, h.sm.blockPark.Bytes(), "putting a block back must not lose or double its budget")
-	require.Contains(t, parkDirEntries(t, h.parkDir), hash.String()+".msgBlock",
+	require.Contains(t, parkDirEntries(t, h.parkDir), hash.String()+".block",
 		"the downloaded block must still be on disk")
 
 	before := h.rec.getDataCount()
@@ -144,7 +159,10 @@ func TestSyncManager_AParkedBlockSurvivesATransientCommitFailure(t *testing.T) {
 	child := h.blocks[1].MsgBlock().BlockHash()
 	parent := h.blocks[0].MsgBlock().BlockHash()
 
-	h.client.On("GetBlockExists", mock.Anything, &child).Return(false, nil).Once()
+	// The streaming route only ever calls GetBlockExists(child) once, at the
+	// real commit attempt below (parking itself never calls it), so this is
+	// that attempt's own answer rather than a second one behind an
+	// already-consumed park-time check.
 	h.client.On("GetBlockExists", mock.Anything, &child).
 		Return(false, errors.NewStorageError("the store is not answering")).Once()
 	h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
@@ -158,71 +176,4 @@ func TestSyncManager_AParkedBlockSurvivesATransientCommitFailure(t *testing.T) {
 	require.NoError(t, h.deliver(t, 0))
 
 	h.requireStillParked(t, child, parkedBytes)
-}
-
-// TestSyncManager_ABlockTheParkRefusesIsDroppedAndAskedForAgain is the row for a
-// block that fails the park's own stateless checks. Nothing was written, so
-// there is no blob to keep or delete, but the header has already left the walk —
-// so the walk still has to be put back onto it or the block is gone for good.
-//
-// It is also the one row where the node's state, rather than the error, decides
-// whether the peer hears about it: handleBlockMsg suppresses every reject while
-// the node is catching blocks, because then it is replaying history rather than
-// judging a peer's tip, and parking must not judge a peer differently from
-// discarding. Both sides of that are driven here.
-func TestSyncManager_ABlockTheParkRefusesIsDroppedAndAskedForAgain(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		fsmState     blockchain2.FSMStateType
-		expectReject bool
-	}{
-		{
-			name:         "catching blocks, so the peer is not blamed",
-			fsmState:     blockchain2.FSMStateCATCHINGBLOCKS,
-			expectReject: false,
-		},
-		{
-			name:         "running, so the peer is told the block was bad",
-			fsmState:     blockchain2.FSMStateRUNNING,
-			expectReject: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newParkWiringHarnessInState(t, true, tc.fsmState)
-
-			// A real header with real proof of work and no transactions at all.
-			// It hashes to the front block of the header list, so the header list
-			// gives it up on arrival exactly as it would for the genuine article,
-			// and then the park refuses it.
-			//
-			// This used to be a header carrying somebody else's transactions,
-			// refused on the merkle root. That check is no longer in the park: it
-			// cost a rebuild over every transaction, 13.7 seconds for a
-			// 100,001-transaction mainnet block on 91% of blocks, and normal block
-			// processing verifies the same root anyway. An empty transaction list
-			// is the cheapest thing the park still refuses, and the disposition
-			// under test is the same one either way.
-			tampered := &wire.MsgBlock{Header: h.blocks[0].MsgBlock().Header}
-			front := tampered.BlockHash()
-
-			h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-
-			getDataBefore := h.rec.getDataCount()
-
-			require.NoError(t, h.deliverBlock(t, tampered, 1))
-
-			require.Zero(t, h.sm.blockPark.Len(), "a refused block must not be parked")
-			require.Empty(t, parkDirEntries(t, h.parkDir), "nothing may reach the disk once the block has been refused")
-
-			h.requireBackInTheWalk(t, front, getDataBefore)
-
-			if tc.expectReject {
-				require.True(t, WaitUntil(func() bool { return h.rec.wasRejected(front) }, 5*time.Second),
-					"a block that failed its own stateless checks is a peer fault and the peer must be told")
-			} else {
-				require.False(t, h.rec.wasRejected(front),
-					"while catching blocks no reject is sent, whether the block is parked or discarded")
-			}
-		})
-	}
 }

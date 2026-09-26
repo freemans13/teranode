@@ -708,25 +708,6 @@ func (p *blockPark) write(ctx context.Context, hash chainhash.Hash, msgBlock *wi
 	return err
 }
 
-// WriteStreamedBody stores a body that arrived straight off the wire, putting
-// the header in front of it so what lands is byte-for-byte what write produces
-// for a decoded block: header, transaction count, transactions.
-//
-// The header is passed separately because the wire handler has already read it
-// to compute the hash and to put it to the gate, and putting it back on the
-// stream there would mean re-serializing it into a buffer the streaming path
-// exists to avoid. n is the total size of the finished file, header included.
-func (p *blockPark) WriteStreamedBody(ctx context.Context, hash chainhash.Hash, r io.Reader, n int64) error {
-	if p == nil || p.store == nil {
-		return errors.NewProcessingError("[blockPark][%s] no store to stream into", hash)
-	}
-
-	writeCtx, cancel := p.storeCtx(ctx)
-	defer cancel()
-
-	return p.store.SetFromReader(writeCtx, hash[:], parkFileType, io.NopCloser(r), parkOpts...)
-}
-
 // WriteConvertedBlock stores a block pipelineBlockSink has already converted and
 // merkle-verified, as a serialized model.Block under fileformat.FileTypeBlock —
 // a few hundred bytes: header, counts, subtree hashes, coinbase — rather than
@@ -1096,23 +1077,11 @@ func (p *blockPark) Restore(entry parkedBlock) {
 // once covers all of them, rather than only the discard path that happened to
 // call it explicitly.
 //
-// It always attempts both file types under the entry's hash, never only one.
-// A single DELIVERY never writes both — pipelineBlockSink either converts
-// (writing FileTypeBlock) or falls back to streamingBlockSink (writing
-// FileTypeMsgBlock), never both in the same call — but a single HASH can
-// still end up with both on disk at once: admitPipelineSink's
-// ErrDuplicateBlockInFlight branch exists precisely to let one peer's read
-// loop convert a hash while a second peer's concurrent delivery of the same
-// hash is declined admission and falls back to streamingBlockSink, which
-// writes the whole body under FileTypeMsgBlock right alongside the first
-// peer's FileTypeBlock record. Attempting both deletes here is what makes
-// that harmless: whichever of the two exists for this hash is removed, and
-// commitParkedBlock already prefers the record over the whole block when an
-// entry could in principle have adopted either (see its own converted field).
-// So the second delete is a no-op only for the ordinary, single-delivery
-// entry, not for every entry; it is not free lunch on every OTHER hash,
-// because the key is this entry's own block hash, which nothing else's data
-// lives under. This must never be extended to also
+// It deletes the whole-block file under the hash too. Only the decoded park
+// route writes one, and removing that route removes this delete. The key is this
+// entry's own block hash, which nothing else's data lives under.
+//
+// This must never be extended to also
 // delete the SUBTREE files a converted record names: those are content-
 // addressed and shared, this function runs on the commit path as much as the
 // discard path, and a committed block's subtree files are its own data now —
@@ -1137,21 +1106,6 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 
 	if err := p.store.Del(delCtx, entry.hash[:], fileformat.FileTypeBlock, parkOpts...); err != nil {
 		p.logger.Warnf("[blockPark][%s] failed to delete converted record, leaving it for the next restart sweep: %v", entry.hash, err)
-	}
-}
-
-// deleteRawBody removes only the whole-body file written for a raw copy of a
-// block, leaving the park's entries and any converted record alone.
-func (p *blockPark) deleteRawBody(ctx context.Context, hash chainhash.Hash) {
-	if p == nil || p.store == nil {
-		return
-	}
-
-	delCtx, cancel := p.storeCtx(ctx)
-	defer cancel()
-
-	if err := p.store.Del(delCtx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...); err != nil {
-		p.logger.Warnf("[blockPark][%s] failed to delete a discarded raw copy, leaving it for the next restart sweep: %v", hash, err)
 	}
 }
 
@@ -1718,79 +1672,12 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store) {
 			continue
 		}
 
-		hash, err := chainhash.NewHashFromStr(strings.TrimSuffix(name, "."+string(fileformat.FileTypeMsgBlock)))
-		if err != nil {
-			p.logger.Warnf("[blockPark] %s in the park directory is not named after a block hash, leaving it alone: %v", name, err)
+		// A whole raw block, written by an older build. Nothing commits a raw block any more,
+		// so it is deleted with its checksum sidecar, and the block is downloaded again.
+		p.removeParkFile(name)
+		p.removeParkFile(name + ".sha256")
 
-			skipped++
-
-			continue
-		}
-
-		info, err := dirEntry.Info()
-		if err != nil {
-			skipped++
-
-			continue
-		}
-
-		size := info.Size() - int64(fileformat.Header{}.Size())
-		if size < 0 {
-			size = 0
-		}
-
-		prevBlock, d, err := p.readParkedPrevBlock(ctx, *hash)
-		if err != nil {
-			// The same policy the drain uses, for the same reason. A read that
-			// could not get one of the store's shared permits, or that was cut
-			// short because this scan's own budget ran out, says nothing about
-			// the block — and deleting on that would destroy fully downloaded
-			// blocks on every restart that happens while the node is busy, which
-			// is when restarts happen.
-			if d.blob != parkBlobDrop {
-				p.logger.Warnf("[blockPark][%s] parked block could not be read (%s), leaving it on disk for the next start: %v", hash, d.reason, err)
-
-				skipped++
-
-				continue
-			}
-
-			p.logger.Warnf("[blockPark][%s] parked block is unusable, deleting it: %v", hash, err)
-			p.Delete(ctx, parkedBlock{hash: *hash})
-
-			discarded++
-
-			continue
-		}
-
-		// The blob's modification time is when the block was parked, and it is on
-		// disk, so it is the one thing about a recovered block that survives the
-		// restart. Stamping time.Now() here instead would restart every block's
-		// window on every boot: a node restarting often would never notice
-		// anything had gone stale, and a block whose parent is genuinely
-		// never coming would hold its budget for as long as that went on. Anything
-		// unusable — a zero time, or a clock that has gone backwards since the
-		// write — falls back to now, which is only ever the old behaviour.
-		parkedAt := info.ModTime()
-		if parkedAt.IsZero() || parkedAt.After(time.Now()) {
-			parkedAt = time.Now()
-		}
-
-		// peer nil and height 0 are both defined: post-commit peer actions fall
-		// back to the current sync peer, and HandleBlockDirect derives a
-		// non-positive height from the parent.
-		entry := parkedBlock{hash: *hash, prevBlock: prevBlock, size: size, parkedAt: parkedAt}
-
-		p.mu.Lock()
-		stored := entry
-		p.entries[entry.hash] = &stored
-		p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
-		p.chargeLocked(entry.hash, size)
-		p.setGauges()
-		p.mu.Unlock()
-
-		adopted++
-		adoptedBytes += size
+		discarded++
 	}
 
 	if abandoned > 0 {
@@ -1804,47 +1691,6 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store) {
 	// Logged even when nothing was adopted, so "recovery found nothing" is never
 	// silent in a directory that had files in it.
 	p.logger.Infof("[blockPark] recovered %d parked block(s) holding %d bytes from %s, discarded %d, left %d file(s) alone", adopted, adoptedBytes, p.dir, discarded, skipped)
-}
-
-// readParkedPrevBlock reads just the 80-byte header off a parked blob and
-// returns its parent, checking on the way that the file really is the block its
-// name claims. GetIoReader has already consumed the store's own 8-byte header,
-// so the first bytes it hands back are the block header.
-//
-// It returns the failure's classification alongside the error, so a caller
-// cannot read a parked blob without being handed the answer to "does this say
-// anything about the block?". Recovery once decided that for itself and deleted
-// good blocks whenever the store was busy; there is no signature here that lets
-// that happen again.
-func (p *blockPark) readParkedPrevBlock(ctx context.Context, hash chainhash.Hash) (chainhash.Hash, parkDisposition, error) {
-	readCtx, cancel := p.storeCtx(ctx)
-	defer cancel()
-
-	rc, err := p.store.GetIoReader(readCtx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...)
-	if err != nil {
-		return chainhash.Hash{}, parkReadFailure(err), err
-	}
-
-	defer func() {
-		if closeErr := rc.Close(); closeErr != nil {
-			p.logger.Warnf("[blockPark][%s] failed to close parked block reader: %v", hash, closeErr)
-		}
-	}()
-
-	var header wire.BlockHeader
-	if err = header.Deserialize(rc); err != nil {
-		err = errors.NewBlockInvalidError("[blockPark][%s] could not read the block header", hash, err)
-
-		return chainhash.Hash{}, parkReadFailure(err), err
-	}
-
-	if got := header.BlockHash(); !got.IsEqual(&hash) {
-		err = errors.NewBlockInvalidError("[blockPark][%s] header belongs to %s", hash, got)
-
-		return chainhash.Hash{}, parkReadFailure(err), err
-	}
-
-	return header.PrevBlock, parkDispositionParked, nil
 }
 
 // removeParkFile unlinks one file from the park directory by name.

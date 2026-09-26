@@ -52,26 +52,6 @@ const consumerStallAfter = 90 * time.Second
 type consumerWait struct {
 	at time.Time
 
-	// queueArmOpen is whether the loop was willing to take another block off the
-	// queue. False is the interesting case: it means the loop had already
-	// accepted work it could not place, so arriving blocks pile up behind it
-	// holding their download budget.
-	queueArmOpen bool
-
-	// pendingHash and pendingHeight name the head-processed block waiting for
-	// window capacity, and are empty when there is none. A pending block is what
-	// closes the queue arm, so a wedge with the arm shut almost always has one.
-	pendingHash   string
-	pendingHeight uint32
-
-	// pendingWindowed distinguishes the two admission rules: a windowed block
-	// needs a slot and budget, an unwindowed one needs an empty frontier.
-	pendingWindowed bool
-
-	// parkJobHeld is whether the loop was holding a park job no worker had taken.
-	// It closes the queue arm for the same reason the pending dispatch does.
-	parkJobHeld bool
-
 	// barrier is the checkpoint gate. Set, it refuses every block whatever the
 	// frontier holds, so it is worth stating outright rather than inferring.
 	barrier bool
@@ -148,18 +128,10 @@ type consumerWait struct {
 // publishConsumerWait records what the loop is about to block on. Called by the
 // consumer only, immediately before its select, so the snapshot describes the
 // wait rather than the work that preceded it.
-func (sm *SyncManager) publishConsumerWait(now time.Time, queueArmOpen bool, pending *blockDispatch) {
+func (sm *SyncManager) publishConsumerWait(now time.Time) {
 	w := &consumerWait{
-		at:           now,
-		queueArmOpen: queueArmOpen,
-		parkJobHeld:  sm.parkJobHeld != nil,
-		drainQueued:  len(sm.drainQueue),
-	}
-
-	if pending != nil {
-		w.pendingHash = shortHash(pending.msgHash().String())
-		w.pendingHeight = pending.height
-		w.pendingWindowed = pending.windowed
+		at:          now,
+		drainQueued: len(sm.drainQueue),
 	}
 
 	if bd := sm.dispatcher; bd != nil {
@@ -303,32 +275,6 @@ func (w *consumerWait) describe(now time.Time) string {
 
 	b.WriteString("the block loop has been waiting ")
 	b.WriteString(now.Sub(w.at).Round(time.Second).String())
-
-	if w.queueArmOpen {
-		b.WriteString(" with its queue arm open, so it would take another block and none is arriving")
-	} else {
-		b.WriteString(" with its queue arm shut, so arriving blocks are piling up behind work it has already accepted")
-	}
-
-	if w.pendingHash != "" {
-		b.WriteString("; it is holding block ")
-		b.WriteString(w.pendingHash)
-		b.WriteString(" at height ")
-		b.WriteString(strconv.FormatUint(uint64(w.pendingHeight), 10))
-		b.WriteString(" for capacity (")
-
-		if w.pendingWindowed {
-			b.WriteString("windowed, so it needs a free slot and budget")
-		} else {
-			b.WriteString("not windowed, so it needs an empty window")
-		}
-
-		b.WriteString(")")
-	}
-
-	if w.parkJobHeld {
-		b.WriteString("; it is holding a park job no worker has taken")
-	}
 
 	if w.barrier {
 		b.WriteString("; the checkpoint barrier is set, which refuses every block until the checkpoint's tail runs")
