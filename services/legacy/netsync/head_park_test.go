@@ -70,8 +70,10 @@ func TestSweep_PostsCommitsToTheConsumerInsteadOfCommitting(t *testing.T) {
 		"the sweep passes the parent height its own lookup fetched, so the drained block's frontier entry is not height-blind")
 
 	// The consumer's side, which is the same one every drained block takes: put
-	// the entry back, then let the drain step claim it through one admission test.
-	h.sm.commitParkedBlockAndDrain(commit.entry)
+	// the entry back, then let the drain claim it — the same composition
+	// submitParkCommit's own no-consumer arm uses (block_park_drain.go).
+	h.sm.blockPark.Restore(commit.entry)
+	h.sm.drainParkedDescendants(commit.entry.prevBlock)
 
 	for _, name := range parkDirEntries(t, h.parkDir) {
 		require.NotContains(t, name, child.String(), "the consumer's commit is what deletes the blob")

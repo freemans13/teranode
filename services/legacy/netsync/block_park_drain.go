@@ -126,10 +126,6 @@ func (sm *SyncManager) parentChainState(hash chainhash.Hash) (exists bool, inval
 // that many frames, each one holding a decoded block. Exactly one block is
 // decoded at a time and it is released before the next is read.
 func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
-	if !sm.blockPark.Enabled() {
-		return
-	}
-
 	stack := []chainhash.Hash{committed}
 
 	for len(stack) > 0 {
@@ -165,39 +161,15 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 // two defaults point opposite ways: a read failure keeps the block, a commit
 // failure judges it.
 func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
-	// A converted entry has a record on disk instead of a whole block —
-	// entry.converted is set once, at AdoptWritten or Recover, from the fact
-	// that made it true then; see its own doc comment for why this must never
-	// go back to asking the store (a blockPark.IsConverted call) on this
-	// goroutine, which commits every parked block in order.
-	if entry.converted {
-		record, err := sm.blockPark.ReadConverted(sm.ctx, entry.hash)
-		if err != nil {
-			return sm.parkedReadFailed(entry, err)
-		}
+	record, err := sm.blockPark.ReadConverted(sm.ctx, entry.hash)
+	if err != nil {
+		return sm.parkedReadFailed(entry, err)
+	}
 
-		// A nil in-flight parent: see HandleConvertedBlock's own doc comment for
-		// why it is never called with anything else.
-		if err = sm.HandleConvertedBlock(sm.ctx, entry.peer, entry.hash, record); err != nil {
-			return sm.parkedBlockFailed(entry, err)
-		}
-	} else {
-		msgBlock, err := sm.blockPark.Read(sm.ctx, entry.hash)
-		if err != nil {
-			return sm.parkedReadFailed(entry, err)
-		}
-
-		// A nil in-flight parent: the parent of a parked block is in the chain by the
-		// time anything commits it, so HandleBlockDirect looks it up there.
-		//
-		// The ancestry proof is re-read from the header cache for the same reason the
-		// dispatcher's parked run does: the run that named this block may have been
-		// replaced, or the process restarted, since it was parked. A cache that still
-		// names it inside a proven prefix gives the same answer it gave on arrival; one
-		// that does not gives the zero value, which denies the fast path.
-		if err = sm.HandleBlockDirect(sm.ctx, entry.peer, entry.hash, msgBlock, nil, sm.blockOrigin(entry.hash)); err != nil {
-			return sm.parkedBlockFailed(entry, err)
-		}
+	// A nil in-flight parent: see HandleConvertedBlock's own doc comment for why it
+	// is never called with anything else.
+	if err = sm.HandleConvertedBlock(sm.ctx, entry.peer, entry.hash, record); err != nil {
+		return sm.parkedBlockFailed(entry, err)
 	}
 
 	// isCheckpointHash is a direct hash comparison against the configured
@@ -482,16 +454,6 @@ type parkCommit struct {
 	parentHeight uint32
 }
 
-// commitParkedBlockAndDrain commits one parked block and then everything parked
-// behind it, both on the calling goroutine. It is what a manager with no
-// dispatcher does, which is the pre-window path and every struct-literal test
-// manager.
-func (sm *SyncManager) commitParkedBlockAndDrain(entry parkedBlock) {
-	if sm.commitParkedBlock(entry) {
-		sm.drainParkedDescendants(entry.hash)
-	}
-}
-
 // scheduleDrain records that a block has committed and blocks parked behind it
 // may now be committable. It is the one entry point for that, and it has two
 // behaviours.
@@ -515,10 +477,6 @@ func (sm *SyncManager) scheduleDrain(parent chainhash.Hash, parentHeight uint32)
 	if !sm.drainAsync.Load() {
 		sm.drainParkedDescendants(parent)
 
-		return
-	}
-
-	if !sm.blockPark.Enabled() {
 		return
 	}
 
@@ -650,21 +608,13 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 // height as each arrives. What actually stops the download reading past a
 // point is positional, not a count of requests in flight at once:
 // wantedBlocks (wanted_range_assign.go) never asks for a height more than
-// lookaheadCeilingLocked's ceiling above the committed height, and that
-// ceiling is legacy_blockDownloadLowerWindow, 128 by default (see
-// settings.go's own getInt call; the "0" on the field's struct tag in
-// legacy_settings.go is stale doc text, not what NewSettings loads, exactly
-// the trap TestLegacyBlockScheduler_Defaults exists to catch), scaled DOWN
-// from there for a large block, never up. legacy_blockDownloadWindow (1024)
-// is a different, count-shaped bound: how many requests may be outstanding
-// at once, the same class of number as the discredited per-peer one above,
-// and it does not gate position at all. TestWantedRange_TheParkNeverExceedsTheReadAheadDepth
-// is what actually proves the park's population bound is the lower window,
-// not this.
+// legacy_blockDownloadWindow above the committed height, 1024 by default.
+// TestWantedRange_TheParkNeverExceedsTheReadAheadDepth is what actually proves
+// the park's population bound is that window, not this.
 //
-// So the real worst case is on the order of 128 recovered blocks needing a
-// lookup, not 1024, and never per park entry per tick: one chain lookup per
-// recovered block, once.
+// So the real worst case is on the order of legacy_blockDownloadWindow
+// recovered blocks needing a lookup, never per park entry per tick: one chain
+// lookup per recovered block, once.
 //
 // Deliberately NOT called from Start(), where Recover runs: at that point
 // nothing is reading sm.parkCommits yet (dispatchBlocks, the consumer, and
@@ -674,10 +624,6 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 // consumer goroutine is started and before the sweep's own goroutine begins,
 // so a hand-off here always has somewhere to go.
 func (sm *SyncManager) reconcileRecoveredParents(ctx context.Context) int {
-	if !sm.blockPark.Enabled() {
-		return 0
-	}
-
 	handed := 0
 
 	for _, candidate := range sm.blockPark.AllParked() {
@@ -765,10 +711,6 @@ func (sm *SyncManager) reconcileRecoveredParents(ctx context.Context) int {
 // Stopping there is free: a lookup the tick does not reach simply leaves the
 // block parked for the next one.
 func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
-	if !sm.blockPark.Enabled() {
-		return
-	}
-
 	deadline := sm.parkSweepClock().Add(parkSweepTimeBudget)
 
 	for i, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {

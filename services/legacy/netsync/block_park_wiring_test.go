@@ -150,6 +150,15 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
+	// New always builds a real stream registry, and newDownloadAssigner's
+	// per-peer depth floors an unmeasured peer at unmeasuredPeerDepth (2) until
+	// its speed is known. A harness peer never streams a real block through
+	// trackBlockStreams, so without a seeded rate it would stay "unmeasured"
+	// for the harness's whole life and silently cap every test in this file at
+	// two requests in flight, whatever legacy_maxBlocksInTransitPerPeer says.
+	sm.streams = newStreamRegistry()
+	sm.streams.rates[syncPeer] = 1
+
 	sm.headersFirstMode.Store(true)
 
 	// assignWantedBlocks reads the header cache, one node per block, in order,
@@ -423,16 +432,21 @@ func TestSyncManager_NothingIsDrainedAfterABlockThatDidNotCommit(t *testing.T) {
 	require.False(t, failed, "a block nobody tried to commit must not be marked as having failed")
 }
 
-// TestHandleBlockDirect_ToleratesANilPeer. Every block recovered from the park
+// TestHandleConvertedBlock_ToleratesANilPeer. Every block recovered from the park
 // after a restart has no delivering peer, and (*Peer).String dereferences the
 // peer's address and asks it whether it is the sync peer — so calling it on nil
 // panics, on the block-queue goroutine, in production.
-func TestHandleBlockDirect_ToleratesANilPeer(t *testing.T) {
+//
+// Ported from the deleted HandleBlockDirect route onto HandleConvertedBlock,
+// which carries the identical nil-peer guard (handle_block.go).
+func TestHandleConvertedBlock_ToleratesANilPeer(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
 	msgBlock := h.blocks[1].MsgBlock()
 	hash := msgBlock.BlockHash()
 	prev := msgBlock.Header.PrevBlock
+
+	blk := bodyCommitment(t, bsvutil.NewBlock(msgBlock))
 
 	// The parent IS stored, so the block gets past the parent lookup and reaches
 	// the tracing call that names the peer. It is stopped just after, on the
@@ -450,7 +464,7 @@ func TestHandleBlockDirect_ToleratesANilPeer(t *testing.T) {
 	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
 
 	require.NotPanics(t, func() {
-		err := h.sm.HandleBlockDirect(context.Background(), nil, hash, msgBlock, nil, blockRequestOrigin{headerProven: true})
+		err := h.sm.HandleConvertedBlock(context.Background(), nil, hash, blk)
 		require.Error(t, err, "the parent is not mined, so this must fail there — not on a nil peer")
 	})
 }

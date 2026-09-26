@@ -322,7 +322,7 @@ func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManag
 	bcClient, err := blockchain2.NewLocalClient(ulogger.TestLogger{}, tSettings, bcStore, nil, nil)
 	require.NoError(t, err)
 
-	return &SyncManager{
+	sm := &SyncManager{
 		logger:           ulogger.TestLogger{},
 		settings:         tSettings,
 		chainParams:      &params,
@@ -334,6 +334,16 @@ func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManag
 		// answers false, which would make every fixture ineligible above.
 		utxoStore: &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}},
 	}
+
+	// New always builds this gate unconditionally now (the streaming pipeline
+	// is the only route left), so a manager built as a struct literal needs it
+	// too, or admitPipelineSink's AcquireBlockPrefetch panics on a nil map.
+	// Sized generously (64, matching the shipped default of
+	// MaxBlocksInTransitPerPeer x pipelineBlockSlotPeerAllowance) so it never
+	// binds unless a test deliberately narrows it.
+	enablePrefetchBudgetForTest(t, sm, 64)
+
+	return sm
 }
 
 // pipelineHeaderFixture points blk's header at a parent the manager's fresh

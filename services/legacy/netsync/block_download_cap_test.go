@@ -131,6 +131,7 @@ func TestFetchHeaderBlocks_NeverAsksForABlockTheLedgerWillNotTrack(t *testing.T)
 	syncPeer, _, rec := connectRacePeer(t, 62, 1000)
 	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+	wireStreamingPath(sm, syncPeer)
 
 	anchor := chainhash.Hash{}
 	anchor[31] = 0xa0

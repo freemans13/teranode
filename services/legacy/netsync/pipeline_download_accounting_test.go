@@ -116,11 +116,10 @@ func TestHandleBlockOnDiskMsg_ReleasesTheAssociationPrimarysAssignment(t *testin
 }
 
 // TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions is the regression
-// test for the missing admission control. AcquireBlockPrefetch is reached only
-// from OnBlock, which the peer dispatches only for a whole-block message; with
-// the pipeline on every block comes back as *peer.MsgBlockOnDisk instead, so
-// OnBlock — and the admission check inside it — never runs, and the pipeline
-// path has no bound on how many blocks convert concurrently.
+// test for the missing admission control. With every block arriving as
+// *peer.MsgBlockOnDisk, the pipeline path had no bound on how many blocks
+// convert concurrently until admitPipelineSink wrapped the sink itself with
+// AcquireBlockPrefetch.
 //
 // This occupies the admission budget's only slot directly (simulating another
 // peer's conversion already in flight), then drives a second, real, convertible
@@ -130,7 +129,7 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 	store := memory.New()
 	sm := newPipelineParkManager(t, store, 8)
 
-	sm.blockPrefetchBudgetBytes = 1
+	sm.blockPrefetchBudgetSlots = 1
 	sm.blockPrefetchBudget = semaphore.NewWeighted(1)
 	sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
 
@@ -148,7 +147,7 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 	// Occupy the only slot, simulating a first block another peer's read loop
 	// is already converting.
 	heldHash := chainhash.Hash{0x01}
-	weight, err := sm.AcquireBlockPrefetch(context.Background(), nil, heldHash, 999)
+	err := sm.AcquireBlockPrefetch(context.Background(), heldHash)
 	require.NoError(t, err, "occupying the only slot must succeed before the second block can be shown to wait on it")
 
 	// A second, distinct, well-formed block. Distinct transaction count from
@@ -180,7 +179,7 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 		// Expected: still blocked on the budget.
 	}
 
-	sm.ReleaseBlockPrefetch(heldHash, weight)
+	sm.ReleaseBlockPrefetch(heldHash)
 
 	require.True(t, WaitUntil(func() bool {
 		select {
@@ -214,7 +213,7 @@ func TestAdmitPipelineSink_DrainsWhenAcquireTimesOut(t *testing.T) {
 	sm := newPipelineParkManager(t, store, 8)
 	sm.settings.Legacy.PeerIdleTimeout = 200 * time.Millisecond
 
-	sm.blockPrefetchBudgetBytes = 1
+	sm.blockPrefetchBudgetSlots = 1
 	sm.blockPrefetchBudget = semaphore.NewWeighted(1)
 	sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
 
@@ -232,7 +231,7 @@ func TestAdmitPipelineSink_DrainsWhenAcquireTimesOut(t *testing.T) {
 	// Occupy the only slot and never release it: the second call's acquire has
 	// no way to succeed within its bound, which is the point.
 	heldHash := chainhash.Hash{0x03}
-	_, err := sm.AcquireBlockPrefetch(context.Background(), nil, heldHash, 1)
+	err := sm.AcquireBlockPrefetch(context.Background(), heldHash)
 	require.NoError(t, err, "occupying the only slot must succeed before the timeout can be shown to fire")
 
 	blk := wireBlockWithTxs(t, 11, false)

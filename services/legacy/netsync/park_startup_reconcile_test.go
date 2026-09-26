@@ -58,15 +58,15 @@ func recoveredParkHarness(t *testing.T) (*SyncManager, chainhash.Hash) {
 
 	// Seeded directly into the index rather than through Admit/Recover: this
 	// harness needs one specific entry in place, not a restart scan over a
-	// directory. Recover would build the same shape (converted: true, a
+	// directory. Recover would build the same shape (a
 	// pre-restart parkedAt) from a real recovery pass; block_park.go's own
 	// Recover is what TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart
 	// exercises for that half.
 	sm.blockPark.entries[hash] = &parkedBlock{
 		hash:      hash,
 		prevBlock: blk.MsgBlock().Header.PrevBlock,
-		converted: true,
-		parkedAt:  time.Now().Add(-parkStuckThreshold - time.Minute),
+
+		parkedAt: time.Now().Add(-parkStuckThreshold - time.Minute),
 	}
 
 	return sm, hash
@@ -90,8 +90,8 @@ func recoveredParkHarnessNoParent(t *testing.T) (*SyncManager, chainhash.Hash) {
 	sm.blockPark.entries[hash] = &parkedBlock{
 		hash:      hash,
 		prevBlock: unresolvedParent,
-		converted: true,
-		parkedAt:  time.Now().Add(-parkStuckThreshold - time.Minute),
+
+		parkedAt: time.Now().Add(-parkStuckThreshold - time.Minute),
 	}
 
 	return sm, hash

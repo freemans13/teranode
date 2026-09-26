@@ -43,13 +43,10 @@ and no loader line arrives as its zero value whatever an operator writes.
 | BlockDownloadTimeoutBasePercent | int64 | 100 | legacy_blockDownloadTimeoutBasePercent | Ceiling on one block download at the chain tip, as a percentage of the target block interval. Floored at 30 minutes, so values at or below 300 change nothing on a 10-minute chain |
 | BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up. Also floored at 30 minutes, which the 600 default clears on a 10-minute chain |
 | BlockDownloadTimeoutPerPeerPercent | int64 | 50 | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling per other peer with a block download outstanding. The total is floored at 30 minutes, so this only adds patience |
-| BlockPrefetchBufferBytes | int64 | 268435456 | legacy_blockPrefetchBufferBytes | On/off switch for asynchronous block admission. 0 disables it. The byte value itself is used only when the block park is off; with the park on the budget is a count of block slots |
 | MultiPeerBlockDownload | bool | true | legacy_multiPeerBlockDownload | Spread block requests over every eligible peer. False assigns them all to the sync peer, disconnects a stalled sync peer instead of demoting it, and ignores notfound |
 | MaxBlocksInTransitPerPeer | int | 16 | legacy_maxBlocksInTransitPerPeer | Block bodies one peer may owe at once. The block-size ladder lowers it further for large blocks. Also sizes the pipeline's admission budget, at four slots per peer |
-| BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Block bodies the whole node may have outstanding, counting every peer together. A count, not svnode's per-peer height range |
-| BlockDownloadLowerWindow | int | 128 | legacy_blockDownloadLowerWindow | How far above the committed tip a block may be asked for, scaled down by the block-size ladder and clamped to BlockDownloadWindow. 0 leaves BlockDownloadWindow as the only bound |
+| BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Block bodies the whole node may have outstanding, counting every peer together, and the read-ahead depth: how far above the committed tip a block may be asked for at all. A count, not svnode's per-peer height range |
 | ParkStoreTimeout | time.Duration | 10s | legacy_parkStoreTimeout | Deadline on each park blob store operation, bounding the wait for the file store's shared permits. Values below 1s are raised to 1s |
-| ParkWorkers | int | 2 | legacy_parkWorkers | Workers that check and write parked blocks, keeping that work off the in-order commit goroutine. 0 or less becomes 1 |
 | PeerRegistryEnabled | bool | true | legacy_peerRegistryEnabled | Mirror connected legacy peers into the centralized peer registry so the dashboard can show them |
 | PeerRegistrySyncInterval | time.Duration | 10s | legacy_peerRegistrySyncInterval | How often that mirror reconciles connected legacy peers into the registry |
 
@@ -138,25 +135,14 @@ and no loader line arrives as its zero value whatever an operator writes.
 
 ### Block Download
 
-- Two bounds act on every assignment pass, and they measure different things.
-  `BlockDownloadWindow` and `MaxBlocksInTransitPerPeer` bound how many block
-  bodies are outstanding. `BlockDownloadLowerWindow` bounds how far above the
-  committed tip they reach, which is what decides how much disk the park needs.
-- `BlockDownloadLowerWindow` is scaled by the block-size ladder the node derives
-  from its rolling average block size, so a configured 128 means fewer blocks in a
-  large-block era. It is clamped to `BlockDownloadWindow`, because a limit looser
-  than the node-wide window could never bind.
-- With `BlockDownloadLowerWindow` at 0 there is no read-ahead limit, and the range
-  of blocks the node names is bounded by `BlockDownloadWindow` instead.
+- `BlockDownloadWindow` and `MaxBlocksInTransitPerPeer` bound how many block
+  bodies are outstanding, and `BlockDownloadWindow` doubles as the read-ahead
+  depth: how far above the committed tip a block may be asked for at all, which
+  is what decides how much disk the park needs.
 - Blocks are chosen by a pass over that range: drop what is already on disk, in
   the park, given up on, inside its failure backoff or already owed, then hand the
   rest to peers with budget. There is no header list and no download cursor, so
   nothing carries a position between passes.
-- The read-ahead depth is also measured in time: at least five minutes of commits at
-  the measured commit rate, capped at 20 GiB of park at the rolling average block
-  size, never shallower than the scaled `BlockDownloadLowerWindow`, and clamped to
-  `BlockDownloadWindow`. A count of blocks alone is seconds of lead on small blocks,
-  which cannot hide one much larger block's download from a single peer.
 - A block whose owner has gone quiet for longer than the 60-second retry window is
   offered to another peer on the next pass.
 - A block still arriving is asked of a second peer when two things hold: its
@@ -170,25 +156,16 @@ and no loader line arrives as its zero value whatever an operator writes.
 
 ### Block Prefetch
 
-- `BlockPrefetchBufferBytes` at 0 disables asynchronous admission: one block is in
-  flight at a time and the per-message watchdog is armed for block messages again.
-  Prefetch is also never active on regtest, whatever the value.
-- With the block park enabled, which is the default, the value in bytes is not
-  used. The block's bytes have already been streamed to files by the time
-  admission runs, so each block charges one slot against a budget sized as
-  `MaxBlocksInTransitPerPeer` times four. At the defaults that is 64 blocks.
-- With the park disabled the budget is bytes, bounding the total serialized size
-  of received-but-not-yet-processed blocks across all peers. A block at least as
-  large as the whole budget is admitted alone, giving no overlap; to get overlap
-  on large blocks the budget has to hold more than one of them.
+Asynchronous block admission is always on and never active on regtest. The
+block's bytes have already been streamed to files by the time admission runs,
+so each block charges one slot against a budget sized as
+`MaxBlocksInTransitPerPeer` times four. At the defaults that is 64 blocks.
 
 ### Out-of-Order Block Park
 
-- The park needs a temp store it can enumerate after a restart, so it turns itself
-  off with a warning on any `temp_store` URL that is not a `file://` store, and on
-  a node with no temp store at all.
-- `ParkWorkers` is a memory decision. A worker holds a block for the length of its
-  write, so more workers mean more blocks in flight at once.
+- The park needs a temp store it can enumerate after a restart, so the node refuses
+  to start on any `temp_store` URL that is not a `file://` store, and on a node
+  with no temp store at all. Every downloaded block goes through the park.
 - `ParkStoreTimeout` bounds the wait for the file store's process-wide permits,
   which are shared with subtree writes, transaction writes and both persisters. It
   does not bound the work the store does once it holds a permit.
@@ -248,8 +225,6 @@ peer-selection decision, and the legacy service's own sync engine
 | TempStore | Must be set | Daemon returns "temp_store config not found" | During store construction |
 | ListenAddresses | Falls back to the outbound interface IP and the network's default port if empty | Network connectivity | During server start |
 | ParkStoreTimeout | Raised to 1s if lower | A zero deadline would fail every store operation instantly | During sync manager construction |
-| ParkWorkers | Raised to 1 if 0 or less | The pool always has at least one worker | During sync manager construction |
-| BlockDownloadLowerWindow | Clamped to BlockDownloadWindow; 0 or less means no read-ahead limit | Decides how far above the committed tip blocks are fetched | On every assignment pass |
 | MaxFeelerPeers | Zeroed by connect-only mode, or by a peer cap too tight to hold the reservation | Feelers and their slot reservation are both switched off, with the reason logged | During server construction |
 | FeelerInterval | Non-positive falls back to 120s with a warning | Probe pacing | When the feeler loop starts |
 | FeelerHandshakeTimeout | Non-positive falls back to 25s; 30s or more is reduced to 29s, both with a warning | A deadline at or above the peer negotiate timeout lets the peer package tear the connection down first | When the feeler loop starts |
@@ -285,7 +260,7 @@ legacy_spendBatcherConcurrency = 64
 ### Bounding Read-Ahead
 
 ```text
-legacy_blockDownloadLowerWindow = 32
+legacy_blockDownloadWindow = 32
 legacy_maxBlocksInTransitPerPeer = 8
 ```
 

@@ -91,7 +91,7 @@ func TestDownloadPassLeavesAnAlreadyParkedBlockAlone(t *testing.T) {
 	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
 
-	require.True(t, park.AdoptWritten(parkedBlock{hash: hash, prevBlock: *blk.Header.HashPrevBlock, converted: true}))
+	require.True(t, park.AdoptWritten(parkedBlock{hash: hash, prevBlock: *blk.Header.HashPrevBlock}))
 
 	require.Empty(t, sm.unownedBlocks([]wantedBlock{{height: 650022, hash: hash}}))
 	require.True(t, park.Has(hash))

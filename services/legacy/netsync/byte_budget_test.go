@@ -107,7 +107,7 @@ func TestAnUnstartedRequestIsNotCountedAsBytes(t *testing.T) {
 	recentBlocks(sm, 2300*qMB)
 
 	// 12 GiB parked, and five requests owed by another peer that have not started arriving.
-	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe8}, prevBlock: chainhash.Hash{0xe9}, converted: true, size: 300, wireSize: 12 << 30}))
+	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe8}, prevBlock: chainhash.Hash{0xe9}, size: 300, wireSize: 12 << 30}))
 
 	other := newTestPeer(t, "10.0.0.8:8333")
 	for i := byte(0); i < 5; i++ {
@@ -130,7 +130,7 @@ func TestAParkedBlockCountsAtItsWireSize(t *testing.T) {
 	recentBlocks(sm, 1<<30)
 
 	// Converted, so the park charges its few-hundred-byte record, but the block is 101 GiB.
-	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe4}, prevBlock: chainhash.Hash{0xe5}, converted: true, size: 300, wireSize: 101 << 30}))
+	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: chainhash.Hash{0xe4}, prevBlock: chainhash.Hash{0xe5}, size: 300, wireSize: 101 << 30}))
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
@@ -198,7 +198,7 @@ func TestIdlePeersAreAskedForBlocksPastThoseAlreadyParkedOrOwed(t *testing.T) {
 	require.True(t, sm.blockDownloads.Add(a, hashes[1]))
 
 	for i := 2; i < 6; i++ {
-		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hashes[i], prevBlock: hashes[i-1], converted: true, size: 300, wireSize: 200 * qMB}))
+		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hashes[i], prevBlock: hashes[i-1], size: 300, wireSize: 200 * qMB}))
 	}
 
 	sm.fetchHeaderBlocks()
@@ -271,7 +271,7 @@ func TestTheBudgetNeverStopsAGapBelowParkedBlocksBeingFilled(t *testing.T) {
 
 	// Everything from the second block to the sixth is parked, far over the budget.
 	for i := 1; i < 6; i++ {
-		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hashes[i], prevBlock: hashes[i-1], converted: true, size: 300, wireSize: 21 << 30}))
+		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hashes[i], prevBlock: hashes[i-1], size: 300, wireSize: 21 << 30}))
 	}
 
 	sm.fetchHeaderBlocks()
@@ -322,15 +322,6 @@ func TestARecoveredBlockCountsAtTheSizeItsRecordCarries(t *testing.T) {
 	require.True(t, park.adoptRecord(chainhash.Hash{0x52}, record, 400, time.Now()))
 
 	require.Equal(t, 300*qMB, park.aheadBytes(2<<30), "the record's own size, not the 2 GiB guess")
-}
-
-// A whole block recovered from the park is its file, so its file size is what it holds.
-func TestARecoveredWholeBlockCountsAtItsFileSize(t *testing.T) {
-	park, _ := newTestPark(t, "")
-
-	require.True(t, park.AdoptWritten(parkedBlock{hash: chainhash.Hash{0x53}, prevBlock: chainhash.Hash{0x54}, size: 700 * qMB}))
-
-	require.Equal(t, 700*qMB, park.aheadBytes(2<<30))
 }
 
 // A peer is asked for legacy_maxBlocksInTransitPerPeer blocks, 16 by default as SV Node's

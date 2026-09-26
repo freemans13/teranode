@@ -27,6 +27,24 @@ func schedulerPeer(t *testing.T, sm *SyncManager, idx uint8, claimedHeight int32
 	return p, rec
 }
 
+// wireStreamingPath gives sm the park and stream registry every multi-peer
+// pass now requires: newDownloadAssigner has only one route since the
+// ladder-based non-streaming path (park disabled) is gone, and that route
+// reads both. It also gives each of peers an equal, non-zero measured rate,
+// so peerQueueDepth's unmeasuredPeerDepth floor (2, for a peer whose speed is
+// not yet known) does not mask the flat per-peer/window assertions these
+// tests make: speedScaledDepth returns its depth argument unchanged whenever
+// a peer's own rate is at least the fastest peer's, which holds for every
+// peer here because all the rates are equal.
+func wireStreamingPath(sm *SyncManager, peers ...*peerpkg.Peer) {
+	sm.blockPark = &blockPark{}
+	sm.streams = newStreamRegistry()
+
+	for _, p := range peers {
+		sm.streams.rates[p] = 1
+	}
+}
+
 // schedulerPeerBudget is how many blocks one peer may be asked for in a single
 // pass: its own cap, floored by the block-size ladder — or the ladder on its
 // own with the scheduler switched off, which is how the node sized a pass before
@@ -92,8 +110,9 @@ func TestScheduler_SpreadsOneHeaderRunAcrossEveryEligiblePeer(t *testing.T) {
 	syncPeer, syncRec := schedulerPeer(t, sm, 80, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	_, secondRec := schedulerPeer(t, sm, 81, 1000)
-	_, thirdRec := schedulerPeer(t, sm, 82, 1000)
+	secondPeer, secondRec := schedulerPeer(t, sm, 81, 1000)
+	thirdPeer, thirdRec := schedulerPeer(t, sm, 82, 1000)
+	wireStreamingPath(sm, syncPeer, secondPeer, thirdPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 
@@ -138,7 +157,8 @@ func TestScheduler_APeerAtItsCapIsNotAskedForMore(t *testing.T) {
 	syncPeer, syncRec := schedulerPeer(t, sm, 83, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	_, secondRec := schedulerPeer(t, sm, 84, 1000)
+	secondPeer, secondRec := schedulerPeer(t, sm, 84, 1000)
+	wireStreamingPath(sm, syncPeer, secondPeer)
 
 	// Four unrelated blocks already outstanding with the sync peer: its cap is
 	// spent before this pass starts.
@@ -171,9 +191,10 @@ func TestScheduler_RespectsTheNodeWideWindow(t *testing.T) {
 	syncPeer, syncRec := schedulerPeer(t, sm, 85, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	_, secondRec := schedulerPeer(t, sm, 86, 1000)
-	_, thirdRec := schedulerPeer(t, sm, 87, 1000)
-	_, fourthRec := schedulerPeer(t, sm, 88, 1000)
+	secondPeer, secondRec := schedulerPeer(t, sm, 86, 1000)
+	thirdPeer, thirdRec := schedulerPeer(t, sm, 87, 1000)
+	fourthPeer, fourthRec := schedulerPeer(t, sm, 88, 1000)
+	wireStreamingPath(sm, syncPeer, secondPeer, thirdPeer, fourthPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 
@@ -191,12 +212,11 @@ func TestScheduler_RespectsTheNodeWideWindow(t *testing.T) {
 	require.Equal(t, 3, sm.blockDownloads.Len())
 
 	// There is no fourth candidate to inspect here, and that is by design
-	// rather than a loss: lookaheadCeilingLocked clamps a lower window to the
-	// node-wide window (as svnode does), so with no lower window configured
-	// the node-wide window doubles as the read-ahead depth, and wantedBlocks
-	// does not name anything beyond it. Nothing is stranded — the next pass
-	// recomputes the same range from the committed tip and finds hashes[3]
-	// exactly when the window or the committer makes room for it.
+	// rather than a loss: wantedBlocks' read-ahead depth is the same
+	// legacy_blockDownloadWindow setting, so it does not name anything beyond
+	// it either. Nothing is stranded — the next pass recomputes the same range
+	// from the committed tip and finds hashes[3] exactly when the window or
+	// the committer makes room for it.
 }
 
 // TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked pins the eligibility
@@ -217,7 +237,8 @@ func TestScheduler_APeerThatHasNotClaimedTheHeightIsNotAsked(t *testing.T) {
 	shortPeer, shortRec := schedulerPeer(t, sm, 89, 5)
 	sm.storeSyncPeer(shortPeer, &syncPeerState{})
 
-	_, longRec := schedulerPeer(t, sm, 90, 1000)
+	longPeer, longRec := schedulerPeer(t, sm, 90, 1000)
+	wireStreamingPath(sm, shortPeer, longPeer)
 
 	// The long peer's claim of 1000 comes from schedulerPeer itself, not from
 	// delivering these headers: nothing credits a sender for a headers batch any
@@ -335,7 +356,8 @@ func TestScheduler_RequestsBlocksWithNoSyncPeerAtAll(t *testing.T) {
 	sm := schedulerManager(t)
 
 	deliverer, delivererRec := schedulerPeer(t, sm, 96, 1000)
-	_, otherRec := schedulerPeer(t, sm, 97, 1000)
+	other, otherRec := schedulerPeer(t, sm, 97, 1000)
+	wireStreamingPath(sm, deliverer, other)
 
 	seedFetchHeaders(t, sm, deliverer, anchor, msg)
 	sm.storeSyncPeer(nil, nil)
@@ -366,7 +388,8 @@ func TestScheduler_NeverAsksASecondPeerForAHashSomebodyAlreadyOwes(t *testing.T)
 	syncPeer, syncRec := schedulerPeer(t, sm, 98, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	_, secondRec := schedulerPeer(t, sm, 99, 1000)
+	secondPeer, secondRec := schedulerPeer(t, sm, 99, 1000)
+	wireStreamingPath(sm, syncPeer, secondPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 
@@ -409,6 +432,7 @@ func TestScheduler_LeavesTheHeaderNobodyCanTakeForTheNextPass(t *testing.T) {
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 100, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+	wireStreamingPath(sm, syncPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 
@@ -421,48 +445,6 @@ func TestScheduler_LeavesTheHeaderNobodyCanTakeForTheNextPass(t *testing.T) {
 	candidate, ok := nextCandidateHash(t, sm)
 	require.True(t, ok, "the header nobody could take must still be a candidate")
 	require.Equal(t, hashes[3], candidate, "and it must be the header nobody could take")
-}
-
-// TestScheduler_HugeBlocksCollapseBackToOnePeerWithOneBlock is the memory
-// ceiling, and the assertion that must never be allowed to rot. The block-size
-// ladder is the node's only reaction to block size: at a two-gigabyte average it
-// allows one block in flight, and fanning out must not turn that into one block
-// per peer. Every peer's read loop holds a fully decoded block before the
-// prefetch byte budget applies, so four peers at that rung is four times the
-// memory the ladder was protecting.
-func TestScheduler_HugeBlocksCollapseBackToOnePeerWithOneBlock(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xda}
-	msg, hashes := linkedHeaders(anchor, 10, &nonce)
-
-	sm := schedulerManager(t)
-
-	const threeGB = int64(3) * 1024 * 1024 * 1024
-	for i := 0; i < 3; i++ {
-		sm.blockSizeTracker.addBlockSize(threeGB)
-	}
-
-	require.Equal(t, 1, sm.blockSizeTracker.calculateMaxInFlightBlocks(), "sanity: the ladder is at its bottom rung")
-
-	syncPeer, syncRec := schedulerPeer(t, sm, 101, 1000)
-	sm.storeSyncPeer(syncPeer, &syncPeerState{})
-
-	_, secondRec := schedulerPeer(t, sm, 102, 1000)
-	_, thirdRec := schedulerPeer(t, sm, 103, 1000)
-	_, fourthRec := schedulerPeer(t, sm, 104, 1000)
-
-	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
-
-	sm.fetchHeaderBlocks()
-
-	require.True(t, WaitUntil(func() bool { return syncRec.count() == 1 }, 5*time.Second),
-		"the one block the ladder allows should have been requested")
-
-	total := syncRec.count() + secondRec.count() + thirdRec.count() + fourthRec.count()
-	require.Equal(t, 1, total, "at the ladder's bottom rung the node asks for one block, from one peer")
-	require.Equal(t, hashes[0:1], syncRec.all())
-	require.Equal(t, 1, sm.blockDownloads.Len())
 }
 
 // TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked is the other
@@ -485,7 +467,8 @@ func TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked(t *testing.
 	shortPeer, shortRec := schedulerPeer(t, sm, 111, 3)
 	sm.storeSyncPeer(shortPeer, &syncPeerState{})
 
-	_, otherRec := schedulerPeer(t, sm, 112, 3)
+	otherPeer, otherRec := schedulerPeer(t, sm, 112, 3)
+	wireStreamingPath(sm, shortPeer, otherPeer)
 
 	seedFetchHeaders(t, sm, shortPeer, anchor, msg)
 
@@ -522,7 +505,8 @@ func TestScheduler_TheNodeWideWindowCountsWhatIsAlreadyInFlight(t *testing.T) {
 	syncPeer, syncRec := schedulerPeer(t, sm, 140, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	_, secondRec := schedulerPeer(t, sm, 141, 1000)
+	secondPeer, secondRec := schedulerPeer(t, sm, 141, 1000)
+	wireStreamingPath(sm, syncPeer, secondPeer)
 
 	elsewhere, _, _ := connectRacePeer(t, 142, 1000)
 	for i := 0; i < 3; i++ {
@@ -636,6 +620,7 @@ func TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock(t *testing.T) {
 	// block back to the peer that already owes it.
 	syncPeer, syncRec := schedulerPeer(t, sm, 96, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+	wireStreamingPath(sm, syncPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 
@@ -656,68 +641,6 @@ func TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock(t *testing.T) {
 
 	require.True(t, sm.blockDownloads.HasOwner(syncPeer, hashes[0]),
 		"the block has to stay owed by the peer that holds the request, or its copy arrives unowned")
-}
-
-// TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit pins
-// legacy_blockDownloadLowerWindow, which is the one download bound svnode has and
-// we did not.
-//
-// The two we already had count requests: how many the node may have outstanding,
-// and how many any one peer may owe. Neither says anything about how far ahead of
-// itself the node reads, and that is the quantity that decides how much disk the
-// park needs — blocks commit strictly in order, so a block fetched a long way
-// ahead of the one being waited on cannot be committed when it arrives and sits
-// parked until everything between it and the chain has landed.
-//
-// The second half of the test is the part that matters: the limit has to be a rate
-// and not a stop. Once the COMMITTER moves, the window moves with it — and only
-// then.
-func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
-	var nonce uint32
-
-	anchor := chainhash.Hash{0xda}
-	msg, hashes := linkedHeaders(anchor, 12, &nonce)
-
-	sm := schedulerManager(t)
-
-	// Budgets deliberately left wide, so the lookahead limit is the only thing
-	// that can bind.
-	sm.settings.Legacy.BlockDownloadLowerWindow = 4
-
-	syncPeer, syncRec := schedulerPeer(t, sm, 88, 1000)
-	sm.storeSyncPeer(syncPeer, &syncPeerState{})
-
-	// seedFetchHeaders anchors the list at height 10, so the seeded headers are
-	// heights 11 upwards and a limit of 4 reaches height 14 — the first four.
-	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
-
-	sm.fetchHeaderBlocks()
-
-	require.True(t, WaitUntil(func() bool { return syncRec.count() >= 4 }, 5*time.Second),
-		"the blocks inside the window must still be asked for")
-
-	require.Equal(t, hashes[0:4], syncRec.all(),
-		"nothing beyond the lookahead limit may be asked for, however much budget is left")
-
-	// There is nothing to inspect for "the next header is still there": the
-	// ceiling means wantedBlocks does not name height 15 at all yet, and there
-	// is no position it could be lost from. The property that matters is that
-	// the next pass picks it up once the ceiling allows it, which is what the
-	// rest of this test drives.
-
-	// The committer moves: height 11, the block this pass just requested, joins
-	// the chain for real. seedFetchHeaders already recorded height 10 (the
-	// anchor) as committed, which is what let the first half's ceiling engage at
-	// all; committing one more is what has to free one more slot, and nothing
-	// short of a real commit may.
-	mockCommittedTip(t, sm, 11, 1)
-
-	sm.fetchHeaderBlocks()
-
-	require.True(t, WaitUntil(func() bool { return syncRec.count() >= 5 }, 5*time.Second),
-		"a limit that never lets go once the committer moves is a stall, not a window")
-	require.Equal(t, hashes[0:5], syncRec.all(),
-		"exactly one more block comes into range for one block committed")
 }
 
 // TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest pins the half of
@@ -749,6 +672,7 @@ func TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest(t *testing.T) {
 
 	peer, rec := schedulerPeer(t, sm, 92, 1000)
 	sm.storeSyncPeer(peer, &syncPeerState{})
+	wireStreamingPath(sm, peer)
 
 	for i := 0; i < perPeer; i++ {
 		require.True(t, sm.blockDownloads.Add(peer, hashes[i]))
@@ -811,6 +735,7 @@ func TestScheduler_DoesNotAskTheBlockchainAboutBlocksItCannotHandOut(t *testing.
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 113, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+	wireStreamingPath(sm, syncPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 
@@ -864,6 +789,7 @@ func TestScheduler_DoesNotAskAgainForABlockTheChainAlreadyHasByAnotherRoute(t *t
 
 	syncPeer, rec := schedulerPeer(t, sm, 133, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+	wireStreamingPath(sm, syncPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 

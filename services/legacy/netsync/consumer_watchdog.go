@@ -101,20 +101,14 @@ type consumerWait struct {
 	// with two read-loops blocked in the acquire — and the report described the
 	// window instead, which is empty during precisely that fault.
 	//
-	// downloadBudget is zero when prefetch is disabled, which is a real state
-	// (synchronous ingestion) rather than a missing reading, so the report says
-	// nothing at all rather than inventing a constraint of zero.
-	//
-	// downloadBudgetIsSlots is the unit these three numbers are in: bytes off
-	// the wire normally, but on the pipeline path AcquireBlockPrefetch charges
-	// one slot per block instead (the bytes are gone before OnBlock runs), so
-	// the same three fields become a block count. Recorded at snapshot time
-	// rather than assumed at print time so the report never shows a count
-	// labelled as bytes.
-	downloadBudget        int64
-	downloadHeld          int64
-	downloadWaiters       int64
-	downloadBudgetIsSlots bool
+	// downloadBudget is a block count: AcquireBlockPrefetch charges one slot
+	// per block (the bytes are gone from memory before admission runs — the
+	// wire layer has already streamed them to disk), so these three fields are
+	// always a count of blocks, never bytes. downloadBudget is zero only in a
+	// manager built without New, which never happens in production.
+	downloadBudget  int64
+	downloadHeld    int64
+	downloadWaiters int64
 
 	// drainDeclines is how many turns have been offered to the drain and given
 	// back. It is the fact the first version of this report was missing: a drain
@@ -146,16 +140,11 @@ func (sm *SyncManager) publishConsumerWait(now time.Time) {
 		}
 	}
 
-	if sm.blockPark != nil {
-		w.parked = sm.blockPark.Len()
-	}
+	w.parked = sm.blockPark.Len()
 
-	if sm.blockPrefetchBudget != nil {
-		w.downloadBudget = sm.blockPrefetchBudgetBytes
-		w.downloadHeld = sm.blockPrefetchReserved.Load()
-		w.downloadWaiters = sm.blockPrefetchWaiters.Load()
-		w.downloadBudgetIsSlots = sm.blockPark != nil && sm.blockPark.Enabled()
-	}
+	w.downloadBudget = sm.blockPrefetchBudgetSlots
+	w.downloadHeld = sm.blockPrefetchReserved.Load()
+	w.downloadWaiters = sm.blockPrefetchWaiters.Load()
 
 	w.drainDeclines = sm.drainDeclined.Load()
 
@@ -313,18 +302,11 @@ func (w *consumerWait) describe(now time.Time) string {
 	// cannot: every other figure here describes work the node has already taken
 	// in, and this is the gate that decides whether any more arrives.
 	if w.downloadBudget > 0 {
-		unit := "bytes"
-		if w.downloadBudgetIsSlots {
-			unit = "slots"
-		}
-
 		b.WriteString("; ")
 		b.WriteString(strconv.FormatInt(w.downloadHeld, 10))
 		b.WriteString(" of ")
 		b.WriteString(strconv.FormatInt(w.downloadBudget, 10))
-		b.WriteString(" download budget ")
-		b.WriteString(unit)
-		b.WriteString(" reserved")
+		b.WriteString(" download budget slots reserved")
 
 		if w.downloadWaiters > 0 {
 			b.WriteString(" with ")

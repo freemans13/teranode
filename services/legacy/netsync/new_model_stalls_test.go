@@ -23,7 +23,7 @@ func cacheManager(t *testing.T, best int32, depth int32) (*SyncManager, *peerpkg
 
 	sm := newRaceManager(t)
 	sm.blockSizeTracker = newBlockSizeTracker(10)
-	sm.settings.Legacy.BlockDownloadLowerWindow = int(depth)
+	sm.settings.Legacy.BlockDownloadWindow = int(depth)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = int(depth)
 
 	mockCommittedTip(t, sm, uint32(best), 0) //nolint:gosec // a small test height
@@ -33,6 +33,7 @@ func cacheManager(t *testing.T, best int32, depth int32) (*SyncManager, *peerpkg
 	require.True(t, sm.headerCache.Fill(parent, best+1, chainOfHeaders(parent, int(depth)+4)))
 
 	peer, rec := schedulerPeer(t, sm, 1, best+1000)
+	wireStreamingPath(sm, peer)
 
 	return sm, peer, rec
 }
@@ -101,18 +102,20 @@ func TestNewModel_LeavingHeadersFirstModeLosesNothing(t *testing.T) {
 // TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling is the negative half of the
 // bound, and it is the regression guard for the defect that shipped to mainnet.
 //
-// The read-ahead ceiling used to be anchored to the front of the header list,
+// The read-ahead depth used to be anchored to the front of the header list,
 // which advances when a block ARRIVES rather than when it commits. So every
 // arrival raised the front, which raised the ceiling, which licensed another
 // depth's worth of requests, with no coupling to the committer at all. Measured
 // during a genesis resync: the front stood at height 4,877 with the chain
 // settled at 868, and the park held its full 4,096 entries.
 //
-// A block delivered with no body is exactly that arrival without a commit: the
-// current lookaheadCeilingLocked already anchors on the committed height read
-// from the chain itself, and nothing about an arrival that never commits
-// changes what the chain reports as its tip. This pins that property directly
-// rather than trusting it did not regress.
+// A block delivered with no body is exactly that arrival without a commit:
+// wantedBlocks anchors on the committed height read from the chain itself, and
+// nothing about an arrival that never commits changes what the chain reports
+// as its tip. This pins that property directly by comparing the wanted range
+// itself before and after, the same technique
+// TestNewModel_LeavingHeadersFirstModeLosesNothing uses, rather than trusting
+// it did not regress.
 //
 // The decoded blockQueueMsg path (handleBlockMsg) this originally drove through
 // is gone; every arrival now streams to handleBlockOnDiskMsg
@@ -126,10 +129,6 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	const depth = int32(4)
 
 	sm, peer, rec := cacheManager(t, 500, depth)
-	// Present only so handleBlockOnDiskMsg's nil guard passes; the path this
-	// test drives (Converted: false, no drained duplicate) never calls a
-	// method on it.
-	sm.blockPark = &blockPark{}
 
 	sm.fetchHeaderBlocks()
 	require.True(t, WaitUntil(func() bool { return rec.count() > 0 }, 5*time.Second),
@@ -139,12 +138,8 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	rec.reset()
 
 	bestBeforeArrival, _, _ := sm.committedTip()
-
-	sm.headerMu.Lock()
-	ceilingBefore, limitedBefore := sm.lookaheadCeilingLocked(bestBeforeArrival)
-	sm.headerMu.Unlock()
-
-	require.True(t, limitedBefore, "the ceiling must be engaged, or this test proves nothing")
+	rangeBefore := sm.wantedBlocks(bestBeforeArrival)
+	require.NotEmpty(t, rangeBefore, "the range must be engaged, or this test proves nothing")
 
 	sm.ctx = context.Background()
 
@@ -165,12 +160,8 @@ func TestNewModel_AnArrivalAloneDoesNotMoveTheCeiling(t *testing.T) {
 	require.Equal(t, bestBeforeArrival, bestAfterArrival,
 		"an arrival that never committed must not move what the chain reports as its tip")
 
-	sm.headerMu.Lock()
-	ceilingAfter, limitedAfter := sm.lookaheadCeilingLocked(bestAfterArrival)
-	sm.headerMu.Unlock()
-
-	require.True(t, limitedAfter)
-	require.Equal(t, ceilingBefore, ceilingAfter,
+	rangeAfter := sm.wantedBlocks(bestAfterArrival)
+	require.Equal(t, rangeBefore, rangeAfter,
 		"a block that arrived but did not commit must not raise the ceiling; that ratchet filled the park and cost 1.8 blocks a minute on mainnet")
 	require.Positive(t, before)
 }

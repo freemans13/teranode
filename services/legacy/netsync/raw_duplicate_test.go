@@ -36,7 +36,7 @@ func TestADuplicateCopyIsDrainedAndNeverParked(t *testing.T) {
 	hash := chainhash.Hash{0x7a}
 
 	// The first copy holds the block's admission.
-	_, err := sm.AcquireBlockPrefetch(context.Background(), nil, hash, 1<<20)
+	err := sm.AcquireBlockPrefetch(context.Background(), hash)
 	require.NoError(t, err)
 
 	inner := func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {

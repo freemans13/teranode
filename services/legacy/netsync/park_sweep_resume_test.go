@@ -15,11 +15,14 @@ import (
 // else drives a fresh request for it, because the block everything was queued
 // behind is the one that was dropped, and no later arrival triggers a pass on
 // its own. It used to go through fetchMoreHeaderBlocks with the sync peer,
-// whose gate is that peer's own in-flight count against the block-size ladder.
-// At the ladder's bottom rung the cap is one block, so a sync peer part-way
-// through a multi-gigabyte transfer held the resume shut for the whole of that
-// transfer, hours in the regime this PR targets, while an idle peer sat there
-// able to serve it.
+// whose gate was that peer's own in-flight count against the block-size
+// ladder; a sync peer part-way through a multi-gigabyte transfer held the
+// resume shut for the whole of that transfer, hours in the regime this PR
+// targets, while an idle peer sat there able to serve it. legacy_maxBlocksInTransitPerPeer
+// narrowed to one is this test's stand-in for that cap now that the ladder no
+// longer narrows the multi-peer fan-out — every peer holds streamingPeerDepth
+// blocks whatever the block size — but the property under test is the same:
+// a peer at its cap must not be the only one considered.
 //
 // So the end state pinned here is that the block gets asked for, not which
 // mechanism asked. svnode schedules per peer and consults no sync peer for block
@@ -33,20 +36,16 @@ func TestParkSweepTicker_AsksAnIdlePeerWhileTheSyncPeerIsFull(t *testing.T) {
 
 	sm := schedulerManager(t)
 
-	// The block-size ladder at its bottom rung: one block in flight per peer,
-	// which is the regime a given-up block is asked for again in, and the one
-	// the old gate could not tell from "this peer is finished".
-	const threeGB = int64(3) * 1024 * 1024 * 1024
-	for i := 0; i < 3; i++ {
-		sm.blockSizeTracker.addBlockSize(threeGB)
-	}
-
-	require.Equal(t, 1, sm.blockSizeTracker.calculateMaxInFlightBlocks(), "sanity: the ladder is at its bottom rung")
+	// One block in flight per peer, which is the regime a given-up block is
+	// asked for again in, and the one the old gate could not tell from "this
+	// peer is finished".
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 1
 
 	syncPeer, syncRec := schedulerPeer(t, sm, 150, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	_, idleRec := schedulerPeer(t, sm, 151, 1000)
+	idlePeer, idleRec := schedulerPeer(t, sm, 151, 1000)
+	wireStreamingPath(sm, syncPeer, idlePeer)
 
 	// The wanted range a released block leaves behind: still named by the
 	// header cache, above the committed tip, and owed by nobody.

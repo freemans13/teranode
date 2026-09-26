@@ -35,8 +35,7 @@ func TestParkRejectionLeavesTheBlockRequestable(t *testing.T) {
 	msgBlock := h.blocks[1].MsgBlock()
 	hash := msgBlock.BlockHash()
 
-	require.Equal(t, parkAccepted,
-		h.sm.blockPark.Park(h.sm.ctx, parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
 	entry, ok := h.sm.blockPark.Take(hash)
@@ -73,7 +72,6 @@ func TestParkRejectionLeavesTheBlockRequestable(t *testing.T) {
 	_, stillMarked := h.sm.recentlyFailedBlocks.Get(hash)
 	require.False(t, stillMarked)
 
-	require.Equal(t, parkAccepted,
-		h.sm.blockPark.Park(h.sm.ctx, parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock),
-		"a good copy of a previously rejected block must be parkable again")
+	require.NoError(t, h.deliver(t, 1), "a good copy of a previously rejected block must be parkable again")
+	require.Equal(t, 1, h.sm.blockPark.Len())
 }

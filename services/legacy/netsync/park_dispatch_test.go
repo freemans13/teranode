@@ -20,27 +20,20 @@ import (
 
 // parkedDispatchFor builds the dispatch the drain will build, for the harness
 // block at the given index, with its park entry already admitted and its blob on
-// disk.
+// disk. It streams the block through the real intake path (pipelineBlockSink +
+// handleBlockOnDiskMsg, via h.deliver) rather than Admit/WriteAdmitted/FinishWrite,
+// which no longer exist — the streaming path is what actually adopts a converted
+// record now (blockPark.AdoptWritten).
 func (h *parkWiringHarness) parkedDispatchFor(t *testing.T, index int) (*blockDispatch, parkedBlock) {
 	t.Helper()
 
-	msgBlock := h.blocks[index].MsgBlock()
+	require.NoError(t, h.deliver(t, index))
 
-	entry := parkedBlock{
-		hash:      msgBlock.BlockHash(),
-		prevBlock: msgBlock.Header.PrevBlock,
-		height:    int32(index + 1),
-		peer:      h.peer,
-	}
-
-	stored, admitted := h.sm.blockPark.Admit(entry, msgBlock)
-	require.Equal(t, admitRegistered, admitted)
-	require.Equal(t, parkAccepted, h.sm.blockPark.WriteAdmitted(context.Background(), stored, msgBlock))
-	h.sm.blockPark.FinishWrite(stored.hash)
+	hash := h.blocks[index].MsgBlock().BlockHash()
 
 	// The drain takes the entry out of the index before it dispatches, so the
 	// dispatch owns it and every path out settles it.
-	taken, ok := h.sm.blockPark.Take(stored.hash)
+	taken, ok := h.sm.blockPark.Take(hash)
 	require.True(t, ok)
 
 	return &blockDispatch{parked: &taken, bytes: taken.size}, taken
@@ -200,10 +193,9 @@ func TestParkDispatch_TheWrongShapeIsRefusedAndTheEntryRestored(t *testing.T) {
 			name: "a non-empty frontier",
 			break_: func(_ *blockDispatch, bd *blockDispatcher) {
 				bd.frontier = append(bd.frontier, &frontierEntry{
-					hash:       chainhash.HashH([]byte("something already in flight")),
-					height:     750_699,
-					rpcStarted: make(chan struct{}),
-					settled:    make(chan struct{}),
+					hash:    chainhash.HashH([]byte("something already in flight")),
+					height:  750_699,
+					settled: make(chan struct{}),
 				})
 			},
 		},
@@ -309,22 +301,18 @@ func TestParkPeek_FirstChildForDoesNotClaimTheEntry(t *testing.T) {
 
 	msgBlock := h.blocks[1].MsgBlock()
 	parent := msgBlock.Header.PrevBlock
+	hash := msgBlock.BlockHash()
 
-	entry := parkedBlock{hash: msgBlock.BlockHash(), prevBlock: parent, height: 2, peer: h.peer}
-
-	stored, admitted := h.sm.blockPark.Admit(entry, msgBlock)
-	require.Equal(t, admitRegistered, admitted)
-	require.Equal(t, parkAccepted, h.sm.blockPark.WriteAdmitted(context.Background(), stored, msgBlock))
-	h.sm.blockPark.FinishWrite(stored.hash)
+	require.NoError(t, h.deliver(t, 1))
 
 	bytesBefore := h.sm.blockPark.Bytes()
 
 	peeked, ok := h.sm.blockPark.FirstChildFor(parent)
 	require.True(t, ok, "the parent has a committable child")
-	require.Equal(t, stored.hash, peeked.hash)
+	require.Equal(t, hash, peeked.hash)
 	require.Positive(t, peeked.size, "the peek carries the size the byte arm of the admission test needs")
 
-	require.True(t, h.sm.blockPark.Has(stored.hash), "a peek must not remove the entry")
+	require.True(t, h.sm.blockPark.Has(hash), "a peek must not remove the entry")
 	require.Equal(t, 1, h.sm.blockPark.Len())
 	require.Equal(t, bytesBefore, h.sm.blockPark.Bytes(), "and must not change the byte total")
 
@@ -334,54 +322,13 @@ func TestParkPeek_FirstChildForDoesNotClaimTheEntry(t *testing.T) {
 	require.Equal(t, peeked.hash, again.hash)
 
 	// The claim is what removes it, and it is the existing call.
-	taken, ok := h.sm.blockPark.Take(stored.hash)
+	taken, ok := h.sm.blockPark.Take(hash)
 	require.True(t, ok)
-	require.Equal(t, stored.hash, taken.hash)
+	require.Equal(t, hash, taken.hash)
 	require.Zero(t, h.sm.blockPark.Len())
 
 	_, ok = h.sm.blockPark.FirstChildFor(parent)
 	require.False(t, ok, "and once claimed there is nothing left to peek")
-}
-
-// TestParkPeek_AWritingChildIsSkippedAndItsRefusedDrainRemembered pins the rule
-// both takers now share.
-//
-// A block whose bytes are not on disk yet cannot be committed, its edge to its
-// parent must stay, and the refused drain has to be recorded, because the drain
-// is driven by a commit that has already happened and will not come round again
-// on its own. Whoever finishes the write asks for it instead.
-func TestParkPeek_AWritingChildIsSkippedAndItsRefusedDrainRemembered(t *testing.T) {
-	h := newParkWiringHarness(t, true)
-
-	msgBlock := h.blocks[1].MsgBlock()
-	parent := msgBlock.Header.PrevBlock
-
-	entry := parkedBlock{hash: msgBlock.BlockHash(), prevBlock: parent, height: 2, peer: h.peer}
-
-	// Admit registers the entry with its write still owed, which is the state a
-	// block is in while a park worker holds it.
-	stored, admitted := h.sm.blockPark.Admit(entry, msgBlock)
-	require.Equal(t, admitRegistered, admitted)
-
-	_, ok := h.sm.blockPark.FirstChildFor(parent)
-	require.False(t, ok, "a block whose bytes are not on disk yet is not committable")
-
-	require.True(t, h.sm.blockPark.Has(stored.hash), "and it keeps its entry")
-
-	h.sm.blockPark.mu.Lock()
-	require.Len(t, h.sm.blockPark.children[parent], 1, "and its edge to its parent")
-	require.True(t, h.sm.blockPark.entries[stored.hash].parentDrained,
-		"and the refused drain is remembered, or the block waits for the sweep instead")
-	h.sm.blockPark.mu.Unlock()
-
-	// Once the write lands it is committable, and FinishWrite reports the drain
-	// that was refused so the worker can ask for it.
-	require.Equal(t, parkAccepted, h.sm.blockPark.WriteAdmitted(context.Background(), stored, msgBlock))
-	require.True(t, h.sm.blockPark.FinishWrite(stored.hash), "the refused drain is handed back")
-
-	peeked, ok := h.sm.blockPark.FirstChildFor(parent)
-	require.True(t, ok, "and now the block can be committed")
-	require.Equal(t, stored.hash, peeked.hash)
 }
 
 // TestDrain_NothingIsTakenUntilTheDispatcherSaysYes is the other half of
@@ -402,10 +349,9 @@ func TestDrain_NothingIsTakenUntilTheDispatcherSaysYes(t *testing.T) {
 
 	// Something else is in flight, so the frontier is not empty.
 	bd.frontier = append(bd.frontier, &frontierEntry{
-		hash:       chainhash.HashH([]byte("a block already in flight")),
-		height:     750_699,
-		rpcStarted: make(chan struct{}),
-		settled:    make(chan struct{}),
+		hash:    chainhash.HashH([]byte("a block already in flight")),
+		height:  750_699,
+		settled: make(chan struct{}),
 	})
 
 	h.sm.drainAsync.Store(true)

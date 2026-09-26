@@ -2125,31 +2125,25 @@ cleanup:
 }
 
 // UseBlockPrefetchIngestion reports whether bounded async block prefetch
-// ingestion is active for the given budget and network: a positive budget AND
-// off regression net. regtest always takes the synchronous submit-then-query
-// path the block-acceptance tooling depends on, so it is excluded regardless of
-// budget. This is the single source of truth for the prefetch-mode predicate,
-// shared by the read-loop (shouldArmProcessingTimer) and the sync manager
-// (netsync.SyncManager.UsePrefetchIngestion) so both agree on when prefetch is
-// active — netsync imports this package, so it calls this directly rather than
-// re-implementing the rule.
-func UseBlockPrefetchIngestion(budgetBytes int64, net wire.BitcoinNet) bool {
-	return budgetBytes > 0 && net != wire.RegTestNet
+// ingestion is active for the given network: off regression net. regtest
+// always takes the synchronous submit-then-query path the block-acceptance
+// tooling depends on, so it is excluded regardless. This is the single source
+// of truth for the prefetch-mode predicate, read only by shouldArmProcessingTimer
+// below.
+func UseBlockPrefetchIngestion(net wire.BitcoinNet) bool {
+	return net != wire.RegTestNet
 }
 
 // shouldArmProcessingTimer reports whether the per-message processing watchdog
-// should run for this command. With block prefetch ingestion active, OnBlock
-// legitimately blocks in AcquireBlockPrefetch under budget backpressure for
-// longer than PeerProcessingTimeout; block-stall detection is owned by the
-// netsync stall detector, the idle timer, and the block-download budget, so the
-// watchdog is not armed for block messages in that mode. It shares the
-// UseBlockPrefetchIngestion predicate with netsync.SyncManager.UsePrefetchIngestion
-// so the read-loop and sync manager agree on when prefetch is active — regtest
-// always takes the synchronous path and keeps the watchdog for blocks. It still
-// arms for all other commands, and for every command (including blocks) when
-// ingestion is not active.
-func shouldArmProcessingTimer(cmd string, prefetchBudgetBytes int64, net wire.BitcoinNet) bool {
-	return !UseBlockPrefetchIngestion(prefetchBudgetBytes, net) || cmd != wire.CmdBlock
+// should run for this command. With block prefetch ingestion active, the
+// pipeline sink legitimately blocks in AcquireBlockPrefetch under admission
+// backpressure for longer than PeerProcessingTimeout; block-stall detection is
+// owned by the netsync stall detector, the idle timer, and the block-download
+// budget, so the watchdog is not armed for block messages in that mode. It
+// still arms for all other commands, and for every command (including blocks)
+// on regtest, which keeps the watchdog for blocks.
+func shouldArmProcessingTimer(cmd string, net wire.BitcoinNet) bool {
+	return !UseBlockPrefetchIngestion(net) || cmd != wire.CmdBlock
 }
 
 // inHandler handles all incoming messages for the peer.  It must be run as a goroutine.
@@ -2264,12 +2258,12 @@ out:
 		p.currentProcessingMsgCmd = rmsg.Command()
 		p.processingCmdMtx.Unlock()
 
-		// With block prefetch enabled, OnBlock legitimately parks in
-		// AcquireBlockPrefetch under budget backpressure for longer than
+		// With block prefetch enabled, the pipeline sink legitimately parks in
+		// AcquireBlockPrefetch under admission backpressure for longer than
 		// PeerProcessingTimeout; block-stall detection is then owned by the
 		// netsync stall detector, the idle timer, and the block-download budget, so
 		// the per-message watchdog must not fire for block messages in that mode.
-		if shouldArmProcessingTimer(rmsg.Command(), p.settings.Legacy.BlockPrefetchBufferBytes, p.cfg.ChainParams.Net) {
+		if shouldArmProcessingTimer(rmsg.Command(), p.cfg.ChainParams.Net) {
 			processingTimer.Reset(p.settings.Legacy.PeerProcessingTimeout)
 		}
 

@@ -10,8 +10,6 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
-	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
@@ -181,32 +179,4 @@ func TestHeaderProvenance_ContradictedCheckpointDisconnects(t *testing.T) {
 	require.False(t, sm.fillHeaderCache(p, msg))
 	require.Zero(t, sm.headerCache.Len(), "a refused batch must not be cached")
 	require.NotNil(t, sm.contradictedCheckpoint(1, genesis, forged), "the refusal must be attributable to the checkpoint, not to linkage")
-}
-
-func TestHandleBlockDirect_RejectsPoWBeforeAssemblyWait(t *testing.T) {
-	sm, p, _ := newHeaderProvenanceManager(t)
-	sm.chainParams = &chaincfg.MainNetParams
-	// Any call to this mock is unexpected: both PoW rejections must precede it.
-	sm.blockAssembly = blockassembly.NewMock()
-
-	for _, bits := range []uint32{0x207fffff, 0} {
-		block := makeDuplicateTxidBlock(1).MsgBlock()
-		block.Header.PrevBlock = *sm.settings.ChainCfgParams.GenesisHash
-		block.Header.Bits = bits
-
-		if bits != 0 {
-			require.True(t, solveBlock(&block.Header, chaincfg.RegressionNetParams.PowLimit))
-		}
-
-		initPrometheusMetrics()
-
-		err := sm.HandleBlockDirect(sm.ctx, p, block.Header.BlockHash(), block, nil, blockRequestOrigin{})
-		require.True(t, errors.Is(err, errors.ErrBlockInvalid), "%v", err)
-
-		if bits != 0 {
-			require.ErrorContains(t, err, "block declares a target easier than the network limit")
-		} else {
-			require.ErrorContains(t, err, "block does not meet target difficulty")
-		}
-	}
 }

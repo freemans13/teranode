@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/blob/file"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
@@ -79,21 +80,14 @@ func TestBlockPark_NeverSchedulesAParkedBlobForDeletion(t *testing.T) {
 	park := mustNewBlockPark(t, ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, park)
 
-	blocks := minedBlocks(t, 1)
-	msgBlock := blocks[0].MsgBlock()
-	hash := msgBlock.BlockHash()
-
-	require.Equal(t, parkAccepted,
-		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	hash := parkedRecord(t, park, chainhash.Hash{0x01}, 1)
 
 	require.Zero(t, scheduler.count(),
 		"a parked block's blob must never be booked for deletion at a height; the park deletes it when the block commits or is given up, and nothing else may")
 
 	// And it is still there to be read back, which is the consequence that
 	// matters to sync.
-	readBack, err := park.Read(context.Background(), hash)
+	readBack, err := park.ReadConverted(context.Background(), hash)
 	require.NoError(t, err)
-
-	readBackHash := readBack.BlockHash()
-	require.True(t, readBackHash.IsEqual(&hash))
+	require.True(t, readBack.Header.Hash().IsEqual(&hash))
 }

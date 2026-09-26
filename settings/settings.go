@@ -406,7 +406,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupAllowQuickValidation:           getBool("blockvalidation_catchup_allow_quick_validation", true, alternativeContext...),
 			OutpointOnlyBelowCheckpoint:           getBool("blockvalidation_outpoint_only_below_checkpoint", false, alternativeContext...),
 			LegacyUnifiedBelowCheckpoint:          getBool("blockvalidation_legacy_unified_below_checkpoint", false, alternativeContext...),
-			LegacyBelowCheckpointFailClosed:       getBool("blockvalidation_legacy_below_checkpoint_fail_closed", false, alternativeContext...),
 			// Catchup circuit breaker configuration
 			CircuitBreakerFailureThreshold: getInt("blockvalidation_circuit_breaker_failure_threshold", 5, alternativeContext...),
 			CircuitBreakerSuccessThreshold: getInt("blockvalidation_circuit_breaker_success_threshold", 2, alternativeContext...),
@@ -743,15 +742,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockDownloadTimeoutBaseIBDPercent: getInt64("legacy_blockDownloadTimeoutBaseIBDPercent", 600, alternativeContext...),
 			BlockDownloadTimeoutPerPeerPercent: getInt64("legacy_blockDownloadTimeoutPerPeerPercent", 50, alternativeContext...),
 
-			BlockPrefetchBufferBytes: getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
-
 			MultiPeerBlockDownload:    getBool("legacy_multiPeerBlockDownload", true, alternativeContext...),
 			MaxBlocksInTransitPerPeer: getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
 			BlockDownloadWindow:       getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
-			BlockDownloadLowerWindow:  getInt("legacy_blockDownloadLowerWindow", 128, alternativeContext...),
 
 			ParkStoreTimeout:         getDuration("legacy_parkStoreTimeout", 10*time.Second, alternativeContext...),
-			ParkWorkers:              getInt("legacy_parkWorkers", 2, alternativeContext...),
 			PeerRegistryEnabled:      getBool("legacy_peerRegistryEnabled", true, alternativeContext...),
 			PeerRegistrySyncInterval: getDuration("legacy_peerRegistrySyncInterval", 10*time.Second, alternativeContext...),
 			Upnp:                     getBool("legacy_upnp", false, alternativeContext...),
