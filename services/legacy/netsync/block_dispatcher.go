@@ -28,37 +28,19 @@ const (
 	baStateCacheTTL = 250 * time.Millisecond
 )
 
-// frontierEntry is the dispatcher's per-block bookkeeping record for a below-checkpoint
-// block whose UTXO store work may still be in flight. HandleBlockDirect's ordering
-// hand-shake (the wait immediately before sm.ProcessBlock) reads a predecessor's entry
-// to decide whether it is safe to start its own RPC; the dispatcher writes hash/height
-// once and closes rpcStarted/settled and sets failed/aborted/err as the block's work
-// progresses and finishes.
+// frontierEntry is the dispatcher's per-block bookkeeping record for a parked block
+// whose commit may still be in flight. The dispatcher writes hash/height once, and the
+// worker closes settled and sets failed/aborted/err as the block's work finishes.
 type frontierEntry struct {
 	hash   chainhash.Hash
 	height uint32
 
-	// rpcStarted closes exactly once, when this block's own ProcessBlock RPC begins.
-	// A child waiting on its parent treats a closed rpcStarted as "safe to start
-	// mine": from that point the parent's spends are already queued behind its own
-	// create in commit order, so a spend of a coin the parent creates can never
-	// land ahead of that create.
-	rpcStarted chan struct{}
-
-	// rpcStartedOnce guards rpcStarted so a retry or a racing caller can never
-	// double-close it.
-	rpcStartedOnce sync.Once
-
 	// settled closes exactly once, when this block's outcome (success or failure)
-	// is fully known. A child that observes settled before rpcStarted learns the
-	// parent never reached its own RPC, so the ordering guarantee rpcStarted would
-	// have given never held — see the hand-shake in HandleBlockDirect for why that
-	// case still lets the child proceed rather than blocking forever.
+	// is fully known.
 	settled chan struct{}
 
-	// settleOnce guards settled the way rpcStartedOnce guards rpcStarted: the worker
-	// settles its own entry and the dispatcher settles it again defensively when the
-	// completion is processed.
+	// settleOnce guards settled: the worker settles its own entry and the dispatcher
+	// settles it again defensively when the completion is processed.
 	settleOnce sync.Once
 
 	failed  atomic.Bool
@@ -70,20 +52,8 @@ type frontierEntry struct {
 	d *blockDispatch
 }
 
-// markRPCStarted closes rpcStarted exactly once, no matter how many times or from how
-// many goroutines it is called.
-func (e *frontierEntry) markRPCStarted() {
-	e.rpcStartedOnce.Do(func() {
-		close(e.rpcStarted)
-	})
-}
-
 // settle records this block's outcome and closes settled, exactly once. The worker
-// calls it after run returns and before it hands the completion to the dispatcher, so
-// in program order rpcStarted (closed inside HandleBlockDirect) always closes strictly
-// before settled — which is what makes the hand-shake's rpcStarted-wins pre-check
-// sound: a successor can never see settled without also seeing a closed rpcStarted for
-// a predecessor that did reach its RPC.
+// calls it after run returns and before it hands the completion to the dispatcher.
 func (e *frontierEntry) settle(err error) {
 	e.settleOnce.Do(func() {
 		e.err = err
@@ -94,38 +64,6 @@ func (e *frontierEntry) settle(err error) {
 
 		close(e.settled)
 	})
-}
-
-// frontierEntryContextKey is the unexported key type under which a block's own
-// frontierEntry travels on its processing context, so HandleBlockDirect's ordering
-// hand-shake can mark it started without threading an extra parameter through every
-// call between the dispatcher and ProcessBlock.
-type frontierEntryContextKey struct{}
-
-// contextWithFrontierEntry returns a copy of ctx carrying e as the current block's own
-// frontier entry.
-func contextWithFrontierEntry(ctx context.Context, e *frontierEntry) context.Context {
-	return context.WithValue(ctx, frontierEntryContextKey{}, e)
-}
-
-// frontierEntryFromContext returns the frontierEntry stashed by contextWithFrontierEntry,
-// or nil if none was stashed — the normal case for every route except the dispatcher's.
-func frontierEntryFromContext(ctx context.Context) *frontierEntry {
-	e, _ := ctx.Value(frontierEntryContextKey{}).(*frontierEntry)
-	return e
-}
-
-// inflightParent is what the head resolved for a block's parent: the parent's
-// height, and its frontier entry when the parent is still in the window. A nil
-// entry with a height is a parent the head found in the chain, so HandleBlockDirect
-// takes the height and skips the lookup the head has just made; the ordering
-// hand-shake is guarded on the entry and never waits on a stored parent. A nil
-// inflightParent means "look the parent up in the blockchain store" — the
-// pre-window behaviour, and what the park drain and every caller other than the
-// head still pass.
-type inflightParent struct {
-	height uint32
-	entry  *frontierEntry
 }
 
 // blockDispatch is what handleBlockMsgHead produced: one queued block that passed every
@@ -258,37 +196,15 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 		}
 	}
 
-	// The parked run: read the blob (or the converted record) on the worker, then
-	// the same call the serial drain makes. The decoded block, when there is one,
-	// lives in this worker's local, so the consumer never holds one.
+	// The parked run: read the converted record on the worker, then the same call
+	// the serial drain makes.
 	//
-	// A nil in-flight parent, always, on both branches. The parent of a parked
-	// block is in the chain by the time anything commits it, so HandleBlockDirect
-	// and HandleConvertedBlock each look it up there, and that lookup is what
-	// enforces "never hand block validation a parentless block" in the worker
-	// rather than on a promise from the consumer. Handing either of them a
-	// resolved parent instead would skip the lookup and is the single most
-	// dangerous edit anyone can make here.
+	// A nil in-flight parent, always. The parent of a parked block is in the chain
+	// by the time anything commits it, so HandleConvertedBlock looks it up there,
+	// and that lookup is what enforces "never hand block validation a parentless
+	// block" in the worker rather than on a promise from the consumer.
 	bd.parkedRun = func(ctx context.Context, d *blockDispatch) error {
-		// d.parked.converted is set once, at AdoptWritten or Recover, from the
-		// fact that made it true then — see parkedBlock.converted's own doc
-		// comment for why asking the store here (a blockPark.IsConverted call,
-		// this task's own fix) is exactly the extra round trip this worker step
-		// must not pay for every parked block, pipeline on or off.
-		if d.parked.converted {
-			record, err := sm.blockPark.ReadConverted(ctx, d.parked.hash)
-			if err != nil {
-				// Recorded apart from the returned error so the tail cannot classify a
-				// read failure by the commit table, which judges the block.
-				d.readErr = err
-
-				return err
-			}
-
-			return sm.HandleConvertedBlock(ctx, d.parked.peer, d.parked.hash, record)
-		}
-
-		msgBlock, err := sm.blockPark.Read(ctx, d.parked.hash)
+		record, err := sm.blockPark.ReadConverted(ctx, d.parked.hash)
 		if err != nil {
 			// Recorded apart from the returned error so the tail cannot classify a
 			// read failure by the commit table, which judges the block.
@@ -297,13 +213,7 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 			return err
 		}
 
-		// A parked block is re-read from disk, sometimes after a restart, so the run
-		// that named it may be long gone from the header cache. Ask anyway rather than
-		// hard-coding the zero value: when the cache still names it inside a proven
-		// prefix the proof is genuine and the fast path is as safe as it was on
-		// arrival, and when it does not the answer is the zero value, which is the
-		// same denial hard-coding would have given.
-		return sm.HandleBlockDirect(ctx, d.parked.peer, d.parked.hash, msgBlock, nil, sm.blockOrigin(d.parked.hash))
+		return sm.HandleConvertedBlock(ctx, d.parked.peer, d.parked.hash, record)
 	}
 
 	// The parked tail: classify in one place, on the consumer, in admission order,
@@ -561,11 +471,10 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 	hash := d.msgHash()
 
 	e := &frontierEntry{
-		hash:       hash,
-		height:     d.height,
-		rpcStarted: make(chan struct{}),
-		settled:    make(chan struct{}),
-		d:          d,
+		hash:    hash,
+		height:  d.height,
+		settled: make(chan struct{}),
+		d:       d,
 	}
 
 	bd.frontierMu.Lock()
@@ -578,19 +487,15 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 		bd.barrier = true
 	}
 
-	ctx := contextWithFrontierEntry(bd.sm.ctx, e)
-
 	go func() {
 		var err error
 
 		if e.aborted.Load() {
 			err = errors.NewServiceError("[blockDispatcher][%s] not started at height %d: a predecessor failed", e.hash.String(), e.height)
 		} else {
-			err = bd.parkedRun(ctx, d)
+			err = bd.parkedRun(bd.sm.ctx, d)
 		}
 
-		// settle after run returns, so rpcStarted (closed inside HandleBlockDirect)
-		// always closes strictly before settled in program order.
 		e.settle(err)
 
 		select {

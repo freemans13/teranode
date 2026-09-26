@@ -12,7 +12,6 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
-	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
@@ -321,10 +320,6 @@ func describeTarget(t *big.Int) string {
 	return t.String()
 }
 
-// parkFileType is the one file type a parked block is stored under, named here
-// so the streaming sink and the park's own writer cannot drift apart.
-var parkFileType = fileformat.FileTypeMsgBlock
-
 // blockOnDiskMsg tells the consumer that a block's body reached the park's store
 // straight off the wire, so the park needs an entry for bytes that are already
 // down.
@@ -453,11 +448,6 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		size:      msg.body.Size,
 		wireSize:  msg.body.Size,
 		peer:      msg.peer,
-		// Straight from the sink's own return value, the same source
-		// BlockBody.Converted itself documents as the only trustworthy one —
-		// see parkedBlock.converted's own doc comment for why this is what
-		// lets commitParkedBlock and parkedRun stop asking the store.
-		converted: msg.body.Converted,
 	}
 
 	// msg.body.Converted says whether THIS delivery's sink actually converted

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,18 +34,19 @@ func chargedTotal(park *blockPark) int64 {
 func TestBlockPark_SettlingABlockTwiceDoesNotMoveTheCounterTwice(t *testing.T) {
 	park, _ := newTestPark(t, "")
 
-	blocks := minedBlocks(t, 2)
+	prevs := []chainhash.Hash{{0x31}, {0x32}}
+	entries := make([]parkedBlock, 0, len(prevs))
 
-	entries := make([]parkedBlock, 0, len(blocks))
+	for i, prev := range prevs {
+		hash := parkedRecord(t, park, prev, byte(i+1))
 
-	for _, b := range blocks {
-		msgBlock := b.MsgBlock()
+		size, exists, err := park.convertedRecordSize(context.Background(), hash)
+		require.NoError(t, err)
+		require.True(t, exists)
 
-		entry := parkedBlock{hash: msgBlock.BlockHash(), prevBlock: msgBlock.Header.PrevBlock}
+		entry := parkedBlock{hash: hash, prevBlock: prev, size: size}
+		require.True(t, park.AdoptWritten(entry))
 
-		require.Equal(t, parkAccepted, park.Park(context.Background(), entry, msgBlock))
-
-		entry.size = int64(msgBlock.SerializeSize())
 		entries = append(entries, entry)
 	}
 
@@ -83,10 +85,15 @@ func TestBlockPark_SettlingABlockTwiceDoesNotMoveTheCounterTwice(t *testing.T) {
 func TestBlockPark_ARestoredBlockIsStillBilled(t *testing.T) {
 	park, _ := newTestPark(t, "")
 
-	msgBlock := minedBlocks(t, 1)[0].MsgBlock()
+	prev := chainhash.Hash{0x35}
+	hash := parkedRecord(t, park, prev, 1)
 
-	entry := parkedBlock{hash: msgBlock.BlockHash(), prevBlock: msgBlock.Header.PrevBlock}
-	require.Equal(t, parkAccepted, park.Park(context.Background(), entry, msgBlock))
+	size, exists, err := park.convertedRecordSize(context.Background(), hash)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	entry := parkedBlock{hash: hash, prevBlock: prev, size: size}
+	require.True(t, park.AdoptWritten(entry))
 
 	full := park.Bytes()
 

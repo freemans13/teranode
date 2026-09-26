@@ -129,9 +129,7 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 		}
 	}
 
-	isConverted, err := sm.blockPark.IsConverted(ctx, *blk.Hash())
-	require.NoError(t, err, "checking for a converted record must not itself fail")
-	require.False(t, isConverted, "the converted record must be cleared too, not just the subtree files")
+	require.False(t, parkHasConvertedRecord(t, sm.blockPark, *blk.Hash()), "the converted record must be cleared too, not just the subtree files")
 }
 
 // A delivery that converted nothing wrote nothing, so deleting for it removes nothing. It is a

@@ -134,12 +134,8 @@ func TestBlockPark_RecoveryAdoptsAConvertedRecord(t *testing.T) {
 		"the entry's previous-block hash must come from the record's own header, not a wire block that does not exist on disk")
 	require.Equal(t, expectedSize, entry.size,
 		"the entry's size must come from the converted record, not the whole block")
-	require.True(t, entry.converted,
-		"fix-round item 1: a recovered converted record must set entry.converted, or commitParkedBlock/parkedRun would try to Read a whole block that was never written")
 
-	stillOnDisk, err := restarted.IsConverted(ctx, hash)
-	require.NoError(t, err)
-	require.True(t, stillOnDisk, "recovery adopting a converted record must not delete it")
+	require.True(t, parkHasConvertedRecord(t, restarted, hash), "recovery adopting a converted record must not delete it")
 }
 
 // TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone is
@@ -248,9 +244,7 @@ func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *t
 	_, ok := restarted.Take(hash)
 	require.False(t, ok, "a converted record whose first subtree is gone must not be adopted; committing it could only fail inside validation")
 
-	stillOnDisk, err := restarted.IsConverted(ctx, hash)
-	require.NoError(t, err)
-	require.False(t, stillOnDisk, "the record itself must be discarded too, not left to be found again on every future restart")
+	require.False(t, parkHasConvertedRecord(t, restarted, hash), "the record itself must be discarded too, not left to be found again on every future restart")
 
 	require.NotEmpty(t, warnings.warnings, "recovery must log when this fires, so a soak can tell whether it ever does")
 

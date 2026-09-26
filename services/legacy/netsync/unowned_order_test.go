@@ -59,7 +59,7 @@ func TestDownloadPassDoesNotReadTheDiskForAParkedBlock(t *testing.T) {
 	sm, counting := orderManager(t)
 	hash := chainhash.Hash{0x11}
 
-	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hash, prevBlock: chainhash.Hash{0x10}, converted: true}))
+	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hash, prevBlock: chainhash.Hash{0x10}}))
 
 	require.Empty(t, sm.unownedBlocks([]wantedBlock{{height: 100, hash: hash}}))
 	require.Zero(t, counting.reads.Load(), "the park's own index answers first")

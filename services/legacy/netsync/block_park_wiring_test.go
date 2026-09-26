@@ -423,16 +423,21 @@ func TestSyncManager_NothingIsDrainedAfterABlockThatDidNotCommit(t *testing.T) {
 	require.False(t, failed, "a block nobody tried to commit must not be marked as having failed")
 }
 
-// TestHandleBlockDirect_ToleratesANilPeer. Every block recovered from the park
+// TestHandleConvertedBlock_ToleratesANilPeer. Every block recovered from the park
 // after a restart has no delivering peer, and (*Peer).String dereferences the
 // peer's address and asks it whether it is the sync peer — so calling it on nil
 // panics, on the block-queue goroutine, in production.
-func TestHandleBlockDirect_ToleratesANilPeer(t *testing.T) {
+//
+// Ported from the deleted HandleBlockDirect route onto HandleConvertedBlock,
+// which carries the identical nil-peer guard (handle_block.go).
+func TestHandleConvertedBlock_ToleratesANilPeer(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
 	msgBlock := h.blocks[1].MsgBlock()
 	hash := msgBlock.BlockHash()
 	prev := msgBlock.Header.PrevBlock
+
+	blk := bodyCommitment(t, bsvutil.NewBlock(msgBlock))
 
 	// The parent IS stored, so the block gets past the parent lookup and reaches
 	// the tracing call that names the peer. It is stopped just after, on the
@@ -450,7 +455,7 @@ func TestHandleBlockDirect_ToleratesANilPeer(t *testing.T) {
 	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
 
 	require.NotPanics(t, func() {
-		err := h.sm.HandleBlockDirect(context.Background(), nil, hash, msgBlock, nil, blockRequestOrigin{headerProven: true})
+		err := h.sm.HandleConvertedBlock(context.Background(), nil, hash, blk)
 		require.Error(t, err, "the parent is not mined, so this must fail there — not on a nil peer")
 	})
 }

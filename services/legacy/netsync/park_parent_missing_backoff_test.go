@@ -86,16 +86,6 @@ func TestParentMissingBackoff(t *testing.T) {
 		require.True(t, ok, "the backoff must only apply to a block that actually failed this way")
 	})
 
-	t.Run("a block still being written is still skipped for its own reason", func(t *testing.T) {
-		p := newPark(t)
-
-		e := entryFor(0x06)
-		e.writing = true
-		p.Restore(e)
-
-		_, ok := p.FirstChildFor(parent)
-		require.False(t, ok, "the write gate is independent of the backoff and must survive it")
-	})
 }
 
 // TestParkedBlockFailed_StampsAMissingParent pins the WIRING. The cases above set

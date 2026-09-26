@@ -50,18 +50,6 @@ func TestAdoptWritten(t *testing.T) {
 		require.Equal(t, e.hash, child.hash)
 	})
 
-	t.Run("an adopted block is not writing, so readers may act on it at once", func(t *testing.T) {
-		p := newPark(t)
-		e := entryFor(0x02, 512)
-
-		require.True(t, p.AdoptWritten(e))
-
-		got, ok := p.Take(e.hash)
-		require.True(t, ok)
-		require.False(t, got.writing,
-			"the bytes are already down, so a reader that waits for a write that never comes would strand the block")
-	})
-
 	t.Run("a second adoption of the same block is refused", func(t *testing.T) {
 		p := newPark(t)
 		e := entryFor(0x03, 4096)

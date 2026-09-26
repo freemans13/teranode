@@ -190,9 +190,7 @@ func TestHandleConvertedBlock_CommitsWithoutTheBlock(t *testing.T) {
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 
-	isConverted, err := sm.blockPark.IsConverted(ctx, *blk.Hash())
-	require.NoError(t, err)
-	require.True(t, isConverted, "the park must carry a converted record, or the route under test is unreachable")
+	require.True(t, parkHasConvertedRecord(t, sm.blockPark, *blk.Hash()), "the park must carry a converted record, or the route under test is unreachable")
 
 	noWholeBlock, err := sm.blockPark.store.Exists(ctx, blk.Hash()[:], fileformat.FileTypeMsgBlock)
 	require.NoError(t, err)
@@ -342,12 +340,11 @@ func TestCommitParkedBlock_RoutesAConvertedEntryWithoutReadingAWholeBlock(t *tes
 
 	// commitParkedBlock takes an entry already detached from the park's index —
 	// see TakeChildren/Take in production — so it is built directly here rather
-	// than round-tripped through Admit, which this test has no need of.
-	// converted: true is what AdoptWritten would have set from the sink's own
-	// BlockBody.Converted (fix-round item 1) — commitParkedBlock now reads that
-	// field instead of asking the store, so a test driving it directly has to
-	// set it the same way.
-	entry := parkedBlock{hash: *blk.Hash(), peer: nil, converted: true}
+	// than round-tripped through AdoptWritten, which this test has no need of.
+	// commitParkedBlock always routes through ReadConverted/HandleConvertedBlock
+	// now (block_park_drain.go): there is no whole-block branch left to select
+	// away from, so the entry needs nothing beyond its own hash.
+	entry := parkedBlock{hash: *blk.Hash(), peer: nil}
 
 	ok := sm.commitParkedBlock(entry)
 	require.True(t, ok, "a valid converted entry, below the checkpoint on the unified route, must commit")
@@ -403,7 +400,7 @@ func TestBlockDispatcher_ParkedRunRoutesAConvertedEntryWithoutReadingAWholeBlock
 
 	bd := newBlockDispatcher(sm)
 
-	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil, converted: true}}
+	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil}}
 
 	runErr := bd.parkedRun(ctx, d)
 	require.NoError(t, runErr, "a valid converted entry, below the checkpoint on the unified route, must commit")
@@ -461,7 +458,7 @@ func TestBlockDispatcher_ParkedRunNeverConsultsTheStoreToRoute(t *testing.T) {
 	sm.blockPark.store = faulted
 
 	bd := newBlockDispatcher(sm)
-	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil, converted: true}}
+	d := &blockDispatch{parked: &parkedBlock{hash: *blk.Hash(), peer: nil}}
 
 	runErr := bd.parkedRun(ctx, d)
 	require.NoError(t, runErr, "a faulted Exists must not affect the commit once routing no longer asks the store")

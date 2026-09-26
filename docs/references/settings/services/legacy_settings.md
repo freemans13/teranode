@@ -49,7 +49,6 @@ and no loader line arrives as its zero value whatever an operator writes.
 | BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Block bodies the whole node may have outstanding, counting every peer together. A count, not svnode's per-peer height range |
 | BlockDownloadLowerWindow | int | 128 | legacy_blockDownloadLowerWindow | How far above the committed tip a block may be asked for, scaled down by the block-size ladder and clamped to BlockDownloadWindow. 0 leaves BlockDownloadWindow as the only bound |
 | ParkStoreTimeout | time.Duration | 10s | legacy_parkStoreTimeout | Deadline on each park blob store operation, bounding the wait for the file store's shared permits. Values below 1s are raised to 1s |
-| ParkWorkers | int | 2 | legacy_parkWorkers | Workers that check and write parked blocks, keeping that work off the in-order commit goroutine. 0 or less becomes 1 |
 | PeerRegistryEnabled | bool | true | legacy_peerRegistryEnabled | Mirror connected legacy peers into the centralized peer registry so the dashboard can show them |
 | PeerRegistrySyncInterval | time.Duration | 10s | legacy_peerRegistrySyncInterval | How often that mirror reconciles connected legacy peers into the registry |
 
@@ -184,11 +183,9 @@ and no loader line arrives as its zero value whatever an operator writes.
 
 ### Out-of-Order Block Park
 
-- The park needs a temp store it can enumerate after a restart, so it turns itself
-  off with a warning on any `temp_store` URL that is not a `file://` store, and on
-  a node with no temp store at all.
-- `ParkWorkers` is a memory decision. A worker holds a block for the length of its
-  write, so more workers mean more blocks in flight at once.
+- The park needs a temp store it can enumerate after a restart, so the node refuses
+  to start on any `temp_store` URL that is not a `file://` store, and on a node
+  with no temp store at all. Every downloaded block goes through the park.
 - `ParkStoreTimeout` bounds the wait for the file store's process-wide permits,
   which are shared with subtree writes, transaction writes and both persisters. It
   does not bound the work the store does once it holds a permit.
@@ -248,7 +245,6 @@ peer-selection decision, and the legacy service's own sync engine
 | TempStore | Must be set | Daemon returns "temp_store config not found" | During store construction |
 | ListenAddresses | Falls back to the outbound interface IP and the network's default port if empty | Network connectivity | During server start |
 | ParkStoreTimeout | Raised to 1s if lower | A zero deadline would fail every store operation instantly | During sync manager construction |
-| ParkWorkers | Raised to 1 if 0 or less | The pool always has at least one worker | During sync manager construction |
 | BlockDownloadLowerWindow | Clamped to BlockDownloadWindow; 0 or less means no read-ahead limit | Decides how far above the committed tip blocks are fetched | On every assignment pass |
 | MaxFeelerPeers | Zeroed by connect-only mode, or by a peer cap too tight to hold the reservation | Feelers and their slot reservation are both switched off, with the reason logged | During server construction |
 | FeelerInterval | Non-positive falls back to 120s with a warning | Probe pacing | When the feeler loop starts |

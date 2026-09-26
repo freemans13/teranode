@@ -2,11 +2,9 @@ package netsync
 
 import (
 	"context"
-	"io"
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -14,14 +12,12 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
-	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
@@ -94,114 +90,6 @@ func parkDirEntries(t *testing.T, dir string) []string {
 	return names
 }
 
-// TestBlockPark_ParksABlockWhoseMerkleRootIsCheckedLater records a deliberate
-// change of behaviour, and the reasoning matters more than the assertion.
-//
-// This test used to assert the opposite: that a peer pairing a genuine,
-// real-work header with somebody else's transactions was refused before
-// anything reached the disk. It called itself the check that mattered most, on
-// the grounds that such a block would otherwise fail only on drain, "by which
-// point it has been given up on", so one crafted message on a public port would
-// stop sync.
-//
-// That last step is no longer true, and it is what the check rested on. A
-// rejection on the drain path drops the parked bytes, puts the block back on the
-// download walk and blames the peer, so the block is obtained again rather than
-// given up on; TestParkRejectionLeavesTheBlockRequestable pins that, including
-// the cascade mark not suppressing the block's own retry.
-//
-// What the check cost was a merkle rebuild over every transaction: 13.7 seconds
-// for a 100,001-transaction mainnet block, a 19.9 second mean across the blocks
-// big enough to log a warning, paid on 91% of blocks because that is how many
-// arrive out of order. The same root is verified during normal block processing
-// on subtrees built from the transactions the peer actually sent, so the
-// fabrication is still caught, just later.
-//
-// So the park now takes this block, and the exposure is a file that exists until
-// the later check refuses it. The proof-of-work check on the 80-byte header
-// stays, and it is the one that matters for flooding: a peer cannot mint
-// unlimited distinct blocks without real work.
-func TestBlockPark_ParksABlockWhoseMerkleRootIsCheckedLater(t *testing.T) {
-	park, dir := newTestPark(t, "")
-
-	blocks := minedBlocks(t, 2)
-
-	// A real header, real proof of work, and somebody else's transactions.
-	tampered := &wire.MsgBlock{
-		Header:       blocks[0].MsgBlock().Header,
-		Transactions: blocks[1].MsgBlock().Transactions,
-	}
-	hash := tampered.BlockHash()
-
-	result := park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: tampered.Header.PrevBlock}, tampered)
-
-	require.Equal(t, parkAccepted, result,
-		"the park no longer rebuilds the merkle tree; normal block processing verifies it")
-	require.NotEmpty(t, parkDirEntries(t, dir))
-	require.Equal(t, 1, park.Len())
-
-	// And the cheap header checks still bite, so this is not a free-for-all: a
-	// block that does not hash to the key we asked for is still refused before
-	// anything is written.
-	fresh, freshDir := newTestPark(t, "")
-	wrongKey := chainhash.Hash{0xde, 0xad}
-
-	require.Equal(t, parkRejected,
-		fresh.Park(context.Background(), parkedBlock{hash: wrongKey}, blocks[0].MsgBlock()),
-		"a block that is not the block we asked for is still refused")
-	require.Empty(t, parkDirEntries(t, freshDir))
-}
-
-// TestBlockPark_RefusesABlockWithNoTransactions covers a remote panic, not just
-// a refusal: the merkle builder sizes its array as nextPowerOfTwo(n)*2-1, and
-// nextPowerOfTwo(0) is 0, so an empty transaction list asks for a slice of
-// length -1. The wire decoder accepts a transaction count of zero, so a peer
-// can send exactly this.
-func TestBlockPark_RefusesABlockWithNoTransactions(t *testing.T) {
-	park, dir := newTestPark(t, "")
-
-	blocks := minedBlocks(t, 1)
-
-	empty := &wire.MsgBlock{Header: blocks[0].MsgBlock().Header}
-	hash := empty.BlockHash()
-
-	require.NotPanics(t, func() {
-		require.Equal(t, parkRejected, park.Park(context.Background(), parkedBlock{hash: hash}, empty))
-	}, "a block with no transactions must be refused, not panic the block-queue goroutine")
-
-	require.Empty(t, parkDirEntries(t, dir))
-}
-
-// TestBlockPark_RefusesABlockThatDoesNotMeetItsTarget pins the check that stops
-// an attacker minting unlimited distinct blocks to fill the park with, and the
-// key/hash disagreement check beside it.
-func TestBlockPark_RefusesABlockThatDoesNotMeetItsTarget(t *testing.T) {
-	blocks := minedBlocks(t, 1)
-
-	t.Run("no proof of work", func(t *testing.T) {
-		park, dir := newTestPark(t, "")
-
-		original := blocks[0].MsgBlock()
-
-		unmined := &wire.MsgBlock{Header: original.Header, Transactions: original.Transactions}
-		// A target nothing can plausibly meet, so the block's own header fails.
-		unmined.Header.Bits = 0x03000001
-
-		hash := unmined.BlockHash()
-
-		require.Equal(t, parkRejected, park.Park(context.Background(), parkedBlock{hash: hash}, unmined))
-		require.Empty(t, parkDirEntries(t, dir))
-	})
-
-	t.Run("hash does not match the key", func(t *testing.T) {
-		park, dir := newTestPark(t, "")
-
-		require.Equal(t, parkRejected,
-			park.Park(context.Background(), parkedBlock{hash: chainhash.Hash{0xde, 0xad}}, blocks[0].MsgBlock()))
-		require.Empty(t, parkDirEntries(t, dir))
-	})
-}
-
 // TestBlockPark_RoundTripsThroughAShardedStore proves the layout does not
 // depend on the temp_store URL. A store built with hashPrefix would otherwise
 // put the blobs in shard subdirectories, where the flat recovery scan finds
@@ -236,40 +124,6 @@ func TestBlockPark_RoundTripsThroughAShardedStore(t *testing.T) {
 		"the parent must be read back out of the stored record")
 }
 
-// TestBlockPark_AFailedWriteLeavesNoGoroutineBehind. The blob store never
-// closes the reader it is handed, so on an error return the goroutine
-// serializing the block into the pipe blocks forever on its next write — one
-// leaked goroutine per failed park, each pinning a whole decoded block.
-func TestBlockPark_AFailedWriteLeavesNoGoroutineBehind(t *testing.T) {
-	park, _ := newTestPark(t, "")
-	park.store = failingWriteStore{Store: park.store}
-
-	blocks := minedBlocks(t, 1)
-	msgBlock := blocks[0].MsgBlock()
-	hash := msgBlock.BlockHash()
-
-	before := runtime.NumGoroutine()
-
-	done := make(chan parkResult, 1)
-
-	go func() {
-		done <- park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock)
-	}()
-
-	select {
-	case result := <-done:
-		require.Equal(t, parkUnavailable, result, "a store that cannot write is a local fault, so the block must be re-requested")
-	case <-time.After(10 * time.Second):
-		t.Fatal("Park never returned: the goroutine serializing the block is stuck writing into a pipe nobody closed")
-	}
-
-	require.Zero(t, park.Bytes(), "a failed write must not leave the budget charged")
-	require.Zero(t, park.Len())
-
-	require.True(t, WaitUntil(func() bool { return runtime.NumGoroutine() <= before }, 5*time.Second),
-		"the goroutine serializing the block must terminate when the write fails")
-}
-
 // TestBlockPark_SizeAloneNeverRefuses pins what is left once both of the
 // park's old bounds are gone: a byte budget, then an entry cap after it. Both
 // were removed for the same shape of reason. The byte budget could only be
@@ -280,17 +134,12 @@ func TestBlockPark_AFailedWriteLeavesNoGoroutineBehind(t *testing.T) {
 // disk now is upstream of both: the download walk's read-ahead depth, in
 // blocks, checked before anything is fetched.
 func TestBlockPark_SizeAloneNeverRefuses(t *testing.T) {
-	blocks := minedBlocks(t, 1)
-	msgBlock := blocks[0].MsgBlock()
-	hash := msgBlock.BlockHash()
-
 	park, dir := newTestPark(t, "")
 
-	require.Equal(t, parkAccepted,
-		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	adoptRecord(t, park, chainhash.Hash{0x99}, 1)
 
 	require.NotEmpty(t, parkDirEntries(t, dir), "the block must be written whatever its size")
-	require.Equal(t, int64(msgBlock.SerializeSize()), park.Bytes(),
+	require.Positive(t, park.Bytes(),
 		"the byte total is still tracked, for the gauge, it just no longer refuses")
 }
 
@@ -343,7 +192,6 @@ func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 		require.Len(t, taken, 1)
 		require.True(t, taken[0].hash.IsEqual(&hashes[i]))
 		require.Nil(t, taken[0].peer, "a recovered block has no delivering peer")
-		require.True(t, taken[0].converted, "a recovered record is a converted block")
 	}
 
 	names := parkDirEntries(t, dir)
@@ -368,6 +216,37 @@ func parkedRecord(t *testing.T, park *blockPark, prev chainhash.Hash, seed byte)
 	require.NoError(t, park.WriteConvertedBlock(context.Background(), hash, blk))
 
 	return hash
+}
+
+// adoptRecord writes a converted record the way parkedRecord does, and then adopts it into the
+// SAME park's own index — the way AdoptWritten does for a streamed body — returning the hash.
+// It stands in for the old Park()/Admit() one-call setup now that a record's bytes always land
+// on disk before anything registers it.
+func adoptRecord(t *testing.T, park *blockPark, prev chainhash.Hash, seed byte) chainhash.Hash {
+	t.Helper()
+
+	hash := parkedRecord(t, park, prev, seed)
+
+	size, exists, err := park.convertedRecordSize(context.Background(), hash)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	require.True(t, park.AdoptWritten(parkedBlock{hash: hash, prevBlock: prev, size: size}))
+
+	return hash
+}
+
+// parkHasConvertedRecord answers whether a converted record exists under hash, the same fact
+// blockPark.IsConverted used to answer before it was removed as unreachable from every commit
+// path: everything parked is a converted record now, so the store's own Exists is asked directly
+// here rather than restoring a production method nothing calls any more.
+func parkHasConvertedRecord(t *testing.T, park *blockPark, hash chainhash.Hash) bool {
+	t.Helper()
+
+	exists, err := park.store.Exists(context.Background(), hash[:], fileformat.FileTypeBlock, parkOpts...)
+	require.NoError(t, err)
+
+	return exists
 }
 
 // TestBlockPark_IsOffWhenItCannotBeRecovered covers the two settings-only kill
@@ -408,7 +287,8 @@ func TestBlockPark_RefusesAStoreItCannotRecover(t *testing.T) {
 		var park *blockPark
 
 		require.False(t, park.Enabled())
-		require.Equal(t, parkDisabled, park.Park(context.Background(), parkedBlock{}, nil))
+		require.Error(t, park.WriteConvertedBlock(context.Background(), chainhash.Hash{}, nil),
+			"a nil park must refuse rather than panic")
 		require.Zero(t, park.Len())
 		require.Zero(t, park.Bytes())
 		require.Nil(t, park.TakeChildren(chainhash.Hash{}))
@@ -444,21 +324,9 @@ func TestBlockPark_ParkStoreDeadlineIsTheOneThatCounts(t *testing.T) {
 	require.NotNil(t, park)
 	require.Equal(t, parkMinStoreTimeout, park.storeTimeout)
 
-	blocks := minedBlocks(t, 1)
-	msgBlock := blocks[0].MsgBlock()
-
-	require.Equal(t, parkAccepted,
-		park.Park(context.Background(), parkedBlock{hash: msgBlock.BlockHash(), prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
-}
-
-// failingWriteStore is a blob store whose writes always fail, so the park's
-// error path can be driven without breaking the filesystem.
-type failingWriteStore struct {
-	blob.Store
-}
-
-func (s failingWriteStore) SetFromReader(_ context.Context, _ []byte, _ fileformat.FileType, _ io.ReadCloser, _ ...options.FileOption) error {
-	return errors.NewStorageError("[test] the store is not taking writes")
+	// parkedRecord's own WriteConvertedBlock call already requires no error; a
+	// deadline floored at zero must still let a genuine write through.
+	parkedRecord(t, park, chainhash.Hash{0x01}, 1)
 }
 
 // TestBlockPark_RecoverDiscardsAConvertedRecordInsteadOfOrphaningItForever is

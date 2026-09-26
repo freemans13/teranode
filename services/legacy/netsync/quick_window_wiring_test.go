@@ -8,21 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bsv-blockchain/teranode/services/blockchain"
-	"github.com/bsv-blockchain/teranode/services/blockvalidation"
-	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
-	"github.com/bsv-blockchain/teranode/services/legacy/peer"
-	"github.com/bsv-blockchain/teranode/services/legacy/testdata"
-	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
-	"github.com/bsv-blockchain/teranode/stores/blob/memory"
-	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -186,115 +174,4 @@ func TestDispatchBlocks_SettingZeroIsATrueBypass(t *testing.T) {
 	require.False(t, failed, "the child was committed, not given up on")
 
 	require.False(t, dispatched.Load(), "the dispatcher is not used when the window is off")
-}
-
-// processBlockRecorder counts ProcessBlock calls so the hand-shake tests can tell "the child
-// went ahead" from "the child short-circuited".
-type processBlockRecorder struct {
-	*blockvalidation.MockBlockValidation
-
-	called atomic.Int32
-}
-
-func (m *processBlockRecorder) ProcessBlock(_ context.Context, _ *model.Block, _ uint32, _, _ string, _ uint32) error {
-	m.called.Add(1)
-
-	return nil
-}
-
-// newHandShakeHarness is the minimum HandleBlockDirect needs to reach its ordering hand-shake
-// with a real block: the fixture arrives with its height unset and the resolved parent puts it
-// at 100, which is the height the subtree-validation mock is scripted for, so a wrong height
-// fails as an unexpected call rather than passing silently.
-func newHandShakeHarness(t *testing.T) (*SyncManager, *processBlockRecorder, *bsvutil.Block) {
-	t.Helper()
-
-	initPrometheusMetrics()
-
-	block, err := testdata.ReadBlockFromFile("../testdata/00000000000000000ad4cd15bbeaf6cb4583c93e13e311f9774194aadea87386.bin")
-	require.NoError(t, err)
-	require.LessOrEqual(t, block.Height(), int32(0), "fixture must arrive with height unset, like a real wire block")
-
-	blockchainClient := &blockchain.Mock{}
-	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-	blockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
-
-	blockAssembly := blockassembly.NewMock()
-	blockAssembly.On("GetBlockAssemblyState", mock.Anything).Return(&blockassembly_api.StateMessage{CurrentHeight: 100}, nil)
-
-	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.On("CheckSubtreeFromBlock", mock.Anything, mock.Anything, "legacy", uint32(100), mock.Anything, mock.Anything).Return(nil)
-
-	recorder := &processBlockRecorder{MockBlockValidation: &blockvalidation.MockBlockValidation{}}
-
-	sm := &SyncManager{
-		settings:          test.CreateBaseTestSettings(t),
-		logger:            ulogger.TestLogger{},
-		orphanTxs:         expiringmap.New[chainhash.Hash, *orphanTxAndParents](10),
-		blockchainClient:  blockchainClient,
-		blockAssembly:     blockAssembly,
-		utxoStore:         &nullstore.NullStore{},
-		subtreeStore:      memory.New(),
-		subtreeValidation: subtreeValidationClient,
-		blockValidation:   recorder,
-	}
-	t.Cleanup(sm.orphanTxs.Stop)
-
-	return sm, recorder, block
-}
-
-// TestHandleBlockDirect_OrderingHandShake drives the wait immediately before ProcessBlock with
-// live channels, in the three states a resolved in-flight parent can be in.
-func TestHandleBlockDirect_OrderingHandShake(t *testing.T) {
-	t.Run("a parent that started its RPC lets the child through", func(t *testing.T) {
-		sm, recorder, block := newHandShakeHarness(t)
-
-		parent := &frontierEntry{rpcStarted: make(chan struct{}), settled: make(chan struct{})}
-		close(parent.rpcStarted)
-
-		own := &frontierEntry{rpcStarted: make(chan struct{}), settled: make(chan struct{})}
-		ctx := contextWithFrontierEntry(context.Background(), own)
-
-		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent}, blockRequestOrigin{headerProven: true})
-		require.NoError(t, err)
-		require.Equal(t, int32(1), recorder.called.Load(), "the child must reach its own RPC")
-
-		select {
-		case <-own.rpcStarted:
-		default:
-			t.Fatal("the child must mark its own entry started before its RPC, or its successor waits forever")
-		}
-	})
-
-	t.Run("a parent that failed before its RPC short-circuits the child", func(t *testing.T) {
-		sm, recorder, block := newHandShakeHarness(t)
-
-		parent := &frontierEntry{rpcStarted: make(chan struct{}), settled: make(chan struct{})}
-		parent.settle(errors.NewProcessingError("the parent broke"))
-
-		own := &frontierEntry{rpcStarted: make(chan struct{}), settled: make(chan struct{})}
-		ctx := contextWithFrontierEntry(context.Background(), own)
-
-		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent}, blockRequestOrigin{headerProven: true})
-		require.Error(t, err)
-		require.True(t, errors.IsTransientLocalError(err), "a predecessor's failure is our fault, not the peer's: %v", err)
-		require.Equal(t, int32(0), recorder.called.Load(), "the child must never start its own RPC")
-	})
-
-	t.Run("a parent that started and then failed still lets the child through", func(t *testing.T) {
-		sm, recorder, block := newHandShakeHarness(t)
-
-		parent := &frontierEntry{rpcStarted: make(chan struct{}), settled: make(chan struct{})}
-		parent.markRPCStarted()
-		parent.settle(errors.NewProcessingError("the parent broke after starting"))
-
-		own := &frontierEntry{rpcStarted: make(chan struct{}), settled: make(chan struct{})}
-		ctx := contextWithFrontierEntry(context.Background(), own)
-
-		// Both arms are ready, and rpcStarted must win every time: the server-side window is
-		// what aborts this block, with the predecessor's recorded error.
-		err := sm.HandleBlockDirect(ctx, &peer.Peer{}, *block.Hash(), block.MsgBlock(), &inflightParent{height: 99, entry: parent}, blockRequestOrigin{headerProven: true})
-		require.NoError(t, err)
-		require.Equal(t, int32(1), recorder.called.Load(), "rpcStarted wins over a settled failure")
-	})
 }

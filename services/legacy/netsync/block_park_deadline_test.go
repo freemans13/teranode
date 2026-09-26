@@ -9,6 +9,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
@@ -28,10 +29,22 @@ type stallingStore struct {
 	blob.Store
 }
 
+func (s stallingStore) Get(ctx context.Context, _ []byte, _ fileformat.FileType, _ ...options.FileOption) ([]byte, error) {
+	<-ctx.Done()
+
+	return nil, errors.NewServiceUnavailableError("[test] no read permit ever came free", ctx.Err())
+}
+
 func (s stallingStore) GetIoReader(ctx context.Context, _ []byte, _ fileformat.FileType, _ ...options.FileOption) (io.ReadCloser, error) {
 	<-ctx.Done()
 
 	return nil, errors.NewServiceUnavailableError("[test] no read permit ever came free", ctx.Err())
+}
+
+func (s stallingStore) Set(ctx context.Context, _ []byte, _ fileformat.FileType, _ []byte, _ ...options.FileOption) error {
+	<-ctx.Done()
+
+	return errors.NewServiceUnavailableError("[test] no write permit ever came free", ctx.Err())
 }
 
 func (s stallingStore) SetFromReader(ctx context.Context, _ []byte, _ fileformat.FileType, _ io.ReadCloser, _ ...options.FileOption) error {
@@ -93,7 +106,7 @@ func TestBlockPark_EveryStoreOperationCarriesTheConfiguredDeadline(t *testing.T)
 		go func() {
 			defer close(done)
 
-			_, readErr = park.Read(context.Background(), hash)
+			_, readErr = park.ReadConverted(context.Background(), hash)
 		}()
 
 		select {
@@ -126,19 +139,19 @@ func TestBlockPark_EveryStoreOperationCarriesTheConfiguredDeadline(t *testing.T)
 	t.Run("write", func(t *testing.T) {
 		park := newStalledPark(deadline)
 
-		blocks := minedBlocks(t, 1)
-		msgBlock := blocks[0].MsgBlock()
+		header := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+		blk, err := model.NewBlock(header, coinbaseTx(t), nil, 0, 0, 0, 0)
+		require.NoError(t, err)
 
 		var (
-			result parkResult
-			done   = make(chan struct{})
+			writeErr error
+			done     = make(chan struct{})
 		)
 
 		go func() {
 			defer close(done)
 
-			result = park.Park(context.Background(),
-				parkedBlock{hash: msgBlock.BlockHash(), prevBlock: msgBlock.Header.PrevBlock}, msgBlock)
+			writeErr = park.WriteConvertedBlock(context.Background(), hash, blk)
 		}()
 
 		select {
@@ -147,7 +160,7 @@ func TestBlockPark_EveryStoreOperationCarriesTheConfiguredDeadline(t *testing.T)
 			t.Fatal("parking a block never gave up waiting for the store")
 		}
 
-		require.Equal(t, parkUnavailable, result, "a write that timed out must leave the block to be downloaded again")
+		require.Error(t, writeErr, "a write that timed out must leave the block to be downloaded again")
 	})
 }
 
@@ -170,7 +183,7 @@ func TestBlockPark_ADrainedBlockCannotSpendMoreThanTwoDeadlinesInTheStore(t *tes
 	go func() {
 		defer wg.Done()
 
-		_, _ = park.Read(context.Background(), entry.hash)
+		_, _ = park.ReadConverted(context.Background(), entry.hash)
 		park.Delete(context.Background(), entry)
 	}()
 

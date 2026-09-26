@@ -162,12 +162,7 @@ func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T)
 func TestParkSweep_AbandonsAParentThatNeverArrives(t *testing.T) {
 	park, dir := newTestPark(t, "")
 
-	blocks := minedBlocks(t, 1)
-	msgBlock := blocks[0].MsgBlock()
-	hash := msgBlock.BlockHash()
-
-	require.Equal(t, parkAccepted,
-		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	hash := adoptRecord(t, park, chainhash.Hash{0x41}, 1)
 
 	// Comfortably past the abandonment window, not merely past the stuck
 	// threshold that only gates whether a lookup is made at all.
@@ -202,12 +197,7 @@ func TestParkSweep_AbandonsAParentThatNeverArrives(t *testing.T) {
 func TestParkSweep_DoesNotAbandonAMerelySlowParent(t *testing.T) {
 	park, dir := newTestPark(t, "")
 
-	blocks := minedBlocks(t, 1)
-	msgBlock := blocks[0].MsgBlock()
-	hash := msgBlock.BlockHash()
-
-	require.Equal(t, parkAccepted,
-		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
+	hash := adoptRecord(t, park, chainhash.Hash{0x42}, 1)
 
 	park.mu.Lock()
 	park.entries[hash].parkedAt = time.Now().Add(-parkStuckThreshold - time.Minute)
