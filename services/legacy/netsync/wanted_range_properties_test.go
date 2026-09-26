@@ -31,14 +31,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// propertyDepth is the read-ahead depth these tests run with.
+// propertyDepth is the read-ahead depth these tests run with. Each test sets
+// legacy_blockDownloadWindow to this value directly: the wanted range's depth
+// and the node-wide request budget are the same setting now, so binding one
+// binds the other.
 //
 // It is deliberately smaller than every other bound a pass is subject to — the
-// per-peer in-flight cap, the block-size ladder's 20, and the node-wide
-// legacy_blockDownloadWindow of 1024 — so that when an assertion holds, the
-// wanted range is the only thing that can be holding it up. A depth equal to the
-// per-peer cap, which is what assignHarness runs with, would leave two candidate
-// explanations for every pass that stopped where it did.
+// per-peer in-flight cap and the block-size ladder's 20 — so that when an
+// assertion holds, the wanted range is the only thing that can be holding it
+// up. A depth equal to the per-peer cap, which is what assignHarness runs
+// with, would leave two candidate explanations for every pass that stopped
+// where it did.
 const propertyDepth = 4
 
 // propertyPasses is how many times each test drives fetchHeaderBlocks. The
@@ -126,21 +129,15 @@ func TestWantedRange_TheDownloaderCannotOutrunTheCommitter(t *testing.T) {
 	// Headers run a long way past anything the node may ask for, so a short
 	// header cache cannot be what stops the pass.
 	sm := assignManager(t, 1, 400)
-	sm.settings.Legacy.BlockDownloadLowerWindow = propertyDepth
-
-	// BlockDownloadWindow is deliberately left at its real default (1024, far
-	// above propertyDepth) rather than narrowed to match: lookaheadCeilingLocked
-	// anchors on the committed height, mocked below, so the ceiling engages on
-	// BlockDownloadLowerWindow alone. Narrowing the window to the same value
-	// would make it impossible to tell from this test's assertions whether the
-	// ceiling or the window was what actually bound each pass to propertyDepth.
+	sm.settings.Legacy.BlockDownloadWindow = propertyDepth
 
 	// Every other bound lifted clear of the depth. The ladder caps this at 20
 	// whatever is asked for, and 20 is five times the depth, which is the point:
 	// a pass that stops at four blocks stopped because of the range.
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 20
 
-	_, rec := schedulerPeer(t, sm, 1, 5000)
+	peer, rec := schedulerPeer(t, sm, 1, 5000)
+	wireStreamingPath(sm, peer)
 
 	require.Greater(t, schedulerPeerBudget(sm), propertyDepth,
 		"the peer's own budget must exceed the depth or it, and not the wanted range, is what bounds a pass")
@@ -213,7 +210,7 @@ func TestWantedRange_ARestartingNodeRequestsOnItsFirstPass(t *testing.T) {
 	const restartHeight = int32(800_000)
 
 	sm := assignManager(t, restartHeight, restartHeight+200)
-	sm.settings.Legacy.BlockDownloadLowerWindow = propertyDepth
+	sm.settings.Legacy.BlockDownloadWindow = propertyDepth
 
 	// committedTip reads the chain directly on every call now, so a restarting
 	// node's first pass sees its real height with nothing to seed. Without this
@@ -330,14 +327,7 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.TempStore = storeURL
-	tSettings.Legacy.BlockDownloadLowerWindow = propertyDepth
-
-	// BlockDownloadWindow stays at its real default here too, for the same
-	// reason as the first test: lookaheadCeilingLocked anchors on the committed
-	// height, which the test mocks below, so BlockDownloadLowerWindow
-	// alone engages the ceiling. Matching the window to the depth would leave the
-	// park-bound property this test proves unable to say which of the two was
-	// doing the binding.
+	tSettings.Legacy.BlockDownloadWindow = propertyDepth
 
 	// As in the first test: every other bound lifted clear of the depth, so the
 	// wanted range is the only candidate explanation for where a pass stops.
@@ -439,10 +429,9 @@ func deliverPropertyBlock(t *testing.T, sm *SyncManager, peer *peerpkg.Peer, blk
 //
 // The park is bounded because the download is bounded by position: a block can
 // only be parked if it was obtained, it can only be obtained if it was
-// requested, and the wanted range will not name a height more than the
-// read-ahead depth above the last committed block. So the park cannot exceed the
-// depth — 4 here, 128 as legacy_blockDownloadLowerWindow ships, scaled down from
-// there by block size.
+// requested, and the wanted range will not name a height more than
+// legacy_blockDownloadWindow above the last committed block. So the park
+// cannot exceed the depth — 4 here, 1024 by default.
 //
 // Blocks are delivered highest-first so every one of them is an orphan on
 // arrival, which is the case the park exists for and the case that filled it.

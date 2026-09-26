@@ -740,12 +740,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockDownloadTimeoutBaseIBDPercent: getInt64("legacy_blockDownloadTimeoutBaseIBDPercent", 600, alternativeContext...),
 			BlockDownloadTimeoutPerPeerPercent: getInt64("legacy_blockDownloadTimeoutPerPeerPercent", 50, alternativeContext...),
 
-			BlockPrefetchBufferBytes: getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
-
 			MultiPeerBlockDownload:    getBool("legacy_multiPeerBlockDownload", true, alternativeContext...),
 			MaxBlocksInTransitPerPeer: getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
 			BlockDownloadWindow:       getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
-			BlockDownloadLowerWindow:  getInt("legacy_blockDownloadLowerWindow", 128, alternativeContext...),
 
 			ParkStoreTimeout:         getDuration("legacy_parkStoreTimeout", 10*time.Second, alternativeContext...),
 			PeerRegistryEnabled:      getBool("legacy_peerRegistryEnabled", true, alternativeContext...),

@@ -132,6 +132,7 @@ func TestFetchHeaderBlocks_NeverAsksAgainForABlockPastItsGivenUpCeiling(t *testi
 
 	syncPeer, rec := schedulerPeer(t, sm, 131, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+	wireStreamingPath(sm, syncPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 

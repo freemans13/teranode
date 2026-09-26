@@ -150,6 +150,15 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
+	// New always builds a real stream registry, and newDownloadAssigner's
+	// per-peer depth floors an unmeasured peer at unmeasuredPeerDepth (2) until
+	// its speed is known. A harness peer never streams a real block through
+	// trackBlockStreams, so without a seeded rate it would stay "unmeasured"
+	// for the harness's whole life and silently cap every test in this file at
+	// two requests in flight, whatever legacy_maxBlocksInTransitPerPeer says.
+	sm.streams = newStreamRegistry()
+	sm.streams.rates[syncPeer] = 1
+
 	sm.headersFirstMode.Store(true)
 
 	// assignWantedBlocks reads the header cache, one node per block, in order,

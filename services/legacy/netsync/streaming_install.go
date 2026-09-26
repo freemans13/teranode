@@ -49,8 +49,8 @@ const streamedBodyRequestWindow = 60 * 60 * 1000000000 // one hour, in nanosecon
 
 // installStreamingBlockPath wires the three functions the wire layer needs
 // before it will stream a block body to disk instead of decoding it. Called
-// once, from the sync manager's construction, and only when the park is
-// available: the park's store is where a streamed body goes, and its entry
+// once, from the sync manager's construction: the park is mandatory, so the
+// park's store is always there for a streamed body to go to, and its entry
 // table is what makes the body findable afterwards.
 //
 // Installing a sink without a gate is refused by the wire layer itself, which
@@ -65,10 +65,6 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 	gate func(chainhash.Hash, *wire.BlockHeader) error,
 	del func(chainhash.Hash, bool) error,
 )) {
-	if sm == nil || sm.blockPark == nil || !sm.blockPark.Enabled() {
-		return
-	}
-
 	// admitPipelineSink wraps the download-admission budget around the
 	// pipeline sink. See that method's doc comment for why it has to wrap
 	// the sink itself rather than being charged in the on-disk message
@@ -91,15 +87,11 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 
 // admitPipelineSink wraps inner (the pipeline sink) with the download-admission
 // budget AcquireBlockPrefetch/ReleaseBlockPrefetch already implement, charged
-// one slot per block on this path (see AcquireBlockPrefetch's own
-// park-enabled branch, manager.go). That budget was sized for exactly this
-// call site — sm.blockPrefetchBudgetBytes is derived from
-// MaxBlocksInTransitPerPeer whenever the park (and so the streaming pipeline)
-// is enabled — but was never reachable from it: AcquireBlockPrefetch is only
-// ever called from OnBlock, which the peer only dispatches for a whole
-// *wire.MsgBlock, and with the park enabled every block comes back as
-// *peer.MsgBlockOnDisk instead, so OnBlock, and the admission check inside it,
-// never runs for this route.
+// one slot per block on this path (see AcquireBlockPrefetch's own doc
+// comment, manager.go). That budget is sized for exactly this call site —
+// blockPrefetchBudgetSlots is derived from MaxBlocksInTransitPerPeer — and this
+// is its only caller: AcquireBlockPrefetch has no other route in, since every
+// block arrives here as a streamed body, never a decoded *wire.MsgBlock.
 //
 // Charged here, wrapping the sink itself, NOT in handleBlockOnDiskMsg (the
 // on-disk message handler that runs once the body is already fully on disk).
@@ -108,16 +100,11 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 // body through the subtree builder and its ~50MB dedup map
 // (newPipelineDedupMap, pipeline_sink.go) on this peer's own read-loop
 // goroutine. A charge that only runs after that resident cost has already been
-// paid bounds nothing real — which is the exact lesson the byte-budget version
-// of this same check already taught (ReleaseBlockPrefetchBytes's own doc
-// comment): charging after the fact cannot be un-taught by moving the charge to
-// a different post-hoc call site. Charging before inner runs instead blocks the
-// read loop that would otherwise start that work, the same trade-off OnBlock
-// already accepts for the decoded path: a peer over budget reads nothing
-// further until a slot frees.
+// paid bounds nothing real. Charging before inner runs instead blocks the read
+// loop that would otherwise start that work.
 //
 // ctx passed to the acquire is sm.ctx bounded by pipelineAdmissionAcquireTimeout,
-// not sm.ctx unbounded, and quit is nil. Fix round 1 found a real self-inflicted
+// not sm.ctx unbounded. Fix round 1 found a real self-inflicted
 // disconnect in the first version of this function: it parked on sm.ctx with no
 // timeout, and peer.inHandler's idle timer (peer/peer.go:2153) only calls
 // idleTimer.Stop() AFTER readMessageStreaming — which is the call this sink runs
@@ -159,7 +146,7 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 		defer cancel()
 
 		acquireStart := time.Now()
-		weight, err := sm.AcquireBlockPrefetch(acquireCtx, nil, hash, n)
+		err := sm.AcquireBlockPrefetch(acquireCtx, hash)
 		admitWait := time.Since(acquireStart)
 
 		switch {
@@ -205,7 +192,7 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 			// nothing productive is left to do with the bytes either.
 			return false, err
 		}
-		defer sm.ReleaseBlockPrefetch(hash, weight)
+		defer sm.ReleaseBlockPrefetch(hash)
 
 		return inner(hash, header, r, n)
 	}
@@ -356,7 +343,7 @@ func (sm *SyncManager) QueueBlockOnDisk(body peerpkg.BlockBody, peer *peerpkg.Pe
 // enough to stream whose parent is already in the chain — the common case, not a
 // corner.
 func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
-	if msg == nil || sm.blockPark == nil {
+	if msg == nil {
 		return
 	}
 

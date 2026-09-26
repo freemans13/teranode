@@ -231,8 +231,8 @@ func TestMaybeRequestMoreHeaders_SinglePeerAsksAgainAfterRateLimitLapses(t *test
 // boundary) — dead time repeating every 2,000 blocks for the whole sync.
 //
 // This cache holds far more heights above the committed tip (300) than the
-// read-ahead depth that limits a single pass (legacy_blockDownloadLowerWindow,
-// 128 by default), so the backstop alone — "does the cache still name
+// read-ahead depth that limits a single pass (legacy_blockDownloadWindow,
+// 1024 by default), so the backstop alone — "does the cache still name
 // last+1?" — would find it does and stay quiet. The fix must still ask,
 // because 300 remaining heights is under headerCacheRefillThreshold (1,000).
 func TestMaybeRequestMoreHeaders_AsksEarlyWhenRemainingCacheIsBelowThreshold(t *testing.T) {
@@ -250,11 +250,11 @@ func TestMaybeRequestMoreHeaders_AsksEarlyWhenRemainingCacheIsBelowThreshold(t *
 
 	anchor := chainhash.Hash{0x74}
 	// 1,300 heights above the tip (1,000 to 2,300 named by the cache, tip at
-	// 1,000): comfortably more than the 128-height read-ahead depth, so the
-	// backstop alone sees plenty of cache left, but the 1,300 remaining above
-	// the tip is what headerCacheRefillThreshold judges, and it is not being
-	// tested here directly — the committed tip is placed 300 below the
-	// cache's top instead, so remaining (300) sits under the 1,000 threshold.
+	// 1,000): comfortably more than the read-ahead depth, so the backstop
+	// alone sees plenty of cache left, but the 1,300 remaining above the tip
+	// is what headerCacheRefillThreshold judges, and it is not being tested
+	// here directly — the committed tip is placed 300 below the cache's top
+	// instead, so remaining (300) sits under the 1,000 threshold.
 	msg, _ := linkedHeaders(anchor, 1300, &nonce)
 
 	sm.headerCache = newHeaderCache()
@@ -262,8 +262,7 @@ func TestMaybeRequestMoreHeaders_AsksEarlyWhenRemainingCacheIsBelowThreshold(t *
 
 	// Committed tip at height 1,000: the cache names up to height 1,300, so
 	// only 300 heights remain above the tip, under headerCacheRefillThreshold
-	// (1,000), even though the read-ahead depth (128) leaves last+1 = 1,129
-	// well short of the cache's own end at 1,300.
+	// (1,000), well short of the cache's own end at 1,300 either way.
 	mockCommittedTip(t, sm, 1000, 0)
 
 	sm.fetchHeaderBlocks()
@@ -286,14 +285,22 @@ func TestMaybeRequestMoreHeaders_DoesNotAskWhenCacheIsComfortablyFull(t *testing
 	sm.ctx = context.Background()
 	sm.blockchainClient = client
 
+	// Narrowed from the real default (1024) so the read-ahead depth, not
+	// wire.MaxBlockHeadersPerMsg (2000, the most one getheaders reply can ever
+	// fill the cache with), is what stops the pass short of the cache's own
+	// end: this test is about the early-trigger threshold, which only applies
+	// when the depth cap is what stopped the pass, not the cache running dry.
+	sm.settings.Legacy.BlockDownloadWindow = 128
+
 	_, _, headers := demotionPeer(t, sm, 252, 1000)
 
 	var nonce uint32
 
 	anchor := chainhash.Hash{0x75}
-	// The cache names up to height 2,500 and the tip sits at 1,000, so 1,500
-	// heights remain above the tip: over headerCacheRefillThreshold (1,000),
-	// with headroom to spare.
+	// The cache names up to height 2,000 (linkedHeaders' MsgHeaders caps at
+	// wire.MaxBlockHeadersPerMsg) and the tip sits at 1,000, so 1,000 heights
+	// remain above the tip: at headerCacheRefillThreshold (1,000), with no
+	// headroom to spare — the depth cap (128) is what actually stops the pass.
 	msg, _ := linkedHeaders(anchor, 2500, &nonce)
 
 	sm.headerCache = newHeaderCache()

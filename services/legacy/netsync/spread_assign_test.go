@@ -27,7 +27,8 @@ func TestSchedulerGivesEachBlockToThePeerOwingTheFewest(t *testing.T) {
 	syncPeer, syncRec := schedulerPeer(t, sm, 120, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	_, secondRec := schedulerPeer(t, sm, 121, 1000)
+	secondPeer, secondRec := schedulerPeer(t, sm, 121, 1000)
+	wireStreamingPath(sm, syncPeer, secondPeer)
 
 	// The sync peer already owes two unrelated blocks.
 	for i := 0; i < 2; i++ {
@@ -43,9 +44,9 @@ func TestSchedulerGivesEachBlockToThePeerOwingTheFewest(t *testing.T) {
 	require.Equal(t, hashes[2:3], syncRec.all(), "then the peers alternate, the sync peer winning a tie")
 }
 
-// With the park on every block streams straight to disk behind the admission budget, so the
-// ladder's memory reason for narrowing the fan-out no longer holds. Every eligible peer carries
-// blocks, each up to the ladder's depth.
+// With the park on every block streams straight to disk behind the admission budget, so every
+// eligible peer carries blocks: with four headers and four peers, and no reason for any one
+// peer to be preferred, each carries exactly one.
 func TestSchedulerUsesEveryPeerWhenBlocksStreamToThePark(t *testing.T) {
 	var nonce uint32
 
@@ -56,19 +57,13 @@ func TestSchedulerUsesEveryPeerWhenBlocksStreamToThePark(t *testing.T) {
 	sm.ctx = context.Background()
 	sm.blockPark, _ = newTestPark(t, "")
 
-	const threeGB = int64(3) * 1024 * 1024 * 1024
-	for i := 0; i < 3; i++ {
-		sm.blockSizeTracker.addBlockSize(threeGB)
-	}
-
-	require.Equal(t, 1, sm.blockSizeTracker.calculateMaxInFlightBlocks())
-
 	syncPeer, syncRec := schedulerPeer(t, sm, 122, 1000)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	_, secondRec := schedulerPeer(t, sm, 123, 1000)
-	_, thirdRec := schedulerPeer(t, sm, 124, 1000)
-	_, fourthRec := schedulerPeer(t, sm, 125, 1000)
+	secondPeer, secondRec := schedulerPeer(t, sm, 123, 1000)
+	thirdPeer, thirdRec := schedulerPeer(t, sm, 124, 1000)
+	fourthPeer, fourthRec := schedulerPeer(t, sm, 125, 1000)
+	wireStreamingPath(sm, syncPeer, secondPeer, thirdPeer, fourthPeer)
 
 	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
 
@@ -86,6 +81,6 @@ func TestSchedulerUsesEveryPeerWhenBlocksStreamToThePark(t *testing.T) {
 	}, 5*time.Second), "one block for each of the four peers")
 
 	for i, r := range recs {
-		require.Equal(t, hashes[i:i+1], r.all(), "peer %d carries one block, the ladder's depth", i)
+		require.Equal(t, hashes[i:i+1], r.all(), "peer %d carries one block, spread evenly across every eligible peer", i)
 	}
 }

@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -39,7 +40,8 @@ func assignHarness(t *testing.T, from, to int32) (*SyncManager, *getDataRecorder
 
 	sm := assignManager(t, from, to)
 
-	_, rec := schedulerPeer(t, sm, 1, to+1000)
+	peer, rec := schedulerPeer(t, sm, 1, to+1000)
+	wireStreamingPath(sm, peer)
 
 	return sm, rec
 }
@@ -53,20 +55,17 @@ func assignHarness(t *testing.T, from, to int32) (*SyncManager, *getDataRecorder
 // fixed byte-pattern hashes. Nothing downstream of assignWantedBlocks reads
 // headerList, so it is left unseeded.
 //
-// BlockDownloadLowerWindow alone is what bounds these tests at assignPassDepth:
-// lookaheadCeilingLocked anchors on the committed height now, which each test
-// mocks the chain to report after calling this, so the ceiling engages on that alone and
-// BlockDownloadWindow is left at its real default. Setting the node-wide window
-// to the same value as the depth used to be how this fixture routed around a
-// ceiling that could not engage at all; doing that here now would only mask
-// whether the depth or the window was the thing actually binding.
+// BlockDownloadWindow is what bounds these tests at assignPassDepth: it is
+// both the node-wide request budget and wantedBlocks' own read-ahead depth
+// now, anchored on the committed height each test mocks the chain to report
+// after calling this.
 func assignManager(t *testing.T, from, to int32) *SyncManager {
 	t.Helper()
 
 	sm := newRaceManager(t)
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 
-	sm.settings.Legacy.BlockDownloadLowerWindow = assignPassDepth
+	sm.settings.Legacy.BlockDownloadWindow = assignPassDepth
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = assignPassDepth
 
 	parent := chainhash.Hash{0xaa}
@@ -170,8 +169,22 @@ func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 	sm := assignManager(t, 1, 20)
 	mockCommittedTip(t, sm, 10, 0)
 
-	_, first := schedulerPeer(t, sm, 1, 1020)
-	_, second := schedulerPeer(t, sm, 2, 1020)
+	// newDownloadAssigner's remaining budget — both the node-wide window and
+	// each peer's own share — is read BEFORE unownedBlocksUpTo forgives
+	// anything, so the harness defaults (window and per-peer cap both equal
+	// to assignPassDepth, exactly what the first pass consumes) compute zero
+	// room on the second pass and never place the re-ask this test is about.
+	// Both widened well past what the ten candidates in [1,20] above the
+	// committed tip of 10 could ever need, so the harness default's role —
+	// bounding the FIRST pass to assignPassDepth's worth of read-ahead — is
+	// carried by the header cache alone here; the assertions below already
+	// use >= rather than == for that reason.
+	sm.settings.Legacy.BlockDownloadWindow = 1024
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 20
+
+	firstPeer, first := schedulerPeer(t, sm, 1, 1020)
+	secondPeer, second := schedulerPeer(t, sm, 2, 1020)
+	wireStreamingPath(sm, firstPeer, secondPeer)
 
 	sm.assignWantedBlocks()
 
@@ -199,6 +212,9 @@ func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 	}
 
 	sm.assignWantedBlocks()
+
+	time.Sleep(300 * time.Millisecond)
+	fmt.Printf("DEBUG second-pass first=%d second=%d want=%d ledgerLen=%d\n", first.count(), second.count(), len(firstOwed)+len(secondOwed), sm.blockDownloads.Len())
 
 	require.True(t, WaitUntil(func() bool { return first.count()+second.count() == len(firstOwed)+len(secondOwed) }, 5*time.Second),
 		"every block whose owner has gone quiet past the retry window must be asked of the other peer")

@@ -59,17 +59,6 @@ const (
 	// based on observed block sizes to avoid memory issues with large blocks.
 	defaultMaxInFlightBlocks = 20
 
-	// minInFlightBlockWeight is the minimum prefetch-budget weight charged for an
-	// admitted block, regardless of how small it serializes. Each in-flight block
-	// costs a fixed overhead beyond its bytes — an awaitBlockResult goroutine
-	// (stack), a reply channel, and the decoded block wrapper. Charging only the
-	// serialized size would let a flood of minimal (e.g. ~81-byte, zero-tx) blocks
-	// admit a huge number of concurrent goroutines within the byte budget; the
-	// floor bounds the in-flight block count (≈ budget/minInFlightBlockWeight) and
-	// therefore the goroutine count. It is well below any real small-block size,
-	// so it never reduces prefetch depth for legitimate traffic.
-	minInFlightBlockWeight = 64 * 1024
-
 	// pipelineBlockSlotPeerAllowance sizes the download-admission semaphore, in
 	// block-count units, when the pipeline path charges slots instead of bytes.
 	//
@@ -713,31 +702,27 @@ type SyncManager struct {
 	//
 	headerCache *headerCache
 
-	// blockPrefetchBudget bounds, by total serialized bytes, the blocks that
-	// have been received from peers but not yet finished processing. It lets
-	// OnBlock admit a block and return (so the read-loop downloads the next
-	// block while this one validates) instead of blocking on per-block
-	// completion, while capping the memory pinned by buffered blocks across ALL
-	// peers and streams. nil when prefetch is disabled (budget <= 0), in which
-	// case OnBlock keeps its original synchronous, one-block-in-flight behaviour.
-	// A block larger than the whole budget is admitted alone (weight clamped to
-	// the budget), preserving full backpressure for huge blocks.
+	// blockPrefetchBudget bounds, by block count, the conversions that are
+	// admitted from the wire but not yet finished streaming to disk. It lets
+	// admitPipelineSink admit a block and let the peer's read loop carry on
+	// reading (so download overlaps the previous block's conversion) instead of
+	// serializing one block's whole conversion behind the next one's read.
+	// Built unconditionally in New, sized as a block count derived from
+	// legacy_maxBlocksInTransitPerPeer (see pipelineBlockSlotPeerAllowance).
 	blockPrefetchBudget      *semaphore.Weighted
-	blockPrefetchBudgetBytes int64
+	blockPrefetchBudgetSlots int64
 
 	// inFlightBlocks is the dedup half of the same block-admission gate whose
-	// byte half is blockPrefetchBudget. It holds the hash of every block that is
-	// currently admitted (has reserved budget) OR parked waiting for budget, so
-	// at most one copy of any given block hash is ever in flight at a time.
+	// other half is blockPrefetchBudget. It holds the hash of every block that is
+	// currently admitted (holds a slot) OR parked waiting for one, so at most one
+	// copy of any given block hash is ever in flight at a time.
 	// AcquireBlockPrefetch inserts the hash BEFORE the (possibly blocking) budget
 	// Acquire and ReleaseBlockPrefetch deletes it alongside the budget release, so
 	// the two halves share exactly one lifetime and can never drift. Without it,
-	// N duplicates of a single requested, near-budget-sized block would each
-	// reserve budget, fill the whole budget, and park every legacy peer's
-	// read-loop in Acquire — the very "a malicious peer cannot outrun the budget"
-	// property this gate exists to guarantee. nil (alongside a nil
-	// blockPrefetchBudget) when prefetch is disabled, so the synchronous/regtest
-	// path skips dedup entirely. inFlightBlocksMu guards the map.
+	// N duplicates of a single requested block would each reserve a slot, fill
+	// the whole budget, and park every legacy peer's read-loop in Acquire — the
+	// very "a malicious peer cannot outrun the budget" property this gate exists
+	// to guarantee. inFlightBlocksMu guards the map.
 	inFlightBlocks map[chainhash.Hash]*inFlightBlock
 
 	// drainedDuplicates counts, per block, copies drained off the wire unwritten because another
@@ -759,14 +744,14 @@ type SyncManager struct {
 	conversions      map[chainhash.Hash]*conversionCtl
 	inFlightBlocksMu sync.Mutex
 
-	// blockPrefetchWaiters counts read-loops currently blocked acquiring
-	// prefetch budget (i.e. local processing cannot keep up). While > 0 the node
+	// blockPrefetchWaiters counts read-loops currently blocked acquiring a
+	// prefetch slot (i.e. local processing cannot keep up). While > 0 the node
 	// is backpressuring its own network reads, so the stall detector must not
 	// hold the resulting zero throughput against the sync peer — the prefetch
 	// analogue of the blockBacklog guard. Read by handleCheckSyncPeer.
 	blockPrefetchWaiters atomic.Int64
 
-	// blockPrefetchReserved shadows how many bytes of blockPrefetchBudget are
+	// blockPrefetchReserved shadows how many slots of blockPrefetchBudget are
 	// currently reserved, purely so the figure can be reported.
 	//
 	// It exists because golang.org/x/sync/semaphore does not expose its own
@@ -777,7 +762,7 @@ type SyncManager struct {
 	// byte budget instead, which is empty during exactly that fault.
 	//
 	// Written only alongside a successful acquire or the single release that
-	// hands bytes back, so it cannot drift from the semaphore it shadows. It
+	// hands the slot back, so it cannot drift from the semaphore it shadows. It
 	// changes no decision — nothing reads it but the report.
 	blockPrefetchReserved atomic.Int64
 
@@ -824,7 +809,7 @@ type SyncManager struct {
 	// the same slot twice.
 	headerRefillPeerIdx atomic.Uint64
 	blockSizeTracker    *blockSizeTracker  // tracks block sizes for dynamic in-flight adjustment
-	commitRate          *commitRateTracker // blocks a second joining the chain, for the read-ahead depth
+	commitRate          *commitRateTracker // blocks a second joining the chain, for the frontier race
 	streams             *streamRegistry    // block bodies arriving now and peers' delivery rates, for the frontier race
 
 	// dispatcher owns the quick window: it decides how many queued blocks may have
@@ -2205,14 +2190,10 @@ func (sm *SyncManager) dispatchBlocks() {
 // The sweep ticker's resume does NOT come through here, because the per-peer
 // question this asks is the wrong one for it — it calls fetchHeaderBlocks
 // directly instead.
-// perPeerDepth is how many blocks one peer may be asked for at once: streamingPeerDepth with the
-// park on, whatever the block size, and the block-size ladder without it.
+// perPeerDepth is how many blocks one peer may be asked for at once:
+// streamingPeerDepth, whatever the block size.
 func (sm *SyncManager) perPeerDepth() int {
-	if sm.blockPark.Enabled() && sm.streams != nil {
-		return sm.streamingPeerDepth()
-	}
-
-	return sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	return sm.streamingPeerDepth()
 }
 
 func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
@@ -2298,11 +2279,10 @@ const headerCacheRefillInterval = 5 * time.Second
 // starts at the same committed tip the current one does, so an early reply
 // supersedes what is held without discarding a single usable height.
 //
-// The read-ahead depth (legacy_blockDownloadLowerWindow, 128) is still the
+// The read-ahead depth (legacy_blockDownloadWindow, 1024) is still the
 // wrong quantity to reach for, for the reason it always was: it bounds how
 // far downloads may run ahead of the commit frontier, not how much header
-// lookahead a getheaders round trip needs, and at 128 it is 6.4 seconds of
-// runway.
+// lookahead a getheaders round trip needs.
 const headerCacheRefillThreshold = int32(wire.MaxBlockHeadersPerMsg / 2)
 
 // maybeRequestMoreHeaders is assignWantedBlocks' other half: the wanted range
@@ -2321,7 +2301,7 @@ const headerCacheRefillThreshold = int32(wire.MaxBlockHeadersPerMsg / 2)
 // fallback. The early trigger, checked only when the backstop finds
 // something: how many heights does the cache still name above the committed
 // tip, independent of the read-ahead depth that capped this pass's own
-// wanted range? wantedBlocksFromCache stops at that depth (128 by default)
+// wanted range? wantedBlocksFromCache stops at that depth (1024 by default)
 // long before the cache itself runs out, since one getheaders reply names up
 // to 2,000 heights — so waiting for the depth-limited range to reach the
 // cache's own end, as the backstop alone does, means the node only ever asks
@@ -2509,133 +2489,6 @@ func (sm *SyncManager) nextHeaderRefillPeer(peers []blockPeer) *peerpkg.Peer {
 	idx := sm.headerRefillPeerIdx.Add(1) - 1
 
 	return peers[idx%uint64(len(peers))].peer
-}
-
-// lookaheadCeilingLocked returns the highest block height this round may ask for,
-// and whether there is a limit at all. The caller must hold headerMu.
-//
-// legacy_blockDownloadWindow and legacy_maxBlocksInTransitPerPeer bound how MANY
-// requests are outstanding. This bounds how far ahead of itself the node reads,
-// which is a different quantity and the one that decides how much disk the park
-// needs: blocks commit strictly in order, so a block fetched a long way ahead of
-// the block we are waiting for cannot be committed when it arrives and sits in
-// the park until everything between it and the chain has landed.
-//
-// best is the last block this node has actually put into the chain, not the
-// header list. It comes in as a parameter rather than being read here because
-// this function runs with headerMu held and reading the chain is a blocking
-// call this package's lock rule has no exception for; wantedBlocks reads it
-// before taking the lock and passes it down. Anchoring on the committed height
-// alone is what svnode does too: -blockdownloadlowerwindow measures from
-// chainActive.Height(), the validated tip.
-//
-// "No limit at all" is now only the two honest cases: no settings to read the
-// configuration from, or the configured lower window is zero or less. A depth
-// that engages but then falls back to some other anchor because a data
-// structure happened to be empty was never a real "no limit" state, just an
-// incidental one.
-//
-// Clamped to the node-wide window, as svnode clamps its lower window to its
-// window: a limit looser than that could never bind.
-func (sm *SyncManager) lookaheadCeilingLocked(best int32) (int64, bool) {
-	if sm.settings == nil {
-		return 0, false
-	}
-
-	lower := sm.settings.Legacy.BlockDownloadLowerWindow
-	if lower <= 0 {
-		return 0, false
-	}
-
-	if window := sm.settings.Legacy.BlockDownloadWindow; window > 0 && lower > window {
-		lower = window
-	}
-
-	// Scaled by the block size actually being seen, because a fixed count of
-	// blocks means completely different things at different points in the chain.
-	// legacy_blockDownloadLowerWindow is 128, which is 128 KB of read-ahead at
-	// height 100,000 and 440 GB of it at height 759,000 where blocks measure
-	// 3.44 GB. One number cannot be right for both.
-	//
-	// This is the bound that matters now, since the two byte budgets that used to
-	// sit beside it are gone: a block's size is unknown until it has been
-	// downloaded, so a byte bound could only ever discard a block already paid
-	// for, and mainnet threw away 1.02 TB in two days doing exactly that. What is
-	// left is a count of blocks, checked before the request goes out, which is
-	// what SV Node bounds by. A count is only honest if it tracks the era.
-	//
-	// It also decides how much disk the park can hold, because the park holds
-	// what has been fetched and cannot yet be committed. At a flat 128 that is a
-	// worst case near 440 GB. Scaled, it is about 20 GB.
-	//
-	// The scaling reuses the ladder the node already derives from its rolling
-	// average block size, rather than introducing a second opinion about what a
-	// big block is. That ladder already governs how many blocks one peer may have
-	// in flight and how deep the quick window goes; the read-ahead depth was the
-	// one bound ignoring it. Its range is 20 for small blocks down to 1 above
-	// 2 GB, so the ratio to its own maximum is the scaling factor, and the
-	// configured depth is what that ratio applies to.
-	//
-	// Never below one: a depth of zero would stop the walk asking for anything at
-	// all, which is a stall rather than a conservative setting.
-	if sm.blockSizeTracker != nil {
-		if fetch := sm.blockSizeTracker.calculateMaxInFlightBlocks(); fetch >= 1 && fetch < maxInFlightLadderTop {
-			scaled := lower * fetch / maxInFlightLadderTop
-			if scaled < 1 {
-				scaled = 1
-			}
-
-			lower = scaled
-		}
-	}
-
-	// And measured in time as well as in blocks. A count of blocks is a lead of
-	// whatever time those blocks take to commit, which on small blocks is
-	// seconds: 128 blocks at 4 a second is 32 seconds, and on 2026-09-23 a 309 MB
-	// block among sub-megabyte ones took 72 seconds to arrive from its one peer,
-	// so the chain waited 49 seconds with every block behind it already parked.
-	// The depth is therefore at least lookaheadLeadTarget of commits at the
-	// measured commit rate, so a block that is slow to download is asked for
-	// minutes before the chain needs it.
-	//
-	// The time depth is bounded by what the park can hold, judged from the
-	// average block size: it limits what is ASKED for, so unlike the byte budgets
-	// this replaced it never throws away a block already downloaded. It never
-	// makes the depth shallower than the ladder's, and the node-wide window below
-	// still clamps it. With no commits seen yet the rate is zero and the depth is
-	// exactly the ladder's.
-	if depth := sm.timeLookaheadDepth(); depth > lower {
-		lower = depth
-	}
-
-	if window := sm.settings.Legacy.BlockDownloadWindow; window > 0 && lower > window {
-		lower = window
-	}
-
-	// Anchored to the last COMMITTED block, and that is the whole rule: never ask
-	// for a block more than the read-ahead depth above what has been validated.
-	//
-	// It used to be anchored to the front of the header list, which advances when
-	// a block ARRIVES rather than when it commits. That made the ceiling a
-	// ratchet driven by downloads: every arrival raised the front, which raised
-	// the ceiling, which licensed another depth's worth of requests, with no
-	// coupling to the committer at all. Measured on mainnet during a genesis
-	// resync on 2026-09-12, the front stood at 4877 with the chain settled at
-	// 868 and the park held its full 4096 entries.
-	//
-	// Anchoring here makes the park self-limiting, so the mechanisms that used to
-	// compensate are unnecessary: the park cannot exceed the depth, so it never
-	// reaches its entry cap, so no block is ever refused, so no hole is ever
-	// punched in the chain of parked blocks. A count of outstanding blocks cannot
-	// achieve any of that, because a block 5000 ahead and a block 1 ahead count
-	// the same.
-	//
-	// There is no fallback to a header-list front any more, and none is needed:
-	// best is read fresh from the chain by wantedBlocks on every call, so this
-	// reads a genuine height on a node restarting mid-chain. A fallback keyed to
-	// a structure nothing fills would only have reintroduced the bug this
-	// function exists to fix.
-	return int64(best) + int64(lower), true
 }
 
 // handleHeadersMsg handles block header messages from all peers.  Headers are
@@ -3419,9 +3272,7 @@ func (sm *SyncManager) blockHandler() {
 	// it posts those back to the consumer through parkCommits.
 	go sm.runParkSweep()
 
-	if sm.streams != nil {
-		go sm.runFrontierRace()
-	}
+	go sm.runFrontierRace()
 
 out:
 	for {
@@ -3539,82 +3390,42 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 	sm.msgChan <- &txMsg{tx: tx, peer: peer, reply: done}
 }
 
-// AcquireBlockPrefetch reserves prefetch budget for a block of the given
-// serialized size and returns the amount actually reserved, which the caller
-// MUST later hand back to ReleaseBlockPrefetch exactly once. The weight is
-// clamped to the total budget so a block larger than the whole budget is
-// admitted alone (it waits until every other in-flight block has drained),
-// which preserves the original one-block-at-a-time backpressure for huge
-// blocks and guarantees Acquire can never deadlock on an oversized block.
+// AcquireBlockPrefetch reserves one admission slot for blockHash, which the
+// caller MUST later hand back to ReleaseBlockPrefetch exactly once. Every
+// admitted block costs exactly one slot: whenever the park is enabled,
+// streaming (and so conversion) is unconditional, and the block's bytes are
+// gone by the time this runs — the wire layer streamed them through the
+// subtree builder and out to files, so there is nothing left to charge by
+// size. One slot per in-flight block is what this path can honestly pay, and
+// it is the unit SV Node bounds by.
 //
 // It returns an error only if ctx is cancelled while waiting (shutdown), in
 // which case nothing was reserved, OR the benign ErrDuplicateBlockInFlight
-// sentinel when blockHash is already in flight (dedup — again nothing reserved).
-// When prefetch is disabled it is a no-op returning (0, nil), which also skips
-// dedup (the synchronous path already keeps one block in flight per peer). While
-// blocked waiting for budget it increments blockPrefetchWaiters so the stall
-// detector can tell self-backpressure apart from a genuinely stalled peer.
+// sentinel when blockHash is already in flight (dedup — again nothing
+// reserved). While blocked waiting for a slot it increments
+// blockPrefetchWaiters so the stall detector can tell self-backpressure apart
+// from a genuinely stalled peer.
 //
-// The caller MUST hand blockHash back to ReleaseBlockPrefetch with the returned
-// weight on success: the hash lives in the in-flight set for exactly the same
-// lifetime as the reserved budget (inserted here, deleted on release), so the
-// dedup half and the byte half of this admission gate never drift.
-func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan struct{}, blockHash chainhash.Hash, size int64) (int64, error) {
-	if sm.blockPrefetchBudget == nil {
-		return 0, nil
-	}
-
-	// Whenever the park is enabled, streaming (and so conversion) is
-	// unconditional, and the block's bytes are gone by the time this runs: the
-	// wire layer streamed them through the subtree builder and out to files, and
-	// what OnBlock holds is a handle. Charging the serialized size would reserve
-	// hundreds of megabytes against a fixed pool for memory nobody is holding, and
-	// a read loop parked in this acquire reads nothing further from its socket —
-	// which is how a peer-wide byte counter once switched the frontier racer off.
-	//
-	// One slot per in-flight block is what this path can honestly pay, and it is
-	// the unit SV Node bounds by. The semaphore, the dedup set and every release
-	// path are unchanged: the weight is chosen here and handed back verbatim.
-	//
-	// sm.blockPark.Enabled() is the same test installStreamingBlockPath uses to
-	// decide whether the pipeline sink is installed at all: with the park
-	// enabled, every block this function is ever called for arrived through
-	// admitPipelineSink; with it disabled, the wire layer never streams and the
-	// only caller left is OnBlock's decoded path, where the byte-weighted branch
-	// below is the correct one.
-	weight := size
-	if sm.blockPark != nil && sm.blockPark.Enabled() {
-		weight = 1
-	} else {
-		// Floor the weight so a flood of tiny blocks can't admit an unbounded
-		// number of in-flight goroutines within the byte budget, then clamp to
-		// the budget so an oversized block is admitted alone (and budgets
-		// smaller than the floor still process one block at a time rather than
-		// deadlocking). Neither applies to the slot path above: 1 is always
-		// payable against a budget that is itself sized as a count of at least 1.
-		if weight < minInFlightBlockWeight {
-			weight = minInFlightBlockWeight
-		}
-		if weight > sm.blockPrefetchBudgetBytes {
-			weight = sm.blockPrefetchBudgetBytes
-		}
-	}
-
-	// Dedup: reserve the hash BEFORE reserving budget. Inserting ahead of the
+// The caller MUST hand blockHash back to ReleaseBlockPrefetch on success: the
+// hash lives in the in-flight set for exactly the same lifetime as the
+// reserved slot (inserted here, deleted on release), so the dedup half and the
+// slot half of this admission gate never drift.
+func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, blockHash chainhash.Hash) error {
+	// Dedup: reserve the hash BEFORE reserving a slot. Inserting ahead of the
 	// (possibly blocking) Acquire is deliberate — it bounds duplicates even while
-	// a copy is parked waiting for budget, so N copies of one requested,
-	// near-budget-sized block cannot each grab budget and fill it. A hash already
-	// present is a duplicate: drop it (nothing reserved, nothing inserted).
+	// a copy is parked waiting for a slot, so N copies of one requested block
+	// cannot each grab a slot and fill the gate. A hash already present is a
+	// duplicate: drop it (nothing reserved, nothing inserted).
 	sm.inFlightBlocksMu.Lock()
 	if _, dup := sm.inFlightBlocks[blockHash]; dup {
 		sm.inFlightBlocksMu.Unlock()
-		return 0, ErrDuplicateBlockInFlight
+		return ErrDuplicateBlockInFlight
 	}
 	sm.inFlightBlocks[blockHash] = &inFlightBlock{}
 	sm.inFlightBlocksMu.Unlock()
 
 	// removeInFlight undoes the reservation above. It runs only when the budget
-	// Acquire fails (ctx/quit cancel): nothing was reserved, so the hash must not
+	// Acquire fails (ctx cancel): nothing was reserved, so the hash must not
 	// linger. On success the hash stays until ReleaseBlockPrefetch deletes it.
 	removeInFlight := func() {
 		sm.inFlightBlocksMu.Lock()
@@ -3622,51 +3433,29 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 		sm.inFlightBlocksMu.Unlock()
 	}
 
-	// Fast path: budget available right now, no waiter accounting needed.
-	if sm.blockPrefetchBudget.TryAcquire(weight) {
-		sm.blockPrefetchReserved.Add(weight)
+	// Fast path: a slot available right now, no waiter accounting needed.
+	if sm.blockPrefetchBudget.TryAcquire(1) {
+		sm.blockPrefetchReserved.Add(1)
 
-		return weight, nil
+		return nil
 	}
 
-	// Slow path: we must wait for in-flight blocks to drain. Flag that this
-	// read-loop is backpressured by our own processing so the stall detector
-	// does not mistake the resulting read stall for a slow peer.
+	// Slow path: we must wait for an in-flight conversion to finish. Flag that
+	// this read-loop is backpressured by our own processing so the stall
+	// detector does not mistake the resulting read stall for a slow peer.
 	sm.blockPrefetchWaiters.Add(1)
 	defer sm.blockPrefetchWaiters.Add(-1)
 
-	// Abort the wait on peer teardown too, not just whole-process ctx cancellation:
-	// the caller's ctx (the ServiceManager errgroup Init context) is cancelled on
-	// daemon shutdown but not by legacy.Server.Stop() alone, while quit (the peer's
-	// quit channel) closes on both individual disconnect and shutdown. This mirrors
-	// awaitBlockResult so a budget-parked read-loop never outlives its peer. The
-	// linking goroutine only exists while we are blocked (the rare backpressure
-	// case) and exits as soon as the acquire resolves.
-	if quit != nil {
-		var cancel context.CancelFunc
-
-		ctx, cancel = context.WithCancel(ctx)
-		defer cancel()
-
-		go func() {
-			select {
-			case <-quit:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
-	}
-
-	if err := sm.blockPrefetchBudget.Acquire(ctx, weight); err != nil {
-		// Nothing reserved: drop the hash we inserted before parking so a torn-down
-		// or cancelled acquire never leaks a slot in the dedup set.
+	if err := sm.blockPrefetchBudget.Acquire(ctx, 1); err != nil {
+		// Nothing reserved: drop the hash we inserted before parking so a
+		// cancelled acquire never leaks a slot in the dedup set.
 		removeInFlight()
-		return 0, err
+		return err
 	}
 
-	sm.blockPrefetchReserved.Add(weight)
+	sm.blockPrefetchReserved.Add(1)
 
-	return weight, nil
+	return nil
 }
 
 // conversionInFlight reports whether a copy of this block holds an admission,
@@ -3680,86 +3469,34 @@ func (sm *SyncManager) conversionInFlight(blockHash chainhash.Hash) bool {
 	return ok
 }
 
-// ReleaseBlockPrefetch returns budget reserved by AcquireBlockPrefetch and drops
-// the block's hash from the in-flight dedup set. The two are released together
-// (same lifetime as the reservation) so the dedup and byte halves of the
-// admission gate never drift. A zero weight (nothing reserved) still deletes the
-// hash but skips the budget Release; a nil budget (prefetch disabled) is a no-op.
-// Only ever called for hashes that AcquireBlockPrefetch successfully admitted —
-// the dup/early-return paths never reach here (OnBlock does not spawn
-// awaitBlockResult for them), so no hash is deleted that was not first inserted.
-func (sm *SyncManager) ReleaseBlockPrefetch(blockHash chainhash.Hash, weight int64) {
-	sm.ReleaseBlockPrefetchBytes(blockHash, weight)
-	sm.ReleaseBlockPrefetchHash(blockHash)
-}
+// inFlightBlock marks that a block's hash currently holds the dedup half of
+// the admission gate. It carries no other state: with the gate down to one
+// slot per block there is nothing left to release in two steps (see
+// ReleaseBlockPrefetch).
+type inFlightBlock struct{}
 
-// inFlightBlock is what the admission gate remembers about one block between its
-// acquire and its departure from the pipeline. Its presence is the dedup half of
-// the gate; bytesReleased is what makes the byte half exactly once.
-type inFlightBlock struct {
-	bytesReleased bool
-}
-
-// ReleaseBlockPrefetchHash drops a block's hash from the in-flight dedup set,
-// which is the half of the admission gate that stops a second copy of a block
-// being validated while the first is still in the pipeline. It runs when the
-// block leaves that pipeline, which is when its reply is sent.
-func (sm *SyncManager) ReleaseBlockPrefetchHash(blockHash chainhash.Hash) {
-	if sm.blockPrefetchBudget == nil {
-		return
-	}
-
+// ReleaseBlockPrefetch returns blockHash's admission slot and drops its hash
+// from the in-flight dedup set, together: with every admitted block costing
+// exactly one slot, there is no earlier moment to hand the slot to a different
+// budget the way a decoded block's serialized bytes once were, so the two
+// halves of the gate share one release as well as one acquire.
+//
+// A second release of a hash already released (or one never acquired) is a
+// no-op rather than a panic: admitPipelineSink's caller may release on both
+// the hand-off and its own deferred cleanup, and the underlying semaphore
+// panics on an unbalanced Release.
+func (sm *SyncManager) ReleaseBlockPrefetch(blockHash chainhash.Hash) {
 	sm.inFlightBlocksMu.Lock()
+	_, ok := sm.inFlightBlocks[blockHash]
 	delete(sm.inFlightBlocks, blockHash)
 	sm.inFlightBlocksMu.Unlock()
-}
 
-// ReleaseBlockPrefetchBytes gives a block's byte weight back to the download
-// budget. It runs as soon as the block's memory has been charged to whichever
-// budget owns it next, which is earlier than the reply and is the point of the
-// split.
-//
-// The two halves used to share one lifetime, deliberately, so that neither could
-// drift from the other. The dedup half still ends at the reply. The byte half
-// must not, because the budget is acquired AFTER a block has been read off the
-// wire, in OnBlock, and a read loop blocked in that acquire cannot read its next
-// message at all. Holding the bytes through validation therefore stops other
-// peers downloading: measured on mainnet at height 752,100 with a 256 MiB budget,
-// one or two blocks in flight and five or six read loops blocked, on a link
-// delivering 27 MB/s.
-//
-// Nothing becomes unbounded. A dispatched block's memory is charged to the
-// window's byte budget in blockDispatcher.dispatch, and a parked block's to the
-// park's own budget in blockPark.Admit. What the split removes is the download
-// budget double-counting memory another budget is already accounting for, and it
-// is that second count which shuts the peers out.
-//
-// Exactly-once is the caller's to guarantee, and awaitBlockResult is the only
-// caller for a live block: it holds the weight from its own successful acquire
-// and releases it on whichever of the hand-off and the reply comes first.
-// Releasing a weight twice, or one never acquired, panics the semaphore on a
-// peer's read loop.
-func (sm *SyncManager) ReleaseBlockPrefetchBytes(blockHash chainhash.Hash, weight int64) {
-	if sm.blockPrefetchBudget == nil || weight <= 0 {
+	if !ok {
 		return
 	}
 
-	sm.inFlightBlocksMu.Lock()
-
-	if b, ok := sm.inFlightBlocks[blockHash]; ok {
-		if b.bytesReleased {
-			sm.inFlightBlocksMu.Unlock()
-
-			return
-		}
-
-		b.bytesReleased = true
-	}
-
-	sm.inFlightBlocksMu.Unlock()
-
-	sm.blockPrefetchBudget.Release(weight)
-	sm.blockPrefetchReserved.Add(-weight)
+	sm.blockPrefetchBudget.Release(1)
+	sm.blockPrefetchReserved.Add(-1)
 }
 
 // committedTip reads the chain's own best block header and returns its height
@@ -3805,48 +3542,13 @@ func (sm *SyncManager) noteChainProgress() {
 	sm.commitRate.note(time.Now())
 }
 
-// lookaheadLeadTarget is how far ahead of the chain, in commit time, the node asks for blocks.
-// Long enough to cover one outlier block's download from a single peer at the sizes of the
-// mid-chain; the park-bytes cap is what keeps it honest at the top of the chain. A constant,
-// not a setting: an operator has no better information to set it by.
-const lookaheadLeadTarget = 5 * time.Minute
-
-// lookaheadParkBytes bounds the time depth by what the park may hold, judged from the rolling
-// average block size. It is about the 20 GB the scaled count was chosen to keep the park under.
-const lookaheadParkBytes = int64(20) << 30
-
-// timeLookaheadDepth is lookaheadLeadTarget of commits at the measured commit rate, capped at
-// lookaheadParkBytes of average-sized blocks. Zero while the rate is unknown.
-func (sm *SyncManager) timeLookaheadDepth() int {
-	rate := sm.commitRate.rate()
-	if rate <= 0 {
-		return 0
-	}
-
-	depth := int64(rate*lookaheadLeadTarget.Seconds() + 0.5)
-
-	if sm.blockSizeTracker != nil {
-		if avg := sm.blockSizeTracker.getAverageSize(); avg > 0 {
-			if byBytes := lookaheadParkBytes / avg; byBytes < depth {
-				depth = byBytes
-			}
-		}
-	}
-
-	if depth > int64(^uint32(0)>>1) {
-		depth = int64(^uint32(0) >> 1)
-	}
-
-	return int(depth)
-}
-
 // localReadBackpressured reports whether the node is currently throttling its
 // own network reads because local block processing cannot keep up. The stall
 // detector skips its checks while this holds, since zero throughput then
 // reflects our validation speed, not the sync peer's health: a read loop is
 // parked in AcquireBlockPrefetch waiting for a conversion slot.
 func (sm *SyncManager) localReadBackpressured() bool {
-	return sm.blockPrefetchBudget != nil && sm.blockPrefetchWaiters.Load() > 0
+	return sm.blockPrefetchWaiters.Load() > 0
 }
 
 // sendDuringShutdown delivers v on ch, recovering from the "send on closed
@@ -4249,40 +3951,28 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// for why that mattered beyond the allocation.
 	sm.installStreamingBlockPath(peerpkg.SetBlockBodyStreaming)
 
-	// Bounded async block prefetch: with a positive budget OnBlock admits a
-	// block against this global weighted semaphore and returns, so the
-	// read-loop downloads the next block while the current one is validated.
-	// A budget of 0 disables prefetch entirely (synchronous, one-block-in-flight).
-	if budget := tSettings.Legacy.BlockPrefetchBufferBytes; budget > 0 {
-		if sm.blockPark != nil && sm.blockPark.Enabled() {
-			// Whenever the park is enabled the streaming pipeline is what
-			// receives every block, and AcquireBlockPrefetch charges one slot
-			// per block on that path, not its serialized size (the bytes are
-			// gone by the time it runs — see that function), so
-			// legacy_blockPrefetchBufferBytes no longer describes anything
-			// real for this path. Size the same semaphore as a block count
-			// instead, derived from the per-peer queue-depth setting rather
-			// than a new one: see pipelineBlockSlotPeerAllowance for the
-			// multiplier's reasoning.
-			capacity := int64(tSettings.Legacy.MaxBlocksInTransitPerPeer) * pipelineBlockSlotPeerAllowance
-			if capacity < 1 {
-				capacity = 1
-			}
-
-			sm.blockPrefetchBudgetBytes = capacity
-			sm.blockPrefetchBudget = semaphore.NewWeighted(capacity)
-			logger.Infof("[legacy] streaming pipeline active: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
-				capacity, tSettings.Legacy.MaxBlocksInTransitPerPeer, pipelineBlockSlotPeerAllowance)
-		} else {
-			// The budget caps the total serialized bytes of in-flight blocks.
-			sm.blockPrefetchBudgetBytes = budget
-			sm.blockPrefetchBudget = semaphore.NewWeighted(budget)
-		}
-		// Dedup half of the same admission gate as the budget semaphore, created
-		// in lockstep with it: paired 1:1 with each budget reservation so at most
-		// one copy of a block hash is ever admitted/queued at a time.
-		sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
+	// Bounded async block prefetch: admitPipelineSink admits a block against
+	// this global weighted semaphore and returns, so the read-loop reads the
+	// next block while the current one converts. Every block costs one slot,
+	// whatever its size — the streaming pipeline is what receives every block,
+	// and the bytes are gone by the time admission runs (see
+	// AcquireBlockPrefetch) — so the budget is sized as a block count derived
+	// from the per-peer queue-depth setting: see pipelineBlockSlotPeerAllowance
+	// for the multiplier's reasoning.
+	capacity := int64(tSettings.Legacy.MaxBlocksInTransitPerPeer) * pipelineBlockSlotPeerAllowance
+	if capacity < 1 {
+		capacity = 1
 	}
+
+	sm.blockPrefetchBudgetSlots = capacity
+	sm.blockPrefetchBudget = semaphore.NewWeighted(capacity)
+	logger.Infof("[legacy] streaming pipeline active: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
+		capacity, tSettings.Legacy.MaxBlocksInTransitPerPeer, pipelineBlockSlotPeerAllowance)
+
+	// Dedup half of the same admission gate as the budget semaphore, created
+	// in lockstep with it: paired 1:1 with each budget reservation so at most
+	// one copy of a block hash is ever admitted/queued at a time.
+	sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
 
 	// create the transaction announcement batcher
 	sm.txAnnounceBatcher = batcher.NewWithDeduplicationAndPool[TxHashAndFee](maxRequestedTxns, 1*time.Second, func(batch []*TxHashAndFee) {

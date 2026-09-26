@@ -117,7 +117,7 @@ type downloadAssigner struct {
 	peers []*assignerPeer
 	// remaining is the node-wide budget left in this pass.
 	remaining int
-	// overBackstop says the bytes really held ahead of the chain have reached lookaheadParkBytes,
+	// overBackstop says the bytes really held ahead of the chain have reached parkBackstopBytes,
 	// so nothing above the highest held block is asked for in this pass. Blocks below it fill
 	// gaps and are never stopped: filling a gap is what lets the park drain.
 	overBackstop bool
@@ -178,15 +178,12 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		return nil
 	}
 
-	// The block-size ladder is the node's only reaction to block size: 20 blocks
-	// in flight below a 100MB average, stepping down to 1 above 2GB. With the
-	// park on it does not apply: every peer holds streamingPeerDepth blocks, and
-	// the largest recent block feeds only the read-ahead byte budget.
-	streaming := sm.blockPark.Enabled() && sm.streams != nil
 	largest := sm.blockSizeTracker.largestRecentSize()
 
-	var overBackstop bool
-
+	// The block-size ladder governs only the single-peer fallback below: with
+	// the park always on, every peer holds streamingPeerDepth blocks instead,
+	// whatever the block size, and the largest recent block feeds only the
+	// disk backstop.
 	ladder := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 
 	if !sm.settings.Legacy.MultiPeerBlockDownload {
@@ -203,10 +200,11 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	window := max(1, sm.settings.Legacy.BlockDownloadWindow)
 
 	// This bounds blocks in flight on the wire. It is NOT what stops the
-	// downloader racing ahead of the committer: that is lookaheadCeilingLocked,
-	// which refuses any header more than the read-ahead depth above the last
-	// committed block. A count cannot do that job, because a block 5000 ahead and
-	// a block 1 ahead each count as one.
+	// downloader racing ahead of the committer: that is wantedBlocks
+	// (wanted_range_assign.go), which never names a height more than
+	// legacy_blockDownloadWindow above the last committed block. A count
+	// cannot do that job, because a block 5000 ahead and a block 1 ahead each
+	// count as one.
 	remaining := window - sm.blockDownloads.Len()
 
 	if remaining <= 0 {
@@ -215,35 +213,21 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		return nil
 	}
 
-	// The per-peer cap governs small blocks and the ladder governs large ones,
-	// and at the ladder's lowest rungs it narrows the fan-out too: at a 2GB
-	// average the node is back to one peer holding one block, which is exactly
-	// what it does today. Every peer's read loop holds one fully decoded block
-	// before the prefetch byte budget applies, so fanning out at that rung would
-	// multiply the memory the ladder exists to protect.
-	perPeer := min(max(1, sm.settings.Legacy.MaxBlocksInTransitPerPeer), ladder)
-	fanout := min(len(eligible), ladder)
+	// Blocks stream straight to disk behind the admission budget and no read
+	// loop holds a decoded block, so every eligible peer carries blocks: there
+	// is no memory reason to narrow the fan-out the way the ladder once did.
+	perPeer := sm.streamingPeerDepth()
+	fanout := len(eligible)
 
-	// With the park on, blocks stream straight to disk behind the admission
-	// budget and no read loop holds a decoded block, so the memory reason for
-	// narrowing the fan-out is gone. Every eligible peer then carries blocks.
-	if sm.blockPark.Enabled() {
-		fanout = len(eligible)
-	}
-
-	if streaming {
-		perPeer = sm.streamingPeerDepth()
-
-		// Every peer is kept at streamingPeerDepth requests. Blocks are processed
-		// faster than they arrive, so the park grows only while the chain waits on
-		// one slow block, and no peer should ever be idle. The one brake is a
-		// backstop for the disk: the bytes really held ahead of the chain, parked
-		// and arriving, reaching lookaheadParkBytes. A block asked for but not yet
-		// arriving holds nothing and is not counted. It used to count at the
-		// largest recent block, and after a 2.3 GB block on 2026-09-25 that filled
-		// the budget with bytes that did not exist while four of eight peers idled.
-		overBackstop = sm.bytesAhead(largest) >= parkBackstopBytes
-	}
+	// Every peer is kept at streamingPeerDepth requests. Blocks are processed
+	// faster than they arrive, so the park grows only while the chain waits on
+	// one slow block, and no peer should ever be idle. The one brake is a
+	// backstop for the disk: the bytes really held ahead of the chain, parked
+	// and arriving, reaching parkBackstopBytes. A block asked for but not yet
+	// arriving holds nothing and is not counted. It used to count at the
+	// largest recent block, and after a 2.3 GB block on 2026-09-25 that filled
+	// the budget with bytes that did not exist while four of eight peers idled.
+	overBackstop := sm.bytesAhead(largest) >= parkBackstopBytes
 
 	peers := make([]*assignerPeer, 0, fanout)
 	assignable := 0
@@ -253,10 +237,8 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	fallbackRate := sm.streams.medianRate()
 
 	var fastest float64
-	if streaming {
-		for _, candidate := range eligible {
-			fastest = max(fastest, sm.streams.peerRate(candidate.peer))
-		}
+	for _, candidate := range eligible {
+		fastest = max(fastest, sm.streams.peerRate(candidate.peer))
 	}
 
 	for _, candidate := range eligible {
@@ -269,16 +251,11 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 			rate = fallbackRate
 		}
 
-		depth := perPeer
-		if streaming {
-			depth = sm.peerQueueDepth(candidate.peer, perPeer, fastest)
-		}
+		depth := sm.peerQueueDepth(candidate.peer, perPeer, fastest)
 
 		budget := depth - sm.blockDownloads.CountForPeer(candidate.peer)
 		if budget <= 0 {
-			if streaming {
-				full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate})
-			}
+			full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate})
 
 			continue
 		}

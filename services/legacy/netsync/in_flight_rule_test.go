@@ -76,7 +76,8 @@ func TestConcurrentDownloadPassesAskForEachBlockOnce(t *testing.T) {
 	a, aRec := schedulerPeer(t, sm, 140, 1000)
 	sm.storeSyncPeer(a, &syncPeerState{})
 
-	_, bRec := schedulerPeer(t, sm, 141, 1000)
+	b, bRec := schedulerPeer(t, sm, 141, 1000)
+	wireStreamingPath(sm, a, b)
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 

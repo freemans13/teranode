@@ -297,6 +297,7 @@ func TestDemotion_ReopensOnlyTheDemotedPeersSliceAndAsksForItAgain(t *testing.T)
 
 	stalled, stalledData, _ := demotionPeer(t, sm, 111, 1000)
 	successor, successorData, _ := demotionPeer(t, sm, 112, 1000)
+	wireStreamingPath(sm, stalled, successor)
 
 	seedFetchHeaders(t, sm, stalled, anchor, msg)
 

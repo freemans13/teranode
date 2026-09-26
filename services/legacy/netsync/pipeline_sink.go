@@ -381,10 +381,10 @@ func (sm *SyncManager) pipelineParentHeight(parent chainhash.Hash) (uint32, bool
 // committedTip's height is the chain's actual tip right now — never negative
 // in practice, floored at 0 defensively. Added to it is the widest the
 // download walk can read ahead of that tip: legacy_blockDownloadWindow, the
-// node-wide ceiling on outstanding block requests (lookaheadCeilingLocked,
-// manager.go, scales a narrower bound DOWN from this one by block size, never
-// wider), floored at 1 so a misconfigured 0 cannot zero the whole sum. No
-// block this node holds — parked, mid-conversion, or committed — can have a
+// node-wide ceiling on outstanding block requests and wantedBlocks' own
+// read-ahead depth (wanted_range_assign.go), floored at 1 so a misconfigured
+// 0 cannot zero the whole sum. No block this node holds — parked,
+// mid-conversion, or committed — can have a
 // height above tip+BlockDownloadWindow, so adding the configured retention on
 // top gives a delete-at-height strictly above any height this specific block
 // can actually turn out to have, exactly the guarantee height + retention
