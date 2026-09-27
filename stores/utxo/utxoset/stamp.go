@@ -902,13 +902,33 @@ func (d *stampDrain) CompleteWindow(ctx context.Context, wLo uint32, anc *chaina
 	stampWindows.Inc()
 	s.logger.Infof("[utxoset][stamp] window %d-%d complete at tip %d, stamped_at %d", wLo, wHi-1, tip, stampedAt)
 
-	// Statistics refreshed after the writes. Stale statistics flipped the UTXO probe to a
-	// bitmap plan 5.7x slower in the bench. ANALYZE samples, so it is cheap on any size.
-	if _, err := s.pool.Exec(ctx, `ANALYZE tx_ident; ANALYZE utxo`); err != nil {
-		s.logger.Warnf("[utxoset][stamp] analyze after window %d: %v", wLo, err)
-	}
+	s.refreshStatistics(ctx, wLo)
 
 	return nil
+}
+
+// refreshStatistics analyzes tx_ident and utxo after a stamped window, and reports whether
+// it ran. Stale statistics flipped the UTXO probe to a bitmap plan 5.7x slower in the bench.
+// ANALYZE samples, so it is cheap on any size.
+//
+// It is skipped while the pruner is rebuilding a UTXO index. Run alongside that rebuild it
+// deadlocks, and PostgreSQL kills the rebuild: five times in three hours on mainnet on
+// 2026-09-26. Waiting instead would hold the stamp worker for the rebuild's fifteen
+// minutes, and the next stamped window analyzes anyway.
+func (s *Store) refreshStatistics(ctx context.Context, window uint32) bool {
+	if !s.indexMaintenance.TryLock() {
+		s.logger.Infof("[utxoset][stamp] statistics refresh after window %d skipped: a UTXO index rebuild is running", window)
+
+		return false
+	}
+
+	defer s.indexMaintenance.Unlock()
+
+	if _, err := s.pool.Exec(ctx, `ANALYZE tx_ident; ANALYZE utxo`); err != nil {
+		s.logger.Warnf("[utxoset][stamp] analyze after window %d: %v", window, err)
+	}
+
+	return true
 }
 
 // auditSampleSQL reads a short run of the window's primary key from a random starting txid.
