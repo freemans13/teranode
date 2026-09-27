@@ -51,16 +51,18 @@ SELECT c.relname,
  WHERE c.relname ~ '^utxo_p[0-9]+$'
    AND ic.relname ~ '^utxo_p[0-9]+_ukey$'`
 
-// invalidUTXOIndexSQL finds a leftover _ccnew index from a REINDEX CONCURRENTLY that was
-// interrupted (crash, cancel, deploy) before it could swap in and drop the old index. Left in
-// place it never serves a scan -- pg_index.indisvalid is false -- and it blocks a later
-// REINDEX CONCURRENTLY on the same index name.
+// invalidUTXOIndexSQL finds what a REINDEX CONCURRENTLY interrupted by a crash, cancel or
+// deploy leaves behind. Before the swap that is the half-built new index, named _ccnew; after
+// the swap and before the final drop it is the old index, renamed _ccold. Either way it is
+// invalid (pg_index.indisvalid is false), so it never serves a scan, and it holds the whole
+// size of the index: two _ccold leftovers held 44 GB on mainnet on 2026-09-27. A _ccnew left
+// in place also blocks a later REINDEX CONCURRENTLY on the same index name.
 const invalidUTXOIndexSQL = `
 SELECT c.relname
   FROM pg_class c
   JOIN pg_index i ON i.indexrelid = c.oid
  WHERE i.indisvalid = false
-   AND c.relname ~ '^utxo_p[0-9]+_ukey_ccnew[0-9]*$'`
+   AND c.relname ~ '^utxo_p[0-9]+_ukey_cc(new|old)[0-9]*$'`
 
 // rebuildOneBloatedUTXOIndex finds the utxo_pN_ukey index with the worst bytes-per-entry
 // ratio, and if decide says it has crossed the line, rebuilds it in place.
@@ -159,9 +161,9 @@ func (s *Store) rebuildOneBloatedUTXOIndex(ctx context.Context, decide func(inde
 	return 1, nil
 }
 
-// dropInvalidUTXOIndexes clears out any _ccnew leftover from a REINDEX CONCURRENTLY that was
-// interrupted before it could swap in, so a later REINDEX CONCURRENTLY on the same base index
-// name is not blocked by it. See invalidUTXOIndexSQL.
+// dropInvalidUTXOIndexes clears out the _ccnew or _ccold leftover of an interrupted REINDEX
+// CONCURRENTLY, which reclaims its space and unblocks a later rebuild of the same index. See
+// invalidUTXOIndexSQL.
 func (s *Store) dropInvalidUTXOIndexes(ctx context.Context) error {
 	rows, err := s.pool.Query(ctx, invalidUTXOIndexSQL)
 	if err != nil {
