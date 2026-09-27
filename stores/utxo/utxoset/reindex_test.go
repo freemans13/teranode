@@ -94,3 +94,40 @@ func TestRebuildWaitsForAStatisticsRefresh(t *testing.T) {
 		t.Fatal("the rebuild never ran after the lock was released")
 	}
 }
+
+// TestInterruptedRebuildLeftoversAreDropped pins both leftovers an interrupted REINDEX
+// CONCURRENTLY can leave. Before the swap it is the half-built _ccnew index; after the swap
+// and before the final drop it is the old index, renamed _ccold. Both are invalid and never
+// serve a scan. Only _ccnew used to be cleared, so on mainnet on 2026-09-27 two _ccold
+// indexes left by a disk-full crash held 44 GB that nothing would ever reclaim.
+//
+// A valid index is left alone whatever it is called, and so is the live index.
+func TestInterruptedRebuildLeftoversAreDropped(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	for _, stmt := range []string{
+		`CREATE INDEX utxo_p0_ukey_ccnew ON utxo_p0 (ukey)`,
+		`CREATE INDEX utxo_p1_ukey_ccold ON utxo_p1 (ukey)`,
+		`CREATE INDEX utxo_p2_ukey_ccold ON utxo_p2 (ukey)`,
+		`UPDATE pg_index SET indisvalid = false
+		  WHERE indexrelid IN ('utxo_p0_ukey_ccnew'::regclass, 'utxo_p1_ukey_ccold'::regclass)`,
+	} {
+		_, err := s.pool.Exec(ctx, stmt)
+		require.NoError(t, err, stmt)
+	}
+
+	require.NoError(t, s.dropInvalidUTXOIndexes(ctx))
+
+	exists := func(name string) bool {
+		var found bool
+
+		require.NoError(t, s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&found))
+
+		return found
+	}
+
+	require.False(t, exists("utxo_p0_ukey_ccnew"), "a half-built index from before the swap is dropped")
+	require.False(t, exists("utxo_p1_ukey_ccold"), "an old index left after the swap is dropped")
+	require.True(t, exists("utxo_p2_ukey_ccold"), "a valid index is never dropped, whatever its name")
+	require.True(t, exists("utxo_p0_ukey"), "the live index is untouched")
+}
