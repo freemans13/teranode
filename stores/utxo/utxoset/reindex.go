@@ -138,6 +138,11 @@ func (s *Store) rebuildOneBloatedUTXOIndex(ctx context.Context, decide func(inde
 
 	indexName := best.partition + "_ukey"
 
+	// Waits for a statistics refresh already running, which takes seconds; see
+	// indexMaintenance for the deadlock this prevents.
+	s.indexMaintenance.Lock()
+	defer s.indexMaintenance.Unlock()
+
 	if _, err := s.pool.Exec(ctx, fmt.Sprintf(`REINDEX INDEX CONCURRENTLY %s`, indexName)); err != nil {
 		return 0, errors.NewStorageError("[utxoset] reindex %s", indexName, err)
 	}

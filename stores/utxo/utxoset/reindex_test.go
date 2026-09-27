@@ -1,8 +1,11 @@
 package utxoset
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,4 +39,58 @@ func TestRebuildUTXOIndexRunsConcurrentlyAndOnce(t *testing.T) {
 	n, err := s.rebuildOneBloatedUTXOIndex(ctx, func(bytes, rows int64) bool { return true })
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
+}
+
+// TestStatisticsRefreshIsSkippedWhileARebuildRuns pins one half of the rule that keeps the
+// stamp worker's ANALYZE and the pruner's REINDEX CONCURRENTLY apart. On mainnet on
+// 2026-09-26 they deadlocked five times in three hours: the rebuild waits for every
+// transaction that could see the old index, the ANALYZE of utxo is one of them, and that
+// ANALYZE waits for the partition lock the rebuild holds. PostgreSQL kills the rebuild, the
+// half-built index is dropped, and the bloated index is never rebuilt.
+//
+// A refresh that finds a rebuild running is skipped rather than queued. A rebuild of a
+// mainnet partition runs for about fifteen minutes, and the stamp worker must not wait that
+// long; the next stamped window analyzes again. The store has no pool here, so a skip that
+// reached the database would panic.
+func TestStatisticsRefreshIsSkippedWhileARebuildRuns(t *testing.T) {
+	s := &Store{logger: ulogger.TestLogger{}}
+
+	s.indexMaintenance.Lock()
+	defer s.indexMaintenance.Unlock()
+
+	require.False(t, s.refreshStatistics(context.Background(), 7), "a refresh must not run while a rebuild holds the lock")
+}
+
+// TestRebuildWaitsForAStatisticsRefresh pins the other half: a rebuild that finds a refresh
+// running waits for it. A refresh takes seconds, and starting the rebuild alongside it is
+// exactly the overlap that deadlocks.
+func TestRebuildWaitsForAStatisticsRefresh(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	s.indexMaintenance.Lock()
+
+	done := make(chan int, 1)
+
+	go func() {
+		n, err := s.rebuildOneBloatedUTXOIndex(ctx, func(bytes, rows int64) bool { return true })
+		if err != nil {
+			n = -1
+		}
+		done <- n
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("the rebuild ran while a statistics refresh held the lock")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	s.indexMaintenance.Unlock()
+
+	select {
+	case n := <-done:
+		require.Equal(t, 1, n, "the rebuild runs once the refresh has finished")
+	case <-time.After(60 * time.Second):
+		t.Fatal("the rebuild never ran after the lock was released")
+	}
 }

@@ -73,6 +73,13 @@ type Store struct {
 	// minedDDL serialises tx_mined window creation within this process.
 	minedDDL sync.Mutex
 
+	// indexMaintenance keeps the pruner's REINDEX CONCURRENTLY and the stamp worker's
+	// statistics refresh from running against the database at the same time, which
+	// deadlocks: the rebuild waits for the ANALYZE's transaction and the ANALYZE waits for
+	// the partition lock the rebuild holds. See rebuildOneBloatedUTXOIndex and
+	// refreshStatistics.
+	indexMaintenance sync.Mutex
+
 	// bodyRetention is how long the serialized transaction bytes are kept, in blocks.
 	bodyRetention uint32
 
