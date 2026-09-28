@@ -83,23 +83,26 @@ import (
 // as it does for createMinedPlanSQL's: the reads take no row lock of their own, so two
 // concurrent creates of one transaction could otherwise both find nothing.
 //
-// fee is written as NULL deliberately. The store does not compute it, and block assembly
-// rebuilds a mining candidate from size and inpoints instead.
+// fee is the transaction's fee when its inputs are extended, and NULL when they are not (see
+// txFee). It used to be NULL always, on the argument that block assembly rebuilds a candidate
+// from size and inpoints; but the validator hands this store's fee to block assembly, and
+// subtree validation recomputes subtree fees from it before the block reward check, so a NULL
+// read back as 0 made every honest block above the checkpoint claim more than subsidy plus 0.
 const createIdentPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
                          $6::int[], $7::bytea[], $8::int[], $9::bigint[],
                          $10::smallint[], $11::bytea[], $12::uuid[], $13::uuid[],
-                         $14::int[], $15::int[], $16::int[])
+                         $14::int[], $15::int[], $16::int[], $26::bigint[])
         AS t(k, leaf, txid, created_height, off_chain_since, size_in_bytes,
              tx_inpoints, locktime, created_at, flags, raw_tx, lo, hi,
-             mined_height, block_id, subtree_idx)
+             mined_height, block_id, subtree_idx, fee)
 ),
 claim AS (
     INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since,
                           fee, size_in_bytes, tx_inpoints, locktime, created_at, flags)
     SELECT t.leaf, t.txid, t.created_height, t.off_chain_since,
-           NULL::bigint, t.size_in_bytes, t.tx_inpoints, t.locktime, t.created_at, t.flags
+           t.fee, t.size_in_bytes, t.tx_inpoints, t.locktime, t.created_at, t.flags
       FROM t
      WHERE NOT EXISTS (SELECT 1 FROM tx_mined m
                         WHERE m.txid = t.txid
@@ -116,7 +119,7 @@ mined AS (
                           size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
     SELECT t.txid, t.mined_height, t.block_id, t.subtree_idx,
            COALESCE(i.created_height, t.created_height), t.size_in_bytes,
-           i.fee, COALESCE(i.tx_inpoints, t.tx_inpoints), COALESCE(i.locktime, t.locktime),
+           COALESCE(i.fee, t.fee), COALESCE(i.tx_inpoints, t.tx_inpoints), COALESCE(i.locktime, t.locktime),
            COALESCE(i.created_at, t.created_at), COALESCE(i.flags, t.flags)
       FROM t
       LEFT JOIN LATERAL (
@@ -199,8 +202,9 @@ SELECT t.k
 // Neither reader runs for a checkpointed block. Storing the inpoints would cost the WAL bytes
 // this store is being shaped to avoid, so the trade is intentional.
 //
-// fee is written NULL for the same reason createIdentPlanSQL writes it NULL: the store never
-// computes one, and a coinbase has none to compute.
+// fee is carried the way createIdentPlanSQL carries it: the computed fee when the inputs are
+// extended, NULL when they are not, which is the below-checkpoint fast path, where the block
+// reward check is skipped for exactly that reason.
 //
 // The body CTE's raw_tx IS NOT NULL is how utxostore_skipTxBodyBelowCheckpoint is applied, and
 // it is a filter on the ROW rather than a second statement on purpose. The caller decides per
@@ -210,16 +214,16 @@ const createMinedPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
                          $6::int[], $7::int[], $8::int[], $9::bigint[], $10::smallint[],
-                         $11::bytea[], $12::uuid[], $13::uuid[])
+                         $11::bytea[], $12::uuid[], $13::uuid[], $25::bigint[])
         AS t(k, leaf, txid, created_height, mined_height, block_id, subtree_idx,
-             size_in_bytes, created_at, flags, raw_tx, lo, hi)
+             size_in_bytes, created_at, flags, raw_tx, lo, hi, fee)
 ),
 mined AS (
     INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
                           size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
     SELECT t.txid, t.mined_height, t.block_id, t.subtree_idx,
            COALESCE(i.created_height, t.created_height), t.size_in_bytes,
-           i.fee, i.tx_inpoints, i.locktime,
+           COALESCE(i.fee, t.fee), i.tx_inpoints, i.locktime,
            COALESCE(i.created_at, t.created_at), COALESCE(i.flags, t.flags)
       FROM t
       LEFT JOIN LATERAL (
@@ -329,12 +333,15 @@ type createItem struct {
 // rather than by a separate mapping.
 type createPlan struct {
 	// One element per transaction that made it into the statement.
-	idx       []int32
-	leaves    []int16
-	txids     [][]byte
-	heights   []int32
-	offChain  []*int32
-	sizes     []int32
+	idx      []int32
+	leaves   []int16
+	txids    [][]byte
+	heights  []int32
+	offChain []*int32
+	sizes    []int32
+	// fees is the transaction's fee when the store can compute it, nil when it cannot: a
+	// transaction whose inputs are not extended carries no input values. See txFee.
+	fees      []*int64
 	inpoints  [][]byte
 	locktimes []int32
 	createdAt []int64
@@ -489,6 +496,7 @@ func (p *createPlan) subset(idx []int) *createPlan {
 		q.heights = append(q.heights, p.heights[i])
 		q.offChain = append(q.offChain, p.offChain[i])
 		q.sizes = append(q.sizes, p.sizes[i])
+		q.fees = append(q.fees, p.fees[i])
 		q.inpoints = append(q.inpoints, p.inpoints[i])
 		q.locktimes = append(q.locktimes, p.locktimes[i])
 		q.createdAt = append(q.createdAt, p.createdAt[i])
@@ -572,7 +580,7 @@ func (s *Store) runIdentPlan(ctx context.Context, q querier, p *createPlan) erro
 		p.inpoints, p.locktimes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
 		p.minedHeight, p.blockID, p.subtreeIdx,
 		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoLeaves, p.utxoFlags,
-		p.utxoUkeys, p.utxoTxids, p.utxoScripts, s.claimFloor())
+		p.utxoUkeys, p.utxoTxids, p.utxoScripts, s.claimFloor(), p.fees)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Create] store", err)
 	}
@@ -610,7 +618,7 @@ func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) erro
 		p.idx, p.leaves, p.txids, p.heights, p.minedHeight, p.blockID, p.subtreeIdx,
 		p.sizes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
 		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoMined, p.utxoBlockIDs,
-		p.utxoLeaves, p.utxoFlags, p.utxoUkeys, p.utxoTxids, p.utxoScripts, s.claimFloor())
+		p.utxoLeaves, p.utxoFlags, p.utxoUkeys, p.utxoTxids, p.utxoScripts, s.claimFloor(), p.fees)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Create] store mined", err)
 	}
