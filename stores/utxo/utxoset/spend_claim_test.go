@@ -306,3 +306,14 @@ func TestAFalseClaimSurvivesAGenuineReplayOfASibling(t *testing.T) {
 	require.ErrorIs(t, redo[0].Err, errors.ErrUtxoHashMismatch)
 	require.NoError(t, redo[1].Err, "the genuine replay must still be recognised as one")
 }
+
+// TestSpendOfNoTransactionIsRefused pins the store half of the conflict-promotion exposure: a
+// spend of no transaction used to return no spends and no error, which a caller reads as every
+// input spent. It is an error now, so a caller that lost the body cannot mistake nothing for
+// success.
+func TestSpendOfNoTransactionIsRefused(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	_, _, err := s.SpendAndCreate(ctx, nil, 1_000, utxo.WithSpendOnly())
+	require.Error(t, err)
+}

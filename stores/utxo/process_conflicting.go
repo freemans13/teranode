@@ -253,6 +253,16 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 				return errors.NewTxNotFoundError("[ProcessConflicting][%s] winning tx not found", txHash.String())
 			}
 
+			// A winner is promoted by spending its inputs, which needs its body. A store may
+			// hold the record without it: utxoset drops bodies after 288 blocks and answers
+			// Get with Tx nil and no error. Handed on, the nil reached SpendAndCreate, which
+			// spent nothing and reported success, so the winner was promoted with its inputs
+			// unspent and the parents the unspend below hands back left live for anyone.
+			// Refused here, while gathering, so nothing has been mutated.
+			if txMeta.Tx == nil {
+				return errors.NewProcessingError("[ProcessConflicting][%s] winning tx has no stored body, so its inputs cannot be spent to promote it", txHash.String())
+			}
+
 			// the transaction should be marked as conflicting, otherwise it shouldn't be in this process
 			// unless it was already processed in this run, then it will be in the processedConflictingHashesMap.
 			// This can occur when a transaction is in multiple forks, and we are moving back from one fork to another
