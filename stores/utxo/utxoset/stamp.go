@@ -62,9 +62,11 @@ func StampDepthFor(coinbaseMaturity uint32) uint32 {
 // window is being published. It is defined as the undo width so the two change together.
 const stampMarginBlocks = SpendJournalPartitionBlocks
 
-// undoMaxLifeBlocks is the longest an undo copy can live with an on-time pruner: retention plus
-// one partition width. A window drops no earlier than stamped_at plus this.
-const undoMaxLifeBlocks = DefaultSpendJournalRetentionBlocks + SpendJournalPartitionBlocks
+// undoMaxLife is the longest an undo copy can live with an on-time pruner: retention plus one
+// partition width. A window drops no earlier than stamped_at plus this.
+func (s *Store) undoMaxLife() uint32 {
+	return s.journalRetention + SpendJournalPartitionBlocks
+}
 
 // The three fixed advisory-lock keys, all in the two-integer form. The store's per-transaction
 // locks are single bigints keyed on the first eight bytes of a txid, and postgres keeps the two
