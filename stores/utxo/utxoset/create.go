@@ -2,6 +2,7 @@ package utxoset
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -11,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -353,6 +355,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.heights = append(p.heights, int32(blockHeight))
 	p.offChain = append(p.offChain, offChainSinceAt(options.MinedBlockInfos, blockHeight))
 	p.sizes = append(p.sizes, int32(tx.Size()))
+	p.fees = append(p.fees, txFee(tx))
 	p.inpoints = append(p.inpoints, inpoints)
 	p.locktimes = append(p.locktimes, int32(tx.LockTime))
 	p.createdAt = append(p.createdAt, time.Now().UnixMilli())
@@ -391,12 +394,46 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		p.utxoBlockIDs = append(p.utxoBlockIDs, utxoBlockID)
 	}
 
+	var fee uint64
+	if f := txFee(tx); f != nil {
+		fee = uint64(*f) //nolint:gosec // txFee never returns a negative fee
+	}
+
 	return &meta.Data{
 		Tx:          tx,
-		Fee:         0,
+		Fee:         fee,
 		SizeInBytes: uint64(tx.Size()),
 		IsCoinbase:  isCoinbase,
 	}, nil
+}
+
+// txFee is the transaction's fee, or nil when the store cannot know it.
+//
+// A coinbase pays none. Otherwise the fee needs every input's value, which the transaction
+// carries only when it arrives extended: the validator extends before it creates, and so does
+// block validation above the checkpoint. The below-checkpoint fast path creates transactions
+// without extending them; their fee is unknown rather than zero, so it is stored as NULL, and
+// the block reward check is skipped there for that reason (model.Block.checkBlockRewardAndFees).
+// Inputs worth less than the outputs are not this store's verdict to give; the validator has
+// already refused such a transaction, so nil is returned rather than a wrapped negative.
+func txFee(tx *bt.Tx) *int64 {
+	if tx.IsCoinbase() {
+		zero := int64(0)
+		return &zero
+	}
+
+	if !tx.IsExtended() {
+		return nil
+	}
+
+	fee, err := util.GetFees(tx)
+	if err != nil || fee > math.MaxInt64 {
+		return nil
+	}
+
+	f := int64(fee)
+
+	return &f
 }
 
 // createIn is Create inside an EXISTING database transaction, so SpendAndCreate can run it in
