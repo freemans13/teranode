@@ -256,7 +256,7 @@ func (p stampingPruner) Prune(ctx context.Context, _ uint32, hash string) (int64
 
 	tip := stampThrough(p.t, p.store, ctx, windows[len(windows)-1].window, map[uint32]uint32{1000: 100})
 
-	dropAt := tip + stampMarginBlocks + undoMaxLifeBlocks
+	dropAt := tip + stampMarginBlocks + p.store.undoMaxLife()
 	require.NoError(p.t, p.store.SetBlockHeight(dropAt))
 
 	return p.Service.Prune(ctx, dropAt, hash)

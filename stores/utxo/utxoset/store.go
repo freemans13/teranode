@@ -302,6 +302,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	s.stampDepth = StampDepthFor(maturity)
 
+	s.journalRetention = spendJournalRetention(logger, tSettings.UtxoStore.SpendJournalRetentionBlocks)
+
 	if tSettings.UtxoStore.RetainWindowsIndefinitely {
 		s.retainIndefinitely = true
 		retainIndefinitelyGauge.Set(1)
@@ -436,4 +438,21 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	}
 
 	return 200, "utxoset: ok", nil
+}
+
+// spendJournalRetention resolves utxostore_spendJournalRetentionBlocks: zero is the default,
+// and anything above MaxSpendJournalRetentionBlocks is clamped to it, with a warning, because
+// the create claims' probe must reach past every undo copy.
+func spendJournalRetention(logger ulogger.Logger, configured uint32) uint32 {
+	switch {
+	case configured == 0:
+		return DefaultSpendJournalRetentionBlocks
+	case configured > MaxSpendJournalRetentionBlocks:
+		logger.Warnf("[utxoset] utxostore_spendJournalRetentionBlocks=%d is above the %d the create probe can cover; using %d",
+			configured, MaxSpendJournalRetentionBlocks, MaxSpendJournalRetentionBlocks)
+
+		return MaxSpendJournalRetentionBlocks
+	default:
+		return configured
+	}
 }

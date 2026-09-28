@@ -131,3 +131,15 @@ func TestInterruptedRebuildLeftoversAreDropped(t *testing.T) {
 	require.True(t, exists("utxo_p2_ukey_ccold"), "a valid index is never dropped, whatever its name")
 	require.True(t, exists("utxo_p0_ukey"), "the live index is untouched")
 }
+
+// TestSpendJournalRetentionSetting pins how utxostore_spendJournalRetentionBlocks resolves:
+// zero is the 288-block default, a value in range is taken as given, and anything above 1440 is
+// clamped, because the create claims' probe must reach past every undo copy.
+func TestSpendJournalRetentionSetting(t *testing.T) {
+	log := ulogger.TestLogger{}
+
+	require.Equal(t, uint32(288), spendJournalRetention(log, 0))
+	require.Equal(t, uint32(100), spendJournalRetention(log, 100))
+	require.Equal(t, uint32(1440), spendJournalRetention(log, 1440))
+	require.Equal(t, uint32(1440), spendJournalRetention(log, 5000))
+}

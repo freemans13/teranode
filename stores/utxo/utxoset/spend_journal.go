@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 
+	subtree "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
@@ -23,19 +24,26 @@ import (
 // per-leaf autovacuum threshold below was sized for 48 blocks and is a soak-set value.
 const SpendJournalPartitionBlocks = 288
 
-// DefaultSpendJournalRetentionBlocks is how far back a spend stays undoable.
+// DefaultSpendJournalRetentionBlocks is how far back a spend stays undoable, unless
+// utxostore_spendJournalRetentionBlocks says otherwise.
 //
-// 1440, not the 288 the design originally proposed. ParentPreservationBlocks is 1440 and
-// its own settings documentation says in bold "DO NOT reduce below 1440 as this risks
-// invalidating legitimate transaction resubmissions" -- so a 288-block journal would
-// have compiled, passed tests, and then silently failed to protect a resubmitted
-// transaction ten days later. The measured UTXO growth slope (251/block, not the 802
-// assumed) leaves the budget at roughly 60-66% even at this depth, so the correct number
-// is affordable.
+// 288: the journal's jobs are putting coins back on a reorg and letting a block interrupted
+// part-way be applied again, and both need far less than a day. It was 1440, to match
+// ParentPreservationBlocks, on the argument that a transaction resubmitted days later needs
+// the journal to show the coins it finds gone were taken by itself. That job now belongs to
+// the validator, which looks the transaction up by its own txid when a spend finds its coins
+// gone (Validator.knownTxResubmission): an unmined transaction keeps its identity row while it
+// waits, and a mined one keeps its block on its unspent coins. At mainnet heights near 876,000
+// a 288-block partition holds about 36 GB, so the 1440-block journal was 214 GB and filled a
+// disk on 2026-09-27.
 //
-// Steady-state leaf count is retention/SpendJournalPartitionBlocks + 1 = 6 tables. Bounded, and
-// dropped as the chain advances.
-const DefaultSpendJournalRetentionBlocks = 1440
+// Steady-state leaf count is retention/SpendJournalPartitionBlocks + 1 = 2 tables.
+const DefaultSpendJournalRetentionBlocks = 288
+
+// MaxSpendJournalRetentionBlocks caps the setting. The create claims' containment probe reads
+// claimReach blocks back and must reach past every undo copy, which lives up to retention plus
+// one partition (see undoMaxLife), so retention plus one partition must stay under claimReach.
+const MaxSpendJournalRetentionBlocks = 1440
 
 // spendJournalSQL deletes the UTXO row AND captures its payload in one statement.
 //
@@ -394,6 +402,14 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 			continue
 		}
 
+		// Before the partition goes, carry forward the spends of transactions still waiting to
+		// be mined. The table exists in every state below until the DROP, attached or not.
+		if l.parent == "spend_journal" {
+			if _, err := s.copyForwardUnminedSpends(ctx, l.leaf, cutoff*SpendJournalPartitionBlocks); err != nil {
+				return dropped, err
+			}
+		}
+
 		switch {
 		case l.detachPending:
 			// FINALIZE is the only way out of this state, and until it runs no other
@@ -471,4 +487,157 @@ func (s *Store) loadOldestUndoLeaf(ctx context.Context) error {
 	s.oldestUndoLeaf.Store(oldest)
 
 	return nil
+}
+
+// unminedInpointsSQL reads every transaction still waiting to be mined, with its inputs. The
+// marker's partial index covers exactly these rows, so this reads the waiting population and
+// nothing else: a few thousand at the tip, none during a sync from genesis.
+const unminedInpointsSQL = `
+SELECT txid, tx_inpoints
+  FROM tx_ident
+ WHERE off_chain_since IS NOT NULL`
+
+// copyForwardSQL copies the named spends out of one retiring partition into the live journal,
+// re-stamped to $4 so they land in a partition that is not about to drop.
+//
+// The retiring partition is addressed by name (%s) and probed on its packed-key index, one
+// descent per waiting input, so the cost follows the waiting population and not the size of
+// the partition, which reached 39 GB at mainnet heights near 876,000.
+//
+// A copied row whose parent coin carried no block, (0,0), gets the parent's block filled in from
+// its stamped containment window. Such a row can only exist because the spend came before the
+// parent's window was stamped, so the original sits below the window's stamped_at and the drop
+// rule has kept the window attached until now; stamped, the window names only the winner, and a
+// stamped pair is final. Without the fill the copy would land above stamped_at, where the drop
+// rule does not look, the window would drop, and Unspend would rebuild the coin with no block.
+// A parent whose window is not stamped yet keeps (0,0): its window cannot drop before its stamp,
+// and the stamp's stamped_at lies above the copy, so the drop rule holds it for the copy too.
+//
+// The NOT EXISTS makes it idempotent. The copy commits on its own and the drop comes after, so
+// a crash between them copies the same partition again on the next pass; a second copy would
+// hand Unspend two rows for one spend. It looks only at partitions from $5 up, the ones the
+// copies land in.
+const copyForwardSQL = `
+INSERT INTO spend_journal (spent_height, satoshis, created_height, spendable_from, flags,
+                           mined_height, block_id, ukey, txid, spending_txid, script, hash_override)
+SELECT $4::int, j.satoshis, j.created_height, j.spendable_from, j.flags,
+       CASE WHEN j.mined_height = 0 THEN coalesce(w.h, 0) ELSE j.mined_height END,
+       CASE WHEN j.mined_height = 0 THEN coalesce(w.b, 0) ELSE j.block_id END,
+       j.ukey, j.txid, j.spending_txid, j.script, j.hash_override
+  FROM unnest($1::uuid[], $2::bytea[], $3::bytea[]) AS k(ukey, txid, spender)
+  JOIN %s j ON j.ukey = k.ukey AND j.txid = k.txid AND j.spending_txid = k.spender
+  LEFT JOIN LATERAL (
+       SELECT m.mined_height AS h, m.block_id AS b
+         FROM tx_mined m
+        WHERE j.mined_height = 0
+          AND m.txid = j.txid
+          AND m.mined_height < (SELECT stamp_complete_floor FROM tx_mined_floor WHERE id = 0)
+        ORDER BY m.mined_height, m.block_id
+        LIMIT 1) w ON true
+ WHERE NOT EXISTS (
+       SELECT 1 FROM spend_journal x
+        WHERE x.spent_height >= $5::int
+          AND x.ukey = j.ukey AND x.txid = j.txid AND x.spending_txid = j.spending_txid)`
+
+// copyForwardBatch bounds one statement's arrays.
+const copyForwardBatch = 10_000
+
+// copyForwardUnminedSpends carries forward, from the journal partition for leaf, every spend
+// whose spending transaction is still waiting to be mined, and returns how many rows it copied.
+// keepFrom is the lowest height the pass keeps; copies are stamped at the store's height, or
+// keepFrom if the store's height is below it, so they never land in a partition the same pass
+// drops.
+//
+// This is the settled design's pruner step 4 (2026-08-26-utxoset-settled-design.md, "Copy
+// forward any journal row whose spending transaction is still unmined"). A waiting
+// transaction's journal rows are the only record of the coins it took, and Unspend rebuilds
+// them from those rows when the transaction loses a double spend to a block. Carried forward,
+// they live as long as the transaction waits, which is what lets journal retention be as short
+// as reorgs need rather than 1440 blocks.
+//
+// Recognising a resubmitted transaction does not need these rows: the validator answers that
+// from the transaction's own txid (Validator.knownTxResubmission).
+func (s *Store) copyForwardUnminedSpends(ctx context.Context, leaf, keepFrom uint32) (int64, error) {
+	rows, err := s.pool.Query(ctx, unminedInpointsSQL)
+	if err != nil {
+		return 0, errors.NewStorageError("[utxoset] list unmined transactions for the journal copy-forward", err)
+	}
+
+	var ukeys, parents, spenders [][]byte
+
+	noInpoints := 0
+
+	for rows.Next() {
+		var txid, raw []byte
+
+		if err := rows.Scan(&txid, &raw); err != nil {
+			rows.Close()
+			return 0, errors.NewStorageError("[utxoset] scan unmined transaction for the journal copy-forward", err)
+		}
+
+		if len(raw) == 0 {
+			noInpoints++
+			continue
+		}
+
+		ip, err := subtree.NewTxInpointsFromBytes(raw)
+		if err != nil {
+			rows.Close()
+			return 0, errors.NewStorageError("[utxoset] decode inputs of unmined transaction %x for the journal copy-forward", txid, err)
+		}
+
+		for _, in := range ip.GetTxInpoints() {
+			k := Pack(in.Hash[:], in.Index)
+			parent := in.Hash
+
+			ukeys = append(ukeys, k[:])
+			parents = append(parents, parent[:])
+			spenders = append(spenders, txid)
+		}
+	}
+
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return 0, errors.NewStorageError("[utxoset] list unmined transactions for the journal copy-forward", err)
+	}
+
+	if noInpoints > 0 {
+		s.logger.Warnf("[utxoset] journal copy-forward: %d unmined transactions carry no inputs, so their spends cannot be carried forward", noInpoints)
+	}
+
+	if len(ukeys) == 0 {
+		return 0, nil
+	}
+
+	stampAt := s.GetBlockHeight()
+	if stampAt < keepFrom {
+		stampAt = keepFrom
+	}
+
+	if err := s.ensureSpendJournalPartition(ctx, stampAt); err != nil {
+		return 0, err
+	}
+
+	stmt := fmt.Sprintf(copyForwardSQL, fmt.Sprintf("spend_journal_%d", leaf))
+
+	var copied int64
+
+	for lo := 0; lo < len(ukeys); lo += copyForwardBatch {
+		hi := min(lo+copyForwardBatch, len(ukeys))
+
+		tag, err := s.pool.Exec(ctx, stmt, ukeys[lo:hi], parents[lo:hi], spenders[lo:hi],
+			int32(stampAt), int32(keepFrom)) //nolint:gosec // heights fit int32
+		if err != nil {
+			return copied, errors.NewStorageError("[utxoset] copy forward unmined spends from journal leaf %d", leaf, err)
+		}
+
+		copied += tag.RowsAffected()
+	}
+
+	if copied > 0 {
+		s.logger.Infof("[utxoset] carried %d spends of unmined transactions forward from journal leaf %d to height %d", copied, leaf, stampAt)
+	}
+
+	return copied, nil
 }
