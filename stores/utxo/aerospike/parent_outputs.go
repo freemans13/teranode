@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-batcher/v2/completion"
 	"github.com/bsv-blockchain/go-bt/v2"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -50,7 +51,12 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 		slotsByOutpoint[op] = append(slotsByOutpoint[op], i)
 	}
 
-	group := completion.NewGroup(int32(len(items)))
+	itemCount, err := safeconversion.IntToInt32(len(items))
+	if err != nil {
+		return nil, errors.NewProcessingError("too many outpoints in one call: %d", len(items), err)
+	}
+
+	group := completion.NewGroup(itemCount)
 
 	for _, item := range items {
 		item.group = group

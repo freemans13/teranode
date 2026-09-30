@@ -535,17 +535,18 @@ func SpendAndCreateMultiRepeatAtCutPoints(t *testing.T, db utxostore.Store) {
 		name  string
 		crash int // list index whose create never happens; -1 crashes before any write
 		split bool
+		seed  byte
 	}{
-		{"before the first write", -1, false},
-		{"level 0, between spend and create", 2, false},
-		{"level 2, between spend and create", 2*width + 3, false},
-		{"last level, between spend and create", (levels-1)*width + 4, true},
-		{"level 1, repeated as two lists", width + 1, true},
+		{"before the first write", -1, false, 0x60},
+		{"level 0, between spend and create", 2, false, 0x61},
+		{"level 2, between spend and create", 2*width + 3, false, 0x62},
+		{"last level, between spend and create", (levels-1)*width + 4, true, 0x63},
+		{"level 1, repeated as two lists", width + 1, true, 0x64},
 	}
 
-	for n, cut := range cuts {
+	for _, cut := range cuts {
 		t.Run(cut.name, func(t *testing.T) {
-			w := BuildMultiWorkload(t, byte(0x60+n), levels, width)
+			w := BuildMultiWorkload(t, cut.seed, levels, width)
 			w.StoreRoots(t, db, height-1)
 
 			runCtx, cancel := context.WithCancel(ctx)
