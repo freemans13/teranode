@@ -601,3 +601,38 @@ func markMined(t *testing.T, store utxo.Store, txs []*bt.Tx) {
 	_, err := store.SetMinedMulti(context.Background(), hashes, utxo.MinedBlockInfo{BlockID: 77, BlockHeight: batchedTestHeight, SubtreeIdx: 0})
 	require.NoError(t, err)
 }
+
+// faultyParentStore fails every parent-output read.
+type faultyParentStore struct {
+	*countingStore
+}
+
+func (f *faultyParentStore) ParentOutputsForValidation(_ context.Context, outpoints []utxo.Outpoint, _ ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	answers := make([]utxo.ParentOutput, len(outpoints))
+	for i := range answers {
+		answers[i] = utxo.ParentOutput{Err: errors.NewStorageError("timeout")}
+	}
+
+	return answers, nil
+}
+
+// A store fault while reading parents is retryable, never a verdict on the
+// block, and nothing is written.
+func TestProcessTransactionsBatched_StoreFaultIsRetryable(t *testing.T) {
+	f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+
+	roots := []*bt.Tx{storedRoot(t, f, 1, opTrue), storedRoot(t, f, 2, opTrue)}
+	txs := chainedTxs(t, roots, 3)
+
+	f.server.utxoStore = &faultyParentStore{countingStore: f.store}
+
+	checker, ok := f.server.batchChecker(blockchain.FSMStateCATCHINGBLOCKS, batchedTestHeight)
+	require.True(t, ok)
+
+	err := f.server.processTransactionsBatched(context.Background(), checker, txs, chainhash.Hash{}, batchedTestHeight, 0, 0, map[uint32]bool{})
+	require.ErrorIs(t, err, errors.ErrProcessing)
+	require.NotErrorIs(t, err, errors.ErrTxInvalid)
+	require.NotErrorIs(t, err, errors.ErrBlockInvalid)
+	require.Zero(t, f.store.multiCalls.Load())
+	requireAbsent(t, f, txs)
+}

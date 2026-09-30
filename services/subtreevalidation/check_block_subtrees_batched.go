@@ -19,8 +19,9 @@ import (
 )
 
 // parentOutputsChunkSize is how many outpoints the batch path asks the store for
-// in one ParentOutputsForValidation call.
-const parentOutputsChunkSize = 8192
+// in one ParentOutputsForValidation call. Small enough that the first answers,
+// and so the first script checks, come back early.
+const parentOutputsChunkSize = 1024
 
 // unconfirmedParentHeight mirrors the validator's sentinel for a parent the store
 // has no block recorded for. The validator substitutes the candidate height for
@@ -109,6 +110,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	}
 
 	// Pre-check, as the level path does: drop what is already validated.
+	start := time.Now()
 	txMetaSlice := make([]metaSliceItem, len(txHashes))
 
 	missed, err := u.processTxMetaUsingCache(ctx, txHashes, txMetaSlice, false)
@@ -122,6 +124,8 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 			return errors.NewProcessingError("[processTransactionsBatched] Failed to check txMeta store", err)
 		}
 	}
+
+	prometheusSubtreeValidationBatchStep.WithLabelValues("precheck").Observe(time.Since(start).Seconds())
 
 	if missed == 0 {
 		return nil
@@ -148,14 +152,6 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 		}
 	}
 
-	start := time.Now()
-
-	if err = u.resolveBatch(ctx, b, blockHeight); err != nil {
-		return err
-	}
-
-	prometheusSubtreeValidationBatchStep.WithLabelValues("resolve").Observe(time.Since(start).Seconds())
-
 	validatorOptions := validator.ProcessOptions(
 		validator.WithSkipPolicyChecks(true),
 		validator.WithInBlock(true),
@@ -171,13 +167,9 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 		return errors.NewProcessingError("[processTransactionsBatched] failed to pre-load MTP store: %v", err)
 	}
 
-	start = time.Now()
-
-	if err = u.checkBatch(ctx, checker, b, blockHeight, validatorOptions); err != nil {
+	if err = u.resolveAndCheckBatch(ctx, checker, b, blockHeight, validatorOptions); err != nil {
 		return err
 	}
-
-	prometheusSubtreeValidationBatchStep.WithLabelValues("check").Observe(time.Since(start).Seconds())
 
 	start = time.Now()
 
@@ -247,8 +239,144 @@ type storeInputRef struct {
 	tx, input int
 }
 
-// resolveBatch extends every input of every missing transaction (step 1).
-func (u *Server) resolveBatch(ctx context.Context, b *batchState, blockHeight uint32) error {
+// resolveAndCheckBatch extends every input of every missing transaction (step
+// 1) and checks each transaction on all cores (step 2), checking a transaction
+// as soon as its own inputs are filled in. A transaction whose parents are all
+// in the batch is checked straight away; the rest are checked as the store reads
+// covering their inputs come back. The script checks, which are CPU work, so run
+// while the parent reads wait on the store, as they overlap the store waits on
+// the per-transaction path.
+//
+// A consensus failure fails the block, as on the level path. A missing parent,
+// or a check that fails for any other reason, sends the transaction and its
+// descendants through the per-transaction path.
+func (u *Server) resolveAndCheckBatch(ctx context.Context, checker validator.BlockBatchChecker, b *batchState, blockHeight uint32, opts *validator.Options) error {
+	start := time.Now()
+
+	refs, outpoints, err := resolveFromMemory(b, blockHeight)
+	if err != nil {
+		return err
+	}
+
+	// pending[i] counts transaction i's inputs still waiting on the store. The
+	// goroutine that takes it to zero hands the transaction to the checkers.
+	pending := make([]atomic.Int32, len(b.txs))
+	for _, ref := range refs {
+		pending[ref.tx].Add(1)
+	}
+
+	// sentBack marks a transaction for the per-transaction path. Store-read
+	// goroutines and checkers set it concurrently; it is folded into b.fallback
+	// once both are done.
+	sentBack := make([]atomic.Bool, len(b.txs))
+
+	// A failed read stops the checkers; a failed check stops the reads through
+	// the errgroup's context. Whichever failed first is the error returned.
+	stageCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(stageCtx)
+
+	var readFailedFirst atomic.Bool
+
+	// Each transaction is sent at most once, so sends never block.
+	ready := make(chan int, len(b.missing))
+
+	for range runtime.GOMAXPROCS(0) {
+		g.Go(func() error {
+			for i := range ready {
+				if err := u.checkOne(gCtx, checker, b, i, blockHeight, opts, sentBack); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
+	}
+
+	for _, i := range b.missing {
+		if pending[i].Load() == 0 {
+			ready <- i
+		}
+	}
+
+	reads := errgroup.Group{}
+	reads.SetLimit(max(1, u.settings.BlockValidation.ProcessTxMetaUsingStoreConcurrency))
+
+	for chunkStart := 0; chunkStart < len(outpoints); chunkStart += parentOutputsChunkSize {
+		chunkEnd := min(chunkStart+parentOutputsChunkSize, len(outpoints))
+
+		reads.Go(func() error {
+			fail := func(err error) error {
+				if gCtx.Err() == nil {
+					readFailedFirst.Store(true)
+				}
+
+				cancel()
+
+				return err
+			}
+
+			answers, err := u.utxoStore.ParentOutputsForValidation(gCtx, outpoints[chunkStart:chunkEnd])
+			if err != nil {
+				return fail(errors.NewProcessingError("[processTransactionsBatched] failed to read parent outputs", err))
+			}
+
+			if len(answers) != chunkEnd-chunkStart {
+				return fail(errors.NewProcessingError("[processTransactionsBatched] store returned %d parent outputs for %d outpoints", len(answers), chunkEnd-chunkStart))
+			}
+
+			for n, answer := range answers {
+				ref := refs[chunkStart+n]
+				op := outpoints[chunkStart+n]
+
+				if err := applyParentOutput(b, ref, op, answer, sentBack); err != nil {
+					return fail(err)
+				}
+
+				if pending[ref.tx].Add(-1) == 0 {
+					ready <- ref.tx
+				}
+			}
+
+			return nil
+		})
+	}
+
+	readErr := reads.Wait()
+
+	prometheusSubtreeValidationBatchStep.WithLabelValues("resolve").Observe(time.Since(start).Seconds())
+
+	close(ready)
+
+	checkErr := g.Wait()
+
+	prometheusSubtreeValidationBatchStep.WithLabelValues("check").Observe(time.Since(start).Seconds())
+
+	switch {
+	case readErr != nil && (checkErr == nil || readFailedFirst.Load()):
+		return readErr
+	case checkErr != nil:
+		return errors.NewProcessingError("[processTransactionsBatched] failed to check transactions", checkErr)
+	case readErr != nil:
+		return readErr
+	}
+
+	for _, i := range b.missing {
+		if sentBack[i].Load() {
+			b.fallback[i] = true
+		}
+	}
+
+	b.markDescendantsFallback()
+
+	return nil
+}
+
+// resolveFromMemory clears every input's previous-output fields and fills each
+// one whose parent is in the batch. It returns the inputs left for the store,
+// in block order.
+func resolveFromMemory(b *batchState, blockHeight uint32) ([]storeInputRef, []utxo.Outpoint, error) {
 	spent := make(map[utxo.Outpoint]int)
 
 	var (
@@ -270,7 +398,7 @@ func (u *Server) resolveBatch(ctx context.Context, b *batchState, blockHeight ui
 			op := utxo.Outpoint{TxID: *in.PreviousTxIDChainHash(), Vout: in.PreviousTxOutIndex}
 
 			if first, dup := spent[op]; dup {
-				return errors.NewBlockInvalidError("[processTransactionsBatched] transactions %s and %s both spend %s:%d", b.hashes[first], b.hashes[i], op.TxID, op.Vout)
+				return nil, nil, errors.NewBlockInvalidError("[processTransactionsBatched] transactions %s and %s both spend %s:%d", b.hashes[first], b.hashes[i], op.TxID, op.Vout)
 			}
 
 			spent[op] = i
@@ -284,12 +412,12 @@ func (u *Server) resolveBatch(ctx context.Context, b *batchState, blockHeight ui
 			}
 
 			if p >= i {
-				return errors.NewBlockInvalidError("[processTransactionsBatched] transaction %s spends %s, which is not earlier in the block", b.hashes[i], op.TxID)
+				return nil, nil, errors.NewBlockInvalidError("[processTransactionsBatched] transaction %s spends %s, which is not earlier in the block", b.hashes[i], op.TxID)
 			}
 
 			parent := b.txs[p]
 			if int(op.Vout) >= len(parent.Outputs) || parent.Outputs[op.Vout] == nil {
-				return errors.NewTxInvalidError("[processTransactionsBatched] transaction %s spends output %d of %s, which has %d outputs", b.hashes[i], op.Vout, op.TxID, len(parent.Outputs))
+				return nil, nil, errors.NewTxInvalidError("[processTransactionsBatched] transaction %s spends output %d of %s, which has %d outputs", b.hashes[i], op.Vout, op.TxID, len(parent.Outputs))
 			}
 
 			in.PreviousTxSatoshis = parent.Outputs[op.Vout].Satoshis
@@ -304,219 +432,172 @@ func (u *Server) resolveBatch(ctx context.Context, b *batchState, blockHeight ui
 	prometheusSubtreeValidationBatchParentOutputs.WithLabelValues("memory").Add(float64(fromMem))
 	prometheusSubtreeValidationBatchParentOutputs.WithLabelValues("store").Add(float64(len(outpoints)))
 
-	// Read every other parent output from the store, in chunks.
-	answers := make([]utxo.ParentOutput, len(outpoints))
+	return refs, outpoints, nil
+}
 
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(max(1, u.settings.BlockValidation.ProcessTxMetaUsingStoreConcurrency))
+// applyParentOutput fills one input from the store's answer. Each input belongs
+// to exactly one read, so no two goroutines write the same slot.
+func applyParentOutput(b *batchState, ref storeInputRef, op utxo.Outpoint, answer utxo.ParentOutput, sentBack []atomic.Bool) error {
+	in := b.txs[ref.tx].Inputs[ref.input]
 
-	for chunkStart := 0; chunkStart < len(outpoints); chunkStart += parentOutputsChunkSize {
-		chunkEnd := min(chunkStart+parentOutputsChunkSize, len(outpoints))
-
-		g.Go(func() error {
-			chunkAnswers, err := u.utxoStore.ParentOutputsForValidation(gCtx, outpoints[chunkStart:chunkEnd])
-			if err != nil {
-				return errors.NewProcessingError("[processTransactionsBatched] failed to read parent outputs", err)
-			}
-
-			if len(chunkAnswers) != chunkEnd-chunkStart {
-				return errors.NewProcessingError("[processTransactionsBatched] store returned %d parent outputs for %d outpoints", len(chunkAnswers), chunkEnd-chunkStart)
-			}
-
-			copy(answers[chunkStart:chunkEnd], chunkAnswers)
-
-			return nil
-		})
+	switch {
+	case answer.Err != nil:
+		// A store fault is never a verdict on the block: retry the batch.
+		return errors.NewProcessingError("[processTransactionsBatched] failed to read parent output %s:%d", op.TxID, op.Vout, answer.Err)
+	case answer.Status == utxo.ParentOutputTxNotFound:
+		// The per-transaction path reports the missing parent and defers it, as
+		// today.
+		sentBack[ref.tx].Store(true)
+		return nil
+	case answer.Status == utxo.ParentOutputNoSuchIndex:
+		return errors.NewTxInvalidError("[processTransactionsBatched] transaction %s spends output %d of %s, which does not exist", b.hashes[ref.tx], op.Vout, op.TxID)
+	case answer.Status == utxo.ParentOutputMined:
+		b.heights[ref.tx][ref.input] = answer.Height
+	case answer.Status == utxo.ParentOutputNotMined:
+		b.heights[ref.tx][ref.input] = unconfirmedParentHeight
+	default:
+		return errors.NewProcessingError("[processTransactionsBatched] store gave no answer for parent output %s:%d", op.TxID, op.Vout)
 	}
 
-	if err := g.Wait(); err != nil {
-		return err
-	}
-
-	for n, answer := range answers {
-		ref := refs[n]
-		in := b.txs[ref.tx].Inputs[ref.input]
-
-		switch {
-		case answer.Err != nil:
-			// A store fault is never a verdict on the block: retry the batch.
-			return errors.NewProcessingError("[processTransactionsBatched] failed to read parent output %s:%d", outpoints[n].TxID, outpoints[n].Vout, answer.Err)
-		case answer.Status == utxo.ParentOutputTxNotFound:
-			// The per-transaction path reports the missing parent and defers it,
-			// as today.
-			b.fallback[ref.tx] = true
-			continue
-		case answer.Status == utxo.ParentOutputNoSuchIndex:
-			return errors.NewTxInvalidError("[processTransactionsBatched] transaction %s spends output %d of %s, which does not exist", b.hashes[ref.tx], outpoints[n].Vout, outpoints[n].TxID)
-		case answer.Status == utxo.ParentOutputMined:
-			b.heights[ref.tx][ref.input] = answer.Height
-		case answer.Status == utxo.ParentOutputNotMined:
-			b.heights[ref.tx][ref.input] = unconfirmedParentHeight
-		default:
-			return errors.NewProcessingError("[processTransactionsBatched] store gave no answer for parent output %s:%d", outpoints[n].TxID, outpoints[n].Vout)
-		}
-
-		in.PreviousTxSatoshis = answer.Satoshis
-		in.PreviousTxScript = answer.LockingScript
-	}
-
-	b.markDescendantsFallback()
+	in.PreviousTxSatoshis = answer.Satoshis
+	in.PreviousTxScript = answer.LockingScript
 
 	return nil
 }
 
-// checkBatch checks every resolved transaction on all cores (step 2). A
-// consensus failure fails the block, as on the level path; any other failure
-// sends the transaction through the per-transaction path.
-func (u *Server) checkBatch(ctx context.Context, checker validator.BlockBatchChecker, b *batchState, blockHeight uint32, opts *validator.Options) error {
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(runtime.GOMAXPROCS(0))
-
-	var sentBack atomic.Int64
-
-	for _, i := range b.missing {
-		if b.fallback[i] {
-			continue
-		}
-
-		g.Go(func() error {
-			err := checker.CheckExtendedTransaction(gCtx, b.txs[i], blockHeight, b.heights[i], opts)
-			if err == nil {
-				return nil
-			}
-
-			if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
-				u.logger.Warnf("[processTransactionsBatched] Invalid transaction detected: %s: %v", b.hashes[i], err)
-				return err
-			}
-
-			if gCtx.Err() != nil {
-				return gCtx.Err()
-			}
-
-			// Each goroutine writes only its own slot.
-			b.fallback[i] = true
-			sentBack.Add(1)
-
-			return nil
-		})
+// checkOne checks one fully resolved transaction.
+func (u *Server) checkOne(ctx context.Context, checker validator.BlockBatchChecker, b *batchState, i int, blockHeight uint32, opts *validator.Options, sentBack []atomic.Bool) error {
+	if sentBack[i].Load() {
+		return nil
 	}
 
-	if err := g.Wait(); err != nil {
-		return errors.NewProcessingError("[processTransactionsBatched] failed to check transactions", err)
+	err := checker.CheckExtendedTransaction(ctx, b.txs[i], blockHeight, b.heights[i], opts)
+	if err == nil {
+		return nil
 	}
 
-	if sentBack.Load() > 0 {
-		b.markDescendantsFallback()
+	if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
+		u.logger.Warnf("[processTransactionsBatched] Invalid transaction detected: %s: %v", b.hashes[i], err)
+		return err
 	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	sentBack[i].Store(true)
 
 	return nil
 }
 
 // writeBatch writes the checked transactions with SpendAndCreateMulti, in block
-// order, in lists bounded by subtreevalidation_spendAndCreateMultiMaxTxs and
-// ..MaxBytes (step 3). Created records have their txmeta published, as the
-// validator publishes them; every other outcome falls back.
+// order, one list at a time, each capped by
+// subtreevalidation_spendAndCreateMultiMaxTxs (step 3). The default cap covers a
+// whole load batch, so a batch is normally one list, and the store writes each
+// dependency level exactly as wide as subtree validation writes it today.
+// Created records have their txmeta published, as the validator publishes them;
+// every other outcome falls back.
 func (u *Server) writeBatch(ctx context.Context, checker validator.BlockBatchChecker, b *batchState, blockHeight uint32) error {
 	maxTxs := max(1, u.settings.SubtreeValidation.SpendAndCreateMultiMaxTxs)
-	maxBytes := u.settings.SubtreeValidation.SpendAndCreateMultiMaxBytes
 
-	var (
-		list      []int
-		listBytes int
-	)
-
-	flush := func() error {
-		if len(list) == 0 {
-			return nil
-		}
-
-		txs := make([]*bt.Tx, len(list))
-		txids := make([]chainhash.Hash, len(list))
-
-		for n, i := range list {
-			txs[n] = b.txs[i]
-			txids[n] = b.hashes[i]
-		}
-
-		prometheusSubtreeValidationBatchLists.Inc()
-
-		results, err := u.utxoStore.SpendAndCreateMulti(ctx, txs, blockHeight, utxo.WithTXIDs(txids), utxo.WithIgnoreLocked(true))
-
-		switch {
-		case utxo.IsSpendAndCreateMultiRefused(err):
-			// The caller already checked what the store refuses, so this is a bug
-			// here. Nothing was written; send the list through today's path.
-			u.logger.Errorf("[processTransactionsBatched] store refused a list of %d transactions, sending them through the per-transaction path: %v", len(list), err)
-
-			for _, i := range list {
-				b.fallback[i] = true
-			}
-		case err != nil:
-			// Retrying the batch is safe: existing records are recognised one by one.
-			return errors.NewProcessingError("[processTransactionsBatched] SpendAndCreateMulti failed", err)
-		case len(results) != len(list):
-			return errors.NewProcessingError("[processTransactionsBatched] SpendAndCreateMulti returned %d results for %d transactions", len(results), len(list))
-		default:
-			created := 0
-
-			for n, r := range results {
-				if r.Status == utxo.MultiTxCreated {
-					created++
-
-					checker.PublishTxMeta(r.Meta, &txids[n], true)
-
-					continue
-				}
-
-				// Existed, failed or parent failed: today's path decides, including
-				// the already-mined-on-our-chain and conflicting checks.
-				b.fallback[list[n]] = true
-			}
-
-			prometheusSubtreeValidationBatchTxs.WithLabelValues("created").Add(float64(created))
-		}
-
-		list = list[:0]
-		listBytes = 0
-
-		return nil
-	}
+	list := make([]int, 0, min(maxTxs, len(b.missing)))
 
 	for _, i := range b.missing {
 		if b.fallback[i] {
 			continue
 		}
 
-		// A parent written in an earlier list that did not end up created sends
-		// its children back too; parents in the current list are the store's to
-		// handle (MultiTxParentFailed).
-		parentFellBack := false
+		if len(list) >= maxTxs {
+			if err := u.writeList(ctx, checker, b, list, blockHeight); err != nil {
+				return err
+			}
 
+			list = list[:0]
+		}
+
+		list = append(list, i)
+	}
+
+	if len(list) == 0 {
+		return nil
+	}
+
+	return u.writeList(ctx, checker, b, list, blockHeight)
+}
+
+// writeList writes one list. Every earlier list has finished, so their outcomes
+// are settled: a transaction whose parent did not end up created is sent back
+// with it, and parents in this list are the store's to handle
+// (MultiTxParentFailed).
+func (u *Server) writeList(ctx context.Context, checker validator.BlockBatchChecker, b *batchState, members []int, blockHeight uint32) error {
+	list := make([]int, 0, len(members))
+
+	for _, i := range members {
 		for _, p := range b.parents[i] {
 			if b.fallback[p] {
-				parentFellBack = true
+				b.fallback[i] = true
 				break
 			}
 		}
 
-		if parentFellBack {
+		if !b.fallback[i] {
+			list = append(list, i)
+		}
+	}
+
+	if len(list) == 0 {
+		return nil
+	}
+
+	txs := make([]*bt.Tx, len(list))
+	txids := make([]chainhash.Hash, len(list))
+
+	for n, i := range list {
+		txs[n] = b.txs[i]
+		txids[n] = b.hashes[i]
+	}
+
+	prometheusSubtreeValidationBatchLists.Inc()
+
+	results, err := u.utxoStore.SpendAndCreateMulti(ctx, txs, blockHeight, utxo.WithTXIDs(txids), utxo.WithIgnoreLocked(true))
+
+	switch {
+	case utxo.IsSpendAndCreateMultiRefused(err):
+		// The caller already checked what the store refuses, so this is a bug
+		// here. Nothing was written; send the list through today's path.
+		u.logger.Errorf("[processTransactionsBatched] store refused a list of %d transactions, sending them through the per-transaction path: %v", len(list), err)
+
+		for _, i := range list {
 			b.fallback[i] = true
+		}
+
+		return nil
+	case err != nil:
+		// Retrying the batch is safe: existing records are recognised one by one.
+		return errors.NewProcessingError("[processTransactionsBatched] SpendAndCreateMulti failed", err)
+	case len(results) != len(list):
+		return errors.NewProcessingError("[processTransactionsBatched] SpendAndCreateMulti returned %d results for %d transactions", len(results), len(list))
+	}
+
+	created := 0
+
+	for n, r := range results {
+		if r.Status == utxo.MultiTxCreated {
+			created++
+
+			checker.PublishTxMeta(r.Meta, &txids[n], true)
+
 			continue
 		}
 
-		size := b.txs[i].Size()
-		if len(list) > 0 && (len(list) >= maxTxs || (maxBytes > 0 && listBytes+size > maxBytes)) {
-			if err := flush(); err != nil {
-				return err
-			}
-		}
-
-		list = append(list, i)
-		listBytes += size
+		// Existed, failed or parent failed: today's path decides, including the
+		// already-mined-on-our-chain and conflicting checks.
+		b.fallback[list[n]] = true
 	}
 
-	return flush()
+	prometheusSubtreeValidationBatchTxs.WithLabelValues("created").Add(float64(created))
+
+	return nil
 }
 
 func appendUniqueInt(s []int, v int) []int {
