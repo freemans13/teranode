@@ -161,7 +161,6 @@ func TestDefaultSpendAndCreateMulti_Refusals(t *testing.T) {
 			require.True(t, IsSpendAndCreateMultiRefused(err), "want a refusal, got %v", err)
 			require.Nil(t, results)
 			require.Empty(t, store.calls, "nothing may be written on a refusal")
-			require.Zero(t, store.decorations, "a refusal happens before the existence check")
 		})
 	}
 }
@@ -172,7 +171,6 @@ func TestDefaultSpendAndCreateMulti_EmptyList(t *testing.T) {
 	results, err := DefaultSpendAndCreateMulti(context.Background(), store, 8, nil, 100)
 	require.NoError(t, err)
 	require.Empty(t, results)
-	require.Zero(t, store.decorations)
 }
 
 // Test 13 of the design: levels run in parallel and in order. Every call of a
@@ -324,46 +322,32 @@ func TestDefaultSpendAndCreateMulti_ResultMapping(t *testing.T) {
 	require.False(t, called)
 }
 
-// A record that already exists is reported Existed and never written, and its
-// children in the list are written after it as if it were an outside parent. A
-// record still marked creating goes through SpendAndCreate, which owns its
-// recovery.
-func TestDefaultSpendAndCreateMulti_ExistenceCheck(t *testing.T) {
+// The default makes no read of its own. A transaction whose record already
+// exists comes back from SpendAndCreate as ErrTxExists and is reported Existed,
+// and its children in the list are still written, after it.
+func TestDefaultSpendAndCreateMulti_ExistingRecord(t *testing.T) {
 	ctx := context.Background()
 
 	existing := multiTx(t, 1, 1, outsideOutpoint(1))
 	child := multiTx(t, 2, 1, outOf(existing, 0))
-	creating := multiTx(t, 3, 1, outsideOutpoint(2))
-	fresh := multiTx(t, 4, 1, outsideOutpoint(3))
 
-	store := &multiFakeStore{existing: map[chainhash.Hash]*meta.Data{
-		*existing.TxIDChainHash(): {},
-		*creating.TxIDChainHash(): {Creating: true},
-	}}
+	store := &multiFakeStore{
+		failWith: map[chainhash.Hash]error{*existing.TxIDChainHash(): errors.NewTxExistsError("exists")},
+		spendsOn: map[chainhash.Hash][]*Spend{*existing.TxIDChainHash(): {{TxID: existing.TxIDChainHash()}}},
+	}
 
-	results, err := DefaultSpendAndCreateMulti(ctx, store, 4, []*bt.Tx{existing, child, creating, fresh}, 100)
+	results, err := DefaultSpendAndCreateMulti(ctx, store, 4, []*bt.Tx{existing, child}, 100)
 	require.NoError(t, err)
 
 	require.Equal(t, MultiTxExisted, results[0].Status)
+	require.NoError(t, results[0].Err)
+	require.NotNil(t, results[0].Spends, "the spends stay in place, as SpendAndCreate leaves them")
 	require.Equal(t, MultiTxCreated, results[1].Status)
-	require.Equal(t, MultiTxCreated, results[2].Status)
-	require.Equal(t, MultiTxCreated, results[3].Status)
+	require.Zero(t, store.decorations, "the default makes no read of its own")
 
-	_, called := store.callFor(*existing.TxIDChainHash())
-	require.False(t, called, "nothing is written to an existing record")
-
-	require.Equal(t, 1, store.decorations, "one existence check per list")
-	require.Equal(t, []fields.FieldName{fields.Creating}, store.decorFields[0])
-}
-
-func TestDefaultSpendAndCreateMulti_ExistenceCheckFailureWritesNothing(t *testing.T) {
-	store := &multiFakeStore{decorErr: errors.NewStorageError("down")}
-
-	results, err := DefaultSpendAndCreateMulti(context.Background(), store, 4, []*bt.Tx{multiTx(t, 1, 1, outsideOutpoint(1))}, 100)
-	require.Error(t, err)
-	require.False(t, IsSpendAndCreateMultiRefused(err), "a store fault is retryable, not a refusal")
-	require.Nil(t, results)
-	require.Empty(t, store.calls)
+	e, _ := store.callFor(*existing.TxIDChainHash())
+	c, _ := store.callFor(*child.TxIDChainHash())
+	require.False(t, c.start.Before(e.end), "the child is written after its existing parent")
 }
 
 // Options apply to every transaction exactly as SpendAndCreate applies them, and

@@ -7,7 +7,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
-	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"golang.org/x/sync/errgroup"
 )
@@ -95,7 +94,6 @@ func SpendAndCreateMultiConcurrency(tSettings *settings.Settings) int {
 // DefaultSpendAndCreateMulti needs.
 type SpendAndCreateMultiStore interface {
 	SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...CreateOption) (*meta.Data, []*Spend, error)
-	BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*UnresolvedMetaData, fields ...fields.FieldName) error
 }
 
 // DefaultSpendAndCreateMulti implements the Store.SpendAndCreateMulti contract by
@@ -111,19 +109,22 @@ type SpendAndCreateMultiStore interface {
 //     transaction, spends one outpoint twice, names an output index past the end
 //     of a parent in the list, holds a transaction twice or a coinbase, or passes
 //     WithTXID, WithSetCoinbase or a WithTXIDs of the wrong length;
-//  2. checks which transactions already have a record, in one BatchDecorate. A
-//     record that exists is MultiTxExisted and is never written; one still marked
-//     creating goes through SpendAndCreate, which owns its recovery;
-//  3. assigns each remaining transaction a level, treating existing records as
-//     outside parents;
-//  4. writes level by level, skipping (MultiTxParentFailed) any transaction whose
+//  2. assigns each transaction a level in memory;
+//  3. writes level by level, skipping (MultiTxParentFailed) any transaction whose
 //     parent in the list failed.
 //
-// The returned error is non-nil when nothing was written (a refusal or a failed
-// existence check), or when ctx was cancelled between levels; in that case the
-// results are returned too and transactions never reached are
-// MultiTxNotAttempted. A repeat of the same list is safe: records that exist are
-// recognised one by one.
+// It makes no read of its own. As on the per-transaction path, the caller drops
+// transactions that already have a record before calling, and a record that
+// appears afterwards (propagation, a sibling block) comes back from
+// SpendAndCreate as ErrTxExists with its spends in place and is reported
+// MultiTxExisted. A repeat after a crash is safe for the same reasons it is on
+// that path: a spend repeated by the same spender is accepted as the same
+// spend, and SpendAndCreate spends before it creates, so a record that exists
+// has made its spends.
+//
+// The returned error is non-nil when nothing was written (a refusal), or when
+// ctx was cancelled between levels; in that case the results are returned too
+// and transactions never reached are MultiTxNotAttempted.
 func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore, concurrency int, txs []*bt.Tx,
 	blockHeight uint32, opts ...CreateOption) ([]SpendAndCreateMultiResult, error) {
 	options, err := ParseCreateOptions(opts...)
@@ -163,42 +164,13 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 
 	results := make([]SpendAndCreateMultiResult, len(txs))
 
-	// Existence check. Skipped for WithSpendOnly, which creates no record.
-	if !options.SpendOnly {
-		items := make([]*UnresolvedMetaData, len(txs))
-		for i := range txs {
-			items[i] = &UnresolvedMetaData{Hash: txids[i], Idx: i}
-		}
-
-		if err := s.BatchDecorate(ctx, items, fields.Creating); err != nil {
-			return nil, errors.NewProcessingError("SpendAndCreateMulti: existence check failed", err)
-		}
-
-		for i, item := range items {
-			switch {
-			case item.Err == nil && item.Data != nil && !item.Data.Creating:
-				results[i].Status = MultiTxExisted
-			case item.Err == nil || errors.Is(item.Err, errors.ErrTxNotFound):
-				// No record, or one still being created: SpendAndCreate handles it.
-			default:
-				return nil, errors.NewProcessingError("SpendAndCreateMulti: existence check failed for %s", txids[i], item.Err)
-			}
-		}
-	}
-
 	// Levels. Parents come before children, so one pass suffices.
 	level := make([]int, len(txs))
 	maxLevel := 0
 
 	for i := range txs {
-		if results[i].Status == MultiTxExisted {
-			continue
-		}
-
 		for _, p := range parentsInList[i] {
-			if results[p].Status != MultiTxExisted && level[p]+1 > level[i] {
-				level[i] = level[p] + 1
-			}
+			level[i] = max(level[i], level[p]+1)
 		}
 
 		maxLevel = max(maxLevel, level[i])
@@ -207,9 +179,7 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 	byLevel := make([][]int, maxLevel+1)
 
 	for i := range txs {
-		if results[i].Status != MultiTxExisted {
-			byLevel[level[i]] = append(byLevel[level[i]], i)
-		}
+		byLevel[level[i]] = append(byLevel[level[i]], i)
 	}
 
 	if concurrency < 1 {
@@ -245,8 +215,8 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 				case err == nil:
 					results[i] = SpendAndCreateMultiResult{Status: MultiTxCreated, Meta: md, Spends: spends}
 				case errors.Is(err, errors.ErrTxExists):
-					// A record appeared after the existence check (propagation, a
-					// sibling block). SpendAndCreate leaves the spends in place.
+					// The record already exists (propagation, a sibling block, or
+					// an earlier attempt). SpendAndCreate leaves the spends in place.
 					results[i] = SpendAndCreateMultiResult{Status: MultiTxExisted, Spends: spends}
 				default:
 					results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Spends: spends, Err: err}

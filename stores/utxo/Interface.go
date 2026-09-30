@@ -520,10 +520,13 @@ type Store interface {
 	// It returns one result per transaction, in list order. The call is not
 	// atomic across the list: each transaction succeeds or fails on its own, a
 	// failed transaction's descendants in the list are not written
-	// (MultiTxParentFailed), and a transaction whose record already exists is
-	// reported MultiTxExisted and not written. A repeat after a crash is safe,
-	// because existing records are recognised one by one and SpendAndCreate
-	// spends before it creates, so a record that exists has made its spends.
+	// (MultiTxParentFailed), and a transaction whose create finds its record
+	// already there (ErrTxExists) is reported MultiTxExisted. Callers drop
+	// transactions that already have a record before calling, as the
+	// per-transaction block path does. A repeat after a crash is safe for the
+	// same reasons it is there: a spend repeated by the same spender is accepted
+	// as the same spend, and SpendAndCreate spends before it creates, so a
+	// record that exists has made its spends.
 	//
 	// A list that breaks the caller's guarantees (a transaction spending a later
 	// one or an outpoint spent twice, an output index past the end of a parent

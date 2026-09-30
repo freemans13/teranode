@@ -510,7 +510,7 @@ func (c *crashAfterSpendStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, h 
 }
 
 // SpendAndCreateMultiRepeatAtCutPoints is design test 2. It interrupts a list
-// after the existence check and between a transaction's spend and its create at
+// before the first write and between a transaction's spend and its create at
 // several levels, then repeats the way the caller really does: the pre-check
 // drops every transaction whose record exists, and the rest are sent again, once
 // as one list and once cut in two. The final records must match a clean run, and
@@ -536,7 +536,7 @@ func SpendAndCreateMultiRepeatAtCutPoints(t *testing.T, db utxostore.Store) {
 		crash int // list index whose create never happens; -1 crashes before any write
 		split bool
 	}{
-		{"after the existence check", -1, false},
+		{"before the first write", -1, false},
 		{"level 0, between spend and create", 2, false},
 		{"level 2, between spend and create", 2*width + 3, false},
 		{"last level, between spend and create", (levels-1)*width + 4, true},
