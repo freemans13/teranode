@@ -979,6 +979,12 @@ func (t *TxMetaCache) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) er
 	return t.utxoStore.PreviousOutputsDecorate(ctx, tx)
 }
 
+// ParentOutputsForValidation delegates to the underlying store. Parent outputs
+// are not cached here: the txmeta cache holds no outputs.
+func (t *TxMetaCache) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, opts ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	return t.utxoStore.ParentOutputsForValidation(ctx, outpoints, opts...)
+}
+
 // BatchPreviousOutputsDecorate fetches previous output information for inputs across
 // multiple transactions in bulk, delegating to the underlying store.
 func (t *TxMetaCache) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {

@@ -267,6 +267,17 @@ func (m *MockUtxostore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) 
 	return args.Error(0)
 }
 
+// ParentOutputsForValidation mocks the read of parent outputs for validation.
+func (m *MockUtxostore) ParentOutputsForValidation(ctx context.Context, outpoints []Outpoint, opts ...ParentOutputOption) ([]ParentOutput, error) {
+	args := m.Called(ctx, outpoints)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]ParentOutput), args.Error(1)
+}
+
 // BatchPreviousOutputsDecorate mocks batch decoration of transaction inputs with previous output data.
 func (m *MockUtxostore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
 	args := m.Called(ctx, txs)

@@ -184,6 +184,15 @@ func (m *MockStore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) erro
 	return args.Error(0)
 }
 
+func (m *MockStore) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, opts ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	args := m.Called(ctx, outpoints)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]utxo.ParentOutput), args.Error(1)
+}
+
 func (m *MockStore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
 	args := m.Called(ctx, txs)
 	return args.Error(0)
@@ -1085,4 +1094,18 @@ func TestInterfaceCompliance(t *testing.T) {
 	loggerStore, ok := store.(*Store)
 	require.True(t, ok)
 	require.NotNil(t, loggerStore)
+}
+
+func TestParentOutputsForValidation_Forwards(t *testing.T) {
+	inner := &MockStore{}
+	s := New(context.Background(), ulogger.TestLogger{}, inner)
+
+	outpoints := []utxo.Outpoint{{TxID: chainhash.Hash{0x01}, Vout: 3}}
+	want := []utxo.ParentOutput{{Status: utxo.ParentOutputMined, Satoshis: 5, Height: 9}}
+	inner.On("ParentOutputsForValidation", mock.Anything, outpoints).Return(want, nil).Once()
+
+	got, err := s.ParentOutputsForValidation(context.Background(), outpoints)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+	inner.AssertExpectations(t)
 }

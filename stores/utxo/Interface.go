@@ -36,6 +36,7 @@ import (
 	"sort"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -355,6 +356,51 @@ func WithSpendOnly() CreateOption {
 	}
 }
 
+// Outpoint names one output of one transaction.
+type Outpoint struct {
+	TxID chainhash.Hash
+	Vout uint32
+}
+
+// ParentOutputStatus says what ParentOutputsForValidation found for one outpoint.
+type ParentOutputStatus uint8
+
+const (
+	// ParentOutputUnknown is the zero value and never a valid answer: a slot left
+	// at it must carry an Err.
+	ParentOutputUnknown ParentOutputStatus = iota
+	// ParentOutputMined means Satoshis, LockingScript and Height are set.
+	ParentOutputMined
+	// ParentOutputNotMined means Satoshis and LockingScript are set, and the store
+	// has no block recorded for the parent at all. Height is not set.
+	ParentOutputNotMined
+	// ParentOutputTxNotFound means the store looked and holds no such transaction.
+	// It is never used for a transient fault; those come back as Err.
+	ParentOutputTxNotFound
+	// ParentOutputNoSuchIndex means the store holds the parent and its output list
+	// proves there is no spendable output at Vout. Callers treat it as an invalid
+	// spend.
+	ParentOutputNoSuchIndex
+)
+
+// ParentOutput is ParentOutputsForValidation's answer for one outpoint.
+type ParentOutput struct {
+	Status        ParentOutputStatus
+	Satoshis      uint64
+	LockingScript *bscript.Script
+	// Height is the creation height, valid only when Status is ParentOutputMined.
+	Height uint32
+	// Err is set when this outpoint could not be answered; Status is then Unknown.
+	Err error
+}
+
+// ParentOutputOptions holds the options of ParentOutputsForValidation. It has no
+// fields yet; the parameter naming the chain being validated will arrive here.
+type ParentOutputOptions struct{}
+
+// ParentOutputOption configures a ParentOutputsForValidation call.
+type ParentOutputOption func(*ParentOutputOptions)
+
 type MinedBlockInfo struct {
 	BlockID        uint32
 	BlockHeight    uint32
@@ -508,6 +554,27 @@ type Store interface {
 
 	// PreviousOutputsDecorate fetches information about transaction inputs' previous outputs.
 	PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error
+
+	// ParentOutputsForValidation returns, for each outpoint, the output's value and
+	// locking script and the height of the block that created it. It is read-only:
+	// it never modifies its argument or any transaction, and callers assign the
+	// values they need themselves.
+	//
+	// The result has one entry per outpoint, in the same order; duplicate outpoints
+	// get identical answers. Answers come only from the parent's own stored outputs,
+	// never from a child's stored copy of an input. The returned error covers the
+	// whole call only (a cancelled context, a store unreachable before any work);
+	// anything that affects some outpoints goes in that entry's Err.
+	//
+	// Height is the lowest height among the blocks recorded for the parent. The
+	// contract is the height on the chain being validated, but nothing tells the
+	// store which chain that is yet, so a parent recorded in two forks reports the
+	// lower of the two. That is harmless while every era activation height sits
+	// below the network's highest checkpoint.
+	//
+	// Parent flags (frozen, conflicting, locked, creating, spendable-in, coinbase
+	// maturity) are not reported: the spend checks them.
+	ParentOutputsForValidation(ctx context.Context, outpoints []Outpoint, opts ...ParentOutputOption) ([]ParentOutput, error)
 
 	// BatchPreviousOutputsDecorate fetches previous output information for inputs across
 	// multiple transactions in bulk. This is more efficient than calling PreviousOutputsDecorate
