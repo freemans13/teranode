@@ -165,6 +165,11 @@ func (m *NullStore) ParentOutputsForValidation(_ context.Context, outpoints []ut
 	return answers, nil
 }
 
+// SpendAndCreateMulti writes the list through DefaultSpendAndCreateMulti.
+func (m *NullStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	return utxo.DefaultSpendAndCreateMulti(ctx, m, 1, txs, blockHeight, opts...)
+}
+
 func (m *NullStore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
 	for _, tx := range txs {
 		if err := m.PreviousOutputsDecorate(ctx, tx); err != nil {

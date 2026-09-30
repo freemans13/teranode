@@ -267,6 +267,17 @@ func (m *MockUtxostore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) 
 	return args.Error(0)
 }
 
+// SpendAndCreateMulti mocks the list form of SpendAndCreate.
+func (m *MockUtxostore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...CreateOption) ([]SpendAndCreateMultiResult, error) {
+	args := m.Called(ctx, txs, blockHeight, opts)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]SpendAndCreateMultiResult), args.Error(1)
+}
+
 // ParentOutputsForValidation mocks the read of parent outputs for validation.
 func (m *MockUtxostore) ParentOutputsForValidation(ctx context.Context, outpoints []Outpoint, opts ...ParentOutputOption) ([]ParentOutput, error) {
 	args := m.Called(ctx, outpoints)

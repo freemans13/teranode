@@ -243,6 +243,7 @@ type CreateOption func(*CreateOptions)
 type CreateOptions struct {
 	MinedBlockInfos    []MinedBlockInfo
 	TxID               *chainhash.Hash
+	TxIDs              []chainhash.Hash // SpendAndCreateMulti only: one txid per transaction of the list
 	IsCoinbase         *bool
 	Frozen             bool
 	Conflicting        bool
@@ -271,6 +272,15 @@ func WithMinedBlockInfo(minedBlockInfos ...MinedBlockInfo) CreateOption {
 func WithTXID(txID *chainhash.Hash) CreateOption {
 	return func(o *CreateOptions) {
 		o.TxID = txID
+	}
+}
+
+// WithTXIDs supplies the txids of a SpendAndCreateMulti list, in the same order,
+// so the store does not rehash each transaction. It is the list form of WithTXID
+// and has no effect on SpendAndCreate.
+func WithTXIDs(txIDs []chainhash.Hash) CreateOption {
+	return func(o *CreateOptions) {
+		o.TxIDs = txIDs
 	}
 }
 
@@ -498,6 +508,29 @@ type Store interface {
 	//     WithCreateOnly(); backend behaviour for a default-mode spend of a
 	//     zero-input tx is undefined.
 	SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...CreateOption) (*meta.Data, []*Spend, error)
+
+	// SpendAndCreateMulti is SpendAndCreate for an ordered list of transactions,
+	// parents before children, that have already passed every consensus and
+	// script check. It spends every input and creates every record, applying
+	// opts to every transaction exactly as SpendAndCreate applies them to one;
+	// with no WithMinedBlockInfo each record is created unmined. WithTXID and
+	// WithSetCoinbase describe one transaction and are refused; WithTXIDs is the
+	// list form of WithTXID.
+	//
+	// It returns one result per transaction, in list order. The call is not
+	// atomic across the list: each transaction succeeds or fails on its own, a
+	// failed transaction's descendants in the list are not written
+	// (MultiTxParentFailed), and a transaction whose record already exists is
+	// reported MultiTxExisted and not written. A repeat after a crash is safe,
+	// because existing records are recognised one by one and SpendAndCreate
+	// spends before it creates, so a record that exists has made its spends.
+	//
+	// A list that breaks the caller's guarantees (a transaction spending a later
+	// one or an outpoint spent twice, an output index past the end of a parent
+	// in the list, a coinbase) is refused with nothing written; see
+	// IsSpendAndCreateMultiRefused. Stores without a faster implementation
+	// delegate to DefaultSpendAndCreateMulti.
+	SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...CreateOption) ([]SpendAndCreateMultiResult, error)
 
 	// Unspend reverses a previous spend operation, marking UTXOs as unspent.
 	// This is used during blockchain reorganizations.
