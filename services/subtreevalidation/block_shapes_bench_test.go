@@ -34,6 +34,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/bsv-blockchain/teranode/util/test"
 	aeroTest "github.com/bsv-blockchain/testcontainers-aerospike-go"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -518,6 +519,52 @@ func createConcurrently(b *testing.B, n int, create func(i int) error) {
 	require.NoError(b, g.Wait())
 }
 
+// histogramSum returns the sum of every sample of a Prometheus histogram in the
+// default registry, zero when it has none yet.
+func histogramSum(b *testing.B, name string) float64 {
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(b, err)
+
+	sum := 0.0
+
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+
+		for _, m := range mf.GetMetric() {
+			sum += m.GetHistogram().GetSampleSum()
+		}
+	}
+
+	return sum
+}
+
+// labeledHistogramSum is histogramSum restricted to samples whose label has the
+// given value.
+func labeledHistogramSum(b *testing.B, name, label, value string) float64 {
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(b, err)
+
+	sum := 0.0
+
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == label && l.GetValue() == value {
+					sum += m.GetHistogram().GetSampleSum()
+				}
+			}
+		}
+	}
+
+	return sum
+}
+
 func cpuTime() time.Duration {
 	var ru syscall.Rusage
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
@@ -536,6 +583,14 @@ func runBlockShape(b *testing.B, storeName string, shape blockShape) {
 		totalGCs  uint32
 		// totalPause is stop-the-world GC pause time inside the timed part.
 		totalPause time.Duration
+		// The timed part split: CheckBlockSubtrees, the ValidateSubtreeInternal
+		// pass inside it, and the record-mined write after it.
+		totalCheckBlock time.Duration
+		totalSecondPass float64
+		totalMinedWrite time.Duration
+		// stepSums is time per step of the batch path; it stays zero on code
+		// that has no batch path.
+		stepSums = map[string]float64{}
 	)
 
 	b.StopTimer()
@@ -561,14 +616,29 @@ func runBlockShape(b *testing.B, storeName string, shape blockShape) {
 
 		b.StartTimer()
 
+		secondPassBefore := histogramSum(b, "teranode_subtreevalidation_validate_subtree")
+
+		for _, step := range []string{"precheck", "resolve", "check", "write", "fallback"} {
+			stepSums[step] -= labeledHistogramSum(b, "teranode_subtreevalidation_batch_step", "step", step)
+		}
+
 		_, err = node.server.CheckBlockSubtrees(ctx, &subtreevalidation_api.CheckBlockSubtreesRequest{Block: blockBytes, BaseUrl: "legacy"})
 		require.NoError(b, err)
+
+		checkBlockDone := time.Now()
+
+		for _, step := range []string{"precheck", "resolve", "check", "write", "fallback"} {
+			stepSums[step] += labeledHistogramSum(b, "teranode_subtreevalidation_batch_step", "step", step)
+		}
+		totalCheckBlock += checkBlockDone.Sub(start)
+		totalSecondPass += histogramSum(b, "teranode_subtreevalidation_validate_subtree") - secondPassBefore
 
 		_, err = node.store.SetMinedMulti(ctx, hashes, utxo.MinedBlockInfo{BlockID: 5000 + benchSeed, BlockHeight: benchHeight, SubtreeIdx: 0})
 		require.NoError(b, err)
 
 		b.StopTimer()
 
+		totalMinedWrite += time.Since(checkBlockDone)
 		totalWall += time.Since(start)
 		totalCPU += cpuTime() - cpuStart
 		totalTxs += len(txs)
@@ -585,4 +655,11 @@ func runBlockShape(b *testing.B, storeName string, shape blockShape) {
 	b.ReportMetric(float64(totalTxs)/float64(b.N), "txs/block")
 	b.ReportMetric(float64(totalGCs)/float64(b.N), "gcs/block")
 	b.ReportMetric(float64(totalPause.Microseconds())/float64(b.N), "gcpause_us/block")
+	b.ReportMetric(totalCheckBlock.Seconds()/float64(b.N), "checkblock_s/block")
+	b.ReportMetric(totalSecondPass/float64(b.N), "secondpass_s/block")
+	b.ReportMetric(totalMinedWrite.Seconds()/float64(b.N), "minedwrite_s/block")
+
+	for step, sum := range stepSums {
+		b.ReportMetric(sum/float64(b.N), "batch_"+step+"_s/block")
+	}
 }
