@@ -454,7 +454,8 @@ func TestPadUTXOs(t *testing.T) {
 		Value: uint64(11),
 	}
 
-	padded := PadUTXOsWithNil(utxos)
+	padded, err := PadUTXOsWithNil(utxos)
+	require.NoError(t, err)
 
 	assert.Equal(t, 12, len(padded))
 

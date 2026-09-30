@@ -139,7 +139,7 @@ pruner_grpcListenAddress.docker.host = localhost:${PORT_PREFIX}${PRUNER_GRPC_POR
 
 **Description**: Skip pruning during blockchain catchup
 
-When enabled, the pruner checks FSM state and skips all deletion operations during catchup. This prevents race conditions where block validation marks transactions as mined faster than the pruner can preserve their parents.
+When enabled, the pruner checks FSM state and skips all deletion operations unless the node is RUNNING, which covers catchup and IDLE after an operator STOP mid-catchup. This prevents race conditions where block validation marks transactions as mined faster than the pruner can preserve their parents.
 
 **Values:**
 

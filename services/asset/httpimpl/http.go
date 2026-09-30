@@ -171,6 +171,10 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	e.Use(middleware.Recover())
 
+	// Security headers first, so a response rejected early by the ban list or answered by the CORS
+	// middleware (a preflight) still carries them.
+	e.Use(securityHeadersMiddleware())
+
 	// Ban list middleware - reject requests from banned IPs early
 	if banList != nil {
 		e.Use(banlist.CreateEchoMiddleware(banList))
@@ -193,8 +197,6 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
 		Skipper: shouldSkipGzipForLargeBinaryAssetResponse,
 	}))
-
-	e.Use(securityHeadersMiddleware())
 
 	// Body size limit runs BEFORE peer-auth so the auth middleware (which reads
 	// the body to verify the SHA-256 digest header) cannot be turned into a
@@ -353,11 +355,20 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/headers/:hash/hex", h.GetBlockHeaders(HEX))
 	apiGroup.GET("/headers/:hash/json", h.GetBlockHeaders(JSON))
 
+	// Heavy: each request resolves a common ancestor and can return up to 10,000 headers.
+	// Per-request cost is bounded for main-chain targets; a fork or stale target still
+	// recurses over its whole ancestry in the store, so price these like the block and
+	// subtree routes below.
+	//
 	// this needs to be removed in the future, after all clients have migrated to the new endpoint
-	apiGroup.GET("/headers_to_common_ancestor/:hash", h.GetBlockHeadersToCommonAncestor(BINARY_STREAM))
-	apiGroup.GET("/headers_to_common_ancestor/:hash/hex", h.GetBlockHeadersToCommonAncestor(HEX))
-	apiGroup.GET("/headers_to_common_ancestor/:hash/json", h.GetBlockHeadersToCommonAncestor(JSON))
+	apiGroup.GET("/headers_to_common_ancestor/:hash", h.GetBlockHeadersToCommonAncestor(BINARY_STREAM), heavyMW()...)
+	apiGroup.GET("/headers_to_common_ancestor/:hash/hex", h.GetBlockHeadersToCommonAncestor(HEX), heavyMW()...)
+	apiGroup.GET("/headers_to_common_ancestor/:hash/json", h.GetBlockHeadersToCommonAncestor(JSON), heavyMW()...)
 
+	// Deliberately NOT heavy: peer catch-up calls this route every iteration, and the
+	// heavy bucket is shared with the /blocks and /subtree fetches that follow in the
+	// same round, so charging it here starves them and fails catch-up against healthy
+	// peers. This route has always resolved its ancestor with an indexed lookup.
 	apiGroup.GET("/headers_from_common_ancestor/:hash", h.GetBlockHeadersFromCommonAncestor(BINARY_STREAM))
 	apiGroup.GET("/headers_from_common_ancestor/:hash/hex", h.GetBlockHeadersFromCommonAncestor(HEX))
 	apiGroup.GET("/headers_from_common_ancestor/:hash/json", h.GetBlockHeadersFromCommonAncestor(JSON))
@@ -520,7 +531,8 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// Register peers endpoint
 	apiGroup.GET("/peers", h.GetPeers)
 
-	// Register settings handler for settings portal (always requires authentication)
+	// Register settings handler for settings portal. It requires authentication when rpc_user and
+	// rpc_pass are set; CheckAuth allows every request when either is empty.
 	settingsHandler := NewSettingsHandler(tSettings, logger)
 	apiSettingsGroup := e.Group(apiPrefix + "/settings")
 	apiSettingsGroup.Use(authHandler.RequireAuthMiddleware)
@@ -772,6 +784,47 @@ func accessLogMiddleware(logger ulogger.Logger) echo.MiddlewareFunc {
 	}
 }
 
+// contentSecurityPolicy is the policy served with every asset-service response, including the
+// built dashboard this binary serves (bitcoin-sv/teranode#4844). It is DEFENCE IN DEPTH, not a
+// strict policy, and it must not be described as one:
+//
+//   - 'unsafe-inline' stays in script-src because the built dashboard carries three inline
+//     <script> blocks (the pre-paint theme setter, font loading, and SvelteKit's bootstrap);
+//     without it the dashboard breaks on first paint. That also means an inline `onerror=`
+//     handler STILL FIRES.
+//   - connect-src keeps https: and wss: because the dashboard is used to drive REMOTE teranode
+//     instances. That also means a same-origin fetch() can still post data to an attacker origin.
+//
+// What it does buy: remote <script src> and import('https://...') are blocked, so the
+// amplification step of a coinbase-borne payload is stopped and an attacker is confined to what
+// fits in a coinbase; <object>/<embed>, <base> hijacking, remote form submission and framing are
+// blocked too.
+//
+// Escaping at the dashboard's HTML sink is the actual fix for markup in peer-controlled fields;
+// this is the second line.
+//
+// The request Host is deliberately NOT interpolated - that would put attacker-influenced input into
+// a response header. That leaves the dashboard's own WebSocket, which it opens over ws:// when the
+// dashboard itself is served over plain http (ui/dashboard/src/routes/api/config/websocket, which
+// picks the scheme from the page's own protocol). Whether 'self' covers a same-origin ws:// URL is a
+// CSP3 refinement rather than something the directive plainly says, so the scheme is named here
+// instead of relied upon. Listing ws: costs nothing that connect-src has not already given away -
+// https: and wss: are each equally unbounded, deliberately, because the dashboard is used to drive
+// remote teranode instances.
+//
+// Keep this string in sync with ui/dashboard/src/hooks.server.ts, which carries the development
+// copy, and with ui/dashboard/tests/csp.spec.ts, which asserts its behaviour in a real browser.
+const contentSecurityPolicy = "default-src 'self'; " +
+	"script-src 'self' 'unsafe-inline'; " +
+	"style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data:; " +
+	"font-src 'self' data:; " +
+	"object-src 'none'; " +
+	"base-uri 'self'; " +
+	"form-action 'self'; " +
+	"frame-ancestors 'none'; " +
+	"connect-src 'self' https: wss: ws:"
+
 // securityHeadersMiddleware adds security headers to all HTTP responses.
 func securityHeadersMiddleware() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
@@ -779,6 +832,13 @@ func securityHeadersMiddleware() echo.MiddlewareFunc {
 			c.Response().Header().Set("X-Content-Type-Options", "nosniff")
 			c.Response().Header().Set("X-Frame-Options", "DENY")
 			c.Response().Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			c.Response().Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			// Emitted on /api/** and binary responses too, where it is inert. A skipper would be
+			// more code, and more chances to get the predicate wrong, than the thing it avoids.
+			// frame-ancestors duplicates X-Frame-Options above; both are kept, the latter for
+			// older clients.
+			c.Response().Header().Set("Content-Security-Policy", contentSecurityPolicy)
+
 			return next(c)
 		}
 	}

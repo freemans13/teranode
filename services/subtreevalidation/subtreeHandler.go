@@ -57,7 +57,9 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 			return errors.NewProcessingError("[subtreeMessageHandler] failed to get FSM current state", err)
 		}
 
-		if *state == blockchain.FSMStateCATCHINGBLOCKS {
+		// Peer subtrees are only validated when caught up. IDLE can follow an
+		// operator STOP mid-catchup, with a UTXO set far behind the tip.
+		if *state != blockchain.FSMStateRUNNING {
 			return nil
 		}
 

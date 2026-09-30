@@ -32,7 +32,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
-	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -201,8 +200,8 @@ func NewTxMetaCache(
 
 	initPrometheusMetrics()
 
-	// base size (MB) from config
-	maxMB, _ := gocore.Config().GetInt("txMetaCacheMaxMB", 256)
+	// base size (MB) from the tagged setting
+	maxMB := tSettings.SubtreeValidation.TxMetaCacheMaxMB
 	// override if caller passed one
 	if len(maxMBOverride) > 0 && maxMBOverride[0] > 0 {
 		maxMB = maxMBOverride[0]
@@ -218,7 +217,7 @@ func NewTxMetaCache(
 
 		cache = pc
 	} else {
-		c, err := New(maxMB*1024*1024, bucketType)
+		c, err := New(maxMB*1024*1024, bucketType, tSettings.SubtreeValidation.TxMetaCacheTrimRatio)
 		if err != nil {
 			return nil, errors.NewProcessingError("error creating cache", err)
 		}
@@ -953,6 +952,41 @@ func (t *TxMetaCache) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight
 	return txMeta, spends, nil
 }
 
+// SpendAndCreateMulti forwards the list to the underlying store, never to
+// utxo.DefaultSpendAndCreateMulti over this wrapper, so a store's own
+// implementation is always the one that runs. It then caches the metadata of
+// each MultiTxCreated transaction under the same rule SpendAndCreate uses.
+func (t *TxMetaCache) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	results, err := t.utxoStore.SpendAndCreateMulti(ctx, txs, blockHeight, opts...)
+	if len(results) != len(txs) {
+		return results, err
+	}
+
+	options := &utxo.CreateOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	for i, r := range results {
+		if r.Status != utxo.MultiTxCreated || r.Meta == nil {
+			continue
+		}
+
+		var txHash *chainhash.Hash
+		if len(options.TxIDs) == len(txs) {
+			txHash = &options.TxIDs[i]
+		} else {
+			txHash = txs[i].TxIDChainHash()
+		}
+
+		if len(r.Meta.BlockIDs) == 0 && !r.Meta.Conflicting {
+			_ = t.SetCache(txHash, r.Meta)
+		}
+	}
+
+	return results, err
+}
+
 // Unspend marks previously spent UTXOs as unspent.
 // This method delegates directly to the underlying UTXO store without caching.
 //
@@ -978,6 +1012,12 @@ func (t *TxMetaCache) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsL
 // - Error if the decoration operation fails
 func (t *TxMetaCache) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	return t.utxoStore.PreviousOutputsDecorate(ctx, tx)
+}
+
+// ParentOutputsForValidation delegates to the underlying store. Parent outputs
+// are not cached here: the txmeta cache holds no outputs.
+func (t *TxMetaCache) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, opts ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	return t.utxoStore.ParentOutputsForValidation(ctx, outpoints, opts...)
 }
 
 // BatchPreviousOutputsDecorate fetches previous output information for inputs across

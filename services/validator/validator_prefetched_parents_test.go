@@ -7,7 +7,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -57,7 +56,7 @@ func Test_getUtxoBlockHeightsAndExtendTx_Prefetched(t *testing.T) {
 	require.Equal(t, []uint32{125, unconfirmedParentHeight, 768}, utxoHeights,
 		"prefetched heights must match the per-parent store path exactly")
 
-	mockUtxoStore.AssertNotCalled(t, "Get", mock.Anything, mock.Anything, mock.Anything)
+	mockUtxoStore.AssertNotCalled(t, "ParentOutputsForValidation", mock.Anything, mock.Anything)
 }
 
 // Test_getUtxoBlockHeightsAndExtendTx_PartialPrefetchFallsBackToStore proves the
@@ -87,228 +86,40 @@ func Test_getUtxoBlockHeightsAndExtendTx_PartialPrefetchFallsBackToStore(t *test
 	v := &Validator{settings: settings.NewSettings(), utxoStore: mockUtxoStore}
 
 	// Only parent1 should ever be read from the store.
-	mockUtxoStore.On("Get", mock.Anything, mock.MatchedBy(func(hash *chainhash.Hash) bool {
-		return hash.IsEqual(parent1)
-	}), mock.Anything).Return(&meta.Data{BlockHeights: []uint32{}, Tx: prefetchParentTx(2000000)}, nil).Once()
+	mockUtxoStore.On("ParentOutputsForValidation", mock.Anything, mock.MatchedBy(func(ops []utxostore.Outpoint) bool {
+		return len(ops) == 1 && ops[0].TxID.IsEqual(parent1)
+	})).Return([]utxostore.ParentOutput{{Status: utxostore.ParentOutputNotMined, Satoshis: 2000000, LockingScript: bscript.NewFromBytes([]byte{0x51})}}, nil).Once()
 
 	utxoHeights, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID(), prefetched)
 	require.NoError(t, err)
 
 	require.Equal(t, []uint32{125, unconfirmedParentHeight, 768}, utxoHeights)
 	// parent0 and parent2 came from the prefetch; only parent1 hit the store.
-	mockUtxoStore.AssertNumberOfCalls(t, "Get", 1)
+	mockUtxoStore.AssertNumberOfCalls(t, "ParentOutputsForValidation", 1)
 }
 
-// Test_getUtxoBlockHeightAndExtendForParentTx_InputIndexOutOfBounds guards the
-// bounds check: an input index >= len(tx.Inputs) must return an out-of-bounds
-// error rather than panic. The check is hoisted to the top of the function so
-// it fires before the utxoHeights[idx] height-write loops (utxoHeights is sized
-// to len(tx.Inputs) by the caller, so an out-of-range idx would otherwise panic
-// there, before the extend path).
-func Test_getUtxoBlockHeightAndExtendForParentTx_InputIndexOutOfBounds(t *testing.T) {
-	ctx := context.Background()
-
-	// Child tx with a single input, so len(tx.Inputs) == 1.
-	childTx := &bt.Tx{Inputs: []*bt.Input{{}}}
-
-	// utxoHeights sized exactly as the real caller does
-	// (make([]uint32, len(tx.Inputs))), so the test exercises the true call
-	// shape rather than an artificially oversized slice.
-	utxoHeights := make([]uint32, len(childTx.Inputs))
-
-	// Parent supplied via prefetch (Tx non-nil so the extend path would be
-	// reached) with a recorded block height, so no store Get is needed.
-	parentHash := chainhash.Hash{}
-	prefetched := map[chainhash.Hash]*meta.Data{
-		parentHash: {BlockHeights: []uint32{100}, Tx: &bt.Tx{Outputs: []*bt.Output{{}}}},
-	}
-
-	v := &Validator{}
-
-	// idx == len(childTx.Inputs) would panic in the height-write loop
-	// (utxoHeights[idx]) without the up-front guard.
-	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentHash, []int{1}, utxoHeights, childTx, prefetched)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "out of bounds")
-}
-
-// Test_getUtxoBlockHeightAndExtendForParentTx_VoutOutOfRange guards the extend
+// Test_getUtxoBlockHeightsAndExtendTx_PrefetchedVoutOutOfRange guards the extend
 // path against an out-of-range PreviousTxOutIndex. The vout comes from the
 // (untrusted) child transaction; a raw tx that references a real parent but a
 // vout beyond that parent's output count must be rejected with a clean error
-// rather than panicking on txMeta.Tx.Outputs[vout] and crashing the validator.
-func Test_getUtxoBlockHeightAndExtendForParentTx_VoutOutOfRange(t *testing.T) {
+// rather than panicking on the parent's Outputs[vout].
+func Test_getUtxoBlockHeightsAndExtendTx_PrefetchedVoutOutOfRange(t *testing.T) {
 	ctx := context.Background()
 
-	// Child tx with a single, validly-indexed input (idx 0) whose
-	// PreviousTxOutIndex points past the parent's outputs.
+	parentHash := chainhash.Hash{}
 	childTx := &bt.Tx{Inputs: []*bt.Input{{PreviousTxOutIndex: 99}}}
-	utxoHeights := make([]uint32, len(childTx.Inputs))
+	require.NoError(t, childTx.Inputs[0].PreviousTxIDAdd(&parentHash))
 
 	// Parent exists and is confirmed, but has only 2 outputs (vouts 0 and 1).
-	parentHash := chainhash.Hash{}
 	prefetched := map[chainhash.Hash]*meta.Data{
 		parentHash: {BlockHeights: []uint32{100}, Tx: &bt.Tx{Outputs: []*bt.Output{{}, {}}}},
 	}
 
 	v := &Validator{}
 
-	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentHash, []int{0}, utxoHeights, childTx, prefetched)
+	_, err := v.getUtxoBlockHeightsAndExtendTx(ctx, childTx, "child", prefetched)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "has no output for index")
-}
-
-// Test_getUtxoBlockHeightAndExtendForParentTx_BodylessParent_CoinExists is test 1
-// of the coin-table fallback: a body-less parent (Tx nil — the steady state once
-// a body window has aged out, or for every transaction mined at or below the
-// checkpoint when utxostore_skipTxBodyBelowCheckpoint is on) whose coin is still
-// in the UTXO table must be filled from PreviousOutputsDecorate, and the values
-// the child transaction ARRIVED carrying must be discarded even though they are
-// well-formed. The mock's Run callback mirrors the real
-// BatchPreviousOutputsDecorate contract precisely (skip an input that already
-// has a script — see decorate.go's doc comment), so if the production code
-// failed to clear the forged script/satoshis before decorating, the mock would
-// skip it exactly as the real store would, and this test would see the forged
-// values survive.
-func Test_getUtxoBlockHeightAndExtendForParentTx_BodylessParent_CoinExists(t *testing.T) {
-	ctx := context.Background()
-
-	realScript := bscript.NewFromBytes([]byte{0x51})
-	const realSats = uint64(4200)
-
-	forgedScript := bscript.NewFromBytes([]byte{0x00, 0x00, 0x00})
-	const forgedSats = uint64(999999999)
-
-	childTx := &bt.Tx{Inputs: []*bt.Input{{
-		PreviousTxOutIndex: 0,
-		// Deliberately wrong: what an attacker (or a stale caller) supplied.
-		PreviousTxScript:   forgedScript,
-		PreviousTxSatoshis: forgedSats,
-	}}}
-	utxoHeights := make([]uint32, len(childTx.Inputs))
-	parentHash := chainhash.Hash{0xAA}
-
-	store := &utxostore.MockUtxostore{}
-	store.On("Get", mock.Anything, &parentHash, mock.Anything).
-		Return(&meta.Data{BlockHeights: []uint32{100}, Tx: nil}, nil)
-	store.On("PreviousOutputsDecorate", mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) {
-			scratch, ok := args.Get(1).(*bt.Tx)
-			require.True(t, ok)
-			for _, in := range scratch.Inputs {
-				if in.PreviousTxScript != nil {
-					// Mirrors decorate.go: "Inputs that already carry a script are skipped".
-					continue
-				}
-				in.PreviousTxScript = realScript
-				in.PreviousTxSatoshis = realSats
-			}
-		}).
-		Return(nil)
-
-	v := &Validator{utxoStore: store}
-
-	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentHash, []int{0}, utxoHeights, childTx, nil)
-	require.NoError(t, err)
-	require.Equal(t, uint32(100), utxoHeights[0])
-	require.Equal(t, realSats, childTx.Inputs[0].PreviousTxSatoshis,
-		"the forged satoshis the tx arrived with must be discarded in favour of the store's")
-	require.Equal(t, realScript.Bytes(), childTx.Inputs[0].PreviousTxScript.Bytes(),
-		"the forged script the tx arrived with must be discarded in favour of the store's")
-}
-
-// Test_getUtxoBlockHeightAndExtendForParentTx_BodylessParent_CoinGone is test 2:
-// a body-less parent whose coin is no longer in the UTXO table (spent, or never
-// created) must classify as a missing parent — the same errors.ErrTxNotFound
-// code extendTransaction already maps to TxMissingParent — not as
-// "has no output for index", which would send an operator hunting a malformed
-// transaction that does not exist. The distinct "body is not retained" message
-// must still be present so an operator can tell this apart from an ordinary
-// missing-parent lookup failure.
-func Test_getUtxoBlockHeightAndExtendForParentTx_BodylessParent_CoinGone(t *testing.T) {
-	ctx := context.Background()
-
-	childTx := &bt.Tx{Inputs: []*bt.Input{{PreviousTxOutIndex: 0}}}
-	utxoHeights := make([]uint32, len(childTx.Inputs))
-	parentHash := chainhash.Hash{}
-
-	store := &utxostore.MockUtxostore{}
-	store.On("Get", mock.Anything, &parentHash, mock.Anything).
-		Return(&meta.Data{BlockHeights: []uint32{100}, Tx: nil}, nil)
-	store.On("PreviousOutputsDecorate", mock.Anything, mock.Anything).
-		Return(errors.NewTxNotFoundError("[utxoset][BatchPreviousOutputsDecorate] 1 of 1 parent outputs not in the utxo set (spent or never created)"))
-
-	v := &Validator{utxoStore: store}
-
-	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentHash, []int{0}, utxoHeights, childTx, nil)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, errors.ErrTxNotFound),
-		"a coin absent from the table must classify the same way extendTransaction classifies a missing parent")
-	require.Contains(t, err.Error(), "its body is not retained by this node")
-	require.Contains(t, err.Error(), "utxostore_skipTxBodyBelowCheckpoint")
-	require.NotContains(t, err.Error(), "has no output for index",
-		"must not be confused with the out-of-range-vout error, which names a real but malformed transaction")
-}
-
-// Test_getUtxoBlockHeightAndExtendForParentTx_BodylessParent_CoinReassigned is
-// test 3: a body-less parent whose coin was reassigned (ReAssignUTXO) must fail
-// as a processing error, not a missing parent — waiting for a reassigned coin
-// never makes it decoratable, unlike a coin that has simply not arrived yet.
-// BatchPreviousOutputsDecorate's own doc comment is explicit that this case
-// must never be silent: an empty script must never reach the caller.
-func Test_getUtxoBlockHeightAndExtendForParentTx_BodylessParent_CoinReassigned(t *testing.T) {
-	ctx := context.Background()
-
-	childTx := &bt.Tx{Inputs: []*bt.Input{{PreviousTxOutIndex: 0}}}
-	utxoHeights := make([]uint32, len(childTx.Inputs))
-	parentHash := chainhash.Hash{0xBB}
-
-	store := &utxostore.MockUtxostore{}
-	store.On("Get", mock.Anything, &parentHash, mock.Anything).
-		Return(&meta.Data{BlockHeights: []uint32{100}, Tx: nil}, nil)
-	// Mirrors decorate.go's own behaviour for a reassigned coin: left
-	// undecorated (no script set) and reported as a processing error, never
-	// as ErrTxNotFound.
-	store.On("PreviousOutputsDecorate", mock.Anything, mock.Anything).
-		Return(errors.NewProcessingError("[utxoset][BatchPreviousOutputsDecorate] 1 of 1 parent outputs were reassigned"))
-
-	v := &Validator{utxoStore: store}
-
-	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentHash, []int{0}, utxoHeights, childTx, nil)
-	require.Error(t, err)
-	require.False(t, errors.Is(err, errors.ErrTxNotFound),
-		"a reassigned coin never becomes decoratable, so it must not be classified as a fetchable missing parent")
-	require.Contains(t, err.Error(), "its body is not retained by this node")
-	require.Nil(t, childTx.Inputs[0].PreviousTxScript,
-		"an empty script must never reach the caller")
-}
-
-// Test_getUtxoBlockHeightAndExtendForParentTx_DecorateReportsSuccessButLeavesGap
-// pins the defensive insurance check: if PreviousOutputsDecorate ever returned
-// nil while actually leaving an input undecorated (a hypothetical regression in
-// the store, not something the real implementation does today), the validator
-// must still refuse rather than let a nil-script input through into signature
-// verification.
-func Test_getUtxoBlockHeightAndExtendForParentTx_DecorateReportsSuccessButLeavesGap(t *testing.T) {
-	ctx := context.Background()
-
-	childTx := &bt.Tx{Inputs: []*bt.Input{{PreviousTxOutIndex: 0}}}
-	utxoHeights := make([]uint32, len(childTx.Inputs))
-	parentHash := chainhash.Hash{0xCC}
-
-	store := &utxostore.MockUtxostore{}
-	store.On("Get", mock.Anything, &parentHash, mock.Anything).
-		Return(&meta.Data{BlockHeights: []uint32{100}, Tx: nil}, nil)
-	// Reports success (nil error) but never touches the scratch input's script
-	// — the regression scenario the defensive check exists for.
-	store.On("PreviousOutputsDecorate", mock.Anything, mock.Anything).Return(nil)
-
-	v := &Validator{utxoStore: store}
-
-	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentHash, []int{0}, utxoHeights, childTx, nil)
-	require.Error(t, err)
-	require.Nil(t, childTx.Inputs[0].PreviousTxScript,
-		"an empty script must never reach the caller even if decorate lies about success")
 }
 
 // Test_getUtxoBlockHeightsAndExtendTx_MixedBodyfulAndBodylessRace is test 4: run

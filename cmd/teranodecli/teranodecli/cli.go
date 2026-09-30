@@ -242,6 +242,7 @@ func Start(args []string, version, commit string) {
 		skipHeaders := cmd.FlagSet.Bool("skipHeaders", false, "Skip processing headers.")
 		skipUTXOs := cmd.FlagSet.Bool("skipUTXOs", false, "Skip processing UTXOs.")
 		force := cmd.FlagSet.Bool("force", false, "Force processing even if lastProcessed.dat or BlockAssembler state already exists.")
+		skipChecksum := cmd.FlagSet.Bool("skipChecksum", false, "Skip verifying the snapshot files against their .sha256 sidecars (only when the caller already verified them).")
 		cmd.Execute = func(args []string) error {
 			if *inputDir == "" {
 				return errors.NewProcessingError("Please provide an inputDir")
@@ -251,7 +252,7 @@ func Start(args []string, version, commit string) {
 				return errors.NewProcessingError("Please provide a hash")
 			}
 
-			return seeder.Seeder(logger, tSettings, *inputDir, *hash, *skipHeaders, *skipUTXOs, *force)
+			return seeder.Seeder(logger, tSettings, *inputDir, *hash, *skipHeaders, *skipUTXOs, *force, *skipChecksum)
 		}
 	case "bitcointoutxoset":
 		blockchainDir := cmd.FlagSet.String("bitcoinDir", "", "Location of bitcoin data")

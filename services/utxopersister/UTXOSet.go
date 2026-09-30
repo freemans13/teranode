@@ -850,12 +850,21 @@ func filterUTXOs(utxos []*UTXO, deletions map[UTXODeletion]struct{}, txID *chain
 	return filteredUTXOs
 }
 
+// MaxOutputIndex is the highest output index a consensus-valid transaction can
+// have: 1,000,000,000 bytes (MAX_TX_SIZE_CONSENSUS_AFTER_GENESIS, see
+// model/block_coinbase_common_rules.go) divided by the 9-byte minimum output
+// (8-byte value, 1-byte script length), minus one. Output indices read from a
+// UTXO-set file are untrusted and are checked against it before anything is
+// sized from them.
+const MaxOutputIndex = 1_000_000_000/9 - 1
+
 // PadUTXOsWithNil pads a slice of UTXOs with nil values to match their indices.
 // It creates a new slice with nil values at positions where no UTXO exists,
 // ensuring that UTXOs are at positions matching their output index.
 // This helps maintain the correct mapping between output indices and their UTXOs.
-// Returns the padded slice.
-func PadUTXOsWithNil(utxos []*UTXO) []*UTXO {
+// It returns an error for an index above MaxOutputIndex, which no valid
+// transaction can have: the slice is sized from the highest index.
+func PadUTXOsWithNil(utxos []*UTXO) ([]*UTXO, error) {
 	// Determine the size of the new slice
 	var maxIndex uint32
 
@@ -865,15 +874,19 @@ func PadUTXOsWithNil(utxos []*UTXO) []*UTXO {
 		}
 	}
 
+	if maxIndex > MaxOutputIndex {
+		return nil, errors.NewProcessingError("output index %d exceeds the maximum %d a valid transaction can have", maxIndex, MaxOutputIndex)
+	}
+
 	// Create a slice with nil values of length maxIdx+1
-	padded := make([]*UTXO, maxIndex+1)
+	padded := make([]*UTXO, int(maxIndex)+1)
 
 	// Place each item in its corresponding index position
 	for _, utxo := range utxos {
 		padded[utxo.Index] = utxo
 	}
 
-	return padded
+	return padded, nil
 }
 
 // UnpadSlice removes nil values from a padded slice.

@@ -917,7 +917,8 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		// assembly: bulk-history txs do not belong in our template. In
 		// RUNNING, assembly stays enabled so txs from a legacy-bridge tip
 		// block survive in the mempool if the block loses a reorg.
-		if *currentState == blockchain.FSMStateCATCHINGBLOCKS {
+		// IDLE is included: an operator STOP can land while catchup is running.
+		if *currentState != blockchain.FSMStateRUNNING {
 			validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
 		}
 
@@ -1026,8 +1027,8 @@ func (u *Server) publishInvalidSubtree(ctx context.Context, subtreeHash, peerURL
 			return
 		}
 
-		if *state == blockchain_api.FSMStateType_CATCHINGBLOCKS {
-			// ignore notifications while syncing or catching up
+		if *state != blockchain_api.FSMStateType_RUNNING {
+			// ignore notifications unless caught up (IDLE can follow a STOP mid-catchup)
 			return
 		}
 	}

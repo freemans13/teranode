@@ -392,6 +392,51 @@ func TestSubtreesHandler_NilSubtree(t *testing.T) {
 // TestSubtreeMessageHandler_BlocksOnly_CatchingBlocksStillSkips verifies that when FSM is in
 // CATCHINGBLOCKS state, processing is skipped regardless of BlocksOnly setting.
 func TestSubtreeMessageHandler_BlocksOnly_CatchingBlocksStillSkips(t *testing.T) {
+	testSubtreeMessageHandlerSkipsInState(t, blockchain.FSMStateCATCHINGBLOCKS)
+}
+
+// TestSubtreeMessageHandler_OnlyRunningParsesPeerSubtrees pins the FSM gate by
+// whether the handler reaches message parsing: a bad hash is counted only when
+// the gate lets the message through. IDLE must skip, because an operator STOP can
+// park a node mid-catchup with a UTXO set far behind the tip.
+func TestSubtreeMessageHandler_OnlyRunningParsesPeerSubtrees(t *testing.T) {
+	InitPrometheusMetrics()
+
+	badHashBytes, err := proto.Marshal(&kafkamessage.KafkaSubtreeTopicMessage{
+		Hash:   "not-a-hex-hash",
+		URL:    "http://localhost:8000",
+		PeerId: "peer1",
+	})
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		state  blockchain.FSMStateType
+		parsed bool
+	}{
+		{blockchain.FSMStateRUNNING, true},
+		{blockchain.FSMStateCATCHINGBLOCKS, false},
+		{blockchain.FSMStateIDLE, false},
+	} {
+		t.Run(tt.state.String(), func(t *testing.T) {
+			server := newMalformedTestServer(t)
+			state := tt.state
+			server.blockchainClient = &blockchain.Mock{}
+			server.blockchainClient.(*blockchain.Mock).On("GetFSMCurrentState", mock.Anything).Return(&state, nil)
+
+			counter := prometheusSubtreeKafkaMalformed.WithLabelValues("bad_hash")
+			before := testutil.ToFloat64(counter)
+			require.NoError(t, server.subtreeMessageHandler(context.Background())(&kafka.KafkaMessage{Value: badHashBytes}))
+
+			if tt.parsed {
+				require.Equal(t, before+1, testutil.ToFloat64(counter), "RUNNING must reach message parsing")
+			} else {
+				require.Equal(t, before, testutil.ToFloat64(counter), "%s must skip peer subtrees before parsing", tt.state)
+			}
+		})
+	}
+}
+
+func testSubtreeMessageHandlerSkipsInState(t *testing.T, state blockchain.FSMStateType) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.SubtreeValidation.BlocksOnly = false // Not blocks-only, but CATCHINGBLOCKS should still skip
 
@@ -406,8 +451,7 @@ func TestSubtreeMessageHandler_BlocksOnly_CatchingBlocksStillSkips(t *testing.T)
 
 	validateSubtreeCalled := atomic.Bool{}
 	blockchainClient := &blockchain.Mock{}
-	catchingBlocksState := blockchain.FSMStateCATCHINGBLOCKS
-	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocksState, nil)
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&state, nil)
 
 	server := &testServer{
 		Server: Server{
@@ -430,7 +474,7 @@ func TestSubtreeMessageHandler_BlocksOnly_CatchingBlocksStillSkips(t *testing.T)
 	require.NoError(t, err)
 
 	time.Sleep(100 * time.Millisecond)
-	assert.False(t, validateSubtreeCalled.Load(), "ValidateSubtreeInternal should not be called when FSM is CATCHINGBLOCKS")
+	assert.False(t, validateSubtreeCalled.Load(), "ValidateSubtreeInternal should not be called when FSM is %s", state)
 }
 
 // newMalformedTestServer builds a minimal Server suitable for exercising the malformed-message

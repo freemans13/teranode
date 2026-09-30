@@ -100,7 +100,7 @@ teranode_pruner_duration_seconds{operation="dah_pruner"} 5.678
     - `block_assembly_timeout` - Timed out or errored waiting for Block Assembly to be ready
     - `below_min_height` - Block height at or below `pruner_minBlockHeight`
     - `fsm_error` - Failed to read the blockchain FSM state
-    - `catchup_mode` - Node is in the CATCHINGBLOCKS FSM state and `pruner_skipDuringCatchup` is set
+    - `catchup_mode` - Node is not in the RUNNING FSM state (CATCHINGBLOCKS, or IDLE after an operator STOP) and `pruner_skipDuringCatchup` is set
 
 **Example:**
 

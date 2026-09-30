@@ -314,7 +314,15 @@ func TestWaitForBlockMinedStatusSkippedWhenNoBAClient(t *testing.T) {
 // pruner_skipDuringCatchup=true and the FSM reports CATCHINGBLOCKS, the
 // pruner records prunerSkipped("catchup_mode"), never notifies the blob
 // deletion worker, and never advances lastProcessedHeight.
+// IDLE is covered because an operator STOP can park a node while its catchup
+// batch is still marking transactions mined.
 func TestSkipDuringCatchupSkipsWhenCatchingUp(t *testing.T) {
+	for _, state := range []blockchain.FSMStateType{blockchain.FSMStateCATCHINGBLOCKS, blockchain.FSMStateIDLE} {
+		t.Run(state.String(), func(t *testing.T) { testSkipDuringCatchupSkipsInState(t, state) })
+	}
+}
+
+func testSkipDuringCatchupSkipsInState(t *testing.T, state blockchain.FSMStateType) {
 	initPrometheusMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -323,8 +331,7 @@ func TestSkipDuringCatchupSkipsWhenCatchingUp(t *testing.T) {
 	logger := ulogger.New("test")
 
 	blockchainMock := &blockchain.Mock{}
-	catchingUp := blockchain.FSMStateCATCHINGBLOCKS
-	blockchainMock.On("GetFSMCurrentState", mock.Anything).Return(&catchingUp, nil)
+	blockchainMock.On("GetFSMCurrentState", mock.Anything).Return(&state, nil)
 
 	server := &Server{
 		ctx:              ctx,

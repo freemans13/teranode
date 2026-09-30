@@ -564,7 +564,7 @@ An IDLE refusal prevents block validation from starting its fetch/validation wor
 func (b *Blockchain) Idle(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error)
 ```
 
-Transitions the FSM to the IDLE state.
+Transitions the FSM to the IDLE state from RUNNING or CATCHINGBLOCKS. A catchup already in progress is not cancelled; its automatic RUN promotion is refused once the FSM is IDLE.
 
 ## Legacy Endpoints
 

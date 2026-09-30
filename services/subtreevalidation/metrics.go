@@ -58,6 +58,23 @@ var (
 	// validation logic, separate from handler overhead.
 	prometheusSubtreeValidationValidateSubtreeDuration prometheus.Histogram
 
+	// prometheusSubtreeValidationBatchStep times each step of the catch-up batch
+	// path (resolve, check, write, fallback) per load batch.
+	prometheusSubtreeValidationBatchStep *prometheus.HistogramVec
+
+	// prometheusSubtreeValidationBatchTxs counts the catch-up batch path's
+	// transactions by outcome: created by SpendAndCreateMulti, or sent through
+	// the per-transaction path.
+	prometheusSubtreeValidationBatchTxs *prometheus.CounterVec
+
+	// prometheusSubtreeValidationBatchParentOutputs counts previous outputs the
+	// catch-up batch path resolved, by source: memory (a parent in the same load
+	// batch) or store (ParentOutputsForValidation).
+	prometheusSubtreeValidationBatchParentOutputs *prometheus.CounterVec
+
+	// prometheusSubtreeValidationBatchLists counts SpendAndCreateMulti lists.
+	prometheusSubtreeValidationBatchLists prometheus.Counter
+
 	// prometheusSubtreeValidationBlessMissingTransaction tracks the duration of bless missing transaction operations.
 	// This histogram measures the time taken to handle missing transactions,
 	// which is an important aspect of subtree validation.
@@ -161,6 +178,46 @@ func _initPrometheusMetrics() {
 			Name:      "validate_subtree_duration",
 			Help:      "Duration of validate subtree",
 			Buckets:   util.MetricsBucketsMilliLongSeconds,
+		},
+	)
+
+	prometheusSubtreeValidationBatchStep = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "batch_step",
+			Help:      "Duration of each step of the catch-up batch path, per load batch",
+			Buckets:   util.MetricsBucketsMilliLongSeconds,
+		},
+		[]string{"step"},
+	)
+
+	prometheusSubtreeValidationBatchTxs = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "batch_txs",
+			Help:      "Transactions handled by the catch-up batch path, by outcome",
+		},
+		[]string{"outcome"},
+	)
+
+	prometheusSubtreeValidationBatchParentOutputs = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "batch_parent_outputs",
+			Help:      "Previous outputs resolved by the catch-up batch path, by source",
+		},
+		[]string{"source"},
+	)
+
+	prometheusSubtreeValidationBatchLists = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "batch_lists",
+			Help:      "SpendAndCreateMulti lists written by the catch-up batch path",
 		},
 	)
 
