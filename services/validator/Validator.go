@@ -897,88 +897,10 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		blockHeight = blockState.Height + 1
 	}
 
-	// Reject coinbase first, matching bitcoin-sv CheckRegularTransaction
-	// (src/validation.cpp:601-603) which short-circuits before any contextual
-	// (finality / MTP) check.
-	if tx.IsCoinbase() {
-		err = errors.NewProcessingError("[Validate][%s] coinbase transactions are not supported", txID)
+	if err = v.precheckTransaction(tx, txID, blockHeight, blockState, validationOptions); err != nil {
 		span.RecordError(err)
 
 		return nil, err
-	}
-
-	if validationOptions.OutpointOnlySpend && !validationOptions.SkipScriptValidation {
-		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend requires SkipScriptValidation", txID)
-		span.RecordError(err)
-
-		return nil, err
-	}
-
-	// Defence-in-depth: OutpointOnlySpend is only ever legitimate at or below the
-	// highest hardcoded checkpoint (the callers gate on this). Reject it above the
-	// checkpoint independently of the caller so a buggy or misconfigured caller
-	// cannot spend-by-outpoint (hash check off, BIP68 skipped) on a steady-state
-	// block. Mirrors the blockvalidation I4 guard; uses the same single-source
-	// HighestCheckpointHeight so the bound cannot drift.
-	if validationOptions.OutpointOnlySpend && blockHeight > blockchain.HighestCheckpointHeight(v.settings.ChainCfgParams.Checkpoints) {
-		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend must not be used above the highest checkpoint (height %d)", txID, blockHeight)
-		span.RecordError(err)
-
-		return nil, err
-	}
-
-	// The guard above bounds the height the CALLER asserted; an attacker simply asserts a low
-	// one. This bounds the height the NODE'S OWN CHAIN has reached. It is a TIP-derived bound,
-	// not a proof that validation has replayed through that height: GetBlockState reads the UTXO
-	// store snapshot, which production initialises from blockchainClient.GetBestHeightAndTime and
-	// refreshes on each Block notification (stores/utxo/factory/utxo.go). It holds because legacy
-	// netsync validates block H's transactions inside prepareSubtrees BEFORE the block is added,
-	// and blockHandler consumes blockQueue on a single goroutine, so the tip cannot reach H while
-	// H is validating. Same `>` boundary as above, so the block AT checkpoint height C (tip C-1)
-	// still qualifies. A lagging snapshot is fail-open (more permissive, never a false rejection);
-	// a tip genuinely past the checkpoint while below-checkpoint work is in flight is a genuine
-	// rejection whose remedy is to turn the fast path off
-	// (blockvalidation_outpoint_only_below_checkpoint=false), which is also the default.
-	// The condition is `>`, mirroring the caller-asserted guard immediately above it, so it also
-	// admits a tip exactly at the highest checkpoint — a case for which the paragraph above claims
-	// no legitimate producer.
-	// Issue 4840, finding B-022.
-	if validationOptions.OutpointOnlySpend && blockState.Height > blockchain.HighestCheckpointHeight(v.settings.ChainCfgParams.Checkpoints) {
-		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend must not be used once the node's chain tip is past the highest checkpoint (tip height %d)", txID, blockState.Height)
-		span.RecordError(err)
-
-		return nil, err
-	}
-
-	// Fail closed on a store that does not support the fast path: OutpointOnlySpend
-	// relies on SkipUTXOHashCheck / SkipExtendedInputs, which such a store ignores —
-	// it would then derive the UTXO hash from absent parent data and hard-error on the
-	// un-decorated inputs, stalling IBD. Ask the store directly (the capability lives on
-	// the store, not a settings scheme guess) so a misconfigured caller cannot reach an
-	// unsupported store on the fast path.
-	if validationOptions.OutpointOnlySpend && !v.utxoStore.SupportsOutpointOnlySpend() {
-		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend requires a UTXO store that supports it", txID)
-		span.RecordError(err)
-
-		return nil, err
-	}
-
-	comparisonTime, skipFinality, finalityErr := selectFinalityComparisonTime(validationOptions, blockHeight, uint32(v.settings.ChainCfgParams.CSVHeight), blockState)
-	if finalityErr != nil {
-		err = finalityErr
-		span.RecordError(err)
-
-		return nil, err
-	}
-
-	if !skipFinality {
-		// this function should be moved into go-bt
-		if err = util.IsTransactionFinal(tx, blockHeight, comparisonTime); err != nil {
-			err = errors.NewUtxoNonFinalError("[Validate][%s] transaction is not final", txID, err)
-			span.RecordError(err)
-
-			return nil, err
-		}
 	}
 
 	var utxoHeights []uint32
@@ -1498,6 +1420,77 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	// unlockLockedTxOnExit call registered above, on this and every other return
 	// path from this point in the function.
 	return txMetaData, nil
+}
+
+// precheckTransaction runs the checks validateInternal makes before it reads any
+// parent: it rejects a coinbase, guards the below-checkpoint outpoint-only mode,
+// and checks finality. CheckExtendedTransaction runs the same checks, so the two
+// entry points cannot drift.
+func (v *Validator) precheckTransaction(tx *bt.Tx, txID string, blockHeight uint32, blockState utxo.BlockState, validationOptions *Options) error {
+	// Reject coinbase first, matching bitcoin-sv CheckRegularTransaction
+	// (src/validation.cpp:601-603) which short-circuits before any contextual
+	// (finality / MTP) check.
+	if tx.IsCoinbase() {
+		return errors.NewProcessingError("[Validate][%s] coinbase transactions are not supported", txID)
+	}
+
+	if validationOptions.OutpointOnlySpend && !validationOptions.SkipScriptValidation {
+		return errors.NewProcessingError("[Validate][%s] OutpointOnlySpend requires SkipScriptValidation", txID)
+	}
+
+	// Defence-in-depth: OutpointOnlySpend is only ever legitimate at or below the
+	// highest hardcoded checkpoint (the callers gate on this). Reject it above the
+	// checkpoint independently of the caller so a buggy or misconfigured caller
+	// cannot spend-by-outpoint (hash check off, BIP68 skipped) on a steady-state
+	// block. Mirrors the blockvalidation I4 guard; uses the same single-source
+	// HighestCheckpointHeight so the bound cannot drift.
+	if validationOptions.OutpointOnlySpend && blockHeight > blockchain.HighestCheckpointHeight(v.settings.ChainCfgParams.Checkpoints) {
+		return errors.NewProcessingError("[Validate][%s] OutpointOnlySpend must not be used above the highest checkpoint (height %d)", txID, blockHeight)
+	}
+
+	// The guard above bounds the height the CALLER asserted; an attacker simply asserts a low
+	// one. This bounds the height the NODE'S OWN CHAIN has reached. It is a TIP-derived bound,
+	// not a proof that validation has replayed through that height: GetBlockState reads the UTXO
+	// store snapshot, which production initialises from blockchainClient.GetBestHeightAndTime and
+	// refreshes on each Block notification (stores/utxo/factory/utxo.go). It holds because legacy
+	// netsync validates block H's transactions inside prepareSubtrees BEFORE the block is added,
+	// and blockHandler consumes blockQueue on a single goroutine, so the tip cannot reach H while
+	// H is validating. Same `>` boundary as above, so the block AT checkpoint height C (tip C-1)
+	// still qualifies. A lagging snapshot is fail-open (more permissive, never a false rejection);
+	// a tip genuinely past the checkpoint while below-checkpoint work is in flight is a genuine
+	// rejection whose remedy is to turn the fast path off
+	// (blockvalidation_outpoint_only_below_checkpoint=false), which is also the default.
+	// The condition is `>`, mirroring the caller-asserted guard immediately above it, so it also
+	// admits a tip exactly at the highest checkpoint — a case for which the paragraph above claims
+	// no legitimate producer.
+	// Issue 4840, finding B-022.
+	if validationOptions.OutpointOnlySpend && blockState.Height > blockchain.HighestCheckpointHeight(v.settings.ChainCfgParams.Checkpoints) {
+		return errors.NewProcessingError("[Validate][%s] OutpointOnlySpend must not be used once the node's chain tip is past the highest checkpoint (tip height %d)", txID, blockState.Height)
+	}
+
+	// Fail closed on a store that does not support the fast path: OutpointOnlySpend
+	// relies on SkipUTXOHashCheck / SkipExtendedInputs, which such a store ignores —
+	// it would then derive the UTXO hash from absent parent data and hard-error on the
+	// un-decorated inputs, stalling IBD. Ask the store directly (the capability lives on
+	// the store, not a settings scheme guess) so a misconfigured caller cannot reach an
+	// unsupported store on the fast path.
+	if validationOptions.OutpointOnlySpend && !v.utxoStore.SupportsOutpointOnlySpend() {
+		return errors.NewProcessingError("[Validate][%s] OutpointOnlySpend requires a UTXO store that supports it", txID)
+	}
+
+	comparisonTime, skipFinality, finalityErr := selectFinalityComparisonTime(validationOptions, blockHeight, uint32(v.settings.ChainCfgParams.CSVHeight), blockState)
+	if finalityErr != nil {
+		return finalityErr
+	}
+
+	if !skipFinality {
+		// this function should be moved into go-bt
+		if err := util.IsTransactionFinal(tx, blockHeight, comparisonTime); err != nil {
+			return errors.NewUtxoNonFinalError("[Validate][%s] transaction is not final", txID, err)
+		}
+	}
+
+	return nil
 }
 
 // unlockLockedTxOnExit is the single point that releases a tx's two-phase-commit
