@@ -107,8 +107,9 @@ type SpendAndCreateMultiStore interface {
 // In order, it:
 //  1. refuses, with nothing written, a list that spends a later or the same
 //     transaction, spends one outpoint twice, names an output index past the end
-//     of a parent in the list, holds a transaction twice or a coinbase, or passes
-//     WithTXID, WithSetCoinbase or a WithTXIDs of the wrong length;
+//     of a parent in the list, holds a nil transaction, a transaction twice or a
+//     coinbase, or passes WithTXID, WithSetCoinbase, WithCreateOnly,
+//     WithSpendOnly or a WithTXIDs of the wrong length;
 //  2. assigns each transaction a level in memory;
 //  3. writes level by level, skipping (MultiTxParentFailed) any transaction whose
 //     parent in the list failed.
@@ -129,7 +130,7 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 	blockHeight uint32, opts ...CreateOption) ([]SpendAndCreateMultiResult, error) {
 	options, err := ParseCreateOptions(opts...)
 	if err != nil {
-		return nil, newSpendAndCreateMultiRefusedError("%v", err)
+		return nil, newSpendAndCreateMultiRefusedError("invalid options", err)
 	}
 
 	if options.TxID != nil {
@@ -138,6 +139,13 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 
 	if options.IsCoinbase != nil {
 		return nil, newSpendAndCreateMultiRefusedError("WithSetCoinbase describes one transaction; a coinbase never belongs in a list")
+	}
+
+	// The results report a record created or existing, with its spends made;
+	// neither half on its own fits that, and a child level would read a parent
+	// as created that has no record.
+	if options.CreateOnly || options.SpendOnly {
+		return nil, newSpendAndCreateMultiRefusedError("WithCreateOnly and WithSpendOnly describe half a write; a list writes both halves")
 	}
 
 	if options.TxIDs != nil && len(options.TxIDs) != len(txs) {
@@ -152,6 +160,10 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 	if txids == nil {
 		txids = make([]chainhash.Hash, len(txs))
 		for i, tx := range txs {
+			if tx == nil {
+				return nil, newSpendAndCreateMultiRefusedError("transaction %d is nil", i)
+			}
+
 			txids[i] = *tx.TxIDChainHash()
 		}
 	}

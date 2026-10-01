@@ -150,6 +150,10 @@ func TestDefaultSpendAndCreateMulti_Refusals(t *testing.T) {
 		{"WithSetCoinbase", []*bt.Tx{parent}, []CreateOption{WithSetCoinbase(false)}},
 		{"WithTXIDs of the wrong length", []*bt.Tx{parent, child}, []CreateOption{WithTXIDs([]chainhash.Hash{*parent.TxIDChainHash()})}},
 		{"WithCreateOnly and WithSpendOnly", []*bt.Tx{parent}, []CreateOption{WithCreateOnly(), WithSpendOnly()}},
+		{"WithCreateOnly", []*bt.Tx{parent}, []CreateOption{WithCreateOnly()}},
+		{"WithSpendOnly", []*bt.Tx{parent}, []CreateOption{WithSpendOnly()}},
+		{"a nil transaction", []*bt.Tx{parent, nil}, nil},
+		{"a nil transaction with WithTXIDs", []*bt.Tx{nil}, []CreateOption{WithTXIDs([]chainhash.Hash{{0x01}})}},
 	}
 
 	for _, tc := range cases {
@@ -159,6 +163,8 @@ func TestDefaultSpendAndCreateMulti_Refusals(t *testing.T) {
 			results, err := DefaultSpendAndCreateMulti(ctx, store, 8, tc.txs, 100, tc.opts...)
 			require.Error(t, err)
 			require.True(t, IsSpendAndCreateMultiRefused(err), "want a refusal, got %v", err)
+			require.NotContains(t, err.Error(), "%v", "the refusal message must be fully formatted")
+			require.NotContains(t, err.Error(), "%!", "the refusal message must be fully formatted")
 			require.Nil(t, results)
 			require.Empty(t, store.calls, "nothing may be written on a refusal")
 		})

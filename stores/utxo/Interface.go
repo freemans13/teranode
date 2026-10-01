@@ -515,7 +515,8 @@ type Store interface {
 	// opts to every transaction exactly as SpendAndCreate applies them to one;
 	// with no WithMinedBlockInfo each record is created unmined. WithTXID and
 	// WithSetCoinbase describe one transaction and are refused; WithTXIDs is the
-	// list form of WithTXID.
+	// list form of WithTXID. WithCreateOnly and WithSpendOnly are refused: the
+	// results cannot report half a write.
 	//
 	// It returns one result per transaction, in list order. The call is not
 	// atomic across the list: each transaction succeeds or fails on its own, a
