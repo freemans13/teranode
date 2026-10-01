@@ -94,7 +94,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, blockIds map[uint32]bool) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processTransactionsBatched",
 		tracing.WithParentStat(u.stats),
-		tracing.WithLogMessage(u.logger, "[processTransactionsBatched] Processing %d transactions at block height %d", len(allTransactions), blockHeight),
+		tracing.WithDebugLogMessage(u.logger, "[processTransactionsBatched] Processing %d transactions at block height %d", len(allTransactions), blockHeight),
 	)
 	defer deferFn()
 

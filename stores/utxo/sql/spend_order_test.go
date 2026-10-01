@@ -7,11 +7,21 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
+
+// A SQLite shared-cache lock cycle is retried like a Postgres deadlock. The
+// message is the one the per-item spend got in Test_handleMultipleTx.
+func TestIsDeadlockRecognisesSQLiteTableLocks(t *testing.T) {
+	require.True(t, isDeadlock(errors.NewStorageError("database table is locked: database is deadlocked (6)")))
+	require.True(t, isDeadlock(errors.NewStorageError("database is locked (5) (SQLITE_BUSY)")))
+	require.False(t, isDeadlock(errors.NewStorageError("UNIQUE constraint failed: transactions.hash")))
+	require.False(t, isDeadlock(nil))
+}
 
 // The bulk spend UPDATE must take its rows in (transaction_id, idx) order, so two
 // batches over overlapping rows lock them in the same order. First arrival
