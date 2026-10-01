@@ -3,6 +3,8 @@ package utxoset
 import (
 	"context"
 	"strconv"
+	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -169,7 +171,22 @@ type nettedWrite struct {
 	blockHeight uint32
 	opts        []utxo.CreateOption
 	items       []*multiTx
+
+	// What the write did and where its time went, for the slow-list log line. The chunk
+	// timings are summed across chunks that run in parallel, so they can exceed wall time.
+	spendChunks  int
+	levels       int
+	createChunks atomic.Int64
+	lockNs       atomic.Int64
+	createNs     atomic.Int64
+	journalNs    atomic.Int64
+	commitNs     atomic.Int64
+	bodyBytes    atomic.Int64
 }
+
+// multiSlowListLog is the step-1-plus-step-2 time above which a list gets an info log line
+// saying where the time went.
+const multiSlowListLog = time.Second
 
 func (s *Store) newNettedWrite(txs []*bt.Tx, list *utxo.SpendAndCreateMultiList, blockHeight uint32,
 	opts []utxo.CreateOption) *nettedWrite {
@@ -201,12 +218,26 @@ func (s *Store) newNettedWrite(txs []*bt.Tx, list *utxo.SpendAndCreateMultiList,
 }
 
 func (w *nettedWrite) run(ctx context.Context) ([]utxo.SpendAndCreateMultiResult, error) {
+	start := time.Now()
+
+	var spent time.Time
+
+	defer func() {
+		if spent.IsZero() {
+			spent = time.Now()
+		}
+
+		w.logIfSlow(start, spent, time.Now())
+	}()
+
 	w.checkNettedInputs()
 	w.failDescendants()
 
 	if err := w.spendOutside(ctx); err != nil {
 		return nil, err
 	}
+
+	spent = time.Now()
 
 	if err := w.undoDescendantsOfFailures(ctx); err != nil {
 		return nil, err
@@ -360,6 +391,8 @@ func (w *nettedWrite) spendOutside(ctx context.Context) error {
 	if len(cur) > 0 {
 		chunks = append(chunks, cur)
 	}
+
+	w.spendChunks = len(chunks)
 
 	if len(chunks) == 0 {
 		return nil
@@ -559,6 +592,7 @@ func (w *nettedWrite) createLevels(ctx context.Context) error {
 		maxLevel = max(maxLevel, level[i])
 	}
 
+	w.levels = maxLevel + 1
 	byLevel := make([][]*multiTx, maxLevel+1)
 	sizes := make(map[*multiTx]int, len(w.items))
 
@@ -800,9 +834,18 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 		}
 	}()
 
+	t0 := time.Now()
+
+	for _, b := range plan.bodies {
+		w.bodyBytes.Add(int64(len(b)))
+	}
+
 	if err = w.s.lockTxids(ctx, dbTx, plan.txids); err != nil {
 		return err
 	}
+
+	t1 := time.Now()
+	w.lockNs.Add(int64(t1.Sub(t0)))
 
 	if err = w.s.runCreatePlan(ctx, dbTx, plan); err != nil {
 		return err
@@ -824,13 +867,22 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 		}
 	}
 
+	t2 := time.Now()
+	w.createNs.Add(int64(t2.Sub(t1)))
+
 	if err = w.writeNettedJournal(ctx, dbTx, journal); err != nil {
 		return err
 	}
 
+	t3 := time.Now()
+	w.journalNs.Add(int64(t3.Sub(t2)))
+
 	if err = dbTx.Commit(ctx); err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] commit create chunk", err)
 	}
+
+	w.commitNs.Add(int64(time.Since(t3)))
+	w.createChunks.Add(1)
 
 	committed = true
 
@@ -897,4 +949,20 @@ func (w *nettedWrite) finishPerTransaction(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// logIfSlow writes one line for a list that took longer than multiSlowListLog, saying how big
+// and how deep it was and where the time went. Step 1 is the outside spends, step 2 the
+// creates; the chunk timings inside step 2 are summed across parallel chunks.
+func (w *nettedWrite) logIfSlow(start, spent, end time.Time) {
+	if end.Sub(start) < multiSlowListLog {
+		return
+	}
+
+	w.s.logger.Infof("[utxoset][SpendAndCreateMulti] slow list at height %d: %d txs, %d levels, %.1f MB of bodies; step 1 %s in %d chunks; step 2 %s in %d chunks (lock %s, create %s, journal %s, commit %s)",
+		w.blockHeight, len(w.items), w.levels, float64(w.bodyBytes.Load())/1e6,
+		spent.Sub(start).Round(time.Millisecond), w.spendChunks,
+		end.Sub(spent).Round(time.Millisecond), w.createChunks.Load(),
+		time.Duration(w.lockNs.Load()).Round(time.Millisecond), time.Duration(w.createNs.Load()).Round(time.Millisecond),
+		time.Duration(w.journalNs.Load()).Round(time.Millisecond), time.Duration(w.commitNs.Load()).Round(time.Millisecond))
 }
