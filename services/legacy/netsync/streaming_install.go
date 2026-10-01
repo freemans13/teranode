@@ -37,16 +37,6 @@ import (
 // two hundred blocks large enough to do the same thing. A streamed body never
 // reserves that budget, because there is nothing in memory to bound.
 
-// streamedBodyRequestWindow is how recently this node must have asked for a
-// block before a peer may write its body to our disk.
-//
-// It is generous on purpose. The gate's job is to refuse bodies nobody asked
-// for, not to enforce timeliness: a body that arrives late is still a body this
-// node wanted, and refusing it means paying for the download again. The
-// tracker's own assignment records expire well before this, so in practice the
-// tracker is the tighter bound and this is the backstop.
-const streamedBodyRequestWindow = 60 * 60 * 1000000000 // one hour, in nanoseconds
-
 // installStreamingBlockPath wires the three functions the wire layer needs
 // before it will stream a block body to disk instead of decoding it. Called
 // once, from the sync manager's construction: the park is mandatory, so the
@@ -262,7 +252,12 @@ func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.Bloc
 		return errors.NewBlockInvalidError("[streamingBlockGate][%s] the header hashes to %s", hash, got)
 	}
 
-	if sm.blockDownloads == nil || !sm.blockDownloads.RequestedWithin(hash, streamedBodyRequestWindow) {
+	// Judged against the ledger's own ownership ceiling (blockRequestAssignmentCeiling,
+	// 375 minutes at shipped mainnet settings), not a separate window. The gate's job
+	// is to refuse bodies nobody asked for, not to enforce timeliness. A second,
+	// shorter clock here (it was a flat hour) refused bodies the ledger still said a
+	// peer owed us.
+	if sm.blockDownloads == nil || !sm.blockDownloads.Requested(hash) {
 		return errors.NewBlockInvalidError("[streamingBlockGate][%s] this node did not ask for this block", hash)
 	}
 

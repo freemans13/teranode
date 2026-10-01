@@ -49,6 +49,7 @@ func TestHoldsBlock_FindsACompleteConvertedRecordOnDisk(t *testing.T) {
 
 	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
 
 	require.False(t, park.Has(hash), "the entry map knows nothing about it, which is the state a restart is in")
 	require.True(t, sm.holdsBlock(ctx, hash),
@@ -82,6 +83,35 @@ func TestHoldsBlock_ExcludesARecordWithAMissingSubtreeFile(t *testing.T) {
 		"the record exists but its subtree file does not, so this is not a block the node can commit and must be requested again")
 }
 
+// TestHoldsBlock_ExcludesARecordWhoseDataFileIsGone: the structure file is still on
+// disk but the subtree data file is not, which subtreeWriter.DeleteAll leaves behind
+// when it stops after deleting the data file (it deletes in write order, data first)
+// and which per-file expiry can leave too. The commit reads the data file, so the
+// block must be requested again rather than skipped on every pass.
+func TestHoldsBlock_ExcludesARecordWhoseDataFileIsGone(t *testing.T) {
+	ctx := context.Background()
+
+	subtreeStoreURL, err := url.Parse("file://" + t.TempDir())
+	require.NoError(t, err)
+
+	subtreeStore, err := file.New(ulogger.TestLogger{}, subtreeStoreURL)
+	require.NoError(t, err)
+
+	park, _ := newTestPark(t, "")
+	sm := &SyncManager{logger: ulogger.TestLogger{}, blockPark: park, subtreeStore: subtreeStore}
+
+	blk, hash := convertedRecordWithSubtrees(t, 1, 100)
+	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
+	require.True(t, sm.holdsBlock(ctx, hash), "sanity: with both files present the record is held")
+
+	require.NoError(t, subtreeStore.Del(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData))
+
+	require.False(t, sm.holdsBlock(ctx, hash),
+		"a record whose data file is gone cannot be committed, so the block must be requested again")
+}
+
 func TestHoldsBlock_IsSafeWithNoPark(t *testing.T) {
 	sm := &SyncManager{logger: ulogger.TestLogger{}}
 
@@ -90,7 +120,7 @@ func TestHoldsBlock_IsSafeWithNoPark(t *testing.T) {
 }
 
 // heldRecord puts a complete converted block on disk for sm, as the pipeline sink leaves one: its
-// record in the park's store and its subtree file in the subtree store. It returns the block's hash.
+// record in the park's store and its structure and data files in the subtree store. It returns the block's hash.
 func heldRecord(t *testing.T, sm *SyncManager, seed byte) chainhash.Hash {
 	t.Helper()
 
@@ -104,6 +134,7 @@ func heldRecord(t *testing.T, sm *SyncManager, seed byte) chainhash.Hash {
 
 	for _, root := range record.Subtrees {
 		require.NoError(t, sm.subtreeStore.Set(context.Background(), root[:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+		require.NoError(t, sm.subtreeStore.Set(context.Background(), root[:], fileformat.FileTypeSubtreeData, []byte("data")))
 	}
 
 	return hash

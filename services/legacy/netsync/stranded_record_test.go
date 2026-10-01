@@ -54,6 +54,7 @@ func TestDownloadPassAdoptsACompleteRecordThePArkDoesNotList(t *testing.T) {
 	blk, hash := convertedRecordWithSubtrees(t, 1, 650022)
 	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
 
 	require.False(t, park.Has(hash), "written but never admitted: the state mainnet was stuck in")
 
@@ -90,6 +91,7 @@ func TestDownloadPassLeavesAnAlreadyParkedBlockAlone(t *testing.T) {
 	blk, hash := convertedRecordWithSubtrees(t, 1, 650022)
 	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
 
 	require.True(t, park.AdoptWritten(parkedBlock{hash: hash, prevBlock: *blk.Header.HashPrevBlock}))
 
@@ -107,6 +109,7 @@ func TestDownloadPassLeavesAFreshRecordToItsAnnouncement(t *testing.T) {
 	blk, hash := convertedRecordWithSubtrees(t, 1, 650022)
 	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
 
 	require.Empty(t, sm.unownedBlocks([]wantedBlock{{height: 650022, hash: hash}}), "held, so not downloaded again")
 	require.False(t, park.Has(hash), "but not adopted: it is not stranded yet")
@@ -122,6 +125,7 @@ func TestDownloadPassLeavesABlockInFlightAlone(t *testing.T) {
 	blk, hash := convertedRecordWithSubtrees(t, 1, 650022)
 	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
 	ageRecord(t, park, hash.String())
 
 	sm.dispatcher = &blockDispatcher{frontier: []*frontierEntry{{hash: hash, height: 650022}}}

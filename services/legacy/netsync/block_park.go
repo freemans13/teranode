@@ -912,6 +912,23 @@ func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, 
 
 			return false
 		}
+
+		// The structure file alone is not proof. subtreeWriter writes it last, so at
+		// write time its presence means the data file is there too, but nothing keeps
+		// that true afterwards: subtreeWriter.DeleteAll removes the data file first and
+		// carries on past a failed delete, and expiry removes each file on its own. Quick
+		// validation reads the data file with no other source (readSubtree in
+		// blockvalidation's quick_validate.go), and the .subtreeToCheck route
+		// (CheckBlockSubtrees) can only replace a missing one by fetching it over HTTP
+		// from the delivering peer's base URL, so a record without it is not one this
+		// node can be sure of committing.
+		dataExists, dataErr := subtreeStore.Exists(ctx, subtree[:], fileformat.FileTypeSubtreeData)
+		if dataErr != nil || !dataExists {
+			p.logger.Warnf("[blockPark][%s] converted record's subtree %s has no data file (exists=%v, err=%v); treating the record as not held",
+				hash, subtree, dataExists, dataErr)
+
+			return false
+		}
 	}
 
 	return true

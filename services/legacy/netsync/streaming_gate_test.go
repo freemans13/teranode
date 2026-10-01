@@ -116,6 +116,36 @@ func TestStreamingBlockGate(t *testing.T) {
 			"the hash-match check must be what refuses this; every later check would refuse it too, for the wrong reason")
 	})
 
+	t.Run("a request the ledger still holds passes the asked-for check however old it is", func(t *testing.T) {
+		// One clock, the ledger's. The ceiling is 375 minutes at shipped mainnet
+		// settings, so a body whose request is two hours old is still one a peer owes
+		// us. The gate used to apply its own flat hour and refuse it.
+		sm := newSM(t)
+
+		now := time.Unix(1_700_000_000, 0)
+		sm.blockDownloads = newBlockDownloadTracker(375 * time.Minute)
+		sm.blockDownloads.now = func() time.Time { return now }
+
+		h := easyHeader()
+		hash := h.BlockHash()
+		require.True(t, sm.blockDownloads.Add(nil, hash))
+
+		now = now.Add(2 * time.Hour)
+
+		err := sm.streamingBlockGate(hash, h)
+		require.Error(t, err, "sanity: mainnet's floor still refuses this easy header")
+		require.NotContains(t, err.Error(), "did not ask for this block",
+			"a request inside the ledger's ownership ceiling must pass the asked-for check")
+		require.Contains(t, err.Error(), "easier than", "the floor, a later check, must be what refuses it")
+
+		now = now.Add(376*time.Minute - 2*time.Hour)
+
+		err = sm.streamingBlockGate(hash, h)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "did not ask for this block",
+			"past the ledger's ceiling nobody owes us the block, so the body is refused")
+	})
+
 	t.Run("the mainnet floor is the value the chain actually uses", func(t *testing.T) {
 		// Guards the direction of the comparison. A floor applied the wrong way
 		// round would refuse every real block and accept every forged one, and

@@ -1681,17 +1681,19 @@ func (p *Peer) blockDownloadBudget() time.Duration {
 // downloading" term of the budget.
 //
 // The scheduler will not place a block once the ledger holds
-// legacy_blockDownloadWindow of them, and it fills one peer to
-// legacy_maxBlocksInTransitPerPeer before moving to the next (block_scheduler.go
-// hands out contiguous runs), so the window divided by that depth is how many
-// peers the configuration spreads the work over. At shipped settings that is
+// legacy_blockDownloadWindow of them, and each peer carries at most
+// legacy_maxBlocksInTransitPerPeer, so the window divided by that depth is how
+// many peers it takes to fill the window. At shipped settings that is
 // 1024/16 = 64.
 //
-// It is a configuration figure, not a runtime measurement, which is the point:
-// the download ledger's ownership ceiling and the peer layer's budget both
-// derive from it, so neither can drift away from the other. blockDownloadBudget
-// caps itself at the result, so a runtime peer count above this bound narrows
-// the budget rather than escaping the ceiling.
+// It is NOT a bound on the live count. fetchHeaderBlocks fans out to every
+// eligible peer (block_scheduler.go), so with more than 64 eligible peers, more
+// than 64 can each hold a block. That is why blockDownloadBudget caps itself at
+// MaxBlockDownloadBudget: a runtime peer count above this figure narrows the
+// budget rather than escaping the ledger's ownership ceiling, which is derived
+// from the same figure (TestBlockDownloadBudgetNeverExceedsItsDerivedMaximum).
+// It is a configuration figure, not a runtime measurement, so both clocks get
+// the same answer at any moment.
 func maxPeersWithBlockDownloads(s *settings.Settings) int {
 	if s == nil {
 		return 1

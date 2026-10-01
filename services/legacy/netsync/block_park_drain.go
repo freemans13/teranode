@@ -318,6 +318,8 @@ func (sm *SyncManager) noteCommittedParkedBlock(entry parkedBlock) {
 		_, meta, err := sm.blockchainClient.GetBlockHeader(ctx, &entry.hash)
 		if err != nil {
 			sm.logger.Warnf("[commitParkedBlock][%s] could not read back the committed height: %v", entry.hash, err)
+		} else if meta == nil {
+			sm.logger.Warnf("[commitParkedBlock][%s] could not read back the committed height: no block metadata returned", entry.hash)
 		} else if h, convErr := safeconversion.Uint32ToInt32(meta.Height); convErr != nil {
 			sm.logger.Errorf(failedToConvertBlockHeightInt32Msg, convErr)
 		} else {

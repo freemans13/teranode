@@ -723,20 +723,16 @@ func (s *Server) logPeerStats(ctx context.Context) {
 					p.GetAddr(), p.GetId(), p.GetServices(), p.GetInbound(), p.GetBytesSent(), p.GetBytesReceived(), p.GetPingTime(), lastSendElapsed, lastRecvElapsed, p.GetCurrentHeight(), p.GetBanscore())
 			}
 
-			// The connection manager's own count against the outbound peers
-			// actually connected: a gap that lasts is a leaked slot, which stops
-			// the node dialling and leaves it syncing on fewer peers.
+			// The connection manager's own count against the automatic outbound
+			// peers actually connected: a gap that lasts is a leaked slot, which
+			// stops the node dialling and leaves it syncing on fewer peers. Both
+			// sides leave out permanent (addnode) peers; the peer_api list has no
+			// persistent flag, so the connected side is read from the server peers.
 			if s.server != nil && s.server.connManager != nil {
-				outbound := 0
-
-				for _, p := range peers {
-					if !p.GetInbound() {
-						outbound++
-					}
-				}
+				outbound := automaticOutboundConnected(s.server.getPeers())
 
 				counted := s.server.connManager.AutomaticOutboundCount()
-				ctxLogger.Infof("[Legacy Server] outbound: %d slots counted by the connection manager, %d outbound peers connected", counted, outbound)
+				ctxLogger.Infof("[Legacy Server] outbound: %d automatic slots counted by the connection manager, %d automatic outbound peers connected", counted, outbound)
 
 				if gap := gapWatch.observe(counted, outbound); gap > 0 {
 					ctxLogger.Warnf("[Legacy Server] %d outbound slots are counted with no peer behind them, for over a minute: the connection manager will not dial to replace them", gap)

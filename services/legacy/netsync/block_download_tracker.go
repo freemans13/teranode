@@ -427,6 +427,19 @@ func (t *blockDownloadTracker) RequestedWithin(h chainhash.Hash, maxAge time.Dur
 	return false
 }
 
+// Requested reports whether anybody is still on the hook for block h, judged
+// against the ledger's own ownership ceiling, the same clock HasOwner uses. It is
+// the question the streaming gate asks before a body is written to disk: a body
+// the ledger still says somebody owes us is one we asked for, however long the
+// transfer has legitimately taken.
+func (t *blockDownloadTracker) Requested(h chainhash.Hash) bool {
+	if t == nil {
+		return false
+	}
+
+	return t.RequestedWithin(h, t.ttl)
+}
+
 // RemoveOwner cancels just this peer's obligation for block h and leaves any
 // other peer still owing it. The frontier race needs the difference: when a
 // raced block arrives it cancels the request with the peers it asked and nobody

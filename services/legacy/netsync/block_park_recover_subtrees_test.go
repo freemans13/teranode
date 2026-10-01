@@ -40,6 +40,8 @@ func TestRecover_ChecksEverySubtreeNotJustTheFirst(t *testing.T) {
 		}
 
 		require.NoError(t, subtreeStore.Set(ctx, st[:], fileformat.FileTypeSubtree, []byte("structure")))
+
+		require.NoError(t, subtreeStore.Set(ctx, st[:], fileformat.FileTypeSubtreeData, []byte("data")))
 	}
 
 	park.Recover(ctx, subtreeStore)
@@ -67,6 +69,7 @@ func TestRecover_KeepsTheHeightItAlreadyRead(t *testing.T) {
 
 	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtree, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
 
 	park.Recover(ctx, subtreeStore)
 
