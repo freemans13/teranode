@@ -342,18 +342,15 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		return
 	}
 
-	// The streamed route never touched sm.blockDownloads, the map
-	// handleBlockMsg releases via RemoveOwner/ForgiveOwners (manager.go) the
-	// moment it dequeues a decoded block. Streaming is now unconditional
-	// whenever the park is enabled, so this on-disk route is every block that
-	// arrives on such a node, not a rare oversized one: without this release a
+	// Every block arrives on this on-disk route, so this is where the download
+	// ledger, sm.blockDownloads, is released for it: without this release a
 	// delivering peer's CountForPeer sticks at MaxBlocksInTransitPerPeer after
 	// roughly sixteen deliveries and the scheduler (block_scheduler.go:144)
 	// stops asking that peer for anything until the hour-long assignment TTL
 	// expires.
 	//
-	// Released HERE — at message intake into this single consumer, the same
-	// point handleBlockMsg releases it, NOT at the block's eventual commit.
+	// Released HERE, at message intake into this single consumer, NOT at the
+	// block's eventual commit.
 	// By the time this message exists the peer has already fully answered: the
 	// sink ran to completion on the peer's own read loop before
 	// QueueBlockOnDisk was ever called, so there is no copy still being
@@ -371,9 +368,8 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// the time this function is reached, the streaming route is the only route
 	// this delivery could have taken.
 	//
-	// Resolve a stream sub-peer to its association primary, exactly as
-	// handleBlockMsg does before its own RemoveOwner call (manager.go:3271-3276)
-	// and as BlockRequested does before its HasOwner check (manager.go:6530-6538):
+	// Resolve a stream sub-peer to its association primary, as BlockRequested
+	// does before its HasOwner check:
 	// the download ledger records ownership under the primary, never under a
 	// BlockPriority association's DATA1/DATA2 sub-peer. msg.peer is exactly
 	// that sub-peer whenever the body arrived on its own stream — OnBlockOnDisk
@@ -479,10 +475,8 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// commits blocks, so an unreachable block does not merely sit there, it
 	// competes with the work the operator is waiting for.
 	//
-	// The decoded path never had to ask this question, because a block only
-	// reaches its park call after handleBlockMsg has walked the header list for
-	// it. Streaming skips that walk by design, which is the point of it, so the
-	// question has to be asked here instead.
+	// Streaming does not walk the header list for a block before parking it,
+	// which is the point of it, so the question has to be asked here.
 	if !sm.parentIsReachable(entry.prevBlock) {
 		sm.logger.Infof("[blockOnDisk][%s] parent %s is neither in the chain nor in the header list, so this block is unreachable; discarding the body",
 			entry.hash, entry.prevBlock)

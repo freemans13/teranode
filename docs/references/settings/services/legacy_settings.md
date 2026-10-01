@@ -17,12 +17,6 @@ and no loader line arrives as its zero value whatever an operator writes.
 | ConnectPeers | []string | [] | legacy_connect_peers | Pipe-separated peers to dial. A non-empty list puts the node in connect-only mode |
 | OrphanEvictionDuration | time.Duration | 10m | legacy_orphanEvictionDuration | How long an orphan transaction is held. On eviction it gets one last validation attempt |
 | MaxOrphanTxs | int | 100 | legacy_maxOrphanTxs | Cap on orphan transactions held in memory. Inserting past the cap evicts the oldest by insertion time. 0 leaves the pool unbounded |
-| StoreBatcherSize | int | 1024 | legacy_storeBatcherSize | Multiplied by StoreBatcherConcurrency to give the concurrent-request limit on UTXO creates while a block is stored |
-| StoreBatcherConcurrency | int | 32 | legacy_storeBatcherConcurrency | The other factor in that UTXO create limit (1024 x 32 = 32768 concurrent requests at the defaults) |
-| SpendBatcherSize | int | 1024 | legacy_spendBatcherSize | Multiplied by SpendBatcherConcurrency to give the concurrent-request limit on UTXO spends |
-| SpendBatcherConcurrency | int | 4 | legacy_spendBatcherConcurrency | The other factor in that UTXO spend limit |
-| OutpointBatcherSize | int | 1024 | legacy_outpointBatcherSize | Goroutine limit for populating transaction inputs in extendTransactions |
-| OutpointBatcherConcurrency | int | 32 | legacy_outpointBatcherConcurrency | Loaded but read by no code. Changing it has no effect |
 | PrintInvMessages | bool | false | legacy_printInvMessages | Log every inventory message sent and received |
 | GRPCAddress | string | "" | legacy_grpcAddress | Address other services dial to reach the legacy service. Client creation fails when empty |
 | AllowBlockPriority | bool | true | legacy_allowBlockPriority | Negotiate the BSV multistream BlockPriority policy, which carries block traffic on its own TCP stream. False also refuses an inbound createstream |
@@ -37,9 +31,6 @@ and no loader line arrives as its zero value whatever an operator writes.
 | FeelerInterval | time.Duration | 120s | legacy_feelerInterval | Mean of the randomised gap between feeler probes. Not a disable lever: a non-positive value falls back to 120s with a warning |
 | FeelerHandshakeTimeout | time.Duration | 25s | legacy_feelerHandshakeTimeout | How long a feeler waits for a version message. Must stay under the 30s peer negotiate timeout |
 | PeerProcessingTimeout | time.Duration | 3m | legacy_peerProcessingTimeout | Per-message processing watchdog. Not armed for block messages while prefetch ingestion is active. Also the pre-admission deadline on an inbound peer, and part of the block-failure map TTL |
-| BlockFailureBackoffBase | time.Duration | 5s | legacy_blockFailureBackoffBase | Base per-block backoff after a transient storage or service failure, multiplied by the consecutive failure count. 0 disables the backoff |
-| BlockFailureBackoffMaxDuration | time.Duration | 150s | legacy_blockFailureBackoffMaxDuration | Cap on that backoff window, and with PeerProcessingTimeout the TTL of the failure-tracking map. 0 or less disables the backoff entirely |
-| BlockFailureAttemptCeiling | int | 20 | legacy_blockFailureAttemptCeiling | Consecutive failures after which a block is given up on for the life of the process. 0 disables the ceiling |
 | BlockDownloadTimeoutBasePercent | int64 | 100 | legacy_blockDownloadTimeoutBasePercent | Ceiling on one block download at the chain tip, as a percentage of the target block interval. Floored at 30 minutes, so values at or below 300 change nothing on a 10-minute chain |
 | BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up. Also floored at 30 minutes, which the 600 default clears on a 10-minute chain |
 | BlockDownloadTimeoutPerPeerPercent | int64 | 50 | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling per other peer with a block download outstanding. The total is floored at 30 minutes, so this only adds patience |
@@ -95,14 +86,6 @@ and no loader line arrives as its zero value whatever an operator writes.
   A non-positive value falls back to 25s, also with a warning. Both warnings are
   emitted once, at startup, and the deadline the feeler settled on is on the
   `[Feeler] Starting` line.
-
-### Batch Processing Performance
-
-- `StoreBatcherSize` multiplied by `StoreBatcherConcurrency` is the limit on
-  concurrent UTXO create requests while a block is stored. `SpendBatcherSize` and
-  `SpendBatcherConcurrency` bound spends the same way.
-- `OutpointBatcherSize` bounds the goroutines that populate transaction inputs.
-  `OutpointBatcherConcurrency` is read by nothing.
 
 ### Peer Timeout Management
 
@@ -247,15 +230,6 @@ legacy_connect_peers = "peer1.example.com:8333|peer2.example.com:8333"
 
 Connect-only mode lowers the peer cap to the length of the list and switches
 feeler probes off. It does not switch off DNS seeding.
-
-### Performance Tuning
-
-```text
-legacy_storeBatcherSize = 2048
-legacy_storeBatcherConcurrency = 64
-legacy_spendBatcherSize = 2048
-legacy_spendBatcherConcurrency = 64
-```
 
 ### Bounding Read-Ahead
 

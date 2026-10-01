@@ -128,12 +128,10 @@ func (sm *SyncManager) wantedBlocks(best int32) []wantedBlock {
 //
 // The recently-failed check runs first, and it only skips the one entry it
 // names, not everything above it: a failed parent's own children earn no mark
-// of their own until each has actually been downloaded once and refused on
-// arrival (handleBlockMsgHead's delivery-side check, keyed on the arriving
-// block's own parent hash), so the first pass after a failure still names
-// them. What this check bounds is every pass after that one: once a hash is
-// marked, whether the parent itself or a child the cascade has since caught,
-// it is not requested again for the life of the mark, rather than being
+// of their own, so a pass after a failure still names them, and they wait in
+// the park behind the missing parent once downloaded. What this check bounds is
+// the marked hash itself: it is not requested again for the life of the mark,
+// rather than being
 // downloaded and refused afresh every single pass for as long as the parent
 // stays failed. Honouring dispatcher.inFlight is what stops a parent that is
 // being retried right now from being misread as a dead one: it was
@@ -144,16 +142,6 @@ func (sm *SyncManager) wantedBlocks(best int32) []wantedBlock {
 // disk should not spend a peer's budget nor be forgiven on a peer's behalf:
 // it is simply done. holdsBlock and the park's own index answer from the
 // filesystem alone.
-//
-// blockGivenUpOn is checked ahead of the transient-failure backoff, not
-// folded into the same map read: a block past its attempt ceiling must never
-// be requested again in this process, where a block merely inside its backoff
-// window is asked for again once that window passes, and conflating the two
-// would either request a given-up block early or never retry a merely
-// backed-off one. Both are map reads, and both run ahead of the blockchain
-// round trip below for exactly that reason: the cheap checks come first, so
-// the round trip is only ever spent on a candidate none of them already
-// rejected.
 //
 // haveInventory is the fallback for the one question none of the checks
 // above can answer: whether the chain already has this block by some route
@@ -206,14 +194,9 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 		}
 
 		// #1333: a block that recently failed to store or validate, judged or
-		// merely unlucky, is not requested again while the mark stands. This is
-		// what actually bounds the cascade review measured: the descendants of
-		// a failed parent are not individually marked until each has been
-		// downloaded once and refused on arrival by the delivery-side check in
-		// handleBlockMsgHead, so the first pass after a failure still names all
-		// of them — but every pass after that skips whichever ones the cascade
-		// has already caught, rather than re-downloading the same read-ahead
-		// depth of blocks for as long as the parent stays written off.
+		// merely unlucky, is not requested again while the mark stands. Its
+		// descendants are not marked themselves; once downloaded they wait in
+		// the park behind the missing parent rather than being asked for again.
 		// dispatcher.inFlight is honoured for the same reason the delivery-side
 		// check honours it: a parent being retried right now was re-admitted,
 		// so it is not a failed parent and must not hold its children back.
@@ -233,35 +216,6 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 		// already safely on its way to disk.
 		if sm.blockPark.Has(block.hash) {
 			continue
-		}
-
-		// blockGivenUpOn: past its attempt ceiling, this block must not be
-		// requested again in this process at all, not merely throttled. This
-		// is the check handleBlockMsg's delivery-side blockGivenUpOn guards
-		// against ever being reached in the first place — without it here, the
-		// only thing stopping a re-request was ever the transient backoff
-		// below, which forgets the block once its own window passes and lets
-		// the whole attempt count restart from a peer that answers nothing new.
-		// Checked ahead of the blockchain round trip below: it is a map read,
-		// not a network call, so a block this cheap check would already
-		// reject is never charged the round trip's cost first.
-		if sm.blockGivenUpOn(block.hash) {
-			continue
-		}
-
-		// The #1187 transient-failure backoff. A block that just failed with a
-		// local, non-judgemental fault (dropBlockFromWalk records it) must wait
-		// out its backoff window before the next pass asks for it again, or the
-		// throttle that exists to stop a re-decorate storm never actually
-		// throttles anything: without this check the backoff map fills but
-		// nothing here ever reads it, and a block that cannot be stored yet is
-		// downloaded again on every pass instead of once per window. Also
-		// ahead of the round trip below for the same reason blockGivenUpOn is:
-		// it is the cheaper check, so it runs first.
-		if sm.blockFailureBackoff != nil {
-			if fs, backedOff := sm.blockFailureBackoff.Get(block.hash); backedOff && time.Now().Before(fs.nextRetry) {
-				continue
-			}
 		}
 
 		// Already asked of a peer within the retry window: skipped from the ledger,
@@ -372,7 +326,7 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 // when the owner is the only peer left the block is reasserted rather than
 // requested a second time. Sending it twice would have the peer answer twice,
 // and the second copy arrives after the first discharged the obligation
-// (handleBlockMsg calls RemoveOwner on the answering peer), so it looks
+// (handleBlockOnDiskMsg calls RemoveOwner on the answering peer), so it looks
 // unrequested and costs an honest peer its whole association.
 //
 // On a node with one peer that means the block is not re-asked at all, which is

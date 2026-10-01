@@ -219,7 +219,7 @@ func TestDemotedSyncPeer_IsNotReElectedStraightAway(t *testing.T) {
 	// The cooldown expires, and the same election runs again.
 	state, exists := sm.peerStates.Get(stalled)
 	require.True(t, exists)
-	state.clearDemotionCooldown()
+	state.demotedUntil.Store(0) // past the cooldown without sleeping
 
 	sm.startSync()
 	require.Equal(t, stalled, sm.loadSyncPeer(),

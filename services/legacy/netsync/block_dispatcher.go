@@ -47,13 +47,11 @@ func (e *frontierEntry) settle(err error) {
 	})
 }
 
-// blockDispatch is what handleBlockMsgHead produced: one queued block that passed every
-// pre-check, with its parent resolved as stored or in flight and its route decided. It
-// carries the state the chain-order tail needs so the tail can run long after the head
-// did, and none of that state is the decoded block: msgBlock is released the moment the
-// worker returns, and the tail must never want it. A block whose parent is neither
-// stored nor in flight never becomes a dispatch at all; the head parks it while it
-// still holds the bytes.
+// blockDispatch is one parked block the park drain hands to the dispatcher, with its
+// route decided. It carries the state the chain-order tail needs so the tail can run
+// long after the worker did, and none of that state is the block's bytes: the worker
+// reads them from the park and drops them when it returns, and the tail must never want
+// them.
 type blockDispatch struct {
 	isCheckpoint bool
 	height       uint32
@@ -106,7 +104,7 @@ type blockCompletion struct {
 // caught by go test -race on TestBlockHandler_TheSweepGoroutinePostsAndTheConsumerCommits
 // and TestSyncManager_TheBlockHandlerRunsTheParkSweep. frontierMu is the fix: every read
 // and write of frontier takes it, for exactly as long as the read or write itself, and
-// never across a call back into tail code (handleBlockMsgTail, by way of fetchHeaderBlocks,
+// never across a call back into tail code (a dispatch's tail, by way of fetchHeaderBlocks,
 // can itself call back into inFlight, so complete must release the lock before invoking a
 // dispatch's tail or it would deadlock against itself on the same goroutine).
 type blockDispatcher struct {
@@ -367,9 +365,9 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 			err = errors.NewServiceError("[blockDispatcher][%s] aborted at height %d: a predecessor failed", head.hash.String(), head.height)
 		case err != nil && (errors.Is(err, context.Canceled) || errors.IsContextError(err)):
 			// Substituted, and deliberately neither wrapping the cause nor quoting its
-			// text: handleBlockMsgTail's context branch replies nil and records the
-			// block as accepted, which an abandoned block is not, and errors.Is
-			// recognises a context error by its message as well as by its code.
+			// text: a context error would be read downstream as a cancelled commit
+			// rather than an abandoned block, and errors.Is recognises a context
+			// error by its message as well as by its code.
 			bd.sm.logger.Warnf("[blockDispatcher][%s] block at height %d abandoned mid-flight: %v", head.hash.String(), head.height, err)
 
 			err = errors.NewServiceError("[blockDispatcher][%s] block at height %d abandoned before it finished", head.hash.String(), head.height)

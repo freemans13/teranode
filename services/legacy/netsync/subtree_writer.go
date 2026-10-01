@@ -296,11 +296,6 @@ func (w *subtreeWriter) deleteAt() uint32 {
 	return w.height + w.settings.GetSubtreeValidationBlockHeightRetention()
 }
 
-// Written lists every artefact this writer has created in the store, in write order.
-func (w *subtreeWriter) Written() []writtenSubtree {
-	return w.written
-}
-
 // DeleteAll removes everything this writer created. It is what a failed block
 // calls: nothing is reading these files, because no block references them until
 // the block is handed over. Files that were already in the store when this writer

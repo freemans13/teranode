@@ -323,31 +323,25 @@ func (sm *SyncManager) singlePeerAssigner(ladder int) *downloadAssigner {
 	}
 }
 
-// take offers a header at this height to the peers in turn and reports which one
-// will carry it. A false answer means the budgets are spent — the node-wide
-// window, or every peer's own cap — and the caller must then stop with the
-// download cursor still on that header, because advancing past a header nobody
-// was asked for loses that block from the walk for good.
+// takeAvoiding offers a block at this height to the peers in turn and reports
+// which one will carry it. A false answer means the budgets are spent, the
+// node-wide window or every peer's own cap.
 //
 // The claimed-height test picks between peers; it is not a veto. When no peer
 // with budget claims a chain that reaches this block, a peer with budget is
 // asked anyway. A claimed height is a lower bound that goes stale downward
 // (see canServe), so "nobody claims it" routinely means we simply have not been
-// told rather than that nobody has the block — and a scheduler that declines to
+// told rather than that nobody has the block, and a scheduler that declines to
 // ask anybody stops sync dead, which is far worse than one wasted request. A
 // peer that really cannot serve it just does not answer, the hash becomes
 // re-requestable after blockRequestRetryInterval, and the one block that
 // actually gates progress is covered by the frontier race.
-func (a *downloadAssigner) take(height int32) (*assignerPeer, bool) {
-	return a.takeAvoiding(height, nil)
-}
-
-// takeAvoiding is take with a preference: a peer the caller would rather not
-// pick is chosen only when no peer without that mark can be found. avoid may be
-// nil, which is exactly take, and take is the only thing the header walk uses —
-// so this preference cannot change which peer that walk picks for anything.
 //
-// The caller that does use it is the wanted-range assignment pass, whose mark is
+// It also takes a preference: a peer the caller would rather not pick is chosen
+// only when no peer without that mark can be found. avoid may be nil, which
+// applies no preference.
+//
+// Its caller is the wanted-range assignment pass, whose mark is
 // "this peer already owes us this block". Asking such a peer for it again makes
 // it send the block twice, and the second copy arrives after the first
 // discharged its obligation, so it looks unrequested and costs an honest peer
@@ -358,7 +352,7 @@ func (a *downloadAssigner) take(height int32) (*assignerPeer, bool) {
 // An unmarked peer that has not claimed a chain reaching this height beats a
 // marked peer that has. canServe is a lower bound that goes stale downward, so
 // "has not claimed it" routinely means only that we have not been told, and
-// take's own reasoning already prefers one wasted request to asking nobody. A
+// the reasoning above already prefers one wasted request to asking nobody. A
 // marked peer, by contrast, can contribute nothing new however high it claims.
 //
 // Within each of those tiers the fastest peer wins, with more room left breaking

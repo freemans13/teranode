@@ -75,16 +75,6 @@ func (sm *SyncManager) chainCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(sm.ctx, timeout)
 }
 
-// blockExistsWithDeadline is the sweep's parent lookup, in a function of its own
-// so the deadline is released at the end of each iteration rather than piling up
-// until the end of the tick.
-func (sm *SyncManager) blockExistsWithDeadline(hash chainhash.Hash) (bool, error) {
-	ctx, cancel := sm.chainCtx()
-	defer cancel()
-
-	return sm.blockchainClient.GetBlockExists(ctx, &hash)
-}
-
 // parentChainState answers every question the sweep has about a parent in one
 // round trip: is it stored, is it usable, and how high is it.
 //
@@ -143,12 +133,11 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 // reporting whether it went in — which is what tells the drain whether to look
 // for blocks parked behind it in turn.
 //
-// It deliberately does NOT go back through handleBlockMsg. That function's front
-// half is wrong for a block committed from disk and would break it twice over:
-// the peer lookup reports "unknown peer" for a peer that has since been evicted,
-// which fails the whole block, and the ownership check sees an obligation that
-// was released when the block first arrived, which disconnects a peer for
-// delivering a block we asked for.
+// It deliberately makes no peer lookup and no ownership check. Either would be
+// wrong for a block committed from disk: the peer lookup reports "unknown peer"
+// for a peer that has since been evicted, which would fail the whole block, and
+// the ownership check would see an obligation that was released when the block
+// first arrived.
 //
 // The entry has already been taken out of the park index by the caller. Its blob
 // is still on disk and still charged against the budget, so every path out of
@@ -224,10 +213,6 @@ func (sm *SyncManager) parkedBlockCommitted(entry parkedBlock, isCheckpointBlock
 
 	sm.applyParkDisposition(entry, parkDispositionCommitted)
 
-	if sm.blockFailureBackoff != nil {
-		sm.blockFailureBackoff.Delete(entry.hash)
-	}
-
 	if sm.recentlyFailedBlocks != nil {
 		sm.recentlyFailedBlocks.Delete(entry.hash)
 	}
@@ -274,12 +259,10 @@ func (sm *SyncManager) replayingHistory() bool {
 func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 	d := parkCommitFailure(err)
 
-	// The same suppression the live path applies. While the node is catching
-	// blocks handleBlockMsg sends no reject for a block that would not commit,
-	// because we are replaying history rather than judging a peer's tip — and
-	// during initial sync this drain is the MAIN commit path, so without this a
-	// parked block earns its peer a reject that the same block delivered live
-	// would not. Committing from disk must judge a peer exactly as the wire does.
+	// While the node is catching blocks no reject is sent for a block that would
+	// not commit, because we are replaying history rather than judging a peer's
+	// tip. Every block commits through this drain, so this is the only place that
+	// rule can live.
 	if d.blamePeer && sm.replayingHistory() {
 		d = d.withoutBlame()
 	}
@@ -346,9 +329,6 @@ func (sm *SyncManager) noteCommittedParkedBlock(entry parkedBlock) {
 
 	entry.peer.UpdateLastBlockHeight(height)
 	state.noteBestKnownHeight(height)
-	// Same fact as the direct-delivery path, discovered later: this peer sent us
-	// this block, and the height is the one we committed it at.
-	state.noteProvenClaim(entry.hash, height)
 }
 
 // livePeer returns the peer a post-commit action should be aimed at: the one

@@ -159,6 +159,6 @@ func TestStreamBuilder_BoundsWhatItRemembers(t *testing.T) {
 		require.NoError(t, b.AddTx(tx, tx.TxIDChainHash()))
 	}
 
-	require.LessOrEqual(t, b.rememberedOutputs(), 4,
+	require.LessOrEqual(t, len(b.recentOutputs), 4,
 		"the map must be bounded; an unbounded one puts the whole block's outputs back in the heap")
 }

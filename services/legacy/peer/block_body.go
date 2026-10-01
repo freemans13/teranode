@@ -99,30 +99,3 @@ func SetBlockBodyStreaming(
 
 	blockBodySink, blockBodyGate, blockBodyDelete = sink, gate, del
 }
-
-// SetBlockBodySink installs the sink alone. Prefer SetBlockBodyStreaming, which
-// is the only way to install a sink that is actually reachable: the handler
-// checks for a gate too, so a sink installed on its own changes nothing. This
-// exists for tests that exercise the sink in isolation.
-func SetBlockBodySink(f func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error)) {
-	blockBodySink = f
-}
-
-// SetBlockBodyGate installs the gate that decides whether a block's body may
-// be streamed to disk. The sync manager calls this where it installs
-// blockBodySink (via SetBlockBodySink), since a store reachable with no gate
-// in front of it is a store anybody can fill; the two must be installed, and
-// removed, together. See blockBodyGate's doc comment for what the gate is
-// required to check.
-func SetBlockBodyGate(f func(hash chainhash.Hash, header *wire.BlockHeader) error) {
-	blockBodyGate = f
-}
-
-// SetBlockBodyDelete installs the callback that removes a body already
-// written under a hash, for the handler to call when it fails after the sink
-// has already returned success. See blockBodyDelete's doc comment for why an
-// orphaned body is worse than a failed download, and for what its converted
-// argument is for.
-func SetBlockBodyDelete(f func(hash chainhash.Hash, converted bool) error) {
-	blockBodyDelete = f
-}

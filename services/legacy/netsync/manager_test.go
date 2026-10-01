@@ -661,24 +661,6 @@ func TestHandleCheckSyncPeer_HeadersFirstMode(t *testing.T) {
 	})
 }
 
-// TestNewBlockFailureBackoffMap verifies the per-block backoff map is built only
-// when both knobs are positive, and is nil (disabled, no zero-TTL leak) otherwise.
-func TestNewBlockFailureBackoffMap(t *testing.T) {
-	require.Nil(t, newBlockFailureBackoffMap(0, time.Minute, time.Minute), "base 0 must disable")
-	require.Nil(t, newBlockFailureBackoffMap(5*time.Second, 0, time.Minute), "window 0 must disable")
-	require.Nil(t, newBlockFailureBackoffMap(-1, time.Minute, time.Minute), "negative base must disable")
-	require.Nil(t, newBlockFailureBackoffMap(5*time.Second, -1, time.Minute), "negative window must disable")
-
-	m := newBlockFailureBackoffMap(5*time.Second, 5*time.Minute, 3*time.Minute)
-	require.NotNil(t, m, "both knobs positive must enable")
-	m.Stop()
-
-	// maxAttempt <= 0 still builds (TTL falls back to window alone).
-	m2 := newBlockFailureBackoffMap(5*time.Second, 5*time.Minute, 0)
-	require.NotNil(t, m2, "non-positive maxAttempt must still build")
-	m2.Stop()
-}
-
 // TestProcessTXmetaBatchMessage_SkipsInBlockTx verifies the tx announce path
 // drops txmeta entries flagged InBlock. The txmeta Kafka topic carries every
 // validated transaction — including those that arrived as part of a block or

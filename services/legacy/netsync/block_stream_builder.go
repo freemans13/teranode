@@ -515,12 +515,6 @@ func (b *blockStreamBuilder) rememberOutputs(txHash chainhash.Hash, tx *bt.Tx) {
 	}
 }
 
-// rememberedOutputs reports how many transactions' outputs are held, for the
-// bound's own test.
-func (b *blockStreamBuilder) rememberedOutputs() int {
-	return len(b.recentOutputs)
-}
-
 // emitCurrent hands the completed subtree to the caller, folds its root into the
 // accumulator, and drops every reference to it.
 func (b *blockStreamBuilder) emitCurrent() error {

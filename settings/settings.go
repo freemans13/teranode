@@ -721,12 +721,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ConnectPeers:                     getMultiString("legacy_connect_peers", "|", []string{}, alternativeContext...),
 			OrphanEvictionDuration:           getDuration("legacy_orphanEvictionDuration", 10*time.Minute, alternativeContext...),
 			MaxOrphanTxs:                     getInt("legacy_maxOrphanTxs", 100, alternativeContext...),
-			StoreBatcherSize:                 getInt("legacy_storeBatcherSize", 1024, alternativeContext...),
-			StoreBatcherConcurrency:          getInt("legacy_storeBatcherConcurrency", 32, alternativeContext...),
-			SpendBatcherSize:                 getInt("legacy_spendBatcherSize", 1024, alternativeContext...),
-			SpendBatcherConcurrency:          getInt("legacy_spendBatcherConcurrency", 4, alternativeContext...),
-			OutpointBatcherSize:              getInt("legacy_outpointBatcherSize", 1024, alternativeContext...),
-			OutpointBatcherConcurrency:       getInt("legacy_outpointBatcherConcurrency", 32, alternativeContext...),
 			PrintInvMessages:                 getBool("legacy_printInvMessages", false, alternativeContext...),
 			GRPCAddress:                      getString("legacy_grpcAddress", "", alternativeContext...),
 			AllowBlockPriority:               getBool("legacy_allowBlockPriority", true, alternativeContext...),
@@ -741,9 +735,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			FeelerInterval:                   getDuration("legacy_feelerInterval", 120*time.Second, alternativeContext...),
 			FeelerHandshakeTimeout:           getDuration("legacy_feelerHandshakeTimeout", 25*time.Second, alternativeContext...),
 			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
-			BlockFailureBackoffBase:          getDuration("legacy_blockFailureBackoffBase", 5*time.Second, alternativeContext...),
-			BlockFailureBackoffMaxDuration:   getDuration("legacy_blockFailureBackoffMaxDuration", 150*time.Second, alternativeContext...),
-			BlockFailureAttemptCeiling:       getInt("legacy_blockFailureAttemptCeiling", 20, alternativeContext...),
 
 			BlockDownloadTimeoutBasePercent:    getInt64("legacy_blockDownloadTimeoutBasePercent", 100, alternativeContext...),
 			BlockDownloadTimeoutBaseIBDPercent: getInt64("legacy_blockDownloadTimeoutBaseIBDPercent", 600, alternativeContext...),

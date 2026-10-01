@@ -213,8 +213,6 @@ func TestHandleInvMsg_AnAnnouncedBlockWeAlreadyHaveAsksForNothing(t *testing.T) 
 
 	require.Equal(t, int32(1500), h.state.BestKnownHeight(),
 		"the height credit on the known-block path must survive the new else arm")
-	require.Equal(t, proofProven, h.state.Claim().proof,
-		"a block we can place is proof, not a pending hash")
 }
 
 // TestHandleInvMsg_AnAnnouncedBlockSomebodyAlreadyOwesAsksForNothing copies SV
@@ -232,25 +230,4 @@ func TestHandleInvMsg_AnAnnouncedBlockSomebodyAlreadyOwesAsksForNothing(t *testi
 
 	require.False(t, WaitUntil(func() bool { return h.headers.count() > h.baseline }, invQuietPeriod),
 		"a block already owed by a peer must not trigger a header repair")
-}
-
-// TestHandleInvMsg_TheAnnouncerIsRememberedAsASourceForThatBlock is the other
-// half of the repair. SV Node calls it UpdateBlockAvailability and does it on
-// this path unconditionally (net_processing.cpp:2426). Without it the peer that
-// told us about the block is not usable as a download source when the headers
-// for it finally arrive.
-func TestHandleInvMsg_TheAnnouncerIsRememberedAsASourceForThatBlock(t *testing.T) {
-	announced := chainhash.Hash{0xef}
-
-	h := newInvRepairHarness(t, 170, nil)
-
-	require.Equal(t, proofNone, h.state.Claim().proof,
-		"harness check: the announcer has demonstrated nothing yet")
-
-	h.announce(announced)
-
-	claim := h.state.Claim()
-	require.Equal(t, proofPending, claim.proof,
-		"a hash we cannot place is worth remembering and worth nothing as permission")
-	require.Equal(t, announced, claim.hash)
 }

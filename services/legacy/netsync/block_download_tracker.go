@@ -352,7 +352,7 @@ func (t *blockDownloadTracker) OwnersOf(h chainhash.Hash) []*peerpkg.Peer {
 // peers it let off. Ownership is kept, so a copy still on the wire from any of
 // them is still admitted; only the obligation goes.
 //
-// This is what every delivery needs, raced or not: handleBlockMsg cancels the
+// This is what every delivery needs, raced or not: handleBlockOnDiskMsg cancels the
 // obligation of the peer that answered and forgives whoever else was asked.
 // Cancelling the other owners outright was
 // the obvious thing and it was wrong in both directions: it freed their budget,

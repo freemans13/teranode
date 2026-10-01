@@ -201,24 +201,20 @@ func parkReadFailure(err error) parkDisposition {
 
 // parkCommitFailure classifies an error from committing a parked block.
 //
-// Its default is the opposite of parkReadFailure's, and that is on purpose: the
-// live-delivery path in handleBlockMsg treats any non-transient failure of
-// HandleBlockDirect as a judgement on the block and rejects it to the peer, so a
-// block committed from disk is judged exactly as a block off the wire is. Two
-// different answers to the same error would be its own bug.
+// Its default is the opposite of parkReadFailure's, and that is on purpose: any
+// non-transient failure of HandleBlockDirect is a judgement on the block, and the
+// park is the only path a block commits through, so this is where that judgement
+// is made.
 //
 // What that default costs is worth stating, because it is more than the wasted
 // re-download the read path costs. parkDispositionBlockRejected sets markFailed,
-// which writes recentlyFailedBlocks, and handleBlockMsg keys its descendant
-// suppression on the PARENT hash: a block wrongly judged here takes every child
-// with it for recentlyFailedBlocksTTL. handleBlockMsg also reads that map as
-// judgedBefore, so the next live delivery of the block spares the delivering peer
-// its association eviction. Both follow from IsTransientLocalError matching only
-// teranode's own error codes, so a store that hands back a raw driver error
-// instead of a StorageError lands here rather than on retryLater
-// (stores/utxo/sql/sql.go returns the bare error from db.Begin and txn.Commit).
-// That gap is the live path's too, so closing it belongs one layer down in the
-// store, not in a guess made here that would break the symmetry above.
+// which writes recentlyFailedBlocks, and the wanted range skips that hash for
+// recentlyFailedBlocksTTL, so a block wrongly judged here is not asked for again
+// for that long. IsTransientLocalError matches only teranode's own error codes,
+// so a store that hands back a raw driver error instead of a StorageError lands
+// here rather than on retryLater (stores/utxo/sql/sql.go returns the bare error
+// from db.Begin and txn.Commit). Closing that gap belongs one layer down in the
+// store, not in a guess made here.
 func parkCommitFailure(err error) parkDisposition {
 	switch {
 	case errors.Is(err, errors.ErrBlockNotFound):
@@ -248,9 +244,8 @@ func parkCommitFailure(err error) parkDisposition {
 }
 
 // withoutBlame returns the same row with the peer left alone. Used while the
-// node is catching blocks, where handleBlockMsg suppresses every other reject
-// too: we are replaying history and a peer that hands us a block we cannot take
-// has not necessarily done anything wrong.
+// node is catching blocks: we are replaying history and a peer that hands us a
+// block we cannot take has not necessarily done anything wrong.
 func (d parkDisposition) withoutBlame() parkDisposition {
 	d.blamePeer = false
 

@@ -101,7 +101,7 @@ func TestSubtreeWriter_WritesTheStructureLast(t *testing.T) {
 	st, data, meta := oneSubtree(t, 8)
 	require.NoError(t, w.Emit(ctx)(0, st, data, meta))
 
-	written := w.Written()
+	written := w.written
 	require.Len(t, written, 3)
 	require.Equal(t, fileformat.FileTypeSubtree, written[2].FileType,
 		"the structure file must be written last: its presence is the marker that the other two are complete")
@@ -130,7 +130,7 @@ func TestSubtreeWriter_DeleteAllRemovesTheFilesFromTheStore(t *testing.T) {
 		require.False(t, exists, "%s must be gone from the store after DeleteAll", ft)
 	}
 
-	require.Empty(t, w.Written(), "and the record of what was written must be cleared")
+	require.Empty(t, w.written, "and the record of what was written must be cleared")
 }
 
 // TestSubtreeWriter_AnAlreadyPresentFileIsNotAnError pins idempotency. Two peers

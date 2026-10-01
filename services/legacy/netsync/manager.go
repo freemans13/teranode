@@ -90,12 +90,11 @@ const (
 	// hashes to store in memory.
 	maxRejectedTxns = 10_000
 
-	// blockFailureBackoffMaxTracked bounds the per-block transient-failure
-	// backoff map (#1187). Legacy sync only has a handful of failing block
-	// hashes in flight, but capping the map guarantees a pathological stream of
-	// distinct failing hashes can never grow it without bound (mirrors the
-	// WithMaxSize bound on orphanTxs).
-	blockFailureBackoffMaxTracked = 1024
+	// recentlyFailedBlocksMaxTracked bounds recentlyFailedBlocks. Legacy sync
+	// only has a handful of failing block hashes in flight, but capping the map
+	// guarantees a pathological stream of distinct failing hashes can never grow
+	// it without bound (mirrors the WithMaxSize bound on orphanTxs).
+	recentlyFailedBlocksMaxTracked = 1024
 
 	// recentlyFailedBlocksTTL is how long a block hash that failed to
 	// store/validate is remembered so its descendants can be short-circuited
@@ -247,7 +246,7 @@ type peerSyncState struct {
 	// A compare-before-shift would close that. It would not close the mirror,
 	// where both drains peek the same item, both pass RequestedWithin before
 	// either Add lands, and the peer is asked twice for one hash: the first copy
-	// discharges the obligation in handleBlockMsg and the second is disconnected
+	// discharges the obligation in handleBlockOnDiskMsg and the second is refused
 	// as unrequested. A lock closes both, so it is a lock.
 	//
 	// Leaf lock, held only for the drain loop. Nothing else takes it, and the
@@ -268,11 +267,6 @@ type peerSyncState struct {
 	// blockHandler goroutine and the per-message inv and headers handlers, each
 	// of which runs on its own goroutine. Only noteBestKnownHeight writes it.
 	bestKnownHeight atomic.Int32
-
-	// peerChainClaimState holds what this peer has DEMONSTRATED it has, as
-	// opposed to bestKnownHeight above, which starts from what the peer said
-	// about itself. See peer_chain_claim.go.
-	peerChainClaimState
 
 	// demotedUntil is the UnixNano instant before which this peer must not be
 	// re-elected sync peer, stamped when it is demoted for stalling.
@@ -299,12 +293,6 @@ func (s *peerSyncState) inDemotionCooldown() bool {
 	until := s.demotedUntil.Load()
 
 	return until > 0 && time.Now().UnixNano() < until
-}
-
-// clearDemotionCooldown makes the peer immediately electable again. Tests use it
-// to step past a cooldown without sleeping; nothing in the service calls it.
-func (s *peerSyncState) clearDemotionCooldown() {
-	s.demotedUntil.Store(0)
 }
 
 // noteBestKnownHeight raises the peer's best known height to h, and never lowers
@@ -570,14 +558,6 @@ func maxInFlightForSize(avgSize int64) int {
 	}
 }
 
-// blockFailureState tracks per-block transient-failure backoff. attempts is the
-// consecutive failure count for a block hash; nextRetry is the earliest time the
-// block may be re-processed. See SyncManager.blockFailureBackoff (#1187).
-type blockFailureState struct {
-	attempts  int
-	nextRetry time.Time
-}
-
 // SyncManager is used to communicate block related messages with peers. The
 // SyncManager is started as by executing Start() in a goroutine. Once started,
 // it selects peers to sync from and starts the initial block download. Once the
@@ -629,12 +609,6 @@ type SyncManager struct {
 	// read and written from any goroutine — the frontier race timer and the
 	// peer read-loops both consult it. See block_download_tracker.go.
 	blockDownloads *blockDownloadTracker
-	// blockFailureBackoff throttles re-processing of a block that just failed
-	// with a transient storage/service error, so a re-delivered block does not
-	// immediately re-run the full multi-million-record decorate at full
-	// concurrency against an already-struggling UTXO store (#1187). Keyed by
-	// block hash; entries self-evict after Legacy.BlockFailureBackoffMaxDuration.
-	blockFailureBackoff *expiringmap.ExpiringMap[chainhash.Hash, *blockFailureState]
 	// recentlyFailedBlocks tracks block hashes that just failed to store/validate
 	// so their already-queued descendants are skipped before any RPC instead of
 	// each failing their parent lookup and logging a misleading "previous block
@@ -1366,10 +1340,9 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	// nothing when choosing a sync peer, and it is the only figure available at
 	// this point.
 	//
-	// It is deliberately NOT a claim. A claim is what the peer has demonstrated,
-	// and nothing here has been demonstrated: this number is the peer's own word,
-	// the record only ever rises, so a self-report written here could never be
-	// contradicted and every peer would claim every block forever. That is
+	// It is the peer's own word, not something it has demonstrated: the record
+	// only ever rises, so a self-report written here could never be
+	// contradicted and every peer would appear to hold every block forever. That is
 	// exactly what made canServe a no-op and left the scheduler asking strangers
 	// for blocks they never had. SV Node keeps the same number in
 	// nStartingHeight and never writes it into pindexBestKnownBlock either.
@@ -1947,82 +1920,12 @@ func (sm *SyncManager) computeCurrent() bool {
 	return true
 }
 
-// newBlockFailureBackoffMap builds the per-block transient-failure backoff map
-// (#1187), or returns nil when the backoff is disabled (either knob <= 0). A nil
-// map is a clean no-op via the nil-guards in handleBlockMsg; returning nil when
-// disabled also avoids constructing an expiringmap with a zero TTL, which spawns
-// no cleanup goroutine and would leak entries. WithMaxSize bounds the map.
-//
-// The map TTL is deliberately DECOUPLED from the backoff cap (window): it is
-// window + maxAttempt, not window. window caps the retry SPACING and must stay
-// below the 180s sync-peer stall window; but the failure COUNT that drives the
-// linear ramp only survives while the entry is live, and the gap between two
-// consecutive recordBlockFailureBackoff calls is (retry spacing ≤ window) + (one
-// full failing HandleBlockDirect attempt). On the exact #1187 overload path that
-// attempt rides the Aerospike overload-retry budget and can reach ~2.5min — well
-// over window alone — so a TTL of just window would expire the entry mid-attempt
-// and reset the count to 1 every time, pinning the backoff at its base and
-// defeating the ramp. Adding maxAttempt (the per-attempt processing bound) keeps
-// the entry alive across one slow attempt so the count ramps as intended.
-func newBlockFailureBackoffMap(base, window, maxAttempt time.Duration) *expiringmap.ExpiringMap[chainhash.Hash, *blockFailureState] {
-	if base <= 0 || window <= 0 {
-		return nil
-	}
-
-	retention := window
-	if maxAttempt > 0 {
-		retention += maxAttempt
-	}
-
-	return expiringmap.New[chainhash.Hash, *blockFailureState](retention).WithMaxSize(blockFailureBackoffMaxTracked)
-}
-
-// blockGivenUpOn reports whether a block has failed so many times in a row that
-// asking for it again is pointless.
-//
-// Without this the retry is unbounded. recordBlockFailureBackoff grows the
-// attempt count without limit and caps only the WAIT, so a block that can never
-// be accepted is downloaded again every BlockFailureBackoffMaxDuration for the
-// life of the process, which at the 150 second default is roughly six hundred
-// pointless downloads a day, each one a full block off the wire.
-//
-// Today that loop terminates only by accident: the block-validation service
-// writes a durable invalid row and the next attempt short-circuits on a lookup
-// that reads the block back as present. The newer validation route deliberately
-// writes no such row, so turning it on makes the loop genuinely unbounded. This
-// is the bound that does not depend on that accident.
-//
-// Nothing durable is written here, and that is deliberate rather than a
-// shortcut. A durable mark keyed on the block hash is a poisoning surface: a
-// block's hash commits only to its 80 byte header, so a peer can replay an
-// honest header with a doctored body at no cost, and a durable mark on that hash
-// would condemn the real block permanently. Losing the count on a restart is
-// correct, because a restart is the most likely thing to have cleared the local
-// fault that caused the rejection.
-func (sm *SyncManager) blockGivenUpOn(hash chainhash.Hash) bool {
-	if sm.blockFailureBackoff == nil || sm.settings == nil {
-		return false
-	}
-
-	ceiling := sm.settings.Legacy.BlockFailureAttemptCeiling
-	if ceiling <= 0 {
-		return false
-	}
-
-	fs, ok := sm.blockFailureBackoff.Get(hash)
-	if !ok {
-		return false
-	}
-
-	return fs.attempts >= ceiling
-}
-
 // peerStateResolvingPrimary returns the sync state for peer, resolving a stream
 // sub-peer (e.g. a BlockPriority DATA1 stream, not itself registered in
 // peerStates) to its association's primary peer. It returns the resolved peer
 // (the primary when a stream peer resolved, otherwise the input peer) and
 // whether a state was found. Centralizes the stream→primary walk previously
-// inlined in handleBlockMsg/handleHeadersMsg/handleInvMsg/BlockRequested; call
+// inlined in handleHeadersMsg/handleInvMsg/BlockRequested; call
 // sites that log the resolution or reassign to the primary compare the returned
 // peer against their input (resolved != input means a stream peer resolved).
 func (sm *SyncManager) peerStateResolvingPrimary(peer *peerpkg.Peer) (*peerSyncState, *peerpkg.Peer, bool) {
@@ -2041,7 +1944,6 @@ func (sm *SyncManager) peerStateResolvingPrimary(peer *peerpkg.Peer) (*peerSyncS
 	return nil, peer, false
 }
 
-// handleBlockMsg handles block messages from all peers.
 // requestMissingBlocks answers a missing-parent condition by sending a getblocks
 // message from our best block, so block validation can proceed in order. In the
 // legacy sync protocol the orphan tip also doubles as the batch-continuation
@@ -2913,9 +2815,6 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 
 			peer.UpdateLastBlockHeight(blockHeightInt32)
 			state.noteBestKnownHeight(blockHeightInt32)
-			// Announced a block we hold, so we know its height without taking
-			// the peer's word for anything.
-			state.noteProvenClaim(invVects[lastBlock].Hash, blockHeightInt32)
 		} else {
 			// A block we cannot place. This is the recovery route that does not
 			// run through the headers round, and it is the one that would have
@@ -2938,15 +2837,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			// tip, sent on one of those announcements, is answered from the tip
 			// forward: a batch that connects, is cached, and releases
 			// fetchHeaderBlocks.
-			//
-			// Remembering the announcer is half the value and is done whatever
-			// else happens here. It is SV Node's UpdateBlockAvailability on the
-			// same path (net_processing.cpp:2426, and again on an unconnecting
-			// headers batch at :3405): without it the peer that told us about
-			// the block is not usable as a download source when its headers
-			// finally arrive.
 			announced := invVects[lastBlock].Hash
-			state.notePendingClaim(announced)
 
 			// Gated on headers-first mode being ON, which SV Node does not do —
 			// it acts on a block inv in every state. The gate is forced by our
@@ -3740,10 +3631,6 @@ func (sm *SyncManager) Stop() error {
 	sm.orphanTxs.Stop()
 	sm.requestedTxns.Stop()
 
-	if sm.blockFailureBackoff != nil {
-		sm.blockFailureBackoff.Stop()
-	}
-
 	if sm.recentlyFailedBlocks != nil {
 		sm.recentlyFailedBlocks.Stop()
 	}
@@ -3986,18 +3873,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// a nil list simply means no proof is ever granted.
 	sm.headerCache = newHeaderCache().WithCheckpoints(config.ChainParams.Checkpoints)
 
-	// Build the per-block backoff map only after the last fallible step above.
-	// newBlockFailureBackoffMap starts a background eviction goroutine that is
-	// only stopped via SyncManager.Stop(); constructing it before an early
-	// error return would leak that goroutine, since the caller receives a nil
-	// SyncManager and can never call Stop() (#1187, review).
-	sm.blockFailureBackoff = newBlockFailureBackoffMap(tSettings.Legacy.BlockFailureBackoffBase, tSettings.Legacy.BlockFailureBackoffMaxDuration, tSettings.Legacy.PeerProcessingTimeout)
-
 	// Tracks recently-failed block hashes so descendants of an unstored/rejected
 	// block are short-circuited rather than triggering a NOT_FOUND ERROR cascade
-	// (#1333). Like blockFailureBackoff this starts a background eviction goroutine
-	// stopped only via Stop(), so build it after the last fallible step above.
-	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](recentlyFailedBlocksTTL).WithMaxSize(blockFailureBackoffMaxTracked)
+	// (#1333). This starts a background eviction goroutine stopped only via
+	// Stop(), so build it after the last fallible step above: constructing it
+	// before an early error return would leak that goroutine, since the caller
+	// receives a nil SyncManager and can never call Stop().
+	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](recentlyFailedBlocksTTL).WithMaxSize(recentlyFailedBlocksMaxTracked)
 
 	// The dispatcher holds a pointer to the manager returned below, so it must be
 	// built from &sm, not from the local value.
