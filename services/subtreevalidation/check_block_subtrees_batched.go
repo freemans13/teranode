@@ -403,6 +403,12 @@ func (u *Server) resolveAndCheckBatch(ctx context.Context, checker validator.Blo
 func resolveFromMemory(b *batchState, blockHeight uint32) ([]storeInputRef, []utxo.Outpoint, error) {
 	spent := make(map[utxo.Outpoint]int)
 
+	// lastChild[p] is 1 + the position of the last transaction that recorded p
+	// as a parent. A transaction's inputs are walked together, so this dedups
+	// its parents in O(1) each; a scan of its list would be quadratic in a
+	// consolidation transaction's parent count.
+	lastChild := make([]int, len(b.txs))
+
 	var (
 		refs      []storeInputRef
 		outpoints []utxo.Outpoint
@@ -448,7 +454,11 @@ func resolveFromMemory(b *batchState, blockHeight uint32) ([]storeInputRef, []ut
 			in.PreviousTxScript = parent.Outputs[op.Vout].LockingScript
 			// A same-block parent is mined at this block's height.
 			b.heights[i][k] = blockHeight
-			b.parents[i] = appendUniqueInt(b.parents[i], p)
+			if lastChild[p] != i+1 {
+				lastChild[p] = i + 1
+				b.parents[i] = append(b.parents[i], p)
+			}
+
 			fromMem++
 		}
 	}
@@ -622,14 +632,4 @@ func (u *Server) writeList(ctx context.Context, checker validator.BlockBatchChec
 	prometheusSubtreeValidationBatchTxs.WithLabelValues("created").Add(float64(created))
 
 	return nil
-}
-
-func appendUniqueInt(s []int, v int) []int {
-	for _, x := range s {
-		if x == v {
-			return s
-		}
-	}
-
-	return append(s, v)
 }

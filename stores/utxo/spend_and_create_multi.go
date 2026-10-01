@@ -278,6 +278,12 @@ func checkSpendAndCreateMultiList(txs []*bt.Tx, txids []chainhash.Hash) ([][]int
 	parentsInList := make([][]int, len(txs))
 	spent := make(map[Outpoint]struct{})
 
+	// lastChild[p] is 1 + the position of the last transaction that recorded p
+	// as a parent. A transaction's inputs are walked together, so this dedups
+	// its parents in O(1) each; a scan of its list would be quadratic in a
+	// consolidation transaction's parent count.
+	lastChild := make([]int, len(txs))
+
 	for i, tx := range txs {
 		for _, in := range tx.Inputs {
 			op := Outpoint{TxID: *in.PreviousTxIDChainHash(), Vout: in.PreviousTxOutIndex}
@@ -301,19 +307,12 @@ func checkSpendAndCreateMultiList(txs []*bt.Tx, txids []chainhash.Hash) ([][]int
 				return nil, newSpendAndCreateMultiRefusedError("transaction %s spends output %d of %s, which has %d outputs", txids[i], op.Vout, op.TxID, len(txs[p].Outputs))
 			}
 
-			parentsInList[i] = appendUnique(parentsInList[i], p)
+			if lastChild[p] != i+1 {
+				lastChild[p] = i + 1
+				parentsInList[i] = append(parentsInList[i], p)
+			}
 		}
 	}
 
 	return parentsInList, nil
-}
-
-func appendUnique(s []int, v int) []int {
-	for _, x := range s {
-		if x == v {
-			return s
-		}
-	}
-
-	return append(s, v)
 }
