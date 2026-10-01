@@ -1,0 +1,327 @@
+package utxoset
+
+import (
+	"context"
+	"testing"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
+	"github.com/stretchr/testify/require"
+)
+
+func TestParentOutputsForValidationUtxoset(t *testing.T) {
+	t.Run("contract", func(t *testing.T) {
+		s, _ := newUncheckpointedStore(t)
+		tests.ParentOutputsForValidation(t, s)
+	})
+
+	t.Run("reads outputs, never inputs", func(t *testing.T) {
+		s, _ := newUncheckpointedStore(t)
+		tests.ParentOutputsReadsOutputsNotInputs(t, s)
+	})
+}
+
+func TestSpendAndCreateMultiUtxoset(t *testing.T) {
+	suite := func(t *testing.T) {
+		t.Run("matches a loop of SpendAndCreate", func(t *testing.T) {
+			s, _ := newUncheckpointedStore(t)
+			tests.SpendAndCreateMultiMatchesLoop(t, s)
+		})
+		t.Run("a spend fails partway", func(t *testing.T) {
+			s, _ := newUncheckpointedStore(t)
+			tests.SpendAndCreateMultiSpendFailsPartway(t, s)
+		})
+		t.Run("a parent in the list exists", func(t *testing.T) {
+			s, _ := newUncheckpointedStore(t)
+			tests.SpendAndCreateMultiParentExists(t, s)
+		})
+		t.Run("a refusal writes nothing", func(t *testing.T) {
+			s, _ := newUncheckpointedStore(t)
+			tests.SpendAndCreateMultiRefusalWritesNothing(t, s)
+		})
+		t.Run("repeat at every cut point", func(t *testing.T) {
+			s, _ := newUncheckpointedStore(t)
+			tests.SpendAndCreateMultiRepeatAtCutPoints(t, s)
+		})
+	}
+
+	t.Run("one spend chunk", suite)
+
+	// One transaction per create chunk lets one chunk of a level commit while another finds its
+	// parent already exists, so the rest of the list finishes per transaction and has to spend
+	// outputs this write netted, by finding their journal rows.
+	t.Run("a create chunk per transaction", func(t *testing.T) {
+		old := multiCreateChunkTxs
+		multiCreateChunkTxs = 1
+
+		t.Cleanup(func() { multiCreateChunkTxs = old })
+
+		suite(t)
+	})
+
+	// One input per spend chunk puts every transaction in its own chunk, run in parallel, so a
+	// failed transaction's descendants have their spends committed before the failure is known
+	// and must be restored.
+	t.Run("a spend chunk per input", func(t *testing.T) {
+		old := multiSpendChunkInputs
+		multiSpendChunkInputs = 1
+
+		t.Cleanup(func() { multiSpendChunkInputs = old })
+
+		suite(t)
+	})
+}
+
+// utxoRowsOf counts the UTXO rows the store holds for tx's outputs.
+func utxoRowsOf(t *testing.T, s *Store, tx *bt.Tx) int {
+	t.Helper()
+
+	h := tx.TxIDChainHash()
+
+	var n int
+	require.NoError(t, s.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM utxo WHERE leaf = $1 AND ukey >= $2 AND ukey <= $3 AND txid = $4`,
+		LeafFor(h[:]), Pack(h[:], 0), Pack(h[:], ^uint32(0)), h[:]).Scan(&n))
+
+	return n
+}
+
+// An output created and spent inside one list is never a UTXO row, and its spend is in the
+// journal naming the child; an output nothing in the list spends is a UTXO row.
+func TestSpendAndCreateMultiNetsOutputsSpentInTheList(t *testing.T) {
+	s, ctx := newUncheckpointedStore(t)
+
+	const height = 700
+
+	w := tests.BuildMultiWorkload(t, 0x70, 3, 4)
+	w.StoreRoots(t, s, height-1)
+
+	results, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
+
+	for i, r := range results {
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+	}
+
+	spentBy := map[chainhash.Hash]map[uint32]chainhash.Hash{}
+
+	for _, tx := range w.Txs {
+		for _, in := range tx.Inputs {
+			p := *in.PreviousTxIDChainHash()
+			if spentBy[p] == nil {
+				spentBy[p] = map[uint32]chainhash.Hash{}
+			}
+
+			spentBy[p][in.PreviousTxOutIndex] = *tx.TxIDChainHash()
+		}
+	}
+
+	for i, tx := range w.Txs {
+		h := *tx.TxIDChainHash()
+		require.Equal(t, len(tx.Outputs)-len(spentBy[h]), utxoRowsOf(t, s, tx), "tx %d: only outputs nothing in the list spends are UTXO rows", i)
+
+		for vout, child := range spentBy[h] {
+			var spender []byte
+			require.NoError(t, s.pool.QueryRow(ctx, `SELECT spending_txid FROM spend_journal WHERE ukey = $1 AND txid = $2`,
+				Pack(h[:], vout), h[:]).Scan(&spender), "tx %d output %d", i, vout)
+			require.Equal(t, child[:], spender)
+		}
+	}
+
+	// A transaction outside the list that spends a netted output is refused as spent, naming
+	// the child that spent it.
+	parent := w.Txs[0]
+	thief := bt.NewTx()
+	require.NoError(t, thief.FromUTXOs(&bt.UTXO{TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis}))
+	thief.Inputs[0].UnlockingScript = tests.Tx.Inputs[0].UnlockingScript
+	require.NoError(t, thief.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", parent.Outputs[0].Satoshis-200))
+
+	_, spends, err := s.SpendAndCreate(ctx, thief, height+1)
+	require.ErrorIs(t, err, errors.ErrSpent)
+	require.Len(t, spends, 1)
+	require.NotNil(t, spends[0].ConflictingTxID)
+	require.Equal(t, spentBy[*parent.TxIDChainHash()][0], *spends[0].ConflictingTxID)
+}
+
+// A crash after step 1, or after any level of step 2, repeats the way the caller repeats: the
+// pre-check drops every transaction that exists and the rest are sent again, as one list or
+// two. The records must match a clean run.
+func TestSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
+	const (
+		height = 800
+		levels = 4
+		width  = 5
+	)
+
+	stages := []string{"spent", "created level 0", "created level 1", "created level 2"}
+
+	for si, stage := range stages {
+		for _, split := range []bool{false, true} {
+			name := stage
+			if split {
+				name += ", repeated as two lists"
+			}
+
+			t.Run(name, func(t *testing.T) {
+				s, ctx := newUncheckpointedStore(t)
+
+				seed := byte(0x80 + si*2)
+				if split {
+					seed++
+				}
+
+				reference := tests.BuildMultiWorkload(t, 0x7f, levels, width)
+				reference.StoreRoots(t, s, height-1)
+
+				for _, tx := range reference.Txs {
+					_, _, err := s.SpendAndCreate(ctx, tx, height, utxo.WithIgnoreLocked(true))
+					require.NoError(t, err)
+				}
+
+				want := reference.Records(t, s)
+				wantRoots := reference.RootSpends(t, s)
+
+				w := tests.BuildMultiWorkload(t, seed, levels, width)
+				w.StoreRoots(t, s, height-1)
+
+				crash := errors.NewProcessingError("injected crash")
+				multiFault = func(at string) error {
+					if at == stage {
+						return crash
+					}
+
+					return nil
+				}
+
+				_, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
+				multiFault = nil
+				require.ErrorIs(t, err, crash)
+
+				var remaining []*bt.Tx
+
+				for _, tx := range w.Txs {
+					if _, err := s.Get(ctx, tx.TxIDChainHash(), fields.Fee); errors.Is(err, errors.ErrTxNotFound) {
+						remaining = append(remaining, tx)
+					} else {
+						require.NoError(t, err)
+					}
+				}
+
+				lists := [][]*bt.Tx{remaining}
+				if split && len(remaining) > 1 {
+					lists = [][]*bt.Tx{remaining[:len(remaining)/2], remaining[len(remaining)/2:]}
+				}
+
+				for _, list := range lists {
+					results, err := s.SpendAndCreateMulti(ctx, list, height, utxo.WithIgnoreLocked(true))
+					require.NoError(t, err)
+
+					for i, r := range results {
+						require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d of the repeat: %v", i, r.Err)
+					}
+				}
+
+				require.Equal(t, want, w.Records(t, s))
+				require.Equal(t, wantRoots, w.RootSpends(t, s))
+			})
+		}
+	}
+}
+
+// A parent whose body the store no longer keeps is answered from the UTXO table while the
+// output is unspent, and from the spend journal once it is spent, including an output the list
+// netted.
+func TestParentOutputsForValidationWithoutABody(t *testing.T) {
+	s, ctx := newUncheckpointedStore(t)
+
+	const height = 900
+
+	w := tests.BuildMultiWorkload(t, 0x90, 2, 2)
+	w.StoreRoots(t, s, height-1)
+
+	results, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
+
+	for i, r := range results {
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+	}
+
+	parent := w.Txs[0] // level 0 tx 0: output 0 netted by level 1 tx 0, output 1 unspent
+	h := parent.TxIDChainHash()
+
+	_, err = s.pool.Exec(ctx, `DELETE FROM tx_body WHERE txid = $1`, h[:])
+	require.NoError(t, err)
+
+	answers, err := s.ParentOutputsForValidation(ctx, []utxo.Outpoint{{TxID: *h, Vout: 0}, {TxID: *h, Vout: 1}, {TxID: *h, Vout: 7}})
+	require.NoError(t, err)
+
+	for vout := 0; vout < 2; vout++ {
+		require.NoError(t, answers[vout].Err)
+		require.Equal(t, utxo.ParentOutputNotMined, answers[vout].Status, "output %d", vout)
+		require.Equal(t, parent.Outputs[vout].Satoshis, answers[vout].Satoshis, "output %d", vout)
+		require.Equal(t, []byte(*parent.Outputs[vout].LockingScript), []byte(*answers[vout].LockingScript), "output %d", vout)
+	}
+
+	require.NoError(t, answers[2].Err)
+	require.Equal(t, utxo.ParentOutputTxNotFound, answers[2].Status)
+}
+
+// payFrom builds a transaction spending the given outputs, extended, paying their sum less 200.
+func payFrom(t *testing.T, lockTime uint32, parents []*bt.Tx, vouts []uint32) *bt.Tx {
+	t.Helper()
+
+	tx := bt.NewTx()
+	tx.LockTime = lockTime
+
+	var in uint64
+
+	for k, p := range parents {
+		out := p.Outputs[vouts[k]]
+		require.NoError(t, tx.FromUTXOs(&bt.UTXO{TxIDHash: p.TxIDChainHash(), Vout: vouts[k], LockingScript: out.LockingScript, Satoshis: out.Satoshis}))
+		tx.Inputs[len(tx.Inputs)-1].UnlockingScript = tests.Tx.Inputs[0].UnlockingScript
+		in += out.Satoshis
+	}
+
+	require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", in-200))
+
+	return tx
+}
+
+// A transaction whose parent in the list fails has its own outside spends undone, even when a
+// parallel chunk committed them before the parent's failure was known.
+func TestSpendAndCreateMultiRestoresTheOutsideSpendsOfAFailedParentsChild(t *testing.T) {
+	old := multiSpendChunkInputs
+	multiSpendChunkInputs = 1
+
+	t.Cleanup(func() { multiSpendChunkInputs = old })
+
+	s, ctx := newUncheckpointedStore(t)
+
+	const height = 1000
+
+	w := tests.BuildMultiWorkload(t, 0xa0, 1, 2) // two roots to spend from
+	w.StoreRoots(t, s, height-1)
+	rootA, rootB := w.Roots[0], w.Roots[1]
+
+	thief := payFrom(t, 1, []*bt.Tx{rootA}, []uint32{0})
+	_, _, err := s.SpendAndCreate(ctx, thief, height)
+	require.NoError(t, err)
+
+	parent := payFrom(t, 2, []*bt.Tx{rootA}, []uint32{0})           // fails: rootA:0 is taken
+	child := payFrom(t, 3, []*bt.Tx{parent, rootB}, []uint32{0, 0}) // rootB:0 is an outside spend
+
+	results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{parent, child}, height, utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
+	require.Equal(t, utxo.MultiTxFailed, results[0].Status)
+	require.Equal(t, utxo.MultiTxParentFailed, results[1].Status)
+
+	// rootB:0 is spendable again: another transaction can take it.
+	other := payFrom(t, 4, []*bt.Tx{rootB}, []uint32{0})
+	_, _, err = s.SpendAndCreate(ctx, other, height)
+	require.NoError(t, err, "the child's spend of rootB:0 was left in place")
+}
