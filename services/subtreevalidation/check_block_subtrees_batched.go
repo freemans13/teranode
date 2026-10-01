@@ -50,8 +50,11 @@ func (u *Server) batchChecker(state blockchain.FSMStateType, blockHeight uint32)
 // checkBlockBodyBound proves, before anything is written, that the block's
 // subtree list is the one its header commits to: it loads the first and last
 // subtrees' node lists and checks the merkle root with the coinbase substituted.
-// Every other subtree is bound to its key when it is loaded. The node lists are
-// stored as FileTypeSubtreeToCheck, so the batch load reads them locally.
+// Every other subtree contributes only its key. A node list fetched from a peer
+// is checked against its key before it is stored as FileTypeSubtreeToCheck, so
+// the batch load reads it locally. A local subtree file is not re-hashed, here
+// or on the level path: this node writes one only after that check, or, on
+// legacy catch-up, after checking the block's merkle root.
 func (u *Server) checkBlockBodyBound(ctx context.Context, request *subtreevalidation_api.CheckBlockSubtreesRequest, block *model.Block, peerID string, dah uint32) error {
 	if len(block.Subtrees) == 0 {
 		return nil
