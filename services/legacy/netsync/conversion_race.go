@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -42,8 +43,16 @@ const admitKeptFaster = "converted from disk: it completed before the copy that 
 // conversionCtl lets a faster copy of a block stop the copy being converted.
 type conversionCtl struct {
 	state atomic.Int32
-	// cleaned is closed once a yielding conversion has removed everything it wrote.
-	cleaned chan struct{}
+	// cleaned is closed once the conversion will write nothing more and has removed what it
+	// wrote: on the yield path, and on every other exit, since a conversion can be taken over and
+	// then fail its own read before it gets back to the yield check.
+	cleaned   chan struct{}
+	cleanOnce sync.Once
+}
+
+// markCleaned releases a copy waiting to take over. Safe to call more than once.
+func (c *conversionCtl) markCleaned() {
+	c.cleanOnce.Do(func() { close(c.cleaned) })
 }
 
 // yielding reports whether a faster copy has taken over.
@@ -102,7 +111,7 @@ func (sm *SyncManager) conversionOf(hash chainhash.Hash) *conversionCtl {
 func (sm *SyncManager) yieldToFasterCopy(hash chainhash.Hash, writer *subtreeWriter, rest io.Reader, ctl *conversionCtl, r io.Reader) (bool, error) {
 	sm.deleteWrittenOnFailure(hash, writer)
 	sm.streams.setStreamPath(r, admitRawDuplicate)
-	close(ctl.cleaned)
+	ctl.markCleaned()
 
 	sm.logger.Infof("[pipelineBlockSink][%s] another copy completed first; stopped converting this one and draining the rest", hash)
 

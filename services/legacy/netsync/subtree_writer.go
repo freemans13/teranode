@@ -17,13 +17,13 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
-// writtenSubtree records one artefact this block put in the store, so a failed
-// merkle root knows what to try to remove. It is not a record of what this
-// block alone wrote: put treats an already-present blob as success (two blocks
-// can share an identical run of transactions and so the same subtree under the
-// same key), and Emit still records the artefact when that happens. Removing
-// it is acceptable rather than a correctness bug, because the file is
-// content-addressed and rebuildable — see DeleteAll's comment below.
+// writtenSubtree records one artefact this block created in the store, so a
+// failed block knows what to remove. An artefact that was already there is not
+// recorded: two blocks, or two copies of one block, can share an identical run
+// of transactions and so the same subtree under the same key, and the file then
+// belongs to whichever block created it. Removing it would leave that block's
+// record pointing at subtree data that is gone, and there is no second source
+// (see subtreeWriter).
 type writtenSubtree struct {
 	Hash     chainhash.Hash
 	FileType fileformat.FileType
@@ -211,11 +211,14 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 		if file, ok := w.pending[index]; ok {
 			delete(w.pending, index)
 
-			if err = file.Commit(ctx, root[:], options.WithDeleteAt(w.deleteAt())); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
+			switch err = file.Commit(ctx, root[:], options.WithDeleteAt(w.deleteAt())); {
+			case err == nil:
+				w.written = append(w.written, writtenSubtree{Hash: *root, FileType: fileformat.FileTypeSubtreeData})
+			case errors.Is(err, errors.ErrBlobAlreadyExists):
+				// Another block's file: Commit has discarded ours, and theirs is left alone.
+			default:
 				return errors.NewStorageError("[subtreeWriter][%s] failed committing %s", root, fileformat.FileTypeSubtreeData, err)
 			}
-
-			w.written = append(w.written, writtenSubtree{Hash: *root, FileType: fileformat.FileTypeSubtreeData})
 		} else {
 			artefacts = append([]struct {
 				fileType fileformat.FileType
@@ -224,23 +227,20 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 		}
 
 		for _, artefact := range artefacts {
-			if err = w.put(ctx, *root, artefact.fileType, artefact.write); err != nil {
-				return err
+			created, putErr := w.put(ctx, *root, artefact.fileType, artefact.write)
+			if putErr != nil {
+				return putErr
 			}
 
-			w.written = append(w.written, writtenSubtree{Hash: *root, FileType: artefact.fileType})
+			if created {
+				w.written = append(w.written, writtenSubtree{Hash: *root, FileType: artefact.fileType})
+			}
 		}
 
 		return nil
 	}
 }
 
-// put writes one artefact through the file storer, matching writeSubtree at
-// services/legacy/netsync/handle_block.go:876.
-//
-// A blob that already exists is success, not failure: two peers can deliver blocks
-// sharing an identical run of transactions, which produces the same subtree under
-// the same key.
 // writeBytes is an artefact already serialised, written as it is.
 func writeBytes(payload []byte) func(io.Writer) error {
 	return func(dst io.Writer) error {
@@ -250,27 +250,41 @@ func writeBytes(payload []byte) func(io.Writer) error {
 	}
 }
 
-func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType fileformat.FileType, write func(io.Writer) error) error {
+// put writes one artefact through the file storer, matching writeSubtree at
+// services/legacy/netsync/handle_block.go:876, and reports whether this call
+// created it.
+//
+// A blob that already exists is success, not failure: two peers can deliver blocks
+// sharing an identical run of transactions, which produces the same subtree under
+// the same key. It is reported as not created, so DeleteAll leaves it to the
+// block that wrote it.
+func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType fileformat.FileType, write func(io.Writer) error) (bool, error) {
 	storer, err := filestorer.NewFileStorer(ctx, w.logger, w.settings, w.store, root[:], fileType, options.WithDeleteAt(w.deleteAt()))
 	if err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			return nil
+			return false, nil
 		}
 
-		return errors.NewStorageError("[subtreeWriter][%s] failed to create %s file", root, fileType, err)
+		return false, errors.NewStorageError("[subtreeWriter][%s] failed to create %s file", root, fileType, err)
 	}
 
 	if err = write(storer); err != nil {
 		storer.Abort(errors.NewProcessingError("[subtreeWriter][%s] write failed for %s", root, fileType))
 
-		return errors.NewStorageError("[subtreeWriter][%s] failed writing %s", root, fileType, err)
+		return false, errors.NewStorageError("[subtreeWriter][%s] failed writing %s", root, fileType, err)
 	}
 
 	if err = storer.Close(ctx); err != nil {
-		return errors.NewStorageError("[subtreeWriter][%s] failed closing %s", root, fileType, err)
+		// Another writer published the same key between the existence check and the
+		// store's own overwrite check: theirs stands, and it is theirs to remove.
+		if errors.Is(err, errors.ErrBlobAlreadyExists) {
+			return false, nil
+		}
+
+		return false, errors.NewStorageError("[subtreeWriter][%s] failed closing %s", root, fileType, err)
 	}
 
-	return nil
+	return true, nil
 }
 
 // deleteAt is the height at which this block's subtree files may be removed.
@@ -282,20 +296,16 @@ func (w *subtreeWriter) deleteAt() uint32 {
 	return w.height + w.settings.GetSubtreeValidationBlockHeightRetention()
 }
 
-// Written lists every artefact this writer has put in the store, in write order.
+// Written lists every artefact this writer has created in the store, in write order.
 func (w *subtreeWriter) Written() []writtenSubtree {
 	return w.written
 }
 
-// DeleteAll removes everything this writer wrote. It is what a failed merkle root
+// DeleteAll removes everything this writer created. It is what a failed block
 // calls: nothing is reading these files, because no block references them until
-// the block is handed over.
-//
-// One known consequence. A subtree file is keyed by its own root hash, so a failed
-// block and a good block containing an identical run of transactions produce the
-// same file, and this can remove one the good block legitimately wrote. It is
-// rebuildable, so that is a performance edge case rather than a correctness one,
-// and it is recorded here so it is not a surprise.
+// the block is handed over. Files that were already in the store when this writer
+// met them are left alone, because another block may reference them (see
+// writtenSubtree).
 func (w *subtreeWriter) DeleteAll(ctx context.Context) error {
 	var firstErr error
 

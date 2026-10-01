@@ -135,6 +135,10 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		// A faster copy of this block may complete first and take over (conversion_race.go).
 		ctl := sm.startConversion(hash)
 		defer sm.endConversion(hash, ctl)
+		// Every failure path below has removed this copy's files before it returns, so a copy that
+		// took over can start once this runs. Without it a failed read after a takeover left that
+		// copy waiting until shutdown.
+		defer ctl.markCleaned()
 
 		for {
 			if ctl.yielding() {
