@@ -7,7 +7,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
-	teranodeblockchain "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
@@ -245,8 +244,9 @@ func (sm *SyncManager) parkedBlockCommitted(entry parkedBlock, isCheckpointBlock
 }
 
 // replayingHistory reports whether the node is catching blocks rather than
-// judging a peer's tip. It is the same question handleBlockMsg asks before it
-// suppresses a reject, asked from the paths that commit a block off disk.
+// judging a peer's tip. It asks suppressBlockRejects, the question the live
+// block path used to ask before it suppressed a reject, from the paths that
+// commit a block off disk: anything short of RUNNING counts as replaying.
 //
 // An FSM state that cannot be read counts as replaying, because that is what the
 // live path does with it too: it fails the block before it ever reaches a reject.
@@ -265,7 +265,7 @@ func (sm *SyncManager) replayingHistory() bool {
 		return true
 	}
 
-	return state != nil && *state == teranodeblockchain.FSMStateCATCHINGBLOCKS
+	return suppressBlockRejects(state)
 }
 
 // parkedBlockFailed decides what to do with a parked block that would not

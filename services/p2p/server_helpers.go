@@ -992,8 +992,8 @@ func (s *Server) isBlockchainSyncingOrCatchingUp(ctx context.Context) (bool, err
 		}
 	}
 
-	if *state == blockchain_api.FSMStateType_CATCHINGBLOCKS {
-		// ignore notifications while syncing or catching up
+	if *state != blockchain_api.FSMStateType_RUNNING {
+		// ignore notifications unless caught up (IDLE can follow a STOP mid-catchup)
 		return true, nil
 	}
 

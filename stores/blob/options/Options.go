@@ -58,6 +58,12 @@ type Options struct {
 	// StoreType identifies which blob store this is (StoreOption)
 	// Used by blockchain service to identify which store this is in the deletion queue
 	StoreType storetypes.BlobStoreType
+	// HTTPAuthToken is the shared secret the HTTP blob store presents on mutating
+	// requests (StoreOption)
+	HTTPAuthToken string
+	// HTTPAuthTokenSet records that WithHTTPAuthToken was given, so an explicit empty token
+	// is distinguishable from no option at all (StoreOption)
+	HTTPAuthTokenSet bool
 }
 
 // StoreOption is a function type for configuring store-level options.
@@ -156,6 +162,16 @@ func WithBlobDeletionScheduler(scheduler BlobDeletionScheduler) StoreOption {
 func WithStoreType(storeType storetypes.BlobStoreType) StoreOption {
 	return func(s *Options) {
 		s.StoreType = storeType
+	}
+}
+
+// WithHTTPAuthToken sets the shared secret the HTTP blob store presents on mutating
+// requests. It is an option rather than a URL parameter because store URLs are logged
+// verbatim (see services/pruner/blob_deletion_worker.go).
+func WithHTTPAuthToken(token string) StoreOption {
+	return func(s *Options) {
+		s.HTTPAuthToken = token
+		s.HTTPAuthTokenSet = true
 	}
 }
 
@@ -277,6 +293,12 @@ func MergeOptions(storeOpts *Options, fileOpts []FileOption) *Options {
 	return options
 }
 
+// AllowOverwriteQueryParam is the query key an HTTP blob client sets on a POST that asks to
+// replace an existing blob. Only HTTPBlobServer.handleSet reads it, and only for a caller that
+// presented the shared secret; FileOptionsToQuery never emits it and QueryToFileOptions never
+// reads it, so no other request can carry or honour it.
+const AllowOverwriteQueryParam = "allowOverwrite"
+
 // FileOptionsToQuery converts FileOptions to URL query parameters
 // FileOptionsToQuery converts FileOptions to URL query parameters.
 // This is useful for transmitting blob options over HTTP or other URL-based protocols.
@@ -307,10 +329,6 @@ func FileOptionsToQuery(fileType fileformat.FileType, opts ...FileOption) url.Va
 		query.Set("filename", options.Filename)
 	}
 
-	if options.AllowOverwrite {
-		query.Set("allowOverwrite", "true")
-	}
-
 	return query
 }
 
@@ -328,6 +346,11 @@ func FileOptionsToQuery(fileType fileformat.FileType, opts ...FileOption) url.Va
 // treated as an absolute DAH value (not a relative retention window). It is not sent in
 // normal peer-to-peer blob transfers; it exists for explicit override scenarios only.
 //
+// Overwrite is deliberately NOT reconstructed here: this runs for every method, before the
+// caller is known. HTTPBlobServer.handleSet reads AllowOverwriteQueryParam itself and honours
+// it only for a caller that passed the bearer-token check. The "filename" key is still
+// honoured; sanitising it is tracked separately in #4847.
+//
 // Parameters:
 //   - query: URL query parameters to convert
 //
@@ -344,10 +367,6 @@ func QueryToFileOptions(query url.Values) []FileOption {
 
 	if filename := query.Get("filename"); filename != "" {
 		opts = append(opts, WithFilename(filename))
-	}
-
-	if allowOverwrite := query.Get("allowOverwrite"); allowOverwrite == "true" {
-		opts = append(opts, WithAllowOverwrite(true))
 	}
 
 	return opts

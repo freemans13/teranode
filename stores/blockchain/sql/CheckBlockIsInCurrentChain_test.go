@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -187,6 +188,28 @@ func TestCheckBlockIsInCurrentChain_InMemory_ClosedDB(t *testing.T) {
 	assert.True(t, result)
 }
 
+// storeUnderReservedID commits block under id, leaving the ids between the
+// previous block and id with no blocks row. That run stands for ids the sequence
+// issued but no block kept. StoreBlock only accepts a caller-supplied id that is
+// reserved for the block, so this moves the sequence up to just below id and
+// reserves id for the block first, the way quick validation would.
+func storeUnderReservedID(t *testing.T, s *SQL, block *model.Block, id uint64) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	_, err := s.db.ExecContext(ctx, `UPDATE sqlite_sequence SET seq = $1 WHERE name = 'blocks'`, id-1)
+	require.NoError(t, err)
+
+	reserved, err := s.AssignBlockID(ctx, block.Hash())
+	require.NoError(t, err)
+	require.Equal(t, id, reserved)
+
+	committed, _, err := s.StoreBlock(ctx, block, "", options.WithID(reserved))
+	require.NoError(t, err)
+	require.Equal(t, id, committed)
+}
+
 // TestCheckBlockIsInCurrentChain_GapIDDivergesBetweenRoutes documents, rather than
 // hides, the one input on which the two routes disagree.
 //
@@ -231,13 +254,15 @@ func TestCheckBlockIsInCurrentChain_InMemory_ClosedDB(t *testing.T) {
 // fresh argument about block-id assignment.
 //
 // What is NOT a guarantee: the protection is where a crash lands, not a rule the code
-// enforces. Two paths can stamp an id that then goes nowhere. storeInvalidBlock re-commits
-// a pre-assigned block under a fresh id, abandoning the id already written onto its
-// transactions (services/blockvalidation/BlockValidation.go). The gRPC AddBlock handler
-// passes a caller-supplied id straight through with no bound and no continuity check
-// (services/blockchain/Server.go). Four production call sites pass options.WithID, so an
-// earlier version of this comment claiming none did was simply wrong. If either path ever
-// fires, the burned id becomes referenced and reachable, permanently, and the asset server
+// enforces. Two paths used to stamp an id that then went nowhere, and both now keep it.
+// storeInvalidBlock stores a pre-assigned block under the id already written onto its
+// transactions instead of a fresh one (services/blockvalidation/BlockValidation.go).
+// StoreBlock refuses a caller-supplied id unless it is the block's reservation, or an id
+// the sequence issued that no other block or reservation holds, so the gRPC AddBlock
+// handler can no longer land a row under an arbitrary id (checkCallerSuppliedBlockID in
+// assign_block_id.go). Four production call sites pass options.WithID. What remains is a
+// crash after a block's transactions are stamped and before its blocks row commits: the
+// id is then referenced with no row until the block is retried, and the asset server
 // reads block ids straight off transaction metadata.
 //
 // The shadow comparison is the standing instrument for that: while
@@ -259,9 +284,7 @@ func TestCheckBlockIsInCurrentChain_GapIDDivergesBetweenRoutes(t *testing.T) {
 
 		// Commit block2 under a high explicit id, leaving a large run of ids below
 		// maxBlockID that belong to no block.
-		committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(highID))
-		require.NoError(t, err)
-		require.Equal(t, uint64(highID), committed)
+		storeUnderReservedID(t, s, block2, highID)
 
 		return s
 	}
@@ -581,9 +604,7 @@ func TestCheckBlockIsInCurrentChain_ShadowCompare_CountsDisagreement(t *testing.
 	_, _, err := s.StoreBlock(context.Background(), block1, "")
 	require.NoError(t, err)
 
-	committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(highID))
-	require.NoError(t, err)
-	require.Equal(t, uint64(highID), committed)
+	storeUnderReservedID(t, s, block2, highID)
 
 	// Both routes agree that the committed id is on the main chain.
 	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{highID})
@@ -675,9 +696,7 @@ func TestCheckBlockIsInCurrentChain_RebuildGuardSuppressesForkedSetRoute(t *test
 	_, _, err := s.StoreBlock(context.Background(), block1, "")
 	require.NoError(t, err)
 
-	committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(highID))
-	require.NoError(t, err)
-	require.Equal(t, uint64(highID), committed)
+	storeUnderReservedID(t, s, block2, highID)
 
 	// Wait out any rebuild StoreBlock kicked off, so the guard state under test is
 	// the one this test sets rather than a leftover.
@@ -808,9 +827,7 @@ func TestCheckBlockIsInCurrentChain_ShadowCompare_SamplesRepeatMismatches(t *tes
 	_, _, err := s.StoreBlock(context.Background(), block1, "")
 	require.NoError(t, err)
 
-	committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(highID))
-	require.NoError(t, err)
-	require.Equal(t, uint64(highID), committed)
+	storeUnderReservedID(t, s, block2, highID)
 
 	logger := &countingErrorLogger{}
 	s.logger = logger
@@ -853,9 +870,7 @@ func TestCheckBlockIsInCurrentChain_ShadowCompare_ComparesTheAcceptedID(t *testi
 	_, _, err := s.StoreBlock(context.Background(), block1, "")
 	require.NoError(t, err)
 
-	committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(highID))
-	require.NoError(t, err)
-	require.Equal(t, uint64(highID), committed)
+	storeUnderReservedID(t, s, block2, highID)
 
 	// The gap id comes first, so it is the one the forked-set route accepts. The real
 	// committed id after it is on the main chain, so SQL over the whole slice says true.

@@ -85,6 +85,13 @@ var (
 	// prometheusBlockAssemblyQueueHeadAge tracks how long the oldest queued batch has been waiting
 	prometheusBlockAssemblyQueueHeadAge prometheus.Gauge
 
+	// prometheusBlockAssemblyDiskTxMapDegraded is 1 while block assembly is
+	// degraded because a reset for a disk tx map storage error hit a storage
+	// error again (a disk fault a fresh rotation can't cure), and 0 otherwise.
+	// Storage-triggered resets are suspended while it is 1; any reset that
+	// completes without a storage error clears it.
+	prometheusBlockAssemblyDiskTxMapDegraded prometheus.Gauge
+
 	// prometheusBlockAssemblerLivenessHeartbeatAge tracks how long since the main select loop last beat
 	prometheusBlockAssemblerLivenessHeartbeatAge prometheus.Gauge
 )
@@ -564,6 +571,15 @@ func _initPrometheusMetrics() {
 			Subsystem: "blockassembly",
 			Name:      "queue_head_age_seconds",
 			Help:      "Age in seconds of the oldest batch still in the ingest queue (0 when empty). A rising value indicates the dispatcher has stopped draining.",
+		},
+	)
+
+	prometheusBlockAssemblyDiskTxMapDegraded = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "disk_tx_map_degraded",
+			Help:      "1 while auto-reset on a disk tx map storage error is suspended because a storage-triggered reset hit a storage error again (a disk fault a rotation can't cure), 0 otherwise. Any reset that completes without a storage error clears it.",
 		},
 	)
 

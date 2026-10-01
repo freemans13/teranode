@@ -198,6 +198,13 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	}
 
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "HandleConvertedBlock",
+		// This span's INFO level is load-bearing. HandleConvertedBlock has a
+		// named (err error) return and passes it to deferFn, and an INFO span
+		// with a non-nil error logs at ERROR (util/tracing/tracing.go,
+		// logTraceMessage). ProcessBlock's span below it, reached through
+		// commitPreparedBlock, is at DEBUG, where that escalation only happens
+		// if the logger is already at DEBUG, so at production logLevel=INFO its
+		// failures surface only here.
 		tracing.WithLogMessage(
 			sm.logger,
 			"[HandleConvertedBlock][%s %d] %d txs, peer %s",
@@ -273,7 +280,7 @@ func (sm *SyncManager) waitForPreviousBlockMined(ctx context.Context, prevBlockH
 
 func (sm *SyncManager) ProcessBlock(ctx context.Context, teranodeBlock *model.Block, peerID string) (err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "SyncManager:processBlock",
-		tracing.WithLogMessage(
+		tracing.WithDebugLogMessage(
 			sm.logger,
 			"[SyncManager:processBlock][%s %d] processing block",
 			teranodeBlock.Hash().String(),

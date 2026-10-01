@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -18,10 +19,10 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/unminedsort"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
-	"github.com/bsv-blockchain/teranode/stores/tempstore"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -177,6 +178,32 @@ type BlockAssembler struct {
 	// resetCh handles reset requests for the assembler
 	resetCh chan resetRequest
 
+	// diskTxMapDegraded is set when a storage-triggered reset (see
+	// resetRequest.StorageTriggered) still hit a disk tx map storage error
+	// itself: the disk fault is one a fresh rotation can't cure, so further
+	// storage-triggered resets are suspended rather than reloading in a loop.
+	// Any reset that completes clean clears it (onResetDone). Touched only by
+	// the main loop goroutine.
+	diskTxMapDegraded bool
+
+	// diskTxMapResetPending is set when a storage-triggered reset is owed but
+	// did not run: it failed before the tx map rotation, so the phantom it was
+	// for is still there (onResetDone), or its request arrived within
+	// storageResetMinInterval of the previous one. The heartbeat runs it once
+	// allowed; any reset that rotates cancels it. Touched only by the main
+	// loop goroutine.
+	diskTxMapResetPending bool
+
+	// storageResetMinInterval is the least time between the end of one
+	// storage-triggered reset and the start of the next (zero means
+	// defaultStorageResetMinInterval), so a fault that each reset cures but
+	// that comes back straight after can't run a full unmined reload every
+	// heartbeat. lastStorageResetDone is when the last one was queued, then
+	// again when it finished. Touched
+	// only by the main loop goroutine.
+	storageResetMinInterval time.Duration
+	lastStorageResetDone    time.Time
+
 	// reconcileCh signals the channel listener to reconcile BA's tip with the
 	// blockchain service's tip via processNewBlockAnnouncement. Buffered cap 1
 	// so multiple triggers coalesce into a single reconciliation pass.
@@ -241,6 +268,10 @@ type blockWithMeta struct {
 //   - *BlockAssembler: New block assembler instance
 func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, stats *gocore.Stat, utxoStore utxo.Store,
 	subtreeStore blob.Store, blockchainClient blockchain.ClientI, newSubtreeChan chan subtreeprocessor.NewSubtreeRequest) (*BlockAssembler, error) {
+	// The main loop updates metrics (e.g. the disk tx map degraded gauge)
+	// whether or not a Server was built around this assembler.
+	initPrometheusMetrics()
+
 	bytesLittleEndian := make([]byte, 4)
 
 	if tSettings.ChainCfgParams == nil {
@@ -492,6 +523,45 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 
 			case <-heartbeatTicker.C:
 				// Idle tick: proves the loop is alive without requiring work.
+				// Also the polling point for a disk tx map post-commit storage
+				// error (moveForwardBlock, reorgBlocks, dequeue, removeTx,
+				// Stop, or reset's own reload): none of those call sites can
+				// fail the operation that observed the error - it already
+				// committed - so they request a reset instead, of which this
+				// is the only reader. A reset reloads unmined transactions
+				// from the UTXO store, the source of truth, curing any
+				// phantom the storage error left in the filter.
+				//
+				//
+				// One storage-triggered reset per fault: if that reset hits a
+				// storage error itself, the node is degraded and requests are
+				// consumed without resetting again, so a persistent disk fault
+				// can't loop full reloads. A clean reset of any kind clears it.
+				// A storage-triggered reset that failed before the tx map
+				// rotation left its phantom in place and is retried here too.
+				// Storage-triggered resets are paced by
+				// storageResetMinInterval; a request arriving sooner waits.
+				requested := b.subtreeProcessor.TakeResetRequested()
+				if b.diskTxMapResetPending {
+					b.diskTxMapResetPending = false
+					requested = true
+				}
+
+				if requested {
+					switch {
+					case b.diskTxMapDegraded:
+						b.logger.Debugf("[BlockAssembler] disk tx map degraded; not resetting for another post-commit storage error")
+					case time.Since(b.lastStorageResetDone) < b.storageResetInterval():
+						b.diskTxMapResetPending = true
+					default:
+						b.logger.Warnf("[BlockAssembler] disk tx map reported a storage error; resetting block assembly")
+
+						// Stamped when queued too, so a tick before the reset
+						// is picked up can't queue a second one.
+						b.lastStorageResetDone = time.Now()
+						b.resetStorageTriggered()
+					}
+				}
 
 			case resetReq := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
@@ -503,7 +573,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 					}
 				}
 
-				err := b.reset(ctx, resetReq.ValidateInputs)
+				resp, err := b.resetWithResponse(ctx, resetReq.ValidateInputs)
 
 				// The Reset path replays moveForward blocks through the same
 				// conflict resolution, so it can queue refusals too. Unlike the
@@ -511,13 +581,21 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// so nothing else would drain them until the next block arrives.
 				b.drainPendingInvalidations(ctx)
 
-				// empty out the reset channel
+				// empty out the reset channel. The reset that ran stands in for
+				// every drained request, so it counts as storage-triggered if
+				// any of them was.
+				storageTriggered := resetReq.StorageTriggered
+
 				for len(b.resetCh) > 0 {
 					bufferedCh := <-b.resetCh
+					storageTriggered = storageTriggered || bufferedCh.StorageTriggered
+
 					if bufferedCh.ErrCh != nil {
 						bufferedCh.ErrCh <- nil
 					}
 				}
+
+				b.onResetDone(storageTriggered, resp, err)
 
 				if resetReq.ErrCh != nil {
 					resetReq.ErrCh <- err
@@ -588,9 +666,19 @@ func (b *BlockAssembler) triggerReconcile() {
 // Returns:
 //   - error: Any error encountered during reset
 func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) error {
+	_, err := b.resetWithResponse(ctx, validateInputs...)
+	return err
+}
+
+// resetWithResponse is reset, also returning the subtree processor's reset
+// response for onResetDone: the zero value when reset failed before reaching
+// the subtree processor, so before the tx map rotation.
+func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs ...bool) (subtreeprocessor.ResetResponse, error) {
+	var resp subtreeprocessor.ResetResponse
+
 	bestBlockchainBlockHeader, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
-		return errors.NewProcessingError("[Reset] error getting best block header", err)
+		return resp, errors.NewProcessingError("[Reset] error getting best block header", err)
 	}
 
 	// reset the block assembly
@@ -599,7 +687,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 	moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
 	if err != nil {
-		return errors.NewProcessingError("[Reset] error getting reorg blocks", err)
+		return resp, errors.NewProcessingError("[Reset] error getting reorg blocks", err)
 	}
 
 	// Fast-forward reset is safe when the whole forward range is at/below the
@@ -639,7 +727,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 	// make sure we have processed all pending blocks before resetting
 	if err = b.subtreeProcessor.WaitForPendingBlocks(ctx); err != nil {
-		return errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
+		return resp, errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
 	}
 
 	// Best-effort wait for BlockValidation to finish processing any invalid moveBack blocks.
@@ -656,7 +744,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 			b.logger.Infof("[BlockAssembler][Reset] waiting for invalid block %s to be processed by BlockValidation", blockHash.String())
 			if waitErr := b.waitForBlockMinedSet(ctx, blockHash); waitErr != nil {
 				if ctx.Err() != nil {
-					return errors.NewProcessingError("[Reset] context cancelled while waiting for invalid block mined_set", waitErr)
+					return resp, errors.NewProcessingError("[Reset] context cancelled while waiting for invalid block mined_set", waitErr)
 				}
 				b.logger.Warnf("[BlockAssembler][Reset] gave up waiting for invalid block %s mined_set: %v (proceeding anyway — txs may be recovered on next reset)", blockHash.String(), waitErr)
 			}
@@ -775,17 +863,15 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 	// in the for/select in the subtreeprocessor
 	postProcessFn := func() error {
 		// reload the unmined transactions
-		if err = b.loadUnminedTransactions(ctx, shouldValidateInputs); err != nil {
+		if err = b.loadUnminedTransactions(ctx, true, shouldValidateInputs); err != nil {
 			return errors.NewProcessingError("[Reset] error loading unmined transactions", err)
 		}
 
 		// Drop any in-flight children of cascaded conflicting parents from
 		// the input queue before the existing post-postProcess drain runs
-		// and before default-case dequeue resumes.
-		if drop := b.unminedDropHashes; len(drop) > 0 {
-			b.subtreeProcessor.DrainQueue(drop)
-		}
-		b.unminedDropHashes = nil
+		// and before default-case dequeue resumes. Report-only: this runs
+		// inside reset's postProcess, after reset has already committed.
+		_ = b.drainUnminedDropHashes("drainQueue_reset_reload", true) // report-only: never returns a non-nil error for isReload=true
 
 		return nil
 	}
@@ -811,8 +897,9 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 	// does not depend on a lookup that can itself fail. See resetBlockHeights.
 	resetHeights := resetBlockHeights(bestBlockchainBlockHeader, currentHeight, moveBackBlocksWithMeta, moveForwardBlocksWithMeta)
 
-	if response := b.subtreeProcessor.Reset(baBestBlockHeader, moveBackBlocks, moveForwardBlocks, useFastForwardReset, postProcessFn); response.Err != nil {
-		b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", response.Err)
+	resp = b.subtreeProcessor.Reset(baBestBlockHeader, moveBackBlocks, moveForwardBlocks, useFastForwardReset, postProcessFn)
+	if resp.Err != nil {
+		b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", resp.Err)
 		// something went wrong, we need to set the best block header in the block assembly to be the
 		// same as the subtree processor's best block header
 		stpHeader := b.subtreeProcessor.GetCurrentBlockHeader()
@@ -820,7 +907,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 			// Nothing to realign to at all. Restore the pre-reset tip for the
 			// same reason as the unresolvable-height branch below.
 			b.setBestBlockHeader(baBestBlockHeader, baHeight)
-			return errors.NewProcessingError("[Reset] subtree processor has no current block header after a failed reset", response.Err)
+			return resp, errors.NewProcessingError("[Reset] subtree processor has no current block header after a failed reset", resp.Err)
 		}
 
 		// Resolve the height locally first. Every entry in resetHeights came from
@@ -852,7 +939,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 				// with nothing left to trigger a retry. Being behind is
 				// recoverable; being wrongly level is not.
 				b.setBestBlockHeader(baBestBlockHeader, baHeight)
-				return errors.NewProcessingError("[Reset] error getting best block header meta", err)
+				return resp, errors.NewProcessingError("[Reset] error getting best block header meta", err)
 			}
 
 			stpHeight = stpHeaderMeta.Height
@@ -872,13 +959,13 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 		// return value and the Errorf above agree with each other. The two
 		// branches above already return without persisting state for the same
 		// reason.
-		return errors.NewProcessingError("[Reset] subtree processor reset failed; block assembly realigned to %s at height %d", stpHeader.Hash().String(), currentHeight, response.Err)
+		return resp, errors.NewProcessingError("[Reset] subtree processor reset failed; block assembly realigned to %s at height %d", stpHeader.Hash().String(), currentHeight, resp.Err)
 	}
 
 	b.setBestBlockHeader(bestBlockchainBlockHeader, currentHeight)
 
 	if err = b.SetState(ctx); err != nil {
-		return errors.NewProcessingError("[Reset] error setting state", err)
+		return resp, errors.NewProcessingError("[Reset] error setting state", err)
 	}
 
 	_, height := b.CurrentBlock()
@@ -886,7 +973,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 	b.logger.Warnf("[BlockAssembler][Reset] resetting block assembler DONE")
 
-	return nil
+	return resp, nil
 }
 
 // resetBlockHeights maps the hash of every block a reset can leave the subtree
@@ -1230,7 +1317,7 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	b.replayPendingConflictIntents(ctx)
 
 	// Load unmined transactions (this includes cleanup of old unmined transactions first)
-	if err = b.loadUnminedTransactions(ctx); err != nil {
+	if err = b.loadUnminedTransactions(ctx, false); err != nil {
 		// we cannot start block assembly if we have not loaded unmined transactions successfully
 		return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions: %v", err)
 	}
@@ -1240,10 +1327,14 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	// input queue with that set as a drop filter before the event-loop
 	// goroutine starts — otherwise in-flight children whose parent was just
 	// flagged would be admitted to the next mining candidate.
-	if drop := b.unminedDropHashes; len(drop) > 0 {
-		b.subtreeProcessor.DrainQueue(drop)
+	// Same reasoning as the reset postProcess DrainQueue call (see
+	// drainUnminedDropHashes): DrainQueue's own writes land after
+	// loadUnminedTransactions' end-of-load flush and need the same
+	// flush-and-check. Unlike reset, this is the startup load itself
+	// (isReload=false): fail, consistent with the load rule.
+	if err = b.drainUnminedDropHashes("drainQueue_startup", false); err != nil {
+		return errors.NewStorageError("[BlockAssembler] failed to flush disk tx map after startup queue drain: %v", err)
 	}
-	b.unminedDropHashes = nil
 
 	// Start SubtreeProcessor goroutine after loading unmined transactions to avoid race conditions
 	b.subtreeProcessor.Start(ctx)
@@ -1744,6 +1835,12 @@ type resetRequest struct {
 	FullReset      bool
 	ValidateInputs bool
 	ErrCh          chan error
+
+	// StorageTriggered marks a reset requested because the subtree processor
+	// reported a post-commit disk tx map storage error (see
+	// SubtreeProcessor.TakeResetRequested). Only such a reset can leave block
+	// assembly degraded (onResetDone); a clean reset of any kind clears it.
+	StorageTriggered bool
 }
 
 // Reset triggers a reset of the block assembler state.
@@ -1776,6 +1873,88 @@ func (b *BlockAssembler) resetWithOptions(fullReset bool, validateInputs bool) {
 			b.logger.Errorf("[BlockAssembler] error resetting: %v", err)
 		}
 	}()
+}
+
+// resetStorageTriggered requests a reset because the subtree processor
+// reported a post-commit disk tx map storage error (heartbeatTicker.C's
+// TakeResetRequested poll). onResetDone decides, once the resetCh handler has
+// run it, whether it cured the map or left block assembly degraded.
+func (b *BlockAssembler) resetStorageTriggered() {
+	go func() {
+		errCh := make(chan error, 1)
+
+		b.resetCh <- resetRequest{
+			ErrCh:            errCh,
+			StorageTriggered: true,
+		}
+
+		if err := <-errCh; err != nil {
+			b.logger.Errorf("[BlockAssembler] error resetting (storage-triggered): %v", err)
+		}
+	}()
+}
+
+// defaultStorageResetMinInterval is the default storageResetMinInterval.
+const defaultStorageResetMinInterval = 10 * time.Minute
+
+// storageResetInterval returns storageResetMinInterval, or its default.
+func (b *BlockAssembler) storageResetInterval() time.Duration {
+	if b.storageResetMinInterval > 0 {
+		return b.storageResetMinInterval
+	}
+
+	return defaultStorageResetMinInterval
+}
+
+// resetAndRecord runs a reset that is not storage-triggered (the reorg
+// fallbacks) and records its outcome like the resetCh handler does.
+func (b *BlockAssembler) resetAndRecord(ctx context.Context, validateInputs bool) error {
+	resp, err := b.resetWithResponse(ctx, validateInputs)
+	b.onResetDone(false, resp, err)
+
+	return err
+}
+
+// onResetDone updates the disk tx map degraded state once a reset has run,
+// from how that reset ended (every reset completion path calls it):
+//   - completed without a storage error: clears degraded;
+//   - storage-triggered and hit a storage error itself (resp.StorageFailed):
+//     sets degraded;
+//   - storage-triggered and failed before the tx map rotation: the phantom it
+//     was for is still there, so the next heartbeat retries it (any reset
+//     that rotates cancels that retry);
+//   - anything else (a non-storage failure after the rotation, which
+//     discarded the phantom, or a manual/reorg reset whose reload left one,
+//     which raises its own request): unchanged.
+func (b *BlockAssembler) onResetDone(storageTriggered bool, resp subtreeprocessor.ResetResponse, resetErr error) {
+	if storageTriggered {
+		b.lastStorageResetDone = time.Now()
+	}
+
+	// Any rotation discards the phantom a pending reset was for.
+	if resp.Rotated {
+		b.diskTxMapResetPending = false
+	}
+
+	switch {
+	case resetErr == nil && !resp.StorageFailed:
+		if b.diskTxMapDegraded {
+			b.logger.Infof("[BlockAssembler] reset completed without a disk tx map storage error; no longer degraded")
+		}
+
+		b.diskTxMapDegraded = false
+		prometheusBlockAssemblyDiskTxMapDegraded.Set(0)
+	case storageTriggered && resp.StorageFailed:
+		if !b.diskTxMapDegraded {
+			b.logger.Errorf("[BlockAssembler] reset for a disk tx map storage error hit a storage error again (reset error: %v); degraded, not resetting again until a reset completes clean", resetErr)
+		}
+
+		b.diskTxMapDegraded = true
+		prometheusBlockAssemblyDiskTxMapDegraded.Set(1)
+	case storageTriggered && resetErr != nil && !resp.Rotated:
+		b.logger.Warnf("[BlockAssembler] reset for a disk tx map storage error failed before the tx map rotation; retrying once storageResetMinInterval allows: %v", resetErr)
+		b.diskTxMapResetPending = true
+	}
 }
 
 // GetMiningCandidate retrieves a candidate block for mining.
@@ -2050,7 +2229,9 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// make sure we wait for the reset to complete
 		// validateInputs=true: getConflictingNodes() may miss conflicts not stored in subtree
 		// files; validateUnminedTxInputs() independently catches them via SpendingData.
-		if err = b.reset(ctx, true); err != nil {
+		err = b.resetAndRecord(ctx, true)
+
+		if err != nil {
 			b.logger.Errorf("[BlockAssembler] error resetting after large reorg: %v", err)
 		}
 
@@ -2096,7 +2277,9 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// already detected by reorgBlocks; re-running validateInputs here is redundant
 		// and currently broken (fields.Inputs alone does not populate data.Tx in the
 		// SQL store, so validateUnminedTxInputs always returns false).
-		if err = b.reset(ctx, reorgFailed); err != nil {
+		err = b.resetAndRecord(ctx, reorgFailed)
+
+		if err != nil {
 			return errors.NewProcessingError("error resetting block assembly after reorg with invalid block", err)
 		}
 
@@ -2724,9 +2907,14 @@ func stableSortUnminedByCreatedAt(txs []*utxo.UnminedTransaction) {
 		return txs[i].CreatedAt < txs[j].CreatedAt
 	})
 
-	// Reorder within each maximal run of equal CreatedAt so in-set parents come
-	// before their children. Only same-timestamp transactions can be misordered,
-	// so unrelated timestamps are left untouched.
+	orderEqualCreatedAtRunsParentsFirst(txs)
+}
+
+// orderEqualCreatedAtRunsParentsFirst reorders, within each maximal run of equal
+// CreatedAt in txs (already sorted by CreatedAt), in-set parents before their
+// children. Only same-timestamp transactions can be misordered, so unrelated
+// timestamps are left untouched.
+func orderEqualCreatedAtRunsParentsFirst(txs []*utxo.UnminedTransaction) {
 	for start := 0; start < len(txs); {
 		end := start + 1
 		for end < len(txs) && txs[end].CreatedAt == txs[start].CreatedAt {
@@ -2975,7 +3163,40 @@ func (b *BlockAssembler) fixUnminedSinceInconsistencies(ctx context.Context) err
 // Called from:
 //   - reset() as postProcessFn (after reorg processing)
 //   - Startup initialization
-func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateInputs ...bool) (err error) {
+//
+// isReload distinguishes the two: true when called from reset's postProcess,
+// false for the startup load. reset has already committed its state change
+// (maps cleared, header at the target tip) by the time postProcess runs, so a
+// disk tx map error surfacing during this reload cannot be rolled back - it
+// is logged and counted (via AddDirectlyReportOnly/AddNodesDirectlyReportOnly)
+// rather than failing the reload, matching reset's own commit-point handling.
+// The startup load has no such commit to protect, so it keeps failing on a
+// pending map error (AddDirectly/AddNodesDirectly): the map may be partially
+// populated, and a restart reloads it.
+// drainUnminedDropHashes drains the input queue with b.unminedDropHashes (set
+// by markAsConflicting during the load just completed) as the drop filter,
+// then flushes and checks the disk tx map for DrainQueue's own writes: they
+// land after loadUnminedTransactions' own end-of-load FlushDiskTxMapForLoad
+// call, so a trailing unflushed failure there needs the same check, or it
+// surfaces later as a spurious "not found in currentTxMap" failure on an
+// unrelated block instead. where and isReload have the same meaning as
+// FlushDiskTxMapForLoad: isReload=true (reset's postProcess) reports only;
+// isReload=false (startup) fails, consistent with the load rule. A no-op,
+// returning nil, when there is nothing to drop.
+func (b *BlockAssembler) drainUnminedDropHashes(where string, isReload bool) error {
+	drop := b.unminedDropHashes
+	b.unminedDropHashes = nil
+
+	if len(drop) == 0 {
+		return nil
+	}
+
+	b.subtreeProcessor.DrainQueue(drop)
+
+	return b.subtreeProcessor.FlushDiskTxMapForLoad(where, isReload)
+}
+
+func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload bool, validateInputs ...bool) (err error) {
 	shouldValidateInputs := len(validateInputs) > 0 && validateInputs[0]
 
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "loadUnminedTransactions",
@@ -3005,7 +3226,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 	// 2. OnRestartValidateParentChain is false (parent validation requires in-memory for small datasets)
 	if b.settings.BlockAssembly.UnminedTxDiskSortEnabled && !b.settings.BlockAssembly.OnRestartValidateParentChain {
 		b.logger.Infof("[loadUnminedTransactions] using disk-based sorting to reduce RAM usage")
-		return b.loadUnminedTransactionsWithDiskSort(ctx)
+		return b.loadUnminedTransactionsWithDiskSort(ctx, isReload)
 	}
 
 	// Wait for the unmined_since index to be ready before attempting to get the iterator
@@ -3147,7 +3368,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 
 					if !b.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
 						// clear the TxInpoints to save memory if we are not using subtree meta
-						unminedTransaction.TxInpoints = &subtree.TxInpoints{}
+						clearUnminedTxInpoints(unminedTransaction)
 					}
 
 					localResult.unminedTxs = append(localResult.unminedTxs, unminedTransaction)
@@ -3308,7 +3529,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 
 			// Pass slice segment directly - no copy needed
 			batch := unminedTransactions[start:end]
-			if err = b.subtreeProcessor.AddNodesDirectly(batch, true); err != nil {
+			if isReload {
+				err = b.subtreeProcessor.AddNodesDirectlyReportOnly(batch, true)
+			} else {
+				err = b.subtreeProcessor.AddNodesDirectly(batch, true)
+			}
+			if err != nil {
 				return errors.NewProcessingError("error adding unmined transactions batch to subtree processor", err)
 			}
 
@@ -3328,7 +3554,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 	} else {
 		// Sequential mode: use AddDirectly for each transaction
 		for idx, unminedTransaction := range unminedTransactions {
-			if err = b.subtreeProcessor.AddDirectly(unminedTransaction.Node, unminedTransaction.TxInpoints, true); err != nil {
+			if isReload {
+				err = b.subtreeProcessor.AddDirectlyReportOnly(unminedTransaction.Node, unminedTransaction.TxInpoints, true)
+			} else {
+				err = b.subtreeProcessor.AddDirectly(unminedTransaction.Node, unminedTransaction.TxInpoints, true)
+			}
+			if err != nil {
 				return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
 			}
 
@@ -3350,6 +3581,14 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 
 	prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(batchStart).Seconds())
 
+	// The tail of the load leaves writes below the disk tx map's flush
+	// threshold unflushed; AddNodesDirectly/AddDirectly's own per-call check
+	// cannot see a flush failure for those. Flush once here, after the whole
+	// load, and check.
+	if err = b.subtreeProcessor.FlushDiskTxMapForLoad("loadUnminedTransactions", isReload); err != nil {
+		return errors.NewProcessingError("error flushing disk tx map after loading unmined transactions", err)
+	}
+
 	// unlock any locked transactions
 	if len(lockedTransactions) > 0 {
 		if err = b.utxoStore.SetLocked(ctx, lockedTransactions, false); err != nil {
@@ -3362,11 +3601,16 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 	return nil
 }
 
-// sortEntry is a lightweight in-memory structure for sorting.
-// Only 12 bytes per transaction instead of full UnminedTransaction.
-type sortEntry struct {
-	CreatedAt int    // 8 bytes - timestamp with milliseconds for sorting
-	Sequence  uint64 // 8 bytes - key to retrieve from temp store
+// clearUnminedTxInpoints empties a reloaded transaction's inpoints in place.
+// Every store iterator allocates inpoints per transaction, so resetting the
+// existing value is safe and avoids retaining a second object per transaction.
+func clearUnminedTxInpoints(tx *utxo.UnminedTransaction) {
+	if tx.TxInpoints == nil {
+		tx.TxInpoints = &subtree.TxInpoints{}
+		return
+	}
+
+	*tx.TxInpoints = subtree.TxInpoints{}
 }
 
 // validateUnminedTxInputs checks that each input of an unmined transaction is still validly
@@ -3558,15 +3802,17 @@ func (b *BlockAssembler) CheckInputValidation(ctx context.Context) (int, error) 
 	return invalidCount, nil
 }
 
-// loadUnminedTransactionsWithDiskSort loads unmined transactions using disk-based sorting
-// to reduce RAM usage. Instead of loading all transaction data into memory, it:
-// 1. Writes transaction data to BadgerDB temp storage
-// 2. Keeps only minimal sort entries (12 bytes each) in memory
-// 3. Sorts in memory by CreatedAt
-// 4. Reads back from disk in sorted order
-func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context) error {
-	scanHeaders := uint64(1000)
-
+// loadUnminedTransactionsWithDiskSort loads unmined transactions with memory
+// bounded by blockassembly_unminedTxSortBufferRecords instead of by the size of
+// the unmined set. Transactions are buffered as compact records, sorted runs are
+// spilled to blockassembly_unminedTxDiskSortPath as buffers fill, and the runs
+// are merged straight into the subtree processor. With no sort path the compact
+// records are sorted in memory.
+//
+// isReload has the same meaning as in loadUnminedTransactions: true when this
+// is reset's postProcess reload (report-only on a disk tx map error), false
+// for the startup load (fail on one).
+func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context, isReload bool) error {
 	// Wait for the unmined_since index to be ready
 	if indexWaiter, ok := b.utxoStore.(interface {
 		WaitForIndexReady(ctx context.Context, indexName string) error
@@ -3591,8 +3837,11 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 		prometheusBlockAssemblerUtxoIndexWaitDuration.WithLabelValues("unminedSinceIndex", "skipped").Observe(0)
 	}
 
-	bestBlockHeader, _ := b.CurrentBlock()
-	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, bestBlockHeader.Hash(), scanHeaders)
+	// Same best-chain coverage as the in-memory path: every header back to
+	// genesis, so a tx mined deep in the chain is still recognised as mined.
+	bestBlockHeader, bestBlockHeight := b.CurrentBlock()
+
+	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, bestBlockHeader.Hash(), uint64(bestBlockHeight)+1)
 	if err != nil {
 		return errors.NewProcessingError(errGettingBestBlockHeaders, err)
 	}
@@ -3611,56 +3860,77 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 		return errors.NewProcessingError(errGettingUnminedTxIterator, err)
 	}
 	prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues("false", "success").Observe(duration)
-	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] successfully created unmined tx iterator")
 
-	// Create temporary BadgerDB store
-	tempStore, err := tempstore.New(tempstore.Options{
-		BasePath: b.settings.BlockAssembly.UnminedTxDiskSortPath,
-		Prefix:   "unmined-sort",
+	return b.loadUnminedSorted(ctx, it, bestBlockHeaderIDsMap, isReload)
+}
+
+// unminedSortDirs returns the configured sort directories, or the OS temp
+// directory when none is set: enabling disk sort always bounds memory, as the
+// previous Badger implementation did.
+func unminedSortDirs(paths []string) []string {
+	dirs := make([]string, 0, len(paths))
+
+	for _, p := range paths {
+		if p = strings.TrimSpace(p); p != "" {
+			dirs = append(dirs, p)
+		}
+	}
+
+	if len(dirs) == 0 {
+		return []string{os.TempDir()}
+	}
+
+	return dirs
+}
+
+// loadUnminedSorted filters the iterator's transactions like the in-memory
+// path, orders them by CreatedAt through an unminedsort.Sorter, and adds them
+// to the subtree processor in batches. isReload is as in
+// loadUnminedTransactionsWithDiskSort.
+func (b *BlockAssembler) loadUnminedSorted(ctx context.Context, it utxo.UnminedTxIterator, bestBlockHeaderIDsMap map[uint32]bool, isReload bool) error {
+	storeTxInpoints := b.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta
+
+	sorter, err := unminedsort.New(unminedsort.Options{
+		Dirs:          unminedSortDirs(b.settings.BlockAssembly.UnminedTxDiskSortPaths),
+		BufferRecords: b.settings.BlockAssembly.UnminedTxSortBufferRecords,
+		WithInpoints:  storeTxInpoints,
 	})
 	if err != nil {
-		return errors.NewProcessingError("error creating temp store for disk-based sorting", err)
+		return errors.NewProcessingError("error creating unmined transaction sorter", err)
 	}
+
 	defer func() {
-		if closeErr := tempStore.Close(); closeErr != nil {
-			b.logger.Warnf("[loadUnminedTransactionsWithDiskSort] error closing temp store: %v", closeErr)
+		if closeErr := sorter.Close(); closeErr != nil {
+			b.logger.Warnf("[loadUnminedTransactionsWithDiskSort] error removing sort runs: %v", closeErr)
 		}
 	}()
 
-	// Lightweight sort entries - only 12 bytes per tx
-	sortEntries := make([]sortEntry, 0, 1024*1024)
 	lockedTransactions := make([]chainhash.Hash, 0, 1024)
 	markAsMinedOnLongestChain := make([]chainhash.Hash, 0, 1024)
 
 	iteratorStart := time.Now()
-	var sequence uint64
-	totalProcessed := atomic.Int64{}
-	skippedCount := atomic.Int64{}
-	alreadyMinedCount := atomic.Int64{}
-	lockedCount := atomic.Int64{}
+	lastLogTime := iteratorStart
 
-	// Write batch for efficient disk writes
-	writeBatch := tempStore.NewWriteBatch()
+	var totalProcessed, skippedCount, alreadyMinedCount int64
 
-	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] processing unmined transactions and writing to temp store")
+	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] scanning unmined transactions (sort dirs %v, buffer %d records)",
+		unminedSortDirs(b.settings.BlockAssembly.UnminedTxDiskSortPaths), b.settings.BlockAssembly.UnminedTxSortBufferRecords)
 
-	// Process batches from iterator
 	for {
 		batch, err := it.Next(ctx)
 		if err != nil {
-			writeBatch.Cancel()
 			return errors.NewProcessingError("error getting unmined transaction", err)
 		}
 
-		if batch == nil || len(batch) == 0 {
+		if len(batch) == 0 {
 			break
 		}
 
 		for _, unminedTx := range batch {
-			totalProcessed.Add(1)
+			totalProcessed++
 
 			if unminedTx.Skip {
-				skippedCount.Add(1)
+				skippedCount++
 				continue
 			}
 
@@ -3674,7 +3944,7 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 				}
 
 				if skipAlreadyMined {
-					alreadyMinedCount.Add(1)
+					alreadyMinedCount++
 					if unminedTx.UnminedSince > 0 {
 						markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, unminedTx.Node.Hash)
 					}
@@ -3682,60 +3952,29 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 				}
 			}
 
-			// Serialize and write to temp store
-			txData, serErr := utxo.SerializeUnminedTransaction(unminedTx)
-			if serErr != nil {
-				writeBatch.Cancel()
-				return errors.NewProcessingError("error serializing unmined transaction", serErr)
+			if err = sorter.Add(int64(unminedTx.CreatedAt), *unminedTx.Node, unminedTx.TxInpoints); err != nil {
+				return errors.NewProcessingError("error buffering unmined transaction %s for sorting", unminedTx.Node.Hash, err)
 			}
-
-			// Use sequence number as key (8 bytes, big-endian for lexicographic ordering)
-			key := make([]byte, 8)
-			binary.BigEndian.PutUint64(key, sequence)
-
-			if setErr := writeBatch.Set(key, txData); setErr != nil {
-				writeBatch.Cancel()
-				return errors.NewProcessingError("error writing to temp store", setErr)
-			}
-
-			// Add lightweight sort entry
-			sortEntries = append(sortEntries, sortEntry{
-				CreatedAt: unminedTx.CreatedAt,
-				Sequence:  sequence,
-			})
 
 			if unminedTx.Locked {
 				lockedTransactions = append(lockedTransactions, unminedTx.Node.Hash)
-				lockedCount.Add(1)
-			}
-
-			sequence++
-
-			// Flush batch periodically to prevent memory buildup
-			if writeBatch.Count() >= 10000 {
-				if flushErr := writeBatch.Flush(); flushErr != nil {
-					return errors.NewProcessingError("error flushing temp store batch", flushErr)
-				}
 			}
 		}
 
-		if totalProcessed.Load()%100_000 == 0 {
-			b.logger.Infof("[loadUnminedTransactionsWithDiskSort] processed %d unmined transactions so far", totalProcessed.Load())
+		if time.Since(lastLogTime) >= 10*time.Second {
+			elapsed := time.Since(iteratorStart)
+			b.logger.Infof("[loadUnminedTransactionsWithDiskSort] progress: %d txs processed, %.0f txs/sec, elapsed %s",
+				totalProcessed, float64(totalProcessed)/elapsed.Seconds(), elapsed.Truncate(time.Second))
+			lastLogTime = time.Now()
 		}
 	}
 
-	// Flush any remaining writes
-	if flushErr := writeBatch.Flush(); flushErr != nil {
-		return errors.NewProcessingError("error flushing final temp store batch", flushErr)
-	}
-
-	iteratorDuration := time.Since(iteratorStart).Seconds()
-	prometheusBlockAssemblerIteratorProcessingTime.WithLabelValues("false").Observe(iteratorDuration)
-	prometheusBlockAssemblerIteratorTransactionsTotal.WithLabelValues("false").Add(float64(totalProcessed.Load()))
-	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues("false", "skipped").Add(float64(skippedCount.Load()))
-	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues("false", "already_mined").Add(float64(alreadyMinedCount.Load()))
-	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues("false", "locked").Add(float64(lockedCount.Load()))
-	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues("false", "added").Add(float64(len(sortEntries)))
+	prometheusBlockAssemblerIteratorProcessingTime.WithLabelValues("false").Observe(time.Since(iteratorStart).Seconds())
+	prometheusBlockAssemblerIteratorTransactionsTotal.WithLabelValues("false").Add(float64(totalProcessed))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues("false", "skipped").Add(float64(skippedCount))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues("false", "already_mined").Add(float64(alreadyMinedCount))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues("false", "locked").Add(float64(len(lockedTransactions)))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues("false", "added").Add(float64(sorter.Len()))
 
 	// Fix data inconsistencies
 	if len(markAsMinedOnLongestChain) > 0 {
@@ -3749,75 +3988,49 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 		b.logger.Infof("[BlockAssembler] fixed %d transactions with inconsistent unmined_since", len(markAsMinedOnLongestChain))
 	}
 
-	// Sort the lightweight entries in memory
-	sortStart := time.Now()
-	sort.Slice(sortEntries, func(i, j int) bool {
-		if sortEntries[i].CreatedAt != sortEntries[j].CreatedAt {
-			return sortEntries[i].CreatedAt < sortEntries[j].CreatedAt
-		}
-		// Deterministic tiebreak on equal CreatedAt: Sequence is the iterator
-		// yield order, which places parents before children where the iterator
-		// itself is ordered. This path does not run validateParentChain (it is
-		// gated on OnRestartValidateParentChain being false), so it never drops
-		// on misordering; the tiebreak removes non-determinism between restarts.
-		return sortEntries[i].Sequence < sortEntries[j].Sequence
-	})
-	txCount := len(sortEntries)
-	var countBucket string
-	switch {
-	case txCount < 1000:
-		countBucket = "<1k"
-	case txCount < 10000:
-		countBucket = "1k-10k"
-	case txCount < 100000:
-		countBucket = "10k-100k"
-	case txCount < 1000000:
-		countBucket = "100k-1M"
-	default:
-		countBucket = ">1M"
+	b.logger.Infof("[BlockAssembler] sorted %d unmined transactions (total processed: %d, skipped: %d, already mined: %d, locked: %d), adding to subtree processor",
+		sorter.Len(), totalProcessed, skippedCount, alreadyMinedCount, len(lockedTransactions))
+
+	batchSize := b.settings.BlockAssembly.UnminedLoadingBatchSize
+	if batchSize <= 0 {
+		batchSize = 1024 * 1024
 	}
-	prometheusBlockAssemblerSortTransactionsTime.WithLabelValues(countBucket).Observe(time.Since(sortStart).Seconds())
 
-	b.logger.Infof("[BlockAssembler] loaded %d unmined transactions into temp store (total processed: %d, skipped: %d, already mined: %d, locked: %d)",
-		len(sortEntries), totalProcessed.Load(), skippedCount.Load(), alreadyMinedCount.Load(), lockedCount.Load())
-
-	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] reading back transactions in sorted order and adding to subtree processor")
-
-	// Read back in sorted order and add to subtree processor
-	batchStart := time.Now()
 	addStart := time.Now()
-	addTxs := float64(0)
 
-	for idx, entry := range sortEntries {
-		// Get transaction data from temp store
-		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(key, entry.Sequence)
-
-		txData, getErr := tempStore.Get(key)
-		if getErr != nil {
-			return errors.NewProcessingError("error reading from temp store", getErr)
+	err = sorter.Drain(ctx, batchSize, func(batch []*utxo.UnminedTransaction) error {
+		// Drain never splits an equal-CreatedAt group across batches, so the
+		// parents-first tiebreak sees every member of a group.
+		if storeTxInpoints {
+			orderEqualCreatedAtRunsParentsFirst(batch)
 		}
 
-		unminedTx, deserErr := utxo.DeserializeUnminedTransaction(txData)
-		if deserErr != nil {
-			return errors.NewProcessingError("error deserializing unmined transaction", deserErr)
+		var addErr error
+		if isReload {
+			addErr = b.subtreeProcessor.AddNodesDirectlyReportOnly(batch, true)
+		} else {
+			addErr = b.subtreeProcessor.AddNodesDirectly(batch, true)
 		}
 
-		if err = b.subtreeProcessor.AddDirectly(unminedTx.Node, unminedTx.TxInpoints, true); err != nil {
-			return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
+		if addErr != nil {
+			return errors.NewProcessingError("error adding unmined transactions batch to subtree processor", addErr)
 		}
 
-		if (idx+1)%10_000 == 0 {
-			prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
-			prometheusBlockAssemblerAddDirectlyTotal.Add(addTxs)
-			addStart = time.Now()
-			addTxs = 0
-		}
+		prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(addStart).Seconds())
+		prometheusBlockAssemblerAddDirectlyTotal.Add(float64(len(batch)))
+		addStart = time.Now()
 
-		addTxs++
+		return nil
+	})
+	if err != nil {
+		return errors.NewProcessingError("error merging sorted unmined transactions into the subtree processor", err)
 	}
 
-	prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(batchStart).Seconds())
+	// See the same call in loadUnminedTransactions: the last batch's writes
+	// can sit below the disk tx map's flush threshold, unflushed.
+	if err = b.subtreeProcessor.FlushDiskTxMapForLoad("loadUnminedTransactionsWithDiskSort", isReload); err != nil {
+		return errors.NewProcessingError("error flushing disk tx map after loading unmined transactions", err)
+	}
 
 	// Unlock any locked transactions
 	if len(lockedTransactions) > 0 {

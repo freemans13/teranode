@@ -548,26 +548,26 @@ func TestProcessBlockFound_NonLegacyBlockKeepsTheCatchupDivert(t *testing.T) {
 	require.Empty(t, ws.client.addedBlocks())
 }
 
-// capturingLogger records the lines the window's startup log writes, so the depth resolution
+// windowCapturingLogger records the lines the window's startup log writes, so the depth resolution
 // can be asserted on rather than merely run.
-type capturingLogger struct {
+type windowCapturingLogger struct {
 	ulogger.TestLogger
 
 	mu    sync.Mutex
 	lines []string
 }
 
-func (l *capturingLogger) Infof(format string, args ...interface{}) { l.record(format, args...) }
-func (l *capturingLogger) Warnf(format string, args ...interface{}) { l.record(format, args...) }
+func (l *windowCapturingLogger) Infof(format string, args ...interface{}) { l.record(format, args...) }
+func (l *windowCapturingLogger) Warnf(format string, args ...interface{}) { l.record(format, args...) }
 
-func (l *capturingLogger) record(format string, args ...interface{}) {
+func (l *windowCapturingLogger) record(format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	l.lines = append(l.lines, fmt.Sprintf(format, args...))
 }
 
-func (l *capturingLogger) recorded() []string {
+func (l *windowCapturingLogger) recorded() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -600,7 +600,7 @@ func TestQuickWindowDepth_ResolvesFromSettingsAndLogsTheClamp(t *testing.T) {
 			tSettings.BlockValidation.QuickValidateSkipUtxoLock = tc.skipLock
 			tSettings.BlockValidation.MaxBlocksBehindBlockAssembly = tc.maxBehind
 
-			logger := &capturingLogger{}
+			logger := &windowCapturingLogger{}
 			require.Equal(t, tc.expected, quickWindowDepth(tSettings, logger))
 
 			fromSettings, _ := tSettings.BlockValidation.QuickWindowConfiguredDepth()
