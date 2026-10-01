@@ -259,7 +259,7 @@ func (h *parkWiringHarness) deliverBlock(t *testing.T, msgBlock *wire.MsgBlock, 
 
 	h.sm.blockDownloads.Add(h.peer, hash)
 
-	converted, err := h.sm.pipelineBlockSink(hash, &msgBlock.Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := h.sm.pipelineBlockSink(hash, &msgBlock.Header, bytes.NewReader(body), sinkPayloadLen(body))
 	if err != nil {
 		return err
 	}

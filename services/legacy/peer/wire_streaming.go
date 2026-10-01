@@ -54,8 +54,9 @@ var blockBodyGate func(hash chainhash.Hash, header *wire.BlockHeader) error
 // converted is blockBodySink's own return value for THIS call, passed straight
 // through rather than re-derived. A hash can be re-requested and re-delivered
 // while an earlier, still-parked delivery for it is waiting on its parent —
-// the streaming gate accepts any hash asked for within the last hour, and
-// ownership is released as soon as a delivery's sink call finishes — so an
+// the streaming gate accepts any hash the download ledger still holds a
+// request for, and ownership is released as soon as a delivery's sink call
+// finishes — so an
 // implementation that inferred "did this call convert something" by asking
 // whether a converted record merely exists for hash would find the OTHER
 // delivery's genuine, still-needed record and destroy it. converted is what
@@ -184,20 +185,16 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 	// caller's generic drain runs, so the orphan can be deleted rather than
 	// left behind uncounted.
 	//
-	// NOTE for the pipeline sink specifically: this check is unreliable on
-	// that path and nobody has fixed it here. blockTxStream
-	// (services/legacy/netsync/block_tx_stream.go) wraps lr in its own
-	// 256 KiB buffered reader, and a bufio.Reader reads ahead of whatever the
-	// caller actually consumed — so for a block small enough to fit inside
-	// that buffer, the read-ahead can already have pulled every remaining
-	// byte off lr before this check ever runs, leaving lr.N at 0 whether or
-	// not the sink's own logic was correct. A large block, where the buffer
-	// cannot get ahead of the whole body, does not have this problem. That
-	// makes this check fire (or not) by block size rather than by
-	// correctness on the pipeline path. Correctness there is still held by
-	// the merkle root comparison inside pipelineBlockSink itself, which does
-	// not depend on this. Not fixed here: this is a note for whoever touches
-	// this next, not a defect this change set is fixing.
+	// The pipeline sink must never reach this with converted true. Its
+	// blockTxStream (services/legacy/netsync/block_tx_stream.go) reads through
+	// a 256 KiB buffer that can pull bytes off lr ahead of what the
+	// transactions consumed, so lr.N here is not a reliable measure on that
+	// path, and a refusal here after converted true would hand
+	// pipelineBlockDelete a record that may stand in for an earlier parked
+	// copy of the same block, whose subtree files it then deletes. The sink
+	// therefore holds the body to exactly the declared length itself
+	// (blockTxStream.RequireEnd) and refuses before writing its record, so on
+	// that path this check only ever fires with converted false.
 	if lr.N > 0 {
 		return nil, deleteOrphanedBody(hash, converted, errors.NewProcessingError(
 			"streaming block %s: peer declared %d byte payload but the body ended early with %d bytes unread", hash, length, lr.N))

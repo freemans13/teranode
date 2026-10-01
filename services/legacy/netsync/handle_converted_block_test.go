@@ -186,7 +186,7 @@ func TestHandleConvertedBlock_CommitsWithoutTheBlock(t *testing.T) {
 	mineRegtestPoW(t, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 
@@ -230,7 +230,7 @@ func TestHandleConvertedBlock_HasNoSubtreeSlicesToRecheck(t *testing.T) {
 	mineRegtestPoW(t, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 
@@ -279,7 +279,7 @@ func TestHandleConvertedBlock_AHeightDisagreementIsTransientNotBlockInvalid(t *t
 	mineRegtestPoW(t, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 
@@ -334,7 +334,7 @@ func TestCommitParkedBlock_RoutesAConvertedEntryWithoutReadingAWholeBlock(t *tes
 	mineRegtestPoW(t, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 
@@ -394,7 +394,7 @@ func TestBlockDispatcher_ParkedRunRoutesAConvertedEntryWithoutReadingAWholeBlock
 	mineRegtestPoW(t, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 
@@ -446,7 +446,7 @@ func TestBlockDispatcher_ParkedRunNeverConsultsTheStoreToRoute(t *testing.T) {
 	mineRegtestPoW(t, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 

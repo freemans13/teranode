@@ -45,7 +45,7 @@ func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err)
 	require.True(t, converted, "a well-formed block below the checkpoint must convert cleanly")
 
@@ -77,7 +77,7 @@ func TestPipelineSink_RejectsAWrongMerkleRoot(t *testing.T) {
 	bad := blk.MsgBlock().Header
 	bad.MerkleRoot[0] ^= 0xFF
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), sinkPayloadLen(body))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "merkle root")
 	require.False(t, converted, "a rejected block must never report having converted")
@@ -98,13 +98,13 @@ func TestPipelineSink_DeletesWhatItWroteOnAWrongMerkleRoot(t *testing.T) {
 	bad := blk.MsgBlock().Header
 	bad.MerkleRoot[0] ^= 0xFF
 
-	_, _ = sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), int64(len(body)))
+	_, _ = sm.pipelineBlockSink(*blk.Hash(), &bad, bytes.NewReader(body), sinkPayloadLen(body))
 
 	// The failed run reports no subtrees, so ask a good run which hashes the block
 	// produces and require every one of them to be absent from the failed store.
 	good := newPipelineParkManager(t, memory.New(), 8)
 	pipelineHeaderFixture(t, good, blk)
-	goodConverted, goodErr := good.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	goodConverted, goodErr := good.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, goodErr, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, goodConverted, "sanity: the good run must actually convert, or this test asserts nothing")
 
@@ -136,7 +136,7 @@ func TestPipelineSink_RejectsADuplicateTransaction(t *testing.T) {
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyWithADuplicate(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "duplicate")
 	require.False(t, converted, "a rejected block must never report having converted")
@@ -157,7 +157,7 @@ func TestPipelineSink_RecordsAWholeBlockModel(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the recorded block")
 
@@ -170,7 +170,7 @@ func TestPipelineSink_RecordsAWholeBlockModel(t *testing.T) {
 	require.Equal(t, uint64(20), got.TransactionCount)
 	require.NotNil(t, got.CoinbaseTx, "the committer serializes the coinbase from this")
 	require.NotEmpty(t, got.Subtrees, "and reads the subtree list from this")
-	require.Equal(t, uint64(len(body)), got.SizeInBytes)
+	require.Equal(t, uint64(sinkPayloadLen(body)), got.SizeInBytes, "the block's size is its whole wire payload, header included") //nolint:gosec // a test body length is never negative
 }
 
 // TestPipelineSink_TheRecordedBlockSurvivesASerializationRoundTrip is what makes
@@ -187,7 +187,7 @@ func TestPipelineSink_TheRecordedBlockSurvivesASerializationRoundTrip(t *testing
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the recorded block")
 
@@ -256,7 +256,7 @@ func TestPipelineSink_CoinbaseOnlyBlockProducesAnEmptyRecord(t *testing.T) {
 
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed coinbase-only block must convert cleanly")
 	require.True(t, converted, "a coinbase-only block must still report having converted")
 
@@ -421,6 +421,12 @@ func blockBodyBytes(t *testing.T, blk *bsvutil.Block) []byte {
 	}
 
 	return buf.Bytes()
+}
+
+// sinkPayloadLen is the n the wire layer passes pipelineBlockSink for this body: the message's
+// declared payload, which is the 80-byte header the wire layer has already read plus the body.
+func sinkPayloadLen(body []byte) int64 {
+	return int64(wire.MaxBlockHeaderPayload + len(body))
 }
 
 // blockBodyWithADuplicate is blockBodyBytes with one non-coinbase transaction

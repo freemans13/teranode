@@ -401,7 +401,7 @@ func deliverPropertyBlock(t *testing.T, sm *SyncManager, peer *peerpkg.Peer, blk
 
 	sm.blockDownloads.Add(peer, hash)
 
-	converted, err := sm.pipelineBlockSink(hash, &msgBlock.Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(hash, &msgBlock.Header, bytes.NewReader(body), sinkPayloadLen(body))
 	if err != nil {
 		return err
 	}

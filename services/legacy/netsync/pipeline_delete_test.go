@@ -78,7 +78,7 @@ func TestInstallStreamingBlockPath_ChoosesTheSinkAndDeleteTogether(t *testing.T)
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := gotSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := gotSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "the installed sink must convert a well-formed block cleanly")
 	require.True(t, converted, "the installed sink must behave like the pipeline sink, not the plain body-write path")
 }
@@ -103,7 +103,7 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, sinkErr, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion to test its cleanup")
 
@@ -147,7 +147,7 @@ func TestPipelineBlockDelete_ADrainedCopyDeletesNothing(t *testing.T) {
 	body := blockBodyBytes(t, blk)
 
 	// The other copy converts the block.
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err)
 	require.True(t, converted)
 
@@ -196,7 +196,7 @@ func TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint(t *testin
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, sinkErr, "an above-checkpoint block must convert cleanly, not be refused")
 	require.True(t, converted, "sanity: this test needs a real conversion above the checkpoint")
 
@@ -256,7 +256,7 @@ func TestPipelineBlockDelete_LogsARealReadFailureInsteadOfSwallowingIt(t *testin
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, sinkErr, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs a real converted record to corrupt")
 
@@ -274,7 +274,7 @@ func TestPipelineBlockDelete_LogsARealReadFailureInsteadOfSwallowingIt(t *testin
 	pipelineHeaderFixture(t, foreignSM, foreign)
 	foreignBody := blockBodyBytes(t, foreign)
 
-	foreignConverted, foreignErr := foreignSM.pipelineBlockSink(*foreign.Hash(), &foreign.MsgBlock().Header, bytes.NewReader(foreignBody), int64(len(foreignBody)))
+	foreignConverted, foreignErr := foreignSM.pipelineBlockSink(*foreign.Hash(), &foreign.MsgBlock().Header, bytes.NewReader(foreignBody), sinkPayloadLen(foreignBody))
 	require.NoError(t, foreignErr, "sanity: the foreign block must also convert cleanly")
 	require.True(t, foreignConverted, "sanity: this test needs a second, genuinely different converted record")
 
@@ -340,7 +340,7 @@ func TestPipelineBlockDelete_DoesNotTouchAnotherDeliverysSubtreeFiles(t *testing
 	body := blockBodyBytes(t, blk)
 
 	// Peer A: a genuine, successful conversion, parked and still needed.
-	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, sinkErr, "sanity: A's delivery must convert cleanly, or this test asserts nothing about protecting it")
 	require.True(t, converted)
 

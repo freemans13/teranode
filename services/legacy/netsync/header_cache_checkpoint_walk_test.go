@@ -445,7 +445,7 @@ func TestCheckpointWalk_EndToEnd_BelowCheckpointBlockProvenAfterExtendWritesSubt
 
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err)
 	require.True(t, converted)
 

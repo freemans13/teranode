@@ -54,16 +54,24 @@ type blockTxStream struct {
 	r       *bufio.Reader
 	txCount uint64
 	read    uint64
+	// src counts every byte pulled from the caller's reader, read-ahead included, so the bytes
+	// actually consumed are src.n less what r still holds buffered.
+	src *countingSource
+	// bodyLen is the declared length of what r reads: the body from the transaction count on.
+	bodyLen int64
 	// txs parses each transaction and computes its id from the bytes as they are read, rather
 	// than serializing it again.
 	txs *txstream.Reader
 }
 
 // newBlockTxStream reads the declared transaction count and positions the stream
-// at the first transaction. payloadLen is the block's declared wire size, and is
-// what makes the count checkable rather than merely bounded.
+// at the first transaction. payloadLen is the declared length of what r reads,
+// the body from the transaction count on (the block's wire payload less its
+// 80-byte header). It is what makes the count checkable rather than merely
+// bounded, and what RequireEnd holds the body to.
 func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
-	br := bufio.NewReaderSize(r, blockTxStreamReadBufferSize)
+	src := &countingSource{r: r}
+	br := bufio.NewReaderSize(src, blockTxStreamReadBufferSize)
 
 	count, err := wire.ReadVarInt(br, wire.ProtocolVersion)
 	if err != nil {
@@ -97,7 +105,7 @@ func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
 		return nil, errors.NewBlockInvalidError("[blockTxStream] block declares %d transactions, above the %d limit", count, uint64(maxBlockTxCount))
 	}
 
-	return &blockTxStream{r: br, txCount: count, txs: txstream.NewReader(br)}, nil
+	return &blockTxStream{r: br, txCount: count, txs: txstream.NewReader(br), src: src, bodyLen: payloadLen}, nil
 }
 
 // TxCount is the transaction count the peer declared, including the coinbase.
@@ -174,27 +182,47 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 	return tx, hash, size, nil
 }
 
-// RequireEnd fails unless the body ends after the last declared transaction. The reader is
-// bounded by the peer's declared payload length, so bytes left here are bytes the peer declared
-// and the transactions did not account for.
+// RequireEnd fails unless the declared transactions used exactly the declared body length and the
+// body ends there. Both ways a delivery can differ from its declaration are refused: bytes left
+// after the last transaction, and a body that stops short of the declared length, which the
+// connection closing after the last transaction presents as a clean io.EOF (an io.LimitedReader
+// passes the underlying EOF through while bytes are still owed).
 //
-// The wire layer refuses such a body too, but only after the sink has reported success, and
-// through a check this stream's read-ahead buffer can hide (readBlockMessage,
+// The wire layer refuses both too, but only after the sink has reported success (readBlockMessage,
 // services/legacy/peer/wire_streaming.go). By then the converted record is written, possibly over
-// a parked copy of the same block, and the refusal's cleanup takes that parked copy with it.
+// a parked copy of the same block, and the refusal's cleanup, pipelineBlockDelete, takes that
+// parked copy's subtree files with it, because they are keyed by root and shared by every copy.
 func (s *blockTxStream) RequireEnd() error {
+	// Corrupt, not invalid, here and below: the transactions matched the header, so a length
+	// that disagrees says nothing about the block, only about this delivery of it.
+	if consumed := s.src.n - int64(s.r.Buffered()); consumed != s.bodyLen {
+		return errors.NewBlockCorruptError("[blockTxStream] the %d declared transactions used %d bytes of a body declared as %d", s.txCount, consumed, s.bodyLen)
+	}
+
 	_, err := s.r.ReadByte()
 
 	switch {
 	case err == nil:
-		// Corrupt, not invalid: the transactions matched the header, so the bytes after them say
-		// nothing about the block, only about this delivery of it.
+		// Only reachable when the caller's reader is not bounded at the declared length.
 		return errors.NewBlockCorruptError("[blockTxStream] body carries bytes after its %d declared transactions", s.txCount)
 	case err == io.EOF:
 		return nil
 	default:
 		return errors.NewBlockCorruptError("[blockTxStream] failed reading past the last of the %d declared transactions", s.txCount, err)
 	}
+}
+
+// countingSource counts the bytes read through it.
+type countingSource struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingSource) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+
+	return n, err
 }
 
 // errRecordingWriter remembers the first error its writer returned, so a failed write can be told

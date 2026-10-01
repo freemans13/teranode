@@ -117,7 +117,7 @@ func TestHandleConvertedBlock_CommitsAboveTheCheckpointWithoutTheUnifiedFlag(t *
 	// client as "skip" (util/blockassemblyutil), the same as every other test
 	// in this file.
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block above the checkpoint must convert cleanly, not be refused")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing")
 

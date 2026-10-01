@@ -107,7 +107,7 @@ func TestBlockPark_RecoveryAdoptsAConvertedRecord(t *testing.T) {
 	body := blockBodyBytes(t, blk)
 	hash := *blk.Hash()
 
-	converted, err := sm.pipelineBlockSink(hash, header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(hash, header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about recovery")
 
@@ -213,7 +213,7 @@ func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *t
 	body := blockBodyBytes(t, blk)
 	hash := *blk.Hash()
 
-	converted, err := sm.pipelineBlockSink(hash, &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(hash, &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about recovery")
 

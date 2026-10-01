@@ -35,7 +35,7 @@ func TestASecondCopyThatCompletesFirstIsTheOneKept(t *testing.T) {
 	body := blockBodyBytes(t, blk)
 	hash := *blk.Hash()
 	header := &blk.MsgBlock().Header
-	n := int64(len(body))
+	n := sinkPayloadLen(body)
 
 	// The first copy arrives slowly: half its bytes, then nothing until the test says so.
 	slowR, slowW := io.Pipe()
@@ -106,7 +106,7 @@ func TestAFirstCopyThatFinishesFirstIsTheOneKept(t *testing.T) {
 	body := blockBodyBytes(t, blk)
 	hash := *blk.Hash()
 	header := &blk.MsgBlock().Header
-	n := int64(len(body))
+	n := sinkPayloadLen(body)
 
 	// Stand in for a first copy that has claimed the finish.
 	ctl := sm.startConversion(hash)

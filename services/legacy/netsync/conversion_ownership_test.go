@@ -51,7 +51,7 @@ func TestAFailedRedeliveryKeepsTheParkedBlocksSubtreeFiles(t *testing.T) {
 			body := blockBodyBytes(t, blk)
 			hash := *blk.Hash()
 			header := &blk.MsgBlock().Header
-			n := int64(len(body))
+			n := sinkPayloadLen(body)
 
 			converted, err := sm.pipelineBlockSink(hash, header, bytes.NewReader(body), n)
 			require.NoError(t, err)
@@ -100,7 +100,7 @@ func TestADuplicateConvertsWhenTheCopyItTookOverFromFails(t *testing.T) {
 	body := blockBodyBytes(t, blk)
 	hash := *blk.Hash()
 	header := &blk.MsgBlock().Header
-	n := int64(len(body))
+	n := sinkPayloadLen(body)
 
 	slowR, slowW := io.Pipe()
 	firstDone := make(chan sinkResult, 1)
@@ -165,7 +165,7 @@ func TestARefusedRedeliveryKeepsTheParkedBlock(t *testing.T) {
 	hash := *blk.Hash()
 	header := &blk.MsgBlock().Header
 
-	converted, err := sm.pipelineBlockSink(hash, header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(hash, header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err)
 	require.True(t, converted)
 	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hash, prevBlock: header.PrevBlock, wireSize: int64(len(body))}))
@@ -177,7 +177,7 @@ func TestARefusedRedeliveryKeepsTheParkedBlock(t *testing.T) {
 	padded := append(append([]byte(nil), body...), make([]byte, 4<<20)...)
 	lr := &io.LimitedReader{R: bytes.NewReader(padded), N: int64(len(padded))}
 
-	converted, err = sm.pipelineBlockSink(hash, header, lr, int64(len(padded)))
+	converted, err = sm.pipelineBlockSink(hash, header, lr, sinkPayloadLen(padded))
 	require.Error(t, err, "the sink refuses a body that does not end at its last transaction")
 	require.True(t, errors.IsBlockCorrupt(err), "corrupt, not invalid: the block itself is fine")
 	require.False(t, converted, "so the wire layer's cleanup has nothing to remove")

@@ -71,7 +71,7 @@ func TestPipelineSink_ParentInHeaderCache_IsTheOrdinaryCase(t *testing.T) {
 
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a parent only in the in-flight header cache must not be treated as a fault")
 	require.True(t, converted, "a parent resolved from the header cache must let the block convert, not fall back")
 
@@ -117,7 +117,7 @@ func TestPipelineSink_UnresolvableParent_StillConverts(t *testing.T) {
 
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "an unresolvable parent must not surface as an error: any non-nil error here is what peer.shouldHandleReadError classifies as malformed and disconnects the peer over")
 	require.True(t, converted, "an unresolvable parent must still convert, not fall back to a whole-body write")
 
@@ -166,7 +166,7 @@ func TestPipelineSink_NilParentMetaIsUnresolved(t *testing.T) {
 
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err)
 	require.True(t, converted)
 
@@ -216,7 +216,7 @@ func TestPipelineSink_NotUnifiedRouteStillConverts(t *testing.T) {
 	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err)
 	require.True(t, converted, "a below-checkpoint block must convert regardless of legacyUnified")
 

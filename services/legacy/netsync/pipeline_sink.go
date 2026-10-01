@@ -64,7 +64,9 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	// with no answer for "unknown" rather than a rule about anything.
 	height, resolved := sm.pipelineParentHeight(header.PrevBlock)
 
-	stream, err := newBlockTxStream(r, n)
+	// n is the block's declared wire payload, header included; r starts after the header, which
+	// the wire layer has already read, so the stream is held to what is left.
+	stream, err := newBlockTxStream(r, n-wire.MaxBlockHeaderPayload)
 	if err != nil {
 		return false, err
 	}
@@ -177,9 +179,10 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		}
 	}
 
-	// Before the record is written: a body the wire layer would refuse afterwards must not be
-	// reported as converted, or pipelineBlockDelete removes what is under this hash, which may be a
-	// parked copy of the same block that this conversion has just overwritten.
+	// Before the record is written: a body the wire layer would refuse afterwards, one longer or
+	// shorter than declared, must not be reported as converted, or pipelineBlockDelete removes what
+	// is under this hash, which may be a parked copy of the same block that this conversion has just
+	// overwritten.
 	if err = stream.RequireEnd(); err != nil {
 		sm.deleteWrittenOnFailure(hash, writer)
 
@@ -265,10 +268,12 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 }
 
 // pipelineBlockDelete is the pipeline path's orphan-delete callback, installed
-// alongside pipelineBlockSink: a body can be converted successfully and only
-// then found unusable by the wire layer's own post-sink checks (the short-body
-// check or the transaction-count read in readBlockMessage,
-// services/legacy/peer/wire_streaming.go).
+// alongside pipelineBlockSink, for a body converted and only then found unusable
+// by the wire layer's own post-sink checks (the short-body check or the
+// transaction-count read in readBlockMessage, services/legacy/peer/wire_streaming.go).
+// With converted true that should no longer happen: the sink refuses both length
+// cases before writing its record (see the end of this comment), so this is the
+// backstop, not the expected route.
 //
 // converted is THIS call's own answer to "did the delivery that just failed
 // actually convert anything" — blockBodySink's own return value for that one
@@ -278,8 +283,8 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // one's first cut found was still wrong: a hash can be re-requested and
 // re-delivered while an EARLIER delivery for it is still genuinely parked,
 // waiting on its own parent — ownership is released as soon as a delivery's
-// sink call finishes, and the streaming gate accepts any hash asked for
-// within the last hour — so a second, unrelated delivery's own failure
+// sink call finishes, and the streaming gate accepts any hash the download
+// ledger still holds a request for — so a second, unrelated delivery's own failure
 // (a body that ends short, for example) must not read that earlier delivery's
 // record back and delete the subtree files it names out from under it. Only
 // when THIS call is known, from its own return value, to have written a
@@ -313,9 +318,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // block already parked converts, overwrites the parked record with an identical
 // one, and reports converted. If the wire layer then refused it, this function
 // would delete the parked block's record and every subtree file it names. The
-// only refusal left after a successful sink was a body with declared bytes after
-// its last transaction, and the sink now refuses that itself
-// (blockTxStream.RequireEnd) before writing the record.
+// refusals left after a successful sink are both about length: declared bytes
+// after the last transaction, and a body that stops short of its declared length
+// and then hits EOF (the peer declares more than it sends and closes). The sink
+// now refuses both itself, before writing the record, by holding the stream to
+// exactly the declared body length (blockTxStream.RequireEnd). The wire layer's
+// transaction-count read cannot fail after a successful sink, because the sink
+// has already read the same count.
 //
 // The converted record itself is deleted by blockPark.Delete, which every path
 // that retires a park entry goes through, not only this discard path.

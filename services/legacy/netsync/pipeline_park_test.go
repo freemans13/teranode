@@ -41,7 +41,7 @@ func TestPipelineSink_ParksARecordNotAPhantom(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the park record")
 
@@ -68,7 +68,7 @@ func TestPipelineSink_TheParkedRecordIsTinyCompared(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the park record")
 
@@ -92,7 +92,7 @@ func TestBlockPark_ReadConvertedRoundTrips(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	body := blockBodyBytes(t, blk)
 
-	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), sinkPayloadLen(body))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the park record")
 
@@ -117,7 +117,7 @@ func TestBlockPark_ReadConvertedRefusesAMismatchedRecord(t *testing.T) {
 
 	headerA := &blkA.MsgBlock().Header
 	bodyA := blockBodyBytes(t, blkA)
-	converted, err := sm.pipelineBlockSink(*blkA.Hash(), headerA, bytes.NewReader(bodyA), int64(len(bodyA)))
+	converted, err := sm.pipelineBlockSink(*blkA.Hash(), headerA, bytes.NewReader(bodyA), sinkPayloadLen(bodyA))
 	require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 	require.True(t, converted, "sanity: this test needs an actual conversion, or it asserts nothing about the park record")
 

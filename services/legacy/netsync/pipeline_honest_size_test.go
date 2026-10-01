@@ -52,7 +52,7 @@ func TestHandleBlockOnDiskMsg_ChargesTheRecordOnlyWhenConverted(t *testing.T) {
 		header := &blk.MsgBlock().Header
 		body := blockBodyBytes(t, blk)
 
-		converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), int64(len(body)))
+		converted, err := sm.pipelineBlockSink(*blk.Hash(), header, bytes.NewReader(body), sinkPayloadLen(body))
 		require.NoError(t, err, "a well-formed block below the checkpoint must convert cleanly")
 		require.True(t, converted, "sanity: this test needs a real converted record on disk")
 
