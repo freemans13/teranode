@@ -168,7 +168,7 @@ func TestProcessSubtreeBatch_ReaderFailure_LeavesNoMmapFiles(t *testing.T) {
 	// mmaps, and only the subsequent data read fails.
 	require.NoError(t, h.subtreeStore.Del(h.ctx, roots[len(roots)-1][:], fileformat.FileTypeSubtreeData))
 
-	batch, err := h.bv.processSubtreeBatch(h.ctx, block, 0, len(roots), make(map[chainhash.Hash]*bt.Tx), false, nil)
+	batch, err := h.bv.processSubtreeBatch(h.ctx, block, 0, len(roots), make(map[chainhash.Hash]*bt.Tx), false)
 	require.Error(t, err, "a batch with an unreadable subtree_data must fail")
 	require.Nil(t, batch)
 
@@ -264,7 +264,7 @@ func TestPipeline_CancelledDuringExtend_ReleasesInHandBatch(t *testing.T) {
 
 	h.bv.utxoStore = &firstCallFailingUtxoStore{Store: h.utxoStore}
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err, "a stage-2 failure must fail the block")
 
 	requireMmapDirEmpty(t, mmapDir)
@@ -303,7 +303,7 @@ func TestPipeline_MultiBatch_MmapBacked_HonestBodyValidates(t *testing.T) {
 	requireMmapEngaged(t, h, block, roots[0])
 	requireMmapDirEmpty(t, mmapDir)
 
-	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil),
+	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", ""),
 		"an honest mmap-backed body spanning three batches must validate")
 
 	for _, group := range groups {

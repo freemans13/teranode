@@ -112,8 +112,6 @@ func TestPublishConsumerWaitDescribesTheWindowAndTheBarrier(t *testing.T) {
 		logger: log,
 		dispatcher: &blockDispatcher{
 			barrier:  true,
-			budget:   8192,
-			inflight: 2048,
 			frontier: []*frontierEntry{entry, running},
 		},
 	}
@@ -135,13 +133,12 @@ func TestPublishConsumerWaitDescribesTheWindowAndTheBarrier(t *testing.T) {
 	require.Contains(t, line, "failed")
 	require.Contains(t, line, "running")
 	require.Contains(t, line, "checkpoint barrier is set")
-	require.Contains(t, line, "2048 of 8192 window bytes charged")
 }
 
 func TestPublishConsumerWaitIsSafeToReadFromAnotherGoroutine(t *testing.T) {
 	sm := &SyncManager{
 		logger:     &captureLogger{Logger: ulogger.TestLogger{}},
-		dispatcher: &blockDispatcher{budget: 1024},
+		dispatcher: &blockDispatcher{},
 	}
 
 	sm.noteConsumerAdmitted(time.Now())
@@ -186,7 +183,7 @@ func TestConsumerStallLineIsOneLine(t *testing.T) {
 
 	sm := &SyncManager{
 		logger:     log,
-		dispatcher: &blockDispatcher{budget: 1},
+		dispatcher: &blockDispatcher{},
 	}
 
 	now := time.Now()

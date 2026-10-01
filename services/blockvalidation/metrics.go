@@ -100,15 +100,6 @@ var (
 	prometheusBlockValidationQuickCommitUnlock      prometheus.Histogram
 	prometheusBlockValidationQuickCommitSubtreesSet prometheus.Histogram
 	prometheusBlockValidationQuickCommitBlockExists prometheus.Histogram
-
-	// quick window: admission depth, gate waits, misses and aborts for the
-	// overlapping below-checkpoint window.
-	prometheusBlockValidationQuickWindowDepth            prometheus.Gauge
-	prometheusBlockValidationQuickWindowGateWait         prometheus.Histogram
-	prometheusBlockValidationQuickWindowGateWaits        prometheus.Counter
-	prometheusBlockValidationQuickWindowMissTotal        prometheus.Counter
-	prometheusBlockValidationQuickWindowAbortsTotal      *prometheus.CounterVec
-	prometheusBlockValidationQuickWindowOldestAgeSeconds prometheus.Gauge
 )
 
 var (
@@ -321,62 +312,6 @@ func _initPrometheusMetrics() {
 			Name:      "quick_commit_block_exists_seconds",
 			Help:      "SetBlockExists duration in the quick-validation commit tail",
 			Buckets:   util.MetricsBucketsSeconds,
-		},
-	)
-
-	prometheusBlockValidationQuickWindowDepth = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Namespace: "teranode",
-			Subsystem: "blockvalidation",
-			Name:      "quick_window_depth",
-			Help:      "Blocks admitted to the quick window and not yet left",
-		},
-	)
-
-	prometheusBlockValidationQuickWindowGateWait = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Namespace: "teranode",
-			Subsystem: "blockvalidation",
-			Name:      "quick_window_gate_wait_seconds",
-			Help:      "Time a batch waited on predecessor gates",
-			Buckets:   util.MetricsBucketsSeconds,
-		},
-	)
-
-	prometheusBlockValidationQuickWindowGateWaits = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: "teranode",
-			Subsystem: "blockvalidation",
-			Name:      "quick_window_gate_waits_total",
-			Help:      "Batches that waited on at least one predecessor gate",
-		},
-	)
-
-	prometheusBlockValidationQuickWindowMissTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: "teranode",
-			Subsystem: "blockvalidation",
-			Name:      "quick_validate_window_miss_total",
-			Help:      "Spends of a registered parent that the store did not find (ship gate: zero)",
-		},
-	)
-
-	prometheusBlockValidationQuickWindowAbortsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "teranode",
-			Subsystem: "blockvalidation",
-			Name:      "quick_window_aborts_total",
-			Help:      "Entries failed, by cause: head_failed, predecessor_failed, gate_failed, commit_failed, shutdown, left_before_commit",
-		},
-		[]string{"cause"},
-	)
-
-	prometheusBlockValidationQuickWindowOldestAgeSeconds = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Namespace: "teranode",
-			Subsystem: "blockvalidation",
-			Name:      "quick_window_oldest_age_seconds",
-			Help:      "Age of the oldest in-flight entry in the quick window",
 		},
 	)
 

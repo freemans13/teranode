@@ -402,13 +402,11 @@ func (sm *SyncManager) runParkSweep() {
 // block-queue consumer to commit, or commits it here when there is no consumer
 // to hand it to.
 //
-// The sweep must not commit from its own goroutine. A commit admits the block
-// into block validation's quick window, and the dispatcher is admitting blocks
-// there at the same time from the consumer goroutine: two admitters race for the
-// window's tail, and the loser is refused for a parent that is in fact stored
-// and judged a local fault. Posting the commit to the consumer puts it behind
-// the dispatcher's own admissions, which is the same route the parking workers
-// use for their outcomes.
+// The sweep must not commit from its own goroutine. The dispatcher commits
+// blocks one at a time from the consumer goroutine, and a second committer on
+// the sweep's goroutine would put two blocks in flight at once. Posting the
+// commit to the consumer puts it behind the dispatcher's own admissions, which
+// is the same route the parking workers use for their outcomes.
 //
 // The inline path is for a manager that has no channel, which is how most of
 // this package's tests build one, and it is what the sweep did before it had a
@@ -466,11 +464,9 @@ type parkCommit struct {
 // entries, which is what keeps a queued request's block visible to the sweep's
 // eviction and stuck-candidate passes while it waits.
 //
-// Otherwise it walks the stack synchronously, exactly as before. That is the
-// pre-window path, where there is no consumer loop to admit anything, and every
-// manager a test builds as a struct literal. Keeping the old call here rather
-// than routing everything through the queue is what makes
-// blockvalidation_quick_window_blocks = 0 a true rollback.
+// Otherwise it walks the stack synchronously, exactly as before: that is every
+// manager a test builds as a struct literal, where there is no consumer loop to
+// admit anything.
 //
 // Every caller runs on the goroutine that owns the queue, so there is no lock and
 // no channel: a channel would only add a send that can block the one goroutine
@@ -532,35 +528,10 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 			continue
 		}
 
-		d := &blockDispatch{parked: &peeked, bytes: peeked.size}
+		d := &blockDispatch{parked: &peeked}
 
 		if req.parentHeight > 0 {
 			d.height = req.parentHeight + 1
-
-			// On the window route with a known height, a drained block may run
-			// alongside another rather than waiting for the window to empty.
-			//
-			// This is the fix for a node that sits idle with a hundred blocks
-			// already on disk. A dispatch was marked windowed in exactly one
-			// place, when its parent was still being validated, and every block
-			// drained from the park has a parent that is already committed. So
-			// no parked block was ever windowed, an unwindowed one is admitted
-			// only into a completely empty window, and during catch-up 91% of
-			// blocks arrive out of order and go through the park. The window's
-			// depth and byte budget exist to keep more than one block in flight
-			// and the path carrying most blocks could not use them.
-			//
-			// A drained block is a safer candidate than the live one this was
-			// built for. Its parent is in the chain rather than merely in
-			// flight, and its height comes from the parent's own committed
-			// height, which the sweep carries for exactly this purpose.
-			//
-			// Height zero is left alone deliberately. That is what a block
-			// recovered from disk after a restart carries, and a zero in the
-			// window is refused as a parent, so such a block keeps the old
-			// one-at-a-time rule rather than being admitted next to something it
-			// cannot chain to.
-			d.windowed = sm.windowRoute(d.height)
 		}
 
 		if !bd.canDispatch(d) {

@@ -2,30 +2,11 @@ package netsync
 
 import (
 	"context"
-	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-)
-
-const (
-	// windowBytesPerWireByte is what one serialized block byte is charged against the
-	// window budget: the decoded transactions, the transaction map, the subtree data
-	// and block validation's own copy all live at once while a block is in flight.
-	windowBytesPerWireByte = 4
-
-	// defaultWindowBudget is the fallback byte budget when the operator set none and
-	// the process runs with no Go memory limit.
-	defaultWindowBudget = 512 << 20
-
-	// baStateCacheTTL bounds how often the dispatcher asks block assembly for its
-	// height. The answer only steers the effective depth, so a quarter of a second
-	// of staleness is free while a per-block RPC would not be.
-	baStateCacheTTL = 250 * time.Millisecond
 )
 
 // frontierEntry is the dispatcher's per-block bookkeeping record for a parked block
@@ -77,9 +58,6 @@ type blockDispatch struct {
 	isCheckpoint bool
 	height       uint32
 
-	windowed bool
-	bytes    int64
-
 	// parked is the park entry this dispatch commits, and nil for a block that
 	// arrived on the wire. A parked dispatch carries no queue message worth
 	// replying to and no peer obligation to settle: its blob is read by the
@@ -114,18 +92,11 @@ type blockCompletion struct {
 	err   error
 }
 
-// cachedBAState is block assembly's last observed height and when it was observed.
-type cachedBAState struct {
-	at     time.Time
-	height uint32
-	ok     bool
-}
-
-// blockDispatcher turns legacy sync's single block-queue consumer into a dispatcher:
-// up to K consecutive below-checkpoint blocks have their UTXO store work in flight at
-// once, while every chain-order step stays in dispatch order on the consumer goroutine.
+// blockDispatcher runs one parked block's work on a worker goroutine, one block at a
+// time, while every chain-order step stays on the consumer goroutine. The frontier holds
+// at most the one block in flight.
 //
-// inflight, barrier and baState are owned by that one goroutine and never touched from
+// barrier is owned by that one goroutine and never touched from
 // a worker, so they need no lock. frontier used to be the same, until the wanted-range
 // pass gained a second caller: the park sweep's own goroutine now calls fetchHeaderBlocks
 // directly (runParkSweep, block_park_drain.go), which reaches inFlight below to check
@@ -139,18 +110,14 @@ type cachedBAState struct {
 // can itself call back into inFlight, so complete must release the lock before invoking a
 // dispatch's tail or it would deadlock against itself on the same goroutine).
 type blockDispatcher struct {
-	sm     *SyncManager
-	depth  int
-	budget int64
+	sm *SyncManager
 
 	// frontierMu guards frontier alone. See the struct comment for why it exists and
 	// the reentrancy rule complete() observes to avoid deadlocking on its own tail call.
 	frontierMu  sync.Mutex
 	frontier    []*frontierEntry
-	inflight    int64
 	barrier     bool
 	completions chan *blockCompletion
-	baState     cachedBAState
 
 	// parkedRun does one parked block's work and parkedTail runs its chain-order
 	// bookkeeping. They are fields so the dispatcher tests can drive it without a
@@ -162,38 +129,7 @@ type blockDispatcher struct {
 func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	bd := &blockDispatcher{
 		sm:          sm,
-		depth:       1,
-		budget:      windowBudgetBytes(0),
 		completions: make(chan *blockCompletion, 64),
-	}
-
-	// Depth 1 with the default budget is the pre-window behaviour, and it is what a
-	// SyncManager built as a struct literal in a test gets.
-	if sm.settings != nil {
-		bd.budget = windowBudgetBytes(sm.settings.BlockValidation.QuickWindowBudgetMiB)
-
-		// One rule for both services: block validation's quickWindowDepth resolves the
-		// same setting through this same helper, so legacy can never overlap blocks
-		// block validation would refuse to admit.
-		depth, reasons := sm.settings.BlockValidation.QuickWindowConfiguredDepth()
-
-		// One startup line, the mirror of block validation's, so a mismatch between the
-		// two services is visible in the log rather than only in a diverted block.
-		switch {
-		case depth == 0:
-			// The dispatcher is built but never fed: dispatchBlocks hands the queue to the
-			// pre-window consumer instead. bd.depth is left at 1 so nothing can read a 0
-			// here as a window that admits nothing.
-			sm.logger.Infof("[blockDispatcher] blockvalidation_quick_window_blocks=0: the quick window is off and the block queue is consumed the pre-window way, one block head to tail")
-		case len(reasons) > 0:
-			bd.depth = depth
-
-			sm.logger.Warnf("[blockDispatcher] blockvalidation_quick_window_blocks=%d resolved to depth %d: %s", sm.settings.BlockValidation.QuickWindowBlocks, bd.depth, strings.Join(reasons, "; "))
-		default:
-			bd.depth = depth
-
-			sm.logger.Infof("[blockDispatcher] blockvalidation_quick_window_blocks=%d resolved to depth %d", sm.settings.BlockValidation.QuickWindowBlocks, bd.depth)
-		}
 	}
 
 	// The parked run: read the converted record on the worker, then the same call
@@ -246,82 +182,6 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	return bd
 }
 
-// windowBudgetBytes resolves the configured budget: the operator's MiB when set, else a
-// tenth of the Go memory limit, else a fixed fallback.
-func windowBudgetBytes(mib int) int64 {
-	if mib > 0 {
-		return int64(mib) << 20
-	}
-
-	// SetMemoryLimit(-1) reads the limit without changing it; math.MaxInt64 is what
-	// the runtime reports when no limit is set, so anything near it means "unset".
-	if limit := debug.SetMemoryLimit(-1); limit > 0 && limit < 1<<62 {
-		return limit / 10
-	}
-
-	return defaultWindowBudget
-}
-
-// effectiveDepth is the configured depth, reduced by block assembly's observed lag so a
-// window block never parks in the block-assembly gate, and by the download-side dynamic
-// in-flight limit so a fat-block era collapses the window as it collapses the fetch depth.
-func (bd *blockDispatcher) effectiveDepth() int {
-	depth := bd.depth
-
-	if bd.sm.blockSizeTracker != nil {
-		if fetch := bd.sm.blockSizeTracker.calculateMaxInFlightBlocks(); fetch >= 1 && fetch < depth {
-			depth = fetch
-		}
-	}
-
-	if depth > 1 && bd.sm.blockAssembly != nil {
-		if baHeight, ok := bd.blockAssemblyHeight(); ok {
-			lag := 0
-			if tip := bd.tailHeight(); tip > baHeight {
-				lag = int(tip - baHeight)
-			}
-
-			// Two blocks of slack: the gate compares against the block being admitted,
-			// not the frontier tail, and a rounded-down lag must not put the last
-			// admitted block on the gate's threshold.
-			if room := bd.sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly - lag - 2; room < depth {
-				depth = room
-			}
-		}
-	}
-
-	if depth < 1 {
-		depth = 1
-	}
-
-	return depth
-}
-
-// blockAssemblyHeight returns block assembly's chain tip, cached for baStateCacheTTL.
-// A failed or empty answer is cached too, so a block assembly that is down does not
-// cost one timing-out RPC per admission.
-func (bd *blockDispatcher) blockAssemblyHeight() (uint32, bool) {
-	if !bd.baState.at.IsZero() && time.Since(bd.baState.at) < baStateCacheTTL {
-		return bd.baState.height, bd.baState.ok
-	}
-
-	ctx, cancel := context.WithTimeout(bd.sm.ctx, time.Second)
-	defer cancel()
-
-	state, err := bd.sm.blockAssembly.GetBlockAssemblyState(ctx)
-
-	bd.baState = cachedBAState{at: time.Now()}
-
-	if err != nil || state == nil {
-		return 0, false
-	}
-
-	bd.baState.height = state.CurrentHeight
-	bd.baState.ok = true
-
-	return bd.baState.height, true
-}
-
 // drainFrontier empties frontier under frontierMu and returns what was in it. It exists
 // for dispatchBlocks' shutdown drain, the one place outside this file that used to read
 // and clear bd.frontier directly, racing the same way dispatch and complete did against
@@ -361,26 +221,6 @@ func (bd *blockDispatcher) frontierLen() int {
 	return len(bd.frontier)
 }
 
-// tailHeight is the height of the last block admitted, or 0 when nothing is in flight.
-// The zero means the block-assembly lag arm of effectiveDepth sees a lag of 0 until the
-// first admission, so at most one block can be admitted on a stale reading of the lag;
-// that block then parks in the block-assembly gate exactly as it would have before the
-// window existed, and every later admission sees the real frontier tail.
-//
-// A frontier entry whose height was never resolved reads as that same zero, which is the
-// right answer for it and needs no special case: such an entry is dispatched un-windowed,
-// so canDispatch admits it only into an empty frontier and it is the only entry there.
-func (bd *blockDispatcher) tailHeight() uint32 {
-	bd.frontierMu.Lock()
-	defer bd.frontierMu.Unlock()
-
-	if n := len(bd.frontier); n > 0 {
-		return bd.frontier[n-1].height
-	}
-
-	return 0
-}
-
 // inFlight reports whether this hash is a block the dispatcher is working on right now.
 // The recently-failed-parent check consults it first: a parent that is being retried is
 // not a failed parent, so its child must not be short-circuited as part of a cascade.
@@ -414,24 +254,8 @@ func (bd *blockDispatcher) canDispatch(d *blockDispatch) bool {
 		return false
 	}
 
-	// Anything not on the window route runs exactly as it did before the window
-	// existed: one block at a time, into an empty frontier.
-	if !d.windowed {
-		return bd.frontierEmpty()
-	}
-
-	if bd.frontierLen() >= bd.effectiveDepth() {
-		return false
-	}
-
-	// A block that alone exceeds what is left of the budget is admitted only into an
-	// empty frontier, so the window collapses to one block in a fat-block era rather
-	// than refusing the block outright.
-	if d.bytes*windowBytesPerWireByte > bd.budget-bd.inflight {
-		return bd.frontierEmpty()
-	}
-
-	return true
+	// One block at a time: a block starts only when nothing else is in flight.
+	return bd.frontierEmpty()
 }
 
 // msgHash is the hash of the block a dispatch is for, from whichever of its two
@@ -443,26 +267,17 @@ func (d *blockDispatch) msgHash() chainhash.Hash {
 	return d.parked.hash
 }
 
-// dispatch charges the budget, appends the frontier entry and starts the worker.
+// dispatch appends the frontier entry and starts the worker.
 //
-// A parked dispatch must arrive in exactly one shape, and the guard is here rather
-// than in a comment because the two ways of getting it wrong are both silent. A
-// resolved parent would skip the worker's own parent lookup, which is what
-// enforces the never-hand-over-a-parentless-block rule. A non-empty frontier
-// would mean the server-side window already holds a legacy entry, so an
-// unwindowed parked block would be refused admission there. Failing closed costs
-// one restored park entry and one ERROR line; failing open costs a lost block.
+// A parked dispatch must arrive into an empty frontier, and the guard is here
+// rather than in a comment because getting it wrong is silent: two blocks in
+// flight at once is the overlap this dispatcher no longer does. Failing closed
+// costs one restored park entry and one ERROR line; failing open costs a lost
+// block.
 func (bd *blockDispatcher) dispatch(d *blockDispatch) {
-	// A parked dispatch must still arrive with no resolved parent: that is what
-	// leaves the worker's own parent lookup in place, which enforces the
-	// never-hand-over-a-parentless-block rule.
-	//
-	// It may now be windowed, and if it is it may arrive alongside another block.
-	// The condition that used to demand an empty window was a consequence of
-	// never being windowed rather than a rule of its own, and it is what kept the
-	// validator idle between every block drained from the park.
-	if !d.windowed && !bd.frontierEmpty() {
-		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch in the wrong shape: windowed=%v frontier=%d", d.parked.hash.String(), d.windowed, bd.frontierLen())
+	// A parked dispatch must arrive into an empty frontier: blocks run one at a time.
+	if !bd.frontierEmpty() {
+		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch while another block is in flight: frontier=%d", d.parked.hash.String(), bd.frontierLen())
 		bd.sm.blockPark.Restore(*d.parked)
 
 		return
@@ -480,8 +295,6 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 	bd.frontierMu.Lock()
 	bd.frontier = append(bd.frontier, e)
 	bd.frontierMu.Unlock()
-
-	bd.inflight += d.bytes * windowBytesPerWireByte
 
 	if d.isCheckpoint {
 		bd.barrier = true
@@ -574,7 +387,6 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 		// prefetch budget.
 		bd.frontier[0] = nil
 		bd.frontier = bd.frontier[1:]
-		bd.inflight -= head.d.bytes * windowBytesPerWireByte
 
 		if head.d.isCheckpoint {
 			bd.barrier = false

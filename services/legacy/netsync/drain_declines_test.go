@@ -30,7 +30,6 @@ import (
 func TestADeclinedDrainDoesNotCostTheTurn(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	bd := h.withDispatcher(t)
-	bd.depth = 1
 
 	h.sm.quit = make(chan struct{})
 	// New() builds this channel unconditionally; wired by hand here so the

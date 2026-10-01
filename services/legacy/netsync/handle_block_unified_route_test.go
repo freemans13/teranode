@@ -17,17 +17,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestHandleConvertedBlock_GateFailureOnWindowRouteIsALocalFault proves that when the
-// block-assembly gate fails for a block on the quick-window route, the error
+// TestHandleConvertedBlock_GateFailureOnUnifiedRouteIsALocalFault proves that when the
+// block-assembly gate fails for a block on the unified below-checkpoint route, the error
 // HandleConvertedBlock returns is a local fault (errors.IsTransientLocalError), not
 // a bare passthrough of WaitForBlockAssemblyReady's error — so a parked gate
 // throttles re-delivery through the local-fault path instead of churning the
 // sync peer as if the block itself were bad.
 //
 // Ported from the deleted HandleBlockDirect route: HandleConvertedBlock carries
-// the identical windowRoute wrap (handle_block.go), so the same gate-failure
+// the identical unifiedRoute wrap (handle_block.go), so the same gate-failure
 // classification is exercised here through the converted-record route instead.
-func TestHandleConvertedBlock_GateFailureOnWindowRouteIsALocalFault(t *testing.T) {
+func TestHandleConvertedBlock_GateFailureOnUnifiedRouteIsALocalFault(t *testing.T) {
 	initPrometheusMetrics()
 
 	const checkpointHeight = int32(1000)
@@ -36,7 +36,6 @@ func TestHandleConvertedBlock_GateFailureOnWindowRouteIsALocalFault(t *testing.T
 
 	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
 	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
-	tSettings.BlockValidation.QuickWindowBlocks = 2
 
 	blockchainClient := &blockchain.Mock{}
 	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
@@ -58,7 +57,7 @@ func TestHandleConvertedBlock_GateFailureOnWindowRouteIsALocalFault(t *testing.T
 		utxoStore:        &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}},
 	}
 
-	require.True(t, sm.windowRoute(blockHeight), "precondition: this block must take the quick-window route")
+	require.True(t, sm.unifiedRoute(blockHeight), "precondition: this block must take the unified route")
 
 	header := &model.BlockHeader{
 		HashPrevBlock:  &chainhash.Hash{0x02},
@@ -72,5 +71,5 @@ func TestHandleConvertedBlock_GateFailureOnWindowRouteIsALocalFault(t *testing.T
 
 	err = sm.HandleConvertedBlock(ctx, nil, *header.Hash(), blk)
 	require.Error(t, err)
-	require.True(t, errors.IsTransientLocalError(err), "a parked gate on the window route must be a local fault, got: %v", err)
+	require.True(t, errors.IsTransientLocalError(err), "a parked gate on the unified route must be a local fault, got: %v", err)
 }

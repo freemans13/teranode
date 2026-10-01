@@ -53,7 +53,7 @@ func TestAdoptionPhase_SignatureInvalidTx_NotBlessedFromCachedMetadata(t *testin
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, honest, coinbase)}),
 		2)
 
-	require.Error(t, h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil))
+	require.Error(t, h.bv.quickValidateBlock(h.ctx, block, "peer", ""))
 
 	h.requireNoUTXOMutation(block, parent, child)
 

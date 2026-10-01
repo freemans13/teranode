@@ -654,7 +654,7 @@ type SyncManager struct {
 	// parkCommits carries a parked block the sweep has found a stored parent for
 	// back to the block-queue consumer, which is the one goroutine that commits.
 	// The sweep runs on its own goroutine and may not commit from there: it
-	// would race the dispatcher for admission into the window. nil on a manager
+	// would race the dispatcher, which commits one block at a time. nil on a manager
 	// built as a struct literal, and submitParkCommit then commits inline, which
 	// is what the sweep did before it had a goroutine of its own.
 	parkCommits chan parkCommit
@@ -812,10 +812,10 @@ type SyncManager struct {
 	commitRate          *commitRateTracker // blocks a second joining the chain, for the frontier race
 	streams             *streamRegistry    // block bodies arriving now and peers' delivery rates, for the frontier race
 
-	// dispatcher owns the quick window: it decides how many queued blocks may have
-	// their UTXO store work in flight at once and runs every chain-order step in
-	// dispatch order. Built in New(); nil when SyncManager was built as a struct
-	// literal in a test, which every dispatcher accessor tolerates.
+	// dispatcher runs each parked block's work on a worker, one block at a time,
+	// and every chain-order step in dispatch order. Built in New(); nil when
+	// SyncManager was built as a struct literal in a test, which every dispatcher
+	// accessor tolerates.
 	dispatcher *blockDispatcher
 
 	// An optional fee estimator.
@@ -2070,54 +2070,13 @@ func (sm *SyncManager) requestMissingBlocks(peer *peerpkg.Peer, blockHash chainh
 	}
 }
 
-// consumeBlocksSerially is the pre-window block-queue consumer, run when
-// blockvalidation_quick_window_blocks is 0: one block at a time, its pre-checks, its own
-// work and its chain-order tail all on this goroutine, so block N+1 is not even taken off
-// the queue until block N has finished. The shutdown drain is the dispatcher's, verbatim:
-// under prefetch each queued block has an awaitBlockResult goroutine holding budget and
-// waiting on its reply, so replying here lets them exit promptly instead of waiting for the
-// peer's own quit/ctx. The feeder races the same sm.quit close, so a block enqueued after
-// this drain returns is not caught here — that block's awaitBlockResult still exits via
-// sp.quit/sp.ctx.Done(), and the feeder's enqueue is itself sm.quit-guarded, so the drain
-// only makes the common case prompt and is not relied on for correctness.
-//
-// The two park arms are the same ones the dispatcher has, because whichever
-// consumer is running is the one goroutine that commits blocks in order, and a
-// parking worker's outcome and a sweep-posted commit both have to land there.
-func (sm *SyncManager) consumeBlocksSerially() {
-	for {
-		select {
-		case <-sm.quit:
-			return
-		case commit := <-sm.parkCommits:
-			// Put back, then drained, as the windowed consumer does. A block the
-			// on-disk handler posts is still in the park's index, and committing it
-			// directly left it there after it joined the chain. The drain takes it
-			// out through the one path every other committed block takes.
-			sm.blockPark.Restore(commit.entry)
-			sm.scheduleDrain(commit.entry.prevBlock, commit.parentHeight)
-		}
-	}
-}
-
 // dispatchBlocks is the block-queue consumer: it runs every pre-check and every
 // chain-order step for one block on this goroutine and hands only the block's own
-// work to a worker, so up to K consecutive below-checkpoint blocks can have their
-// UTXO store work in flight while their tails still run in dispatch order. A block
-// whose parent is neither in the chain nor in flight never reaches a worker: the
-// head parks it, with its bytes, and the drain commits it when the parent lands.
-// It returns when sm.quit closes.
+// work to a worker, one block at a time, so its tail still runs in dispatch order. A
+// block whose parent is not in the chain never reaches a worker: the head parks it,
+// with its bytes, and the drain commits it when the parent lands. It returns when
+// sm.quit closes.
 func (sm *SyncManager) dispatchBlocks() {
-	// blockvalidation_quick_window_blocks=0 is a true bypass, not a one-deep window:
-	// the dispatcher is not used at all and each parked block is committed whole, one
-	// after another, as its parent commits.
-	if sm.settings != nil {
-		if depth, _ := sm.settings.BlockValidation.QuickWindowConfiguredDepth(); depth == 0 {
-			sm.consumeBlocksSerially()
-			return
-		}
-	}
-
 	bd := sm.dispatcher
 
 	// From here the drain is this loop's admission source rather than a call made
@@ -2170,7 +2129,7 @@ func (sm *SyncManager) dispatchBlocks() {
 			// The sweep found a parked block whose parent is in the chain after
 			// all. It decided that on its own goroutine and posts here, because
 			// this is the one goroutine that admits blocks: committing from the
-			// sweep would race the dispatcher for admission into the window.
+			// sweep would race the dispatcher, which commits one block at a time.
 			//
 			// Put back, then queued, rather than committed here. The sweep took
 			// the entry out of the index to hand it over, and restoring it means
@@ -3239,7 +3198,7 @@ func (sm *SyncManager) blockHandler() {
 	ticker := time.NewTicker(syncPeerTickerInterval)
 	defer ticker.Stop()
 
-	// The dispatcher admits parked blocks into the quick window on the consumer
+	// The dispatcher commits parked blocks one at a time on the consumer
 	// goroutine. Nil-guarded because tests build SyncManager as a struct literal
 	// that bypasses New().
 	if sm.dispatcher == nil {

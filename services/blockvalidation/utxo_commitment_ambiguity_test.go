@@ -146,7 +146,7 @@ func TestExtendBatch_OverwritesPeerSuppliedPreviousOutputs(t *testing.T) {
 		txRanges:    make([][2]int, 1),
 	}
 
-	require.NoError(t, bv.extendBatch(ctx, block, batch, map[chainhash.Hash]*bt.Tx{}, nil))
+	require.NoError(t, bv.extendBatch(ctx, block, batch, map[chainhash.Hash]*bt.Tx{}))
 
 	require.Equal(t, ambiguousRealSats, forged.Inputs[0].PreviousTxSatoshis,
 		"previous-output value must come from the UTXO store, not the announcing peer")
@@ -176,7 +176,7 @@ func TestExtendBatch_OverwritesPeerSuppliedSameBlockParent(t *testing.T) {
 		txRanges:    make([][2]int, 1),
 	}
 
-	require.NoError(t, bv.extendBatch(ctx, block, batch, map[chainhash.Hash]*bt.Tx{}, nil))
+	require.NoError(t, bv.extendBatch(ctx, block, batch, map[chainhash.Hash]*bt.Tx{}))
 
 	require.Equal(t, ambiguousRealSats, forged.Inputs[0].PreviousTxSatoshis,
 		"previous-output value must come from the in-block parent, not the announcing peer")
@@ -227,7 +227,7 @@ func TestProcessSubtreeBatch_OverwritesPeerSuppliedPreviousOutputs(t *testing.T)
 			require.NoError(t, blobs.Set(ctx, tree.RootHash()[:], fileformat.FileTypeSubtreeData, dataBytes))
 			block := testhelpers.CreateTestBlocks(t, 1)[0]
 			block.Subtrees = []*chainhash.Hash{tree.RootHash()}
-			batch, err := bv.processSubtreeBatch(ctx, block, 0, 1, map[chainhash.Hash]*bt.Tx{}, false, nil)
+			batch, err := bv.processSubtreeBatch(ctx, block, 0, 1, map[chainhash.Hash]*bt.Tx{}, false)
 			require.NoError(t, err)
 			defer batch.Close()
 			require.Len(t, batch.batchTxs, len(txs))

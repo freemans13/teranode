@@ -183,11 +183,8 @@ func newOneWaveHarness(t *testing.T, dbName string) (*BlockValidation, *applyRec
 	return bv, recorder, cleanup
 }
 
-// oneWaveBatchForErr is oneWaveBatchFor without the require dependency, so a caller that must
-// build a batch from inside a spawned goroutine — because decorateExternalInputs can now block
-// that build on an in-flight predecessor's gate, see oneWaveBatchFor — can report the error over
-// a channel instead of calling testify's require off the main test goroutine.
-func oneWaveBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, owner *windowEntry) (*SubtreeProcessingBatch, error) {
+// oneWaveBatchForErr is oneWaveBatchFor without the require dependency.
+func oneWaveBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx) (*SubtreeProcessingBatch, error) {
 	batch := &SubtreeProcessingBatch{
 		subtreeData:  make([]*subtreepkg.Data, len(txs)),
 		txRanges:     make([][2]int, len(txs)),
@@ -201,7 +198,7 @@ func oneWaveBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, o
 		batch.subtreeData[i] = &subtreepkg.Data{Txs: []*bt.Tx{tx}}
 	}
 
-	if err := bv.extendBatch(context.Background(), block, batch, map[chainhash.Hash]*bt.Tx{}, owner); err != nil {
+	if err := bv.extendBatch(context.Background(), block, batch, map[chainhash.Hash]*bt.Tx{}); err != nil {
 		return nil, err
 	}
 
@@ -211,19 +208,11 @@ func oneWaveBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, o
 // oneWaveBatchFor builds a batch out of txs, one subtree per transaction, and runs the real
 // extend stage over it so the in-block-parent partition is derived by production code rather
 // than asserted into place.
-//
-// owner is this batch's quick-window entry, exactly as extendBatch's production caller would
-// pass it (nil outside the window): a test whose txs spend an in-flight PREDECESSOR's coin must
-// pass its own entry here, or decorateExternalInputs has no owner to exclude and no window to
-// check, and a registered-but-uncommitted parent looks identical to a genuinely missing one.
-//
-// Only safe to call from the main test goroutine: it can now block on a predecessor's gate (see
-// decorateExternalInputs), so a test that needs block 2's own batch built while block 1 is still
-// in flight must call oneWaveBatchForErr directly from its own goroutine instead.
-func oneWaveBatchFor(t *testing.T, bv *BlockValidation, block *model.Block, txs []*bt.Tx, owner *windowEntry) *SubtreeProcessingBatch {
+
+func oneWaveBatchFor(t *testing.T, bv *BlockValidation, block *model.Block, txs []*bt.Tx) *SubtreeProcessingBatch {
 	t.Helper()
 
-	batch, err := oneWaveBatchForErr(bv, block, txs, owner)
+	batch, err := oneWaveBatchForErr(bv, block, txs)
 	require.NoError(t, err)
 	require.Len(t, batch.hasInBlockParent, len(txs), "the extend stage must answer for every tx")
 
@@ -296,7 +285,7 @@ func TestOneWave_NoInBlockParentsTakesOneCall(t *testing.T) {
 	}
 
 	block := &model.Block{Height: 100, ID: 42}
-	batch := oneWaveBatchFor(t, bv, block, txs, nil)
+	batch := oneWaveBatchFor(t, bv, block, txs)
 
 	for i := range txs {
 		require.False(t, batch.hasInBlockParent[i], "tx %d spends nothing of this block", i)
@@ -347,7 +336,7 @@ func TestOneWave_ChainedAndIndependentMix(t *testing.T) {
 			txs := []*bt.Tx{c1, c2, c3, i1, i2}
 
 			block := &model.Block{Height: 100, ID: 42}
-			batch := oneWaveBatchFor(t, bv, block, txs, nil)
+			batch := oneWaveBatchFor(t, bv, block, txs)
 
 			require.Equal(t, []bool{false, true, true, false, false}, batch.hasInBlockParent,
 				"only c2 and c3 spend a sibling")
@@ -409,12 +398,12 @@ func TestOneWave_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
 
 	block := &model.Block{Height: 100, ID: 42}
 
-	first := oneWaveBatchFor(t, bv, block, txs, nil)
+	first := oneWaveBatchFor(t, bv, block, txs)
 	require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, first))
 
 	// The same block offered again, exactly as a dirty restart offers it.
 	replayBlock := &model.Block{Height: 100, ID: 43}
-	second := oneWaveBatchFor(t, bv, replayBlock, txs, nil)
+	second := oneWaveBatchFor(t, bv, replayBlock, txs)
 
 	recorder.reset()
 	require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, replayBlock, second),
@@ -467,7 +456,7 @@ func TestOneWave_MissingParentFailsTheBlock(t *testing.T) {
 	orphan := spendOf(t, privateKey, ghost, 0, 90_000)
 
 	block := &model.Block{Height: 100, ID: 42}
-	batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{orphan}, nil)
+	batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{orphan})
 
 	require.False(t, batch.hasInBlockParent[0], "the missing parent is not in this block either")
 
@@ -517,7 +506,7 @@ func TestOneWave_FailedApplyReleasesNoChainedSpends(t *testing.T) {
 			i1 := spendOf(t, key, root, 1, 90_000)
 
 			block := &model.Block{Height: 100, ID: 42}
-			batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{c1, c2, i1}, nil)
+			batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{c1, c2, i1})
 
 			require.Equal(t, []bool{false, true, false}, batch.hasInBlockParent)
 

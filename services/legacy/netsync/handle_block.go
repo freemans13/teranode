@@ -225,8 +225,8 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 
 	// Wait for block assembly to be ready.
 	if err = blockassemblyutil.WaitForBlockAssemblyReady(ctx, sm.logger, sm.blockAssembly, blockHeight, sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly); err != nil {
-		if sm.windowRoute(blockHeight) {
-			return errors.NewServiceError("[HandleConvertedBlock][%s] block assembly not ready for height %d on the window route", blockHash.String(), blockHeight, err)
+		if sm.unifiedRoute(blockHeight) {
+			return errors.NewServiceError("[HandleConvertedBlock][%s] block assembly not ready for height %d on the unified route", blockHash.String(), blockHeight, err)
 		}
 
 		return err
@@ -375,23 +375,16 @@ func (sm *SyncManager) legacyOutpointOnly(origin blockRequestOrigin, height uint
 	return model.OutpointOnlyEligible(sm.settings, sm.utxoStore, sm.chainParams, height)
 }
 
-// windowRouteEnabled is every conjunct of windowRoute that does not depend on the
-// block's height: the settings, the store's outpoint-only support and the chain
-// params. The dispatcher asks it before spending an RPC to resolve a block's height,
-// because with any of these off the answer to windowRoute could only be false.
-func (sm *SyncManager) windowRouteEnabled() bool {
+// unifiedRoute reports whether a block at height takes block validation's unified
+// below-checkpoint route, where a block-assembly gate that is not ready is a local
+// condition: the caller must neither reject the block nor rotate the peer for it.
+func (sm *SyncManager) unifiedRoute(height uint32) bool {
 	return sm.settings != nil &&
-		sm.settings.BlockValidation.QuickWindowBlocks >= 1 &&
 		sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint &&
 		sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint &&
 		sm.utxoStore != nil && sm.utxoStore.SupportsOutpointOnlySpend() &&
-		sm.chainParams != nil
-}
-
-// windowRoute reports whether blocks at height take the quick window: the unified
-// below-checkpoint route with the window setting at 1 or more.
-func (sm *SyncManager) windowRoute(height uint32) bool {
-	return sm.windowRouteEnabled() && model.BelowCheckpoint(sm.chainParams.Checkpoints, height)
+		sm.chainParams != nil &&
+		model.BelowCheckpoint(sm.chainParams.Checkpoints, height)
 }
 
 // needsParentMinedWait reports whether HandleConvertedBlock must block on the
@@ -399,9 +392,9 @@ func (sm *SyncManager) windowRoute(height uint32) bool {
 // never wait (pre-existing behaviour). On the below-checkpoint outpoint-only
 // fast path the wait is redundant three ways: (1) its documented purpose is
 // BIP68 parent-height lookup, and BIP68 is skipped below the checkpoint;
-// (2) the quick window gates every spend on the commit of the create that made
-// its coin, so a parent's outputs are never spent before the parent's create
-// has committed, see services/blockvalidation/quick_window.go; (3) the legacy
+// (2) blocks are applied one at a time and a block is dispatched only once its
+// parent has committed, so a parent's outputs are never spent before the
+// parent's create has committed; (3) the legacy
 // path calls AddBlock with WithMinedSet(true)
 // (see buildAddBlockOpts in services/blockvalidation/BlockValidation.go), so
 // GetBlockIsMined is always instantly true and only costs a gRPC round-trip

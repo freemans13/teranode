@@ -122,7 +122,7 @@ func TestQuickValidateBlock_LateCorruptVerdictUnwrapped(t *testing.T) {
 
 	fixture := newLateCorruptFixture(t, suite, 100)
 
-	err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, fixture.block, "test", "", nil)
+	err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, fixture.block, "test", "")
 	require.Error(t, err)
 	require.True(t, errors.IsBlockCorrupt(err),
 		"a late corrupt verdict must be returned unwrapped, got: %v", err)

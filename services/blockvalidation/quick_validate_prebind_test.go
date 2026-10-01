@@ -563,7 +563,7 @@ func TestQuickValidate_MultiBatch_HonestBody_Validates(t *testing.T) {
 
 	block := h.newPreBindBlock(coinbase, roots, merkleRoot, 10)
 
-	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil),
+	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", ""),
 		"an honest body must validate however many batches it spans")
 
 	for _, group := range groups {
@@ -610,7 +610,7 @@ func TestQuickValidate_MultiBatch_MismatchedBody_NoUTXOMutation(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, other, coinbase)}),
 		10)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.True(t, errors.IsBlockCorrupt(err), "an unbound body is a corrupt download, got %v", err)
 
@@ -731,7 +731,7 @@ func TestQuickValidate_FakeCoinbaseSlot_CarriedPath_NoUTXOMutation(t *testing.T)
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, first, coinbase), *second.RootHash()}),
 		4)
 
-	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err, "a transaction that is not the one its node names must be rejected")
 
 	// Red on reversion: phase 1 creates it.
@@ -820,7 +820,7 @@ func TestQuickValidate_FakeCoinbaseSlot_LaterBatch_FakeNeverCreated(t *testing.T
 
 	block := h.newPreBindBlock(coinbase, roots, merkleRoot, 10)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.False(t, errors.IsBlockCorrupt(err),
 		"the disposition is the quarantine of a local blob, not a corrupt verdict against the peer's body, got %v", err)
@@ -895,7 +895,7 @@ func TestQuickValidate_MismatchedBody_NoUTXOMutation(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, honest, coinbase)}),
 		2)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.True(t, errors.IsBlockCorrupt(err), "an unbound body is a corrupt download, got %v", err)
 
@@ -919,7 +919,7 @@ func TestQuickValidate_HonestBodyAfterMismatch_Validates(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, served, coinbase)}),
 		2)
 
-	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil))
+	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", ""))
 
 	created, err := h.utxoStore.Get(h.ctx, child.TxIDChainHash())
 	require.NoError(t, err)
@@ -964,7 +964,7 @@ func TestQuickValidate_DuplicateTx_NoUTXOMutation(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, st, coinbase), *dup.RootHash()}),
 		4)
 
-	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 
 	h.requireNoUTXOMutation(block, parent, child)
@@ -995,7 +995,7 @@ func TestQuickValidate_NonPlaceholderFirstNode_NoUTXOMutation(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, st, coinbase)}),
 		3)
 
-	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.True(t, errors.IsBlockCorrupt(err), "got %v", err)
 
@@ -1062,7 +1062,7 @@ func TestQuickValidate_ForgedSubtreeHeaderRoot_NoUTXOMutation(t *testing.T) {
 
 	block := h.newPreBindBlock(coinbase, roots, merkleRoot, 4)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 
 	h.requireNoUTXOMutation(block, parent, forgedChild)
@@ -1101,7 +1101,7 @@ func TestQuickValidate_SubtreeBlobUnderWrongKey_NoUTXOMutation(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, borrowed, coinbase)}),
 		2)
 
-	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.False(t, errors.IsBlockCorrupt(err), "a local blob fault must not condemn the peer's body, got %v", err)
 
@@ -1181,7 +1181,7 @@ func TestQuickValidate_Sequential_MismatchedBody_NoUTXOMutation(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, honest, coinbase)}),
 		2)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.True(t, errors.IsBlockCorrupt(err), "got %v", err)
 
@@ -1209,7 +1209,7 @@ func TestQuickValidate_Sequential_HonestBody_WritesSubtreeFiles(t *testing.T) {
 		2)
 
 	require.NotPanics(t, func() {
-		_, err := h.bv.processBlockSubtrees(h.ctx, block, false, nil)
+		_, err := h.bv.processBlockSubtrees(h.ctx, block, false)
 		require.NoError(t, err)
 	})
 
@@ -1273,7 +1273,7 @@ func TestQuickValidate_ForgedFullSubtreeBlob_NoUTXOMutation(t *testing.T) {
 				close(writeJobsChan)
 				require.NoError(t, g.Wait())
 			} else {
-				err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+				err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 			}
 
 			require.Error(t, err)
@@ -1785,7 +1785,7 @@ func TestQuickValidate_BlobReplacedAfterPreBind_QuarantinedAndAborts(t *testing.
 				close(writeJobsChan)
 				require.NoError(t, g.Wait())
 			} else {
-				err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+				err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 			}
 
 			require.Error(t, err)
@@ -1955,7 +1955,7 @@ func TestQuickValidate_TwoForgedBlobs_BothQuarantined(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{firstKey, secondKey}),
 		4)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.False(t, errors.IsBlockCorrupt(err), "a local blob fault must not condemn the peer's body, got %v", err)
 
@@ -2033,7 +2033,7 @@ func TestQuickValidate_FullSubtreeBlobReplacedAfterPreBind_NoUTXOMutation(t *tes
 				close(writeJobsChan)
 				require.NoError(t, g.Wait())
 			} else {
-				err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+				err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 			}
 
 			require.Error(t, err, "the replaced promoted blob must be rejected at the batch read")
@@ -2106,7 +2106,7 @@ func TestQuickValidate_FullSubtreeExistsProbeFails_FailsClosed(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, served, coinbase)}),
 		2)
 
-	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err, "an existence probe that cannot answer must fail closed, not be read as absent")
 	require.False(t, errors.IsBlockCorrupt(err), "a local storage fault must not condemn the peer's body, got %v", err)
 
@@ -2142,7 +2142,7 @@ func TestQuickValidate_BothFileTypesForged_BothQuarantined(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, honest, coinbase)}),
 		2)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.False(t, errors.IsBlockCorrupt(err), "a local blob fault must not condemn the peer's body, got %v", err)
 
@@ -2181,7 +2181,7 @@ func TestQuickValidate_HonestSiblingSurvivesQuarantine(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, honest, coinbase)}),
 		2)
 
-	require.Error(t, h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil))
+	require.Error(t, h.bv.quickValidateBlock(h.ctx, block, "peer", ""))
 
 	h.requireNoUTXOMutation(block, parent, child)
 
@@ -2306,7 +2306,7 @@ func TestQuickValidate_PromotedSubtreeReadExactlyTwice(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, served, coinbase)}),
 		2)
 
-	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil),
+	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", ""),
 		"an honest body must validate, and a third read of the promoted blob would poison it")
 
 	require.Equal(t, 2, store.servedCount("get", served.RootHash(), fileformat.FileTypeSubtree),
@@ -2621,7 +2621,7 @@ func TestQuickValidate_PromotedOnlySubtreeReadOnce(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, served, coinbase)}),
 		2)
 
-	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil),
+	require.NoError(t, h.bv.quickValidateBlock(h.ctx, block, "peer", ""),
 		"neither pass may Get the promoted blob, so the poison must never be served")
 
 	require.Zero(t, store.servedCount("get", served.RootHash(), fileformat.FileTypeSubtree),
@@ -2668,7 +2668,7 @@ func TestQuickValidate_TwoForgedBlobsInDifferentChunks_BothQuarantined(t *testin
 
 	block := h.newPreBindBlock(coinbase, roots, merkleRoot, 10)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 	require.False(t, errors.IsBlockCorrupt(err), "a local blob fault must not condemn the peer's body, got %v", err)
 
@@ -3135,7 +3135,7 @@ func TestQuickValidate_FakeCoinbaseSlot_FirstAttempt_NoUTXOMutation(t *testing.T
 
 	f := h.fakeCoinbaseFirstAttemptBody(0x28, 0xda)
 
-	require.Error(t, h.bv.quickValidateBlock(h.ctx, f.block, "peer", "", nil),
+	require.Error(t, h.bv.quickValidateBlock(h.ctx, f.block, "peer", ""),
 		"a transaction that is not the one its node names must be rejected")
 
 	h.requireFirstAttemptUnmutated(f)
@@ -3262,7 +3262,7 @@ func (h *preBindHarness) runQuickValidate(d quickValidateDriver, block *model.Bl
 	h.bv.settings.BlockValidation.SubtreeBatchPrefetchDepth = d.prefetchDepth
 
 	if !d.async {
-		return h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+		return h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	}
 
 	writeJobsChan := make(chan *SubtreeWriteJob, 16)
@@ -3474,7 +3474,7 @@ func TestQuickValidate_SubtreeDataSweep_ClassifiesLaterBodyFaults(t *testing.T) 
 
 			r.setup(h, f, store)
 
-			err := h.bv.quickValidateBlock(h.ctx, f.block, "peer", "", nil)
+			err := h.bv.quickValidateBlock(h.ctx, f.block, "peer", "")
 
 			h.requireForgedBodiesQuarantined(f, err, 1)
 
@@ -3664,7 +3664,7 @@ func TestQuickValidate_NonPowerOfTwoFirstSubtree_NoUTXOMutation(t *testing.T) {
 		composeBlockMerkleRoot(t, []chainhash.Hash{coinbaseSubstitutedRoot(t, first, coinbase), *lifted}),
 		4)
 
-	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err = h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 
 	// Store state first, so the mutation fails the test because the batch mutated, not
@@ -3824,7 +3824,7 @@ func TestQuickValidate_TruncatedNonFirstSubtreeData_NoUTXOMutation(t *testing.T)
 
 	block := h.newPreBindBlock(coinbase, roots, merkleRoot, 4)
 
-	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "", nil)
+	err := h.bv.quickValidateBlock(h.ctx, block, "peer", "")
 	require.Error(t, err)
 
 	// Store state first, so the mutation fails the test because the batch mutated, not

@@ -62,11 +62,6 @@ type consumerWait struct {
 	// with no worker goroutine alive is a completion that was lost.
 	frontier []string
 
-	// inflightBytes and budget are the byte half of the admission rule, so a
-	// refusal for want of budget can be told apart from one for want of a slot.
-	inflightBytes int64
-	budget        int64
-
 	// drainQueued is how many parents are waiting to have their parked children
 	// looked at. It is the loop's second admission source, so a wedge with work
 	// queued here is different from one with none.
@@ -131,8 +126,6 @@ func (sm *SyncManager) publishConsumerWait(now time.Time) {
 	if bd := sm.dispatcher; bd != nil {
 		w.drainShutByWindow = len(sm.drainQueue) > 0 && !bd.frontierEmpty()
 		w.barrier = bd.barrier
-		w.inflightBytes = bd.inflight
-		w.budget = bd.budget
 		w.frontier = make([]string, 0, len(bd.frontier))
 
 		for _, e := range bd.frontier {
@@ -275,12 +268,6 @@ func (w *consumerWait) describe(now time.Time) string {
 		b.WriteString("; the window holds ")
 		b.WriteString(strings.Join(w.frontier, ", "))
 	}
-
-	b.WriteString("; ")
-	b.WriteString(strconv.FormatInt(w.inflightBytes, 10))
-	b.WriteString(" of ")
-	b.WriteString(strconv.FormatInt(w.budget, 10))
-	b.WriteString(" window bytes charged")
 
 	if w.drainQueued > 0 {
 		b.WriteString("; ")

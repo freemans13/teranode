@@ -36,7 +36,7 @@ func (h *parkWiringHarness) parkedDispatchFor(t *testing.T, index int) (*blockDi
 	taken, ok := h.sm.blockPark.Take(hash)
 	require.True(t, ok)
 
-	return &blockDispatch{parked: &taken, bytes: taken.size}, taken
+	return &blockDispatch{parked: &taken}, taken
 }
 
 // TestParkDispatch_ADispatchedParkedBlockCommitsAndTakesTheParkedTail is the happy
@@ -177,13 +177,8 @@ func TestParkDispatch_ADrainedBlockPassesANilParentSoTheWorkerLooksItUp(t *testi
 // one for a decoded queue message, are both deleted), so there is nothing left
 // to break that way.
 //
-// Being windowed was a third wrong shape and is not one any more. A drained
-// dispatch on the window route with a known height is now marked windowed
-// deliberately, so it can run beside another block instead of waiting for the
-// window to empty, which is what left the validator idle between every block
-// drained from the park. TestParkedDispatchMayBeWindowed covers the accepted
-// case; the emptiness rule below still applies to a dispatch that is not
-// windowed, which is what the height-zero case remains.
+// Blocks run one at a time, so a parked dispatch that arrives while another
+// block is in flight is the wrong shape: it is refused and its entry restored.
 func TestParkDispatch_TheWrongShapeIsRefusedAndTheEntryRestored(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -233,7 +228,6 @@ func TestParkDispatch_ShutdownRestoresAParkedDispatchInsteadOfReplying(t *testin
 	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
 	h.sm.quit = make(chan struct{})
-	h.sm.settings.BlockValidation.QuickWindowBlocks = 1
 	h.sm.settings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 	release := make(chan struct{})
@@ -377,7 +371,6 @@ func TestDrain_AChainOfParkedBlocksDrainsOneAfterAnother(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	h.withDispatcher(t)
 
-	h.sm.settings.BlockValidation.QuickWindowBlocks = 1
 	h.sm.settings.BlockValidation.QuickValidateSkipUtxoLock = true
 	h.sm.quit = make(chan struct{})
 
@@ -434,7 +427,6 @@ func TestDrain_TheSweepsPostIsRestoredAndThenDispatched(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	h.withDispatcher(t)
 
-	h.sm.settings.BlockValidation.QuickWindowBlocks = 1
 	h.sm.settings.BlockValidation.QuickValidateSkipUtxoLock = true
 	h.sm.quit = make(chan struct{})
 

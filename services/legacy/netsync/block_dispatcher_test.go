@@ -16,13 +16,10 @@ import (
 // testDispatcher builds a dispatcher with an injected tail so no peer, store or
 // gRPC client is needed. Each test also replaces bd.parkedRun, so nothing here
 // ever reaches HandleBlockDirect or HandleConvertedBlock.
-func testDispatcher(t *testing.T, depth int) (*blockDispatcher, *tailRecorder) {
+func testDispatcher(t *testing.T) (*blockDispatcher, *tailRecorder) {
 	t.Helper()
 
 	s := test.CreateBaseTestSettings(t)
-	s.BlockValidation.QuickWindowBlocks = depth
-	s.BlockValidation.QuickValidateSkipUtxoLock = true
-	s.BlockValidation.MaxBlocksBehindBlockAssembly = 20
 
 	sm := &SyncManager{logger: ulogger.TestLogger{}, settings: s, ctx: context.Background()}
 	bd := newBlockDispatcher(sm)
@@ -60,14 +57,12 @@ func (r *tailRecorder) count() int {
 // dispatchAt builds the dispatch a drain would build for a parked block at
 // height, with no resolved parent — see blockDispatcher.dispatch's own guard
 // for why that must always be true of a parked dispatch.
-func dispatchAt(height uint32, bytes int64) *blockDispatch {
+func dispatchAt(height uint32) *blockDispatch {
 	h := chainhash.HashH([]byte{byte(height)})
 
 	return &blockDispatch{
-		parked:   &parkedBlock{hash: h},
-		height:   height,
-		windowed: true,
-		bytes:    bytes,
+		parked: &parkedBlock{hash: h},
+		height: height,
 	}
 }
 
@@ -103,163 +98,62 @@ func (bd *blockDispatcher) drainCompletions(t *testing.T, rec *tailRecorder, wan
 	}
 }
 
-func TestDispatcher_TailsRunInDispatchOrderWhenWorkersFinishOutOfOrder(t *testing.T) {
-	bd, rec := testDispatcher(t, 3)
-
-	release := map[uint32]chan struct{}{1: make(chan struct{}), 2: make(chan struct{}), 3: make(chan struct{})}
-	bd.parkedRun = func(_ context.Context, d *blockDispatch) error { <-release[d.height]; return nil }
-
-	for h := uint32(1); h <= 3; h++ {
-		d := dispatchAt(h, 1000)
-		require.True(t, bd.canDispatch(d))
-		bd.dispatch(d)
-	}
-
-	close(release[3])
-	close(release[2])
-	bd.drainCompletions(t, rec, 0)
-	require.Equal(t, 0, rec.count(), "no tail before the head completed")
-
-	close(release[1])
-	bd.drainCompletions(t, rec, 3)
-
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	require.Equal(t, []uint32{1, 2, 3}, rec.heights)
-}
-
-func TestDispatcher_HeadFailureAbortsSuccessorsWithServiceErrorsAndNoBackoff(t *testing.T) {
-	bd, rec := testDispatcher(t, 3)
-
-	release := map[uint32]chan struct{}{1: make(chan struct{}), 2: make(chan struct{}), 3: make(chan struct{})}
-	bd.parkedRun = func(_ context.Context, d *blockDispatch) error {
-		<-release[d.height]
-
-		if d.height == 1 {
-			return errors.NewProcessingError("block 1 broke")
-		}
-
-		return nil
-	}
-
-	dispatches := make([]*blockDispatch, 0, 3)
-
-	for h := uint32(1); h <= 3; h++ {
-		d := dispatchAt(h, 1000)
-		dispatches = append(dispatches, d)
-		bd.dispatch(d)
-	}
-
-	close(release[1])
-	close(release[2])
-	close(release[3])
-	bd.drainCompletions(t, rec, 3)
-
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	require.Equal(t, []uint32{1, 2, 3}, rec.heights)
-	require.False(t, errors.IsTransientLocalError(rec.errs[0]), "the head keeps its own error class")
-	require.True(t, errors.IsTransientLocalError(rec.errs[1]))
-	require.True(t, errors.IsTransientLocalError(rec.errs[2]))
-	require.False(t, dispatches[0].aborted, "the head is at fault, so its tail still records a failure backoff")
-	require.True(t, dispatches[1].aborted, "an aborted successor records no failure backoff")
-	require.True(t, dispatches[2].aborted)
-	require.True(t, bd.frontierEmpty())
-}
-
-func TestDispatcher_CapacityAndBudgetGateAdmission(t *testing.T) {
-	bd, rec := testDispatcher(t, 2)
-	// Two 1000-byte blocks fit (each charged four times its wire size); a third is
-	// held out by the depth, not the budget.
-	bd.budget = 12_000
-
+// TestDispatcher_OneBlockAtATime pins what replaced the quick window: a second block
+// is never admitted while one is in flight, and is admitted as soon as the first one's
+// tail has run. Two blocks in flight at once is the window this branch removed.
+func TestDispatcher_OneBlockAtATime(t *testing.T) {
+	bd, rec := testDispatcher(t)
 	block := make(chan struct{})
 	bd.parkedRun = func(context.Context, *blockDispatch) error { <-block; return nil }
 
-	require.True(t, bd.canDispatch(dispatchAt(1, 1000)))
-	bd.dispatch(dispatchAt(1, 1000))
-	require.True(t, bd.canDispatch(dispatchAt(2, 1000)))
-	bd.dispatch(dispatchAt(2, 1000))
-	require.False(t, bd.canDispatch(dispatchAt(3, 1000)), "depth 2 reached")
-
-	close(block)
-	bd.drainCompletions(t, rec, 2)
-	require.True(t, bd.frontierEmpty())
-
-	// An over-budget block is admitted only into an empty frontier, and once it is
-	// in flight nothing joins it.
-	over := dispatchAt(4, 20_000)
-	require.True(t, bd.canDispatch(over), "over budget but the window is empty")
-	bd.dispatch(over)
-	require.False(t, bd.canDispatch(dispatchAt(5, 1000)), "the budget is already overdrawn")
-}
-
-func TestDispatcher_NonWindowBlockWaitsForAnEmptyFrontier(t *testing.T) {
-	bd, rec := testDispatcher(t, 3)
-	block := make(chan struct{})
-	bd.parkedRun = func(context.Context, *blockDispatch) error { <-block; return nil }
-
-	bd.dispatch(dispatchAt(1, 1000))
-
-	serial := dispatchAt(2, 1000)
-	serial.windowed = false
-	require.False(t, bd.canDispatch(serial))
+	require.True(t, bd.canDispatch(dispatchAt(1)))
+	bd.dispatch(dispatchAt(1))
+	require.False(t, bd.canDispatch(dispatchAt(2)), "nothing joins a block in flight")
 
 	close(block)
 	bd.drainCompletions(t, rec, 1)
-	require.True(t, bd.canDispatch(serial))
+	require.True(t, bd.frontierEmpty())
+	require.True(t, bd.canDispatch(dispatchAt(2)))
 }
 
-// With the window route off, a drained block carries height zero and is never
-// marked windowed (see drainStep). That has to change nothing: an unwindowed
-// block is still admitted only into an empty frontier, and the budget it
-// charges and releases still nets back to where it started rather than
-// drifting.
-func TestDispatcher_UnmeasuredNonWindowBlockChargesNothingAndStillSerialises(t *testing.T) {
-	bd, rec := testDispatcher(t, 3)
-	block := make(chan struct{})
-	bd.parkedRun = func(context.Context, *blockDispatch) error { <-block; return nil }
+// TestDispatcher_AFailedBlockKeepsItsOwnErrorClass: with one block in flight there is no
+// successor to abort, and the failed block's tail still records its own error, not a
+// substituted local fault.
+func TestDispatcher_AFailedBlockKeepsItsOwnErrorClass(t *testing.T) {
+	bd, rec := testDispatcher(t)
+	bd.parkedRun = func(context.Context, *blockDispatch) error { return errors.NewProcessingError("block 1 broke") }
 
-	require.Zero(t, bd.inflight)
-
-	first := dispatchAt(1, 0)
-	first.windowed = false
-	require.True(t, bd.canDispatch(first))
-	bd.dispatch(first)
-	require.Zero(t, bd.inflight, "an unmeasured block charges nothing")
-
-	second := dispatchAt(2, 0)
-	second.windowed = false
-	require.False(t, bd.canDispatch(second), "a zero size must not let a second block join the frontier")
-
-	close(block)
+	d := dispatchAt(1)
+	bd.dispatch(d)
 	bd.drainCompletions(t, rec, 1)
 
-	require.True(t, bd.frontierEmpty())
-	require.Zero(t, bd.inflight, "the release nets the charge back to zero")
-	require.True(t, bd.canDispatch(second))
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	require.Error(t, rec.errs[0])
+	require.False(t, errors.IsTransientLocalError(rec.errs[0]), "the block keeps its own error class")
+	require.False(t, d.aborted, "the block is at fault, so its tail still records a failure backoff")
 }
 
 func TestDispatcher_CheckpointBlockIsABarrier(t *testing.T) {
-	bd, rec := testDispatcher(t, 3)
+	bd, rec := testDispatcher(t)
 	block := make(chan struct{})
 	bd.parkedRun = func(context.Context, *blockDispatch) error { <-block; return nil }
 
-	cp := dispatchAt(1, 1000)
+	cp := dispatchAt(1)
 	cp.isCheckpoint = true
 	bd.dispatch(cp)
-	require.False(t, bd.canDispatch(dispatchAt(2, 1000)), "nothing dispatches while a checkpoint block is in flight")
+	require.False(t, bd.canDispatch(dispatchAt(2)), "nothing dispatches while a checkpoint block is in flight")
 
 	close(block)
 	bd.drainCompletions(t, rec, 1)
-	require.True(t, bd.canDispatch(dispatchAt(2, 1000)))
+	require.True(t, bd.canDispatch(dispatchAt(2)))
 }
 
 func TestDispatcher_ContextErrorFromAWorkerIsSubstitutedWithAServiceError(t *testing.T) {
-	bd, rec := testDispatcher(t, 2)
+	bd, rec := testDispatcher(t)
 	bd.parkedRun = func(context.Context, *blockDispatch) error { return context.Canceled }
 
-	bd.dispatch(dispatchAt(1, 1000))
+	bd.dispatch(dispatchAt(1))
 	bd.drainCompletions(t, rec, 1)
 
 	rec.mu.Lock()
@@ -271,7 +165,7 @@ func TestDispatcher_ContextErrorFromAWorkerIsSubstitutedWithAServiceError(t *tes
 
 // TestDispatcher_InFlight covers the frontier lookup the drain uses to decide
 // whether a hash already has a worker running for it: any hash in the frontier
-// counts as in flight, whether it is the tail or further back.
+// counts as in flight.
 //
 // This used to also cover parentFor, the head's own lookup for which frontier
 // tail a queued block's parent was — deleted along with the decoded-block
@@ -279,21 +173,17 @@ func TestDispatcher_ContextErrorFromAWorkerIsSubstitutedWithAServiceError(t *tes
 // resolves a parent of its own any more (blockDispatcher.dispatch refuses one),
 // so there is nothing left to pin there.
 func TestDispatcher_InFlight(t *testing.T) {
-	bd, rec := testDispatcher(t, 3)
+	bd, rec := testDispatcher(t)
 	block := make(chan struct{})
 	bd.parkedRun = func(context.Context, *blockDispatch) error { <-block; return nil }
 
-	first := dispatchAt(1, 1000)
-	second := dispatchAt(2, 1000)
+	first := dispatchAt(1)
 	bd.dispatch(first)
-	bd.dispatch(second)
 
 	require.True(t, bd.inFlight(first.parked.hash))
-	require.True(t, bd.inFlight(second.parked.hash))
 	require.False(t, bd.inFlight(chainhash.HashH([]byte("absent"))))
 
 	close(block)
-	bd.drainCompletions(t, rec, 2)
+	bd.drainCompletions(t, rec, 1)
 	require.False(t, bd.inFlight(first.parked.hash))
-	require.False(t, bd.inFlight(second.parked.hash))
 }
