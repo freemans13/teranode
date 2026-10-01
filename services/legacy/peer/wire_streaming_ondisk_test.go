@@ -58,7 +58,7 @@ func serialisedBlock(t *testing.T, txs int) ([]byte, chainhash.Hash) {
 func fakeSyncManagerGate(requested map[chainhash.Hash]bool, limit *big.Int) func(chainhash.Hash, *wire.BlockHeader) error {
 	return func(hash chainhash.Hash, header *wire.BlockHeader) error {
 		if !requested[hash] {
-			return errors.NewProcessingError("block %s was never requested", hash)
+			return &BlockNotRequestedError{Hash: hash}
 		}
 
 		var headerBytes bytes.Buffer
@@ -197,6 +197,11 @@ func TestStreamingBlockHandlerRefusesABadHeaderBeforeStoring(t *testing.T) {
 	// nBits sits at offset 72 of the 80-byte header.
 	copy(payload[72:76], []byte{0x00, 0x00, 0x00, 0x00})
 
+	// The header changed, so its hash did too. Mark the changed header's own
+	// hash as requested, or the requested check refuses it first and this test
+	// never reaches the target check it is about.
+	hash = chainhash.DoubleHashH(payload[:80])
+
 	called := false
 
 	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
@@ -212,6 +217,7 @@ func TestStreamingBlockHandlerRefusesABadHeaderBeforeStoring(t *testing.T) {
 
 	_, _, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.Error(t, err, "a header that fails its own target must be refused")
+	require.Contains(t, err.Error(), "does not meet its own target", "the target check must be what refuses it")
 	require.False(t, called, "nothing may be written for a block that failed the check")
 }
 
@@ -232,6 +238,10 @@ func TestStreamingBlockHandlerRefusesAnEasyTargetBeforeStoring(t *testing.T) {
 	// LSB first.
 	copy(payload[72:76], []byte{0xff, 0xff, 0x00, 0x21})
 
+	// As above: request the changed header's own hash, so the floor check is
+	// what refuses it rather than the requested check.
+	hash = chainhash.DoubleHashH(payload[:80])
+
 	limit := chaincfg.RegressionNetParams.PowLimit
 
 	nb := model.NBit{0xff, 0xff, 0x00, 0x21}
@@ -250,15 +260,16 @@ func TestStreamingBlockHandlerRefusesAnEasyTargetBeforeStoring(t *testing.T) {
 
 	_, _, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
 	require.Error(t, err, "a header declaring an easier-than-limit target must be refused")
+	require.Contains(t, err.Error(), "easier than the chain's difficulty limit", "the floor check must be what refuses it")
 	require.False(t, called, "nothing may be written for a block declaring an impossible target")
 }
 
-// FINDING 2. A block nobody asked for must be refused before storing, even
-// with a header that is otherwise perfectly valid. Without this, an
-// unsolicited block message alone is enough to reach the sink; today that only
-// costs a decode, which the decode itself bounds, but streaming makes it cost
-// disk, unbounded, because the park's byte budget is only consulted at Admit,
-// which happens after the write.
+// FINDING 2. A block nobody asked for must never reach the sink, even with a
+// header that is otherwise perfectly valid. Without this, an unsolicited block
+// message alone would put bytes on disk, unbounded, because the park's byte
+// budget is only consulted at Admit, which happens after the write. It is
+// discarded rather than failed, so the peer keeps its connection as SV Node's
+// does (see BlockNotRequestedError).
 func TestStreamingBlockHandlerRefusesAnUnrequestedBlockBeforeStoring(t *testing.T) {
 	payload, _ := serialisedBlock(t, 4)
 
@@ -273,8 +284,9 @@ func TestStreamingBlockHandlerRefusesAnUnrequestedBlockBeforeStoring(t *testing.
 	// Nothing is marked requested, so every hash is refused by this gate.
 	installGate(t, fakeSyncManagerGate(map[chainhash.Hash]bool{}, chaincfg.RegressionNetParams.PowLimit))
 
-	_, _, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
-	require.Error(t, err, "a block nobody asked for must be refused")
+	_, msg, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 24)
+	require.NoError(t, err, "a block nobody asked for is discarded, not held against the peer")
+	require.IsType(t, &MsgBlockDiscarded{}, msg)
 	require.False(t, called, "nothing may be written for a block nobody asked for")
 }
 

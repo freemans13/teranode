@@ -258,7 +258,9 @@ func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.Bloc
 	// shorter clock here (it was a flat hour) refused bodies the ledger still said a
 	// peer owed us.
 	if sm.blockDownloads == nil || !sm.blockDownloads.Requested(hash) {
-		return errors.NewBlockInvalidError("[streamingBlockGate][%s] this node did not ask for this block", hash)
+		// Not the peer's fault: the peer layer discards the body and keeps the
+		// connection for this type, as SV Node does. See BlockNotRequestedError.
+		return &peerpkg.BlockNotRequestedError{Hash: hash}
 	}
 
 	// No chain means no floor to check against, and an unbounded write is the

@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -292,4 +293,62 @@ func TestRegisterStreamingBlockHandler_DispatchesViaWire(t *testing.T) {
 	_, _, raw, err = wire.ReadMessageWithEncodingN(&buf, wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
 	require.NoError(t, err)
 	require.Nil(t, raw, "streaming handler must remain installed after repeated Register calls")
+}
+
+// TestStreamingBlockHandler_AnUnrequestedBlockIsDiscardedNotAnError pins SV
+// Node's rule: a block this node did not ask for is not the peer's fault. The
+// body is read off the wire and thrown away, the handler returns a discarded
+// message rather than an error, and the stream is left on the next message's
+// boundary so the connection carries on.
+func TestStreamingBlockHandler_AnUnrequestedBlockIsDiscardedNotAnError(t *testing.T) {
+	var sinkCalled bool
+
+	restore := installTestSink(t,
+		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+			sinkCalled = true
+			return true, nil
+		},
+		func(hash chainhash.Hash, _ *wire.BlockHeader) error {
+			return &BlockNotRequestedError{Hash: hash}
+		},
+		func(chainhash.Hash, bool) error { return nil },
+	)
+	defer restore()
+
+	block, payload := testBlockPayload(t, 3)
+	tail := []byte("NEXT-MESSAGE")
+	src := io.MultiReader(bytes.NewReader(payload), bytes.NewReader(tail))
+
+	_, msg, _, err := streamingBlockHandler(src, uint64(len(payload)), 0)
+	require.NoError(t, err, "an unrequested block must not be an error, or the peer is disconnected for it")
+
+	discarded, ok := msg.(*MsgBlockDiscarded)
+	require.True(t, ok, "expected *MsgBlockDiscarded, got %T", msg)
+	require.Equal(t, block.BlockHash(), discarded.Hash)
+	require.False(t, sinkCalled, "nothing may be written for a block nobody asked for")
+
+	got := make([]byte, len(tail))
+	_, err = io.ReadFull(src, got)
+	require.NoError(t, err)
+	require.Equal(t, tail, got, "the body must be drained exactly, leaving the next message intact")
+}
+
+// TestStreamingBlockHandler_AnyOtherGateRefusalIsStillAnError keeps the other
+// refusals what they were: a forged or malformed header is the peer's doing, and
+// the error is what disconnects it.
+func TestStreamingBlockHandler_AnyOtherGateRefusalIsStillAnError(t *testing.T) {
+	restore := installTestSink(t,
+		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) { return true, nil },
+		func(chainhash.Hash, *wire.BlockHeader) error {
+			return errors.NewBlockInvalidError("declared target is easier than the chain limit")
+		},
+		func(chainhash.Hash, bool) error { return nil },
+	)
+	defer restore()
+
+	_, payload := testBlockPayload(t, 2)
+
+	_, msg, _, err := streamingBlockHandler(bytes.NewReader(payload), uint64(len(payload)), 0)
+	require.Error(t, err)
+	require.Nil(t, msg)
 }

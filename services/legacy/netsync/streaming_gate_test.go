@@ -1,12 +1,14 @@
 package netsync
 
 import (
+	stderrors "errors"
 	"math/big"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,6 +53,13 @@ func TestStreamingBlockGate(t *testing.T) {
 		// asked-for check is deleted and a later one happens to fire instead.
 		require.Contains(t, err.Error(), "did not ask for this block",
 			"the asked-for check must be what refuses this, or its removal goes unnoticed")
+
+		// The type is what the peer reads to discard the body and keep the
+		// connection, as SV Node does, instead of disconnecting the peer.
+		var notRequested *peerpkg.BlockNotRequestedError
+		require.True(t, stderrors.As(err, &notRequested),
+			"an unrequested block must be refused with the type the peer discards quietly, got %T", err)
+		require.Equal(t, hash, notRequested.Hash)
 	})
 
 	t.Run("a requested block with a target below the chain floor is refused", func(t *testing.T) {
@@ -137,6 +146,10 @@ func TestStreamingBlockGate(t *testing.T) {
 		require.NotContains(t, err.Error(), "did not ask for this block",
 			"a request inside the ledger's ownership ceiling must pass the asked-for check")
 		require.Contains(t, err.Error(), "easier than", "the floor, a later check, must be what refuses it")
+
+		var notRequested *peerpkg.BlockNotRequestedError
+		require.False(t, stderrors.As(err, &notRequested),
+			"a forged header is not an unrequested block; its peer must still be disconnected")
 
 		now = now.Add(376*time.Minute - 2*time.Hour)
 

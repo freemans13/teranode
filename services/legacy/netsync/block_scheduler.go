@@ -344,8 +344,8 @@ func (sm *SyncManager) singlePeerAssigner(ladder int) *downloadAssigner {
 // Its caller is the wanted-range assignment pass, whose mark is
 // "this peer already owes us this block". Asking such a peer for it again makes
 // it send the block twice, and the second copy arrives after the first
-// discharged its obligation, so it looks unrequested and costs an honest peer
-// its whole association. A marked peer is still returned when it is all there
+// discharged its obligation, so it looks unrequested and is thrown away, a
+// wasted download. A marked peer is still returned when it is all there
 // is, because the caller has something useful to do with it that is not a second
 // getdata; it just must never be preferred over a peer that could actually help.
 //

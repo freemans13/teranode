@@ -327,7 +327,7 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 // requested a second time. Sending it twice would have the peer answer twice,
 // and the second copy arrives after the first discharged the obligation
 // (handleBlockOnDiskMsg calls RemoveOwner on the answering peer), so it looks
-// unrequested and costs an honest peer its whole association.
+// unrequested and is thrown away, a wasted download.
 //
 // On a node with one peer that means the block is not re-asked at all, which is
 // the right answer rather than a gap: there is nobody to help, so the only thing

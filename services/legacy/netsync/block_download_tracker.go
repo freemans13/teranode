@@ -63,7 +63,7 @@ const (
 	// track, so a flood of announcements cannot grow it without limit. The cap
 	// is applied by refusing the newcomer, never by dropping work already in
 	// progress: a block that arrives after its record was dropped looks
-	// unrequested and costs an honest peer its connection, and the block we have
+	// unrequested and is thrown away, a wasted download, and the block we have
 	// waited longest for — the frontier everything else is queued behind — is by
 	// definition the oldest record of all. Refusing is only safe because Add
 	// says so to its caller, which then does not send the getdata; see Add.
@@ -183,11 +183,11 @@ func newBlockDownloadTracker(ttl time.Duration) *blockDownloadTracker {
 //
 // A false answer means the ledger is at its size cap and this is a block it does
 // not already know about. The caller must then not send the getdata, because a
-// request the ledger cannot vouch for comes back looking unrequested and costs
-// an honest peer its connection. Refusing the newcomer is the only way to apply
+// request the ledger cannot vouch for comes back looking unrequested and is
+// thrown away, a wasted download. Refusing the newcomer is the only way to apply
 // the cap that leaves every block we are already waiting on exactly where it
-// was; evicting to make room would aim that same disconnect at whichever peer
-// lost the eviction, which for oldest-first is the frontier peer — the one block
+// was; evicting to make room would aim that same waste at whichever peer lost
+// the eviction, which for oldest-first is the frontier peer — the one block
 // sync cannot proceed without.
 //
 // Recording an additional owner for a block already in the ledger never fails.

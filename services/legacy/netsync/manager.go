@@ -1488,7 +1488,7 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 //   - it does not call clearRequestedState. The peer is staying, so stopping its
 //     requested-transaction map would leave it with no cleanup at all, and
 //     revoking its block ownership would make its late copies arrive looking
-//     unrequested and cost it its connection.
+//     unrequested and be thrown away.
 //   - it does not disconnect. Up to 2000 verified headers and a live connection
 //     were being thrown away because one peer was slow at headers.
 //   - it does not reset the header state, so headers-first mode and the header

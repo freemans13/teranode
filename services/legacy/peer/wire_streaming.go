@@ -2,6 +2,7 @@ package peer
 
 import (
 	"bytes"
+	stderrors "errors"
 	"io"
 	"sync"
 
@@ -164,6 +165,15 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 	// any of this, on the grounds that it already happened here; as written
 	// today that admission path only knows about decoded blocks.
 	if err := blockBodyGate(hash, &header); err != nil {
+		// A block this node did not ask for is not the peer's fault, so it is
+		// discarded rather than failed: the caller drains the body and the
+		// connection carries on, as SV Node's does. Matched by type, never by
+		// message text, so no other refusal can be mistaken for this one.
+		var notRequested *BlockNotRequestedError
+		if stderrors.As(err, &notRequested) {
+			return &MsgBlockDiscarded{Hash: hash, Size: int64(length)}, nil
+		}
+
 		return nil, errors.NewProcessingError("streaming block %s: refused", hash, err)
 	}
 

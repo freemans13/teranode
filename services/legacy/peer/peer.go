@@ -2354,6 +2354,13 @@ out:
 				p.cfg.Listeners.OnBlockOnDisk(p, msg)
 			}
 
+		case *MsgBlockDiscarded:
+			// A block this node did not ask for. SV Node neither disconnects nor
+			// scores a peer for one: it is usually a block announced and pushed
+			// before our getdata, or a second copy after we stopped wanting it.
+			// The body has already been drained, so the connection carries on.
+			p.logger.Debugf("[%s] discarded block %s, %d bytes, which this node did not ask for", p, msg.Hash, msg.Size)
+
 		case *wire.MsgInv:
 			if p.cfg.Listeners.OnInv != nil {
 				p.cfg.Listeners.OnInv(p, msg)

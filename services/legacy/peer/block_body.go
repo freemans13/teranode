@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -74,6 +75,46 @@ func (m *MsgBlockOnDisk) Command() string { return wire.CmdBlock }
 
 // MaxPayloadLength defers to the decoded block's answer.
 func (m *MsgBlockOnDisk) MaxPayloadLength(pver uint32) uint64 {
+	return (&wire.MsgBlock{}).MaxPayloadLength(pver)
+}
+
+// BlockNotRequestedError is what a block body gate returns for a block this node
+// did not ask for. It is not the peer's fault: SV Node never disconnects or scores
+// a peer for an unrequested block, it just does not keep it. The streaming handler
+// reads this type, by type and not by message, and discards the body instead of
+// failing the message, so the connection carries on. Any other gate refusal is
+// still an error and still disconnects the peer.
+type BlockNotRequestedError struct {
+	Hash chainhash.Hash
+}
+
+func (e *BlockNotRequestedError) Error() string {
+	return fmt.Sprintf("[streamingBlockGate][%s] this node did not ask for this block", e.Hash)
+}
+
+// MsgBlockDiscarded is a block message whose body was read off the wire and thrown
+// away, because this node did not ask for the block. It carries only what a log
+// line needs.
+type MsgBlockDiscarded struct {
+	Hash chainhash.Hash
+	Size int64
+}
+
+// Bsvdecode always fails: the body was discarded, not kept.
+func (m *MsgBlockDiscarded) Bsvdecode(io.Reader, uint32, wire.MessageEncoding) error {
+	return errors.NewProcessingError("MsgBlockDiscarded cannot be decoded: its body was discarded")
+}
+
+// BsvEncode always fails: there is no body to send.
+func (m *MsgBlockDiscarded) BsvEncode(io.Writer, uint32, wire.MessageEncoding) error {
+	return errors.NewProcessingError("MsgBlockDiscarded cannot be encoded: its body was discarded")
+}
+
+// Command returns the protocol command the message arrived as.
+func (m *MsgBlockDiscarded) Command() string { return wire.CmdBlock }
+
+// MaxPayloadLength is the same bound a block message has.
+func (m *MsgBlockDiscarded) MaxPayloadLength(pver uint32) uint64 {
 	return (&wire.MsgBlock{}).MaxPayloadLength(pver)
 }
 
