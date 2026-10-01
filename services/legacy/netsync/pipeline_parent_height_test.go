@@ -2,13 +2,16 @@ package netsync
 
 import (
 	"bytes"
+	"context"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -135,6 +138,59 @@ func TestPipelineSink_UnresolvableParent_StillConverts(t *testing.T) {
 		require.NoError(t, existsErr)
 		require.False(t, quick, "an unresolved height must never write .subtree — that would assert no validation is owed, which is the one unsafe outcome in this task")
 	}
+}
+
+// TestPipelineSink_NilParentMetaIsUnresolved: a blockchain client that answers
+// GetBlockHeader with a nil meta and a nil error must leave the parent height
+// unresolved, not panic the streaming receive path on meta.Height. The real
+// sqlitememory store never answers that way, so this drives the sink through
+// nilMetaClient, which overrides only that one call on the real client; the end state asserted is the same as for any unresolvable
+// parent: the block converts at the 0 sentinel height with .subtreeToCheck files.
+func TestPipelineSink_NilParentMetaIsUnresolved(t *testing.T) {
+	ctx := t.Context()
+
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+
+	parent := chainhash.HashH([]byte("nil-meta-parent"))
+	blk.MsgBlock().Header.PrevBlock = parent
+
+	sm.blockchainClient = nilMetaClient{ClientI: sm.blockchainClient}
+
+	height, ok := sm.pipelineParentHeight(parent)
+	require.False(t, ok, "a nil meta must leave the parent height unresolved")
+	require.Zero(t, height)
+
+	body := blockBodyBytes(t, blk)
+
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err)
+	require.True(t, converted)
+
+	got, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Zero(t, got.Height, "height must be the unresolved sentinel")
+	require.NotEmpty(t, got.Subtrees)
+
+	for _, h := range got.Subtrees {
+		toCheck, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtreeToCheck)
+		require.NoError(t, existsErr)
+		require.True(t, toCheck, "an unresolved height must take the conservative .subtreeToCheck form")
+	}
+}
+
+// nilMetaClient answers GetBlockHeader with a nil header, a nil meta and a nil
+// error, and passes every other call through to the real client it wraps.
+type nilMetaClient struct {
+	blockchain.ClientI
+}
+
+func (nilMetaClient) GetBlockHeader(context.Context, *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	return nil, nil, nil
 }
 
 // TestPipelineSink_NotUnifiedRouteStillConverts is task 13's second claim:

@@ -107,3 +107,33 @@ func TestReadSubtreeDataRefusesATruncatedFile(t *testing.T) {
 	_, err := ReadSubtreeData(st, bytes.NewReader(file[:len(file)-2]))
 	require.Error(t, err)
 }
+
+// readerTestCoinbase builds a coinbase-shaped transaction: one input spending the null outpoint.
+func readerTestCoinbase(t *testing.T, seed byte) *bt.Tx {
+	t.Helper()
+
+	tx := bt.NewTx()
+	in := &bt.Input{PreviousTxOutIndex: 0xffffffff, SequenceNumber: 0xffffffff}
+	require.NoError(t, in.PreviousTxIDAdd(&chainhash.Hash{}))
+	in.UnlockingScript = bscript.NewFromBytes([]byte{0x03, seed, 0x01, 0x02})
+	tx.Inputs = append(tx.Inputs, in)
+	tx.Outputs = append(tx.Outputs, &bt.Output{Satoshis: 5000000000, LockingScript: bscript.NewFromBytes([]byte{0x76, 0xa9, seed})})
+	require.True(t, tx.IsCoinbase(), "sanity: the fixture must be coinbase-shaped")
+
+	return tx
+}
+
+// A file that starts with the coinbase fills the placeholder slot with it.
+func TestReadSubtreeDataFillsThePlaceholderWithTheCoinbase(t *testing.T) {
+	txs := []*bt.Tx{readerTestTx(t, 1), readerTestTx(t, 2)}
+	st, file := subtreeWith(t, txs)
+
+	cb := readerTestCoinbase(t, 1)
+	file = append(cb.Bytes(), file...)
+
+	got, err := ReadSubtreeData(st, bytes.NewReader(file))
+	require.NoError(t, err)
+	require.Equal(t, cb.Bytes(), got.Txs[0].Bytes())
+	require.Equal(t, *txs[0].TxIDChainHash(), *got.Txs[1].TxIDChainHash())
+	require.Equal(t, *txs[1].TxIDChainHash(), *got.Txs[2].TxIDChainHash())
+}
