@@ -1,12 +1,16 @@
 package subtreevalidation
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -111,5 +115,78 @@ func BenchmarkResolveFromMemory_FanIn(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// A block whose transaction spends several outputs of the same in-block parents,
+// in an interleaved order, is checked and written whole on the batch path: every
+// record is created and every one of those outputs is spent by the right input.
+func TestCheckBlockSubtreesBatched_RepeatedInBlockParents(t *testing.T) {
+	f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+
+	roots := []*bt.Tx{storedRoot(t, f, 1, opTrue), storedRoot(t, f, 2, opTrue), storedRoot(t, f, 3, opTrue)}
+	a := opTrueTx(t, 11, []*bt.Tx{roots[0]}, []uint32{0})
+	b := opTrueTx(t, 12, []*bt.Tx{roots[1]}, []uint32{0})
+	c := opTrueTx(t, 13, []*bt.Tx{roots[2]}, []uint32{0})
+	child := opTrueTx(t, 14, []*bt.Tx{b, a, b, c, a}, []uint32{0, 0, 1, 0, 1})
+	grandchild := opTrueTx(t, 15, []*bt.Tx{child}, []uint32{0})
+	txs := []*bt.Tx{a, b, c, child, grandchild}
+
+	require.NoError(t, checkBlock(t, f, storeBlock(t, f, txs, false)))
+	require.Positive(t, f.store.multiCalls.Load(), "catch-up above the checkpoint must take the batch path")
+
+	requireCreatedUnmined(t, f, txs)
+
+	for _, s := range []struct {
+		parent *bt.Tx
+		vout   uint32
+		child  *bt.Tx
+		vin    int
+	}{{b, 0, child, 0}, {a, 0, child, 1}, {b, 1, child, 2}, {c, 0, child, 3}, {a, 1, child, 4}, {child, 0, grandchild, 0}} {
+		utxoHash, err := util.UTXOHashFromOutput(s.parent.TxIDChainHash(), s.parent.Outputs[s.vout], s.vout)
+		require.NoError(t, err)
+
+		resp, err := f.store.GetSpend(context.Background(), &utxo.Spend{TxID: s.parent.TxIDChainHash(), Vout: s.vout, UTXOHash: utxoHash})
+		require.NoError(t, err)
+		require.NotNil(t, resp.SpendingData, "%s:%d is unspent", s.parent.TxIDChainHash(), s.vout)
+		require.Equal(t, *s.child.TxIDChainHash(), *resp.SpendingData.TxID)
+		require.Equal(t, s.vin, resp.SpendingData.Vin)
+	}
+}
+
+// When a parent spent several times by one child falls back to the
+// per-transaction path, the child falls back with it, however many of its inputs
+// name that parent, and ends up exactly as the per-transaction path leaves it.
+// Lists of two put the child in a list after its parent's, so it is the batch
+// path's own parent bookkeeping, not the store's, that has to send it back.
+func TestProcessTransactionsBatched_RepeatedParentFallsBackWithChild(t *testing.T) {
+	f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+	f.server.settings.SubtreeValidation.SpendAndCreateMultiMaxTxs = 2
+
+	checker, ok := f.server.batchChecker(blockchain.FSMStateCATCHINGBLOCKS, batchedTestHeight)
+	require.True(t, ok)
+
+	roots := []*bt.Tx{storedRoot(t, f, 1, opTrue), storedRoot(t, f, 2, opTrue)}
+
+	// An unmined transaction spends root 0's output 0 first, so loser's spend
+	// fails on the batch path and it goes through the per-transaction path.
+	thief := opTrueTx(t, 99, []*bt.Tx{roots[0]}, []uint32{0})
+	_, err := f.validator.Validate(context.Background(), thief, batchedTestHeight)
+	require.NoError(t, err)
+
+	loser := opTrueTx(t, 1, []*bt.Tx{roots[0]}, []uint32{0})
+	winner := opTrueTx(t, 2, []*bt.Tx{roots[1]}, []uint32{0})
+	child := opTrueTx(t, 3, []*bt.Tx{loser, winner, loser}, []uint32{0, 0, 1})
+
+	err = f.server.processTransactionsBatched(context.Background(), checker, []*bt.Tx{loser, winner, child}, chainhash.Hash{}, batchedTestHeight, 0, 0, map[uint32]bool{})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), f.store.multiCalls.Load(), "the child's list is never sent: the child falls back before it")
+
+	requireCreatedUnmined(t, f, []*bt.Tx{winner})
+
+	for _, tx := range []*bt.Tx{loser, child} {
+		md, err := f.store.Get(context.Background(), tx.TxIDChainHash())
+		require.NoError(t, err)
+		require.True(t, md.Conflicting, "%s went through the per-transaction path, which creates it conflicting", tx.TxIDChainHash())
 	}
 }
