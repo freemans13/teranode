@@ -190,7 +190,19 @@ After each state change, verify the new state:
 
 ## Advanced Method: Using grpcurl
 
-For advanced users or automated scripts, you can use `grpcurl` directly. This method requires network access to the blockchain gRPC service on port 18087.
+For advanced users or automated scripts, you can use `grpcurl` directly. This method requires network access to the blockchain gRPC service on port 18087. Prefer `teranode-cli` inside a Teranode container when you can: it already has the key.
+
+Every Blockchain RPC except `HealthGRPC` requires the `x-api-key` header, and server reflection is off by default. Run grpcurl from a Teranode source checkout so it can load the service definition, and pass the same `grpc_admin_api_key` the services use:
+
+```bash
+# Run from the root of a Teranode source checkout
+fsm() {
+  grpcurl -plaintext -H "x-api-key: $grpc_admin_api_key" \
+    -import-path . -proto services/blockchain/blockchain_api/blockchain_api.proto "$@"
+}
+```
+
+A missing or wrong key returns `Unauthenticated`.
 
 ### Docker Compose Environment
 
@@ -200,20 +212,20 @@ Access the blockchain gRPC service directly:
 
 ```bash
 # Connect to blockchain service on port 18087
-grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.GetFSMCurrentState
+fsm blockchain:18087 blockchain_api.BlockchainAPI.GetFSMCurrentState
 ```
 
 **Trigger State Transitions:**
 
 ```bash
 # Transition to RUNNING state
-grpcurl -plaintext -d '{"event":"RUN"}' blockchain:18087 blockchain_api.BlockchainAPI.SendFSMEvent
+fsm -d '{"event":"RUN"}' blockchain:18087 blockchain_api.BlockchainAPI.SendFSMEvent
 
 # Transition to CATCHINGBLOCKS state
-grpcurl -plaintext -d '{"event":"CATCHUPBLOCKS"}' blockchain:18087 blockchain_api.BlockchainAPI.SendFSMEvent
+fsm -d '{"event":"CATCHUPBLOCKS"}' blockchain:18087 blockchain_api.BlockchainAPI.SendFSMEvent
 
 # Transition to IDLE state
-grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.Idle
+fsm blockchain:18087 blockchain_api.BlockchainAPI.Idle
 ```
 
 ### Kubernetes Environment
@@ -228,7 +240,7 @@ kubectl port-forward -n teranode-operator service/blockchain 18087:18087
 **Check Current State:**
 
 ```bash
-grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.GetFSMCurrentState
+fsm localhost:18087 blockchain_api.BlockchainAPI.GetFSMCurrentState
 ```
 
 Expected output for a fresh Kubernetes operator deployment (a restarted node
@@ -244,25 +256,27 @@ normally reports its persisted state):
 
 ```bash
 # Transition to RUNNING state
-grpcurl -plaintext -d '{"event":"RUN"}' localhost:18087 blockchain_api.BlockchainAPI.SendFSMEvent
+fsm -d '{"event":"RUN"}' localhost:18087 blockchain_api.BlockchainAPI.SendFSMEvent
 
 # Transition to CATCHINGBLOCKS state
-grpcurl -plaintext -d '{"event":"CATCHUPBLOCKS"}' localhost:18087 blockchain_api.BlockchainAPI.SendFSMEvent
+fsm -d '{"event":"CATCHUPBLOCKS"}' localhost:18087 blockchain_api.BlockchainAPI.SendFSMEvent
 
 # Transition to IDLE state
-grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.Idle
+fsm localhost:18087 blockchain_api.BlockchainAPI.Idle
 ```
 
 ### Wait for State Change
 
-There is no blocking "wait" endpoint. To wait for a specific state, poll the current state until it matches:
+There is no blocking "wait" endpoint. To wait for a specific state, poll the current state until it matches. Bound the loop and stop on a grpcurl error, so a bad key or an unreachable service fails instead of polling forever:
 
 ```bash
-# Poll until the FSM reaches RUNNING
-until grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.GetFSMCurrentState \
-  | grep -q '"state": "RUNNING"'; do
+# Poll for up to 120 seconds until the FSM reaches RUNNING
+for i in $(seq 1 120); do
+  out=$(fsm localhost:18087 blockchain_api.BlockchainAPI.GetFSMCurrentState) || exit 1
+  echo "$out" | grep -q '"state": "RUNNING"' && exit 0
   sleep 1
 done
+exit 1
 ```
 
 ## Further Reading

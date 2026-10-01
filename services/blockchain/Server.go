@@ -521,6 +521,11 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	var closeOnce sync.Once
 	defer closeOnce.Do(func() { close(readyCh) })
 
+	if err := util.ValidateRequiredAdminAPIKey(b.settings.GRPCAdminAPIKey); err != nil {
+		return err
+	}
+	util.ValidateAdminAPIKey(b.logger, "Blockchain", b.settings.GRPCAdminAPIKey, b.settings.BlockChain.GRPCListenAddress, b.settings.SecurityLevelGRPC)
+
 	b.startKafka()
 
 	// Settings here still live under tSettings.P2P.* — the centralized
@@ -532,7 +537,8 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	if storeURL := b.settings.BlockChain.PeerRegistryStore; storeURL != nil {
 		store, err := blob.NewStore(b.logger, storeURL,
-			blobstoreoptions.WithStoreType(blobstoretypes.PEERREGISTRYSTORE))
+			blobstoreoptions.WithStoreType(blobstoretypes.PEERREGISTRYSTORE),
+			blobstoreoptions.WithHTTPAuthToken(b.settings.BlobHTTPAuthToken))
 		if err != nil {
 			b.logger.Warnf("[Blockchain] failed to construct peer registry blob store %s: %v", storeURL.Redacted(), err)
 		} else {
@@ -580,7 +586,7 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		blockchain_api.RegisterBlockchainAPIServer(server, b)
 		blockchain_api.RegisterPeerRegistryServiceServer(server, b)
 		closeOnce.Do(func() { close(readyCh) })
-	}, nil); err != nil {
+	}, b.grpcAuthOptions()); err != nil {
 		return errors.WrapGRPC(errors.NewServiceNotStartedError("[Blockchain][Start] can't start GRPC server", err))
 	}
 
@@ -635,8 +641,8 @@ func (b *Blockchain) startHTTP(ctx context.Context) error {
 		return c.String(http.StatusOK, "OK")
 	})
 
-	e.GET("/invalidate/:hash", b.invalidateHandler)
-	e.GET("/revalidate/:hash", b.revalidateHandler)
+	e.POST("/invalidate/:hash", b.invalidateHandler, b.requireAdminAPIKey)
+	e.POST("/revalidate/:hash", b.revalidateHandler, b.requireAdminAPIKey)
 
 	go func() {
 		<-ctx.Done()
@@ -3761,7 +3767,7 @@ func (b *Blockchain) CompleteBlobDeletions(ctx context.Context, req *blockchain_
 // AcquireBlobDeletionBatch acquires a batch of deletions with locking.
 func (b *Blockchain) AcquireBlobDeletionBatch(ctx context.Context, req *blockchain_api.AcquireBlobDeletionBatchRequest) (*blockchain_api.AcquireBlobDeletionBatchResponse, error) {
 	storeWithBatchAcquisition, ok := b.store.(interface {
-		AcquireBlobDeletionBatch(ctx context.Context, height uint32, limit int, lockTimeoutSeconds int) ([]*blockchain_sql.ScheduledDeletion, error)
+		AcquireBlobDeletionBatch(ctx context.Context, height uint32, limit int, lockTimeoutSeconds int, excludeStoreTypes []int32) ([]*blockchain_sql.ScheduledDeletion, error)
 	})
 	if !ok {
 		return nil, errors.NewStorageError("blockchain store does not support batch acquisition")
@@ -3772,7 +3778,7 @@ func (b *Blockchain) AcquireBlobDeletionBatch(ctx context.Context, req *blockcha
 		lockTimeout = 300 // Default: 5 minutes
 	}
 
-	deletions, err := storeWithBatchAcquisition.AcquireBlobDeletionBatch(ctx, req.Height, int(req.Limit), lockTimeout)
+	deletions, err := storeWithBatchAcquisition.AcquireBlobDeletionBatch(ctx, req.Height, int(req.Limit), lockTimeout, req.ExcludeStoreTypes)
 	if err != nil {
 		return nil, err
 	}
@@ -3816,7 +3822,7 @@ func (b *Blockchain) AcquireBlobDeletionBatch(ctx context.Context, req *blockcha
 		}
 	}
 
-	b.logger.Infof("Acquired blob deletion batch: token=%s, count=%d, height=%d", token, len(deletions), req.Height)
+	b.logger.Infof("Acquired blob deletion batch: token=%s, count=%d, height=%d, excluded=%v", token, len(deletions), req.Height, req.ExcludeStoreTypes)
 
 	return &blockchain_api.AcquireBlobDeletionBatchResponse{
 		BatchToken: token,

@@ -37,7 +37,9 @@ message HealthResponse {
 **Example:**
 
 ```bash
-grpcurl -plaintext localhost:8096 pruner.PrunerAPI/HealthGRPC
+# Run from a Teranode source checkout: server reflection is off by default
+grpcurl -plaintext -import-path . -proto services/pruner/pruner_api/pruner_api.proto \
+  localhost:8096 pruner.PrunerAPI/HealthGRPC
 ```
 
 **Response:**
@@ -407,8 +409,8 @@ ERROR [PreserveParents] Failed to preserve parent transaction: CRITICAL - aborti
 2. Verify UTXO store connection:
 
     ```bash
-    # Check UTXO store health
-    grpcurl -plaintext localhost:8090 asset.AssetAPI/HealthGRPC
+    # Check UTXO store health (Asset reports its dependencies over HTTP)
+    curl -s http://localhost:8090/health
     ```
 
 3. Check logs for initialization errors:
