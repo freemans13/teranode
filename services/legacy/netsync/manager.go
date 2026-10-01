@@ -1777,8 +1777,6 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		return errors.NewServiceError("[handleBlockMsg] skipping block %s from disconnected peer %s", bmsg.blockHash, bmsg.peer)
 	}
 
-	catchingBlocks := false
-
 	sm.logger.Debugf("[handleBlockMsg][%s] checking current FSM state", bmsg.blockHash)
 
 	fsmState, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
@@ -1786,9 +1784,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		return errors.NewProcessingError("[handleBlockMsg] failed to get current FSM state", err)
 	}
 
-	if fsmState != nil && *fsmState == teranodeblockchain.FSMStateCATCHINGBLOCKS {
-		catchingBlocks = true
-	}
+	catchingBlocks := suppressBlockRejects(fsmState)
 
 	// If we didn't ask for this block then the peer is misbehaving.
 	if _, exists = state.requestedBlocks.Get(bmsg.blockHash); !exists {
@@ -3902,42 +3898,49 @@ func (sm *SyncManager) kafkaINVListener(ctx context.Context, kafkaURL *url.URL, 
 }
 
 func (sm *SyncManager) kafkaBlocksFinalListener(ctx context.Context, kafkaURL *url.URL, groupID string) {
-	kafka.StartKafkaListener(ctx, sm.logger, kafkaURL, groupID, true, func(msg *kafka.KafkaMessage) error {
-		if msg.Key == nil {
-			sm.logger.Errorf("[kafkaBlocksFinalListener] no Kafka message key specified, skipping message")
-			// not going to retry, if we don't have a key/hash
-			return nil
-		}
+	kafka.StartKafkaListener(ctx, sm.logger, kafkaURL, groupID, true, sm.processBlocksFinalMessage, &sm.settings.Kafka)
+}
 
-		hash, err := chainhash.NewHashFromStr(string(msg.Key))
-		if err != nil {
-			sm.logger.Errorf("[kafkaBlocksFinalListener][%s] failed to create hash from Kafka message key: %v", hash, err)
-			// not going to retry, if we cannot parse the message
-			return nil
-		}
-
-		var blockMsg kafkamessage.KafkaBlocksFinalTopicMessage
-		if err := proto.Unmarshal(msg.Value, &blockMsg); err != nil {
-			sm.logger.Errorf("[kafkaBlocksFinalListener][%s] failed to unmarshal kafka block topic message: %v", hash, err)
-			// not going to retry, if we cannot parse the message
-			return nil
-		}
-
-		header, err := model.NewBlockHeaderFromBytes(blockMsg.Header)
-		if err != nil {
-			sm.logger.Errorf("[kafkaBlocksFinalListener][%s] failed to create block header from Kafka message: %v", hash, err)
-			// not going to retry, if we cannot parse the message
-			return nil
-		}
-
-		// create wireBlockHeader
-		wireBlockHeader := header.ToWireBlockHeader()
-
-		sm.logger.Infof("[kafkaBlocksFinalListener] received block final message from Kafka: %s, %s", hash, header.String())
-		sm.peerNotifier.RelayInventory(wire.NewInvVect(wire.InvTypeBlock, hash), wireBlockHeader)
-
+// processBlocksFinalMessage announces a block from the blocks_final topic to
+// peers and signals the rebroadcast queue that a new block has been added.
+// Malformed messages are logged and skipped; it never returns an error, so
+// the listener does not retry them.
+func (sm *SyncManager) processBlocksFinalMessage(msg *kafka.KafkaMessage) error {
+	if msg.Key == nil {
+		sm.logger.Errorf("[kafkaBlocksFinalListener] no Kafka message key specified, skipping message")
+		// not going to retry, if we don't have a key/hash
 		return nil
-	}, &sm.settings.Kafka)
+	}
+
+	hash, err := chainhash.NewHashFromStr(string(msg.Key))
+	if err != nil {
+		sm.logger.Errorf("[kafkaBlocksFinalListener][%s] failed to create hash from Kafka message key: %v", hash, err)
+		// not going to retry, if we cannot parse the message
+		return nil
+	}
+
+	var blockMsg kafkamessage.KafkaBlocksFinalTopicMessage
+	if err := proto.Unmarshal(msg.Value, &blockMsg); err != nil {
+		sm.logger.Errorf("[kafkaBlocksFinalListener][%s] failed to unmarshal kafka block topic message: %v", hash, err)
+		// not going to retry, if we cannot parse the message
+		return nil
+	}
+
+	header, err := model.NewBlockHeaderFromBytes(blockMsg.Header)
+	if err != nil {
+		sm.logger.Errorf("[kafkaBlocksFinalListener][%s] failed to create block header from Kafka message: %v", hash, err)
+		// not going to retry, if we cannot parse the message
+		return nil
+	}
+
+	// create wireBlockHeader
+	wireBlockHeader := header.ToWireBlockHeader()
+
+	sm.logger.Infof("[kafkaBlocksFinalListener] received block final message from Kafka: %s, %s", hash, header.String())
+	sm.peerNotifier.RelayInventory(wire.NewInvVect(wire.InvTypeBlock, hash), wireBlockHeader)
+	sm.peerNotifier.BlockConnected()
+
+	return nil
 }
 
 // kafkaTXmetaListener processes TxMeta Kafka messages in binary batch format.
@@ -4089,4 +4092,11 @@ func (sm *SyncManager) processTXmetaBatchMessage(data []byte) error {
 	}
 
 	return nil
+}
+
+// suppressBlockRejects reports whether invalid blocks must not be rejected to the
+// serving peer. Only RUNNING proves the node is caught up; IDLE is included
+// because an operator STOP can land while blocks are still syncing.
+func suppressBlockRejects(state *teranodeblockchain.FSMStateType) bool {
+	return state == nil || *state != teranodeblockchain.FSMStateRUNNING
 }

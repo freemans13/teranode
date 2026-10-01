@@ -552,7 +552,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtrees] Failed to get FSM current state", err))
 	}
 
-	addTXToBlockAssembly := *currentState != blockchain.FSMStateCATCHINGBLOCKS
+	// Only RUNNING feeds block assembly. IDLE can follow an operator STOP while
+	// a catchup batch is still validating historical blocks.
+	addTXToBlockAssembly := *currentState == blockchain.FSMStateRUNNING
 
 	// BATCHED SUBTREE LOADING: Get blockIds once before batching
 	blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Header.HashPrevBlock, uint64(u.settings.GetUtxoStoreBlockHeightRetention()*2))

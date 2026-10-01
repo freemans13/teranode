@@ -13,9 +13,8 @@ import (
 func newTestDiskTxMap(t *testing.T) *DiskTxMap {
 	t.Helper()
 	m, err := NewDiskTxMap(DiskTxMapOptions{
-		BasePath:       t.TempDir(),
-		Prefix:         "test",
-		FilterCapacity: 10_000,
+		BasePath: t.TempDir(),
+		Prefix:   "test",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { m.Close() })
@@ -172,10 +171,21 @@ func TestDiskTxMap_SerializationRoundtrip(t *testing.T) {
 	built.SubtreeIndex = 42
 	ip := &built
 
-	serialized := serializeTxMapValue(ip)
-	deserialized := deserializeTxMapValue(serialized)
+	m := newTestDiskTxMap(t)
+	hash := chainhash.HashH([]byte("child"))
+	m.Set(hash, ip)
 
-	require.NotNil(t, deserialized)
-	require.Equal(t, int16(42), deserialized.SubtreeIndex)
-	require.Equal(t, len(ip.ParentTxHashes), len(deserialized.ParentTxHashes))
+	for _, flush := range []bool{false, true} {
+		if flush {
+			require.NoError(t, m.Flush())
+		}
+
+		deserialized, ok := m.Get(hash)
+		require.True(t, ok)
+		require.Equal(t, int16(42), deserialized.SubtreeIndex)
+		require.Equal(t, ip.GetParentTxHashes(), deserialized.GetParentTxHashes())
+		require.Equal(t, ip.GetTxInpoints(), deserialized.GetTxInpoints())
+	}
+
+	require.NoError(t, m.TakeErr())
 }
