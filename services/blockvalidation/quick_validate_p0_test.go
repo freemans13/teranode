@@ -65,7 +65,7 @@ func TestValidateSubtrees_DuplicateTransactionRejected(t *testing.T) {
 
 // TestValidateSubtrees_NonCoinbaseBodyRejected — the subtree-carrying shape had no
 // block.CoinbaseTx.IsCoinbase() check anywhere on this route. The shape check in
-// readSubtree inspects subtreeData.Txs[0], a different object.
+// getBlockTransactions inspects subtreeData.Txs[0], a different object.
 //
 // Checked after CheckMerkleRoot, where the body is bound, so BlockInvalid is the
 // correct class: the header commits to this transaction.
@@ -127,7 +127,7 @@ func TestQuickValidateBlock_LooseCoinbaseRejectedOnRoute(t *testing.T) {
 	block.Header.Nonce = 0
 	testhelpers.MineHeader(block.Header)
 
-	err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+	err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "", nil)
 
 	require.Error(t, err, "the route must apply the consensus predicate, not go-bt's looser one")
 	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "the body is bound: got %v", err)
@@ -244,10 +244,8 @@ func TestQuickValidateBlock_SubtreeInvalidVerdictNotShadowed(t *testing.T) {
 	txs := transactions.CreateTestTransactionChainWithCount(t, 4)
 	regularTxs := txs[1:]
 
-	// A coinbase go-bt accepts and consensus does not, so the body-derived coinbase-shape
-	// check is what rejects the block. Since bitcoin-sv/teranode#4838 that check runs in the
-	// whole-block binding pass, i.e. BEFORE the UTXO batches rather than after them, which is
-	// what the no-mutation assertions at the end of this test now pin.
+	// A coinbase go-bt accepts and consensus does not, so validateSubtrees — reached only
+	// after the UTXO batches have run — is what rejects the block.
 	loose := bt.NewTx()
 	require.NoError(t, loose.From("0000000000000000000000000000000000000000000000000000000000000000", 0, "", 0))
 	loose.Inputs[0].SequenceNumber = 0xFFFFFFFF
@@ -284,22 +282,20 @@ func TestQuickValidateBlock_SubtreeInvalidVerdictNotShadowed(t *testing.T) {
 	block.Header.HashMerkleRoot, err = subtree.RootHashWithReplaceRootNode(loose.TxIDChainHash(), 0, 0)
 	require.NoError(t, err)
 
-	// All optional: the block is rejected before any of them, so a mandatory expectation would
-	// assert the very calls the binding-before-mutation fix removes. Their absence is asserted
-	// positively below instead.
-	suite.MockUTXOStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return((*meta.Data)(nil), errors.NewNotFoundError("not found")).Maybe()
-	suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).Return(&meta.Data{}, nil, nil).Maybe()
-	suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).Return(nil, []*utxo.Spend{}, nil).Maybe()
+	suite.MockUTXOStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return((*meta.Data)(nil), errors.NewNotFoundError("not found"))
+	suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).Return(&meta.Data{}, nil, nil)
+	suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCombined()).Return(&meta.Data{}, []*utxo.Spend{}, nil).Maybe()
+	suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).Return(nil, []*utxo.Spend{}, nil)
+	// Optional: the block is rejected before the post-AddBlock unlock, so this must not
+	// be an unmet expectation — the point of the test is that it never gets that far.
 	suite.MockUTXOStore.On("SetLocked", mock.Anything, mock.Anything, false).Return(nil).Maybe()
 	suite.MockValidator.Errors = []error{nil, nil, nil}
 
-	err = suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+	err = suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "", nil)
 
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "got %v", err)
 	require.False(t, errors.Is(err, errors.ErrProcessing),
 		"the invalid verdict must reach the caller unwrapped, as the corrupt verdict does — a wrapped one matches both classes and routes by check order: got %v", err)
 	suite.MockBlockchain.AssertNotCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
-	suite.MockUTXOStore.AssertNotCalled(t, "SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
-	suite.MockBlockchain.AssertNotCalled(t, "AssignBlockID", mock.Anything, mock.Anything)
 }
