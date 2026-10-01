@@ -232,6 +232,16 @@ func (sm *SyncManager) reportConsumerStall(now time.Time) {
 		return
 	}
 
+	// Silence is a stall only when something is waiting. In headers-first mode
+	// the node has always asked for blocks it has not yet received, so silence
+	// there is reported whatever the snapshot holds. Outside it, at the tip,
+	// blocks arrive about every ten minutes and a quiet loop with nothing
+	// parked, queued, held or waiting is a node keeping up; reporting it every
+	// minute made the line useless.
+	if !sm.headersFirstMode.Load() && !w.hasWork() {
+		return
+	}
+
 	sm.consumerStallLoggedAt.Store(now.UnixNano())
 
 	// The header round is appended rather than folded into describe(), because
@@ -246,6 +256,15 @@ func (sm *SyncManager) reportConsumerStall(now time.Time) {
 
 	sm.logger.Warnf("[consumerWatchdog] no block admitted for %s: %s",
 		now.Sub(time.Unix(0, last)).Round(time.Second), report)
+}
+
+// hasWork reports whether the snapshot shows anything waiting to be admitted or
+// still being worked: a block in the dispatcher's frontier, parents queued for a
+// drain, blocks parked on disk, or blocks holding or waiting for the download
+// budget.
+func (w *consumerWait) hasWork() bool {
+	return len(w.frontier) > 0 || w.drainQueued > 0 || w.parked > 0 ||
+		w.downloadHeld > 0 || w.downloadWaiters > 0
 }
 
 // describe says, in one line, what the loop is waiting for and what is waiting on

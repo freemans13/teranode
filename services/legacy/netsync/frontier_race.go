@@ -441,7 +441,12 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		sm.streams.mu.Unlock()
 
 		if worth {
-			tip, _, _ := sm.committedTip()
+			// The lead is only printed for a block whose height is known, so the
+			// tip is only read for one.
+			var tip int32
+			if s.height > 0 {
+				tip, _, _ = sm.committedTip()
+			}
 
 			sm.streams.mu.Lock()
 			line, _ := s.report(now, tip)
@@ -554,10 +559,29 @@ const queueReportEvery = 6
 // one summary line how many peers are idle or below streamingPeerDepth requests, and the bytes
 // really held ahead of the chain against the disk backstop. The download is judged on that line:
 // no peer below two requests unless the backstop is reached.
+//
+// The queue lines describe the headers-first scheduler, so they are printed only in
+// headers-first mode. Above the last checkpoint blocks arrive on the inv path, which never
+// uses the scheduler, and every peer reads as idle there whatever it is doing. The
+// download-waste line counts every delivery in every mode and is always printed.
 func (sm *SyncManager) logDownloadQueues() {
 	if sm.streams == nil || sm.blockSizeTracker == nil || sm.blockDownloads == nil {
 		return
 	}
+
+	if sm.headersFirstMode.Load() {
+		sm.logSchedulerQueues()
+	}
+
+	w := &sm.waste
+	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",
+		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.streamsFailed.Load(),
+		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load())
+}
+
+// logSchedulerQueues is logDownloadQueues' per-peer lines and summary, for the headers-first
+// scheduler.
+func (sm *SyncManager) logSchedulerQueues() {
 
 	largest := sm.blockSizeTracker.largestRecentSize()
 	eligible := sm.eligibleBlockPeers()
@@ -588,9 +612,4 @@ func (sm *SyncManager) logDownloadQueues() {
 
 	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below their speed-scaled depth of up to %d requests; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
 		len(eligible), idle, short, depth, float64(sm.bytesAhead(largest))/1e9, float64(parkBackstopBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
-
-	w := &sm.waste
-	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",
-		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.streamsFailed.Load(),
-		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load())
 }

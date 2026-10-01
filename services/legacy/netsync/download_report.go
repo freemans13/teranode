@@ -42,7 +42,10 @@ func (r *streamRegistry) noteAdmission(hash chainhash.Hash, wait time.Duration, 
 
 // report is one line on this block's download, and whether it is worth logging: a download of
 // reportSlowDownload or more, an admission wait of reportSlowAdmit or more, or a raw fallback.
-// tip is the committed height when the download finished.
+// tip is the committed height when the download finished. A height of zero means the node
+// does not know the block's height, which is every block above the last checkpoint, where
+// the header cache is empty; the line then leaves the height and the lead out rather than
+// claim a block at height 0 hundreds of thousands of blocks behind the chain.
 func (s *blockStream) report(now time.Time, tip int32) (string, bool) {
 	took := now.Sub(s.start)
 	path := s.path
@@ -66,7 +69,12 @@ func (s *blockStream) report(now time.Time, tip int32) (string, bool) {
 		rate = float64(s.read.Load()) / secs / 1e6
 	}
 
-	return fmt.Sprintf("height %d, %d ahead of the chain, %.1f MB in %s at %.1f MB/s; %s; waited %s for an admission slot; %s",
-		s.height, s.height-tip, float64(s.total)/1e6, took.Round(time.Second), rate, requested,
+	where := "height not known"
+	if s.height > 0 {
+		where = fmt.Sprintf("height %d, %d ahead of the chain", s.height, s.height-tip)
+	}
+
+	return fmt.Sprintf("%s, %.1f MB in %s at %.1f MB/s; %s; waited %s for an admission slot; %s",
+		where, float64(s.total)/1e6, took.Round(time.Second), rate, requested,
 		s.admitWait.Round(time.Second), path), true
 }

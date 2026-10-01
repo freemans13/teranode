@@ -44,6 +44,7 @@ func TestReportConsumerStallStaysQuietBeforeTheThreshold(t *testing.T) {
 func TestReportConsumerStallReportsOnceAnInterval(t *testing.T) {
 	log := &captureLogger{Logger: ulogger.TestLogger{}}
 	sm := &SyncManager{logger: log}
+	sm.headersFirstMode.Store(true) // a sync in progress, where silence is always worth reporting
 
 	now := time.Now()
 
@@ -185,6 +186,7 @@ func TestConsumerStallLineIsOneLine(t *testing.T) {
 		logger:     log,
 		dispatcher: &blockDispatcher{},
 	}
+	sm.headersFirstMode.Store(true)
 
 	now := time.Now()
 
@@ -258,17 +260,17 @@ func TestConsumerWatchdog_ReportsTheHeaderCacheState(t *testing.T) {
 }
 
 // TestConsumerWatchdog_ReportsCacheStateEvenWithHeadersFirstOff pins that the
-// report is unconditional now. The old header-list summary said nothing outside
-// a headers-first round, on the reasoning that the list was not the thing
-// holding blocks up in any other state; the header cache and the committed
-// height are worth a reader's attention whatever mode the node is in, so this
-// clause is no longer gated on headersFirstMode at all.
+// header-cache clause is not gated on headersFirstMode. Outside headers-first
+// mode the watchdog reports only when something is waiting, here a read loop
+// waiting on the download budget; when it does report, the header cache and the
+// committed height are part of the line whatever mode the node is in.
 func TestConsumerWatchdog_ReportsCacheStateEvenWithHeadersFirstOff(t *testing.T) {
 	log := &captureLogger{Logger: ulogger.TestLogger{}}
 	sm := &SyncManager{logger: log}
 
 	seedStalledHeaderRound(t, sm, 800128, 12)
 	sm.headersFirstMode.Store(false)
+	sm.blockPrefetchWaiters.Store(1)
 
 	line := stallReport(t, sm, log)
 
