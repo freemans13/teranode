@@ -37,7 +37,9 @@ func TestSortSpendUpdateRows(t *testing.T) {
 
 // Design test 14: two concurrent bulk spend batches over the same outputs, in
 // opposite arrival order, must both complete; a deadlock, if Postgres still
-// picks one, is absorbed by the retry.
+// picks one, is absorbed by the retry. It proves completion only, not that the
+// sort prevents deadlocks: it passes either way, and the sort's effect shows
+// only in the "[Spend] deadlock detected" retry warnings.
 func TestSpendBatchesInOppositeOrderBothComplete(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Postgres integration test in short mode")

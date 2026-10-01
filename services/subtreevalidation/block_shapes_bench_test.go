@@ -542,9 +542,9 @@ func histogramSum(b *testing.B, name string) float64 {
 
 // labeledHistogramSum is histogramSum restricted to samples whose label has the
 // given value.
-func labeledHistogramSum(b *testing.B, name, label, value string) float64 {
+func labeledHistogramSum(tb testing.TB, name, label, value string) float64 {
 	mfs, err := prometheus.DefaultGatherer.Gather()
-	require.NoError(b, err)
+	require.NoError(tb, err)
 
 	sum := 0.0
 
@@ -618,7 +618,7 @@ func runBlockShape(b *testing.B, storeName string, shape blockShape) {
 
 		secondPassBefore := histogramSum(b, "teranode_subtreevalidation_validate_subtree")
 
-		for _, step := range []string{"precheck", "resolve", "check", "write", "fallback"} {
+		for _, step := range []string{"precheck", "resolve", "check", "check_after_reads", "write", "fallback"} {
 			stepSums[step] -= labeledHistogramSum(b, "teranode_subtreevalidation_batch_step", "step", step)
 		}
 
@@ -627,7 +627,7 @@ func runBlockShape(b *testing.B, storeName string, shape blockShape) {
 
 		checkBlockDone := time.Now()
 
-		for _, step := range []string{"precheck", "resolve", "check", "write", "fallback"} {
+		for _, step := range []string{"precheck", "resolve", "check", "check_after_reads", "write", "fallback"} {
 			stepSums[step] += labeledHistogramSum(b, "teranode_subtreevalidation_batch_step", "step", step)
 		}
 		totalCheckBlock += checkBlockDone.Sub(start)

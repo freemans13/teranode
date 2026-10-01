@@ -295,6 +295,8 @@ func (u *Server) resolveAndCheckBatch(ctx context.Context, checker validator.Blo
 	// Each transaction is sent at most once, so sends never block.
 	ready := make(chan int, len(b.missing))
 
+	checkStart := time.Now()
+
 	for range runtime.GOMAXPROCS(0) {
 		g.Go(func() error {
 			for i := range ready {
@@ -358,13 +360,19 @@ func (u *Server) resolveAndCheckBatch(ctx context.Context, checker validator.Blo
 
 	readErr := reads.Wait()
 
-	prometheusSubtreeValidationBatchStep.WithLabelValues("resolve").Observe(time.Since(start).Seconds())
+	// The resolve and check steps overlap by design, so the two observations do
+	// not add up. check_after_reads is the part of the check that no read
+	// overlaps: large when the script checks, not the parent reads, set the pace.
+	readsDone := time.Now()
+
+	prometheusSubtreeValidationBatchStep.WithLabelValues("resolve").Observe(readsDone.Sub(start).Seconds())
 
 	close(ready)
 
 	checkErr := g.Wait()
 
-	prometheusSubtreeValidationBatchStep.WithLabelValues("check").Observe(time.Since(start).Seconds())
+	prometheusSubtreeValidationBatchStep.WithLabelValues("check").Observe(time.Since(checkStart).Seconds())
+	prometheusSubtreeValidationBatchStep.WithLabelValues("check_after_reads").Observe(time.Since(readsDone).Seconds())
 
 	switch {
 	case readErr != nil && (checkErr == nil || readFailedFirst.Load()):

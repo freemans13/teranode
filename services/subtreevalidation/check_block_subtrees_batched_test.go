@@ -695,3 +695,74 @@ func TestProcessTransactionsBatched_StoreFaultIsRetryable(t *testing.T) {
 	require.Zero(t, f.store.multiCalls.Load())
 	requireAbsent(t, f, txs)
 }
+
+// slowParentStore delays every parent-output read.
+type slowParentStore struct {
+	*countingStore
+	delay time.Duration
+}
+
+func (s *slowParentStore) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, opts ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	time.Sleep(s.delay)
+
+	return s.countingStore.ParentOutputsForValidation(ctx, outpoints, opts...)
+}
+
+// slowChecker delays every script check.
+type slowChecker struct {
+	validator.BlockBatchChecker
+	delay time.Duration
+}
+
+func (s *slowChecker) CheckExtendedTransaction(ctx context.Context, tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, opts *validator.Options) error {
+	time.Sleep(s.delay)
+
+	return s.BlockBatchChecker.CheckExtendedTransaction(ctx, tx, blockHeight, utxoHeights, opts)
+}
+
+func batchStepSum(t *testing.T, step string) float64 {
+	t.Helper()
+
+	return labeledHistogramSum(t, "teranode_subtreevalidation_batch_step", "step", step)
+}
+
+// The resolve and check steps overlap, so check_after_reads, the check time
+// left once every parent read is back, is what tells slow reads from slow
+// checks: near zero when the reads set the pace, at least the check time when
+// the checks do.
+func TestProcessTransactionsBatched_StepMetricsSeparateReadsFromChecks(t *testing.T) {
+	const delay = 300 * time.Millisecond
+
+	t.Run("slow reads", func(t *testing.T) {
+		f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+		root := storedRoot(t, f, 1, opTrue)
+		tx := opTrueTx(t, 1, []*bt.Tx{root}, []uint32{0})
+
+		f.server.utxoStore = &slowParentStore{countingStore: f.store, delay: delay}
+
+		checker, ok := f.server.batchChecker(blockchain.FSMStateCATCHINGBLOCKS, batchedTestHeight)
+		require.True(t, ok)
+
+		resolveBefore, tailBefore := batchStepSum(t, "resolve"), batchStepSum(t, "check_after_reads")
+
+		require.NoError(t, f.server.processTransactionsBatched(context.Background(), checker, []*bt.Tx{tx}, chainhash.Hash{}, batchedTestHeight, 0, 0, map[uint32]bool{}))
+
+		require.GreaterOrEqual(t, batchStepSum(t, "resolve")-resolveBefore, delay.Seconds(), "resolve covers the parent reads")
+		require.Less(t, batchStepSum(t, "check_after_reads")-tailBefore, delay.Seconds(), "a fast check leaves little after the reads")
+	})
+
+	t.Run("slow checks", func(t *testing.T) {
+		f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+		root := storedRoot(t, f, 1, opTrue)
+		tx := opTrueTx(t, 1, []*bt.Tx{root}, []uint32{0})
+
+		inner, ok := f.server.batchChecker(blockchain.FSMStateCATCHINGBLOCKS, batchedTestHeight)
+		require.True(t, ok)
+
+		tailBefore := batchStepSum(t, "check_after_reads")
+
+		require.NoError(t, f.server.processTransactionsBatched(context.Background(), &slowChecker{BlockBatchChecker: inner, delay: delay}, []*bt.Tx{tx}, chainhash.Hash{}, batchedTestHeight, 0, 0, map[uint32]bool{}))
+
+		require.GreaterOrEqual(t, batchStepSum(t, "check_after_reads")-tailBefore, delay.Seconds(), "a slow check shows after the reads")
+	})
+}
