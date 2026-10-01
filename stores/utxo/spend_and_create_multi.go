@@ -127,40 +127,16 @@ type SpendAndCreateMultiStore interface {
 // and transactions never reached are MultiTxNotAttempted.
 func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore, concurrency int, txs []*bt.Tx,
 	blockHeight uint32, opts ...CreateOption) ([]SpendAndCreateMultiResult, error) {
-	options, err := ParseCreateOptions(opts...)
+	list, err := PrepareSpendAndCreateMulti(txs, opts...)
 	if err != nil {
-		return nil, newSpendAndCreateMultiRefusedError("%v", err)
-	}
-
-	if options.TxID != nil {
-		return nil, newSpendAndCreateMultiRefusedError("WithTXID describes one transaction; use WithTXIDs")
-	}
-
-	if options.IsCoinbase != nil {
-		return nil, newSpendAndCreateMultiRefusedError("WithSetCoinbase describes one transaction; a coinbase never belongs in a list")
-	}
-
-	if options.TxIDs != nil && len(options.TxIDs) != len(txs) {
-		return nil, newSpendAndCreateMultiRefusedError("WithTXIDs has %d txids for %d transactions", len(options.TxIDs), len(txs))
+		return nil, err
 	}
 
 	if len(txs) == 0 {
 		return []SpendAndCreateMultiResult{}, nil
 	}
 
-	txids := options.TxIDs
-	if txids == nil {
-		txids = make([]chainhash.Hash, len(txs))
-		for i, tx := range txs {
-			txids[i] = *tx.TxIDChainHash()
-		}
-	}
-
-	// parentsInList[i] holds the positions of tx i's parents that are in the list.
-	parentsInList, err := checkSpendAndCreateMultiList(txs, txids)
-	if err != nil {
-		return nil, err
-	}
+	txids, parentsInList := list.TxIDs, list.ParentsInList
 
 	results := make([]SpendAndCreateMultiResult, len(txs))
 
@@ -230,6 +206,62 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 	}
 
 	return results, nil
+}
+
+// SpendAndCreateMultiList is a list SpendAndCreateMulti has accepted: its
+// parsed options, every transaction's txid, and for each transaction the
+// positions of its parents earlier in the list.
+type SpendAndCreateMultiList struct {
+	Options       *CreateOptions
+	TxIDs         []chainhash.Hash
+	ParentsInList [][]int
+}
+
+// PrepareSpendAndCreateMulti runs SpendAndCreateMulti's refusal checks with
+// nothing written, and returns what a store needs to write the list. A store
+// with its own SpendAndCreateMulti calls it first so it refuses exactly the lists
+// DefaultSpendAndCreateMulti refuses. An empty list is accepted and gives an
+// empty SpendAndCreateMultiList.
+func PrepareSpendAndCreateMulti(txs []*bt.Tx, opts ...CreateOption) (*SpendAndCreateMultiList, error) {
+	options, err := ParseCreateOptions(opts...)
+	if err != nil {
+		return nil, newSpendAndCreateMultiRefusedError("%v", err)
+	}
+
+	if options.TxID != nil {
+		return nil, newSpendAndCreateMultiRefusedError("WithTXID describes one transaction; use WithTXIDs")
+	}
+
+	if options.IsCoinbase != nil {
+		return nil, newSpendAndCreateMultiRefusedError("WithSetCoinbase describes one transaction; a coinbase never belongs in a list")
+	}
+
+	if options.TxIDs != nil && len(options.TxIDs) != len(txs) {
+		return nil, newSpendAndCreateMultiRefusedError("WithTXIDs has %d txids for %d transactions", len(options.TxIDs), len(txs))
+	}
+
+	if len(txs) == 0 {
+		return &SpendAndCreateMultiList{Options: options}, nil
+	}
+
+	txids := options.TxIDs
+	if txids == nil {
+		txids = make([]chainhash.Hash, len(txs))
+		for i, tx := range txs {
+			if tx == nil {
+				return nil, newSpendAndCreateMultiRefusedError("transaction %d is nil", i)
+			}
+
+			txids[i] = *tx.TxIDChainHash()
+		}
+	}
+
+	parentsInList, err := checkSpendAndCreateMultiList(txs, txids)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SpendAndCreateMultiList{Options: options, TxIDs: txids, ParentsInList: parentsInList}, nil
 }
 
 func failedParent(results []SpendAndCreateMultiResult, parents []int) bool {
