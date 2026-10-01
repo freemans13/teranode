@@ -100,6 +100,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	}
 
 	txHashes := make([]chainhash.Hash, len(allTransactions))
+	position := make(map[chainhash.Hash]int, len(allTransactions))
 
 	for i, tx := range allTransactions {
 		if tx == nil {
@@ -107,6 +108,17 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 		}
 
 		txHashes[i] = *tx.TxIDChainHash()
+
+		// A transaction twice in the batch is a CVE-2012-2459 duplicate-last
+		// mutation: it keeps the subtree root, so checkBlockBodyBound cannot see
+		// it. Classify it as ValidateSubtreeInternal does, corrupt rather than
+		// invalid, before its repeated spends read as a double spend and condemn
+		// an honest block hash.
+		if first, dup := position[txHashes[i]]; dup {
+			return errors.NewBlockCorruptError("[processTransactionsBatched] duplicate transaction %s at indexes %d and %d", txHashes[i], first, i)
+		}
+
+		position[txHashes[i]] = i
 	}
 
 	// Pre-check, as the level path does: drop what is already validated.
@@ -134,7 +146,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	b := &batchState{
 		txs:      allTransactions,
 		hashes:   txHashes,
-		position: make(map[chainhash.Hash]int, len(allTransactions)),
+		position: position,
 		heights:  make([][]uint32, len(allTransactions)),
 		parents:  make([][]int, len(allTransactions)),
 		fallback: make([]bool, len(allTransactions)),
@@ -142,10 +154,11 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 
 	for i, tx := range allTransactions {
 		if tx.IsCoinbase() {
+			// The coinbase that arrives with the subtree data is never a parent.
+			delete(b.position, txHashes[i])
+
 			continue
 		}
-
-		b.position[txHashes[i]] = i
 
 		if !txMetaSlice[i].isSet {
 			b.missing = append(b.missing, i)
@@ -164,7 +177,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	)
 
 	if err = u.validatorClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
-		return errors.NewProcessingError("[processTransactionsBatched] failed to pre-load MTP store: %v", err)
+		return errors.NewProcessingError("[processTransactionsBatched] failed to pre-load MTP store", err)
 	}
 
 	if err = u.resolveAndCheckBatch(ctx, checker, b, blockHeight, validatorOptions); err != nil {

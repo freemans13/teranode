@@ -215,9 +215,26 @@ func chainedTxs(t *testing.T, roots []*bt.Tx, levels int) []*bt.Tx {
 func storeBlock(t *testing.T, f *batchedFixture, txs []*bt.Tx, doctor bool) *model.Block {
 	t.Helper()
 
+	return storeBlockBody(t, f, txs, doctor, false)
+}
+
+// storeBlockBody is storeBlock that, when dupLast is set, stores a
+// CVE-2012-2459 duplicate-last mutation of the subtree under the honest
+// subtree's hash: the node list and subtree data carry the last transaction
+// twice, and the root, so the header's merkle root, is unchanged. That needs
+// an odd node count (coinbase placeholder included), so len(txs) must be even.
+func storeBlockBody(t *testing.T, f *batchedFixture, txs []*bt.Tx, doctor, dupLast bool) *model.Block {
+	t.Helper()
+
 	ctx := context.Background()
 
-	st, err := subtreepkg.NewTreeByLeafCount(nextPow2(len(txs) + 1))
+	leaves := nextPow2(len(txs) + 1)
+	if dupLast {
+		require.Zero(t, len(txs)%2, "a duplicate-last mutation keeps the root only over an odd node count")
+		leaves = nextPow2(len(txs) + 2)
+	}
+
+	st, err := subtreepkg.NewTreeByLeafCount(leaves)
 	require.NoError(t, err)
 	require.NoError(t, st.AddCoinbaseNode())
 
@@ -229,6 +246,14 @@ func storeBlock(t *testing.T, f *batchedFixture, txs []*bt.Tx, doctor bool) *mod
 	}
 
 	subtreeHash := *st.RootHash()
+
+	if dupLast {
+		last := txs[len(txs)-1]
+		require.NoError(t, st.AddNode(*last.TxIDChainHash(), 100, uint64(last.Size()))) //nolint:gosec
+		data = append(data, last.Bytes()...)
+
+		require.Equal(t, subtreeHash, *st.RootHash(), "the mutation must keep the subtree root")
+	}
 
 	stBytes, err := st.Serialize()
 	require.NoError(t, err)
@@ -377,6 +402,40 @@ func TestCheckBlockSubtreesBatched_DoctoredBodyWritesNothing(t *testing.T) {
 	requireAbsent(t, f, txs)
 
 	require.NoError(t, checkBlock(t, f, storeBlock(t, f, txs, false)))
+	requireCreatedUnmined(t, f, txs)
+}
+
+// A CVE-2012-2459 duplicate-last mutation keeps the subtree root, so it passes
+// the body-binding check. Its repeated transaction must make the block corrupt,
+// as ValidateSubtreeInternal's duplicate scan does on the level path, never
+// invalid: an invalid verdict would condemn an honest block hash. Nothing is
+// written, and the honest body then goes through.
+func TestCheckBlockSubtreesBatched_DuplicateLastMutationIsCorrupt(t *testing.T) {
+	f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+
+	root := storedRoot(t, f, 1, opTrue)
+	a := opTrueTx(t, 1, []*bt.Tx{root}, []uint32{0})
+	b := opTrueTx(t, 2, []*bt.Tx{a}, []uint32{0})
+	txs := []*bt.Tx{a, b}
+
+	mutated := storeBlockBody(t, f, txs, false, true)
+
+	err := checkBlock(t, f, mutated)
+	require.Error(t, err)
+	require.True(t, errors.IsBlockCorrupt(err), "a duplicate-last mutation is corrupt, got %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "a duplicate-last mutation must never mark the block invalid, got %v", err)
+	require.Zero(t, f.store.multiCalls.Load())
+	requireAbsent(t, f, txs)
+
+	// The mutated files sit under the honest subtree hash; drop them so the
+	// honest body can be stored in their place, as a re-download would.
+	for _, fileType := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData} {
+		require.NoError(t, f.server.subtreeStore.Del(context.Background(), mutated.Subtrees[0][:], fileType))
+	}
+
+	honest := storeBlock(t, f, txs, false)
+	require.Equal(t, mutated.Header.HashMerkleRoot, honest.Header.HashMerkleRoot, "the mutation keeps the header's merkle root")
+	require.NoError(t, checkBlock(t, f, honest))
 	requireCreatedUnmined(t, f, txs)
 }
 
