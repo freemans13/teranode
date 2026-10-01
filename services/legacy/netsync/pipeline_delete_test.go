@@ -314,7 +314,8 @@ func TestPipelineBlockDelete_LogsARealReadFailureInsteadOfSwallowingIt(t *testin
 // The concrete shape, per the review: peer A delivers a block, it converts
 // and parks (still waiting on its own parent — genuine, needed). Ownership is
 // released at intake, so the same hash is immediately re-requestable, and the
-// streaming gate accepts any hash asked for within the last hour. Peer B then
+// streaming gate accepts any hash the download ledger still holds a request
+// for. Peer B then
 // delivers the SAME hash and its own body ends short, so B's own sink call
 // returns converted=false; the wire layer's orphan-delete callback still runs
 // for B's failed delivery, with the hash B claimed to be delivering — which is
