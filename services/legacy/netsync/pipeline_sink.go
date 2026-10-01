@@ -367,7 +367,7 @@ func (sm *SyncManager) pipelineParentHeight(parent chainhash.Hash) (uint32, bool
 	}
 
 	_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &parent)
-	if err != nil {
+	if err != nil || meta == nil {
 		return 0, false
 	}
 
