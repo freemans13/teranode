@@ -105,6 +105,20 @@ var (
 		blob:   parkBlobKeep,
 	}
 
+	// parkDispositionParentNotMinedYet — the parent is in the chain and valid,
+	// but block validation has not yet set its mined flag, and
+	// waitForPreviousBlockMined ran out of retries waiting for it (about 80 s
+	// with the default blockvalidation_isParentMined_retry_* settings). That is
+	// our own pipeline being slow, not anything wrong with this block or its
+	// peer: the same block commits on the next attempt once the flag is set.
+	// Keep the blob, write nothing off, blame nobody. The sweep resubmits it.
+	// Its own log line, because "the mined flag is late" points an operator at
+	// setTxMined, where a busy store or a reorg would not.
+	parkDispositionParentNotMinedYet = parkDisposition{
+		reason: "its parent is not marked mined yet",
+		blob:   parkBlobKeep,
+	}
+
 	// parkDispositionBlobUnusable — the blob is gone, or will not decode, or
 	// decodes into some other block. That is evidence about the file and not
 	// about the peer: we wrote it, so a bad blob is our fault. Delete it; the
@@ -209,6 +223,15 @@ func parkCommitFailure(err error) parkDisposition {
 	switch {
 	case errors.Is(err, errors.ErrBlockNotFound):
 		return parkDispositionParentGone
+
+	case errors.Is(err, errors.ErrBlockParentNotMined):
+		// waitForPreviousBlockMined giving up. Before the default arm, which
+		// read it as a rejection and threw away a block that commits on the
+		// next try (20 times on mainnet between 2026-09-28 and 2026-10-01).
+		// The only other producer, UpdateTxMinedStatus's "already being
+		// processed", is swallowed by block validation's setTxMined and never
+		// reaches here; if it ever did, keeping the block would still be right.
+		return parkDispositionParentNotMinedYet
 
 	case errors.IsContextError(err), errors.IsTransientLocalError(err):
 		return parkDispositionRetryLater
