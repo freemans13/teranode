@@ -177,6 +177,15 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		}
 	}
 
+	// Before the record is written: a body the wire layer would refuse afterwards must not be
+	// reported as converted, or pipelineBlockDelete removes what is under this hash, which may be a
+	// parked copy of the same block that this conversion has just overwritten.
+	if err = stream.RequireEnd(); err != nil {
+		sm.deleteWrittenOnFailure(hash, writer)
+
+		return false, err
+	}
+
 	if !root.IsEqual(&header.MerkleRoot) {
 		sm.deleteWrittenOnFailure(hash, writer)
 
@@ -298,6 +307,15 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // all. The guard is left in as defence in depth against that positivity
 // clause moving later, matching subtreeWriter's own belt-and-braces choice,
 // not because removing it would delete the wrong file today.
+//
+// That guarantee has one hole, and pipelineBlockSink closes it rather than this
+// function. The record is written with overwrite allowed, so a redelivery of a
+// block already parked converts, overwrites the parked record with an identical
+// one, and reports converted. If the wire layer then refused it, this function
+// would delete the parked block's record and every subtree file it names. The
+// only refusal left after a successful sink was a body with declared bytes after
+// its last transaction, and the sink now refuses that itself
+// (blockTxStream.RequireEnd) before writing the record.
 //
 // The converted record itself is deleted by blockPark.Delete, which every path
 // that retires a park entry goes through, not only this discard path.

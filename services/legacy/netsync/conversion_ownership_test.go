@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/file"
@@ -143,4 +144,57 @@ func TestADuplicateConvertsWhenTheCopyItTookOverFromFails(t *testing.T) {
 	_, err = sm.blockPark.ReadConverted(ctx, hash)
 	require.NoError(t, err)
 	requireNoSideFiles(t, sm.blockPark.dir)
+}
+
+// A redelivery of a parked block that converts cleanly and is then refused by the wire layer must
+// not take the parked block with it. The wire layer refuses a body that left declared bytes
+// unread after the sink succeeded (readBlockMessage's short-body check), and a peer can cause
+// that by appending bytes after the last transaction. The redelivery's conversion overwrites the
+// parked record with an identical one, so "this delivery converted" does not mean "this delivery
+// owns what is under the hash".
+func TestARefusedRedeliveryKeepsTheParkedBlock(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+
+	blk := wireBlockWithTxs(t, 40, false)
+	pipelineHeaderFixture(t, sm, blk)
+	proveBlockOrigin(t, sm, blk)
+
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+	header := &blk.MsgBlock().Header
+
+	converted, err := sm.pipelineBlockSink(hash, header, bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err)
+	require.True(t, converted)
+	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hash, prevBlock: header.PrevBlock, wireSize: int64(len(body))}))
+
+	record, err := sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err)
+
+	// The same body with junk after it, more than the stream's read-ahead buffer can swallow.
+	padded := append(append([]byte(nil), body...), make([]byte, 4<<20)...)
+	lr := &io.LimitedReader{R: bytes.NewReader(padded), N: int64(len(padded))}
+
+	converted, err = sm.pipelineBlockSink(hash, header, lr, int64(len(padded)))
+	require.Error(t, err, "the sink refuses a body that does not end at its last transaction")
+	require.True(t, errors.IsBlockCorrupt(err), "corrupt, not invalid: the block itself is fine")
+	require.False(t, converted, "so the wire layer's cleanup has nothing to remove")
+
+	// What readBlockMessage does with a sink failure.
+	require.NoError(t, sm.pipelineBlockDelete(hash, converted))
+
+	require.True(t, sm.blockPark.Has(hash), "the parked block is still parked")
+
+	_, err = sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err, "the parked block's record survives")
+
+	for _, h := range record.Subtrees {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+			exists, err := store.Exists(ctx, h[:], ft)
+			require.NoError(t, err)
+			require.True(t, exists, "the refused redelivery removed the parked block's %s file for subtree %s", ft, h)
+		}
+	}
 }

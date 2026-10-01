@@ -174,6 +174,29 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 	return tx, hash, size, nil
 }
 
+// RequireEnd fails unless the body ends after the last declared transaction. The reader is
+// bounded by the peer's declared payload length, so bytes left here are bytes the peer declared
+// and the transactions did not account for.
+//
+// The wire layer refuses such a body too, but only after the sink has reported success, and
+// through a check this stream's read-ahead buffer can hide (readBlockMessage,
+// services/legacy/peer/wire_streaming.go). By then the converted record is written, possibly over
+// a parked copy of the same block, and the refusal's cleanup takes that parked copy with it.
+func (s *blockTxStream) RequireEnd() error {
+	_, err := s.r.ReadByte()
+
+	switch {
+	case err == nil:
+		// Corrupt, not invalid: the transactions matched the header, so the bytes after them say
+		// nothing about the block, only about this delivery of it.
+		return errors.NewBlockCorruptError("[blockTxStream] body carries bytes after its %d declared transactions", s.txCount)
+	case err == io.EOF:
+		return nil
+	default:
+		return errors.NewBlockCorruptError("[blockTxStream] failed reading past the last of the %d declared transactions", s.txCount, err)
+	}
+}
+
 // errRecordingWriter remembers the first error its writer returned, so a failed write can be told
 // apart from a failed read.
 type errRecordingWriter struct {
