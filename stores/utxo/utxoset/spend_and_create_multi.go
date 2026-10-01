@@ -32,16 +32,19 @@ import (
 //     commits, so a failed transaction never leaves a spend behind. Its descendants in the list
 //     are then failed too, and any of their spends a parallel chunk already committed are
 //     restored through Unspend. That is the rare path: it needs a double spend in a block.
-//  2. Create the survivors, level by level, each level in chunks. A parent's chunk writes its
-//     identity, its body, the UTXOs nobody in the list spends, and one spend-journal row for
-//     each output a child in the list spends. The child's own chunk writes only the child.
+//  2. Create the survivors in dependency-level order. A parent's chunk writes its identity, its
+//     body, the UTXOs nobody in the list spends, and one spend-journal row for each output a
+//     child in the list spends. The child's chunk writes only the child. Consecutive narrow
+//     levels share one chunk transaction, so a deep chain does not pay a commit per level; a
+//     level too wide for one chunk is split and its chunks run in parallel. See createLevels.
 //
 // That order is what makes a crash at any point safe to repeat. Every transaction that exists
 // has made all of its spends: its outside spends committed in step 1, before any create, and
-// its spends of list parents committed with those parents, which are at an earlier level. On the
-// repeat the caller's pre-check drops every transaction that exists, and every remaining input
-// is either an outside spend repeated by the same spender, or a spend-journal row naming the
-// same spender, and the spend path accepts both as the same spend.
+// its spends of list parents committed with those parents, which are at an earlier level and so
+// in an earlier commit or the same one. On the repeat the caller's pre-check drops every
+// transaction that exists, and every remaining input is either an outside spend repeated by the
+// same spender, or a spend-journal row naming the same spender, and the spend path accepts both
+// as the same spend.
 //
 // It does NOT net, and hands the list to the per-transaction default instead, for a list whose
 // options the netted write does not model: create-only or spend-only, frozen, conflicting or
@@ -99,9 +102,15 @@ var multiSpendChunkInputs = 8192
 // most about 2,000. A variable so a test can force one transaction per chunk.
 var multiCreateChunkTxs = 256
 
-// multiFault is a test hook called after step 1 and after each level of step 2. An error from
-// it stops the write there, as a crash would. nil in production.
+// multiFault is a test hook called after step 1, as "spent", and after each commit unit of step
+// 2, as "created group N" with N counting from 0: a group of merged levels, or one level split
+// into parallel chunks. An error from it stops the write there, as a crash would. nil in
+// production.
 var multiFault func(stage string) error
+
+// multiCreateCommitted is a test hook called with the transaction count of each step-2 chunk
+// transaction that commits. nil in production.
+var multiCreateCommitted func(txs int)
 
 // multiConcurrency is how many chunk transactions run at once. Each holds one pool connection
 // and takes no second one, so at most half the pool, leaving the rest of the node its share,
@@ -505,6 +514,24 @@ func newNettedKey(txid []byte, ukey [16]byte) nettedKey {
 }
 
 // createLevels is step 2.
+//
+// Levels are written in order, and the cost it is shaped around is the commit. A deep chain is
+// one transaction per level, and a commit per level is ~3 ms; mainnet block 955958 has 1,055
+// transactions in 592 levels and spent 4.4 s here when every level committed alone, against
+// ~0.6 s for a flat block of the same size. So consecutive levels are gathered into one pending
+// group while it stays within multiCreateChunkTxs transactions and spendAndCreateBatchByteBudget
+// bytes, the same bounds one chunk has, and the group is written as one chunk transaction. A
+// level that would push the group past either bound flushes the group first and starts the
+// next. A level that alone exceeds a bound is written as before: split into chunks that run
+// multiConcurrency at a time, all of them committed before the next level starts.
+//
+// Merging keeps the crash argument intact. A merged group commits a parent's netted journal rows
+// and the identity of the child that spends them in the same database transaction, and groups
+// commit in level order, so every transaction that exists still has all of its spends. A parent
+// in a group that turns out to exist already (errNettedParentExists) rolls the whole group back:
+// none of its members gets a result, so finishPerTransaction, which takes every live transaction
+// still MultiTxNotAttempted, hands the group and everything after it to the per-transaction
+// default. Results are only set after a commit, so a rolled-back group leaves none behind.
 func (w *nettedWrite) createLevels(ctx context.Context) error {
 	spender := make(map[nettedKey][]byte)
 	level := make([]int, len(w.items))
@@ -533,10 +560,12 @@ func (w *nettedWrite) createLevels(ctx context.Context) error {
 	}
 
 	byLevel := make([][]*multiTx, maxLevel+1)
+	sizes := make(map[*multiTx]int, len(w.items))
 
 	for i, it := range w.items {
 		if !it.dead() {
 			byLevel[level[i]] = append(byLevel[level[i]], it)
+			sizes[it] = it.tx.Size()
 		}
 	}
 
@@ -556,45 +585,108 @@ func (w *nettedWrite) createLevels(ctx context.Context) error {
 		}
 	}
 
-	for lvl, members := range byLevel {
+	var (
+		pending      []*multiTx
+		pendingBytes int
+		group        int
+	)
+
+	// committed runs the fault hook after one commit unit and counts it.
+	committed := func() error {
+		stage := "created group " + strconv.Itoa(group)
+		group++
+
+		if multiFault != nil {
+			return multiFault(stage)
+		}
+
+		return nil
+	}
+
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+
+		if err := w.createChunk(ctx, pending, spender); err != nil {
+			return err
+		}
+
+		pending, pendingBytes = nil, 0
+
+		return committed()
+	}
+
+	for _, members := range byLevel {
+		if len(members) == 0 {
+			continue
+		}
+
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		g, gCtx := errgroup.WithContext(ctx)
-		g.SetLimit(w.s.multiConcurrency())
+		levelBytes := 0
+		for _, it := range members {
+			levelBytes += sizes[it]
+		}
 
-		start, size := 0, 0
-
-		for i, it := range members {
-			txSize := it.tx.Size()
-
-			if i > start && (size+txSize > spendAndCreateBatchByteBudget || i-start >= multiCreateChunkTxs) {
-				chunk := members[start:i]
-				g.Go(func() error { return w.createChunk(gCtx, chunk, spender) })
-				start, size = i, 0
+		if len(members) > multiCreateChunkTxs || levelBytes > spendAndCreateBatchByteBudget {
+			if err := flush(); err != nil {
+				return err
 			}
 
-			size += txSize
+			if err := w.createSplitLevel(ctx, members, sizes, spender); err != nil {
+				return err
+			}
+
+			if err := committed(); err != nil {
+				return err
+			}
+
+			continue
 		}
 
-		if start < len(members) {
-			chunk := members[start:]
-			g.Go(func() error { return w.createChunk(gCtx, chunk, spender) })
-		}
-
-		if err := g.Wait(); err != nil {
-			return err
-		}
-
-		if multiFault != nil {
-			if err := multiFault("created level " + strconv.Itoa(lvl)); err != nil {
+		if len(pending)+len(members) > multiCreateChunkTxs || pendingBytes+levelBytes > spendAndCreateBatchByteBudget {
+			if err := flush(); err != nil {
 				return err
 			}
 		}
+
+		pending = append(pending, members...)
+		pendingBytes += levelBytes
 	}
 
-	return nil
+	return flush()
+}
+
+// createSplitLevel writes one level too wide for a single chunk: cut into chunks by the chunk
+// bounds, multiConcurrency in flight, and every one committed before it returns.
+func (w *nettedWrite) createSplitLevel(ctx context.Context, members []*multiTx, sizes map[*multiTx]int,
+	spender map[nettedKey][]byte) error {
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(w.s.multiConcurrency())
+
+	start, size := 0, 0
+
+	for i, it := range members {
+		txSize := sizes[it]
+
+		if i > start && (size+txSize > spendAndCreateBatchByteBudget || i-start >= multiCreateChunkTxs) {
+			chunk := members[start:i]
+			g.Go(func() error { return w.createChunk(gCtx, chunk, spender) })
+			start, size = i, 0
+		}
+
+		size += txSize
+	}
+
+	if start < len(members) {
+		chunk := members[start:]
+		g.Go(func() error { return w.createChunk(gCtx, chunk, spender) })
+	}
+
+	return g.Wait()
 }
 
 // nettedRows is a plan's spend-journal rows for the outputs the list spends.
@@ -675,9 +767,10 @@ SELECT $1::int, j.satoshis, j.created_height, j.spendable_from, j.flags,
     AS j(satoshis, created_height, spendable_from, flags, mined_height, block_id,
          ukey, txid, spending_txid, script)`
 
-// createChunk creates one chunk of one level in one database transaction: the claims, the
-// bodies and surviving UTXOs, and the spend-journal rows of the netted ones. Results are set
-// only after the commit.
+// createChunk creates one chunk in one database transaction: the claims, the bodies and
+// surviving UTXOs, and the spend-journal rows of the netted ones. The chunk is part of one level
+// or several whole consecutive levels, parents before children. Results are set only after the
+// commit.
 func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender map[nettedKey][]byte) error {
 	items := make([]*createItem, len(chunk))
 	for k, it := range chunk {
@@ -740,6 +833,10 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 	}
 
 	committed = true
+
+	if multiCreateCommitted != nil {
+		multiCreateCommitted(len(chunk))
+	}
 
 	for k, it := range chunk {
 		if existed[k] {
