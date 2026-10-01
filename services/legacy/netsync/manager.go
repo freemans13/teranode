@@ -2726,6 +2726,15 @@ func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 			return true, nil
 		}
 
+		// A block the dispatcher has taken off the park to validate is in neither the
+		// park nor the chain until it commits, and above the last checkpoint every
+		// block passes through that gap while peers are still announcing it. Answering
+		// "not held" there fetched it again in full: on mainnet from 2026-09-28 about
+		// one block in twelve was downloaded and converted twice.
+		if sm.dispatcher.inFlight(invVect.Hash) {
+			return true, nil
+		}
+
 		// single round-trip: GetBlockHeader tells us both existence and validity
 		_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &invVect.Hash)
 		if err != nil {

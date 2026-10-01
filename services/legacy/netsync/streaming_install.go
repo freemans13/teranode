@@ -509,6 +509,22 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	sm.logger.Infof("[blockOnDisk][%s] body streamed to disk, %d bytes, %d txs, parent %s",
 		entry.hash, entry.size, msg.body.TxCount, entry.prevBlock)
 
+	// A copy of a block the dispatcher is validating right now is a duplicate even
+	// though the park no longer holds the first copy: the dispatcher took it out to
+	// validate it. Parking this one would give the block a second entry, dispatched
+	// after the first copy commits and deletes the shared record, which then finds
+	// nothing. Deleting it would take the record the first copy may still be reading,
+	// so it is only counted.
+	if sm.dispatcher.inFlight(entry.hash) {
+		if msg.body.Converted {
+			sm.waste.dupConverted.Add(1)
+		}
+
+		sm.logger.Infof("[blockOnDisk][%s] a duplicate copy from %s arrived while the block is being validated; not parked", entry.hash, msg.peer)
+
+		return
+	}
+
 	if !sm.blockPark.AdoptWritten(entry) {
 		// Either we already hold this block, in which case the body on disk is
 		// the one the existing entry points at and there is nothing to do, or
