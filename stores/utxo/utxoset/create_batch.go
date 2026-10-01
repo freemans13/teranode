@@ -454,6 +454,7 @@ func (p *createPlan) sortRows() {
 	p.heights = permute(p.heights, order)
 	p.offChain = permute(p.offChain, order)
 	p.sizes = permute(p.sizes, order)
+	p.fees = permute(p.fees, order)
 	p.inpoints = permute(p.inpoints, order)
 	p.locktimes = permute(p.locktimes, order)
 	p.createdAt = permute(p.createdAt, order)
