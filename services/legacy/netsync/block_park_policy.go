@@ -228,9 +228,15 @@ func parkCommitFailure(err error) parkDisposition {
 		// waitForPreviousBlockMined giving up. Before the default arm, which
 		// read it as a rejection and threw away a block that commits on the
 		// next try (20 times on mainnet between 2026-09-28 and 2026-10-01).
-		// The only other producer, UpdateTxMinedStatus's "already being
-		// processed", is swallowed by block validation's setTxMined and never
-		// reaches here; if it ever did, keeping the block would still be right.
+		// Four places raise this code, and only this one reaches the park with
+		// the code intact. UpdateTxMinedStatus's "already being processed" is
+		// swallowed by block validation's setTxMined. Block validation's own
+		// waitForPreviousBlocksToBeProcessed is replaced by an unwrapped block
+		// error before it returns. Block assembly's waitForBlockMinedSet stays
+		// inside its Reset. None of them says anything about the child, so a
+		// change that let one through would still be right to keep the block;
+		// but a change that wrapped a genuine rejection in this code would move
+		// it here, so keep this list current when touching those call sites.
 		return parkDispositionParentNotMinedYet
 
 	case errors.IsContextError(err), errors.IsTransientLocalError(err):
