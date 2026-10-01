@@ -605,3 +605,108 @@ func TestSpendAndCreateMultiByteBudgetClosesAGroup(t *testing.T) {
 	require.Equal(t, wantRecs, recordsOf(t, s, w))
 	require.Equal(t, wantRoots, w.RootSpends(t, s))
 }
+
+// buildNarrowThenWide builds the shape a mainnet block has: a chain of narrow levels, then one
+// level of wide transactions, then one narrow level after it. The last chain transaction carries
+// wide extra outputs; wide child j spends its output j+1, and a tail transaction spends output 0
+// of the first wide child.
+func buildNarrowThenWide(t *testing.T, seed byte, narrow, wide int) *tests.MultiWorkload {
+	t.Helper()
+
+	w := buildChain(t, seed, narrow, map[int]int{narrow - 1: wide})
+	last := w.Txs[narrow-1]
+
+	children := make([]*bt.Tx, wide)
+
+	for j := 0; j < wide; j++ {
+		children[j] = payFrom(t, uint32(seed)<<24|0x10000|uint32(j), []*bt.Tx{last}, []uint32{uint32(j + 1)}) //nolint:gosec // test data
+	}
+
+	w.Txs = append(w.Txs, children...)
+	w.Txs = append(w.Txs, payFrom(t, uint32(seed)<<24|0x20000, []*bt.Tx{children[0]}, []uint32{0})) //nolint:gosec // test data
+
+	return w
+}
+
+// Narrow levels gathered into a pending group are flushed before a level wider than the chunk
+// bound is split, so the parents commit before the children that spend them. With a chunk bound
+// of 2, three narrow levels, a level of five and one narrow level after it, the commits are the
+// group of the first two levels, the group of the third, the three chunks of the wide level in
+// any order, and the tail. A crash after any of those commit units repeats through the caller's
+// pre-check to the records of a clean run.
+func TestSpendAndCreateMultiFlushesPendingBeforeASplitLevel(t *testing.T) {
+	const (
+		height = 1500
+		narrow = 3
+		wide   = 5
+	)
+
+	old := multiCreateChunkTxs
+	multiCreateChunkTxs = 2
+
+	t.Cleanup(func() { multiCreateChunkTxs = old })
+
+	t.Run("commit order", func(t *testing.T) {
+		s, ctx := newUncheckpointedStore(t)
+
+		wantRecs, wantRoots := perTxReference(t, s, buildNarrowThenWide(t, 0xf0, narrow, wide), height)
+
+		w := buildNarrowThenWide(t, 0xf1, narrow, wide)
+		w.StoreRoots(t, s, height-1)
+
+		commits := countCreateCommits(t)
+
+		results, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
+		require.NoError(t, err)
+
+		for i, r := range results {
+			require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+		}
+
+		got := commits()
+		require.Len(t, got, 6)
+		require.Equal(t, []int{2, 1}, got[:2], "the pending narrow levels commit before the split level")
+		require.ElementsMatch(t, []int{2, 2, 1}, got[2:5])
+		require.Equal(t, 1, got[5])
+		require.Equal(t, wantRecs, recordsOf(t, s, w))
+		require.Equal(t, wantRoots, w.RootSpends(t, s))
+	})
+
+	for gi, stage := range []string{"spent", "created group 0", "created group 1", "created group 2", "created group 3"} {
+		t.Run("crash after "+stage, func(t *testing.T) {
+			s, ctx := newUncheckpointedStore(t)
+
+			wantRecs, wantRoots := perTxReference(t, s, buildNarrowThenWide(t, byte(0xf2+2*gi), narrow, wide), height) //nolint:gosec // test data
+
+			w := buildNarrowThenWide(t, byte(0xf3+2*gi), narrow, wide) //nolint:gosec // test data
+			w.StoreRoots(t, s, height-1)
+
+			crash := errors.NewProcessingError("injected crash")
+			multiFault = func(at string) error {
+				if at == stage {
+					return crash
+				}
+
+				return nil
+			}
+
+			_, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
+			multiFault = nil
+			require.ErrorIs(t, err, crash)
+
+			remaining := missingTxs(t, s, w.Txs)
+
+			if len(remaining) > 0 {
+				results, err := s.SpendAndCreateMulti(ctx, remaining, height, utxo.WithIgnoreLocked(true))
+				require.NoError(t, err)
+
+				for i, r := range results {
+					require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d of the repeat: %v", i, r.Err)
+				}
+			}
+
+			require.Equal(t, wantRecs, recordsOf(t, s, w))
+			require.Equal(t, wantRoots, w.RootSpends(t, s))
+		})
+	}
+}
