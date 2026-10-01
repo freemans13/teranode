@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/stretchr/testify/mock"
@@ -176,4 +177,96 @@ func TestSyncManager_AParkedBlockSurvivesATransientCommitFailure(t *testing.T) {
 	require.NoError(t, h.deliver(t, 0))
 
 	h.requireStillParked(t, child, parkedBytes)
+}
+
+// TestParkCommitFailure_AParentNotYetMarkedMinedKeepsTheBlock pins the row for a
+// parent that is in the chain and valid but whose setTxMined has not finished.
+// waitForPreviousBlockMined gives up with ErrBlockParentNotMined after about
+// 80 s with the default retry settings, and that says nothing about the child:
+// the same block commits on the next attempt once the parent is marked. Reading
+// it as a rejection threw away a downloaded block, wrote it off in
+// recentlyFailedBlocks and downloaded it again, 20 times on mainnet since
+// 2026-09-28.
+func TestParkCommitFailure_AParentNotYetMarkedMinedKeepsTheBlock(t *testing.T) {
+	parent := chainhash.HashH([]byte("parent"))
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "plain, as waitForPreviousBlockMined returns it",
+			err:  errors.NewBlockParentNotMinedError("[waitForPreviousBlockMined][height:%d] parent %s not mined yet", 2, parent.String()),
+		},
+		{
+			name: "wrapped by a caller further up",
+			err:  errors.NewProcessingError("failed to process block", errors.NewBlockParentNotMinedError("parent %s not mined yet", parent.String())),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := parkCommitFailure(tc.err)
+
+			require.Equal(t, parkDispositionParentNotMinedYet, d)
+			require.Equal(t, parkBlobKeep, d.blob, "the downloaded block must stay parked")
+			require.False(t, d.markFailed, "a block whose parent is merely slow must not be written off")
+			require.False(t, d.blamePeer, "the peer sent a good block; the delay is ours")
+			require.NotEqual(t, parkDispositionRetryLater.reason, d.reason, "an operator must be able to tell this apart from a busy store")
+			require.NotEqual(t, parkDispositionParentGone.reason, d.reason, "an operator must be able to tell this apart from a reorg")
+		})
+	}
+}
+
+// TestSyncManager_AParkedBlockSurvivesAParentThatIsSlowToBeMarkedMined is the
+// mainnet incident end to end through the park. The parent is in the chain but
+// GetBlockIsMined keeps answering false for longer than the retry budget, so the
+// first commit attempt gives up. The block must stay parked (not deleted, not
+// written off, no peer blamed, not asked for again) and the sweep's next pass
+// must commit it from disk once the parent is marked, without a fetch.
+//
+// The FSM is RUNNING so the blame suppression that applies while catching blocks
+// cannot hide a reject.
+func TestSyncManager_AParkedBlockSurvivesAParentThatIsSlowToBeMarkedMined(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING)
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+	parent := h.blocks[0].MsgBlock().BlockHash()
+
+	// The wait must run: it is skipped only on the below-checkpoint outpoint-only
+	// path. One retry at 1 ms makes the wait give up after two lookups.
+	h.sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
+	h.sm.settings.BlockValidation.IsParentMinedRetryMaxRetry = 1
+	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
+	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
+
+	spy := &convertedRouteSpyValidation{}
+	h.sm.blockValidation = spy
+
+	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+	h.client.On("GetBlockIsMined", mock.Anything, &parent).Return(false, nil).Times(2)
+	h.client.On("GetBlockIsMined", mock.Anything, &parent).Return(true, nil)
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len())
+
+	parkedBytes := h.sm.blockPark.Bytes()
+
+	// The parent is in the chain and valid, but its mined flag is not set yet.
+	h.chainHolds(t, parent)
+
+	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
+
+	require.Zero(t, spy.callCount(), "sanity: the first attempt must have given up on the parent's mined flag")
+	h.client.AssertNumberOfCalls(t, "GetBlockIsMined", 2)
+	h.requireStillParked(t, child, parkedBytes)
+
+	getDataBefore := h.rec.getDataCount()
+
+	// The next sweep pass resubmits the kept block; the parent is marked by now.
+	h.sm.sweepParkedBlocks(time.Now().Add(2*parkStuckThreshold + time.Second))
+
+	require.Equal(t, 1, spy.callCount(), "the kept block must commit from disk on the resubmit")
+	require.Zero(t, h.sm.blockPark.Len(), "the committed block must leave the park")
+	require.Zero(t, h.sm.blockPark.Bytes(), "committing must give the park budget back")
+	require.False(t, h.rec.askedForSince(getDataBefore, child), "the block was on disk, so it must not be fetched again")
+	require.False(t, h.rec.wasRejected(child), "the peer must never have been blamed")
 }
