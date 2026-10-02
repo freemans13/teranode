@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -426,9 +427,22 @@ func (d parkDisposition) withoutBlame() parkDisposition {
 	return d
 }
 
+// parkRejectWriteBound is how long rejectThenDropPeer gives the reject to reach
+// the wire before the association is dropped regardless. A reject is a few
+// dozen bytes, so on a peer that is reading this is microseconds; the bound is
+// for one that is not. Within it the peer is still connected, still the sync
+// peer if it was, and may deliver another block, which parks or commits as any
+// other; none of that is on the commit goroutine's time.
+const parkRejectWriteBound = 2 * time.Second
+
 // applyParkDisposition carries out one row of the table. It is the ONLY place
 // that deletes a parked blob, restores a parked entry, rejects one to a peer,
 // or drops the peer that delivered one.
+//
+// It runs on the in-order commit goroutine (parkedBlockFailed, from the drain),
+// so nothing here may wait on a peer: a reject is queued, never awaited, and
+// the one case that wants the reject written before the socket is closed under
+// it, blame and drop together, is handed to rejectThenDropPeer.
 func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition) {
 	switch d.blob {
 	case parkBlobKeep:
@@ -460,18 +474,56 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 		return
 	}
 
-	if d.blamePeer {
-		// Waited for when the peer is about to be dropped: the reject is queued,
-		// not written, and a disconnect straight after a queue would close the
-		// socket under it, so the one message the peer was owed never left.
-		entry.peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &entry.hash, d.dropPeer)
-	}
+	dropReason := fmt.Sprintf("block %s rejected (%s)", entry.hash, d.reason)
 
-	if d.dropPeer {
+	switch {
+	case d.blamePeer && d.dropPeer:
+		// A disconnect straight after a queue closes the socket under the
+		// reject, so the one message the peer was owed never left; waiting for
+		// the write here held the commit goroutine for as long as the peer
+		// chose not to read. Both wants are met off this goroutine.
+		sm.rejectThenDropPeer(entry, dropReason)
+
+	case d.blamePeer:
+		entry.peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &entry.hash, false)
+
+	case d.dropPeer:
 		// The whole association, through its primary: entry.peer is the DATA1
 		// sub-peer whenever the body arrived on its own stream, and only the
 		// primary is known to netsync's peer bookkeeping. DisconnectAssociation
-		// resolves that itself.
-		entry.peer.DisconnectAssociation(fmt.Sprintf("block %s rejected (%s)", entry.hash, d.reason))
+		// resolves that itself. Closing sockets and a quit channel, nothing
+		// waited on.
+		entry.peer.DisconnectAssociation(dropReason)
 	}
+}
+
+// rejectThenDropPeer queues the reject for entry to the peer that delivered it,
+// gives the write parkRejectWriteBound to happen, and then drops the peer's
+// whole association, on a goroutine of its own so the commit goroutine that
+// called it carries on at once.
+//
+// The peer connection has no write deadline, so a remote that has stopped
+// reading our socket holds a write until the socket is closed, and the idle
+// timer does not close it while the remote keeps sending. The bound is what
+// ends that: when it passes the reject is given up and the disconnect closes
+// the socket, which fails the hung write and signals the done channel, so the
+// goroutine ends within the bound either way. A peer that disconnects before
+// the write is signalled too (QueueMessage on a disconnected peer, and the
+// output handler's drain on quit, both send on it).
+func (sm *SyncManager) rejectThenDropPeer(entry parkedBlock, dropReason string) {
+	go func() {
+		sent := make(chan struct{}, 1)
+		entry.peer.QueueRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &entry.hash, sent)
+
+		timer := time.NewTimer(parkRejectWriteBound)
+		defer timer.Stop()
+
+		select {
+		case <-sent:
+		case <-timer.C:
+			sm.logger.Warnf("[applyParkDisposition][%s] the reject was not written to peer %s within %s; dropping the association without it", entry.hash, entry.peer, parkRejectWriteBound)
+		}
+
+		entry.peer.DisconnectAssociation(dropReason)
+	}()
 }

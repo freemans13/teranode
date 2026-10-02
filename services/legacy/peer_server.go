@@ -1115,7 +1115,8 @@ func (sp *serverPeer) OnTx(_ *peer.Peer, msg *wire.MsgTx) {
 
 // tearDownAssociationStreams closes the live connection of every stream
 // sub-peer in assoc except the given peer. It is the primary-disconnect
-// counterpart to disconnectMisbehaving: when an association's PRIMARY goes away
+// counterpart to peer.DisconnectAssociation, which disconnects a misbehaving
+// sub-peer's primary: when an association's PRIMARY goes away
 // (misbehaviour eviction, sync-peer rotation, remote hang-up), handleDonePeerMsg
 // removes only the association BOOKKEEPING, which left the DATA1 sub-peer's TCP
 // connection open reading blocks off the wire for a dead association, and left a
@@ -1126,8 +1127,8 @@ func (sp *serverPeer) OnTx(_ *peer.Peer, msg *wire.MsgTx) {
 // the waiter. StreamPeers() includes the primary (registered as the GENERAL
 // stream at construction), so callers pass it as except — it is already
 // disconnecting. DisconnectWithInfo is idempotent (atomic guard), so overlap
-// with disconnectMisbehaving's explicit stream disconnect, or a sub-peer already
-// mid-teardown, is safe.
+// with DisconnectAssociation's own disconnect of the sub-peer it was called on,
+// or a sub-peer already mid-teardown, is safe.
 func tearDownAssociationStreams(assoc *peer.Association, except *peer.Peer) {
 	if assoc == nil {
 		return
@@ -4039,8 +4040,9 @@ func (sp *serverPeer) OnBlockOnDisk(_ *peer.Peer, msg *peer.MsgBlockOnDisk) {
 // full and the sink raised ERR_BLOCK_BODY_MISMATCH, which only its three SV Node
 // DoS(100) parity sites do (a merkle root the header does not carry, a duplicate
 // transaction, no coinbase; services/legacy/netsync pipeline_sink.go,
-// block_stream_builder.go, block_tx_stream.go). SV Node scores those
-// CorruptionOrDoS, 100 points at a threshold of 100, a 24 h ban
+// block_stream_builder.go, block_tx_stream.go). SV Node scores each of those
+// 100 points, the first two as CorruptionOrDoS and bad-cb-missing as a plain
+// DoS(100) (validation.cpp CheckBlock), at a threshold of 100, a 24 h ban
 // (consensus/validation.h, net/block_download_tracker.cpp BlockChecked,
 // net_processing.cpp SendRejectsAndCheckIfBanned), and it scores them only
 // after the whole message is deserialised; a message that ends early is a

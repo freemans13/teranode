@@ -4,6 +4,8 @@ import (
 	"bytes"
 	stderrors "errors"
 	"io"
+	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
@@ -327,4 +330,160 @@ func TestWire_OnlyABodyDeliveredInFullIsProvenBad(t *testing.T) {
 	exists, err := store.Exists(sm.ctx, hash[:], fileformat.FileTypeBlock)
 	require.NoError(t, err)
 	require.False(t, exists, "no converted record may be left under a refused block's hash")
+}
+
+// stallingConn is a net.Conn whose writes hang once stall is called, which is
+// what a socket does when the remote has stopped reading and the kernel send
+// buffer is full. Close releases every hung write with an error, as closing the
+// socket does. Reads are untouched, so the remote can keep sending.
+type stallingConn struct {
+	net.Conn
+
+	stalled   chan struct{}
+	released  chan struct{}
+	stallOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newStallingConn(c net.Conn) *stallingConn {
+	return &stallingConn{Conn: c, stalled: make(chan struct{}), released: make(chan struct{})}
+}
+
+// stall makes every Write from now on hang until Close.
+func (c *stallingConn) stall() {
+	c.stallOnce.Do(func() { close(c.stalled) })
+}
+
+func (c *stallingConn) Write(b []byte) (int, error) {
+	select {
+	case <-c.stalled:
+		<-c.released
+
+		return 0, net.ErrClosed
+	default:
+		return c.Conn.Write(b)
+	}
+}
+
+func (c *stallingConn) Close() error {
+	c.closeOnce.Do(func() { close(c.released) })
+
+	return c.Conn.Close()
+}
+
+// connectStallingPeer is connectRecordingPeer with the local peer's writes
+// routed through a stallingConn; stall hangs them from then on.
+func connectStallingPeer(t *testing.T, idx uint8, lastBlock int32) (local, remote *peerpkg.Peer, rec *peerMsgRecorder, stall func()) {
+	t.Helper()
+
+	rec = &peerMsgRecorder{}
+	chainParams := &chaincfg.MainNetParams
+
+	remoteCfg := peerpkg.Config{
+		Listeners: peerpkg.MessageListeners{
+			OnReject: func(_ *peerpkg.Peer, msg *wire.MsgReject) { rec.recordReject(msg) },
+		},
+		UserAgentName:    "btcdtest",
+		UserAgentVersion: "1.0",
+		ChainParams:      chainParams,
+	}
+	localCfg := peerpkg.Config{
+		UserAgentName:    "btcdtest",
+		UserAgentVersion: "1.0",
+		ChainParams:      chainParams,
+	}
+
+	conn1, conn2 := Pipe(
+		&SimpleAddr{net: "tcp", addr: "10.0.0." + strconv.Itoa(int(idx)) + ":8333"},
+		&SimpleAddr{net: "tcp", addr: "10.0.1." + strconv.Itoa(int(idx)) + ":8333"},
+	)
+	localConn := newStallingConn(conn2)
+
+	remote, local, err := makeConnectedPeersOn(t, remoteCfg, localCfg, conn1, localConn)
+	require.NoError(t, err)
+
+	local.UpdateLastBlockHeight(lastBlock)
+
+	t.Cleanup(func() {
+		local.DisconnectWithInfo("test over")
+		remote.DisconnectWithInfo("test over")
+	})
+
+	return local, remote, rec, localConn.stall
+}
+
+// TestSyncManager_APeerThatStopsReadingDoesNotStallTheDrain pins the drain's
+// liveness against the peer it is punishing. A block judged invalid at the
+// drain earns its peer a reject and the association dropped, and the drain runs
+// on the in-order commit goroutine: every later commit waits behind it. The
+// peer here has stopped reading our socket, the way a remote with a full
+// receive window does, so a write to it never returns and no write deadline on
+// the connection ends it.
+//
+// End state: the parent is committed, the judged block is gone from the park and
+// written off, the drain step returned long before anything bounded the write
+// to the peer, the peer is dropped anyway, and the remote never saw the reject,
+// because the reject's one chance to leave was the socket that was closed under
+// it. That last cost is accepted: a peer that will not read is told nothing.
+//
+// Before this fix the drain pushed the reject with wait=true and waited for the
+// write on the commit goroutine, so a RUNNING-state peer that stopped reading
+// held every commit until its socket died.
+func TestSyncManager_APeerThatStopsReadingDoesNotStallTheDrain(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING)
+
+	stalledPeer, _, rec, stall := connectStallingPeer(t, 74, 1000)
+	registerRacePeer(h.sm, stalledPeer)
+	h.peer = stalledPeer
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+	parent := h.blocks[0].MsgBlock().BlockHash()
+
+	h.validation.failOnce(child, errors.NewBlockInvalidError("[ValidateBlock][%s] block is invalid", child.String()))
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len(), "the child parks until its parent commits")
+
+	// The remote stops reading from here on; the handshake and the delivery
+	// above went through.
+	stall()
+
+	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+	require.NoError(t, h.deliver(t, 0))
+
+	var commit parkCommit
+	select {
+	case commit = <-h.sm.parkCommits:
+	default:
+		t.Fatal("the parent's arrival posted no parkCommit")
+	}
+
+	// drainOneParkCommit's two steps, run off the test goroutine so a drain
+	// that waits on the peer's socket is a failed assertion and not a hung
+	// test. The drain commits the parent and judges the child.
+	drained := make(chan struct{})
+
+	go func() {
+		defer close(drained)
+
+		h.sm.blockPark.Restore(commit.entry)
+		h.sm.scheduleDrain(commit.entry.prevBlock, commit.parentHeight)
+	}()
+
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("the drain is still waiting on the punished peer's socket: the in-order commit goroutine must never wait for a peer to read")
+	}
+
+	h.requireCommitted(t, parent)
+	require.Equal(t, 1, h.validation.callsFor(child), "the child reached block validation, which is what judged it")
+	require.Zero(t, h.sm.blockPark.Len(), "a judged block does not stay parked")
+
+	_, failed := h.sm.recentlyFailedBlocks.Get(child)
+	require.True(t, failed, "a judged block is written off")
+
+	require.True(t, disconnectsWithin(stalledPeer, 10*time.Second),
+		"the peer that delivered a block judged invalid is dropped even though it never read the reject")
+	require.False(t, rec.wasRejected(child), "the stall held: the reject died with the socket, which is the accepted cost of a peer that will not read")
 }

@@ -53,9 +53,10 @@ import (
 //     server bans a host for: a merkle root the header does not carry (this
 //     file), a duplicate transaction (block_stream_builder.go AddStreamedTx) and
 //     a body with no coinbase (block_tx_stream.go newBlockTxStream). Each judges
-//     a body that parsed to its end, which is where SV Node's CorruptionOrDoS
-//     applies (validation.cpp bad-txnmrklroot, bad-txns-duplicate,
-//     bad-cb-missing). No other producer may raise the marker: a count the body
+//     a body that parsed to its end, which is where SV Node's CheckBlock scores
+//     them at 100 points: bad-txnmrklroot and bad-txns-duplicate as
+//     CorruptionOrDoS, bad-cb-missing as a plain DoS(100) (validation.cpp). No
+//     other producer may raise the marker: a count the body
 //     cannot hold, a shape fault of our own builder or a delivery cut short is
 //     what SV Node logs as a deserialisation failure and never scores.
 //   - a connection that ends mid-body carries no teranode code at all, whatever

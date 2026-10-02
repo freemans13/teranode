@@ -1211,11 +1211,43 @@ func (p *Peer) ForgetLastHeadersRequest() {
 // or block and should be nil in other cases.  The wait parameter will cause the
 // function to block until the reject message has actually been sent.
 //
+// The wait has no bound: it returns when the write to the connection returns,
+// and the connection has no write deadline, so a remote that has stopped
+// reading holds the caller until the socket is closed. Call it with wait only
+// from a goroutine that belongs to this peer, such as its own read loop, or
+// use QueueRejectMsg and bound the wait yourself.
+//
 // This function is safe for concurrent access.
 func (p *Peer) PushRejectMsg(command string, code wire.RejectCode, reason string, hash *chainhash.Hash, wait bool) {
+	// Send the message without waiting if the caller has not requested it.
+	if !wait {
+		p.QueueRejectMsg(command, code, reason, hash, nil)
+		return
+	}
+
+	// Send the message and block until it has been sent before returning.
+	doneChan := make(chan struct{}, 1)
+	p.QueueRejectMsg(command, code, reason, hash, doneChan)
+	<-doneChan
+}
+
+// QueueRejectMsg queues the reject message PushRejectMsg sends and returns at
+// once. doneChan, when not nil, receives one value when the message has been
+// written, or when it will never be: the peer disconnected first, the write
+// failed, or the remote's protocol version predates reject messages. It should
+// be buffered so a late signal does not block the output handler.
+//
+// This function is safe for concurrent access.
+func (p *Peer) QueueRejectMsg(command string, code wire.RejectCode, reason string, hash *chainhash.Hash, doneChan chan<- struct{}) {
 	// Don't bother sending the reject message if the protocol version
 	// is too low.
 	if p.VersionKnown() && p.ProtocolVersion() < wire.RejectVersion {
+		if doneChan != nil {
+			go func() {
+				doneChan <- struct{}{}
+			}()
+		}
+
 		return
 	}
 
@@ -1233,16 +1265,7 @@ func (p *Peer) PushRejectMsg(command string, code wire.RejectCode, reason string
 		msg.Hash = *hash
 	}
 
-	// Send the message without waiting if the caller has not requested it.
-	if !wait {
-		p.QueueMessage(msg, nil)
-		return
-	}
-
-	// Send the message and block until it has been sent before returning.
-	doneChan := make(chan struct{}, 1)
 	p.QueueMessage(msg, doneChan)
-	<-doneChan
 }
 
 // handlePingMsg is invoked when a peer receives a ping bitcoin message.  For
