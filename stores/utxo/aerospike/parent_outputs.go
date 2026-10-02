@@ -122,13 +122,14 @@ func parentOutputAnswer(vout uint32, parent *bt.Tx, readErr error, external bool
 		return utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
 	}
 
+	// A nil entry is an output the store never held: the seeder leaves spent
+	// positions nil when it rebuilds a parent from a UTXO snapshot, and an
+	// external reconstruction drops them the same way. Reporting it as a fault
+	// made the validator retry a block that spends such an output for ever,
+	// where the legacy path and the SQL store both reject it as invalid.
 	out := parent.Outputs[vout]
 	if out == nil {
-		if external {
-			return utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
-		}
-
-		return utxo.ParentOutput{Err: errors.NewStorageError("parent record has no output at index %d", vout)}
+		return utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
 	}
 
 	answer := utxo.ParentOutput{

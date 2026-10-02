@@ -50,10 +50,10 @@ func TestParentOutputAnswer(t *testing.T) {
 		require.NoError(t, a.Err)
 	})
 
-	t.Run("a nil entry in an inline record is Err", func(t *testing.T) {
+	t.Run("a nil entry in an inline record is NoSuchIndex, as the seeder leaves spent outputs", func(t *testing.T) {
 		a := parentOutputAnswer(1, parent, nil, false, nil, nil)
-		require.Equal(t, utxo.ParentOutputUnknown, a.Status)
-		require.Error(t, a.Err)
+		require.Equal(t, utxo.ParentOutputNoSuchIndex, a.Status)
+		require.NoError(t, a.Err)
 	})
 
 	t.Run("an output an external reconstruction dropped is NoSuchIndex", func(t *testing.T) {

@@ -61,6 +61,22 @@ func ParentOutputsForValidation(t *testing.T, db utxostore.Store) {
 	unmined := parentOutputsTx(t, 2, 4000)
 	forked := parentOutputsTx(t, 3, 5000)
 
+	// A parent as the seeder rebuilds it from a UTXO snapshot (cmd/seeder
+	// processUTXO): no inputs, each unspent output at its index, the outputs
+	// spent before the snapshot nil at theirs, and the txid supplied. Spending a
+	// gap must read as NoSuchIndex, a verdict, never as a fault the caller would
+	// retry for ever.
+	seeded := &bt.Tx{Outputs: []*bt.Output{
+		{Satoshis: 6000, LockingScript: Tx.Outputs[0].LockingScript},
+		nil,
+		{Satoshis: 8000, LockingScript: Tx.Outputs[0].LockingScript},
+	}}
+
+	var seededID chainhash.Hash
+	seededID[0] = 0x5e
+	seededID[1] = 0xed
+	seededID[31] = 0x04
+
 	var missing chainhash.Hash
 	missing[0] = 0xee
 	missing[31] = 0x01
@@ -71,7 +87,12 @@ func ParentOutputsForValidation(t *testing.T, db utxostore.Store) {
 		require.NoError(t, err)
 	}
 
-	_, err := db.SetMinedMulti(ctx, []*chainhash.Hash{mined.TxIDChainHash()}, utxostore.MinedBlockInfo{BlockID: 11, BlockHeight: 101, SubtreeIdx: 0})
+	_ = db.Delete(ctx, &seededID)
+	_, _, err := db.SpendAndCreate(ctx, seeded, 100, utxostore.WithCreateOnly(), utxostore.WithTXID(&seededID),
+		utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 0, BlockHeight: 100, SubtreeIdx: 0}))
+	require.NoError(t, err)
+
+	_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{mined.TxIDChainHash()}, utxostore.MinedBlockInfo{BlockID: 11, BlockHeight: 101, SubtreeIdx: 0})
 	require.NoError(t, err)
 
 	// Record the higher height first and under the lower block id, so "first
@@ -89,6 +110,8 @@ func ParentOutputsForValidation(t *testing.T, db utxostore.Store) {
 		{TxID: *forked.TxIDChainHash(), Vout: 0},
 		{TxID: *mined.TxIDChainHash(), Vout: 0},
 		{TxID: *mined.TxIDChainHash(), Vout: 2},
+		{TxID: seededID, Vout: 1},
+		{TxID: seededID, Vout: 2},
 	}
 	before := append([]utxostore.Outpoint(nil), outpoints...)
 
@@ -123,6 +146,10 @@ func ParentOutputsForValidation(t *testing.T, db utxostore.Store) {
 	requireOutput(4, utxostore.ParentOutputMined, forked.Outputs[0], 103)
 	requireOutput(5, utxostore.ParentOutputMined, mined.Outputs[0], 101)
 	require.Equal(t, answers[0], answers[6], "duplicate outpoints get identical answers")
+
+	require.NoError(t, answers[7].Err, "a seeded gap is a verdict, not a fault")
+	require.Equal(t, utxostore.ParentOutputNoSuchIndex, answers[7].Status)
+	requireOutput(8, utxostore.ParentOutputMined, seeded.Outputs[2], 100)
 
 	empty, err := db.ParentOutputsForValidation(ctx, nil)
 	require.NoError(t, err)
