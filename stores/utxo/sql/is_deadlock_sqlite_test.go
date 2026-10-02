@@ -28,9 +28,14 @@ import (
 // validates a block's transactions in parallel over this store and a create's
 // transaction and a spend batch's transaction each want the other's table.
 //
-// The error is produced for real rather than written as a string, because a
-// string fixture passes on the old code through the "deadlock" substring and
-// proves nothing about the error the engine raises.
+// The error is produced for real rather than written as a string, because the
+// SQLite arm of isDeadlock matches the result code on a *sqlite.Error, which a
+// string fixture cannot carry. A plain-string error falls through to the
+// "database is locked" substring fallback in both the old and the new
+// isDeadlock, and "database table is locked: database is deadlocked" does not
+// contain it, so a string fixture is red on both and proves nothing about the
+// fix. Only isLockError's "deadlock" substring fallback, the secondary assert
+// below, would accept a string.
 func TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable(t *testing.T) {
 	ctx := context.Background()
 
