@@ -597,3 +597,65 @@ func TestSyncManager_AMissingParentOutputKeepsTheParkedBlock(t *testing.T) {
 	h.requireStillParked(t, child, parkedBytes)
 	require.False(t, h.parkedEntry(t, child).parentMissingAt.IsZero(), "the row stamps the entry so the next turn is not spent on it")
 }
+
+// TestSyncManager_AnInvalidTransactionVerdictFromTheFullRouteIsAJudgementOnTheBlock
+// is the BlockRejected row for the shape the full route now returns for a legacy
+// block with a consensus-invalid transaction: ErrBlockInvalid around subtree
+// validation's processing wrap around ErrTxInvalid, with no corrupt code in the
+// chain. Before the producer was corrected the same block came back corrupt and
+// landed on RecordCorrupt: dropped, unmarked, re-asked on the next wanted-range
+// pass, and judged corrupt again, without bound. Here the record is dropped,
+// the hash is written off, the peer is told once RUNNING, and the block is not
+// asked for again while recentlyFailedBlocks names it.
+//
+// This test pins the row for the shape. It does not fail when the producer in
+// block validation is reverted, because the spy returns what the test injects;
+// TestProcessBlockFound_AnInvalidTransactionOnTheLegacyFullRouteIsAJudgementNotACorruptRecord
+// in services/blockvalidation is the test that does.
+func TestSyncManager_AnInvalidTransactionVerdictFromTheFullRouteIsAJudgementOnTheBlock(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+	parent := h.blocks[0].MsgBlock().BlockHash()
+
+	verdict := errors.NewBlockInvalidError("[ValidateBlock][%s] block contains invalid transactions", child.String(),
+		errors.NewProcessingError("[CheckBlockSubtrees] failed to process transactions",
+			errors.NewTxInvalidError("transaction in subtree is invalid")))
+	require.False(t, errors.IsBlockCorrupt(verdict), "fixture: the full route's legacy verdict carries no corrupt code")
+
+	h.validation.failOnce(child, verdict)
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len())
+
+	before := h.rec.getDataCount()
+
+	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+
+	require.NoError(t, h.deliver(t, 0))
+	h.drainOneParkCommit(t)
+
+	h.requireCommitted(t, parent)
+	require.Equal(t, 1, h.validation.callsFor(child), "the child reached block validation, which is what judged it")
+
+	exists, err := h.chain.GetBlockExists(h.sm.ctx, &child)
+	require.NoError(t, err)
+	require.False(t, exists, "a block with an invalid transaction is not in the chain")
+
+	require.Zero(t, h.sm.blockPark.Len(), "a judged block does not stay parked")
+
+	for _, name := range parkDirEntries(t, h.parkDir) {
+		require.NotContains(t, name, child.String(), "a judged block must not leave its blob behind")
+	}
+
+	require.True(t, WaitUntil(func() bool { return h.rec.wasRejected(child) }, 5*time.Second),
+		"the sink bound the body to the header, so the verdict is about the block the peer sent and the peer is told")
+
+	_, failed := h.sm.recentlyFailedBlocks.Get(child)
+	require.True(t, failed, "a judged block is written off so its descendants are short-circuited and it is not re-asked")
+
+	h.sm.fetchHeaderBlocks()
+
+	require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, time.Second),
+		"a block written off must not be downloaded again while recentlyFailedBlocks names it; that re-ask is the loop this closes")
+}

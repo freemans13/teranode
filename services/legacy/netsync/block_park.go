@@ -937,10 +937,11 @@ func (p *blockPark) setGauges() {
 //
 // This is the ONE place that decides "complete" for a converted record.
 // Recover calls it while deciding whether a record left over from a previous
-// run is worth adopting; holdsBlock calls it while deciding whether a block
-// needs downloading again; commitParkedBlock and the dispatcher's parkedRun
-// call it before handing a record to block validation. All four are the same
-// question, so all four get the same answer.
+// run is worth adopting; adoptStranded calls it for a record that reached disk
+// with nothing announcing it; holdsBlock calls it while deciding whether a
+// block needs downloading again; commitParkedBlock and the dispatcher's
+// parkedRun call it before handing a record to block validation. Five callers,
+// one question, one answer.
 //
 // The answer has three states, not two, and the third is the one that
 // matters on the commit path. (true, nil): every file is there. (false, nil):

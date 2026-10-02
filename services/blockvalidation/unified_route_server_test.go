@@ -501,3 +501,64 @@ func TestProcessBlockFound_AKeyMismatchingLocalSubtreeFileIsACorruptRecordOnTheL
 
 	requireNothingApplied(t, us, block, parent, child)
 }
+
+// TestProcessBlockFound_AnInvalidTransactionOnTheLegacyFullRouteIsAJudgementNotACorruptRecord
+// pins the full route's answer for a legacy block with a consensus-invalid transaction.
+// ValidateBlockWithOptions reclassifies that verdict as corrupt because, on the p2p route,
+// nothing has bound the subtree list to the header and the body may be the serving peer's
+// own. On the legacy route the list IS bound: the pipeline sink checked the merkle root
+// against the header before the record existed and derived every subtree hash from the
+// bytes it wrote. A corrupt verdict there lands on the legacy caller's RecordCorrupt row,
+// which drops the record with no mark and no blame, so the same block is downloaded,
+// validated in full and dropped again on every wanted-range pass. A judgement must come
+// back as one: ErrBlockInvalid, which the caller's BlockRejected row marks and rejects.
+//
+// The control drives the same verdict with a p2p baseURL and requires corrupt, so the gate
+// is proven to be the route and not the fixture. headerProven is false so the block takes
+// full validation, which is where subtree validation is called.
+func TestProcessBlockFound_AnInvalidTransactionOnTheLegacyFullRouteIsAJudgementNotACorruptRecord(t *testing.T) {
+	txInvalid := func() error {
+		// The shape processTransactionsInLevels raises: the per-transaction invalid under
+		// subtree validation's processing wrap.
+		return errors.NewProcessingError("[CheckBlockSubtrees] failed to process transactions",
+			errors.NewTxInvalidError("transaction in subtree is invalid"))
+	}
+
+	t.Run("legacy route", func(t *testing.T) {
+		us := newUnifiedRouteServer(t, "unified_route_legacy_tx_invalid")
+
+		block, parent, child := unifiedRouteSpendingBlock(t, us, 0x14)
+
+		us.subtreeValidation.On("CheckBlockSubtrees", mock.Anything, mock.Anything, "peer-1", "legacy").
+			Return(txInvalid()).Once()
+
+		err := us.s.processBlockFound(context.Background(), block.Hash(), "peer-1", "legacy", false, block)
+		require.Error(t, err, "a block with an invalid transaction must not commit")
+		require.False(t, errors.IsBlockCorrupt(err), "the sink bound the subtree list, so this is a judgement, not a corrupt record: %v", err)
+		require.True(t, errors.Is(err, errors.ErrBlockInvalid), "the legacy caller's BlockRejected row keys on ErrBlockInvalid: %v", err)
+		require.True(t, errors.Is(err, errors.ErrTxInvalid), "the cause must still be in the chain: %v", err)
+		require.False(t, errors.IsTransientLocalError(err), "a judgement must not come back as retry-later: %v", err)
+
+		us.subtreeValidation.AssertExpectations(t)
+		require.Len(t, us.subtreeValidation.Calls, 1, "exactly one subtree validation call: the full route, never the quick route")
+
+		requireNothingApplied(t, us, block, parent, child)
+	})
+
+	t.Run("p2p control keeps the corrupt verdict", func(t *testing.T) {
+		us := newUnifiedRouteServer(t, "unified_route_p2p_tx_invalid")
+
+		block, parent, child := unifiedRouteSpendingBlock(t, us, 0x15)
+
+		us.subtreeValidation.On("CheckBlockSubtrees", mock.Anything, mock.Anything, "peer-1", "http://peer:8000").
+			Return(txInvalid()).Once()
+
+		err := us.s.blockValidation.ValidateBlockWithOptions(context.Background(), block, "http://peer:8000", &ValidateBlockOptions{PeerID: "peer-1"})
+		require.Error(t, err)
+		require.True(t, errors.IsBlockCorrupt(err), "on the p2p route the list is unbound, so the verdict stays corrupt: %v", err)
+		require.False(t, errors.Is(err, errors.ErrBlockInvalid), "a corrupt verdict never carries the invalid code: %v", err)
+
+		us.subtreeValidation.AssertExpectations(t)
+		requireNothingApplied(t, us, block, parent, child)
+	})
+}

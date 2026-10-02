@@ -177,7 +177,15 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 			// than fall to a row that deletes the record. The error itself still
 			// reaches frontierEntry.settle and complete's failFrom, so the blocks
 			// queued behind this one are aborted exactly as for any failure.
-			return errors.NewServiceError("[parkedRun][%s] record's subtree files are not all present or could not be checked", d.parked.hash, checkErr)
+			//
+			// Two messages, one per state: errors.New only peels a trailing
+			// argument that is a non-nil error, so passing a nil checkErr on the
+			// absent path would render as a stray format argument.
+			if checkErr != nil {
+				return errors.NewServiceError("[parkedRun][%s] record's subtree files could not be checked", d.parked.hash, checkErr)
+			}
+
+			return errors.NewServiceError("[parkedRun][%s] record's subtree files are not all present", d.parked.hash)
 		}
 
 		return sm.HandleConvertedBlock(ctx, d.parked.peer, d.parked.hash, record)

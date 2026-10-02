@@ -130,25 +130,41 @@ var (
 		blob:   parkBlobDrop,
 	}
 
-	// parkDispositionRecordCorrupt — quick validation returned a corrupt
-	// verdict for a record this node wrote. On the converted route the body
-	// was verified against the header at the sink before anything was
-	// written, so a corrupt verdict afterwards is about this node's own files,
-	// never about the peer's bytes. Drop the record, mark nothing, blame
-	// nobody; the block is unowed on the next wanted-range pass and is
-	// downloaded again.
+	// parkDispositionRecordCorrupt — block validation returned a corrupt
+	// verdict for a record this node wrote. Every record that commits through
+	// the park was converted at the pipeline sink, which checked the merkle
+	// root against the header and derived each subtree hash from the bytes it
+	// wrote before the record existed, so a corrupt verdict afterwards is about
+	// this node's own files, never about the peer's bytes. Drop the record,
+	// mark nothing, blame nobody; the block is unowed on the next wanted-range
+	// pass and is downloaded again.
 	//
-	// Dropping repairs it only because of where the verdict comes from: every
-	// corrupt verdict the converted route can raise follows a root-vs-key
-	// anchor of a structure file (readSubtreeStructure in blockvalidation's
-	// quick_validate.go), and a file that fails the anchor is deleted by
-	// quarantineSubtreeKeyMismatch before the verdict is returned, so the
-	// re-download writes it afresh. subtreeWriter.put never rewrites a key
-	// that is already there, so a damaged file that was NOT removed could not
-	// be repaired this way; block validation returns that case as a local
-	// fault (ServiceError), which lands on retryLater above, not here. A
-	// future corrupt verdict raised for a file whose content matches its key
-	// would make this row loop; keep that in mind when adding one.
+	// Dropping repairs the one case it is written for: on the unified route a
+	// structure file that does not hash to its key is deleted by
+	// quarantineSubtreeKeyMismatch before the verdict is returned
+	// (blockvalidation's quick_validate.go), so the re-download writes it
+	// afresh; when the quarantine could not confirm the delete, block
+	// validation returns a ServiceError instead, which lands on retryLater
+	// above. subtreeWriter.put never rewrites a key that is already there, so
+	// no other corrupt verdict is repaired by a re-download, and for every
+	// other one this row is a loop (drop, re-ask, same verdict). What those
+	// others are, and why none is reachable for a sink-written record except
+	// through a bug or a damaged file: quick validation's own corrupt verdicts
+	// after the anchor (coinbase placeholder outside [0][0], subtree size
+	// mismatch, merkle root mismatch) restate what the sink already checked;
+	// and on the full route, which a legacy block takes when the unified route
+	// is off (the default) or it carries no header proof, block.Valid and
+	// subtree validation raise corrupt for a duplicate
+	// transaction, a merkle root mismatch, a subtree length mismatch or a
+	// missing coinbase, each of which the sink refused or verified on the way
+	// in, and removePeerSuppliedSubtreeToCheck leaves a .subtreeToCheck that
+	// was on disk before the attempt, which netsync's always is. The one
+	// full-route verdict a legacy block CAN reach on an honest run, an invalid
+	// transaction in a subtree, is returned as ErrBlockInvalid for baseURL
+	// "legacy" (BlockValidation.go, the ErrTxInvalid branch) because the sink
+	// bound the list, so it lands on BlockRejected below and not here. A new
+	// corrupt producer on either route has to answer the same question before
+	// this row is right for it: does the re-download rewrite the file?
 	parkDispositionRecordCorrupt = parkDisposition{
 		reason: "a corrupt verdict on a record this node wrote; the body was verified against the header at the sink, so the fault is local",
 		blob:   parkBlobDrop,
@@ -287,9 +303,10 @@ func parkReadFailure(err error) parkDisposition {
 //
 // The order of the arms is load-bearing. The transient arm stays above the
 // local-fault rows so a Service or Storage wrap around a not-found keeps the
-// blob: block validation's full route wraps every failure in a ServiceError
-// (Server.go processBlockFound), and readSubtreeStructure wraps a non-ENOENT
-// open failure as NotFound around a StorageError. Corrupt is tested before
+// blob: block validation's full route wraps every failure that is not a
+// BlockInvalid or BlockCorrupt verdict in a ServiceError (Server.go
+// processBlockFound), and readSubtreeStructure wraps a non-ENOENT open failure
+// as NotFound around a StorageError. Corrupt is tested before
 // ErrBlockInvalid because the errors package guarantees a corrupt error never
 // wraps an invalid one (sanitizeCorruptParams) but not the reverse. The
 // explicit ErrBlockInvalid arm changes nothing today and exists so a judgement

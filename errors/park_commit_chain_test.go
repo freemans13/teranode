@@ -27,6 +27,10 @@ func parkCommitChain(inner error) error {
 // found) and 10 (block not found) are each still matched by Is after WrapGRPC
 // and UnwrapGRPC under three ProcessingError wraps, none of them reads as a
 // transient local fault, and a Service or Storage wrap around any of them does.
+// The last case is the judgement row's shape for the full route's
+// invalid-transaction verdict on a legacy block: codes 11 (block invalid) and 31
+// (tx invalid) survive and code 120 does not appear, which is what keeps that
+// verdict off the corrupt row the table tests first.
 // WrapGRPC walks the whole chain into status details and UnwrapGRPC rebuilds it
 // in order, so a change to either that dropped or reordered a link would make
 // a table row dead in production while a bare-error test stayed green.
@@ -66,6 +70,12 @@ func TestParkCommitErrorCodesSurviveTheGRPCRoundTrip(t *testing.T) {
 			inner:   NewBlockNotFoundError("block not found", ErrNotFound),
 			matches: []error{ErrBlockNotFound, ErrNotFound},
 			misses:  []error{ErrTxNotFound, ErrBlockCorrupt},
+		},
+		{
+			name:    "the full route's legacy verdict for an invalid transaction: invalid around processing around tx-invalid, no corrupt code",
+			inner:   NewBlockInvalidError("[ValidateBlock][hash] block contains invalid transactions", NewProcessingError("[CheckBlockSubtrees] failed to process transactions", NewTxInvalidError("transaction in subtree is invalid"))),
+			matches: []error{ErrBlockInvalid, ErrTxInvalid},
+			misses:  []error{ErrBlockCorrupt, ErrNotFound, ErrTxNotFound},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

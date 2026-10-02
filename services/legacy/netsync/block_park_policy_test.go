@@ -427,3 +427,30 @@ func TestParkCommitFailure_AMissingParentOutputKeepsTheBlockAndBlamesNobody(t *t
 	fileMiss := parkCommitChain(errors.NewNotFoundError("[readSubtree/hash] failed to get subtree data", errors.ErrNotFound))
 	require.NotEqual(t, parkDispositionLocalUtxoFault, parkCommitFailure(fileMiss), "a missing file is not a missing output")
 }
+
+// TestParkCommitFailure_TheFullRoutesInvalidTransactionVerdictIsAJudgement pins
+// the shape block validation's full route returns for a legacy block whose fault
+// is a consensus-invalid transaction: ErrBlockInvalid around subtree validation's
+// processing wrap around ErrTxInvalid, with no corrupt code anywhere in the chain.
+// It lands on BlockRejected. The corrupt-coded shape the p2p route returns for the
+// same fault is pinned alongside so the two are visibly different rows: on the
+// legacy route that shape would be a loop (drop, re-ask, drop), which is why the
+// producer never raises it there.
+func TestParkCommitFailure_TheFullRoutesInvalidTransactionVerdictIsAJudgement(t *testing.T) {
+	legacy := parkCommitChain(errors.NewBlockInvalidError("[ValidateBlock][hash] block contains invalid transactions",
+		errors.NewProcessingError("[CheckBlockSubtrees] failed to process transactions",
+			errors.NewTxInvalidError("transaction in subtree is invalid"))))
+	require.False(t, errors.IsBlockCorrupt(legacy), "fixture: the legacy route's verdict carries no corrupt code")
+	require.True(t, errors.Is(legacy, errors.ErrTxInvalid), "fixture: the cause is still in the chain")
+
+	d := parkCommitFailure(legacy)
+	require.Equal(t, parkDispositionBlockRejected, d)
+	require.True(t, d.markFailed, "a judgement is remembered so the block is not asked for again")
+	require.True(t, d.blamePeer, "the sink bound the body to the header, so the block the peer sent is the one judged")
+
+	p2p := parkCommitChain(errors.NewBlockCorruptError("[ValidateBlock][hash] block contains invalid transactions",
+		errors.NewProcessingError("[CheckBlockSubtrees] failed to process transactions",
+			errors.NewTxInvalidError("transaction in subtree is invalid"))))
+	require.Equal(t, parkDispositionRecordCorrupt, parkCommitFailure(p2p),
+		"the p2p route's corrupt-coded shape is the RecordCorrupt row; the producer must not raise it on the legacy route")
+}

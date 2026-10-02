@@ -15,8 +15,14 @@ import (
 )
 
 // legacyCorruptPeerID is the serving-peer identity threaded into
-// blockValidation.ProcessBlock, so block validation's log lines can name the
-// legacy connection a block came from.
+// blockValidation.ProcessBlock. What consumes it is the commit: block
+// validation passes it to blockchainClient.AddBlock (commitBlock in
+// quick_validate.go on the unified route, the AddBlock in ValidateBlockWithOptions
+// on the full route), so the chain's block row records the legacy connection the
+// block came from. The processBlockFound log lines that print a peerID cannot
+// fire for a legacy value: one is gated by isPeerMalicious, which is false for
+// every LegacyPeerIDPrefix value, the other by corruptAttemptsExhausted, which
+// never trips for a legacy block.
 //
 // It carries the LegacyPeerIDPrefix namespace so nothing downstream of
 // blockvalidation can mistake this value for a libp2p peer ID: isLegacyPeerID
