@@ -1,10 +1,13 @@
 package netsync
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -150,4 +153,124 @@ func TestHeaderCache_IsSafeOnANilReceiver(t *testing.T) {
 
 	_, ok = c.Top()
 	require.False(t, ok)
+}
+
+// minedRun is linkedRun with every header ground to its own declared target,
+// judged by model.BlockHeader.HasMetTargetDifficulty rather than by the code
+// under test, the way mineRegtestPoW does. Needed by any test that gives the
+// cache a proof-of-work ceiling: linkedRun's unmined 0x207fffff headers pass a
+// roughly 2^255 target about half the time, and chainOfHeaders' 0x1d00ffff ones
+// never do, so a pow-limit-bearing cache fed either would be flaky or always
+// refused.
+func minedRun(t *testing.T, parent chainhash.Hash, count int, bits uint32) ([]*wire.BlockHeader, []chainhash.Hash) {
+	t.Helper()
+
+	headers := make([]*wire.BlockHeader, 0, count)
+	hashes := make([]chainhash.Hash, 0, count)
+
+	prev := parent
+
+	for i := 0; i < count; i++ {
+		header := wire.NewBlockHeader(1, &prev, &chainhash.Hash{byte(i)}, bits, 0)
+		mineWireHeader(t, header)
+
+		hash := header.BlockHash()
+		headers = append(headers, header)
+		hashes = append(hashes, hash)
+		prev = hash
+	}
+
+	return headers, hashes
+}
+
+// mineWireHeader bumps header.Nonce until model's own HasMetTargetDifficulty
+// accepts the header against its declared Bits.
+func mineWireHeader(t *testing.T, header *wire.BlockHeader) {
+	t.Helper()
+
+	for nonce := uint32(0); nonce < 10_000_000; nonce++ {
+		header.Nonce = nonce
+
+		if wireHeaderMeetsItsTarget(t, header) {
+			return
+		}
+	}
+
+	t.Fatalf("could not find a nonce meeting target %08x", header.Bits)
+}
+
+// wireHeaderMeetsItsTarget is HasMetTargetDifficulty over a wire header, the
+// independent judge of the work Fill is being tested on.
+func wireHeaderMeetsItsTarget(t *testing.T, header *wire.BlockHeader) bool {
+	t.Helper()
+
+	var buf bytes.Buffer
+	require.NoError(t, header.Serialize(&buf))
+
+	modelHeader, err := model.NewBlockHeaderFromBytes(buf.Bytes())
+	require.NoError(t, err)
+
+	ok, _, _ := modelHeader.HasMetTargetDifficulty()
+
+	return ok
+}
+
+// TestHeaderCache_RefusesAHeaderThatDoesNotMeetItsOwnTarget is SV Node's
+// CheckProofOfWork run by Fill: a batch in which one header's hash exceeds the
+// target its own nBits declares is refused whole and nothing is cached. The
+// control run, every header mined, is accepted by the same kind of cache, and a
+// cache without a ceiling accepts the spoiled batch too, because it checks
+// linkage alone, as every test cache does.
+func TestHeaderCache_RefusesAHeaderThatDoesNotMeetItsOwnTarget(t *testing.T) {
+	parent := chainhash.Hash{0xc0}
+	ceiling := model.PowLimitCeiling(&chaincfg.RegressionNetParams)
+	require.NotNil(t, ceiling)
+
+	headers, _ := minedRun(t, parent, 5, 0x207fffff)
+
+	c := newHeaderCache().WithPowLimit(ceiling)
+	require.True(t, c.Fill(parent, 101, headers), "a run of mined headers is accepted")
+	require.Equal(t, 5, c.Len())
+
+	// Spoil one header: move its nonce until its hash exceeds the target, then
+	// relink and re-mine the headers after it so the only fault in the batch is
+	// that one header's work.
+	spoiled, _ := minedRun(t, parent, 5, 0x207fffff)
+
+	for wireHeaderMeetsItsTarget(t, spoiled[2]) {
+		spoiled[2].Nonce++
+	}
+
+	for i := 3; i < len(spoiled); i++ {
+		spoiled[i].PrevBlock = spoiled[i-1].BlockHash()
+		mineWireHeader(t, spoiled[i])
+	}
+
+	refusing := newHeaderCache().WithPowLimit(ceiling)
+	require.False(t, refusing.Fill(parent, 101, spoiled), "one header without work refuses the whole batch")
+	require.Zero(t, refusing.Len(), "and nothing is cached")
+
+	linkageOnly := newHeaderCache()
+	require.True(t, linkageOnly.Fill(parent, 101, spoiled), "without a ceiling Fill checks linkage alone")
+}
+
+// TestHeaderCache_RefusesATargetEasierThanTheChainCeiling is the range half of
+// CheckProofOfWork: a header that declares a target easier than the chain's
+// limit is refused even when its hash meets that trivial target. This is the
+// free half of GHSA-gggq-8f59-4jm9, a 2000-header run for the price of hashing
+// it, which the ceiling takes away. Without a ceiling the same run is accepted,
+// pinning that the default stays linkage-only.
+func TestHeaderCache_RefusesATargetEasierThanTheChainCeiling(t *testing.T) {
+	parent := chainhash.Hash{0xc1}
+
+	// 0x207fffff is regtest's minimum; on mainnet it is far above the limit.
+	headers, _ := minedRun(t, parent, 4, 0x207fffff)
+
+	mainnet := newHeaderCache().WithPowLimit(model.PowLimitCeiling(&chaincfg.MainNetParams))
+	require.False(t, mainnet.Fill(parent, 101, headers), "a target easier than mainnet's limit is refused however well it is met")
+	require.Zero(t, mainnet.Len())
+
+	noCeiling := newHeaderCache()
+	require.True(t, noCeiling.Fill(parent, 101, headers), "no ceiling, no proof-of-work check")
+	require.Equal(t, 4, noCeiling.Len())
 }

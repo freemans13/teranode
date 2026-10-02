@@ -41,7 +41,9 @@ func legacyCorruptPeerID(peer *peer.Peer) string {
 }
 
 // commitPreparedBlock checks a converted block's proof of work and commits it
-// through ProcessBlock.
+// through ProcessBlock. origin is the header cache's answer for this block,
+// read once by the caller and carried through so the proof block validation
+// sees is the one the route decision was made on.
 //
 // The merkle root and the CVE-2012-2459 duplicate check are not repeated here,
 // and that is not skipping them. The pipeline sink verified the merkle root
@@ -49,7 +51,7 @@ func legacyCorruptPeerID(peer *peer.Peer) string {
 // and the stream builder's duplicate map refuses a repeated transaction, so
 // neither failure can reach a written record. Re-running either would need the
 // transactions themselves, which is what this route exists not to read.
-func (sm *SyncManager) commitPreparedBlock(ctx context.Context, teranodeBlock *model.Block, peerID string) error {
+func (sm *SyncManager) commitPreparedBlock(ctx context.Context, teranodeBlock *model.Block, peerID string, origin blockRequestOrigin) error {
 	// pre-check that there is enough proof of work on the block, before we do any other processing
 	headerValid, _, err := teranodeBlock.Header.HasMetTargetDifficulty()
 	if !headerValid {
@@ -57,7 +59,7 @@ func (sm *SyncManager) commitPreparedBlock(ctx context.Context, teranodeBlock *m
 	}
 
 	// call the process block wrapper, which will add tracing and logging
-	return sm.ProcessBlock(ctx, teranodeBlock, peerID)
+	return sm.ProcessBlock(ctx, teranodeBlock, peerID, origin)
 }
 
 // HandleConvertedBlock commits a block that was converted from wire bytes into
@@ -190,6 +192,33 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 
 	blockHeight := blk.Height
 
+	// One read of the header cache for the whole commit, so the mined-wait
+	// decision below and the proof handed to block validation describe the same
+	// cache state. Re-read here rather than remembered from the delivery that
+	// converted this record: a converted record can be committed after a
+	// restart, where nothing about that delivery survives.
+	origin := sm.blockOrigin(blockHash)
+
+	// Refused here, before the block-assembly wait and before any RPC, when the
+	// unified route would take this block but the header cache cannot prove it
+	// is on the checkpointed chain. Block validation would refuse the quick
+	// route for it anyway (Server.legacyUnifiedRoute requires the proof) and
+	// fall to full validation, which is correct for a .subtreeToCheck record and
+	// slow: after a restart every parked record is unproven until the header
+	// walk reaches a checkpoint again, and paying full validation for each of
+	// them would be the restart cost this refusal removes. A ServiceError, the
+	// same shape the parent-not-resolvable case above uses, so parkCommitFailure
+	// reads parkDispositionRetryLater: keep the blob, no rewind, no blame.
+	// parkedBlockFailed stamps the entry so the drain does not spend every turn
+	// on it, and fillHeaderCache re-offers it the moment a fill proves it.
+	//
+	// Above the checkpoint, or with the route flags off, there is nothing to
+	// refuse: the block takes full validation whether or not it is proven, and
+	// an unprovable record there simply takes the mined wait below.
+	if sm.unifiedRoute(blockHeight) && !origin.headerProven {
+		return errors.NewServiceError("[HandleConvertedBlock][%s] block at height %d is on the unified route but the header cache has not proven it; retrying once the header walk has", blockHash.String(), blockHeight)
+	}
+
 	// A block committed from the park after a restart, or drained by a worker
 	// whose parked entry carries a nil peer, has no delivering peer at all.
 	peerLabel := "recovered-from-disk"
@@ -237,18 +266,15 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	// on the outpoint-only fast path, that wait is skipped as redundant. Above
 	// the checkpoint outpoint-only is not active, so the wait runs.
 	//
-	// The origin is re-read from the header cache rather than remembered from the
-	// delivery that converted this record: a converted record can be committed
-	// after a restart, where nothing about that delivery survives. An unprovable
-	// record simply takes the wait, which is the safe direction — the wait costs
-	// latency, skipping it wrongly costs ordering.
-	if sm.needsParentMinedWait(sm.blockOrigin(blockHash), blockHeight) {
+	// An unprovable record takes the wait, which is the safe direction: the
+	// wait costs latency, skipping it wrongly costs ordering.
+	if sm.needsParentMinedWait(origin, blockHeight) {
 		if err = sm.waitForPreviousBlockMined(ctx, blk.Header.HashPrevBlock, blockHeight); err != nil {
 			return err
 		}
 	}
 
-	return sm.commitPreparedBlock(ctx, blk, legacyCorruptPeerID(peer))
+	return sm.commitPreparedBlock(ctx, blk, legacyCorruptPeerID(peer), origin)
 }
 
 // waitForPreviousBlockMined waits for the previous block to have mined_set=true.
@@ -278,7 +304,10 @@ func (sm *SyncManager) waitForPreviousBlockMined(ctx context.Context, prevBlockH
 	return err
 }
 
-func (sm *SyncManager) ProcessBlock(ctx context.Context, teranodeBlock *model.Block, peerID string) (err error) {
+// ProcessBlock hands a block to block validation. origin carries the header
+// cache's ancestry proof for it; block validation requires that proof before it
+// takes the below-checkpoint quick route, and takes full validation without it.
+func (sm *SyncManager) ProcessBlock(ctx context.Context, teranodeBlock *model.Block, peerID string, origin blockRequestOrigin) (err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "SyncManager:processBlock",
 		tracing.WithDebugLogMessage(
 			sm.logger,
@@ -293,9 +322,9 @@ func (sm *SyncManager) ProcessBlock(ctx context.Context, teranodeBlock *model.Bl
 	}()
 
 	// send the block to the blockValidation for processing and validation
-	// teranodeBlock.ID travels as a separate proto field in the gRPC request because
-	// block.Bytes() does not serialize ID.
-	if err = sm.blockValidation.ProcessBlock(ctx, teranodeBlock, teranodeBlock.Height, peerID, "legacy", teranodeBlock.ID); err != nil {
+	// teranodeBlock.ID and the header proof travel as separate proto fields in the
+	// gRPC request because block.Bytes() serializes neither.
+	if err = sm.blockValidation.ProcessBlock(ctx, teranodeBlock, teranodeBlock.Height, peerID, "legacy", teranodeBlock.ID, origin.headerProven); err != nil {
 		if errors.Is(err, errors.ErrBlockExists) {
 			sm.logger.Infof("[SyncManager:processBlock][%s %d] block already exists", teranodeBlock.Hash().String(), teranodeBlock.Height)
 			return nil
@@ -378,6 +407,14 @@ func (sm *SyncManager) legacyOutpointOnly(origin blockRequestOrigin, height uint
 // unifiedRoute reports whether a block at height takes block validation's unified
 // below-checkpoint route, where a block-assembly gate that is not ready is a local
 // condition: the caller must neither reject the block nor rotate the peer for it.
+//
+// Deliberately provenance-free. It answers "would block validation route this
+// height through quickValidateBlock if it could", which is a function of the
+// settings, the store and the checkpoint table alone. Whether a particular block
+// IS proven is blockOrigin's question, and HandleConvertedBlock asks both: an
+// eligible block the cache cannot prove is refused before the RPC, and a parked
+// block-assembly gate is a local condition for every eligible block whether or
+// not it is proven, so the ServiceError wrap there must not depend on the proof.
 func (sm *SyncManager) unifiedRoute(height uint32) bool {
 	return sm.settings != nil &&
 		sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint &&

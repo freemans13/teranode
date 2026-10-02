@@ -270,11 +270,17 @@ func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.Bloc
 	}
 
 	// A larger target is easier work. Refusing a target above the chain's limit
-	// is what bounds the header's own claim before it is tested against it.
+	// is what bounds the header's own claim before it is tested against it. The
+	// limit is model.PowLimitCeiling, the looser of PowLimit and PowLimitBits,
+	// so this gate and the header cache's Fill agree on it and neither refuses
+	// an honest minimum-difficulty header on a chain whose two declarations of
+	// the limit disagree (STN).
+	ceiling := model.PowLimitCeiling(sm.chainParams)
+
 	target := blockchain.CompactToBig(header.Bits)
-	if target == nil || target.Sign() <= 0 || target.Cmp(sm.chainParams.PowLimit) > 0 {
+	if target == nil || target.Sign() <= 0 || target.Cmp(ceiling) > 0 {
 		return errors.NewBlockInvalidError("[streamingBlockGate][%s] declared target %s is easier than the chain limit %s",
-			hash, describeTarget(target), sm.chainParams.PowLimit)
+			hash, describeTarget(target), ceiling)
 	}
 
 	var headerBytes bytes.Buffer

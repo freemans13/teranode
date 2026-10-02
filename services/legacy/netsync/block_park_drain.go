@@ -277,6 +277,16 @@ func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 			entry.parentMissingAt = time.Now()
 		}
 
+		// The refusal in HandleConvertedBlock arrives as a plain ServiceError, and
+		// errors.Is cannot tell one ServiceError from another (it matches on the
+		// code), so the condition is re-derived here from the same two facts the
+		// committer read. The drain then leaves the block alone for
+		// awaitingProofRetryAfter instead of re-dispatching it every turn, and
+		// fillHeaderCache clears the stamp when a fill proves the block.
+		if d.reason == parkDispositionRetryLater.reason && sm.awaitingHeaderProof(entry) {
+			entry.awaitingProofAt = time.Now()
+		}
+
 		sm.logger.Infof("[commitParkedBlock][%s] leaving the block parked (%s), parent %s: %v", entry.hash, d.reason, entry.prevBlock, err)
 	} else {
 		sm.logger.Errorf("[commitParkedBlock][%s] giving the block up (%s): %v", entry.hash, d.reason, err)
@@ -724,4 +734,45 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 
 		sm.submitParkCommit(parkCommit{entry: entry, parentHeight: parentHeight})
 	}
+}
+
+// awaitingHeaderProof reports whether a parked block is held back by a missing
+// header proof: it is on the unified below-checkpoint route and the header
+// cache cannot prove it is on the checkpointed chain. It is the condition
+// HandleConvertedBlock refuses on, re-derived for the drain's bookkeeping.
+//
+// The route needs the block's height, and a parked entry does not always
+// carry one: an entry recovered from disk has the record's height, but an
+// entry parked off the wire (handleBlockOnDiskMsg) has none, because the
+// delivery carries no height and the park never reads the record to find
+// out. For those the height is resolved the way HandleConvertedBlock resolves
+// it, from the stored parent, which is in the chain whenever a commit of this
+// block was attempted. One lookup on a refusal path, bounded by the floor the
+// stamp then imposes; a lookup failure leaves the stamp off, which costs a
+// re-dispatch, never a wrong verdict.
+func (sm *SyncManager) awaitingHeaderProof(entry parkedBlock) bool {
+	height := entry.height
+
+	if height <= 0 {
+		ctx, cancel := sm.chainCtx()
+		defer cancel()
+
+		_, meta, err := sm.blockchainClient.GetBlockHeader(ctx, &entry.prevBlock)
+		if err != nil || meta == nil {
+			return false
+		}
+
+		parentHeight, convErr := safeconversion.Uint32ToInt32(meta.Height)
+		if convErr != nil {
+			return false
+		}
+
+		height = parentHeight + 1
+	}
+
+	if height <= 0 {
+		return false
+	}
+
+	return sm.unifiedRoute(uint32(height)) && !sm.blockOrigin(entry.hash).headerProven //nolint:gosec // height > 0 checked above
 }

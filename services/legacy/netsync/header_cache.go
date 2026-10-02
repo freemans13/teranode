@@ -1,11 +1,14 @@
 package netsync
 
 import (
+	"math/big"
 	"sync"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 )
 
 // headerCache holds the block hashes for a contiguous run of heights above the
@@ -82,6 +85,13 @@ type headerCache struct {
 	//
 	// Zero means no proof, and every caller reads it as "deny the fast path".
 	provenTo int32
+
+	// powLimit is the easiest target a header may declare on this chain
+	// (model.PowLimitCeiling), held so that Fill can refuse a header that does
+	// not meet proof of work under the same lock-free walk that checks linkage.
+	// nil means no proof-of-work check, which is what every test that only
+	// cares which heights the cache names gets, and what New never leaves it at.
+	powLimit *big.Int
 }
 
 func newHeaderCache() *headerCache {
@@ -113,6 +123,50 @@ func (c *headerCache) WithCheckpoints(checkpoints []chaincfg.Checkpoint) *header
 	return c
 }
 
+// WithPowLimit hands the cache the chain's proof-of-work ceiling and returns it,
+// in the same shape as WithCheckpoints and for the same reason: the many callers
+// that only care which heights the cache names have no chain to give, and a nil
+// ceiling means Fill checks linkage alone, as it always did.
+//
+// With a ceiling, Fill refuses any batch containing a header whose declared
+// target is easier than the ceiling or whose hash does not meet its own target.
+// That is SV Node's CheckProofOfWork (pow.cpp:144-164: target non-zero, not
+// negative, not overflowing, not above powLimit, hash <= target), which
+// CheckBlockHeader runs on every header (validation.cpp:5586-5596, rejecting as
+// high-hash with DoS(50)) before AcceptBlockHeader does anything else. It is a
+// cost, not a defence: at minimum difficulty a header is
+// about 2^32 hashes, so a 2000-header fake run is seconds on an ASIC. The proof
+// (provenTo, Wantable) is the defence; this only removes the free version of the
+// attack, where a run of unmined headers was cached for the price of hashing it.
+func (c *headerCache) WithPowLimit(ceiling *big.Int) *headerCache {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.powLimit = ceiling
+
+	return c
+}
+
+// PowLimit returns the proof-of-work ceiling Fill judges headers against, or
+// nil when it judges linkage alone. fillHeaderCache reads it to classify a
+// refusal with the same ceiling Fill used, never one re-derived elsewhere: a
+// cache built without a ceiling must not have its refusals explained by a
+// check it never ran.
+func (c *headerCache) PowLimit() *big.Int {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.powLimit
+}
+
 // Fill installs headers as either an extension of this cache's own previous
 // contents or a fresh replacement of them, and reports whether anything was
 // accepted. Which one happens is decided here, not by the caller: parent is
@@ -137,7 +191,10 @@ func (c *headerCache) WithCheckpoints(checkpoints []chaincfg.Checkpoint) *header
 // Both paths share one linkage walk, run once here: every header must name the
 // one before it, or the whole batch is refused before either path is tried,
 // because a break anywhere makes every height after it a guess, and a height
-// is exactly what this structure exists to provide.
+// is exactly what this structure exists to provide. The same walk checks proof
+// of work when the cache has a ceiling (WithPowLimit), because Fill is the only
+// writer of the cache, so a check inside it cannot be bypassed by a future
+// caller.
 //
 // Refusing changes nothing. The caller asks again, of the same peer or
 // another.
@@ -145,6 +202,12 @@ func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*w
 	if c == nil || len(headers) == 0 {
 		return false
 	}
+
+	// Read once, outside the lock: WithPowLimit is called before any Fill and
+	// the walk below is the expensive part of this function.
+	c.mu.Lock()
+	ceiling := c.powLimit
+	c.mu.Unlock()
 
 	// Walk the whole batch before touching anything, so a refusal leaves the
 	// previous contents intact rather than half-replaced.
@@ -159,6 +222,11 @@ func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*w
 		}
 
 		hash := header.BlockHash()
+
+		if ceiling != nil && !headerMeetsWork(header.Bits, hash, ceiling) {
+			return false
+		}
+
 		hashes = append(hashes, hash)
 		prev = hash
 	}
@@ -171,6 +239,43 @@ func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*w
 	}
 
 	return c.replaceLocked(parent, baseHeight, headers, hashes)
+}
+
+// headerMeetsWork is CheckProofOfWork for one header: the declared target must
+// be a positive number no easier than the chain's ceiling, and the header's hash,
+// read as the 256-bit number the header's own difficulty is defined over, must
+// not exceed that target. The range half comes first because a malformed or
+// absurdly easy target makes the hash comparison meaningless.
+//
+// hash is a chainhash.Hash, whose bytes are the reverse of the number's
+// big-endian form, so they are reversed before SetBytes, exactly as
+// model.BlockHeader.HasMetTargetDifficulty does.
+func headerMeetsWork(bits uint32, hash chainhash.Hash, ceiling *big.Int) bool {
+	target := blockchain.CompactToBig(bits)
+	if target == nil || target.Sign() <= 0 || target.Cmp(ceiling) > 0 {
+		return false
+	}
+
+	return new(big.Int).SetBytes(bt.ReverseBytes(hash[:])).Cmp(target) <= 0
+}
+
+// firstHeaderWithoutWork returns the index of the first header in headers that
+// headerMeetsWork refuses under ceiling, or -1 when every header passes or there
+// is no ceiling. Fill reports a refusal as one false, so fillHeaderCache re-walks
+// the batch with this to tell "does not meet proof of work" apart from the other
+// reasons Fill says no, for the log line and the disconnect.
+func firstHeaderWithoutWork(headers []*wire.BlockHeader, ceiling *big.Int) int {
+	if ceiling == nil {
+		return -1
+	}
+
+	for i, header := range headers {
+		if !headerMeetsWork(header.Bits, header.BlockHash(), ceiling) {
+			return i
+		}
+	}
+
+	return -1
 }
 
 // findAnchor returns the index of the first header in headers usable once the
@@ -453,6 +558,62 @@ func (c *headerCache) At(height int32) (chainhash.Hash, bool) {
 	hash, ok := c.byHeight[height]
 
 	return hash, ok
+}
+
+// Wantable is At with the proof the below-checkpoint fast paths rest on: the
+// hash this cache names for height, and whether the node may ask a peer for
+// that block yet.
+//
+// At answers "does the cache name this height"; this answers "may a block be
+// requested for it", and below the last checkpoint the two differ. There every
+// requested block is destined for the quick route, which runs no header or
+// chain-membership rule of its own, so a block must not be requested from a run
+// the cache has not yet tied to a pinned checkpoint hash (provenTo). A run that
+// has matched no checkpoint still names heights, which keeps the header walk
+// going, but it is not yet a chain this node can download from. That is the
+// merge-base's checkpoint-gated fetch, restored.
+//
+// Above the last checkpoint nothing is quick-routed and no proof can exist, so
+// every named height is wantable. The boundary is belowLastCheckpointLocked's,
+// read at height-1: true exactly when a pinned checkpoint sits at or above
+// height, the same line model.BelowCheckpoint draws, reused rather than
+// re-derived.
+//
+// This is teranode's form of SV Node's bad-fork-prior-to-checkpoint
+// (validation.cpp:5748-5775, CheckIndexAgainstCheckpoint, called from
+// AcceptBlockHeader at 6025): SV Node refuses any header below its last
+// checkpoint that does not extend the checkpointed chain, and it can, because it
+// holds the header index through that checkpoint before it downloads a body.
+// Teranode has no header index, so the check runs forward instead: a run is
+// tied to a pinned hash and nothing below that hash is asked for until it is.
+//
+// Cost of the gate, stated plainly: downloads between checkpoints C and C'
+// begin only once the walk has matched C', and continueCheckpointWalkIfNeeded
+// walks toward NextCheckpointAbove(best), so the walk to C' starts when the
+// committed tip reaches C. That pause is per boundary: at 2000 headers a reply
+// the widest mainnet gap (about 43,000 heights) is about 22 round trips, and
+// over the 34 mainnet checkpoints roughly 470 round trips with nothing to
+// download. SV Node has no such pause because its header sync finishes before
+// body download starts; walking one checkpoint ahead of the tip is the
+// follow-up if the soak shows it.
+func (c *headerCache) Wantable(height int32) (chainhash.Hash, bool) {
+	if c == nil {
+		return chainhash.Hash{}, false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	hash, ok := c.byHeight[height]
+	if !ok {
+		return chainhash.Hash{}, false
+	}
+
+	if c.belowLastCheckpointLocked(height-1) && height > c.provenTo {
+		return chainhash.Hash{}, false
+	}
+
+	return hash, true
 }
 
 // HeightOf is At's reverse: the height this cache names for hash, and whether

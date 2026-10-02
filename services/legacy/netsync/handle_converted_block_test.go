@@ -119,17 +119,18 @@ type convertedRouteSpyValidation struct {
 }
 
 type convertedRouteProcessBlockCall struct {
-	block       *model.Block
-	blockHeight uint32
-	peerID      string
-	baseURL     string
-	blockID     uint32
+	block        *model.Block
+	blockHeight  uint32
+	peerID       string
+	baseURL      string
+	blockID      uint32
+	headerProven bool
 }
 
-func (v *convertedRouteSpyValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error {
+func (v *convertedRouteSpyValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32, headerProven bool) error {
 	v.mu.Lock()
 	v.calls = append(v.calls, convertedRouteProcessBlockCall{
-		block: block, blockHeight: blockHeight, peerID: peerID, baseURL: baseURL, blockID: blockID,
+		block: block, blockHeight: blockHeight, peerID: peerID, baseURL: baseURL, blockID: blockID, headerProven: headerProven,
 	})
 
 	hash := *block.Hash()
@@ -272,6 +273,12 @@ func TestHandleConvertedBlock_CommitsWithoutTheBlock(t *testing.T) {
 	blk.MsgBlock().Header.Bits = 0x207fffff
 	pipelineHeaderFixture(t, sm, blk)
 	mineRegtestPoW(t, blk)
+	// The unified route commits nothing the header cache has not proven
+	// (HandleConvertedBlock's refusal, GHSA-gggq-8f59-4jm9), so the fixture
+	// carries a genuine proof: a real Fill of the block's own header against a
+	// pinned checkpoint naming its hash.
+	blk.SetHeight(1)
+	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
 	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
@@ -297,8 +304,127 @@ func TestHandleConvertedBlock_CommitsWithoutTheBlock(t *testing.T) {
 	require.Equal(t, record.Header.Hash().String(), call.block.Header.Hash().String(), "the committed block must be the record's own")
 	require.Equal(t, record.Height, call.blockHeight, "the committed height must be the record's own height, re-verified against the chain")
 	require.Equal(t, uint32(0), call.blockID, "the unified route assigns the block ID server-side, inside quickValidateBlock")
+	require.True(t, call.headerProven, "the header cache's proof must travel with the record: block validation requires it before it takes the quick route")
 	require.Equal(t, uint64(6), call.block.TransactionCount, "the record's transaction count must reach the committer unchanged")
 	require.Equal(t, len(record.Subtrees), len(call.block.Subtrees), "the record's subtree list must reach the committer unchanged")
+}
+
+// TestHandleConvertedBlock_RefusesAnUnprovenBlockOnTheUnifiedRoute pins the
+// netsync half of GHSA-gggq-8f59-4jm9 independently of block validation: with
+// the unified route on and the header cache unable to prove the block is on the
+// checkpointed chain, HandleConvertedBlock never makes the RPC. The failure is a
+// ServiceError, which parkCommitFailure reads as retry-later (blob kept, no
+// rewind, no blame), because the proof arrives from the header walk and the
+// block is right once it does. Block validation would refuse the quick route
+// for such a block anyway and fall to full validation; refusing here is what
+// keeps a restart from paying full validation for every parked record.
+//
+// The fixture is the proven one with the cache discarded afterwards: the same
+// record, the same route, only the proof gone, as it is after a restart.
+func TestHandleConvertedBlock_RefusesAnUnprovenBlockOnTheUnifiedRoute(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+
+	sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+
+	spy := &convertedRouteSpyValidation{}
+	sm.blockValidation = spy
+
+	blk := wireBlockWithTxs(t, 6, false)
+	blk.MsgBlock().Header.Bits = 0x207fffff
+	pipelineHeaderFixture(t, sm, blk)
+	mineRegtestPoW(t, blk)
+	blk.SetHeight(1)
+	proveBlockOrigin(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+
+	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
+	require.NoError(t, err)
+	require.True(t, converted)
+
+	record, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+	require.NoError(t, err)
+
+	require.True(t, sm.unifiedRoute(record.Height), "sanity: the route must apply, or the refusal is unreachable")
+
+	// The restart shape: the record is on disk, the cache is empty.
+	sm.headerCache.Discard()
+	require.False(t, sm.blockOrigin(*blk.Hash()).headerProven)
+
+	err = sm.HandleConvertedBlock(ctx, nil, *blk.Hash(), record)
+	require.Error(t, err, "an unproven block on the unified route must not commit")
+	require.True(t, errors.IsTransientLocalError(err), "retry-later, not a verdict on the block: %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "the peer sent nothing wrong; the proof is this node's to obtain")
+	require.Zero(t, spy.callCount(), "the refusal happens before any RPC to block validation")
+
+	// The same record commits once the proof is back, carrying it.
+	proveBlockOrigin(t, sm, blk)
+
+	require.NoError(t, sm.HandleConvertedBlock(ctx, nil, *blk.Hash(), record))
+	require.Equal(t, 1, spy.callCount())
+	require.True(t, spy.lastCall().headerProven)
+}
+
+// TestHandleConvertedBlock_ForwardsTheHeaderProof pins what travels on the
+// request: the header cache's answer at commit time, whatever it is. Off the
+// unified route an unprovable record still commits, because block validation
+// takes full validation for it and the proof only decides the quick route; what
+// must not happen is a constant standing in for the cache's answer.
+func TestHandleConvertedBlock_ForwardsTheHeaderProof(t *testing.T) {
+	initPrometheusMetrics()
+
+	for _, tc := range []struct {
+		name   string
+		proven bool
+	}{
+		{name: "proven record carries true", proven: true},
+		{name: "unprovable record off the unified route carries false", proven: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := memory.New()
+			sm := newPipelineParkManager(t, store, 8)
+
+			// Off the unified route for the unproven case, so the refusal does
+			// not apply and the record reaches the spy with the cache's answer.
+			sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = tc.proven
+			sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = tc.proven
+			sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+
+			spy := &convertedRouteSpyValidation{}
+			sm.blockValidation = spy
+
+			blk := wireBlockWithTxs(t, 6, false)
+			blk.MsgBlock().Header.Bits = 0x207fffff
+			pipelineHeaderFixture(t, sm, blk)
+			mineRegtestPoW(t, blk)
+			blk.SetHeight(1)
+
+			if tc.proven {
+				proveBlockOrigin(t, sm, blk)
+			}
+
+			body := blockBodyBytes(t, blk)
+
+			converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
+			require.NoError(t, err)
+			require.True(t, converted)
+
+			record, err := sm.blockPark.ReadConverted(ctx, *blk.Hash())
+			require.NoError(t, err)
+
+			require.Equal(t, tc.proven, sm.blockOrigin(*blk.Hash()).headerProven, "sanity: the cache's answer is what the case is about")
+
+			require.NoError(t, sm.HandleConvertedBlock(ctx, nil, *blk.Hash(), record))
+			require.Equal(t, 1, spy.callCount())
+			require.Equal(t, tc.proven, spy.lastCall().headerProven, "the request carries the cache's answer, not a constant")
+		})
+	}
 }
 
 // TestHandleConvertedBlock_HasNoSubtreeSlicesToRecheck pins why the merkle and
@@ -420,6 +546,9 @@ func TestCommitParkedBlock_RoutesAConvertedEntryWithoutReadingAWholeBlock(t *tes
 	blk.MsgBlock().Header.Bits = 0x207fffff
 	pipelineHeaderFixture(t, sm, blk)
 	mineRegtestPoW(t, blk)
+	// A genuine proof: the unified route refuses an unproven record.
+	blk.SetHeight(1)
+	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
 	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
@@ -480,6 +609,10 @@ func TestBlockDispatcher_ParkedRunRoutesAConvertedEntryWithoutReadingAWholeBlock
 	blk.MsgBlock().Header.Bits = 0x207fffff
 	pipelineHeaderFixture(t, sm, blk)
 	mineRegtestPoW(t, blk)
+	// The unified route commits nothing the header cache has not proven
+	// (HandleConvertedBlock's refusal), so the fixture carries a genuine proof.
+	blk.SetHeight(1)
+	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
 	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
@@ -532,6 +665,9 @@ func TestBlockDispatcher_ParkedRunNeverConsultsTheStoreToRoute(t *testing.T) {
 	blk.MsgBlock().Header.Bits = 0x207fffff
 	pipelineHeaderFixture(t, sm, blk)
 	mineRegtestPoW(t, blk)
+	// A genuine proof, as above: the route refuses an unproven record.
+	blk.SetHeight(1)
+	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
 	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))

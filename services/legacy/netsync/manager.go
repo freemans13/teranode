@@ -2506,15 +2506,31 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	_, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
 
 	if !sm.headerCache.Fill(tipHash, best+1, msg.Headers) {
-		// Two different refusals arrive here as one false, and only one of them is
+		// Three different refusals arrive here as one false, and two of them are
 		// the peer's fault. Fill refuses a run that does not reach above the
 		// committed tip, which is an honest answer to a question this node has
-		// stopped asking, and it refuses a run that reaches a checkpoint height
-		// carrying the wrong hash, which is a lie about the certified chain.
-		// Re-deriving which it was costs one walk of the batch and is worth it,
-		// because upstream disconnects for the second (handleHeadersMsg's
+		// stopped asking; it refuses a header that does not meet proof of work,
+		// which nobody paid for; and it refuses a run that reaches a checkpoint
+		// height carrying the wrong hash, which is a lie about the certified
+		// chain. Re-deriving which it was costs one walk of the batch and is
+		// worth it, because upstream disconnects for the last (handleHeadersMsg's
 		// "does NOT match expected checkpoint hash") and this branch lost that
 		// defence along with the header list.
+		//
+		// Proof of work first, because Fill checks it first: a batch that fails
+		// it was never judged against the tip or the checkpoints at all. Judged
+		// with the cache's own ceiling, so a cache built without one (every test
+		// that only cares which heights are named) never has a refusal explained
+		// by a check Fill did not run. SV Node rejects the header as high-hash
+		// with DoS(50) (validation.cpp:5586-5596, CheckBlockHeader); here the peer
+		// loses its connection, and the ban score is the peer-punishment work's
+		// to add.
+		if i := firstHeaderWithoutWork(msg.Headers, sm.headerCache.PowLimit()); i >= 0 {
+			peer.DisconnectWithWarning(fmt.Sprintf("block header %s does not meet proof of work (index %d of %d)", msg.Headers[i].BlockHash(), i, len(msg.Headers)))
+
+			return false
+		}
+
 		if cp := sm.contradictedCheckpoint(best+1, tipHash, msg.Headers); cp != nil {
 			peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash %s", cp.Height, cp.Hash))
 
@@ -2568,11 +2584,68 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 
 	if newProven := sm.headerCache.ProvenTo(); newProven > prevProven {
 		sm.logger.Infof("[fillHeaderCache][%s] header walk matched checkpoint at height %d", peer, newProven)
+
+		sm.reofferParkedBlocksProvenBy(newProven)
 	}
 
 	sm.continueCheckpointWalkIfNeeded(peer, best, top)
 
 	return true
+}
+
+// reofferParkedBlocksProvenBy hands the parked blocks sitting directly behind
+// the committed tip back to the block-queue consumer once a fill has raised the
+// cache's proof to newProven, so a block HandleConvertedBlock refused as
+// unproven commits the moment the walk proves it rather than when the park
+// sweep next notices it.
+//
+// It is the other half of the refusal in HandleConvertedBlock. After a restart
+// every parked record is unproven, because the header cache starts empty and
+// reconcileRecoveredParents runs before any headers reply; each one is refused
+// with the blob kept and awaitingProofAt stamped. Nothing on the drain's own path
+// changes that answer, and the sweep only looks at a block after
+// parkStuckThreshold and then parkSweepRPCBudget at a time, so without this the
+// restart dead spot would be the walk plus minutes of sweep cadence. The proof
+// arrives here, so the re-offer belongs here.
+//
+// Only the tip's own children are re-offered: a block parked behind anything
+// else cannot commit yet whatever the cache proves, and the drain that follows
+// its parent's commit will reach it in order. They are taken through
+// TakeChildrenForProof rather than TakeChildren, because the ordinary take
+// honours the awaitingProofAt floor and would hand back nothing for exactly the
+// block this is for; the copy handed over has the stamp cleared, or the
+// consumer's own committableChildLocked would hold it for the rest of the floor
+// and the proof event would be lost until the sweep.
+//
+// This runs on the headers goroutine (handleHeadersMsg is started with go), so
+// it posts through submitParkCommit, the cross-goroutine route the sweep uses,
+// never through scheduleDrain, which only the consumer may call. The tip is
+// re-read rather than taken from the top of fillHeaderCache: the chain moves
+// under a fill, and the children of a tip that has since advanced are not the
+// blocks held up.
+func (sm *SyncManager) reofferParkedBlocksProvenBy(newProven int32) {
+	if sm.blockPark == nil {
+		return
+	}
+
+	best, tipHash, ok := sm.committedTip()
+	if !ok || best+1 > newProven {
+		return
+	}
+
+	for _, entry := range sm.blockPark.TakeChildrenForProof(tipHash) {
+		if !sm.blockOrigin(entry.hash).headerProven {
+			// Not this fill's doing: a sibling the cache does not name, or a
+			// height still above the proof. Back as it was, stamp and all.
+			sm.blockPark.Restore(entry)
+
+			continue
+		}
+
+		sm.logger.Infof("[fillHeaderCache][%s] header walk proved parked block %s at height %d, re-offering it for commit", tipHash, entry.hash, best+1)
+
+		sm.submitParkCommit(parkCommit{entry: entry, parentHeight: uint32(best)}) //nolint:gosec // a committed height, never negative
+	}
 }
 
 // continueCheckpointWalkIfNeeded sends the next getheaders immediately when
@@ -3879,8 +3952,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// the same lock that installs it, so no reader can ever see this run's contents
 	// with the previous run's proof. config.ChainParams is non-nil on every path
 	// that reaches here (startSync dereferences it unguarded a few lines below);
-	// a nil list simply means no proof is ever granted.
-	sm.headerCache = newHeaderCache().WithCheckpoints(config.ChainParams.Checkpoints)
+	// a nil list simply means no proof is ever granted. The proof-of-work
+	// ceiling goes in the same way, so Fill refuses a header nobody paid for
+	// before it names a height (SV Node's CheckProofOfWork on every header).
+	sm.headerCache = newHeaderCache().
+		WithCheckpoints(config.ChainParams.Checkpoints).
+		WithPowLimit(model.PowLimitCeiling(config.ChainParams))
 
 	// Tracks recently-failed block hashes so descendants of an unstored/rejected
 	// block are short-circuited rather than triggering a NOT_FOUND ERROR cascade

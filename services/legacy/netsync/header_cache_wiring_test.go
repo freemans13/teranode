@@ -238,3 +238,94 @@ func TestFillHeaderCache_ASameHeightReorgIsFollowed(t *testing.T) {
 
 	require.True(t, peer.Connected(), "an honest reply from the new chain must not cost the peer its connection")
 }
+
+// TestFillHeaderCache_AHeaderWithoutWorkDisconnectsTheSender is the handler
+// side of Fill's proof-of-work check: a batch refused for a header that does not
+// meet proof of work costs the sender its connection, the way a wrong hash at a
+// checkpoint height does, because nobody paid for it. SV Node scores the same
+// header high-hash with DoS(50) (validation.cpp, CheckBlockHeader). The honest
+// refusal beside it, a batch that does not link, still keeps the peer
+// (TestFillHeaderCache_ABatchThatDoesNotLinkIsDroppedAndThePeerKeepsItsConnection).
+func TestFillHeaderCache_AHeaderWithoutWorkDisconnectsTheSender(t *testing.T) {
+	sm := newHeaderCacheManager(t)
+	sm.headerCache = newHeaderCache().WithPowLimit(model.PowLimitCeiling(&chaincfg.MainNetParams))
+
+	tipHash := mockCommittedTip(t, sm, 100, 0)
+
+	peer, _, _ := connectRacePeer(t, 214, 1000)
+
+	var nonce uint32
+	// Mainnet difficulty-1 headers that nobody mined: they link to the tip and
+	// fail nothing but the work.
+	msg, _ := linkedHeaders(tipHash, 3, &nonce)
+
+	require.False(t, sm.fillHeaderCache(peer, msg), "a batch with a header that does not meet proof of work is refused")
+	require.Zero(t, sm.headerCache.Len(), "and nothing is cached")
+	require.False(t, peer.Connected(), "the sender of a header nobody paid for loses the connection")
+}
+
+// TestFillHeaderCache_ClassifiesARefusalWithTheCacheOwnCeiling pins that the
+// disconnect above is explained by the ceiling Fill actually used: a cache
+// built without one, as every test that only cares about heights builds it,
+// must never have an honest refusal (here, a batch that does not link) blamed
+// on a proof-of-work check Fill did not run.
+func TestFillHeaderCache_ClassifiesARefusalWithTheCacheOwnCeiling(t *testing.T) {
+	sm := newHeaderCacheManager(t)
+	require.Nil(t, sm.headerCache.PowLimit(), "sanity: the harness cache has no ceiling")
+	mockCommittedTip(t, sm, 100, 0)
+
+	peer, _, _ := connectRacePeer(t, 215, 1000)
+
+	var nonce uint32
+	msg, _ := linkedHeaders(chainhash.Hash{0x79}, 3, &nonce)
+
+	require.False(t, sm.fillHeaderCache(peer, msg))
+	require.True(t, peer.Connected(), "an unmined header is not the reason a ceiling-less cache refused this batch")
+}
+
+// TestNew_WiresThePowLimitIntoTheHeaderCache is the guard against the ceiling
+// being forgotten in the constructor, in the shape of TestNew_BuildsAHeaderCache:
+// the real New, the real field, and a Fill that must refuse an unmined run.
+func TestNew_WiresThePowLimitIntoTheHeaderCache(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+
+	client := &blockchain2.Mock{}
+	client.Mock.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 800_000}, nil)
+	client.Mock.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(false, nil)
+
+	config := &Config{
+		ChainParams:        &chaincfg.MainNetParams,
+		DisableCheckpoints: true,
+	}
+
+	tSettings := &settings.Settings{}
+
+	sm, err := New(
+		ctx,
+		ulogger.TestLogger{},
+		tSettings,
+		client,
+		&validator.MockValidator{},
+		&utxo.MockUtxostore{},
+		blob_memory.New(),
+		parkTempStore(t, tSettings),
+		&subtreevalidation.MockSubtreeValidation{},
+		&blockvalidation.MockBlockValidation{},
+		blockassembly.NewMock(),
+		config,
+	)
+	require.NoError(t, err)
+
+	want := model.PowLimitCeiling(&chaincfg.MainNetParams)
+	require.NotNil(t, want)
+	require.NotNil(t, sm.headerCache.PowLimit(), "the constructor must hand the cache the chain's ceiling")
+	require.Zero(t, want.Cmp(sm.headerCache.PowLimit()), "and it must be model.PowLimitCeiling's answer for the chain")
+
+	var nonce uint32
+	msg, _ := linkedHeaders(*bestHeader.Hash(), 3, &nonce)
+	require.False(t, sm.headerCache.Fill(*bestHeader.Hash(), 800_001, msg.Headers), "an unmined run is refused by the cache New built")
+}

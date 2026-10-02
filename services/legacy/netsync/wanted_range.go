@@ -28,6 +28,13 @@ type wantedBlock struct {
 // it. A block whose parent never arrives cannot commit, so blocks fetched
 // beyond a hole only wait in the park, and a park that fills starts refusing
 // the very block that would close the hole.
+//
+// Below the last checkpoint the run also stops at the first height the cache
+// cannot PROVE (headerCache.Wantable): no block is requested from a run that
+// has not yet matched a pinned checkpoint hash, which is what the merge-base's
+// checkpoint-gated fetch did. The header walk itself is unaffected, because
+// maybeRequestMoreHeaders and continueCheckpointWalkIfNeeded read At and Top,
+// so the cache keeps filling toward the checkpoint while nothing is wantable.
 func (sm *SyncManager) wantedBlocksFromCache(best int32, depth int32) []wantedBlock {
 	if depth < 1 {
 		// A depth of zero asks for nothing for ever, which is a stall wearing a
@@ -38,7 +45,7 @@ func (sm *SyncManager) wantedBlocksFromCache(best int32, depth int32) []wantedBl
 	wanted := make([]wantedBlock, 0, depth)
 
 	for i := int32(1); i <= depth; i++ {
-		hash, ok := sm.headerCache.At(best + i)
+		hash, ok := sm.headerCache.Wantable(best + i)
 		if !ok {
 			break
 		}

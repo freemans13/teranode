@@ -39,6 +39,12 @@ const (
 	// route back.
 	parentMissingRetryAfter = 5 * time.Second
 
+	// awaitingProofRetryAfter is parentMissingRetryAfter's twin for a block the
+	// header cache has not proven yet (see parkedBlock.awaitingProofAt). The
+	// floor exists to stop the drain spinning, not to pace the proof: a fill
+	// that proves the block clears the stamp and re-offers it at once.
+	awaitingProofRetryAfter = 5 * time.Second
+
 	// parkStuckThreshold is how old a parked block must be before the sweep
 	// spends an RPC asking whether its parent is in the chain after all. A
 	// missing parent is not the only thing that surfaces as ErrBlockNotFound,
@@ -185,6 +191,20 @@ type parkedBlock struct {
 	// so waiting before asking again costs nothing and hands the turn to a block
 	// that can actually be committed.
 	parentMissingAt time.Time
+	// awaitingProofAt is when a commit of this block last failed because it is
+	// on the unified below-checkpoint route and the header cache could not
+	// prove it is on the checkpointed chain (HandleConvertedBlock's refusal),
+	// zero if it never has.
+	//
+	// Same hot-retry problem as parentMissingAt, different cause and different
+	// way out. A proof arrives from the header walk, not from a commit, so
+	// nothing on the drain's own path changes the answer between one turn and
+	// the next; without this floor the consumer would re-dispatch the same
+	// unproven block as fast as block validation's existence check answers,
+	// for every parked record after a restart, until the walk reaches a
+	// checkpoint. fillHeaderCache clears the stamp when a fill proves the
+	// block, so the floor only ever holds while the proof is genuinely absent.
+	awaitingProofAt time.Time
 }
 
 // blockPark keeps blocks whose parent is not stored yet on disk, and commits
@@ -568,6 +588,13 @@ func (p *blockPark) committableChildLocked(child chainhash.Hash) (*parkedBlock, 
 		return entry, false
 	}
 
+	// Refused for a missing header proof within the floor, so not worth the
+	// turn either: the proof comes from the header walk, and fillHeaderCache
+	// re-offers the block with the stamp cleared the moment a fill proves it.
+	if !entry.awaitingProofAt.IsZero() && time.Since(entry.awaitingProofAt) < awaitingProofRetryAfter {
+		return entry, false
+	}
+
 	return entry, true
 }
 
@@ -752,6 +779,55 @@ func (p *blockPark) AllParked() []parkedBlock {
 	}
 
 	return out
+}
+
+// TakeChildrenForProof removes and returns every block parked directly behind
+// parent that is in the index, whether or not a retry floor is holding it back,
+// with awaitingProofAt cleared on each copy returned. It exists for
+// fillHeaderCache's re-offer: the caller has just obtained the proof
+// awaitingProofAt was waiting for, so the floor TakeChildren honours is the one
+// thing that must not stop it. Edges to blocks still being written are kept, as
+// TakeChildren keeps them. Blobs stay on disk and charged until the caller
+// commits (Delete) or gives back (Restore).
+func (p *blockPark) TakeChildrenForProof(parent chainhash.Hash) []parkedBlock {
+	if p == nil {
+		return nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	hashes := p.children[parent]
+	if len(hashes) == 0 {
+		return nil
+	}
+
+	taken := make([]parkedBlock, 0, len(hashes))
+
+	var kept []chainhash.Hash
+
+	for _, h := range hashes {
+		entry, ok := p.entries[h]
+		if !ok {
+			kept = append(kept, h)
+
+			continue
+		}
+
+		copied := *entry
+		copied.awaitingProofAt = time.Time{}
+
+		taken = append(taken, copied)
+		delete(p.entries, h)
+	}
+
+	if len(kept) == 0 {
+		delete(p.children, parent)
+	} else {
+		p.children[parent] = kept
+	}
+
+	return taken
 }
 
 // Take removes one specific block from the index, leaving its blob on disk and

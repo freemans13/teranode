@@ -7,9 +7,13 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,7 +30,22 @@ import (
 // (subtree fetch, UTXO create/spend, kafka, gRPC); this harness is built the
 // same way so the "must leave the park" half of the test is a genuine commit,
 // not a stand-in for one.
-func recoveredParkHarness(t *testing.T) (*SyncManager, chainhash.Hash) {
+//
+// proven says whether the header cache is given a genuine proof that the block
+// is on the checkpointed chain. After a real restart it is not: the cache
+// starts empty and reconcileRecoveredParents runs before any headers reply, so
+// the unproven shape is the one production actually recovers into.
+//
+// recoveredParkFixture is what a recoveredParkHarness test needs besides the
+// manager: the parked block's hash, its header (to prove it later through a
+// real fill) and the spy that stands in for block validation.
+type recoveredParkFixture struct {
+	hash   chainhash.Hash
+	header *wire.BlockHeader
+	spy    *convertedRouteSpyValidation
+}
+
+func recoveredParkHarness(t *testing.T, proven bool) (*SyncManager, *recoveredParkFixture) {
 	t.Helper()
 
 	initPrometheusMetrics()
@@ -38,7 +57,12 @@ func recoveredParkHarness(t *testing.T) (*SyncManager, chainhash.Hash) {
 	sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
 	sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
-	sm.blockValidation = &convertedRouteSpyValidation{}
+
+	// With a chain, so a commit stores the block where HandleConvertedBlock's
+	// own GetBlockExists reads it back: the test that re-offers a block after a
+	// proof needs the second attempt to be a real commit, not a repeat.
+	spy := &convertedRouteSpyValidation{chain: sm.blockchainClient}
+	sm.blockValidation = spy
 
 	blk := wireBlockWithTxs(t, 6, false)
 	// wireBlockWithTxs' Bits is mainnet genesis-era difficulty, a real target
@@ -48,6 +72,19 @@ func recoveredParkHarness(t *testing.T) (*SyncManager, chainhash.Hash) {
 	blk.MsgBlock().Header.Bits = 0x207fffff
 	pipelineHeaderFixture(t, sm, blk)
 	mineRegtestPoW(t, blk)
+	blk.SetHeight(1)
+
+	if proven {
+		proveBlockOrigin(t, sm, blk)
+	} else {
+		// The checkpoint sits above the block so the unified route applies, but
+		// the cache has never seen a run that reaches it: unproven, as after a
+		// restart.
+		hash := *blk.Hash()
+		sm.chainParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1, Hash: &hash}}
+		sm.headerCache = newHeaderCache().WithCheckpoints(sm.chainParams.Checkpoints)
+	}
+
 	body := blockBodyBytes(t, blk)
 
 	converted, err := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
@@ -59,17 +96,21 @@ func recoveredParkHarness(t *testing.T) (*SyncManager, chainhash.Hash) {
 	// Seeded directly into the index rather than through Admit/Recover: this
 	// harness needs one specific entry in place, not a restart scan over a
 	// directory. Recover would build the same shape (a
-	// pre-restart parkedAt) from a real recovery pass; block_park.go's own
-	// Recover is what TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart
-	// exercises for that half.
+	// pre-restart parkedAt, the record's height) from a real recovery pass;
+	// block_park.go's own Recover is what
+	// TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart exercises
+	// for that half. The sink's Admit leaves the entry out of children, so it
+	// is added here the way Restore and Recover both do.
 	sm.blockPark.entries[hash] = &parkedBlock{
 		hash:      hash,
 		prevBlock: blk.MsgBlock().Header.PrevBlock,
+		height:    1,
 
 		parkedAt: time.Now().Add(-parkStuckThreshold - time.Minute),
 	}
+	sm.blockPark.children[blk.MsgBlock().Header.PrevBlock] = append(sm.blockPark.children[blk.MsgBlock().Header.PrevBlock], hash)
 
-	return sm, hash
+	return sm, &recoveredParkFixture{hash: hash, header: &blk.MsgBlock().Header, spy: spy}
 }
 
 // recoveredParkHarnessNoParent is the other half: one entry parked behind a
@@ -105,13 +146,67 @@ func recoveredParkHarnessNoParent(t *testing.T) (*SyncManager, chainhash.Hash) {
 // One pass after recovery settles it. A thirty-second ticker settles it too,
 // eventually, and then keeps asking for the rest of the node's life.
 func TestReconcileRecoveredParents_CommitsABlockWhoseParentIsAlreadyInTheChain(t *testing.T) {
-	sm, parked := recoveredParkHarness(t)
+	sm, f := recoveredParkHarness(t, true)
 
 	n := sm.reconcileRecoveredParents(context.Background())
 
 	require.Equal(t, 1, n, "the recovered block's parent is in the chain, so it must be handed on")
-	require.False(t, sm.blockPark.Has(parked),
-		"and it must leave the park, because nothing else will ever wake it")
+	require.False(t, sm.blockPark.Has(f.hash),
+		"and it must leave the park, because no commit event will ever wake it")
+	require.Equal(t, 1, f.spy.callCount(), "handed on means committed")
+	require.True(t, f.spy.lastCall().headerProven, "a proven record carries its proof to block validation")
+}
+
+// TestReconcileRecoveredParents_AnUnprovenBlockWaitsForTheHeaderWalkAndCommitsWhenProven
+// is the restart as it really happens. The header cache starts empty and
+// reconcileRecoveredParents runs before any headers reply, so every recovered
+// block on the unified route is unproven when it is first handed on.
+// HandleConvertedBlock refuses it (a ServiceError, read as retry-later: blob
+// kept, no mark, no blame) and the drain stamps it so the consumer does not
+// spend every turn on it. Then a fill that reaches the pinned checkpoint proves
+// it, and fillHeaderCache re-offers it at once: the second attempt is a real
+// commit through the route that was refused the first time, carrying the proof.
+//
+// Nothing here forces the outcome: the proof is a genuine headerCache.Fill of
+// the block's own header against the pinned hash, and the re-offer is the
+// production hook on fillHeaderCache, driven through the production handler.
+func TestReconcileRecoveredParents_AnUnprovenBlockWaitsForTheHeaderWalkAndCommitsWhenProven(t *testing.T) {
+	sm, f := recoveredParkHarness(t, false)
+	ctx := context.Background()
+
+	n := sm.reconcileRecoveredParents(ctx)
+	require.Equal(t, 1, n, "the parent is in the chain, so the block is handed on")
+
+	// Refused, kept, and stamped.
+	require.True(t, sm.blockPark.Has(f.hash), "an unproven block on the unified route stays parked")
+	require.Zero(t, f.spy.callCount(), "the refusal happens before any RPC to block validation")
+
+	entry, ok := sm.blockPark.entries[f.hash]
+	require.True(t, ok)
+	require.False(t, entry.awaitingProofAt.IsZero(), "the drain stamps the block so it is not re-dispatched every turn")
+
+	_, committable := sm.blockPark.committableChildLocked(f.hash)
+	require.False(t, committable, "within the floor the drain leaves it alone")
+
+	exists, err := sm.blockchainClient.GetBlockExists(ctx, &f.hash)
+	require.NoError(t, err)
+	require.False(t, exists, "nothing was stored")
+
+	// The header walk reaches the checkpoint: a one-header run from the
+	// committed tip (genesis) ending at the pinned hash.
+	p := peer.NewInboundPeer(ulogger.TestLogger{}, sm.settings, &peer.Config{})
+
+	require.True(t, sm.fillHeaderCache(p, headersMsgOf(t, []*wire.BlockHeader{f.header})), "the run links to genesis and matches the checkpoint")
+	require.True(t, sm.blockOrigin(f.hash).headerProven, "sanity: the fill must have proven the block")
+
+	// Re-offered by the fill, committed through the same route, with the proof.
+	require.False(t, sm.blockPark.Has(f.hash), "the proven block leaves the park")
+	require.Equal(t, 1, f.spy.callCount(), "exactly one commit, the re-offer")
+	require.True(t, f.spy.lastCall().headerProven, "the re-offer carries the proof the first attempt lacked")
+
+	exists, err = sm.blockchainClient.GetBlockExists(ctx, &f.hash)
+	require.NoError(t, err)
+	require.True(t, exists, "the block is in the chain")
 }
 
 // TestReconcileRecoveredParents_LeavesABlockWhoseParentIsGenuinelyMissing is the
