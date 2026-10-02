@@ -45,8 +45,19 @@ import (
 //     commit to, a duplicate transaction, a count the body cannot hold) or
 //     ERR_BLOCK_CORRUPT (a delivery whose length and transactions disagree). While
 //     sm.ctx is live only these two codes reach the read loop as a read error, and
-//     so a reject; once it is cancelled absorbLocalSinkFault lets any code through
-//     to the read loop, see its doc comment.
+//     so a reject naming the block and the association dropped
+//     (peer.BlockBodyRejectedError); once it is cancelled absorbLocalSinkFault
+//     lets any code through to the read loop, see its doc comment.
+//   - of those, exactly three refusals also wrap errors.ErrBlockBodyMismatch
+//     inside the invalid verdict, and they are the only ones the legacy peer
+//     server bans a host for: a merkle root the header does not carry (this
+//     file), a duplicate transaction (block_stream_builder.go AddStreamedTx) and
+//     a body with no coinbase (block_tx_stream.go newBlockTxStream). Each judges
+//     a body that parsed to its end, which is where SV Node's CorruptionOrDoS
+//     applies (validation.cpp bad-txnmrklroot, bad-txns-duplicate,
+//     bad-cb-missing). No other producer may raise the marker: a count the body
+//     cannot hold, a shape fault of our own builder or a delivery cut short is
+//     what SV Node logs as a deserialisation failure and never scores.
 //   - a connection that ends mid-body carries no teranode code at all, whatever
 //     ended it: a hang-up by FIN before the declared length is returned as the bare
 //     io.ErrUnexpectedEOF (block_tx_stream.go endOfBody), and a socket that failed,
@@ -239,7 +250,12 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	if !root.IsEqual(&header.MerkleRoot) {
 		sm.deleteWrittenOnFailure(hash, writer)
 
-		return false, errors.NewBlockInvalidError("[pipelineBlockSink][%s] merkle root %s does not match header's %s", hash, root, header.MerkleRoot)
+		// ErrBlockBodyMismatch inside the verdict: the whole body was read
+		// (RequireEnd passed just above) and its root is not the header's, which
+		// is SV Node's bad-txnmrklroot, CorruptionOrDoS. The marker is what the
+		// legacy peer server bans on; see the producer rule in this file's doc
+		// comment for the three sites that may raise it.
+		return false, errors.NewBlockInvalidError("[pipelineBlockSink][%s] merkle root %s does not match header's %s", hash, root, header.MerkleRoot, errors.ErrBlockBodyMismatch)
 	}
 
 	// Convert the wire header into a teranode header the same way

@@ -126,7 +126,7 @@ func TestStartSync_HonestPeerKeepsItsAuthorisationAcrossASyncPeerChange(t *testi
 		"sanity: startSync must have run to completion, so the ledger-wide clear was reached")
 
 	// The honest peer's copy turns up on the streaming route.
-	err := sm.streamingBlockGate(frontier, header)
+	err := sm.streamingBlockGate(frontier, header, 0)
 	require.NoError(t, err,
 		"the block was requested, so the streaming gate must not treat the honest peer's delivery as unrequested")
 }

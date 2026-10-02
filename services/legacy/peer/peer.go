@@ -10,6 +10,7 @@ import (
 	"container/list"
 	"crypto/rand"
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"math"
@@ -188,6 +189,15 @@ type MessageListeners struct {
 	// rather than decoded. Its transactions are not in memory; the listener
 	// reads them back from the park if it needs them.
 	OnBlockOnDisk func(p *Peer, msg *MsgBlockOnDisk)
+
+	// OnBlockBodyRejected is invoked, on the peer's read loop, when the body
+	// this peer streamed for a block was refused by the installed sink as the
+	// peer's fault (see BlockBodyRejectedError). By the time it is called the
+	// peer package has decided the connection's fate: once the listener
+	// returns a reject naming the block is sent and the whole association is
+	// disconnected through its primary. What the listener owns is the ban, and
+	// only on rejected.ProvenBad(); it must not disconnect anything itself.
+	OnBlockBodyRejected func(p *Peer, rejected *BlockBodyRejectedError)
 
 	// OnCFilter is invoked when a peer receives a cfilter bitcoin message.
 	OnCFilter func(p *Peer, msg *wire.MsgCFilter)
@@ -2227,6 +2237,31 @@ out:
 			// local peer is not forcibly disconnecting and the
 			// remote peer has not disconnected.
 			if p.shouldHandleReadError(err) {
+				// A body the sink refused as the peer's fault, read to the end
+				// or not. This is a judgement on a named block, not a message
+				// that would not parse, so the peer is told which block and
+				// why, and the whole association goes, not only the stream the
+				// body came in on: under BlockPriority that stream is a DATA1
+				// sub-peer, and dropping it alone leaves the primary as sync
+				// peer with every block it owed still owed (netsync only
+				// releases a primary). Checked by type before the "malformed"
+				// path so that path is unchanged for every other error.
+				// stderrors.As, not errors.As: teranode's As stops at the first
+				// *Error it finds inside and never tries the outer type.
+				var rejected *BlockBodyRejectedError
+				if stderrors.As(err, &rejected) {
+					p.logger.Warnf("[%s] rejected the body of block %s (truncated=%t): %v", p, rejected.Hash, rejected.Truncated, rejected.Err)
+
+					if p.cfg.Listeners.OnBlockBodyRejected != nil {
+						p.cfg.Listeners.OnBlockBodyRejected(p, rejected)
+					}
+
+					p.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block body rejected", &rejected.Hash, true)
+					p.DisconnectAssociation("block body rejected")
+
+					break out
+				}
+
 				errMsg := fmt.Sprintf("Can't read message from %s: %v", p, err)
 				if err != io.ErrUnexpectedEOF {
 					p.logger.Errorf("%s", errMsg)
@@ -2355,11 +2390,14 @@ out:
 			}
 
 		case *MsgBlockDiscarded:
-			// A block this node did not ask for. SV Node neither disconnects nor
-			// scores a peer for one: it is usually a block announced and pushed
-			// before our getdata, or a second copy after we stopped wanting it.
-			// The body has already been drained, so the connection carries on.
-			p.logger.Debugf("[%s] discarded block %s, %d bytes, which this node did not ask for", p, msg.Hash, msg.Size)
+			// A block this node did not ask for, or one its own block policy
+			// declines on size. SV Node neither disconnects nor scores a peer
+			// for an unrequested block: it is usually a block announced and
+			// pushed before our getdata, or a second copy after we stopped
+			// wanting it. A policy decline is this node's configuration, not
+			// the peer's conduct. The body has already been drained, so the
+			// connection carries on either way.
+			p.logger.Debugf("[%s] discarded block %s, %d bytes: %s", p, msg.Hash, msg.Size, msg.Reason)
 
 		case *wire.MsgInv:
 			if p.cfg.Listeners.OnInv != nil {
@@ -2852,6 +2890,35 @@ func (p *Peer) DisconnectWithInfo(reason string) {
 
 func (p *Peer) DisconnectWithWarning(reason string) {
 	p.DisconnectWithLogFunc(reason, p.logger.Warnf)
+}
+
+// DisconnectAssociation disconnects this peer and, when it is a stream sub-peer
+// of a multistream association, the association's primary as well, at warning
+// level with reason.
+//
+// It is the one way to drop a peer for misbehaviour. Under BlockPriority a
+// block body arrives on a DATA1 sub-peer, and a sub-peer is not what the sync
+// manager knows: it is never in netsync's peerStates and never owns a block in
+// the download ledger, both of which are kept under the primary. Disconnecting
+// only the sub-peer therefore left the primary as sync peer with every block it
+// owed still owed, and nothing re-opens a lost DATA1 (openRequiredStreams runs
+// once, from OnProtoconf). Disconnecting the primary is what drives the peer
+// server's association teardown and netsync's handleDonePeerMsg, which
+// releases the ledger and rotates the sync peer.
+//
+// The primary goes first so its done message is what the peer server acts on;
+// this peer's own disconnect then finds the association already being torn
+// down. DisconnectWithLogFunc is idempotent, so the overlap with the server's
+// tearDownAssociationStreams costs a debug line. A peer with no association,
+// or that is itself the primary, is simply disconnected.
+func (p *Peer) DisconnectAssociation(reason string) {
+	if assoc := p.AssociationRef(); assoc != nil {
+		if primary := assoc.PrimaryPeer(); primary != nil && primary != p {
+			primary.DisconnectWithWarning(reason + " (received on its stream " + strconv.Itoa(int(p.StreamType())) + ")")
+		}
+	}
+
+	p.DisconnectWithWarning(reason)
 }
 
 func (p *Peer) DisconnectWithLogFunc(reason string, logFunc func(format string, args ...interface{})) {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -52,7 +53,7 @@ import (
 // park sink left to choose between.
 func (sm *SyncManager) installStreamingBlockPath(set func(
 	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
-	gate func(chainhash.Hash, *wire.BlockHeader) error,
+	gate func(chainhash.Hash, *wire.BlockHeader, uint64) error,
 	del func(chainhash.Hash, bool) error,
 )) {
 	// admitPipelineSink wraps the download-admission budget around the
@@ -295,7 +296,7 @@ func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
 // disk, and is the only check that runs before the bytes land. Nothing
 // downstream can refuse a write that has already happened.
 //
-// Three questions, in the order that makes each of the later ones meaningful.
+// Four questions, in the order that makes each of the later ones meaningful.
 //
 // First, did this node ask for this block. A peer that can choose what to write
 // to our disk can fill it, and no amount of later verification gets the space
@@ -304,22 +305,37 @@ func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
 // we asked somebody for is a body we wanted, and which peer answered is settled
 // later on the same paths that already settle it for a decoded block.
 //
-// Second, is the header's declared target at least as hard as the chain's own
-// limit. This is the check without which the third one gates nothing: a header
+// Second, is the declared payload within this node's own block policy
+// (Policy.ExcessiveBlockSize). The length is in the message header, so a body
+// too large for this node to ever commit is refused before its first byte is
+// read instead of after the whole download. After the asked-for check on
+// purpose, so an unrequested oversize body is still only discarded. This is a
+// decline, not a verdict: the error carries ErrBlockPolicyDeclined, which the
+// wire layer turns into a discard with the connection kept, and the hash is
+// marked in recentlyFailedBlocks so the wanted-range pass does not ask for it
+// again and drain it in a loop. At shipped defaults this arm never fires:
+// go-wire refuses a payload above maxWireBlockPayload (4,000,000,000,
+// services/legacy/config.go) before this handler runs, and the default
+// excessiveblocksize is 4,294,967,296; it exists for an operator who lowers
+// the policy below the wire cap.
+//
+// Third, is the header's declared target at least as hard as the chain's own
+// limit. This is the check without which the fourth one gates nothing: a header
 // carries the target it claims to meet, so a peer picks an easy one and always
 // passes. This codebase's own hardening work measured 64 of 64 forged headers
 // passing a target check that lacked this floor.
 //
-// Third, does the header actually meet that now-bounded target. This is the
+// Fourth, does the header actually meet that now-bounded target. This is the
 // work that makes minting distinct block hashes expensive, which is what stops
 // an attacker filling the park with unlimited fabrications.
 //
 // The body itself is not checked here and cannot be: it has not been read yet.
-// A body that turns out to be rubbish is caught when the park reads it back and
-// the block's transactions are parsed and its merkle root rebuilt, exactly as
-// for a decoded block. What the gate buys is that the bytes on our disk are
-// always bytes we asked for, under a hash somebody paid real work to produce.
-func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.BlockHeader) error {
+// A body that is not the block its header names is caught by the pipeline sink
+// as it streams, before any record of it exists (pipelineBlockSink checks the
+// merkle root against the header). What the gate buys is that the bytes on our
+// disk are always bytes we asked for, under a hash somebody paid real work to
+// produce.
+func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.BlockHeader, length uint64) error {
 	if header == nil {
 		return errors.NewBlockInvalidError("[streamingBlockGate][%s] no header", hash)
 	}
@@ -340,6 +356,22 @@ func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.Bloc
 		// Not the peer's fault: the peer layer discards the body and keeps the
 		// connection for this type, as SV Node does. See BlockNotRequestedError.
 		return &peerpkg.BlockNotRequestedError{Hash: hash}
+	}
+
+	// sm.settings is nil on struct-literal managers in tests; recentlyFailedBlocks
+	// likewise. Policy.ExcessiveBlockSize is 0 when the operator disabled the
+	// limit. The map is guarded by its own lock (util/expiringmap), so writing it
+	// from the read loop is safe.
+	if sm.settings != nil && sm.settings.Policy.ExcessiveBlockSize > 0 {
+		if limit, err := safeconversion.IntToUint64(sm.settings.Policy.ExcessiveBlockSize); err == nil && length > limit {
+			if sm.recentlyFailedBlocks != nil {
+				sm.recentlyFailedBlocks.Set(hash, struct{}{})
+			}
+
+			sm.logger.Warnf("[streamingBlockGate][%s] declared %d-byte body exceeds excessiveblocksize %d (local policy); not read", hash, length, limit)
+
+			return errors.NewBlockPolicyDeclinedError("[streamingBlockGate][%s] declared %d-byte body exceeds excessiveblocksize %d (local policy)", hash, length, limit)
+		}
 	}
 
 	// No chain means no floor to check against, and an unbounded write is the

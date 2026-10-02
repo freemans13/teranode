@@ -24,9 +24,11 @@ import (
 // false for every LegacyPeerIDPrefix value, and the one gated by
 // corruptAttemptsExhausted, which is never recorded for baseURL "legacy". Two
 // can: the policy-decline cap line, because recordPolicyDeclineAttempt has no
-// legacy skip and the legacy receive path does not enforce
-// Policy.ExcessiveBlockSize, so an operator limit below the legacy wire cap
-// trips it; and the catch-up channel-full warning, reachable when
+// legacy skip and a parked record can reach commit above an operator limit
+// that was lowered after its body was streamed (the streaming gate refuses a
+// declared payload above Policy.ExcessiveBlockSize before reading it, so at a
+// steady limit no such record exists); and the catch-up channel-full warning,
+// reachable when
 // legacyUnifiedEligible is false and the parent is missing at
 // processBlockFound's GetBlockExists. Both print this value as a label only.
 //
@@ -42,7 +44,12 @@ import (
 // before anything was written, so a corrupt verdict there is this node's own
 // record or files and is settled by the park's own table (parkCommitFailure,
 // block_park_policy.go), which neither marks the hash failed nor blames the
-// peer.
+// peer. Punishment for a legacy delivery lives on the legacy side: a body the
+// sink refuses as the peer's fault is a reject and the association dropped at
+// the read loop, banned only for the three ErrBlockBodyMismatch sites
+// (serverPeer.OnBlockBodyRejected, services/legacy/peer_server.go); a block
+// judged invalid at commit drops the delivering association through the
+// park table's dropPeer (applyParkDisposition).
 //
 // Peer.Addr() dereferences the peer with no nil-receiver guard, so a nil peer
 // degrades to the empty peerID rather than panicking. That is also what a block

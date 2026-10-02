@@ -1031,21 +1031,42 @@ func (sp *serverPeer) openRequiredStreams() {
 		return
 	}
 
-	// Create a serverPeer wrapper for the stream connection, matching the
-	// pattern used by inboundPeerConnected/outboundPeerConnected so that
-	// callbacks reference the correct serverPeer instance.
-	streamSP := newServerPeer(sp.server, false)
-	streamPeerCfg := newPeerConfig(streamSP)
-	streamPeerCfg.AllowBlockPriority = true
-	streamSP.Peer = peer.NewInboundPeer(sp.server.logger, sp.server.settings, streamPeerCfg)
-
-	streamSP.Peer.SetAssociation(assoc)
-	streamSP.Peer.SetStreamType(wire.StreamTypeData1)
-	assoc.AddStream(wire.StreamTypeData1, streamSP.Peer)
+	streamSP := sp.server.newStreamServerPeer(assoc, conn)
 	streamSP.AssociateConnection(conn)
 
 	go sp.server.peerDoneHandler(streamSP)
 	sp.server.logger.Infof("DATA1 stream established to %s for association %s", peerAddr, assoc.ID())
+}
+
+// newStreamServerPeer builds the serverPeer for an outbound DATA1 stream to the
+// remote at the other end of conn and registers it with assoc, matching the
+// pattern inboundPeerConnected and outboundPeerConnected use so every callback
+// references its own serverPeer. The caller associates the connection.
+//
+// The whitelist is read here, from the connection's remote address, as
+// inboundPeerConnected does for every inbound connection. newServerPeer leaves
+// isWhitelisted false, and this constructor used to leave it there, so a
+// whitelisted host's DATA1 sub-peer could be banned for a body it delivered
+// while its primary, whitelisted, could not.
+func (s *server) newStreamServerPeer(assoc *peer.Association, conn net.Conn) *serverPeer {
+	streamSP := newServerPeer(s, false)
+
+	var err error
+
+	streamSP.isWhitelisted, err = isWhitelisted(conn.RemoteAddr())
+	if err != nil {
+		s.logger.Warnf("Cannot whitelist stream peer %v: %v", conn.RemoteAddr(), err)
+	}
+
+	streamPeerCfg := newPeerConfig(streamSP)
+	streamPeerCfg.AllowBlockPriority = true
+	streamSP.Peer = peer.NewInboundPeer(s.logger, s.settings, streamPeerCfg)
+
+	streamSP.Peer.SetAssociation(assoc)
+	streamSP.Peer.SetStreamType(wire.StreamTypeData1)
+	assoc.AddStream(wire.StreamTypeData1, streamSP.Peer)
+
+	return streamSP
 }
 
 // OnMemPool is invoked when a peer receives a mempool bitcoin message.
@@ -2052,10 +2073,34 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 	// Clean up multistream association state.
 	if assoc := sp.Peer.AssociationRef(); assoc != nil {
 		if sp.Peer.IsStreamPeer() {
-			// Secondary stream disconnected - remove from association.
+			// A secondary stream disconnected. An association is one logical
+			// peer, so the primary goes with it. Nothing re-opens a lost DATA1
+			// (openRequiredStreams runs only from OnProtoconf), and under
+			// BlockPriority DATA1 is the stream block bodies arrive on, so an
+			// association without it can still be sync peer and still own
+			// blocks in the download ledger while being unable to deliver any.
+			// Netsync releases a peer's blocks and rotates the sync peer only
+			// for a primary (handleDonePeerMsg returns at once for a peer not in
+			// peerStates, which a sub-peer never is), so the primary's own done
+			// message is what carries that out, one peerHandler round trip
+			// from here. SV Node does the same: any one stream closing or
+			// erroring closes the whole node (net/stream.cpp
+			// CloseSocketDisconnect, net/net.cpp shutting the association), and
+			// an SV Node remote already does it to us when our DATA1 closes.
+			//
+			// Not gated on the primary still being connected:
+			// DisconnectWithLogFunc is idempotent, so when the primary went
+			// first and tearDownAssociationStreams is what closed this stream,
+			// this costs one debug line. Idle churn is not a risk: the idle
+			// timer consults HasRecentActivity across every stream before it
+			// fires, and under BlockPriority pings travel on DATA1.
 			assoc.RemoveStream(sp.Peer.StreamType())
 			s.logger.Debugf("Removed stream type %d from association %s",
 				sp.Peer.StreamType(), assoc.ID())
+
+			if primary := assoc.PrimaryPeer(); primary != nil && primary != sp.Peer {
+				primary.DisconnectWithInfo(fmt.Sprintf("stream %d closed; dropping the association", sp.Peer.StreamType()))
+			}
 		} else {
 			// Primary peer disconnected - tear down the whole association:
 			// close every sub-peer's live connection, then remove the
@@ -2619,31 +2664,35 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 	return &peer.Config{
 		// This is a complete list including ignored messages.
 		Listeners: peer.MessageListeners{
-			OnVersion:      sp.OnVersion,
-			OnProtoconf:    sp.OnProtoconf,
-			OnMemPool:      sp.OnMemPool,
-			OnTx:           sp.OnTx,
-			OnBlockOnDisk:  sp.OnBlockOnDisk,
-			OnInv:          sp.OnInv,
-			OnHeaders:      sp.OnHeaders,
-			OnGetData:      sp.OnGetData,
-			OnGetBlocks:    sp.OnGetBlocks,
-			OnGetHeaders:   sp.OnGetHeaders,
-			OnGetCFilters:  sp.OnGetCFilters,  // not implemented, just logs a warning
-			OnGetCFHeaders: sp.OnGetCFHeaders, // not implemented, just logs a warning
-			OnGetCFCheckpt: sp.OnGetCFCheckpt, // not implemented, just logs a warning
-			OnFeeFilter:    sp.OnFeeFilter,    // being set, but not being enforced, could cause peer to disconnect
-			OnFilterAdd:    sp.OnFilterAdd,    // not implemented, just logs a warning
-			OnFilterClear:  sp.OnFilterClear,  // not implemented, just logs a warning
-			OnFilterLoad:   sp.OnFilterLoad,   // not implemented, just logs a warning
-			OnGetAddr:      sp.OnGetAddr,
-			OnAddr:         sp.OnAddr,
-			OnRead:         sp.OnRead,
-			OnWrite:        sp.OnWrite,
-			OnReject:       sp.OnReject,
-			OnNotFound:     sp.OnNotFound,
-			OnCreateStream: sp.OnCreateStream,
-			OnStreamAck:    sp.OnStreamAck,
+			OnVersion:     sp.OnVersion,
+			OnProtoconf:   sp.OnProtoconf,
+			OnMemPool:     sp.OnMemPool,
+			OnTx:          sp.OnTx,
+			OnBlockOnDisk: sp.OnBlockOnDisk,
+			// Set on every serverPeer, the DATA1 stream peer included
+			// (newStreamServerPeer builds it through this same function), since
+			// under BlockPriority that is the peer whose read loop sees the body.
+			OnBlockBodyRejected: sp.OnBlockBodyRejected,
+			OnInv:               sp.OnInv,
+			OnHeaders:           sp.OnHeaders,
+			OnGetData:           sp.OnGetData,
+			OnGetBlocks:         sp.OnGetBlocks,
+			OnGetHeaders:        sp.OnGetHeaders,
+			OnGetCFilters:       sp.OnGetCFilters,  // not implemented, just logs a warning
+			OnGetCFHeaders:      sp.OnGetCFHeaders, // not implemented, just logs a warning
+			OnGetCFCheckpt:      sp.OnGetCFCheckpt, // not implemented, just logs a warning
+			OnFeeFilter:         sp.OnFeeFilter,    // being set, but not being enforced, could cause peer to disconnect
+			OnFilterAdd:         sp.OnFilterAdd,    // not implemented, just logs a warning
+			OnFilterClear:       sp.OnFilterClear,  // not implemented, just logs a warning
+			OnFilterLoad:        sp.OnFilterLoad,   // not implemented, just logs a warning
+			OnGetAddr:           sp.OnGetAddr,
+			OnAddr:              sp.OnAddr,
+			OnRead:              sp.OnRead,
+			OnWrite:             sp.OnWrite,
+			OnReject:            sp.OnReject,
+			OnNotFound:          sp.OnNotFound,
+			OnCreateStream:      sp.OnCreateStream,
+			OnStreamAck:         sp.OnStreamAck,
 		},
 		AddrMe:            addrMe,
 		NewestBlock:       sp.newestBlock,
@@ -3979,4 +4028,69 @@ func (sp *serverPeer) OnBlockOnDisk(_ *peer.Peer, msg *peer.MsgBlockOnDisk) {
 	}
 
 	sp.server.syncManager.QueueBlockOnDisk(msg.BlockBody, sp.Peer)
+}
+
+// OnBlockBodyRejected is invoked when the body this peer streamed for a block
+// was refused by the sink as the peer's fault. The peer package has already
+// decided the connection's fate (a reject naming the block, the association
+// dropped through its primary); this decides the ban, and only this.
+//
+// The ban rests on rejected.ProvenBad() and nothing else: the body arrived in
+// full and the sink raised ERR_BLOCK_BODY_MISMATCH, which only its three SV Node
+// DoS(100) parity sites do (a merkle root the header does not carry, a duplicate
+// transaction, no coinbase; services/legacy/netsync pipeline_sink.go,
+// block_stream_builder.go, block_tx_stream.go). SV Node scores those
+// CorruptionOrDoS, 100 points at a threshold of 100, a 24 h ban
+// (consensus/validation.h, net/block_download_tracker.cpp BlockChecked,
+// net_processing.cpp SendRejectsAndCheckIfBanned), and it scores them only
+// after the whole message is deserialised; a message that ends early is a
+// log-only deserialisation failure there. Every other refusal (a corrupt
+// delivery whose length and transactions disagree, an invalid verdict without
+// the marker, a body that was cut short) costs the peer its connection and no
+// more, because a code alone is not proof of conduct: the merge base never
+// banned on ERR_BLOCK_INVALID either, so a ban here is new policy, not restored
+// policy, and it is kept to the three sites where the parity is exact.
+//
+// An outright ban rather than a score: addBanScore bans only once the score
+// passes cfg.BanThreshold, and the score lives on this serverPeer, which dies
+// with the connection the peer package is about to drop, so a strike followed by
+// a disconnect never banned and a reconnecting peer started at zero. The ban is
+// what bounds the amplification: one wasted body per host per cfg.BanDuration
+// instead of one per download.
+func (sp *serverPeer) OnBlockBodyRejected(_ *peer.Peer, rejected *peer.BlockBodyRejectedError) {
+	if rejected == nil || sp.server == nil {
+		return
+	}
+
+	if !rejected.ProvenBad() {
+		sp.server.logger.Warnf("Peer %s delivered a body for block %s that was rejected (truncated=%t); dropping it without a ban: %v", sp, rejected.Hash, rejected.Truncated, rejected.Err)
+
+		return
+	}
+
+	sp.banMisbehaving(fmt.Sprintf("block %s body is not the block its header names: %v", rejected.Hash, rejected.Err))
+}
+
+// banMisbehaving bans this peer's host for cfg.BanDuration, with the two
+// exemptions addBanScore has: banning disabled, and a whitelisted host. It does
+// not disconnect; the caller has already arranged that. BanPeer queues to the
+// peerHandler, whose handleBanPeerMsg bans by host from sp.Addr(), which both
+// streams of an association share, so a ban raised on the DATA1 sub-peer covers
+// the primary's reconnect too (handleAddPeerMsg refuses a banned host; the
+// outbound dial sites check the ban list).
+func (sp *serverPeer) banMisbehaving(reason string) {
+	if cfg.DisableBanning {
+		sp.server.logger.Warnf("Misbehaving peer %s: %s (banning disabled)", sp, reason)
+
+		return
+	}
+
+	if sp.isWhitelisted {
+		sp.server.logger.Warnf("Misbehaving whitelisted peer %s: %s (not banned)", sp, reason)
+
+		return
+	}
+
+	sp.server.logger.Warnf("Misbehaving peer %s: %s -- banning for %v", sp, reason, cfg.BanDuration)
+	sp.server.BanPeer(sp)
 }

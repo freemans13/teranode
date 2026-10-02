@@ -40,7 +40,11 @@ var blockBodySink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reade
 // falls back to decoding, exactly as a nil blockBodySink already does, so a
 // caller that wires a sink but forgets a gate gets the old safe behaviour
 // rather than an open door.
-var blockBodyGate func(hash chainhash.Hash, header *wire.BlockHeader) error
+//
+// length is the payload length the peer declared in the message header, known
+// before any byte of the body is read, so a body too large for this node's own
+// block policy can be refused without reading it.
+var blockBodyGate func(hash chainhash.Hash, header *wire.BlockHeader, length uint64) error
 
 // blockBodyDelete removes a block body already written under hash. It is
 // installed alongside blockBodySink and blockBodyGate. A body can be fully
@@ -120,6 +124,16 @@ func streamingBlockHandler(r io.Reader, length uint64, totalBytes int) (int, wir
 		err = drainErr
 	}
 
+	// A sink refusal is only a judgement on the whole body if the whole body
+	// arrived. drainErr is non-nil exactly when the declared payload did not: the
+	// copy failed, or the stream ended with bytes still owed. The bit travels on
+	// the typed error so the peer server can refuse to ban for a body it never
+	// saw the end of, whatever code the sink chose; see BlockBodyRejectedError.
+	var rejected *BlockBodyRejectedError
+	if drainErr != nil && stderrors.As(err, &rejected) {
+		rejected.Truncated = true
+	}
+
 	// totalBytes accounts for the header already read by
 	// ReadMessageWithEncodingN; add the full declared payload length so the
 	// caller's bytesReceived counter stays consistent with the non-streaming
@@ -164,16 +178,30 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 	// park's admission path for a streamed body is expected to skip re-running
 	// any of this, on the grounds that it already happened here; as written
 	// today that admission path only knows about decoded blocks.
-	if err := blockBodyGate(hash, &header); err != nil {
+	if err := blockBodyGate(hash, &header, length); err != nil {
 		// A block this node did not ask for is not the peer's fault, so it is
 		// discarded rather than failed: the caller drains the body and the
 		// connection carries on, as SV Node's does. Matched by type, never by
 		// message text, so no other refusal can be mistaken for this one.
 		var notRequested *BlockNotRequestedError
 		if stderrors.As(err, &notRequested) {
-			return &MsgBlockDiscarded{Hash: hash, Size: int64(length)}, nil
+			return &MsgBlockDiscarded{Hash: hash, Size: int64(length), Reason: "this node did not ask for it"}, nil
 		}
 
+		// A declared payload above this node's own block policy is this node's
+		// configuration, not the peer's conduct: every peer serves the same
+		// block, so dropping this one buys nothing. Discarded and drained like
+		// the unrequested case, with the connection kept. Matched on the code,
+		// which the gate raises for this one refusal.
+		if errors.Is(err, errors.ErrBlockPolicyDeclined) {
+			return &MsgBlockDiscarded{Hash: hash, Size: int64(length), Reason: "its declared size is above this node's own block policy"}, nil
+		}
+
+		// Everything else the gate refuses (a header that hashes to another
+		// block, a target easier than the chain's floor, a hash that does not
+		// meet its target) is the peer's doing and stays what it was: an error
+		// the read loop answers with a "malformed" reject and a disconnect. No
+		// ban: SV Node scores a high-hash header DoS(50), below its threshold.
 		return nil, errors.NewProcessingError("streaming block %s: refused", hash, err)
 	}
 
@@ -205,6 +233,21 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 			return nil, deleteOrphanedBody(hash, converted, err)
 		}
 
+		// The two codes that are the peer's (the producer rule again): a body
+		// that is not the block its header commits to, or a delivery whose
+		// length and transactions disagree. Typed, so the read loop sends a
+		// reject naming the block and drops the whole association instead of
+		// answering "malformed"; whether the host is then banned is the peer
+		// server's decision and rests on BlockBodyRejectedError.ProvenBad.
+		if errors.Is(err, errors.ErrBlockInvalid) || errors.IsBlockCorrupt(err) {
+			return nil, deleteOrphanedBody(hash, converted, &BlockBodyRejectedError{Hash: hash, Err: err})
+		}
+
+		// Any other coded error is one this node's sink wrapper did not absorb.
+		// While the sync manager is live that wrapper drains and keeps the peer
+		// for every fault of this node's own; once it is shutting down it lets
+		// any code through (absorbLocalSinkFault), and the server is already
+		// closing every connection, so the "malformed" disconnect costs nothing.
 		return nil, deleteOrphanedBody(hash, converted, errors.NewProcessingError("streaming block %s: could not store the body", hash, err))
 	}
 

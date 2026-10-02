@@ -1,6 +1,8 @@
 package netsync
 
 import (
+	"fmt"
+
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 )
@@ -74,6 +76,20 @@ type parkDisposition struct {
 	// lookup (#1333). Only meaningful for a block that has actually been judged
 	// and given up on.
 	markFailed bool
+
+	// dropPeer disconnects the delivering peer's whole association, resolved
+	// through its primary (peer.DisconnectAssociation), so the sync peer rotates
+	// and the blocks it owed are released by netsync's handleDonePeerMsg. Set
+	// only when the block itself was judged invalid by a verdict that says so
+	// (the explicit ErrBlockInvalid row), never on the default arm, where an
+	// error nobody has classified lands. Independent of blamePeer, which is the
+	// reject message: withoutBlame clears the reject while the node is catching
+	// blocks and leaves this set, because a block judged invalid is invalid
+	// during replay too. No ban at the drain: a commit-time verdict passes
+	// through block validation and the gRPC code rebuild, and a wrong 24 h ban
+	// strands the node where a wrong disconnect costs a reconnect;
+	// recentlyFailedBlocks already stops the hash being re-asked.
+	dropPeer bool
 }
 
 // The table. Read down the columns: keep-or-drop, rewind-or-not, blame-or-not.
@@ -240,9 +256,45 @@ var (
 		markFailed: true,
 	}
 
+	// parkDispositionBlockInvalid — block validation said the block is
+	// invalid, in so many words (ErrBlockInvalid in the chain). The sink bound
+	// the body to the header before the record existed, so the block judged is
+	// the block the peer sent: the peer hears about it, the hash is written
+	// off, and the delivering association is dropped so the sync peer rotates.
+	// The base disconnected the association for an invalid block too
+	// (shouldDisconnectOnBlockErr, with no FSM gate); only the reject was
+	// suppressed outside RUNNING, which withoutBlame still does.
+	parkDispositionBlockInvalid = parkDisposition{
+		reason: "block validation judged the block invalid",
+		blob:   parkBlobDrop,
+
+		blamePeer:  true,
+		markFailed: true,
+		dropPeer:   true,
+	}
+
+	// parkDispositionPolicyDeclined — block validation declined the block
+	// under this node's own policy (ErrBlockPolicyDeclined: excessiveblocksize).
+	// A statement about this node's configuration, not about the block or the
+	// peer: the rest of the network may well accept it. Drop the record and
+	// write the hash off so it is not asked for again, blame nobody and drop
+	// nobody. The streaming gate refuses an oversize declared payload before
+	// it is read, so for a streamed body this row is reached only when the
+	// policy changed between download and commit; the table is still the one
+	// place the answer lives.
+	parkDispositionPolicyDeclined = parkDisposition{
+		reason: "declined by this node's own block policy",
+		blob:   parkBlobDrop,
+
+		markFailed: true,
+	}
+
 	// parkDispositionBlockRejected — the block itself would not go into the
-	// chain. This is the one case where the peer hears about it, and the only
-	// one that writes the block off in recentlyFailedBlocks.
+	// chain, for a reason nothing above classified. The peer hears about it and
+	// the hash is written off, as for an invalid verdict; the peer is NOT
+	// dropped, because this is the default arm, where a raw driver error or an
+	// unclassified block-validation failure lands too, and rotating the sync
+	// peer on one of those during IBD costs a reconnect for nothing.
 	parkDispositionBlockRejected = parkDisposition{
 		reason: "the block failed to store or validate",
 		blob:   parkBlobDrop,
@@ -309,9 +361,14 @@ func parkReadFailure(err error) parkDisposition {
 // as NotFound around a StorageError. Corrupt is tested before
 // ErrBlockInvalid because the errors package guarantees a corrupt error never
 // wraps an invalid one (sanitizeCorruptParams) but not the reverse. The
-// explicit ErrBlockInvalid arm changes nothing today and exists so a judgement
-// that happens to wrap a not-found stays a judgement rather than being read by
-// the FilesGone row.
+// explicit ErrBlockInvalid arm is the one row that drops the peer: a verdict
+// that says invalid in so many words is positive evidence about the block the
+// peer sent, where the default arm is only the absence of anything better. It
+// also keeps a judgement that happens to wrap a not-found from being read by the
+// FilesGone row. The policy-declined arm sits after it: the two codes never
+// share a chain (errors/block_policy_declined_test.go pins that), so the order
+// between them does not matter, and both sit before the default so neither is
+// read as a rejection.
 func parkCommitFailure(err error) parkDisposition {
 	switch {
 	case errors.Is(err, errors.ErrBlockNotFound):
@@ -342,7 +399,10 @@ func parkCommitFailure(err error) parkDisposition {
 		return parkDispositionRecordCorrupt
 
 	case errors.Is(err, errors.ErrBlockInvalid):
-		return parkDispositionBlockRejected
+		return parkDispositionBlockInvalid
+
+	case errors.Is(err, errors.ErrBlockPolicyDeclined):
+		return parkDispositionPolicyDeclined
 
 	case errors.Is(err, errors.ErrNotFound), errors.Is(err, errors.ErrBlobNotFound):
 		return parkDispositionFilesGone
@@ -355,9 +415,11 @@ func parkCommitFailure(err error) parkDisposition {
 	}
 }
 
-// withoutBlame returns the same row with the peer left alone. Used while the
+// withoutBlame returns the same row with the reject left unsent. Used while the
 // node is catching blocks: we are replaying history and a peer that hands us a
-// block we cannot take has not necessarily done anything wrong.
+// block we cannot take has not necessarily done anything wrong. dropPeer is left
+// as it is on purpose: a block judged invalid by block validation is invalid
+// during replay too, and the base disconnected for one in every FSM state.
 func (d parkDisposition) withoutBlame() parkDisposition {
 	d.blamePeer = false
 
@@ -365,8 +427,8 @@ func (d parkDisposition) withoutBlame() parkDisposition {
 }
 
 // applyParkDisposition carries out one row of the table. It is the ONLY place
-// that deletes a parked blob, restores a parked entry, or rejects one to a
-// peer.
+// that deletes a parked blob, restores a parked entry, rejects one to a peer,
+// or drops the peer that delivered one.
 func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition) {
 	switch d.blob {
 	case parkBlobKeep:
@@ -382,7 +444,7 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 		sm.recentlyFailedBlocks.Set(entry.hash, struct{}{})
 	}
 
-	if !d.blamePeer {
+	if !d.blamePeer && !d.dropPeer {
 		return
 	}
 
@@ -390,9 +452,26 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 	// nowhere at all. Aiming it at a fallback peer would punish an innocent one
 	// for a block it never sent; losing the signal when the guilty peer has
 	// already left is the cheaper mistake.
-	if entry.peer != nil && entry.peer.Connected() {
-		entry.peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &entry.hash, false)
-	} else {
-		sm.logger.Warnf("[applyParkDisposition][%s] no connected peer to reject the block to; the signal is lost", entry.hash)
+	if entry.peer == nil || !entry.peer.Connected() {
+		// A record recovered from the park after a restart has no peer at all,
+		// and a peer can leave between delivery and verdict.
+		sm.logger.Warnf("[applyParkDisposition][%s] no connected peer to reject the block to or to drop (reject=%t drop=%t); the signal is lost", entry.hash, d.blamePeer, d.dropPeer)
+
+		return
+	}
+
+	if d.blamePeer {
+		// Waited for when the peer is about to be dropped: the reject is queued,
+		// not written, and a disconnect straight after a queue would close the
+		// socket under it, so the one message the peer was owed never left.
+		entry.peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &entry.hash, d.dropPeer)
+	}
+
+	if d.dropPeer {
+		// The whole association, through its primary: entry.peer is the DATA1
+		// sub-peer whenever the body arrived on its own stream, and only the
+		// primary is known to netsync's peer bookkeeping. DisconnectAssociation
+		// resolves that itself.
+		entry.peer.DisconnectAssociation(fmt.Sprintf("block %s rejected (%s)", entry.hash, d.reason))
 	}
 }

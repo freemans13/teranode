@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/stretchr/testify/require"
@@ -383,7 +385,7 @@ func TestParkCommitFailure_AMissingSubtreeFileDropsTheRecordWithoutJudgingIt(t *
 		{
 			name: "a judgement around a not-found stays a judgement",
 			err:  parkCommitChain(errors.NewBlockInvalidError("[ValidateBlock][hash] block is invalid", errors.NewNotFoundError("subtree not found"))),
-			want: parkDispositionBlockRejected,
+			want: parkDispositionBlockInvalid,
 		},
 		{
 			name: "a missing parent block carries code 3 inside code 10 and is the parent's row, not this one",
@@ -444,13 +446,113 @@ func TestParkCommitFailure_TheFullRoutesInvalidTransactionVerdictIsAJudgement(t 
 	require.True(t, errors.Is(legacy, errors.ErrTxInvalid), "fixture: the cause is still in the chain")
 
 	d := parkCommitFailure(legacy)
-	require.Equal(t, parkDispositionBlockRejected, d)
+	require.Equal(t, parkDispositionBlockInvalid, d)
 	require.True(t, d.markFailed, "a judgement is remembered so the block is not asked for again")
 	require.True(t, d.blamePeer, "the sink bound the body to the header, so the block the peer sent is the one judged")
+	require.True(t, d.dropPeer, "and a verdict that says invalid drops the association that delivered it")
 
 	p2p := parkCommitChain(errors.NewBlockCorruptError("[ValidateBlock][hash] block contains invalid transactions",
 		errors.NewProcessingError("[CheckBlockSubtrees] failed to process transactions",
 			errors.NewTxInvalidError("transaction in subtree is invalid"))))
 	require.Equal(t, parkDispositionRecordCorrupt, parkCommitFailure(p2p),
 		"the p2p route's corrupt-coded shape is the RecordCorrupt row; the producer must not raise it on the legacy route")
+}
+
+// TestSyncManager_ARejectedParkedBlockDropsItsPeerInEveryState pins the drain's
+// half of peer punishment. Block validation judges a parked block invalid, in
+// so many words, at the drain's real commit attempt over the real chain. End
+// state in both FSM states: the park is empty, the hash is written off, and the
+// peer that delivered the block is disconnected. The reject is sent only when
+// RUNNING (the existing suppression while catching blocks, pinned alongside);
+// the drop is not suppressed, because a block judged invalid is invalid during
+// replay too, and the base disconnected for one in every FSM state.
+//
+// Before this step a block that failed commit cost the peer a reject only, and
+// only in RUNNING: the peer stayed connected and stayed sync peer.
+//
+// The third subtest is the sub-peer shape: the body arrived on a DATA1 sub-peer
+// of an association, so the entry's peer is the sub-peer, and the drop must
+// resolve to the primary, the only peer netsync's bookkeeping knows. The fourth
+// pins the two rows that must NOT drop: a policy decline, which is this node's
+// configuration, and the default arm, where an error nobody has classified
+// lands.
+func TestSyncManager_ARejectedParkedBlockDropsItsPeerInEveryState(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		fsmState     blockchain2.FSMStateType
+		expectReject bool
+	}{
+		{name: "catching blocks: no reject, but the peer is dropped", fsmState: blockchain2.FSMStateCATCHINGBLOCKS, expectReject: false},
+		{name: "running: the reject is sent and the peer is dropped", fsmState: blockchain2.FSMStateRUNNING, expectReject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newParkWiringHarnessInState(t, true, tc.fsmState)
+
+			child := h.blocks[1].MsgBlock().BlockHash()
+			parent := h.blocks[0].MsgBlock().BlockHash()
+
+			h.validation.failOnce(child, errors.NewBlockInvalidError("[ValidateBlock][%s] block is invalid", child.String()))
+
+			require.NoError(t, h.deliver(t, 1))
+			require.Equal(t, 1, h.sm.blockPark.Len())
+			require.True(t, h.peer.Connected(), "sanity: the delivering peer is connected before the verdict")
+
+			h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+
+			require.NoError(t, h.deliver(t, 0))
+			h.drainOneParkCommit(t)
+
+			h.requireCommitted(t, parent)
+			require.Equal(t, 1, h.validation.callsFor(child), "the child reached block validation, which is what judged it")
+
+			require.Zero(t, h.sm.blockPark.Len(), "a judged block does not stay parked")
+
+			_, failed := h.sm.recentlyFailedBlocks.Get(child)
+			require.True(t, failed, "a judged block is written off")
+
+			require.True(t, disconnectsWithin(h.peer, 2*time.Second),
+				"the peer that delivered a block judged invalid must be dropped, in every FSM state")
+
+			if tc.expectReject {
+				require.True(t, WaitUntil(func() bool { return h.rec.wasRejected(child) }, 5*time.Second),
+					"when RUNNING the peer is told the block was rejected, before it is dropped")
+			} else {
+				require.False(t, h.rec.wasRejected(child), "while catching blocks no reject is sent; only the drop stands")
+			}
+		})
+	}
+
+	t.Run("a body that arrived on a DATA1 sub-peer drops the association's primary", func(t *testing.T) {
+		h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING)
+
+		// A second connected peer as the DATA1 sub-peer of an association whose
+		// primary is the harness's own sync peer.
+		data1, _, _ := connectRecordingPeer(t, 72, 1000)
+		assoc := peerpkg.NewAssociation([]byte{0x04, 0x05, 0x06}, h.peer)
+		h.peer.SetAssociation(assoc)
+		require.True(t, assoc.AddStream(wire.StreamTypeData1, data1))
+		data1.SetAssociation(assoc)
+		data1.SetStreamType(wire.StreamTypeData1)
+
+		entry := parkedBlock{hash: h.blocks[1].MsgBlock().BlockHash(), peer: data1}
+
+		h.sm.applyParkDisposition(entry, parkDispositionBlockInvalid)
+
+		require.True(t, disconnectsWithin(h.peer, 2*time.Second), "the primary is what netsync knows; the drop must resolve to it")
+		require.True(t, disconnectsWithin(data1, 2*time.Second), "and the sub-peer goes with it")
+	})
+
+	t.Run("a policy decline and the default arm drop nobody", func(t *testing.T) {
+		declined := parkCommitFailure(parkCommitChain(errors.NewBlockPolicyDeclinedError("block size exceeds excessiveblocksize")))
+		require.Equal(t, parkDispositionPolicyDeclined, declined)
+		require.Equal(t, parkBlobDrop, declined.blob)
+		require.True(t, declined.markFailed, "written off so it is not asked for again")
+		require.False(t, declined.blamePeer, "this node's configuration is not the peer's conduct")
+		require.False(t, declined.dropPeer)
+
+		unclassified := parkCommitFailure(parkCommitChain(errors.NewBlockError("something nobody classified")))
+		require.Equal(t, parkDispositionBlockRejected, unclassified)
+		require.True(t, unclassified.blamePeer, "the default arm still sends the reject, as it always did")
+		require.False(t, unclassified.dropPeer, "an error nobody has classified must not rotate the sync peer")
+	})
 }

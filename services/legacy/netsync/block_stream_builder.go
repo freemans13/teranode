@@ -361,7 +361,12 @@ func (b *blockStreamBuilder) addTx(tx *bt.Tx, txHash *chainhash.Hash, size uint6
 			// classifies a genuine duplicate as a transient fault the moment
 			// the other map's wording ever changes.
 			if errors.Is(err, errors.ErrTxExists) || errors.Is(err, txmap.ErrHashAlreadyExists) {
-				return b.fail(errors.NewBlockInvalidError("[blockStreamBuilder] block contains duplicate transaction %s (CVE-2012-2459)", txHash))
+				// ErrBlockBodyMismatch inside the verdict: a duplicate is the
+				// peer's bytes, judged on the transaction itself, SV Node's
+				// bad-txns-duplicate (CorruptionOrDoS). One of the three sites
+				// that may raise the marker; see pipelineBlockSink's producer
+				// rule.
+				return b.fail(errors.NewBlockInvalidError("[blockStreamBuilder] block contains duplicate transaction %s (CVE-2012-2459)", txHash, errors.ErrBlockBodyMismatch))
 			}
 
 			return b.fail(errors.NewProcessingError("[blockStreamBuilder] failed recording transaction %s for duplicate detection", txHash, err))

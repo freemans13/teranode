@@ -57,12 +57,12 @@ func TestInstallStreamingBlockPath_ChoosesTheSinkAndDeleteTogether(t *testing.T)
 	sm := newPipelineParkManager(t, memory.New(), 8)
 
 	var gotSink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)
-	var gotGate func(chainhash.Hash, *wire.BlockHeader) error
+	var gotGate func(chainhash.Hash, *wire.BlockHeader, uint64) error
 	var gotDelete func(chainhash.Hash, bool) error
 
 	sm.installStreamingBlockPath(func(
 		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
-		gate func(chainhash.Hash, *wire.BlockHeader) error,
+		gate func(chainhash.Hash, *wire.BlockHeader, uint64) error,
 		del func(chainhash.Hash, bool) error,
 	) {
 		gotSink = sink

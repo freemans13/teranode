@@ -40,7 +40,7 @@ func TestInstallStreamingBlockPath_NilSettingsDoesNotPanic(t *testing.T) {
 	require.NotPanics(t, func() {
 		sm.installStreamingBlockPath(func(
 			sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
-			gate func(chainhash.Hash, *wire.BlockHeader) error,
+			gate func(chainhash.Hash, *wire.BlockHeader, uint64) error,
 			del func(chainhash.Hash, bool) error,
 		) {
 			installed = true

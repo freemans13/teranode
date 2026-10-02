@@ -137,7 +137,7 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 
 	sm.installStreamingBlockPath(func(
 		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
-		gate func(chainhash.Hash, *wire.BlockHeader) error,
+		gate func(chainhash.Hash, *wire.BlockHeader, uint64) error,
 		del func(chainhash.Hash, bool) error,
 	) {
 		installedSink = sink
@@ -221,7 +221,7 @@ func TestAdmitPipelineSink_DrainsWhenAcquireTimesOut(t *testing.T) {
 
 	sm.installStreamingBlockPath(func(
 		sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error),
-		gate func(chainhash.Hash, *wire.BlockHeader) error,
+		gate func(chainhash.Hash, *wire.BlockHeader, uint64) error,
 		del func(chainhash.Hash, bool) error,
 	) {
 		installedSink = sink

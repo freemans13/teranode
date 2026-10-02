@@ -312,7 +312,11 @@ func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 	// While the node is catching blocks no reject is sent for a block that would
 	// not commit, because we are replaying history rather than judging a peer's
 	// tip. Every block commits through this drain, so this is the only place that
-	// rule can live.
+	// rule can live. withoutBlame removes the reject and nothing else: a row's
+	// dropPeer stands, so a block that block validation judged invalid drops the
+	// association that delivered it in every FSM state. The base did the same;
+	// its disconnect ran in peer_server.awaitBlockResult with no FSM gate, and
+	// only the reject was suppressed.
 	if d.blamePeer && sm.replayingHistory() {
 		d = d.withoutBlame()
 	}

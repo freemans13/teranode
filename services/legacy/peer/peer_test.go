@@ -20,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
@@ -1650,25 +1651,34 @@ func TestPeerRequeueInventory(t *testing.T) {
 
 // blockStreamingPair connects two peers with the streaming block path installed
 // and the given gate, and returns the receiving peer plus a channel of pings it
-// receives.
-func blockStreamingPair(t *testing.T, gate func(chainhash.Hash, *wire.BlockHeader) error) (sender, receiver *peer.Peer, pings chan struct{}) {
+// receives. The sink accepts everything.
+func blockStreamingPair(t *testing.T, gate func(chainhash.Hash, *wire.BlockHeader, uint64) error) (sender, receiver *peer.Peer, pings chan struct{}) {
+	t.Helper()
+
+	return blockStreamingPairWithSink(t, gate,
+		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) { return true, nil },
+		peer.MessageListeners{})
+}
+
+// blockStreamingPairWithSink is blockStreamingPair with the sink chosen by the
+// caller and extra listeners merged into both peers' configs (the two share one
+// config, so a listener set here fires on whichever side the message reaches).
+func blockStreamingPairWithSink(t *testing.T, gate func(chainhash.Hash, *wire.BlockHeader, uint64) error,
+	sink func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error), extra peer.MessageListeners,
+) (sender, receiver *peer.Peer, pings chan struct{}) {
 	t.Helper()
 
 	peer.RegisterStreamingBlockHandler()
-	peer.SetBlockBodyStreaming(
-		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) { return true, nil },
-		gate,
-		func(chainhash.Hash, bool) error { return nil },
-	)
+	peer.SetBlockBodyStreaming(sink, gate, func(chainhash.Hash, bool) error { return nil })
 
 	verack := make(chan struct{}, 2)
 	pings = make(chan struct{}, 1)
 
+	extra.OnVerAck = func(*peer.Peer, *wire.MsgVerAck) { verack <- struct{}{} }
+	extra.OnPing = func(*peer.Peer, *wire.MsgPing) { pings <- struct{}{} }
+
 	cfg := &peer.Config{
-		Listeners: peer.MessageListeners{
-			OnVerAck: func(*peer.Peer, *wire.MsgVerAck) { verack <- struct{}{} },
-			OnPing:   func(*peer.Peer, *wire.MsgPing) { pings <- struct{}{} },
-		},
+		Listeners:              extra,
 		UserAgentName:          "peer",
 		UserAgentVersion:       "1.0",
 		ChainParams:            &chaincfg.MainNetParams,
@@ -1729,7 +1739,7 @@ func streamingTestBlock() *wire.MsgBlock {
 // a peer that sends a block this node did not ask for stays connected, and the
 // next message on the same connection is read and handled.
 func TestPeer_AnUnrequestedBlockKeepsTheConnection(t *testing.T) {
-	sender, receiver, pings := blockStreamingPair(t, func(hash chainhash.Hash, _ *wire.BlockHeader) error {
+	sender, receiver, pings := blockStreamingPair(t, func(hash chainhash.Hash, _ *wire.BlockHeader, _ uint64) error {
 		return &peer.BlockNotRequestedError{Hash: hash}
 	})
 
@@ -1749,7 +1759,7 @@ func TestPeer_AnUnrequestedBlockKeepsTheConnection(t *testing.T) {
 // header that fails the gate for any reason but "not asked for" is the peer's
 // doing, and the peer is disconnected.
 func TestPeer_AForgedBlockStillDisconnects(t *testing.T) {
-	sender, receiver, _ := blockStreamingPair(t, func(chainhash.Hash, *wire.BlockHeader) error {
+	sender, receiver, _ := blockStreamingPair(t, func(chainhash.Hash, *wire.BlockHeader, uint64) error {
 		return errors.New("declared target is easier than the chain limit")
 	})
 
@@ -1766,4 +1776,101 @@ func TestPeer_AForgedBlockStillDisconnects(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("a peer sending a forged block must be disconnected")
 	}
+}
+
+// TestPeer_ARejectedBodyAtTheReadLoopDropsTheAssociationPrimary pins the read
+// loop's own half of a sink refusal, with a fake sink returning the real error
+// class (TestPipelineSink_RejectsAWrongMerkleRoot in netsync pins that the real
+// sink returns it): the receiver is a DATA1 sub-peer of an association whose
+// primary is a separate peer, as every block body arrives under the default
+// legacy_allowBlockPriority. End state: the primary is disconnected, so is the
+// sub-peer, the OnBlockBodyRejected listener was handed the block's hash with
+// the sink's error, and the sender received a reject for command block, code
+// invalid, naming the hash, not the "malformed" reject every other read error
+// earns. The second subtest has no listener set and the two disconnects still
+// happen. The end-to-end version over the real sink and a real ledger is
+// TestPeer_ARejectedBodyDropsTheAssociationPrimary in netsync.
+func TestPeer_ARejectedBodyAtTheReadLoopDropsTheAssociationPrimary(t *testing.T) {
+	block := streamingTestBlock()
+	hash := block.BlockHash()
+
+	disconnected := func(p *peer.Peer) bool {
+		done := make(chan struct{})
+
+		go func() {
+			p.WaitForDisconnect()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			return true
+		case <-time.After(2 * time.Second):
+			return false
+		}
+	}
+
+	refusingSink := func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+		return false, terrors.NewBlockInvalidError("merkle root does not match header's", terrors.ErrBlockBodyMismatch)
+	}
+
+	newPrimary := func(t *testing.T, receiver *peer.Peer) *peer.Peer {
+		t.Helper()
+
+		primary := peer.NewInboundPeer(ulogger.TestLogger{}, test.CreateBaseTestSettings(t), &peer.Config{})
+		assoc := peer.NewAssociation([]byte{0x01, 0x02, 0x03}, primary)
+		primary.SetAssociation(assoc)
+		require.True(t, assoc.AddStream(wire.StreamTypeData1, receiver))
+		receiver.SetAssociation(assoc)
+		receiver.SetStreamType(wire.StreamTypeData1)
+
+		return primary
+	}
+
+	t.Run("with the listener set", func(t *testing.T) {
+		rejections := make(chan *peer.BlockBodyRejectedError, 1)
+		rejects := make(chan *wire.MsgReject, 1)
+
+		sender, receiver, _ := blockStreamingPairWithSink(t, func(chainhash.Hash, *wire.BlockHeader, uint64) error { return nil },
+			refusingSink, peer.MessageListeners{
+				OnBlockBodyRejected: func(_ *peer.Peer, rejected *peer.BlockBodyRejectedError) { rejections <- rejected },
+				OnReject:            func(_ *peer.Peer, msg *wire.MsgReject) { rejects <- msg },
+			})
+		primary := newPrimary(t, receiver)
+
+		sender.QueueMessage(block, nil)
+
+		require.True(t, disconnected(primary), "the association's primary must be disconnected, not only the stream the body came in on")
+		require.True(t, disconnected(receiver), "the sub-peer that carried the body must be disconnected")
+
+		select {
+		case rejected := <-rejections:
+			require.Equal(t, hash, rejected.Hash)
+			require.True(t, terrors.Is(rejected.Err, terrors.ErrBlockInvalid))
+			require.False(t, rejected.Truncated, "the whole body arrived")
+			require.True(t, rejected.ProvenBad())
+		case <-time.After(2 * time.Second):
+			t.Fatal("OnBlockBodyRejected was never invoked")
+		}
+
+		select {
+		case reject := <-rejects:
+			require.Equal(t, wire.CmdBlock, reject.Cmd, "the reject names the block command, not malformed")
+			require.Equal(t, wire.RejectInvalid, reject.Code)
+			require.Equal(t, hash, reject.Hash)
+		case <-time.After(2 * time.Second):
+			t.Fatal("the sender never received the reject")
+		}
+	})
+
+	t.Run("with no listener set", func(t *testing.T) {
+		sender, receiver, _ := blockStreamingPairWithSink(t, func(chainhash.Hash, *wire.BlockHeader, uint64) error { return nil },
+			refusingSink, peer.MessageListeners{})
+		primary := newPrimary(t, receiver)
+
+		sender.QueueMessage(block, nil)
+
+		require.True(t, disconnected(primary), "the primary is dropped whether or not anyone listens for the ban")
+		require.True(t, disconnected(receiver))
+	})
 }

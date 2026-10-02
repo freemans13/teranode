@@ -2,6 +2,7 @@ package peer
 
 import (
 	"bytes"
+	stderrors "errors"
 	"io"
 	"math/big"
 	"testing"
@@ -55,8 +56,8 @@ func serialisedBlock(t *testing.T, txs int) ([]byte, chainhash.Hash) {
 // asked for, then refuse a header whose declared target is easier than the
 // chain's own difficulty limit, then refuse one that does not meet its own
 // (now-bounded) target.
-func fakeSyncManagerGate(requested map[chainhash.Hash]bool, limit *big.Int) func(chainhash.Hash, *wire.BlockHeader) error {
-	return func(hash chainhash.Hash, header *wire.BlockHeader) error {
+func fakeSyncManagerGate(requested map[chainhash.Hash]bool, limit *big.Int) func(chainhash.Hash, *wire.BlockHeader, uint64) error {
+	return func(hash chainhash.Hash, header *wire.BlockHeader, _ uint64) error {
 		if !requested[hash] {
 			return &BlockNotRequestedError{Hash: hash}
 		}
@@ -89,13 +90,13 @@ func fakeSyncManagerGate(requested map[chainhash.Hash]bool, limit *big.Int) func
 // permissiveGate lets any hash and header through. Tests that only care about
 // exercising the sink path, not the gate's own logic, use this so a failure to
 // wire the gate correctly cannot masquerade as a passing test.
-func permissiveGate(chainhash.Hash, *wire.BlockHeader) error { return nil }
+func permissiveGate(chainhash.Hash, *wire.BlockHeader, uint64) error { return nil }
 
 // installGate sets blockBodyGate for the duration of the test and restores it
 // to nil afterwards. wire.SetExternalHandler and its collaborators are process
 // globals, so a test that moves blockBodyGate and forgets to put it back would
 // poison every test that runs after it in this package.
-func installGate(t *testing.T, gate func(chainhash.Hash, *wire.BlockHeader) error) {
+func installGate(t *testing.T, gate func(chainhash.Hash, *wire.BlockHeader, uint64) error) {
 	t.Helper()
 
 	blockBodyGate = gate
@@ -384,7 +385,7 @@ func TestStreamingBlockHandlerDrainsThePayloadAfterAGateRejection(t *testing.T) 
 	}
 	t.Cleanup(func() { blockBodySink = nil })
 
-	installGate(t, func(chainhash.Hash, *wire.BlockHeader) error {
+	installGate(t, func(chainhash.Hash, *wire.BlockHeader, uint64) error {
 		return errors.NewProcessingError("rejected for this test")
 	})
 
@@ -395,4 +396,166 @@ func TestStreamingBlockHandlerDrainsThePayloadAfterAGateRejection(t *testing.T) 
 	_, readErr := io.ReadFull(src, got)
 	require.NoError(t, readErr)
 	require.Equal(t, tail, got, "the rejection must drain exactly the declared payload, leaving the next message intact")
+}
+
+// TestStreamingBlockHandlerReportsASinkRefusalAsRejected pins the arm that
+// turns the sink's two peer-fault codes into the typed error the read loop acts
+// on, and only those two. Every other coded error keeps the "malformed" wrap:
+// this node's own faults are absorbed inside the sync manager's sink wrapper
+// and never reach here while it is live, and once it is shutting down any code
+// comes through and the disconnect costs nothing.
+//
+// The last row is the Truncated bit: the sink refused with the ban marker, but
+// the peer declared more bytes than it sent, so the handler's drain found the
+// stream short. The rejection is still typed (reject, association dropped) but
+// not ProvenBad, because a body this node never saw the end of was never
+// judged in full.
+func TestStreamingBlockHandlerReportsASinkRefusalAsRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		sinkErr        error
+		declaredExtra  uint64
+		wantRejected   bool
+		wantTruncated  bool
+		wantProvenBad  bool
+		wantInvalidErr bool
+	}{
+		{
+			name:           "an invalid body is rejected",
+			sinkErr:        errors.NewBlockInvalidError("merkle root does not match"),
+			wantRejected:   true,
+			wantInvalidErr: true,
+		},
+		{
+			name:         "a corrupt delivery is rejected",
+			sinkErr:      errors.NewBlockCorruptError("the declared transactions used fewer bytes than declared"),
+			wantRejected: true,
+		},
+		{
+			name:    "a storage fault is not a rejection",
+			sinkErr: errors.NewStorageError("disk full"),
+		},
+		{
+			name:           "the ban marker in a body delivered in full is proven bad",
+			sinkErr:        errors.NewBlockInvalidError("merkle root does not match", errors.ErrBlockBodyMismatch),
+			wantRejected:   true,
+			wantProvenBad:  true,
+			wantInvalidErr: true,
+		},
+		{
+			name:           "the ban marker in a body cut short is truncated, not proven bad",
+			sinkErr:        errors.NewBlockInvalidError("block contains duplicate transaction", errors.ErrBlockBodyMismatch),
+			declaredExtra:  32,
+			wantRejected:   true,
+			wantTruncated:  true,
+			wantInvalidErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, hash := serialisedBlock(t, 4)
+
+			blockBodySink = func(_ chainhash.Hash, _ *wire.BlockHeader, r io.Reader, _ int64) (bool, error) {
+				// Refuse part-way, as the duplicate and no-coinbase sites do, so
+				// the drain has something to do.
+				_, _ = io.CopyN(io.Discard, r, 16)
+
+				return false, tc.sinkErr
+			}
+			t.Cleanup(func() { blockBodySink = nil })
+
+			var deletes int
+
+			blockBodyDelete = func(h chainhash.Hash, converted bool) error {
+				deletes++
+
+				require.Equal(t, hash, h)
+				require.False(t, converted)
+
+				return nil
+			}
+			t.Cleanup(func() { blockBodyDelete = nil })
+
+			installGate(t, permissiveGate)
+
+			tail := []byte("NEXT")
+			src := io.MultiReader(bytes.NewReader(payload), bytes.NewReader(tail))
+
+			_, msg, _, err := streamingBlockHandler(src, uint64(len(payload))+tc.declaredExtra, 24)
+			require.Error(t, err)
+			require.Nil(t, msg)
+			require.Equal(t, 1, deletes, "a refused body is deleted exactly once, by the hash the sink was given")
+
+			var rejected *BlockBodyRejectedError
+			got := stderrors.As(err, &rejected)
+			require.Equal(t, tc.wantRejected, got, "typed rejection: got %T", err)
+
+			if !tc.wantRejected {
+				require.True(t, errors.Is(err, errors.ErrProcessing), "every other coded refusal keeps the processing wrap the read loop answers as malformed")
+
+				return
+			}
+
+			require.Equal(t, hash, rejected.Hash)
+			require.Equal(t, tc.wantInvalidErr, errors.Is(rejected.Err, errors.ErrBlockInvalid))
+			require.Equal(t, tc.wantTruncated, rejected.Truncated)
+			require.Equal(t, tc.wantProvenBad, rejected.ProvenBad())
+
+			if tc.declaredExtra == 0 {
+				got := make([]byte, len(tail))
+				_, readErr := io.ReadFull(src, got)
+				require.NoError(t, readErr)
+				require.Equal(t, tail, got, "the rest of the declared payload must be drained, leaving the next message intact")
+			}
+		})
+	}
+}
+
+// TestStreamingBlockHandlerDiscardsABodyTheGateDeclinesOnPolicy pins the gate
+// arm for this node's own block policy: the declared payload is above
+// excessiveblocksize, which is this node's configuration and not the peer's
+// conduct, so the body is drained unread, the handler returns a discard, no
+// error reaches the read loop, and the next message on the connection is
+// intact, exactly as for a block nobody asked for.
+func TestStreamingBlockHandlerDiscardsABodyTheGateDeclinesOnPolicy(t *testing.T) {
+	payload, hash := serialisedBlock(t, 4)
+
+	var gotLength uint64
+
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+		t.Fatal("a body the policy declines must never reach the sink")
+
+		return false, nil
+	}
+	t.Cleanup(func() { blockBodySink = nil })
+
+	blockBodyDelete = func(chainhash.Hash, bool) error {
+		t.Fatal("nothing was written, so nothing may be deleted")
+
+		return nil
+	}
+	t.Cleanup(func() { blockBodyDelete = nil })
+
+	installGate(t, func(_ chainhash.Hash, _ *wire.BlockHeader, length uint64) error {
+		gotLength = length
+
+		return errors.NewBlockPolicyDeclinedError("declared %d-byte body exceeds excessiveblocksize (local policy)", length)
+	})
+
+	tail := []byte("MARKER-AFTER-PAYLOAD")
+	src := io.MultiReader(bytes.NewReader(payload), bytes.NewReader(tail))
+
+	_, msg, _, err := streamingBlockHandler(src, uint64(len(payload)), 24)
+	require.NoError(t, err, "a policy decline is this node's, so it must not be an error the read loop answers with a disconnect")
+	require.Equal(t, uint64(len(payload)), gotLength, "the gate is handed the declared payload length, before any byte of the body is read")
+
+	discarded, ok := msg.(*MsgBlockDiscarded)
+	require.True(t, ok, "expected *MsgBlockDiscarded, got %T", msg)
+	require.Equal(t, hash, discarded.Hash)
+	require.Equal(t, int64(len(payload)), discarded.Size)
+	require.Contains(t, discarded.Reason, "block policy", "the discard log must say why, and not that the block was not asked for")
+
+	got := make([]byte, len(tail))
+	_, readErr := io.ReadFull(src, got)
+	require.NoError(t, readErr)
+	require.Equal(t, tail, got, "the declined body must be drained exactly, leaving the next message intact")
 }

@@ -93,11 +93,62 @@ func (e *BlockNotRequestedError) Error() string {
 }
 
 // MsgBlockDiscarded is a block message whose body was read off the wire and thrown
-// away, because this node did not ask for the block. It carries only what a log
-// line needs.
+// away for a reason that is this node's and not the peer's: the block was not asked
+// for, or its declared size is above this node's own block policy. It carries only
+// what a log line needs.
 type MsgBlockDiscarded struct {
 	Hash chainhash.Hash
 	Size int64
+
+	// Reason is the one clause the discard log line prints. Two producers set it
+	// (readBlockMessage, from the gate's refusal type): a block nobody asked for,
+	// and a declared payload the local block policy declines. The log used to say
+	// "did not ask for" for both.
+	Reason string
+}
+
+// BlockBodyRejectedError is what the streaming block handler returns when the
+// installed sink refused a body as the peer's fault: the body is not the block
+// its header commits to (ERR_BLOCK_INVALID), or its length and transactions
+// disagree (ERR_BLOCK_CORRUPT). It exists so the read loop can match the refusal
+// by type, never by message text, and treat it differently from a message it
+// could not read at all: the peer is sent a reject naming the block and the
+// whole association is disconnected, which is what rotates the sync peer and
+// releases the blocks it owed (netsync handleDonePeerMsg, clearRequestedState).
+//
+// Every other sink error keeps today's path. This node's own faults are drained
+// and kept inside the sink wrapper (netsync absorbLocalSinkFault) and never
+// reach here; an uncoded connection error is passed through by identity; any
+// other coded error is still a "malformed" disconnect.
+type BlockBodyRejectedError struct {
+	Hash chainhash.Hash
+	Err  error
+
+	// Truncated reports that the declared payload never fully arrived: after the
+	// sink refused, the handler's drain of what was left hit the end of the
+	// stream. A body that was not delivered in full was never judged in full, so
+	// it earns no ban whatever code the sink chose. Set by streamingBlockHandler
+	// after the drain, which is the one place that knows; the sink cannot, and
+	// readBlockMessage returns before the drain runs.
+	Truncated bool
+}
+
+func (e *BlockBodyRejectedError) Error() string {
+	return fmt.Sprintf("block %s: the body was rejected: %v", e.Hash, e.Err)
+}
+
+func (e *BlockBodyRejectedError) Unwrap() error { return e.Err }
+
+// ProvenBad is the one predicate a ban is allowed to rest on, and the legacy
+// peer server (serverPeer.OnBlockBodyRejected) bans on nothing else: the body
+// arrived in full, and the sink raised ERR_BLOCK_BODY_MISMATCH, which only its
+// three SV Node DoS(100) parity sites do (a merkle root the header does not
+// carry, a duplicate transaction, no coinbase). SV Node reaches CheckBlock only
+// after the whole message is deserialised, so a short delivery never scores
+// there either; Truncated gives teranode the same property on a path that
+// judges the body as it streams.
+func (e *BlockBodyRejectedError) ProvenBad() bool {
+	return e != nil && !e.Truncated && errors.IsBlockBodyMismatch(e.Err)
 }
 
 // Bsvdecode always fails: the body was discarded, not kept.
@@ -127,9 +178,12 @@ func (m *MsgBlockDiscarded) MaxPayloadLength(pver uint32) uint64 {
 // The handler already refuses to stream unless a sink and a gate are both
 // present, and this makes the same rule true of how they are installed rather
 // than only of how they are read.
+//
+// The gate is handed the declared payload length as well as the header, so it
+// can refuse a body on its size before the first byte of it is read.
 func SetBlockBodyStreaming(
 	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error),
-	gate func(hash chainhash.Hash, header *wire.BlockHeader) error,
+	gate func(hash chainhash.Hash, header *wire.BlockHeader, length uint64) error,
 	del func(hash chainhash.Hash, converted bool) error,
 ) {
 	if sink == nil || gate == nil || del == nil {

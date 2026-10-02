@@ -97,7 +97,13 @@ func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
 	}
 
 	if count == 0 {
-		return nil, errors.NewBlockInvalidError("[blockTxStream] block has no transactions, not even a coinbase")
+		// ErrBlockBodyMismatch inside the verdict: the count parsed and says
+		// zero, so there is no coinbase, SV Node's bad-cb-missing
+		// (CorruptionOrDoS). One of the three sites that may raise the marker;
+		// see pipelineBlockSink's producer rule. The count checks below are
+		// not: a count the body cannot hold is what SV Node logs as a
+		// deserialisation failure.
+		return nil, errors.NewBlockInvalidError("[blockTxStream] block has no transactions, not even a coinbase", errors.ErrBlockBodyMismatch)
 	}
 
 	// The body's own length is a real, cheap bound on the count — a

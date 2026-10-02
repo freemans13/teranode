@@ -48,7 +48,7 @@ func makeTestBlock(t testing.TB, numTxs, scriptLen int) *wire.MsgBlock {
 // so one test cannot leak state into the next.
 func installTestSink(t *testing.T,
 	sink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error),
-	gate func(chainhash.Hash, *wire.BlockHeader) error,
+	gate func(chainhash.Hash, *wire.BlockHeader, uint64) error,
 	del func(hash chainhash.Hash, converted bool) error,
 ) func() {
 	t.Helper()
@@ -115,7 +115,7 @@ func TestStreamingBlockHandler_SinkReceivesTheHeader(t *testing.T) {
 
 			return false, err
 		},
-		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
+		func(chainhash.Hash, *wire.BlockHeader, uint64) error { return nil },
 		func(chainhash.Hash, bool) error { return nil },
 	)
 	defer restore()
@@ -151,7 +151,7 @@ func TestStreamingBlockHandler_SmallBlocksAlsoStream(t *testing.T) {
 
 			return false, err
 		},
-		func(chainhash.Hash, *wire.BlockHeader) error { return nil },
+		func(chainhash.Hash, *wire.BlockHeader, uint64) error { return nil },
 		func(chainhash.Hash, bool) error { return nil },
 	)
 	defer restore()
@@ -308,7 +308,7 @@ func TestStreamingBlockHandler_AnUnrequestedBlockIsDiscardedNotAnError(t *testin
 			sinkCalled = true
 			return true, nil
 		},
-		func(hash chainhash.Hash, _ *wire.BlockHeader) error {
+		func(hash chainhash.Hash, _ *wire.BlockHeader, _ uint64) error {
 			return &BlockNotRequestedError{Hash: hash}
 		},
 		func(chainhash.Hash, bool) error { return nil },
@@ -339,7 +339,7 @@ func TestStreamingBlockHandler_AnUnrequestedBlockIsDiscardedNotAnError(t *testin
 func TestStreamingBlockHandler_AnyOtherGateRefusalIsStillAnError(t *testing.T) {
 	restore := installTestSink(t,
 		func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) { return true, nil },
-		func(chainhash.Hash, *wire.BlockHeader) error {
+		func(chainhash.Hash, *wire.BlockHeader, uint64) error {
 			return errors.NewBlockInvalidError("declared target is easier than the chain limit")
 		},
 		func(chainhash.Hash, bool) error { return nil },

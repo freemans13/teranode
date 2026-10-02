@@ -66,7 +66,7 @@ func regtestStreamedBlock(t *testing.T, sm *SyncManager, txCount int) (*wire.Msg
 		hash := header.BlockHash()
 		require.True(t, sm.blockDownloads.Add(nil, hash))
 
-		if sm.streamingBlockGate(hash, header) == nil {
+		if sm.streamingBlockGate(hash, header, 0) == nil {
 			break
 		}
 	}
