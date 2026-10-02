@@ -1,8 +1,10 @@
 package netsync
 
 import (
+	"strconv"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
@@ -62,8 +64,18 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// Ahead of the assigner and its budget cap on purpose: whether the cache has
 	// run out is a question about the header round, not about whether there is
 	// download budget free this instant, so it must be asked on every call this
-	// function makes, not only the ones that go on to place a block.
+	// function makes, not only the ones that go on to place a block. It gates
+	// itself on headers-first mode, so it is safe to call outside it.
 	sm.maybeRequestMoreHeaders(wanted)
+
+	// Above the last checkpoint the cache names nothing new, and the ledger is
+	// the only record of a block some peer was asked for. Appended to the cache
+	// range rather than replacing it: when the committed tip crosses the final
+	// checkpoint and the mode switches off, the cache can still name up to two
+	// thousand heights above it, and this pass is what keeps placing them.
+	if !sm.headersFirstMode.Load() {
+		wanted = sm.appendOutstandingAtTip(wanted)
+	}
 
 	assigner := sm.newDownloadAssigner()
 	if assigner == nil {
@@ -117,6 +129,72 @@ func (sm *SyncManager) wantedBlocks(best int32) []wantedBlock {
 	return sm.wantedBlocksFromCache(best, depth)
 }
 
+// appendOutstandingAtTip adds to the pass's range the blocks the ledger names
+// above the last checkpoint (blockDownloadTracker.OutstandingAtTip: each quiet
+// owner's head-of-queue block, and every block whose owners were all let off),
+// skipping any the cache already names. Only the sweep reaches this: the
+// per-arrival and headers-reply triggers of the pass are headers-first only
+// (topUpHeaderBlocks, handleHeadersMsg), so a quiet owner's block is re-asked
+// at the first sweep after blockRequestRetryInterval, 60 to 90 seconds after
+// the owner went quiet.
+//
+// Heights are not known on this route and are left at zero. canServe(0) is
+// true, highestHeld's extends test is false and the backstop never stops a
+// height of zero, so nothing downstream vetoes on them; the two log lines that
+// print a height render zero as not known (describeWantedHeight).
+//
+// Every entry then goes through unownedBlocksUpTo's checks like a cache-named
+// one: blockHeldLocally (the step-9 seam the inv path shares), the retry
+// window, disk, chain, then the busy-owner test and ForgiveOwners. A block an
+// owner is still delivering is left alone; a quiet owner's block is forgiven
+// and goes to the fastest other peer, full queue or not (fastestAvoiding). With
+// one eligible peer that already owes it, requestBlocks reasserts rather than
+// asking twice, so a one-peer node re-asks nothing here, and newDownloadAssigner
+// answers nil when every eligible peer is at its depth, so a sync peer
+// saturated by a getblocks burst and nobody else with room means no re-ask
+// that pass.
+//
+// Known and accepted: this walk and drainRequestQueue (the inv path) both go
+// RequestedWithin then Add with no lock in common, so an inv landing in the same
+// instant as a sweep can send two getdatas for one never-started block. That
+// could not happen in headers-first mode, where processInvMsg returns before
+// queuing. Bounded to one extra copy: the second is drained or discarded at the
+// sink (dupDrained, dupConverted) and blockHeldLocally keeps a third from being
+// asked for.
+func (sm *SyncManager) appendOutstandingAtTip(wanted []wantedBlock) []wantedBlock {
+	hashes := sm.blockDownloads.OutstandingAtTip(blockRequestRetryInterval)
+	if len(hashes) == 0 {
+		return wanted
+	}
+
+	named := make(map[chainhash.Hash]struct{}, len(wanted))
+	for _, block := range wanted {
+		named[block.hash] = struct{}{}
+	}
+
+	for _, h := range hashes {
+		if _, ok := named[h]; ok {
+			continue
+		}
+
+		wanted = append(wanted, wantedBlock{hash: h})
+	}
+
+	return wanted
+}
+
+// describeWantedHeight renders a wanted block's height for a log line. The
+// ledger-named range above the last checkpoint carries no height, and a line
+// that said "height 0" for a mainnet block would send a reader to the wrong
+// place.
+func describeWantedHeight(height int32) string {
+	if height <= 0 {
+		return "height not known above the last checkpoint"
+	}
+
+	return "height " + strconv.Itoa(int(height))
+}
+
 // unownedBlocks keeps the wanted blocks this node neither already holds nor
 // currently owes, is not given up on, and is not stalled behind a recent
 // failure, and lets a quiet owner off the hook on the way past.
@@ -126,22 +204,21 @@ func (sm *SyncManager) wantedBlocks(best int32) []wantedBlock {
 // blockchain round trip, and none of it is worth spending on a candidate this
 // pass could not place anyway.
 //
-// The recently-failed check runs first, and it only skips the one entry it
+// blockHeldLocally runs first: a block parked, being validated, arriving or
+// converting is in hand and is never asked for again, whatever the ledger says.
+// It is the one answer the inv path shares (step 9 of the 2026-10-02 re-review).
+//
+// The recently-failed check runs next, and it only skips the one entry it
 // names, not everything above it: a failed parent's own children earn no mark
 // of their own, so a pass after a failure still names them, and they wait in
 // the park behind the missing parent once downloaded. What this check bounds is
 // the marked hash itself: it is not requested again for the life of the mark,
-// rather than being
-// downloaded and refused afresh every single pass for as long as the parent
-// stays failed. Honouring dispatcher.inFlight is what stops a parent that is
-// being retried right now from being misread as a dead one: it was
-// re-admitted, so its children must not be held back on the strength of an
-// attempt that may yet succeed.
+// rather than being downloaded and refused afresh every single pass for as long
+// as the parent stays failed.
 //
-// The disk checks run next, ahead of the ledger, because a block already on
-// disk should not spend a peer's budget nor be forgiven on a peer's behalf:
-// it is simply done. holdsBlock and the park's own index answer from the
-// filesystem alone.
+// The disk check runs after the ledger's retry window, because a block already
+// on disk should not spend a peer's budget nor be forgiven on a peer's behalf:
+// it is simply done. holdsBlock answers from the filesystem alone.
 //
 // haveInventory is the fallback for the one question none of the checks
 // above can answer: whether the chain already has this block by some route
@@ -184,12 +261,16 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 			break
 		}
 
-		// A block in flight is never asked for again, as SV Node never asks for a block
-		// in mapBlocksInFlight: its bytes are arriving or it is being converted, whatever
-		// the ledger says about who owes it. The ledger can let every peer off a block
-		// that is still arriving, and on 2026-09-24 that asked for block 734,077
-		// seventeen times in thirteen seconds.
-		if sm.streams.arriving(block.hash) || sm.conversionInFlight(block.hash) {
+		// A block in hand is never asked for again: parked (the park's index is
+		// written synchronously at admission, before the blob write lands, so a
+		// pass run from inside the admission itself sees it), taken off the park
+		// to validate, its bytes arriving, or being converted, whatever the
+		// ledger says about who owes it. The ledger can let every peer off a
+		// block that is still arriving, and on 2026-09-24 that asked for block
+		// 734,077 seventeen times in thirteen seconds. SV Node never asks the
+		// same peer again for a block in mapBlocksInFlight and asks another peer
+		// only through its 30-second parallel fetch (net_processing.cpp:462-507).
+		if sm.blockHeldLocally(block.hash) {
 			continue
 		}
 
@@ -197,25 +278,12 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 		// merely unlucky, is not requested again while the mark stands. Its
 		// descendants are not marked themselves; once downloaded they wait in
 		// the park behind the missing parent rather than being asked for again.
-		// dispatcher.inFlight is honoured for the same reason the delivery-side
-		// check honours it: a parent being retried right now was re-admitted,
-		// so it is not a failed parent and must not hold its children back.
-		if sm.recentlyFailedBlocks != nil && !sm.dispatcher.inFlight(block.hash) {
+		// A parent being retried right now is in the dispatcher's window and
+		// was skipped above, so the mark is read only for a block nothing holds.
+		if sm.recentlyFailedBlocks != nil {
 			if _, failed := sm.recentlyFailedBlocks.Get(block.hash); failed {
 				continue
 			}
-		}
-
-		// The park's own in-memory index, checked separately from holdsBlock:
-		// Admit registers a block there synchronously, before its blob write
-		// is handed to a worker, so a pass that lands in the gap between
-		// admission and the write landing on disk must still see it as held.
-		// Without this, a pass triggered from inside the admission itself —
-		// parkOrphanBlock's own top-up call among them — re-requests the block
-		// it is that same instant holding, spending a peer's slot on a block
-		// already safely on its way to disk.
-		if sm.blockPark.Has(block.hash) {
-			continue
 		}
 
 		// Already asked of a peer within the retry window: skipped from the ledger,
@@ -244,7 +312,7 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 			// its files are gone.
 			if !sm.blockPark.Has(block.hash) && !sm.dispatcher.inFlight(block.hash) &&
 				sm.blockPark.adoptStranded(sm.ctx, block.hash, sm.subtreeStore) {
-				sm.logger.Warnf("[unownedBlocks][%s] adopted a complete record at height %d that was on disk but not in the park", block.hash, block.height)
+				sm.logger.Warnf("[unownedBlocks][%s] adopted a complete record at %s that was on disk but not in the park", block.hash, describeWantedHeight(block.height))
 			}
 
 			continue
@@ -298,7 +366,7 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 					since = time.Since(last).Round(time.Second).String()
 				}
 
-				sm.logger.Infof("[reRequest][%s] height %d: %s owed it and last sent block bytes %s ago; it may be asked of another peer", block.hash, block.height, p, since)
+				sm.logger.Infof("[reRequest][%s] %s: %s owed it and last sent block bytes %s ago; it may be asked of another peer", block.hash, describeWantedHeight(block.height), p, since)
 			}
 
 			block.reAsked = true

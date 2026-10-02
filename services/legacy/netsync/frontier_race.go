@@ -24,11 +24,22 @@ import (
 // SV Node: DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT is 30 s, DEFAULT_MIN_BLOCK_STALLING_RATE is
 // 100 KB/s.
 //
-// The race judges only a block whose bytes have started. A peer that has not started sending a
-// block is not struggling with it: it may be sending blocks queued ahead of it, or reading it from
-// disk before its first byte. That case is handled by letting another peer be asked after
-// blockRequestRetryInterval, whose comment explains what an SV Node peer is doing while it is
-// quiet. Do not extend the race to it.
+// The race judges only a block whose bytes have started, and only in headers-first mode:
+// trackBlockStreams takes a stream's height from the header cache, which is empty above the last
+// checkpoint, so pickRace's height test skips every tip stream. That makes the race narrower than SV
+// Node's parallel fetch, which after DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT (30 s) asks another
+// peer for the first in-flight block of a peer whose block-stream bandwidth is below the stalling
+// rate, bytes started or not (FindNextBlocksToDownload, net_processing.cpp:462-507, capped at
+// DEFAULT_MAX_BLOCK_PARALLEL_FETCH, 3). A peer that has not started sending a block is not
+// struggling with it here: it may be sending blocks queued ahead of it, or reading it from disk
+// before its first byte. That case is handled in both modes by the download pass,
+// assignWantedBlocks, which after blockRequestRetryInterval lets a quiet owner off and asks another
+// peer: below the last checkpoint the pass names blocks from the header cache, above it from the
+// ledger, one head-of-queue block per quiet owner (appendOutstandingAtTip). The 60-second quiet
+// rule is the looser cousin of SV Node's: any quiet owner rather than a bandwidth test, 60 s rather
+// than 30, one re-ask per owner per retry window rather than three parallel fetches.
+// blockRequestRetryInterval's comment explains what an SV Node peer is doing while it is quiet. Do
+// not extend the race to it.
 
 const (
 	// raceCheckInterval is how often the race is considered. It runs on its own ticker because

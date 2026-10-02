@@ -378,3 +378,87 @@ func TestForgivenAssignment_IsStillOwnedButNoLongerSpendsBudget(t *testing.T) {
 	advance(blockRequestAssignmentTTL + time.Minute)
 	require.False(t, tr.ReassertOwner(p, h), "a dead assignment must not be re-armed")
 }
+
+// TestOutstandingAtTip_NamesOneHeadPerOwnerInRequestOrder is the ledger half of
+// the tip walk. A peer answers getdata in the order it was asked, so of a peer's
+// unforgiven records only the oldest can be the one it is stalled on; the rest
+// are named nothing, and so cost the pass nothing. Records go out in request
+// order across peers, so the pass is deterministic and looks at the earliest
+// request first.
+func TestOutstandingAtTip_NamesOneHeadPerOwnerInRequestOrder(t *testing.T) {
+	tr, advance := newTestTracker(time.Hour)
+
+	p1 := newTestPeer(t, "10.0.0.1:8333")
+	p2 := newTestPeer(t, "10.0.0.2:8333")
+
+	hA, hB, hC, hD := chainhash.Hash{0xa}, chainhash.Hash{0xb}, chainhash.Hash{0xc}, chainhash.Hash{0xd}
+
+	// Four requests inside one instant, as one getdata of four makes them: the
+	// clock cannot order them, the sequence number does.
+	require.True(t, tr.Add(p2, hD))
+	require.True(t, tr.Add(p1, hA))
+	require.True(t, tr.Add(p1, hB))
+	require.True(t, tr.Add(p1, hC))
+
+	require.Equal(t, []chainhash.Hash{hD, hA}, tr.OutstandingAtTip(blockRequestRetryInterval),
+		"p2's head then p1's head, in the order they were asked for; p1's second and third blocks are not named")
+
+	// Let p1 off its head, as a re-ask does, and ask another peer for it: p1's
+	// head moves on only once that re-ask has had its own retry window.
+	require.Len(t, tr.ForgiveOwners(hA, blockRequestRetryInterval), 1)
+	require.True(t, tr.Add(p2, hA))
+
+	require.Equal(t, []chainhash.Hash{hD}, tr.OutstandingAtTip(blockRequestRetryInterval),
+		"p1 is named nothing while its re-asked head is fresh with p2; hA is behind hD in p2's queue so it is not p2's head")
+
+	advance(blockRequestRetryInterval + time.Second)
+
+	require.Equal(t, []chainhash.Hash{hD, hB}, tr.OutstandingAtTip(blockRequestRetryInterval),
+		"the re-ask has aged out of its window, so p1's next block is its head")
+
+	// Delivery removes the delivering peer's record; the other owner's forgiven
+	// record stays. A block owed by nobody unforgiven is named so the pass can
+	// check it against disk and chain, which is the cost the method's comment
+	// states.
+	tr.RemoveOwner(p2, hA)
+
+	require.Equal(t, []chainhash.Hash{hD, hA, hB}, tr.OutstandingAtTip(blockRequestRetryInterval),
+		"an all-forgiven block is named in request order of its oldest record")
+}
+
+// TestOutstandingAtTip_NamesABlockWhoseEveryOwnerWasLetOff is the demotion
+// shape: ForgetForRetryPeer leaves a peer's whole queue forgiven, nothing else
+// names those blocks above the last checkpoint, and Len does not count them.
+func TestOutstandingAtTip_NamesABlockWhoseEveryOwnerWasLetOff(t *testing.T) {
+	tr, _ := newTestTracker(time.Hour)
+
+	p := newTestPeer(t, "10.0.0.3:8333")
+	h1, h2 := chainhash.Hash{0x1}, chainhash.Hash{0x2}
+
+	require.True(t, tr.Add(p, h1))
+	require.True(t, tr.Add(p, h2))
+	require.Len(t, tr.ForgetForRetryPeer(p, blockRequestRetryInterval), 2)
+
+	require.Zero(t, tr.Len(), "precondition: Len excludes forgiven records")
+	require.Equal(t, []chainhash.Hash{h1, h2}, tr.OutstandingAtTip(blockRequestRetryInterval),
+		"every block the demoted peer was let off is named, not just its head: nobody is on the hook for any of them")
+}
+
+// TestOutstandingAtTip_IgnoresExpiredRecordsAndANilLedger pins the two
+// boundaries every method of this ledger keeps.
+func TestOutstandingAtTip_IgnoresExpiredRecordsAndANilLedger(t *testing.T) {
+	tr, advance := newTestTracker(time.Hour)
+
+	p := newTestPeer(t, "10.0.0.4:8333")
+	old, fresh := chainhash.Hash{0x5}, chainhash.Hash{0x6}
+
+	require.True(t, tr.Add(p, old))
+	advance(2 * time.Hour)
+	require.True(t, tr.Add(p, fresh))
+
+	require.Equal(t, []chainhash.Hash{fresh}, tr.OutstandingAtTip(blockRequestRetryInterval),
+		"a record past the ownership ceiling is not a request anybody still holds")
+
+	var none *blockDownloadTracker
+	require.Nil(t, none.OutstandingAtTip(blockRequestRetryInterval))
+}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -260,10 +261,14 @@ func TestConsumerWatchdog_ReportsTheHeaderCacheState(t *testing.T) {
 }
 
 // TestConsumerWatchdog_ReportsCacheStateEvenWithHeadersFirstOff pins that the
-// header-cache clause is not gated on headersFirstMode. Outside headers-first
+// header-cache clause survives the switch out of headers-first mode. When the
+// committed tip passes the final checkpoint the cache can still name up to two
+// thousand heights above it, and the download pass keeps placing them, so a
+// report at the crossing must still say how many it names. Outside headers-first
 // mode the watchdog reports only when something is waiting, here a read loop
-// waiting on the download budget; when it does report, the header cache and the
-// committed height are part of the line whatever mode the node is in.
+// waiting on the download budget; when it does report, the line carries the
+// tip's own summary (blocks owed, split from blocks arriving) and the cache's
+// remaining run, not the headers-first claim that a getheaders is outstanding.
 func TestConsumerWatchdog_ReportsCacheStateEvenWithHeadersFirstOff(t *testing.T) {
 	log := &captureLogger{Logger: ulogger.TestLogger{}}
 	sm := &SyncManager{logger: log}
@@ -275,7 +280,9 @@ func TestConsumerWatchdog_ReportsCacheStateEvenWithHeadersFirstOff(t *testing.T)
 	line := stallReport(t, sm, log)
 
 	require.Contains(t, line, "no block admitted")
-	require.Contains(t, line, "the header cache names 12 heights")
+	require.Contains(t, line, "0 blocks are owed by peers")
+	require.Contains(t, line, "the header cache still names 12 heights up to 800140")
+	require.NotContains(t, line, "waiting on a getheaders")
 }
 
 // TestConsumerWatchdog_ANilHeaderCacheStillProducesAReport matches the harness
@@ -314,4 +321,63 @@ func TestConsumerWait_Describe_NamesDeclinedDrainTurns(t *testing.T) {
 	quiet := (&consumerWait{at: now}).describe(now)
 	require.False(t, strings.Contains(quiet, "declined"),
 		"a drain that has never declined a turn must not add a clause saying so")
+}
+
+// tipWatchdogManager is a manager above the final checkpoint for the watchdog
+// to read: a real sqlitememory LocalClient (so committedTip and the summary
+// read a chain rather than a stand-in), headers-first off, nothing parked,
+// nothing in the window, no download slot held, and a live ledger. Everything
+// the watchdog's hasWork gate reads is empty here on purpose: an owed block is
+// in none of those fields, and that silence is the shape 4ad6e3818 made the
+// watchdog blind to.
+func tipWatchdogManager(t *testing.T) (*SyncManager, *captureLogger) {
+	t.Helper()
+
+	log := &captureLogger{Logger: ulogger.TestLogger{}}
+
+	sm := newPipelineManager(t, memory.New(), 8)
+	sm.logger = log
+	sm.blockDownloads = newBlockDownloadTracker(blockRequestAssignmentTTL)
+	sm.headersFirstMode.Store(false)
+
+	return sm, log
+}
+
+// TestConsumerWatchdog_ReportsABlockOwedAtTheTipWithNothingElseWaiting is Major 5
+// of the 2026-10-02 re-review: above the last checkpoint a peer accepts our
+// getdata and sends nothing, and the node is silent about it. The ledger is the
+// only place that block exists, so the watchdog reads it, counts it as work,
+// and says what is owed rather than claiming to wait on a getheaders.
+func TestConsumerWatchdog_ReportsABlockOwedAtTheTipWithNothingElseWaiting(t *testing.T) {
+	sm, log := tipWatchdogManager(t)
+
+	require.True(t, sm.blockDownloads.Add(newTestPeer(t, "10.0.0.1:8333"), chainhash.Hash{0x95}))
+
+	line := stallReport(t, sm, log)
+
+	require.Contains(t, line, "best block processed 0")
+	require.Contains(t, line, "1 blocks are owed by peers")
+	require.Contains(t, line, "0 of them are arriving now")
+	require.NotContains(t, line, "waiting on a getheaders", "at the tip no getheaders is outstanding and the line must not claim one")
+}
+
+// TestConsumerWatchdog_StaysQuietAtTheTipWhenNothingIsOwed is the other half:
+// a tip node keeping up, with a ledger whose only record is a forgiven one (a
+// delivered block's other owner, let off at delivery), has nothing to report.
+// Len excludes forgiven records, so that record is not work.
+func TestConsumerWatchdog_StaysQuietAtTheTipWhenNothingIsOwed(t *testing.T) {
+	sm, log := tipWatchdogManager(t)
+
+	hash := chainhash.Hash{0x96}
+
+	require.True(t, sm.blockDownloads.Add(newTestPeer(t, "10.0.0.2:8333"), hash))
+	require.Len(t, sm.blockDownloads.ForgiveOwners(hash, blockRequestRetryInterval), 1)
+
+	now := time.Now()
+
+	sm.noteConsumerAdmitted(now)
+	sm.publishConsumerWait(now)
+	sm.reportConsumerStall(now.Add(consumerStallAfter + time.Second))
+
+	require.Empty(t, log.warns, "a node at the tip with nothing owed, parked, queued or held is keeping up, not stalled")
 }

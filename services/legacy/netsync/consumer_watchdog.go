@@ -236,9 +236,19 @@ func (sm *SyncManager) reportConsumerStall(now time.Time) {
 	// the node has always asked for blocks it has not yet received, so silence
 	// there is reported whatever the snapshot holds. Outside it, at the tip,
 	// blocks arrive about every ten minutes and a quiet loop with nothing
-	// parked, queued, held or waiting is a node keeping up; reporting it every
-	// minute made the line useless.
-	if !sm.headersFirstMode.Load() && !w.hasWork() {
+	// parked, queued, held, waiting or owed is a node keeping up; reporting it
+	// every minute made the line useless.
+	//
+	// Owed is read here, on the watchdog's goroutine, not in the consumer's
+	// snapshot: Len takes the ledger's mutex and may sweep it, and the snapshot
+	// is kept lock-free by design. A block asked for by getdata whose first byte
+	// has not arrived is in no snapshot field at all, and above the last
+	// checkpoint that silence is the only shape a peer that accepted our getdata
+	// and sends nothing ever takes; 4ad6e3818's gate made it invisible. Len
+	// excludes forgiven records, so a delivered block's let-off other owner does
+	// not wake the watchdog.
+	owed := sm.blockDownloads.Len()
+	if !sm.headersFirstMode.Load() && !w.hasWork() && owed == 0 {
 		return
 	}
 

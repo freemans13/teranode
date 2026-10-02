@@ -1,6 +1,8 @@
 package netsync
 
 import (
+	"bytes"
+	"sort"
 	"sync"
 	"time"
 
@@ -74,6 +76,14 @@ const (
 type ownerRecord struct {
 	// at is when we last asked, and what the ownership ceiling is measured from.
 	at time.Time
+	// seq orders this peer's requests as they went out: a peer answers getdata
+	// in the order it was asked (SV Node's ProcessGetData, one block at a time,
+	// first asked first sent), so the record with the lowest seq among a peer's
+	// unforgiven records is the block at the head of its queue. Stamped by Add,
+	// which is the only path that sends a getdata; ReassertOwner sends nothing
+	// and leaves it alone. Two Adds in the same instant get distinct values,
+	// which the request clock cannot promise.
+	seq uint64
 	// forgiven marks an assignment the peer has been let off. The record stays,
 	// because a copy that does turn up must still be admitted rather than costing
 	// an honest peer its whole association — but the peer is no longer spending
@@ -124,6 +134,8 @@ type blockDownloadTracker struct {
 	// count and its removal are both O(what that peer owes) rather than O(all).
 	byPeer    map[*peerpkg.Peer]map[chainhash.Hash]struct{}
 	lastSweep time.Time
+	// seq is the last request sequence number handed out; see ownerRecord.seq.
+	seq uint64
 }
 
 // blockRequestAssignmentCeiling is how long a peer stays on the hook for a block
@@ -228,7 +240,8 @@ func (t *blockDownloadTracker) Add(p *peerpkg.Peer, h chainhash.Hash) bool {
 		t.byHash[h] = owners
 	}
 
-	owners[p] = ownerRecord{at: now}
+	t.seq++
+	owners[p] = ownerRecord{at: now, seq: t.seq}
 
 	hashes := t.byPeer[p]
 	if hashes == nil {
@@ -418,13 +431,7 @@ func (t *blockDownloadTracker) RequestedWithin(h chainhash.Hash, maxAge time.Dur
 	now := t.clock()
 	t.maybeSweepLocked(now)
 
-	for _, rec := range t.byHash[h] {
-		if !t.expiredAt(rec.at, now, maxAge) {
-			return true
-		}
-	}
-
-	return false
+	return t.requestedWithinLocked(h, now, maxAge)
 }
 
 // Requested reports whether anybody is still on the hook for block h, judged
@@ -685,6 +692,161 @@ func (t *blockDownloadTracker) Len() int {
 	}
 
 	return n
+}
+
+// OutstandingAtTip names the blocks the download pass should consider when no
+// header cache names any: above the last checkpoint, where a block is asked for
+// off an inv and this ledger is the only record that it was asked for at all.
+// The result is in request order (seq, oldest first), so a pass over it is
+// deterministic and the earliest request is looked at first.
+//
+// Two kinds of block are named, and the first is bounded per owner:
+//
+//   - For each peer with records, the block at the head of its queue: its
+//     lowest-seq unforgiven record. A peer sends its queue in order, so a later
+//     block from the same peer cannot be the one it is stalled on, and naming
+//     only the head is what keeps the pass's disk and chain checks off the rest
+//     of a long queue: one getblocks reply above the checkpoint has one peer owing
+//     up to 500 blocks, and checking all 500 against disk and chain costs a blob
+//     read and a round trip each, every sweep. SV Node has the same shape twice
+//     over: FindNextBlocksToDownload judges only the first already-in-flight block
+//     (net_processing.cpp:462-507) and DetectStalling's disconnect timeout reads
+//     vBlocksInFlight.front() (:5476-5500). The peer is named nothing at all while
+//     a forgiven record of its, older than the head, is still inside retryWindow
+//     for some other peer: that is a re-ask of an earlier head still fresh, and
+//     SV Node's front stays the front until it arrives. Without that pause a peer
+//     quiet for twenty minutes, which blockRequestRetryInterval's comment says is
+//     normal while an SV Node peer reads a multi-gigabyte block from disk, would
+//     have one more of its blocks downloaded twice on every sweep.
+//   - Every block whose every live record is forgiven. demoteSyncPeer's
+//     ForgetForRetryPeer leaves a stalled sync peer's whole queue in that state,
+//     and handleCheckSyncPeer runs outside headers-first mode too; a re-ask that
+//     found nobody leaves the same shape. Below the checkpoint the header cache
+//     names such a block again on the next pass; above it nothing else does.
+//
+// The second kind costs something, stated plainly. handleBlockOnDiskMsg removes
+// the delivering peer's record and forgives the rest, and removeOwnerFromHashLocked
+// drops a hash only once nobody owes it, so every block that was re-asked and then
+// delivered by either owner keeps one forgiven record for the rest of the
+// ownership ceiling (375 minutes at shipped mainnet settings) and is named here on
+// every sweep. While it is parked the pass skips it from memory; once committed
+// the pass spends one blob read (a miss) and one GetBlockHeader round trip on it
+// per sweep before the chain says it has it. The set is bounded by the number of
+// re-asks, which the head-of-queue rule above keeps to one per quiet peer per
+// retry window. Dropping the records at delivery instead would remove the cost
+// and change a settled ledger rule (the never-forget rule at ForgetForRetryPeer),
+// so it is left for a separate decision.
+//
+// Expired records are ignored, as everywhere else in this ledger. A nil receiver
+// names nothing.
+func (t *blockDownloadTracker) OutstandingAtTip(retryWindow time.Duration) []chainhash.Hash {
+	if t == nil {
+		return nil
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := t.clock()
+	t.maybeSweepLocked(now)
+
+	// hash -> the lowest seq of the records that named it, for the final order.
+	named := make(map[chainhash.Hash]uint64)
+
+	name := func(h chainhash.Hash, seq uint64) {
+		if prev, ok := named[h]; !ok || seq < prev {
+			named[h] = seq
+		}
+	}
+
+	type peerRecord struct {
+		hash chainhash.Hash
+		rec  ownerRecord
+	}
+
+	for p, hashes := range t.byPeer {
+		queue := make([]peerRecord, 0, len(hashes))
+
+		for h := range hashes {
+			rec, ok := t.byHash[h][p]
+			if !ok || t.expiredAt(rec.at, now, t.ttl) {
+				continue
+			}
+
+			queue = append(queue, peerRecord{hash: h, rec: rec})
+		}
+
+		sort.Slice(queue, func(i, j int) bool { return queue[i].rec.seq < queue[j].rec.seq })
+
+		for _, r := range queue {
+			if !r.rec.forgiven {
+				name(r.hash, r.rec.seq)
+
+				break
+			}
+
+			// An earlier head of this peer's, let off and re-asked of somebody
+			// whose request is still fresh: leave the peer alone this pass.
+			if t.requestedWithinLocked(r.hash, now, retryWindow) {
+				break
+			}
+		}
+	}
+
+	for h, owners := range t.byHash {
+		live := false
+		allForgiven := true
+
+		var lowest uint64
+
+		for _, rec := range owners {
+			if t.expiredAt(rec.at, now, t.ttl) {
+				continue
+			}
+
+			if !rec.forgiven {
+				allForgiven = false
+
+				break
+			}
+
+			if !live || rec.seq < lowest {
+				lowest = rec.seq
+			}
+
+			live = true
+		}
+
+		if live && allForgiven {
+			name(h, lowest)
+		}
+	}
+
+	out := make([]chainhash.Hash, 0, len(named))
+	for h := range named {
+		out = append(out, h)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if named[out[i]] != named[out[j]] {
+			return named[out[i]] < named[out[j]]
+		}
+
+		return bytes.Compare(out[i][:], out[j][:]) < 0
+	})
+
+	return out
+}
+
+// requestedWithinLocked is RequestedWithin with the lock already held.
+func (t *blockDownloadTracker) requestedWithinLocked(h chainhash.Hash, now time.Time, maxAge time.Duration) bool {
+	for _, rec := range t.byHash[h] {
+		if !t.expiredAt(rec.at, now, maxAge) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // clock reads the injected time source, tolerating a tracker built as a struct

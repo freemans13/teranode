@@ -132,6 +132,21 @@ const (
 	// can only disagree one way round: the peer layer is at least as patient as
 	// netsync everywhere, so netsync rotates a stalled sync peer before the peer
 	// layer would disconnect it, during catch-up and at the tip alike.
+	//
+	// This floor is not the recovery path for a peer that accepted a getdata
+	// and sends nothing. netsync re-asks such a block of another peer after
+	// blockRequestRetryInterval in both sync modes (assignWantedBlocks,
+	// services/legacy/netsync/wanted_range_assign.go: from the header cache
+	// below the last checkpoint, from the download ledger above it), so the
+	// floor bounds only how long the quiet peer stays connected. SV Node's
+	// equivalent is in two parts: a parallel fetch of a stalling peer's first
+	// in-flight block after 30 s (net_processing.cpp:462-507), and a disconnect
+	// timeout of nPowTargetSpacing * (base + perPeer * others) with no floor,
+	// ten minutes at the tip (DetectStalling, net_processing.cpp:5483-5496).
+	// The thirty-minute floor is the deliberate difference, dated 2026-08-25
+	// (67e459c20): it exists so the percentage settings cannot narrow the
+	// shipped ceiling threefold, and lifting it would cut a healthy multi-GB
+	// tip transfer under about 7 MB/s at ten minutes.
 	MaxBlockDownloadTime = 30 * time.Minute
 )
 

@@ -931,10 +931,32 @@ func (sm *SyncManager) isCheckpointHash(hash chainhash.Hash) bool {
 // download budget. None of them described the header list, and metrics.go had
 // no gauge for it either. That structure and its front-of-list anchor are gone
 // now, replaced by the cache and the chain's own tip this reads instead.
+//
+// Above the last checkpoint the cache is not what names blocks, so the line
+// says what is: how many blocks peers owe, split from how many are arriving
+// now, since Len counts a block minutes into a transfer as owed too and the
+// common tip report fires during exactly such a transfer. The cache clause is
+// kept while the cache still names heights, because at the crossing out of
+// headers-first mode it can name up to two thousand and the pass keeps placing
+// them.
 func (sm *SyncManager) headerRoundSummary() string {
 	best, _, _ := sm.committedTip()
 
 	top, haveTop := sm.headerCache.Top()
+
+	if !sm.headersFirstMode.Load() {
+		_, arriving := sm.streams.arrivingBytes()
+
+		line := fmt.Sprintf("best block processed %d, past the final checkpoint so blocks are named by announcements and the download ledger; %d blocks are owed by peers and %d of them are arriving now",
+			best, sm.blockDownloads.Len(), arriving)
+
+		if haveTop {
+			line += fmt.Sprintf("; the header cache still names %d heights up to %d", sm.headerCache.Len(), top)
+		}
+
+		return line
+	}
+
 	if !haveTop {
 		return fmt.Sprintf("best block processed %d, the header cache is empty so the next pass can name nothing and is waiting on a getheaders", best)
 	}
