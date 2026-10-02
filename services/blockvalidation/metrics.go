@@ -98,7 +98,6 @@ var (
 	// final commit for the quick-validation path.
 	prometheusBlockValidationQuickCommitAddBlock    prometheus.Histogram
 	prometheusBlockValidationQuickCommitUnlock      prometheus.Histogram
-	prometheusBlockValidationQuickCommitSubtreesSet prometheus.Histogram
 	prometheusBlockValidationQuickCommitBlockExists prometheus.Histogram
 )
 
@@ -291,16 +290,6 @@ func _initPrometheusMetrics() {
 			Subsystem: "blockvalidation",
 			Name:      "quick_commit_unlock_seconds",
 			Help:      "Unlock pass duration in the quick-validation commit tail",
-			Buckets:   util.MetricsBucketsSeconds,
-		},
-	)
-
-	prometheusBlockValidationQuickCommitSubtreesSet = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Namespace: "teranode",
-			Subsystem: "blockvalidation",
-			Name:      "quick_commit_subtrees_set_seconds",
-			Help:      "SetBlockSubtreesSet duration in the quick-validation commit tail",
 			Buckets:   util.MetricsBucketsSeconds,
 		},
 	)

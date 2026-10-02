@@ -575,7 +575,12 @@ const queueReportEvery = 6
 // headers-first mode. Above the last checkpoint blocks arrive on the inv path, which never
 // uses the scheduler, and every peer reads as idle there whatever it is doing. The
 // download-waste line counts every delivery in every mode and is always printed.
+//
+// The same tick publishes the download gauges and counters, ahead of the guard below,
+// because publishDownloadMetrics copes with each of the fields it checks being nil.
 func (sm *SyncManager) logDownloadQueues() {
+	sm.publishDownloadMetrics()
+
 	if sm.streams == nil || sm.blockSizeTracker == nil || sm.blockDownloads == nil {
 		return
 	}
@@ -588,6 +593,27 @@ func (sm *SyncManager) logDownloadQueues() {
 	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",
 		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.localFaultDrained.Load(), w.streamsFailed.Load(),
 		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load())
+}
+
+// publishDownloadMetrics sets the download gauges, blocks owed, heights the header cache names
+// and bytes held ahead of the chain, and adds the waste counters' increase since the last call.
+// The report tick is its only production caller, so the gauges lag by up to 30 seconds.
+func (sm *SyncManager) publishDownloadMetrics() {
+	if prometheusLegacyNetsyncBlocksOwed == nil {
+		return
+	}
+
+	prometheusLegacyNetsyncBlocksOwed.Set(float64(sm.blockDownloads.Len()))
+	prometheusLegacyNetsyncHeaderCacheHeights.Set(float64(sm.headerCache.Len()))
+
+	var largest int64
+	if sm.blockSizeTracker != nil {
+		largest = sm.blockSizeTracker.largestRecentSize()
+	}
+
+	prometheusLegacyNetsyncBytesAhead.Set(float64(sm.bytesAhead(largest)))
+
+	sm.waste.publish()
 }
 
 // logSchedulerQueues is logDownloadQueues' per-peer lines and summary, for the headers-first

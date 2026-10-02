@@ -4028,6 +4028,14 @@ func (sp *serverPeer) OnBlockOnDisk(_ *peer.Peer, msg *peer.MsgBlockOnDisk) {
 		return
 	}
 
+	// The histogram times the hand-off alone: QueueBlockOnDisk is a send on the sync
+	// manager's message channel, so a long tail here is that consumer falling behind,
+	// with the peer's read loop waiting on it.
+	_, _, deferFn := tracing.Tracer("legacy").Start(sp.ctx, "serverPeer.OnBlockOnDisk",
+		tracing.WithHistogram(peerServerMetrics["OnBlockOnDisk"]),
+	)
+	defer deferFn()
+
 	sp.server.syncManager.QueueBlockOnDisk(msg.BlockBody, sp.Peer)
 }
 

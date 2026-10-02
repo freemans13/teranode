@@ -61,6 +61,10 @@ const (
 // block once something has gone wrong with it (or, for parkDispositionCommitted,
 // once it has gone right).
 type parkDisposition struct {
+	// name is the row's label on park_dispositions_total: short, fixed, and
+	// distinct per row, so a dashboard can group by it.
+	name string
+
 	// reason is the operator-facing half of the row: what the log line says.
 	reason string
 
@@ -98,6 +102,7 @@ var (
 	// parkDispositionCommitted — the block is in the chain. The blob has done
 	// its job; nothing to re-request and nobody to blame.
 	parkDispositionCommitted = parkDisposition{
+		name:   "committed",
 		reason: "committed from the park",
 		blob:   parkBlobDrop,
 	}
@@ -111,6 +116,7 @@ var (
 	// condition that is over in seconds. Blocks kept this way are not kept
 	// forever: the sweep evicts them once the chain has gone past them.
 	parkDispositionRetryLater = parkDisposition{
+		name:   "retry_later",
 		reason: "a local fault that says nothing about the block",
 		blob:   parkBlobKeep,
 	}
@@ -119,6 +125,7 @@ var (
 	// reorg under the drain. Same three answers as retryLater and a different
 	// log line, because an operator needs to tell a reorg from a busy store.
 	parkDispositionParentGone = parkDisposition{
+		name:   "parent_missing",
 		reason: "the parent is missing again",
 		blob:   parkBlobKeep,
 	}
@@ -133,6 +140,7 @@ var (
 	// Its own log line, because "the mined flag is late" points an operator at
 	// setTxMined, where a busy store or a reorg would not.
 	parkDispositionParentNotMinedYet = parkDisposition{
+		name:   "parent_not_mined",
 		reason: "its parent is not marked mined yet",
 		blob:   parkBlobKeep,
 	}
@@ -143,6 +151,7 @@ var (
 	// block is still in the wanted range and now unowed, so the next
 	// wanted-range pass downloads it again.
 	parkDispositionBlobUnusable = parkDisposition{
+		name:   "blob_unusable",
 		reason: "the parked blob is not the block it claims to be",
 		blob:   parkBlobDrop,
 	}
@@ -183,6 +192,7 @@ var (
 	// corrupt producer on either route has to answer the same question before
 	// this row is right for it: does the re-download rewrite the file?
 	parkDispositionRecordCorrupt = parkDisposition{
+		name:   "record_corrupt",
 		reason: "a corrupt verdict on a record this node wrote; the body was verified against the header at the sink, so the fault is local",
 		blob:   parkBlobDrop,
 	}
@@ -208,6 +218,7 @@ var (
 	// which parkCommitFailure routes BEFORE this row. A new raiser of code 3
 	// on a store must be checked against this row.
 	parkDispositionFilesGone = parkDisposition{
+		name:   "files_gone",
 		reason: "the record names subtree files that are no longer on disk",
 		blob:   parkBlobDrop,
 	}
@@ -227,6 +238,7 @@ var (
 	// that was not verified against the header, so it is the one that can be
 	// wrong.
 	parkDispositionLocalUtxoFault = parkDisposition{
+		name:   "local_utxo_fault",
 		reason: "a parent output this node should already hold is missing from its UTXO set",
 		blob:   parkBlobKeep,
 	}
@@ -240,6 +252,7 @@ var (
 	// peer's fault: it sent what we asked for, and being wrong about a fork, or
 	// stale, is not misbehaviour.
 	parkDispositionAbandoned = parkDisposition{
+		name:   "abandoned",
 		reason: "its parent never arrived",
 		blob:   parkBlobDrop,
 	}
@@ -251,6 +264,7 @@ var (
 	// separately. The peer is not blamed: it sent a block whose parent WE
 	// rejected, which says nothing about the peer.
 	parkDispositionParentInvalid = parkDisposition{
+		name:   "parent_invalid",
 		reason: "its parent is invalid",
 		blob:   parkBlobDrop,
 
@@ -266,6 +280,7 @@ var (
 	// (shouldDisconnectOnBlockErr, with no FSM gate); only the reject was
 	// suppressed outside RUNNING, which withoutBlame still does.
 	parkDispositionBlockInvalid = parkDisposition{
+		name:   "block_invalid",
 		reason: "block validation judged the block invalid",
 		blob:   parkBlobDrop,
 
@@ -284,6 +299,7 @@ var (
 	// policy changed between download and commit; the table is still the one
 	// place the answer lives.
 	parkDispositionPolicyDeclined = parkDisposition{
+		name:   "policy_declined",
 		reason: "declined by this node's own block policy",
 		blob:   parkBlobDrop,
 
@@ -297,6 +313,7 @@ var (
 	// unclassified block-validation failure lands too, and rotating the sync
 	// peer on one of those during IBD costs a reconnect for nothing.
 	parkDispositionBlockRejected = parkDisposition{
+		name:   "block_rejected",
 		reason: "the block failed to store or validate",
 		blob:   parkBlobDrop,
 
@@ -304,6 +321,26 @@ var (
 		markFailed: true,
 	}
 )
+
+// parkDispositionRows is every row of the table above, for the metric that
+// pre-initialises one park_dispositions_total series per row. A new row goes
+// here and in TestParkDispositionNames_AreUniqueAndSet, which lists the rows by
+// hand and fails when one it names is missing here.
+var parkDispositionRows = []parkDisposition{
+	parkDispositionCommitted,
+	parkDispositionRetryLater,
+	parkDispositionParentGone,
+	parkDispositionParentNotMinedYet,
+	parkDispositionBlobUnusable,
+	parkDispositionRecordCorrupt,
+	parkDispositionFilesGone,
+	parkDispositionLocalUtxoFault,
+	parkDispositionAbandoned,
+	parkDispositionParentInvalid,
+	parkDispositionBlockInvalid,
+	parkDispositionPolicyDeclined,
+	parkDispositionBlockRejected,
+}
 
 // parkReadFailure classifies an error from reading a parked block back off
 // disk.
@@ -444,6 +481,10 @@ const parkRejectWriteBound = 2 * time.Second
 // the one case that wants the reject written before the socket is closed under
 // it, blame and drop together, is handed to rejectThenDropPeer.
 func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition) {
+	if prometheusLegacyNetsyncParkDispositions != nil {
+		prometheusLegacyNetsyncParkDispositions.WithLabelValues(d.name).Inc()
+	}
+
 	switch d.blob {
 	case parkBlobKeep:
 		sm.blockPark.Restore(entry)

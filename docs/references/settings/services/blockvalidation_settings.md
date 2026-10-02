@@ -74,6 +74,8 @@
 | CatchupMinThroughputKBps | int | 100 | blockvalidation_catchup_min_throughput_kbps | Minimum throughput (KB/s) before switching peers |
 | CatchupParallelFetchEnabled | bool | true | blockvalidation_catchup_parallel_fetch_enabled | Enable parallel fetching from multiple peers |
 | CatchupParallelFetchWorkers | int | 3 | blockvalidation_catchup_parallel_fetch_workers | Number of parallel fetch workers |
+| OutpointOnlyBelowCheckpoint | bool | false | blockvalidation_outpoint_only_below_checkpoint | Below the hardcoded checkpoint, quick validation spends by outpoint and skips parent reads, fees and the UTXO-hash checksum. Only on stores that support outpoint-only spends (SQL); Aerospike keeps reading parent outputs |
+| LegacyUnifiedBelowCheckpoint | bool | false | blockvalidation_legacy_unified_below_checkpoint | Legacy below-checkpoint blocks are quick-validated through the native catchup path's machinery instead of fully validated. Requires the setting above, a store that supports outpoint-only spends and a header run proven to end at a pinned checkpoint; legacy and block validation must agree on both settings. Off, every legacy block is fully validated |
 
 ## Configuration Dependencies
 
