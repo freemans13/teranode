@@ -249,8 +249,12 @@ type peerSyncState struct {
 	// discharges the obligation in handleBlockOnDiskMsg and the second is refused
 	// as unrequested. A lock closes both, so it is a lock.
 	//
-	// Leaf lock, held only for the drain loop. Nothing else takes it, and the
-	// getdata send is deliberately outside it.
+	// Held only for the drain loop; the getdata send is deliberately outside
+	// it. Not a leaf lock: the drain's held-block and busy-owner checks take
+	// the park's mu, the dispatcher's frontierMu, the stream registry's mu, the
+	// admission gate's inFlightBlocksMu and the download ledger's mu under it.
+	// None of those ever takes this one, and drainRequestQueue is its only
+	// taker, so there is no inverse order and no deadlock.
 	requestQueueMu sync.Mutex
 
 	// bestKnownHeight is the highest block height this peer has demonstrated it
@@ -2796,25 +2800,25 @@ func (sm *SyncManager) contradictedCheckpoint(baseHeight int32, parent chainhash
 func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 	switch invVect.Type {
 	case wire.InvTypeBlock:
-		// A parked block is downloaded, checked and on disk; it is simply not in
-		// the chain yet, because its parent is not. Asking the blockchain alone
-		// answers "no" for it, and past the final checkpoint — which is every
-		// mainnet node — that answer is what the whole recovery loop runs on: the
-		// getblocks a park sends brings back an inv, the inv is not recognised,
-		// and the block we are already holding is downloaded all over again,
-		// once every blockRequestRetryInterval for as long as it stays parked.
-		// Without this the park saves the disk write and none of the bandwidth
-		// outside headers-first mode.
-		if sm.blockPark.Has(invVect.Hash) {
-			return true, nil
-		}
-
-		// A block the dispatcher has taken off the park to validate is in neither the
-		// park nor the chain until it commits, and above the last checkpoint every
-		// block passes through that gap while peers are still announcing it. Answering
-		// "not held" there fetched it again in full: on mainnet from 2026-09-28 about
-		// one block in twelve was downloaded and converted twice.
-		if sm.dispatcher.inFlight(invVect.Hash) {
+		// Parked, being validated, arriving or converting: in none of those
+		// states is the block in the chain, and in all of them asking a peer for
+		// it downloads it again.
+		//
+		// The park case is what makes the park save bandwidth outside
+		// headers-first mode, which is every mainnet node: the getblocks a park
+		// sends brings back an inv for the block being held, and without this
+		// the block was downloaded all over again once every
+		// blockRequestRetryInterval for as long as it stayed parked. The
+		// dispatcher case is the gap between leaving the park and committing,
+		// which every block above the last checkpoint passes through while peers
+		// are still announcing it; on mainnet from 2026-09-28 about one block in
+		// twelve was downloaded and converted twice through it. The arriving and
+		// converting cases are the ones the wanted-range pass has checked since
+		// the 2026-09-24 incident (unownedBlocksUpTo) and this path did not: a multi-gigabyte
+		// block still streaming past the retry window was fetched again from
+		// every peer that announced it, each copy streamed whole into a side
+		// file and drained.
+		if sm.blockHeldLocally(invVect.Hash) {
 			return true, nil
 		}
 
@@ -3055,6 +3059,41 @@ outside:
 
 		switch iv.Type {
 		case wire.InvTypeBlock:
+			// Held or on its way since this item was queued: nothing to ask for.
+			// The bare break leaves the switch and falls through to the Shift
+			// below, so the item is consumed, as it would have been had
+			// processInvMsg seen the block held. It guards a caller that does
+			// not go through processInvMsg, and a stream that starts between
+			// the Append and this drain.
+			if sm.blockHeldLocally(iv.Hash) {
+				break
+			}
+
+			// An owner still sending block bytes has not gone quiet, however
+			// long ago the block was asked for: it is delivering what was queued
+			// ahead of this one, and nothing is arriving for THIS block yet, so
+			// blockHeldLocally above is false and the retry window below has
+			// passed. Asking another peer then downloads the block twice. The
+			// wanted-range pass has made the same check since the 447 MB block
+			// at height 705,000 (unownedBlocksUpTo); SV Node does not re-ask a
+			// block from a peer that is still delivering. Consumed like the
+			// RequestedWithin case under it.
+			//
+			// What this widens, handed to the tip walk (step 10 of the 2026-10-02
+			// re-review): suppression now lasts the whole stream and the whole
+			// busy delivery, not sixty seconds, so a stream that fails above the
+			// checkpoint has by then consumed every peer's one-shot inv for the
+			// block. Recovery today is the next block's park sending
+			// requestMissingBlocks (handleBlockOnDiskMsg), one block interval.
+			// The tip walk's quiet re-ask owns that gap, and must call
+			// blockHeldLocally before re-asking or it brings this bug back for
+			// the owed-block case.
+			if sm.blockDownloads.AnyOwner(iv.Hash, func(p *peerpkg.Peer) bool {
+				return time.Since(sm.streams.lastBlockBytes(p)) < blockRequestRetryInterval
+			}) {
+				break
+			}
+
 			// Request the block if there is not already a pending request.
 			if !sm.blockDownloads.RequestedWithin(iv.Hash, blockRequestRetryInterval) {
 				// As in fetchHeaderBlocks: a block the ledger will not take is
@@ -3132,6 +3171,17 @@ func (sm *SyncManager) processInvMsg(i int, iv *wire.InvVect, processInvs bool, 
 		return
 	}
 
+	// A block this node holds but the chain does not: no getdata, because the
+	// bytes are here or on their way; and no getblocks either, because the
+	// branch at the bottom anchors its locator on the announced block, and
+	// GetBlockLocator fails for a hash the chain does not have (the real
+	// client walks the chain from it), which logged one Error per duplicate
+	// inv at the tip. Answered from memory, before the chain round trip
+	// haveInventory makes.
+	if iv.Type == wire.InvTypeBlock && sm.blockHeldLocally(iv.Hash) {
+		return
+	}
+
 	// Request the inventory if we don't already have it.
 	haveInv, err := sm.haveInventory(iv)
 	if err != nil {
@@ -3150,6 +3200,40 @@ func (sm *SyncManager) processInvMsg(i int, iv *wire.InvVect, processInvs bool, 
 			}
 		}
 
+		// The disk, after memory and the chain have both said no. holdsBlock
+		// reads the converted record back and covers the hand-off that none of
+		// blockHeldLocally's four states does, and that hand-off is on EVERY
+		// block, not a corner: handleBlockOnDiskMsg forgives the owners at
+		// intake, which back-dates the ledger so RequestedWithin no longer
+		// suppresses a re-ask, then reads the record's size from disk and asks
+		// the chain whether the parent is reachable before AdoptWritten parks
+		// it; and blockDispatcher.dispatch takes the entry out of the park
+		// before it appends it to the frontier. In both windows the record on
+		// disk is the only sign the block is here. Placed after haveInventory
+		// so an inv for a chain-held block, the common case at the tip where
+		// every peer announces every block, pays no blob read.
+		//
+		// Held on disk but not in the park is a record nothing announced: its
+		// peer dropped between the sink writing it and the on-disk message
+		// reaching the consumer (adoptStranded's doc has the incident, mainnet
+		// stopped at 650,021 on 2026-09-23). Above the checkpoint the
+		// wanted-range pass never visits the height, so this is the only path
+		// that can adopt it; swallowing the inv without adopting would leave the
+		// record unadopted until a restart's Recover. Same guard as
+		// unownedBlocksUpTo: a block being committed has left the park but not
+		// the disk, which is in flight, not stranded, and putting it back would
+		// have it read again after its files are gone. adoptStranded itself
+		// refuses a record younger than strandedRecordAge, so the hand-off above
+		// is never adopted under the consumer.
+		if iv.Type == wire.InvTypeBlock && sm.holdsBlock(sm.ctx, iv.Hash) {
+			if !sm.blockPark.Has(iv.Hash) && !sm.dispatcher.inFlight(iv.Hash) &&
+				sm.blockPark.adoptStranded(sm.ctx, iv.Hash, sm.subtreeStore) {
+				sm.logger.Warnf("[handleInvMsg][%s] adopted a complete record that was on disk but not in the park", iv.Hash)
+			}
+
+			return
+		}
+
 		// Add it to the request queue.
 		state.requestQueue.Append(iv)
 
@@ -3159,6 +3243,12 @@ func (sm *SyncManager) processInvMsg(i int, iv *wire.InvVect, processInvs bool, 
 	if iv.Type == wire.InvTypeBlock {
 		// We already have the final block advertised by this inventory message, so force a request for more.  This
 		// should only happen if we're on a really long side chain.
+		//
+		// Only a block the chain holds reaches here now, so GetBlockLocator can
+		// anchor on it. The height passed is 0, so the locator it builds is
+		// genesis-only (computeLocatorHeights(0) is [0]); that is a pre-existing
+		// defect of this branch, left in place here, not something the early
+		// returns above made correct.
 		if i == lastBlock {
 			// Request blocks after this one up to the final one the remote peer knows about (zero stop hash).
 			locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, &iv.Hash, 0)
@@ -3409,6 +3499,28 @@ func (sm *SyncManager) conversionInFlight(blockHash chainhash.Hash) bool {
 	_, ok := sm.inFlightBlocks[blockHash]
 
 	return ok
+}
+
+// blockHeldLocally reports whether this node already holds block h or is in the
+// middle of taking it in: parked on disk, taken off the park by the dispatcher to
+// validate, its bytes arriving from a peer now, or being converted. It is the
+// in-memory half of "do we need to ask a peer for this block"; the chain is the
+// other half, and haveInventory asks it. SV Node asks an inv the same two
+// questions, AlreadyHave (IsBlockKnown for MSG_BLOCK) and
+// BlockDownloadTracker::IsInFlight (net/net_processing.cpp, the inv handler).
+// Its IsInFlight covers getdata to receipt (MarkBlockAsInFlight to
+// MarkBlockAsReceived); here RequestedWithin covers the first retry window of
+// that and arriving starts at the first byte, so the requested-but-silent window
+// is drainRequestQueue's busy-owner guard, not this.
+//
+// One answer for the inv path and the wanted-range pass, which has skipped
+// arriving and converting blocks since the 2026-09-24 incident (unownedBlocksUpTo)
+// while the inv path checked parked and validating only, and drifted. Every term
+// guards a nil receiver (blockPark.Has, blockDispatcher.inFlight,
+// streamRegistry.arriving) or reads a nil map under a zero mutex
+// (conversionInFlight), so a struct-literal manager in a test may call it.
+func (sm *SyncManager) blockHeldLocally(h chainhash.Hash) bool {
+	return sm.blockPark.Has(h) || sm.dispatcher.inFlight(h) || sm.streams.arriving(h) || sm.conversionInFlight(h)
 }
 
 // inFlightBlock marks that a block's hash currently holds the dedup half of
