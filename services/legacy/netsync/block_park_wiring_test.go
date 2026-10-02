@@ -172,10 +172,9 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	// windowRoute reads sm.chainParams.Checkpoints, so switching it here would
 	// silently change which heights those tests' preconditions see as
 	// below-checkpoint. pipelineBlockSink itself checks no PoW (only the
-	// merkle root against the header) and blockOrigin/quickValidationAllowed
-	// answering false for these fixture heights under mainnet checkpoints is
-	// harmless — none of this file's tests assert on the .subtree vs
-	// .subtreeToCheck file suffix that decision drives.
+	// merkle root against the header) and reads no checkpoint for the file
+	// type, which is .subtreeToCheck everywhere, so mainnet checkpoints over
+	// these fixture heights change nothing this file's tests assert on.
 	sm.blockchainClient = chain
 	// The commit is real: HandleConvertedBlock ends in ProcessBlock, and with a
 	// real chain every block whose parent is stored gets that far.

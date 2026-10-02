@@ -101,6 +101,10 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
+	// Proven, the production shape of a header-walked block below the
+	// checkpoint. The sink writes FileTypeSubtreeToCheck for it all the same,
+	// and the delete below must not need to know which type was written.
+	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
 	converted, sinkErr := sm.pipelineBlockSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
@@ -114,6 +118,12 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 	hashes := got.Subtrees
 	require.NotEmpty(t, hashes, "sanity: the sink must have produced subtrees, or this test asserts nothing")
 
+	for _, h := range hashes {
+		toCheck, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtreeToCheck)
+		require.NoError(t, existsErr)
+		require.True(t, toCheck, "sanity: the sink must have written FileTypeSubtreeToCheck, or the delete assertion below is vacuous for that type")
+	}
+
 	// converted: true — exactly the value the sink call above just returned,
 	// which is what the wire layer would actually pass through here (see
 	// BlockBody.Converted / deleteOrphanedBody). Fix-round item 2 gates the
@@ -121,8 +131,10 @@ func TestPipelineBlockDelete_RemovesTheSubtreeFilesTheSinkWrote(t *testing.T) {
 	// whether a converted record merely exists for the hash.
 	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), true))
 
+	// All four types: the delete probes every one rather than recomputing which
+	// structure type was written, see pipelineBlockDelete's doc comment.
 	for _, h := range hashes {
-		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
 			exists, err := store.Exists(ctx, h[:], ft)
 			require.NoError(t, err)
 			require.False(t, exists, "pipelineBlockDelete must remove every subtree artefact the sink wrote, got %s still present for subtree %s", ft, h)
@@ -169,11 +181,12 @@ func TestPipelineBlockDelete_ADrainedCopyDeletesNothing(t *testing.T) {
 
 // TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint is
 // fix-round item 6. Every other test in this file resolves its block to
-// height 1 under a checkpoint at 1000 (newPipelineManager), so
-// quickValidationAllowed is always true and FileTypeSubtree is always the
-// structure type pipelineBlockDelete deletes — the FileTypeSubtreeToCheck
-// branch, which is what a mainnet block above the highest checkpoint takes,
-// had no test at all.
+// height 1 under a checkpoint at 1000 (newPipelineManager); this one is the
+// block above the highest checkpoint, which a mainnet node converts for every
+// block once it has passed the last pinned hash. The sink writes
+// FileTypeSubtreeToCheck on both sides of the checkpoint now, so the two
+// cases differ only in the height the sink resolves, and this test keeps the
+// above-checkpoint shape covered.
 //
 // Task 13 removed pipelineBlockSink's own above-checkpoint refusal, so this
 // now drives the real sink rather than building a record by hand: an
@@ -188,8 +201,7 @@ func TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint(t *testin
 	// BelowCheckpoint (model/checkpoint.go) requires highest > 0, so a
 	// checkpoint height of 0 means "no checkpoint reaches this chain", and
 	// every height — including this fixture's resolved height of 1 — reads as
-	// above it, so quickValidationAllowed is false and the sink must choose
-	// FileTypeSubtreeToCheck.
+	// above it.
 	sm.chainParams.Checkpoints = []chaincfg.Checkpoint{{Height: 0}}
 
 	blk := wireBlockWithTxs(t, 20, false)
@@ -207,10 +219,9 @@ func TestPipelineBlockDelete_RemovesSubtreeToCheckFilesAboveCheckpoint(t *testin
 	hashes := got.Subtrees
 	require.NotEmpty(t, hashes, "sanity: the builder must have produced subtrees, or this test asserts nothing")
 
-	// Sanity on the writer's own choice, not yet on the delete: above the
-	// checkpoint it must have used FileTypeSubtreeToCheck, and NOT
-	// FileTypeSubtree, or the delete assertion below would pass even with the
-	// wrong structure type hardcoded.
+	// Sanity on the writer, not yet on the delete: it must have written
+	// FileTypeSubtreeToCheck and not FileTypeSubtree, or the delete assertion
+	// below is vacuous for the type that was written.
 	for _, h := range hashes {
 		toCheck, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtreeToCheck)
 		require.NoError(t, existsErr)
@@ -333,10 +344,7 @@ func TestPipelineBlockDelete_DoesNotTouchAnotherDeliverysSubtreeFiles(t *testing
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
-	// Below-checkpoint gating now also demands the header be PROVEN (an ancestry
-	// proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9), not merely below the
-	// checkpoint height, or the sink writes .subtreeToCheck instead of the .subtree
-	// this test's assertion checks for. See proveBlockOrigin.
+	// Proven, so A's delivery has the production shape of a header-walked block.
 	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
@@ -356,7 +364,7 @@ func TestPipelineBlockDelete_DoesNotTouchAnotherDeliverysSubtreeFiles(t *testing
 	require.NoError(t, sm.pipelineBlockDelete(*blk.Hash(), false))
 
 	for _, h := range record.Subtrees {
-		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
 			exists, existsErr := store.Exists(ctx, h[:], ft)
 			require.NoError(t, existsErr)
 			require.True(t, exists,

@@ -103,7 +103,7 @@ func TestAShortRedeliveryThroughTheWireKeepsTheParkedBlock(t *testing.T) {
 	require.NoError(t, err, "the parked block's record still reads back")
 
 	for _, root := range record.Subtrees {
-		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
 			exists, existsErr := store.Exists(ctx, root[:], ft)
 			require.NoError(t, existsErr)
 			require.True(t, exists, "the refused redelivery removed the parked block's %s file for subtree %s", ft, root)

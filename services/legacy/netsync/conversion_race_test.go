@@ -81,7 +81,7 @@ func TestASecondCopyThatCompletesFirstIsTheOneKept(t *testing.T) {
 	require.NotEmpty(t, record.Subtrees)
 
 	for _, h := range record.Subtrees {
-		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
 			exists, err := store.Exists(ctx, h[:], ft)
 			require.NoError(t, err)
 			require.True(t, exists, "the first copy's cleanup removed none of the second copy's %s files", ft)

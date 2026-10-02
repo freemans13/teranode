@@ -865,19 +865,21 @@ func (p *blockPark) setGauges() {
 // honest peer.
 //
 // Either file type counts, and that is a completeness question rather than a
-// validation one. This used to be handed the fast-path predicate and stat exactly
-// the type that predicate implied, which worked only while the predicate was a
-// pure function of height. It is not any more: the below-checkpoint fast path now
-// also requires a checkpoint-ancestry proof read from the header cache (see
-// blockRequestOrigin), so the answer for the same height legitimately differs
-// between the run that wrote the file and the run that is looking for it, and a
-// record written as .subtree would be judged incomplete and downloaded again.
+// validation one. subtreeWriter writes .subtreeToCheck for every record now,
+// but a record on disk can still have .subtree beside or instead of it: block
+// validation promotes the structure to .subtree after validating and leaves the
+// .subtreeToCheck in place on the unified route, and a record parked by an
+// earlier build was stamped .subtree from the header proof alone. This used to
+// recompute the type from the fast-path predicate, which was wrong as soon as
+// that predicate stopped being a pure function of height (it read a proof from
+// the header cache that a refill can drop), and a record written as .subtree
+// would have been judged incomplete and downloaded again.
 //
 // Nothing is laundered by accepting both. The file's type is what it is on disk;
 // this decides only whether the record still points at files that exist.
 // .subtreeToCheck still means "needs validating" to everything downstream, and
-// .subtree still means a previous run decided it did not — that decision is not
-// revisited here and was never revisited here.
+// .subtree still means block validation decided it did not — that decision is
+// not revisited here and was never revisited here.
 func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, record *model.Block, subtreeStore blob.Store) bool {
 	if record == nil {
 		return false

@@ -27,6 +27,13 @@ import (
 // TestPipelineSink_WritesTheSubtreeFiles is the whole claim: a block arrives as
 // bytes on a reader and leaves as files in the store, without ever being a whole
 // object in memory.
+//
+// The block is header-proven and below the checkpoint, the shape every mainnet
+// block has during IBD, and the structure file is still FileTypeSubtreeToCheck:
+// netsync has verified the merkle root and nothing else, so it never writes the
+// "already validated" name. Block validation promotes the file after it has
+// validated the block (quick_validate.go writeSubtreeFilesFromTxs on the unified
+// route, SubtreeValidation.go on the full route).
 func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	ctx := context.Background()
 	store := memory.New()
@@ -38,10 +45,9 @@ func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	// the parent up, so point it at the one header a fresh store already
 	// holds: its genesis. See pipelineHeaderFixture.
 	pipelineHeaderFixture(t, sm, blk)
-	// Below-checkpoint gating now also demands the header be PROVEN (an ancestry
-	// proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9), not merely below the
-	// checkpoint height, or the sink writes .subtreeToCheck instead of the .subtree
-	// this test checks for. See proveBlockOrigin.
+	// Proven (an ancestry proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9)
+	// so the fixture is the production shape. The proof used to switch the
+	// structure file to .subtree; the assertion below is that it no longer does.
 	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
@@ -57,9 +63,13 @@ func TestPipelineSink_WritesTheSubtreeFiles(t *testing.T) {
 	require.NotEmpty(t, hashes, "a 20-transaction block at 8 per subtree must produce subtrees")
 
 	for _, h := range hashes {
-		exists, err := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
+		toCheck, err := store.Exists(ctx, h[:], fileformat.FileTypeSubtreeToCheck)
 		require.NoError(t, err)
-		require.True(t, exists, "every subtree the sink reported must be in the store")
+		require.True(t, toCheck, "every subtree the sink reported must be in the store as FileTypeSubtreeToCheck: netsync has not validated it")
+
+		promoted, err := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
+		require.NoError(t, err)
+		require.False(t, promoted, "a proven block must not make netsync write the already-validated name; only block validation does that, after validating")
 	}
 }
 
@@ -116,7 +126,7 @@ func TestPipelineSink_DeletesWhatItWroteOnAWrongMerkleRoot(t *testing.T) {
 	require.NotEmpty(t, produced, "sanity: the good run must produce subtrees, or this test asserts nothing")
 
 	for _, h := range produced {
-		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
 			exists, err := failStore.Exists(ctx, h[:], ft)
 			require.NoError(t, err)
 			require.False(t, exists, "a block that failed its merkle check must leave no %s behind", ft)
@@ -284,10 +294,12 @@ var pipelineManagerStoreCounter atomic.Int64
 // sink's parent-height lookup runs against a real store rather than a narrowed
 // stand-in.
 //
-// The checkpoint is set high (1000) purely so a fixture block, whose resolved
-// height sits at 1 (one past the fresh store's genesis), reads as below
-// checkpoint: that is what makes the writer choose FileTypeSubtree over
-// FileTypeSubtreeToCheck, which the tests above assert on.
+// The checkpoint is set high (1000) so a fixture block, whose resolved height
+// sits at 1 (one past the fresh store's genesis), reads as below checkpoint,
+// which is the shape every mainnet block has during IBD and what the
+// below-checkpoint route tests in this package (handle_converted_block_test.go)
+// depend on. It no longer changes the structure file type: the sink writes
+// FileTypeSubtreeToCheck above and below it.
 func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManager {
 	t.Helper()
 
@@ -302,11 +314,10 @@ func newPipelineManager(t *testing.T, store blob.Store, maxItems int) *SyncManag
 
 	// Task 13 removed pipelineBlockSink's own legacyUnified gate: every block
 	// converts now, whether or not it is eligible for the unified route (see
-	// pipeline_parent_height_test.go's TestPipelineSink_NotUnifiedRouteStillConverts).
-	// These two stay on regardless, because they are still what
-	// quickValidationAllowed and the structure-file-type choice below the
-	// checkpoint depend on, and other tests in this package (handle_converted_block_test.go)
-	// still exercise the unified commit route on top of a converted record.
+	// pipeline_parent_height_test.go's TestPipelineSink_NotUnifiedRouteStillConverts),
+	// and the sink reads neither flag. They stay on because other tests in this
+	// package (handle_converted_block_test.go) exercise the unified commit route
+	// on top of a converted record, and unifiedRoute reads both.
 	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
 
@@ -386,7 +397,7 @@ func pipelineHeaderFixture(t *testing.T, sm *SyncManager, blk *bsvutil.Block) {
 	coinbase, _ := btTxFromWireTx(t, txs[0])
 
 	discard := memory.New()
-	writer := newSubtreeWriter(sm.logger, sm.settings, discard, 1, true)
+	writer := newSubtreeWriter(sm.logger, sm.settings, discard, 1)
 
 	dedup := txmap.NewSplitSwissMapUint64(uint32(len(txs))) //nolint:gosec // test tx count is small
 

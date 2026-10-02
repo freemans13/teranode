@@ -412,9 +412,11 @@ func TestCheckpointWalk_CrossingACheckpointContinuesTowardTheNextOne(t *testing.
 }
 
 // Test 10: end to end through blockOrigin — a below-checkpoint block delivered
-// after a genuine EXTENDING walk is header-proven, and the streaming sink
-// writes .subtree for it, not .subtreeToCheck.
-func TestCheckpointWalk_EndToEnd_BelowCheckpointBlockProvenAfterExtendWritesSubtree(t *testing.T) {
+// after a genuine EXTENDING walk is header-proven, and the streaming sink still
+// writes .subtreeToCheck for it, never .subtree: the proof says the block is on
+// the checkpointed chain, not that anyone has validated its transactions, and
+// only block validation writes the already-validated name, after it has.
+func TestCheckpointWalk_EndToEnd_BelowCheckpointBlockProvenAfterExtendStillWritesSubtreeToCheck(t *testing.T) {
 	ctx := t.Context()
 	store := memory.New()
 	sm := newPipelineParkManager(t, store, 8)
@@ -455,13 +457,13 @@ func TestCheckpointWalk_EndToEnd_BelowCheckpointBlockProvenAfterExtendWritesSubt
 	require.NotEmpty(t, got.Subtrees)
 
 	for _, h := range got.Subtrees {
-		exists, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
-		require.NoError(t, existsErr)
-		require.True(t, exists, "a below-checkpoint block proven via the extending walk must write .subtree")
-
 		toCheck, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtreeToCheck)
 		require.NoError(t, existsErr)
-		require.False(t, toCheck, "it must never ALSO write .subtreeToCheck")
+		require.True(t, toCheck, "a below-checkpoint block proven via the extending walk still writes .subtreeToCheck")
+
+		promoted, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
+		require.NoError(t, existsErr)
+		require.False(t, promoted, "the proof must never make netsync write .subtree: that is block validation's claim to make after validating")
 	}
 }
 

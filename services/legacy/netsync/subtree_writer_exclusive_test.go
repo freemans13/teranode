@@ -94,7 +94,7 @@ func TestSubtreeWriter_AKeyTakenWhileStreamingIsNotCreated(t *testing.T) {
 				competeErr = plain.Set(ctx, key, ft, theirs)
 			}
 
-			w := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000, true)
+			w := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000)
 			_, root := streamTx(t, 1)
 
 			created, err := w.put(ctx, *root, fileType, writeBytes(mine))
@@ -135,7 +135,7 @@ func TestSubtreeWriter_TwoWritersOfOneSubtreeOverAFileStore(t *testing.T) {
 	structureBytes, err := st.Serialize()
 	require.NoError(t, err)
 
-	a := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), plain, 800000, true)
+	a := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), plain, 800000)
 
 	// The hook runs on the file storer's goroutine, so it records and the test asserts.
 	var (
@@ -150,7 +150,7 @@ func TestSubtreeWriter_TwoWritersOfOneSubtreeOverAFileStore(t *testing.T) {
 		switch ft {
 		case fileformat.FileTypeSubtreeMeta:
 			payload = metaBytes
-		case fileformat.FileTypeSubtree:
+		case fileformat.FileTypeSubtreeToCheck:
 			payload = structureBytes
 		default:
 			// The data file is streamed into a pending file and never comes through
@@ -170,7 +170,7 @@ func TestSubtreeWriter_TwoWritersOfOneSubtreeOverAFileStore(t *testing.T) {
 		}
 	}
 
-	b := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000, true)
+	b := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000)
 
 	sink, err := b.OpenData(ctx)(0)
 	require.NoError(t, err)
@@ -181,7 +181,7 @@ func TestSubtreeWriter_TwoWritersOfOneSubtreeOverAFileStore(t *testing.T) {
 	require.NoError(t, competeErr, "writer A's publishes must succeed")
 	require.Empty(t, unexpected, "only the two small artefacts are streamed through SetFromReader")
 
-	types := []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtree}
+	types := []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtreeToCheck}
 
 	countCreated := func(w *subtreeWriter, ft fileformat.FileType) int {
 		n := 0
@@ -200,12 +200,12 @@ func TestSubtreeWriter_TwoWritersOfOneSubtreeOverAFileStore(t *testing.T) {
 	}
 
 	require.Equal(t, 1, countCreated(b, fileformat.FileTypeSubtreeData), "B streamed the data file before A ran")
-	require.Equal(t, 0, countCreated(b, fileformat.FileTypeSubtreeMeta)+countCreated(b, fileformat.FileTypeSubtree), "B lost both streamed artefacts at the publish")
+	require.Equal(t, 0, countCreated(b, fileformat.FileTypeSubtreeMeta)+countCreated(b, fileformat.FileTypeSubtreeToCheck), "B lost both streamed artefacts at the publish")
 
 	// The writer that did not create a file leaves it; the one that did removes it.
 	require.NoError(t, b.DeleteAll(ctx))
 
-	for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtree} {
+	for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtreeToCheck} {
 		exists, err := plain.Exists(ctx, root[:], ft)
 		require.NoError(t, err)
 		require.True(t, exists, "B's DeleteAll must leave A's %s", ft)

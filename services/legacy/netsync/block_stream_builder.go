@@ -383,13 +383,14 @@ func (b *blockStreamBuilder) addTx(tx *bt.Tx, txHash *chainhash.Hash, size uint6
 
 	// A fee is only real when every input is extended: a partial extension
 	// cannot produce one, and a wrong fee is worse than no fee. Zero stays the
-	// default otherwise. That default is safe at every height regardless: below
-	// the checkpoint subtree fees are not consensus-checked at all, and above it
+	// default otherwise. That default is safe at every height:
 	// newSubtreeWriter/newSubtreeWriterUnresolvedHeight (subtree_writer.go)
 	// write every subtree from this path as FileTypeSubtreeToCheck, never the
-	// already-validated FileTypeSubtree, so subtree validation re-derives the
-	// real fee from the transactions before any consensus check reads it —
-	// exactly as it does for a subtree fetched whole from a peer, which also
+	// already-validated FileTypeSubtree, so the route that validates the block
+	// writes its own FileTypeSubtree with fees it derived itself before any
+	// consensus check reads one (ValidateSubtreeInternal rebuilds the nodes
+	// from tx meta on the full route; writeSubtreeFilesFromTxs on the unified
+	// route) — exactly as for a subtree fetched whole from a peer, which also
 	// carries no fee of its own until that same re-derivation runs. What
 	// stamping the real fee here buys is work that re-derivation no longer has
 	// to do, and a transaction that already arrives extended for every

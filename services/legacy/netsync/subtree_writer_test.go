@@ -14,11 +14,11 @@ import (
 
 // writerFixture builds a writer over a REAL in-memory blob store. Nothing here is
 // faked: a passing assertion means bytes are in the store under that key.
-func writerFixture(t *testing.T, quickValidation bool) (*subtreeWriter, *blobmemory.Memory) {
+func writerFixture(t *testing.T) (*subtreeWriter, *blobmemory.Memory) {
 	t.Helper()
 
 	store := blobmemory.New()
-	w := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000, quickValidation)
+	w := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000)
 
 	return w, store
 }
@@ -27,7 +27,7 @@ func writerFixture(t *testing.T, quickValidation bool) (*subtreeWriter, *blobmem
 // version could not make: it asserts the bytes exist, not that a method was called.
 func TestSubtreeWriter_PutsAllThreeArtefactsInTheStore(t *testing.T) {
 	ctx := context.Background()
-	w, store := writerFixture(t, true)
+	w, store := writerFixture(t)
 
 	st, data, meta := oneSubtree(t, 8)
 	root := st.RootHash()
@@ -35,7 +35,7 @@ func TestSubtreeWriter_PutsAllThreeArtefactsInTheStore(t *testing.T) {
 	require.NoError(t, w.Emit(ctx)(0, st, data, meta))
 
 	for _, ft := range []fileformat.FileType{
-		fileformat.FileTypeSubtree,
+		fileformat.FileTypeSubtreeToCheck,
 		fileformat.FileTypeSubtreeData,
 		fileformat.FileTypeSubtreeMeta,
 	} {
@@ -50,14 +50,14 @@ func TestSubtreeWriter_PutsAllThreeArtefactsInTheStore(t *testing.T) {
 // subtree, including its node hashes.
 func TestSubtreeWriter_StructureFileRoundTrips(t *testing.T) {
 	ctx := context.Background()
-	w, store := writerFixture(t, true)
+	w, store := writerFixture(t)
 
 	st, data, meta := oneSubtree(t, 8)
 	root := st.RootHash()
 
 	require.NoError(t, w.Emit(ctx)(0, st, data, meta))
 
-	raw, err := store.Get(ctx, root[:], fileformat.FileTypeSubtree)
+	raw, err := store.Get(ctx, root[:], fileformat.FileTypeSubtreeToCheck)
 	require.NoError(t, err)
 
 	got, err := subtreepkg.NewSubtreeFromBytes(raw)
@@ -67,28 +67,26 @@ func TestSubtreeWriter_StructureFileRoundTrips(t *testing.T) {
 	require.Equal(t, root.String(), got.RootHash().String(), "root hash must survive the round trip")
 }
 
-// TestSubtreeWriter_NamesTheStructureByValidationMode pins the trust claim the file
-// name makes. Below a checkpoint legacy has done the work itself and writes the
-// already-validated name; otherwise the subtree validation service re-checks it.
-// Getting these backwards would make an unvalidated subtree look validated.
-func TestSubtreeWriter_NamesTheStructureByValidationMode(t *testing.T) {
+// TestSubtreeWriter_NamesTheStructureToCheck pins the trust claim the file name
+// makes. Netsync has validated nothing, so the writer names every structure file
+// FileTypeSubtreeToCheck and never FileTypeSubtree, the already-validated name
+// that block validation writes after it validates. A writer that wrote the
+// other name would make CheckBlockSubtrees skip the subtree's transactions on
+// the full route without anything having created them.
+func TestSubtreeWriter_NamesTheStructureToCheck(t *testing.T) {
 	ctx := context.Background()
 
-	quick, quickStore := writerFixture(t, true)
+	w, store := writerFixture(t)
 	st, data, meta := oneSubtree(t, 8)
-	require.NoError(t, quick.Emit(ctx)(0, st, data, meta))
+	require.NoError(t, w.Emit(ctx)(0, st, data, meta))
 
-	exists, err := quickStore.Exists(ctx, st.RootHash()[:], fileformat.FileTypeSubtree)
+	toCheck, err := store.Exists(ctx, st.RootHash()[:], fileformat.FileTypeSubtreeToCheck)
 	require.NoError(t, err)
-	require.True(t, exists, "quick validation writes the already-validated name")
+	require.True(t, toCheck, "the structure must be marked for checking")
 
-	normal, normalStore := writerFixture(t, false)
-	st2, data2, meta2 := oneSubtree(t, 8)
-	require.NoError(t, normal.Emit(ctx)(0, st2, data2, meta2))
-
-	exists, err = normalStore.Exists(ctx, st2.RootHash()[:], fileformat.FileTypeSubtreeToCheck)
+	promoted, err := store.Exists(ctx, st.RootHash()[:], fileformat.FileTypeSubtree)
 	require.NoError(t, err)
-	require.True(t, exists, "without quick validation the subtree must be marked for checking")
+	require.False(t, promoted, "netsync must never write the already-validated name")
 }
 
 // TestSubtreeWriter_WritesTheStructureLast pins the ordering that makes a crash
@@ -96,14 +94,14 @@ func TestSubtreeWriter_NamesTheStructureByValidationMode(t *testing.T) {
 // presence has to mean the transactions and inpoints are already whole.
 func TestSubtreeWriter_WritesTheStructureLast(t *testing.T) {
 	ctx := context.Background()
-	w, _ := writerFixture(t, true)
+	w, _ := writerFixture(t)
 
 	st, data, meta := oneSubtree(t, 8)
 	require.NoError(t, w.Emit(ctx)(0, st, data, meta))
 
 	written := w.written
 	require.Len(t, written, 3)
-	require.Equal(t, fileformat.FileTypeSubtree, written[2].FileType,
+	require.Equal(t, fileformat.FileTypeSubtreeToCheck, written[2].FileType,
 		"the structure file must be written last: its presence is the marker that the other two are complete")
 }
 
@@ -112,7 +110,7 @@ func TestSubtreeWriter_WritesTheStructureLast(t *testing.T) {
 // block is handed over, so a failed root check deletes exactly what it wrote.
 func TestSubtreeWriter_DeleteAllRemovesTheFilesFromTheStore(t *testing.T) {
 	ctx := context.Background()
-	w, store := writerFixture(t, true)
+	w, store := writerFixture(t)
 
 	st, data, meta := oneSubtree(t, 8)
 	root := st.RootHash()
@@ -121,7 +119,7 @@ func TestSubtreeWriter_DeleteAllRemovesTheFilesFromTheStore(t *testing.T) {
 	require.NoError(t, w.DeleteAll(ctx))
 
 	for _, ft := range []fileformat.FileType{
-		fileformat.FileTypeSubtree,
+		fileformat.FileTypeSubtreeToCheck,
 		fileformat.FileTypeSubtreeData,
 		fileformat.FileTypeSubtreeMeta,
 	} {
@@ -139,7 +137,7 @@ func TestSubtreeWriter_DeleteAllRemovesTheFilesFromTheStore(t *testing.T) {
 // success and so must this.
 func TestSubtreeWriter_AnAlreadyPresentFileIsNotAnError(t *testing.T) {
 	ctx := context.Background()
-	w, _ := writerFixture(t, true)
+	w, _ := writerFixture(t)
 
 	st, data, meta := oneSubtree(t, 8)
 

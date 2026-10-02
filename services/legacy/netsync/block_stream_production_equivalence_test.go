@@ -63,7 +63,7 @@ func TestPipeline_DeserialisesToTheSameSubtree(t *testing.T) {
 	block := wireBlockWithTxs(t, txCount, false)
 
 	pipeStore := blobmemory.New()
-	writer := newSubtreeWriter(sm.logger, sm.settings, pipeStore, uint32(block.Height()), true) //nolint:gosec // test height is small and non-negative
+	writer := newSubtreeWriter(sm.logger, sm.settings, pipeStore, uint32(block.Height())) //nolint:gosec // test height is small and non-negative
 
 	seen := txmap.NewSplitSwissMapUint64(uint32(txCount)) //nolint:gosec // test tx count is small
 
@@ -83,7 +83,7 @@ func TestPipeline_DeserialisesToTheSameSubtree(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, len(pipeHashes), 0, "test case must produce at least one subtree")
 
-	raw, err := pipeStore.Get(ctx, pipeHashes[0][:], fileformat.FileTypeSubtree)
+	raw, err := pipeStore.Get(ctx, pipeHashes[0][:], fileformat.FileTypeSubtreeToCheck)
 	require.NoError(t, err)
 
 	st, err := subtreepkg.NewSubtreeFromBytes(raw)

@@ -37,22 +37,18 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	// Every block converts. There is no fallback and nothing writes a whole
 	// block body to one file any more.
 	//
-	// An unknown parent height does not stop it. The height feeds exactly two
-	// decisions and both have an explicit answer without one. The subtree file
-	// type takes .subtreeToCheck ("still needs validating"), forced there
-	// rather than left to fall out of quickValidationAllowed(0): that call
-	// already returns false for height 0 today, because model.BelowCheckpoint
-	// requires height > 0 before anything else and that clause predates this
-	// branch — so this is defence in depth against that clause moving later,
-	// not a fix for a live misreading. The delete-at-height falls back to the
-	// committed tip plus the read-ahead depth plus the retention, which is
-	// above any height this block can actually have, so it gives the same
-	// guarantee a known height does: pruning is driven by the committed chain,
-	// and a block waiting in the park is above it — this half IS load-bearing,
-	// unlike the file-type half above, because nothing else stops a delete
-	// computed from height + retention landing far below the tip. The
-	// committer re-derives the height from the store before committing
-	// anything, so a record carrying zero is corrected there.
+	// An unknown parent height does not stop it. The height feeds one decision,
+	// the subtree files' delete-at-height, and that has an explicit answer
+	// without it: the committed tip plus the read-ahead depth plus the
+	// retention, which is above any height this block can actually have, so it
+	// gives the same guarantee a known height does. Pruning is driven by the
+	// committed chain, and a block waiting in the park is above it; nothing
+	// else stops a delete computed from height + retention landing far below
+	// the tip. The committer re-derives the height from the store before
+	// committing anything, so a record carrying zero is corrected there.
+	//
+	// The subtree structure file type is not a decision this sink makes at all:
+	// it is always .subtreeToCheck, see subtreeWriter.
 	//
 	// Two refusals used to sit here and both were wrong. One declined to convert
 	// above the final checkpoint, on the grounds that a converted record carries
@@ -80,14 +76,29 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 	var writer *subtreeWriter
 	if resolved {
-		// The ancestry proof is read here, on the streaming route, because this is
-		// where the below-checkpoint fast path is actually taken: the flag decides
-		// whether the subtree files this block writes are stamped .subtree ("already
-		// validated") or .subtreeToCheck ("still needs validating"). Height alone was
-		// the gate before the merge, and height alone certifies nothing — see
-		// blockRequestOrigin. An unprovable block writes .subtreeToCheck and is
-		// validated in full, which is the safe direction.
-		writer = newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height, sm.quickValidationAllowed(sm.blockOrigin(hash), height))
+		// The structure files are .subtreeToCheck whatever the header proof and
+		// the route flags say. This sink has checked the merkle root and nothing
+		// else, so that is the only claim it can make; block validation promotes
+		// the file to .subtree after it validates the block, on both routes
+		// (quick_validate.go writeSubtreeFilesFromTxs writes it with overwrite
+		// allowed whenever the structure it read was not already a .subtree;
+		// SubtreeValidation.go writes it on the full route). It used to be
+		// stamped .subtree here from the proof alone, and a block that then took
+		// full validation (unified flag off, or a store without outpoint-only
+		// spends) had every subtree skipped by CheckBlockSubtrees' Exists(
+		// FileTypeSubtree) gate, so none of its transactions was ever created.
+		//
+		// On the unified route the .subtreeToCheck written here stays beside the
+		// promoted .subtree until pipelineBlockDelete or its delete-at-height:
+		// quick validation's only Del is the forged-blob quarantine
+		// (quick_validate_bind.go deleteSubtreeBlobConfirmed), and the full
+		// route's removePeerSuppliedSubtreeToCheck skips files that were on disk
+		// before the attempt. A retried commit therefore reads this file again
+		// (findLocalSubtreeFile prefers .subtreeToCheck), anchors it and the
+		// promoted .subtree beside it against their key (readSubtreeStructure),
+		// and carries the promoted one so writeSubtreeFilesFromTxs does not write
+		// it a second time. Both carry the same transaction hashes.
+		writer = newSubtreeWriter(sm.logger, sm.settings, sm.subtreeStore, height)
 	} else {
 		writer = newSubtreeWriterUnresolvedHeight(sm.logger, sm.settings, sm.subtreeStore, sm.fallbackSubtreeDAH())
 	}
@@ -297,21 +308,18 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // true, the record ReadConverted hands back names every subtree THIS call's
 // own sink wrote (record.Subtrees) — true only because converted being true
 // guarantees this call was the one that just wrote whatever sits under hash
-// right now, with nothing else able to have raced in between — and the
-// structure file type each one was written under — FileTypeSubtree or
-// FileTypeSubtreeToCheck — is a pure function of the record's own height via
-// quickValidationAllowed, the same test subtreeWriter used to choose it while
-// writing. Height 0 is pipelineParentHeight's own "unresolved" sentinel (see
-// its doc comment), never a real height, and subtreeWriter's unresolved-height
-// constructor always writes FileTypeSubtreeToCheck for it. The explicit
-// `record.Height != 0` guard below is NOT what makes that agree with what was
-// actually written: quickValidationAllowed(0) already returns false on its
-// own, because model.BelowCheckpoint requires height > 0 before anything else
-// — a clause that predates this branch — so plain quickValidationAllowed(record.Height)
-// would compute the same FileTypeSubtreeToCheck for height 0 with no guard at
-// all. The guard is left in as defence in depth against that positivity
-// clause moving later, matching subtreeWriter's own belt-and-braces choice,
-// not because removing it would delete the wrong file today.
+// right now, with nothing else able to have raced in between.
+//
+// The delete probes all four file types under each root rather than
+// recomputing which structure type the sink chose. subtreeWriter always writes
+// FileTypeSubtreeToCheck now, but a record parked by an earlier build may
+// name roots stamped FileTypeSubtree, and recomputing the type from the live
+// header cache, as this used to, could pick the wrong one: the cache can lose
+// a proof on a refill (header_cache.go Proven), so the type derived at delete
+// time need not be the type derived at write time. Deleting a file that is not
+// there is a no-op in every blob store this can run over (memory, file, S3 and
+// HTTP each treat a missing key as deleted), and ErrNotFound is tolerated for
+// any that does not.
 //
 // That guarantee has one hole, and pipelineBlockSink closes it rather than this
 // function. The record is written with overwrite allowed, so a redelivery of a
@@ -342,14 +350,10 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 
 	switch {
 	case err == nil && record != nil:
-		structureType := fileformat.FileTypeSubtreeToCheck
-		if record.Height != 0 && sm.quickValidationAllowed(sm.blockOrigin(hash), record.Height) {
-			structureType = fileformat.FileTypeSubtree
-		}
-
 		for _, root := range record.Subtrees {
-			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, structureType} {
-				if delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft); delErr != nil && firstErr == nil {
+			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtree} {
+				delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft)
+				if delErr != nil && !errors.Is(delErr, errors.ErrNotFound) && firstErr == nil {
 					firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
 				}
 			}

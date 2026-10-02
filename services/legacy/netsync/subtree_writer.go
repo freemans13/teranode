@@ -40,16 +40,22 @@ type writtenSubtree struct {
 // a memory-mapped read falling back to a heap read of the same local file
 // (services/blockvalidation/quick_validate.go:973).
 //
-// The structure's file type is a claim about trust. Below a checkpoint legacy has
-// done the work itself and writes FileTypeSubtree, the already-validated marker;
-// otherwise it writes FileTypeSubtreeToCheck and the subtree validation service
-// re-checks it.
+// The structure's file type is a claim about trust, and this writer always makes
+// the weaker one: FileTypeSubtreeToCheck, "still needs validating". Netsync has
+// checked the merkle root against the header and nothing else; it has not
+// validated a transaction, created a UTXO or spent one. The already-validated
+// name, FileTypeSubtree, is written only by the component that did that work,
+// after it did it: quick validation's writeSubtreeFilesFromTxs on the unified
+// route and SubtreeValidation on the full route, both in services/blockvalidation.
+// Stamping FileTypeSubtree here from the header proof alone, as this writer used
+// to do below a checkpoint, made CheckBlockSubtrees skip every subtree of a block
+// that then took full validation (its missing-subtree gate keys on
+// Exists(FileTypeSubtree)), so no transaction of that block was ever created.
 type subtreeWriter struct {
-	logger          ulogger.Logger
-	settings        *settings.Settings
-	store           blob.Store
-	height          uint32
-	quickValidation bool
+	logger   ulogger.Logger
+	settings *settings.Settings
+	store    blob.Store
+	height   uint32
 	// heightUnknown is true when this writer was built by
 	// newSubtreeWriterUnresolvedHeight rather than newSubtreeWriter: height
 	// above is not a real block height (it is never read in that case) and
@@ -92,41 +98,29 @@ func (s pendingDataSink) Abort() {
 	s.file.Abort()
 }
 
-func newSubtreeWriter(logger ulogger.Logger, tSettings *settings.Settings, store blob.Store, height uint32, quickValidation bool) *subtreeWriter {
+func newSubtreeWriter(logger ulogger.Logger, tSettings *settings.Settings, store blob.Store, height uint32) *subtreeWriter {
 	return &subtreeWriter{
-		logger:          logger,
-		settings:        tSettings,
-		store:           store,
-		height:          height,
-		quickValidation: quickValidation,
-		written:         make([]writtenSubtree, 0, 3),
+		logger:   logger,
+		settings: tSettings,
+		store:    store,
+		height:   height,
+		written:  make([]writtenSubtree, 0, 3),
 	}
 }
 
 // newSubtreeWriterUnresolvedHeight builds a writer for a block whose parent
 // height pipelineParentHeight could not resolve at conversion time.
 //
-// Both of the height-dependent decisions below get an explicit answer rather
-// than being computed from a height that would otherwise default to zero:
+// The height feeds one decision, the delete-at-height, and it gets an explicit
+// answer rather than being computed from a height that would otherwise default
+// to zero. height + retention with a zero height would put the delete far below
+// the chain tip, collecting the files almost immediately out from under a block
+// still waiting. The caller supplies dah as the committed tip plus the read-ahead
+// depth plus the retention, above any height this block can actually have, the
+// same guarantee height + retention gives when the height is real.
 //
-// The structure file type is unconditionally .subtreeToCheck (quickValidation
-// is forced false and never exposed as a constructor argument here). This is
-// defence in depth, not a correctness fix: model.BelowCheckpoint
-// (model/checkpoint.go) already requires height > 0 before anything else,
-// deliberately and documented, and that clause predates this branch — a zero
-// height was never going to be read as below any checkpoint, and
-// quickValidationAllowed(0) has always been false. Forcing it explicitly here
-// means this constructor cannot start writing the unearned, already-validated
-// .subtree form if that positivity clause is ever loosened or removed later
-// without this file being touched.
-//
-// The delete-at-height is dah, supplied by the caller rather than computed
-// from height + retention (which a zero height would put far below the chain
-// tip, collecting the files almost immediately out from under a block still
-// waiting — this half IS a real correctness requirement, unlike the file-type
-// half above). The caller computes it as the committed tip plus the read-ahead
-// depth plus the retention — above any height this block can actually have,
-// the same guarantee height + retention gives when the height is real.
+// The structure file type is not a decision here or in newSubtreeWriter: see the
+// type comment.
 func newSubtreeWriterUnresolvedHeight(logger ulogger.Logger, tSettings *settings.Settings, store blob.Store, dah uint32) *subtreeWriter {
 	return &subtreeWriter{
 		logger:        logger,
@@ -171,10 +165,9 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 			return errors.NewProcessingError("[subtreeWriter] subtree %d has no root hash", index)
 		}
 
+		// Always the "still needs validating" name; see the type comment for why
+		// netsync never writes the other one.
 		structureType := fileformat.FileTypeSubtreeToCheck
-		if w.quickValidation {
-			structureType = fileformat.FileTypeSubtree
-		}
 
 		metaBytes, err := meta.Serialize()
 		if err != nil {

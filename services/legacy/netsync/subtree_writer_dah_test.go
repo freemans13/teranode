@@ -101,7 +101,7 @@ func TestSubtreeWriter_StampsEveryFileWithADeleteAtHeight(t *testing.T) {
 
 	const height = uint32(12345)
 
-	writer := newSubtreeWriter(ulogger.TestLogger{}, tSettings, store, height, true)
+	writer := newSubtreeWriter(ulogger.TestLogger{}, tSettings, store, height)
 
 	st, data, meta := oneSubtree(t, 8)
 	root := st.RootHash()
@@ -118,7 +118,7 @@ func TestSubtreeWriter_StampsEveryFileWithADeleteAtHeight(t *testing.T) {
 	for _, ft := range []fileformat.FileType{
 		fileformat.FileTypeSubtreeData,
 		fileformat.FileTypeSubtreeMeta,
-		fileformat.FileTypeSubtree,
+		fileformat.FileTypeSubtreeToCheck,
 	} {
 		got := scheduler.dahFor(t, root[:], ft)
 		require.Equal(t, expected, got,

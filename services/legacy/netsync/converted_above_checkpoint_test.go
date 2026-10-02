@@ -72,8 +72,9 @@ func TestHandleConvertedBlock_CommitsAboveTheCheckpointWithoutTheUnifiedFlag(t *
 	sm := newPipelineParkManager(t, store, 8)
 
 	// Left off deliberately, to say plainly that this test does not depend on
-	// them: quickValidationAllowed alone (BelowCheckpoint) is what decides
-	// eligibility for conversion now, not legacyUnified.
+	// them: every block converts, the sink reads neither flag, and the flags
+	// only pick the commit route (unifiedRoute), which above the checkpoint is
+	// full validation whatever they say.
 	sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = false
 	sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
 	sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}

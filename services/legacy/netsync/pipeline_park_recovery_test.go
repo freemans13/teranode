@@ -202,12 +202,11 @@ func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *t
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
-	// Below-checkpoint gating now also demands the header be PROVEN (an ancestry
-	// proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9), not merely below the
-	// checkpoint height, or pipelineBlockSink writes .subtreeToCheck instead of the
-	// .subtree this test deletes below — and hasCompleteRecord accepts either type,
-	// so the sanity that "the file recovery must notice missing" is only true when
-	// the deleted type is the one actually written. See proveBlockOrigin.
+	// Proven, the production shape of a header-walked block below the
+	// checkpoint. pipelineBlockSink writes .subtreeToCheck for it all the same,
+	// which is the type this test deletes below; hasCompleteRecord accepts
+	// either type, so the sanity that "the file recovery must notice missing" is
+	// only true when the deleted type is the one actually written.
 	proveBlockOrigin(t, sm, blk)
 
 	body := blockBodyBytes(t, blk)
@@ -223,14 +222,13 @@ func TestBlockPark_RecoveryDiscardsAConvertedRecordWhoseSubtreeFilesAreGone(t *t
 
 	firstSubtree := record.Subtrees[0]
 
-	// Below the checkpoint with quick validation on, subtreeWriter's structure
-	// file is FileTypeSubtree — see its own doc comment. Removing exactly that
-	// file, not the whole subtree's data/meta, is what Recover's own check
-	// looks at.
-	require.NoError(t, store.Del(ctx, firstSubtree[:], fileformat.FileTypeSubtree),
+	// subtreeWriter's structure file is FileTypeSubtreeToCheck — see its own doc
+	// comment. Removing exactly that file, not the whole subtree's data/meta, is
+	// what Recover's own check looks at.
+	require.NoError(t, store.Del(ctx, firstSubtree[:], fileformat.FileTypeSubtreeToCheck),
 		"sanity: the file recovery must notice missing has to actually be gone")
 
-	stillExists, err := store.Exists(ctx, firstSubtree[:], fileformat.FileTypeSubtree)
+	stillExists, err := store.Exists(ctx, firstSubtree[:], fileformat.FileTypeSubtreeToCheck)
 	require.NoError(t, err)
 	require.False(t, stillExists, "sanity: the subtree file must actually be gone before Recover runs")
 

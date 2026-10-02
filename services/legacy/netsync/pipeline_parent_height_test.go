@@ -59,10 +59,9 @@ func TestPipelineSink_ParentInHeaderCache_IsTheOrdinaryCase(t *testing.T) {
 
 	// Install that parent in the in-flight header cache via the real Fill, at
 	// height 41, so the block under test — its child — must resolve to height
-	// 42. This also pins a checkpoint at blk's own (height, hash): below-
-	// checkpoint gating now demands the header be PROVEN
-	// (GHSA-gggq-8f59-4jm9), not merely resolved to a height, or the sink
-	// writes .subtreeToCheck instead of the .subtree this test checks for.
+	// 42. This also pins a checkpoint at blk's own (height, hash) so the run is
+	// PROVEN (GHSA-gggq-8f59-4jm9), the production shape of a header-walked
+	// block; the proof does not change the structure file type.
 	hash := *blk.Hash()
 	sm.chainParams.Checkpoints = []chaincfg.Checkpoint{{Height: 42, Hash: &hash}}
 	sm.headerCache = newHeaderCache().WithCheckpoints(sm.chainParams.Checkpoints)
@@ -85,7 +84,7 @@ func TestPipelineSink_ParentInHeaderCache_IsTheOrdinaryCase(t *testing.T) {
 	require.Equal(t, uint32(42), got.Height, "height must come from the header-cache parent (41+1), proving the committed store was not what resolved it")
 
 	for _, h := range hashes {
-		exists, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
+		exists, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtreeToCheck)
 		require.NoError(t, existsErr)
 		require.True(t, exists, "every subtree the sink reported must be in the store")
 	}
@@ -95,12 +94,11 @@ func TestPipelineSink_ParentInHeaderCache_IsTheOrdinaryCase(t *testing.T) {
 // an unknown parent height no longer stops conversion. FIX 2 (below) already
 // established that pipelineParentHeight not resolving is a genuine miss
 // beyond the ordinary out-of-order case; task 13 removes the decline that
-// used to sit behind that miss. The height feeds two decisions and both have
-// a safe answer without one — see pipelineBlockSink's own doc comment — so
-// this asserts both of them directly: the record's height is the 0 sentinel,
-// and its structure files are FileTypeSubtreeToCheck, never FileTypeSubtree.
-// The second assertion is the one genuinely unsafe outcome available in this
-// task if it were ever flipped (see task-13-brief.md Step 10).
+// used to sit behind that miss. The height feeds the delete-at-height, which
+// has a safe answer without one — see pipelineBlockSink's own doc comment —
+// so this asserts the record's height is the 0 sentinel, and that the
+// structure files are FileTypeSubtreeToCheck and never FileTypeSubtree, the
+// same as for every resolved height: the sink does not choose the type.
 func TestPipelineSink_UnresolvableParent_StillConverts(t *testing.T) {
 	ctx := t.Context()
 
@@ -201,6 +199,13 @@ func (nilMetaClient) GetBlockHeader(context.Context, *chainhash.Hash) (*model.Bl
 // existed and why it is gone: Step 1 of task 13 established that blockID 0 is
 // the universal "assign server-side" convention on every route, not only the
 // unified one, so there is nothing left for legacyUnified to gate here.
+//
+// The structure file is the second half. With the unified flag off this block
+// takes full validation, and CheckBlockSubtrees skips every subtree that already
+// has a .subtree file (check_block_subtrees.go, the Exists(FileTypeSubtree)
+// gate), so a .subtree written here would mean no transaction of this block is
+// ever created. The sink therefore writes .subtreeToCheck, proven or not, and
+// only the component that validates promotes it.
 func TestPipelineSink_NotUnifiedRouteStillConverts(t *testing.T) {
 	ctx := t.Context()
 	store := memory.New()
@@ -209,10 +214,9 @@ func TestPipelineSink_NotUnifiedRouteStillConverts(t *testing.T) {
 
 	blk := wireBlockWithTxs(t, 20, false)
 	pipelineHeaderFixture(t, sm, blk)
-	// Below-checkpoint gating now also demands the header be PROVEN (an ancestry
-	// proof to a pinned checkpoint hash, GHSA-gggq-8f59-4jm9), not merely below the
-	// checkpoint height, or the sink writes .subtreeToCheck instead of the .subtree
-	// this test checks for. See proveBlockOrigin.
+	// Proven, so the fixture is the production shape a header-walked block has.
+	// The proof used to be what made the sink write .subtree; it no longer
+	// changes the file type, which is the point of the assertion below.
 	proveBlockOrigin(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
@@ -224,11 +228,16 @@ func TestPipelineSink_NotUnifiedRouteStillConverts(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.NotZero(t, got.Height, "sanity: this block's parent resolves via the header fixture, so its height must be real")
+	require.NotEmpty(t, got.Subtrees, "sanity: a 20-transaction block at 8 per subtree must produce subtrees, or this test asserts nothing")
 
 	for _, h := range got.Subtrees {
-		exists, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
+		toCheck, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtreeToCheck)
 		require.NoError(t, existsErr)
-		require.True(t, exists, "below the checkpoint the structure file must be FileTypeSubtree regardless of legacyUnified")
+		require.True(t, toCheck, "with the unified route off the block is fully validated, and full validation only validates subtrees it finds as FileTypeSubtreeToCheck")
+
+		promoted, existsErr := store.Exists(ctx, h[:], fileformat.FileTypeSubtree)
+		require.NoError(t, existsErr)
+		require.False(t, promoted, "a .subtree file from netsync would make CheckBlockSubtrees skip this subtree's transactions without anything having created them")
 	}
 }
 

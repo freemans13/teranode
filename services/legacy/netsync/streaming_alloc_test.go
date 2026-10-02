@@ -94,7 +94,7 @@ func TestTheSubtreeDataFileIsWrittenAsAStream(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	w := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000, true)
+	w := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000)
 
 	const leaves = 8
 	const size = 1 << 20
@@ -141,7 +141,7 @@ func streamingWriter(t *testing.T) (*subtreeWriter, blob.Store) {
 	)
 	require.NoError(t, err)
 
-	return newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000, true), store
+	return newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000), store
 }
 
 func heapInUse() uint64 {
@@ -216,7 +216,7 @@ func TestStreamedAndBufferedSubtreeDataFilesMatch(t *testing.T) {
 		return hashes
 	}
 
-	buffered, memStore := writerFixture(t, true)
+	buffered, memStore := writerFixture(t)
 	streamed, fileStore := streamingWriter(t)
 
 	want := run(buffered)
@@ -314,7 +314,7 @@ func TestABlockStreamedFromTheWireWritesTheSameSubtreeFiles(t *testing.T) {
 	gotRoot, got, err := sb.Finish()
 	require.NoError(t, err)
 
-	buffered, memStore := writerFixture(t, true)
+	buffered, memStore := writerFixture(t)
 
 	bb, err := newBlockStreamBuilder(txs+1, maxItems, cb, buffered.Emit(ctx), newDedupMap(txs+1))
 	require.NoError(t, err)
@@ -340,7 +340,7 @@ func TestABlockStreamedFromTheWireWritesTheSameSubtreeFiles(t *testing.T) {
 	require.Greater(t, len(got), 1, "several subtrees")
 
 	for _, root := range got {
-		for _, fileType := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtree} {
+		for _, fileType := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtreeToCheck} {
 			a, err := memStore.Get(ctx, root[:], fileType)
 			require.NoError(t, err, "%s %s", root, fileType)
 

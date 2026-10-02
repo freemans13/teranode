@@ -74,7 +74,7 @@ func TestAFailedRedeliveryKeepsTheParkedBlocksSubtreeFiles(t *testing.T) {
 			require.NoError(t, err, "the honest record survives")
 
 			for _, h := range record.Subtrees {
-				for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+				for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
 					exists, err := store.Exists(ctx, h[:], ft)
 					require.NoError(t, err)
 					require.True(t, exists, "the failed delivery removed the parked block's %s file for subtree %s", ft, h)
@@ -191,7 +191,7 @@ func TestARefusedRedeliveryKeepsTheParkedBlock(t *testing.T) {
 	require.NoError(t, err, "the parked block's record survives")
 
 	for _, h := range record.Subtrees {
-		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
 			exists, err := store.Exists(ctx, h[:], ft)
 			require.NoError(t, err)
 			require.True(t, exists, "the refused redelivery removed the parked block's %s file for subtree %s", ft, h)
