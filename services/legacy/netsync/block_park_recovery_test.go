@@ -336,8 +336,9 @@ func TestSyncManager_AParkedBlockThatWillNotCommitIsGivenUpAndRejected(t *testin
 	}
 }
 
-// TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked covers the
-// first of the two ways a drain declines to commit without giving the block up:
+// TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked covers one
+// of the ways a drain declines to commit without giving the block up (the table in
+// block_park_policy.go has three keep rows: RetryLater, ParentGone, ParentNotMinedYet):
 // HandleConvertedBlock's own GetBlockHeader on the previous hash answers
 // ErrBlockNotFound, and parkCommitFailure maps that to the ParentGone row. A
 // missing parent says nothing about the child, so the child has to go back in
@@ -376,8 +377,8 @@ func TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked(t *testi
 	require.False(t, h.rec.wasRejected(child), "a missing parent is not the peer's fault, so it must not be told the block was bad")
 }
 
-// TestSyncManager_AParkedBlockIsKeptWhenTheCommitIsCancelled covers the other
-// one. On shutdown the commit is cancelled mid-flight; the block has not been
+// TestSyncManager_AParkedBlockIsKeptWhenTheCommitIsCancelled covers the
+// RetryLater row. On shutdown the commit is cancelled mid-flight; the block has not been
 // judged, so it must be left where the restart scan will find it rather than
 // deleted and re-downloaded.
 func TestSyncManager_AParkedBlockIsKeptWhenTheCommitIsCancelled(t *testing.T) {
