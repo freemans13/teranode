@@ -10,6 +10,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
@@ -147,13 +148,24 @@ func (a *applyRecorder) reset() {
 
 // newOneWaveHarness builds a BlockValidation over a fresh sqlitememory UTXO store wrapped in
 // the recorder. dbName must be unique per test so two tests never share a database.
-func newOneWaveHarness(t *testing.T, dbName string) (*BlockValidation, *applyRecorder, func()) {
+//
+// outpointOnly runs the harness in the below-checkpoint mode that ships on the Hetzner nodes:
+// the operator flag on and a checkpoint above the fixture height, because regtest ships no
+// checkpoints and createAndSpendUTXOsForBatch's invariant I4 fails any outpoint-only batch
+// above the highest one before it applies anything. CreateBaseTestSettings copies the chain
+// params per call, so the checkpoint leaks into no other test.
+func newOneWaveHarness(t *testing.T, dbName string, outpointOnly bool) (*BlockValidation, *applyRecorder, func()) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 
 	logger := ulogger.TestLogger{}
 	tSettings := testutil.CreateBaseTestSettings(t)
+
+	if outpointOnly {
+		tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+		tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1000}}
+	}
 
 	storeURL, err := url.Parse("sqlitememory:///" + dbName)
 	require.NoError(t, err)
@@ -183,15 +195,17 @@ func newOneWaveHarness(t *testing.T, dbName string) (*BlockValidation, *applyRec
 	return bv, recorder, cleanup
 }
 
-// oneWaveBatchForErr is oneWaveBatchFor without the require dependency.
-func oneWaveBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx) (*SubtreeProcessingBatch, error) {
+// oneWaveBatchForErr is oneWaveBatchFor without the require dependency. outpointOnly is the
+// per-block mode the batch carries, the same value that drives create and spend below and
+// that the I4 guard keys on.
+func oneWaveBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, outpointOnly bool) (*SubtreeProcessingBatch, error) {
 	batch := &SubtreeProcessingBatch{
 		subtreeData:  make([]*subtreepkg.Data, len(txs)),
 		txRanges:     make([][2]int, len(txs)),
 		batchTxs:     make([]*bt.Tx, 0, len(txs)),
 		batchStart:   0,
 		batchEnd:     len(txs),
-		outpointOnly: false,
+		outpointOnly: outpointOnly,
 	}
 
 	for i, tx := range txs {
@@ -209,10 +223,10 @@ func oneWaveBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx) (
 // extend stage over it so the in-block-parent partition is derived by production code rather
 // than asserted into place.
 
-func oneWaveBatchFor(t *testing.T, bv *BlockValidation, block *model.Block, txs []*bt.Tx) *SubtreeProcessingBatch {
+func oneWaveBatchFor(t *testing.T, bv *BlockValidation, block *model.Block, txs []*bt.Tx, outpointOnly bool) *SubtreeProcessingBatch {
 	t.Helper()
 
-	batch, err := oneWaveBatchForErr(bv, block, txs)
+	batch, err := oneWaveBatchForErr(bv, block, txs, outpointOnly)
 	require.NoError(t, err)
 	require.Len(t, batch.hasInBlockParent, len(txs), "the extend stage must answer for every tx")
 
@@ -271,7 +285,7 @@ func requireSpentBy(t *testing.T, store utxo.Store, tx *bt.Tx, vout uint32, spen
 // only coins already in the store, so every one of them is applied by a single combined call
 // and neither WithCreateOnly nor WithSpendOnly is ever passed.
 func TestOneWave_NoInBlockParentsTakesOneCall(t *testing.T) {
-	bv, recorder, cleanup := newOneWaveHarness(t, "one_wave_independent")
+	bv, recorder, cleanup := newOneWaveHarness(t, "one_wave_independent", false)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -285,7 +299,7 @@ func TestOneWave_NoInBlockParentsTakesOneCall(t *testing.T) {
 	}
 
 	block := &model.Block{Height: 100, ID: 42}
-	batch := oneWaveBatchFor(t, bv, block, txs)
+	batch := oneWaveBatchFor(t, bv, block, txs, false)
 
 	for i := range txs {
 		require.False(t, batch.hasInBlockParent[i], "tx %d spends nothing of this block", i)
@@ -317,7 +331,7 @@ func TestOneWave_NoInBlockParentsTakesOneCall(t *testing.T) {
 func TestOneWave_ChainedAndIndependentMix(t *testing.T) {
 	for run := 0; run < 5; run++ {
 		t.Run(fmt.Sprintf("run %d", run), func(t *testing.T) {
-			bv, recorder, cleanup := newOneWaveHarness(t, fmt.Sprintf("one_wave_mixed_%d", run))
+			bv, recorder, cleanup := newOneWaveHarness(t, fmt.Sprintf("one_wave_mixed_%d", run), false)
 			defer cleanup()
 
 			ctx := context.Background()
@@ -336,7 +350,7 @@ func TestOneWave_ChainedAndIndependentMix(t *testing.T) {
 			txs := []*bt.Tx{c1, c2, c3, i1, i2}
 
 			block := &model.Block{Height: 100, ID: 42}
-			batch := oneWaveBatchFor(t, bv, block, txs)
+			batch := oneWaveBatchFor(t, bv, block, txs, false)
 
 			require.Equal(t, []bool{false, true, true, false, false}, batch.hasInBlockParent,
 				"only c2 and c3 spend a sibling")
@@ -379,95 +393,123 @@ func TestOneWave_ChainedAndIndependentMix(t *testing.T) {
 	}
 }
 
+// oneWaveModes runs a one-wave test once in decorate mode and once in the outpoint-only mode
+// that ships, each over its own database. The outpoint-only run is the one that pins the
+// failure classes against the real SQL store; the outpoint-only tests elsewhere in this
+// package assert against a mock store.
+func oneWaveModes(t *testing.T, dbName string, run func(t *testing.T, dbName string, outpointOnly bool)) {
+	t.Helper()
+
+	for _, outpointOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("outpointOnly=%v", outpointOnly), func(t *testing.T) {
+			run(t, fmt.Sprintf("%s_outpoint_only_%v", dbName, outpointOnly), outpointOnly)
+		})
+	}
+}
+
 // TestOneWave_ReplayStampsAndCreatesNothingTwice is case (c): applying the same batch a second
 // time succeeds, every transaction comes back as already existing rather than being created
 // again, and the block facts are restamped.
 func TestOneWave_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
-	bv, recorder, cleanup := newOneWaveHarness(t, "one_wave_replay")
-	defer cleanup()
+	oneWaveModes(t, "one_wave_replay", func(t *testing.T, dbName string, outpointOnly bool) {
+		bv, recorder, cleanup := newOneWaveHarness(t, dbName, outpointOnly)
+		defer cleanup()
 
-	ctx := context.Background()
+		ctx := context.Background()
 
-	root, key := seedRoot(t, recorder.Store, 2, "ONE_WAVE_REPLAY_KEY")
+		root, key := seedRoot(t, recorder.Store, 2, "ONE_WAVE_REPLAY_KEY")
 
-	independent := spendOf(t, key, root, 0, 90_000)
-	chained := spendOf(t, key, independent, 0, 80_000)
-	other := spendOf(t, key, root, 1, 90_000)
+		independent := spendOf(t, key, root, 0, 90_000)
+		chained := spendOf(t, key, independent, 0, 80_000)
+		other := spendOf(t, key, root, 1, 90_000)
 
-	txs := []*bt.Tx{independent, chained, other}
+		txs := []*bt.Tx{independent, chained, other}
 
-	block := &model.Block{Height: 100, ID: 42}
+		block := &model.Block{Height: 100, ID: 42}
 
-	first := oneWaveBatchFor(t, bv, block, txs)
-	require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, first))
+		first := oneWaveBatchFor(t, bv, block, txs, outpointOnly)
+		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, first))
 
-	// The same block offered again, exactly as a dirty restart offers it.
-	replayBlock := &model.Block{Height: 100, ID: 43}
-	second := oneWaveBatchFor(t, bv, replayBlock, txs)
+		// The same block offered again, exactly as a dirty restart offers it.
+		replayBlock := &model.Block{Height: 100, ID: 43}
+		second := oneWaveBatchFor(t, bv, replayBlock, txs, outpointOnly)
 
-	recorder.reset()
-	require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, replayBlock, second),
-		"a replayed batch must apply cleanly")
+		recorder.reset()
+		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, replayBlock, second),
+			"a replayed batch must apply cleanly")
 
-	for _, tx := range txs {
-		calls := recorder.callsFor(tx.TxIDChainHash())
-		require.NotEmpty(t, calls)
+		for _, tx := range txs {
+			calls := recorder.callsFor(tx.TxIDChainHash())
+			require.NotEmpty(t, calls)
 
-		sawExists := false
+			sawExists := false
 
-		for _, c := range calls {
-			if c.spendOnly {
-				continue // the spend half of a replay reports nothing
+			for _, c := range calls {
+				if c.spendOnly {
+					continue // the spend half of a replay reports nothing
+				}
+
+				sawExists = sawExists || errors.Is(c.err, errors.ErrTxExists)
 			}
 
-			sawExists = sawExists || errors.Is(c.err, errors.ErrTxExists)
+			require.True(t, sawExists,
+				"%s must be reported as already existing, not created a second time", tx.TxIDChainHash().String())
 		}
 
-		require.True(t, sawExists,
-			"%s must be reported as already existing, not created a second time", tx.TxIDChainHash().String())
-	}
-
-	// And the restamp landed: the mined-info update ran for the whole union.
-	for _, tx := range txs {
-		md, err := recorder.Store.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
-		require.NoError(t, err)
-		require.Contains(t, md.BlockIDs, uint32(43), "%s must carry the replayed block id", tx.TxIDChainHash().String())
-	}
+		// And the restamp landed: the mined-info update ran for the whole union.
+		for _, tx := range txs {
+			md, err := recorder.Store.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
+			require.NoError(t, err)
+			require.Contains(t, md.BlockIDs, uint32(43), "%s must carry the replayed block id", tx.TxIDChainHash().String())
+		}
+	})
 }
 
 // TestOneWave_MissingParentFailsTheBlock is case (d): a transaction whose parent is in neither
 // the block nor the store has no coin to spend, and the one-wave apply must fail the block
 // rather than let it through.
+//
+// In outpoint-only mode this is the one variant that pins something the decorate run does
+// not: the decorate stage is skipped, so nothing before the apply can notice the missing
+// parent, and the block is held up only by the store spending before it creates
+// (utxo.SequentialSpendAndCreate, which the SQL store's SpendAndCreate is). The orphan must
+// end absent from the store either way.
 func TestOneWave_MissingParentFailsTheBlock(t *testing.T) {
-	bv, recorder, cleanup := newOneWaveHarness(t, "one_wave_missing_parent")
-	defer cleanup()
+	oneWaveModes(t, "one_wave_missing_parent", func(t *testing.T, dbName string, outpointOnly bool) {
+		bv, recorder, cleanup := newOneWaveHarness(t, dbName, outpointOnly)
+		defer cleanup()
 
-	ctx := context.Background()
+		ctx := context.Background()
 
-	// A parent that is never written anywhere.
-	_, publicKey := bec.PrivateKeyFromBytes([]byte("ONE_WAVE_MISSING_PARENT_KEY"))
-	privateKey, _ := bec.PrivateKeyFromBytes([]byte("ONE_WAVE_MISSING_PARENT_KEY"))
+		// A parent that is never written anywhere.
+		_, publicKey := bec.PrivateKeyFromBytes([]byte("ONE_WAVE_MISSING_PARENT_KEY"))
+		privateKey, _ := bec.PrivateKeyFromBytes([]byte("ONE_WAVE_MISSING_PARENT_KEY"))
 
-	ghost := transactions.Create(t,
-		transactions.WithCoinbaseData(1, "/ghost/"),
-		transactions.WithP2PKHOutputs(1, 100_000, publicKey),
-	)
+		ghost := transactions.Create(t,
+			transactions.WithCoinbaseData(1, "/ghost/"),
+			transactions.WithP2PKHOutputs(1, 100_000, publicKey),
+		)
 
-	orphan := spendOf(t, privateKey, ghost, 0, 90_000)
+		orphan := spendOf(t, privateKey, ghost, 0, 90_000)
 
-	block := &model.Block{Height: 100, ID: 42}
-	batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{orphan})
+		block := &model.Block{Height: 100, ID: 42}
+		batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{orphan}, outpointOnly)
 
-	require.False(t, batch.hasInBlockParent[0], "the missing parent is not in this block either")
+		require.False(t, batch.hasInBlockParent[0], "the missing parent is not in this block either")
 
-	recorder.reset()
+		recorder.reset()
 
-	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
-	require.Error(t, err, "a transaction with no parent anywhere must fail the block")
-	require.True(t, errors.Is(err, errors.ErrTxNotFound),
-		"the failure must be the not-found class, got: %v", err)
-	require.Contains(t, err.Error(), fmt.Sprintf("%s:0", ghost.TxIDChainHash().String()),
-		"the failure must name the missing outpoint, got: %v", err)
+		err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+		require.Error(t, err, "a transaction with no parent anywhere must fail the block")
+		require.True(t, errors.Is(err, errors.ErrTxNotFound),
+			"the failure must be the not-found class, got: %v", err)
+		require.Contains(t, err.Error(), fmt.Sprintf("%s:0", ghost.TxIDChainHash().String()),
+			"the failure must name the missing outpoint, got: %v", err)
+
+		_, err = recorder.Store.Get(ctx, orphan.TxIDChainHash())
+		require.True(t, errors.Is(err, errors.ErrTxNotFound),
+			"the orphan must not have been created, got: %v", err)
+	})
 }
 
 // TestOneWave_FailedApplyReleasesNoChainedSpends pins the barrier's failure side.
@@ -490,37 +532,59 @@ func TestOneWave_MissingParentFailsTheBlock(t *testing.T) {
 // failCombinedDelay makes the chained create wave finish and park on the barrier before the
 // one-wave apply reports its failure, which is the widest window the black box allows.
 func TestOneWave_FailedApplyReleasesNoChainedSpends(t *testing.T) {
-	for run := 0; run < 5; run++ {
-		t.Run(fmt.Sprintf("run %d", run), func(t *testing.T) {
-			bv, recorder, cleanup := newOneWaveHarness(t, fmt.Sprintf("one_wave_barrier_%d", run))
-			defer cleanup()
+	oneWaveModes(t, "one_wave_barrier", func(t *testing.T, dbName string, outpointOnly bool) {
+		for run := 0; run < 5; run++ {
+			t.Run(fmt.Sprintf("run %d", run), func(t *testing.T) {
+				bv, recorder, cleanup := newOneWaveHarness(t, fmt.Sprintf("%s_%d", dbName, run), outpointOnly)
+				defer cleanup()
 
-			ctx := context.Background()
+				ctx := context.Background()
 
-			root, key := seedRoot(t, recorder.Store, 3, "ONE_WAVE_BARRIER_KEY")
+				root, key := seedRoot(t, recorder.Store, 3, "ONE_WAVE_BARRIER_KEY")
 
-			// c1 is independent and c2 spends it, so c2's spend depends on c1's create — which
-			// is exactly the create the failing one-wave apply never lands.
-			c1 := spendOf(t, key, root, 0, 90_000)
-			c2 := spendOf(t, key, c1, 0, 80_000)
-			i1 := spendOf(t, key, root, 1, 90_000)
+				// c1 is independent and c2 spends it, so c2's spend depends on c1's create — which
+				// is exactly the create the failing one-wave apply never lands.
+				c1 := spendOf(t, key, root, 0, 90_000)
+				c2 := spendOf(t, key, c1, 0, 80_000)
+				i1 := spendOf(t, key, root, 1, 90_000)
 
-			block := &model.Block{Height: 100, ID: 42}
-			batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{c1, c2, i1})
+				block := &model.Block{Height: 100, ID: 42}
+				batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{c1, c2, i1}, outpointOnly)
 
-			require.Equal(t, []bool{false, true, false}, batch.hasInBlockParent)
+				require.Equal(t, []bool{false, true, false}, batch.hasInBlockParent)
 
-			recorder.reset()
-			recorder.failCombined = errors.NewProcessingError("forced one-wave failure")
-			recorder.failCombinedDelay = 50 * time.Millisecond
+				recorder.reset()
+				recorder.failCombined = errors.NewProcessingError("forced one-wave failure")
+				recorder.failCombinedDelay = 50 * time.Millisecond
 
-			err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
-			require.Error(t, err, "a failed one-wave apply must fail the block")
+				err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+				require.Error(t, err, "a failed one-wave apply must fail the block")
 
-			require.Zero(t, recorder.spendOnlyCalls(),
-				"no chained spend may be issued after the one-wave apply failed")
-			require.Contains(t, err.Error(), "forced one-wave failure",
-				"the apply's own failure must surface, not a context error masking it")
-		})
-	}
+				require.Zero(t, recorder.spendOnlyCalls(),
+					"no chained spend may be issued after the one-wave apply failed")
+				require.Contains(t, err.Error(), "forced one-wave failure",
+					"the apply's own failure must surface, not a context error masking it")
+
+				// The end state the barrier protects. The forced failure stopped the one-wave
+				// apply before the store, so c1 and i1 were never created and the root's coins
+				// are untouched. c2 is not asserted absent: its create ran in the chained
+				// create wave, which the barrier does not gate (createWave runs beside the
+				// one-wave apply, and the two-phase code it replaced landed creates first
+				// too), so its row may be in the store with its input unspent. What the
+				// barrier guarantees is that no spend of c1's output was ever issued, which
+				// the spendOnlyCalls assert above pins.
+				for _, tx := range []*bt.Tx{c1, i1} {
+					_, err := recorder.Store.Get(ctx, tx.TxIDChainHash())
+					require.True(t, errors.Is(err, errors.ErrTxNotFound),
+						"%s must not have been created, got: %v", tx.TxIDChainHash().String(), err)
+				}
+
+				for _, vout := range []uint32{0, 1} {
+					resp, err := recorder.Store.GetSpend(ctx, &utxo.Spend{TxID: root.TxIDChainHash(), Vout: vout})
+					require.NoError(t, err)
+					require.Nil(t, resp.SpendingData, "root output %d must still be unspent", vout)
+				}
+			})
+		}
+	})
 }

@@ -2245,8 +2245,16 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 	return false
 }
 
-// isDeadlock checks if a database error is a PostgreSQL deadlock (SQLSTATE 40P01)
-// or a SQLite BUSY error that should be retried.
+// isDeadlock reports whether a database error is a lock the spend batch should
+// retry: a PostgreSQL deadlock (SQLSTATE 40P01), or a SQLite BUSY or LOCKED
+// result. The SQLite arm matches the result code, as isLockError below and
+// usql.isRetriable do, because the two codes carry different messages: BUSY is
+// "database is locked", while the shared-cache table lock the sqlitememory
+// engine raises when two transactions wait on each other is LOCKED, "database
+// table is locked: database is deadlocked". This used to match the BUSY message
+// alone, so a spend batch that collided with a create's transaction was aborted
+// instead of retried (see is_deadlock_sqlite_test.go). The message check stays
+// as the fallback for a driver error that is not a *sqlite.Error.
 func isDeadlock(err error) bool {
 	if err == nil {
 		return false
@@ -2254,6 +2262,10 @@ func isDeadlock(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == usql.PgErrDeadlockDetected {
 		return true
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code() == sqlite3.SQLITE_BUSY || sqliteErr.Code() == sqlite3.SQLITE_LOCKED
 	}
 	return strings.Contains(err.Error(), "database is locked")
 }
