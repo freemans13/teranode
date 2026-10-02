@@ -9,7 +9,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,10 +45,12 @@ func TestParkDispatch_ADispatchedParkedBlockCommitsAndTakesTheParkedTail(t *test
 	h := newParkWiringHarness(t, true)
 	bd := h.withDispatcher(t)
 
-	// The chain holds everything, which is how every park test fakes a commit.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-
 	d, entry := h.parkedDispatchFor(t, 1)
+
+	// The parent lands after the child has parked and been taken for dispatch.
+	// Order matters on a real chain: with the parent already stored, the
+	// child's delivery would have committed it inline instead of parking it.
+	h.chainHolds(t, h.blocks[0].MsgBlock().BlockHash())
 
 	require.True(t, bd.canDispatch(d), "an unwindowed dispatch is admissible into an empty frontier")
 
@@ -58,6 +59,10 @@ func TestParkDispatch_ADispatchedParkedBlockCommitsAndTakesTheParkedTail(t *test
 	require.Equal(t, entry.hash, bd.frontier[0].hash, "the entry is keyed by the parked block's own hash, not by a queue message")
 
 	drainCompletionsUntilEmpty(t, bd)
+
+	// The commit is real: the block is in the chain and block validation saw
+	// it once. Everything below is the bookkeeping that follows from that.
+	h.requireCommitted(t, entry.hash)
 
 	require.Zero(t, h.sm.blockPark.Len(), "the entry is settled, not left in the index")
 
@@ -79,8 +84,6 @@ func TestParkDispatch_ADispatchedParkedBlockCommitsAndTakesTheParkedTail(t *test
 func TestParkDispatch_AReadFailureKeepsTheBlockAndIsNotJudged(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	bd := h.withDispatcher(t)
-
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
 	d, entry := h.parkedDispatchFor(t, 1)
 
@@ -106,16 +109,17 @@ func TestParkDispatch_ACommitFailureIsJudgedByTheCommitTable(t *testing.T) {
 
 	d, entry := h.parkedDispatchFor(t, 1)
 
-	// The block's own existence check fails with a fault of the block, which is
-	// the same route the park's own recovery tests use to drive a judged commit.
-	h.client.On("GetBlockExists", mock.Anything, &entry.hash).
-		Return(false, errors.NewBlockInvalidError("this block is not one we can take"))
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+	// The parent is in the chain, so the dispatched child gets past the parent
+	// lookup to the commit, where block validation's verdict is a fault of the
+	// block itself.
+	h.chainHolds(t, h.blocks[0].MsgBlock().BlockHash())
+	h.validation.failOnce(entry.hash, errors.NewBlockInvalidError("this block is not one we can take"))
 
 	bd.dispatch(d)
 	drainCompletionsUntilEmpty(t, bd)
 
 	require.Nil(t, d.readErr, "the blob read succeeded; this is a commit failure")
+	require.Equal(t, 1, h.validation.callsFor(entry.hash), "the block reached block validation, which is what judged it")
 	require.Zero(t, h.sm.blockPark.Len(), "a judged block does not stay parked")
 
 	_, failed := h.sm.recentlyFailedBlocks.Get(entry.hash)
@@ -128,37 +132,39 @@ func TestParkDispatch_ACommitFailureIsJudgedByTheCommitTable(t *testing.T) {
 //
 // Legacy must never hand block validation a block whose parent is not committed.
 // A parked dispatch enforces that in the worker rather than on a promise from the
-// consumer: it passes a nil parent, so HandleBlockDirect performs its own
+// consumer: it passes a nil parent, so HandleConvertedBlock performs its own
 // GetBlockHeader on the previous hash and refuses the block if the parent is not
 // there. Passing &inflightParent{height} instead would look like an optimisation,
 // would skip that lookup, and would take the height on trust from a park entry
 // whose height came off the header list.
 //
-// So this test puts the parent NOT in the chain, which is the state the guard
-// exists for, and requires that the lookup happened and the block was kept rather
-// than judged. Under the mutation the lookup never runs.
+// So this test leaves the parent out of the real chain, which is the state the
+// guard exists for, and requires that the lookup happened (the ParentGone row
+// stamped the entry) and the block was kept rather than judged or handed to
+// block validation. Under the mutation the lookup never runs.
 func TestParkDispatch_ADrainedBlockPassesANilParentSoTheWorkerLooksItUp(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	bd := h.withDispatcher(t)
 
 	d, entry := h.parkedDispatchFor(t, 1)
 
-	// The block itself is not stored, so HandleBlockDirect goes on to the parent.
-	// The harness answers every header lookup with "no such block", so the parent
-	// is missing, which is what makes the lookup observable.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+	// The block itself is not stored, so HandleConvertedBlock goes on to the
+	// parent, and the parent (blocks[0]) is genuinely absent from the real
+	// chain. The lookup is observable by its consequence: the ParentGone row
+	// stamps the entry it puts back.
 
-	// A parked dispatch carries no resolved parent at all any more — the field
-	// itself is gone — which is what leaves HandleBlockDirect's own lookup below
-	// as the only route to an answer.
+	// A parked dispatch carries no resolved parent at all any more (the field
+	// itself is gone), which is what leaves HandleConvertedBlock's own lookup
+	// below as the only route to an answer.
 
 	bd.dispatch(d)
 	drainCompletionsUntilEmpty(t, bd)
 
-	h.client.AssertCalled(t, "GetBlockHeader", mock.Anything, &entry.prevBlock)
-
 	require.Equal(t, 1, h.sm.blockPark.Len(),
 		"a parent that is gone keeps the block, so the sweep can retry it when the parent lands")
+	require.False(t, h.parkedEntry(t, entry.hash).parentMissingAt.IsZero(),
+		"the worker looked the parent up and found it gone: the ParentGone row stamped the entry")
+	require.Zero(t, h.validation.callCount(), "a block whose parent is missing never reaches block validation")
 
 	_, failed := h.sm.recentlyFailedBlocks.Get(entry.hash)
 	require.False(t, failed, "and a missing parent is not a judgement on the block")
@@ -199,8 +205,6 @@ func TestParkDispatch_TheWrongShapeIsRefusedAndTheEntryRestored(t *testing.T) {
 			h := newParkWiringHarness(t, true)
 			bd := h.withDispatcher(t)
 
-			h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-
 			d, entry := h.parkedDispatchFor(t, 1)
 			require.Zero(t, h.sm.blockPark.Len(), "precondition: the drain has taken the entry")
 
@@ -224,8 +228,6 @@ func TestParkDispatch_TheWrongShapeIsRefusedAndTheEntryRestored(t *testing.T) {
 func TestParkDispatch_ShutdownRestoresAParkedDispatchInsteadOfReplying(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	bd := h.withDispatcher(t)
-
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
 	h.sm.quit = make(chan struct{})
 	h.sm.settings.BlockValidation.QuickValidateSkipUtxoLock = true
@@ -335,7 +337,6 @@ func TestDrain_NothingIsTakenUntilTheDispatcherSaysYes(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 	bd := h.withDispatcher(t)
 
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
@@ -381,22 +382,17 @@ func TestDrain_AChainOfParkedBlocksDrainsOneAfterAnother(t *testing.T) {
 	secondHash := second.BlockHash()
 	thirdHash := third.BlockHash()
 
-	// Both later blocks arrive before their parents and park. The streaming
-	// route never calls GetBlockExists while parking (only a real commit
-	// attempt does), so nothing needs scripting for either arrival.
+	// Both later blocks arrive before their parents and park: neither has its
+	// parent in the chain yet.
 	require.NoError(t, h.deliver(t, 2))
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 2, h.sm.blockPark.Len(), "a chain of two blocks is parked")
 
-	// From here the chain holds everything, which is how a commit is faked, and
-	// the first block's own parent resolves so its arrival's own parkCommit
-	// posts rather than committing inline.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-	h.chainHolds(t, first.Header.PrevBlock)
-
-	// New() builds this channel unconditionally; a struct-literal harness needs
-	// it wired by hand so the first block's own commit goes through the
-	// dispatcher's drain step below rather than being committed inline.
+	// The first block's own parent is genesis, which the real chain holds, so
+	// its arrival is committable at once. New() builds this channel
+	// unconditionally; a struct-literal harness needs it wired by hand so that
+	// commit goes through the dispatcher's drain step below rather than being
+	// committed inline.
 	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
 
 	go h.sm.dispatchBlocks()
@@ -407,6 +403,15 @@ func TestDrain_AChainOfParkedBlocksDrainsOneAfterAnother(t *testing.T) {
 
 	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 0 }, 10*time.Second),
 		"both parked blocks must drain, so a committed drained block has to schedule the one behind it")
+
+	// All three are in the real chain, each committed once, in order.
+	h.requireCommitted(t, first.BlockHash())
+	h.requireCommitted(t, secondHash)
+	h.requireCommitted(t, thirdHash)
+
+	_, meta, err := h.chain.GetBestBlockHeader(h.sm.ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(3), meta.Height, "the chain tip is the last drained block")
 
 	for _, name := range parkDirEntries(t, h.parkDir) {
 		require.NotContains(t, name, secondHash.String(), "the first drained block's blob is deleted")
@@ -435,7 +440,9 @@ func TestDrain_TheSweepsPostIsRestoredAndThenDispatched(t *testing.T) {
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+	// The parent lands after the child has parked: the sweep's post below is
+	// built as though the sweep had just found it in the chain.
+	h.chainHolds(t, h.blocks[0].MsgBlock().BlockHash())
 
 	// The pool gives the manager the channel the sweep posts on.
 	startParkPool(t, h, 1)
@@ -465,6 +472,8 @@ func TestDrain_TheSweepsPostIsRestoredAndThenDispatched(t *testing.T) {
 
 	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 0 }, 10*time.Second),
 		"the consumer must restore the posted entry and then dispatch it through the drain step")
+
+	h.requireCommitted(t, child)
 
 	for _, name := range parkDirEntries(t, h.parkDir) {
 		require.NotContains(t, name, child.String(), "and the commit deletes the blob")

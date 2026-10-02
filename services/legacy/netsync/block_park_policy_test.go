@@ -13,7 +13,6 @@ import (
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -129,9 +128,6 @@ func TestSyncManager_AParkedBlockSurvivesAReadThatSaysNothingAboutTheBlock(t *te
 			child := h.blocks[1].MsgBlock().BlockHash()
 			parent := h.blocks[0].MsgBlock().BlockHash()
 
-			h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
-			h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-
 			require.NoError(t, h.deliver(t, 1))
 			require.Equal(t, 1, h.sm.blockPark.Len())
 
@@ -139,11 +135,17 @@ func TestSyncManager_AParkedBlockSurvivesAReadThatSaysNothingAboutTheBlock(t *te
 
 			h.store.failReadsWith(tc.err)
 
-			// The parent lands, so the drain reaches for the child and the read
-			// fails for a reason that is nothing to do with the child.
-			require.NoError(t, h.deliver(t, 0))
+			// The parent is in the chain and the drain its commit would have
+			// scheduled runs, so the drain reaches for the child and the read
+			// fails for a reason that is nothing to do with the child. The
+			// parent is stored directly rather than delivered, because the
+			// faulted store would fail the parent's own record read first and
+			// leave two blocks parked instead of one.
+			h.chainHolds(t, parent)
+			h.sm.drainParkedDescendants(parent)
 
 			h.requireStillParked(t, child, parkedBytes)
+			require.Zero(t, h.validation.callsFor(child), "a block whose record would not read back never reached block validation")
 		})
 	}
 }
@@ -160,21 +162,22 @@ func TestSyncManager_AParkedBlockSurvivesATransientCommitFailure(t *testing.T) {
 	child := h.blocks[1].MsgBlock().BlockHash()
 	parent := h.blocks[0].MsgBlock().BlockHash()
 
-	// The streaming route only ever calls GetBlockExists(child) once, at the
-	// real commit attempt below (parking itself never calls it), so this is
-	// that attempt's own answer rather than a second one behind an
-	// already-consumed park-time check.
-	h.client.On("GetBlockExists", mock.Anything, &child).
-		Return(false, errors.NewStorageError("the store is not answering")).Once()
-	h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+	// Block validation's verdict on the child, once: the store was not
+	// answering. sm.ProcessBlock wraps it in a ProcessingError and
+	// IsTransientLocalError walks the chain, so the row is still RetryLater.
+	h.validation.failOnce(child, errors.NewStorageError("the store is not answering"))
 
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
 	parkedBytes := h.sm.blockPark.Bytes()
 
+	// The parent arrives, commits for real, and the drain behind it offers the
+	// child to block validation.
 	require.NoError(t, h.deliver(t, 0))
+
+	h.requireCommitted(t, parent)
+	require.Equal(t, 1, h.validation.callsFor(child), "the child reached block validation, which is where the store failed")
 
 	h.requireStillParked(t, child, parkedBytes)
 }
@@ -232,18 +235,9 @@ func TestSyncManager_AParkedBlockSurvivesAParentThatIsSlowToBeMarkedMined(t *tes
 	parent := h.blocks[0].MsgBlock().BlockHash()
 
 	// The wait must run: it is skipped only on the below-checkpoint outpoint-only
-	// path. One retry at 1 ms makes the wait give up after two lookups.
+	// path. The harness's one retry at 1 ms makes the wait give up after two
+	// lookups.
 	h.sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
-	h.sm.settings.BlockValidation.IsParentMinedRetryMaxRetry = 1
-	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
-	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
-
-	spy := &convertedRouteSpyValidation{}
-	h.sm.blockValidation = spy
-
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-	h.client.On("GetBlockIsMined", mock.Anything, &parent).Return(false, nil).Times(2)
-	h.client.On("GetBlockIsMined", mock.Anything, &parent).Return(true, nil)
 
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
@@ -251,20 +245,23 @@ func TestSyncManager_AParkedBlockSurvivesAParentThatIsSlowToBeMarkedMined(t *tes
 	parkedBytes := h.sm.blockPark.Bytes()
 
 	// The parent is in the chain and valid, but its mined flag is not set yet.
-	h.chainHolds(t, parent)
+	h.chainHoldsUnmined(t, parent)
 
 	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
-	require.Zero(t, spy.callCount(), "sanity: the first attempt must have given up on the parent's mined flag")
-	h.client.AssertNumberOfCalls(t, "GetBlockIsMined", 2)
+	require.Zero(t, h.validation.callCount(), "sanity: the first attempt must have given up on the parent's mined flag")
+	require.Equal(t, int32(2), h.chain.minedPolls.Load(), "one lookup and one retry before the wait gave up")
 	h.requireStillParked(t, child, parkedBytes)
 
 	getDataBefore := h.rec.getDataCount()
 
-	// The next sweep pass resubmits the kept block; the parent is marked by now.
+	// setTxMined finishes for the parent, and the next sweep pass resubmits the
+	// kept block.
+	require.NoError(t, h.chain.SetBlockMinedSet(h.sm.ctx, &parent))
+
 	h.sm.sweepParkedBlocks(time.Now().Add(2*parkStuckThreshold + time.Second))
 
-	require.Equal(t, 1, spy.callCount(), "the kept block must commit from disk on the resubmit")
+	h.requireCommitted(t, child)
 	require.Zero(t, h.sm.blockPark.Len(), "the committed block must leave the park")
 	require.Zero(t, h.sm.blockPark.Bytes(), "committing must give the park budget back")
 	require.False(t, h.rec.askedForSince(getDataBefore, child), "the block was on disk, so it must not be fetched again")

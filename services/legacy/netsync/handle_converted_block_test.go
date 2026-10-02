@@ -11,11 +11,13 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	chainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/stretchr/testify/require"
 )
@@ -72,17 +74,38 @@ func mineRegtestPoW(t *testing.T, blk *bsvutil.Block) {
 }
 
 // convertedRouteSpyValidation stands in for the real blockvalidation.Server so
-// this test can drive HandleConvertedBlock without wiring the server's own
+// a test can drive HandleConvertedBlock without wiring the server's own
 // dependencies (subtree fetch, UTXO create/spend, kafka, gRPC). It records what
-// it was called with and reports success; it does not itself write anything to
-// a blockchain store or a UTXO store. See
-// TestHandleConvertedBlock_CommitsWithoutTheBlock's own doc comment for exactly
-// what that means this test does, and does not, prove.
+// it was called with and, when it has a chain, stores the block there the way
+// the real server's commit does (AddBlock with mined_set and subtrees_set, the
+// options buildAddBlockOpts in services/blockvalidation/BlockValidation.go
+// passes), so the next block drained behind this one finds its parent in the
+// same real store HandleConvertedBlock reads. It never touches a UTXO store:
+// the gRPC hop and quickValidateBlock's UTXO work are what it stands in for.
+//
+// With chain nil it records and reports success, which is what the tests in
+// this file need. See TestHandleConvertedBlock_CommitsWithoutTheBlock's own doc
+// comment for exactly what that means that test does, and does not, prove.
+//
+// Faults are keyed by hash rather than by call order: one deliver() in the park
+// harness commits the parent and drains the child in the same call, so an
+// unkeyed "fail the next call" would fire on whichever block happened to reach
+// the commit first.
 type convertedRouteSpyValidation struct {
 	blockvalidation.MockBlockValidation
 
+	// chain, when set, is where a block that is not faulted is stored.
+	chain blockchain2.ClientI
+
 	mu    sync.Mutex
 	calls []convertedRouteProcessBlockCall
+	// failures is consumed one entry per matching call, like testify's .Once():
+	// the park's resubmit of the same block then goes through.
+	failures map[chainhash.Hash]error
+	// recordOnly names blocks whose ProcessBlock reports success without the
+	// chain getting the row, which is the shape of a commit that was reported
+	// and then reorged out before the child looked its parent up.
+	recordOnly map[chainhash.Hash]struct{}
 }
 
 type convertedRouteProcessBlockCall struct {
@@ -93,15 +116,54 @@ type convertedRouteProcessBlockCall struct {
 	blockID     uint32
 }
 
-func (v *convertedRouteSpyValidation) ProcessBlock(_ context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error {
+func (v *convertedRouteSpyValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-
 	v.calls = append(v.calls, convertedRouteProcessBlockCall{
 		block: block, blockHeight: blockHeight, peerID: peerID, baseURL: baseURL, blockID: blockID,
 	})
 
-	return nil
+	hash := *block.Hash()
+	err, failing := v.failures[hash]
+	delete(v.failures, hash)
+	_, skipCommit := v.recordOnly[hash]
+	chain := v.chain
+	v.mu.Unlock()
+
+	if failing {
+		return err
+	}
+
+	if chain == nil || skipCommit {
+		return nil
+	}
+
+	return chain.AddBlock(ctx, block, peerID, chainoptions.WithMinedSet(true), chainoptions.WithSubtreesSet(true))
+}
+
+// failOnce makes the next ProcessBlock for hash return err instead of
+// committing; the call after that commits as usual.
+func (v *convertedRouteSpyValidation) failOnce(hash chainhash.Hash, err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.failures == nil {
+		v.failures = make(map[chainhash.Hash]error)
+	}
+
+	v.failures[hash] = err
+}
+
+// recordOnlyFor makes every ProcessBlock for hash report success without
+// storing the block.
+func (v *convertedRouteSpyValidation) recordOnlyFor(hash chainhash.Hash) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.recordOnly == nil {
+		v.recordOnly = make(map[chainhash.Hash]struct{})
+	}
+
+	v.recordOnly[hash] = struct{}{}
 }
 
 func (v *convertedRouteSpyValidation) callCount() int {
@@ -109,6 +171,22 @@ func (v *convertedRouteSpyValidation) callCount() int {
 	defer v.mu.Unlock()
 
 	return len(v.calls)
+}
+
+// callsFor counts the ProcessBlock calls made for one block.
+func (v *convertedRouteSpyValidation) callsFor(hash chainhash.Hash) int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	n := 0
+
+	for _, call := range v.calls {
+		if call.block.Hash().IsEqual(&hash) {
+			n++
+		}
+	}
+
+	return n
 }
 
 func (v *convertedRouteSpyValidation) lastCall() convertedRouteProcessBlockCall {

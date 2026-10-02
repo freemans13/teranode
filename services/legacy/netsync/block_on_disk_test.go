@@ -8,7 +8,6 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -136,9 +135,8 @@ func TestHandleBlockOnDiskMsg_RefusesAnUnreachableParent(t *testing.T) {
 		h := newParkWiringHarness(t, true)
 		h.sm.drainAsync.Store(true)
 
-		// The harness answers "no such block" for every header lookup, and the
-		// header list holds only the harness's own three blocks, so this parent
-		// is in neither.
+		// The real chain holds only genesis, and the header list only the
+		// harness's own three blocks, so this parent is in neither.
 		body := bodyFor(chainhash.Hash{0x9e})
 
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
@@ -188,9 +186,7 @@ func TestHandleBlockOnDiskMsg_RefusesAnUnreachableParent(t *testing.T) {
 		h := newParkWiringHarness(t, true)
 		h.sm.drainAsync.Store(true)
 
-		h.noSuchBlock.Unset()
-		h.client.On("GetBlockHeader", mock.Anything, mock.Anything).
-			Return(nil, nil, errors.NewStorageError("the store is not answering"))
+		h.chain.failHeaderReadsWith(errors.NewStorageError("the store is not answering"))
 
 		body := bodyFor(chainhash.Hash{0x9f})
 
@@ -279,15 +275,18 @@ func TestHandleBlockOnDiskMsg_ParentInFlightIsKept(t *testing.T) {
 // could not commit: measured on mainnet on 2026-09-10, five blocks streamed and
 // six parent-missing failures inside one 45-second window with nothing committing.
 func TestHandleBlockOnDiskMsg_DrainsOnlyWhenTheParentIsCommitted(t *testing.T) {
-	header := wire.BlockHeader{Version: 1, PrevBlock: chainhash.Hash{0xc1}}
-	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 2048, Hash: header.BlockHash(), Converted: true}
-
 	t.Run("a committed parent asks for a drain", func(t *testing.T) {
 		h := newParkWiringHarness(t, true)
 		h.sm.drainAsync.Store(true)
 		h.sm.parkCommits = make(chan parkCommit, 4)
 
-		h.chainHolds(t, header.PrevBlock)
+		// The parent is a block the real chain can hold: blocks[0], committed
+		// here before the child arrives.
+		parent := h.blocks[0].MsgBlock().BlockHash()
+		h.chainHolds(t, parent)
+
+		header := wire.BlockHeader{Version: 1, PrevBlock: parent}
+		body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 2048, Hash: header.BlockHash(), Converted: true}
 
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
 
@@ -299,6 +298,9 @@ func TestHandleBlockOnDiskMsg_DrainsOnlyWhenTheParentIsCommitted(t *testing.T) {
 		h := newParkWiringHarness(t, true)
 		h.sm.drainAsync.Store(true)
 		h.sm.parkCommits = make(chan parkCommit, 4)
+
+		header := wire.BlockHeader{Version: 1, PrevBlock: chainhash.Hash{0xc1}}
+		body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 2048, Hash: header.BlockHash(), Converted: true}
 
 		// A parent that is parked rather than committed: worth keeping the child,
 		// not worth a drain.

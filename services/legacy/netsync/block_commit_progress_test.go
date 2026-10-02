@@ -3,7 +3,6 @@ package netsync
 import (
 	"testing"
 
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,10 +28,9 @@ func TestSyncManager_ADrainCommitIsChainProgress(t *testing.T) {
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len(), "the drain needs something parked to commit")
 
-	// The block is now in the chain, which HandleBlockDirect answers with a nil
-	// error, so the drain counts it as committed. That is the same route the
-	// park's own commit-walk test uses to drive a successful drain.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+	// The parent is in the chain, so the drain behind it reaches the child and
+	// HandleConvertedBlock commits it for real.
+	h.chainHolds(t, h.blocks[0].MsgBlock().BlockHash())
 
 	before := h.sm.commitRate.count
 
@@ -41,4 +39,5 @@ func TestSyncManager_ADrainCommitIsChainProgress(t *testing.T) {
 	require.Zero(t, h.sm.blockPark.Len(), "the drain committed the parked block")
 	require.Greater(t, h.sm.commitRate.count, before,
 		"a parked block joining the chain is progress even though no queue message finished")
+	h.requireCommitted(t, h.blocks[1].MsgBlock().BlockHash())
 }

@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,17 +49,13 @@ func TestSyncManager_TheBlockHandlerRunsTheParkSweep(t *testing.T) {
 
 	child := h.blocks[1].MsgBlock().BlockHash()
 
-	// The child arrives before its parent and parks. The streaming route
-	// (handleBlockOnDiskMsg) never calls GetBlockExists while parking — only a
-	// real commit attempt does — so nothing needs scripting for the arrival
-	// itself; the parent is in the chain, but nothing in this node committed
-	// it, so no drain was ever triggered — the state a restart leaves behind.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-
+	// The child arrives before its parent and parks.
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
-	// And usable, not merely present: the sweep asks that as one question now,
+	// Then the parent is in the chain, but nothing in this node committed it,
+	// so no drain was ever triggered: the state a restart leaves behind. And
+	// usable, not merely present: the sweep asks that as one question now,
 	// because invalidation is a flag on the row rather than a delete, so a
 	// parent this node has rejected still exists.
 	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
@@ -77,6 +72,8 @@ func TestSyncManager_TheBlockHandlerRunsTheParkSweep(t *testing.T) {
 
 	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 0 }, 5*time.Second),
 		"the block handler's own ticker must run the park sweep, or a restart-recovered block is never committed by anything")
+
+	h.requireCommitted(t, child)
 
 	_, failed := h.sm.recentlyFailedBlocks.Get(child)
 	require.False(t, failed, "the sweep must have committed the block, not given up on it")

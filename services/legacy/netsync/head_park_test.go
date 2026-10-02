@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,12 +50,9 @@ func TestSweep_PostsCommitsToTheConsumerInsteadOfCommitting(t *testing.T) {
 
 	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
 
-	// The commit's own existence check would see this, and the drain would count
-	// the block committed. It must not have been asked yet.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-
 	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
+	require.Zero(t, h.validation.callCount(), "the sweep itself committed nothing")
 	require.Len(t, h.sm.parkCommits, 1, "the sweep posts the commit to the consumer")
 	require.Zero(t, h.sm.blockPark.Len(), "and has taken the entry out of the index for the consumer to commit")
 	require.Contains(t, parkDirEntries(t, h.parkDir), child.String()+".block", "without touching the blob")
@@ -74,6 +70,8 @@ func TestSweep_PostsCommitsToTheConsumerInsteadOfCommitting(t *testing.T) {
 	// submitParkCommit's own no-consumer arm uses (block_park_drain.go).
 	h.sm.blockPark.Restore(commit.entry)
 	h.sm.drainParkedDescendants(commit.entry.prevBlock)
+
+	h.requireCommitted(t, child)
 
 	for _, name := range parkDirEntries(t, h.parkDir) {
 		require.NotContains(t, name, child.String(), "the consumer's commit is what deletes the blob")
@@ -93,11 +91,11 @@ func TestSweep_WithoutAConsumerChannelCommitsInline(t *testing.T) {
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
 	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
 	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
 	require.Zero(t, h.sm.blockPark.Len())
+	h.requireCommitted(t, child)
 
 	for _, name := range parkDirEntries(t, h.parkDir) {
 		require.NotContains(t, name, child.String(), "the inline commit deleted the blob")
@@ -118,7 +116,6 @@ func TestBlockHandler_TheSweepGoroutinePostsAndTheConsumerCommits(t *testing.T) 
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
 
 	h.sm.blockPark.mu.Lock()
@@ -150,6 +147,8 @@ func TestBlockHandler_TheSweepGoroutinePostsAndTheConsumerCommits(t *testing.T) 
 
 	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 0 }, 5*time.Second),
 		"the sweep goroutine must post the commit and the consumer must carry it out")
+
+	h.requireCommitted(t, child)
 
 	_, failed := h.sm.recentlyFailedBlocks.Get(child)
 	require.False(t, failed, "the block was committed, not given up on")

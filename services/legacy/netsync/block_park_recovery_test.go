@@ -14,7 +14,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -163,8 +162,6 @@ func TestSyncManager_AParkedOrphanIsStillAnsweredWithAGetblocks(t *testing.T) {
 
 			child := h.blocks[1].MsgBlock().BlockHash()
 
-			h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-
 			require.NoError(t, h.deliver(t, 1))
 
 			require.Equal(t, 1, h.sm.blockPark.Len(), "the block must be kept, not thrown away")
@@ -182,14 +179,16 @@ func TestSyncManager_AParkedOrphanIsStillAnsweredWithAGetblocks(t *testing.T) {
 // owes it from the committed tip on every call, with no position or index of
 // its own to lose, which is what makes this safe with no header list behind it
 // at all.
+//
+// The front is the block one above the committed tip. On a real chain the
+// harness's blocks[0] commits on arrival (its parent is genesis), so the front
+// here is blocks[1], parked above a blocks[0] that is committed after it.
 func TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
-	front := h.blocks[0].MsgBlock().BlockHash()
+	front := h.blocks[1].MsgBlock().BlockHash()
 
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-
-	require.NoError(t, h.deliver(t, 0))
+	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len(), "the front block parks like any other orphan")
 
 	// The block is given up on. The trigger used to be a thirty-minute timer;
@@ -198,7 +197,7 @@ func TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp(t *testing.
 	// for again. So this drives the give-up through a path that does rewind and
 	// that a node meets in earnest: the parent turns up, the sweep goes to
 	// commit the block, and its blob will not read back.
-	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
+	h.chainHolds(t, h.blocks[0].MsgBlock().BlockHash())
 	h.store.failReadsWith(errors.ErrBlobNotFound)
 
 	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
@@ -223,9 +222,6 @@ func TestSyncManager_AParkedBlockThatWillNotReadBackIsAskedForAgain(t *testing.T
 	child := h.blocks[1].MsgBlock().BlockHash()
 	parent := h.blocks[0].MsgBlock().BlockHash()
 
-	h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
@@ -235,24 +231,17 @@ func TestSyncManager_AParkedBlockThatWillNotReadBackIsAskedForAgain(t *testing.T
 
 	before := h.rec.getDataCount()
 
-	// The parent's own parent (genesis) has to still answer reachable at this
-	// second delivery: the first delivery's own topUpHeaderBlocks already
-	// pruned genesis from the header cache (headerCache.Prune keeps only what
-	// is still ahead of the committed tip), so parentIsReachable's fallback to
-	// the chain is what this test now needs explicitly, not an accident of
-	// call order.
-	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
-
 	// See drainOneParkCommit's own doc comment: the parent's arrival resolves
-	// its own parent (genesis) immediately, so handleBlockOnDiskMsg posts
-	// straight to a channel rather than committing inline, and this drains it
-	// the way a running node's consumer loop would.
+	// its own parent (genesis, always in the real chain) immediately, so
+	// handleBlockOnDiskMsg posts straight to a channel rather than committing
+	// inline, and this drains it the way a running node's consumer loop would.
 	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
 
 	// The parent commits, so the drain reaches for the child and finds nothing.
 	require.NoError(t, h.deliver(t, 0))
 	h.drainOneParkCommit(t)
 
+	h.requireCommitted(t, parent)
 	require.Zero(t, h.sm.blockPark.Len(), "a block that cannot be read back must not stay in the index")
 
 	h.sm.fetchHeaderBlocks()
@@ -296,34 +285,31 @@ func TestSyncManager_AParkedBlockThatWillNotCommitIsGivenUpAndRejected(t *testin
 			child := h.blocks[1].MsgBlock().BlockHash()
 			parent := h.blocks[0].MsgBlock().BlockHash()
 
-			// The streaming route only ever calls GetBlockExists(child) once,
-			// on the drain's real commit attempt below (parking itself never
-			// calls it), and that call fails with a fault that is the
-			// block's and not the local node's, so the error itself is a
-			// judgement on the block.
-			h.client.On("GetBlockExists", mock.Anything, &child).
-				Return(false, errors.NewBlockInvalidError("this block is not one we can take")).Once()
-			h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
-			h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+			// Block validation's verdict on the child, at the drain's real
+			// commit attempt below: a fault that is the block's and not the
+			// local node's, so the error itself is a judgement on the block.
+			h.validation.failOnce(child, errors.NewBlockInvalidError("this block is not one we can take"))
 
 			require.NoError(t, h.deliver(t, 1))
 			require.Equal(t, 1, h.sm.blockPark.Len())
 
 			before := h.rec.getDataCount()
 
-			// The first delivery's own topUpHeaderBlocks already pruned genesis
-			// from the header cache, so the parent's own reachability at this
-			// second delivery needs the chain to answer for it explicitly.
-			h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
-
 			// See drainOneParkCommit's own doc comment: the parent's arrival
-			// resolves its own parent (genesis) immediately, so
-			// handleBlockOnDiskMsg posts straight to a channel rather than
-			// committing inline.
+			// resolves its own parent (genesis, always in the real chain)
+			// immediately, so handleBlockOnDiskMsg posts straight to a channel
+			// rather than committing inline.
 			h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
 
 			require.NoError(t, h.deliver(t, 0))
 			h.drainOneParkCommit(t)
+
+			h.requireCommitted(t, parent)
+			require.Equal(t, 1, h.validation.callsFor(child), "the child reached block validation, which is what judged it")
+
+			exists, err := h.chain.GetBlockExists(h.sm.ctx, &child)
+			require.NoError(t, err)
+			require.False(t, exists, "a refused block is not in the chain")
 
 			require.Zero(t, h.sm.blockPark.Len(), "a block that will not commit must not stay parked")
 
@@ -361,10 +347,10 @@ func TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked(t *testi
 	child := h.blocks[1].MsgBlock().BlockHash()
 	parent := h.blocks[0].MsgBlock().BlockHash()
 
-	// The parent commits, but the child's own parent lookup still fails, which
-	// is exactly what a reorg under the drain looks like.
-	h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+	// The parent's commit reports success, but the chain never gets the row,
+	// so the child's own parent lookup still fails: exactly what a reorg
+	// between the parent's commit and the child's lookup looks like.
+	h.validation.recordOnlyFor(parent)
 
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
@@ -373,7 +359,10 @@ func TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked(t *testi
 
 	require.NoError(t, h.deliver(t, 0))
 
+	require.Equal(t, 1, h.validation.callsFor(parent), "sanity: the parent's commit was reported")
 	require.Equal(t, 1, h.sm.blockPark.Len(), "a block whose parent went missing again must stay parked")
+	require.False(t, h.parkedEntry(t, child).parentMissingAt.IsZero(), "the ParentGone row stamped the entry, so the next turn is not spent on it")
+	require.Zero(t, h.validation.callsFor(child), "a block whose parent is missing never reaches block validation")
 	require.Equal(t, parkedBytes, h.sm.blockPark.Bytes(), "putting a block back must not lose or double its budget")
 	require.Contains(t, parkDirEntries(t, h.parkDir), child.String()+".block",
 		"the blob must still be on disk for the retry")
@@ -394,18 +383,16 @@ func TestSyncManager_AParkedBlockIsKeptWhenTheCommitIsCancelled(t *testing.T) {
 	child := h.blocks[1].MsgBlock().BlockHash()
 	parent := h.blocks[0].MsgBlock().BlockHash()
 
-	// The streaming route only ever calls GetBlockExists(child) once, at the
-	// real commit attempt below (parking itself never calls it).
-	h.client.On("GetBlockExists", mock.Anything, &child).
-		Return(false, errors.NewContextCanceledError("shutting down", context.Canceled)).Once()
-	h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+	// The child's commit is cancelled mid-flight at block validation; the
+	// parent's goes through.
+	h.validation.failOnce(child, errors.NewContextCanceledError("shutting down", context.Canceled))
 
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
 	require.NoError(t, h.deliver(t, 0))
 
+	h.requireCommitted(t, parent)
 	require.Equal(t, 1, h.sm.blockPark.Len(), "a cancelled commit must leave the block parked for the restart scan")
 	require.Contains(t, parkDirEntries(t, h.parkDir), child.String()+".block")
 

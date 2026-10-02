@@ -6,7 +6,6 @@ import (
 
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,8 +29,6 @@ func TestSyncManager_AParkedBlockIsNotDownloadedAllOverAgain(t *testing.T) {
 	// Past the final checkpoint: headers-first mode is over and the inventory
 	// path is what fetches blocks.
 	h.sm.headersFirstMode.Store(false)
-
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 
 	// The queue handleInvMsg drains into a getdata, which the real constructor
 	// builds and this struct-literal harness does not.

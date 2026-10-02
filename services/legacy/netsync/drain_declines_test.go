@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,9 +62,6 @@ func TestADeclinedDrainDoesNotCostTheTurn(t *testing.T) {
 	// about to need.
 	h.sm.drainAsync.Store(true)
 	h.sm.scheduleDrain(chainhash.Hash{0xaa}, 0)
-
-	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
 	go h.sm.dispatchBlocks()
 

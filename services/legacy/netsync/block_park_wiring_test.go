@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"net/url"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,19 +19,25 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	chainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-// parkWiringHarness is a sync manager with a real, file-backed park and a
-// blockchain client that reports every block missing until told otherwise, so a
-// block really does arrive before its parent.
+// parkWiringHarness is a sync manager with a real, file-backed park and a real
+// blockchain client over a sqlitememory store, so a block really does arrive
+// before its parent and really is committed once the parent is there.
+//
+// The store starts holding regtest genesis and nothing else. That is the one
+// fact every test here builds on: blocks[0]'s parent is always in the chain, so
+// a delivery of blocks[0] commits on arrival, and blocks[1] and blocks[2] park
+// until something stores the block under them (chainHolds, or a commit).
 type parkWiringHarness struct {
 	sm      *SyncManager
-	client  *blockchain2.Mock
+	chain   *parkWiringChain
 	peer    *peerpkg.Peer
 	rec     *peerMsgRecorder
 	parkDir string
@@ -39,38 +47,61 @@ type parkWiringHarness struct {
 	// without disturbing the blob itself. Pass-through until a test says
 	// otherwise, so every other test in this file is unaffected.
 	store *parkReadFaultStore
-	// noSuchBlock is the catch-all GetBlockHeader expectation. testify matches
-	// the first registered expectation whose arguments fit, so a per-hash answer
-	// added later would never be reached while this one stands. chainHolds
-	// unsets it, adds the specific answer, and puts it back behind.
-	noSuchBlock *mock.Call
-	// genesis is the hash the header cache is filled from — height 0 there,
-	// unlike every h.blocks entry (height index+1) — so chainHolds can answer
-	// with the height the header cache already committed to, rather than a
-	// flat guess that only happened to fit blocks[0]'s own parent.
+	// validation is what HandleConvertedBlock commits through. It stores each
+	// block it is handed in chain, so a drained block's parent lookup reads a
+	// real row, and it is where a test injects a commit failure
+	// (failOnce), the one place a production commit failure originates.
+	validation *convertedRouteSpyValidation
+	// genesis is the hash the header cache is filled from, height 0 there and
+	// always in the store, unlike every h.blocks entry (height index+1).
 	genesis chainhash.Hash
 }
 
-// heightOf resolves hash to the height the harness's own header cache gave
-// it: 0 for genesis, index+1 for h.blocks[index]. chainHolds and
-// chainHoldsInvalid use this so a mocked GetBlockHeader answer never
-// disagrees with pipelineParentHeight's own header-cache resolution — a
-// disagreement here is exactly what turned into a spurious "block height is
-// not the correct height" commit failure the first time this harness reused
-// a flat Height: 1 for genesis instead of genesis's real height, 0.
-func (h *parkWiringHarness) heightOf(hash chainhash.Hash) uint32 {
-	if hash.IsEqual(&h.genesis) {
-		return 0
-	}
+// parkWiringChain is the real LocalClient over a sqlitememory store with the
+// two seams the park tests need and the real client cannot give: the FSM state
+// (LocalClient hard-codes RUNNING, and handleBlockMsg's reject suppression
+// turns on it) and a GetBlockHeader fault, for the test that proves a store
+// fault is not read as a missing parent. It also counts GetBlockIsMined polls
+// for the mined-wait test. Every other call reaches the real store.
+type parkWiringChain struct {
+	blockchain2.ClientI
 
-	for i, b := range h.blocks {
-		if bh := b.MsgBlock().BlockHash(); bh.IsEqual(&hash) {
-			return uint32(i + 1) //nolint:gosec // a small fixture index, never negative
-		}
-	}
-
-	return 1
+	fsm        atomic.Pointer[blockchain2.FSMStateType]
+	headerErr  atomic.Pointer[error]
+	minedPolls atomic.Int32
 }
+
+func (c *parkWiringChain) GetFSMCurrentState(context.Context) (*blockchain2.FSMStateType, error) {
+	return c.fsm.Load(), nil
+}
+
+func (c *parkWiringChain) IsFSMCurrentState(_ context.Context, state blockchain2.FSMStateType) (bool, error) {
+	return *c.fsm.Load() == state, nil
+}
+
+func (c *parkWiringChain) GetBlockHeader(ctx context.Context, hash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	if e := c.headerErr.Load(); e != nil {
+		return nil, nil, *e
+	}
+
+	return c.ClientI.GetBlockHeader(ctx, hash)
+}
+
+func (c *parkWiringChain) GetBlockIsMined(ctx context.Context, hash *chainhash.Hash) (bool, error) {
+	c.minedPolls.Add(1)
+
+	return c.ClientI.GetBlockIsMined(ctx, hash)
+}
+
+// failHeaderReadsWith makes every GetBlockHeader fail with err, the way a store
+// that is briefly not answering does.
+func (c *parkWiringChain) failHeaderReadsWith(err error) {
+	c.headerErr.Store(&err)
+}
+
+// parkWiringStoreCounter gives each harness its own sqlitememory database:
+// the driver shares one in-memory database per name within the process.
+var parkWiringStoreCounter atomic.Int64
 
 func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
 	t.Helper()
@@ -91,21 +122,6 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 
 	blocks := minedBlocks(t, 3)
 
-	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
-
-	client := &blockchain2.Mock{}
-	client.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
-	// Height 0, not some other placeholder: committedTip reads this mock
-	// directly now, and the header cache below is seeded starting at height 1
-	// — genesis plus these mined blocks — so the two have to agree on where
-	// the chain sits or the wanted range computed from them names nothing.
-	client.On("GetBestBlockHeader", mock.Anything).Return(bestHeader, &model.BlockHeaderMeta{Height: 0}, nil)
-	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return([]*chainhash.Hash{{}}, nil)
-	// Nothing is stored, so every parent lookup fails the way it does for a
-	// block that arrives before its parent.
-	noSuchBlock := client.On("GetBlockHeader", mock.Anything, mock.Anything).
-		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
-
 	root := t.TempDir()
 
 	storeURL, err := url.Parse("file://" + root)
@@ -116,11 +132,39 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 
 	store := &parkReadFaultStore{Store: realStore}
 
+	// Regtest params, so the store seeds the regtest genesis the header cache
+	// below is filled from and minedBlocks builds on.
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.TempStore = storeURL
 
+	// The harness has no utxoStore, so legacyOutpointOnly is false and every
+	// block above height 1 waits on its parent's mined_set before it commits.
+	// chainHolds and the spy both store with mined_set, so the wait is one
+	// lookup; a test that stores a parent WITHOUT it (chainHoldsUnmined) wants
+	// the wait to give up in milliseconds, not the default 45 retries.
+	tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 1
+	tSettings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
+	tSettings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
+
+	ctx := context.Background()
+
+	chainURL, err := url.Parse("sqlitememory:///park_wiring_" + strconv.FormatInt(parkWiringStoreCounter.Add(1), 10))
+	require.NoError(t, err)
+
+	bcStore, err := blockchainstore.NewStore(ulogger.TestLogger{}, chainURL, tSettings)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = bcStore.Close(ctx) })
+
+	local, err := blockchain2.NewLocalClient(ulogger.TestLogger{}, tSettings, bcStore, store, nil)
+	require.NoError(t, err)
+
+	chain := &parkWiringChain{ClientI: local}
+	chain.fsm.Store(&fsmState)
+
+	validation := &convertedRouteSpyValidation{chain: chain}
+
 	sm := newRaceManager(t)
-	sm.ctx = context.Background()
+	sm.ctx = ctx
 	sm.settings = tSettings
 	// chainParams stays newRaceManager's default (MainNetParams) deliberately:
 	// several tests outside this file (e.g. TestParkedDispatchMayBeWindowed)
@@ -132,7 +176,10 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	// answering false for these fixture heights under mainnet checkpoints is
 	// harmless — none of this file's tests assert on the .subtree vs
 	// .subtreeToCheck file suffix that decision drives.
-	sm.blockchainClient = client
+	sm.blockchainClient = chain
+	// The commit is real: HandleConvertedBlock ends in ProcessBlock, and with a
+	// real chain every block whose parent is stored gets that far.
+	sm.blockValidation = validation
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 	sm.rejectedTxns = txmap.NewSyncedMap[chainhash.Hash, struct{}](100)
 	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Minute)
@@ -162,21 +209,16 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	sm.headersFirstMode.Store(true)
 
 	// assignWantedBlocks reads the header cache, one node per block, in order,
-	// none of them requested yet. The chain mock above reports height 0, which
-	// is exactly the height these blocks (1, 2, 3, ...) sit above.
+	// none of them requested yet. The fresh store's best block is genesis at
+	// height 0, which is exactly the height these blocks (1, 2, 3, ...) sit
+	// above.
 	//
-	// Genesis itself is included as the run's own height-0 entry, not merely
-	// the anchor it is filled from. Genesis is always in the chain in
-	// reality, but the harness's blockchain mock answers every GetBlockHeader
-	// with "no such block" by default, and the streaming route now checks a
-	// block's parent for reachability the same way for every arrival
-	// (parentIsReachable, streaming_install.go) — including the harness's own
-	// height-1 blocks, whose parent is genesis. Naming genesis in the header
-	// cache is what makes it reachable without also answering "yes, this is
-	// committed" (that is parentIsInChain's separate GetBlockHeader check,
-	// which stays false until a test's own chainHolds says otherwise) — so a
-	// height-1 delivery parks like any other orphan instead of being
-	// discarded, or committed on the strength of an unrelated mock.
+	// Genesis is included as the run's own height-0 entry, not merely the
+	// anchor it is filled from, so the cache describes the same chain the
+	// store holds. The store really does hold genesis, so blocks[0] is
+	// committable the moment it is delivered (parentIsInChain,
+	// streaming_install.go), while blocks[1] and blocks[2] park until the
+	// block under them is stored.
 	genesis := bsvutil.NewBlock(chaincfg.RegressionNetParams.GenesisBlock)
 	genesisHeader := genesis.MsgBlock().Header
 
@@ -189,46 +231,91 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	}
 	require.True(t, sm.headerCache.Fill(genesisHeader.PrevBlock, 0, headers))
 
-	return &parkWiringHarness{sm: sm, client: client, peer: syncPeer, rec: rec, parkDir: parkDirectory(storeURL), blocks: blocks, store: store, noSuchBlock: noSuchBlock, genesis: genesisHeader.BlockHash()}
+	return &parkWiringHarness{sm: sm, chain: chain, peer: syncPeer, rec: rec, parkDir: parkDirectory(storeURL), blocks: blocks, store: store, validation: validation, genesis: genesisHeader.BlockHash()}
 }
 
-// chainHolds makes the blockchain answer that it has this block, and that the
-// block is valid.
+// fixtureBlock returns the harness block with this hash.
+func (h *parkWiringHarness) fixtureBlock(t *testing.T, hash chainhash.Hash) *bsvutil.Block {
+	t.Helper()
+
+	for _, b := range h.blocks {
+		if bh := b.MsgBlock().BlockHash(); bh.IsEqual(&hash) {
+			return b
+		}
+	}
+
+	t.Fatalf("fixtureBlock: %s is not one of the harness's blocks; a real store cannot hold a block at an arbitrary hash", hash)
+
+	return nil
+}
+
+// storeBlock puts a harness block into the real chain store with the given
+// options, as a commit that happened outside this test would have. Storing a
+// block the chain already holds is a no-op, so a block the spy has already
+// committed can be named again.
+func (h *parkWiringHarness) storeBlock(t *testing.T, hash chainhash.Hash, opts ...chainoptions.StoreBlockOption) {
+	t.Helper()
+
+	if hash.IsEqual(&h.genesis) {
+		return
+	}
+
+	blk, err := model.NewBlockFromMsgBlock(h.fixtureBlock(t, hash).MsgBlock(), h.sm.settings)
+	require.NoError(t, err)
+
+	err = h.chain.AddBlock(h.sm.ctx, blk, "", opts...)
+	if err != nil && errors.Is(err, errors.ErrBlockExists) {
+		return
+	}
+
+	require.NoError(t, err)
+}
+
+// chainHolds puts this block into the real chain, committed and mined, the way
+// a commit this node made before the test started would have left it. For
+// genesis it is a no-op: genesis is always stored.
 //
 // The sweep asks GetBlockHeader rather than GetBlockExists because invalidation
 // is a flag on the row and not a delete, so existence alone cannot say whether a
-// parent is usable. The harness answers "no such block" for everything by
-// default, and testify serves the first matching expectation, so making one hash
-// resolve means taking the catch-all out and putting it back behind the specific
-// answer.
+// parent is usable; both read the same real row here.
 func (h *parkWiringHarness) chainHolds(t *testing.T, hash chainhash.Hash) {
 	t.Helper()
 
-	h.noSuchBlock.Unset()
-
-	h.client.On("GetBlockHeader", mock.Anything, &hash).
-		Return(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
-			&model.BlockHeaderMeta{Height: h.heightOf(hash)}, nil)
-
-	h.noSuchBlock = h.client.On("GetBlockHeader", mock.Anything, mock.Anything).
-		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
+	h.storeBlock(t, hash, chainoptions.WithMinedSet(true), chainoptions.WithSubtreesSet(true))
 }
 
-// chainHoldsInvalid is the same, for a parent this node has stored and rejected.
-// A parked block behind one of those can never be committed, however long it is
-// held, and committing it on the strength of the parent merely existing is the
-// hole the pair closes.
-func (h *parkWiringHarness) chainHoldsInvalid(t *testing.T, hash chainhash.Hash) {
+// chainHoldsUnmined stores the block committed but with mined_set still clear,
+// which is the state a parent is in between block validation storing it and
+// setTxMined finishing.
+func (h *parkWiringHarness) chainHoldsUnmined(t *testing.T, hash chainhash.Hash) {
 	t.Helper()
 
-	h.noSuchBlock.Unset()
+	h.storeBlock(t, hash, chainoptions.WithSubtreesSet(true))
+}
 
-	h.client.On("GetBlockHeader", mock.Anything, &hash).
-		Return(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
-			&model.BlockHeaderMeta{Height: h.heightOf(hash), Invalid: true}, nil)
+// parkedEntry returns the park's own entry for hash, failing the test if it is
+// not parked.
+func (h *parkWiringHarness) parkedEntry(t *testing.T, hash chainhash.Hash) parkedBlock {
+	t.Helper()
 
-	h.noSuchBlock = h.client.On("GetBlockHeader", mock.Anything, mock.Anything).
-		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
+	h.sm.blockPark.mu.Lock()
+	defer h.sm.blockPark.mu.Unlock()
+
+	entry, ok := h.sm.blockPark.entries[hash]
+	require.True(t, ok, "%s is not parked", hash)
+
+	return *entry
+}
+
+// requireCommitted asserts the end state a committed block must reach: it is in
+// the real chain, and block validation was handed it exactly once.
+func (h *parkWiringHarness) requireCommitted(t *testing.T, hash chainhash.Hash) {
+	t.Helper()
+
+	exists, err := h.chain.GetBlockExists(h.sm.ctx, &hash)
+	require.NoError(t, err)
+	require.True(t, exists, "%s must be in the chain, not merely gone from the park", hash)
+	require.Equal(t, 1, h.validation.callsFor(hash), "block validation must have been handed %s exactly once", hash)
 }
 
 // deliver streams one block through the pipeline sink and the on-disk
@@ -329,24 +416,23 @@ func TestSyncManager_AParkedBlockIsCommittedWhenItsParentArrives(t *testing.T) {
 	require.Equal(t, 1, h.sm.blockPark.Len(), "a block whose parent is missing must be kept, not thrown away")
 	require.Contains(t, parkDirEntries(t, h.parkDir), child.String()+".block")
 
-	// Now the parent arrives. Its own parent is genesis, which the streaming
-	// route checks via GetBlockHeader (parentIsInChain, streaming_install.go)
-	// before it will even attempt a commit — chainHolds is what makes that
-	// check pass. GetBlockExists answering true for everything after this is
-	// the existing "already exists" short-circuit HandleConvertedBlock and
-	// HandleBlockDirect share, which is enough for the park's own bookkeeping
-	// (this is a wiring test, not a validation test).
-	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-
+	// Now the parent arrives. Its own parent is genesis, which the real store
+	// holds, so the streaming route's parentIsInChain check
+	// (streaming_install.go) passes and the parent can be committed now.
+	//
 	// New() builds this channel unconditionally; wired by hand here so the
-	// parent's own arrival — its parent (genesis) already resolvable — posts
-	// rather than committing through handleBlockOnDiskMsg's own direct call,
-	// which see drainOneParkCommit's own doc comment for why to avoid.
+	// parent's own arrival posts rather than committing through
+	// handleBlockOnDiskMsg's own direct call, which see drainOneParkCommit's
+	// own doc comment for why to avoid.
 	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
 
 	require.NoError(t, h.deliver(t, 0))
 	h.drainOneParkCommit(t)
+
+	// Both blocks are in the real chain, each handed to block validation once:
+	// the parent by its own arrival, the child by the drain behind it.
+	h.requireCommitted(t, h.blocks[0].MsgBlock().BlockHash())
+	h.requireCommitted(t, child)
 
 	require.Zero(t, h.sm.blockPark.Len(), "the parked block must be committed once its parent is in the chain")
 	require.Zero(t, h.sm.blockPark.Bytes(), "committing a parked block must give its budget back")
@@ -380,9 +466,6 @@ func TestSyncManager_AParkedBlockFromADepartedPeerStillCommits(t *testing.T) {
 	h.sm.storeSyncPeer(other, &syncPeerState{})
 	h.peer = other
 
-	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-
 	// See drainOneParkCommit's own doc comment for why this channel needs to
 	// be wired by hand for the parent's own arrival to commit correctly.
 	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
@@ -392,6 +475,9 @@ func TestSyncManager_AParkedBlockFromADepartedPeerStillCommits(t *testing.T) {
 	}, "a parked block whose peer has gone must still commit")
 
 	h.drainOneParkCommit(t)
+
+	h.requireCommitted(t, h.blocks[0].MsgBlock().BlockHash())
+	h.requireCommitted(t, child)
 
 	require.Zero(t, h.sm.blockPark.Len(), "losing the delivering peer must not lose the block")
 
@@ -403,30 +489,40 @@ func TestSyncManager_AParkedBlockFromADepartedPeerStillCommits(t *testing.T) {
 // that tells the two apart: nothing may be drained behind a block that did not
 // go into the chain.
 //
-// The mechanism for "the parent did not go into the chain" changed with the
-// streaming route: there is no decoded handleBlockMsg any more to return nil
-// from an orphan branch. Here the parent (blocks[0]) is itself an orphan
-// relative to genesis, which the harness never puts in the header cache or
-// the chain, so parentIsReachable (streaming_install.go) discards it outright
-// before any commit is even attempted — a stronger guarantee than "attempted
-// and failed", but the same property: the child parked behind it must be left
-// alone.
+// The parent (blocks[0]) arrives with its own parent, genesis, in the chain, so
+// it is committed on arrival, and block validation refuses it. That is the
+// mechanism a node meets: a block that reaches the commit and is judged
+// invalid. The child parked behind it must be left exactly where it is, with
+// its blob, unjudged and never offered to block validation. Draining it would
+// either fail it for a missing parent or, worse, commit it on top of a block
+// this node has just rejected.
 func TestSyncManager_NothingIsDrainedAfterABlockThatDidNotCommit(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
+	parent := h.blocks[0].MsgBlock().BlockHash()
 	child := h.blocks[1].MsgBlock().BlockHash()
 
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
-	// The parent itself now arrives and is discarded as unreachable (its own
-	// parent, genesis, is neither committed nor in the header list).
+	// Block validation's verdict on the parent, at the one place a production
+	// commit failure originates.
+	h.validation.failOnce(parent, errors.NewBlockInvalidError("refused"))
+
 	require.NoError(t, h.deliver(t, 0))
+
+	_, parentFailed := h.sm.recentlyFailedBlocks.Get(parent)
+	require.True(t, parentFailed, "the parent was judged, so it is remembered as failed")
+
+	exists, err := h.chain.GetBlockExists(h.sm.ctx, &parent)
+	require.NoError(t, err)
+	require.False(t, exists, "a refused block is not in the chain")
 
 	require.Equal(t, 1, h.sm.blockPark.Len(),
 		"the parent never landed, so nothing may be drained behind it")
 	require.Contains(t, parkDirEntries(t, h.parkDir), child.String()+".block",
 		"the child's blob must still be on disk; a drain that should not have run would have given it up")
+	require.Zero(t, h.validation.callsFor(child), "the child must never have been offered to block validation")
 
 	_, failed := h.sm.recentlyFailedBlocks.Get(child)
 	require.False(t, failed, "a block nobody tried to commit must not be marked as having failed")
@@ -449,24 +545,21 @@ func TestHandleConvertedBlock_ToleratesANilPeer(t *testing.T) {
 	blk := bodyCommitment(t, bsvutil.NewBlock(msgBlock))
 
 	// The parent IS stored, so the block gets past the parent lookup and reaches
-	// the tracing call that names the peer. It is stopped just after, on the
-	// parent's mined status, so the test does not need the whole ingest pipeline.
-	h.client = &blockchain2.Mock{}
-	h.sm.blockchainClient = h.client
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-	h.client.On("GetBlockHeader", mock.Anything, &prev).
-		Return(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
-			&model.BlockHeaderMeta{Height: 1}, nil)
-	h.client.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(false, nil)
+	// the tracing call that names the peer. It is stored without mined_set, so
+	// the call is stopped just after, on the parent's mined status, and the
+	// test does not need the whole ingest pipeline. The harness's retry
+	// settings make that wait give up after one retry.
+	h.chainHoldsUnmined(t, prev)
 
 	h.sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
-	h.sm.settings.BlockValidation.IsParentMinedRetryMaxRetry = 1
-	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
 
 	require.NotPanics(t, func() {
 		err := h.sm.HandleConvertedBlock(context.Background(), nil, hash, blk)
-		require.Error(t, err, "the parent is not mined, so this must fail there — not on a nil peer")
+		require.Error(t, err, "the parent is not mined, so this must fail there, not on a nil peer")
+		require.True(t, errors.Is(err, errors.ErrBlockParentNotMined), "the failure must be the mined wait's, not something earlier: %v", err)
 	})
+
+	require.Zero(t, h.validation.callsFor(hash), "a block whose parent is not mined yet never reaches block validation")
 }
 
 // TestSyncManager_TheSweepCommitsABlockWhoseParentTurnedUpQuietly. A block can
@@ -482,10 +575,11 @@ func TestSyncManager_TheSweepCommitsABlockWhoseParentTurnedUpQuietly(t *testing.
 
 	// The parent is in the chain, but nothing in this node committed it, so no
 	// drain was ever triggered.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
 
 	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
+
+	h.requireCommitted(t, h.blocks[1].MsgBlock().BlockHash())
 
 	require.Zero(t, h.sm.blockPark.Len(),
 		"a parked block whose parent is in the chain must be committed by the sweep, not left waiting")
@@ -509,8 +603,6 @@ func TestSyncManager_TheSweepKeepsABlockWhoseParentIsMerelyLate(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
 	child := h.blocks[1].MsgBlock().BlockHash()
-
-	h.client.On("GetBlockExists", mock.Anything, &child).Return(false, nil).Once()
 
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
