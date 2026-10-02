@@ -186,18 +186,22 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 
 	converted, err := blockBodySink(hash, &header, &counted, int64(length))
 	if err != nil {
-		// A connection that ended mid-body comes back from the sink as the bare
-		// io.EOF or io.ErrUnexpectedEOF so that peer.shouldHandleReadError, which
-		// compares the read error against those sentinels with ==, logs a
+		// Every judgement the sink makes carries a teranode code outermost (the
+		// producer rule on pipelineBlockSink, services/legacy/netsync). What
+		// carries none is the connection's: a hang-up by FIN before the declared
+		// length comes back as the bare io.ErrUnexpectedEOF, and a socket that
+		// failed (a reset, a closed connection) as the bare *net.OpError the
+		// socket returned. peer.shouldHandleReadError reads those by identity, the
+		// sentinels with == and the OpError with a type assertion, and logs a
 		// disconnect instead of pushing a reject for a "malformed" message. go-wire
 		// and readMessageStreaming pass the handler's error through untouched, so
 		// this wrap was the one place that identity was lost; it is kept for every
-		// other sink error and skipped for these two. Compared by identity here
-		// too, deliberately: the sink's rule is to return the bare sentinel, and
-		// teranode's (*Error).Is matches a non-teranode target by message text, so
-		// errors.Is would read any wrapped error mentioning EOF as the connection
-		// ending.
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		// coded verdict and skipped for anything uncoded. The code is looked for
+		// with errors.As, not errors.Is: teranode's (*Error).Is matches a
+		// non-teranode target by message text, so errors.Is against a sentinel
+		// would read any wrapped error mentioning EOF as the connection ending.
+		var coded *errors.Error
+		if !errors.As(err, &coded) {
 			return nil, deleteOrphanedBody(hash, converted, err)
 		}
 

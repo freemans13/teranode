@@ -299,6 +299,75 @@ func TestWire_AMidBodyEOFReachesTheReadLoopByIdentity(t *testing.T) {
 	requireNothingOfTheBlockOnDisk(t, store, hash, roots)
 }
 
+// TestPipelineSink_AResetMidTransactionIsADeliveryFaultNotAnInvalidBlock is the
+// socket-error twin of the cut-body test above, on the real sink: the connection
+// dies inside a transaction with a *net.OpError (a reset by the peer, a NAT timing
+// out, the idle timer closing the socket) instead of a FIN. The error leaves the
+// sink bare and by identity, because peer.shouldHandleReadError type-asserts
+// *net.OpError directly and logs a network error instead of pushing a reject. It
+// carries neither the invalid nor the corrupt code, and the classifier does not
+// read it as this node's fault. Nothing of the block is left on disk.
+func TestPipelineSink_AResetMidTransactionIsADeliveryFaultNotAnInvalidBlock(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.blockDownloads = newBlockDownloadTracker(time.Hour)
+
+	msgBlock, hash := regtestStreamedBlock(t, sm, 40)
+	roots := goodRunSubtreeRoots(t, msgBlock, hash)
+	body := blockBodyBytes(t, bsvutil.NewBlock(msgBlock))
+
+	// Seven bytes short of the last transaction, so the reset lands inside it; n
+	// still declares the whole body.
+	reset := connectionReset()
+	src := &resetReader{r: bytes.NewReader(body[:len(body)-7]), err: reset}
+
+	converted, err := sm.pipelineBlockSink(hash, &msgBlock.Header, src, sinkPayloadLen(body))
+	require.False(t, converted)
+	require.Error(t, err)
+	require.Same(t, reset, err, "the read loop type-asserts *net.OpError (peer.go shouldHandleReadError), so the socket's own error must come out")
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "a reset mid-body is not an invalid block")
+	require.False(t, errors.IsBlockCorrupt(err), "nor a corrupt one: the declared body never finished arriving")
+	require.False(t, isLocalSinkFault(err), "nor this node's fault")
+
+	require.False(t, sm.blockPark.Has(hash))
+	requireNothingOfTheBlockOnDisk(t, store, hash, roots)
+}
+
+// TestWire_AMidBodyResetReachesTheReadLoopByIdentity drives the reset through
+// go-wire's ReadMessageWithEncodingN and the registered handler, the route the
+// peer's read loop takes. readBlockMessage passed only the two EOF sentinels
+// through by identity and wrapped every other sink error in a ProcessingError, so
+// the socket error the sink now preserves was lost one layer up and the peer was
+// still rejected as malformed. A net.Pipe cannot produce a *net.OpError, so this
+// is the highest layer the shape can be driven through in a test.
+func TestWire_AMidBodyResetReachesTheReadLoopByIdentity(t *testing.T) {
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.blockDownloads = newBlockDownloadTracker(time.Hour)
+
+	msgBlock, hash := regtestStreamedBlock(t, sm, 40)
+	roots := goodRunSubtreeRoots(t, msgBlock, hash)
+
+	sm.installStreamingBlockPath(peerpkg.SetBlockBodyStreaming)
+	t.Cleanup(func() { peerpkg.SetBlockBodyStreaming(nil, nil, nil) })
+	peerpkg.RegisterStreamingBlockHandler()
+
+	var framed bytes.Buffer
+	_, err := wire.WriteMessageN(&framed, msgBlock, wire.ProtocolVersion, wire.MainNet)
+	require.NoError(t, err)
+
+	message := framed.Bytes()
+	reset := connectionReset()
+	src := &resetReader{r: bytes.NewReader(message[:len(message)-7]), err: reset}
+
+	_, _, _, err = wire.ReadMessageWithEncodingN(src, wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+	require.Error(t, err)
+	require.Same(t, reset, err, "the wire layer must hand the read loop the socket error it type-asserts")
+
+	require.False(t, sm.blockPark.Has(hash))
+	requireNothingOfTheBlockOnDisk(t, store, hash, roots)
+}
+
 // TestHandleBlockOnDiskMsg_ALocalFaultDrainLetsTheOtherOwnersOffAndLeavesNoMark
 // pins the ledger outcome in headers-first mode: the delivering peer is released,
 // every other owner is forgiven (not cancelled, so a copy still on the wire from
@@ -424,6 +493,7 @@ func TestIsLocalSinkFault_ReadsTheOutermostVerdict(t *testing.T) {
 		{"block corrupt", errors.NewBlockCorruptError("bytes after the last transaction"), false},
 		{"raw io.EOF", io.EOF, false},
 		{"raw io.ErrUnexpectedEOF", io.ErrUnexpectedEOF, false},
+		{"raw net.OpError", connectionReset(), false},
 		{"plain error", stderrors.New("a socket error with no teranode code"), false},
 	}
 

@@ -43,11 +43,20 @@ import (
 //
 //   - the peer's fault carries ERR_BLOCK_INVALID (a body the header does not
 //     commit to, a duplicate transaction, a count the body cannot hold) or
-//     ERR_BLOCK_CORRUPT (a delivery whose length and transactions disagree). Only
-//     these two codes reach the read loop as a read error, and so a reject.
-//   - a connection that ends mid-body is returned as the bare io.ErrUnexpectedEOF,
-//     by identity, never wrapped (block_tx_stream.go endOfBody): the read loop
-//     compares it with == and logs a disconnect rather than a reject.
+//     ERR_BLOCK_CORRUPT (a delivery whose length and transactions disagree). While
+//     sm.ctx is live only these two codes reach the read loop as a read error, and
+//     so a reject; once it is cancelled absorbLocalSinkFault lets any code through
+//     to the read loop, see its doc comment.
+//   - a connection that ends mid-body carries no teranode code at all, whatever
+//     ended it: a hang-up by FIN before the declared length is returned as the bare
+//     io.ErrUnexpectedEOF (block_tx_stream.go endOfBody), and a socket that failed,
+//     a reset or a closed connection, as the bare *net.OpError the socket returned
+//     (block_tx_stream.go countingSource records it, the stream returns it before
+//     judging anything). Both by identity, never wrapped: the read loop compares
+//     the sentinel with == and type-asserts the OpError, and on a match logs a
+//     disconnect rather than a reject. The wire layer (peer/wire_streaming.go
+//     readBlockMessage) wraps only a coded verdict, so an uncoded error keeps its
+//     identity all the way up.
 //   - everything else is this node's: a store that failed (ERR_STORAGE_ERROR),
 //     an invariant of our own builder or accumulator (ERR_PROCESSING,
 //     ERR_SUBTREE_ERROR, ERR_TX_ERROR). Those are drained, the peer is kept, and

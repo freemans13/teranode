@@ -3,6 +3,8 @@ package netsync
 import (
 	"bytes"
 	"io"
+	"net"
+	"syscall"
 	"testing"
 
 	"github.com/bsv-blockchain/go-wire"
@@ -115,6 +117,86 @@ func TestBlockTxStream_ABodyCutShortOfItsDeclaredLengthIsADeliveryFault(t *testi
 	_, _, err = s.Next()
 	require.Same(t, io.ErrUnexpectedEOF, err, "a body cut before its declared length is a hang-up, returned by identity")
 	require.NotErrorIs(t, err, errBlockTxStreamDone)
+}
+
+// resetReader hands out its bytes and then fails with the error a connection that
+// died produces instead of a clean FIN: a *net.OpError, which is what net.Conn
+// returns for a reset by the peer, a closed socket or a NAT timing out. A net.Pipe
+// cannot produce one (closing it gives io.EOF or io.ErrClosedPipe), so this is how
+// the shape is driven in a test.
+type resetReader struct {
+	r   io.Reader
+	err error
+}
+
+func (r *resetReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if err == io.EOF {
+		return n, r.err
+	}
+
+	return n, err
+}
+
+// connectionReset is the error a hung-up TCP socket hands the reader: non-temporary
+// by Go's definition (syscall.Errno.Temporary is true only for EINTR, EMFILE, ENFILE
+// and the timeout errnos), so peer.shouldHandleReadError logs it as a network error
+// rather than answering it with a reject.
+func connectionReset() *net.OpError {
+	return &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+}
+
+// TestBlockTxStream_AResetMidTransactionIsADeliveryFault pins the second way a
+// connection ends: not a FIN, which the decoder sees as EOF and endOfBody judges by
+// where the body stopped, but a socket error inside a transaction. That error is
+// the connection's, never the block's, so it leaves the stream bare and by identity
+// (peer.shouldHandleReadError type-asserts *net.OpError directly), with neither the
+// invalid nor the corrupt code and not read as this node's fault either. Before
+// this fix every non-EOF read failure was wrapped in NewBlockInvalidError, so a
+// reset was answered with a reject for a "malformed" block.
+func TestBlockTxStream_AResetMidTransactionIsADeliveryFault(t *testing.T) {
+	var buf bytes.Buffer
+
+	require.NoError(t, wire.WriteVarInt(&buf, wire.ProtocolVersion, 2))
+
+	raw, _ := streamTxBytes(t, 1)
+	_, err := buf.Write(raw)
+	require.NoError(t, err)
+
+	// Half of the second transaction, under a declaration of both in full, then the reset.
+	cut := append([]byte(nil), raw[:len(raw)/2]...)
+	_, err = buf.Write(cut)
+	require.NoError(t, err)
+
+	reset := connectionReset()
+	src := &resetReader{r: bytes.NewReader(buf.Bytes()), err: reset}
+
+	s, err := newBlockTxStream(src, int64(buf.Len()+len(raw)-len(cut)))
+	require.NoError(t, err)
+
+	_, _, err = s.Next()
+	require.NoError(t, err)
+
+	_, _, err = s.Next()
+	require.Error(t, err)
+	require.Same(t, reset, err, "the socket's own error must come out by identity; the read loop type-asserts it")
+	require.NotErrorIs(t, err, errBlockTxStreamDone)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "a reset mid-body says nothing about the block")
+	require.False(t, errors.IsBlockCorrupt(err), "nor about this delivery's declaration: it never finished arriving")
+	require.False(t, isLocalSinkFault(err), "nor is it this node's fault")
+}
+
+// TestBlockTxStream_AResetBeforeTheCountIsADeliveryFault pins the same rule at the
+// count read, the other place the stream reads from the socket and judges the
+// failure, which used to stamp any non-EOF read error as a badly encoded varint.
+func TestBlockTxStream_AResetBeforeTheCountIsADeliveryFault(t *testing.T) {
+	reset := connectionReset()
+
+	_, err := newBlockTxStream(&resetReader{r: bytes.NewReader(nil), err: reset}, 100)
+	require.Error(t, err)
+	require.Same(t, reset, err, "the connection died before a byte of the body arrived")
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid))
+	require.False(t, errors.IsBlockCorrupt(err))
 }
 
 // TestBlockTxStream_RefusesABodyTooShortForACount pins the collision the

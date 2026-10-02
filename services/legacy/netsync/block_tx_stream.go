@@ -76,13 +76,19 @@ func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
 
 	count, err := wire.ReadVarInt(br, wire.ProtocolVersion)
 	if err != nil {
-		// The body ending here is classified by where it ended (endOfBody): a
-		// hang-up before the declared length is returned as the bare EOF
-		// sentinel, a body complete at its declared length with no count in it
-		// is a corrupt delivery. Any other failure is a varint the peer encoded
-		// badly, which is an invalid block. NewBlockInvalidError, not
-		// NewProcessingError: giving it errBlockTxStreamDone's code would make
-		// errors.Is match it against clean exhaustion (see the sentinel's comment).
+		// The connection failing is the socket's error, returned as the socket
+		// gave it (see countingSource), before anything is judged. The body
+		// ending by FIN is classified by where it ended (endOfBody): a hang-up
+		// before the declared length is returned as the bare EOF sentinel, a body
+		// complete at its declared length with no count in it is a corrupt
+		// delivery. Any other failure is a varint the peer encoded badly, which
+		// is an invalid block. NewBlockInvalidError, not NewProcessingError:
+		// giving it errBlockTxStreamDone's code would make errors.Is match it
+		// against clean exhaustion (see the sentinel's comment).
+		if src.err != nil {
+			return nil, src.err
+		}
+
 		if ended := endOfBody(err, src.n, payloadLen, "[blockTxStream] the body ended before a transaction count"); ended != nil {
 			return nil, ended
 		}
@@ -182,10 +188,17 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 			return nil, nil, 0, errors.NewStorageError("[blockTxStream] failed writing transaction %d of the %d declared", s.read, s.txCount, sink.err)
 		}
 
-		// A stream that ends inside a transaction is judged by where the body
-		// ended, not stamped invalid: the peer hanging up says nothing about the
-		// block (see endOfBody). Everything else txstream refuses is the peer's
-		// encoding, an invalid block.
+		// A socket that failed inside a transaction says nothing about the block:
+		// the socket's own error goes out as the socket gave it, before any
+		// judgement, because the decoder above the source may have wrapped it
+		// (see countingSource). A stream that ends by FIN inside a transaction is
+		// judged by where the body ended, not stamped invalid (see endOfBody).
+		// Everything else txstream refuses is the peer's encoding, an invalid
+		// block.
+		if s.src.err != nil {
+			return nil, nil, 0, s.src.err
+		}
+
 		if ended := endOfBody(err, s.src.n, s.bodyLen, "[blockTxStream] the body ended inside transaction %d of the %d declared", s.read, s.txCount); ended != nil {
 			return nil, nil, 0, ended
 		}
@@ -228,8 +241,10 @@ func (s *blockTxStream) RequireEnd() error {
 	}
 }
 
-// endOfBody classifies a read error that is the stream ending, and returns nil for
-// any other error so the caller gives that its own verdict.
+// endOfBody classifies a read error that is the stream ending by FIN, and returns
+// nil for any other error so the caller gives that its own verdict. A socket that
+// failed instead of closing never reaches it: countingSource records that error and
+// the stream returns it bare before calling here.
 //
 // Two things look the same from inside a transaction decoder, an io.EOF or
 // io.ErrUnexpectedEOF, and they are not the same fault. The reader is bounded at
@@ -276,15 +291,33 @@ func endOfBody(err error, consumed, declared int64, corruptMsg string, params ..
 	return errors.NewBlockCorruptError(corruptMsg, params...)
 }
 
-// countingSource counts the bytes read through it.
+// countingSource counts the bytes read through it and remembers the first error
+// its reader returned that was not the stream ending.
+//
+// The reader is the socket: the wire layer's io.LimitedReader over the connection
+// and the countingReader in front of it (peer/wire_streaming.go readBlockMessage)
+// both pass the connection's error through as it is, so what it returns for a
+// reset, a closed socket or a NAT timing out is the bare *net.OpError. Everything
+// above this point may wrap it: go-bt's VarInt.ReadFrom wraps with pkg/errors, and
+// what txstream then returns is that wrapper. The read loop type-asserts
+// *net.OpError directly (peer.shouldHandleReadError), so the bare value is kept
+// here, at the only layer that still has it, and the stream returns it by identity
+// before classifying anything. io.EOF and io.ErrUnexpectedEOF are not recorded:
+// those are the connection ending by FIN, and endOfBody judges them by where the
+// body stopped.
 type countingSource struct {
-	r io.Reader
-	n int64
+	r   io.Reader
+	n   int64
+	err error
 }
 
 func (c *countingSource) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
+
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF && c.err == nil {
+		c.err = err
+	}
 
 	return n, err
 }
