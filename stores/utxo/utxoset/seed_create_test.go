@@ -131,3 +131,79 @@ func TestCreateBatchPanicAnswersEveryCaller(t *testing.T) {
 		}
 	}
 }
+
+// After a seed, nothing may be left below the stamp floor for the stamp worker to trip over.
+// The seed writes a containment row for every transaction, in windows below the floor the hook
+// sets; the stamp never visits those windows, so they could never drop and the worker raised
+// its "can never drop" alarm on every pass. Above the checkpoint the seed also files coins at
+// the unconfirmed sentinel with an identity row, which only the stamp fills in. The hook now
+// settles both: it stamps those coins from their containment rows, removes the identity rows,
+// and drops every window below the floor.
+func TestSetStampFloorsForSeedLeavesNothingBelowTheFloor(t *testing.T) {
+	s, ctx := newTestStore(t) // mainnet checkpoints: 945,000 is the last
+
+	const (
+		below = 500     // block-path create: coins carry their height from birth
+		above = 999_000 // identity-path create, in a window below the seed floor
+		seed  = 1_000_100
+	)
+
+	create := func(id byte, height uint32) chainhash.Hash {
+		var h chainhash.Hash
+		h[0] = 0x5f
+		h[1] = id
+
+		_, _, err := s.SpendAndCreate(ctx, seededTx(map[uint32]uint64{0: 10, 2: 20}), height,
+			utxo.WithCreateOnly(), utxo.WithTXID(&h), utxo.WithSetCoinbase(false),
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 0, BlockHeight: height, SubtreeIdx: 0}))
+		require.NoError(t, err)
+
+		return h
+	}
+
+	low := create(1, below)
+	high := create(2, above)
+
+	minedHeight := func(h chainhash.Hash, vout uint32) int32 {
+		var mh int32
+		require.NoError(t, s.pool.QueryRow(ctx, `SELECT mined_height FROM utxo WHERE leaf = $1 AND ukey = $2 AND txid = $3`,
+			LeafFor(h[:]), Pack(h[:], vout), h[:]).Scan(&mh))
+
+		return mh
+	}
+
+	require.Equal(t, int32(0), minedHeight(high, 0), "precondition: above the checkpoint the seed leaves coins at the sentinel")
+
+	require.NoError(t, s.SetStampFloorsForSeed(ctx, seed))
+
+	floors, err := s.Floors(ctx)
+	require.NoError(t, err)
+
+	windows, err := s.listTxMinedWindows(ctx)
+	require.NoError(t, err)
+
+	for _, w := range windows {
+		require.GreaterOrEqual(t, w.window*TxMinedPartitionBlocks, floors.StampCompleteFloor,
+			"window %s is below the stamp-complete floor and would never drop", w.name)
+	}
+
+	var idents int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_ident`).Scan(&idents))
+	require.Zero(t, idents, "seeded identity rows are settled by the hook, not left for a stamp that never comes")
+
+	for _, vout := range []uint32{0, 2} {
+		require.Equal(t, int32(below), minedHeight(low, vout))
+		require.Equal(t, int32(above), minedHeight(high, vout), "the hook stamps seeded coins above the checkpoint")
+	}
+
+	for h, want := range map[chainhash.Hash]uint32{low: below, high: above} {
+		answers, err := s.ParentOutputsForValidation(ctx, []utxo.Outpoint{{TxID: h, Vout: 2}})
+		require.NoError(t, err)
+		require.NoError(t, answers[0].Err)
+		require.Equal(t, utxo.ParentOutputMined, answers[0].Status)
+		require.Equal(t, want, answers[0].Height)
+		require.Equal(t, uint64(20), answers[0].Satoshis)
+	}
+
+	require.NoError(t, s.SetStampFloorsForSeed(ctx, seed), "a second run is harmless")
+}
