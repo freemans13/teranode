@@ -197,7 +197,7 @@ func (s *Store) sendSpendAndCreateBatch(batch []*spendAndCreateItem) {
 	for i, item := range batch {
 		size := 0
 		if item.tx != nil {
-			size = item.tx.Size()
+			size = txSize(item.tx)
 		}
 
 		if i > start && bytes+size > spendAndCreateBatchByteBudget {
@@ -368,7 +368,7 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 
 	for _, item := range batch {
 		if item.tx != nil {
-			siblings[*item.tx.TxIDChainHash()] = struct{}{}
+			siblings[createTxID(item.tx, item.options)] = struct{}{}
 		}
 	}
 
