@@ -15,6 +15,9 @@ type downloadWaste struct {
 	dupDrained atomic.Int64
 	// dupConverted is copies converted in full for a block already parked.
 	dupConverted atomic.Int64
+	// localFaultDrained is copies drained because this node failed to store the block; the
+	// peer was kept and the block asked for again.
+	localFaultDrained atomic.Int64
 	// streamsFailed is block bodies cut part way, and bytesWasted the bytes of those and of
 	// drained duplicates.
 	streamsFailed atomic.Int64

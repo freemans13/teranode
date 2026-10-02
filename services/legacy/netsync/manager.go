@@ -712,6 +712,9 @@ type SyncManager struct {
 
 	drainedDuplicatesMu sync.Mutex
 	drainedDuplicates   map[chainhash.Hash]int
+	// localFaultDrains counts, per block, copies drained because this node failed to store
+	// them (absorbLocalSinkFault). Guarded by drainedDuplicatesMu; made on first use.
+	localFaultDrains map[chainhash.Hash]int
 	// conversions is the conversion in progress for each block, so a faster copy can take it
 	// over (conversion_race.go).
 	conversionsMu    sync.Mutex

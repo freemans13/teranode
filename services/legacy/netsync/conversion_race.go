@@ -151,9 +151,22 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 		_ = os.Remove(f.Name())
 	}()
 
+	// The side file lives on the park's disk, so a failed write to it is the same class of
+	// fault as a failed record write: ours, and never the peer's. The recorder tells the two
+	// sides of the copy apart; a read failure is the peer's socket and is returned as it is
+	// for the read loop, a write failure drops this copy and drains the rest, as the Flush
+	// branch below already does.
 	w := bufio.NewWriterSize(f, 1<<20)
-	if _, err = io.Copy(w, r); err != nil {
-		return false, err
+	rec := &errRecordingWriter{w: w}
+
+	if _, err = io.Copy(rec, r); err != nil {
+		if rec.err == nil {
+			return false, err
+		}
+
+		sm.logger.Warnf("[blockOnDisk][%s] could not write a second copy to disk, dropping it: %v", hash, rec.err)
+
+		return sm.drainDuplicate(hash, r)
 	}
 
 	if err = w.Flush(); err != nil {

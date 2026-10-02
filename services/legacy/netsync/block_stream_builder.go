@@ -551,8 +551,16 @@ func (b *blockStreamBuilder) Finish() (*chainhash.Hash, []chainhash.Hash, error)
 		return nil, nil, b.failed
 	}
 
+	// A processing error, not an invalid block: this guards the caller's
+	// contract, not the peer's bytes. The builder is told the count up front and
+	// fed by its caller, and the one production caller, pipelineBlockSink, only
+	// reaches Finish after the stream reported errBlockTxStreamDone, which it
+	// does only once every declared transaction was read; a body that ends
+	// early is reported by the stream itself, before Finish, with the verdict
+	// that fits where it ended (block_tx_stream.go endOfBody). So a count this
+	// check finds short is a caller that stopped feeding, which is ours.
 	if b.seen != b.txCount {
-		return nil, nil, b.fail(errors.NewBlockInvalidError("[blockStreamBuilder] stream ended after %d of the %d transactions it declared", b.seen, b.txCount))
+		return nil, nil, b.fail(errors.NewProcessingError("[blockStreamBuilder] stream ended after %d of the %d transactions it declared", b.seen, b.txCount))
 	}
 
 	if b.current != nil && b.current.Length() > 0 {

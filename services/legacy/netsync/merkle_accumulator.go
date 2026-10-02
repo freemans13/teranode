@@ -104,17 +104,26 @@ func (m *merkleAccumulator) Add(st *subtreepkg.Subtree, isLast bool) error {
 		// second subtree has actually shown up, because a single-subtree block
 		// is exempt (Root() never builds a top tree for it); reaching the else
 		// branch at all is proof there is one.
+		//
+		// These three shape checks are processing errors, not invalid blocks:
+		// they judge this node's own partition, never the peer's bytes. The
+		// subtree lengths come from partitionLegacyBlock (every non-final
+		// subtree is maxItems, a power of two by its own check) and from
+		// startSubtree's capacity for the final one; a peer that sends more
+		// transactions than it declared is refused by the builder before any
+		// subtree reaches here. Stamping them invalid charged the peer for a
+		// fault in our own code.
 		if !subtreepkg.IsPowerOfTwo(m.targetLength) {
-			return errors.NewBlockInvalidError("[merkleAccumulator] first subtree leaf count is not a power of two: %d", m.targetLength)
+			return errors.NewProcessingError("[merkleAccumulator] first subtree leaf count is not a power of two: %d", m.targetLength)
 		}
 
 		if !isLast && st.Length() != m.targetLength {
-			return errors.NewBlockInvalidError("[merkleAccumulator] only the final subtree may be incomplete (index %d, length %d, target %d)",
+			return errors.NewProcessingError("[merkleAccumulator] only the final subtree may be incomplete (index %d, length %d, target %d)",
 				m.added, st.Length(), m.targetLength)
 		}
 
 		if isLast && st.Length() > m.targetLength {
-			return errors.NewBlockInvalidError("[merkleAccumulator] final subtree exceeds the first subtree's size (length %d, target %d)",
+			return errors.NewProcessingError("[merkleAccumulator] final subtree exceeds the first subtree's size (length %d, target %d)",
 				st.Length(), m.targetLength)
 		}
 

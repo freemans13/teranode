@@ -156,20 +156,28 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 				// at 707,178 and 708,115 on 2026-09-24 and stopped the chain each time. It is
 				// kept in a side file instead, and converted only if it completes before the
 				// copy converting now, after that copy has stopped and cleaned up.
-				return sm.raceDuplicateCopy(hash, header, r, n, inner)
+				//
+				// Through absorbLocalSinkFault like the direct route below: if the
+				// side copy converts and fails in our store, the wire reader is
+				// already fully consumed, so the drain inside is a no-op there and
+				// only the mark and the log apply.
+				converted, err := sm.raceDuplicateCopy(hash, header, r, n, inner)
+
+				return sm.absorbLocalSinkFault(hash, r, converted, err)
 			}
 
 			if errors.Is(err, context.DeadlineExceeded) {
 				// pipelineAdmissionAcquireTimeout expired, not sm.ctx itself —
 				// distinguished from the shutdown case below by which one a
 				// context.WithTimeout-derived ctx reports. Falling back here
-				// rather than returning an error keeps this peer connected:
-				// any non-benign error from this sink disconnects the peer
-				// (peer.shouldHandleReadError, see pipelineBlockSink's doc
-				// comment on why it never errors for its own declines), so
-				// erroring here would turn OUR admission pressure into a
-				// disconnect blamed on the peer, exactly the failure mode
-				// this bound exists to avoid.
+				// rather than returning an error keeps this peer connected. A
+				// sink error the read loop sees ends in a reject and a
+				// disconnect (peer.inHandler), so this node's own conditions
+				// must leave as converted=false with no error: absorbLocalSinkFault
+				// does that for the sink's own storage and processing faults,
+				// and this branch does it for admission pressure. Erroring here
+				// would turn OUR admission pressure into a disconnect blamed on
+				// the peer, exactly the failure mode this bound exists to avoid.
 				//
 				// The copy is drained and the block is asked for again. It
 				// used to be written whole to the park as a raw block, a
@@ -180,12 +188,83 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 
 			// sm.ctx cancelled (daemon shutdown): nothing was reserved and
 			// nothing productive is left to do with the bytes either.
+			//
+			// Returned as an error on purpose. sm.ctx is the peer server's
+			// context (peer_server.go hands it to netsync.New), and the server
+			// cancels it and then disconnects every peer, so draining the rest
+			// of a multi-gigabyte body here would hold shutdown for it. The cost
+			// is at most one reject written to a closing socket, and
+			// shouldHandleReadError suppresses even that once the peer's own
+			// disconnect flag is set.
 			return false, err
 		}
 		defer sm.ReleaseBlockPrefetch(hash)
 
-		return inner(hash, header, r, n)
+		converted, err := inner(hash, header, r, n)
+
+		return sm.absorbLocalSinkFault(hash, r, converted, err)
 	}
+}
+
+// absorbLocalSinkFault is the one seam every pipeline sink error crosses on its
+// way to the wire layer, and where this node's own faults stop. A sink error that
+// reaches peer.inHandler is a read error: a reject "malformed" and a disconnect.
+// That is right for the peer's faults, an invalid or corrupt body, and wrong for
+// ours: a record write that failed, a subtree file the store refused, an
+// invariant of our own builder. Those used to shed every peer delivering a block
+// the moment the park's volume filled, and the log read as a wave of misbehaving
+// peers. SV Node never charges a peer for a failure of this node's storage
+// (validation.cpp AbortNode on a failed block write records state.Error, which
+// is not state.IsInvalid, so BlockChecked never scores the peer).
+//
+// For a fault of ours the rest of the body is read off the wire unwritten, the
+// stream is marked so the waste report counts it, the drain is noted by hash for
+// handleBlockOnDiskMsg to find, and the call returns converted=false with no
+// error, exactly as the admission-timeout branch of admitPipelineSink does.
+// Nothing is deleted here: pipelineBlockSink has already run
+// deleteWrittenOnFailure on every failure path that comes after its writer
+// exists (the two earlier returns, the count and the coinbase, happen before
+// anything is written), and a blockPark.Delete keyed only by hash would take an
+// earlier parked copy's record (the trap pipelineBlockDelete's doc comment
+// describes).
+//
+// The classification is isLocalSinkFault's, with one guard in front of it that
+// has to live here and not in the pure function: at shutdown sm.ctx is cancelled
+// before the peer server disconnects its peers, and a store call cut by that
+// cancellation comes back as a StorageError whose chain cannot reveal the
+// cancellation, because teranode's errors.New flattens a foreign cause to its
+// message (errors.Is(err, context.Canceled) is false on it). So the context is
+// checked, not the chain: once sm.ctx is done the error goes to the read loop as
+// it is, which is what the shutdown branch above does for the same reason, and
+// the server, already closing every connection, takes it from there. With sm.ctx
+// live a context error in the chain is still ours: the park puts its own
+// deadline on each store call (blockPark.storeCtx), and that running out is a
+// slow disk, not shutdown.
+//
+// A drain that fails is the socket, returned as it is for the read loop to see.
+func (sm *SyncManager) absorbLocalSinkFault(hash chainhash.Hash, r io.Reader, converted bool, err error) (bool, error) {
+	if err == nil || converted {
+		return converted, err
+	}
+
+	if sm.ctx.Err() != nil {
+		return converted, err
+	}
+
+	if !isLocalSinkFault(err) {
+		return converted, err
+	}
+
+	sm.logger.Errorf("[pipelineBlockSink][%s] this node failed to store the block, so the peer's copy is drained and the block will be asked for again; the peer is not at fault: %v", hash, err)
+	sm.streams.setStreamPath(r, admitLocalFault)
+
+	if _, drainErr := io.Copy(io.Discard, r); drainErr != nil {
+		return false, drainErr
+	}
+
+	sm.noteLocalFaultDrain(hash)
+
+	return false, nil
 }
 
 // pipelineAdmissionAcquireDivisor is how much smaller admitPipelineSink's
@@ -416,13 +495,42 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	}
 
 	// The block is here, so whoever else was asked for it is let off; a copy still on the
-	// wire from them is admitted when it lands.
+	// wire from them is admitted when it lands. The same forgiveness serves the local-fault
+	// branch below, where the block is NOT here: ForgiveOwners back-dates the records, so
+	// the block is re-requestable at once, and keeps ownership, so a racing copy from one of
+	// them still passes the gate.
 	sm.blockDownloads.ForgiveOwners(msg.body.Hash, blockRequestRetryInterval)
 
-	// Every delivery that wrote nothing is a drained copy, noted and consumed above. Anything
-	// else unconverted cannot happen: the pipeline sink is the only sink, and the raw-body
-	// route that once wrote whole blocks here is gone.
 	if !msg.body.Converted {
+		// A copy drained because this node could not store it (absorbLocalSinkFault). It sits
+		// here, after RemoveOwner and ForgiveOwners, and is deliberately not folded into the
+		// drained-duplicate return above: that return skips ForgiveOwners because another copy
+		// is converting, which is not the case here. No recentlyFailedBlocks mark either: that
+		// skips the block for ten minutes, the wrong judgement for a store blip, the same one
+		// parkDispositionRetryLater already makes for a commit-time fault of ours.
+		//
+		// How the block is asked for again depends on the mode. Inside headers-first mode the
+		// deferred topUpHeaderBlocks runs assignWantedBlocks, whose unownedBlocksUpTo offers
+		// the block again now that nothing is arriving or converting for it and no owner is
+		// within the retry window. Above the final checkpoint topUpHeaderBlocks returns at
+		// once, the block was requested from an inv the delivering peer will not repeat, and
+		// nothing else would ask: so the same peer is asked again directly. The fault was ours
+		// and the block is still there. A getblocks would not do, because PushGetBlocksMsg
+		// drops a repeat with the same locator and stop hash, which is what a second request
+		// at an unmoved tip is.
+		if sm.takeLocalFaultDrain(msg.body.Hash) {
+			sm.logger.Warnf("[blockOnDisk][%s] the copy from %s was drained because this node could not store it; whoever else was asked is let off and the block is asked for again", msg.body.Hash, msg.peer)
+
+			if !sm.headersFirstMode.Load() && primary != nil {
+				sm.reAskBlockFromPeer(primary, msg.body.Hash)
+			}
+
+			return
+		}
+
+		// Every other delivery that wrote nothing is a drained copy, noted and consumed above.
+		// Anything else unconverted cannot happen: the pipeline sink is the only sink, and the
+		// raw-body route that once wrote whole blocks here is gone.
 		sm.logger.Warnf("[blockOnDisk][%s] a delivery from %s wrote no converted record and was not a drained copy; ignoring it", msg.body.Hash, msg.peer)
 
 		return
@@ -709,4 +817,77 @@ func (sm *SyncManager) takeDrainedDuplicate(hash chainhash.Hash) bool {
 	}
 
 	return true
+}
+
+// noteLocalFaultDrain records one copy of hash drained because this node failed to store
+// it (absorbLocalSinkFault). The sink's (bool, error) signature is a peer-package global
+// shared with its tests, so the reason a copy was drained travels netsync-side by hash,
+// as drained duplicates do; a separate map keeps the two reasons apart in the counters
+// and the log.
+func (sm *SyncManager) noteLocalFaultDrain(hash chainhash.Hash) {
+	sm.drainedDuplicatesMu.Lock()
+	defer sm.drainedDuplicatesMu.Unlock()
+
+	if sm.localFaultDrains == nil {
+		sm.localFaultDrains = make(map[chainhash.Hash]int)
+	}
+
+	sm.localFaultDrains[hash]++
+	sm.waste.localFaultDrained.Add(1)
+}
+
+// takeLocalFaultDrain consumes one local-fault drain of hash, reporting whether there was
+// one.
+//
+// Both drain marks are keyed by hash only, so two unconverted copies of one hash that end
+// close together, one drained as a duplicate and one for a local fault, can consume each
+// other's mark in handleBlockOnDiskMsg. Inside headers-first mode, where two copies of one
+// block can be in flight (the frontier race, or the quiet-owner re-ask in
+// unownedBlocksUpTo), the outcomes are bounded: a duplicate
+// wrongly read as a local fault runs ForgiveOwners while another copy converts, and
+// unownedBlocksUpTo's arriving/conversionInFlight guard stops that from asking for the
+// block again; a local fault wrongly read as a duplicate skips ForgiveOwners, and
+// unownedBlocksUpTo forgives the owners itself once they have sent no block bytes for
+// blockRequestRetryInterval, and offers the block again. Above the final checkpoint
+// drainRequestQueue requests a block from one peer per retry window, so a second copy
+// needs two requests a window apart whose deliveries end together; that case is not
+// recovered here and is left as documented.
+func (sm *SyncManager) takeLocalFaultDrain(hash chainhash.Hash) bool {
+	sm.drainedDuplicatesMu.Lock()
+	defer sm.drainedDuplicatesMu.Unlock()
+
+	n := sm.localFaultDrains[hash]
+	if n == 0 {
+		return false
+	}
+
+	if n == 1 {
+		delete(sm.localFaultDrains, hash)
+	} else {
+		sm.localFaultDrains[hash] = n - 1
+	}
+
+	return true
+}
+
+// reAskBlockFromPeer asks peer for one block again with a getdata, recording the
+// request in the ledger first so the body passes the gate when it comes. Used above
+// the final checkpoint, where the headers-first scheduler is off and an inv is not
+// repeated. A ledger that will not take the request is logged and left alone: a body
+// nobody recorded a request for would look unrequested and be discarded.
+func (sm *SyncManager) reAskBlockFromPeer(peer *peerpkg.Peer, hash chainhash.Hash) {
+	if !sm.blockDownloads.Add(peer, hash) {
+		sm.logger.Warnf("[blockOnDisk][%s] block download ledger full at %d blocks, not asking %s for the block again", hash, maxTrackedBlockDownloads, peer)
+
+		return
+	}
+
+	gdmsg := wire.NewMsgGetData()
+	if err := gdmsg.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash)); err != nil {
+		sm.logger.Warnf("[blockOnDisk][%s] could not build the getdata to ask %s for the block again: %v", hash, peer, err)
+
+		return
+	}
+
+	peer.QueueMessage(gdmsg, nil)
 }

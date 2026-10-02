@@ -186,6 +186,21 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 
 	converted, err := blockBodySink(hash, &header, &counted, int64(length))
 	if err != nil {
+		// A connection that ended mid-body comes back from the sink as the bare
+		// io.EOF or io.ErrUnexpectedEOF so that peer.shouldHandleReadError, which
+		// compares the read error against those sentinels with ==, logs a
+		// disconnect instead of pushing a reject for a "malformed" message. go-wire
+		// and readMessageStreaming pass the handler's error through untouched, so
+		// this wrap was the one place that identity was lost; it is kept for every
+		// other sink error and skipped for these two. Compared by identity here
+		// too, deliberately: the sink's rule is to return the bare sentinel, and
+		// teranode's (*Error).Is matches a non-teranode target by message text, so
+		// errors.Is would read any wrapped error mentioning EOF as the connection
+		// ending.
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil, deleteOrphanedBody(hash, converted, err)
+		}
+
 		return nil, deleteOrphanedBody(hash, converted, errors.NewProcessingError("streaming block %s: could not store the body", hash, err))
 	}
 

@@ -33,6 +33,29 @@ import (
 // conversion by asking whether some blob happens to exist for this hash — see
 // that field's doc comment for why a blob's mere existence is the wrong
 // question.
+//
+// The error it returns is a verdict on whose fault the failure was, and the
+// wrapper around this sink (admitPipelineSink, through absorbLocalSinkFault and
+// isLocalSinkFault) reads that verdict from the OUTERMOST teranode code alone,
+// because teranode's errors.Is matches any code in the chain and these producers
+// wrap foreign causes. So the rule for every producer this sink calls, the stream,
+// the builder, the accumulator, the subtree writer and the park:
+//
+//   - the peer's fault carries ERR_BLOCK_INVALID (a body the header does not
+//     commit to, a duplicate transaction, a count the body cannot hold) or
+//     ERR_BLOCK_CORRUPT (a delivery whose length and transactions disagree). Only
+//     these two codes reach the read loop as a read error, and so a reject.
+//   - a connection that ends mid-body is returned as the bare io.ErrUnexpectedEOF,
+//     by identity, never wrapped (block_tx_stream.go endOfBody): the read loop
+//     compares it with == and logs a disconnect rather than a reject.
+//   - everything else is this node's: a store that failed (ERR_STORAGE_ERROR),
+//     an invariant of our own builder or accumulator (ERR_PROCESSING,
+//     ERR_SUBTREE_ERROR, ERR_TX_ERROR). Those are drained, the peer is kept, and
+//     the block is asked for again.
+//
+// A producer keeps its verdict outermost and never wraps a peer verdict inside a
+// local code: NewProcessingError("...", blockInvalidErr) would read as our fault,
+// keep the peer and re-download a body that is genuinely bad.
 func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 	// Every block converts. There is no fallback and nothing writes a whole
 	// block body to one file any more.
@@ -69,9 +92,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 	// The coinbase is the first transaction in the stream, and the builder needs
 	// it before any other: it occupies slot zero of the first subtree.
+	// Returned as it is, like every stream error below: the stream has already
+	// said whose fault it was (an invalid encoding, a corrupt delivery, or the
+	// bare EOF of a connection that ended), and wrapping it here in the invalid
+	// code re-stamped a hang-up as a bad block.
 	coinbase, coinbaseHash, err := stream.Next()
 	if err != nil {
-		return false, errors.NewBlockInvalidError("[pipelineBlockSink][%s] failed reading the coinbase", hash, err)
+		return false, err
 	}
 
 	var writer *subtreeWriter
@@ -510,5 +537,41 @@ func newPipelineDedupMap(declared uint64) txmap.TxMap {
 func (sm *SyncManager) deleteWrittenOnFailure(hash chainhash.Hash, writer *subtreeWriter) {
 	if delErr := writer.DeleteAll(sm.ctx); delErr != nil {
 		sm.logger.Warnf("[pipelineBlockSink][%s] failed to delete subtree files after a failed block: %v", hash, delErr)
+	}
+}
+
+// isLocalSinkFault reports whether an error from pipelineBlockSink is this node's
+// own fault rather than the peer's. It reads the verdict pipelineBlockSink's doc
+// comment says every producer keeps outermost.
+//
+// The outermost teranode code is used, not errors.Is, because teranode's Is
+// matches any code in the chain and the producers wrap foreign causes: an fs
+// error inside a StorageError, io.ErrUnexpectedEOF inside a BlockInvalid. The
+// outermost code is the verdict; what it wraps is the evidence.
+//
+// A non-teranode error (a bare io.EOF or io.ErrUnexpectedEOF from a connection
+// that ended, a net.OpError) is not ours: it is returned to the read loop
+// unchanged so peer.shouldHandleReadError can see it by identity. ERR_BLOCK_INVALID
+// and ERR_BLOCK_CORRUPT are the peer's. Every other code is ours, and so is any
+// code added later: the default keeps the peer, which is the safe direction.
+//
+// errors.IsTransientLocalError is not used because it would miss ERR_PROCESSING,
+// ERR_SUBTREE_ERROR and ERR_TX_ERROR, which the stream builder and the merkle
+// accumulator return for faults of this node's own.
+func isLocalSinkFault(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var tErr *errors.Error
+	if !errors.As(err, &tErr) || tErr == nil {
+		return false
+	}
+
+	switch tErr.Code() {
+	case errors.ERR_BLOCK_INVALID, errors.ERR_BLOCK_CORRUPT:
+		return false
+	default:
+		return true
 	}
 }

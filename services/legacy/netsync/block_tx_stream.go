@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"bufio"
+	stderrors "errors"
 	"io"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -75,10 +76,17 @@ func newBlockTxStream(r io.Reader, payloadLen int64) (*blockTxStream, error) {
 
 	count, err := wire.ReadVarInt(br, wire.ProtocolVersion)
 	if err != nil {
-		// NewBlockInvalidError, not NewProcessingError: a body too short to carry
-		// a transaction count is a malformed block from the peer, not a local
-		// processing fault, and giving it errBlockTxStreamDone's code would make
+		// The body ending here is classified by where it ended (endOfBody): a
+		// hang-up before the declared length is returned as the bare EOF
+		// sentinel, a body complete at its declared length with no count in it
+		// is a corrupt delivery. Any other failure is a varint the peer encoded
+		// badly, which is an invalid block. NewBlockInvalidError, not
+		// NewProcessingError: giving it errBlockTxStreamDone's code would make
 		// errors.Is match it against clean exhaustion (see the sentinel's comment).
+		if ended := endOfBody(err, src.n, payloadLen, "[blockTxStream] the body ended before a transaction count"); ended != nil {
+			return nil, ended
+		}
+
 		return nil, errors.NewBlockInvalidError("[blockTxStream] could not read the transaction count", err)
 	}
 
@@ -174,6 +182,14 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 			return nil, nil, 0, errors.NewStorageError("[blockTxStream] failed writing transaction %d of the %d declared", s.read, s.txCount, sink.err)
 		}
 
+		// A stream that ends inside a transaction is judged by where the body
+		// ended, not stamped invalid: the peer hanging up says nothing about the
+		// block (see endOfBody). Everything else txstream refuses is the peer's
+		// encoding, an invalid block.
+		if ended := endOfBody(err, s.src.n, s.bodyLen, "[blockTxStream] the body ended inside transaction %d of the %d declared", s.read, s.txCount); ended != nil {
+			return nil, nil, 0, ended
+		}
+
 		return nil, nil, 0, errors.NewBlockInvalidError("[blockTxStream] failed reading transaction %d of the %d declared", s.read, s.txCount, err)
 	}
 
@@ -210,6 +226,54 @@ func (s *blockTxStream) RequireEnd() error {
 	default:
 		return errors.NewBlockCorruptError("[blockTxStream] failed reading past the last of the %d declared transactions", s.txCount, err)
 	}
+}
+
+// endOfBody classifies a read error that is the stream ending, and returns nil for
+// any other error so the caller gives that its own verdict.
+//
+// Two things look the same from inside a transaction decoder, an io.EOF or
+// io.ErrUnexpectedEOF, and they are not the same fault. The reader is bounded at
+// the declared body length (an io.LimitedReader over the socket), so:
+//
+//   - fewer bytes than declared arrived (consumed < declared): the connection
+//     ended, which says nothing about the block. Returned as the bare
+//     io.ErrUnexpectedEOF, by identity, because peer.shouldHandleReadError
+//     (services/legacy/peer/peer.go) compares the read error against that
+//     sentinel with ==, and on a match logs the peer as disconnected instead of
+//     rejecting it as malformed. Wrapping it, in any code, turned a hang-up into
+//     a reject plus a "malformed message" disconnect, and would hand M2's
+//     punishment a code it must never score on (HARDEN 1421: a delivery fault
+//     never carries the invalid code).
+//   - the whole declared body arrived (consumed >= declared) and the declared
+//     transactions are still owed: the message disagrees with itself. That is a
+//     corrupt delivery, the same code RequireEnd gives a length that disagrees
+//     with the transactions, and it is the peer's.
+//
+// A declared length below zero cannot be judged and is read as the connection
+// ending, the direction that keeps the peer.
+//
+// Detected with the standard library's errors.Is rather than ==, because go-bt's
+// readers may wrap what io.ReadFull returned, and what matters is what goes OUT by
+// identity, not what came in. A teranode error is never one of these, whatever
+// its text: (*errors.Error).Is falls back to substring matching on the message
+// against a non-teranode target, so without this guard a TxInvalidError from
+// txstream whose text happened to contain "EOF" would read as the connection
+// ending.
+func endOfBody(err error, consumed, declared int64, corruptMsg string, params ...interface{}) error {
+	var tErr *errors.Error
+	if stderrors.As(err, &tErr) {
+		return nil
+	}
+
+	if !stderrors.Is(err, io.EOF) && !stderrors.Is(err, io.ErrUnexpectedEOF) {
+		return nil
+	}
+
+	if declared < 0 || consumed < declared {
+		return io.ErrUnexpectedEOF
+	}
+
+	return errors.NewBlockCorruptError(corruptMsg, params...)
 }
 
 // countingSource counts the bytes read through it.

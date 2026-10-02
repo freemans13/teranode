@@ -416,7 +416,7 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		sm.streams.finish(s, now, complete)
 
 		sm.streams.mu.Lock()
-		drained := s.path == admitRawDuplicate
+		drained := s.path == admitRawDuplicate || s.path == admitLocalFault
 		sm.streams.mu.Unlock()
 
 		switch {
@@ -574,8 +574,8 @@ func (sm *SyncManager) logDownloadQueues() {
 	}
 
 	w := &sm.waste
-	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",
-		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.streamsFailed.Load(),
+	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",
+		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.localFaultDrained.Load(), w.streamsFailed.Load(),
 		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load())
 }
 
