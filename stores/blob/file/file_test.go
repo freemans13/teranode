@@ -732,11 +732,10 @@ func TestSetFromReader_ConcurrentWritersNeverExposePartialFinal(t *testing.T) {
 }
 
 func TestRenameTempFile_OverwriteAndRejectSemantics(t *testing.T) {
-	// renameTempFile's cross-platform contract: on POSIX, rename atomically replaces an
-	// existing destination regardless of allowOverwrite; on non-POSIX, allowOverwrite
-	// controls whether an existing destination is replaced or whether ErrBlobAlreadyExists
-	// is returned. This test documents the observable POSIX behaviour and exercises both
-	// allowOverwrite values so a regression on either branch shows up.
+	// The publish contract, the same on every platform: allowOverwrite=true replaces an
+	// existing blob atomically; allowOverwrite=false is refused with ErrBlobAlreadyExists and
+	// the existing blob stands. Here the refusal comes from errorOnOverwrite's early exit; the
+	// refusal at the publish itself is TestRenameTempFile_SecondNoOverwritePublishOfOneNameIsRefused.
 	tempDir := t.TempDir()
 
 	u, err := url.Parse("file://" + tempDir)

@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"math"
 	"math/big"
 	"net/http"
@@ -786,9 +787,11 @@ func (s *File) Close(_ context.Context) error {
 
 func (s *File) errorOnOverwrite(filename string, opts *options.Options) error {
 	if !opts.AllowOverwrite {
-		// Note: No semaphore acquisition here because this is only called from SetFromReader
-		// which already holds the write semaphore. The os.Stat call is safe because we're
-		// within the write operation's semaphore protection.
+		// This Stat is a cheap early exit, not the no-overwrite check. The write semaphore the
+		// callers hold is a pool of defaultWriteLimit permits, not a mutex, so two writers of
+		// one key can both be here at once and both find nothing; the Stat decides nothing
+		// between them. It only saves streaming a body the publish would refuse. The
+		// authoritative check is renameTempFile's link(2), which fails if the name exists.
 		if _, err := os.Stat(filename); err == nil {
 			return errors.NewBlobAlreadyExistsError("[File][allowOverwrite] [%s] already exists in store", filename)
 		}
@@ -949,13 +952,12 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 	return nil
 }
 
-// publishTempFile renames a finished, synced and closed temporary file to its final name and
+// publishTempFile gives a finished, synced and closed temporary file its final name and
 // publishes or clears its checksum sidecar. It is the last step of every streamed write, shared by
-// SetFromReader and a pending file's Commit so the two publish a blob identically. Once it has
-// renamed the file the temporary name no longer exists, so a caller must not remove it after a
-// nil return.
+// SetFromReader and a pending file's Commit so the two publish a blob identically. After a nil
+// return the temporary name has been given up (renamed, or unlinked after the link), so a caller
+// must not remove it; after an error the caller still owns it.
 func (s *File) publishTempFile(tmpFilename, filename string, merged *options.Options, hasher hash.Hash) error {
-	// rename the file to remove the .tmp extension
 	if err := s.renameTempFile(tmpFilename, filename, merged.AllowOverwrite); err != nil {
 		return err
 	}
@@ -963,10 +965,9 @@ func (s *File) publishTempFile(tmpFilename, filename string, merged *options.Opt
 	if !s.checksum {
 		// A blob written while checksums were enabled leaves a sidecar behind; republishing the
 		// blob without checksums would leave that sidecar describing content that no longer
-		// exists. Nothing in this package can prove a sidecar is absent — errorOnOverwrite treats
-		// every Stat error as "missing", renameTempFile has a documented TOCTOU window, and Del
-		// swallows a failed sidecar unlink — so the removal is attempted unconditionally rather
-		// than predicated on any such proof.
+		// exists. Nothing in this package can prove a sidecar is absent (errorOnOverwrite treats
+		// every Stat error as "missing", and Del swallows a failed sidecar unlink), so the
+		// removal is attempted unconditionally rather than predicated on any such proof.
 		//
 		// Best-effort: a stale sidecar is inert (nothing in this repository reads one) and must
 		// not turn a successfully published blob into a failed write.
@@ -1645,23 +1646,40 @@ func (s *File) syncParentDirBestEffort(filename string) {
 
 // renameTempFile publishes a completed temp file at its final filename.
 //
-// The temp file must be a sibling of filename; createTempSibling enforces that pattern.
-// When source and destination are on the same filesystem, rename makes the final path
-// appear atomically, so readers either see the previous complete file or the new complete
-// file, never a partially written final file.
+// The temp file is on the same filesystem as filename: createTempSibling puts it in the
+// final name's own directory, and a PendingFile's temp sits in the zero-key prefix directory
+// of the same store tree. Either way the final name appears in one step, so a reader sees
+// the previous complete file or the new complete file, never a partial one.
 //
-// Cross-platform rename semantics differ when the destination already exists:
+// Which step depends on allowOverwrite, because the two contracts need different syscalls:
 //
-//   - POSIX (Linux, macOS, *BSD): rename(2) atomically replaces an existing regular file
-//     with the same name. The "destination exists" branch below is therefore unreachable
-//     on those platforms; an existing final file is silently overwritten on rename. The
-//     blob store's no-overwrite contract is enforced by SetFromReader's earlier call to
-//     errorOnOverwrite, not here. There is a small TOCTOU window between that check and
-//     this rename in which two concurrent writers can both pass the check and then race
-//     on rename — that race is out of scope for this helper.
-//   - Windows / some non-POSIX targets: rename can fail when the destination exists. The
-//     fallback handles that case: if allowOverwrite is true we remove the destination and
-//     retry the rename; otherwise we normalize the error to ErrBlobAlreadyExists.
+//   - allowOverwrite=false: the no-overwrite contract is enforced here, by link(2). Linking
+//     the temp file to its final name fails with EEXIST if that name exists, atomically; that
+//     is POSIX, tested here on APFS (the dev Macs) and not yet run on ext4 (the Hetzner
+//     nodes). The refusal is returned as ErrBlobAlreadyExists. The temp name is then unlinked. rename(2) cannot do
+//     this: on Linux and macOS it replaces an existing regular file without error, so two
+//     writers that both passed errorOnOverwrite's Stat both published and both believed
+//     they created the blob. Exactly one writer is now told it created the blob, which is
+//     what the legacy subtree writer's DeleteAll relies on (services/legacy/netsync/
+//     subtree_writer.go). What the exclusive publish does not decide is the blob's
+//     delete-at-height: constructFilename schedules it before the publish, from both
+//     writers, last writer wins.
+//   - allowOverwrite=true: rename(2), which replaces an existing name atomically. Where a
+//     non-POSIX rename refuses to replace, the destination is removed and the rename retried.
+//
+// The cost of link then unlink: a crash between the two leaves a ".tmp" sibling that is a
+// second hard link to the published blob. Del and delete-at-height free the name, not the
+// inode, until that sibling is removed; the block park sweeps its dot-prefixed files at
+// Start (block_park.go), the subtree store has no such sweep yet. This was chosen over
+// renameat2(RENAME_NOREPLACE) on Linux plus renameatx_np(RENAME_EXCL) on macOS so one code
+// path is tested identically on the dev Macs and the Hetzner nodes.
+//
+// A filesystem without hard links (FAT, some FUSE and network mounts) refuses link(2) with
+// EPERM or ENOTSUP. The store then falls back to the rename path above, which is what every
+// write did before, and warns once per process that publishes there are not exclusive. The
+// fallback stays until hard links are confirmed on the Hetzner containers' data directory
+// and on the Docker Desktop bind mounts the Mac docker contexts use; neither has been
+// checked yet.
 //
 // On success this helper also attempts to sync the parent directory so the newly published
 // name is more likely to survive a crash. That directory sync is correctness-critical on
@@ -1683,8 +1701,38 @@ func (s *File) renameTempFile(tmpFilename, filename string, allowOverwrite bool)
 	}
 	defer root.Close()
 
+	if !allowOverwrite {
+		switch err := root.Link(tmpRel, finalRel); {
+		case err == nil:
+			if removeErr := root.Remove(tmpRel); removeErr != nil && !os.IsNotExist(removeErr) {
+				s.logger.Warnf("[File][%s] published but failed to remove temporary name %s, which is now a second link to the blob: %v", filename, tmpFilename, removeErr)
+			}
+
+			s.syncParentDirBestEffort(filename)
+
+			return nil
+
+		case errors.Is(err, fs.ErrExist):
+			if info, statErr := root.Stat(finalRel); statErr == nil && info.IsDir() {
+				return errors.NewStorageError("[File][%s] a directory occupies the blob's name", filename, err)
+			}
+
+			return errors.NewBlobAlreadyExistsError("[File][%s] already exists in store", filename)
+
+		case hardLinksUnsupported(err):
+			linkUnsupportedWarning.Do(func() {
+				s.logger.Warnf("[File][%s] filesystem refused a hard link (%v); publishing by rename instead, so two writers of one blob are not detected on this store", s.path, err)
+			})
+
+		default:
+			return errors.NewStorageError("[File][%s] failed to publish temporary file %s", filename, tmpFilename, err)
+		}
+	}
+
 	if err := root.Rename(tmpRel, finalRel); err != nil {
 		if fileInfo, statErr := root.Stat(finalRel); statErr == nil && !fileInfo.IsDir() {
+			// Reached only on the hard-link fallback above, and only where rename refuses to
+			// replace an existing name. On Linux and macOS rename replaces it silently.
 			if !allowOverwrite {
 				return errors.NewBlobAlreadyExistsError("[File][%s] already exists in store", filename)
 			}
@@ -1708,6 +1756,18 @@ func (s *File) renameTempFile(tmpFilename, filename string, allowOverwrite bool)
 
 	s.syncParentDirBestEffort(filename)
 	return nil
+}
+
+// linkUnsupportedWarning limits the hard-link fallback warning to once per process; the
+// filesystem does not change under a running store.
+var linkUnsupportedWarning sync.Once
+
+// hardLinksUnsupported reports whether a link(2) failure means the filesystem has no hard
+// links at all, which is EPERM on Linux (link(2): "the filesystem ... does not support the
+// creation of hard links") and ENOTSUP or EOPNOTSUPP elsewhere. On Linux the last two are one
+// errno. EEXIST is never one of these: it is the refusal the no-overwrite publish wants.
+func hardLinksUnsupported(err error) bool {
+	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP)
 }
 
 // writeFileAtomically writes a small sidecar file via temp-file publication.

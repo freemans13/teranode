@@ -39,7 +39,12 @@ type Options struct {
 	// Negative: Use last N characters of hash as directory
 	// Zero: Don't use hash-based directories
 	HashPrefix int
-	// AllowOverwrite determines if existing blobs can be overwritten
+	// AllowOverwrite determines if existing blobs can be overwritten (FileOption).
+	// False, the default, means a write of a key that exists fails with ErrBlobAlreadyExists.
+	// In the file store that refusal is exclusive: the blob is published by hard-linking the
+	// finished temporary file to its name, which fails if the name exists, so of two writers
+	// racing on one key exactly one is told it created the blob. True publishes by atomic
+	// rename, which replaces an existing blob.
 	AllowOverwrite bool
 	// SkipHeader determines if the file header should be skipped for easier CLI readability
 	SkipHeader bool

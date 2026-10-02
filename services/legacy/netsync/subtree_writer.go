@@ -250,17 +250,21 @@ func writeBytes(payload []byte) func(io.Writer) error {
 	}
 }
 
-// put writes one artefact through the file storer, matching writeSubtree at
-// services/legacy/netsync/handle_block.go:876, and reports whether this call
+// put writes one artefact through the file storer and reports whether this call
 // created it.
 //
 // A blob that already exists is success, not failure: two peers can deliver blocks
 // sharing an identical run of transactions, which produces the same subtree under
 // the same key. It is reported as not created, so DeleteAll leaves it to the
-// block that wrote it.
+// block that wrote it. Whether this call created the blob is decided by the
+// store's publish, which is exclusive (stores/blob/file/file.go renameTempFile
+// links the temp file to its name and fails if the name exists), not by the
+// existence check in NewFileStorer, which is only a shortcut. The store can
+// refuse the key at three moments, and each is a not-created answer.
 func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType fileformat.FileType, write func(io.Writer) error) (bool, error) {
 	storer, err := filestorer.NewFileStorer(ctx, w.logger, w.settings, w.store, root[:], fileType, options.WithDeleteAt(w.deleteAt()))
 	if err != nil {
+		// The key was taken before this call started.
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
 			return false, nil
 		}
@@ -271,12 +275,20 @@ func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType f
 	if err = write(storer); err != nil {
 		storer.Abort(errors.NewProcessingError("[subtreeWriter][%s] write failed for %s", root, fileType))
 
+		// The key was taken between NewFileStorer's existence check and the store's own
+		// pre-check at the start of SetFromReader, which closed the pipe with this error;
+		// a body larger than the storer's buffer meets it here, mid-write. Theirs stands.
+		if errors.Is(err, errors.ErrBlobAlreadyExists) {
+			return false, nil
+		}
+
 		return false, errors.NewStorageError("[subtreeWriter][%s] failed writing %s", root, fileType, err)
 	}
 
 	if err = storer.Close(ctx); err != nil {
-		// Another writer published the same key between the existence check and the
-		// store's own overwrite check: theirs stands, and it is theirs to remove.
+		// Another writer published the same key after the pre-check, while this body was
+		// streaming. The store's publish is exclusive, so exactly one of the two is told it
+		// created the blob; this one was not, and the file is the other's to remove.
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
 			return false, nil
 		}
