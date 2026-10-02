@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/stretchr/testify/require"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable produces the error two
@@ -113,4 +114,31 @@ func TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable(t *testing.T) {
 
 	require.True(t, isDeadlock(refused.err), "the spend batch must retry a shared-cache table lock, got a non-retryable classification for: %v", refused.err)
 	require.True(t, isLockError(refused.err), "the create path already classifies it as a lock error; the two must agree")
+}
+
+// TestIsSQLiteLockCode_ExtendedCodesAreStillLocks pins the primary-code
+// comparison. The first cut of the *sqlite.Error arm compared the whole code
+// against SQLITE_BUSY and SQLITE_LOCKED, so a BUSY_SNAPSHOT (517) from a WAL
+// snapshot conflict or a LOCKED_SHAREDCACHE (262) stopped being retried while
+// the plain codes were. Reverting isSQLiteLockCode to a whole-code compare
+// fails the three extended rows below.
+func TestIsSQLiteLockCode_ExtendedCodesAreStillLocks(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		want bool
+	}{
+		{"busy", sqlite3.SQLITE_BUSY, true},
+		{"locked", sqlite3.SQLITE_LOCKED, true},
+		{"busy_snapshot 517", sqlite3.SQLITE_BUSY_SNAPSHOT, true},
+		{"busy_recovery 261", sqlite3.SQLITE_BUSY_RECOVERY, true},
+		{"locked_sharedcache 262", sqlite3.SQLITE_LOCKED_SHAREDCACHE, true},
+		{"error 1", sqlite3.SQLITE_ERROR, false},
+		{"constraint 19", sqlite3.SQLITE_CONSTRAINT, false},
+		{"constraint_unique 2067", sqlite3.SQLITE_CONSTRAINT_UNIQUE, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isSQLiteLockCode(tc.code))
+		})
+	}
 }
