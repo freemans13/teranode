@@ -212,9 +212,18 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	// parkedBlockFailed stamps the entry so the drain does not spend every turn
 	// on it, and fillHeaderCache re-offers it the moment a fill proves it.
 	//
-	// Above the checkpoint, or with the route flags off, there is nothing to
-	// refuse: the block takes full validation whether or not it is proven, and
-	// an unprovable record there simply takes the mined wait below.
+	// The boundary is unifiedRoute's, and model.BelowCheckpoint reads the LAST
+	// pinned checkpoint, so a block between two checkpoints is refused here too
+	// when unproven: it waits for continueCheckpointWalkIfNeeded to match the
+	// next pinned hash, which is also when Wantable would first have named it.
+	// Wantable names no height the cache has not proven, so a block the walk
+	// asked for arrives proven; this arm is for a record whose proof the cache
+	// does not hold, above all one recovered after a restart, when the cache is
+	// empty again.
+	//
+	// Above the last checkpoint, or with the route flags off, there is nothing
+	// to refuse: the block takes full validation whether or not it is proven,
+	// and an unprovable record there simply takes the mined wait below.
 	if sm.unifiedRoute(blockHeight) && !origin.headerProven {
 		return errors.NewServiceError("[HandleConvertedBlock][%s] block at height %d is on the unified route but the header cache has not proven it; retrying once the header walk has", blockHash.String(), blockHeight)
 	}

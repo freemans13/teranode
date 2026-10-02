@@ -591,7 +591,7 @@ func (c *headerCache) At(height int32) (chainhash.Hash, bool) {
 // begin only once the walk has matched C', and continueCheckpointWalkIfNeeded
 // walks toward NextCheckpointAbove(best), so the walk to C' starts when the
 // committed tip reaches C. That pause is per boundary: at 2000 headers a reply
-// the widest mainnet gap (about 43,000 heights) is about 22 round trips, and
+// the widest mainnet gap (50,000 heights, from 600000 on) is 25 round trips, and
 // over the 34 mainnet checkpoints roughly 470 round trips with nothing to
 // download. SV Node has no such pause because its header sync finishes before
 // body download starts; walking one checkpoint ahead of the tip is the
@@ -766,8 +766,8 @@ func (c *headerCache) Prune(height int32) {
 	// Walk up from the lowest height held rather than ranging over the map.
 	// This runs on every assignment pass, which is once per committed block on
 	// the serial commit path, and below a checkpoint the list holds up to a
-	// whole checkpoint interval, about 43,000 heights at the widest mainnet
-	// gap. Ranging over all of that on every pass, under the cache lock that
+	// whole checkpoint interval, 50,000 heights at the widest mainnet gap.
+	// Ranging over all of that on every pass, under the cache lock that
 	// block delivery reads Proven through, is exactly the per-block bookkeeping
 	// already crowding that path. The list is always one contiguous run of
 	// heights: replaceLocked writes baseHeight up to top, extendLocked appends

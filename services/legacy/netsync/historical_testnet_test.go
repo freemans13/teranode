@@ -27,9 +27,18 @@ import (
 // headers message proves the run through testnet's first checkpoint at 546, each
 // block streams through pipelineBlockSink into the file store as a converted
 // record, and commitParkedBlock commits it through the blockvalidation server
-// over gRPC. Height 547 is above the checkpoint and takes full validation on both
-// routes. No checkpoint proof travels on that RPC: the historical difficulty
-// calculator must work with release/v0.15's stricter proof gate too.
+// over gRPC.
+//
+// Height 547 is the one the two routes treat differently. It sits above the
+// checkpoint the run matched and below testnet's last pinned checkpoint, so
+// unifiedRoute(547) is true while the 546-header run proves nothing above 546.
+// With the route flags off it takes full validation, unproven, and no
+// checkpoint proof travels on that RPC: the historical difficulty calculator
+// must work with release/v0.15's stricter proof gate too. On the unified route
+// HandleConvertedBlock refuses to commit it, the retry-later shape that keeps
+// the record parked until the header walk reaches the next checkpoint; in
+// production Wantable would not have asked for it before then, and this test
+// hands it over unasked to pin that refusal.
 //
 // Two subtests, the shipped default first, each over its own stack:
 //
@@ -37,13 +46,14 @@ import (
 //     node runs. Every block takes ValidateBlockWithOptions, which is the route PR
 //     1732 wrote this test for: the expected-nBits rule it added lives there and
 //     nowhere on the quick route, so this subtest is the one that exercises it
-//     over real testnet headers.
+//     over real testnet headers. Ends at height 547.
 //   - "unified-below-checkpoint": both true, the configuration the Hetzner nodes
 //     soak. Heights 1 to 546 take quickValidateBlock on real testnet shapes for
 //     the first time in a test: 380 coinbase-only bodies through the zero-subtree
 //     AssignBlockID branch, then 112 blocks of two to forty-nine
 //     transactions from height 381 on, through bindSubtreeBodyToHeader over
 //     sink-written .subtreeToCheck files, spending coinbases and each other.
+//     Height 547 is refused, kept parked and stamped; the chain ends at 546.
 //
 // The download ledger is bypassed on purpose: the test calls the sink and the
 // commit directly, never handleBlockOnDiskMsg, so the wanted-range pass that the
@@ -132,7 +142,7 @@ func runHistoricalTestnetSync(t *testing.T, unified bool) {
 		if height <= 546 {
 			require.True(t, origin.headerProven, "height %d must come from the verified header run", height)
 		} else {
-			require.False(t, origin.headerProven, "height %d is above the pinned checkpoint and the headers run never named it", height)
+			require.False(t, origin.headerProven, "height %d is above the checkpoint the run matched and the headers run never named it", height)
 		}
 
 		if height == 149 {
@@ -151,9 +161,32 @@ func runHistoricalTestnetSync(t *testing.T, unified bool) {
 		require.NoError(t, err, "height %d must convert", height)
 		require.True(t, converted, "height %d must convert", height)
 
+		entry := parkedBlock{hash: hash, prevBlock: block.Header.PrevBlock, peer: p}
+
+		if unified && height == 547 {
+			// Below testnet's last pinned checkpoint and unproven, so the
+			// unified route applies and HandleConvertedBlock refuses the commit.
+			// The disposition is retry-later: the record is kept, the entry goes
+			// back into the park stamped so the drain does not spin on it, and
+			// nothing reaches the chain.
+			require.True(t, sm.unifiedRoute(height), "height %d is below testnet's last pinned checkpoint, so the unified route applies to it", height)
+			require.False(t, sm.commitParkedBlock(entry), "height %d must be refused: on the unified route and not proven by the header walk", height)
+			require.True(t, sm.blockPark.Has(hash), "height %d must stay parked for the header walk to prove", height)
+
+			parked, ok := sm.blockPark.entries[hash]
+			require.True(t, ok)
+			require.False(t, parked.awaitingProofAt.IsZero(), "height %d must be stamped so the drain leaves it alone within the floor", height)
+
+			exists, err := stack.chain.GetBlockExists(ctx, &hash)
+			require.NoError(t, err)
+			require.False(t, exists, "height %d must not reach the chain unproven", height)
+
+			break
+		}
+
 		// The commit runs the disposition that deletes the record, so the park
 		// does not accumulate 547 entries over the run.
-		require.True(t, sm.commitParkedBlock(parkedBlock{hash: hash, prevBlock: block.Header.PrevBlock, peer: p}), "height %d must commit", height)
+		require.True(t, sm.commitParkedBlock(entry), "height %d must commit", height)
 
 		_, meta, err := stack.chain.GetBlockHeader(ctx, &hash)
 		require.NoError(t, err, "height %d must be in the chain", height)
@@ -169,9 +202,14 @@ func runHistoricalTestnetSync(t *testing.T, unified bool) {
 		requireBlockMinedByValidation(t, stack, hash)
 	}
 
+	wantBest := uint32(547)
+	if unified {
+		wantBest = 546
+	}
+
 	_, best, err := stack.chain.GetBestBlockHeader(ctx)
 	require.NoError(t, err)
-	require.Equal(t, uint32(547), best.Height)
+	require.Equal(t, wantBest, best.Height)
 
-	t.Logf("replayed 547 testnet blocks (unified=%v) in %s", unified, time.Since(started).Round(time.Second))
+	t.Logf("replayed 547 testnet blocks, committed %d (unified=%v) in %s", wantBest, unified, time.Since(started).Round(time.Second))
 }

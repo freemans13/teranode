@@ -2613,9 +2613,11 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 // its parent's commit will reach it in order. They are taken through
 // TakeChildrenForProof rather than TakeChildren, because the ordinary take
 // honours the awaitingProofAt floor and would hand back nothing for exactly the
-// block this is for; the copy handed over has the stamp cleared, or the
-// consumer's own committableChildLocked would hold it for the rest of the floor
-// and the proof event would be lost until the sweep.
+// block this is for. The stamp is cleared here, on the one copy handed over:
+// both consumers of submitParkCommit Restore the entry and then drain, and the
+// drain's committableChildLocked would hold a stamped entry for the rest of the
+// floor, losing the proof event until the sweep. A child the fill did not prove
+// is given back with its stamp untouched, for the same reason in reverse.
 //
 // This runs on the headers goroutine (handleHeadersMsg is started with go), so
 // it posts through submitParkCommit, the cross-goroutine route the sweep uses,
@@ -2635,14 +2637,19 @@ func (sm *SyncManager) reofferParkedBlocksProvenBy(newProven int32) {
 
 	for _, entry := range sm.blockPark.TakeChildrenForProof(tipHash) {
 		if !sm.blockOrigin(entry.hash).headerProven {
-			// Not this fill's doing: a sibling the cache does not name, or a
-			// height still above the proof. Back as it was, stamp and all.
+			// Not this fill's doing. Every child of the tip sits at best+1, and
+			// the early return above has already placed best+1 within the proof,
+			// so the only child the cache does not name is a fork sibling: the
+			// proven chain carries a different hash at this height. Back as it
+			// was, stamp and all; the floor it was refused under still stands.
 			sm.blockPark.Restore(entry)
 
 			continue
 		}
 
 		sm.logger.Infof("[fillHeaderCache][%s] header walk proved parked block %s at height %d, re-offering it for commit", tipHash, entry.hash, best+1)
+
+		entry.awaitingProofAt = time.Time{}
 
 		sm.submitParkCommit(parkCommit{entry: entry, parentHeight: uint32(best)}) //nolint:gosec // a committed height, never negative
 	}

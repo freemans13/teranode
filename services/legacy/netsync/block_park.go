@@ -202,8 +202,13 @@ type parkedBlock struct {
 	// the next; without this floor the consumer would re-dispatch the same
 	// unproven block as fast as block validation's existence check answers,
 	// for every parked record after a restart, until the walk reaches a
-	// checkpoint. fillHeaderCache clears the stamp when a fill proves the
-	// block, so the floor only ever holds while the proof is genuinely absent.
+	// checkpoint. fillHeaderCache re-offers the block with the stamp cleared
+	// the moment a fill proves it. One window stays open: parkedBlockFailed
+	// re-derives the condition at stamp time, but a fill that lands between
+	// that read and applyParkDisposition's Restore finds nothing in the park
+	// to re-offer, and the entry goes back stamped with the proof present. The
+	// cost there is one floor, awaitingProofRetryAfter, before the drain or the
+	// sweep offers it again and it commits; never a verdict on the block.
 	awaitingProofAt time.Time
 }
 
@@ -782,13 +787,17 @@ func (p *blockPark) AllParked() []parkedBlock {
 }
 
 // TakeChildrenForProof removes and returns every block parked directly behind
-// parent that is in the index, whether or not a retry floor is holding it back,
-// with awaitingProofAt cleared on each copy returned. It exists for
-// fillHeaderCache's re-offer: the caller has just obtained the proof
-// awaitingProofAt was waiting for, so the floor TakeChildren honours is the one
-// thing that must not stop it. Edges to blocks still being written are kept, as
-// TakeChildren keeps them. Blobs stay on disk and charged until the caller
-// commits (Delete) or gives back (Restore).
+// parent that is in the index, whether or not a retry floor is holding it back.
+// It exists for fillHeaderCache's re-offer: the caller has just obtained the
+// proof awaitingProofAt was waiting for, so the floor TakeChildren honours is
+// the one thing that must not stop it. The copies come back with their stamps
+// intact, because the proof may not be for every child taken: a fork sibling at
+// the same height is lifted out too, and the caller gives it back through
+// Restore exactly as it was, floor and all. Clearing the stamp is the caller's
+// to do, on the one entry the proof is for. A hash with no entry is gone and its
+// edge goes with it, as committableChildLocked answers for TakeChildren. Blobs
+// stay on disk and charged until the caller commits (Delete) or gives back
+// (Restore).
 func (p *blockPark) TakeChildrenForProof(parent chainhash.Hash) []parkedBlock {
 	if p == nil {
 		return nil
@@ -804,28 +813,19 @@ func (p *blockPark) TakeChildrenForProof(parent chainhash.Hash) []parkedBlock {
 
 	taken := make([]parkedBlock, 0, len(hashes))
 
-	var kept []chainhash.Hash
-
 	for _, h := range hashes {
 		entry, ok := p.entries[h]
 		if !ok {
-			kept = append(kept, h)
-
 			continue
 		}
 
-		copied := *entry
-		copied.awaitingProofAt = time.Time{}
-
-		taken = append(taken, copied)
+		taken = append(taken, *entry)
 		delete(p.entries, h)
 	}
 
-	if len(kept) == 0 {
-		delete(p.children, parent)
-	} else {
-		p.children[parent] = kept
-	}
+	delete(p.children, parent)
+
+	p.setGauges()
 
 	return taken
 }

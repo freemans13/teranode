@@ -531,8 +531,9 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 
 		entry, ok := sm.blockPark.Take(peeked.hash)
 		if !ok {
-			// The sweep took it between the peek and the claim. Its own path will
-			// commit it, so this turn has nothing to do.
+			// Another taker had it between the peek and the claim: the sweep, or
+			// fillHeaderCache's re-offer of a block a fill just proved. Either
+			// posts it back through submitParkCommit, so this turn has nothing to do.
 			return false
 		}
 

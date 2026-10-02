@@ -209,6 +209,65 @@ func TestReconcileRecoveredParents_AnUnprovenBlockWaitsForTheHeaderWalkAndCommit
 	require.True(t, exists, "the block is in the chain")
 }
 
+// TestReofferParkedBlocksProvenBy_AnUnprovenSiblingKeepsItsFloor is the
+// re-offer with two blocks parked behind the tip: the one the fill proves, and
+// a sibling at the same height the cache names a different hash for, a fork
+// child below the last checkpoint that HandleConvertedBlock refused and the
+// drain stamped. TakeChildrenForProof lifts both out of the park, because the
+// proof could be for either; only the proven one may lose its floor. The
+// sibling goes back exactly as it was, stamp and all, so the drain the re-offer
+// triggers leaves it alone instead of dispatching it hot for HandleConvertedBlock
+// to refuse again.
+//
+// The sibling is a bare entry with no record on disk, which is enough: the
+// re-offer path for an unproven child is Restore, nothing reads it. If the
+// stamp were lost the drain would take it (committableChildLocked no longer
+// holds it) and the read would fail, so the stamp assertion is also the
+// assertion that it was never dispatched.
+func TestReofferParkedBlocksProvenBy_AnUnprovenSiblingKeepsItsFloor(t *testing.T) {
+	sm, f := recoveredParkHarness(t, false)
+	ctx := context.Background()
+
+	var sibling chainhash.Hash
+	sibling[0] = 0x5B
+
+	stampedAt := time.Now()
+	parent := f.header.PrevBlock
+
+	sm.blockPark.entries[sibling] = &parkedBlock{
+		hash:            sibling,
+		prevBlock:       parent,
+		height:          1,
+		parkedAt:        stampedAt.Add(-time.Minute),
+		awaitingProofAt: stampedAt,
+	}
+	// First among the children, so a copy that came back without its stamp is
+	// in the index before the proven block's drain runs, whatever the map order.
+	sm.blockPark.children[parent] = append([]chainhash.Hash{sibling}, sm.blockPark.children[parent]...)
+
+	p := peer.NewInboundPeer(ulogger.TestLogger{}, sm.settings, &peer.Config{})
+
+	require.True(t, sm.fillHeaderCache(p, headersMsgOf(t, []*wire.BlockHeader{f.header})), "the run links to genesis and matches the checkpoint")
+	require.True(t, sm.blockOrigin(f.hash).headerProven, "sanity: the fill must have proven the block")
+	require.False(t, sm.blockOrigin(sibling).headerProven, "sanity: the cache names a different hash at this height")
+
+	// The proven block is re-offered and committed.
+	require.False(t, sm.blockPark.Has(f.hash), "the proven block leaves the park")
+	require.Equal(t, 1, f.spy.callCount(), "exactly one commit, the proven block's re-offer")
+
+	exists, err := sm.blockchainClient.GetBlockExists(ctx, &f.hash)
+	require.NoError(t, err)
+	require.True(t, exists, "the proven block is in the chain")
+
+	// The sibling is back as it was.
+	entry, ok := sm.blockPark.entries[sibling]
+	require.True(t, ok, "the unproven sibling stays parked")
+	require.Equal(t, stampedAt, entry.awaitingProofAt, "the sibling keeps the floor it was stamped with; the proof was not for it")
+
+	_, committable := sm.blockPark.committableChildLocked(sibling)
+	require.False(t, committable, "so the drain the re-offer triggered left it alone")
+}
+
 // TestReconcileRecoveredParents_LeavesABlockWhoseParentIsGenuinelyMissing is the
 // other half. A parent that has not arrived is not an error and must not be
 // treated as one: the block waits for the ordinary commit event.
