@@ -1607,7 +1607,8 @@ func (s *File) syncAndCloseTempFile(file *os.File, tmpFilename string) error {
 // and the next checkpoint can therefore lose the freshly published file's name even when
 // the file's data has been fsynced. Removing this call regresses crash safety on those
 // filesystems; future maintainers should not delete it under the assumption that "best
-// effort" implies optional.
+// effort" implies optional. The same holds for the no-overwrite publish in renameTempFile,
+// which is link then unlink: both change only directory entries, so both need this sync.
 //
 // The "best-effort" framing applies only to failure handling: directory sync is not
 // supported uniformly across platforms (notably some Windows and network-attached

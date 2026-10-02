@@ -484,7 +484,7 @@ The file-based blob store implements automatic cleanup of stale temporary files:
 - Temporary files use `.tmp` extension during writes
 - On successful write, temp files are published under their final names in one step (hard link, or atomic rename when overwriting is allowed); a subtreeData published by another writer first is kept and promoted rather than failing the block
 - On error/abort, temp files are immediately deleted
-- During store initialization, stale `.tmp` files older than 10 minutes are automatically cleaned up
+- A `.tmp` file left by a crash is not swept by the file store; removing it is an operator task
 
 ## Metrics
 
