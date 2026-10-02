@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"runtime/debug"
 	"sort"
 	"time"
 
@@ -403,9 +404,9 @@ func (s *Store) planCreates(items []*createItem) *createPlan {
 			continue
 		}
 
-		txHash := it.tx.TxIDChainHash()
+		txHash := createTxID(it.tx, it.options)
 
-		if _, dup := seen[*txHash]; dup {
+		if _, dup := seen[txHash]; dup {
 			p.errs[i] = errors.NewTxExistsError("[utxoset][Create] %s", txHash.String())
 			continue
 		}
@@ -416,7 +417,7 @@ func (s *Store) planCreates(items []*createItem) *createPlan {
 			continue
 		}
 
-		seen[*txHash] = struct{}{}
+		seen[txHash] = struct{}{}
 		p.perItem[i] = data
 	}
 
@@ -737,7 +738,9 @@ func (p *createPlan) settle(rows pgx.Rows) error {
 
 		item := p.owner[k]
 		p.perItem[item] = nil
-		p.errs[item] = errors.NewTxExistsError("[utxoset][Create] %s", p.txs[k].TxIDChainHash().String())
+		var h chainhash.Hash
+		copy(h[:], p.txids[k])
+		p.errs[item] = errors.NewTxExistsError("[utxoset][Create] %s", h.String())
 	}
 
 	return nil
@@ -820,6 +823,25 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 	// hand-off. See createInFlight on Store.
 	s.createInFlight.Add(1)
 	defer s.createInFlight.Done()
+
+	// A panic in here would be caught by the batcher and logged, and every caller in the batch
+	// would wait forever on a channel nobody writes to, as the spend-and-create batcher once
+	// did. They get an error instead. Each channel holds one answer, so a send that would block
+	// means the caller already has its answer.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Errorf("[utxoset][Create] batch of %d panicked: %v\n%s", len(batch), r, debug.Stack())
+
+			err := errors.NewStorageError("[utxoset][Create] batch panicked: %v", r)
+
+			for _, item := range batch {
+				select {
+				case item.done <- createResult{err: err}:
+				default:
+				}
+			}
+		}
+	}()
 
 	ctx := context.Background()
 
