@@ -20,11 +20,11 @@ import (
 // parents are reconstructed through GetOutpointsFromExternalStore, which re-hashes
 // the blob against its key and caches the outputs.
 //
-// An index past the end of the parent's output list, or an output an external
-// parent's reconstruction dropped as provably unspendable, is NoSuchIndex, the
-// same outcome (TxInvalid) PreviousOutputsDecorate reports for both today. A nil
-// entry inside an inline record's output list is Err: it comes from a partial
-// (padded) record, which proves nothing about the spend.
+// An index past the end of the parent's output list is NoSuchIndex, and so is a
+// nil entry inside it: an output the seeder left out when it rebuilt the parent
+// from a UTXO snapshot, or one an external reconstruction dropped as provably
+// unspendable. Both are the outcome (TxInvalid) PreviousOutputsDecorate reports
+// for the same cases today.
 func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, _ ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
 	_, _, deferFn := tracing.Tracer("aerospike").Start(ctx, "aerospike:ParentOutputsForValidation")
 	defer deferFn()
