@@ -132,11 +132,11 @@ func TestParkDispatch_ACommitFailureIsJudgedByTheCommitTable(t *testing.T) {
 //
 // Legacy must never hand block validation a block whose parent is not committed.
 // A parked dispatch enforces that in the worker rather than on a promise from the
-// consumer: it passes a nil parent, so HandleConvertedBlock performs its own
-// GetBlockHeader on the previous hash and refuses the block if the parent is not
-// there. Passing &inflightParent{height} instead would look like an optimisation,
-// would skip that lookup, and would take the height on trust from a park entry
-// whose height came off the header list.
+// consumer: HandleConvertedBlock takes no parent parameter at all, so it performs
+// its own GetBlockHeader on the previous hash and refuses the block if the parent
+// is not there. Giving it a resolved parent to skip that lookup would look like
+// an optimisation, and would take the height on trust from a park entry whose
+// height came off the header list.
 //
 // So this test leaves the parent out of the real chain, which is the state the
 // guard exists for, and requires that the lookup happened (the ParentGone row

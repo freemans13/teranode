@@ -77,11 +77,16 @@ func mineRegtestPoW(t *testing.T, blk *bsvutil.Block) {
 // a test can drive HandleConvertedBlock without wiring the server's own
 // dependencies (subtree fetch, UTXO create/spend, kafka, gRPC). It records what
 // it was called with and, when it has a chain, stores the block there the way
-// the real server's commit does (AddBlock with mined_set and subtrees_set, the
-// options buildAddBlockOpts in services/blockvalidation/BlockValidation.go
-// passes), so the next block drained behind this one finds its parent in the
-// same real store HandleConvertedBlock reads. It never touches a UTXO store:
-// the gRPC hop and quickValidateBlock's UTXO work are what it stands in for.
+// the real server's quick-validation commit does: AddBlock with mined_set and
+// subtrees_set, two of the three options commitBlock in
+// services/blockvalidation/quick_validate.go passes. The spy omits the third,
+// WithID: the ID a converted record carries to ProcessBlock is zero, because
+// block.Bytes() never serializes it (see the call in handle_block.go and
+// HandleConvertedBlock's comment on "assign server-side"). So the next block
+// drained behind this one finds its parent in the same real store
+// HandleConvertedBlock reads. It never
+// touches a UTXO store: the gRPC hop and quickValidateBlock's UTXO work are
+// what it stands in for.
 //
 // With chain nil it records and reports success, which is what the tests in
 // this file need. See TestHandleConvertedBlock_CommitsWithoutTheBlock's own doc
@@ -103,8 +108,13 @@ type convertedRouteSpyValidation struct {
 	// the park's resubmit of the same block then goes through.
 	failures map[chainhash.Hash]error
 	// recordOnly names blocks whose ProcessBlock reports success without the
-	// chain getting the row, which is the shape of a commit that was reported
-	// and then reorged out before the child looked its parent up.
+	// chain getting the row. That is a fault injection, not a shape the store
+	// has been traced to produce: the SQL GetBlockHeader query selects by hash
+	// with no filter on the invalid flag, so an invalidated parent is still
+	// returned, and it caches hits only, so a miss made before the parent's
+	// commit cannot outlive it. What the injection buys is a drain that the
+	// parent's own commit triggered reaching parkCommitFailure's
+	// ErrBlockNotFound row through the real chain.
 	recordOnly map[chainhash.Hash]struct{}
 }
 

@@ -337,9 +337,10 @@ func TestSyncManager_AParkedBlockThatWillNotCommitIsGivenUpAndRejected(t *testin
 }
 
 // TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked covers the
-// first of the two ways a drain declines to commit without giving the block up.
-// A reorg can take the parent back out from under a block that was about to be
-// committed; the block itself is still perfectly good, so it has to go back in
+// first of the two ways a drain declines to commit without giving the block up:
+// HandleConvertedBlock's own GetBlockHeader on the previous hash answers
+// ErrBlockNotFound, and parkCommitFailure maps that to the ParentGone row. A
+// missing parent says nothing about the child, so the child has to go back in
 // the index with its blob intact rather than be written off and re-downloaded.
 func TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked(t *testing.T) {
 	h := newParkWiringHarness(t, true)
@@ -348,8 +349,10 @@ func TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked(t *testi
 	parent := h.blocks[0].MsgBlock().BlockHash()
 
 	// The parent's commit reports success, but the chain never gets the row,
-	// so the child's own parent lookup still fails: exactly what a reorg
-	// between the parent's commit and the child's lookup looks like.
+	// so the drain the parent's commit triggers reaches the child and the
+	// child's own parent lookup still fails. This is a fault injection to get
+	// the drain onto the ParentGone row; see recordOnly's comment for why no
+	// store path (a reorg included) has been traced to produce it.
 	h.validation.recordOnlyFor(parent)
 
 	require.NoError(t, h.deliver(t, 1))
@@ -370,7 +373,7 @@ func TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked(t *testi
 	_, failed := h.sm.recentlyFailedBlocks.Get(child)
 	require.False(t, failed, "a block nobody could commit yet must not be written off as a failure")
 
-	require.False(t, h.rec.wasRejected(child), "a reorg is not the peer's fault, so it must not be told the block was bad")
+	require.False(t, h.rec.wasRejected(child), "a missing parent is not the peer's fault, so it must not be told the block was bad")
 }
 
 // TestSyncManager_AParkedBlockIsKeptWhenTheCommitIsCancelled covers the other
