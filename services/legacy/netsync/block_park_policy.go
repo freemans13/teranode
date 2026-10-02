@@ -10,12 +10,13 @@ import (
 //
 // A parked block is a block that is already downloaded, already checked against
 // its own header hash and proof of work, and already written to disk. Its merkle
-// root is NOT checked at park time; that happens on the way back out, in
-// HandleBlockDirect. Many things can
-// go wrong with it afterwards — the blob will not read back, the commit fails,
-// the parent disappears under a reorg, its time runs out, the node is shutting
-// down, the store is out of permits, the budget is full — and each of those has
-// to settle the same two questions:
+// root was checked against the header by the pipeline sink before the record
+// was written (pipelineBlockSink, pipeline_sink.go); what can still go wrong
+// afterwards is local: the record or its files on disk, the UTXO set, the
+// store, the chain under it. Many things can go wrong with it — the blob will
+// not read back, the commit fails, the parent disappears under a reorg, its
+// time runs out, the node is shutting down, the store is out of permits, the
+// budget is full — and each of those has to settle the same two questions:
 //
 //	does the blob survive, or is the download thrown away?
 //	is the peer that sent it told the block was bad?
@@ -129,6 +130,74 @@ var (
 		blob:   parkBlobDrop,
 	}
 
+	// parkDispositionRecordCorrupt — quick validation returned a corrupt
+	// verdict for a record this node wrote. On the converted route the body
+	// was verified against the header at the sink before anything was
+	// written, so a corrupt verdict afterwards is about this node's own files,
+	// never about the peer's bytes. Drop the record, mark nothing, blame
+	// nobody; the block is unowed on the next wanted-range pass and is
+	// downloaded again.
+	//
+	// Dropping repairs it only because of where the verdict comes from: every
+	// corrupt verdict the converted route can raise follows a root-vs-key
+	// anchor of a structure file (readSubtreeStructure in blockvalidation's
+	// quick_validate.go), and a file that fails the anchor is deleted by
+	// quarantineSubtreeKeyMismatch before the verdict is returned, so the
+	// re-download writes it afresh. subtreeWriter.put never rewrites a key
+	// that is already there, so a damaged file that was NOT removed could not
+	// be repaired this way; block validation returns that case as a local
+	// fault (ServiceError), which lands on retryLater above, not here. A
+	// future corrupt verdict raised for a file whose content matches its key
+	// would make this row loop; keep that in mind when adding one.
+	parkDispositionRecordCorrupt = parkDisposition{
+		reason: "a corrupt verdict on a record this node wrote; the body was verified against the header at the sink, so the fault is local",
+		blob:   parkBlobDrop,
+	}
+
+	// parkDispositionFilesGone — the record names subtree files that are no
+	// longer on disk. The record carries no delete-at-height of its own while
+	// every subtree file does (subtree_writer.go), so expiry removes the files
+	// from under it; a concurrent conversion's cleanup can do the same. Drop
+	// the record, mark nothing, blame nobody: the next wanted-range pass sees
+	// the block as not held and downloads it again, and the sink rewrites
+	// whichever files are missing (put skips the ones still there).
+	//
+	// Reached two ways. hasCompleteRecord on the commit path finds the files
+	// gone before anything is validated, which is the normal route and the
+	// one that keeps a missing file out of quick validation's UTXO work.
+	// Failing that, the not-found from inside block validation lands here
+	// through parkCommitFailure, which relies on one invariant: on the commit
+	// chain a code-3 NotFound is raised only by the blob store for a missing
+	// file (stores/blob/file/file.go, the bare ErrNotFound it returns and the
+	// NotFound wraps readSubtree and readSubtreeStructure put around it). A
+	// UTXO-store miss carries code 30 (ErrTxNotFound) or a Storage or Service
+	// wrap, and a missing parent block carries code 10 (ErrBlockNotFound),
+	// which parkCommitFailure routes BEFORE this row. A new raiser of code 3
+	// on a store must be checked against this row.
+	parkDispositionFilesGone = parkDisposition{
+		reason: "the record names subtree files that are no longer on disk",
+		blob:   parkBlobDrop,
+	}
+
+	// parkDispositionLocalUtxoFault — a parent output this block spends is
+	// missing from the UTXO set. Below the checkpoint the block is on the
+	// certified chain (the unified route requires the header proof), so the
+	// output it spends exists in history and the thing that is wrong is this
+	// node's UTXO set, not the block. Keep the blob: a re-download cannot
+	// repair a UTXO set, and the block is retried by the sweep for as long as
+	// it stays parked (parkStuckThreshold, parkSweepInterval), at error level
+	// each time, because only an operator can clear the cause. Blame nobody.
+	//
+	// SV Node rejects such a block as invalid (bad-txns-inputs-missingorspent,
+	// DoS 100), and can, because it has run every script and proven the chain
+	// to the checkpoint itself. On this route the UTXO set is the only input
+	// that was not verified against the header, so it is the one that can be
+	// wrong.
+	parkDispositionLocalUtxoFault = parkDisposition{
+		reason: "a parent output this node should already hold is missing from its UTXO set",
+		blob:   parkBlobKeep,
+	}
+
 	// parkDispositionAbandoned — the parent has been genuinely absent from the
 	// chain for longer than parkAbandonAfter, so this is judged orphaned rather
 	// than merely slow: a losing fork at the frontier, or a block from a stale
@@ -201,10 +270,10 @@ func parkReadFailure(err error) parkDisposition {
 
 // parkCommitFailure classifies an error from committing a parked block.
 //
-// Its default is the opposite of parkReadFailure's, and that is on purpose: any
-// non-transient failure of HandleBlockDirect is a judgement on the block, and the
-// park is the only path a block commits through, so this is where that judgement
-// is made.
+// Its default is the opposite of parkReadFailure's, and that is on purpose: a
+// failure of HandleConvertedBlock that nothing above has classified is a
+// judgement on the block, and the park is the only path a block commits
+// through, so this is where that judgement is made.
 //
 // What that default costs is worth stating, because it is more than the wasted
 // re-download the read path costs. parkDispositionBlockRejected sets markFailed,
@@ -215,9 +284,23 @@ func parkReadFailure(err error) parkDisposition {
 // here rather than on retryLater (stores/utxo/sql/sql.go returns the bare error
 // from db.Begin and txn.Commit). Closing that gap belongs one layer down in the
 // store, not in a guess made here.
+//
+// The order of the arms is load-bearing. The transient arm stays above the
+// local-fault rows so a Service or Storage wrap around a not-found keeps the
+// blob: block validation's full route wraps every failure in a ServiceError
+// (Server.go processBlockFound), and readSubtreeStructure wraps a non-ENOENT
+// open failure as NotFound around a StorageError. Corrupt is tested before
+// ErrBlockInvalid because the errors package guarantees a corrupt error never
+// wraps an invalid one (sanitizeCorruptParams) but not the reverse. The
+// explicit ErrBlockInvalid arm changes nothing today and exists so a judgement
+// that happens to wrap a not-found stays a judgement rather than being read by
+// the FilesGone row.
 func parkCommitFailure(err error) parkDisposition {
 	switch {
 	case errors.Is(err, errors.ErrBlockNotFound):
+		// Before FilesGone on purpose: the blockchain store raises this code
+		// with errors.ErrNotFound wrapped inside it (stores/blockchain/sql
+		// GetBlockHeader), so a missing parent carries code 10 AND code 3.
 		return parkDispositionParentGone
 
 	case errors.Is(err, errors.ErrBlockParentNotMined):
@@ -237,6 +320,18 @@ func parkCommitFailure(err error) parkDisposition {
 
 	case errors.IsContextError(err), errors.IsTransientLocalError(err):
 		return parkDispositionRetryLater
+
+	case errors.IsBlockCorrupt(err):
+		return parkDispositionRecordCorrupt
+
+	case errors.Is(err, errors.ErrBlockInvalid):
+		return parkDispositionBlockRejected
+
+	case errors.Is(err, errors.ErrNotFound), errors.Is(err, errors.ErrBlobNotFound):
+		return parkDispositionFilesGone
+
+	case errors.Is(err, errors.ErrTxNotFound):
+		return parkDispositionLocalUtxoFault
 
 	default:
 		return parkDispositionBlockRejected

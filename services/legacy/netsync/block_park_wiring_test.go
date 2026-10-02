@@ -18,7 +18,9 @@ import (
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
-	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/file"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	chainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -109,25 +111,59 @@ func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
 	return newParkWiringHarnessInState(t, parkOn, blockchain2.FSMStateCATCHINGBLOCKS)
 }
 
+// parkWiringOption adjusts the harness at construction.
+type parkWiringOption func(*parkWiringConfig)
+
+type parkWiringConfig struct {
+	txsPerBlock int
+}
+
+// withTransactions mines every harness block with n non-coinbase transactions,
+// each spending a distinct outpoint nothing created, so the converted record
+// the sink writes names a subtree whose structure and data files are on disk.
+// The default harness mines coinbase-only blocks, whose records name no
+// subtree at all, which is no use to a test about those files.
+//
+// The spy block validation reads none of them, and the sink needs no parent
+// output to stream a transaction into a subtree file, so an outpoint nothing
+// created is exactly the shape wireBlockWithTxs already converts in this
+// package's sink tests.
+func withTransactions(n int) parkWiringOption {
+	return func(c *parkWiringConfig) { c.txsPerBlock = n }
+}
+
 // newParkWiringHarnessInState is the same harness with the FSM state chosen by
 // the caller. It matters for one decision only: handleBlockMsg suppresses every
 // reject while the node is catching blocks, so a test about who gets blamed has
 // to be able to run on both sides of that.
-func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2.FSMStateType) *parkWiringHarness {
+func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2.FSMStateType, opts ...parkWiringOption) *parkWiringHarness {
 	t.Helper()
+
+	var cfg parkWiringConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 
 	// The real constructor registers these; a struct-literal manager reaches the
 	// same gauges on the commit path.
 	initPrometheusMetrics()
 
-	blocks := minedBlocks(t, 3)
+	blocks := minedBlocksCarrying(t, 3, cfg.txsPerBlock)
 
 	root := t.TempDir()
 
 	storeURL, err := url.Parse("file://" + root)
 	require.NoError(t, err)
 
-	realStore, err := blob.NewStore(ulogger.TestLogger{}, storeURL)
+	// A deletion scheduler because the sink stamps every subtree file it
+	// writes with a delete-at-height, and the file store refuses such a write
+	// without one; a coinbase-only block writes no subtree file, so the
+	// default harness never needed it. The same construction
+	// pipeline_park_recovery_test.go uses.
+	realStore, err := file.New(ulogger.TestLogger{}, storeURL,
+		options.WithBlobDeletionScheduler(&recordingDeletionScheduler{}),
+		options.WithStoreType(storetypes.TEMPSTORE),
+	)
 	require.NoError(t, err)
 
 	store := &parkReadFaultStore{Store: realStore}

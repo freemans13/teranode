@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -29,6 +30,14 @@ type parkReadFaultStore struct {
 
 	mu  sync.Mutex
 	err error
+
+	// existsKey and existsErr arm a fault on Exists for ONE key only. The
+	// commit path's completeness check (hasCompleteRecord) stats a record's
+	// subtree files, and a test about a stat that cannot run must fault that
+	// stat without faulting the existence pre-check every sink write makes
+	// for every other block's files (filestorer.NewFileStorer).
+	existsKey []byte
+	existsErr error
 }
 
 func (s *parkReadFaultStore) failReadsWith(err error) {
@@ -36,6 +45,28 @@ func (s *parkReadFaultStore) failReadsWith(err error) {
 	defer s.mu.Unlock()
 
 	s.err = err
+}
+
+// failExistsFor makes every Exists for key fail with err, whatever the file
+// type. A nil key disarms it.
+func (s *parkReadFaultStore) failExistsFor(key []byte, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.existsKey = key
+	s.existsErr = err
+}
+
+func (s *parkReadFaultStore) Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (bool, error) {
+	s.mu.Lock()
+	faultKey, err := s.existsKey, s.existsErr
+	s.mu.Unlock()
+
+	if faultKey != nil && err != nil && bytes.Equal(faultKey, key) {
+		return false, err
+	}
+
+	return s.Store.Exists(ctx, key, fileType, opts...)
 }
 
 func (s *parkReadFaultStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (io.ReadCloser, error) {
@@ -266,4 +297,133 @@ func TestSyncManager_AParkedBlockSurvivesAParentThatIsSlowToBeMarkedMined(t *tes
 	require.Zero(t, h.sm.blockPark.Bytes(), "committing must give the park budget back")
 	require.False(t, h.rec.askedForSince(getDataBefore, child), "the block was on disk, so it must not be fetched again")
 	require.False(t, h.rec.wasRejected(child), "the peer must never have been blamed")
+}
+
+// parkCommitChain is the shape a block-validation verdict has by the time
+// parkCommitFailure sees it: quickValidateBlock's ProcessingError around the
+// subtree pipeline's, the gRPC hop (WrapGRPC in the server, UnwrapGRPC in the
+// client), and netsync ProcessBlock's own ProcessingError on top. inner is what
+// the pipeline raised. The gRPC round trip is included rather than stylised
+// because it rebuilds the chain from details, and a code dropped there would
+// make a classifier arm dead in production while a bare-error test stayed
+// green.
+func parkCommitChain(inner error) error {
+	server := errors.NewProcessingError("[quickValidateBlock][hash] failed to process block subtrees",
+		errors.NewProcessingError("[processBlockSubtrees][hash] subtree 0 failed", inner))
+
+	return errors.NewProcessingError("failed to process block", errors.UnwrapGRPC(errors.WrapGRPC(server)))
+}
+
+// TestParkCommitFailure_ACorruptVerdictIsNotHeldAgainstTheBlockOrThePeer pins
+// the RecordCorrupt row. On the converted route the body was verified against
+// the header at the sink, so a corrupt verdict later is about this node's own
+// files: the record is dropped and downloaded again, the hash is not written
+// off and the peer is not told anything. Ported from the deleted
+// TestHandleBlockMsg_CorruptBody_NotMarkedFailed, whose property this is.
+func TestParkCommitFailure_ACorruptVerdictIsNotHeldAgainstTheBlockOrThePeer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "bare, as processBlockFound returns a corrupt verdict on the unified route",
+			err:  errors.NewBlockCorruptError("[quickValidateBlock][hash] merkle root does not match"),
+		},
+		{
+			name: "through the production chain",
+			err:  parkCommitChain(errors.NewBlockCorruptError("[bindSubtreeBodyToHeader][hash] subtree does not hash to its key")),
+		},
+		{
+			name: "corrupt wrapped around a key-mismatch processing error, as the legacy unified branch returns it",
+			err:  parkCommitChain(errors.NewBlockCorruptError("[processBlockFound][hash] a subtree file this node wrote does not hash to its key", errors.NewProcessingError("subtree key mismatch"))),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := parkCommitFailure(tc.err)
+
+			require.Equal(t, parkDispositionRecordCorrupt, d)
+			require.Equal(t, parkBlobDrop, d.blob, "the record is dropped so the block is downloaded again")
+			require.False(t, d.markFailed, "a corrupt verdict on this node's own record must not write the block off")
+			require.False(t, d.blamePeer, "the peer's bytes were verified at the sink; the fault is local")
+			require.NotEqual(t, parkDispositionBlobUnusable.reason, d.reason, "an operator must be able to tell a corrupt verdict from an unreadable blob")
+		})
+	}
+}
+
+// TestParkCommitFailure_AMissingSubtreeFileDropsTheRecordWithoutJudgingIt pins
+// the FilesGone row and the two arms that must win over it: a Service or
+// Storage wrap keeps the blob, and a judgement that happens to wrap a not-found
+// stays a judgement.
+func TestParkCommitFailure_AMissingSubtreeFileDropsTheRecordWithoutJudgingIt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want parkDisposition
+	}{
+		{
+			name: "the blob store's bare not-found under readSubtree's wrap",
+			err:  parkCommitChain(errors.NewNotFoundError("[readSubtree/hash] failed to get subtree data", errors.ErrNotFound)),
+			want: parkDispositionFilesGone,
+		},
+		{
+			name: "a blob-not-found inside",
+			err:  parkCommitChain(errors.NewNotFoundError("[readSubtreeStructure/hash] failed to get subtree", errors.NewBlobNotFoundError("no such blob"))),
+			want: parkDispositionFilesGone,
+		},
+		{
+			name: "a not-found around a storage error, readSubtreeStructure's shape for an open failure that is not ENOENT",
+			err:  parkCommitChain(errors.NewNotFoundError("[readSubtreeStructure/hash] failed to get subtree", errors.NewStorageError("open: permission denied"))),
+			want: parkDispositionRetryLater,
+		},
+		{
+			name: "a service error around a not-found, the full route's wrap",
+			err:  errors.NewProcessingError("failed to process block", errors.NewServiceError("failed block validation BlockFound", errors.NewNotFoundError("subtree not found"))),
+			want: parkDispositionRetryLater,
+		},
+		{
+			name: "a judgement around a not-found stays a judgement",
+			err:  parkCommitChain(errors.NewBlockInvalidError("[ValidateBlock][hash] block is invalid", errors.NewNotFoundError("subtree not found"))),
+			want: parkDispositionBlockRejected,
+		},
+		{
+			name: "a missing parent block carries code 3 inside code 10 and is the parent's row, not this one",
+			err:  errors.NewProcessingError("failed to get block header for previous block", errors.NewBlockNotFoundError("block not found", errors.ErrNotFound)),
+			want: parkDispositionParentGone,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := parkCommitFailure(tc.err)
+
+			require.Equal(t, tc.want, d)
+
+			if tc.want == parkDispositionFilesGone {
+				require.Equal(t, parkBlobDrop, d.blob, "a record whose files are gone is dropped and downloaded again")
+				require.False(t, d.markFailed, "a file going missing on this node must not write the block off")
+				require.False(t, d.blamePeer, "the files going missing on this node is not the peer's fault")
+			}
+		})
+	}
+}
+
+// TestParkCommitFailure_AMissingParentOutputKeepsTheBlockAndBlamesNobody pins
+// the LocalUtxoFault row: a code-30 miss from the UTXO store, in the shape the
+// SQL store's batched spend raises it (a UtxoError whose Join chains the
+// per-spend TxNotFound), keeps the blob with its own operator-facing reason.
+// A code-3 not-found must not land here: 3 is a file, 30 is an output.
+func TestParkCommitFailure_AMissingParentOutputKeepsTheBlockAndBlamesNobody(t *testing.T) {
+	err := parkCommitChain(errors.NewUtxoError("error in sql spend (batched mode) - errors",
+		errors.NewTxNotFoundError("output %d of %s not found", 0, "abcd")))
+
+	d := parkCommitFailure(err)
+
+	require.Equal(t, parkDispositionLocalUtxoFault, d)
+	require.Equal(t, parkBlobKeep, d.blob, "a re-download cannot repair a UTXO set, so the block stays parked")
+	require.False(t, d.markFailed, "the block is canonical below the checkpoint; the UTXO set is what is wrong")
+	require.False(t, d.blamePeer, "the peer sent a good block")
+	require.NotEqual(t, parkDispositionRetryLater.reason, d.reason, "an operator must be able to tell this from a busy store")
+	require.NotEqual(t, parkDispositionParentGone.reason, d.reason, "and from a reorg")
+	require.NotEqual(t, parkDispositionParentNotMinedYet.reason, d.reason, "and from a late mined flag")
+
+	fileMiss := parkCommitChain(errors.NewNotFoundError("[readSubtree/hash] failed to get subtree data", errors.ErrNotFound))
+	require.NotEqual(t, parkDispositionLocalUtxoFault, parkCommitFailure(fileMiss), "a missing file is not a missing output")
 }

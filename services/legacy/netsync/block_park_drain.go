@@ -149,9 +149,27 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 // two defaults point opposite ways: a read failure keeps the block, a commit
 // failure judges it.
 func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
-	record, err := sm.blockPark.ReadConverted(sm.ctx, entry.hash)
+	// The read and the completeness check share one store deadline, the same
+	// one holdsBlock puts on the identical pair of calls: both run on the
+	// goroutine that commits blocks in order, and the file store's permit wait
+	// is 25 seconds per call without a caller deadline (blockPark.storeCtx).
+	// The commit below runs on sm.ctx, not this one: validation runs long and
+	// is not a store call.
+	readCtx, cancel := sm.blockPark.storeCtx(sm.ctx)
+
+	record, err := sm.blockPark.ReadConverted(readCtx, entry.hash)
 	if err != nil {
+		cancel()
+
 		return sm.parkedReadFailed(entry, err)
+	}
+
+	complete, checkErr := sm.blockPark.hasCompleteRecord(readCtx, entry.hash, record, sm.subtreeStore)
+
+	cancel()
+
+	if checkErr != nil || !complete {
+		return sm.parkedRecordIncomplete(entry, checkErr)
 	}
 
 	// A nil in-flight parent: see HandleConvertedBlock's own doc comment for why it
@@ -185,6 +203,38 @@ func (sm *SyncManager) parkedReadFailed(entry parkedBlock, err error) bool {
 
 	sm.logger.Warnf("[commitParkedBlock][%s] parked block could not be read back (%s): %v", entry.hash, d.reason, err)
 	sm.applyParkDisposition(entry, d)
+
+	return false
+}
+
+// parkedRecordIncomplete settles a record that read back cleanly but whose
+// subtree files could not all be found, and reports false so the drain stops
+// walking that branch. Reached from both commit paths after ReadConverted and
+// before anything is validated, which is the point: quick validation below the
+// checkpoint mutates the UTXO set batch by batch with no unwind, so a record
+// whose files are gone must be turned away before it gets there, not judged by
+// the not-found that comes back from inside it.
+//
+// checkErr is hasCompleteRecord's third state. Nil means a stat ran and said a
+// file is absent: the FilesGone row, drop the record so the next wanted-range
+// pass downloads the block again, no mark and no blame. Non-nil means the stat
+// could not run, which says nothing about the files, so the block is kept for
+// the sweep exactly as a read that found the store out of permits is
+// (parkDispositionRetryLater). The row is applied directly rather than through
+// a sentinel error and parkReadFailure: teranode's errors.Is matches by code,
+// so a NotFound sentinel could only be told from the store's own NotFound by
+// pointer identity, which is one refactor away from matching every code-3
+// error.
+func (sm *SyncManager) parkedRecordIncomplete(entry parkedBlock, checkErr error) bool {
+	if checkErr != nil {
+		sm.logger.Warnf("[commitParkedBlock][%s] could not check the record's subtree files (%s); leaving the block parked: %v", entry.hash, parkDispositionRetryLater.reason, checkErr)
+		sm.applyParkDisposition(entry, parkDispositionRetryLater)
+
+		return false
+	}
+
+	sm.logger.Warnf("[commitParkedBlock][%s] %s; dropping the record so the next wanted-range pass downloads the block again", entry.hash, parkDispositionFilesGone.reason)
+	sm.applyParkDisposition(entry, parkDispositionFilesGone)
 
 	return false
 }
@@ -267,13 +317,17 @@ func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 		d = d.withoutBlame()
 	}
 
-	if d.blob == parkBlobKeep {
+	switch {
+	case d.blob == parkBlobKeep:
 		// Stamped before the disposition is carried out, so the entry that goes
 		// back into the park carries it. Without this the parent stays queued
 		// for a drain and the very next turn picks this same block again: 1,494
 		// of 3,000 log lines on mainnet on 2026-09-10, about seven a second,
-		// while a block whose parent was the tip waited behind it.
-		if d.reason == parkDispositionParentGone.reason {
+		// while a block whose parent was the tip waited behind it. A missing
+		// parent OUTPUT is stamped for the same reason: the UTXO set will not
+		// have grown it by the next turn any more than the chain will have
+		// grown a missing parent block.
+		if d.reason == parkDispositionParentGone.reason || d.reason == parkDispositionLocalUtxoFault.reason {
 			entry.parentMissingAt = time.Now()
 		}
 
@@ -287,9 +341,22 @@ func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 			entry.awaitingProofAt = time.Now()
 		}
 
-		sm.logger.Infof("[commitParkedBlock][%s] leaving the block parked (%s), parent %s: %v", entry.hash, d.reason, entry.prevBlock, err)
-	} else {
+		if d.reason == parkDispositionLocalUtxoFault.reason {
+			// At error level because, unlike every other keep row, nothing on
+			// this node's own path clears it: the block is retried by the
+			// sweep, and the UTXO set needs an operator.
+			sm.logger.Errorf("[commitParkedBlock][%s] leaving the block parked (%s); the block is retried, the UTXO set needs an operator: %v", entry.hash, d.reason, err)
+		} else {
+			sm.logger.Infof("[commitParkedBlock][%s] leaving the block parked (%s), parent %s: %v", entry.hash, d.reason, entry.prevBlock, err)
+		}
+
+	case d.markFailed:
 		sm.logger.Errorf("[commitParkedBlock][%s] giving the block up (%s): %v", entry.hash, d.reason, err)
+
+	default:
+		// A drop that is not a judgement: the record is this node's own and
+		// the block is downloaded again on the next wanted-range pass.
+		sm.logger.Warnf("[commitParkedBlock][%s] dropping the record (%s); it will be downloaded again: %v", entry.hash, d.reason, err)
 	}
 
 	sm.applyParkDisposition(entry, d)

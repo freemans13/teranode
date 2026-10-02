@@ -29,6 +29,16 @@ import (
 func minedBlocks(t *testing.T, n int) []*bsvutil.Block {
 	t.Helper()
 
+	return minedBlocksCarrying(t, n, 0)
+}
+
+// minedBlocksCarrying is minedBlocks with txsPerBlock non-coinbase
+// transactions in every block, each spending a distinct outpoint that nothing
+// created (the same shape wireBlockWithTxs uses), so a block's converted record
+// names a subtree. Zero gives minedBlocks' coinbase-only blocks.
+func minedBlocksCarrying(t *testing.T, n, txsPerBlock int) []*bsvutil.Block {
+	t.Helper()
+
 	chainParams := chaincfg.RegressionNetParams
 
 	address, _, err := GenerateAnyoneCanspendAddress(&chainParams)
@@ -38,7 +48,24 @@ func minedBlocks(t *testing.T, n int) []*bsvutil.Block {
 	prev := bsvutil.NewBlock(chainParams.GenesisBlock)
 
 	for i := 0; i < n; i++ {
-		block, err := CreateBlock(prev, nil, 2, nullTime, address, []wire.TxOut{}, &chainParams)
+		var inclusion []*bsvutil.Tx
+
+		for j := 0; j < txsPerBlock; j++ {
+			var prevHash chainhash.Hash
+			prevHash[0], prevHash[1] = byte(i+1), byte(j+1) //nolint:gosec // test fixture indices
+
+			tx := wire.NewMsgTx(1)
+			tx.AddTxIn(&wire.TxIn{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				SignatureScript:  []byte{0x00, byte(i + 1), byte(j + 1)}, //nolint:gosec // test fixture indices
+				Sequence:         wire.MaxTxInSequenceNum,
+			})
+			tx.AddTxOut(&wire.TxOut{Value: int64(1000 + j), PkScript: []byte{0x76, 0xa9, 0x14, byte(i + 1), byte(j + 1)}}) //nolint:gosec // test fixture indices
+
+			inclusion = append(inclusion, bsvutil.NewTx(tx))
+		}
+
+		block, err := CreateBlock(prev, inclusion, 2, nullTime, address, []wire.TxOut{}, &chainParams)
 		require.NoError(t, err)
 
 		blocks = append(blocks, block)

@@ -190,6 +190,12 @@ type parkedBlock struct {
 	// A parent that is genuinely missing is not going to appear within a turn,
 	// so waiting before asking again costs nothing and hands the turn to a block
 	// that can actually be committed.
+	//
+	// Also stamped for a missing parent OUTPUT (parkDispositionLocalUtxoFault),
+	// for the same reason: a UTXO set that is missing an output this node
+	// should hold is not going to grow it within a turn either, and without
+	// the stamp the restored block is re-dispatched every consumer turn off
+	// the still-queued drain request for its parent.
 	parentMissingAt time.Time
 	// awaitingProofAt is when a commit of this block last failed because it is
 	// on the unified below-checkpoint route and the header cache could not
@@ -926,19 +932,28 @@ func (p *blockPark) setGauges() {
 // hasCompleteRecord answers whether a converted record that has already been
 // read and hash-checked (record) is safe to treat as held: every subtree file
 // it names is still on disk. record being nil means the record itself is not
-// there, or would not read, so the answer is false before anything is walked.
+// there, or would not read, so the answer is (false, nil) before anything is
+// walked.
 //
 // This is the ONE place that decides "complete" for a converted record.
 // Recover calls it while deciding whether a record left over from a previous
 // run is worth adopting; holdsBlock calls it while deciding whether a block
-// needs downloading again. Both are the same question, so both get the same
-// answer — a record whose subtree files are gone is neither adopted here nor
-// reported as held there.
+// needs downloading again; commitParkedBlock and the dispatcher's parkedRun
+// call it before handing a record to block validation. All four are the same
+// question, so all four get the same answer.
 //
-// A missing or errored subtree stat answers false. That is the safe
-// direction: the alternative is adopting a commit that fails inside
-// validation and lands on the path that deletes the only copy and blames an
-// honest peer.
+// The answer has three states, not two, and the third is the one that
+// matters on the commit path. (true, nil): every file is there. (false, nil):
+// a stat ran and said a file is absent, positive evidence the record cannot be
+// committed from. (false, err): a stat could not run at all. The file store
+// takes a read permit before every Exists and gives up on it after its
+// deadline with a StorageError, and the same call is cancelled at shutdown;
+// neither says anything about the files. holdsBlock and adoptStranded read
+// the third state as "not held", which costs a re-download of a record still
+// on disk. The commit path must not read it as "absent": there, absent means
+// the only copy of a downloaded block is deleted, and deleting it over a store
+// that was briefly out of permits is the regression block_park_policy.go
+// exists to stop.
 //
 // Either file type counts, and that is a completeness question rather than a
 // validation one. subtreeWriter writes .subtreeToCheck for every record now,
@@ -954,15 +969,15 @@ func (p *blockPark) setGauges() {
 // Nothing is laundered by accepting both. The file's type is what it is on disk;
 // this decides only whether the record still points at files that exist.
 // .subtreeToCheck still means "needs validating" to everything downstream, and
-// .subtree still means block validation decided it did not — that decision is
+// .subtree still means block validation decided it did not; that decision is
 // not revisited here and was never revisited here.
-func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, record *model.Block, subtreeStore blob.Store) bool {
+func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, record *model.Block, subtreeStore blob.Store) (bool, error) {
 	if record == nil {
-		return false
+		return false, nil
 	}
 
 	if subtreeStore == nil || len(record.Subtrees) == 0 {
-		return true
+		return true, nil
 	}
 
 	// Every subtree the record names, not just the first. Checking only
@@ -973,22 +988,37 @@ func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, 
 	// only copy and blames an honest peer.
 	for _, subtree := range record.Subtrees {
 		var (
-			exists    bool
-			existsErr error
+			found   bool
+			statErr error
 		)
 
+		// A stat error on one type and a clean "absent" on the other is not
+		// evidence of absence: the file may well be there under the type whose
+		// stat failed. So an error is remembered across both types and wins
+		// over a clean miss; only two clean misses say the structure is gone.
 		for _, structureType := range []fileformat.FileType{fileformat.FileTypeSubtree, fileformat.FileTypeSubtreeToCheck} {
-			exists, existsErr = subtreeStore.Exists(ctx, subtree[:], structureType)
-			if existsErr == nil && exists {
+			exists, err := subtreeStore.Exists(ctx, subtree[:], structureType)
+			if err != nil {
+				statErr = err
+
+				continue
+			}
+
+			if exists {
+				found = true
+
 				break
 			}
 		}
 
-		if existsErr != nil || !exists {
-			p.logger.Warnf("[blockPark][%s] converted record's subtree %s is gone (exists=%v, err=%v); treating the record as not held",
-				hash, subtree, exists, existsErr)
+		if !found {
+			if statErr != nil {
+				return false, statErr
+			}
 
-			return false
+			p.logger.Warnf("[blockPark][%s] converted record's subtree %s is gone; treating the record as not held", hash, subtree)
+
+			return false, nil
 		}
 
 		// The structure file alone is not proof. subtreeWriter writes it last, so at
@@ -1001,15 +1031,18 @@ func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, 
 		// from the delivering peer's base URL, so a record without it is not one this
 		// node can be sure of committing.
 		dataExists, dataErr := subtreeStore.Exists(ctx, subtree[:], fileformat.FileTypeSubtreeData)
-		if dataErr != nil || !dataExists {
-			p.logger.Warnf("[blockPark][%s] converted record's subtree %s has no data file (exists=%v, err=%v); treating the record as not held",
-				hash, subtree, dataExists, dataErr)
+		if dataErr != nil {
+			return false, dataErr
+		}
 
-			return false
+		if !dataExists {
+			p.logger.Warnf("[blockPark][%s] converted record's subtree %s has no data file; treating the record as not held", hash, subtree)
+
+			return false, nil
 		}
 	}
 
-	return true
+	return true, nil
 }
 
 // Recover adopts whatever a previous run left on disk, and cleans up whatever
@@ -1103,7 +1136,14 @@ func (p *blockPark) adoptStranded(ctx context.Context, hash chainhash.Hash, subt
 	}
 
 	record, err := p.ReadConverted(readCtx, hash)
-	if err != nil || !p.hasCompleteRecord(readCtx, hash, record, subtreeStore) {
+	if err != nil {
+		return false
+	}
+
+	// Both a clean "absent" and a stat that could not run answer not adopted:
+	// the record stays on disk either way, and holdsBlock then answers false
+	// for it, so the cost of the unknown case is a re-download, never a loss.
+	if complete, checkErr := p.hasCompleteRecord(readCtx, hash, record, subtreeStore); checkErr != nil || !complete {
 		return false
 	}
 
@@ -1238,10 +1278,26 @@ func (p *blockPark) Recover(ctx context.Context, subtreeStore blob.Store) {
 			// record has no delete-at-height of its own, while every subtree
 			// file does (subtree_writer.go), so a record can survive long
 			// enough to outlive them. hasCompleteRecord is the one place that
-			// answers this — holdsBlock asks it the identical question when
+			// answers this; holdsBlock asks it the identical question when
 			// deciding whether a block needs downloading again, so the two
 			// cannot disagree about what "complete" means.
-			if !p.hasCompleteRecord(ctx, *hash, record, subtreeStore) {
+			//
+			// Only a stat that RAN and said absent deletes the record. A stat
+			// that could not run (the store out of read permits inside the
+			// deadline, the recovery budget spent) leaves the record where it
+			// is, under the same policy the unreadable-record arm above
+			// applies: the next start looks again, and until then holdsBlock
+			// answers false for it so the block is downloaded if it is needed.
+			complete, checkErr := p.hasCompleteRecord(ctx, *hash, record, subtreeStore)
+			if checkErr != nil {
+				p.logger.Warnf("[blockPark][%s] could not check the converted record's subtree files, leaving it on disk for the next start: %v", hash, checkErr)
+
+				skipped++
+
+				continue
+			}
+
+			if !complete {
 				p.Delete(ctx, parkedBlock{hash: *hash})
 
 				discarded++

@@ -15,23 +15,26 @@ import (
 )
 
 // legacyCorruptPeerID is the serving-peer identity threaded into
-// blockValidation.ProcessBlock for the block-validation corrupt cap
-// (bitcoin-sv/teranode#4692).
+// blockValidation.ProcessBlock, so block validation's log lines can name the
+// legacy connection a block came from.
 //
-// The two caps' keys intentionally differ only by the LegacyPeerIDPrefix namespace:
-// netsync's own cap (recordCorruptBlockAttempt) keys on the bare peer.Addr(), while
-// this value carries the prefix — both are still derived from the identical
-// peer.Addr() call, so they still bound the same serving connection. The divergence
-// exists solely so nothing downstream of blockvalidation can mistake this value for a
-// libp2p peer ID: isLegacyPeerID (services/blockvalidation/peer_metrics_helpers.go)
-// makes isPeerMalicious, penalizeCorruptBlockPeer and the invalid-block Kafka producer
-// treat any LegacyPeerIDPrefix-prefixed value the same as an empty peerID, so it never
-// reaches p2pClient.AddBanScore/IsPeerMalicious.
+// It carries the LegacyPeerIDPrefix namespace so nothing downstream of
+// blockvalidation can mistake this value for a libp2p peer ID: isLegacyPeerID
+// (services/blockvalidation/peer_metrics_helpers.go) makes isPeerMalicious,
+// penalizeCorruptBlockPeer and the invalid-block Kafka producer treat any
+// LegacyPeerIDPrefix-prefixed value the same as an empty peerID, so it never
+// reaches p2pClient.AddBanScore/IsPeerMalicious. Block validation's corrupt
+// re-download cap records nothing for a block whose baseURL is "legacy"
+// (accountCorruptAttempt in services/blockvalidation/Server.go): a legacy block
+// arrives converted, its body verified against the header at the pipeline sink
+// before anything was written, so a corrupt verdict there is this node's own
+// record or files and is settled by the park's own table (parkCommitFailure,
+// block_park_policy.go), which neither marks the hash failed nor blames the
+// peer.
 //
-// Peer.Addr() dereferences the peer with no nil-receiver guard, so a nil peer degrades
-// to the empty-peerID no-cap defence rather than panicking. That is also what a block
-// recovered from disk gets: the park has no peer to charge, and charging the wrong one
-// is worse than charging nobody.
+// Peer.Addr() dereferences the peer with no nil-receiver guard, so a nil peer
+// degrades to the empty peerID rather than panicking. That is also what a block
+// recovered from disk gets: the park has no peer to name.
 func legacyCorruptPeerID(peer *peer.Peer) string {
 	if peer == nil {
 		return ""
@@ -79,10 +82,14 @@ func (sm *SyncManager) HandleConvertedBlock(ctx context.Context, peer *peer.Peer
 	sm.logger.Debugf("[HandleConvertedBlock][%s] starting handling converted block", blockHash.String())
 
 	// check whether this block already exists
+	// A ServiceError, as the parent lookup below returns for the same kind of
+	// fault: a blockchain client that cannot answer says nothing about the
+	// block, and parkCommitFailure must read it as retry-later (keep the blob)
+	// rather than fall to its default, which judges the block.
 	blockExists, err := sm.blockchainClient.GetBlockExists(ctx, &blockHash)
 	if err != nil {
 		sm.logger.Errorf("[HandleConvertedBlock][%s] failed to check if block exists: %s", blockHash.String(), err)
-		return errors.NewProcessingError("failed to check if block exists", err)
+		return errors.NewServiceError("[HandleConvertedBlock][%s] failed to check if block exists", blockHash.String(), err)
 	}
 
 	if blockExists {

@@ -77,6 +77,16 @@ type blockDispatch struct {
 	// load.
 	readErr error
 
+	// incomplete is set by parkedRun when the record read back but its subtree
+	// files could not all be found, and statErr says why: nil when a stat ran
+	// and said a file is absent, the store's error when the stat could not run.
+	// Kept apart from readErr and the commit error because the rows they land
+	// on (FilesGone: drop, no mark, no blame; or RetryLater when the stat could
+	// not run) are neither a read failure's nor a judgement's. Written on the
+	// worker, read on the consumer after settle.
+	incomplete bool
+	statErr    error
+
 	// aborted is set by complete before the tail runs when this block was never at
 	// fault — a predecessor failed. The tail reads it to skip the failure backoff.
 	// Written and read on the consumer goroutine only.
@@ -138,13 +148,36 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	// and that lookup is what enforces "never hand block validation a parentless
 	// block" in the worker rather than on a promise from the consumer.
 	bd.parkedRun = func(ctx context.Context, d *blockDispatch) error {
-		record, err := sm.blockPark.ReadConverted(ctx, d.parked.hash)
+		// One store deadline over the read and the completeness check, as
+		// commitParkedBlock and holdsBlock put on the same pair; the commit
+		// below runs on the worker's own ctx.
+		readCtx, cancel := sm.blockPark.storeCtx(ctx)
+
+		record, err := sm.blockPark.ReadConverted(readCtx, d.parked.hash)
 		if err != nil {
+			cancel()
+
 			// Recorded apart from the returned error so the tail cannot classify a
 			// read failure by the commit table, which judges the block.
 			d.readErr = err
 
 			return err
+		}
+
+		complete, checkErr := sm.blockPark.hasCompleteRecord(readCtx, d.parked.hash, record, sm.subtreeStore)
+
+		cancel()
+
+		if checkErr != nil || !complete {
+			d.incomplete = true
+			d.statErr = checkErr
+
+			// A ServiceError, so that if the tail's incomplete arm were ever lost
+			// the commit table would still read this as RetryLater (keep) rather
+			// than fall to a row that deletes the record. The error itself still
+			// reaches frontierEntry.settle and complete's failFrom, so the blocks
+			// queued behind this one are aborted exactly as for any failure.
+			return errors.NewServiceError("[parkedRun][%s] record's subtree files are not all present or could not be checked", d.parked.hash, checkErr)
 		}
 
 		return sm.HandleConvertedBlock(ctx, d.parked.peer, d.parked.hash, record)
@@ -159,6 +192,9 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 		switch {
 		case d.readErr != nil:
 			sm.parkedReadFailed(entry, d.readErr)
+
+		case d.incomplete:
+			sm.parkedRecordIncomplete(entry, d.statErr)
 
 		case err != nil:
 			sm.parkedBlockFailed(entry, err)

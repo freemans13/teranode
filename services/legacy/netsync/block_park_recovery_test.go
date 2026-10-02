@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
@@ -402,4 +403,197 @@ func TestSyncManager_AParkedBlockIsKeptWhenTheCommitIsCancelled(t *testing.T) {
 
 	_, failed := h.sm.recentlyFailedBlocks.Get(child)
 	require.False(t, failed, "a cancelled commit is not a verdict on the block")
+}
+
+// TestSyncManager_AParkedRecordWhoseDataFileIsGoneIsReDownloadedNotRejected is
+// the FilesGone row end to end. A converted record is a few hundred bytes
+// naming subtree files that carry their own delete-at-height; the record does
+// not, so it can outlive the files it points at. Before this, the commit path
+// handed such a record to block validation, whose read of the missing file came
+// back as a not-found that parkCommitFailure's default read as a judgement on
+// the block: the only copy deleted, the hash frozen in recentlyFailedBlocks for
+// ten minutes, and a reject sent to an honest peer once RUNNING.
+//
+// Now the record's completeness is checked on the commit path, before anything
+// is validated, and a record whose files are gone is dropped without a mark or
+// a reject so the next wanted-range pass downloads the block again.
+//
+// The FSM is RUNNING so a reject, were one sent, would not be suppressed.
+// The spy block validation reads no files, so with the completeness check
+// removed the child COMMITS: callsFor(child) and GetBlockExists(child) are the
+// assertions that tell the two apart.
+func TestSyncManager_AParkedRecordWhoseDataFileIsGoneIsReDownloadedNotRejected(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+	parent := h.blocks[0].MsgBlock().BlockHash()
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len())
+
+	record, err := h.sm.blockPark.ReadConverted(h.sm.ctx, child)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees, "sanity: the record must name a subtree, or there is no file to lose")
+
+	// The data file expires under the record, the way the subtree store's own
+	// delete-at-height removes each file on its own.
+	require.NoError(t, h.store.Del(h.sm.ctx, record.Subtrees[0][:], fileformat.FileTypeSubtreeData))
+
+	before := h.rec.getDataCount()
+
+	// See drainOneParkCommit's own doc comment: the parent's arrival resolves
+	// its own parent (genesis) immediately, so handleBlockOnDiskMsg posts to a
+	// channel rather than committing inline.
+	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+
+	require.NoError(t, h.deliver(t, 0))
+	h.drainOneParkCommit(t)
+
+	h.requireCommitted(t, parent)
+
+	require.Zero(t, h.validation.callsFor(child), "a record whose files are gone must never reach block validation")
+
+	exists, err := h.chain.GetBlockExists(h.sm.ctx, &child)
+	require.NoError(t, err)
+	require.False(t, exists, "a record whose files are gone cannot have been committed")
+
+	require.Zero(t, h.sm.blockPark.Len(), "the record is dropped, not kept")
+
+	for _, name := range parkDirEntries(t, h.parkDir) {
+		require.NotContains(t, name, child.String(), "the dropped record must not leave its blob behind")
+	}
+
+	require.False(t, h.rec.wasRejected(child), "the files going missing on this node is not the peer's fault")
+
+	_, failed := h.sm.recentlyFailedBlocks.Get(child)
+	require.False(t, failed, "a block nobody judged must not be written off, or the wanted range skips it for the TTL")
+
+	h.sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
+		"a record whose files are gone must be downloaded again at once")
+}
+
+// TestSyncManager_AParkedRecordWhoseFilesCannotBeCheckedIsKept is the other
+// half of the completeness check: a stat that could not run is not a stat that
+// said absent. The file store takes a read permit before every Exists and gives
+// up on it after its deadline with a StorageError, and the same call is
+// cancelled at shutdown; reading either as "the files are gone" would delete
+// the only copy of a downloaded block over a condition that is over in
+// seconds, the regression the policy file was written to stop. The block stays
+// parked, unjudged, for the sweep to try again.
+func TestSyncManager_AParkedRecordWhoseFilesCannotBeCheckedIsKept(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+	parent := h.blocks[0].MsgBlock().BlockHash()
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len())
+
+	parkedBytes := h.sm.blockPark.Bytes()
+
+	record, err := h.sm.blockPark.ReadConverted(h.sm.ctx, child)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees, "sanity: the record must name a subtree, or there is no stat to fault")
+
+	// The shape File.Exists returns when acquireReadPermit runs out of time:
+	// a StorageError around a ServiceUnavailable. Armed for the child's
+	// subtree key only, so the parent's own sink writes below are untouched.
+	h.store.failExistsFor(record.Subtrees[0][:],
+		errors.NewStorageError("[File][Exists] failed to acquire read permit", errors.NewServiceUnavailableError("read permit not acquired within 25s")))
+
+	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+
+	require.NoError(t, h.deliver(t, 0))
+	h.drainOneParkCommit(t)
+
+	h.requireCommitted(t, parent)
+
+	require.Zero(t, h.validation.callsFor(child), "a record whose completeness is unknown must not be handed to block validation either")
+
+	// Disarmed before the end-state check: requireStillParked proves the block
+	// is not asked for again through holdsBlock, which stats the same files.
+	h.store.failExistsFor(nil, nil)
+
+	h.requireStillParked(t, child, parkedBytes)
+}
+
+// TestSyncManager_ACorruptVerdictFromTheParkDropsTheRecordAndBlamesNobody is
+// the RecordCorrupt row end to end: block validation's corrupt verdict on a
+// record this node wrote drops the record, writes nothing off and tells the
+// peer nothing, and the block is downloaded again. The FSM is RUNNING so the
+// reject the default row would send is not suppressed by the catching-blocks
+// rule.
+func TestSyncManager_ACorruptVerdictFromTheParkDropsTheRecordAndBlamesNobody(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+	parent := h.blocks[0].MsgBlock().BlockHash()
+
+	// What a quick validation that finds a structure file not hashing to its
+	// key returns, after quarantining the file.
+	h.validation.failOnce(child, errors.NewBlockCorruptError("[processBlockFound][%s] a subtree file this node wrote does not hash to its key", child.String()))
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len())
+
+	before := h.rec.getDataCount()
+
+	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+
+	require.NoError(t, h.deliver(t, 0))
+	h.drainOneParkCommit(t)
+
+	h.requireCommitted(t, parent)
+	require.Equal(t, 1, h.validation.callsFor(child), "the child reached block validation, which is what returned the verdict")
+
+	exists, err := h.chain.GetBlockExists(h.sm.ctx, &child)
+	require.NoError(t, err)
+	require.False(t, exists, "a block with a corrupt verdict is not in the chain")
+
+	require.Zero(t, h.sm.blockPark.Len(), "the record is dropped so the block is downloaded again")
+
+	for _, name := range parkDirEntries(t, h.parkDir) {
+		require.NotContains(t, name, child.String(), "the dropped record must not leave its blob behind")
+	}
+
+	require.False(t, h.rec.wasRejected(child), "the body was verified at the sink; a corrupt record is this node's fault, not the peer's")
+
+	_, failed := h.sm.recentlyFailedBlocks.Get(child)
+	require.False(t, failed, "a corrupt verdict on this node's own record must not write the block off")
+
+	h.sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
+		"a block whose record was corrupt must be downloaded again")
+}
+
+// TestSyncManager_AMissingParentOutputKeepsTheParkedBlock is the LocalUtxoFault
+// row end to end: the UTXO store reports an output the block spends as not
+// found, and the block stays parked, unjudged and not re-asked, with the
+// parent-missing stamp so the drain does not spend every turn on it.
+func TestSyncManager_AMissingParentOutputKeepsTheParkedBlock(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+	parent := h.blocks[0].MsgBlock().BlockHash()
+
+	// The SQL store's batched spend shape: a UtxoError whose chain carries
+	// the per-spend TxNotFound, under quickValidateBlock's wrap.
+	h.validation.failOnce(child, errors.NewProcessingError("[quickValidateBlock][%s] failed to process block subtrees", child.String(),
+		errors.NewUtxoError("error in sql spend (batched mode) - errors", errors.NewTxNotFoundError("output 0 of %s not found", "abcd"))))
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len())
+
+	parkedBytes := h.sm.blockPark.Bytes()
+
+	require.NoError(t, h.deliver(t, 0))
+
+	h.requireCommitted(t, parent)
+	require.Equal(t, 1, h.validation.callsFor(child), "the child reached block validation, which is where the UTXO set came up short")
+
+	h.requireStillParked(t, child, parkedBytes)
+	require.False(t, h.parkedEntry(t, child).parentMissingAt.IsZero(), "the row stamps the entry so the next turn is not spent on it")
 }

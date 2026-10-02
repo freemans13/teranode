@@ -39,9 +39,11 @@ import (
 // Every write goes to a temporary sibling, is flushed, and is renamed into
 // place, so a partial file is never published and a torn read is not possible.
 //
-// A store error answers false. That is the safe direction: we re-ask for a block
-// we may already have, which costs bandwidth, rather than skip one we do not,
-// which stops the chain.
+// A store error answers false. That is the safe direction HERE: we re-ask for a
+// block we may already have, which costs bandwidth, rather than skip one we do
+// not, which stops the chain. hasCompleteRecord reports a stat that could not
+// run apart from a stat that said absent because the commit path, its other
+// caller, must not treat the two alike; this caller may.
 func (sm *SyncManager) holdsBlock(ctx context.Context, hash chainhash.Hash) bool {
 	if sm.blockPark == nil || sm.blockPark.store == nil {
 		return false
@@ -57,5 +59,7 @@ func (sm *SyncManager) holdsBlock(ctx context.Context, hash chainhash.Hash) bool
 		return false
 	}
 
-	return sm.blockPark.hasCompleteRecord(readCtx, hash, record, sm.subtreeStore)
+	complete, err := sm.blockPark.hasCompleteRecord(readCtx, hash, record, sm.subtreeStore)
+
+	return err == nil && complete
 }

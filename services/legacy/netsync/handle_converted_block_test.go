@@ -642,10 +642,17 @@ func TestBlockDispatcher_ParkedRunRoutesAConvertedEntryWithoutReadingAWholeBlock
 // to fail the whole commit (TestBlockDispatcher_ParkedRunKeepsTheBlockWhenIsConvertedFails
 // pinned exactly that, and is gone along with the check it pinned).
 //
-// This arms the same existsFaultStore that test used — every Exists call
-// fails — and requires the commit to succeed anyway: d.parked.converted, set
-// at AdoptWritten from the sink's own return value, is what routes this now,
-// and it costs nothing the store can refuse.
+// This arms the same existsFaultStore that test used — every Exists call on
+// the PARK's store fails — and requires the commit to succeed anyway:
+// d.parked.converted, set at AdoptWritten from the sink's own return value, is
+// what routes this now, and it costs nothing the store can refuse.
+//
+// The commit path does stat the record's subtree files again since then, for
+// a different question (hasCompleteRecord, before the record is handed to
+// block validation) and on the subtree store, which is a separate handle here
+// even though it is the same backing store; a fault on THAT stat keeps the
+// block rather than failing the commit, which
+// TestSyncManager_AParkedRecordWhoseFilesCannotBeCheckedIsKept pins.
 func TestBlockDispatcher_ParkedRunNeverConsultsTheStoreToRoute(t *testing.T) {
 	initPrometheusMetrics()
 

@@ -462,3 +462,42 @@ func TestProcessBlockFound_BlockAssemblyBehindIsALocalFaultForAnEligibleBlockPro
 		})
 	}
 }
+
+// TestProcessBlockFound_AKeyMismatchingLocalSubtreeFileIsACorruptRecordOnTheLegacyRoute pins the
+// unified branch's treatment of a structure file that does not hash to the key it is stored under.
+// The read that rejects it returns a bare ProcessingError carrying only a data marker, which the
+// legacy caller's commit table cannot key on and would read as a judgement on the block: the only
+// copy deleted, the hash frozen for ten minutes, a reject sent to an honest peer. The route is
+// legacy, so the file is this node's own and the sink has already verified the bytes it was written
+// from; once the quarantine has removed the blob, the verdict comes back as corrupt, the code the
+// caller's RecordCorrupt row reads (drop the record, no mark, no blame, download again). The end
+// state is read off the real stores: the mismatching file is gone, and nothing was applied.
+func TestProcessBlockFound_AKeyMismatchingLocalSubtreeFileIsACorruptRecordOnTheLegacyRoute(t *testing.T) {
+	us := newUnifiedRouteServer(t, "unified_route_key_mismatch")
+
+	ctx := context.Background()
+
+	block, parent, child := unifiedRouteSpendingBlock(t, us, 0x13)
+	key := block.Subtrees[0]
+
+	// Another valid subtree, over a different spend of the same parent, written under THIS
+	// block's key: a local file that does not hash to the name it is stored under.
+	other := buildSubtreeOver(t, true, []*bt.Tx{preBindSpendOf(t, parent, 8_000)})
+	require.NotEqual(t, *key, *other.RootHash(), "sanity: the substitute must hash to a different root")
+
+	otherBytes, err := other.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, us.subtreeStore.Set(ctx, key[:], fileformat.FileTypeSubtreeToCheck, otherBytes, bloboptions.WithAllowOverwrite(true)))
+
+	err = us.s.processBlockFound(ctx, block.Hash(), "peer-1", "legacy", true, block)
+	require.Error(t, err, "a structure file that does not hash to its key must not commit")
+	require.True(t, errors.IsBlockCorrupt(err), "the verdict must be corrupt so the legacy caller drops the record and downloads it again, got: %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "a damaged local file is never a judgement on the block: %v", err)
+	require.False(t, errors.IsTransientLocalError(err), "a quarantined file is not a retry-later fault: %v", err)
+
+	exists, err := us.subtreeStore.Exists(ctx, key[:], fileformat.FileTypeSubtreeToCheck)
+	require.NoError(t, err)
+	require.False(t, exists, "the mismatching file must have been quarantined, or the re-download could not rewrite it")
+
+	requireNothingApplied(t, us, block, parent, child)
+}

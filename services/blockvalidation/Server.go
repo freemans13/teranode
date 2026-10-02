@@ -1715,11 +1715,11 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	// the hash, and once the window expires an honest body flows through. GetBlockExists returned
 	// false just above, so the block is NOT stored: returning nil here would be read by a caller as
 	// "accepted" for a block that was never stored (bitcoin-sv/teranode#4692). Return a
-	// CORRUPT-CLASSIFIED, non-poisoning error instead. Corrupt routes through the already-safe path:
-	// it is not ErrBlockInvalid (never poisons), it does not disconnect the peer
-	// (shouldDisconnectOnBlockErr is false for corrupt) and the legacy netsync corrupt branch returns
-	// before recentlyFailedBlocks.Set, so it cannot suppress descendants — and no caller can mistake
-	// it for acceptance.
+	// CORRUPT-CLASSIFIED, non-poisoning error instead: it is not ErrBlockInvalid, so it never
+	// poisons, and no caller can mistake it for acceptance. It never fires for a legacy block,
+	// because accountCorruptAttempt records nothing for baseURL "legacy"; netsync's own corrupt
+	// row (parkCommitFailure, services/legacy/netsync/block_park_policy.go) neither marks the hash
+	// failed nor blames the peer.
 	if u.corruptAttemptsExhausted(hash, peerID) {
 		u.logger.Warnf("[processBlockFound][%s] corrupt re-download cap reached for peer %s; suppressing this re-download until the cooldown window expires", hash.String(), peerID)
 		return errors.NewBlockCorruptError("[processBlockFound][%s] corrupt re-download cap reached for peer %s; re-download suppressed until the cooldown window expires (block not stored, not invalid)", hash.String(), peerID)
@@ -1873,12 +1873,30 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	if unifiedRoute {
 		u.logger.Debugf("[processBlockFound][%s] unified route: quick-validating legacy block at height %d", block.Hash().String(), block.Height)
 
-		// A corrupt result here (bitcoin-sv/teranode#4692) is returned to the legacy caller and struck at
-		// the legacy peer layer (peer_server.addBanScore via sp.blockProcessed), which owns the
-		// serving peer identity — the netsync ProcessBlock path carries no usable peerID here, so
-		// attributing the strike at that layer is the only correct attribution.
+		// A corrupt result here is returned to the legacy caller, whose parkCommitFailure
+		// (services/legacy/netsync/block_park_policy.go) classifies it as a local record fault:
+		// the record is dropped and downloaded again, with no strike and no mark, because the
+		// body was verified against the header at the pipeline sink before the record existed.
 		qErr := u.blockValidation.quickValidateBlock(ctx, block, peerID, baseURL)
-		u.accountCorruptAttempt(hash, peerID, qErr)
+		u.accountCorruptAttempt(hash, peerID, baseURL, qErr)
+
+		// A structure or data file that does not hash to the key it is stored under comes back
+		// as a bare ProcessingError carrying only a data marker, which the legacy caller's table
+		// cannot key on and would read as a judgement on the block. The route is legacy here
+		// (legacyUnifiedEligible requires it), so the file is this node's own and the sink has
+		// already verified the bytes it was written from. When the quarantine confirmed the blob
+		// removed, the record is corrupt and a re-download rewrites the file, so say so with the
+		// code the caller's corrupt row reads. When the blob could NOT be confirmed removed, a
+		// re-download cannot repair it (subtreeWriter.put never rewrites an existing key) and a
+		// corrupt drop would loop every wanted-range pass, so that case is a local fault to
+		// retry later, which the caller reads as keep.
+		if qErr != nil && len(subtreeKeyMismatchRefs(qErr)) > 0 {
+			if isUnquarantinedLocalSubtree(qErr) {
+				return errors.NewServiceError("[processBlockFound][%s] a subtree file this node wrote does not hash to its key and could not be confirmed removed; retrying later", hash.String(), qErr)
+			}
+
+			return errors.NewBlockCorruptError("[processBlockFound][%s] a subtree file this node wrote does not hash to its key; it has been removed so the block can be downloaded again", hash.String(), qErr)
+		}
 
 		return qErr
 	}
@@ -1905,9 +1923,18 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	}
 
 	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, baseURL, opts)
-	u.accountCorruptAttempt(hash, peerID, err)
+	u.accountCorruptAttempt(hash, peerID, baseURL, err)
 
 	if err != nil {
+		// A verdict on the block goes back as itself. The ServiceError wrap below is for
+		// everything else (a store that did not answer, a fetch that failed), which a caller
+		// reads as retry-later; wrapping a genuine rejection or a corrupt body in it made the
+		// legacy caller's table read every full-route rejection as a transient local fault, so
+		// the block was kept and retried on every sweep for as long as it stayed parked.
+		if errors.Is(err, errors.ErrBlockInvalid) || errors.IsBlockCorrupt(err) {
+			return err
+		}
+
 		return errors.NewServiceError("failed block validation BlockFound [%s]", block.String(), err)
 	}
 
@@ -2658,7 +2685,7 @@ func (u *Server) recordCorruptAttempt(blockHash *chainhash.Hash, peerID string) 
 
 // accountCorruptAttempt records or clears the per-(hash, peerID) corrupt re-download counter from a
 // block-validation OUTCOME in processBlockFound (bitcoin-sv/teranode#4692). This is the SINGLE
-// accounting point for every RUNNING delivery route: both the block-processing worker
+// accounting point for every peer-served delivery route: both the block-processing worker
 // (processBlockWithPriority) and the direct ProcessBlock gRPC handler funnel through
 // processBlockFound, so a corrupt delivery is counted exactly once regardless of route and the cap
 // cannot be bypassed by hammering ProcessBlock directly. A corrupt result records toward the cap; a
@@ -2668,9 +2695,21 @@ func (u *Server) recordCorruptAttempt(blockHash *chainhash.Hash, peerID string) 
 // this function's own peerID=="" fail-open guard is what actually keeps it from recording under an
 // unidentified delivery. Non-corrupt errors (transient / service / invalid) leave the counter
 // untouched.
-func (u *Server) accountCorruptAttempt(blockHash *chainhash.Hash, peerID string, validationErr error) {
+//
+// Nothing is recorded for a block whose baseURL is "legacy". A legacy block arrives converted:
+// netsync's pipeline sink verified the body against the header before anything was written, so
+// a corrupt verdict here is this node's own record or files, never the peer's bytes. Counting it
+// would trip corruptAttemptsExhausted after MaxCorruptAttemptsPerBlock and hand netsync a
+// corrupt error for a block nobody did anything wrong with. Keyed on the route rather than on
+// the LegacyPeerIDPrefix of peerID because the fact that justifies the skip is the route (a
+// sink-verified body), not the identity string.
+func (u *Server) accountCorruptAttempt(blockHash *chainhash.Hash, peerID, baseURL string, validationErr error) {
 	if validationErr == nil {
 		u.clearCorruptAttempts(blockHash, peerID)
+		return
+	}
+
+	if baseURL == "legacy" {
 		return
 	}
 
@@ -2699,7 +2738,9 @@ func (u *Server) clearCorruptAttempts(blockHash *chainhash.Hash, peerID string) 
 // bound (re-opens the corrupt-body bandwidth DoS). Nil-safe: a nil settings or nil cache (Server
 // literals in tests that don't wire them) behaves as CAP DISABLED — it returns false (never
 // "exhausted"), so a missing config can never silently drop honest blocks. Returns a bool — never
-// an error — so the gate can never emit a poisoning result.
+// an error — so the gate can never emit a poisoning result. It cannot trip for a legacy block:
+// accountCorruptAttempt records nothing for baseURL "legacy", so the counter it reads is never
+// written for one.
 func (u *Server) corruptAttemptsExhausted(blockHash *chainhash.Hash, peerID string) bool {
 	if u.settings == nil || u.blockCorruptAttempts == nil {
 		return false

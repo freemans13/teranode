@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/stretchr/testify/require"
 )
@@ -484,4 +485,42 @@ func TestDrain_TheSweepsPostIsRestoredAndThenDispatched(t *testing.T) {
 
 	require.Positive(t, onAWorker.Load(),
 		"the posted block must be committed by a worker through the drain step, not on the consumer; committing on the arm puts a full read and validate back where this change took it from")
+}
+
+// TestParkDispatch_ARecordWhoseDataFileIsGoneIsDroppedBeforeValidation is the
+// dispatcher's half of the commit-path completeness check. The dispatcher is the
+// production commit path, so it must apply the same check and the same row as
+// the serial drain, before the worker hands the record to block validation.
+func TestParkDispatch_ARecordWhoseDataFileIsGoneIsDroppedBeforeValidation(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+	bd := h.withDispatcher(t)
+
+	d, entry := h.parkedDispatchFor(t, 1)
+
+	// The parent is in the chain, so nothing short of the completeness check
+	// stands between the dispatch and block validation.
+	h.chainHolds(t, h.blocks[0].MsgBlock().BlockHash())
+
+	record, err := h.sm.blockPark.ReadConverted(h.sm.ctx, entry.hash)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees, "sanity: the record must name a subtree, or there is no file to lose")
+	require.NoError(t, h.store.Del(h.sm.ctx, record.Subtrees[0][:], fileformat.FileTypeSubtreeData))
+
+	bd.dispatch(d)
+	drainCompletionsUntilEmpty(t, bd)
+
+	require.Nil(t, d.readErr, "the record read back; this is not a read failure")
+	require.True(t, d.incomplete, "the worker found the record incomplete")
+	require.Nil(t, d.statErr, "the stat ran and said absent; it did not fail")
+	require.Zero(t, h.validation.callsFor(entry.hash), "a record whose files are gone must never reach block validation")
+	require.Zero(t, h.sm.blockPark.Len(), "the record is dropped, not kept")
+
+	for _, name := range parkDirEntries(t, h.parkDir) {
+		require.NotContains(t, name, entry.hash.String(), "the dropped record must not leave its blob behind")
+	}
+
+	require.False(t, h.rec.wasRejected(entry.hash), "the files going missing on this node is not the peer's fault")
+
+	_, failed := h.sm.recentlyFailedBlocks.Get(entry.hash)
+	require.False(t, failed, "a block nobody judged must not be written off")
 }
