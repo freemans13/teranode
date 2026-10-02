@@ -19,10 +19,16 @@ import (
 // validation passes it to blockchainClient.AddBlock (commitBlock in
 // quick_validate.go on the unified route, the AddBlock in ValidateBlockWithOptions
 // on the full route), so the chain's block row records the legacy connection the
-// block came from. The processBlockFound log lines that print a peerID cannot
-// fire for a legacy value: one is gated by isPeerMalicious, which is false for
-// every LegacyPeerIDPrefix value, the other by corruptAttemptsExhausted, which
-// never trips for a legacy block.
+// block came from. Of the processBlockFound log lines that print a peerID, two
+// cannot fire for a legacy value: the one gated by isPeerMalicious, which is
+// false for every LegacyPeerIDPrefix value, and the one gated by
+// corruptAttemptsExhausted, which is never recorded for baseURL "legacy". Two
+// can: the policy-decline cap line, because recordPolicyDeclineAttempt has no
+// legacy skip and the legacy receive path does not enforce
+// Policy.ExcessiveBlockSize, so an operator limit below the legacy wire cap
+// trips it; and the catch-up channel-full warning, reachable when
+// legacyUnifiedEligible is false and the parent is missing at
+// processBlockFound's GetBlockExists. Both print this value as a label only.
 //
 // It carries the LegacyPeerIDPrefix namespace so nothing downstream of
 // blockvalidation can mistake this value for a libp2p peer ID: isLegacyPeerID
