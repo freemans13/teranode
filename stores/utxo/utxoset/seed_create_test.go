@@ -2,12 +2,15 @@ package utxoset
 
 import (
 	"context"
+	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -206,4 +209,82 @@ func TestSetStampFloorsForSeedLeavesNothingBelowTheFloor(t *testing.T) {
 	}
 
 	require.NoError(t, s.SetStampFloorsForSeed(ctx, seed), "a second run is harmless")
+}
+
+// openSeedingStore opens a second store on the test database with seeding=true on its URL,
+// sharing the schema newTestStore created.
+func openSeedingStore(t *testing.T, base *Store) *Store {
+	t.Helper()
+
+	u, err := url.Parse(testDSN(t))
+	require.NoError(t, err)
+
+	q := u.Query()
+	q.Set("seeding", "true")
+	u.RawQuery = q.Encode()
+
+	s, err := New(context.Background(), ulogger.TestLogger{}, base.settings, u)
+	require.NoError(t, err, "seeding=true must not reach the Postgres driver")
+
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	require.True(t, s.seeding)
+
+	return s
+}
+
+// In seeding mode a seed's create writes the coins alone, with their block height, below and
+// above the checkpoint: no containment row and no identity row, so a mainnet seed never puts
+// tens of gigabytes of rows on the disk for its hook to clear. Lookups still answer it as mined
+// at its height, a re-run is refused as an existing transaction, and a create that is not shaped
+// like the seeder's takes its normal route.
+func TestSeedingModeWritesCoinsOnly(t *testing.T) {
+	base, ctx := newTestStore(t) // mainnet checkpoints
+	s := openSeedingStore(t, base)
+
+	count := func(sql string, args ...any) int {
+		var n int
+		require.NoError(t, s.pool.QueryRow(ctx, sql, args...).Scan(&n))
+
+		return n
+	}
+
+	for i, height := range []uint32{500, 999_000} {
+		var id chainhash.Hash
+		id[0] = 0x60
+		id[1] = byte(i)
+
+		opts := []utxo.CreateOption{
+			utxo.WithCreateOnly(), utxo.WithTXID(&id), utxo.WithSetCoinbase(false),
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 0, BlockHeight: height, SubtreeIdx: 0}),
+		}
+
+		_, _, err := s.SpendAndCreate(ctx, seededTx(map[uint32]uint64{0: 10, 2: 20}), height, opts...)
+		require.NoError(t, err, "height %d", height)
+
+		require.Equal(t, 2, count(`SELECT count(*) FROM utxo WHERE txid = $1 AND mined_height = $2`, id[:], int32(height)),
+			"height %d: both coins carry their height from birth", height) //nolint:gosec // test heights fit int32
+		require.Zero(t, count(`SELECT count(*) FROM tx_mined WHERE txid = $1`, id[:]), "height %d: no containment row", height)
+		require.Zero(t, count(`SELECT count(*) FROM tx_ident WHERE txid = $1`, id[:]), "height %d: no identity row", height)
+
+		answers, err := s.ParentOutputsForValidation(ctx, []utxo.Outpoint{{TxID: id, Vout: 2}})
+		require.NoError(t, err)
+		require.NoError(t, answers[0].Err)
+		require.Equal(t, utxo.ParentOutputMined, answers[0].Status, "height %d", height)
+		require.Equal(t, height, answers[0].Height)
+
+		_, _, err = s.SpendAndCreate(ctx, seededTx(map[uint32]uint64{0: 10, 2: 20}), height, opts...)
+		require.ErrorIs(t, err, errors.ErrTxExists, "height %d: a re-run of the seed skips the transaction", height)
+		require.Equal(t, 2, count(`SELECT count(*) FROM utxo WHERE txid = $1`, id[:]), "height %d: no coin written twice", height)
+	}
+
+	require.Zero(t, count(`SELECT count(*) FROM pg_class WHERE relname ~ '^tx_mined_w[0-9]+$'`),
+		"a seed creates no containment windows")
+
+	// A create without the seeder's shape takes the normal route even in seeding mode.
+	normal := seededTx(map[uint32]uint64{0: 30})
+	normal.Outputs = normal.Outputs[:1]
+	_, err := s.Create(ctx, normal, 1_000_000)
+	require.NoError(t, err)
+	require.Equal(t, 1, count(`SELECT count(*) FROM tx_ident WHERE txid = $1`, normal.TxIDChainHash()[:]))
 }
