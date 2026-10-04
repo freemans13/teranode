@@ -1135,7 +1135,19 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 
 	// Check for errors from both operations
 	if storeErr != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", storeErr)
+		// ErrBlobAlreadyExists at the publish is benign HERE, as it is for the subtreeToCheck
+		// write above. The file store's publish is exclusive and refuses only a complete body
+		// at its end, so when a sibling block validating the same subtree published first,
+		// this writer's whole body has streamed through the tee and every transaction is
+		// parsed, which is what this call is for; the file on disk is another writer's
+		// complete subtreeData for the same root hash. Only the parse and count checks below
+		// still decide the call. (When the key was taken before this write began, the store
+		// refuses before reading, the tee fails, and parseErr fails the call as before.)
+		if errors.Is(storeErr, errors.ErrBlobAlreadyExists) {
+			u.logger.Warnf("[processSubtreeDataStream][%s] subtreeData was published by another writer while this one streamed; keeping theirs", subtree.RootHash().String())
+		} else {
+			return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", storeErr)
+		}
 	}
 
 	if parseErr != nil {

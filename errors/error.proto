@@ -106,4 +106,9 @@ enum ERR {
   BLOCK_CORRUPT=120;
   // A block this node declined under its own local policy: never a verdict on the block or the peer.
   BLOCK_POLICY_DECLINED=121;
+  // A delivered block body, read to its declared end, that cannot be the block its header names:
+  // a merkle root the header does not carry, a duplicate transaction, or no coinbase. Always the
+  // peer's doing, and the only verdict the legacy peer server bans a host for. Wrapped inside the
+  // BLOCK_INVALID verdict at the sites that raise it, never the outermost code.
+  BLOCK_BODY_MISMATCH=122;
 }

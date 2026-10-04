@@ -39,7 +39,12 @@ type Options struct {
 	// Negative: Use last N characters of hash as directory
 	// Zero: Don't use hash-based directories
 	HashPrefix int
-	// AllowOverwrite determines if existing blobs can be overwritten
+	// AllowOverwrite determines if existing blobs can be overwritten (FileOption).
+	// False, the default, means a write of a key that exists fails with ErrBlobAlreadyExists.
+	// In the file store that refusal is exclusive: the blob is published by hard-linking the
+	// finished temporary file to its name, which fails if the name exists, so of two writers
+	// racing on one key exactly one is told it created the blob. True publishes by atomic
+	// rename, which replaces an existing blob.
 	AllowOverwrite bool
 	// SkipHeader determines if the file header should be skipped for easier CLI readability
 	SkipHeader bool
@@ -181,6 +186,25 @@ func WithHTTPAuthToken(token string) StoreOption {
 func WithDeleteAt(dah uint32) FileOption {
 	return func(s *Options) {
 		s.DAH = dah
+	}
+}
+
+// WithNoDAH turns Delete-At-Height off for one operation, whatever retention the
+// store itself was built with. It is the file-level counterpart of the
+// WithDisableDAH store option, and the counterpart of WithNoHashPrefix below:
+// something a caller can pass to undo a store-level default it does not own.
+//
+// It exists because MergeOptions copies the store's BlockHeightRetention into
+// every operation BEFORE any file option runs, and the file store then derives a
+// DAH from that retention for any blob that has none of its own. A caller that
+// owns the whole lifetime of the blobs it writes — deleting them itself, on its
+// own schedule, and needing them present until it does — otherwise has no way to
+// say so, and would silently start losing blobs the day somebody gave its store
+// a retention. Pass it on every operation for such a blob, not only the write.
+func WithNoDAH() FileOption {
+	return func(s *Options) {
+		s.DAH = 0
+		s.DisableDAH = true
 	}
 }
 
