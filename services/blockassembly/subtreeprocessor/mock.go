@@ -43,6 +43,9 @@ type MockSubtreeProcessor struct {
 	// so tests set it directly. TakeResetRequested reads and clears, like the
 	// real code.
 	ResetRequested atomic.Bool
+
+	// DrainResetRequested backs TakeDrainResetRequested the same way.
+	DrainResetRequested atomic.Bool
 }
 
 func (m *MockSubtreeProcessor) GetCurrentTxMap() TxInpointsMap {
@@ -89,6 +92,11 @@ func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlo
 // ResetRequested.
 func (m *MockSubtreeProcessor) TakeResetRequested() bool {
 	return m.ResetRequested.Swap(false)
+}
+
+// TakeDrainResetRequested implements Interface.TakeDrainResetRequested.
+func (m *MockSubtreeProcessor) TakeDrainResetRequested() bool {
+	return m.DrainResetRequested.Swap(false)
 }
 
 func (m *MockSubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {
@@ -208,6 +216,12 @@ func (m *MockSubtreeProcessor) GetIncompleteSubtreeMiningData(_ context.Context)
 		return nil
 	}
 	return args.Get(0).(*PrecomputedMiningData)
+}
+
+// DrainingAfterBlock implements Interface.DrainingAfterBlock. The mock never
+// defers a drain, so it is never draining.
+func (m *MockSubtreeProcessor) DrainingAfterBlock() bool {
+	return false
 }
 
 // AddBatch implements Interface.AddBatch

@@ -543,9 +543,44 @@ install-lint:
 # lint will check the changed files in the current branch compared to main, including commits and unstaged/untracked changes
 # It will show new linting errors/warnings, by updating local copy of origin/main with the latest state of the remote main branch.
 .PHONY: lint
-lint:
+lint: lint-tracing-info
 	git fetch origin main
 	golangci-lint run ./... --new-from-rev origin/main --disable gosec --disable prealloc # TODO: re-enable gosec once gosec >v2.23.0 is released (fixes float constant panic)
+
+# tracing.WithLogMessage logs at INFO on span start AND again on span end, so each
+# call site costs two INFO lines per operation. Sites on per-transaction,
+# per-subtree or per-request paths belong on tracing.WithDebugLogMessage instead.
+# This gate pins that count exactly, so it ratchets both ways: adding a site
+# fails, and so does removing one without lowering the number here. Otherwise a
+# demotion would free a slot that a later INFO site could take unnoticed.
+# Change TRACING_INFO_SITES in the same commit as the site, and say why.
+# Only production code counts: test files are excluded so that deleting a test
+# cannot silently free a slot for a new production INFO site.
+TRACING_INFO_SITES := 61
+
+.PHONY: lint-tracing-info
+lint-tracing-info:
+	@count=$$(git grep -oh "tracing\.WithLogMessage(" -- '*.go' ':!*_test.go' ':!test/**' | wc -l | tr -d ' '); \
+	if [ "$$count" -lt 1 ]; then \
+		echo "lint-tracing-info: counted $$count sites, which cannot be right."; \
+		echo "Either the count command failed (not a git checkout, or git grep"; \
+		echo "unavailable) or tracing.WithLogMessage was renamed and this gate needs"; \
+		echo "updating. Failing rather than passing silently."; \
+		exit 1; \
+	fi; \
+	if [ "$$count" -gt "$(TRACING_INFO_SITES)" ]; then \
+		echo "tracing.WithLogMessage sites: $$count (expected $(TRACING_INFO_SITES))"; \
+		echo "Each is two INFO lines per operation. Use tracing.WithDebugLogMessage on"; \
+		echo "per-tx/per-subtree/per-request paths, or raise TRACING_INFO_SITES deliberately."; \
+		exit 1; \
+	elif [ "$$count" -lt "$(TRACING_INFO_SITES)" ]; then \
+		echo "tracing.WithLogMessage sites: $$count (expected $(TRACING_INFO_SITES))"; \
+		echo "A site was removed or demoted. Lower TRACING_INFO_SITES to $$count in the"; \
+		echo "same change, so the freed slot cannot be reused by a new INFO site."; \
+		exit 1; \
+	else \
+		echo "tracing.WithLogMessage sites: $$count (expected $(TRACING_INFO_SITES)) OK"; \
+	fi
 
 # lint-new will only check only your unstaged/untracked changes (not committed changes), or fallback to check last commit if no changes in checkout
 # It is useful for quickly checking that your current, uncommitted work doesn't introduce new lint errors.

@@ -521,6 +521,11 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	var closeOnce sync.Once
 	defer closeOnce.Do(func() { close(readyCh) })
 
+	if err := util.ValidateRequiredAdminAPIKey(b.settings.GRPCAdminAPIKey); err != nil {
+		return err
+	}
+	util.ValidateAdminAPIKey(b.logger, "Blockchain", b.settings.GRPCAdminAPIKey, b.settings.BlockChain.GRPCListenAddress, b.settings.SecurityLevelGRPC)
+
 	b.startKafka()
 
 	// Settings here still live under tSettings.P2P.* — the centralized
@@ -532,7 +537,8 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	if storeURL := b.settings.BlockChain.PeerRegistryStore; storeURL != nil {
 		store, err := blob.NewStore(b.logger, storeURL,
-			blobstoreoptions.WithStoreType(blobstoretypes.PEERREGISTRYSTORE))
+			blobstoreoptions.WithStoreType(blobstoretypes.PEERREGISTRYSTORE),
+			blobstoreoptions.WithHTTPAuthToken(b.settings.BlobHTTPAuthToken))
 		if err != nil {
 			b.logger.Warnf("[Blockchain] failed to construct peer registry blob store %s: %v", storeURL.Redacted(), err)
 		} else {
@@ -580,7 +586,7 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		blockchain_api.RegisterBlockchainAPIServer(server, b)
 		blockchain_api.RegisterPeerRegistryServiceServer(server, b)
 		closeOnce.Do(func() { close(readyCh) })
-	}, nil); err != nil {
+	}, b.grpcAuthOptions()); err != nil {
 		return errors.WrapGRPC(errors.NewServiceNotStartedError("[Blockchain][Start] can't start GRPC server", err))
 	}
 
@@ -635,8 +641,8 @@ func (b *Blockchain) startHTTP(ctx context.Context) error {
 		return c.String(http.StatusOK, "OK")
 	})
 
-	e.GET("/invalidate/:hash", b.invalidateHandler)
-	e.GET("/revalidate/:hash", b.revalidateHandler)
+	e.POST("/invalidate/:hash", b.invalidateHandler, b.requireAdminAPIKey)
+	e.POST("/revalidate/:hash", b.revalidateHandler, b.requireAdminAPIKey)
 
 	go func() {
 		<-ctx.Done()
@@ -1298,7 +1304,7 @@ func (b *Blockchain) GetBlocks(ctx context.Context, req *blockchain_api.GetBlock
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlocks",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetBlockHeaders),
-		tracing.WithLogMessage(b.logger, "[GetBlocks] called for %s", util.ReverseAndHexEncodeSlice(req.Hash)),
+		tracing.WithDebugLogMessage(b.logger, "[GetBlocks] called for %s", util.ReverseAndHexEncodeSlice(req.Hash)),
 	)
 	defer deferFn()
 
@@ -1333,7 +1339,7 @@ func (b *Blockchain) GetBlockByHeight(ctx context.Context, request *blockchain_a
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlockByHeight",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetBlock),
-		tracing.WithLogMessage(b.logger, "[GetBlockByHeight] called for %d", request.Height),
+		tracing.WithDebugLogMessage(b.logger, "[GetBlockByHeight] called for %d", request.Height),
 	)
 	defer deferFn()
 
@@ -1366,10 +1372,10 @@ func (b *Blockchain) GetBlockByHeight(ctx context.Context, request *blockchain_a
 
 // GetBlockByID retrieves a block by its ID.
 func (b *Blockchain) GetBlockByID(ctx context.Context, request *blockchain_api.GetBlockByIDRequest) (*blockchain_api.GetBlockResponse, error) {
-	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlockByHeight",
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlockByID",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetBlock),
-		tracing.WithLogMessage(b.logger, "[GetBlockByID] called for %d", request.Id),
+		tracing.WithDebugLogMessage(b.logger, "[GetBlockByID] called for %d", request.Id),
 	)
 	defer deferFn()
 
@@ -2650,10 +2656,10 @@ func (b *Blockchain) RevalidateBlock(ctx context.Context, request *blockchain_ap
 //   - *emptypb.Empty: Empty response indicating successful notification queuing
 //   - error: Any error encountered during notification processing
 func (b *Blockchain) SendNotification(ctx context.Context, req *blockchain_api.Notification) (*emptypb.Empty, error) {
-	_, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "RevalidateBlock",
+	_, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "SendNotification",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainSendNotification),
-		tracing.WithLogMessage(b.logger, "[SendNotification] called for %s notification type %s", util.ReverseAndHexEncodeSlice(req.Hash), req.Type.String()),
+		tracing.WithDebugLogMessage(b.logger, "[SendNotification] called for %s notification type %s", util.ReverseAndHexEncodeSlice(req.Hash), req.Type.String()),
 	)
 	defer deferFn()
 
@@ -3828,7 +3834,7 @@ func (b *Blockchain) CompleteBlobDeletions(ctx context.Context, req *blockchain_
 // AcquireBlobDeletionBatch acquires a batch of deletions with locking.
 func (b *Blockchain) AcquireBlobDeletionBatch(ctx context.Context, req *blockchain_api.AcquireBlobDeletionBatchRequest) (*blockchain_api.AcquireBlobDeletionBatchResponse, error) {
 	storeWithBatchAcquisition, ok := b.store.(interface {
-		AcquireBlobDeletionBatch(ctx context.Context, height uint32, limit int, lockTimeoutSeconds int) ([]*blockchain_sql.ScheduledDeletion, error)
+		AcquireBlobDeletionBatch(ctx context.Context, height uint32, limit int, lockTimeoutSeconds int, excludeStoreTypes []int32) ([]*blockchain_sql.ScheduledDeletion, error)
 	})
 	if !ok {
 		return nil, errors.NewStorageError("blockchain store does not support batch acquisition")
@@ -3839,7 +3845,7 @@ func (b *Blockchain) AcquireBlobDeletionBatch(ctx context.Context, req *blockcha
 		lockTimeout = 300 // Default: 5 minutes
 	}
 
-	deletions, err := storeWithBatchAcquisition.AcquireBlobDeletionBatch(ctx, req.Height, int(req.Limit), lockTimeout)
+	deletions, err := storeWithBatchAcquisition.AcquireBlobDeletionBatch(ctx, req.Height, int(req.Limit), lockTimeout, req.ExcludeStoreTypes)
 	if err != nil {
 		return nil, err
 	}
@@ -3883,7 +3889,7 @@ func (b *Blockchain) AcquireBlobDeletionBatch(ctx context.Context, req *blockcha
 		}
 	}
 
-	b.logger.Infof("Acquired blob deletion batch: token=%s, count=%d, height=%d", token, len(deletions), req.Height)
+	b.logger.Infof("Acquired blob deletion batch: token=%s, count=%d, height=%d, excluded=%v", token, len(deletions), req.Height, req.ExcludeStoreTypes)
 
 	return &blockchain_api.AcquireBlobDeletionBatchResponse{
 		BatchToken: token,

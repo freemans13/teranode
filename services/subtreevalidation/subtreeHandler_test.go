@@ -591,3 +591,63 @@ func TestSubtreeMessageHandler_MalformedMetric(t *testing.T) {
 		})
 	}
 }
+
+// TestSubtreeMessageHandler_AlreadyExistsMetric checks that a subtree message for a subtree
+// already in the store increments prometheusSubtreeAlreadyExistsSkipped. The per-message log
+// line for this case is at DEBUG, so the counter is the only signal of a rate spike at
+// production log levels.
+func TestSubtreeMessageHandler_AlreadyExistsMetric(t *testing.T) {
+	InitPrometheusMetrics()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.SubtreeValidation.QuorumPath = t.TempDir()
+	tSettings.SubtreeValidation.BlocksOnly = false
+
+	subtreeHash, err := chainhash.NewHashFromStr("d580e67e847f65c73496a9f1adafacc5f73b4ca9d44fbd0749d6d926914bdcaf")
+	require.NoError(t, err)
+
+	msgBytes, err := proto.Marshal(&kafkamessage.KafkaSubtreeTopicMessage{
+		Hash:   subtreeHash.String(),
+		URL:    "http://localhost:8000",
+		PeerId: "peer1",
+	})
+	require.NoError(t, err)
+
+	blockchainClient := &blockchain.Mock{}
+	runningState := blockchain.FSMStateRUNNING
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&runningState, nil)
+
+	subtreeStore := memory.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The subtree file already exists, so the quorum lock is refused and subtreesHandler
+	// returns ErrSubtreeExists.
+	require.NoError(t, subtreeStore.Set(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtree, []byte("existing")))
+
+	blockIDsMap := make(map[uint32]bool)
+	server := &testServer{
+		Server: Server{
+			logger:              ulogger.TestLogger{},
+			settings:            tSettings,
+			blockchainClient:    blockchainClient,
+			subtreeStore:        subtreeStore,
+			currentBlockIDsMap:  atomic.Pointer[map[uint32]bool]{},
+			bestBlockHeaderMeta: atomic.Pointer[model.BlockHeaderMeta]{},
+		},
+	}
+	server.Server.currentBlockIDsMap.Store(&blockIDsMap)
+	server.Server.bestBlockHeaderMeta.Store(&model.BlockHeaderMeta{Height: 100})
+	server.Server.quorum, err = NewQuorum(ulogger.TestLogger{}, subtreeStore, tSettings.SubtreeValidation.QuorumPath)
+	require.NoError(t, err)
+
+	before := testutil.ToFloat64(prometheusSubtreeAlreadyExistsSkipped)
+
+	handler := server.subtreeMessageHandler(ctx)
+	require.NoError(t, handler(&kafka.KafkaMessage{Value: msgBytes}), "an existing subtree must be skipped, not errored")
+
+	// subtreesHandler runs in the handler's errgroup, so the increment is asynchronous.
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(prometheusSubtreeAlreadyExistsSkipped) == before+1
+	}, 5*time.Second, 10*time.Millisecond, "already-exists counter should increment by 1")
+}
