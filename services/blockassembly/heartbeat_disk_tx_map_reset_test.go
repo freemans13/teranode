@@ -95,6 +95,24 @@ func TestBlockAssembler_HeartbeatActsOnDiskTxMapResetRequest(t *testing.T) {
 	require.Zero(t, degradedGauge())
 }
 
+// A failed drain after a block (bsv-blockchain/teranode#1881) lost the txs it
+// had taken off the queue. That is not a storage fault, so the reset it asks
+// for must run even on a node whose disk tx map is degraded, where
+// storage-triggered resets are suppressed.
+func TestBlockAssembler_HeartbeatResetsOnDrainFailureEvenWhenDegraded(t *testing.T) {
+	m, resets := resetTestMock(nil)
+	m.DrainResetRequested.Store(true)
+
+	startWithMock(t, m, func(items *baTestItems) {
+		items.blockAssembler.diskTxMapDegraded = true
+	})
+
+	require.Eventually(t, func() bool { return resets.Load() == 1 }, 2*time.Second, 5*time.Millisecond,
+		"a drain failure must reset block assembly even while the disk tx map is degraded")
+	require.Never(t, func() bool { return resets.Load() > 1 }, 200*time.Millisecond, 10*time.Millisecond,
+		"the request is take-once: one reset per request")
+}
+
 // A persistent fault: the storage-triggered reset's own reload hits a storage
 // error again. There must be exactly one such reset, after which the node is
 // degraded and stops auto-resetting instead of looping full reloads.

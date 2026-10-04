@@ -2957,14 +2957,20 @@ func (ba *BlockAssembly) tipWaitExpiredError(ctx context.Context, timeout time.D
 // assemblerReady reports whether block assembly is level with bestHeader and has
 // finished whatever transition brought it there. A nil current header means the
 // assembler has not loaded its best block yet, which is a wait condition rather
-// than a failure.
+// than a failure. The transition includes the queue drain the subtree processor
+// runs after answering MoveForwardBlock: a candidate taken before it finishes
+// has none of the queued transactions.
 func (ba *BlockAssembly) assemblerReady(bestHeader *model.BlockHeader) bool {
 	currentHeader, _ := ba.blockAssembler.CurrentBlock()
 	if currentHeader == nil || !currentHeader.Hash().IsEqual(bestHeader.Hash()) {
 		return false
 	}
 
-	return ba.blockAssembler.GetCurrentRunningState() == StateRunning
+	if ba.blockAssembler.GetCurrentRunningState() != StateRunning {
+		return false
+	}
+
+	return ba.blockAssembler.subtreeProcessor == nil || !ba.blockAssembler.subtreeProcessor.DrainingAfterBlock()
 }
 
 // waitForBestBlockHeaderUpdate waits for the best block header to be updated after block submission
