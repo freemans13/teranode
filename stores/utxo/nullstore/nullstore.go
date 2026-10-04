@@ -143,8 +143,13 @@ func (m *NullStore) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error 
 
 // ParentOutputsForValidation answers every outpoint as mined at height 1 with
 // the null store's default outputs, matching Get, so validation against the null
-// store succeeds. An index past the default outputs is NoSuchIndex.
-func (m *NullStore) ParentOutputsForValidation(_ context.Context, outpoints []utxo.Outpoint, _ ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+// store succeeds. An index past the default outputs is NoSuchIndex. A cancelled
+// context fails the whole call, as it does on the other stores.
+func (m *NullStore) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, _ ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	answers := make([]utxo.ParentOutput, len(outpoints))
 
 	for i, op := range outpoints {

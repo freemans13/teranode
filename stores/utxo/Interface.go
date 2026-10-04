@@ -515,7 +515,8 @@ type Store interface {
 	// opts to every transaction exactly as SpendAndCreate applies them to one;
 	// with no WithMinedBlockInfo each record is created unmined. WithTXID and
 	// WithSetCoinbase describe one transaction and are refused; WithTXIDs is the
-	// list form of WithTXID.
+	// list form of WithTXID. WithCreateOnly and WithSpendOnly are refused: the
+	// results cannot report half a write.
 	//
 	// It returns one result per transaction, in list order. The call is not
 	// atomic across the list: each transaction succeeds or fails on its own, a
@@ -625,8 +626,15 @@ type Store interface {
 	// Height is the lowest height among the blocks recorded for the parent. The
 	// contract is the height on the chain being validated, but nothing tells the
 	// store which chain that is yet, so a parent recorded in two forks reports the
-	// lower of the two. That is harmless while every era activation height sits
-	// below the network's highest checkpoint.
+	// lower of the two. The validator reads the height for two things: the script
+	// era (Genesis, Chronicle), and BIP68 sequence locks, which TxValidator only
+	// enforces below Genesis. On a fork above the highest checkpoint the choice
+	// cannot change a verdict while both activation heights sit below that
+	// checkpoint, as they do on mainnet and testnet. A side chain forking below
+	// the checkpoint can never become the best chain, but blocks on it are not
+	// yet refused outright, so a verdict on one below Genesis can still read the
+	// wrong fork's height. The chain-blind read it replaces, the first recorded
+	// height, had the same limit.
 	//
 	// Parent flags (frozen, conflicting, locked, creating, spendable-in, coinbase
 	// maturity) are not reported: the spend checks them.

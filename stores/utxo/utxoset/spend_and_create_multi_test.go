@@ -274,8 +274,10 @@ func TestParentOutputsForValidationWithoutABody(t *testing.T) {
 		require.Equal(t, []byte(*parent.Outputs[vout].LockingScript), []byte(*answers[vout].LockingScript), "output %d", vout)
 	}
 
+	// A known parent with no coin at the index, in neither table, is a verdict, as on the other
+	// stores.
 	require.NoError(t, answers[2].Err)
-	require.Equal(t, utxo.ParentOutputTxNotFound, answers[2].Status)
+	require.Equal(t, utxo.ParentOutputNoSuchIndex, answers[2].Status)
 }
 
 // payFrom builds a transaction spending the given outputs, extended, paying their sum less 200.

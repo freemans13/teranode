@@ -59,7 +59,9 @@ var (
 	prometheusSubtreeValidationValidateSubtreeDuration prometheus.Histogram
 
 	// prometheusSubtreeValidationBatchStep times each step of the catch-up batch
-	// path (resolve, check, write, fallback) per load batch.
+	// path (precheck, resolve, check, check_after_reads, write, fallback) per
+	// load batch. resolve and check overlap, so their sum overstates the time;
+	// check_after_reads is the check time left once every parent read is back.
 	prometheusSubtreeValidationBatchStep *prometheus.HistogramVec
 
 	// prometheusSubtreeValidationBatchTxs counts the catch-up batch path's
@@ -191,7 +193,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "subtreevalidation",
 			Name:      "batch_step",
-			Help:      "Duration of each step of the catch-up batch path, per load batch",
+			Help:      "Duration of each step of the catch-up batch path, per load batch; resolve and check overlap, check_after_reads is the check time after the last parent read",
 			Buckets:   util.MetricsBucketsMilliLongSeconds,
 		},
 		[]string{"step"},

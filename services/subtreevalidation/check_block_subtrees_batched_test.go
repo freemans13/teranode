@@ -215,9 +215,26 @@ func chainedTxs(t *testing.T, roots []*bt.Tx, levels int) []*bt.Tx {
 func storeBlock(t *testing.T, f *batchedFixture, txs []*bt.Tx, doctor bool) *model.Block {
 	t.Helper()
 
+	return storeBlockBody(t, f, txs, doctor, false)
+}
+
+// storeBlockBody is storeBlock that, when dupLast is set, stores a
+// CVE-2012-2459 duplicate-last mutation of the subtree under the honest
+// subtree's hash: the node list and subtree data carry the last transaction
+// twice, and the root, so the header's merkle root, is unchanged. That needs
+// an odd node count (coinbase placeholder included), so len(txs) must be even.
+func storeBlockBody(t *testing.T, f *batchedFixture, txs []*bt.Tx, doctor, dupLast bool) *model.Block {
+	t.Helper()
+
 	ctx := context.Background()
 
-	st, err := subtreepkg.NewTreeByLeafCount(nextPow2(len(txs) + 1))
+	leaves := nextPow2(len(txs) + 1)
+	if dupLast {
+		require.Zero(t, len(txs)%2, "a duplicate-last mutation keeps the root only over an odd node count")
+		leaves = nextPow2(len(txs) + 2)
+	}
+
+	st, err := subtreepkg.NewTreeByLeafCount(leaves)
 	require.NoError(t, err)
 	require.NoError(t, st.AddCoinbaseNode())
 
@@ -229,6 +246,14 @@ func storeBlock(t *testing.T, f *batchedFixture, txs []*bt.Tx, doctor bool) *mod
 	}
 
 	subtreeHash := *st.RootHash()
+
+	if dupLast {
+		last := txs[len(txs)-1]
+		require.NoError(t, st.AddNode(*last.TxIDChainHash(), 100, uint64(last.Size()))) //nolint:gosec
+		data = append(data, last.Bytes()...)
+
+		require.Equal(t, subtreeHash, *st.RootHash(), "the mutation must keep the subtree root")
+	}
 
 	stBytes, err := st.Serialize()
 	require.NoError(t, err)
@@ -377,6 +402,40 @@ func TestCheckBlockSubtreesBatched_DoctoredBodyWritesNothing(t *testing.T) {
 	requireAbsent(t, f, txs)
 
 	require.NoError(t, checkBlock(t, f, storeBlock(t, f, txs, false)))
+	requireCreatedUnmined(t, f, txs)
+}
+
+// A CVE-2012-2459 duplicate-last mutation keeps the subtree root, so it passes
+// the body-binding check. Its repeated transaction must make the block corrupt,
+// as ValidateSubtreeInternal's duplicate scan does on the level path, never
+// invalid: an invalid verdict would condemn an honest block hash. Nothing is
+// written, and the honest body then goes through.
+func TestCheckBlockSubtreesBatched_DuplicateLastMutationIsCorrupt(t *testing.T) {
+	f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+
+	root := storedRoot(t, f, 1, opTrue)
+	a := opTrueTx(t, 1, []*bt.Tx{root}, []uint32{0})
+	b := opTrueTx(t, 2, []*bt.Tx{a}, []uint32{0})
+	txs := []*bt.Tx{a, b}
+
+	mutated := storeBlockBody(t, f, txs, false, true)
+
+	err := checkBlock(t, f, mutated)
+	require.Error(t, err)
+	require.True(t, errors.IsBlockCorrupt(err), "a duplicate-last mutation is corrupt, got %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "a duplicate-last mutation must never mark the block invalid, got %v", err)
+	require.Zero(t, f.store.multiCalls.Load())
+	requireAbsent(t, f, txs)
+
+	// The mutated files sit under the honest subtree hash; drop them so the
+	// honest body can be stored in their place, as a re-download would.
+	for _, fileType := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData} {
+		require.NoError(t, f.server.subtreeStore.Del(context.Background(), mutated.Subtrees[0][:], fileType))
+	}
+
+	honest := storeBlock(t, f, txs, false)
+	require.Equal(t, mutated.Header.HashMerkleRoot, honest.Header.HashMerkleRoot, "the mutation keeps the header's merkle root")
+	require.NoError(t, checkBlock(t, f, honest))
 	requireCreatedUnmined(t, f, txs)
 }
 
@@ -635,4 +694,75 @@ func TestProcessTransactionsBatched_StoreFaultIsRetryable(t *testing.T) {
 	require.NotErrorIs(t, err, errors.ErrBlockInvalid)
 	require.Zero(t, f.store.multiCalls.Load())
 	requireAbsent(t, f, txs)
+}
+
+// slowParentStore delays every parent-output read.
+type slowParentStore struct {
+	*countingStore
+	delay time.Duration
+}
+
+func (s *slowParentStore) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, opts ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	time.Sleep(s.delay)
+
+	return s.countingStore.ParentOutputsForValidation(ctx, outpoints, opts...)
+}
+
+// slowChecker delays every script check.
+type slowChecker struct {
+	validator.BlockBatchChecker
+	delay time.Duration
+}
+
+func (s *slowChecker) CheckExtendedTransaction(ctx context.Context, tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, opts *validator.Options) error {
+	time.Sleep(s.delay)
+
+	return s.BlockBatchChecker.CheckExtendedTransaction(ctx, tx, blockHeight, utxoHeights, opts)
+}
+
+func batchStepSum(t *testing.T, step string) float64 {
+	t.Helper()
+
+	return labeledHistogramSum(t, "teranode_subtreevalidation_batch_step", "step", step)
+}
+
+// The resolve and check steps overlap, so check_after_reads, the check time
+// left once every parent read is back, is what tells slow reads from slow
+// checks: near zero when the reads set the pace, at least the check time when
+// the checks do.
+func TestProcessTransactionsBatched_StepMetricsSeparateReadsFromChecks(t *testing.T) {
+	const delay = 300 * time.Millisecond
+
+	t.Run("slow reads", func(t *testing.T) {
+		f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+		root := storedRoot(t, f, 1, opTrue)
+		tx := opTrueTx(t, 1, []*bt.Tx{root}, []uint32{0})
+
+		f.server.utxoStore = &slowParentStore{countingStore: f.store, delay: delay}
+
+		checker, ok := f.server.batchChecker(blockchain.FSMStateCATCHINGBLOCKS, batchedTestHeight)
+		require.True(t, ok)
+
+		resolveBefore, tailBefore := batchStepSum(t, "resolve"), batchStepSum(t, "check_after_reads")
+
+		require.NoError(t, f.server.processTransactionsBatched(context.Background(), checker, []*bt.Tx{tx}, chainhash.Hash{}, batchedTestHeight, 0, 0, map[uint32]bool{}))
+
+		require.GreaterOrEqual(t, batchStepSum(t, "resolve")-resolveBefore, delay.Seconds(), "resolve covers the parent reads")
+		require.Less(t, batchStepSum(t, "check_after_reads")-tailBefore, delay.Seconds(), "a fast check leaves little after the reads")
+	})
+
+	t.Run("slow checks", func(t *testing.T) {
+		f := newBatchedFixture(t, blockchain.FSMStateCATCHINGBLOCKS)
+		root := storedRoot(t, f, 1, opTrue)
+		tx := opTrueTx(t, 1, []*bt.Tx{root}, []uint32{0})
+
+		inner, ok := f.server.batchChecker(blockchain.FSMStateCATCHINGBLOCKS, batchedTestHeight)
+		require.True(t, ok)
+
+		tailBefore := batchStepSum(t, "check_after_reads")
+
+		require.NoError(t, f.server.processTransactionsBatched(context.Background(), &slowChecker{BlockBatchChecker: inner, delay: delay}, []*bt.Tx{tx}, chainhash.Hash{}, batchedTestHeight, 0, 0, map[uint32]bool{}))
+
+		require.GreaterOrEqual(t, batchStepSum(t, "check_after_reads")-tailBefore, delay.Seconds(), "a slow check shows after the reads")
+	})
 }

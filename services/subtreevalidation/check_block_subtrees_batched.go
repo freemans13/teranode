@@ -50,8 +50,11 @@ func (u *Server) batchChecker(state blockchain.FSMStateType, blockHeight uint32)
 // checkBlockBodyBound proves, before anything is written, that the block's
 // subtree list is the one its header commits to: it loads the first and last
 // subtrees' node lists and checks the merkle root with the coinbase substituted.
-// Every other subtree is bound to its key when it is loaded. The node lists are
-// stored as FileTypeSubtreeToCheck, so the batch load reads them locally.
+// Every other subtree contributes only its key. A node list fetched from a peer
+// is checked against its key before it is stored as FileTypeSubtreeToCheck, so
+// the batch load reads it locally. A local subtree file is not re-hashed, here
+// or on the level path: this node writes one only after that check, or, on
+// legacy catch-up, after checking the block's merkle root.
 func (u *Server) checkBlockBodyBound(ctx context.Context, request *subtreevalidation_api.CheckBlockSubtreesRequest, block *model.Block, peerID string, dah uint32) error {
 	if len(block.Subtrees) == 0 {
 		return nil
@@ -91,7 +94,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, blockIds map[uint32]bool) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processTransactionsBatched",
 		tracing.WithParentStat(u.stats),
-		tracing.WithLogMessage(u.logger, "[processTransactionsBatched] Processing %d transactions at block height %d", len(allTransactions), blockHeight),
+		tracing.WithDebugLogMessage(u.logger, "[processTransactionsBatched] Processing %d transactions at block height %d", len(allTransactions), blockHeight),
 	)
 	defer deferFn()
 
@@ -100,6 +103,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	}
 
 	txHashes := make([]chainhash.Hash, len(allTransactions))
+	position := make(map[chainhash.Hash]int, len(allTransactions))
 
 	for i, tx := range allTransactions {
 		if tx == nil {
@@ -107,6 +111,17 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 		}
 
 		txHashes[i] = *tx.TxIDChainHash()
+
+		// A transaction twice in the batch is a CVE-2012-2459 duplicate-last
+		// mutation: it keeps the subtree root, so checkBlockBodyBound cannot see
+		// it. Classify it as ValidateSubtreeInternal does, corrupt rather than
+		// invalid, before its repeated spends read as a double spend and condemn
+		// an honest block hash.
+		if first, dup := position[txHashes[i]]; dup {
+			return errors.NewBlockCorruptError("[processTransactionsBatched] duplicate transaction %s at indexes %d and %d", txHashes[i], first, i)
+		}
+
+		position[txHashes[i]] = i
 	}
 
 	// Pre-check, as the level path does: drop what is already validated.
@@ -134,7 +149,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	b := &batchState{
 		txs:      allTransactions,
 		hashes:   txHashes,
-		position: make(map[chainhash.Hash]int, len(allTransactions)),
+		position: position,
 		heights:  make([][]uint32, len(allTransactions)),
 		parents:  make([][]int, len(allTransactions)),
 		fallback: make([]bool, len(allTransactions)),
@@ -142,10 +157,11 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 
 	for i, tx := range allTransactions {
 		if tx.IsCoinbase() {
+			// The coinbase that arrives with the subtree data is never a parent.
+			delete(b.position, txHashes[i])
+
 			continue
 		}
-
-		b.position[txHashes[i]] = i
 
 		if !txMetaSlice[i].isSet {
 			b.missing = append(b.missing, i)
@@ -164,7 +180,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	)
 
 	if err = u.validatorClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
-		return errors.NewProcessingError("[processTransactionsBatched] failed to pre-load MTP store: %v", err)
+		return errors.NewProcessingError("[processTransactionsBatched] failed to pre-load MTP store", err)
 	}
 
 	if err = u.resolveAndCheckBatch(ctx, checker, b, blockHeight, validatorOptions); err != nil {
@@ -282,6 +298,8 @@ func (u *Server) resolveAndCheckBatch(ctx context.Context, checker validator.Blo
 	// Each transaction is sent at most once, so sends never block.
 	ready := make(chan int, len(b.missing))
 
+	checkStart := time.Now()
+
 	for range runtime.GOMAXPROCS(0) {
 		g.Go(func() error {
 			for i := range ready {
@@ -345,13 +363,19 @@ func (u *Server) resolveAndCheckBatch(ctx context.Context, checker validator.Blo
 
 	readErr := reads.Wait()
 
-	prometheusSubtreeValidationBatchStep.WithLabelValues("resolve").Observe(time.Since(start).Seconds())
+	// The resolve and check steps overlap by design, so the two observations do
+	// not add up. check_after_reads is the part of the check that no read
+	// overlaps: large when the script checks, not the parent reads, set the pace.
+	readsDone := time.Now()
+
+	prometheusSubtreeValidationBatchStep.WithLabelValues("resolve").Observe(readsDone.Sub(start).Seconds())
 
 	close(ready)
 
 	checkErr := g.Wait()
 
-	prometheusSubtreeValidationBatchStep.WithLabelValues("check").Observe(time.Since(start).Seconds())
+	prometheusSubtreeValidationBatchStep.WithLabelValues("check").Observe(time.Since(checkStart).Seconds())
+	prometheusSubtreeValidationBatchStep.WithLabelValues("check_after_reads").Observe(time.Since(readsDone).Seconds())
 
 	switch {
 	case readErr != nil && (checkErr == nil || readFailedFirst.Load()):
@@ -378,6 +402,12 @@ func (u *Server) resolveAndCheckBatch(ctx context.Context, checker validator.Blo
 // in block order.
 func resolveFromMemory(b *batchState, blockHeight uint32) ([]storeInputRef, []utxo.Outpoint, error) {
 	spent := make(map[utxo.Outpoint]int)
+
+	// lastChild[p] is 1 + the position of the last transaction that recorded p
+	// as a parent. A transaction's inputs are walked together, so this dedups
+	// its parents in O(1) each; a scan of its list would be quadratic in a
+	// consolidation transaction's parent count.
+	lastChild := make([]int, len(b.txs))
 
 	var (
 		refs      []storeInputRef
@@ -424,7 +454,11 @@ func resolveFromMemory(b *batchState, blockHeight uint32) ([]storeInputRef, []ut
 			in.PreviousTxScript = parent.Outputs[op.Vout].LockingScript
 			// A same-block parent is mined at this block's height.
 			b.heights[i][k] = blockHeight
-			b.parents[i] = appendUniqueInt(b.parents[i], p)
+			if lastChild[p] != i+1 {
+				lastChild[p] = i + 1
+				b.parents[i] = append(b.parents[i], p)
+			}
+
 			fromMem++
 		}
 	}
@@ -598,14 +632,4 @@ func (u *Server) writeList(ctx context.Context, checker validator.BlockBatchChec
 	prometheusSubtreeValidationBatchTxs.WithLabelValues("created").Add(float64(created))
 
 	return nil
-}
-
-func appendUniqueInt(s []int, v int) []int {
-	for _, x := range s {
-		if x == v {
-			return s
-		}
-	}
-
-	return append(s, v)
 }

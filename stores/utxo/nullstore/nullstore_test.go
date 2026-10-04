@@ -94,4 +94,11 @@ func TestNullStoreParentOutputsForValidation(t *testing.T) {
 	require.Equal(t, uint32(1), answers[0].Height)
 	require.Equal(t, utxo.ParentOutputMined, answers[1].Status)
 	require.Equal(t, utxo.ParentOutputNoSuchIndex, answers[2].Status)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	answers, err = store.ParentOutputsForValidation(cancelled, []utxo.Outpoint{{Vout: 0}})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, answers)
 }

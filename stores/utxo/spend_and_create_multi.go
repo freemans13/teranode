@@ -107,8 +107,9 @@ type SpendAndCreateMultiStore interface {
 // In order, it:
 //  1. refuses, with nothing written, a list that spends a later or the same
 //     transaction, spends one outpoint twice, names an output index past the end
-//     of a parent in the list, holds a transaction twice or a coinbase, or passes
-//     WithTXID, WithSetCoinbase or a WithTXIDs of the wrong length;
+//     of a parent in the list, holds a nil transaction, a transaction twice or a
+//     coinbase, or passes WithTXID, WithSetCoinbase, WithCreateOnly,
+//     WithSpendOnly or a WithTXIDs of the wrong length;
 //  2. assigns each transaction a level in memory;
 //  3. writes level by level, skipping (MultiTxParentFailed) any transaction whose
 //     parent in the list failed.
@@ -225,7 +226,7 @@ type SpendAndCreateMultiList struct {
 func PrepareSpendAndCreateMulti(txs []*bt.Tx, opts ...CreateOption) (*SpendAndCreateMultiList, error) {
 	options, err := ParseCreateOptions(opts...)
 	if err != nil {
-		return nil, newSpendAndCreateMultiRefusedError("%v", err)
+		return nil, newSpendAndCreateMultiRefusedError("invalid options", err)
 	}
 
 	if options.TxID != nil {
@@ -234,6 +235,13 @@ func PrepareSpendAndCreateMulti(txs []*bt.Tx, opts ...CreateOption) (*SpendAndCr
 
 	if options.IsCoinbase != nil {
 		return nil, newSpendAndCreateMultiRefusedError("WithSetCoinbase describes one transaction; a coinbase never belongs in a list")
+	}
+
+	// The results report a record created or existing, with its spends made;
+	// neither half on its own fits that, and a child level would read a parent
+	// as created that has no record.
+	if options.CreateOnly || options.SpendOnly {
+		return nil, newSpendAndCreateMultiRefusedError("WithCreateOnly and WithSpendOnly describe half a write; a list writes both halves")
 	}
 
 	if options.TxIDs != nil && len(options.TxIDs) != len(txs) {
@@ -298,6 +306,12 @@ func checkSpendAndCreateMultiList(txs []*bt.Tx, txids []chainhash.Hash) ([][]int
 	parentsInList := make([][]int, len(txs))
 	spent := make(map[Outpoint]struct{})
 
+	// lastChild[p] is 1 + the position of the last transaction that recorded p
+	// as a parent. A transaction's inputs are walked together, so this dedups
+	// its parents in O(1) each; a scan of its list would be quadratic in a
+	// consolidation transaction's parent count.
+	lastChild := make([]int, len(txs))
+
 	for i, tx := range txs {
 		for _, in := range tx.Inputs {
 			op := Outpoint{TxID: *in.PreviousTxIDChainHash(), Vout: in.PreviousTxOutIndex}
@@ -321,19 +335,12 @@ func checkSpendAndCreateMultiList(txs []*bt.Tx, txids []chainhash.Hash) ([][]int
 				return nil, newSpendAndCreateMultiRefusedError("transaction %s spends output %d of %s, which has %d outputs", txids[i], op.Vout, op.TxID, len(txs[p].Outputs))
 			}
 
-			parentsInList[i] = appendUnique(parentsInList[i], p)
+			if lastChild[p] != i+1 {
+				lastChild[p] = i + 1
+				parentsInList[i] = append(parentsInList[i], p)
+			}
 		}
 	}
 
 	return parentsInList, nil
-}
-
-func appendUnique(s []int, v int) []int {
-	for _, x := range s {
-		if x == v {
-			return s
-		}
-	}
-
-	return append(s, v)
 }

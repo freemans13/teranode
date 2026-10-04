@@ -2,11 +2,13 @@ package sql
 
 import (
 	"context"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 )
@@ -61,7 +63,7 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 		end := min(start+chunkSize, len(pairs))
 		chunk := pairs[start:end]
 
-		found, err := s.parentOutputsChunk(ctx, chunk)
+		found, err := s.parentOutputsChunkWithRetry(ctx, chunk)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -92,6 +94,51 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 	}
 
 	return answers, nil
+}
+
+// parentOutputsReadRetries bounds how many times one chunk is tried when the
+// database refuses it with a lock error, before its outpoints are marked with
+// the error.
+const parentOutputsReadRetries = 3
+
+// parentOutputsChunkWithRetry retries a chunk the database refused with a lock
+// error. The chunk's one statement reads transactions, outputs and block_ids
+// together, so under SQLite's shared cache, which sqlitememory uses and which
+// locks whole tables, it can meet a spend transaction that holds one of those
+// tables and waits for another: SQLite breaks the cycle by failing one side with
+// SQLITE_LOCKED. sendSpendBatch retries the spend side; this is the read side.
+// A failed read holds no locks, so running it again is safe.
+func (s *Store) parentOutputsChunkWithRetry(ctx context.Context, chunk []outpointPair) (map[utxo.Outpoint]utxo.ParentOutput, error) {
+	var found map[utxo.Outpoint]utxo.ParentOutput
+
+	err := retryReadOnLockError(ctx, s.logger, len(chunk), func() error {
+		var err error
+
+		found, err = s.parentOutputsChunk(ctx, chunk)
+
+		return err
+	})
+
+	return found, err
+}
+
+// retryReadOnLockError runs read up to parentOutputsReadRetries times while it
+// fails with an error isDeadlock recognises, and returns its last error.
+func retryReadOnLockError(ctx context.Context, logger ulogger.Logger, outpoints int, read func() error) error {
+	for attempt := 1; ; attempt++ {
+		err := read()
+		if err == nil || !isDeadlock(err) || attempt >= parentOutputsReadRetries {
+			return err
+		}
+
+		logger.Warnf("[ParentOutputsForValidation] lock error (attempt %d/%d), retrying chunk of %d outpoints: %v", attempt, parentOutputsReadRetries, outpoints, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
+		}
+	}
 }
 
 // parentOutputsChunk runs one statement for chunk and returns an answer for

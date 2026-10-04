@@ -33,9 +33,11 @@ SELECT k.ref, j.satoshis, j.script, j.hash_override
 // is recorded in, comes from the same read order Get uses. The output itself comes from the
 // parent's body while the store keeps it. Without a body, which is the steady state below the
 // checkpoint and 288 blocks behind the tip, it comes from the UTXO table or the spend journal.
-// An output in neither is reported TxNotFound, as a missing parent: the store cannot tell a
-// spent output older than the journal from one that never existed, and the caller goes and
-// looks for the parent either way.
+// An output of a known parent in neither is reported NoSuchIndex, as the Aerospike and SQL
+// stores report a parent with no output at that index. It covers an output the seeder never
+// held (spent before the snapshot), one that never existed, and one spent before the journal's
+// retention; none of them can be spent, so all three are a verdict on the spender rather than
+// a missing parent to go and fetch. Only an unknown parent is TxNotFound.
 func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint,
 	_ ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
 	answers := make([]utxo.ParentOutput, len(outpoints))
@@ -186,7 +188,7 @@ func (s *Store) readParentCoins(ctx context.Context, outpoints []utxo.Outpoint, 
 
 	for k, i := range idx {
 		if !found[k] && answers[i].Err == nil {
-			answers[i] = utxo.ParentOutput{Status: utxo.ParentOutputTxNotFound}
+			answers[i] = utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
 		}
 	}
 }
