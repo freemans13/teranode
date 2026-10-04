@@ -141,11 +141,11 @@ func digestRequestBody(req *http.Request) (string, error) {
 	sum := sha256.Sum256(buf)
 	req.Body = io.NopCloser(bytes.NewReader(buf))
 	req.ContentLength = int64(len(buf))
-	// GetBody is consulted by net/http on redirects and HTTP/2 retries; provide
-	// a clone so signed retries don't lose the body.
-	req.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(buf)), nil
-	}
+	// Signing must not change what the client will do with this request, so it does not install
+	// GetBody: that would let net/http replay the body across a 307 or 308 on the signer's say-so.
+	// executeHTTPRequestWithClient, which builds the body, sets GetBody itself for transport
+	// retries and relies on ssrfCheckRedirect to refuse any redirect of a POST.
+
 	return hex.EncodeToString(sum[:]), nil
 }
 

@@ -335,10 +335,11 @@ var ssrfDialContext = NewSSRFSafeDialContext(DefaultSSRFDialPolicy)
 // maxSSRFRedirects bounds redirect chains followed while fetching peer-supplied URLs.
 const maxSSRFRedirects = 10
 
-// ssrfCheckRedirect builds the CheckRedirect used for peer-supplied URLs: it bounds the hop
-// count, then rejects a redirect target that leaves http/https, carries credentials, or names
-// a blocked IP literal. Targets naming a hostname are caught by the dialer instead, so this
-// is a cheap pre-check that avoids attempting the connection at all.
+// ssrfCheckRedirect builds the CheckRedirect used for peer-supplied URLs: it refuses any
+// redirect of a POST unconditionally, then - when SSRF protection is enabled - bounds the hop
+// count and rejects a redirect target that leaves the origin, leaves http/https, carries
+// credentials, or names a blocked IP literal. Targets naming a hostname are caught by the
+// dialer instead, so this is a cheap pre-check that avoids attempting the connection at all.
 //
 // Both the shared httpClient and every client from NewSSRFSafeHTTPClient use this, so there is
 // one redirect rule for the threat rather than two that can drift apart.
@@ -348,20 +349,24 @@ func ssrfCheckRedirect(policy SSRFDialPolicy) func(req *http.Request, via []*htt
 			return errors.NewInvalidArgumentError("stopped after %d redirects", maxSSRFRedirects)
 		}
 
+		// A POST body is built from peer-supplied data, so a redirect of a POST is always a peer
+		// choosing a destination for bytes we assembled. A 301, 302 or 303 turns it into a GET
+		// wherever the peer points; a 307 or 308 replays method and body verbatim. Neither is ever
+		// wanted, so this refusal is not conditional on the SSRF toggle below - test topologies
+		// disable that toggle to reach loopback, and must not thereby re-open this. Only POST
+		// reaches here today; any other method that is not a plain read (PUT, PATCH, DELETE, ...)
+		// is refused on the same grounds, so a future caller does not re-open it. An empty method
+		// means GET to net/http.
+		if len(via) > 0 && via[0] != nil && !isReadMethod(via[0].Method) {
+			return errors.NewInvalidArgumentError("SSRF redirect check: refusing to follow a redirect of a %s", via[0].Method)
+		}
+
 		if !ssrfProtectionEnabled.Load() {
 			return nil
 		}
 
-		if len(via) > 0 && via[0] != nil {
-			// A POST body was built from peer-supplied data. Go does not replay it on a 307
-			// or 308, but a 301, 302 or 303 turns it into a GET to wherever the peer points.
-			if via[0].Method == http.MethodPost {
-				return errors.NewInvalidArgumentError("SSRF redirect check: refusing to follow a redirect of a POST")
-			}
-
-			if via[0].URL != nil && !sameOriginOrUpgrade(via[0].URL, req.URL) {
-				return errors.NewInvalidArgumentError("SSRF redirect check: redirect leaves the origin of the requested URL")
-			}
+		if len(via) > 0 && via[0] != nil && via[0].URL != nil && !sameOriginOrUpgrade(via[0].URL, req.URL) {
+			return errors.NewInvalidArgumentError("SSRF redirect check: redirect leaves the origin of the requested URL")
 		}
 
 		scheme := strings.ToLower(req.URL.Scheme)
@@ -383,6 +388,12 @@ func ssrfCheckRedirect(policy SSRFDialPolicy) func(req *http.Request, via []*htt
 
 		return nil
 	}
+}
+
+// isReadMethod reports whether a request method only reads. net/http treats an empty method
+// as GET.
+func isReadMethod(method string) bool {
+	return method == "" || method == http.MethodGet || method == http.MethodHead
 }
 
 // sameOriginOrUpgrade reports whether a redirect from one URL to another keeps the same
@@ -789,7 +800,18 @@ func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFu
 	// the binary payload, and reject the request with HTTP 400 — degrading peer
 	// catchup reputation across the network.
 	if len(requestBody) > 0 && requestBody[0] != nil {
-		req.Body = io.NopCloser(bytes.NewReader(requestBody[0]))
+		body := requestBody[0]
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		// GetBody lets net/http resend the body on a fresh connection when an HTTP/2 stream is
+		// refused or its connection goes away, or when a reused HTTP/1.1 connection fails before
+		// anything was written - failures a caller would otherwise charge to the peer. It would
+		// equally let net/http replay the body across a 307 or 308, which ssrfCheckRedirect refuses
+		// for every request that is not a plain read, unconditionally; httpClient is the only client
+		// that reaches here with a body. It is set here, where the body is built, and not by the
+		// signer: signing must not change what the client does with the request.
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
 		req.Method = http.MethodPost
 		req.Header.Set("Content-Type", "application/octet-stream")
 	}
