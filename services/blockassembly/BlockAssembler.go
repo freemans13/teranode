@@ -541,6 +541,15 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// rotation left its phantom in place and is retried here too.
 				// Storage-triggered resets are paced by
 				// storageResetMinInterval; a request arriving sooner waits.
+				// A failed queue drain after a block left the txs it had
+				// dequeued in no subtree. Not a storage fault, so it resets
+				// even while degraded, as a plain (not storage-triggered)
+				// reset.
+				if b.subtreeProcessor.TakeDrainResetRequested() {
+					b.logger.Warnf("[BlockAssembler] the queue drain after a block failed; resetting block assembly")
+					b.resetAfterDrainFailure()
+				}
+
 				requested := b.subtreeProcessor.TakeResetRequested()
 				if b.diskTxMapResetPending {
 					b.diskTxMapResetPending = false
@@ -1537,7 +1546,11 @@ func (b *BlockAssembler) conflictIntentRefusalHandler(blockHash chainhash.Hash) 
 // refused because it would have reversed a confirmed spend. Called after block
 // movement has completed, never during it: InvalidateBlock re-enters the
 // blockchain service and emits notifications, which is unsafe while the subtree
-// processor still holds movement state.
+// processor still holds movement state. "Completed" means MoveForwardBlock has
+// returned, so the block is committed and finalized; the subtree processor may
+// still be draining its queue (see deferredBlockDrain), but any reorg or reset
+// that InvalidateBlock leads to reaches it as a request it only takes once that
+// drain is done.
 //
 // Best-effort by design. The UTXO set is already consistent with the honest
 // chain thanks to the refusal itself; invalidation is what restores agreement
@@ -1890,6 +1903,20 @@ func (b *BlockAssembler) resetStorageTriggered() {
 
 		if err := <-errCh; err != nil {
 			b.logger.Errorf("[BlockAssembler] error resetting (storage-triggered): %v", err)
+		}
+	}()
+}
+
+// resetAfterDrainFailure queues a reset that is not storage-triggered, for a
+// failed queue drain after a block (see Interface.TakeDrainResetRequested).
+func (b *BlockAssembler) resetAfterDrainFailure() {
+	go func() {
+		errCh := make(chan error, 1)
+
+		b.resetCh <- resetRequest{ErrCh: errCh}
+
+		if err := <-errCh; err != nil {
+			b.logger.Errorf("[BlockAssembler] error resetting after a failed queue drain: %v", err)
 		}
 	}()
 }
