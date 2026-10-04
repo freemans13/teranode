@@ -153,13 +153,15 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// Both windows BEFORE the transaction is opened, never inside it: the DDL needs its own
 	// pool connection, and taking one while holding a transaction from the same pool
 	// deadlocks the pool under concurrency, with no timeout.
-	if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
-		return nil, err
-	}
-
-	if mi, mined := minedBlock(options.MinedBlockInfos); mined {
-		if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+	if !s.seedingCreate(options) {
+		if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 			return nil, err
+		}
+
+		if mi, mined := minedBlock(options.MinedBlockInfos); mined {
+			if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -315,7 +317,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		minedHeight = int32(mi.BlockHeight) //nolint:gosec // a height fits int32 for any reachable chain
 		blockID = int32(mi.BlockID)         //nolint:gosec // a block id fits int32
 		subtreeIdx = int32(mi.SubtreeIdx)   //nolint:gosec // a subtree index fits int32
-		atBirth = model.BelowCheckpoint(s.checkpoints, mi.BlockHeight)
+		atBirth = model.BelowCheckpoint(s.checkpoints, mi.BlockHeight) || s.seedingCreate(options)
 	}
 
 	// What the UTXOs carry from birth: the block's pair when the store lets the create write
@@ -379,6 +381,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.txFlags = append(p.txFlags, flags)
 	p.bodies = append(p.bodies, body)
 	p.minedRows = append(p.minedRows, atBirth)
+	p.seedRows = append(p.seedRows, s.seedingCreate(options))
 	p.minedHeight = append(p.minedHeight, minedHeight)
 	p.blockID = append(p.blockID, blockID)
 	p.subtreeIdx = append(p.subtreeIdx, subtreeIdx)
@@ -599,4 +602,26 @@ func txSize(tx *bt.Tx) int {
 	}
 
 	return size
+}
+
+// seedingCreate reports whether a create is a seed's, written by the seeding route.
+//
+// A seed from a UTXO snapshot loads every unspent output at once, with its block height. Through
+// the normal routes each transaction also gets a containment row, and above the checkpoint an
+// identity row and coins at the unconfirmed sentinel; all of it waits for a stamp that never
+// visits heights below a seed, and on mainnet the containment rows alone would be tens of
+// gigabytes on the disk until the seed's hook clears them. The seeding route writes the coins
+// alone, with their height and block already set, as the stamp would leave them.
+//
+// It needs seeding=true on the store URL, which only a seed's settings set, and it applies only
+// to a create shaped like the seeder's: create-only, with the caller's txid and a block. Every
+// other create takes its normal route even in seeding mode.
+func (s *Store) seedingCreate(options *utxo.CreateOptions) bool {
+	if !s.seeding || options == nil || !options.CreateOnly || options.TxID == nil {
+		return false
+	}
+
+	_, mined := minedBlock(options.MinedBlockInfos)
+
+	return mined
 }

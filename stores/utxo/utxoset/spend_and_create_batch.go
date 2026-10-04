@@ -298,7 +298,7 @@ func (s *Store) ensurePartitionsFor(ctx context.Context, batch []*spendAndCreate
 			}
 		}
 
-		if !item.options.SpendOnly {
+		if !item.options.SpendOnly && !s.seedingCreate(item.options) {
 			if win := item.blockHeight / TxBodyPartitionBlocks; !has(windows, win) {
 				windows[win] = struct{}{}
 
