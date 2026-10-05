@@ -10,10 +10,9 @@ import (
 )
 
 // seedIndexBuildConcurrency is how many partitions build their ukey index at once after a
-// deferred-index seed: all of them. Measured on a full mainnet seed (4.6 billion coins, eight
-// 17 GB indexes), eight at once took 21 minutes against 48 for two at a time, with neither disk
-// past 78% busy; the builds are bound by sorting and Postgres's parallel worker pool, not I/O.
-const seedIndexBuildConcurrency = NumLeaves
+// deferred-index seed. Each build sorts through temporary files until it finishes, so they are
+// bounded rather than all eight together.
+const seedIndexBuildConcurrency = 4
 
 // seedIndexBuildMemory is each build's maintenance_work_mem, so the builds together take
 // seedIndexBuildConcurrency times this.
