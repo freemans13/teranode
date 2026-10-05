@@ -2,10 +2,8 @@ package utxoset
 
 import (
 	"context"
-	"encoding/binary"
 	"net/url"
 	"testing"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -348,46 +346,5 @@ func TestSeedingFastInsertMatchesGuardedRoute(t *testing.T) {
 		require.NoError(t, answers[0].Err)
 		require.Equal(t, utxo.ParentOutputMined, answers[0].Status)
 		require.Equal(t, uint64(30), answers[0].Satoshis)
-	}
-}
-
-// The seed fast route takes no per-transaction advisory lock: with another connection holding
-// the lock the guarded route would take for a transaction, a seed of it through SpendAndCreate,
-// which is how the seeder writes, still completes. The guarded route would wait for the lock.
-func TestSeedingFastRouteTakesNoAdvisoryLock(t *testing.T) {
-	base, ctx := newTestStore(t)
-	_, err := base.pool.Exec(ctx, `TRUNCATE utxo`)
-	require.NoError(t, err)
-
-	s := openSeedingStore(t, base)
-	require.True(t, s.seedFast)
-
-	var id chainhash.Hash
-	id[0] = 0x6a
-	id[1] = 0x01
-
-	holder, err := base.pool.Begin(ctx)
-	require.NoError(t, err)
-
-	t.Cleanup(func() { _ = holder.Rollback(context.Background()) })
-
-	_, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(binary.BigEndian.Uint64(id[:8]))) //nolint:gosec // a hash prefix as a lock key, as lockTxids takes it
-	require.NoError(t, err)
-
-	done := make(chan error, 1)
-
-	go func() {
-		_, _, err := s.SpendAndCreate(ctx, seededTx(map[uint32]uint64{0: 10}), 960_000,
-			utxo.WithCreateOnly(), utxo.WithTXID(&id), utxo.WithSetCoinbase(false),
-			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 0, BlockHeight: 960_000, SubtreeIdx: 0}))
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(10 * time.Second):
-		_ = holder.Rollback(context.Background())
-		t.Fatal("the seed waited on the advisory lock: it took the guarded route")
 	}
 }

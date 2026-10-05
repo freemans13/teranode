@@ -1024,24 +1024,14 @@ func (p *createPlan) allSeedRows() bool {
 	return true
 }
 
-// execSeedFast writes a plan's coins through createSeedFastSQL. Every transaction in the plan is
-// then created, which is what the guarded route reports when its claim takes them all. Both the
-// create batcher and the create-only batches of the spend-and-create batcher, which is the one
-// the seeder writes through, call it.
-func (s *Store) execSeedFast(ctx context.Context, q querier, p *createPlan) error {
-	if _, err := q.Exec(ctx, createSeedFastSQL,
+// sendSeedFast writes a batch of seed creates through createSeedFastSQL and reports each
+// transaction created, which is what the guarded route reports when its claim takes them all.
+func (s *Store) sendSeedFast(ctx context.Context, batch []*createItem, plan *createPlan) {
+	p := plan
+	if _, err := s.pool.Exec(ctx, createSeedFastSQL,
 		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoMined, p.utxoBlockIDs, p.utxoLeaves,
 		p.utxoFlags, p.utxoUkeys, p.utxoTxids, p.utxoScripts); err != nil {
-		return errors.NewStorageError("[utxoset][Create] seed insert", err)
-	}
-
-	return nil
-}
-
-// sendSeedFast writes a create batcher batch of seed creates through execSeedFast.
-func (s *Store) sendSeedFast(ctx context.Context, batch []*createItem, plan *createPlan) {
-	if err := s.execSeedFast(ctx, s.pool, plan); err != nil {
-		s.failBatch(batch, err)
+		s.failBatch(batch, errors.NewStorageError("[utxoset][Create] seed insert", err))
 		return
 	}
 
