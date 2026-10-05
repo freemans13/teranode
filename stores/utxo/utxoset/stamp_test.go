@@ -440,8 +440,10 @@ func TestStampResumesAfterACrashMidWindow(t *testing.T) {
 	require.Zero(t, testutil.ToFloat64(stampCompletionMissing))
 }
 
-// TestStampTreatsAWindowWithNoTableAsEmpty is decision 8: a missing window is counted, both
-// stamp floors move past it, and the pass carries on to the next window.
+// TestStampTreatsAWindowWithNoTableAsEmpty is decision 8: both stamp floors move past a missing
+// window and the pass carries on to the next. Windows below the lowest window that exists are
+// what a seed leaves (it writes no containment rows), so they are skipped without being counted
+// as missing.
 func TestStampTreatsAWindowWithNoTableAsEmpty(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
@@ -456,7 +458,7 @@ func TestStampTreatsAWindowWithNoTableAsEmpty(t *testing.T) {
 
 	stampThrough(t, s, ctx, 3, map[uint32]uint32{1000: 30})
 
-	require.Equal(t, before+3, testutil.ToFloat64(stampMissingWindows), "windows 0, 1 and 2")
+	require.Equal(t, before, testutil.ToFloat64(stampMissingWindows), "windows 0, 1 and 2 lie below the lowest window, as after a seed")
 	require.Equal(t, [][2]int32{{1000, 30}}, pairsOf(t, s, ctx, tx))
 
 	for _, w := range []uint32{0, 288, 576} {
@@ -645,4 +647,34 @@ func TestNoIndexOnUTXONamesMinedHeight(t *testing.T) {
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'utxo%' AND indexdef LIKE '%mined_height%'`).Scan(&n))
 	require.Zero(t, n)
+}
+
+// A window missing above one that exists is not what a seed leaves: it can be a window dropped by
+// mistake, so it is still counted. The floors move past it either way.
+func TestStampCountsAMissingWindowAboveAnExistingOne(t *testing.T) {
+	s, ctx := newUncheckpointedStore(t)
+
+	// Windows 3 and 5 exist; 4 does not.
+	early := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, early, 999)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(early), utxo.MinedBlockInfo{BlockID: 30, BlockHeight: 1000, OnLongestChain: true})
+	require.NoError(t, err)
+
+	late := mkTx(t, 1, 6_000)
+	_, err = s.Create(ctx, late, 1599)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(late), utxo.MinedBlockInfo{BlockID: 50, BlockHeight: 1600, OnLongestChain: true})
+	require.NoError(t, err)
+
+	before := testutil.ToFloat64(stampMissingWindows)
+
+	stampThrough(t, s, ctx, 5, map[uint32]uint32{1000: 30, 1600: 50})
+
+	require.Equal(t, before+1, testutil.ToFloat64(stampMissingWindows), "window 4 only; 0, 1 and 2 lie below the lowest window")
+	require.Equal(t, [][2]int32{{1600, 50}}, pairsOf(t, s, ctx, late))
+
+	floors, err := s.Floors(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(6*288), floors.StampCompleteFloor)
 }
