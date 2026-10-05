@@ -482,6 +482,27 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 	if len(creators) > 0 {
 		plan := s.planCreates(creators)
 
+		// A create-only batch of seed creates into a table that was empty when the store
+		// opened needs no claim, so no transaction or lock either. See seedFast.
+		if dbTx == nil && s.seedFast && plan.allSeedRows() {
+			if err = s.execSeedFast(ctx, s.pool, plan); err != nil {
+				return results, rejected, err
+			}
+
+			for k, i := range owners {
+				results[i].data = plan.perItem[k]
+				results[i].err = plan.errs[k]
+			}
+
+			// A create-only batch has no spend phase, so nothing waits on a sibling.
+			final := make([]bool, len(batch))
+			for i := range final {
+				final[i] = true
+			}
+
+			return results, final, nil
+		}
+
 		// A create-only batch has no spend phase and so no transaction yet, and it needs one:
 		// the claim's advisory lock is transaction-scoped, so taken on the pool it would be
 		// released at the end of its own statement and would guard nothing. This used to run
