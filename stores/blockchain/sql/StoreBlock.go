@@ -451,6 +451,11 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 //   - invalid: Whether the previous block is marked as invalid
 //   - err: Any error encountered during retrieval
 func (s *SQL) getPreviousBlockInfo(ctx context.Context, prevBlockHash chainhash.Hash) (id uint64, chainWork []byte, height uint32, invalid bool, err error) {
+	return s.getPreviousBlockInfoOn(ctx, s.db, prevBlockHash)
+}
+
+// getPreviousBlockInfoOn is getPreviousBlockInfo reading through exec. See getPreviousBlockDataOn.
+func (s *SQL) getPreviousBlockInfoOn(ctx context.Context, exec execQuerier, prevBlockHash chainhash.Hash) (id uint64, chainWork []byte, height uint32, invalid bool, err error) {
 	// Query database for previous block info
 	q := `
 		SELECT
@@ -461,7 +466,7 @@ func (s *SQL) getPreviousBlockInfo(ctx context.Context, prevBlockHash chainhash.
 		FROM blocks b
 		WHERE b.hash = $1
 	`
-	err = s.db.QueryRowContext(ctx, q, prevBlockHash[:]).Scan(
+	err = exec.QueryRowContext(ctx, q, prevBlockHash[:]).Scan(
 		&id,
 		&chainWork,
 		&height,
@@ -551,7 +556,7 @@ func (s *SQL) storeBlock(ctx context.Context, exec execQuerier, block *model.Blo
 		coinbaseTxID = block.CoinbaseTx.TxID()
 	}
 
-	genesis, height, previousBlockID, previousChainWork, previousBlockInvalid, err := s.getPreviousBlockData(ctx, coinbaseTxID, block)
+	genesis, height, previousBlockID, previousChainWork, previousBlockInvalid, err := s.getPreviousBlockDataOn(ctx, exec, coinbaseTxID, block)
 	if err != nil {
 		s.logger.Errorf("[StoreBlock] Failed to get previous block data for block %s: %v", block.Hash().String(), err)
 		return 0, 0, nil, false, err
@@ -973,6 +978,24 @@ func (s *SQL) getPreviousBlockData(
 	previousBlockInvalid bool,
 	err error,
 ) {
+	return s.getPreviousBlockDataOn(ctx, s.db, coinbaseTxID, block)
+}
+
+// getPreviousBlockDataOn is getPreviousBlockData reading through exec, so a caller inside a
+// transaction finds a parent it inserted earlier in that same transaction.
+func (s *SQL) getPreviousBlockDataOn(
+	ctx context.Context,
+	exec execQuerier,
+	coinbaseTxID string,
+	block *model.Block,
+) (
+	genesis bool,
+	height uint32,
+	previousBlockID uint64,
+	previousChainWork []byte,
+	previousBlockInvalid bool,
+	err error,
+) {
 	if coinbaseTxID == s.chainParams.GenesisBlock.Transactions[0].TxHash().String() {
 		// genesis block
 		genesis = true
@@ -983,7 +1006,7 @@ func (s *SQL) getPreviousBlockData(
 		// Handle Non-Genesis Block
 		var previousHeight uint32
 
-		previousBlockID, previousChainWork, previousHeight, previousBlockInvalid, err = s.getPreviousBlockInfo(ctx, *block.Header.HashPrevBlock)
+		previousBlockID, previousChainWork, previousHeight, previousBlockInvalid, err = s.getPreviousBlockInfoOn(ctx, exec, *block.Header.HashPrevBlock)
 		if err != nil {
 			// Check specifically for the ErrNoRows error from the database query
 			if errors.Is(err, sql.ErrNoRows) {
