@@ -9,16 +9,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// seedIndexBuildConcurrency is how many partitions build their ukey index at once per
-// tablespace after a deferred-index seed. Each build holds temporary sort files about the size
-// of the index it is writing until it finishes, at the end of a seed when the disks are
-// fullest. Bounding it per tablespace rather than overall matters: on mainnet five partitions
-// share the second drive, and four of them building together there would leave it about 20 GB
-// free at the peak, where two at a time leaves about 55 GB.
-const seedIndexBuildConcurrency = 2
+// seedIndexBuildConcurrency is how many partitions build their ukey index at once after a
+// deferred-index seed. Each build sorts through temporary files about the size of its index,
+// so it is bounded rather than all eight together, to keep the scratch space at the end of a
+// seed, when the disks are fullest, to a few indexes' worth.
+const seedIndexBuildConcurrency = 4
 
-// seedIndexBuildMemory is each build's maintenance_work_mem. With two builds per tablespace and
-// two tablespaces on mainnet, four at once take four times this out of the container's memory.
+// seedIndexBuildMemory is each build's maintenance_work_mem. Four builds at once take four
+// times this out of the container's memory.
 const seedIndexBuildMemory = "1GB"
 
 // dropUTXOIndexesForSeed drops every partition's ukey index. Only a seedDeferIndex store calls
@@ -43,31 +41,12 @@ func (s *Store) dropUTXOIndexesForSeed(ctx context.Context) error {
 func (s *Store) buildUTXOIndexesAfterSeed(ctx context.Context) error {
 	start := time.Now()
 
-	byTablespace := make(map[string][]int, 2)
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(seedIndexBuildConcurrency)
 
 	for leaf := 0; leaf < NumLeaves; leaf++ {
-		ts, err := s.partitionTablespace(ctx, leaf)
-		if err != nil {
-			return err
-		}
-
-		byTablespace[ts] = append(byTablespace[ts], leaf)
-	}
-
-	g, gCtx := errgroup.WithContext(ctx)
-
-	for ts, leaves := range byTablespace {
 		g.Go(func() error {
-			tg, tCtx := errgroup.WithContext(gCtx)
-			tg.SetLimit(seedIndexBuildConcurrency)
-
-			for _, leaf := range leaves {
-				tg.Go(func() error {
-					return s.buildOneUTXOIndexAfterSeed(tCtx, leaf, ts)
-				})
-			}
-
-			return tg.Wait()
+			return s.buildOneUTXOIndexAfterSeed(gCtx, leaf)
 		})
 	}
 
@@ -80,24 +59,19 @@ func (s *Store) buildUTXOIndexesAfterSeed(ctx context.Context) error {
 	return nil
 }
 
-// partitionTablespace is the tablespace utxo_pN lives in, pg_default when it has none of its own.
-func (s *Store) partitionTablespace(ctx context.Context, leaf int) (string, error) {
-	var tablespace string
-	if err := s.pool.QueryRow(ctx, `SELECT coalesce(t.spcname, 'pg_default')
-  FROM pg_class c LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
- WHERE c.relname = $1`, fmt.Sprintf("utxo_p%d", leaf)).Scan(&tablespace); err != nil {
-		return "", errors.NewStorageError("[utxoset] read the tablespace of utxo_p%d", leaf, err)
-	}
-
-	return tablespace, nil
-}
-
-func (s *Store) buildOneUTXOIndexAfterSeed(ctx context.Context, leaf int, tablespace string) error {
+func (s *Store) buildOneUTXOIndexAfterSeed(ctx context.Context, leaf int) error {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return errors.NewStorageError("[utxoset] acquire a connection to build utxo_p%d_ukey", leaf, err)
 	}
 	defer conn.Release()
+
+	var tablespace string
+	if err := conn.QueryRow(ctx, `SELECT coalesce(t.spcname, 'pg_default')
+  FROM pg_class c LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
+ WHERE c.relname = $1`, fmt.Sprintf("utxo_p%d", leaf)).Scan(&tablespace); err != nil {
+		return errors.NewStorageError("[utxoset] read the tablespace of utxo_p%d", leaf, err)
+	}
 
 	// Session settings on this connection only, reset before it goes back to the pool.
 	stmts := []string{
