@@ -724,8 +724,13 @@ func TestSpendAndCreateMultiFlushesPendingBeforeASplitLevel(t *testing.T) {
 // belowCheckpointOptions are the options quick validation applies a block with below the
 // checkpoint: the block carried from birth, and outpoint-only spends.
 func belowCheckpointOptions(height uint32) []utxo.CreateOption {
+	return belowCheckpointOptionsAt(height, 0)
+}
+
+// belowCheckpointOptionsAt is belowCheckpointOptions for a transaction in subtree idx.
+func belowCheckpointOptionsAt(height uint32, idx int) []utxo.CreateOption {
 	return []utxo.CreateOption{
-		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 7, BlockHeight: height, SubtreeIdx: 0}),
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 7, BlockHeight: height, SubtreeIdx: idx}),
 		utxo.WithIgnoreLocked(true),
 		utxo.WithSkipExtendedInputs(true),
 		utxo.WithSkipUTXOHashCheck(true),
@@ -821,8 +826,14 @@ func TestSpendAndCreateMultiBelowTheCheckpointRepeatsTheWholeList(t *testing.T) 
 			reference := tests.BuildMultiWorkload(t, 0x40, levels, width)
 			reference.StoreRoots(t, s, height-1)
 
-			for _, tx := range outpointOnly(reference.Txs) {
-				_, _, err := s.SpendAndCreate(ctx, tx, height, belowCheckpointOptions(height)...)
+			// Each transaction in its own subtree, as a batch spanning several subtrees has it.
+			idxs := make([]int, len(reference.Txs))
+			for i := range idxs {
+				idxs[i] = 3 + i
+			}
+
+			for i, tx := range outpointOnly(reference.Txs) {
+				_, _, err := s.SpendAndCreate(ctx, tx, height, belowCheckpointOptionsAt(height, idxs[i])...)
 				require.NoError(t, err)
 			}
 
@@ -830,6 +841,7 @@ func TestSpendAndCreateMultiBelowTheCheckpointRepeatsTheWholeList(t *testing.T) 
 			w.StoreRoots(t, s, height-1)
 
 			list := outpointOnly(w.Txs)
+			listOptions := append(belowCheckpointOptions(height), utxo.WithSubtreeIdxs(idxs))
 
 			crash := errors.NewProcessingError("injected crash")
 			multiFault = func(at string) error {
@@ -840,11 +852,11 @@ func TestSpendAndCreateMultiBelowTheCheckpointRepeatsTheWholeList(t *testing.T) 
 				return nil
 			}
 
-			_, err := s.SpendAndCreateMulti(ctx, list, height, belowCheckpointOptions(height)...)
+			_, err := s.SpendAndCreateMulti(ctx, list, height, listOptions...)
 			multiFault = nil
 			require.ErrorIs(t, err, crash)
 
-			results, err := s.SpendAndCreateMulti(ctx, list, height, belowCheckpointOptions(height)...)
+			results, err := s.SpendAndCreateMulti(ctx, list, height, listOptions...)
 			require.NoError(t, err)
 
 			for i, r := range results {
@@ -854,5 +866,51 @@ func TestSpendAndCreateMultiBelowTheCheckpointRepeatsTheWholeList(t *testing.T) 
 			require.Equal(t, reference.Records(t, s), w.Records(t, s))
 			require.Equal(t, reference.RootSpends(t, s), w.RootSpends(t, s))
 		})
+	}
+}
+
+// When a parent in the list already exists, as on a repeat after a crash, the netted write hands
+// the rest of the list to the per-transaction default. That hand-off must carry each remaining
+// transaction's own subtree index, not refuse the shorter list or shift the indexes.
+func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
+	old := multiCreateChunkTxs
+	multiCreateChunkTxs = 1
+
+	t.Cleanup(func() { multiCreateChunkTxs = old })
+
+	s, ctx := newTestStore(t)
+
+	const height = 950
+
+	w := tests.BuildMultiWorkload(t, 0x52, 2, 3)
+	w.StoreRoots(t, s, height-1)
+
+	list := outpointOnly(w.Txs)
+
+	idxs := make([]int, len(list))
+	for i := range idxs {
+		idxs[i] = 10 + i
+	}
+
+	// A crash left level 0 transaction 1 written for this block.
+	_, _, err := s.SpendAndCreate(ctx, list[1], height, belowCheckpointOptionsAt(height, idxs[1])...)
+	require.NoError(t, err)
+
+	results, err := s.SpendAndCreateMulti(ctx, list, height, append(belowCheckpointOptions(height), utxo.WithSubtreeIdxs(idxs))...)
+	require.NoError(t, err, "the hand-off must not be refused")
+
+	for i, r := range results {
+		if i == 1 {
+			require.Equal(t, utxo.MultiTxExisted, r.Status)
+			continue
+		}
+
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+	}
+
+	for i, tx := range list {
+		md, err := s.Get(ctx, tx.TxIDChainHash(), fields.SubtreeIdxs)
+		require.NoError(t, err, "tx %d", i)
+		require.Equal(t, []int{idxs[i]}, md.SubtreeIdxs, "tx %d keeps its own subtree index", i)
 	}
 }

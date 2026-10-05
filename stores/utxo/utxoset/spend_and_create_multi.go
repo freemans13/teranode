@@ -919,7 +919,10 @@ func (w *nettedWrite) finishPerTransaction(ctx context.Context) error {
 		rest  []*multiTx
 		txs   []*bt.Tx
 		txids []chainhash.Hash
+		idxs  []int
 	)
+
+	listIdxs := w.list.Options.SubtreeIdxs
 
 	for _, it := range w.items {
 		if it.dead() || it.result.Status != utxo.MultiTxNotAttempted {
@@ -931,13 +934,22 @@ func (w *nettedWrite) finishPerTransaction(ctx context.Context) error {
 		rest = append(rest, it)
 		txs = append(txs, it.tx)
 		txids = append(txids, it.txid)
+
+		if listIdxs != nil {
+			idxs = append(idxs, listIdxs[it.pos])
+		}
 	}
 
 	if len(rest) == 0 {
 		return nil
 	}
 
+	// The shorter list carries its own txids and, from each transaction's place in the original
+	// list, its own subtree indexes; both replace the original list's.
 	opts := append(append([]utxo.CreateOption{}, w.opts...), utxo.WithTXIDs(txids))
+	if listIdxs != nil {
+		opts = append(opts, utxo.WithSubtreeIdxs(idxs))
+	}
 
 	results, err := utxo.DefaultSpendAndCreateMulti(ctx, w.s, utxo.SpendAndCreateMultiConcurrency(w.s.settings), txs, w.blockHeight, opts...)
 	for k, r := range results {
