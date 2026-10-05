@@ -344,9 +344,10 @@ func (d *stampDrain) BeginWindow(ctx context.Context, wLo uint32, anc *chainance
 	}
 
 	// Precondition 5: the partition is attached. A window with no table at all is empty by
-	// decision: both stamp floors move past it, so a seeded store that predates the floor
-	// write, or one whose floors were lost, still prunes. It is counted and logged because a
-	// missing table above the dropped floor can also be a window dropped by mistake.
+	// decision: both stamp floors move past it. Below the lowest window that exists that is
+	// what a seed leaves, since a seed writes no containment rows, so those windows are skipped
+	// quietly. A missing window above an existing one is counted and logged, because it can
+	// also be a window dropped by mistake.
 	state, err := s.txMinedWindowState(ctx, wLo/TxMinedPartitionBlocks)
 	if err != nil {
 		return 0, err
@@ -354,7 +355,12 @@ func (d *stampDrain) BeginWindow(ctx context.Context, wLo uint32, anc *chainance
 
 	switch {
 	case state == nil:
-		if err := s.skipMissingWindow(ctx, wLo, wHi); err != nil {
+		leading, err := s.belowLowestTxMinedWindow(ctx, wLo/TxMinedPartitionBlocks)
+		if err != nil {
+			return 0, err
+		}
+
+		if err := s.skipMissingWindow(ctx, wLo, wHi, leading); err != nil {
 			return 0, err
 		}
 
@@ -376,10 +382,28 @@ func (d *stampDrain) BeginWindow(ctx context.Context, wLo uint32, anc *chainance
 	return pruner.StampWindowReady, nil
 }
 
+// belowLowestTxMinedWindow reports whether no containment window exists at or below window, which
+// is how a seeded store looks below the first block applied after its seed.
+func (s *Store) belowLowestTxMinedWindow(ctx context.Context, window uint32) (bool, error) {
+	windows, err := s.listTxMinedWindows(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	for _, w := range windows {
+		if w.window <= window {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
 // skipMissingWindow advances both stamp floors past a window that has no table. The completion
 // floor is advanced by compare-and-set against the value BeginWindow read, so a second drain
-// that somehow got past the session lock cannot advance it twice.
-func (s *Store) skipMissingWindow(ctx context.Context, wLo, wHi uint32) error {
+// that somehow got past the session lock cannot advance it twice. A leading window, one below
+// every window that exists, is expected after a seed and is not counted as missing.
+func (s *Store) skipMissingWindow(ctx context.Context, wLo, wHi uint32, leading bool) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE tx_mined_floor
 		   SET stamp_fence          = GREATEST(stamp_fence, $1::int),
@@ -392,6 +416,14 @@ func (s *Store) skipMissingWindow(ctx context.Context, wLo, wHi uint32) error {
 
 	if tag.RowsAffected() != 1 {
 		return errors.NewProcessingError("[utxoset][stamp] the stamp-complete floor moved from %d under this drain", wLo)
+	}
+
+	if leading {
+		if s.leadingSkipLogged.CompareAndSwap(false, true) {
+			s.logger.Infof("[utxoset][stamp] no containment window exists from window %d-%d down, as after a seed; skipping up to the lowest window without counting them as missing", wLo, wHi-1)
+		}
+
+		return nil
 	}
 
 	stampMissingWindows.Inc()
@@ -1092,144 +1124,4 @@ func (s *Store) auditWindow(ctx context.Context, wLo, wHi uint32, anc *chainance
 	}
 
 	return nil
-}
-
-// SetStampFloorsForSeed is the seeding tool's hook. The tool calls it once its last UTXO is
-// written, with the seed height, and every floor moves to the window holding the first block
-// that will be applied after the seed, so the stamp does not start at window 0 and walk about
-// 3,280 windows.
-//
-// Before it moves the floors it settles everything the seed left below them, because the stamp
-// will never visit those windows. The seed's creates carry each transaction's block height, so
-// they write a containment row per transaction into windows below the new floor. Left alone,
-// those windows have no completion record and can never drop: the drain then raises its
-// "can never drop" alarm on every pass, and on mainnet they would hold tens of gigabytes for
-// good. Above the checkpoint the seed's creates also take the identity route, filing coins at
-// the unconfirmed sentinel with an identity row, and only the stamp would fill them in. So for
-// each window wholly below the floor the hook stamps those coins from the window's containment
-// rows, deletes their identity rows, and drops the window. Seeded coins below the checkpoint
-// already carry their height from birth. After the drop every seeded transaction is answered
-// from its coins, which is how the store answers for any transaction whose window has retired.
-//
-// The node is not running while it seeds, so the windows are dropped directly rather than
-// detached concurrently. GREATEST on the floors and IF EXISTS on the drop make a re-run
-// harmless.
-func (s *Store) SetStampFloorsForSeed(ctx context.Context, seedHeight uint32) error {
-	window := (seedHeight + 1) / TxMinedPartitionBlocks
-	height := window * TxMinedPartitionBlocks
-
-	windows, err := s.listTxMinedWindows(ctx)
-	if err != nil {
-		return err
-	}
-
-	settled := 0
-
-	for _, w := range windows {
-		if w.window >= window {
-			continue
-		}
-
-		stamped, err := s.stampSeededWindow(ctx, w.name)
-		if err != nil {
-			return err
-		}
-
-		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s;
-DELETE FROM tx_mined_stamped WHERE window_start = %[2]d;`, w.name, w.window*TxMinedPartitionBlocks)); err != nil {
-			return errors.NewStorageError("[utxoset][stamp] drop seeded window %s", w.name, err)
-		}
-
-		if stamped > 0 {
-			s.logger.Infof("[utxoset][stamp] seed: stamped %d transactions' coins from window %s before dropping it", stamped, w.name)
-		}
-
-		settled++
-	}
-
-	if _, err := s.pool.Exec(ctx, `
-		UPDATE tx_mined_floor
-		   SET floor                = GREATEST(floor, $1::int),
-		       stamp_fence          = GREATEST(stamp_fence, $2::int),
-		       stamp_complete_floor = GREATEST(stamp_complete_floor, $2::int)
-		 WHERE id = 0`,
-		int32(window), int32(height)); err != nil { //nolint:gosec // heights fit int32
-		return errors.NewStorageError("[utxoset][stamp] set floors for a seed at height %d", seedHeight, err)
-	}
-
-	s.minedWindow.Store(0)
-
-	s.logger.Infof("[utxoset][stamp] floors set for a seed at height %d: %d seeded windows below window %d settled and dropped; the stamp and the drop begin at window %d, height %d",
-		seedHeight, settled, window, window, height)
-
-	return nil
-}
-
-// seedStampPage bounds the identity rows one statement of stampSeededWindow settles.
-const seedStampPage = 10_000
-
-// stampSeededWindow does the stamp's work for one window below a seed's floor: every
-// transaction of the window that still has an identity row gets the window's block on its
-// coins, and the identity row goes. It returns how many transactions it settled.
-func (s *Store) stampSeededWindow(ctx context.Context, window string) (int, error) {
-	total := 0
-
-	for {
-		rows, err := s.pool.Query(ctx, fmt.Sprintf(`
-SELECT i.leaf, i.txid, m.mined_height, m.block_id
-  FROM tx_ident i
-  JOIN %s m ON m.txid = i.txid
- LIMIT %d`, window, seedStampPage))
-		if err != nil {
-			return total, errors.NewStorageError("[utxoset][stamp] read seeded identities in %s", window, err)
-		}
-
-		var (
-			leaves     []int16
-			txids      [][]byte
-			los, his   [][16]byte
-			hs, blocks []int32
-		)
-
-		for rows.Next() {
-			var (
-				leaf int16
-				txid []byte
-				h, b int32
-			)
-
-			if err := rows.Scan(&leaf, &txid, &h, &b); err != nil {
-				rows.Close()
-				return total, errors.NewStorageError("[utxoset][stamp] scan seeded identity in %s", window, err)
-			}
-
-			leaves = append(leaves, leaf)
-			txids = append(txids, txid)
-			los = append(los, Pack(txid, 0))
-			his = append(his, Pack(txid, ^uint32(0)))
-			hs = append(hs, h)
-			blocks = append(blocks, b)
-		}
-
-		rows.Close()
-
-		if err := rows.Err(); err != nil {
-			return total, errors.NewStorageError("[utxoset][stamp] read seeded identities in %s", window, err)
-		}
-
-		if len(txids) == 0 {
-			return total, nil
-		}
-
-		if _, err := s.pool.Exec(ctx, stampUTXOsSQL, leaves, txids, los, his, hs, blocks); err != nil {
-			return total, errors.NewStorageError("[utxoset][stamp] stamp seeded coins in %s", window, err)
-		}
-
-		if _, err := s.pool.Exec(ctx, `DELETE FROM tx_ident i USING unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid) WHERE i.leaf = k.leaf AND i.txid = k.txid`,
-			leaves, txids); err != nil {
-			return total, errors.NewStorageError("[utxoset][stamp] delete seeded identities in %s", window, err)
-		}
-
-		total += len(txids)
-	}
 }
