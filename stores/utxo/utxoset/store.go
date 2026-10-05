@@ -74,6 +74,10 @@ type Store struct {
 	// catalog is only touched when it changes. Holds window+1 so zero means "nothing yet".
 	minedWindow atomic.Uint32
 
+	// leadingSkipLogged is set once the stamp has logged that it is skipping the windows below
+	// the lowest containment window, so a seeded store says so once rather than per window.
+	leadingSkipLogged atomic.Bool
+
 	// minedDDL serialises tx_mined window creation within this process.
 	minedDDL sync.Mutex
 
