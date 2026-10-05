@@ -127,11 +127,11 @@ func TestQuickValidateBlock(t *testing.T) {
 
 		// Setup UTXO store expectations for creating all transactions (including coinbase)
 		// Use mock.Anything for the transaction since the order may vary
-		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).Return(&meta.Data{}, nil, nil)
+		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).Return(&meta.Data{}, nil, nil).Maybe()
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCombined()).Return(&meta.Data{}, []*utxo.Spend{}, nil).Maybe()
 
 		// Setup UTXO store expectations for spending transactions
-		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).Return(nil, []*utxo.Spend{}, nil)
+		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).Return(nil, []*utxo.Spend{}, nil).Maybe()
 
 		// Setup SetLocked expectation for unlocking UTXOs after AddBlock
 		suite.MockUTXOStore.On("SetLocked", mock.Anything, mock.Anything, false).Return(nil)
@@ -241,21 +241,18 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 			batchEnd:   2,
 		}
 
-		// Mock the create phase to succeed (no ErrTxExists)
-		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).
-			Return(&meta.Data{}, nil, nil).Maybe()
-
-		// Mock the spend phase
-		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).
-			Return(nil, []*utxo.Spend{}, nil).Maybe()
+		// The batch is one netted list; through the mock's per-transaction default each
+		// transaction is one combined call, which succeeds (no ErrTxExists).
+		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCombined()).
+			Return(&meta.Data{}, []*utxo.Spend{}, nil).Maybe()
 
 		// SetMinedMulti should NOT be called since all txs are new
 
 		err := suite.Server.blockValidation.createAndSpendUTXOsForBatch(suite.Ctx, block, batch)
 		require.NoError(t, err)
 
-		// Verify the create phase ran for each transaction
-		require.Equal(t, 2, countCreatePhaseCalls(suite.MockUTXOStore))
+		// Verify each transaction was applied
+		require.Equal(t, 2, countCombinedCalls(suite.MockUTXOStore))
 		// Verify SetMinedMulti was NOT called
 		suite.MockUTXOStore.AssertNotCalled(t, "SetMinedMulti", mock.Anything, mock.Anything, mock.Anything)
 	})
@@ -281,8 +278,8 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 			batchEnd:   2,
 		}
 
-		// Mock the create phase to return ErrTxExists for all transactions
-		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).
+		// Every transaction already exists
+		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCombined()).
 			Return((*meta.Data)(nil), nil, errors.ErrTxExists).Maybe()
 
 		// Mock SetMinedMulti - should be called with both transaction hashes
@@ -324,8 +321,8 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 			batchEnd:   1,
 		}
 
-		// Mock the create phase to return ErrTxExists
-		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).
+		// The transaction already exists
+		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCombined()).
 			Return((*meta.Data)(nil), nil, errors.ErrTxExists).Maybe()
 
 		// Mock the spend phase. The mined-info stamp now runs after both waves rather than
@@ -590,12 +587,16 @@ func matchCombined() interface{} {
 	})
 }
 
-// countCreatePhaseCalls counts recorded SpendAndCreate calls that carried WithCreateOnly.
-func countCreatePhaseCalls(m *utxo.MockUtxostore) int {
+// countCombinedCalls counts recorded SpendAndCreate calls with neither half suppressed.
+func countCombinedCalls(m *utxo.MockUtxostore) int {
 	count := 0
 
 	for _, c := range m.Calls {
-		if c.Method == "SpendAndCreate" && parseCreateOptions(c.Arguments.Get(3).([]utxo.CreateOption)).CreateOnly {
+		if c.Method != "SpendAndCreate" {
+			continue
+		}
+
+		if o := parseCreateOptions(c.Arguments.Get(3).([]utxo.CreateOption)); !o.CreateOnly && !o.SpendOnly {
 			count++
 		}
 	}
@@ -771,9 +772,9 @@ func setupQuickValidateMocks(s *CatchupTestSuite) {
 	s.MockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	s.MockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil).Maybe()
 	s.MockUTXOStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return((*meta.Data)(nil), errors.NewNotFoundError("not found"))
-	s.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchCreateOnly()).Return(&meta.Data{}, nil, nil)
+	s.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchCreateOnly()).Return(&meta.Data{}, nil, nil).Maybe()
 	s.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchCombined()).Return(&meta.Data{}, []*utxo.Spend{}, nil).Maybe()
-	s.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).Return(nil, []*utxo.Spend{}, nil)
+	s.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).Return(nil, []*utxo.Spend{}, nil).Maybe()
 	s.MockUTXOStore.On("SetLocked", mock.Anything, mock.Anything, false).Return(nil).Maybe()
 	s.MockValidator.Errors = []error{nil, nil, nil}
 }

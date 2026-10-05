@@ -48,6 +48,14 @@ func TestSpendAndCreateMultiUtxoset(t *testing.T) {
 			s, _ := newUncheckpointedStore(t)
 			tests.SpendAndCreateMultiRepeatAtCutPoints(t, s)
 		})
+		t.Run("subtree indexes", func(t *testing.T) {
+			s, _ := newUncheckpointedStore(t)
+			tests.SpendAndCreateMultiSubtreeIdxs(t, s)
+		})
+		t.Run("subtree indexes below the checkpoint", func(t *testing.T) {
+			s, _ := newTestStore(t)
+			tests.SpendAndCreateMultiSubtreeIdxs(t, s)
+		})
 	}
 
 	t.Run("one spend chunk", suite)
@@ -710,5 +718,199 @@ func TestSpendAndCreateMultiFlushesPendingBeforeASplitLevel(t *testing.T) {
 			require.Equal(t, wantRecs, recordsOf(t, s, w))
 			require.Equal(t, wantRoots, w.RootSpends(t, s))
 		})
+	}
+}
+
+// belowCheckpointOptions are the options quick validation applies a block with below the
+// checkpoint: the block carried from birth, and outpoint-only spends.
+func belowCheckpointOptions(height uint32) []utxo.CreateOption {
+	return belowCheckpointOptionsAt(height, 0)
+}
+
+// belowCheckpointOptionsAt is belowCheckpointOptions for a transaction in subtree idx.
+func belowCheckpointOptionsAt(height uint32, idx int) []utxo.CreateOption {
+	return []utxo.CreateOption{
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 7, BlockHeight: height, SubtreeIdx: idx}),
+		utxo.WithIgnoreLocked(true),
+		utxo.WithSkipExtendedInputs(true),
+		utxo.WithSkipUTXOHashCheck(true),
+	}
+}
+
+// outpointOnly copies txs with every input stripped to its outpoint, as a block below the
+// checkpoint arrives: no previous script and no previous satoshis.
+func outpointOnly(txs []*bt.Tx) []*bt.Tx {
+	out := make([]*bt.Tx, len(txs))
+
+	for i, tx := range txs {
+		c := tx.Clone()
+		for _, in := range c.Inputs {
+			in.PreviousTxScript = nil
+			in.PreviousTxSatoshis = 0
+		}
+
+		out[i] = c
+	}
+
+	return out
+}
+
+// Below the checkpoint, with outpoint-only inputs, the list is netted, not handed to the
+// per-transaction default, and leaves exactly the records the per-transaction calls quick
+// validation makes today would leave.
+func TestSpendAndCreateMultiNetsBelowTheCheckpoint(t *testing.T) {
+	s, ctx := newTestStore(t) // mainnet checkpoints: 800 is below them
+
+	const height = 800
+
+	reference := tests.BuildMultiWorkload(t, 0x61, 3, 4)
+	reference.StoreRoots(t, s, height-1)
+
+	for _, tx := range outpointOnly(reference.Txs) {
+		_, _, err := s.SpendAndCreate(ctx, tx, height, belowCheckpointOptions(height)...)
+		require.NoError(t, err)
+	}
+
+	w := tests.BuildMultiWorkload(t, 0x62, 3, 4)
+	w.StoreRoots(t, s, height-1)
+
+	commits := 0
+	multiCreateCommitted = func(int) { commits++ }
+
+	t.Cleanup(func() { multiCreateCommitted = nil })
+
+	results, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, belowCheckpointOptions(height)...)
+	require.NoError(t, err)
+
+	for i, r := range results {
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+	}
+
+	require.Positive(t, commits, "the netted write ran, not the per-transaction default")
+	require.Equal(t, reference.Records(t, s), w.Records(t, s))
+	require.Equal(t, reference.RootSpends(t, s), w.RootSpends(t, s))
+
+	// Netted: an output a child in the list spends is no UTXO row.
+	parent := w.Txs[0]
+	for _, tx := range w.Txs {
+		for _, in := range tx.Inputs {
+			if *in.PreviousTxIDChainHash() == *parent.TxIDChainHash() {
+				var n int
+				require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE ukey = $1 AND txid = $2`,
+					Pack(parent.TxIDChainHash()[:], in.PreviousTxOutIndex), parent.TxIDChainHash()[:]).Scan(&n))
+				require.Zero(t, n, "output %d of the first transaction was spent in the list", in.PreviousTxOutIndex)
+			}
+		}
+	}
+}
+
+// Below the checkpoint quick validation repeats a whole batch after a crash, with no check for
+// what already exists. Whatever point the netted write stopped at, repeating the whole list must
+// leave the records a clean run leaves.
+func TestSpendAndCreateMultiBelowTheCheckpointRepeatsTheWholeList(t *testing.T) {
+	const (
+		height = 900
+		levels = 4
+		width  = 5
+	)
+
+	old := multiCreateChunkTxs
+	multiCreateChunkTxs = width
+
+	t.Cleanup(func() { multiCreateChunkTxs = old })
+
+	for si, stage := range []string{"spent", "created group 0", "created group 1", "created group 2"} {
+		t.Run(stage, func(t *testing.T) {
+			s, ctx := newTestStore(t)
+
+			reference := tests.BuildMultiWorkload(t, 0x40, levels, width)
+			reference.StoreRoots(t, s, height-1)
+
+			// Each transaction in its own subtree, as a batch spanning several subtrees has it.
+			idxs := make([]int, len(reference.Txs))
+			for i := range idxs {
+				idxs[i] = 3 + i
+			}
+
+			for i, tx := range outpointOnly(reference.Txs) {
+				_, _, err := s.SpendAndCreate(ctx, tx, height, belowCheckpointOptionsAt(height, idxs[i])...)
+				require.NoError(t, err)
+			}
+
+			w := tests.BuildMultiWorkload(t, byte(0x41+si), levels, width)
+			w.StoreRoots(t, s, height-1)
+
+			list := outpointOnly(w.Txs)
+			listOptions := append(belowCheckpointOptions(height), utxo.WithSubtreeIdxs(idxs))
+
+			crash := errors.NewProcessingError("injected crash")
+			multiFault = func(at string) error {
+				if at == stage {
+					return crash
+				}
+
+				return nil
+			}
+
+			_, err := s.SpendAndCreateMulti(ctx, list, height, listOptions...)
+			multiFault = nil
+			require.ErrorIs(t, err, crash)
+
+			results, err := s.SpendAndCreateMulti(ctx, list, height, listOptions...)
+			require.NoError(t, err)
+
+			for i, r := range results {
+				require.Contains(t, []utxo.SpendAndCreateMultiStatus{utxo.MultiTxCreated, utxo.MultiTxExisted}, r.Status, "tx %d of the repeat: %v", i, r.Err)
+			}
+
+			require.Equal(t, reference.Records(t, s), w.Records(t, s))
+			require.Equal(t, reference.RootSpends(t, s), w.RootSpends(t, s))
+		})
+	}
+}
+
+// When a parent in the list already exists, as on a repeat after a crash, the netted write hands
+// the rest of the list to the per-transaction default. That hand-off must carry each remaining
+// transaction's own subtree index, not refuse the shorter list or shift the indexes.
+func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
+	old := multiCreateChunkTxs
+	multiCreateChunkTxs = 1
+
+	t.Cleanup(func() { multiCreateChunkTxs = old })
+
+	s, ctx := newTestStore(t)
+
+	const height = 950
+
+	w := tests.BuildMultiWorkload(t, 0x52, 2, 3)
+	w.StoreRoots(t, s, height-1)
+
+	list := outpointOnly(w.Txs)
+
+	idxs := make([]int, len(list))
+	for i := range idxs {
+		idxs[i] = 10 + i
+	}
+
+	// A crash left level 0 transaction 1 written for this block.
+	_, _, err := s.SpendAndCreate(ctx, list[1], height, belowCheckpointOptionsAt(height, idxs[1])...)
+	require.NoError(t, err)
+
+	results, err := s.SpendAndCreateMulti(ctx, list, height, append(belowCheckpointOptions(height), utxo.WithSubtreeIdxs(idxs))...)
+	require.NoError(t, err, "the hand-off must not be refused")
+
+	for i, r := range results {
+		if i == 1 {
+			require.Equal(t, utxo.MultiTxExisted, r.Status)
+			continue
+		}
+
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+	}
+
+	for i, tx := range list {
+		md, err := s.Get(ctx, tx.TxIDChainHash(), fields.SubtreeIdxs)
+		require.NoError(t, err, "tx %d", i)
+		require.Equal(t, []int{idxs[i]}, md.SubtreeIdxs, "tx %d keeps its own subtree index", i)
 	}
 }

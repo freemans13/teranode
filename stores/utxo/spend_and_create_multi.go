@@ -182,9 +182,9 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 			}
 
 			g.Go(func() error {
-				callOpts := make([]CreateOption, 0, len(opts)+1)
+				callOpts := make([]CreateOption, 0, len(opts)+2)
 				callOpts = append(callOpts, opts...)
-				callOpts = append(callOpts, WithTXID(&txids[i]))
+				callOpts = append(callOpts, withListItem(i), WithTXID(&txids[i]))
 
 				md, spends, err := s.SpendAndCreate(ctx, txs[i], blockHeight, callOpts...)
 
@@ -246,6 +246,16 @@ func PrepareSpendAndCreateMulti(txs []*bt.Tx, opts ...CreateOption) (*SpendAndCr
 
 	if options.TxIDs != nil && len(options.TxIDs) != len(txs) {
 		return nil, newSpendAndCreateMultiRefusedError("WithTXIDs has %d txids for %d transactions", len(options.TxIDs), len(txs))
+	}
+
+	if options.SubtreeIdxs != nil {
+		if len(options.MinedBlockInfos) == 0 {
+			return nil, newSpendAndCreateMultiRefusedError("WithSubtreeIdxs needs WithMinedBlockInfo: the indexes are positions in that block")
+		}
+
+		if len(options.SubtreeIdxs) != len(txs) {
+			return nil, newSpendAndCreateMultiRefusedError("WithSubtreeIdxs has %d indexes for %d transactions", len(options.SubtreeIdxs), len(txs))
+		}
 	}
 
 	if len(txs) == 0 {

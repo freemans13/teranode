@@ -9,7 +9,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/jackc/pgx/v5"
@@ -49,10 +48,15 @@ import (
 // as the same spend.
 //
 // It does NOT net, and hands the list to the per-transaction default instead, for a list whose
-// options the netted write does not model: create-only or spend-only, frozen, conflicting or
-// locked creates, the below-checkpoint outpoint-only spend, and a create carrying a block at or
-// below the checkpoint, which takes the block-path claim. None of those is how subtree
-// validation calls it above the checkpoint.
+// options the netted write does not model: create-only or spend-only, and frozen, conflicting or
+// locked creates.
+//
+// Below the checkpoint, where quick validation applies blocks with their block carried from
+// birth and outpoint-only spends, it nets too. A create there takes the block-path claim, which
+// writes a containment row for every transaction whether or not any of its outputs survive as
+// UTXOs, so a transaction whose outputs were all netted is still found on a repeat and is not
+// written twice. An outpoint-only child presents no claim to check against its parent's output,
+// so its netted inputs are excused the check exactly as its outside spends are.
 //
 // A transaction in the list that turns out to exist already, which the caller's pre-check makes
 // a race with another writer, is reported MultiTxExisted when nothing in the list spends it.
@@ -81,15 +85,7 @@ func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeig
 
 // canNet reports whether the netted write models every option of the list.
 func (s *Store) canNet(o *utxo.CreateOptions) bool {
-	if o.SpendOnly || o.CreateOnly || o.Frozen || o.Conflicting || o.Locked || o.IgnoreFlags.SkipUTXOHashCheck {
-		return false
-	}
-
-	if mi, mined := minedBlock(o.MinedBlockInfos); mined && model.BelowCheckpoint(s.checkpoints, mi.BlockHeight) {
-		return false
-	}
-
-	return true
+	return !o.SpendOnly && !o.CreateOnly && !o.Frozen && !o.Conflicting && !o.Locked
 }
 
 // multiSpendChunkInputs bounds the inputs one step-1 transaction spends. A variable so a test
@@ -307,7 +303,7 @@ func (w *nettedWrite) checkNettedInputs() {
 			out := parent.tx.Outputs[in.PreviousTxOutIndex]
 			if out == nil || out.LockingScript == nil || !utxo.ShouldStoreOutputAsUTXO(out, w.blockHeight, genesis) {
 				rec.Err = errors.NewTxNotFoundError("[utxoset][SpendAndCreateMulti] output %d of %s is not a spendable output", in.PreviousTxOutIndex, parent.txid.String())
-			} else if err := claimMismatch(in, rec, int64(out.Satoshis), *out.LockingScript, nil, false); err != nil { //nolint:gosec // satoshis fit int64
+			} else if err := claimMismatch(in, rec, int64(out.Satoshis), *out.LockingScript, nil, w.list.Options.IgnoreFlags.SkipUTXOHashCheck); err != nil { //nolint:gosec // satoshis fit int64
 				rec.Err = err
 			} else {
 				decorateInput(in, int64(out.Satoshis), *out.LockingScript, nil) //nolint:gosec // satoshis fit int64
@@ -808,7 +804,7 @@ SELECT $1::int, j.satoshis, j.created_height, j.spendable_from, j.flags,
 func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender map[nettedKey][]byte) error {
 	items := make([]*createItem, len(chunk))
 	for k, it := range chunk {
-		items[k] = &createItem{tx: it.tx, blockHeight: w.blockHeight, options: w.list.Options}
+		items[k] = &createItem{tx: it.tx, blockHeight: w.blockHeight, options: w.list.Options.ItemOptions(it.pos)}
 	}
 
 	plan := w.s.planCreates(items)
@@ -923,7 +919,10 @@ func (w *nettedWrite) finishPerTransaction(ctx context.Context) error {
 		rest  []*multiTx
 		txs   []*bt.Tx
 		txids []chainhash.Hash
+		idxs  []int
 	)
+
+	listIdxs := w.list.Options.SubtreeIdxs
 
 	for _, it := range w.items {
 		if it.dead() || it.result.Status != utxo.MultiTxNotAttempted {
@@ -935,13 +934,22 @@ func (w *nettedWrite) finishPerTransaction(ctx context.Context) error {
 		rest = append(rest, it)
 		txs = append(txs, it.tx)
 		txids = append(txids, it.txid)
+
+		if listIdxs != nil {
+			idxs = append(idxs, listIdxs[it.pos])
+		}
 	}
 
 	if len(rest) == 0 {
 		return nil
 	}
 
+	// The shorter list carries its own txids and, from each transaction's place in the original
+	// list, its own subtree indexes; both replace the original list's.
 	opts := append(append([]utxo.CreateOption{}, w.opts...), utxo.WithTXIDs(txids))
+	if listIdxs != nil {
+		opts = append(opts, utxo.WithSubtreeIdxs(idxs))
+	}
 
 	results, err := utxo.DefaultSpendAndCreateMulti(ctx, w.s, utxo.SpendAndCreateMultiConcurrency(w.s.settings), txs, w.blockHeight, opts...)
 	for k, r := range results {
