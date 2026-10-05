@@ -2891,6 +2891,13 @@ func (s *txFailingUtxoStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, bloc
 	return s.Store.SpendAndCreate(ctx, tx, blockHeight, opts...)
 }
 
+// SpendAndCreateMulti runs the list one transaction at a time through this store's
+// SpendAndCreate, so the chosen transaction still fails when quick validation applies a batch
+// as one list.
+func (s *txFailingUtxoStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	return utxo.DefaultSpendAndCreateMulti(ctx, s, 1, txs, blockHeight, opts...)
+}
+
 // TestTryQuickValidation_LaterBatchFailure_SweepsOwnSubtreeFiles restores the coverage
 // the corrupt_uncovered_branches rewrite dropped: the ORDINARY LOCAL-FAULT branch
 // deleting quick validation's own FileTypeSubtree output.
