@@ -44,13 +44,6 @@ type Store struct {
 	// See seedingCreate.
 	seeding bool
 
-	// seedFast is seeding on a UTXO table that was empty when the store opened. A seed's
-	// creates then go in as one plain insert per batch, with no advisory lock and no
-	// own-output probe: a snapshot holds every transaction once, and an empty table holds
-	// nothing for it to collide with. A re-run of an interrupted seed is a new store that
-	// finds coins present, so it keeps the guarded route and its ErrTxExists skip.
-	seedFast bool
-
 	// utxo.BlockStateFields supplies the chain-tip pair — block height and median
 	// block time — and the six Store methods that read and write it, over a single
 	// atomic snapshot. Embedding the shared implementation rather than carrying two
@@ -359,19 +352,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err := s.loadOldestUndoLeaf(ctx); err != nil {
 		pool.Close()
 		return nil, err
-	}
-
-	if seeding {
-		if err := pool.QueryRow(ctx, `SELECT NOT EXISTS (SELECT 1 FROM utxo)`).Scan(&s.seedFast); err != nil {
-			pool.Close()
-			return nil, errors.NewStorageError("[utxoset] read whether the UTXO table is empty", err)
-		}
-
-		if s.seedFast {
-			logger.Infof("[utxoset] seeding into an empty UTXO table: each batch is one plain insert, with no per-transaction lock or existence probe")
-		} else {
-			logger.Infof("[utxoset] seeding into a UTXO table that already holds coins: creates keep the guarded route, so a re-run skips what is already there")
-		}
 	}
 
 	// The create batcher, sized from the same settings the sql and aerospike stores use, so

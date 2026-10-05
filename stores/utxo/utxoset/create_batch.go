@@ -955,11 +955,6 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 		}
 	}
 
-	if s.seedFast && plan.allSeedRows() {
-		s.sendSeedFast(ctx, batch, plan)
-		return
-	}
-
 	// A transaction of its own, where the batch used to run on the pool. The advisory lock the
 	// claim depends on is transaction-scoped, so on the pool it would be taken and released
 	// within its own statement and would guard nothing.
@@ -993,47 +988,6 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 	}
 
 	committed = true
-
-	for i, item := range batch {
-		item.done <- createResult{data: plan.perItem[i], err: plan.errs[i]}
-	}
-}
-
-// createSeedFastSQL writes a seed batch's coins with no claim. It is used only by seedFast, so
-// the table held no coins when the store opened and the snapshot holds each transaction once:
-// there is nothing for the own-output probe in createSeedPlanSQL to find. One statement is
-// atomic on its own, so it needs no explicit transaction either.
-const createSeedFastSQL = `
-INSERT INTO utxo (satoshis, created_height, spendable_from, mined_height, block_id,
-                  leaf, flags, ukey, txid, script)
-SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[], $4::int[], $5::int[], $6::smallint[],
-                     $7::smallint[], $8::uuid[], $9::bytea[], $10::bytea[])`
-
-// allSeedRows reports whether every transaction the plan writes takes the seeding route.
-func (p *createPlan) allSeedRows() bool {
-	if len(p.owner) == 0 {
-		return false
-	}
-
-	for _, seed := range p.seedRows {
-		if !seed {
-			return false
-		}
-	}
-
-	return true
-}
-
-// sendSeedFast writes a batch of seed creates through createSeedFastSQL and reports each
-// transaction created, which is what the guarded route reports when its claim takes them all.
-func (s *Store) sendSeedFast(ctx context.Context, batch []*createItem, plan *createPlan) {
-	p := plan
-	if _, err := s.pool.Exec(ctx, createSeedFastSQL,
-		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoMined, p.utxoBlockIDs, p.utxoLeaves,
-		p.utxoFlags, p.utxoUkeys, p.utxoTxids, p.utxoScripts); err != nil {
-		s.failBatch(batch, errors.NewStorageError("[utxoset][Create] seed insert", err))
-		return
-	}
 
 	for i, item := range batch {
 		item.done <- createResult{data: plan.perItem[i], err: plan.errs[i]}
