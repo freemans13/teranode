@@ -1115,14 +1115,6 @@ func (s *Store) auditWindow(ctx context.Context, wLo, wHi uint32, anc *chainance
 // detached concurrently. GREATEST on the floors and IF EXISTS on the drop make a re-run
 // harmless.
 func (s *Store) SetStampFloorsForSeed(ctx context.Context, seedHeight uint32) error {
-	// The seeder calls this once the import is done, so it is where a seed that loaded with
-	// no ukey index builds it, before anything below reads the coins.
-	if s.seedDeferIndex {
-		if err := s.buildUTXOIndexesAfterSeed(ctx); err != nil {
-			return err
-		}
-	}
-
 	window := (seedHeight + 1) / TxMinedPartitionBlocks
 	height := window * TxMinedPartitionBlocks
 

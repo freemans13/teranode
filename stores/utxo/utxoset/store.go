@@ -51,12 +51,6 @@ type Store struct {
 	// finds coins present, so it keeps the guarded route and its ErrTxExists skip.
 	seedFast bool
 
-	// seedDeferIndex is seedDeferIndex=true on the store URL of a seedFast store. The ukey
-	// indexes are dropped while the table is empty, the seed loads with none, and
-	// SetStampFloorsForSeed builds them once the import is done: one sorted build per
-	// partition instead of an index entry, and its log record, per coin. See seed_index.go.
-	seedDeferIndex bool
-
 	// utxo.BlockStateFields supplies the chain-tip pair — block height and median
 	// block time — and the six Store methods that read and write it, over a single
 	// atomic snapshot. Embedding the shared implementation rather than carrying two
@@ -234,10 +228,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	q := dsn.Query()
 	seeding := q.Get("seeding") == "true"
 	q.Del("seeding")
-
-	// seedDeferIndex is the store's too. See seedDeferIndex on Store.
-	seedDeferIndex := seeding && q.Get("seedDeferIndex") == "true"
-	q.Del("seedDeferIndex")
 	dsn.RawQuery = q.Encode()
 
 	cfg, err := pgxpool.ParseConfig(dsn.String())
@@ -379,15 +369,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 		if s.seedFast {
 			logger.Infof("[utxoset] seeding into an empty UTXO table: each batch is one plain insert, with no per-transaction lock or existence probe")
-
-			if seedDeferIndex {
-				if err := s.dropUTXOIndexesForSeed(ctx); err != nil {
-					pool.Close()
-					return nil, err
-				}
-
-				s.seedDeferIndex = true
-			}
 		} else {
 			logger.Infof("[utxoset] seeding into a UTXO table that already holds coins: creates keep the guarded route, so a re-run skips what is already there")
 		}
