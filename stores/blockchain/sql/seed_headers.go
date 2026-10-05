@@ -57,7 +57,7 @@ func (s *SQL) StoreSeedHeaders(ctx context.Context, blocks []*model.Block, peerI
 
 	err = s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
 		for _, b := range blocks {
-			id, height, _, storedInvalid, storeErr := s.storeBlock(ctx, tx, b, peerID, storeBlockOptions, true)
+			id, height, _, storedInvalid, storeErr := s.storeBlockWith(ctx, tx, tx, b, peerID, storeBlockOptions, true)
 			if storeErr != nil {
 				return storeErr
 			}
