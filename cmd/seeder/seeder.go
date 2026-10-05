@@ -297,6 +297,16 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 	return nil
 }
 
+// seedHeaderBatchSize is how many headers processHeaders hands a seedHeaderStore at once. A
+// variable so a test can make the batches small.
+var seedHeaderBatchSize = 10_000
+
+// seedHeaderStore is a blockchain store that can write a run of headers extending its best block
+// in one transaction. The SQL store is one.
+type seedHeaderStore interface {
+	StoreSeedHeaders(ctx context.Context, blocks []*model.Block, peerID string, opts ...blockchainoptions.StoreBlockOption) (bool, error)
+}
+
 // processHeaders reads the UTXO headers from a file and stores them in the blockchain store.
 //
 //nolint:gocognit // Requires refactoring to reduce cognitive complexity
@@ -359,6 +369,48 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 
 	var blockIndex *utxopersister.BlockIndex
 
+	storeOptions := []blockchainoptions.StoreBlockOption{
+		blockchainoptions.WithMinedSet(true),
+		blockchainoptions.WithSubtreesSet(true),
+		blockchainoptions.WithPersistedAt(), // Mark as persisted now, since we're seeding and the block persister won't be able to do it later
+	}
+
+	// A store that can write a run of headers in one transaction gets them in batches: one
+	// commit per batch instead of one per header, which is most of what a header costs.
+	batchStore, canBatch := blockchainStore.(seedHeaderStore)
+	batch := make([]*model.Block, 0, seedHeaderBatchSize)
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+
+		if canBatch {
+			stored, err := batchStore.StoreSeedHeaders(ctx, batch, "headers", storeOptions...)
+			if err != nil {
+				return errors.NewProcessingError("failed to add headers", err)
+			}
+
+			if stored {
+				batch = batch[:0]
+				return nil
+			}
+
+			// A run the store will not take as one chain on top of its best block (a re-run
+			// over headers already stored, say) goes through StoreBlock, as it always did.
+		}
+
+		for _, block := range batch {
+			if _, _, err := blockchainStore.StoreBlock(ctx, block, "headers", storeOptions...); err != nil {
+				return errors.NewProcessingError("failed to add block", err)
+			}
+		}
+
+		batch = batch[:0]
+
+		return nil
+	}
+
 	for {
 		blockIndex, err = utxopersister.NewUTXOHeaderFromReader(reader, isV1)
 		if err != nil {
@@ -374,23 +426,17 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 			continue
 		}
 
-		block := &model.Block{
+		batch = append(batch, &model.Block{
 			Header:           blockIndex.BlockHeader,
 			CoinbaseTx:       blockIndex.CoinbaseTx,
 			TransactionCount: blockIndex.TxCount,
 			Height:           blockIndex.Height,
-		}
+		})
 
-		_, _, err = blockchainStore.StoreBlock(
-			ctx,
-			block,
-			"headers",
-			blockchainoptions.WithMinedSet(true),
-			blockchainoptions.WithSubtreesSet(true),
-			blockchainoptions.WithPersistedAt(), // Mark as persisted now, since we're seeding and the block persister won't be able to do it later
-		)
-		if err != nil {
-			return errors.NewProcessingError("failed to add block", err)
+		if len(batch) == seedHeaderBatchSize {
+			if err = flush(); err != nil {
+				return err
+			}
 		}
 
 		headersProcessed++
@@ -399,6 +445,10 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 		if blockIndex.Height%10000 == 0 {
 			fmt.Printf("Processed to block height %d\n", blockIndex.Height)
 		}
+	}
+
+	if err = flush(); err != nil {
+		return err
 	}
 
 	logger.Infof("FINISHED  %16s headers with %16s transactions", formatNumber(headersProcessed), formatNumber(txCount))
