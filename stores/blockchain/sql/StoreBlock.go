@@ -547,6 +547,14 @@ type execQuerier interface {
 //   - error: Any error encountered during the operation, including validation failures. A
 //     failed INSERT returns the driver's error unwrapped; StoreBlock types it
 func (s *SQL) storeBlock(ctx context.Context, exec execQuerier, block *model.Block, peerID string, storeBlockOptions options.StoreBlockOptions, onMainChain bool) (uint64, uint32, []byte, bool, error) {
+	return s.storeBlockWith(ctx, exec, s.db, block, peerID, storeBlockOptions, onMainChain)
+}
+
+// storeBlockWith is storeBlock with the parent looked up through parentExec rather than the
+// pool. StoreSeedHeaders passes its transaction, so each header finds the parent it inserted
+// just before in the same transaction; every other caller reads the committed parent from the
+// pool, as storeBlock always has.
+func (s *SQL) storeBlockWith(ctx context.Context, exec execQuerier, parentExec execQuerier, block *model.Block, peerID string, storeBlockOptions options.StoreBlockOptions, onMainChain bool) (uint64, uint32, []byte, bool, error) {
 	var (
 		coinbaseTxID string
 		q            string
@@ -556,7 +564,7 @@ func (s *SQL) storeBlock(ctx context.Context, exec execQuerier, block *model.Blo
 		coinbaseTxID = block.CoinbaseTx.TxID()
 	}
 
-	genesis, height, previousBlockID, previousChainWork, previousBlockInvalid, err := s.getPreviousBlockDataOn(ctx, exec, coinbaseTxID, block)
+	genesis, height, previousBlockID, previousChainWork, previousBlockInvalid, err := s.getPreviousBlockDataOn(ctx, parentExec, coinbaseTxID, block)
 	if err != nil {
 		s.logger.Errorf("[StoreBlock] Failed to get previous block data for block %s: %v", block.Hash().String(), err)
 		return 0, 0, nil, false, err
