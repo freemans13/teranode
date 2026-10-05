@@ -240,7 +240,11 @@ func openSeedingStore(t *testing.T, base *Store) *Store {
 // like the seeder's takes its normal route.
 func TestSeedingModeWritesCoinsOnly(t *testing.T) {
 	base, ctx := newTestStore(t) // mainnet checkpoints
+	_, err := base.pool.Exec(ctx, `TRUNCATE utxo`)
+	require.NoError(t, err)
+
 	s := openSeedingStore(t, base)
+	require.True(t, s.seedFast, "a seeding store opened on an empty UTXO table takes the unguarded insert")
 
 	count := func(sql string, args ...any) int {
 		var n int
@@ -273,7 +277,12 @@ func TestSeedingModeWritesCoinsOnly(t *testing.T) {
 		require.Equal(t, utxo.ParentOutputMined, answers[0].Status, "height %d", height)
 		require.Equal(t, height, answers[0].Height)
 
-		_, _, err = s.SpendAndCreate(ctx, seededTx(map[uint32]uint64{0: 10, 2: 20}), height, opts...)
+		// A re-run of the seed is a new seeder process, so a new store, which finds coins
+		// already present and takes the guarded route.
+		rerun := openSeedingStore(t, base)
+		require.False(t, rerun.seedFast, "a seeding store opened on a table with coins keeps the guarded route")
+
+		_, _, err = rerun.SpendAndCreate(ctx, seededTx(map[uint32]uint64{0: 10, 2: 20}), height, opts...)
 		require.ErrorIs(t, err, errors.ErrTxExists, "height %d: a re-run of the seed skips the transaction", height)
 		require.Equal(t, 2, count(`SELECT count(*) FROM utxo WHERE txid = $1`, id[:]), "height %d: no coin written twice", height)
 	}
@@ -284,7 +293,58 @@ func TestSeedingModeWritesCoinsOnly(t *testing.T) {
 	// A create without the seeder's shape takes the normal route even in seeding mode.
 	normal := seededTx(map[uint32]uint64{0: 30})
 	normal.Outputs = normal.Outputs[:1]
-	_, err := s.Create(ctx, normal, 1_000_000)
+	_, err = s.Create(ctx, normal, 1_000_000)
 	require.NoError(t, err)
 	require.Equal(t, 1, count(`SELECT count(*) FROM tx_ident WHERE txid = $1`, normal.TxIDChainHash()[:]))
+}
+
+// A seed into an empty UTXO table writes each batch with one plain insert: no per-transaction
+// advisory lock and no own-output probe, because a snapshot holds every transaction once and the
+// table held nothing to collide with when the store opened. What lands is exactly what the
+// guarded route writes: every coin once, with its height, and nothing in the identity or
+// containment tables.
+func TestSeedingFastInsertMatchesGuardedRoute(t *testing.T) {
+	base, ctx := newTestStore(t)
+	_, err := base.pool.Exec(ctx, `TRUNCATE utxo`)
+	require.NoError(t, err)
+
+	s := openSeedingStore(t, base)
+	require.True(t, s.seedFast)
+
+	const height = 960_000
+
+	ids := make([]chainhash.Hash, 40)
+	errs := make(chan error, len(ids))
+
+	for i := range ids {
+		ids[i][0] = byte(i)
+		ids[i][1] = 0x5f
+
+		go func(id chainhash.Hash) {
+			_, _, err := s.SpendAndCreate(ctx, seededTx(map[uint32]uint64{0: 10, 3: 30}), height,
+				utxo.WithCreateOnly(), utxo.WithTXID(&id), utxo.WithSetCoinbase(false),
+				utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 0, BlockHeight: height, SubtreeIdx: 0}))
+			errs <- err
+		}(ids[i])
+	}
+
+	for range ids {
+		require.NoError(t, <-errs)
+	}
+
+	var coins, ident, mined int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE mined_height = $1`, int32(height)).Scan(&coins))
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_ident`).Scan(&ident))
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_mined`).Scan(&mined))
+	require.Equal(t, 2*len(ids), coins, "every coin once, with its height")
+	require.Zero(t, ident)
+	require.Zero(t, mined)
+
+	for _, id := range ids {
+		answers, err := s.ParentOutputsForValidation(ctx, []utxo.Outpoint{{TxID: id, Vout: 3}})
+		require.NoError(t, err)
+		require.NoError(t, answers[0].Err)
+		require.Equal(t, utxo.ParentOutputMined, answers[0].Status)
+		require.Equal(t, uint64(30), answers[0].Satoshis)
+	}
 }
