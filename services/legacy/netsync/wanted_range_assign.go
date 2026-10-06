@@ -310,7 +310,7 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 			// A block being committed has left the park but not the disk: that is in
 			// flight, not stranded, and putting it back would have it read again after
 			// its files are gone.
-			if !sm.blockPark.Has(block.hash) && !sm.dispatcher.inFlight(block.hash) &&
+			if !sm.blockPark.Has(block.hash) && !sm.blockCommitting(block.hash) &&
 				sm.blockPark.adoptStranded(sm.ctx, block.hash, sm.subtreeStore) {
 				sm.logger.Warnf("[unownedBlocks][%s] adopted a complete record at %s that was on disk but not in the park", block.hash, describeWantedHeight(block.height))
 			}

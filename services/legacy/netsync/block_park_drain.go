@@ -149,6 +149,15 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 // two defaults point opposite ways: a read failure keeps the block, a commit
 // failure judges it.
 func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
+	// Committing from here until every path below has settled the record, so the
+	// download pass and the on-disk handler see the block as in use rather than
+	// stranded or duplicate. Cleared on return, after the disposition has deleted
+	// whatever it deletes.
+	hash := entry.hash
+	sm.parkCommitting.Store(&hash)
+
+	defer sm.parkCommitting.Store(nil)
+
 	// The read and the completeness check share one store deadline, the same
 	// one holdsBlock puts on the identical pair of calls: both run on the
 	// goroutine that commits blocks in order, and the file store's permit wait

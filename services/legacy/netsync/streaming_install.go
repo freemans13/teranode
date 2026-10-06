@@ -661,7 +661,7 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// after the first copy commits and deletes the shared record, which then finds
 	// nothing. Deleting it would take the record the first copy may still be reading,
 	// so it is only counted.
-	if sm.dispatcher.inFlight(entry.hash) {
+	if sm.blockCommitting(entry.hash) {
 		if msg.body.Converted {
 			sm.waste.dupConverted.Add(1)
 		}

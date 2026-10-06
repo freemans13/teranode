@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/file"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -132,4 +135,62 @@ func TestDownloadPassLeavesABlockInFlightAlone(t *testing.T) {
 
 	require.Empty(t, sm.unownedBlocks([]wantedBlock{{height: 650022, hash: hash}}))
 	require.False(t, park.Has(hash), "a block being committed is not put back in the park")
+}
+
+// midCommitSubtreeStore runs the download pass the first time the park's commit route checks a
+// record's subtree files, which is the moment that route has taken the block out of the park and
+// is still using its record. It then fails every check, so the commit stops at the completeness
+// check instead of going on to validation, which this test has no stores for.
+type midCommitSubtreeStore struct {
+	blob.Store
+
+	during    func()
+	ran, fail bool
+}
+
+func (s *midCommitSubtreeStore) Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (bool, error) {
+	if s.fail {
+		return false, errors.NewStorageError("failing the commit's completeness check on purpose")
+	}
+
+	if !s.ran {
+		s.ran = true
+		s.during()
+		s.fail = true
+
+		return false, errors.NewStorageError("failing the commit's completeness check on purpose")
+	}
+
+	return s.Store.Exists(ctx, key, fileType, opts...)
+}
+
+// The park's sweep commits a block through commitParkedBlock, not the dispatcher, so the
+// dispatcher's in-flight list never covered it. A download pass on the sweep's goroutine in that
+// window found the record on disk and out of the park, adopted it back in, and the second entry
+// was read after the first commit had deleted the record. Mainnet logged that five times in its
+// first 22 minutes after the dispatcher's own window was closed on 2026-10-06.
+func TestDownloadPassLeavesABlockTheParkSweepIsCommittingAlone(t *testing.T) {
+	ctx := context.Background()
+	sm, park, subtreeStore := strandedRecordManager(t)
+
+	blk, hash := convertedRecordWithSubtrees(t, 1, 650022)
+	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
+	ageRecord(t, park, hash.String())
+
+	var adoptedMidCommit bool
+
+	hook := &midCommitSubtreeStore{Store: subtreeStore}
+	hook.during = func() {
+		sm.unownedBlocks([]wantedBlock{{height: 650022, hash: hash}})
+		adoptedMidCommit = park.Has(hash)
+	}
+	sm.subtreeStore = hook
+
+	sm.commitParkedBlock(parkedBlock{hash: hash, height: 650022})
+
+	require.True(t, hook.ran, "the download pass ran while the block was being committed")
+	require.False(t, adoptedMidCommit, "a block the park is committing is not put back in the park")
+	require.False(t, sm.blockCommitting(hash), "and is no longer being committed once the call returns")
 }
