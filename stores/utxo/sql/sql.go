@@ -5927,6 +5927,19 @@ func buildMultiValueInsert(baseSQL string, colsPerRow, numRows, startIdx int) st
 	return sb.String()
 }
 
+// isSQLiteLockCode reports whether a SQLite result code is a BUSY or LOCKED
+// condition. modernc.org/sqlite enables extended result codes on every
+// connection, so the primary code is the low byte and the detail sits above
+// it: SQLITE_BUSY_SNAPSHOT (517) is SQLITE_BUSY (5), SQLITE_LOCKED_SHAREDCACHE
+// (262) is SQLITE_LOCKED (6). Comparing the whole code against the two
+// primaries drops every extended variant out of the retry. Same shape as
+// isDeadlock's SQLite arm above and usql.isRetriableSQLiteCode (util/usql/retry.go).
+func isSQLiteLockCode(code int) bool {
+	primary := code & 0xff
+
+	return primary == sqlite3.SQLITE_BUSY || primary == sqlite3.SQLITE_LOCKED
+}
+
 // isLockError checks if the error is a database lock/deadlock error
 func isLockError(err error) bool {
 	if err == nil {
@@ -5944,9 +5957,9 @@ func isLockError(err error) bool {
 		return pqErr.Code == usql.PgErrSerializationFail || pqErr.Code == usql.PgErrDeadlockDetected || pqErr.Code == usql.PgErrLockNotAvailable
 	}
 
-	// SQLite busy/locked errors
+	// SQLite busy/locked errors, extended codes included
 	if sqliteErr, ok := err.(*sqlite.Error); ok {
-		return sqliteErr.Code() == sqlite3.SQLITE_BUSY || sqliteErr.Code() == sqlite3.SQLITE_LOCKED
+		return isSQLiteLockCode(sqliteErr.Code())
 	}
 
 	// Check error message for common lock patterns
