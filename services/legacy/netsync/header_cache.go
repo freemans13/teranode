@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/work"
@@ -678,24 +679,43 @@ func (c *headerCache) judge(plan fillPlan, headers []*wire.BlockHeader, hashes [
 // whose fork point the store does not hold, and one forking above the last
 // committed checkpoint: SV Node would keep that header as a side branch, and
 // below the tip this cache holds none. Store lookups that fail say nothing
-// about the peer.
+// about the peer: only a lookup the store answers with not found means a
+// header is not stored, and any other failure abandons the batch without
+// blame, because reading it as "not stored" would move the search and place
+// the fork lower than it is.
 func trunkFork(rules *headerRules, checkpoints []chaincfg.Checkpoint, floor int32, headers []*wire.BlockHeader, hashes []chainhash.Hash) fillResult {
 	ctx := context.Background()
 
-	stored := func(hash chainhash.Hash) bool {
+	// stored reports whether hash is a stored block, and answered whether the
+	// store gave an answer at all.
+	stored := func(hash chainhash.Hash) (isStored, answered bool) {
 		header, meta, err := rules.trunk.GetBlockHeader(ctx, &hash)
 
-		return err == nil && header != nil && meta != nil
+		switch {
+		case err == nil && header != nil && meta != nil:
+			return true, true
+		case err != nil && errors.Is(err, errors.ErrNotFound):
+			return false, true
+		default:
+			return false, false
+		}
 	}
 
-	if stored(hashes[len(hashes)-1]) {
+	isStored, answered := stored(hashes[len(hashes)-1])
+	if isStored || !answered {
 		return fillResult{}
 	}
 
 	lo, hi := 0, len(hashes)-1 // hashes[hi] is not stored
 	for lo < hi {
 		mid := (lo + hi) / 2
-		if stored(hashes[mid]) {
+
+		isStored, answered = stored(hashes[mid])
+		if !answered {
+			return fillResult{}
+		}
+
+		if isStored {
 			lo = mid + 1
 		} else {
 			hi = mid
