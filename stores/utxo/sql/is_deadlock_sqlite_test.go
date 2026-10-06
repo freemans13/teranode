@@ -3,11 +3,14 @@ package sql
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/stretchr/testify/require"
+	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
@@ -140,4 +143,67 @@ func TestIsSQLiteLockCode_ExtendedCodesAreStillLocks(t *testing.T) {
 			require.Equal(t, tc.want, isSQLiteLockCode(tc.code))
 		})
 	}
+}
+
+// TestIsLockError_SQLiteBusySnapshotIsRetryable produces a real
+// SQLITE_BUSY_SNAPSHOT (517) and asserts the create path retries it.
+//
+// In WAL mode a read transaction pins a snapshot. If another connection commits
+// after that, the reader cannot upgrade to a writer, because its snapshot is
+// stale, and the engine refuses the write with BUSY_SNAPSHOT at once, whatever
+// busy_timeout says. isLockError's typed arm used to compare the whole code
+// against SQLITE_BUSY (5) and return false without reaching the "database is
+// locked" string fallback, so this error was not retried. Each Create retry
+// opens a fresh transaction, so a retry gets a new snapshot.
+func TestIsLockError_SQLiteBusySnapshotIsRetryable(t *testing.T) {
+	ctx := context.Background()
+
+	dsn := "file:" + filepath.Join(t.TempDir(), "busy_snapshot.db") + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(0)"
+
+	db, err := usql.Open("sqlite", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	_, err = db.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)`)
+	require.NoError(t, err)
+
+	reader, err := db.Conn(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reader.Close() })
+
+	writer, err := db.Conn(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Close() })
+
+	txn, err := reader.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = txn.Rollback() })
+
+	var n int
+	require.NoError(t, txn.QueryRowContext(ctx, `SELECT count(*) FROM t`).Scan(&n))
+
+	_, err = writer.ExecContext(ctx, `INSERT INTO t (v) VALUES (1)`)
+	require.NoError(t, err)
+
+	_, err = txn.ExecContext(ctx, `INSERT INTO t (v) VALUES (2)`)
+	require.Error(t, err, "a write on a stale WAL snapshot must be refused")
+
+	var sqliteErr *sqlite.Error
+	require.True(t, errors.As(err, &sqliteErr), "the engine must return a *sqlite.Error, got %T: %v", err, err)
+	require.Equal(t, sqlite3.SQLITE_BUSY_SNAPSHOT, sqliteErr.Code(), "the engine must report BUSY_SNAPSHOT, not something else: %v", err)
+
+	require.True(t, isLockError(err), "the create path must retry a BUSY_SNAPSHOT, got a non-retryable classification for: %v", err)
+}
+
+// TestIsLockError_WrappedSQLiteLockedIsRetryable covers the shape create-path
+// insert errors actually arrive in. classifyInsertError wraps the driver error
+// with NewStorageError, which keeps only its message, so the typed arm never
+// sees it and the string fallback decides. SQLITE_LOCKED's message is "database
+// table is locked"; without a "deadlock" suffix it used to fall through as not
+// retryable, while isDeadlock retried the same message.
+func TestIsLockError_WrappedSQLiteLockedIsRetryable(t *testing.T) {
+	err := errors.NewStorageError("Failed to insert %s", "transaction", errors.NewProcessingError("database table is locked: transactions (262)"))
+
+	require.True(t, isLockError(err), "a wrapped SQLITE_LOCKED must be retried by create: %v", err)
+	require.True(t, isDeadlock(err), "isDeadlock already retries the same message: %v", err)
 }

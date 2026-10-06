@@ -5957,13 +5957,19 @@ func isLockError(err error) bool {
 	}
 
 	// SQLite busy/locked errors, extended codes included
-	if sqliteErr, ok := err.(*sqlite.Error); ok {
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
 		return isSQLiteLockCode(sqliteErr.Code())
 	}
 
-	// Check error message for common lock patterns
+	// Check error message for common lock patterns. teranode's errors package
+	// keeps only the message of a driver error it wraps, so an insert failure
+	// wrapped by NewStorageError reaches here, not the typed arm above.
+	// "database table is locked" is SQLITE_LOCKED's message, matched as in
+	// isDeadlock.
 	errStr := err.Error()
 	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "database table is locked") ||
 		strings.Contains(errStr, "deadlock") ||
 		strings.Contains(errStr, "lock timeout")
 }
