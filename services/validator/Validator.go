@@ -1720,9 +1720,13 @@ func extendInputFromPrefetchedParent(tx *bt.Tx, inputIdx int, parent *meta.Data,
 
 	// PreviousTxOutIndex comes from the (untrusted) child transaction, so bound
 	// it against the parent's output count before indexing.
+	// A parent with no output at that index is the same verdict the store path
+	// gives for NoSuchIndex: the child is invalid, not the read. Reported as a
+	// processing error, a block spending a nonexistent output was retried for
+	// ever on the level path and its peer never penalised.
 	vout := tx.Inputs[inputIdx].PreviousTxOutIndex
 	if parent.Tx.Outputs == nil || int(vout) >= len(parent.Tx.Outputs) || parent.Tx.Outputs[vout] == nil {
-		return errors.NewProcessingError("[Validate][%s] parent transaction %s has no output for index %d",
+		return errors.NewTxInvalidError("[Validate][%s] parent transaction %s has no output %d",
 			tx.TxIDChainHash().String(), tx.Inputs[inputIdx].PreviousTxIDChainHash().String(), vout)
 	}
 

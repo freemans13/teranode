@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -101,8 +102,9 @@ func Test_getUtxoBlockHeightsAndExtendTx_PartialPrefetchFallsBackToStore(t *test
 // Test_getUtxoBlockHeightsAndExtendTx_PrefetchedVoutOutOfRange guards the extend
 // path against an out-of-range PreviousTxOutIndex. The vout comes from the
 // (untrusted) child transaction; a raw tx that references a real parent but a
-// vout beyond that parent's output count must be rejected with a clean error
-// rather than panicking on the parent's Outputs[vout].
+// vout beyond that parent's output count must be rejected as invalid, the
+// verdict the store path gives for NoSuchIndex, rather than panicking on the
+// parent's Outputs[vout] or being reported as a processing error to retry.
 func Test_getUtxoBlockHeightsAndExtendTx_PrefetchedVoutOutOfRange(t *testing.T) {
 	ctx := context.Background()
 
@@ -118,8 +120,9 @@ func Test_getUtxoBlockHeightsAndExtendTx_PrefetchedVoutOutOfRange(t *testing.T) 
 	v := &Validator{}
 
 	_, err := v.getUtxoBlockHeightsAndExtendTx(ctx, childTx, "child", prefetched)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "has no output for index")
+	require.ErrorIs(t, err, errors.ErrTxInvalid)
+	require.NotErrorIs(t, err, errors.ErrProcessing)
+	require.Contains(t, err.Error(), "has no output 99")
 }
 
 // prefetchParentTx builds the minimal parent metadata the unconditional

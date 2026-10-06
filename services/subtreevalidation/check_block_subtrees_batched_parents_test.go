@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/util"
@@ -189,4 +190,23 @@ func TestProcessTransactionsBatched_RepeatedParentFallsBackWithChild(t *testing.
 		require.NoError(t, err)
 		require.True(t, md.Conflicting, "%s went through the per-transaction path, which creates it conflicting", tx.TxIDChainHash())
 	}
+}
+
+// On the level path, which RUNNING takes, a transaction spending an output its
+// parent does not have is invalid, the verdict the store path and the batch
+// path give. Level-path parents are prefetched, so this exercises
+// extendInputFromPrefetchedParent; reported as a processing error there, the
+// block was retried for ever and the peer never penalised.
+func TestCheckBlockSubtrees_LevelPathRejectsSpendOfMissingOutput(t *testing.T) {
+	f := newBatchedFixture(t, blockchain.FSMStateRUNNING)
+
+	root := storedRoot(t, f, 1, opTrue)
+	child := opTrueTx(t, 1, []*bt.Tx{root}, []uint32{0})
+	child.Inputs[0].PreviousTxOutIndex = uint32(len(root.Outputs)) //nolint:gosec // test data
+
+	err := checkBlock(t, f, storeBlock(t, f, []*bt.Tx{child}, false))
+	require.Error(t, err)
+	require.ErrorIs(t, err, errors.ErrTxInvalid, "a spend of a nonexistent output is a verdict on the block, not a retry: %v", err)
+	require.Zero(t, f.store.multiCalls.Load(), "RUNNING takes the level path")
+	requireAbsent(t, f, []*bt.Tx{child})
 }
