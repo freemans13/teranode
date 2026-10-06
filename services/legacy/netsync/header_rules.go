@@ -25,6 +25,11 @@ const (
 	// headerAccepted is the zero value: nothing was refused.
 	headerAccepted headerRejection = iota
 
+	// rejectCheckpointMismatch is CheckIndexAgainstCheckpoint's "checkpoint
+	// mismatch": a header at a checkpoint height that is not the pinned hash
+	// (validation.cpp:5757-5761, DoS 100).
+	rejectCheckpointMismatch
+
 	// rejectBadDiffBits is ContextualCheckBlockHeader's "bad-diffbits": the
 	// header's nBits is not what the difficulty rules demand at its height
 	// (validation.cpp:5789-5793, DoS 100).
@@ -54,13 +59,15 @@ const (
 // costs the sender its connection. The rest refuse the header and keep the
 // peer, as SV Node's Invalid-without-DoS does.
 func (r headerRejection) disconnects() bool {
-	return r == rejectBadDiffBits
+	return r == rejectBadDiffBits || r == rejectCheckpointMismatch
 }
 
 func (r headerRejection) String() string {
 	switch r {
 	case headerAccepted:
 		return "accepted"
+	case rejectCheckpointMismatch:
+		return "checkpoint mismatch"
 	case rejectBadDiffBits:
 		return "bad-diffbits"
 	case rejectTimeTooOld:

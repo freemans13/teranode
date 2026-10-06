@@ -212,9 +212,9 @@ type pauseMsg struct {
 // It arrives from upstream's PR 1390 security merge, where it was threaded through
 // a map from block hash to origin filled by fetchHeaderBlocks as it walked the
 // header list. That list is gone on this branch, so the flag is now answered from
-// the header cache instead — see blockOrigin and headerCache.provenTo. The meaning
-// is identical and the source is narrower: one run, replaced whole, never extended
-// past the point that was verified.
+// the header cache instead: see blockOrigin and headerCache.Proven. The meaning
+// is identical: a header is proven only when a held checkpoint node at or above
+// it, matched against the pinned hash, descends from it.
 type blockRequestOrigin struct {
 	// headerProven is true when the block's hash is named by a header-cache run in
 	// which a pinned checkpoint hash was matched at or above this block's height.
@@ -1606,6 +1606,10 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 	// Remove the peer from the list of candidate peers.
 	sm.peerStates.Delete(peer)
 
+	// Its header branch goes with it, as SV Node forgets a peer's best known
+	// header when the peer goes. Headers another peer also holds stay.
+	sm.headerCache.DropPeer(peer)
+
 	// A peer leaving with blocks owed costs whatever of them was already on the
 	// wire, and the blocks must be asked of someone else.
 	if owed := sm.blockDownloads.CountForPeer(peer); owed > 0 {
@@ -2171,9 +2175,8 @@ const headerCacheRefillInterval = 5 * time.Second
 // 5-second floor mean a silent peer costs one interval per attempt, so 1,000
 // heights is about 50 seconds at the measured 20 blocks/s: ten attempts
 // across rotated peers before the cache runs dry. Asking early is close to
-// free here, because Fill replaces rather than merges and a fresh batch
-// starts at the same committed tip the current one does, so an early reply
-// supersedes what is held without discarding a single usable height.
+// free here, because a reply the peer's branch already holds changes
+// nothing (headerCache.FillFrom), so an early reply discards no usable height.
 //
 // The read-ahead depth (legacy_blockDownloadWindow, 1024) is still the
 // wrong quantity to reach for, for the reason it always was: it bounds how
@@ -2291,21 +2294,29 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		return
 	}
 
+	peer := sm.nextHeaderRefillPeer(peers)
+
 	var (
 		locator blockchain.BlockLocator
 		err     error
 	)
 
-	if walkIncomplete && haveTop {
-		if topHash, ok := sm.headerCache.At(top); ok {
-			locator, err = sm.extendingHeadersLocator(topHash)
-		} else {
-			// The top height Top() just reported is gone from the map: a
-			// concurrent Prune or a whole-list drop landed between the two
-			// calls. Fall through to the ordinary tip-anchored locator, the
-			// same one a genuinely empty list gets below.
-			locator, err = sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
+	// A walk continues from the asked peer's own branch tip when it has one,
+	// so each peer's walk grows its own branch (see continueCheckpointWalkIfNeeded),
+	// and from the active branch's tip for a peer with none yet, so a peer that
+	// holds the same chain answers where the walk already is.
+	extendFrom, extend := chainhash.Hash{}, false
+
+	if walkIncomplete {
+		if _, own, ok := sm.headerCache.PeerTop(sm.headerOwner(peer)); ok {
+			extendFrom, extend = own, true
+		} else if haveTop {
+			extendFrom, extend = sm.headerCache.At(top)
 		}
+	}
+
+	if extend {
+		locator, err = sm.extendingHeadersLocator(extendFrom)
 	} else {
 		locator, err = sm.headersRoundLocator(&tipHash, uint32(best)) //nolint:gosec // a chain height
 	}
@@ -2315,8 +2326,6 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 
 		return
 	}
-
-	peer := sm.nextHeaderRefillPeer(peers)
 
 	// This call only ever runs because the header cache came up short, so
 	// every request from here is a deliberate retry: peer rotation closes
@@ -2478,13 +2487,14 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 // list. Neither structure exists here. What does exist is stronger in the one way
 // that matters and weaker in one way that does not:
 //
-//   - stronger, because the cache holds ONE run, verified to be internally linked
-//     and rooted in this node's own committed tip, and it is replaced whole rather
-//     than appended to. Upstream's list could be extended past the point that had
-//     actually been verified, which is the hole its second security commit had to
-//     go back and close with headerNodeProven.
+//   - stronger, because a header is proven only as an ancestor of a held node
+//     carrying a pinned checkpoint hash, on branches verified to be internally
+//     linked and rooted in this node's own committed tip. Upstream's list could
+//     be extended past the point that had actually been verified, which is the
+//     hole its second security commit had to go back and close with
+//     headerNodeProven.
 //   - weaker, because it is read at delivery rather than stamped at request, so a
-//     refill that lands while a block is on the wire can lose the proof. That
+//     branch dropped while a block is on the wire can lose the proof. That
 //     direction costs full validation and nothing else. See headerCache.Proven.
 //
 // Every route that cannot show the run gets the zero value: peer advertisements,
@@ -2494,34 +2504,31 @@ func (sm *SyncManager) blockOrigin(blockHash chainhash.Hash) blockRequestOrigin 
 	return blockRequestOrigin{headerProven: sm.headerCache.Proven(blockHash)}
 }
 
-// fillHeaderCache turns a headers batch into the cache the wanted range reads,
-// and reports whether anything was cached.
+// fillHeaderCache turns a headers batch into the sender's branch of the header
+// cache, and reports whether the sender's branch moved.
 //
-// The batch must contain the block this node has committed, which is what the
-// tip-anchored locator asks for — contain it, not begin just above it: the tip
-// moves under the reply while it is in flight, and Fill keeps whatever part of
-// the run still sits above the tip when it arrives. A batch that does not
-// connect at all is dropped without blaming the sender: under the new model the
+// The batch must connect to the committed tip or to a header the cache already
+// holds; the tip moves under a reply while it is in flight, and Fill keeps
+// whatever part of the run still sits above the tip when it arrives. A batch
+// that does not connect at all is dropped without blaming the sender: the
 // locator steps back to genesis, so a peer answering from an older shared
-// ancestor is answering correctly, just about a point this node has already
-// passed.
+// ancestor is answering correctly, just about a point this node has passed.
+//
+// Each peer has its own branch (headerCache), keyed by the peer this message is
+// resolved to, so a stream connection's headers count for its primary peer and
+// leave with it.
 //
 // The return value is what handleHeadersMsg gates its assignment pass on, so
-// only a batch that actually left heights behind triggers one.
+// only a batch that moved a branch triggers one.
 func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders) bool {
 	if len(msg.Headers) == 0 {
 		return false
 	}
 
 	// Read as one value, height and hash together, so the batch can never be
-	// keyed under a height the hash no longer belongs to: a caller reading the
-	// height and then making a second, separate call for the hash could see a
-	// commit land in between and key the batch wrong. committedTip's single
-	// GetBestBlockHeader call rules that out. It also means this always judges
-	// linkage against the chain's real tip, including a tip a same-height reorg
-	// just replaced: the stored, monotonic-on-height copy this used to read
-	// could never be updated by such a reorg, so the cache refused every batch
-	// forever until the process restarted.
+	// keyed under a height the hash no longer belongs to. It also means this
+	// always judges linkage against the chain's real tip, including a tip a
+	// same-height reorg just replaced.
 	best, tipHash, ok := sm.committedTip()
 	if !ok {
 		sm.logger.Debugf("[fillHeaderCache] no committed tip recorded yet, dropping %d headers from %s", len(msg.Headers), peer)
@@ -2529,28 +2536,29 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 		return false
 	}
 
-	// Read before Fill, which below the last checkpoint may EXTEND this cache
-	// rather than replace it (see headerCache.Fill and extendLocked). Both are
-	// needed afterward purely to report what happened correctly — the log line
-	// below and the "list dropped" disconnect on the failure path — neither of
-	// which Fill itself is in a position to say: it has no logger, and on a
-	// wrong-hash drop it has already reset the state that would say so.
-	prevTop, havePrevTop := sm.headerCache.Top()
-	prevTopHash, _ := sm.headerCache.At(prevTop)
+	owner := sm.headerOwner(peer)
 	prevProven := sm.headerCache.ProvenTo()
-	_, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
 
-	result := sm.headerCache.FillDetailed(tipHash, best+1, msg.Headers)
-	accepted, extended := result.accepted, result.extended
+	result := sm.headerCache.FillFrom(owner, tipHash, best+1, msg.Headers)
 
-	// A header the contextual rules refused. bad-diffbits is SV Node's DoS 100
-	// (validation.cpp:5789-5793): a header carrying any difficulty but the one
-	// the adjustment rules demand at its height is not this chain, and the batch
-	// was refused whole. Here the sender loses its connection rather than being
-	// banned; the ban score is the peer-punishment work's to add. The other
-	// reasons are SV Node's Invalid without DoS: the headers before the refused
-	// one were kept and the peer stays.
+	// A header a rule refused. bad-diffbits and checkpoint mismatch are SV
+	// Node's DoS 100 (validation.cpp:5789-5793 and 5757-5761): the sender is not
+	// describing this chain and the batch was refused whole. Here the sender
+	// loses its connection rather than being banned; the ban score is the
+	// peer-punishment work's to add. Its branch goes now, not when the
+	// disconnect is processed, so nothing it sent is read in between. The
+	// other reasons are SV Node's Invalid without DoS: the headers before the
+	// refused one were kept and the peer stays.
 	if result.rejection.disconnects() {
+		sm.headerCache.DropPeer(owner)
+
+		if result.rejection == rejectCheckpointMismatch {
+			sm.logger.Warnf("[fillHeaderCache][%s] header branch dropped: %s", peer, result.detail)
+			peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash: %s", result.rejectedHeight, result.detail))
+
+			return false
+		}
+
 		peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d refused as %s: %s", result.rejectedHeight, result.rejection, result.detail))
 
 		return false
@@ -2560,82 +2568,32 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 		sm.logger.Infof("[fillHeaderCache][%s] header at height %d refused as %s: %s", peer, result.rejectedHeight, result.rejection, result.detail)
 	}
 
-	if !accepted {
-		// Three different refusals arrive here as one false, and two of them are
-		// the peer's fault. Fill refuses a run that does not reach above the
-		// committed tip, which is an honest answer to a question this node has
-		// stopped asking; it refuses a header that does not meet proof of work,
-		// which nobody paid for; and it refuses a run that reaches a checkpoint
-		// height carrying the wrong hash, which is a lie about the certified
-		// chain. Re-deriving which it was costs one walk of the batch and is
-		// worth it, because upstream disconnects for the last (handleHeadersMsg's
-		// "does NOT match expected checkpoint hash") and this branch lost that
-		// defence along with the header list.
-		//
-		// Proof of work first, because Fill checks it first: a batch that fails
-		// it was never judged against the tip or the checkpoints at all. Judged
-		// with the cache's own ceiling, so a cache built without one (every test
-		// that only cares which heights are named) never has a refusal explained
-		// by a check Fill did not run. SV Node rejects the header as high-hash
-		// with DoS(50) (validation.cpp:5586-5596, CheckBlockHeader); here the peer
-		// loses its connection, and the ban score is the peer-punishment work's
-		// to add.
+	if !result.accepted {
+		// Proof of work is re-derived because Fill reports a linkage or work
+		// failure as one false, and only the second is the peer's fault. Judged
+		// with the cache's own ceiling, so a cache built without one never has a
+		// refusal explained by a check it did not run. SV Node rejects the
+		// header as high-hash with DoS(50) (validation.cpp:5586-5596,
+		// CheckBlockHeader); here the peer loses its connection.
 		if i := firstHeaderWithoutWork(msg.Headers, sm.headerCache.PowLimit()); i >= 0 {
 			peer.DisconnectWithWarning(fmt.Sprintf("block header %s does not meet proof of work (index %d of %d)", msg.Headers[i].BlockHash(), i, len(msg.Headers)))
 
 			return false
 		}
 
-		if cp := sm.contradictedCheckpoint(best+1, tipHash, msg.Headers); cp != nil {
-			peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash %s", cp.Height, cp.Hash))
-
-			return false
-		}
-
-		// Below the last checkpoint, once this cache already named heights above
-		// the tip, Fill judges the batch against the list's own top instead of
-		// best+1 (extendLocked) — so a wrong hash reached that way shows up only
-		// when the batch is re-walked from prevTop+1, never from best+1 above.
-		// A match here means Fill has already wiped every entry the dropped run
-		// had proven, because they were all one linked chain with the batch that
-		// just failed to agree; this block is purely the classification for the
-		// disconnect and the log, not the decision itself.
-		if havePrevTop && prevTop >= best+1 && checkpointAhead {
-			if cp := sm.contradictedCheckpoint(prevTop+1, prevTopHash, msg.Headers); cp != nil {
-				sm.logger.Warnf("[fillHeaderCache][%s] header list dropped: the walk reached checkpoint height %d without the pinned hash %s", peer, cp.Height, cp.Hash)
-				peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d does NOT match the expected checkpoint hash %s", cp.Height, cp.Hash))
-
-				return false
-			}
-		}
-
-		sm.logger.Debugf("[fillHeaderCache] batch of %d headers from %s does not reach above the committed tip at height %d, dropping it", len(msg.Headers), peer, best)
+		sm.logger.Debugf("[fillHeaderCache] batch of %d headers from %s does not move its branch above the committed tip at height %d, dropping it", len(msg.Headers), peer, best)
 
 		return false
 	}
 
-	// Read the new top back from the cache rather than computed from the batch
-	// length: Fill drops whatever prefix does not belong, and below the last
-	// checkpoint it may append onto prevTop instead of starting at best+1, so
-	// the batch's own length no longer names either end on its own.
-	top, _ := sm.headerCache.Top()
-
-	// The low end of what THIS call added. extended is Fill's own answer for
-	// how it installed the batch: an extending fill appended onto prevTop, a
-	// replacing one starts at best+1 regardless of what the cache held before.
-	// It is not re-derived from prevTop, because below the last checkpoint an
-	// unproven run can be replaced even though the cache named heights above
-	// the tip (headerCache.fillLocked). Getting this wrong would have the one
-	// log line an operator panel parses report the whole accumulated list's
-	// size against a single reply's header count.
-	low := best + 1
-	if extended {
-		low = prevTop + 1
+	// low and added are what THIS call made the cache hold for the first time;
+	// top is the sender's branch tip. The operator panel parses this line.
+	low := result.low
+	if result.added == 0 {
+		low = result.top + 1
 	}
 
-	cached := top - low + 1
-
-	sm.logger.Infof("[fillHeaderCache] cached %d of %d headers from %s, heights %d to %d", cached, len(msg.Headers), peer, low, top)
+	sm.logger.Infof("[fillHeaderCache] cached %d of %d headers from %s, heights %d to %d", result.added, len(msg.Headers), peer, low, result.top)
 
 	if newProven := sm.headerCache.ProvenTo(); newProven > prevProven {
 		sm.logger.Infof("[fillHeaderCache][%s] header walk matched checkpoint at height %d", peer, newProven)
@@ -2643,9 +2601,23 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 		sm.reofferParkedBlocksProvenBy(newProven)
 	}
 
-	sm.continueCheckpointWalkIfNeeded(peer, best, top)
+	sm.continueCheckpointWalkIfNeeded(peer, best, result.top, result.topHash)
 
 	return true
+}
+
+// headerOwner is the key of peer's branch in the header cache: the primary
+// peer a stream connection belongs to, or peer itself.
+func (sm *SyncManager) headerOwner(peer *peerpkg.Peer) any {
+	if sm.peerStates == nil {
+		return peer
+	}
+
+	if _, resolved, ok := sm.peerStateResolvingPrimary(peer); ok && resolved != nil {
+		return resolved
+	}
+
+	return peer
 }
 
 // reofferParkedBlocksProvenBy hands the parked blocks sitting directly behind
@@ -2722,7 +2694,11 @@ func (sm *SyncManager) reofferParkedBlocksProvenBy(newProven int32) {
 // Asks the peer that just answered, not a rotated one: it has just proved it
 // holds this chain and is reachable, and asking anyone else here would be a
 // second request for the same range before the first has even had a chance to
-// answer again. Rotation on a stalled walk is still maybeRequestMoreHeaders'
+// answer again. The locator leads with that peer's own branch tip (top and
+// topHash, from the fill), as SV Node asks for more from pindexLast
+// (net_processing.cpp:3452-3464), never with another peer's: a peer asked to
+// continue a branch it does not hold answers from the committed tip, and its own
+// walk would never get past one reply. Rotation on a stalled walk is still maybeRequestMoreHeaders'
 // job — see its own doc for how it now also owns this walk as a backstop.
 //
 // lastHeaderRequestAt is still updated on a successful send, so the periodic
@@ -2735,18 +2711,13 @@ func (sm *SyncManager) reofferParkedBlocksProvenBy(newProven int32) {
 // through fillHeaderCache with a bare, unconnected test peer that was never
 // meant to receive a real getheaders, and this must not be the thing that
 // changes that.
-func (sm *SyncManager) continueCheckpointWalkIfNeeded(peer *peerpkg.Peer, best, top int32) {
+func (sm *SyncManager) continueCheckpointWalkIfNeeded(peer *peerpkg.Peer, best, top int32, topHash chainhash.Hash) {
 	if !sm.headersFirstMode.Load() || !peer.Connected() {
 		return
 	}
 
 	next, ok := sm.headerCache.NextCheckpointAbove(best)
 	if !ok || top >= next.Height {
-		return
-	}
-
-	topHash, ok := sm.headerCache.At(top)
-	if !ok {
 		return
 	}
 
@@ -4200,7 +4171,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	sm.headerCache = newHeaderCache().
 		WithCheckpoints(config.ChainParams.Checkpoints).
 		WithPowLimit(model.PowLimitCeiling(config.ChainParams)).
-		WithHeaderRules(headerRules)
+		WithHeaderRules(headerRules).
+		WithMinimumChainWork(minimumChainWork(config.ChainParams))
 
 	// Tracks recently-failed block hashes so descendants of an unstored/rejected
 	// block are short-circuited rather than triggering a NOT_FOUND ERROR cascade

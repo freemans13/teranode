@@ -296,42 +296,52 @@ func TestCheckpointWalk_ExtendingFillContinuesImmediatelyWithoutWaitingTheInterv
 		"a successful extending fill short of the checkpoint must send its own next request immediately, not wait out the interval")
 }
 
-// Test 7: above the last checkpoint, a reply replaces from the tip exactly as
-// before, even when a stale, already-extended list still reaches above the
-// new tip — the chain can still reorg up there, and extending would keep a
-// branch this node may have left.
-func TestCheckpointWalk_PastTheLastCheckpointAlwaysReplaces(t *testing.T) {
+// Test 7: above the last checkpoint, where the chain can still reorg, a fork
+// from the committed tip is a branch of its own and the branch with the most
+// chain work is the one read, as SV Node's chain selection reads it. The
+// single-run cache this replaced threw the held run away on every reply from
+// the tip; with branches a reply from another peer cannot take the held run
+// away unless it carries more work.
+func TestCheckpointWalk_PastTheLastCheckpointTheMostWorkBranchIsRead(t *testing.T) {
 	tip0 := chainhash.Hash{0x41}
 	full, hashes := linkedRun(tip0, 20)
 
 	cache := newHeaderCache().WithCheckpoints([]chaincfg.Checkpoint{{Height: 2, Hash: &hashes[1]}})
 
-	require.True(t, cache.Fill(tip0, 1, full))
+	require.True(t, cache.FillFrom("a", tip0, 1, full).accepted)
 	require.Equal(t, int32(2), cache.ProvenTo(), "sanity: the first fill matched the only checkpoint")
+
+	// The tip has since advanced, honestly, along the SAME chain, to height 10
+	// (hashes[9]), past the only checkpoint. Another peer forks from it.
+	fork, forkHashes := forgedRun(hashes[9], 15)
+
+	require.True(t, cache.FillFrom("b", hashes[9], 11, fork[:5]).accepted, "a fork from the real tip is held as the sender's own branch")
 
 	top, ok := cache.Top()
 	require.True(t, ok)
-	require.Equal(t, int32(20), top, "sanity: the list already extends well above the tip below")
+	require.Equal(t, int32(20), top, "five headers carry less work than the ten held above the tip, so the held branch is still read")
 
-	// The tip has since advanced, honestly, along the SAME chain, to height 10
-	// (hashes[9]) — but height 10 is already past the only checkpoint, so
-	// nothing is ahead to walk toward any more.
-	next, _ := linkedRun(hashes[9], 5)
-
-	require.True(t, cache.Fill(hashes[9], 11, next),
-		"an above-checkpoint fill must still accept a batch anchored on the real tip")
-
-	newTop, ok := cache.Top()
+	got, ok := cache.At(11)
 	require.True(t, ok)
-	require.Equal(t, int32(15), newTop)
-	require.Equal(t, 5, cache.Len(), "a replace, not an extend: the old heights 1..20 must be gone")
+	require.Equal(t, hashes[10], got)
 
-	_, ok = cache.At(1)
-	require.False(t, ok, "the pre-checkpoint-crossing content must not survive a replace")
+	require.True(t, cache.FillFrom("b", hashes[9], 11, fork[5:]).accepted, "the fork's peer extends its own branch")
 
-	require.Zero(t, cache.ProvenTo(), "nothing is proven once there is no checkpoint left to walk toward")
+	top, ok = cache.Top()
+	require.True(t, ok)
+	require.Equal(t, int32(25), top, "fifteen headers above the tip outweigh ten: the fork is read now")
+	require.Equal(t, 15, cache.Len())
 
-	for _, h := range next {
+	got, ok = cache.At(11)
+	require.True(t, ok)
+	require.Equal(t, forkHashes[0], got)
+
+	_, ok = cache.At(10)
+	require.False(t, ok, "nothing at or below the committed tip is named")
+
+	require.Zero(t, cache.ProvenTo(), "the fork carries no checkpoint")
+
+	for _, h := range fork {
 		require.False(t, cache.Proven(h.BlockHash()))
 	}
 }

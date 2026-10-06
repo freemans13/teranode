@@ -20,18 +20,17 @@ import (
 // reachable (worth charging) but never committed (never reaches
 // submitParkCommit).
 //
-// Written directly into the cache's own maps rather than through Fill, which
+// Written directly into the cache's own index rather than through Fill, which
 // demands a batch that actually chains together: this needs one specific,
-// arbitrary hash to be found there, not a real header run.
+// arbitrary hash to be found there, not a real header run. No floor is set, so
+// height 0 counts as above it.
 func headerCacheParent(t *testing.T, sm *SyncManager, name string) chainhash.Hash {
 	t.Helper()
 
 	parent := chainhash.HashH([]byte(name))
 
 	sm.headerCache = newHeaderCache()
-	sm.headerCache.byHeight[0] = parent
-	sm.headerCache.byHash[parent] = 0
-	sm.headerCache.filled = true
+	sm.headerCache.index[parent] = &headerNode{hash: parent, height: 0}
 
 	return parent
 }

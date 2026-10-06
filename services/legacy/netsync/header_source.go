@@ -2,13 +2,11 @@ package netsync
 
 import (
 	"context"
-	"math/big"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
-	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	"github.com/bsv-blockchain/teranode/util"
 )
 
@@ -20,20 +18,6 @@ type cachedHeader struct {
 	header    *model.BlockHeader
 	height    int32
 	chainWork [32]byte
-}
-
-// childOf returns the cachedHeader for header built on parent: one higher, with
-// parent's chain work plus this header's own proof, which is SV Node's
-// GetBlockProof (block_index.cpp:105, 2^256 / (target+1)) as work.CalcBlockWork computes it
-// for the store.
-func childOf(parentHeight int32, parentWork []byte, header *model.BlockHeader, bits uint32) *cachedHeader {
-	sum := new(big.Int).SetBytes(parentWork)
-	sum.Add(sum, work.CalcBlockWork(bits))
-
-	child := &cachedHeader{header: header, height: parentHeight + 1}
-	sum.FillBytes(child.chainWork[:])
-
-	return child
 }
 
 // branchSource is the blockchain.HeaderSource the header rules judge a cached

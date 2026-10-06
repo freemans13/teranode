@@ -51,12 +51,15 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// for one made while the header lock is held.
 	best, _, _ := sm.committedTip()
 
-	// Below the last checkpoint a fill only ever appends (headerCache.Fill,
-	// extendLocked), so nothing else shrinks the list as the tip advances past
-	// what it already names. Pruned on every pass, not only after a fill,
-	// because most passes here are driven by a commit, not a headers reply —
-	// see headerCache.Prune for why height itself, not merely below it, is
-	// safe to drop.
+	// The header cache is told the committed height on every pass, not only
+	// after a fill, because most passes here are driven by a commit, not a
+	// headers reply: nothing at or below it is named from then on, a branch
+	// whose tip it has reached stops being a candidate, and the active branch is
+	// chosen again (headerCache.Prune). The check that a branch still connects
+	// to the tip's hash is made with the hash a fill reads, not here, because a
+	// branch that forked below the tip can only have been built by a fill.
+	// Dropping the tip's own height is safe because a parent at the tip resolves
+	// through pipelineParentHeight's blockchain fallback.
 	sm.headerCache.Prune(best)
 
 	wanted := sm.wantedBlocks(best)

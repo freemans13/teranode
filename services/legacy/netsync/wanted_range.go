@@ -32,9 +32,12 @@ type wantedBlock struct {
 // Below the last checkpoint the run also stops at the first height the cache
 // cannot PROVE (headerCache.Wantable): no block is requested from a run that
 // has not yet matched a pinned checkpoint hash, which is what the merge-base's
-// checkpoint-gated fetch did. The header walk itself is unaffected, because
-// maybeRequestMoreHeaders and continueCheckpointWalkIfNeeded read At and Top,
-// so the cache keeps filling toward the checkpoint while nothing is wantable.
+// checkpoint-gated fetch did. Above the last checkpoint it stops when the
+// active branch's chain work is below SV Node's nMinimumChainWork. The header
+// walk itself is unaffected, because maybeRequestMoreHeaders and
+// continueCheckpointWalkIfNeeded read Top, At and each peer's own branch tip
+// (PeerTop), so the cache keeps filling toward the checkpoint while nothing is
+// wantable.
 func (sm *SyncManager) wantedBlocksFromCache(best int32, depth int32) []wantedBlock {
 	if depth < 1 {
 		// A depth of zero asks for nothing for ever, which is a stall wearing a
