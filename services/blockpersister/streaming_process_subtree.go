@@ -203,12 +203,14 @@ func (u *Server) CreateSubtreeDataFileStreaming(ctx context.Context, subtreeHash
 		}
 
 		// Another writer (block validation's processSubtreeDataStream, or the asset service's
-		// on-demand GetSubtreeDataReader) published this subtreeData while this one streamed,
-		// and the file store's exclusive publish refused ours. Theirs is judged exactly as a
-		// file found before the write is: read back, kept and made permanent if it holds the
-		// subtree's transactions, removed if not. The two writers do not produce identical
-		// bytes for a block's first subtree (this service writes the coinbase at the
-		// placeholder slot, the others do not), which is why the read-back is not skipped.
+		// on-demand GetSubtreeDataReader) published this subtreeData after this service found
+		// none, and the store refused ours with ErrBlobAlreadyExists (on the file store, at
+		// its pre-write check, which a body that fits the writer's buffer meets at Close).
+		// Theirs is judged exactly as a file found before the write is: read back, kept and
+		// made permanent if it holds the subtree's transactions, removed if not. The two
+		// writers do not produce identical bytes for a block's first subtree (this service
+		// writes the coinbase at the placeholder slot, the others do not), which is why the
+		// read-back is not skipped.
 		u.logger.Infof("[BlockPersister] subtreeData for %s was published by another writer while this one streamed", subtreeHash.String())
 
 		// Nothing of ours is on disk under the name, so the deferred abort has nothing to discard.

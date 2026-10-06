@@ -1477,11 +1477,11 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 									subtreeDataBytes,
 									options.WithDeleteAt(dah),
 								); subtreeDataErr != nil && errors.Is(subtreeDataErr, errors.ErrBlobAlreadyExists) {
-									// The file store's publish is exclusive. Between the Exists check above
-									// and this Set a whole subtree_data fetch went by, and another writer of
-									// this key (processSubtreeDataStream for a sibling block, the block
-									// persister, the asset service's on-demand writer) published first. Their
-									// file holds this subtree's transactions, so it is read below like a file
+									// Between the Exists check above and this Set a whole subtree_data fetch
+									// went by, and another writer of this key (processSubtreeDataStream for a
+									// sibling block, the block persister, the asset service's on-demand
+									// writer) published first, so the store refused this Set. Their file
+									// holds this subtree's transactions, so it is read below like a file
 									// found at the Exists check; the per-transaction fallback is not taken.
 									u.logger.Infof("[validateSubtree][%s] subtree data from %s was published by another writer first; reading theirs", subtreeHash.String(), url)
 									subtreeDataExists = true

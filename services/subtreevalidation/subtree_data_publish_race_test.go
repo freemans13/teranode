@@ -21,6 +21,8 @@ import (
 // This test runs over the REAL file store (stores/blob/file) in a temporary directory,
 // decorated with one hook so a second writer publishes the key at the first read of the body,
 // which is after the store's pre-check and before its publish. Nothing about storage is faked.
+// This writer does not ask for the file store's exclusive publish, so both writers publish and
+// the later rename replaces the file, with the same bytes.
 
 type noopDeletionScheduler struct{}
 
@@ -53,11 +55,11 @@ func (r *competeOnFirstRead) Read(p []byte) (int, error) {
 	return r.ReadCloser.Read(p)
 }
 
-// TestProcessSubtreeDataStream_ALostPublishRaceKeepsTheOtherWritersFile: a sibling block
+// TestProcessSubtreeDataStream_ARacingWriterOfTheSameSubtreeIsNotAFailure: a sibling block
 // validating the same subtree publishes its subtreeData while this call is streaming. Every
-// transaction has been parsed from the stream and the file on disk is the same transactions,
-// so the call succeeds and the other writer's file stands.
-func TestProcessSubtreeDataStream_ALostPublishRaceKeepsTheOtherWritersFile(t *testing.T) {
+// transaction has been parsed from the stream and both writers wrote the same transactions,
+// so the call succeeds and the file holds them, whichever publish came last.
+func TestProcessSubtreeDataStream_ARacingWriterOfTheSameSubtreeIsNotAFailure(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
@@ -94,10 +96,10 @@ func TestProcessSubtreeDataStream_ALostPublishRaceKeepsTheOtherWritersFile(t *te
 
 	err = server.processSubtreeDataStream(context.Background(), subtree, io.NopCloser(bytes.NewReader(subtreeData)), &allTransactions, 100, nil)
 	require.NoError(t, competeErr, "the other writer's publish must succeed")
-	require.NoError(t, err, "losing the publish to a writer of the same bytes is not a failure")
+	require.NoError(t, err, "racing a writer of the same bytes is not a failure")
 	require.Len(t, allTransactions, 2, "every transaction was parsed from the stream")
 
 	got, err := plain.Get(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
 	require.NoError(t, err)
-	require.Equal(t, subtreeData, got, "the other writer's file stands")
+	require.Equal(t, subtreeData, got, "the file holds the subtree's transactions")
 }

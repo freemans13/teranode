@@ -204,7 +204,7 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 		if file, ok := w.pending[index]; ok {
 			delete(w.pending, index)
 
-			switch err = file.Commit(ctx, root[:], options.WithDeleteAt(w.deleteAt())); {
+			switch err = file.Commit(ctx, root[:], options.WithDeleteAt(w.deleteAt()), options.WithExclusivePublish()); {
 			case err == nil:
 				w.written = append(w.written, writtenSubtree{Hash: *root, FileType: fileformat.FileTypeSubtreeData})
 			case errors.Is(err, errors.ErrBlobAlreadyExists):
@@ -250,12 +250,13 @@ func writeBytes(payload []byte) func(io.Writer) error {
 // sharing an identical run of transactions, which produces the same subtree under
 // the same key. It is reported as not created, so DeleteAll leaves it to the
 // block that wrote it. Whether this call created the blob is decided by the
-// store's publish, which is exclusive (stores/blob/file/file.go renameTempFile
-// links the temp file to its name and fails if the name exists), not by the
-// existence check in NewFileStorer, which is only a shortcut. The store can
-// refuse the key at three moments, and each is a not-created answer.
+// store's publish, which this writer asks to be exclusive (options.WithExclusivePublish:
+// the file store links the temp file to its name and fails if the name exists,
+// stores/blob/file/file.go renameTempFile), not by the existence check in
+// NewFileStorer, which is only a shortcut. The store can refuse the key at three
+// moments, and each is a not-created answer.
 func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType fileformat.FileType, write func(io.Writer) error) (bool, error) {
-	storer, err := filestorer.NewFileStorer(ctx, w.logger, w.settings, w.store, root[:], fileType, options.WithDeleteAt(w.deleteAt()))
+	storer, err := filestorer.NewFileStorer(ctx, w.logger, w.settings, w.store, root[:], fileType, options.WithDeleteAt(w.deleteAt()), options.WithExclusivePublish())
 	if err != nil {
 		// The key was taken before this call started.
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
@@ -280,8 +281,8 @@ func (w *subtreeWriter) put(ctx context.Context, root chainhash.Hash, fileType f
 
 	if err = storer.Close(ctx); err != nil {
 		// Another writer published the same key after the pre-check, while this body was
-		// streaming. The store's publish is exclusive, so exactly one of the two is told it
-		// created the blob; this one was not, and the file is the other's to remove.
+		// streaming. This writer's publish is exclusive, so exactly one of the two is told
+		// it created the blob; this one was not, and the file is the other's to remove.
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
 			return false, nil
 		}

@@ -328,9 +328,10 @@ func (repo *Repository) dualStreamWithFileCreation(ctx context.Context, subtreeH
 		// Close the file storer successfully
 		if closeErr := storer.Close(gCtx); closeErr != nil {
 			// Another writer (block validation's processSubtreeDataStream or the block
-			// persister's CreateSubtreeDataFileStreaming) published this subtreeData while
-			// this one streamed, and the file store's exclusive publish refused ours at the
-			// end of the body. Every byte had gone to both destinations by then, so the
+			// persister's CreateSubtreeDataFileStreaming) published this subtreeData first,
+			// and the store refused ours with ErrBlobAlreadyExists. On the file store that is
+			// its pre-write check, which a body that fits the file storer's buffer meets only
+			// here, at Close. Every byte had gone to both destinations by then, so the
 			// requesting peer has the complete body: this request succeeded, and the store
 			// holds the other writer's file. A mid-write refusal is handled above instead,
 			// because there the peer's body is short.

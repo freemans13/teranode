@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sync/atomic"
@@ -23,20 +22,20 @@ import (
 )
 
 // Set is the whole-value write getSubtreeMissingTxs uses. (*blobfile.File).Set calls the
-// embedded File's SetFromReader, not the decorator's, so the hook has to be attached here:
-// the competitor publishes at the first read of the body, after the store's pre-check and
-// before its publish, exactly as the SetFromReader decorator in
-// subtree_data_publish_race_test.go does.
+// embedded File's SetFromReader, not the decorator's, so the hook has to be attached here.
+// The competitor publishes first, after the caller's Exists check and before the store's
+// pre-write check, which then refuses this write: the refusal a caller of the file store
+// gets without options.WithExclusivePublish.
 func (s *publishRaceStore) Set(ctx context.Context, key []byte, fileType fileformat.FileType, value []byte, opts ...options.FileOption) error {
-	body := &competeOnFirstRead{ReadCloser: io.NopCloser(bytes.NewReader(value)), hook: func() { s.compete(key, fileType) }}
+	s.compete(key, fileType)
 
-	return s.File.SetFromReader(ctx, key, fileType, body, opts...)
+	return s.File.Set(ctx, key, fileType, value, opts...)
 }
 
 // TestGetSubtreeMissingTxs_ALostPublishRaceReadsTheOtherWritersFile: the subtreeData file
 // is absent at the Exists check, the whole file is fetched from the peer, and while this
-// call stores it another writer publishes the same key. The file store refuses the second
-// publish with ErrBlobAlreadyExists. The file on disk holds the subtree's transactions, so
+// call stores it another writer publishes the same key. The file store refuses this Set at
+// its pre-write check with ErrBlobAlreadyExists. The file on disk holds the subtree's transactions, so
 // the missing transactions are read from it and not fetched one by one over HTTP.
 func TestGetSubtreeMissingTxs_ALostPublishRaceReadsTheOtherWritersFile(t *testing.T) {
 	txMetaStore, validatorClient, _, _, blockchainClient, deferFunc := setup(t)

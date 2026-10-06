@@ -15,14 +15,17 @@ import (
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
-// A no-overwrite publish is exclusive: of two writers of one name, exactly one is told it
-// created the blob. The tests here drive the REAL file store in a temporary directory; nothing
-// is faked. They are the detectors for the publish mechanism in renameTempFile, which the
-// subtree writer's "records only files it created" rule rests on.
+// With options.WithExclusivePublish a no-overwrite publish is exclusive: of two writers of one
+// name, exactly one is told it created the blob. Without it the store behaves as it always
+// has: the later of two writers past the pre-check replaces the earlier. The tests here drive
+// the REAL file store in a temporary directory; nothing is faked. They are the detectors for
+// the publish mechanism in renameTempFile, which the subtree writer's "records only files it
+// created" rule rests on, and for the option leaving every other writer alone.
 
 func exclusiveStore(t *testing.T) (*File, string) {
 	t.Helper()
@@ -106,8 +109,12 @@ func TestSetFromReader_TwoWritersPastThePreCheckPublishExactlyOne(t *testing.T) 
 	resultA := make(chan error, 1)
 	resultB := make(chan error, 1)
 
-	go func() { resultA <- f.SetFromReader(ctx, key, fileformat.FileTypeTesting, readerA) }()
-	go func() { resultB <- f.SetFromReader(ctx, key, fileformat.FileTypeTesting, readerB) }()
+	go func() {
+		resultA <- f.SetFromReader(ctx, key, fileformat.FileTypeTesting, readerA, options.WithExclusivePublish())
+	}()
+	go func() {
+		resultB <- f.SetFromReader(ctx, key, fileformat.FileTypeTesting, readerB, options.WithExclusivePublish())
+	}()
 
 	<-readerA.started
 	<-readerB.started
@@ -160,13 +167,13 @@ func TestRenameTempFile_SecondNoOverwritePublishOfOneNameIsRefused(t *testing.T)
 	tmpA := writeTemp("A")
 	tmpB := writeTemp("B")
 
-	require.NoError(t, f.renameTempFile(tmpA, final, false))
+	require.NoError(t, f.renameTempFile(tmpA, final, false, true))
 	require.Equal(t, uint64(1), nlink(t, final), "the temporary name was unlinked after the publish")
 
 	_, err = os.Stat(tmpA)
 	require.True(t, os.IsNotExist(err), "the first temp name is gone")
 
-	err = f.renameTempFile(tmpB, final, false)
+	err = f.renameTempFile(tmpB, final, false, true)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrBlobAlreadyExists), "got %v", err)
 
@@ -176,4 +183,76 @@ func TestRenameTempFile_SecondNoOverwritePublishOfOneNameIsRefused(t *testing.T)
 
 	_, err = os.Stat(tmpB)
 	require.NoError(t, err, "the refused temp file is its caller's to remove")
+}
+
+// TestSetFromReader_WithoutExclusivePublishTheLaterWriterWins pins that the option is the only
+// way in: a plain no-overwrite write keeps the store's behaviour from before the exclusive
+// publish existed. Both writers are past the pre-check, both are told they wrote the blob, the
+// later publish's bytes stand under one name, and no temporary file is left.
+func TestSetFromReader_WithoutExclusivePublishTheLaterWriterWins(t *testing.T) {
+	ctx := context.Background()
+	f, dir := exclusiveStore(t)
+
+	key := []byte("two-writers-no-option")
+	bodyA := bytes.Repeat([]byte("A"), 4096)
+	bodyB := bytes.Repeat([]byte("B"), 4096)
+
+	readerA := newGatedReader(bodyA)
+	readerB := newGatedReader(bodyB)
+
+	resultA := make(chan error, 1)
+	resultB := make(chan error, 1)
+
+	go func() { resultA <- f.SetFromReader(ctx, key, fileformat.FileTypeTesting, readerA) }()
+	go func() { resultB <- f.SetFromReader(ctx, key, fileformat.FileTypeTesting, readerB) }()
+
+	<-readerA.started
+	<-readerB.started
+
+	close(readerA.release)
+	require.NoError(t, <-resultA)
+
+	close(readerB.release)
+	require.NoError(t, <-resultB, "without the option a writer past the pre-check replaces the blob, as before")
+
+	got, err := f.Get(ctx, key, fileformat.FileTypeTesting)
+	require.NoError(t, err)
+	require.Equal(t, bodyB, got, "the later publish's bytes stand")
+
+	for _, path := range filesUnder(t, dir) {
+		require.False(t, strings.HasSuffix(path, ".tmp"), "no temporary file may be left behind: %s", path)
+	}
+
+	filename, err := f.options.ConstructFilename(dir, key, fileformat.FileTypeTesting)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), nlink(t, filename), "the blob has one name")
+}
+
+// Without the option the publish helper renames, so a second publish of one name replaces the
+// first and consumes its temporary name, exactly as before the exclusive publish existed.
+func TestRenameTempFile_WithoutExclusivePublishASecondPublishReplaces(t *testing.T) {
+	f, dir := exclusiveStore(t)
+
+	final, err := f.options.ConstructFilename(dir, []byte("one-name-rename"), fileformat.FileTypeTesting)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(final), 0755))
+
+	for _, body := range []string{"A", "B"} {
+		file, tmp, err := f.createTempSibling(final, 0644)
+		require.NoError(t, err)
+
+		_, err = io.WriteString(file, body)
+		require.NoError(t, err)
+		require.NoError(t, f.syncAndCloseTempFile(file, tmp))
+
+		require.NoError(t, f.renameTempFile(tmp, final, false, false))
+
+		_, err = os.Stat(tmp)
+		require.True(t, os.IsNotExist(err), "the rename consumed the temporary name")
+	}
+
+	got, err := os.ReadFile(final)
+	require.NoError(t, err)
+	require.Equal(t, "B", string(got), "the second publish replaced the first")
+	require.Equal(t, uint64(1), nlink(t, final))
 }

@@ -17,8 +17,10 @@ import (
 )
 
 // This test runs over the REAL file store (stores/blob/file) in a temporary directory,
-// decorated with one hook so a second writer publishes the key at the first read of the body,
-// which is after the store's pre-check and before its publish. Nothing about storage is faked.
+// decorated with one hook so a second writer publishes the key as this writer's SetFromReader
+// starts: after the caller's own existence check and before the store's pre-write check.
+// Nothing about storage is faked. This writer does not ask for the file store's exclusive
+// publish, so the pre-write check is where the store refuses it.
 
 // cancellingScheduler records which file types had their deletion cancelled, which is what a
 // SetDAH to zero does on the file store.
@@ -45,24 +47,18 @@ type publishRaceStore struct {
 	compete func(key []byte, fileType fileformat.FileType)
 }
 
+// SetFromReader lets the competitor publish first, then writes. The store's pre-write check
+// then finds the competitor's file and refuses this write, which is the refusal a caller of
+// the file store gets without options.WithExclusivePublish.
 func (s *publishRaceStore) SetFromReader(ctx context.Context, key []byte, fileType fileformat.FileType, reader io.ReadCloser, opts ...options.FileOption) error {
-	return s.File.SetFromReader(ctx, key, fileType, &competeOnFirstRead{ReadCloser: reader, hook: func() { s.compete(key, fileType) }}, opts...)
-}
+	s.compete(key, fileType)
 
-type competeOnFirstRead struct {
-	io.ReadCloser
-	hook func()
-	once sync.Once
-}
-
-func (r *competeOnFirstRead) Read(p []byte) (int, error) {
-	r.once.Do(r.hook)
-
-	return r.ReadCloser.Read(p)
+	return s.File.SetFromReader(ctx, key, fileType, reader, opts...)
 }
 
 // TestCreateSubtreeDataFileStreaming_ALostPublishRaceIsJudgedLikeAFileFoundFirst: block
-// validation publishes the subtreeData while the persister is streaming the same subtree. The
+// validation publishes the subtreeData after the persister found no file and before the store's
+// pre-write check, so the store refuses the persister's write and Close reports it. The
 // persister treats the other writer's file as it treats one found before the write: read back,
 // kept and made permanent (data and structure file both) when it holds the subtree's
 // transactions, removed when it does not, with an error that makes the block retry rather

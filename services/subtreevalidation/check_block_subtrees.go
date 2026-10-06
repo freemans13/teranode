@@ -1136,14 +1136,16 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 
 	// Check for errors from both operations
 	if storeErr != nil {
-		// ErrBlobAlreadyExists at the publish is benign HERE, as it is for the subtreeToCheck
-		// write above. The file store's publish is exclusive and refuses only a complete body
-		// at its end, so when a sibling block validating the same subtree published first,
-		// this writer's whole body has streamed through the tee and every transaction is
-		// parsed, which is what this call is for; the file on disk is another writer's
-		// complete subtreeData for the same root hash. Only the parse and count checks below
-		// still decide the call. (When the key was taken before this write began, the store
-		// refuses before reading, the tee fails, and parseErr fails the call as before.)
+		// ErrBlobAlreadyExists is benign HERE, as it is for the subtreeToCheck write above,
+		// when the store refused at the end of the body: a store with an exclusive publish
+		// (options.WithExclusivePublish on the file store, which this writer does not pass)
+		// refuses only a complete body there, so this writer's whole body has streamed through
+		// the tee and every transaction is parsed, which is what this call is for, and the
+		// file on disk is another writer's complete subtreeData for the same root hash. Only
+		// the parse and count checks below still decide the call. When the key was taken
+		// before this write began, the store refuses before reading, the tee fails, and
+		// parseErr fails the call as before. On the file store without that option a writer
+		// that races past the pre-write check publishes by rename and replaces the file.
 		if errors.Is(storeErr, errors.ErrBlobAlreadyExists) {
 			u.logger.Warnf("[processSubtreeDataStream][%s] subtreeData was published by another writer while this one streamed; keeping theirs", subtree.RootHash().String())
 		} else {
