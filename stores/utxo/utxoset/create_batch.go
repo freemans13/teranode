@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"runtime/debug"
 	"sort"
 	"time"
 
@@ -351,7 +352,9 @@ type createPlan struct {
 	// checkpoint, which is what sends it to createMinedPlanSQL instead of createIdentPlanSQL.
 	// The three fields below carry the block for every transaction that carries one, whichever
 	// claim it takes, and are 0 for a create with no block.
-	minedRows   []bool
+	minedRows []bool
+	// seedRows is true for a seed's create, which seedingCreate sends to createSeedPlanSQL.
+	seedRows    []bool
 	minedHeight []int32
 	blockID     []int32
 	subtreeIdx  []int32
@@ -403,9 +406,9 @@ func (s *Store) planCreates(items []*createItem) *createPlan {
 			continue
 		}
 
-		txHash := it.tx.TxIDChainHash()
+		txHash := createTxID(it.tx, it.options)
 
-		if _, dup := seen[*txHash]; dup {
+		if _, dup := seen[txHash]; dup {
 			p.errs[i] = errors.NewTxExistsError("[utxoset][Create] %s", txHash.String())
 			continue
 		}
@@ -416,7 +419,7 @@ func (s *Store) planCreates(items []*createItem) *createPlan {
 			continue
 		}
 
-		seen[*txHash] = struct{}{}
+		seen[txHash] = struct{}{}
 		p.perItem[i] = data
 	}
 
@@ -454,12 +457,14 @@ func (p *createPlan) sortRows() {
 	p.heights = permute(p.heights, order)
 	p.offChain = permute(p.offChain, order)
 	p.sizes = permute(p.sizes, order)
+	p.fees = permute(p.fees, order)
 	p.inpoints = permute(p.inpoints, order)
 	p.locktimes = permute(p.locktimes, order)
 	p.createdAt = permute(p.createdAt, order)
 	p.txFlags = permute(p.txFlags, order)
 	p.bodies = permute(p.bodies, order)
 	p.minedRows = permute(p.minedRows, order)
+	p.seedRows = permute(p.seedRows, order)
 	p.minedHeight = permute(p.minedHeight, order)
 	p.blockID = permute(p.blockID, order)
 	p.subtreeIdx = permute(p.subtreeIdx, order)
@@ -503,6 +508,7 @@ func (p *createPlan) subset(idx []int) *createPlan {
 		q.txFlags = append(q.txFlags, p.txFlags[i])
 		q.bodies = append(q.bodies, p.bodies[i])
 		q.minedRows = append(q.minedRows, p.minedRows[i])
+		q.seedRows = append(q.seedRows, p.seedRows[i])
 		q.minedHeight = append(q.minedHeight, p.minedHeight[i])
 		q.blockID = append(q.blockID, p.blockID[i])
 		q.subtreeIdx = append(q.subtreeIdx, p.subtreeIdx[i])
@@ -548,13 +554,22 @@ func (s *Store) runCreatePlan(ctx context.Context, q querier, p *createPlan) err
 		return nil
 	}
 
-	var identIdx, minedIdx []int
+	var identIdx, minedIdx, seedIdx []int
 
 	for i, m := range p.minedRows {
-		if m {
+		switch {
+		case p.seedRows[i]:
+			seedIdx = append(seedIdx, i)
+		case m:
 			minedIdx = append(minedIdx, i)
-		} else {
+		default:
 			identIdx = append(identIdx, i)
+		}
+	}
+
+	if len(seedIdx) > 0 {
+		if err := s.runSeedPlan(ctx, q, p.subset(seedIdx)); err != nil {
+			return err
 		}
 	}
 
@@ -571,6 +586,53 @@ func (s *Store) runCreatePlan(ctx context.Context, q querier, p *createPlan) err
 	}
 
 	return nil
+}
+
+// createSeedPlanSQL is the seeding route: the coins of each transaction, with their block height
+// and block id already set, and nothing else. No containment row, no identity row, no body: a
+// seeded transaction is answered from its coins, as any transaction whose window has retired is.
+//
+// The claim is that the transaction has no coin yet, the own-output probe the other two
+// statements also carry, with the same fence. A snapshot holds every transaction once and only
+// with unspent outputs, so a coin already present means a re-run of the seed, which the seeder
+// takes as ErrTxExists and skips. lockTxids serialises two creates of one transaction, as it
+// does for the other routes.
+const createSeedPlanSQL = `
+WITH t AS (
+    SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::uuid[], $5::uuid[])
+        AS t(k, leaf, txid, lo, hi)
+),
+claim AS (
+    SELECT t.k, t.leaf, t.txid
+      FROM t
+     WHERE NOT EXISTS (SELECT 1 FROM utxo u
+                        WHERE u.leaf = t.leaf AND u.ukey >= t.lo AND u.ukey <= t.hi AND u.txid = t.txid
+                        ORDER BY u.ukey LIMIT 1 OFFSET 0)
+),
+UTXOs AS (
+    INSERT INTO utxo (satoshis, created_height, spendable_from, mined_height, block_id,
+                      leaf, flags, ukey, txid, script)
+    SELECT o.satoshis, o.created_height, o.spendable_from, o.mined_height, o.block_id,
+           o.leaf, o.flags, o.ukey, o.txid, o.script
+      FROM unnest($6::bigint[], $7::int[], $8::int[], $9::int[], $10::int[], $11::smallint[],
+                  $12::smallint[], $13::uuid[], $14::bytea[], $15::bytea[])
+        AS o(satoshis, created_height, spendable_from, mined_height, block_id, leaf, flags,
+             ukey, txid, script)
+      JOIN claim c ON c.leaf = o.leaf AND c.txid = o.txid
+)
+SELECT c.k FROM claim c`
+
+// runSeedPlan writes a seed's creates through createSeedPlanSQL.
+func (s *Store) runSeedPlan(ctx context.Context, q querier, p *createPlan) error {
+	rows, err := q.Query(ctx, createSeedPlanSQL,
+		p.idx, p.leaves, p.txids, p.lo, p.hi,
+		p.utxoSats, p.utxoHeights, p.utxoSpendable, p.utxoMined, p.utxoBlockIDs, p.utxoLeaves,
+		p.utxoFlags, p.utxoUkeys, p.utxoTxids, p.utxoScripts)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][Create] seed", err)
+	}
+
+	return p.settle(rows)
 }
 
 // runIdentPlan claims the identity half of a plan on the identity table.
@@ -736,7 +798,9 @@ func (p *createPlan) settle(rows pgx.Rows) error {
 
 		item := p.owner[k]
 		p.perItem[item] = nil
-		p.errs[item] = errors.NewTxExistsError("[utxoset][Create] %s", p.txs[k].TxIDChainHash().String())
+		var h chainhash.Hash
+		copy(h[:], p.txids[k])
+		p.errs[item] = errors.NewTxExistsError("[utxoset][Create] %s", h.String())
 	}
 
 	return nil
@@ -820,6 +884,25 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 	s.createInFlight.Add(1)
 	defer s.createInFlight.Done()
 
+	// A panic in here would be caught by the batcher and logged, and every caller in the batch
+	// would wait forever on a channel nobody writes to, as the spend-and-create batcher once
+	// did. They get an error instead. Each channel holds one answer, so a send that would block
+	// means the caller already has its answer.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Errorf("[utxoset][Create] batch of %d panicked: %v\n%s", len(batch), r, debug.Stack())
+
+			err := errors.NewStorageError("[utxoset][Create] batch panicked: %v", r)
+
+			for _, item := range batch {
+				select {
+				case item.done <- createResult{err: err}:
+				default:
+				}
+			}
+		}
+	}()
+
 	ctx := context.Background()
 
 	// Planned outside any connection: this is processor work, and holding one while doing it
@@ -832,7 +915,11 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 	// limit. A batch can span windows, so every distinct one is prepared.
 	seen := make(map[int32]struct{}, 4)
 
-	for _, h := range plan.heights {
+	for i, h := range plan.heights {
+		if plan.seedRows[i] {
+			continue
+		}
+
 		win := h / TxBodyPartitionBlocks
 		if _, dup := seen[win]; dup {
 			continue
@@ -851,7 +938,7 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 	minedSeen := make(map[int32]struct{}, 4)
 
 	for i, h := range plan.minedHeight {
-		if h == 0 {
+		if h == 0 || plan.seedRows[i] {
 			continue
 		}
 

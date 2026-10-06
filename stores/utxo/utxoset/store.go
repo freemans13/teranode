@@ -40,6 +40,10 @@ type Store struct {
 	settings *settings.Settings
 	pool     *pgxpool.Pool
 
+	// seeding is set by seeding=true on the store URL, for a seed from a UTXO snapshot only.
+	// See seedingCreate.
+	seeding bool
+
 	// utxo.BlockStateFields supplies the chain-tip pair — block height and median
 	// block time — and the six Store methods that read and write it, over a single
 	// atomic snapshot. Embedding the shared implementation rather than carrying two
@@ -216,6 +220,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		dsn.Scheme = "postgres"
 	}
 
+	// seeding is this store's own argument, not the driver's: left on the URL, the driver would
+	// send it to the server as a runtime parameter, which the server refuses.
+	q := dsn.Query()
+	seeding := q.Get("seeding") == "true"
+	q.Del("seeding")
+	dsn.RawQuery = q.Encode()
+
 	cfg, err := pgxpool.ParseConfig(dsn.String())
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset] parse dsn", err)
@@ -283,7 +294,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
 		journalRetention: DefaultSpendJournalRetentionBlocks,
 		bodyRetention:    DefaultTxBodyRetentionBlocks,
-		utxoIndexDecider: utxoIndexNeedsRebuild}
+		utxoIndexDecider: utxoIndexNeedsRebuild,
+		seeding:          seeding}
+
+	if seeding {
+		logger.Warnf("[utxoset] seeding mode is on (seeding=true on the store URL): seeded creates write coins only, with their block height and no containment or identity row. Use it only for a seed from a UTXO snapshot, never for a running node")
+	}
 
 	// The SAME checkpoint list the outpoint-only spend gate tests against
 	// (model.OutpointOnlyEligible -> model.BelowCheckpoint), so the heights at which this store

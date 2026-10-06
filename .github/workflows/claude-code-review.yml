@@ -41,11 +41,12 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
 
     env:
-      # Strip Anthropic, cloud and Actions secrets from the environment of commands Claude runs.
-      # GH_TOKEN and GITHUB_TOKEN are kept, so gh still works. The action only enables this when
-      # allowed_non_write_users is set, and setting that would relax its write-access actor check,
-      # so it is set here instead. This is the env scrub only: the PID-namespace isolation the
-      # action pairs it with needs bubblewrap, which it installs only for allowed_non_write_users.
+      # Strip Anthropic, cloud and Actions secrets from the environment of commands Claude runs,
+      # and run those commands in their own PID namespace. GH_TOKEN and GITHUB_TOKEN are kept, so
+      # gh still works. The action only enables this when allowed_non_write_users is set, and
+      # setting that would relax its write-access actor check, so it is set here instead. On Linux
+      # Claude Code refuses to start with this set unless bubblewrap is installed: see "Install
+      # subprocess isolation dependencies".
       CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
 
     steps:
@@ -152,6 +153,37 @@ jobs:
       - name: Ensure change set directory exists
         if: ${{ !cancelled() && steps.pr.outputs.is_draft == 'false' }}
         run: mkdir -p "$RUNNER_TEMP/ccr"
+
+      # Mirrors the action's own step of the same name, which it runs only for
+      # allowed_non_write_users. Without bubblewrap, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB makes Claude
+      # Code exit at startup. No continue-on-error: the review step cannot run without it.
+      # The action's two other allowed_non_write_users steps are left out on purpose. "Pin bun
+      # binary for post-steps" copies bun into $GITHUB_ACTION_PATH, which exists only inside the
+      # action. "Prepend system bin dirs to PATH" undoes PATH changes made during the run, and
+      # this review has no Write/Edit tools and no git file-write path to make any.
+      - name: Install subprocess isolation dependencies
+        if: steps.pr.outputs.is_draft == 'false'
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends bubblewrap socat; then
+              break
+            fi
+            if [ "$i" = 3 ]; then
+              echo "::error::Could not install bubblewrap"
+              exit 1
+            fi
+            echo "apt-get attempt $i failed, retrying..."
+            sleep 5
+          done
+          # Ubuntu 24.04+ restricts unprivileged user namespaces via AppArmor, which bubblewrap
+          # needs. The sysctl doesn't exist on older kernels.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          # Prove bubblewrap can create a PID namespace here, so a blocked user namespace fails
+          # this step rather than the review after it has started.
+          bwrap --ro-bind / / --dev /dev --unshare-pid true
 
       - name: Run Claude Code Review
         if: steps.pr.outputs.is_draft == 'false'

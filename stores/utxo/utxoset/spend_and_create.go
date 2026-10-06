@@ -110,7 +110,7 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 
 	notedHeight := s.GetBlockHeight()
 
-	if !options.SpendOnly {
+	if !options.SpendOnly && !s.seedingCreate(options) {
 		if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 			return nil, nil, err
 		}

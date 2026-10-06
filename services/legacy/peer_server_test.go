@@ -689,6 +689,14 @@ func TestShouldDisconnectOnBlockErr_CorruptDoesNotDisconnect(t *testing.T) {
 
 	// Genuine consensus failure — must disconnect (rotate the peer).
 	require.True(t, shouldDisconnectOnBlockErr(errors.NewBlockInvalidError("invalid")))
+	// The two shapes a catch-up block gets back from block validation's batch path,
+	// each wrapped twice as block validation and netsync's ProcessBlock wrap them:
+	// a consensus failure over an invalid transaction disconnects, a parent read
+	// that failed on the store does not.
+	require.True(t, shouldDisconnectOnBlockErr(errors.NewProcessingError("failed to process block",
+		errors.NewBlockInvalidError("block invalid", errors.NewTxInvalidError("spends output 7 of a parent that has 1")))))
+	require.False(t, shouldDisconnectOnBlockErr(errors.NewProcessingError("failed to process block",
+		errors.NewProcessingError("failed to read parent output", errors.NewStorageError("aerospike timeout")))))
 	// Transient local infra — must NOT disconnect (existing behaviour, guarded here too).
 	require.False(t, shouldDisconnectOnBlockErr(errors.NewServiceError("service down")))
 	require.False(t, shouldDisconnectOnBlockErr(nil))

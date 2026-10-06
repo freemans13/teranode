@@ -53,7 +53,9 @@ func TestValidate_ResubmissionIsRecognisedByItsOwnTxid(t *testing.T) {
 		validator, err := New(context.Background(), ulogger.TestLogger{}, settings, mockStore, nil, nil, nil, nil, nil)
 		require.NoError(t, err)
 
-		mockStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(&meta.Data{Tx: parent, BlockHeights: []uint32{}}, nil)
+		mockStore.On("ParentOutputsForValidation", mock.Anything, mock.Anything).Return([]utxo.ParentOutput{{
+			Status: utxo.ParentOutputNotMined, Satoshis: parent.Outputs[0].Satoshis, LockingScript: parent.Outputs[0].LockingScript,
+		}}, nil)
 		mockStore.On("GetBlockState").Return(utxo.BlockState{Height: 100, MedianTime: 1000000000})
 		mockStore.On("SpendAndCreate", mock.Anything, tx, mock.Anything, mock.Anything).
 			Return(nil, spends, errors.NewUtxoError("spend failed"))

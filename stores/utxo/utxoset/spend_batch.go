@@ -25,6 +25,10 @@ type spendItem struct {
 	tx          *bt.Tx
 	blockHeight uint32
 	ignoreFlags utxo.IgnoreFlags
+	// skip[vin] leaves input vin out of the statement while still giving it a record. Only
+	// SpendAndCreateMulti sets it, for an input whose parent is created by the same list and
+	// whose spend it writes itself. nil spends every input.
+	skip []bool
 }
 
 // spendPlan is the argument set for one call of the spend statement, however many
@@ -123,6 +127,18 @@ func planSpends(items []*spendItem) *spendPlan {
 		for vin, in := range it.tx.Inputs {
 			parent := in.PreviousTxIDChainHash()
 
+			spenders[vin] = spendpkg.SpendingData{TxID: spendingTxID, Vin: vin}
+			records[vin] = utxo.Spend{
+				TxID:         parent,
+				Vout:         in.PreviousTxOutIndex,
+				SpendingData: &spenders[vin],
+			}
+			spends[vin] = &records[vin]
+
+			if it.skip != nil && it.skip[vin] {
+				continue
+			}
+
 			p.leaves = append(p.leaves, LeafFor(parent[:]))
 			p.ukeys = append(p.ukeys, Pack(parent[:], in.PreviousTxOutIndex))
 			p.txids = append(p.txids, parent[:])
@@ -142,14 +158,8 @@ func planSpends(items []*spendItem) *spendPlan {
 			//
 			// The UTXO hash is deliberately left unset. Computing it is a double hash per
 			// input, which is a real cost on this path, and nothing that reads these records
-			// uses it: this store's Unspend restores on the outpoint and the spender.
-			spenders[vin] = spendpkg.SpendingData{TxID: spendingTxID, Vin: vin}
-			records[vin] = utxo.Spend{
-				TxID:         parent,
-				Vout:         in.PreviousTxOutIndex,
-				SpendingData: &spenders[vin],
-			}
-			spends[vin] = &records[vin]
+			// uses it: this store's Unspend restores on the outpoint and the spender. The
+			// record is built above, before the skip test, so a skipped input has one too.
 		}
 
 		p.perItem[i] = spends

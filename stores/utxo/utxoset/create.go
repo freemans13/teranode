@@ -153,13 +153,15 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// Both windows BEFORE the transaction is opened, never inside it: the DDL needs its own
 	// pool connection, and taking one while holding a transaction from the same pool
 	// deadlocks the pool under concurrency, with no timeout.
-	if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
-		return nil, err
-	}
-
-	if mi, mined := minedBlock(options.MinedBlockInfos); mined {
-		if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+	if !s.seedingCreate(options) {
+		if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 			return nil, err
+		}
+
+		if mi, mined := minedBlock(options.MinedBlockInfos); mined {
+			if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -225,9 +227,17 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		options = &utxo.CreateOptions{}
 	}
 
-	txHash := tx.TxIDChainHash()
+	txHash := createTxID(tx, options)
 	leaf := LeafFor(txHash[:])
+	rebuilt := isRebuilt(tx)
+
+	// "Coinbase" is the caller's to say when it says it. The seeder rebuilds a coinbase from its
+	// unspent outputs alone, with no input to recognise it by, and passes WithSetCoinbase; read
+	// from the shape alone it would lose its coinbase flag and its maturity.
 	isCoinbase := tx.IsCoinbase()
+	if options.IsCoinbase != nil {
+		isCoinbase = *options.IsCoinbase
+	}
 
 	// Coinbase maturity and the ReAssignUTXO delay fold into one precomputed height, so the
 	// spend hot path never branches on "is this a coinbase".
@@ -307,7 +317,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		minedHeight = int32(mi.BlockHeight) //nolint:gosec // a height fits int32 for any reachable chain
 		blockID = int32(mi.BlockID)         //nolint:gosec // a block id fits int32
 		subtreeIdx = int32(mi.SubtreeIdx)   //nolint:gosec // a subtree index fits int32
-		atBirth = model.BelowCheckpoint(s.checkpoints, mi.BlockHeight)
+		atBirth = model.BelowCheckpoint(s.checkpoints, mi.BlockHeight) || s.seedingCreate(options)
 	}
 
 	// What the UTXOs carry from birth: the block's pair when the store lets the create write
@@ -339,8 +349,13 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	// transaction a block places below the checkpoint has its bytes in a subtree data file; a
 	// mempool arrival carries no mined height at all and keeps its body whatever the setting
 	// says, which is why `mined` has to hold before the boundary is even consulted.
+	//
+	// A transaction the caller filed under its own ID is kept only if it really hashes to that
+	// ID. The seeder's rebuilt transactions do not: their spent outputs are missing, so their
+	// bytes are not the transaction's, and storing them would hand any later reader a body
+	// that does not match the ID it was asked for.
 	var body []byte
-	if !mined || !model.BelowCheckpoint(s.bodyCheckpoints, mi.BlockHeight) {
+	if (!mined || !model.BelowCheckpoint(s.bodyCheckpoints, mi.BlockHeight)) && faithful(tx, options, txHash) {
 		body = tx.Bytes()
 	}
 
@@ -354,14 +369,19 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.txids = append(p.txids, txHash[:])
 	p.heights = append(p.heights, int32(blockHeight))
 	p.offChain = append(p.offChain, offChainSinceAt(options.MinedBlockInfos, blockHeight))
-	p.sizes = append(p.sizes, int32(tx.Size()))
-	p.fees = append(p.fees, txFee(tx))
+	p.sizes = append(p.sizes, int32(txSize(tx))) //nolint:gosec // a transaction's size fits int32
+	if rebuilt {
+		p.fees = append(p.fees, nil)
+	} else {
+		p.fees = append(p.fees, txFee(tx))
+	}
 	p.inpoints = append(p.inpoints, inpoints)
 	p.locktimes = append(p.locktimes, int32(tx.LockTime))
 	p.createdAt = append(p.createdAt, time.Now().UnixMilli())
 	p.txFlags = append(p.txFlags, flags)
 	p.bodies = append(p.bodies, body)
 	p.minedRows = append(p.minedRows, atBirth)
+	p.seedRows = append(p.seedRows, s.seedingCreate(options))
 	p.minedHeight = append(p.minedHeight, minedHeight)
 	p.blockID = append(p.blockID, blockID)
 	p.subtreeIdx = append(p.subtreeIdx, subtreeIdx)
@@ -395,14 +415,14 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	}
 
 	var fee uint64
-	if f := txFee(tx); f != nil {
+	if f := p.fees[len(p.fees)-1]; f != nil {
 		fee = uint64(*f) //nolint:gosec // txFee never returns a negative fee
 	}
 
 	return &meta.Data{
 		Tx:          tx,
 		Fee:         fee,
-		SizeInBytes: uint64(tx.Size()),
+		SizeInBytes: uint64(txSize(tx)), //nolint:gosec // a size is never negative
 		IsCoinbase:  isCoinbase,
 	}, nil
 }
@@ -472,9 +492,7 @@ func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeigh
 	}
 
 	if options.Conflicting {
-		txHash := tx.TxIDChainHash()
-
-		if cerr := s.noteConflictOnParents(ctx, dbTx, tx, txHash[:], notedHeight); cerr != nil {
+		if cerr := s.noteConflictOnParents(ctx, dbTx, tx, plan.txids[0], notedHeight); cerr != nil {
 			return nil, cerr
 		}
 	}
@@ -525,4 +543,85 @@ func (s *Store) noteConflictOnParents(ctx context.Context, q querier, tx *bt.Tx,
 	}
 
 	return nil
+}
+
+// createTxID is the ID a create files tx under: the caller's when it gives one. The seeder must,
+// because a transaction it rebuilt from a UTXO snapshot does not hash to its real ID.
+func createTxID(tx *bt.Tx, options *utxo.CreateOptions) chainhash.Hash {
+	if options != nil && options.TxID != nil {
+		return *options.TxID
+	}
+
+	return *tx.TxIDChainHash()
+}
+
+// isRebuilt reports a transaction rebuilt from its unspent outputs, with nil in the place of
+// every spent one. Its bytes are not the transaction's, and serialising it panics.
+func isRebuilt(tx *bt.Tx) bool {
+	for _, out := range tx.Outputs {
+		if out == nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+// faithful reports whether tx's own bytes are the transaction filed under txHash.
+func faithful(tx *bt.Tx, options *utxo.CreateOptions, txHash chainhash.Hash) bool {
+	if isRebuilt(tx) {
+		return false
+	}
+
+	if options == nil || options.TxID == nil {
+		return true
+	}
+
+	return *tx.TxIDChainHash() == txHash
+}
+
+// txSize is tx.Size(), and for a rebuilt transaction the size of the parts it has: tx.Size()
+// dereferences every output and panics on the missing ones.
+func txSize(tx *bt.Tx) int {
+	if !isRebuilt(tx) {
+		return tx.Size()
+	}
+
+	size := 4 + len(bt.VarInt(uint64(len(tx.Inputs))).Bytes()) + len(bt.VarInt(uint64(len(tx.Outputs))).Bytes()) + 4
+
+	for _, in := range tx.Inputs {
+		if in != nil {
+			size += in.Size()
+		}
+	}
+
+	for _, out := range tx.Outputs {
+		if out != nil {
+			size += out.Size()
+		}
+	}
+
+	return size
+}
+
+// seedingCreate reports whether a create is a seed's, written by the seeding route.
+//
+// A seed from a UTXO snapshot loads every unspent output at once, with its block height. Through
+// the normal routes each transaction also gets a containment row, and above the checkpoint an
+// identity row and coins at the unconfirmed sentinel; all of it waits for a stamp that never
+// visits heights below a seed, and on mainnet the containment rows alone would be tens of
+// gigabytes on the disk until the seed's hook clears them. The seeding route writes the coins
+// alone, with their height and block already set, as the stamp would leave them.
+//
+// It needs seeding=true on the store URL, which only a seed's settings set, and it applies only
+// to a create shaped like the seeder's: create-only, with the caller's txid and a block. Every
+// other create takes its normal route even in seeding mode.
+func (s *Store) seedingCreate(options *utxo.CreateOptions) bool {
+	if !s.seeding || options == nil || !options.CreateOnly || options.TxID == nil {
+		return false
+	}
+
+	_, mined := minedBlock(options.MinedBlockInfos)
+
+	return mined
 }
