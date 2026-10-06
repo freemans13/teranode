@@ -177,14 +177,12 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 	hash := header.BlockHash()
 
 	// blockBodyGate is what stops a peer filling this node's disk: nothing is
-	// written until it returns nil. The sync manager's implementation of it is
-	// expected to check, in order, that this node actually asked for this
-	// hash, that the header's declared target is not easier than the chain's
-	// own difficulty limit, and only then that the header meets that (now
-	// bounded) target; the first check answers "was this asked for", and of
-	// the other two the limit check is what makes the target check mean
-	// anything, since without it a peer can simply declare a target it always
-	// meets.
+	// written until it returns nil. The sync manager's implementation of it
+	// checks the header first (that it hashes to this hash, that its declared
+	// target is not easier than the chain's own difficulty limit, and that it
+	// meets that now-bounded target), and only then whether this node asked
+	// for the hash, so a forged header is refused as the peer's fault whatever
+	// hash it carries and only an honest one earns the quiet discard below.
 	//
 	// This runs before the park sees the block at all. A future change to the
 	// park's admission path for a streamed body is expected to skip re-running

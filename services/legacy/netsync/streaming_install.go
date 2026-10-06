@@ -297,16 +297,30 @@ func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
 // disk, and is the only check that runs before the bytes land. Nothing
 // downstream can refuse a write that has already happened.
 //
-// Four questions, in the order that makes each of the later ones meaningful.
+// The header is judged first, then whether this node wants the block, so that
+// a forged header is the peer's fault whatever hash it carries, and only an
+// honest header can earn the quiet discard an unrequested block gets.
 //
-// First, did this node ask for this block. A peer that can choose what to write
-// to our disk can fill it, and no amount of later verification gets the space
-// back. The check is by hash rather than by peer because the wire handler is
-// registered globally with go-wire and has no peer in scope; a body for a hash
-// we asked somebody for is a body we wanted, and which peer answered is settled
-// later on the same paths that already settle it for a decoded block.
+// First, the header. The body is filed under its hash, so the hash must be the
+// header's own. The header's declared target must be at least as hard as the
+// chain's own limit: a header carries the target it claims to meet, so without
+// this floor a peer picks an easy one and always passes (this codebase's own
+// hardening work measured 64 of 64 forged headers passing a target check that
+// lacked it). And the header must meet that now-bounded target, the work that
+// makes minting distinct block hashes expensive. Any of these failing is a
+// header nobody did the work for, which SV Node refuses in CheckBlockHeader
+// before it looks at anything else (validation.cpp:5586-5596, high-hash), and
+// here the error is the peer's: a disconnect.
 //
-// Second, is the declared payload within this node's own block policy
+// Second, did this node ask for this block. A peer that can choose what to
+// write to our disk can fill it, and no amount of later verification gets the
+// space back. The check is by hash rather than by peer: a body for a hash we
+// asked somebody for is a body we wanted, and which peer answered is settled
+// later on the same paths that already settle it for a decoded block. An
+// unrequested block with an honest header is not the peer's fault: it is
+// discarded and the connection kept, as SV Node does.
+//
+// Third, is the declared payload within this node's own block policy
 // (Policy.ExcessiveBlockSize). The length is in the message header, so a body
 // too large for this node to ever commit is refused before its first byte is
 // read instead of after the whole download. After the asked-for check on
@@ -320,16 +334,6 @@ func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
 // excessiveblocksize is 4,294,967,296; it exists for an operator who lowers
 // the policy below the wire cap.
 //
-// Third, is the header's declared target at least as hard as the chain's own
-// limit. This is the check without which the fourth one gates nothing: a header
-// carries the target it claims to meet, so a peer picks an easy one and always
-// passes. This codebase's own hardening work measured 64 of 64 forged headers
-// passing a target check that lacked this floor.
-//
-// Fourth, does the header actually meet that now-bounded target. This is the
-// work that makes minting distinct block hashes expensive, which is what stops
-// an attacker filling the park with unlimited fabrications.
-//
 // The body itself is not checked here and cannot be: it has not been read yet.
 // A body that is not the block its header names is caught by the pipeline sink
 // as it streams, before any record of it exists (pipelineBlockSink checks the
@@ -337,15 +341,8 @@ func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
 // disk are always bytes we asked for, under a hash somebody paid real work to
 // produce.
 func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.BlockHeader, length uint64) error {
-	if header == nil {
-		return errors.NewBlockInvalidError("[streamingBlockGate][%s] no header", hash)
-	}
-
-	// The body is filed under hash, so a hash the header does not produce would
-	// put bytes on disk under a name that is not theirs — and every later reader
-	// trusts the name.
-	if got := header.BlockHash(); !got.IsEqual(&hash) {
-		return errors.NewBlockInvalidError("[streamingBlockGate][%s] the header hashes to %s", hash, got)
+	if err := sm.streamingHeaderCheck(hash, header); err != nil {
+		return err
 	}
 
 	// Judged against the ledger's own ownership ceiling (blockRequestAssignmentCeiling,
@@ -373,6 +370,23 @@ func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.Bloc
 
 			return errors.NewBlockPolicyDeclinedError("[streamingBlockGate][%s] declared %d-byte body exceeds excessiveblocksize %d (local policy)", hash, length, limit)
 		}
+	}
+
+	return nil
+}
+
+// streamingHeaderCheck is the gate's first question: is this a real header for
+// this hash. See streamingBlockGate.
+func (sm *SyncManager) streamingHeaderCheck(hash chainhash.Hash, header *wire.BlockHeader) error {
+	if header == nil {
+		return errors.NewBlockInvalidError("[streamingBlockGate][%s] no header", hash)
+	}
+
+	// The body is filed under hash, so a hash the header does not produce would
+	// put bytes on disk under a name that is not theirs — and every later reader
+	// trusts the name.
+	if got := header.BlockHash(); !got.IsEqual(&hash) {
+		return errors.NewBlockInvalidError("[streamingBlockGate][%s] the header hashes to %s", hash, got)
 	}
 
 	// No chain means no floor to check against, and an unbounded write is the

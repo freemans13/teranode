@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/stretchr/testify/require"
@@ -44,8 +45,11 @@ func TestStreamingBlockGate(t *testing.T) {
 	}
 
 	t.Run("a block nobody asked for is refused", func(t *testing.T) {
+		// An honest header, so the header checks that come first pass and only
+		// the asked-for check can refuse it.
 		sm := newSM(t)
-		h := easyHeader()
+		sm.chainParams = &chaincfg.RegressionNetParams
+		h := minedRegtestHeader(t)
 		hash := h.BlockHash()
 
 		err := sm.streamingBlockGate(hash, h, 0)
@@ -133,33 +137,54 @@ func TestStreamingBlockGate(t *testing.T) {
 		// settings, so a body whose request is two hours old is still one a peer owes
 		// us. The gate used to apply its own flat hour and refuse it.
 		sm := newSM(t)
+		sm.chainParams = &chaincfg.RegressionNetParams
 
 		now := time.Unix(1_700_000_000, 0)
 		sm.blockDownloads = newBlockDownloadTracker(375 * time.Minute)
 		sm.blockDownloads.now = func() time.Time { return now }
 
-		h := easyHeader()
+		h := minedRegtestHeader(t)
 		hash := h.BlockHash()
 		require.True(t, sm.blockDownloads.Add(nil, hash))
 
 		now = now.Add(2 * time.Hour)
 
-		err := sm.streamingBlockGate(hash, h, 0)
-		require.Error(t, err, "sanity: mainnet's floor still refuses this easy header")
-		require.NotContains(t, err.Error(), "did not ask for this block",
+		require.NoError(t, sm.streamingBlockGate(hash, h, 0),
 			"a request inside the ledger's ownership ceiling must pass the asked-for check")
-		require.Contains(t, err.Error(), "easier than", "the floor, a later check, must be what refuses it")
-
-		var notRequested *peerpkg.BlockNotRequestedError
-		require.False(t, stderrors.As(err, &notRequested),
-			"a forged header is not an unrequested block; its peer must still be disconnected")
 
 		now = now.Add(376*time.Minute - 2*time.Hour)
 
-		err = sm.streamingBlockGate(hash, h, 0)
+		err := sm.streamingBlockGate(hash, h, 0)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "did not ask for this block",
 			"past the ledger's ceiling nobody owes us the block, so the body is refused")
+	})
+
+	// The header is judged before the asked-for check, so a forged header for a
+	// hash nobody asked for is the peer's fault and costs it the connection; it
+	// is not the quiet discard an honest unrequested block gets.
+	t.Run("a forged header is refused as invalid whether or not it was asked for", func(t *testing.T) {
+		sm := newSM(t)
+		h := easyHeader()
+		hash := h.BlockHash()
+
+		err := sm.streamingBlockGate(hash, h, 0)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "easier than")
+		require.True(t, errors.Is(err, errors.ErrBlockInvalid), "a forged header is an invalid block, got %v", err)
+
+		var notRequested *peerpkg.BlockNotRequestedError
+		require.False(t, stderrors.As(err, &notRequested), "a forged header is never the quiet unrequested discard")
+
+		sm.chainParams = &chaincfg.RegressionNetParams
+		unmet := minedRegtestHeader(t)
+		unmet.Bits = chaincfg.MainNetParams.PowLimitBits
+		unmetHash := unmet.BlockHash()
+
+		err = sm.streamingBlockGate(unmetHash, unmet, 0)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "does not meet its own target")
+		require.False(t, stderrors.As(err, &notRequested), "a header without its work is never the quiet unrequested discard")
 	})
 
 	t.Run("the mainnet floor is the value the chain actually uses", func(t *testing.T) {
@@ -260,4 +285,24 @@ func TestStreamingBlockGate_RefusesADeclaredPayloadAboveTheExcessiveBlockSize(t 
 
 		require.NoError(t, sm.streamingBlockGate(hash, h, 1<<40))
 	})
+}
+
+// minedRegtestHeader returns a header that meets regtest's own limit, the
+// easiest target the chain allows, found by trying nonces.
+func minedRegtestHeader(t *testing.T) *wire.BlockHeader {
+	t.Helper()
+
+	h := &wire.BlockHeader{Version: 1, Bits: chaincfg.RegressionNetParams.PowLimitBits, Timestamp: time.Unix(1_600_000_000, 0)}
+
+	for nonce := uint32(0); nonce < 1000; nonce++ {
+		h.Nonce = nonce
+
+		if headerMeetsWork(h.Bits, h.BlockHash(), model.PowLimitCeiling(&chaincfg.RegressionNetParams)) {
+			return h
+		}
+	}
+
+	t.Fatal("regtest's target is met about every other nonce")
+
+	return nil
 }
