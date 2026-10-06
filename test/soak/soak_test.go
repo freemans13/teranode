@@ -23,7 +23,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/internal/soak"
 	"github.com/bsv-blockchain/teranode/test"
-	inmemorykafka "github.com/bsv-blockchain/teranode/util/kafka/in_memory_kafka"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 	"golang.org/x/sync/errgroup"
@@ -160,11 +159,6 @@ func TestSoakSteadyLoad(t *testing.T) {
 	for time.Since(start) < cfg.duration {
 		pool = runCycle(t, td, privKey, pool)
 		cycles++
-
-		// The test daemon's in-memory Kafka broker keeps every message ever produced. Production Kafka does not,
-		// and by now the cycle is mined, so every consumer has its messages; drop the history so harness retention
-		// is not reported as a daemon leak.
-		truncateInMemoryKafka()
 
 		if cfg.injectLeak {
 			leak.inject()
@@ -356,15 +350,6 @@ func (l *leakInjector) release() {
 
 		injectedLeak = nil
 	})
-}
-
-// truncateInMemoryKafka drops the retained-message history of every topic on the shared in-memory broker. Only the
-// history buffer is cleared; per-consumer delivery channels are untouched.
-func truncateInMemoryKafka() {
-	broker := inmemorykafka.GetSharedBroker()
-	for _, topic := range broker.Topics() {
-		broker.TruncateTopic(topic)
-	}
 }
 
 // writeProfile saves the named runtime profile to dir/file. Failures are logged, not fatal: profiles are diagnostics.
