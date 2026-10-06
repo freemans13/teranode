@@ -13,30 +13,28 @@ import (
 
 // TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable produces the error two
 // pooled connections raise against each other on the sqlitememory engine and
-// asserts the spend batch's retry classifier recognises it.
+// asserts that both retry classifiers, isDeadlock for the spend batch and
+// isLockError for create, treat it as retryable.
 //
 // InitSQLiteDB opens sqlitememory as a shared-cache in-memory database with a
 // pool of five connections. A writer that wants a table another connection's
 // transaction holds waits for it, and when the two wait for each other the
 // engine breaks the cycle with SQLITE_LOCKED and the message "database table is
-// locked: database is deadlocked", not SQLITE_BUSY's "database is locked".
-// isDeadlock matched only the latter string, so sendSpendBatch's retry, written
-// for exactly this collision, never fired on it: the batch was aborted and every
-// item got "[Spend] batch aborted due to previous DB error". Create's isLockError
-// in the same file matches the code, so the store retried its creates and not
-// its spends. Found by the legacy historical replay (services/legacy/netsync,
-// TestLegacyHistoricalTestnetSync/default-settings), where subtree validation
-// validates a block's transactions in parallel over this store and a create's
-// transaction and a spend batch's transaction each want the other's table.
+// locked: database is deadlocked", not SQLITE_BUSY's "database is locked". The
+// legacy historical replay (services/legacy/netsync,
+// TestLegacyHistoricalTestnetSync/default-settings) hits this collision when
+// subtree validation runs a block's creates and spend batches in parallel over
+// this store.
 //
-// The error is produced for real rather than written as a string, because the
-// SQLite arm of isDeadlock matches the result code on a *sqlite.Error, which a
-// string fixture cannot carry. A plain-string error falls through to the
-// "database is locked" substring fallback in both the old and the new
-// isDeadlock, and "database table is locked: database is deadlocked" does not
-// contain it, so a string fixture is red on both and proves nothing about the
-// fix. Only isLockError's "deadlock" substring fallback, the secondary assert
-// below, would accept a string.
+// This is a regression guard on the real engine error, not coverage of the
+// extended-code mask. On modernc.org/sqlite v1.54.0 the cycle is reported with
+// the plain primary code 6, not an extended LOCKED_SHAREDCACHE (262), so both
+// classifiers already matched it before the mask was added to isLockError, and
+// this test stays green with the mask removed.
+// TestIsSQLiteLockCode_ExtendedCodesAreStillLocks below is the test that pins
+// the mask. String fixtures for the same message are in spend_order_test.go and
+// parent_outputs_test.go; this test exists because only a real *sqlite.Error
+// reaches the typed code arms.
 func TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable(t *testing.T) {
 	ctx := context.Background()
 
@@ -113,15 +111,16 @@ func TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable(t *testing.T) {
 	}
 
 	require.True(t, isDeadlock(refused.err), "the spend batch must retry a shared-cache table lock, got a non-retryable classification for: %v", refused.err)
-	require.True(t, isLockError(refused.err), "the create path already classifies it as a lock error; the two must agree")
+	require.True(t, isLockError(refused.err), "the create path must retry the same shared-cache table lock as the spend path, got a non-retryable classification for: %v", refused.err)
 }
 
 // TestIsSQLiteLockCode_ExtendedCodesAreStillLocks pins the primary-code
-// comparison. The first cut of the *sqlite.Error arm compared the whole code
-// against SQLITE_BUSY and SQLITE_LOCKED, so a BUSY_SNAPSHOT (517) from a WAL
-// snapshot conflict or a LOCKED_SHAREDCACHE (262) stopped being retried while
-// the plain codes were. Reverting isSQLiteLockCode to a whole-code compare
-// fails the three extended rows below.
+// comparison that isDeadlock and isLockError share. isLockError's *sqlite.Error
+// arm used to compare the whole code against SQLITE_BUSY and SQLITE_LOCKED and
+// return without reaching its string fallback, so a BUSY_SNAPSHOT (517) from a
+// WAL snapshot conflict or a LOCKED_SHAREDCACHE (262) was not retried while the
+// plain codes were. Reverting isSQLiteLockCode to a whole-code compare fails
+// the three extended rows below.
 func TestIsSQLiteLockCode_ExtendedCodesAreStillLocks(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -2262,10 +2262,8 @@ func isDeadlock(err error) bool {
 	// parent in one joined statement. SQLite's remedy is to roll back and retry,
 	// which is what a true return here does.
 	var sqliteErr *sqlite.Error
-	if errors.As(err, &sqliteErr) {
-		if code := sqliteErr.Code() & 0xff; code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED {
-			return true
-		}
+	if errors.As(err, &sqliteErr) && isSQLiteLockCode(sqliteErr.Code()) {
+		return true
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
@@ -5932,8 +5930,9 @@ func buildMultiValueInsert(baseSQL string, colsPerRow, numRows, startIdx int) st
 // connection, so the primary code is the low byte and the detail sits above
 // it: SQLITE_BUSY_SNAPSHOT (517) is SQLITE_BUSY (5), SQLITE_LOCKED_SHAREDCACHE
 // (262) is SQLITE_LOCKED (6). Comparing the whole code against the two
-// primaries drops every extended variant out of the retry. Same shape as
-// isDeadlock's SQLite arm above and usql.isRetriableSQLiteCode (util/usql/retry.go).
+// primaries drops every extended variant out of the retry. isDeadlock and
+// isLockError both use it; usql.isRetriableSQLiteCode (util/usql/retry.go) has
+// the same shape.
 func isSQLiteLockCode(code int) bool {
 	primary := code & 0xff
 
