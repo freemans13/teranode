@@ -1848,7 +1848,8 @@ func TestPeer_ARejectedBodyAtTheReadLoopDropsTheAssociationPrimary(t *testing.T)
 			require.Equal(t, hash, rejected.Hash)
 			require.True(t, terrors.Is(rejected.Err, terrors.ErrBlockInvalid))
 			require.False(t, rejected.Truncated, "the whole body arrived")
-			require.True(t, rejected.ProvenBad())
+			require.True(t, rejected.MismatchInFull())
+			require.False(t, rejected.ProvenBad(), "the streaming path never verifies the wire checksum, so the read loop never hands over a ban")
 		case <-time.After(2 * time.Second):
 			t.Fatal("OnBlockBodyRejected was never invoked")
 		}

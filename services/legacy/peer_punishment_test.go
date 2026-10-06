@@ -38,12 +38,16 @@ func peerDisconnectsWithin(p *peer.Peer, d time.Duration) bool {
 // what it rests on. The peer package has already decided the connection's fate
 // when it calls OnBlockBodyRejected; this decides whether the host may come
 // back. It may not, for cfg.BanDuration, when and only when the rejection is
-// ProvenBad: the body arrived in full and the sink raised the ban marker at one
-// of its three SV Node DoS(100) parity sites. Every other rejection (the marker
-// on a body cut short, an invalid verdict without the marker, a corrupt
-// delivery) costs the connection and nothing more; so does a proven-bad body
-// when banning is disabled or the host is whitelisted, the two exemptions
-// addBanScore has.
+// ProvenBad: the body arrived in full, the sink raised the ban marker at one of
+// its three SV Node DoS(100) parity sites, and the wire checksum was verified.
+//
+// The streaming path cannot verify that checksum today (see
+// peer.streamingBlockHandler), so the first row, the exact shape the wire hands
+// over for a mismatched body from an ordinary peer, records no ban. The rows
+// with ChecksumVerified set are the ban as it will run once go-wire passes the
+// checksum through, and they pin the exemptions: banning disabled, a
+// whitelisted host, an addnode peer and a local address, which are the ones SV
+// Node's SendRejectsAndCheckIfBanned applies.
 //
 // The rejection is raised on a DATA1 sub-peer of an association, which is
 // where a body arrives under BlockPriority, and the ban is checked against a
@@ -59,40 +63,64 @@ func TestServerPeer_ARejectedBodyBansTheHostSoItCannotReconnect(t *testing.T) {
 	t.Cleanup(func() { cfg = origCfg })
 
 	hash := chainhash.HashH([]byte("block"))
+	mismatch := func() error {
+		return errors.NewBlockInvalidError("merkle root does not match", errors.ErrBlockBodyMismatch)
+	}
 
 	for _, tc := range []struct {
 		name           string
 		rejected       *peer.BlockBodyRejectedError
+		host           string
 		disableBanning bool
 		whitelisted    bool
+		addnode        bool
 		wantBan        bool
 	}{
 		{
+			name:     "a mismatched body delivered in full is not banned while the wire checksum is unverified",
+			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: mismatch()},
+		},
+		{
 			name:     "a body proven bad bans the host",
-			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockInvalidError("merkle root does not match", errors.ErrBlockBodyMismatch)},
+			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: mismatch(), ChecksumVerified: true},
 			wantBan:  true,
 		},
 		{
 			name:     "the marker on a body cut short is not banned: it was never judged in full",
-			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockInvalidError("duplicate transaction", errors.ErrBlockBodyMismatch), Truncated: true},
+			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockInvalidError("duplicate transaction", errors.ErrBlockBodyMismatch), Truncated: true, ChecksumVerified: true},
 		},
 		{
 			name:     "an invalid verdict without the marker is not banned",
-			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockInvalidError("declares more transactions than its body can hold")},
+			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockInvalidError("declares more transactions than its body can hold"), ChecksumVerified: true},
 		},
 		{
 			name:     "a corrupt delivery is not banned",
-			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockCorruptError("the declared transactions used fewer bytes than declared")},
+			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockCorruptError("the declared transactions used fewer bytes than declared"), ChecksumVerified: true},
 		},
 		{
 			name:           "banning disabled",
-			rejected:       &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockInvalidError("merkle root does not match", errors.ErrBlockBodyMismatch)},
+			rejected:       &peer.BlockBodyRejectedError{Hash: hash, Err: mismatch(), ChecksumVerified: true},
 			disableBanning: true,
 		},
 		{
 			name:        "a whitelisted host",
-			rejected:    &peer.BlockBodyRejectedError{Hash: hash, Err: errors.NewBlockInvalidError("merkle root does not match", errors.ErrBlockBodyMismatch)},
+			rejected:    &peer.BlockBodyRejectedError{Hash: hash, Err: mismatch(), ChecksumVerified: true},
 			whitelisted: true,
+		},
+		{
+			name:     "an addnode peer is not banned",
+			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: mismatch(), ChecksumVerified: true},
+			addnode:  true,
+		},
+		{
+			name:     "a loopback address is not banned",
+			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: mismatch(), ChecksumVerified: true},
+			host:     "127.0.0.1",
+		},
+		{
+			name:     "an IPv6 loopback address is not banned",
+			rejected: &peer.BlockBodyRejectedError{Hash: hash, Err: mismatch(), ChecksumVerified: true},
+			host:     "::1",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,6 +131,13 @@ func TestServerPeer_ARejectedBodyBansTheHostSoItCannotReconnect(t *testing.T) {
 				MaxPeers:       8,
 				MaxPeersPerIP:  8,
 			}
+
+			host := tc.host
+			if host == "" {
+				host = "10.0.0.1"
+			}
+
+			addr := net.JoinHostPort(host, "8333")
 
 			srv := &server{
 				ctx:      context.Background(),
@@ -115,13 +150,14 @@ func TestServerPeer_ARejectedBodyBansTheHostSoItCannotReconnect(t *testing.T) {
 
 			// The rejection arrives on the DATA1 sub-peer of an association
 			// whose primary is a separate peer from the same host.
-			primary := newTestOutboundPeer(t, srv, "10.0.0.1:8333")
+			primary := newTestOutboundPeer(t, srv, addr)
 			assoc := peer.NewAssociation([]byte{0x01, 0x02, 0x03}, primary.Peer)
 			primary.Peer.SetAssociation(assoc)
 
-			sp := newTestOutboundPeer(t, srv, "10.0.0.1:8333")
+			sp := newTestOutboundPeer(t, srv, addr)
 			sp.ctx = context.Background()
 			sp.isWhitelisted = tc.whitelisted
+			sp.addnode = tc.addnode
 			require.True(t, assoc.AddStream(wire.StreamTypeData1, sp.Peer))
 			sp.Peer.SetAssociation(assoc)
 			sp.Peer.SetStreamType(wire.StreamTypeData1)
@@ -135,7 +171,7 @@ func TestServerPeer_ARejectedBodyBansTheHostSoItCannotReconnect(t *testing.T) {
 			case <-time.After(100 * time.Millisecond):
 			}
 
-			reconnecting := newTestOutboundPeer(t, srv, "10.0.0.1:8333")
+			reconnecting := newTestOutboundPeer(t, srv, addr)
 
 			if !tc.wantBan {
 				require.Nil(t, banned, "nothing may be queued for the ban handler")
@@ -153,18 +189,18 @@ func TestServerPeer_ARejectedBodyBansTheHostSoItCannotReconnect(t *testing.T) {
 			select {
 			case event := <-srv.banChan:
 				require.Equal(t, "add", event.Action)
-				require.Equal(t, "10.0.0.1", event.IP)
+				require.Equal(t, host, event.IP)
 			case <-time.After(time.Second):
 				t.Fatal("the ban must be published as a ban event")
 			}
 
-			banEnd, ok := state.banned.Get("10.0.0.1")
+			banEnd, ok := state.banned.Get(host)
 			require.True(t, ok, "the host, not the connection, is what is banned")
 			require.False(t, banEnd.Before(time.Now().Add(cfg.BanDuration-time.Second)), "banned for cfg.BanDuration")
 
 			require.False(t, srv.handleAddPeerMsg(state, reconnecting), "a fresh connection from the banned host must be refused")
 			require.True(t, peerDisconnectsWithin(reconnecting.Peer, time.Second), "and disconnected")
-			require.True(t, srv.banList.IsBanned("10.0.0.1:8333"), "the ban list, which the outbound dial sites consult, holds the host")
+			require.True(t, srv.banList.IsBanned(addr), "the ban list, which the outbound dial sites consult, holds the host")
 		})
 	}
 }
@@ -267,12 +303,49 @@ func TestNewStreamServerPeer_ReadsTheWhitelist(t *testing.T) {
 				remote: &net.TCPAddr{IP: net.ParseIP(tc.remote), Port: 8333},
 			}
 
-			sp := s.newStreamServerPeer(assoc, conn)
+			sp := s.newStreamServerPeer(assoc, conn, false)
 
 			require.Equal(t, tc.want, sp.isWhitelisted)
 			require.Equal(t, wire.StreamTypeData1, sp.Peer.StreamType())
 			require.Same(t, assoc, sp.Peer.AssociationRef())
 			require.NotNil(t, assoc.Stream(wire.StreamTypeData1), "the stream is registered with the association")
 		})
+	}
+}
+
+// TestNewStreamServerPeer_CopiesThePrimarysAddnodeFlag pins the addnode
+// exemption on the peer that carries block bodies. A DATA1 sub-peer is built
+// non-persistent, so without the copy an addnode host's sub-peer could be
+// banned for a body while its primary could not.
+func TestNewStreamServerPeer_CopiesThePrimarysAddnodeFlag(t *testing.T) {
+	origCfg := cfg
+	t.Cleanup(func() { cfg = origCfg })
+
+	cfg = &config{}
+
+	s := &server{
+		ctx:         context.Background(),
+		logger:      ulogger.TestLogger{},
+		settings:    test.CreateBaseTestSettings(t),
+		addrManager: addrmgr.New(ulogger.TestLogger{}, t.TempDir(), nil),
+	}
+
+	for _, addnode := range []bool{true, false} {
+		primary := peer.NewInboundPeer(ulogger.TestLogger{}, s.settings, &peer.Config{})
+		assoc := peer.NewAssociation([]byte{0x01, 0x02, 0x03}, primary)
+
+		ours, theirs := net.Pipe()
+		t.Cleanup(func() { _ = ours.Close(); _ = theirs.Close() })
+
+		conn := &tcpAddrConn{
+			Conn:   ours,
+			local:  &net.TCPAddr{IP: net.ParseIP("10.0.0.9"), Port: 8333},
+			remote: &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 8333},
+		}
+
+		sp := s.newStreamServerPeer(assoc, conn, addnode)
+
+		require.Equal(t, addnode, sp.addnode)
+		require.False(t, sp.persistent, "the sub-peer is never in persistentPeers")
 	}
 }

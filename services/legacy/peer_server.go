@@ -540,9 +540,15 @@ type serverPeer struct {
 
 	*peer.Peer
 
-	connReq        *connmgr.ConnReq
-	server         *server
-	persistent     bool
+	connReq    *connmgr.ConnReq
+	server     *server
+	persistent bool
+	// addnode is SV Node's fAddnode for this connection: the operator named
+	// the host (connect or addpeer at startup, or a permanent node add), so
+	// banMisbehaving never bans it. Set from persistent in newServerPeer. A
+	// DATA1 sub-peer is never persistent (it is not in persistentPeers), so
+	// newStreamServerPeer copies its primary's flag instead.
+	addnode        bool
 	continueHash   *chainhash.Hash
 	relayMtx       sync.Mutex
 	disableRelayTx bool
@@ -564,6 +570,7 @@ func newServerPeer(s *server, isPersistent bool) *serverPeer {
 		ctx:            s.ctx, // set the context to the server, if server dies, all peers die
 		server:         s,
 		persistent:     isPersistent,
+		addnode:        isPersistent,
 		filter:         bloom.LoadFilter(nil),
 		knownAddresses: make(map[string]struct{}),
 		quit:           make(chan struct{}),
@@ -1036,7 +1043,7 @@ func (sp *serverPeer) openRequiredStreams() {
 		return
 	}
 
-	streamSP := sp.server.newStreamServerPeer(assoc, conn)
+	streamSP := sp.server.newStreamServerPeer(assoc, conn, sp.addnode)
 	streamSP.AssociateConnection(conn)
 
 	go sp.server.peerDoneHandler(streamSP)
@@ -1052,9 +1059,12 @@ func (sp *serverPeer) openRequiredStreams() {
 // inboundPeerConnected does for every inbound connection. newServerPeer leaves
 // isWhitelisted false, and this constructor used to leave it there, so a
 // whitelisted host's DATA1 sub-peer could be banned for a body it delivered
-// while its primary, whitelisted, could not.
-func (s *server) newStreamServerPeer(assoc *peer.Association, conn net.Conn) *serverPeer {
+// while its primary, whitelisted, could not. addnode is the primary's flag,
+// copied for the same reason: the sub-peer is built non-persistent, and it is
+// the peer whose read loop sees every block body.
+func (s *server) newStreamServerPeer(assoc *peer.Association, conn net.Conn, addnode bool) *serverPeer {
 	streamSP := newServerPeer(s, false)
+	streamSP.addnode = addnode
 
 	var err error
 
@@ -4109,21 +4119,27 @@ func (sp *serverPeer) OnBlockOnDisk(_ *peer.Peer, msg *peer.MsgBlockOnDisk) {
 // dropped through its primary); this decides the ban, and only this.
 //
 // The ban rests on rejected.ProvenBad() and nothing else: the body arrived in
-// full and the sink raised ERR_BLOCK_BODY_MISMATCH, which only its three SV Node
-// DoS(100) parity sites do (a merkle root the header does not carry, a duplicate
-// transaction, no coinbase; services/legacy/netsync pipeline_sink.go,
-// block_stream_builder.go, block_tx_stream.go). SV Node scores each of those
-// 100 points, the first two as CorruptionOrDoS and bad-cb-missing as a plain
-// DoS(100) (validation.cpp CheckBlock), at a threshold of 100, a 24 h ban
-// (consensus/validation.h, net/block_download_tracker.cpp BlockChecked,
-// net_processing.cpp SendRejectsAndCheckIfBanned), and it scores them only
-// after the whole message is deserialised; a message that ends early is a
-// log-only deserialisation failure there. Every other refusal (a corrupt
-// delivery whose length and transactions disagree, an invalid verdict without
-// the marker, a body that was cut short) costs the peer its connection and no
-// more, because a code alone is not proof of conduct: the merge base never
-// banned on ERR_BLOCK_INVALID either, so a ban here is new policy, not restored
-// policy, and it is kept to the three sites where the parity is exact.
+// full, the sink raised ERR_BLOCK_BODY_MISMATCH, which only its three sites do
+// (a merkle root the header does not carry, a duplicate transaction, no
+// coinbase; services/legacy/netsync pipeline_sink.go, block_stream_builder.go,
+// block_tx_stream.go), and the wire checksum was verified. SV Node scores each
+// of those three 100 points, the first two as CorruptionOrDoS and
+// bad-cb-missing as a plain DoS(100) (validation.cpp CheckBlock), at a
+// threshold of 100, a 24 h ban (consensus/validation.h,
+// net/block_download_tracker.cpp BlockChecked, net_processing.cpp
+// SendRejectsAndCheckIfBanned). It scores them only after the message checksum
+// has passed and the whole message is deserialised; a message that fails the
+// checksum is dropped (one point only for a burst of more than 100 within
+// 500 ms) and one that ends early is a log-only deserialisation failure there.
+//
+// The streaming path cannot verify the checksum yet (peer.streamingBlockHandler
+// says why), so ProvenBad is never true today and this bans nobody: a
+// mismatched body costs the peer its connection and no more, which is the merge
+// base's behaviour. The ban comes back when go-wire passes the checksum to the
+// handler. Every other refusal (a corrupt delivery whose length and
+// transactions disagree, an invalid verdict without the marker, a body that was
+// cut short) costs the connection and nothing more either way, because a code
+// alone is not proof of conduct.
 //
 // An outright ban rather than a score: addBanScore bans only once the score
 // passes cfg.BanThreshold, and the score lives on this serverPeer, which dies
@@ -4137,7 +4153,7 @@ func (sp *serverPeer) OnBlockBodyRejected(_ *peer.Peer, rejected *peer.BlockBody
 	}
 
 	if !rejected.ProvenBad() {
-		sp.server.logger.Warnf("Peer %s delivered a body for block %s that was rejected (truncated=%t); dropping it without a ban: %v", sp, rejected.Hash, rejected.Truncated, rejected.Err)
+		sp.server.logger.Warnf("Peer %s delivered a body for block %s that was rejected (truncated=%t, checksumVerified=%t); dropping it without a ban: %v", sp, rejected.Hash, rejected.Truncated, rejected.ChecksumVerified, rejected.Err)
 
 		return
 	}
@@ -4145,13 +4161,24 @@ func (sp *serverPeer) OnBlockBodyRejected(_ *peer.Peer, rejected *peer.BlockBody
 	sp.banMisbehaving(fmt.Sprintf("block %s body is not the block its header names: %v", rejected.Hash, rejected.Err))
 }
 
-// banMisbehaving bans this peer's host for cfg.BanDuration, with the two
-// exemptions addBanScore has: banning disabled, and a whitelisted host. It does
-// not disconnect; the caller has already arranged that. BanPeer queues to the
-// peerHandler, whose handleBanPeerMsg bans by host from sp.Addr(), which both
-// streams of an association share, so a ban raised on the DATA1 sub-peer covers
-// the primary's reconnect too (handleAddPeerMsg refuses a banned host; the
-// outbound dial sites check the ban list).
+// banMisbehaving bans this peer's host for cfg.BanDuration, unless one of the
+// exemptions below applies. It does not disconnect; the caller has already
+// arranged that. BanPeer queues to the peerHandler, whose handleBanPeerMsg bans
+// by host from sp.Addr(), which both streams of an association share, so a ban
+// raised on the DATA1 sub-peer covers the primary's reconnect too
+// (handleAddPeerMsg refuses a banned host; the outbound dial sites check the
+// ban list).
+//
+// The exemptions are SV Node's, from SendRejectsAndCheckIfBanned
+// (net/net_processing.cpp): a whitelisted peer and an addnode peer are never
+// banned, and a local address (IPv4 127.0.0.0/8 or 0.0.0.0/8, IPv6 ::1, as
+// CNetAddr::IsLocal draws it) is disconnected but not banned. Banning disabled
+// is teranode's own. Two differences from SV Node, both on the side of not
+// banning: addnode here covers every permanent peer, which includes the
+// connect list, where SV Node sets fAddnode only for -addnode peers; and SV
+// Node does not disconnect a whitelisted or addnode peer at all, while this
+// node has already disconnected it by the time this runs, and the connection
+// manager redials a permanent peer.
 func (sp *serverPeer) banMisbehaving(reason string) {
 	if cfg.DisableBanning {
 		sp.server.logger.Warnf("Misbehaving peer %s: %s (banning disabled)", sp, reason)
@@ -4165,6 +4192,39 @@ func (sp *serverPeer) banMisbehaving(reason string) {
 		return
 	}
 
+	if sp.addnode {
+		sp.server.logger.Warnf("Misbehaving addnode peer %s: %s (not banned)", sp, reason)
+
+		return
+	}
+
+	if isLocalAddr(sp.Addr()) {
+		sp.server.logger.Warnf("Misbehaving local peer %s: %s (not banned)", sp, reason)
+
+		return
+	}
+
 	sp.server.logger.Warnf("Misbehaving peer %s: %s -- banning for %v", sp, reason, cfg.BanDuration)
 	sp.server.BanPeer(sp)
+}
+
+// isLocalAddr is SV Node's CNetAddr::IsLocal (net/netaddress.cpp) for a
+// host:port or bare host string: IPv4 127.0.0.0/8 or 0.0.0.0/8, or IPv6 ::1.
+// An address that does not parse is not local.
+func isLocalAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 127 || ip4[0] == 0
+	}
+
+	return ip.Equal(net.IPv6loopback)
 }

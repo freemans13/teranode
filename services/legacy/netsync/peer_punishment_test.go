@@ -151,9 +151,10 @@ func disconnectsWithin(p *peerpkg.Peer, d time.Duration) bool {
 //
 // End state: the sender is told the block was rejected (a reject for command
 // block, code invalid, naming the hash), the primary is disconnected and so is
-// the sub-peer, the listener that owns the ban was handed a rejection that is
-// ProvenBad (the one predicate serverPeer.OnBlockBodyRejected bans on: the body
-// arrived in full and carries ErrBlockBodyMismatch), the primary's departure
+// the sub-peer, the listener that owns the ban was handed a rejection whose body
+// arrived in full and carries ErrBlockBodyMismatch but is NOT ProvenBad, because
+// the streaming path never verified the wire checksum (so
+// serverPeer.OnBlockBodyRejected records no ban), the primary's departure
 // releases the block it owed, and nothing of the block is left on disk.
 //
 // Before this step the sink's refusal was wrapped as a ProcessingError and the
@@ -218,8 +219,10 @@ func TestPeer_ARejectedBodyDropsTheAssociationPrimary(t *testing.T) {
 	require.Equal(t, hash, rejected.Hash)
 	require.True(t, errors.Is(rejected.Err, errors.ErrBlockInvalid), "a body that is not the header's is an invalid block")
 	require.False(t, rejected.Truncated, "the whole declared payload arrived")
-	require.True(t, rejected.ProvenBad(),
-		"the merkle root site carries ErrBlockBodyMismatch and the body arrived in full: this is the predicate serverPeer.OnBlockBodyRejected bans on")
+	require.True(t, rejected.MismatchInFull(), "the merkle root site carries ErrBlockBodyMismatch and the body arrived in full")
+	require.False(t, rejected.ChecksumVerified, "go-wire hands the body over before its checksum check, so the streaming path has not verified it")
+	require.False(t, rejected.ProvenBad(),
+		"a mismatch on bytes whose checksum nobody verified must not be the predicate serverPeer.OnBlockBodyRejected bans on")
 
 	reject := capture.oneReject(t)
 	require.Equal(t, wire.CmdBlock, reject.Cmd, "the reject names the block command, not malformed")
@@ -247,7 +250,7 @@ func framedBlock(t *testing.T, msgBlock *wire.MsgBlock) []byte {
 	return framed.Bytes()
 }
 
-// TestWire_OnlyABodyDeliveredInFullIsProvenBad is the no-ban-on-EOF gate,
+// TestWire_OnlyABodyDeliveredInFullIsAMismatchInFull is the no-ban-on-EOF gate,
 // driven through go-wire's ReadMessageWithEncodingN and the registered handler
 // into the real pipeline sink, the route the peer's read loop takes.
 //
@@ -255,10 +258,12 @@ func framedBlock(t *testing.T, msgBlock *wire.MsgBlock) []byte {
 // (CVE-2012-2459, SV Node's bad-txns-duplicate, one of the three ban sites):
 //
 //   - delivered in full: the sink refuses at the duplicate, the handler drains
-//     the rest, the rejection is ProvenBad;
+//     the rest, the rejection is MismatchInFull. It is still not ProvenBad,
+//     because the wire checksum was never verified on this path (see
+//     peerpkg.streamingBlockHandler);
 //   - cut seven bytes short: the sink refuses at the duplicate exactly as
 //     before, but the drain hits the end of the stream with bytes still owed,
-//     so the rejection is Truncated and NOT ProvenBad, whatever code the sink
+//     so the rejection is Truncated and NOT MismatchInFull, whatever code the sink
 //     chose. A body this node never saw the end of earns a disconnect and no
 //     ban, which is what SV Node gets for free by deserialising the whole
 //     message before CheckBlock;
@@ -266,7 +271,7 @@ func framedBlock(t *testing.T, msgBlock *wire.MsgBlock) []byte {
 //     leaves as the bare io.ErrUnexpectedEOF (the HARDEN 1421 rule, pinned by
 //     TestWire_AMidBodyEOFReachesTheReadLoopByIdentity) and is not a
 //     BlockBodyRejectedError, so OnBlockBodyRejected can never see it.
-func TestWire_OnlyABodyDeliveredInFullIsProvenBad(t *testing.T) {
+func TestWire_OnlyABodyDeliveredInFullIsAMismatchInFull(t *testing.T) {
 	store := memory.New()
 	sm := newPipelineParkManager(t, store, 8)
 	sm.blockDownloads = newBlockDownloadTracker(time.Hour)
@@ -291,7 +296,7 @@ func TestWire_OnlyABodyDeliveredInFullIsProvenBad(t *testing.T) {
 		return err
 	}
 
-	t.Run("a duplicate transaction in a body delivered in full is proven bad", func(t *testing.T) {
+	t.Run("a duplicate transaction in a body delivered in full is a mismatch in full", func(t *testing.T) {
 		err := readThroughTheHandler(duplicateBody)
 		require.Error(t, err)
 
@@ -300,10 +305,11 @@ func TestWire_OnlyABodyDeliveredInFullIsProvenBad(t *testing.T) {
 		require.Equal(t, hash, rejected.Hash)
 		require.True(t, errors.Is(rejected.Err, errors.ErrBlockInvalid))
 		require.False(t, rejected.Truncated, "the whole declared payload was read")
-		require.True(t, rejected.ProvenBad(), "the duplicate site carries the marker and the body arrived in full")
+		require.True(t, rejected.MismatchInFull(), "the duplicate site carries the marker and the body arrived in full")
+		require.False(t, rejected.ProvenBad(), "the wire checksum was not verified, so no ban rests on it")
 	})
 
-	t.Run("the same body cut short is rejected but not proven bad", func(t *testing.T) {
+	t.Run("the same body cut short is rejected but not a mismatch in full", func(t *testing.T) {
 		err := readThroughTheHandler(duplicateBody[:len(duplicateBody)-7])
 		require.Error(t, err)
 
@@ -312,7 +318,7 @@ func TestWire_OnlyABodyDeliveredInFullIsProvenBad(t *testing.T) {
 		require.Equal(t, hash, rejected.Hash)
 		require.True(t, errors.IsBlockBodyMismatch(rejected.Err), "the sink's own code is the marker: the bit, not the code, is what withholds the ban")
 		require.True(t, rejected.Truncated, "the drain found the stream ended with bytes still owed")
-		require.False(t, rejected.ProvenBad(), "a body this node never saw the end of must not be banned for")
+		require.False(t, rejected.MismatchInFull(), "a body this node never saw the end of must not be banned for")
 	})
 
 	t.Run("a well-formed body cut mid-transaction is not a rejection at all", func(t *testing.T) {

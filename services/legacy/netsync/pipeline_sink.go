@@ -50,7 +50,9 @@ import (
 //     lets any code through to the read loop, see its doc comment.
 //   - of those, exactly three refusals also wrap errors.ErrBlockBodyMismatch
 //     inside the invalid verdict, and they are the only ones the legacy peer
-//     server bans a host for: a merkle root the header does not carry (this
+//     server will ban a host for, once the wire checksum is verified, which the
+//     streaming path cannot do yet (peer.streamingBlockHandler), so today none
+//     of them bans: a merkle root the header does not carry (this
 //     file), a duplicate transaction (block_stream_builder.go AddStreamedTx) and
 //     a body with no coinbase (block_tx_stream.go newBlockTxStream). Each judges
 //     a body that parsed to its end, which is where SV Node's CheckBlock scores
@@ -254,8 +256,9 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		// ErrBlockBodyMismatch inside the verdict: the whole body was read
 		// (RequireEnd passed just above) and its root is not the header's, which
 		// is SV Node's bad-txnmrklroot, CorruptionOrDoS. The marker is what the
-		// legacy peer server bans on; see the producer rule in this file's doc
-		// comment for the three sites that may raise it.
+		// legacy peer server will ban on once the wire checksum is verified; see
+		// the producer rule in this file's doc comment for the three sites that
+		// may raise it.
 		return false, errors.NewBlockInvalidError("[pipelineBlockSink][%s] merkle root %s does not match header's %s", hash, root, header.MerkleRoot, errors.ErrBlockBodyMismatch)
 	}
 

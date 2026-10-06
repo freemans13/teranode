@@ -46,7 +46,8 @@ import (
 // block_park_policy.go), which neither marks the hash failed nor blames the
 // peer. Punishment for a legacy delivery lives on the legacy side: a body the
 // sink refuses as the peer's fault is a reject and the association dropped at
-// the read loop, banned only for the three ErrBlockBodyMismatch sites
+// the read loop, and a ban is reserved for the three ErrBlockBodyMismatch sites
+// once the wire checksum is verified, which the streaming path cannot do yet
 // (serverPeer.OnBlockBodyRejected, services/legacy/peer_server.go); a block
 // judged invalid at commit drops the delivering association through the
 // park table's dropPeer (applyParkDisposition).

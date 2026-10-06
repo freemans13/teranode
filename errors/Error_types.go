@@ -298,7 +298,10 @@ func NewBlockPolicyDeclinedError(message string, params ...interface{}) *Error {
 // reader of that verdict is unchanged; this marker is what lets the legacy peer
 // server tell those three refusals, which SV Node scores DoS(100), from every
 // other invalid verdict, which it does not ban for. A delivery that ended early
-// never carries it: those sites judge only a body that parsed to its end.
+// never carries it: those sites judge only a body that parsed to its end. The
+// marker alone is not grounds for a ban: SV Node scores those three only after
+// the message checksum passed, and the legacy streaming path cannot check that
+// checksum yet (peer.BlockBodyRejectedError.ProvenBad).
 func IsBlockBodyMismatch(err error) bool {
 	if err == nil {
 		return false

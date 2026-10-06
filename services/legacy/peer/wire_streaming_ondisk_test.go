@@ -408,8 +408,9 @@ func TestStreamingBlockHandlerDrainsThePayloadAfterAGateRejection(t *testing.T) 
 // The last row is the Truncated bit: the sink refused with the ban marker, but
 // the peer declared more bytes than it sent, so the handler's drain found the
 // stream short. The rejection is still typed (reject, association dropped) but
-// not ProvenBad, because a body this node never saw the end of was never
-// judged in full.
+// not MismatchInFull, because a body this node never saw the end of was never
+// judged in full. No row is ProvenBad: this handler never verifies the wire
+// checksum, so ChecksumVerified is never set (see streamingBlockHandler).
 func TestStreamingBlockHandlerReportsASinkRefusalAsRejected(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -417,7 +418,7 @@ func TestStreamingBlockHandlerReportsASinkRefusalAsRejected(t *testing.T) {
 		declaredExtra  uint64
 		wantRejected   bool
 		wantTruncated  bool
-		wantProvenBad  bool
+		wantMismatch   bool
 		wantInvalidErr bool
 	}{
 		{
@@ -436,14 +437,14 @@ func TestStreamingBlockHandlerReportsASinkRefusalAsRejected(t *testing.T) {
 			sinkErr: errors.NewStorageError("disk full"),
 		},
 		{
-			name:           "the ban marker in a body delivered in full is proven bad",
+			name:           "the ban marker in a body delivered in full is a mismatch in full",
 			sinkErr:        errors.NewBlockInvalidError("merkle root does not match", errors.ErrBlockBodyMismatch),
 			wantRejected:   true,
-			wantProvenBad:  true,
+			wantMismatch:   true,
 			wantInvalidErr: true,
 		},
 		{
-			name:           "the ban marker in a body cut short is truncated, not proven bad",
+			name:           "the ban marker in a body cut short is truncated, not a mismatch in full",
 			sinkErr:        errors.NewBlockInvalidError("block contains duplicate transaction", errors.ErrBlockBodyMismatch),
 			declaredExtra:  32,
 			wantRejected:   true,
@@ -498,7 +499,9 @@ func TestStreamingBlockHandlerReportsASinkRefusalAsRejected(t *testing.T) {
 			require.Equal(t, hash, rejected.Hash)
 			require.Equal(t, tc.wantInvalidErr, errors.Is(rejected.Err, errors.ErrBlockInvalid))
 			require.Equal(t, tc.wantTruncated, rejected.Truncated)
-			require.Equal(t, tc.wantProvenBad, rejected.ProvenBad())
+			require.Equal(t, tc.wantMismatch, rejected.MismatchInFull())
+			require.False(t, rejected.ChecksumVerified, "go-wire gives this handler no checksum to verify")
+			require.False(t, rejected.ProvenBad(), "no ban may rest on bytes whose checksum nobody verified")
 
 			if tc.declaredExtra == 0 {
 				got := make([]byte, len(tail))

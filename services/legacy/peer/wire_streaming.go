@@ -76,17 +76,29 @@ var blockBodyDelete func(hash chainhash.Hash, converted bool) error
 // ~2.86 GB of legacy heap inuse during sync, the second-largest contributor
 // to RSS after the per-tx scratch buffer.
 //
-// Note on the wire-level DoubleHash checksum: the default path verifies the
-// peer-supplied checksum over the payload bytes. This handler skips it, so
-// the early-rejection signal that checksum provides is lost. Integrity is
-// preserved by the existing downstream validation in
-// netsync.HandleBlockDirect — PoW via HasMetTargetDifficulty, merkle root
-// reconstruction during subtree preparation, and per-tx parse + validate.
-// Any payload corruption that a wire-level checksum would have caught also
-// fails one of those downstream checks; what we give up is rejecting a bad
-// block before paying the decode cost. Preserving the checksum under
-// streaming would require a TeeReader → SHA-256 pass over multi-GB
-// payloads, which is not justified given the downstream guarantees.
+// Note on the wire-level DoubleHash checksum: this handler never verifies it.
+// go-wire calls an external handler and returns its result before it reaches
+// the checksum check (go-wire v1.2.11 message.go:488-490 hand the payload
+// reader to the handler; the comparison is at :504-511, on the non-streaming
+// path only), and the handler's signature carries no checksum, so there is
+// nothing here to compare the body against. Corruption is still caught
+// downstream: the sink rebuilds the merkle root from the bytes it read and
+// checks it against the header, so a damaged body is refused rather than
+// stored. What is lost is the ability to tell a body damaged in transit from
+// a body the peer built wrong: both reach the sink's merkle-root,
+// duplicate-transaction or zero-count check and raise
+// ERR_BLOCK_BODY_MISMATCH. SV Node can tell them apart, because it drops a
+// message whose checksum fails (net_processing.cpp ProcessMessages, scoring one
+// point only for a burst of more than 100 within 500 ms), and bans only a body
+// that passed the checksum and still did not match.
+//
+// So a rejection from here never has ChecksumVerified set, and therefore is
+// never ProvenBad: the peer is sent a reject and disconnected, and not banned.
+// Banning on these bytes would ban an honest peer for 24 hours over a bit flip
+// that TCP's 16-bit checksum missed. The root fix is in go-wire: pass the
+// header's checksum to the external handler, so this handler can double-SHA256
+// the payload as it streams, treat a mismatch as a delivery fault (drain,
+// disconnect, no ban), and set ChecksumVerified when it matches.
 //
 // Whenever both a sink and a gate are installed, the body is never decoded at
 // all, regardless of size: the header is read, put to the gate, and

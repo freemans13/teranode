@@ -131,6 +131,14 @@ type BlockBodyRejectedError struct {
 	// after the drain, which is the one place that knows; the sink cannot, and
 	// readBlockMessage returns before the drain runs.
 	Truncated bool
+
+	// ChecksumVerified reports that the payload's double-SHA256 was compared
+	// with the checksum in the message header and matched. Nothing sets it
+	// today: go-wire hands the body to the streaming handler before it checks
+	// the checksum, and does not pass the checksum to the handler (see
+	// streamingBlockHandler). It is false, so ProvenBad is false, until that
+	// changes.
+	ChecksumVerified bool
 }
 
 func (e *BlockBodyRejectedError) Error() string {
@@ -141,13 +149,26 @@ func (e *BlockBodyRejectedError) Unwrap() error { return e.Err }
 
 // ProvenBad is the one predicate a ban is allowed to rest on, and the legacy
 // peer server (serverPeer.OnBlockBodyRejected) bans on nothing else: the body
-// arrived in full, and the sink raised ERR_BLOCK_BODY_MISMATCH, which only its
+// arrived in full, the sink raised ERR_BLOCK_BODY_MISMATCH, which only its
 // three SV Node DoS(100) parity sites do (a merkle root the header does not
-// carry, a duplicate transaction, no coinbase). SV Node reaches CheckBlock only
-// after the whole message is deserialised, so a short delivery never scores
-// there either; Truncated gives teranode the same property on a path that
-// judges the body as it streams.
+// carry, a duplicate transaction, no coinbase), and the wire checksum over the
+// payload was verified. SV Node reaches CheckBlock only after the whole message
+// is deserialised, so a short delivery never scores there either; Truncated
+// gives teranode the same property on a path that judges the body as it
+// streams. SV Node also checks the message checksum first and drops a message
+// that fails it (net_processing.cpp ProcessMessages, "CHECKSUM ERROR"), scoring
+// one point only for a burst of more than 100 within 500 ms, so a body damaged
+// in transit never reaches CheckBlock.
+// ChecksumVerified is that half, and it is never true today: see
+// streamingBlockHandler.
 func (e *BlockBodyRejectedError) ProvenBad() bool {
+	return e != nil && e.ChecksumVerified && e.MismatchInFull()
+}
+
+// MismatchInFull reports that the body arrived in full and the sink raised
+// ERR_BLOCK_BODY_MISMATCH at one of its three sites: the delivery half of
+// ProvenBad, without the checksum half.
+func (e *BlockBodyRejectedError) MismatchInFull() bool {
 	return e != nil && !e.Truncated && errors.IsBlockBodyMismatch(e.Err)
 }
 
