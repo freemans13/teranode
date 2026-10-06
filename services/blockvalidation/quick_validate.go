@@ -2191,11 +2191,16 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		}
 	}
 
-	// Track transactions that already exist so we can update their mined info.
-	var existingTxHashes []*chainhash.Hash
+	// Track transactions that already exist so we can update their mined info, and spend
+	// their inputs again below.
+	var (
+		existingTxHashes []*chainhash.Hash
+		existingTxs      []*bt.Tx
+	)
 
 	collectExisting := func(tx *bt.Tx) {
 		existingTxHashes = append(existingTxHashes, tx.TxIDChainHash())
+		existingTxs = append(existingTxs, tx)
 	}
 
 	start := time.Now()
@@ -2204,12 +2209,14 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	nettedDuration := time.Since(start)
 
 	// Spend the unspendable transactions' inputs once every create of the batch has committed,
-	// since they may spend an output the list created. Conflicts are NOT tolerated here: the
-	// quick path never writes conflicting subtree nodes and has no resolver for a loser, so a
-	// spend attributed to a non-canonical transaction would stay that way. A replay re-spends an
-	// output with the same spender, which the store accepts as the same spend.
+	// since they may spend an output the list created. A transaction the store reported as
+	// already existing is spent again too, as the separate spend phase always spent every
+	// transaction: an earlier attempt that stored it is not proof it made its spends, and a
+	// repeat spend by the same spender is the store's idempotent success path. Conflicts are NOT
+	// tolerated here: the quick path never writes conflicting subtree nodes and has no resolver
+	// for a loser, so a spend attributed to a non-canonical transaction would stay that way.
 	if applyErr == nil {
-		applyErr = u.spendBatchWithRetry(ctx, block, unspendableTxs, outpointOnly)
+		applyErr = u.spendBatchWithRetry(ctx, block, append(unspendableTxs, existingTxs...), outpointOnly)
 	}
 
 	// Logged on the failure path too: how long the list ran for is the first thing anyone
@@ -2261,9 +2268,9 @@ type txApply struct {
 }
 
 // applyNetted writes a batch's list through SpendAndCreateMulti, repeating the whole list on a
-// store fault: a repeat is safe because every transaction that exists has made all its spends,
-// and the store reports one it finds again as existing rather than writing it twice. A
-// transaction that exists is collected for the mined-info stamp, as before. A transaction the
+// store fault: a repeat is safe because the store reports a transaction it finds again as
+// existing rather than writing it twice. A transaction that exists is collected for the
+// mined-info stamp and for a second spend of its inputs, as the separate phases did. A transaction the
 // store fails, or whose parent in the list failed, fails the batch closed unless the failure is
 // retryable, which the per-transaction default reports per transaction rather than as an error.
 func (u *BlockValidation) applyNetted(ctx context.Context, block *model.Block, txs []*bt.Tx, txids []chainhash.Hash,
