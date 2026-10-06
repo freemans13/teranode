@@ -305,10 +305,8 @@ func TestRepository_PendingSubtreeIsNotServed(t *testing.T) {
 		// subtree to regenerate from. There is still no data file here, so getting a reader
 		// back proves the refusal above came from the missing validated subtree.
 		// Regeneration reads the transaction from the UTXO store, so store it, and drain the
-		// stream here so the regeneration goroutine finishes inside the test. Regeneration also
-		// takes the process-wide quorum (assetQuorumOnce in GetSubtreeData.go), which binds to
-		// the first repository's subtree store, so this subtest fails under -count greater
-		// than 1; that is the singleton, not the gate.
+		// stream here so the regeneration goroutine finishes inside the test. The fixture runs
+		// without a quorum, so the shared assetQuorumOnce singleton is never involved.
 		creator, ok := repo.UtxoStore.(interface {
 			Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error)
 		})
@@ -747,6 +745,13 @@ func createTestRepositoryWithSubtreeDataToCheck(t *testing.T, subtreeHash *chain
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	settings := test.CreateBaseTestSettings(t)
+
+	// No quorum. Regeneration would otherwise take the process-wide quorum
+	// (assetQuorumOnce in GetSubtreeData.go), which stays bound to the subtree store of
+	// whichever repository in this test binary used it first. A data file that an earlier
+	// run left in that store would then answer "exists" for this hash, and the read from
+	// this repository's store would fail.
+	settings.SubtreeValidation.QuorumPath = ""
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
