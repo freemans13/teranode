@@ -3,6 +3,7 @@ package netsync
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"sync"
@@ -28,9 +29,11 @@ import (
 // coexist, and each peer's best known header (pindexBestKnownBlock) only ever
 // moves to a header with at least as much chain work (UpdateBlockAvailability).
 // A peer that feeds it a fake branch gets a branch of its own; it cannot take
-// another peer's away. This cache is the same structure with two bounds SV Node
-// does not need, because SV Node never discards a header: at most one branch per
-// peer, and each branch at most branchCap headers above the committed tip.
+// another peer's away. This cache is the same structure with three bounds SV
+// Node does not need, because SV Node never discards a header: at most one
+// branch per peer, each branch at most branchCap headers above the committed
+// tip, and at most nodeCap headers over all branches, enforced by evicting the
+// lowest ranked branch that is neither active nor proven.
 //
 // It is still a cache and not a work queue. Everything in it can be asked for
 // again in one message, so a branch can be dropped at any instant: when its peer
@@ -112,6 +115,11 @@ type headerCache struct {
 	// the checkpoints (see capForCheckpoints).
 	branchCap int32
 
+	// nodeCap is the most headers the tree holds over all branches, set with
+	// branchCap (see nodeCapForBranchCap). Over it, a fill evicts branches
+	// (see enforceNodeCapLocked).
+	nodeCap int
+
 	// powLimit is the easiest target a header may declare on this chain
 	// (model.PowLimitCeiling). nil means no proof-of-work check, which is what
 	// every test that only cares which heights the cache names gets.
@@ -129,32 +137,82 @@ type headerCache struct {
 
 // headerNode is one held header. Everything but refs and proven is fixed when
 // the node is made; parent is cut to nil only by the sweep, which holds fillMu.
+//
+// The header is kept as its six wire fields, not as a wire.BlockHeader, whose
+// time.Time timestamp costs 24 bytes against the wire's 4 and pads the struct.
+// All six are kept, merkle root and nonce included, although no rule reads
+// those two: the branchSource hands the difficulty calculator and the median
+// time past walk model headers, and both check each header's Hash() against
+// the hash they asked for (services/blockchain/Difficulty.go and
+// medianTimePast), which needs every byte of the 80. Fields are ordered so
+// nothing pads: 176 bytes, from 208.
 type headerNode struct {
-	hash   chainhash.Hash
-	header wire.BlockHeader
-
-	// parent is the node this header builds on, or nil when that parent is
-	// committed (header.PrevBlock names it in the trunk).
-	parent *headerNode
-	height int32
+	hash       chainhash.Hash
+	prevBlock  chainhash.Hash
+	merkleRoot chainhash.Hash
 
 	// chainWork is cumulative work to and including this header, 32 bytes
 	// big-endian, the store's chain_work form.
 	chainWork [32]byte
 
+	// parent is the node this header builds on, or nil when that parent is
+	// committed (prevBlock names it in the trunk).
+	parent *headerNode
+
 	seq uint64
+
+	version   int32
+	timestamp uint32
+	bits      uint32
+	nonce     uint32
+	height    int32
 
 	// cpHeight is the highest checkpoint height on the path from the trunk to
 	// this node, 0 when none.
 	cpHeight int32
 
-	// proven is true for a checkpoint node and every node below it: linkage
-	// commits backwards, so the pinned hash fixes all of them.
-	proven bool
-
 	// refs counts the held children and branch tips that point at this node.
 	// At zero the node is released.
 	refs int32
+
+	// proven is true for a checkpoint node and every node below it: linkage
+	// commits backwards, so the pinned hash fixes all of them.
+	proven bool
+}
+
+// newHeaderNode makes the node for header, whose hash is hash.
+func newHeaderNode(hash chainhash.Hash, header *wire.BlockHeader, parent *headerNode, height, cpHeight int32) *headerNode {
+	return &headerNode{
+		hash:       hash,
+		prevBlock:  header.PrevBlock,
+		merkleRoot: header.MerkleRoot,
+		parent:     parent,
+		version:    header.Version,
+		timestamp:  uint32(header.Timestamp.Unix()), //nolint:gosec // a header timestamp is 32 bits on the wire
+		bits:       header.Bits,
+		nonce:      header.Nonce,
+		height:     height,
+		cpHeight:   cpHeight,
+	}
+}
+
+// modelHeader is the node's header in the model's form, the same 80 bytes the
+// header arrived as, so its Hash() is the node's hash.
+func (n *headerNode) modelHeader() *model.BlockHeader {
+	prev, merkle := n.prevBlock, n.merkleRoot
+
+	var bits model.NBit
+
+	binary.LittleEndian.PutUint32(bits[:], n.bits)
+
+	return &model.BlockHeader{
+		Version:        uint32(n.version), //nolint:gosec // the same 32 bits either way
+		HashPrevBlock:  &prev,
+		HashMerkleRoot: &merkle,
+		Timestamp:      n.timestamp,
+		Bits:           bits,
+		Nonce:          n.nonce,
+	}
 }
 
 // headerBranch is one peer's best known header.
@@ -179,8 +237,28 @@ func newHeaderCache() *headerCache {
 		index:        make(map[chainhash.Hash]*headerNode),
 		branches:     make(map[any]*headerBranch),
 		branchCap:    capForCheckpoints(nil),
+		nodeCap:      nodeCapForBranchCap(capForCheckpoints(nil)),
 		storeTimeout: headerStoreTimeout,
 	}
+}
+
+// nodeCapForBranchCap is the most headers the tree may hold over all branches:
+// two branches' worth, plus two replies for what the sweep has not yet removed
+// below the committed tip.
+//
+// Honest peers on one chain share their headers, so twenty of them hold one
+// branch's worth between them, at most branchCap above the committed tip, plus
+// what lies below the tip unswept: the sweep runs once the tip has moved a
+// reply's worth (MaxBlockHeadersPerMsg) and keeps a reply's worth below it, so
+// up to two replies. That is branchCap + 4,000, which the cap clears by a whole
+// branch, the room for one honest competing chain. The cap is what stops many
+// peers, each with a branch of its own, holding branchCap headers apiece: 52,000
+// on mainnet, so 125 such peers would hold 6.5 million.
+//
+// Mainnet: 2 x 52,000 + 4,000 = 108,000 headers. Testnet: 2 x 102,010 + 4,000 =
+// 208,020. With no checkpoints: 2 x 4,000 + 4,000 = 12,000.
+func nodeCapForBranchCap(branchCap int32) int {
+	return 2*int(branchCap) + 2*wire.MaxBlockHeadersPerMsg
 }
 
 // headerStoreTimeout is the most one fill may spend in blockchain calls while
@@ -254,6 +332,7 @@ func (c *headerCache) WithCheckpoints(checkpoints []chaincfg.Checkpoint) *header
 
 	c.checkpoints = checkpoints
 	c.branchCap = capForCheckpoints(checkpoints)
+	c.nodeCap = nodeCapForBranchCap(c.branchCap)
 
 	return c
 }
@@ -680,7 +759,7 @@ func (c *headerCache) judge(ctx context.Context, plan fillPlan, headers []*wire.
 		if rules != nil {
 			var parentHeader *model.BlockHeader
 			if prev != nil {
-				parentHeader = modelHeader(&prev.header)
+				parentHeader = prev.modelHeader()
 			} else {
 				header, _, err := rules.trunk.GetBlockHeader(ctx, &plan.parent)
 				if err != nil || header == nil {
@@ -695,7 +774,7 @@ func (c *headerCache) judge(ctx context.Context, plan fillPlan, headers []*wire.
 			}
 		}
 
-		node := &headerNode{hash: hashes[i], header: *headers[i], parent: prev, height: height, cpHeight: parentCP}
+		node := newHeaderNode(hashes[i], headers[i], prev, height, parentCP)
 
 		sum := new(big.Int).SetBytes(parentWork[:])
 		sum.Add(sum, work.CalcBlockWork(headers[i].Bits))
@@ -796,7 +875,7 @@ func trunkFork(ctx context.Context, rules *headerRules, checkpoints []chaincfg.C
 
 // cached is the node in the form branchSource reads.
 func (n *headerNode) cached() *cachedHeader {
-	return &cachedHeader{header: modelHeader(&n.header), height: n.height, chainWork: n.chainWork}
+	return &cachedHeader{header: n.modelHeader(), height: n.height, chainWork: n.chainWork}
 }
 
 // installLocked holds the judged nodes and moves owner's branch to the batch's
@@ -859,11 +938,77 @@ func (c *headerCache) installLocked(owner any, plan fillPlan, nodes []*headerNod
 
 	c.setTipLocked(owner, tip)
 	c.selectLocked()
+	c.enforceNodeCapLocked()
+
+	// The cap can evict the branch this fill just moved, when it ranks lowest.
+	if branch := c.branches[owner]; branch == nil || branch.tip != tip {
+		result.low, result.added = 0, 0
+
+		return result
+	}
 
 	result.accepted = true
 	result.top, result.topHash = tip.height, tip.hash
 
 	return result
+}
+
+// enforceNodeCapLocked brings the tree back under nodeCap: it frees what dropped
+// branches held, sweeps if a sweep is due, and then evicts branches one at a
+// time, the lowest ranked first, until the tree is under the cap or only branches
+// it must keep are left. It never evicts the active branch, nor a branch whose
+// proof reaches above the committed tip: the first is what every reader sees,
+// and the second is on the checkpointed chain, which the next download needs.
+// A branch that no longer counts (diverged, or at or below the committed tip) is
+// evicted before any that does. Called with fillMu and mu held; it costs nothing
+// while the tree is under the cap.
+func (c *headerCache) enforceNodeCapLocked() {
+	if c.nodeCap <= 0 || len(c.index) <= c.nodeCap {
+		return
+	}
+
+	c.reapLocked()
+
+	if len(c.index) > c.nodeCap && c.haveFloor && c.floorHeight-c.sweptTo >= int32(wire.MaxBlockHeadersPerMsg) {
+		c.sweepLocked()
+	}
+
+	for len(c.index) > c.nodeCap {
+		var (
+			victimOwner any
+			victim      *headerBranch
+		)
+
+		for owner, branch := range c.branches {
+			if branch == c.active || c.effectiveProofLocked(branch) > 0 {
+				continue
+			}
+
+			if victim == nil || c.evictBeforeLocked(branch, victim) {
+				victimOwner, victim = owner, branch
+			}
+		}
+
+		if victim == nil {
+			return
+		}
+
+		c.dropBranchLocked(victimOwner)
+		c.reapLocked()
+	}
+}
+
+// evictBeforeLocked reports whether a should be evicted before b: a branch that
+// no longer counts goes first, then the lower ranked by betterLocked.
+func (c *headerCache) evictBeforeLocked(a, b *headerBranch) bool {
+	deadA := a.diverged || (c.haveFloor && a.tip.height <= c.floorHeight)
+	deadB := b.diverged || (c.haveFloor && b.tip.height <= c.floorHeight)
+
+	if deadA != deadB {
+		return deadA
+	}
+
+	return c.betterLocked(b, a)
 }
 
 // floorSnapshot is the recorded committed tip, saved so a refused fill can
@@ -1015,7 +1160,7 @@ func (c *headerCache) anchoredLocked(branch *headerBranch) bool {
 		}
 	}
 
-	return first.height == c.floorHeight+1 && first.header.PrevBlock == c.floorHash
+	return first.height == c.floorHeight+1 && first.prevBlock == c.floorHash
 }
 
 // provenTo is the highest height on node's path that a matched checkpoint
