@@ -2017,10 +2017,15 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	lockUTXOs := !u.quickValidateSkipsUtxoLock(block)
 
-	// The batch goes to the store as ONE list, in block order, through SpendAndCreateMulti: an
-	// output created and spent inside the batch never becomes a UTXO, and its spend goes straight
-	// to the spend journal. A batch spans several subtrees, so each transaction carries its own
-	// subtree index. The list is ordered parents first because a block is.
+	// The batch goes to the store as ONE list, in block order, through SpendAndCreateMulti. A
+	// batch spans several subtrees, so each transaction carries its own subtree index. The list
+	// is ordered parents first because a block is. What the store does with the list is up to
+	// the store: the SQL and Aerospike stores apply it through DefaultSpendAndCreateMulti, one
+	// SpendAndCreate per transaction, a dependency level at a time, so a parent's outputs are
+	// created as UTXOs and its child in the list spends them a level later. Each level waits for
+	// the one before it, so a chain of N dependent transactions in the batch costs N rounds of
+	// store calls there. A store with its own SpendAndCreateMulti may instead net the list and
+	// never write an output the list also spends.
 	//
 	// A transaction whose create is skipped as unspendable stays out of the list and has its
 	// inputs spent afterwards, as before: it has no output anything can spend, so it is nobody's
@@ -2066,8 +2071,8 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	start := time.Now()
 
-	applyErr := u.applyNetted(ctx, block, txs, txids, subtreeIdxs, lockUTXOs, outpointOnly, collectExisting)
-	nettedDuration := time.Since(start)
+	applyErr := u.applyList(ctx, block, txs, txids, subtreeIdxs, lockUTXOs, outpointOnly, collectExisting)
+	listDuration := time.Since(start)
 
 	// Spend the unspendable transactions' inputs once every create of the batch has committed,
 	// since they may spend an output the list created. A transaction the store reported as
@@ -2082,8 +2087,8 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	// Logged on the failure path too: how long the list ran for is the first thing anyone
 	// reading the log wants.
-	u.logger.Infof("[createAndSpendUTXOsForBatch][%s] batch %d-%d applied: listed=%d unspendable=%d existing=%d (netted=%v, total=%v, err=%v)",
-		block.Hash().String(), batch.batchStart, batch.batchEnd, len(txs), len(unspendableTxs), len(existingTxHashes), nettedDuration, time.Since(start), applyErr)
+	u.logger.Infof("[createAndSpendUTXOsForBatch][%s] batch %d-%d applied: listed=%d unspendable=%d existing=%d (list=%v, total=%v, err=%v)",
+		block.Hash().String(), batch.batchStart, batch.batchEnd, len(txs), len(unspendableTxs), len(existingTxHashes), listDuration, time.Since(start), applyErr)
 
 	if applyErr != nil {
 		return applyErr
@@ -2195,13 +2200,13 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 	return errors.NewProcessingError("[spendBatchWithRetry][%s] %d of %d spends still failing after %d retries", block.Hash().String(), len(pending), total, maxRetries)
 }
 
-// applyNetted writes a batch's list through SpendAndCreateMulti, repeating the whole list on a
+// applyList writes a batch's list through SpendAndCreateMulti, repeating the whole list on a
 // store fault: a repeat is safe because the store reports a transaction it finds again as
 // existing rather than writing it twice. A transaction that exists is collected for the
 // mined-info stamp and for a second spend of its inputs, as the separate phases did. A transaction the
 // store fails, or whose parent in the list failed, fails the batch closed unless the failure is
 // retryable, which the per-transaction default reports per transaction rather than as an error.
-func (u *BlockValidation) applyNetted(ctx context.Context, block *model.Block, txs []*bt.Tx, txids []chainhash.Hash,
+func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs []*bt.Tx, txids []chainhash.Hash,
 	subtreeIdxs []int, lockUTXOs, outpointOnly bool, collectExisting func(*bt.Tx)) error {
 	const maxRetries = 10
 
@@ -2228,12 +2233,12 @@ func (u *BlockValidation) applyNetted(ctx context.Context, block *model.Block, t
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			u.logger.Infof("[applyNetted][%s] retry %d/%d of a list of %d transactions: %v", block.Hash().String(), attempt, maxRetries, len(txs), lastErr)
-			time.Sleep(backoff)
+			u.logger.Infof("[applyList][%s] retry %d/%d of a list of %d transactions: %v", block.Hash().String(), attempt, maxRetries, len(txs), lastErr)
+			sleepUnlessDone(ctx, backoff)
 		}
 
 		if ctx.Err() != nil {
-			return errors.NewProcessingError("[applyNetted][%s] context cancelled", block.Hash().String())
+			return errors.NewProcessingError("[applyList][%s] context cancelled", block.Hash().String())
 		}
 
 		results, err := u.utxoStore.SpendAndCreateMulti(ctx, txs, block.Height, opts...)
@@ -2246,14 +2251,14 @@ func (u *BlockValidation) applyNetted(ctx context.Context, block *model.Block, t
 			// meets the same outcome and error class it always did: a duplicate comes back as
 			// existing and the duplicate check condemns the block later, a double spend fails
 			// as a spend.
-			u.logger.Warnf("[applyNetted][%s] the store refused the list of %d transactions, applying them one at a time: %v", block.Hash().String(), len(txs), err)
+			u.logger.Warnf("[applyList][%s] the store refused the list of %d transactions, applying them one at a time: %v", block.Hash().String(), len(txs), err)
 
 			return u.applyOneByOne(ctx, block, txs, subtreeIdxs, lockUTXOs, outpointOnly, collectExisting)
 		case err != nil:
 			lastErr = err
 			continue
 		case len(results) != len(txs):
-			return errors.NewProcessingError("[applyNetted][%s] SpendAndCreateMulti returned %d results for %d transactions", block.Hash().String(), len(results), len(txs))
+			return errors.NewProcessingError("[applyList][%s] SpendAndCreateMulti returned %d results for %d transactions", block.Hash().String(), len(results), len(txs))
 		}
 
 		// Any retryable failure repeats the whole list, including the children it failed as
@@ -2273,7 +2278,7 @@ func (u *BlockValidation) applyNetted(ctx context.Context, block *model.Block, t
 			}
 
 			if hard == nil {
-				hard = errors.NewProcessingError("[applyNetted][%s] transaction %s could not be applied (status %d)", block.Hash().String(), txids[i].String(), r.Status, r.Err)
+				hard = errors.NewProcessingError("[applyList][%s] transaction %s could not be applied (status %d)", block.Hash().String(), txids[i].String(), r.Status, r.Err)
 			}
 		}
 
@@ -2295,7 +2300,7 @@ func (u *BlockValidation) applyNetted(ctx context.Context, block *model.Block, t
 		return nil
 	}
 
-	return errors.NewProcessingError("[applyNetted][%s] a list of %d transactions still failing after %d retries", block.Hash().String(), len(txs), maxRetries, lastErr)
+	return errors.NewProcessingError("[applyList][%s] a list of %d transactions still failing after %d retries", block.Hash().String(), len(txs), maxRetries, lastErr)
 }
 
 // applyOneByOne applies txs one SpendAndCreate at a time, in block order: the path for a list the
@@ -2316,12 +2321,12 @@ func (u *BlockValidation) applyOneByOne(ctx context.Context, block *model.Block,
 		// A transient store error is retried, as the per-transaction waves retried it; a
 		// repeat of the same transaction is accepted as the same spends and create.
 		for attempt := 0; attempt <= maxRetries; attempt++ {
-			if ctx.Err() != nil {
-				return errors.NewProcessingError("[applyOneByOne][%s] context cancelled", block.Hash().String())
+			if attempt > 0 {
+				sleepUnlessDone(ctx, backoff)
 			}
 
-			if attempt > 0 {
-				time.Sleep(backoff)
+			if ctx.Err() != nil {
+				return errors.NewProcessingError("[applyOneByOne][%s] context cancelled", block.Hash().String())
 			}
 
 			_, _, err = u.utxoStore.SpendAndCreate(ctx, tx, block.Height,
@@ -2346,6 +2351,18 @@ func (u *BlockValidation) applyOneByOne(ctx context.Context, block *model.Block,
 	}
 
 	return nil
+}
+
+// sleepUnlessDone waits for d, or until ctx is done if that comes first. The caller checks ctx
+// afterwards, so a cancelled block stops retrying at once instead of sleeping out its backoff.
+func sleepUnlessDone(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 // writeSubtreeFilesForBatch writes the full subtree files (.subtree) for a batch.

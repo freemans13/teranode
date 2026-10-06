@@ -28,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These tests pin the netted apply: a batch goes to the store as ONE SpendAndCreateMulti list,
+// These tests pin the list apply: a batch goes to the store as ONE SpendAndCreateMulti list,
 // in block order, each transaction carrying its own subtree index. They run against the
 // sqlitememory UTXO store, so "applied" means the rows are really there, and wrap it in a
 // recorder so every list, and every per-transaction call, is observable.
@@ -52,6 +52,9 @@ type applyRecorder struct {
 	// reach the store.
 	failMulti      error
 	failMultiTimes int
+
+	// failApply, when set, fails every SpendAndCreate before it reaches the store.
+	failApply error
 
 	mu    sync.Mutex
 	calls []recordedApply
@@ -116,6 +119,10 @@ func (a *applyRecorder) recordedLists() []recordedList {
 func (a *applyRecorder) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
 	options := parseCreateOptions(opts)
+
+	if a.failApply != nil {
+		return nil, nil, a.failApply
+	}
 
 	md, spends, err := a.Store.SpendAndCreate(ctx, tx, blockHeight, opts...)
 
@@ -187,7 +194,7 @@ func (a *applyRecorder) reset() {
 	a.mu.Unlock()
 }
 
-// newNettedHarness builds a BlockValidation over a fresh sqlitememory UTXO store wrapped in
+// newListHarness builds a BlockValidation over a fresh sqlitememory UTXO store wrapped in
 // the recorder. dbName must be unique per test so two tests never share a database.
 //
 // outpointOnly runs the harness in the below-checkpoint mode that ships on the Hetzner nodes:
@@ -195,7 +202,7 @@ func (a *applyRecorder) reset() {
 // checkpoints and createAndSpendUTXOsForBatch's invariant I4 fails any outpoint-only batch
 // above the highest one before it applies anything. CreateBaseTestSettings copies the chain
 // params per call, so the checkpoint leaks into no other test.
-func newNettedHarness(t *testing.T, dbName string, outpointOnly bool) (*BlockValidation, *applyRecorder, func()) {
+func newListHarness(t *testing.T, dbName string, outpointOnly bool) (*BlockValidation, *applyRecorder, func()) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -236,10 +243,10 @@ func newNettedHarness(t *testing.T, dbName string, outpointOnly bool) (*BlockVal
 	return bv, recorder, cleanup
 }
 
-// nettedBatchForErr is nettedBatchFor without the require dependency. outpointOnly is the
+// listBatchForErr is listBatchFor without the require dependency. outpointOnly is the
 // per-block mode the batch carries, the same value that drives create and spend below and
 // that the I4 guard keys on.
-func nettedBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, outpointOnly bool) (*SubtreeProcessingBatch, error) {
+func listBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, outpointOnly bool) (*SubtreeProcessingBatch, error) {
 	batch := &SubtreeProcessingBatch{
 		subtreeData:  make([]*subtreepkg.Data, len(txs)),
 		txRanges:     make([][2]int, len(txs)),
@@ -260,14 +267,14 @@ func nettedBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, ou
 	return batch, nil
 }
 
-// nettedBatchFor builds a batch out of txs, one subtree per transaction, and runs the real
+// listBatchFor builds a batch out of txs, one subtree per transaction, and runs the real
 // extend stage over it so the in-block-parent partition is derived by production code rather
 // than asserted into place.
 
-func nettedBatchFor(t *testing.T, bv *BlockValidation, block *model.Block, txs []*bt.Tx, outpointOnly bool) *SubtreeProcessingBatch {
+func listBatchFor(t *testing.T, bv *BlockValidation, block *model.Block, txs []*bt.Tx, outpointOnly bool) *SubtreeProcessingBatch {
 	t.Helper()
 
-	batch, err := nettedBatchForErr(bv, block, txs, outpointOnly)
+	batch, err := listBatchForErr(bv, block, txs, outpointOnly)
 	require.NoError(t, err)
 
 	return batch
@@ -321,11 +328,11 @@ func requireSpentBy(t *testing.T, store utxo.Store, tx *bt.Tx, vout uint32, spen
 		"output %d of %s must be spent by %s", vout, tx.TxIDChainHash().String(), spender.TxIDChainHash().String())
 }
 
-// TestNetted_BatchIsOneListInBlockOrder: the whole batch goes to the store as one list, in
+// TestBatchList_BatchIsOneListInBlockOrder: the whole batch goes to the store as one list, in
 // block order, each transaction with the subtree index it sits in, and every transaction ends
 // created with its input spent.
-func TestNetted_BatchIsOneListInBlockOrder(t *testing.T) {
-	bv, recorder, cleanup := newNettedHarness(t, "netted_one_list", false)
+func TestBatchList_BatchIsOneListInBlockOrder(t *testing.T) {
+	bv, recorder, cleanup := newListHarness(t, "netted_one_list", false)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -339,7 +346,7 @@ func TestNetted_BatchIsOneListInBlockOrder(t *testing.T) {
 	}
 
 	block := &model.Block{Height: 100, ID: 42}
-	batch := nettedBatchFor(t, bv, block, txs, false)
+	batch := listBatchFor(t, bv, block, txs, false)
 
 	recorder.reset()
 	require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, batch))
@@ -360,11 +367,11 @@ func TestNetted_BatchIsOneListInBlockOrder(t *testing.T) {
 	}
 }
 
-// TestNetted_ChainedAndIndependentMix: a three-deep chain beside transactions with no parent in
+// TestBatchList_ChainedAndIndependentMix: a three-deep chain beside transactions with no parent in
 // the block all end applied from the one list, every spend naming its child.
-func TestNetted_ChainedAndIndependentMix(t *testing.T) {
-	nettedModes(t, "netted_mixed", func(t *testing.T, dbName string, outpointOnly bool) {
-		bv, recorder, cleanup := newNettedHarness(t, dbName, outpointOnly)
+func TestBatchList_ChainedAndIndependentMix(t *testing.T) {
+	listModes(t, "netted_mixed", func(t *testing.T, dbName string, outpointOnly bool) {
+		bv, recorder, cleanup := newListHarness(t, dbName, outpointOnly)
 		defer cleanup()
 
 		ctx := context.Background()
@@ -380,7 +387,7 @@ func TestNetted_ChainedAndIndependentMix(t *testing.T) {
 		txs := []*bt.Tx{c1, c2, c3, i1, i2}
 
 		block := &model.Block{Height: 100, ID: 42}
-		batch := nettedBatchFor(t, bv, block, txs, outpointOnly)
+		batch := listBatchFor(t, bv, block, txs, outpointOnly)
 
 		recorder.reset()
 		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, batch))
@@ -399,9 +406,9 @@ func TestNetted_ChainedAndIndependentMix(t *testing.T) {
 	})
 }
 
-// nettedModes runs a test once in decorate mode and once in the outpoint-only mode that ships,
+// listModes runs a test once in decorate mode and once in the outpoint-only mode that ships,
 // each over its own database.
-func nettedModes(t *testing.T, dbName string, run func(t *testing.T, dbName string, outpointOnly bool)) {
+func listModes(t *testing.T, dbName string, run func(t *testing.T, dbName string, outpointOnly bool)) {
 	t.Helper()
 
 	for _, outpointOnly := range []bool{false, true} {
@@ -411,12 +418,12 @@ func nettedModes(t *testing.T, dbName string, run func(t *testing.T, dbName stri
 	}
 }
 
-// TestNetted_ReplayStampsAndCreatesNothingTwice: applying the same batch again, as a dirty
+// TestBatchList_ReplayStampsAndCreatesNothingTwice: applying the same batch again, as a dirty
 // restart does, succeeds, every transaction comes back as already existing, and the block facts
 // are restamped.
-func TestNetted_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
-	nettedModes(t, "netted_replay", func(t *testing.T, dbName string, outpointOnly bool) {
-		bv, recorder, cleanup := newNettedHarness(t, dbName, outpointOnly)
+func TestBatchList_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
+	listModes(t, "netted_replay", func(t *testing.T, dbName string, outpointOnly bool) {
+		bv, recorder, cleanup := newListHarness(t, dbName, outpointOnly)
 		defer cleanup()
 
 		ctx := context.Background()
@@ -430,10 +437,10 @@ func TestNetted_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
 		txs := []*bt.Tx{first, chained, other}
 
 		block := &model.Block{Height: 100, ID: 42}
-		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, nettedBatchFor(t, bv, block, txs, outpointOnly)))
+		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, listBatchFor(t, bv, block, txs, outpointOnly)))
 
 		replayBlock := &model.Block{Height: 100, ID: 43}
-		second := nettedBatchFor(t, bv, replayBlock, txs, outpointOnly)
+		second := listBatchFor(t, bv, replayBlock, txs, outpointOnly)
 
 		recorder.reset()
 		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, replayBlock, second), "a replayed batch must apply cleanly")
@@ -453,16 +460,16 @@ func TestNetted_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
 	})
 }
 
-// TestNetted_MissingParentFailsTheBlock: a transaction whose parent is in neither the block nor
+// TestBatchList_MissingParentFailsTheBlock: a transaction whose parent is in neither the block nor
 // the store fails the block with the not-found class naming the outpoint, and is not created.
 //
 // Outpoint-only mode only: in the normal mode the extension step reads every parent first, so a
 // missing parent fails there, before the list reaches the store.
-func TestNetted_MissingParentFailsTheBlock(t *testing.T) {
+func TestBatchList_MissingParentFailsTheBlock(t *testing.T) {
 	const outpointOnly = true
 
 	{
-		bv, recorder, cleanup := newNettedHarness(t, "netted_missing_parent", outpointOnly)
+		bv, recorder, cleanup := newListHarness(t, "netted_missing_parent", outpointOnly)
 		defer cleanup()
 
 		ctx := context.Background()
@@ -477,7 +484,7 @@ func TestNetted_MissingParentFailsTheBlock(t *testing.T) {
 		orphan := spendOf(t, privateKey, ghost, 0, 90_000)
 
 		block := &model.Block{Height: 100, ID: 42}
-		batch := nettedBatchFor(t, bv, block, []*bt.Tx{orphan}, outpointOnly)
+		batch := listBatchFor(t, bv, block, []*bt.Tx{orphan}, outpointOnly)
 
 		err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
 		require.Error(t, err, "a transaction with no parent anywhere must fail the block")
@@ -490,10 +497,10 @@ func TestNetted_MissingParentFailsTheBlock(t *testing.T) {
 	}
 }
 
-// TestNetted_StoreFaultRetriesTheList: a store fault on the list is retried, and the whole list
+// TestBatchList_StoreFaultRetriesTheList: a store fault on the list is retried, and the whole list
 // is repeated, which is safe because existing records are recognised; a refusal is not retried.
-func TestNetted_StoreFaultRetriesTheList(t *testing.T) {
-	bv, recorder, cleanup := newNettedHarness(t, "netted_retry", true)
+func TestBatchList_StoreFaultRetriesTheList(t *testing.T) {
+	bv, recorder, cleanup := newListHarness(t, "netted_retry", true)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -503,7 +510,7 @@ func TestNetted_StoreFaultRetriesTheList(t *testing.T) {
 	txs := []*bt.Tx{spendOf(t, key, root, 0, 90_000), spendOf(t, key, root, 1, 90_000)}
 
 	block := &model.Block{Height: 100, ID: 42}
-	batch := nettedBatchFor(t, bv, block, txs, true)
+	batch := listBatchFor(t, bv, block, txs, true)
 
 	recorder.reset()
 	recorder.failMulti = errors.NewStorageError("forced store fault")
@@ -517,10 +524,72 @@ func TestNetted_StoreFaultRetriesTheList(t *testing.T) {
 	}
 }
 
-// TestNetted_RetryableParentFailureRetriesTheList: a parent that fails with a retryable store
+// TestBatchList_CancelStopsTheBackoff: a block cancelled while the list, or the one-at-a-time
+// fallback for a refused list, waits out a retry backoff stops at once rather than sleeping the
+// backoff out, fails the batch, and leaves none of its transactions in the store.
+func TestBatchList_CancelStopsTheBackoff(t *testing.T) {
+	const backoff = 30 * time.Second
+
+	for _, tc := range []struct {
+		name    string
+		refused bool
+	}{
+		{name: "list", refused: false},
+		{name: "one at a time", refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bv, recorder, cleanup := newListHarness(t, fmt.Sprintf("list_cancel_refused_%v", tc.refused), true)
+			defer cleanup()
+
+			bv.spendRetryBackoff = backoff
+
+			root, key := seedRoot(t, recorder.Store, 1, "LIST_CANCEL_KEY")
+			tx := spendOf(t, key, root, 0, 90_000)
+
+			// The same transaction twice is a list the store refuses, which sends the batch
+			// one transaction at a time.
+			txs := []*bt.Tx{tx}
+			if tc.refused {
+				txs = append(txs, tx)
+			}
+
+			recorder.reset()
+
+			fault := errors.NewStorageError("forced store fault")
+			if tc.refused {
+				recorder.failApply = fault
+			} else {
+				recorder.failMulti = fault
+				recorder.failMultiTimes = 1_000
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			time.AfterFunc(100*time.Millisecond, cancel)
+
+			block := &model.Block{Height: 100, ID: 42}
+			txids := make([]chainhash.Hash, len(txs))
+
+			for i, x := range txs {
+				txids[i] = *x.TxIDChainHash()
+			}
+
+			start := time.Now()
+			err := bv.applyList(ctx, block, txs, txids, make([]int, len(txs)), true, true, func(*bt.Tx) {})
+			elapsed := time.Since(start)
+
+			require.Error(t, err)
+			require.Less(t, elapsed, backoff/2, "cancellation must cut the backoff short")
+
+			_, getErr := recorder.Store.Get(context.Background(), tx.TxIDChainHash())
+			require.True(t, errors.Is(getErr, errors.ErrTxNotFound), "a cancelled batch writes nothing: %v", getErr)
+		})
+	}
+}
+
+// TestBatchList_RetryableParentFailureRetriesTheList: a parent that fails with a retryable store
 // error marks its child ParentFailed, which is not itself retryable. The list must be retried
 // rather than the block failed, as the per-transaction waves retried it.
-func TestNetted_RetryableParentFailureRetriesTheList(t *testing.T) {
+func TestBatchList_RetryableParentFailureRetriesTheList(t *testing.T) {
 	store := &utxo.MockUtxostore{}
 
 	bv := &BlockValidation{
@@ -545,6 +614,6 @@ func TestNetted_RetryableParentFailureRetriesTheList(t *testing.T) {
 	}, nil).Once()
 
 	block := &model.Block{Height: 100, ID: 42}
-	require.NoError(t, bv.applyNetted(context.Background(), block, txs, txids, []int{0, 0}, false, false, func(*bt.Tx) {}))
+	require.NoError(t, bv.applyList(context.Background(), block, txs, txids, []int{0, 0}, false, false, func(*bt.Tx) {}))
 	store.AssertNumberOfCalls(t, "SpendAndCreateMulti", 2)
 }

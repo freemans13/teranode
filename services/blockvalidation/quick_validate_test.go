@@ -240,7 +240,7 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 			batchEnd:   2,
 		}
 
-		// The batch is one netted list; through the mock's per-transaction default each
+		// The batch is one list; through the mock's per-transaction default each
 		// transaction is one combined call, which succeeds (no ErrTxExists).
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCombined()).
 			Return(&meta.Data{}, []*utxo.Spend{}, nil).Maybe()
@@ -567,7 +567,7 @@ func matchCreateOnly() interface{} {
 	return mock.MatchedBy(func(opts []utxo.CreateOption) bool { return parseCreateOptions(opts).CreateOnly })
 }
 
-// matchCombined matches a SpendAndCreate call that both spends and creates, as the netted
+// matchCombined matches a SpendAndCreate call that both spends and creates, as the batch
 // list's per-transaction default makes.
 func matchCombined() interface{} {
 	return mock.MatchedBy(func(opts []utxo.CreateOption) bool {
@@ -662,7 +662,7 @@ func assertCreatedLocked(t *testing.T, m *utxo.MockUtxostore, wantLocked bool) {
 		opts, ok := c.Arguments.Get(3).([]utxo.CreateOption)
 		require.True(t, ok, "SpendAndCreate 4th arg should be []utxo.CreateOption")
 		o := parseCreateOptions(opts)
-		// A create-phase call, or a netted list's combined call, which creates too.
+		// A create-phase call, or a list's combined call, which creates too.
 		if o.SpendOnly {
 			continue
 		}
@@ -685,7 +685,7 @@ func assertCreatedSkipExtended(t *testing.T, m *utxo.MockUtxostore, want bool) {
 		opts, ok := c.Arguments.Get(3).([]utxo.CreateOption)
 		require.True(t, ok, "SpendAndCreate 4th arg should be []utxo.CreateOption")
 		o := parseCreateOptions(opts)
-		// A create-phase call, or a netted list's combined call, which creates too.
+		// A create-phase call, or a list's combined call, which creates too.
 		if o.SpendOnly {
 			continue
 		}
@@ -708,7 +708,7 @@ func assertSpentSkipUTXOHashCheck(t *testing.T, m *utxo.MockUtxostore, want bool
 		opts, ok := c.Arguments.Get(3).([]utxo.CreateOption)
 		require.True(t, ok, "SpendAndCreate 4th arg should be []utxo.CreateOption")
 		o := parseCreateOptions(opts)
-		// A spend-phase call, or a netted list's combined call, which spends too.
+		// A spend-phase call, or a list's combined call, which spends too.
 		if o.CreateOnly {
 			continue
 		}
