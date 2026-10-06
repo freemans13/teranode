@@ -2724,6 +2724,7 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 		UserAgentName:     userAgentName,
 		UserAgentVersion:  version.String(),
 		UserAgentComments: cfg.UserAgentComments,
+		Whitelisted:       sp.isWhitelisted,
 		ChainParams:       sp.server.settings.ChainCfgParams,
 		CatchingUp: func() bool {
 			if sp.server == nil || sp.server.syncManager == nil {
@@ -2800,6 +2801,14 @@ func (s *server) outboundPeerConnected(c *connmgr.ConnReq, conn net.Conn) {
 		return
 	}
 
+	// Read before newPeerConfig, which copies it into the peer's config.
+	var err error
+
+	sp.isWhitelisted, err = isWhitelisted(conn.RemoteAddr())
+	if err != nil {
+		s.logger.Warnf("Cannot whitelist peer %v: %v", conn.RemoteAddr(), err)
+	}
+
 	p, err := peer.NewOutboundPeer(s.logger, s.settings, newPeerConfig(sp), c.GetAddr().String())
 	if err != nil {
 		sp.server.logger.Debugf("Cannot create outbound peer %s: %v", c.GetAddr(), err)
@@ -2815,11 +2824,6 @@ func (s *server) outboundPeerConnected(c *connmgr.ConnReq, conn net.Conn) {
 
 	sp.Peer = p
 	sp.connReq = c
-
-	sp.isWhitelisted, err = isWhitelisted(conn.RemoteAddr())
-	if err != nil {
-		s.logger.Warnf("Cannot whitelist peer %v: %v", conn.RemoteAddr(), err)
-	}
 
 	sp.AssociateConnection(conn)
 

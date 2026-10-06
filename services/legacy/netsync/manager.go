@@ -288,8 +288,8 @@ type peerSyncState struct {
 	// headersAsked is set by requestHeaders, before it sends this peer a
 	// getheaders, and never cleared: the state is dropped with the peer. Below
 	// the last checkpoint handleHeadersMsg reads a headers message only from a
-	// peer with it set, so only a peer this node asked can create or extend a
-	// header branch there.
+	// peer with it set that mayAskForHeaders still allows, so only a peer this
+	// node asked, and may still ask, can create or extend a header branch there.
 	headersAsked atomic.Bool
 }
 
@@ -1040,14 +1040,21 @@ func (sm *SyncManager) startSync() {
 	sm.logger.Debugf("[startSync] selecting sync peer from %d candidates", sm.peerStates.Length())
 
 	// Below the last checkpoint the elected peer is sent the round's first
-	// getheaders, and requestHeaders refuses an inbound peer there, so an
-	// inbound peer is not elected.
+	// getheaders, so the election follows SV Node's preferred-download rule
+	// (net_processing.cpp:120 and :5057): a preferred peer, outbound or
+	// whitelisted, is elected when one is ahead, and an inbound peer that is not
+	// whitelisted only when none is. requestHeadersAs applies the same rule to
+	// the elected peer.
 	electedHeight, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
 	if err != nil {
 		sm.logger.Errorf("[startSync] failed to convert block height to int32: %v", err)
 
 		return
 	}
+
+	headerRule := sm.chainParams != nil && sm.findNextHeaderCheckpoint(electedHeight) != nil
+	inboundFallback := headerRule && !sm.preferredPeerAhead(electedHeight)
+	skippedByRule := 0
 
 	for peer, state := range sm.peerStates.Range() {
 		if !state.syncCandidate {
@@ -1056,8 +1063,10 @@ func (sm *SyncManager) startSync() {
 			continue
 		}
 
-		if !sm.mayAskForHeaders(peer, electedHeight) {
-			sm.logger.Debugf("[startSync] peer %v is inbound and the committed height %d is below the last checkpoint, skipping", peer.String(), electedHeight)
+		if headerRule && !inboundFallback && !preferredDownloadPeer(peer) {
+			sm.logger.Debugf("[startSync] peer %v is inbound and not whitelisted, the committed height %d is below the last checkpoint and a preferred download peer (outbound or whitelisted) is ahead, so it is not elected", peer.String(), electedHeight)
+
+			skippedByRule++
 
 			continue
 		}
@@ -1140,7 +1149,7 @@ func (sm *SyncManager) startSync() {
 
 	// Start syncing from the best peer if one was selected.
 	if bestPeer == nil {
-		sm.logger.Warnf("[startSync] No sync peer candidates available after evaluating %d total peers (%d ahead, %d at same height)", sm.peerStates.Length(), len(bestPeers), len(okPeers))
+		sm.logger.Warnf("[startSync] No sync peer candidates available after evaluating %d total peers (%d ahead, %d at same height, %d inbound skipped because a preferred download peer is ahead below the last checkpoint)", sm.peerStates.Length(), len(bestPeers), len(okPeers), skippedByRule)
 
 		return
 	}
@@ -1228,13 +1237,17 @@ func (sm *SyncManager) startSync() {
 	if nextCP != nil &&
 		bestBlockHeightInt32 < nextCP.Height &&
 		sm.chainParams != &chaincfg.RegressionNetParams {
-		if err = sm.requestHeaders(bestPeer, bestBlockHeightInt32, locator, &zeroHash); err != nil {
+		if err = sm.requestHeadersAs(bestPeer, bestBlockHeightInt32, locator, &zeroHash, bestPeer); err != nil {
 			sm.logger.Warnf("[startSync] Failed to send getheaders message to peer %s: %v", bestPeer.String(), err)
 
 			return
 		}
 
 		sm.headersFirstMode.Store(true)
+
+		if !preferredDownloadPeer(bestPeer) {
+			sm.logger.Infof("[startSync] no outbound or whitelisted peer is ahead of committed height %d below the last checkpoint, so inbound peer %s is elected as the one inbound peer asked for headers (SV Node's preferred-download fallback)", bestBlockHeightInt32, bestPeer.String())
+		}
 
 		sm.logger.Infof("[startSync] Downloading headers for blocks %d to %d from peer %s", bestBlockHeaderMeta.Height+1, nextCP.Height, bestPeer.String())
 	} else {
@@ -1565,6 +1578,13 @@ func (sm *SyncManager) demoteSyncPeer(sp *peerpkg.Peer, state *peerSyncState) {
 
 	sp.SetSyncPeer(false)
 	sm.storeSyncPeer(nil, nil)
+
+	// An inbound peer that is not whitelisted is asked for headers only as the
+	// fallback sync peer (mayAskForHeaders), so its branch goes with the role.
+	// That keeps at most one such peer holding a branch at any time.
+	if !preferredDownloadPeer(sp) {
+		sm.headerCache.DropPeer(sp)
+	}
 
 	// Makes the blocks this peer still owes askable of somebody else straight
 	// away, rather than waiting out the retry interval. The demoted peer keeps
@@ -2396,27 +2416,69 @@ func (sm *SyncManager) allowedToRequestMoreHeadersNow(now time.Time) bool {
 }
 
 // mayAskForHeaders reports whether this node may send peer a getheaders while
-// its committed height is best: always, except that below the last checkpoint
-// an inbound peer is never asked. Judged on the primary peer a stream
+// its committed height is best. Above the last checkpoint it always may. Below
+// it, it may ask a preferred download peer, outbound or whitelisted, and an
+// inbound peer that is not whitelisted only when that peer is the sync peer and
+// no preferred peer is ahead of best. Judged on the primary peer a stream
 // connection belongs to.
 //
+// This is SV Node's rule. A peer is a preferred download peer when it is
+// outbound or whitelisted (net_processing.cpp:120), and headers and blocks are
+// fetched from a preferred peer, or from any peer when none is preferred
+// (net_processing.cpp:5057 and :5516). SV Node counts every preferred peer;
+// this counts only the ones ahead of the committed height, because the
+// election here takes only peers ahead and a preferred peer that is not ahead
+// has nothing to give.
+//
 // Below the last checkpoint handleHeadersMsg reads headers only from a peer this
-// node asked, and each asked peer may hold a branch of up to branchCap headers.
-// Asking only outbound peers bounds those branches by the outbound connections
-// this node makes, which its configuration and operator choose (the automatic
-// outbound target, 8 by default, plus addnode or connect peers), never by the
-// inbound connections anyone may open. SV Node sends its initial getheaders
-// to a preferred-download peer, outbound or whitelisted
-// (net_processing.cpp:120 and :5063), but falls back to an inbound one when it
-// has no preferred peer; this does not fall back.
+// node asked and may still ask, and each such peer holds at most one branch of
+// up to branchCap headers. So the branches are bounded by the outbound
+// connections this node makes (the automatic outbound target, 8 by default,
+// plus addnode or connect peers) and the whitelisted inbound peers the operator
+// allows, plus one inbound fallback peer, never by how many peers connect to
+// it. The fallback's branch is dropped when it is demoted (demoteSyncPeer) and
+// stops growing once a preferred peer is ahead.
 func (sm *SyncManager) mayAskForHeaders(peer *peerpkg.Peer, best int32) bool {
+	return sm.mayAskForHeadersAs(peer, best, sm.loadSyncPeer())
+}
+
+// mayAskForHeadersAs is mayAskForHeaders with syncPeer standing as the sync
+// peer, for startSync, which asks the peer it elects before it stores it.
+func (sm *SyncManager) mayAskForHeadersAs(peer *peerpkg.Peer, best int32, syncPeer *peerpkg.Peer) bool {
 	if sm.chainParams == nil || sm.findNextHeaderCheckpoint(best) == nil {
 		return true
 	}
 
 	_, primary, _ := sm.peerStateResolvingPrimary(peer)
 
-	return !primary.Inbound()
+	if preferredDownloadPeer(primary) {
+		return true
+	}
+
+	return syncPeer != nil && primary == syncPeer && !sm.preferredPeerAhead(best)
+}
+
+// preferredDownloadPeer is SV Node's fPreferredDownload
+// (net_processing.cpp:120): the peer is outbound, or its address is
+// whitelisted.
+func preferredDownloadPeer(peer *peerpkg.Peer) bool {
+	return !peer.Inbound() || peer.Whitelisted()
+}
+
+// preferredPeerAhead reports whether a connected sync candidate that is a
+// preferred download peer has announced a height above best.
+func (sm *SyncManager) preferredPeerAhead(best int32) bool {
+	if sm.peerStates == nil {
+		return false
+	}
+
+	for p, state := range sm.peerStates.Range() {
+		if state != nil && state.syncCandidate && p.Connected() && preferredDownloadPeer(p) && p.LastBlock() > best {
+			return true
+		}
+	}
+
+	return false
 }
 
 // requestHeaders sends peer a getheaders for locator and stopHash, and records
@@ -2429,8 +2491,14 @@ func (sm *SyncManager) mayAskForHeaders(peer *peerpkg.Peer, best int32) bool {
 //
 // Every getheaders this package sends goes through here.
 func (sm *SyncManager) requestHeaders(peer *peerpkg.Peer, best int32, locator blockchain.BlockLocator, stopHash *chainhash.Hash) error {
-	if !sm.mayAskForHeaders(peer, best) {
-		return errors.NewProcessingError("peer %s is inbound and the committed height %d is below the last checkpoint, so it is not asked for headers", peer, best)
+	return sm.requestHeadersAs(peer, best, locator, stopHash, sm.loadSyncPeer())
+}
+
+// requestHeadersAs is requestHeaders with syncPeer standing as the sync peer
+// (see mayAskForHeadersAs).
+func (sm *SyncManager) requestHeadersAs(peer *peerpkg.Peer, best int32, locator blockchain.BlockLocator, stopHash *chainhash.Hash, syncPeer *peerpkg.Peer) error {
+	if !sm.mayAskForHeadersAs(peer, best, syncPeer) {
+		return errors.NewProcessingError("peer %s is inbound, not whitelisted and not the fallback sync peer, and the committed height %d is below the last checkpoint, so it is not asked for headers", peer, best)
 	}
 
 	if state, _, ok := sm.peerStateResolvingPrimary(peer); ok {
@@ -2449,7 +2517,9 @@ func (sm *SyncManager) headersAskedOf(peer *peerpkg.Peer) bool {
 }
 
 // headerRequestPeers is eligibleBlockPeers less the peers mayAskForHeaders
-// refuses at best, the peers maybeRequestMoreHeaders rotates through.
+// refuses at best, the peers maybeRequestMoreHeaders rotates through. Below the
+// last checkpoint that is the preferred download peers, or the inbound fallback
+// sync peer alone when no preferred peer is ahead.
 func (sm *SyncManager) headerRequestPeers(best int32) []blockPeer {
 	peers := sm.eligibleBlockPeers()
 	askable := peers[:0]
@@ -2537,13 +2607,15 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	// The outbound rule. Below the last checkpoint a batch may create or extend
-	// a header branch only for a peer this node sent a getheaders to
-	// (requestHeaders records it), and only outbound peers are ever sent one
-	// there. Each such peer holds at most one branch of at most branchCap
-	// headers, so the cache is bounded by the number of outbound peers, which
-	// this node chooses, and not by how many peers connect to it. Anything else
-	// is dropped without blame: the cache asks again for whatever it needs.
+	// The preferred-peer rule. Below the last checkpoint a batch may create or
+	// extend a header branch only for a peer this node sent a getheaders to
+	// (requestHeaders records it) and may still ask (mayAskForHeaders): a
+	// preferred download peer, outbound or whitelisted, or the one inbound
+	// fallback sync peer while no preferred peer is ahead. Each such peer holds
+	// at most one branch of at most branchCap headers, so the cache is bounded
+	// by the peers this node and its operator choose plus one, and not by how
+	// many peers connect to it. Anything else is dropped without blame: the
+	// cache asks again for whatever it needs.
 	//
 	// The tip is read once, here, and that one read serves both the rule and
 	// fillHeaderCacheAt, so a headers message costs one GetBestBlockHeader call
@@ -2559,7 +2631,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	if !asked && sm.findNextHeaderCheckpoint(best) != nil {
+	if sm.findNextHeaderCheckpoint(best) != nil && (!asked || !sm.mayAskForHeaders(peer, best)) {
 		sm.logger.Debugf("[handleHeadersMsg] dropping %d unsolicited headers from %s below the last checkpoint (committed height %d)", numHeaders, peer, best)
 
 		return

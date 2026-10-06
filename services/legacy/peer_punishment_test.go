@@ -306,6 +306,7 @@ func TestNewStreamServerPeer_ReadsTheWhitelist(t *testing.T) {
 			sp := s.newStreamServerPeer(assoc, conn, false)
 
 			require.Equal(t, tc.want, sp.isWhitelisted)
+			require.Equal(t, tc.want, sp.Peer.Whitelisted(), "newPeerConfig copies the whitelist into the peer, where netsync reads it")
 			require.Equal(t, wire.StreamTypeData1, sp.Peer.StreamType())
 			require.Same(t, assoc, sp.Peer.AssociationRef())
 			require.NotNil(t, assoc.Stream(wire.StreamTypeData1), "the stream is registered with the association")

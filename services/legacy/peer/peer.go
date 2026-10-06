@@ -403,6 +403,11 @@ type Config struct {
 	// AllowBlockPriority is used to signal that the peer has the ability to
 	// receive block priority messages via connection streaming.
 	AllowBlockPriority bool
+
+	// Whitelisted records that the peer's address is in the operator's
+	// whitelist (the whitelist setting). The peer server reads it from the
+	// connection's remote address before it builds the peer.
+	Whitelisted bool
 }
 
 // minUint32 is a helper function to return the minimum of two uint32s.
@@ -787,6 +792,14 @@ func (p *Peer) Addr() string {
 // This function is safe for concurrent access.
 func (p *Peer) Inbound() bool {
 	return p.inbound
+}
+
+// Whitelisted returns whether the peer's address is in the operator's
+// whitelist, as set in its Config when it was built.
+//
+// This function is safe for concurrent access.
+func (p *Peer) Whitelisted() bool {
+	return p.cfg.Whitelisted
 }
 
 // Services returns the services flag of the remote peer.
