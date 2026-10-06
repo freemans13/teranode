@@ -806,6 +806,14 @@ type SyncManager struct {
 	// accessor tolerates.
 	dispatcher *blockDispatcher
 
+	// parkCommitting is the block commitParkedBlock is committing, from the moment its
+	// caller takes it out of the park until its record has been deleted. That route
+	// bypasses the dispatcher, so the dispatcher's in-flight list never covers it; the
+	// park sweep commits through it, and a download pass on the sweep's own goroutine
+	// would otherwise find the record on disk, out of the park, and adopt it back in.
+	// Read through blockCommitting.
+	parkCommitting atomic.Pointer[chainhash.Hash]
+
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
@@ -3255,7 +3263,7 @@ func (sm *SyncManager) processInvMsg(i int, iv *wire.InvVect, processInvs bool, 
 		// refuses a record younger than strandedRecordAge, so the hand-off above
 		// is never adopted under the consumer.
 		if iv.Type == wire.InvTypeBlock && sm.holdsBlock(sm.ctx, iv.Hash) {
-			if !sm.blockPark.Has(iv.Hash) && !sm.dispatcher.inFlight(iv.Hash) &&
+			if !sm.blockPark.Has(iv.Hash) && !sm.blockCommitting(iv.Hash) &&
 				sm.blockPark.adoptStranded(sm.ctx, iv.Hash, sm.subtreeStore) {
 				sm.logger.Warnf("[handleInvMsg][%s] adopted a complete record that was on disk but not in the park", iv.Hash)
 			}
@@ -3549,7 +3557,19 @@ func (sm *SyncManager) conversionInFlight(blockHash chainhash.Hash) bool {
 // streamRegistry.arriving) or reads a nil map under a zero mutex
 // (conversionInFlight), so a struct-literal manager in a test may call it.
 func (sm *SyncManager) blockHeldLocally(h chainhash.Hash) bool {
-	return sm.blockPark.Has(h) || sm.dispatcher.inFlight(h) || sm.streams.arriving(h) || sm.conversionInFlight(h)
+	return sm.blockPark.Has(h) || sm.blockCommitting(h) || sm.streams.arriving(h) || sm.conversionInFlight(h)
+}
+
+// blockCommitting reports whether this block is out of the park and being committed, by
+// either route: the dispatcher, or commitParkedBlock, which the park sweep uses. Its record
+// is still on disk and still in use until the commit's own disposition deletes it, so
+// nothing may park it again or treat it as stranded. Nil-safe on both terms.
+func (sm *SyncManager) blockCommitting(h chainhash.Hash) bool {
+	if committing := sm.parkCommitting.Load(); committing != nil && committing.IsEqual(&h) {
+		return true
+	}
+
+	return sm.dispatcher.inFlight(h)
 }
 
 // inFlightBlock marks that a block's hash currently holds the dedup half of
