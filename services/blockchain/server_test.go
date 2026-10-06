@@ -3714,32 +3714,11 @@ func Test_IsFullyReady(t *testing.T) {
 func Test_Idle(t *testing.T) {
 	ctx := setup(t)
 
-	tests := []struct {
-		name        string
-		expectError bool
-	}{
-		{
-			name:        "idle request",
-			expectError: true, // Fresh node starts in CATCHINGBLOCKS; STOP event has no CATCHINGBLOCKS->IDLE edge
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			request := &emptypb.Empty{}
-
-			response, err := ctx.server.Idle(context.Background(), request)
-
-			if tt.expectError {
-				require.Error(t, err)
-				require.Nil(t, response)
-				return
-			}
-
-			require.NoError(t, err)
-			require.NotNil(t, response)
-		})
-	}
+	// A fresh node starts in CATCHINGBLOCKS; STOP parks it in IDLE.
+	response, err := ctx.server.Idle(context.Background(), &emptypb.Empty{})
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	require.Equal(t, blockchain_api.FSMStateType_IDLE.String(), ctx.server.finiteStateMachine.Current())
 }
 
 // Test_WaitUntilFSMTransitionFromIdleState tests the WaitUntilFSMTransitionFromIdleState gRPC method
