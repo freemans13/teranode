@@ -127,10 +127,12 @@ type blockDispatcher struct {
 
 	// settling is the entry complete has popped and whose tail is running: out of the
 	// frontier, so a block can be admitted behind it, but still in flight, because the
-	// tail is what deletes its record. Without it the block was on disk, out of the
-	// park and not in flight for the length of the tail, which is exactly what the
-	// wanted-range pass reads as a stranded record, so it adopted the block back into
-	// the park and the sweep later read it after its files had gone.
+	// tail is what deletes its record. It keeps inFlight true for the length of the
+	// tail, which parentIsReachable reads. It was added because the wanted-range pass
+	// read a block in that window as a stranded record and adopted it back into the
+	// park; the park now refuses that on its own, because the block stays handed out
+	// (blockPark.out) until the tail's Delete or Restore, so settling is no longer what
+	// stops it.
 	settling *frontierEntry
 
 	barrier     bool

@@ -216,6 +216,13 @@ type parkedBlock struct {
 	// cost there is one floor, awaitingProofRetryAfter, before the drain or the
 	// sweep offers it again and it commits; never a verdict on the block.
 	awaitingProofAt time.Time
+
+	// claim is the hand-out this copy was taken under, set by Take,
+	// TakeChildren and TakeChildrenForProof, and zero on a copy nobody took
+	// (an entry built for AdoptWritten, or one the on-disk handler posts). Only
+	// a copy carrying the claim the park recorded for the hash may Restore it
+	// or settle its record with Delete; see blockPark.out.
+	claim uint64
 }
 
 // blockPark keeps blocks whose parent is not stored yet on disk, and commits
@@ -253,6 +260,24 @@ type blockPark struct {
 	charged  map[chainhash.Hash]int64
 	children map[chainhash.Hash][]chainhash.Hash
 	bytes    int64
+
+	// out records every block taken out of the index and not yet given back
+	// (Restore) or settled (Delete), by hash, with the claim it was taken
+	// under. A taken block's record is still on disk and still in use, so
+	// while it is out nothing may adopt it again (AdoptWritten, adoptRecord),
+	// nothing but its taker may put it back or delete its record, and
+	// blockCommitting reads it as in use.
+	//
+	// It replaces three in-use marks kept outside the park, each of which
+	// closed one window between a take and its own mark: the sweep's
+	// hand-over to the consumer, the serial drain's commit, and the gap
+	// between a take and the dispatcher's frontier. Restore, which every
+	// put-back goes through, checked none of them, so a put-back posted by the
+	// on-disk handler re-indexed a block the dispatcher was validating, or one
+	// already committed and deleted. Every take and every put-back passes
+	// through this lock, so the rule is atomic where the marks were not.
+	out       map[chainhash.Hash]uint64
+	nextClaim uint64
 }
 
 // newBlockPark builds the park. It is not optional: every block legacy sync
@@ -294,6 +319,7 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		entries:      make(map[chainhash.Hash]*parkedBlock),
 		children:     make(map[chainhash.Hash][]chainhash.Hash),
 		charged:      make(map[chainhash.Hash]int64),
+		out:          make(map[chainhash.Hash]uint64),
 	}, nil
 }
 
@@ -381,6 +407,41 @@ func (p *blockPark) Has(hash chainhash.Hash) bool {
 	return ok
 }
 
+// HandedOut reports whether this block has been taken out of the park and not
+// yet given back or settled: its record is on disk and its taker is using it.
+func (p *blockPark) HandedOut(hash chainhash.Hash) bool {
+	if p == nil {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	_, ok := p.out[hash]
+
+	return ok
+}
+
+// handOutLocked removes entry from the index, records it as handed out under a
+// fresh claim and returns the copy the taker holds. The caller holds mu and
+// removes the parent edge itself, since the three takes keep their edges
+// differently.
+func (p *blockPark) handOutLocked(entry *parkedBlock) parkedBlock {
+	if p.out == nil {
+		p.out = make(map[chainhash.Hash]uint64)
+	}
+
+	p.nextClaim++
+
+	taken := *entry
+	taken.claim = p.nextClaim
+
+	p.out[taken.hash] = taken.claim
+	delete(p.entries, taken.hash)
+
+	return taken
+}
+
 // Bytes returns the serialized bytes currently charged against the budget.
 func (p *blockPark) Bytes() int64 {
 	if p == nil {
@@ -445,7 +506,8 @@ func (p *blockPark) WriteConvertedBlock(ctx context.Context, hash chainhash.Hash
 // takes the lock and reports refusal rather than assuming it can always insert.
 //
 // Refuses a hash already held, so a re-delivered body is neither charged nor
-// indexed twice. There is no entry ceiling to refuse at any more: the park's
+// indexed twice, and a hash handed out (see out), whose record its taker is
+// still using. There is no entry ceiling to refuse at any more: the park's
 // disk is bounded upstream, by the download walk's read-ahead depth, not by how
 // much room this index has left.
 func (p *blockPark) AdoptWritten(entry parkedBlock) bool {
@@ -460,17 +522,30 @@ func (p *blockPark) AdoptWritten(entry parkedBlock) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if _, held := p.entries[entry.hash]; held {
+	if !p.adoptableLocked(entry.hash) {
 		return false
 	}
 
 	stored := entry
+	stored.claim = 0
 	p.entries[entry.hash] = &stored
 	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
 	p.chargeLocked(entry.hash, entry.size)
 	p.setGauges()
 
 	return true
+}
+
+// adoptableLocked reports whether hash may be indexed: not in the index already
+// and not handed out. The caller holds mu.
+func (p *blockPark) adoptableLocked(hash chainhash.Hash) bool {
+	if _, held := p.entries[hash]; held {
+		return false
+	}
+
+	_, out := p.out[hash]
+
+	return !out
 }
 
 // ReadConverted reads back a converted record and checks it is the block the
@@ -563,8 +638,7 @@ func (p *blockPark) TakeChildren(parent chainhash.Hash) []parkedBlock {
 			continue
 		}
 
-		taken = append(taken, *entry)
-		delete(p.entries, h)
+		taken = append(taken, p.handOutLocked(entry))
 	}
 
 	if len(kept) == 0 {
@@ -640,22 +714,40 @@ func (p *blockPark) FirstChildFor(parent chainhash.Hash) (parkedBlock, bool) {
 	return parkedBlock{}, false
 }
 
-// Restore puts a block the caller could not commit back in the index. Used when
-// the parent has gone missing again under a reorg: the blob is still on disk and
-// still charged, so this is a re-index and nothing more.
-func (p *blockPark) Restore(entry parkedBlock) {
+// Restore puts a block the caller took and could not commit back in the index:
+// the blob is still on disk and still charged, so this is a re-index and nothing
+// more. It reports whether it did.
+//
+// Only the taker may: entry must carry the claim the park recorded when it was
+// taken (see out). Anything else is refused. A copy nobody took, such as the
+// entry the on-disk handler posts for a block it has just adopted, has no claim,
+// and by the time it is received that block may be out with the dispatcher, so
+// re-indexing it would give the block a second entry. A copy whose hand-out has
+// already ended has a claim the park no longer holds: either it was put back
+// already, or its record was deleted (Delete), and re-indexing that would list a
+// block whose record is gone.
+func (p *blockPark) Restore(entry parkedBlock) bool {
 	if p == nil {
-		return
+		return false
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if claim, out := p.out[entry.hash]; !out || entry.claim == 0 || claim != entry.claim {
+		return false
+	}
+
+	delete(p.out, entry.hash)
+
 	if _, ok := p.entries[entry.hash]; ok {
-		return
+		// Unreachable while every insert checks out, and kept so that an index
+		// entry is never overwritten.
+		return false
 	}
 
 	stored := entry
+	stored.claim = 0
 	p.entries[entry.hash] = &stored
 	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
 
@@ -665,6 +757,8 @@ func (p *blockPark) Restore(entry parkedBlock) {
 	// route it travelled.
 	p.chargeLocked(entry.hash, entry.size)
 	p.setGauges()
+
+	return true
 }
 
 // Delete drops a block's blob and releases its budget. The entry must already
@@ -690,12 +784,29 @@ func (p *blockPark) Restore(entry parkedBlock) {
 // discard path, and a committed block's subtree files are its own data now —
 // deleting them here would destroy a block this node just accepted. Only
 // pipelineBlockDelete's own discard-only path may remove subtree files.
+//
+// A handed-out block's record belongs to its taker (see out), so a Delete for a
+// handed-out hash by a copy without that claim is refused and the record left:
+// it is a copy of the block that was never adopted, and the record on disk is
+// the one the taker is reading. The taker's own Delete ends the hand-out only
+// after the record is gone, so there is no moment at which the record is on
+// disk, out of the index and marked by nothing, which is what the download
+// pass would adopt as stranded.
 func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	if p == nil {
 		return
 	}
 
 	p.mu.Lock()
+
+	claim, out := p.out[entry.hash]
+	if out && claim != entry.claim {
+		p.mu.Unlock()
+		p.logger.Warnf("[blockPark][%s] not deleting the converted record: the block is handed out and this copy is not the taker's", entry.hash)
+
+		return
+	}
+
 	p.releaseLocked(entry.hash)
 	p.setGauges()
 	p.mu.Unlock()
@@ -705,6 +816,14 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 
 	if err := p.store.Del(delCtx, entry.hash[:], fileformat.FileTypeBlock, parkOpts...); err != nil {
 		p.logger.Warnf("[blockPark][%s] failed to delete converted record, leaving it for the next restart sweep: %v", entry.hash, err)
+	}
+
+	if out {
+		p.mu.Lock()
+		if p.out[entry.hash] == entry.claim {
+			delete(p.out, entry.hash)
+		}
+		p.mu.Unlock()
 	}
 }
 
@@ -825,8 +944,7 @@ func (p *blockPark) TakeChildrenForProof(parent chainhash.Hash) []parkedBlock {
 			continue
 		}
 
-		taken = append(taken, *entry)
-		delete(p.entries, h)
+		taken = append(taken, p.handOutLocked(entry))
 	}
 
 	delete(p.children, parent)
@@ -851,11 +969,11 @@ func (p *blockPark) Take(hash chainhash.Hash) (parkedBlock, bool) {
 		return parkedBlock{}, false
 	}
 
-	delete(p.entries, hash)
+	taken := p.handOutLocked(entry)
 	p.removeChildLocked(entry.prevBlock, hash)
 	p.setGauges()
 
-	return *entry, true
+	return taken, true
 }
 
 // removeChildLocked drops one parent->child edge. The caller holds mu.
@@ -1073,7 +1191,7 @@ func (p *blockPark) hasCompleteRecord(ctx context.Context, hash chainhash.Hash, 
 // adoptRecord indexes a converted record that is already complete on disk, under its parent,
 // charged at its on-disk size. Startup recovery and the download pass's stranded-record
 // adoption share it, so the two cannot disagree about what an adopted entry looks like.
-// It reports false when the block is already indexed.
+// It reports false when the block is already indexed or handed out.
 func (p *blockPark) adoptRecord(hash chainhash.Hash, record *model.Block, size int64, parkedAt time.Time) bool {
 	recoveredHeight, heightErr := safeconversion.Uint32ToInt32(record.Height)
 	if heightErr != nil {
@@ -1095,7 +1213,7 @@ func (p *blockPark) adoptRecord(hash chainhash.Hash, record *model.Block, size i
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if _, held := p.entries[hash]; held {
+	if !p.adoptableLocked(hash) {
 		return false
 	}
 
@@ -1121,7 +1239,7 @@ const strandedRecordAge = time.Minute
 // reports whether it adopted the record; a record that is unreadable or missing a subtree file
 // is left to holdsBlock, which then answers false so the block is downloaded again.
 func (p *blockPark) adoptStranded(ctx context.Context, hash chainhash.Hash, subtreeStore blob.Store) bool {
-	if p == nil || p.Has(hash) {
+	if p == nil || p.Has(hash) || p.HandedOut(hash) {
 		return false
 	}
 

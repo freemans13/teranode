@@ -806,23 +806,6 @@ type SyncManager struct {
 	// accessor tolerates.
 	dispatcher *blockDispatcher
 
-	// parkCommitting is the block commitParkedBlock is committing, from the moment its
-	// caller takes it out of the park until its record has been deleted. That route
-	// bypasses the dispatcher, so the dispatcher's in-flight list never covers it; the
-	// park sweep commits through it, and a download pass on the sweep's own goroutine
-	// would otherwise find the record on disk, out of the park, and adopt it back in.
-	// Read through blockCommitting.
-	parkCommitting atomic.Pointer[chainhash.Hash]
-
-	// handedOver counts the blocks submitParkCommit has handed to the consumer and the
-	// consumer has not yet put back in the park. The caller took each one out of the park
-	// to hand it over, so until the put-back it is out of the park and marked nowhere
-	// else; the sweep's own goroutine runs a download pass straight after, which would
-	// adopt it. A count, not a flag, because one block can be handed over twice. Guarded
-	// by handedOverMu; read through blockCommitting.
-	handedOverMu sync.Mutex
-	handedOver   map[chainhash.Hash]int
-
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
@@ -3569,53 +3552,18 @@ func (sm *SyncManager) blockHeldLocally(h chainhash.Hash) bool {
 	return sm.blockPark.Has(h) || sm.blockCommitting(h) || sm.streams.arriving(h) || sm.conversionInFlight(h)
 }
 
-// blockCommitting reports whether this block is out of the park and being committed, by
-// either route: the dispatcher, or commitParkedBlock, which the park sweep uses. Its record
-// is still on disk and still in use until the commit's own disposition deletes it, so
-// nothing may park it again or treat it as stranded. Nil-safe on both terms.
+// blockCommitting reports whether this block is out of the park and in use: taken by
+// any route (the drain step for the dispatcher, the serial drain, the sweep or the
+// header walk's re-offer) and not yet given back or settled. Its record is still on disk
+// and still in use until its taker's disposition deletes it or puts it back, so nothing
+// may park it again or treat it as stranded. The park owns that answer (blockPark.out).
+//
+// The dispatcher's own in-flight list is asked as well. Every block it dispatches is one
+// the drain step took from the park, so in production this adds nothing; it is kept
+// because inFlight is the dispatcher's own contract (parentIsReachable reads it too), and
+// a frontier entry is in flight whoever built it. Nil-safe on both terms.
 func (sm *SyncManager) blockCommitting(h chainhash.Hash) bool {
-	if committing := sm.parkCommitting.Load(); committing != nil && committing.IsEqual(&h) {
-		return true
-	}
-
-	if sm.isHandedOver(h) {
-		return true
-	}
-
-	return sm.dispatcher.inFlight(h)
-}
-
-// markHandedOver records that a block is on its way from submitParkCommit to the
-// consumer's put-back; clearHandedOver ends that once it is back in the park.
-func (sm *SyncManager) markHandedOver(h chainhash.Hash) {
-	sm.handedOverMu.Lock()
-	defer sm.handedOverMu.Unlock()
-
-	if sm.handedOver == nil {
-		sm.handedOver = make(map[chainhash.Hash]int)
-	}
-
-	sm.handedOver[h]++
-}
-
-func (sm *SyncManager) clearHandedOver(h chainhash.Hash) {
-	sm.handedOverMu.Lock()
-	defer sm.handedOverMu.Unlock()
-
-	if sm.handedOver[h] <= 1 {
-		delete(sm.handedOver, h)
-
-		return
-	}
-
-	sm.handedOver[h]--
-}
-
-func (sm *SyncManager) isHandedOver(h chainhash.Hash) bool {
-	sm.handedOverMu.Lock()
-	defer sm.handedOverMu.Unlock()
-
-	return sm.handedOver[h] > 0
+	return sm.blockPark.HandedOut(h) || sm.dispatcher.inFlight(h)
 }
 
 // inFlightBlock marks that a block's hash currently holds the dedup half of

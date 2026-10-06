@@ -141,7 +141,10 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 //
 // The entry has already been taken out of the park index by the caller. Its blob
 // is still on disk and still charged against the budget, so every path out of
-// here goes through applyParkDisposition, which is what settles that.
+// here goes through applyParkDisposition, which is what settles that. Until it
+// does, the park holds the block as handed out (blockPark.out), so the download
+// pass and the on-disk handler see it as in use rather than stranded or
+// duplicate.
 //
 // It is composed from three helpers rather than written out, because a second
 // scheduler commits parked blocks through a worker and a tail and has to apply
@@ -149,15 +152,6 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 // two defaults point opposite ways: a read failure keeps the block, a commit
 // failure judges it.
 func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
-	// Committing from here until every path below has settled the record, so the
-	// download pass and the on-disk handler see the block as in use rather than
-	// stranded or duplicate. Cleared on return, after the disposition has deleted
-	// whatever it deletes.
-	hash := entry.hash
-	sm.parkCommitting.Store(&hash)
-
-	defer sm.parkCommitting.Store(nil)
-
 	// The read and the completeness check share one store deadline, the same
 	// one holdsBlock puts on the identical pair of calls: both run on the
 	// goroutine that commits blocks in order, and the file store's permit wait
@@ -472,9 +466,14 @@ func (sm *SyncManager) runParkSweep() {
 // ending the hand-off, then queues the drain, so that the drain step claims it through the
 // one path every other drained block takes, with one admission test and one header-front
 // advance.
+//
+// The put-back succeeds only for an entry its poster took (the sweep, the startup pass,
+// the header walk's re-offer). The on-disk handler posts an entry it adopted and never
+// took, and Restore refuses that: the block is still in the park, or the drain step has
+// since taken it, and in neither case is a second index entry wanted. The drain is queued
+// either way.
 func (sm *SyncManager) receiveParkCommit(commit parkCommit) {
 	sm.blockPark.Restore(commit.entry)
-	sm.clearHandedOver(commit.entry.hash)
 	sm.scheduleDrain(commit.entry.prevBlock, commit.parentHeight)
 }
 
@@ -492,18 +491,15 @@ func (sm *SyncManager) receiveParkCommit(commit parkCommit) {
 // this package's tests build one, and it is what the sweep did before it had a
 // goroutine of its own. A send on a nil channel would block forever.
 func (sm *SyncManager) submitParkCommit(commit parkCommit) {
-	// In use from here until it is back in the park, on every path below: the caller
-	// took it out to hand it over, so nothing else marks it, and a download pass in
-	// between would adopt it as stranded.
-	sm.markHandedOver(commit.entry.hash)
-
+	// A taken entry stays handed out in the park (blockPark.out) until one of the
+	// Restores below, or the consumer's, gives it back, so a download pass in between
+	// cannot adopt it as stranded.
 	if sm.parkCommits == nil {
 		// Put back, then drained here and now, for the reason the consumers give: an
 		// entry the on-disk handler posts is still in the index, and committing it
 		// directly left it there. The drain walks synchronously, because the caller
 		// may be the sweep's own goroutine, and the consumer's queue is not its to touch.
 		sm.blockPark.Restore(commit.entry)
-		sm.clearHandedOver(commit.entry.hash)
 		sm.drainParkedDescendants(commit.entry.prevBlock)
 
 		return
@@ -515,7 +511,6 @@ func (sm *SyncManager) submitParkCommit(commit parkCommit) {
 	select {
 	case <-sm.quit:
 		sm.blockPark.Restore(commit.entry)
-		sm.clearHandedOver(commit.entry.hash)
 
 		return
 	default:
@@ -528,7 +523,6 @@ func (sm *SyncManager) submitParkCommit(commit parkCommit) {
 		// Nobody will commit it now. The caller took it out of the index, so put
 		// it back: its blob stays charged and Recover finds it on the next start.
 		sm.blockPark.Restore(commit.entry)
-		sm.clearHandedOver(commit.entry.hash)
 	}
 }
 

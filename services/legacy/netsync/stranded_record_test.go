@@ -164,11 +164,12 @@ func (s *midCommitSubtreeStore) Exists(ctx context.Context, key []byte, fileType
 	return s.Store.Exists(ctx, key, fileType, opts...)
 }
 
-// The park's sweep commits a block through commitParkedBlock, not the dispatcher, so the
-// dispatcher's in-flight list never covered it. A download pass on the sweep's goroutine in that
-// window found the record on disk and out of the park, adopted it back in, and the second entry
-// was read after the first commit had deleted the record. Mainnet logged that five times in its
-// first 22 minutes after the dispatcher's own window was closed on 2026-10-06.
+// The serial drain commits a block through commitParkedBlock, not the dispatcher, so the
+// dispatcher's in-flight list never covered it. A download pass in that window found the record
+// on disk and out of the park, adopted it back in, and the second entry was read after the first
+// commit had deleted the record. The block is taken through drainParkedDescendants, the only
+// production caller of commitParkedBlock, and the park holds it as handed out from that take
+// until its disposition settles it.
 func TestDownloadPassLeavesABlockTheParkSweepIsCommittingAlone(t *testing.T) {
 	ctx := context.Background()
 	sm, park, subtreeStore := strandedRecordManager(t)
@@ -188,7 +189,10 @@ func TestDownloadPassLeavesABlockTheParkSweepIsCommittingAlone(t *testing.T) {
 	}
 	sm.subtreeStore = hook
 
-	sm.commitParkedBlock(parkedBlock{hash: hash, height: 650022})
+	parent := *blk.Header.HashPrevBlock
+	require.True(t, park.AdoptWritten(parkedBlock{hash: hash, prevBlock: parent, height: 650022}))
+
+	sm.drainParkedDescendants(parent)
 
 	require.True(t, hook.ran, "the download pass ran while the block was being committed")
 	require.False(t, adoptedMidCommit, "a block the park is committing is not put back in the park")
@@ -214,9 +218,11 @@ func TestDownloadPassLeavesABlockTheSweepHasQueuedAlone(t *testing.T) {
 	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
 	ageRecord(t, park, hash.String())
 
-	entry := parkedBlock{hash: hash, prevBlock: *blk.Header.HashPrevBlock, height: 650022}
+	require.True(t, park.AdoptWritten(parkedBlock{hash: hash, prevBlock: *blk.Header.HashPrevBlock, height: 650022}))
 
 	// What the sweep does: take it out of the index and queue it for the consumer.
+	entry, ok := park.Take(hash)
+	require.True(t, ok)
 	sm.submitParkCommit(parkCommit{entry: entry, parentHeight: 650021})
 
 	sm.unownedBlocks([]wantedBlock{{height: 650022, hash: hash}})

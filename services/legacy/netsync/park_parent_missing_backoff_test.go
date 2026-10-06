@@ -41,7 +41,7 @@ func TestParentMissingBackoff(t *testing.T) {
 
 		e := entryFor(0x01)
 		e.parentMissingAt = time.Now()
-		p.Restore(e)
+		require.True(t, p.AdoptWritten(e))
 
 		_, ok := p.FirstChildFor(parent)
 		require.False(t, ok,
@@ -53,7 +53,7 @@ func TestParentMissingBackoff(t *testing.T) {
 
 		e := entryFor(0x02)
 		e.parentMissingAt = time.Now().Add(-parentMissingRetryAfter - time.Second)
-		p.Restore(e)
+		require.True(t, p.AdoptWritten(e))
 
 		got, ok := p.FirstChildFor(parent)
 		require.True(t, ok, "the backoff is a floor on the retry, not an abandonment")
@@ -67,10 +67,10 @@ func TestParentMissingBackoff(t *testing.T) {
 
 		stuck := entryFor(0x03)
 		stuck.parentMissingAt = time.Now()
-		p.Restore(stuck)
+		require.True(t, p.AdoptWritten(stuck))
 
 		ready := entryFor(0x04)
-		p.Restore(ready)
+		require.True(t, p.AdoptWritten(ready))
 
 		got, ok := p.FirstChildFor(parent)
 		require.True(t, ok)
@@ -80,7 +80,7 @@ func TestParentMissingBackoff(t *testing.T) {
 
 	t.Run("a block that never failed is unaffected", func(t *testing.T) {
 		p := newPark(t)
-		p.Restore(entryFor(0x05))
+		require.True(t, p.AdoptWritten(entryFor(0x05)))
 
 		_, ok := p.FirstChildFor(parent)
 		require.True(t, ok, "the backoff must only apply to a block that actually failed this way")
@@ -100,6 +100,11 @@ func TestParkedBlockFailed_StampsAMissingParent(t *testing.T) {
 
 		entry := parkedBlock{hash: chainhash.Hash{0x11}, prevBlock: parent, size: 1024, parkedAt: time.Now()}
 
+		// The drain hands parkedBlockFailed a block it took out of the park.
+		require.True(t, h.sm.blockPark.AdoptWritten(entry))
+		entry, ok := h.sm.blockPark.Take(entry.hash)
+		require.True(t, ok)
+
 		// The error shape the store returns for a parent it does not have, which
 		// is what parkCommitFailure grades as the parent being gone.
 		err := errors.NewProcessingError("failed to get block header for previous block",
@@ -118,6 +123,10 @@ func TestParkedBlockFailed_StampsAMissingParent(t *testing.T) {
 		h := newParkWiringHarness(t, true)
 
 		entry := parkedBlock{hash: chainhash.Hash{0x12}, prevBlock: parent, size: 1024, parkedAt: time.Now()}
+
+		require.True(t, h.sm.blockPark.AdoptWritten(entry))
+		entry, ok := h.sm.blockPark.Take(entry.hash)
+		require.True(t, ok)
 
 		h.sm.parkedBlockFailed(entry, errors.NewStorageError("the store is not answering"))
 
