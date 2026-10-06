@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -78,7 +79,9 @@ func TestInstallStreamingBlockPath_ChoosesTheSinkAndDeleteTogether(t *testing.T)
 	pipelineHeaderFixture(t, sm, blk)
 	body := blockBodyBytes(t, blk)
 
-	converted, err := gotSink(*blk.Hash(), &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
+	owner := owingPeer(t, sm, *blk.Hash(), 35)
+
+	converted, err := gotSink(*blk.Hash(), &blk.MsgBlock().Header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), sinkPayloadLen(body))
 	require.NoError(t, err, "the installed sink must convert a well-formed block cleanly")
 	require.True(t, converted, "the installed sink must behave like the pipeline sink, not the plain body-write path")
 }

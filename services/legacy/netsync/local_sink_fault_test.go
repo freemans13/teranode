@@ -201,6 +201,8 @@ func TestPeer_AStoreFaultAtTheSinkKeepsTheConnection(t *testing.T) {
 	roots := goodRunSubtreeRoots(t, msgBlock, hash)
 
 	sender, receiver, onDisk, pings := streamingPeerPair(t, sm, 21)
+	// The peer the read loop names as sending is the one asked for the block.
+	require.True(t, sm.blockDownloads.Add(receiver, hash))
 
 	sender.QueueMessage(msgBlock, nil)
 	sender.QueueMessage(wire.NewMsgPing(42), nil)
@@ -290,8 +292,9 @@ func TestWire_AMidBodyEOFReachesTheReadLoopByIdentity(t *testing.T) {
 
 	message := framed.Bytes()
 	cut := message[:len(message)-7]
+	owner := owingPeer(t, sm, hash, 22)
 
-	_, _, _, err = wire.ReadMessageWithEncodingN(bytes.NewReader(cut), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+	_, _, _, err = wire.ReadMessageWithEncodingN(peerpkg.NewDeliveryReader(bytes.NewReader(cut), owner), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
 	require.Error(t, err)
 	require.Same(t, io.ErrUnexpectedEOF, err, "the wire layer must hand the read loop the bare sentinel it compares by identity")
 
@@ -359,8 +362,9 @@ func TestWire_AMidBodyResetReachesTheReadLoopByIdentity(t *testing.T) {
 	message := framed.Bytes()
 	reset := connectionReset()
 	src := &resetReader{r: bytes.NewReader(message[:len(message)-7]), err: reset}
+	owner := owingPeer(t, sm, hash, 23)
 
-	_, _, _, err = wire.ReadMessageWithEncodingN(src, wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+	_, _, _, err = wire.ReadMessageWithEncodingN(peerpkg.NewDeliveryReader(src, owner), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
 	require.Error(t, err)
 	require.Same(t, reset, err, "the wire layer must hand the read loop the socket error it type-asserts")
 

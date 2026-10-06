@@ -134,6 +134,25 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 // indefinitely into the idle timer's path.
 func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)) func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
 	return func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
+		// Only a peer the download ledger says owes the block may write it. The gate admits a
+		// body for any hash the ledger holds a request for, from any peer, and the first copy of a
+		// hash takes its conversion slot. Without this check a peer that knew a requested block's
+		// header could send a well-formed body with the wrong merkle root just ahead of the owner:
+		// the honest copy became the duplicate and went to a side file, the junk claimed the
+		// finish and then failed its root check, and the honest copy, unable to take over, was
+		// thrown away. The sender was disconnected without a ban and could do it again. Checked
+		// here, before the admission slot and before anything is written, so it covers the first
+		// copy and every racing copy alike; raceDuplicateCopy is only reached past it. Drained with
+		// the connection kept, as an unrequested block is: a peer that pushes a block we asked
+		// someone else for is not misbehaving. A forgiven owner and a re-asked peer are still
+		// owners (ForgiveOwners back-dates, reAskBlockFromPeer records the request).
+		if !sm.deliveringPeerOwes(r, hash) {
+			sm.streams.setStreamPath(r, admitNotOwed)
+			sm.logger.Infof("[pipelineBlockSink][%s] a copy from %s, which does not owe this block, was drained unwritten", hash, deliveringPeer(r))
+
+			return sm.drainDuplicate(hash, r)
+		}
+
 		acquireCtx, cancel := context.WithTimeout(sm.ctx, sm.pipelineAdmissionAcquireTimeout())
 		defer cancel()
 
@@ -536,7 +555,7 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		// Only the sending peer is let off. The other owners are not: the copy being
 		// converted is not here yet, and letting them off freed the block to be asked for
 		// again while it was still arriving.
-		sm.logger.Infof("[blockOnDisk][%s] a duplicate copy from %s was drained unwritten while another copy converted", msg.body.Hash, msg.peer)
+		sm.logger.Infof("[blockOnDisk][%s] a copy from %s was drained unwritten: another copy converted, or this peer did not owe the block", msg.body.Hash, msg.peer)
 
 		return
 	}

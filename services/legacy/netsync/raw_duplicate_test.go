@@ -47,8 +47,9 @@ func TestADuplicateCopyIsDrainedAndNeverParked(t *testing.T) {
 
 	body := bytes.Repeat([]byte{7}, 4096)
 	r := bytes.NewReader(body)
+	owner := owingPeer(t, sm, hash, 37)
 
-	converted, err := sm.admitPipelineSink(inner)(hash, &wire.BlockHeader{}, r, int64(len(body)))
+	converted, err := sm.admitPipelineSink(inner)(hash, &wire.BlockHeader{}, peerpkg.NewDeliveryReader(r, owner), int64(len(body)))
 	require.NoError(t, err, "the peer did nothing wrong")
 	require.False(t, converted)
 	require.Zero(t, r.Len(), "every byte is read off the wire")

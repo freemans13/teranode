@@ -128,17 +128,10 @@ func (sm *SyncManager) yieldToFasterCopy(hash chainhash.Hash, writer *subtreeWri
 // raceDuplicateCopy handles a copy that arrives while another converts: it keeps the bytes in a
 // side file and, if this copy completes first, converts from it.
 //
-// Only a copy from a peer the download ledger says owes the block may race. The gate admits a body
-// for any hash the ledger holds a request for, from any peer, so without this a peer that knew a
-// requested block's header could send junk under it, make the honest copy stop and drain, and then
-// fail as corrupt on its own copy: disconnected without a ban, free to come back and do it again.
-// Any other copy is drained, as every second copy was before the race existed.
+// Only a copy from a peer the download ledger says owes the block reaches here: admitPipelineSink
+// drains every other copy, first or racing, before it asks for an admission slot.
 func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64,
 	convert func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)) (bool, error) {
-	if !sm.deliveringPeerOwes(r, hash) {
-		return sm.drainDuplicate(hash, r)
-	}
-
 	ctl := sm.conversionOf(hash)
 
 	var dir string

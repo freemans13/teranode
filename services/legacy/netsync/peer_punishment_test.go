@@ -287,11 +287,15 @@ func TestWire_OnlyABodyDeliveredInFullIsAMismatchInFull(t *testing.T) {
 	withDuplicate.Transactions[2] = withDuplicate.Transactions[1]
 	duplicateBody := framedBlock(t, withDuplicate)
 
-	wellFormed, _ := regtestStreamedBlock(t, sm, 40)
+	wellFormed, wellFormedHash := regtestStreamedBlock(t, sm, 40)
 	wellFormedBody := framedBlock(t, wellFormed)
 
+	// Both blocks are owed by the peer the bodies are read from.
+	owner := owingPeer(t, sm, hash, 33)
+	require.True(t, sm.blockDownloads.Add(owner, wellFormedHash))
+
 	readThroughTheHandler := func(message []byte) error {
-		_, _, _, err := wire.ReadMessageWithEncodingN(bytes.NewReader(message), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+		_, _, _, err := wire.ReadMessageWithEncodingN(peerpkg.NewDeliveryReader(bytes.NewReader(message), owner), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
 
 		return err
 	}

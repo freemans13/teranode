@@ -13,6 +13,7 @@ const (
 	admitRawDuplicate = "drained unwritten: another copy was being converted"
 	admitRawTimedOut  = "drained: the wait for an admission slot timed out"
 	admitLocalFault   = "drained: this node failed to store the block; the peer is not at fault"
+	admitNotOwed      = "drained unwritten: this peer does not owe the block"
 )
 
 // Thresholds for reporting a block's download. Below them a download says nothing new.

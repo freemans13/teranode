@@ -72,9 +72,10 @@ func TestAShortRedeliveryThroughTheWireKeepsTheParkedBlock(t *testing.T) {
 	require.NoError(t, err)
 
 	message := framed.Bytes()
+	owner := owingPeer(t, sm, hash, 34)
 
 	// An exactly sized delivery still converts.
-	_, msg, _, err := wire.ReadMessageWithEncodingN(bytes.NewReader(message), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+	_, msg, _, err := wire.ReadMessageWithEncodingN(peerpkg.NewDeliveryReader(bytes.NewReader(message), owner), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
 	require.NoError(t, err, "a body of exactly its declared length must be accepted")
 
 	onDisk, ok := msg.(*peerpkg.MsgBlockOnDisk)
@@ -93,7 +94,7 @@ func TestAShortRedeliveryThroughTheWireKeepsTheParkedBlock(t *testing.T) {
 	short := append([]byte(nil), message...)
 	binary.LittleEndian.PutUint32(short[16:20], binary.LittleEndian.Uint32(short[16:20])+4096)
 
-	_, _, _, err = wire.ReadMessageWithEncodingN(bytes.NewReader(short), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+	_, _, _, err = wire.ReadMessageWithEncodingN(peerpkg.NewDeliveryReader(bytes.NewReader(short), owner), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
 	require.Error(t, err, "a body shorter than declared must be refused")
 	require.True(t, errors.IsBlockCorrupt(err), "refused inside the sink as corrupt, before its record is written: %v", err)
 

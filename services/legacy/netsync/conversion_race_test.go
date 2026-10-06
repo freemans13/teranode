@@ -215,6 +215,78 @@ func TestANonOwnersCopyNeverInterruptsTheOwnersConversion(t *testing.T) {
 	require.NotEmpty(t, record.Subtrees, "the owner's block is parked")
 }
 
+// A non-owner's copy that arrives before the owner's never takes the block's conversion slot. The
+// gate admits a body for any requested hash from any peer, so a peer that knew a requested block's
+// header could send a well-formed body with the wrong merkle root just ahead of the owner. That
+// copy used to start converting: the owner's honest copy became the duplicate and downloaded in
+// full to a side file, the junk reached its last transaction and claimed the finish, then failed
+// its root check, and the owner's copy, unable to take over, was thrown away. The non-owner's
+// copy is drained before it writes anything, and the owner's copy converts and parks.
+func TestANonOwnersCopyArrivingFirstNeverTakesTheConversionSlot(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.blockPark.dir = t.TempDir()
+
+	blk := wireBlockWithTxs(t, 40, false)
+	pipelineHeaderFixture(t, sm, blk)
+	proveBlockOrigin(t, sm, blk)
+
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+	header := &blk.MsgBlock().Header
+	n := sinkPayloadLen(body)
+
+	owner := owingPeer(t, sm, hash, 254)
+	stranger, _, _ := connectRacePeer(t, 255, 1000)
+
+	// Well formed, but the final transaction's lock time is changed, so the merkle root is wrong.
+	junk := append([]byte(nil), body...)
+	junk[len(junk)-1] ^= 0xff
+
+	sink := sm.admitPipelineSink(sm.pipelineBlockSink)
+
+	// The stranger's whole junk copy is on the wire and its connection stays open, so a copy that
+	// started converting would hold the slot.
+	junkR, junkW := io.Pipe()
+	junkDone := make(chan sinkResult, 1)
+
+	go func() {
+		converted, err := sink(hash, header, peerpkg.NewDeliveryReader(junkR, stranger), n)
+		junkDone <- sinkResult{converted, err}
+	}()
+
+	_, err := junkW.Write(junk)
+	require.NoError(t, err)
+
+	require.Never(t, func() bool { return sm.conversionOf(hash) != nil || len(store.ListKeys()) > 0 },
+		500*time.Millisecond, 10*time.Millisecond, "the stranger's copy took the conversion slot or wrote files")
+
+	// The owner's copy arrives while the stranger's connection is still open.
+	converted, err := sink(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), n)
+	require.NoError(t, err)
+	require.True(t, converted, "the owner's copy converted")
+
+	require.NoError(t, junkW.Close())
+
+	var got sinkResult
+
+	select {
+	case got = <-junkDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stranger's copy is still running")
+	}
+
+	require.NoError(t, got.err, "the stranger's copy is drained with the connection kept")
+	require.False(t, got.converted)
+	require.True(t, sm.takeDrainedDuplicate(hash), "the stranger's copy is accounted as drained")
+	requireNoSideFiles(t, sm.blockPark.dir)
+
+	record, err := sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees, "the owner's block is parked")
+}
+
 // owingPeer connects a peer and records in sm's download ledger that it owes hash.
 func owingPeer(t *testing.T, sm *SyncManager, hash chainhash.Hash, idx uint8) *peerpkg.Peer {
 	t.Helper()

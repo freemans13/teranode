@@ -159,6 +159,7 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 	body := blockBodyBytes(t, blk)
 	header := &blk.MsgBlock().Header
 	hash := *blk.Hash()
+	owner := owingPeer(t, sm, hash, 36)
 
 	var (
 		converted bool
@@ -168,7 +169,7 @@ func TestPipelineOnDiskRoute_AdmissionBoundsInFlightConversions(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		converted, sinkErr = installedSink(hash, header, bytes.NewReader(body), sinkPayloadLen(body))
+		converted, sinkErr = installedSink(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), sinkPayloadLen(body))
 		close(done)
 	}()
 
@@ -239,6 +240,7 @@ func TestAdmitPipelineSink_DrainsWhenAcquireTimesOut(t *testing.T) {
 	body := blockBodyBytes(t, blk)
 	header := &blk.MsgBlock().Header
 	hash := *blk.Hash()
+	owner := owingPeer(t, sm, hash, 36)
 
 	var (
 		converted bool
@@ -248,7 +250,7 @@ func TestAdmitPipelineSink_DrainsWhenAcquireTimesOut(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		converted, sinkErr = installedSink(hash, header, bytes.NewReader(body), sinkPayloadLen(body))
+		converted, sinkErr = installedSink(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), sinkPayloadLen(body))
 		close(done)
 	}()
 

@@ -427,7 +427,7 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		sm.streams.finish(s, now, complete)
 
 		sm.streams.mu.Lock()
-		drained := s.path == admitRawDuplicate || s.path == admitLocalFault
+		drained := s.path == admitRawDuplicate || s.path == admitLocalFault || s.path == admitNotOwed
 		sm.streams.mu.Unlock()
 
 		switch {
