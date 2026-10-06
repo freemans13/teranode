@@ -2557,7 +2557,8 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	prevProven := sm.headerCache.ProvenTo()
 	_, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
 
-	if !sm.headerCache.Fill(tipHash, best+1, msg.Headers) {
+	accepted, extended := sm.headerCache.FillReporting(tipHash, best+1, msg.Headers)
+	if !accepted {
 		// Three different refusals arrive here as one false, and two of them are
 		// the peer's fault. Fill refuses a run that does not reach above the
 		// committed tip, which is an honest answer to a question this node has
@@ -2617,14 +2618,14 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	// the batch's own length no longer names either end on its own.
 	top, _ := sm.headerCache.Top()
 
-	// The low end of what THIS call added. extended mirrors exactly the
-	// condition Fill itself used to choose extendLocked over replaceLocked: an
-	// extending fill appended onto prevTop, a replacing one starts at best+1
-	// regardless of what the cache held before. Getting this wrong would have
-	// the one log line an operator panel parses report the whole accumulated
-	// list's size against a single reply's header count.
-	extended := havePrevTop && prevTop >= best+1 && checkpointAhead
-
+	// The low end of what THIS call added. extended is Fill's own answer for
+	// how it installed the batch: an extending fill appended onto prevTop, a
+	// replacing one starts at best+1 regardless of what the cache held before.
+	// It is not re-derived from prevTop, because below the last checkpoint an
+	// unproven run can be replaced even though the cache named heights above
+	// the tip (headerCache.fillLocked). Getting this wrong would have the one
+	// log line an operator panel parses report the whole accumulated list's
+	// size against a single reply's header count.
 	low := best + 1
 	if extended {
 		low = prevTop + 1
