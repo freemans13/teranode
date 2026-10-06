@@ -378,7 +378,7 @@ func TestDoHTTPRequestForStreaming_HTMLResponseClosesBody(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	reader, retryAfter, err := doHTTPRequestForStreamingWithRetryAfter(context.Background(), srv.URL)
+	reader, retryAfter, err := doHTTPRequestWithRetryAfter(context.Background(), httpStreamingTimeout, srv.URL)
 	require.Error(t, err, "an HTML response is an error on the streaming path too")
 	require.Contains(t, err.Error(), "returned HTML")
 	require.Nil(t, reader, "no reader is handed to the caller, so the body must be closed internally")

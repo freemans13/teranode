@@ -139,7 +139,8 @@ func (u *Server) loadSubtreeBatch(ctx, fetchCtx context.Context, request *subtre
 				// controls what *this node* assembles; peers may legitimately produce larger subtrees.
 				maxSubtreeBytes := u.settings.SubtreeValidation.MaxIncomingSubtreeBytes
 
-				subtreeNodeBytes, err := util.DoHTTPRequestBounded(gCtx, url, maxSubtreeBytes)
+				// Retry a 429/503 rather than failing the whole block on one rate-limited GET.
+				subtreeNodeBytes, err := util.DoHTTPRequestBoundedWithRetry(gCtx, url, maxSubtreeBytes)
 				if err != nil {
 					return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree from %s", subtreeHash.String(), url, err)
 				}

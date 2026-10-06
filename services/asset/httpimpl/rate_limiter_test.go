@@ -3,6 +3,7 @@ package httpimpl
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 )
 
 func init() {
@@ -454,4 +456,41 @@ func TestCatchupHeavyBurst(t *testing.T) {
 		require.Equal(t, 40, burst)
 		require.True(t, warned)
 	})
+}
+
+// TestTieredRateLimiter_429CarriesRetryAfter — a rejected client must be told how
+// long to wait. Without the header the peer-catchup client backs off blindly on a
+// fixed ladder that has no relation to the bucket's refill rate.
+func TestTieredRateLimiter_429CarriesRetryAfter(t *testing.T) {
+	e := echo.New()
+	e.Use(setTierMiddleware(tierUnverified, ""))
+	e.Use(newTieredRateLimiter(2, 1, 0, 0, "test").Middleware())
+	e.GET("/test", func(c echo.Context) error {
+		return c.String(http.StatusOK, "ok")
+	})
+
+	var rec *httptest.ResponseRecorder
+
+	for i := 0; i < 3; i++ {
+		rec = httptest.NewRecorder()
+		e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/test", nil))
+	}
+
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"),
+		"a 2/s bucket refills a token in 500ms, which rounds up to the 1s Retry-After floor")
+}
+
+// TestTieredRateLimiter_RetryAfterFromSlowRate — a bucket slower than one token per
+// second must advertise the real refill time, not the 1s floor.
+func TestTieredRateLimiter_RetryAfterFromSlowRate(t *testing.T) {
+	rl := newTieredRateLimiter(1, 1, 0, 0, "test")
+	require.Equal(t, "4", rl.retryAfterSeconds(rate.NewLimiter(rate.Limit(0.25), 1)),
+		"0.25 tokens/s refills in 4s")
+	require.Equal(t, "1", rl.retryAfterSeconds(rate.NewLimiter(rate.Limit(1000), 1)),
+		"a fast bucket still floors at 1s - Retry-After cannot express sub-second values")
+	require.Equal(t, "1", rl.retryAfterSeconds(rate.NewLimiter(0, 1)),
+		"a zero/invalid rate must not divide by zero")
+	require.Equal(t, strconv.Itoa(maxRetryAfterSeconds), rl.retryAfterSeconds(rate.NewLimiter(rate.Limit(1e-300), 1)),
+		"a near-zero rate must cap rather than overflow the int conversion")
 }
