@@ -2540,7 +2540,26 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	prevProven := sm.headerCache.ProvenTo()
 	_, checkpointAhead := sm.headerCache.NextCheckpointAbove(best)
 
-	accepted, extended := sm.headerCache.FillReporting(tipHash, best+1, msg.Headers)
+	result := sm.headerCache.FillDetailed(tipHash, best+1, msg.Headers)
+	accepted, extended := result.accepted, result.extended
+
+	// A header the contextual rules refused. bad-diffbits is SV Node's DoS 100
+	// (validation.cpp:5789-5793): a header carrying any difficulty but the one
+	// the adjustment rules demand at its height is not this chain, and the batch
+	// was refused whole. Here the sender loses its connection rather than being
+	// banned; the ban score is the peer-punishment work's to add. The other
+	// reasons are SV Node's Invalid without DoS: the headers before the refused
+	// one were kept and the peer stays.
+	if result.rejection.disconnects() {
+		peer.DisconnectWithWarning(fmt.Sprintf("block header at height %d refused as %s: %s", result.rejectedHeight, result.rejection, result.detail))
+
+		return false
+	}
+
+	if result.rejection != headerAccepted {
+		sm.logger.Infof("[fillHeaderCache][%s] header at height %d refused as %s: %s", peer, result.rejectedHeight, result.rejection, result.detail)
+	}
+
 	if !accepted {
 		// Three different refusals arrive here as one false, and two of them are
 		// the peer's fault. Fill refuses a run that does not reach above the
@@ -4053,6 +4072,15 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// legitimately keeping the same transfer alive.
 	assignmentCeiling := blockRequestAssignmentCeiling(tSettings, config.ChainParams)
 
+	// SV Node's ContextualCheckBlockHeader for the header cache, judged against
+	// this chain's parameters and reading the committed chain through the
+	// blockchain client. Built here, before anything in New starts a goroutine,
+	// because it is the one step that can fail.
+	headerRules, err := newHeaderRules(logger, tSettings, config.ChainParams, blockchainClient)
+	if err != nil {
+		return nil, err
+	}
+
 	sm := SyncManager{
 		ctx:          ctx,
 		settings:     tSettings,
@@ -4167,9 +4195,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// a nil list simply means no proof is ever granted. The proof-of-work
 	// ceiling goes in the same way, so Fill refuses a header nobody paid for
 	// before it names a height (SV Node's CheckProofOfWork on every header).
+	// The contextual header rules go in the same way (built at the top of New,
+	// before any goroutine starts, because building them can fail).
 	sm.headerCache = newHeaderCache().
 		WithCheckpoints(config.ChainParams.Checkpoints).
-		WithPowLimit(model.PowLimitCeiling(config.ChainParams))
+		WithPowLimit(model.PowLimitCeiling(config.ChainParams)).
+		WithHeaderRules(headerRules)
 
 	// Tracks recently-failed block hashes so descendants of an unstored/rejected
 	// block are short-circuited rather than triggering a NOT_FOUND ERROR cascade

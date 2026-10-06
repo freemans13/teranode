@@ -201,6 +201,14 @@ func newLegacySyncManager(t *testing.T, stack *legacyValidationStack, s *setting
 	// went through New has not registered it.
 	initPrometheusMetrics()
 
+	// The header cache New builds: checkpoints, the proof-of-work ceiling and
+	// SV Node's contextual header rules reading the committed chain through
+	// this stack's blockchain client, so a headers message here is judged as a
+	// production node judges it.
+	rules, err := newHeaderRules(logger, s, params, stack.chain)
+	require.NoError(t, err)
+	require.NotNil(t, rules)
+
 	sm := &SyncManager{
 		ctx:                  stack.ctx,
 		logger:               logger,
@@ -218,7 +226,7 @@ func newLegacySyncManager(t *testing.T, stack *legacyValidationStack, s *setting
 		blockSizeTracker:     newBlockSizeTracker(10),
 		commitRate:           newCommitRateTracker(),
 		streams:              newStreamRegistry(),
-		headerCache:          newHeaderCache().WithCheckpoints(params.Checkpoints),
+		headerCache:          newHeaderCache().WithCheckpoints(params.Checkpoints).WithPowLimit(model.PowLimitCeiling(params)).WithHeaderRules(rules),
 		recentlyFailedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 	}
 	t.Cleanup(sm.orphanTxs.Stop)

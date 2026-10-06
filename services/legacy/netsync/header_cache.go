@@ -1,6 +1,8 @@
 package netsync
 
 import (
+	"context"
+	"fmt"
 	"math/big"
 	"sync"
 
@@ -92,13 +94,48 @@ type headerCache struct {
 	// nil means no proof-of-work check, which is what every test that only
 	// cares which heights the cache names gets, and what New never leaves it at.
 	powLimit *big.Int
+
+	// rules is ContextualCheckBlockHeader (see headerRules), run on every header
+	// before Fill keeps it. nil means no contextual check, which is what every
+	// test that only cares which heights the cache names gets; New sets it.
+	rules *headerRules
+
+	// info is what rules needs to know about each header the cache holds: the
+	// header itself and its chain work, keyed by hash and kept in step with
+	// byHash. Empty when rules is nil.
+	info map[chainhash.Hash]*cachedHeader
+
+	// fillMu makes one Fill at a time. The rules read the ancestry of a batch
+	// outside mu, because the trunk half is a blockchain call, and two fills
+	// judging against each other's half-installed state would judge nothing.
+	fillMu sync.Mutex
 }
 
 func newHeaderCache() *headerCache {
 	return &headerCache{
 		byHeight: make(map[int32]chainhash.Hash),
 		byHash:   make(map[chainhash.Hash]int32),
+		info:     make(map[chainhash.Hash]*cachedHeader),
 	}
+}
+
+// WithHeaderRules hands the cache SV Node's contextual header rules and returns
+// it, in the shape of WithCheckpoints. With rules, Fill refuses a header whose
+// nBits is not the expected difficulty at its height, whose time is not after
+// its parent's median time past or is more than two hours ahead, or whose
+// version is obsolete at its height. nil leaves Fill checking linkage, proof of
+// work and checkpoints only.
+func (c *headerCache) WithHeaderRules(rules *headerRules) *headerCache {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.rules = rules
+
+	return c
 }
 
 // WithCheckpoints hands the cache the chain's pinned checkpoints and returns it,
@@ -212,27 +249,149 @@ func (c *headerCache) Fill(parent chainhash.Hash, baseHeight int32, headers []*w
 // it read before the call, because below the last checkpoint an extend that
 // fails can still end in a replace (see fillLocked).
 func (c *headerCache) FillReporting(parent chainhash.Hash, baseHeight int32, headers []*wire.BlockHeader) (accepted, extended bool) {
+	result := c.FillDetailed(parent, baseHeight, headers)
+
+	return result.accepted, result.extended
+}
+
+// fillResult is FillDetailed's answer. rejection is set when a header rules
+// refused cut the batch short or refused it whole; rejectedHeight is that
+// header's height and detail says what the rule saw.
+type fillResult struct {
+	accepted       bool
+	extended       bool
+	rejection      headerRejection
+	rejectedHeight int32
+	detail         string
+}
+
+// FillDetailed is FillReporting that also reports a header the rules refused.
+//
+// The rules run before anything is installed, over every header from the
+// earliest point either anchor (the committed tip, or the cache's own top) could
+// keep. A header's verdict depends only on its ancestry, which its hash fixes,
+// so judging the batch once, before the dispatch picks an anchor, judges
+// whichever subset the dispatch then keeps.
+//
+// A refusal that SV Node scores DoS 100 refuses the whole batch: the sender is
+// lying about the chain and nothing it sent is kept. Any other refusal keeps the
+// headers before the refused one, as SV Node's ProcessNewBlockHeaders keeps the
+// headers it accepted before the first it did not.
+func (c *headerCache) FillDetailed(parent chainhash.Hash, baseHeight int32, headers []*wire.BlockHeader) fillResult {
 	if c == nil || len(headers) == 0 {
-		return false, false
+		return fillResult{}
 	}
 
-	// Read once, outside the lock: WithPowLimit is called before any Fill and
-	// the walk below is the expensive part of this function.
+	c.fillMu.Lock()
+	defer c.fillMu.Unlock()
+
+	// Read once, outside the lock: WithPowLimit and WithHeaderRules are called
+	// before any Fill and the walk below is the expensive part of this function.
 	c.mu.Lock()
 	ceiling := c.powLimit
+	rules := c.rules
 	c.mu.Unlock()
 
 	// Walk the whole batch before touching anything, so a refusal leaves the
 	// previous contents intact rather than half-replaced.
 	hashes, ok := linkedHashes(headers, ceiling)
 	if !ok {
-		return false, false
+		return fillResult{}
+	}
+
+	var (
+		result  fillResult
+		pending map[chainhash.Hash]*cachedHeader
+	)
+
+	if rules != nil {
+		var cut int
+
+		pending, cut, result = c.judge(rules, parent, headers, hashes)
+		if result.rejection.disconnects() {
+			return result
+		}
+
+		headers, hashes = headers[:cut], hashes[:cut]
+		if len(headers) == 0 {
+			return result
+		}
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.fillLocked(parent, baseHeight, headers, hashes)
+	result.accepted, result.extended = c.fillLocked(parent, baseHeight, headers, hashes)
+
+	if result.accepted {
+		for hash, header := range pending {
+			if _, held := c.byHash[hash]; held {
+				c.info[hash] = header
+			}
+		}
+	}
+
+	return result
+}
+
+// judge runs the header rules over the batch from the earliest index either
+// anchor would keep, and returns what it learned about each header it passed,
+// the index of the first header it refused (len(headers) when none), and that
+// refusal. A batch that meets neither anchor is not judged: Fill refuses it
+// whatever the rules say.
+func (c *headerCache) judge(rules *headerRules, parent chainhash.Hash, headers []*wire.BlockHeader, hashes []chainhash.Hash) (map[chainhash.Hash]*cachedHeader, int, fillResult) {
+	start := findAnchor(headers, hashes, parent)
+
+	c.mu.Lock()
+	topHash, haveTop := c.byHeight[c.top]
+	haveTop = haveTop && c.filled
+	c.mu.Unlock()
+
+	if haveTop {
+		if fromTop := findAnchor(headers, hashes, topHash); fromTop >= 0 && (start < 0 || fromTop < start) {
+			start = fromTop
+		}
+	}
+
+	if start < 0 {
+		return nil, len(headers), fillResult{}
+	}
+
+	pending := make(map[chainhash.Hash]*cachedHeader, len(headers)-start)
+	source := &branchSource{
+		trunk: rules.trunk,
+		lookup: func(hash chainhash.Hash) (*cachedHeader, bool) {
+			if header, ok := pending[hash]; ok {
+				return header, true
+			}
+
+			c.mu.Lock()
+			defer c.mu.Unlock()
+
+			header, ok := c.info[hash]
+
+			return header, ok
+		},
+	}
+
+	ctx := context.Background()
+
+	for i := start; i < len(headers); i++ {
+		parentHeader, parentMeta, err := source.GetBlockHeader(ctx, &headers[i].PrevBlock)
+		if err != nil || parentHeader == nil || parentMeta == nil {
+			return pending, i, fillResult{rejection: rejectUnjudgeable, detail: fmt.Sprintf("parent %s of header %s: %v", headers[i].PrevBlock, hashes[i], err)}
+		}
+
+		parentHeight := int32(parentMeta.Height) //nolint:gosec // a stored height fits a chain height
+
+		if rejection, detail := rules.check(ctx, source, parentHeader, parentHeight, headers[i]); rejection != headerAccepted {
+			return pending, i, fillResult{rejection: rejection, rejectedHeight: parentHeight + 1, detail: detail}
+		}
+
+		pending[hashes[i]] = childOf(parentHeight, parentMeta.ChainWork, modelHeader(headers[i]), headers[i].Bits)
+	}
+
+	return pending, len(headers), fillResult{}
 }
 
 // linkedHashes is Fill's walk: it returns each header's hash, or false when a
@@ -445,6 +604,7 @@ func (c *headerCache) replaceLocked(parent chainhash.Hash, baseHeight int32, hea
 
 	c.byHeight = make(map[int32]chainhash.Hash, len(kept))
 	c.byHash = make(map[chainhash.Hash]int32, len(kept))
+	c.info = make(map[chainhash.Hash]*cachedHeader, len(kept))
 
 	for i, hash := range kept {
 		height := baseHeight + int32(i) //nolint:gosec // a batch index, bounded by the wire limit
@@ -807,6 +967,7 @@ func (c *headerCache) Discard() {
 func (c *headerCache) resetLocked() {
 	c.byHeight = make(map[int32]chainhash.Hash)
 	c.byHash = make(map[chainhash.Hash]int32)
+	c.info = make(map[chainhash.Hash]*cachedHeader)
 	c.top = 0
 	c.filled = false
 	// The proof belongs to the contents, so it goes with them. Leaving it behind
@@ -860,6 +1021,7 @@ func (c *headerCache) Prune(height int32) {
 		if hash, ok := c.byHeight[h]; ok {
 			delete(c.byHeight, h)
 			delete(c.byHash, hash)
+			delete(c.info, hash)
 		}
 	}
 
