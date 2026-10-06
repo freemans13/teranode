@@ -2544,7 +2544,22 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// headers, so the cache is bounded by the number of outbound peers, which
 	// this node chooses, and not by how many peers connect to it. Anything else
 	// is dropped without blame: the cache asks again for whatever it needs.
-	if best, _, ok := sm.committedTip(); ok && !sm.headersAskedOf(peer) && sm.findNextHeaderCheckpoint(best) != nil {
+	//
+	// The tip is read once, here, and that one read serves both the rule and
+	// fillHeaderCacheAt, so a headers message costs one GetBestBlockHeader call
+	// (an uncached blockchain round trip). A failed read drops the batch: the
+	// rule cannot be judged without the committed height, and skipping it would
+	// let a later read inside the fill admit a batch the rule refuses.
+	asked := sm.headersAskedOf(peer)
+
+	best, tipHash, ok := sm.committedTip()
+	if !ok {
+		sm.logger.Debugf("[handleHeadersMsg] the committed tip could not be read, dropping %d headers from %s", numHeaders, peer)
+
+		return
+	}
+
+	if !asked && sm.findNextHeaderCheckpoint(best) != nil {
 		sm.logger.Debugf("[handleHeadersMsg] dropping %d unsolicited headers from %s below the last checkpoint (committed height %d)", numHeaders, peer, best)
 
 		return
@@ -2562,7 +2577,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// The wanted-range pass reads sm.headerCache: wantedBlocks (in
 	// wanted_range_assign.go) calls wantedBlocksFromCache, which is the only
 	// consumer of what a fill lands here.
-	if !sm.fillHeaderCache(hmsg.peer, msg) {
+	if !sm.fillHeaderCacheAt(hmsg.peer, msg, best, tipHash) {
 		return
 	}
 
@@ -2628,6 +2643,9 @@ func (sm *SyncManager) blockOrigin(blockHash chainhash.Hash) blockRequestOrigin 
 //
 // The return value is what handleHeadersMsg gates its assignment pass on, so
 // only a batch that moved a branch triggers one.
+//
+// It reads the committed tip itself; handleHeadersMsg, which has already read
+// the tip for its own rule, calls fillHeaderCacheAt with that read instead.
 func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders) bool {
 	if len(msg.Headers) == 0 {
 		return false
@@ -2641,6 +2659,16 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	if !ok {
 		sm.logger.Debugf("[fillHeaderCache] no committed tip recorded yet, dropping %d headers from %s", len(msg.Headers), peer)
 
+		return false
+	}
+
+	return sm.fillHeaderCacheAt(peer, msg, best, tipHash)
+}
+
+// fillHeaderCacheAt is fillHeaderCache against a committed tip the caller has
+// already read: best and tipHash must come from one committedTip call.
+func (sm *SyncManager) fillHeaderCacheAt(peer *peerpkg.Peer, msg *wire.MsgHeaders, best int32, tipHash chainhash.Hash) bool {
+	if len(msg.Headers) == 0 {
 		return false
 	}
 
