@@ -284,6 +284,13 @@ type peerSyncState struct {
 	// by pointer across the blockHandler goroutine and the per-message handlers.
 	// Nothing sweeps it — the stamp is only ever read.
 	demotedUntil atomic.Int64
+
+	// headersAsked is set by requestHeaders, before it sends this peer a
+	// getheaders, and never cleared: the state is dropped with the peer. Below
+	// the last checkpoint handleHeadersMsg reads a headers message only from a
+	// peer with it set, so only a peer this node asked can create or extend a
+	// header branch there.
+	headersAsked atomic.Bool
 }
 
 // noteDemotedFor bars this peer from election as sync peer for d.
@@ -1032,9 +1039,25 @@ func (sm *SyncManager) startSync() {
 
 	sm.logger.Debugf("[startSync] selecting sync peer from %d candidates", sm.peerStates.Length())
 
+	// Below the last checkpoint the elected peer is sent the round's first
+	// getheaders, and requestHeaders refuses an inbound peer there, so an
+	// inbound peer is not elected.
+	electedHeight, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
+	if err != nil {
+		sm.logger.Errorf("[startSync] failed to convert block height to int32: %v", err)
+
+		return
+	}
+
 	for peer, state := range sm.peerStates.Range() {
 		if !state.syncCandidate {
 			sm.logger.Debugf("[startSync] peer %v is not a sync candidate", peer.String())
+
+			continue
+		}
+
+		if !sm.mayAskForHeaders(peer, electedHeight) {
+			sm.logger.Debugf("[startSync] peer %v is inbound and the committed height %d is below the last checkpoint, skipping", peer.String(), electedHeight)
 
 			continue
 		}
@@ -1205,7 +1228,7 @@ func (sm *SyncManager) startSync() {
 	if nextCP != nil &&
 		bestBlockHeightInt32 < nextCP.Height &&
 		sm.chainParams != &chaincfg.RegressionNetParams {
-		if err = bestPeer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
+		if err = sm.requestHeaders(bestPeer, bestBlockHeightInt32, locator, &zeroHash); err != nil {
 			sm.logger.Warnf("[startSync] Failed to send getheaders message to peer %s: %v", bestPeer.String(), err)
 
 			return
@@ -2276,7 +2299,7 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 		}
 	}
 
-	peers := sm.eligibleBlockPeers()
+	peers := sm.headerRequestPeers(best)
 	if len(peers) == 0 {
 		return
 	}
@@ -2336,7 +2359,7 @@ func (sm *SyncManager) maybeRequestMoreHeaders(wanted []wantedBlock) {
 	// accidental duplicate while logging success.
 	peer.ForgetLastHeadersRequest()
 
-	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
+	if err := sm.requestHeaders(peer, best, locator, &zeroHash); err != nil {
 		sm.logger.Warnf("[assignWantedBlocks][%s] failed to send getheaders to refill the header cache past height %d: %v", peer.String(), last, err)
 
 		return
@@ -2370,6 +2393,74 @@ func (sm *SyncManager) allowedToRequestMoreHeadersNow(now time.Time) bool {
 			return true
 		}
 	}
+}
+
+// mayAskForHeaders reports whether this node may send peer a getheaders while
+// its committed height is best: always, except that below the last checkpoint
+// an inbound peer is never asked. Judged on the primary peer a stream
+// connection belongs to.
+//
+// Below the last checkpoint handleHeadersMsg reads headers only from a peer this
+// node asked, and each asked peer may hold a branch of up to branchCap headers.
+// Asking only outbound peers bounds those branches by the outbound connections
+// this node makes, which its configuration and operator choose (the automatic
+// outbound target, 8 by default, plus addnode or connect peers), never by the
+// inbound connections anyone may open. SV Node sends its initial getheaders
+// to a preferred-download peer, outbound or whitelisted
+// (net_processing.cpp:120 and :5063), but falls back to an inbound one when it
+// has no preferred peer; this does not fall back.
+func (sm *SyncManager) mayAskForHeaders(peer *peerpkg.Peer, best int32) bool {
+	if sm.chainParams == nil || sm.findNextHeaderCheckpoint(best) == nil {
+		return true
+	}
+
+	_, primary, _ := sm.peerStateResolvingPrimary(peer)
+
+	return !primary.Inbound()
+}
+
+// requestHeaders sends peer a getheaders for locator and stopHash, and records
+// on the peer's state that this node asked it, which is what lets its headers
+// create or extend a branch below the last checkpoint (handleHeadersMsg). The
+// record is made before the send, so a reply can never arrive ahead of it; a
+// send that then fails leaves an outbound peer marked, which only lets an
+// unrequested reply from it be read. best is the committed height the caller
+// read. It refuses, sending and recording nothing, when mayAskForHeaders does.
+//
+// Every getheaders this package sends goes through here.
+func (sm *SyncManager) requestHeaders(peer *peerpkg.Peer, best int32, locator blockchain.BlockLocator, stopHash *chainhash.Hash) error {
+	if !sm.mayAskForHeaders(peer, best) {
+		return errors.NewProcessingError("peer %s is inbound and the committed height %d is below the last checkpoint, so it is not asked for headers", peer, best)
+	}
+
+	if state, _, ok := sm.peerStateResolvingPrimary(peer); ok {
+		state.headersAsked.Store(true)
+	}
+
+	return peer.PushGetHeadersMsg(locator, stopHash)
+}
+
+// headersAskedOf reports whether this node has sent peer, or the primary peer a
+// stream connection belongs to, a getheaders.
+func (sm *SyncManager) headersAskedOf(peer *peerpkg.Peer) bool {
+	state, _, ok := sm.peerStateResolvingPrimary(peer)
+
+	return ok && state.headersAsked.Load()
+}
+
+// headerRequestPeers is eligibleBlockPeers less the peers mayAskForHeaders
+// refuses at best, the peers maybeRequestMoreHeaders rotates through.
+func (sm *SyncManager) headerRequestPeers(best int32) []blockPeer {
+	peers := sm.eligibleBlockPeers()
+	askable := peers[:0]
+
+	for _, p := range peers {
+		if sm.mayAskForHeaders(p.peer, best) {
+			askable = append(askable, p)
+		}
+	}
+
+	return askable
 }
 
 // nextHeaderRefillPeer picks the peer maybeRequestMoreHeaders asks this call,
@@ -2421,24 +2512,41 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		peer = resolved
 	}
 
-	// The remote peer is misbehaving if we didn't request headers.
 	msg := hmsg.headers
 	numHeaders := len(msg.Headers)
 
+	// Outside headers-first mode nothing reads a headers message: past the last
+	// checkpoint blocks are named by announcements. The message is dropped and
+	// the sender keeps its connection. Upstream disconnected it as unrequested;
+	// SV Node's ProcessHeadersMessage (net_processing.cpp:3338) scores a headers
+	// message for its size, linkage and validity, never for arriving unasked.
+	//
 	// headersFirstMode alone, without upstream's "|| sm.nextCheckpoint == nil": the
 	// stored checkpoint field is gone, and startSync — the one place that turns this
 	// flag on — already derives the next checkpoint fresh and refuses to enter
 	// headers-first mode when there is none ahead. A second, stored copy of that
 	// decision is what went stale and left the mode unreachable.
 	if !sm.headersFirstMode.Load() {
-		reason := fmt.Sprintf("Got %d unrequested headers from %s", numHeaders, peer.String())
-		peer.DisconnectWithWarning(reason)
+		sm.logger.Debugf("[handleHeadersMsg] not in headers-first mode, dropping %d headers from %s", numHeaders, peer)
 
 		return
 	}
 
 	// Nothing to do for an empty headers message.
 	if numHeaders == 0 {
+		return
+	}
+
+	// The outbound rule. Below the last checkpoint a batch may create or extend
+	// a header branch only for a peer this node sent a getheaders to
+	// (requestHeaders records it), and only outbound peers are ever sent one
+	// there. Each such peer holds at most one branch of at most branchCap
+	// headers, so the cache is bounded by the number of outbound peers, which
+	// this node chooses, and not by how many peers connect to it. Anything else
+	// is dropped without blame: the cache asks again for whatever it needs.
+	if best, _, ok := sm.committedTip(); ok && !sm.headersAskedOf(peer) && sm.findNextHeaderCheckpoint(best) != nil {
+		sm.logger.Debugf("[handleHeadersMsg] dropping %d unsolicited headers from %s below the last checkpoint (committed height %d)", numHeaders, peer, best)
+
 		return
 	}
 
@@ -2745,7 +2853,7 @@ func (sm *SyncManager) continueCheckpointWalkIfNeeded(peer *peerpkg.Peer, best, 
 
 	peer.ForgetLastHeadersRequest()
 
-	if err := peer.PushGetHeadersMsg(locator, &zeroHash); err != nil {
+	if err := sm.requestHeaders(peer, best, locator, &zeroHash); err != nil {
 		sm.logger.Warnf("[fillHeaderCache][%s] failed to send the immediate continuation toward checkpoint height %d: %v", peer, next.Height, err)
 
 		return
@@ -2971,10 +3079,10 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 
 			// Gated on headers-first mode being ON, which SV Node does not do —
 			// it acts on a block inv in every state. The gate is forced by our
-			// own code: handleHeadersMsg disconnects any peer that answers a
-			// getheaders sent while headersFirstMode is false ("Got %d
-			// unrequested headers"), so asking outside the mode would cost us
-			// the peer that helped.
+			// own code: handleHeadersMsg drops every headers message while
+			// headersFirstMode is false, so a getheaders sent outside the mode
+			// would be answered into nothing. It goes through requestHeaders,
+			// so below the last checkpoint an inbound announcer is not asked.
 			//
 			// headersRoundLocator anchored on the committed tip, the same
 			// locator startSync uses, rather than a header-list-anchored one:
@@ -2997,11 +3105,11 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			// a reorg, whose headers are needed before any block is worth asking
 			// for.
 			if sm.headersFirstMode.Load() && !sm.blockDownloads.RequestedWithin(announced, blockRequestRetryInterval) {
-				if tipHeight, tipHash, ok := sm.committedTip(); ok {
+				if tipHeight, tipHash, ok := sm.committedTip(); ok && sm.mayAskForHeaders(peer, tipHeight) {
 					if locator, lerr := sm.headersRoundLocator(&tipHash, uint32(tipHeight)); lerr != nil { //nolint:gosec // a chain height
 						sm.logger.Warnf("[handleInvMsg] could not build repair getheaders locator for announced block %s: %v", announced, lerr)
 					} else if len(locator) > 0 {
-						if err := peer.PushGetHeadersMsg(locator, &announced); err != nil {
+						if err := sm.requestHeaders(peer, tipHeight, locator, &announced); err != nil {
 							sm.logger.Warnf("[handleInvMsg] Failed to send repair getheaders for announced block %s to peer %s: %v", announced, peer, err)
 						}
 					}

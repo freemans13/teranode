@@ -104,10 +104,15 @@ func runHistoricalTestnetSync(t *testing.T, unified bool) {
 	// reads the same settings and store, so this pins which subtest proves what.
 	require.Equal(t, unified, sm.unifiedRoute(1), "the route flags must select the route this subtest names")
 
-	p := peer.NewInboundPeer(ulogger.TestLogger{}, s, &peer.Config{})
+	// Outbound and asked: below the last checkpoint only a peer this node sent
+	// a getheaders to may fill the header cache, and only outbound peers are
+	// sent one. The peer is not connected, so the getheaders itself is dropped.
+	p, err := peer.NewOutboundPeer(ulogger.TestLogger{}, s, &peer.Config{}, "10.0.0.1:18333")
+	require.NoError(t, err)
 	registerRacePeer(sm, p)
 	sm.storeSyncPeer(p, &syncPeerState{})
 	sm.headersFirstMode.Store(true)
+	askForHeaders(t, sm, p)
 
 	data, err := os.ReadFile("testdata/testnet_blocks_1_547.gz")
 	require.NoError(t, err)

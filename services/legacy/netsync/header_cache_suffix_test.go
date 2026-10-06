@@ -269,6 +269,10 @@ func TestHandleHeadersMsg_ASuccessfulFillRunsAnAssignmentPass(t *testing.T) {
 
 	peer, rec := schedulerPeer(t, sm, 60, 2000)
 
+	// Height 100 is below mainnet's last checkpoint, where only a peer this
+	// node asked may fill the cache, so the batch is the answer to a getheaders.
+	askForHeaders(t, sm, peer)
+
 	var nonce uint32
 
 	msg, hashes := linkedHeaders(tip, 12, &nonce)

@@ -29,11 +29,18 @@ import (
 // coexist, and each peer's best known header (pindexBestKnownBlock) only ever
 // moves to a header with at least as much chain work (UpdateBlockAvailability).
 // A peer that feeds it a fake branch gets a branch of its own; it cannot take
-// another peer's away. This cache is the same structure with three bounds SV
-// Node does not need, because SV Node never discards a header: at most one
-// branch per peer, each branch at most branchCap headers above the committed
-// tip, and at most nodeCap headers over all branches, enforced by evicting the
-// lowest ranked branch that is neither active nor proven.
+// another peer's away. This cache is the same structure with two bounds SV Node
+// does not need, because SV Node never discards a header: at most one branch per
+// peer, and each branch at most branchCap headers above the committed tip.
+//
+// There is no bound over all branches, because any such bound has to evict
+// someone, and below a checkpoint the honest branch cannot be told from a fake
+// until it reaches the pinned hash: in mainnet's difficulty-1 era a fake header
+// carries the same work as an honest one, so fakes that stop one short of the
+// checkpoint outrank the honest branch and an eviction by rank removes the
+// honest one. The number of branches is bounded instead by who may hold one:
+// below the last checkpoint only a peer this node asked for headers, and only
+// outbound peers are asked (SyncManager.handleHeadersMsg and requestHeaders).
 //
 // It is still a cache and not a work queue. Everything in it can be asked for
 // again in one message, so a branch can be dropped at any instant: when its peer
@@ -114,11 +121,6 @@ type headerCache struct {
 	// branchCap is how far above the committed tip a branch may reach, set from
 	// the checkpoints (see capForCheckpoints).
 	branchCap int32
-
-	// nodeCap is the most headers the tree holds over all branches, set with
-	// branchCap (see nodeCapForBranchCap). Over it, a fill evicts branches
-	// (see enforceNodeCapLocked).
-	nodeCap int
 
 	// powLimit is the easiest target a header may declare on this chain
 	// (model.PowLimitCeiling). nil means no proof-of-work check, which is what
@@ -237,28 +239,8 @@ func newHeaderCache() *headerCache {
 		index:        make(map[chainhash.Hash]*headerNode),
 		branches:     make(map[any]*headerBranch),
 		branchCap:    capForCheckpoints(nil),
-		nodeCap:      nodeCapForBranchCap(capForCheckpoints(nil)),
 		storeTimeout: headerStoreTimeout,
 	}
-}
-
-// nodeCapForBranchCap is the most headers the tree may hold over all branches:
-// two branches' worth, plus two replies for what the sweep has not yet removed
-// below the committed tip.
-//
-// Honest peers on one chain share their headers, so twenty of them hold one
-// branch's worth between them, at most branchCap above the committed tip, plus
-// what lies below the tip unswept: the sweep runs once the tip has moved a
-// reply's worth (MaxBlockHeadersPerMsg) and keeps a reply's worth below it, so
-// up to two replies. That is branchCap + 4,000, which the cap clears by a whole
-// branch, the room for one honest competing chain. The cap is what stops many
-// peers, each with a branch of its own, holding branchCap headers apiece: 52,000
-// on mainnet, so 125 such peers would hold 6.5 million.
-//
-// Mainnet: 2 x 52,000 + 4,000 = 108,000 headers. Testnet: 2 x 102,010 + 4,000 =
-// 208,020. With no checkpoints: 2 x 4,000 + 4,000 = 12,000.
-func nodeCapForBranchCap(branchCap int32) int {
-	return 2*int(branchCap) + 2*wire.MaxBlockHeadersPerMsg
 }
 
 // headerStoreTimeout is the most one fill may spend in blockchain calls while
@@ -332,7 +314,6 @@ func (c *headerCache) WithCheckpoints(checkpoints []chaincfg.Checkpoint) *header
 
 	c.checkpoints = checkpoints
 	c.branchCap = capForCheckpoints(checkpoints)
-	c.nodeCap = nodeCapForBranchCap(c.branchCap)
 
 	return c
 }
@@ -938,77 +919,11 @@ func (c *headerCache) installLocked(owner any, plan fillPlan, nodes []*headerNod
 
 	c.setTipLocked(owner, tip)
 	c.selectLocked()
-	c.enforceNodeCapLocked()
-
-	// The cap can evict the branch this fill just moved, when it ranks lowest.
-	if branch := c.branches[owner]; branch == nil || branch.tip != tip {
-		result.low, result.added = 0, 0
-
-		return result
-	}
 
 	result.accepted = true
 	result.top, result.topHash = tip.height, tip.hash
 
 	return result
-}
-
-// enforceNodeCapLocked brings the tree back under nodeCap: it frees what dropped
-// branches held, sweeps if a sweep is due, and then evicts branches one at a
-// time, the lowest ranked first, until the tree is under the cap or only branches
-// it must keep are left. It never evicts the active branch, nor a branch whose
-// proof reaches above the committed tip: the first is what every reader sees,
-// and the second is on the checkpointed chain, which the next download needs.
-// A branch that no longer counts (diverged, or at or below the committed tip) is
-// evicted before any that does. Called with fillMu and mu held; it costs nothing
-// while the tree is under the cap.
-func (c *headerCache) enforceNodeCapLocked() {
-	if c.nodeCap <= 0 || len(c.index) <= c.nodeCap {
-		return
-	}
-
-	c.reapLocked()
-
-	if len(c.index) > c.nodeCap && c.haveFloor && c.floorHeight-c.sweptTo >= int32(wire.MaxBlockHeadersPerMsg) {
-		c.sweepLocked()
-	}
-
-	for len(c.index) > c.nodeCap {
-		var (
-			victimOwner any
-			victim      *headerBranch
-		)
-
-		for owner, branch := range c.branches {
-			if branch == c.active || c.effectiveProofLocked(branch) > 0 {
-				continue
-			}
-
-			if victim == nil || c.evictBeforeLocked(branch, victim) {
-				victimOwner, victim = owner, branch
-			}
-		}
-
-		if victim == nil {
-			return
-		}
-
-		c.dropBranchLocked(victimOwner)
-		c.reapLocked()
-	}
-}
-
-// evictBeforeLocked reports whether a should be evicted before b: a branch that
-// no longer counts goes first, then the lower ranked by betterLocked.
-func (c *headerCache) evictBeforeLocked(a, b *headerBranch) bool {
-	deadA := a.diverged || (c.haveFloor && a.tip.height <= c.floorHeight)
-	deadB := b.diverged || (c.haveFloor && b.tip.height <= c.floorHeight)
-
-	if deadA != deadB {
-		return deadA
-	}
-
-	return c.betterLocked(b, a)
 }
 
 // floorSnapshot is the recorded committed tip, saved so a refused fill can
