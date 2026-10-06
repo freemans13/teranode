@@ -4,42 +4,55 @@
 
 Every key below is loaded in the `Legacy: LegacySettings{` block of
 `settings/settings.go`. That block is the only thing that makes a setting
-configurable, and the default shown here is the one it passes. A struct tag in
-`settings/legacy_settings.go` is documentation, not wiring: a field with a tag
-and no loader line arrives as its zero value whatever an operator writes.
+configurable. A struct tag in `settings/legacy_settings.go` is documentation,
+not wiring: a field with a tag and no loader line arrives as its zero value
+whatever an operator writes.
+
+Two values are shown for each key:
+
+- **Loader fallback** is the default `settings/settings.go` passes. A node uses
+  it only when no configuration file sets the key.
+- **settings.conf** is the base value in the committed `settings.conf`. A node
+  that runs on the repository configuration uses this value, unless
+  `settings_local.conf` or a context-specific key (`key.<context>`) sets
+  another. "not set" means the file has no base line for the key, so the loader
+  fallback applies.
+
+`${DATADIR}` is `./data` in `settings.conf` (`/data` in the `operator`
+context), and `${LEGACY_GRPC_PORT}` is `8099`.
 
 ## Configuration Settings
 
-| Setting | Type | Default | Environment Variable | Usage |
-|---------|------|---------|---------------------|-------|
-| WorkingDir | string | "../../data" | legacy_workingDir | Directory for legacy peer data, resolved to an absolute path and created at startup. Holds the address book when SavePeers is true. Read from the config directly, not through the settings struct |
-| ListenAddresses | []string | [] | legacy_listen_addresses | Pipe-separated addresses to accept wire-protocol peers on. Empty falls back to the node's outbound interface IP and the network's default port |
-| ConnectPeers | []string | [] | legacy_connect_peers | Pipe-separated peers to dial. A non-empty list puts the node in connect-only mode |
-| OrphanEvictionDuration | time.Duration | 10m | legacy_orphanEvictionDuration | How long an orphan transaction is held. On eviction it gets one last validation attempt |
-| MaxOrphanTxs | int | 100 | legacy_maxOrphanTxs | Cap on orphan transactions held in memory. Inserting past the cap evicts the oldest by insertion time. 0 leaves the pool unbounded |
-| PrintInvMessages | bool | false | legacy_printInvMessages | Log every inventory message sent and received |
-| GRPCAddress | string | "" | legacy_grpcAddress | Address other services dial to reach the legacy service. Client creation fails when empty |
-| AllowBlockPriority | bool | true | legacy_allowBlockPriority | Negotiate the BSV multistream BlockPriority policy, which carries block traffic on its own TCP stream. False also refuses an inbound createstream |
-| GRPCListenAddress | string | "" | legacy_grpcListenAddress | Bind address for the legacy gRPC server |
-| SavePeers | bool | false | legacy_savePeers | Persist the address book. When false the address manager is given no directory and keeps nothing across a restart |
-| AllowSyncCandidateFromLocalPeers | bool | false | legacy_allowSyncCandidateFromLocalPeers | Regtest only. False admits only 127.0.0.1 and localhost peers as sync candidates. On every other network the setting is not read |
-| TempStore | *url.URL | "file://./data/tempstore" | temp_store | Blob store for temporary data. The out-of-order block park writes here and needs a file:// URL |
-| PeerIdleTimeout | time.Duration | 125s | legacy_peerIdleTimeout | Disconnect a peer after this long with no message. A multistream association with recent traffic on another stream resets the timer. Half this value bounds the streaming pipeline's admission wait |
-| MaxAddnodePeers | int | 8 | legacy_maxAddnodePeers | Ceiling on addnode peers, budgeted separately from MaxPeers and enforced on both the startup list and the runtime RPC |
-| ReplenishInterval | time.Duration | 2s | legacy_replenishInterval | How often the connection manager dials to close its outbound deficit. 0 restores the one-minute ticker and disables the event-driven wake |
-| MaxFeelerPeers | int | 1 | legacy_maxFeelerPeers | Peer slots reserved for short-lived feeler probes, and the cap on probes at once. 0 disables feelers and the reservation together |
-| FeelerInterval | time.Duration | 120s | legacy_feelerInterval | Mean of the randomised gap between feeler probes. Not a disable lever: a non-positive value falls back to 120s with a warning |
-| FeelerHandshakeTimeout | time.Duration | 25s | legacy_feelerHandshakeTimeout | How long a feeler waits for a version message. Must stay under the 30s peer negotiate timeout |
-| PeerProcessingTimeout | time.Duration | 3m | legacy_peerProcessingTimeout | Per-message processing watchdog. Not armed for block messages while prefetch ingestion is active. Also the pre-admission deadline on an inbound peer, and part of the block-failure map TTL |
-| BlockDownloadTimeoutBasePercent | int64 | 100 | legacy_blockDownloadTimeoutBasePercent | Ceiling on one block download at the chain tip, as a percentage of the target block interval. Floored at 30 minutes, so values at or below 300 change nothing on a 10-minute chain |
-| BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up. Also floored at 30 minutes, which the 600 default clears on a 10-minute chain |
-| BlockDownloadTimeoutPerPeerPercent | int64 | 50 | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling per other peer with a block download outstanding. The total is floored at 30 minutes, so this only adds patience |
-| MultiPeerBlockDownload | bool | true | legacy_multiPeerBlockDownload | Spread block requests over every eligible peer. False assigns them all to the sync peer, disconnects a stalled sync peer instead of demoting it, and ignores notfound |
-| MaxBlocksInTransitPerPeer | int | 16 | legacy_maxBlocksInTransitPerPeer | Block bodies one peer may owe at once with multi-peer download on, speed-scaled per peer and at most 2 until a peer's speed is measured. Not reduced for large blocks: the 100 GiB park backstop (`parkBackstopBytes`) guards the disk instead. In every mode it also sizes the pipeline's admission budget, at four slots per peer, and the peer package's download-timeout budget |
-| BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Block bodies the whole node may have outstanding, counting every peer together, and the read-ahead depth: how far above the committed tip a block may be asked for at all. A count, not svnode's per-peer height range |
-| ParkStoreTimeout | time.Duration | 10s | legacy_parkStoreTimeout | Deadline on each park blob store operation, bounding the wait for the file store's shared permits. Values below 1s are raised to 1s |
-| PeerRegistryEnabled | bool | true | legacy_peerRegistryEnabled | Mirror connected legacy peers into the centralized peer registry so the dashboard can show them |
-| PeerRegistrySyncInterval | time.Duration | 10s | legacy_peerRegistrySyncInterval | How often that mirror reconciles connected legacy peers into the registry |
+| Setting | Type | Loader fallback | settings.conf | Environment Variable | Usage |
+|---------|------|-----------------|---------------|---------------------|-------|
+| WorkingDir | string | "../../data" | `${DATADIR}/legacy` | legacy_workingDir | Directory for legacy peer data, resolved to an absolute path and created at startup. Holds the address book when SavePeers is true. Read from the config directly, not through the settings struct |
+| ListenAddresses | []string | [] | not set | legacy_listen_addresses | Pipe-separated addresses to accept wire-protocol peers on. Empty falls back to the node's outbound interface IP and the network's default port |
+| ConnectPeers | []string | [] | not set | legacy_connect_peers | Pipe-separated peers to dial. A non-empty list puts the node in connect-only mode |
+| OrphanEvictionDuration | time.Duration | 10m | not set | legacy_orphanEvictionDuration | How long an orphan transaction is held. On eviction it gets one last validation attempt |
+| MaxOrphanTxs | int | 100 | not set | legacy_maxOrphanTxs | Cap on orphan transactions held in memory. Inserting past the cap evicts the oldest by insertion time. 0 leaves the pool unbounded |
+| PrintInvMessages | bool | false | false | legacy_printInvMessages | Log every inventory message sent and received |
+| GRPCAddress | string | "" | `localhost:${LEGACY_GRPC_PORT}` | legacy_grpcAddress | Address other services dial to reach the legacy service. Client creation fails when empty |
+| AllowBlockPriority | bool | true | true | legacy_allowBlockPriority | Negotiate the BSV multistream BlockPriority policy, which carries block traffic on its own TCP stream. False also refuses an inbound createstream |
+| GRPCListenAddress | string | "" | `:${LEGACY_GRPC_PORT}` | legacy_grpcListenAddress | Bind address for the legacy gRPC server |
+| SavePeers | bool | false | not set | legacy_savePeers | Persist the address book. When false the address manager is given no directory and keeps nothing across a restart |
+| AllowSyncCandidateFromLocalPeers | bool | false | not set | legacy_allowSyncCandidateFromLocalPeers | Regtest only. False admits only 127.0.0.1 and localhost peers as sync candidates. On every other network the setting is not read |
+| TempStore | *url.URL | "file://./data/tempstore" | `file://${DATADIR}/tempstore?checksum=false` | temp_store | Blob store for temporary data. The out-of-order block park writes here and needs a file:// URL |
+| PeerIdleTimeout | time.Duration | 125s | not set | legacy_peerIdleTimeout | Disconnect a peer after this long with no message. A multistream association with recent traffic on another stream resets the timer. Half this value bounds the streaming pipeline's admission wait |
+| MaxAddnodePeers | int | 8 | not set | legacy_maxAddnodePeers | Ceiling on addnode peers, budgeted separately from MaxPeers and enforced on both the startup list and the runtime RPC |
+| ReplenishInterval | time.Duration | 2s | not set | legacy_replenishInterval | How often the connection manager dials to close its outbound deficit. 0 restores the one-minute ticker and disables the event-driven wake |
+| MaxFeelerPeers | int | 1 | not set | legacy_maxFeelerPeers | Peer slots reserved for short-lived feeler probes, and the cap on probes at once. 0 disables feelers and the reservation together |
+| FeelerInterval | time.Duration | 120s | not set | legacy_feelerInterval | Mean of the randomised gap between feeler probes. Not a disable lever: a non-positive value falls back to 120s with a warning |
+| FeelerHandshakeTimeout | time.Duration | 25s | not set | legacy_feelerHandshakeTimeout | How long a feeler waits for a version message. Must stay under the 30s peer negotiate timeout |
+| PeerProcessingTimeout | time.Duration | 3m | 10m | legacy_peerProcessingTimeout | Per-message processing watchdog. Not armed for block messages while prefetch ingestion is active. Also the pre-admission deadline on an inbound peer, and part of the block-failure map TTL |
+| BlockDownloadTimeoutBasePercent | int64 | 100 | not set | legacy_blockDownloadTimeoutBasePercent | Ceiling on one block download at the chain tip, as a percentage of the target block interval. Floored at 30 minutes, so values at or below 300 change nothing on a 10-minute chain |
+| BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | not set | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up. Also floored at 30 minutes, which the 600 default clears on a 10-minute chain |
+| BlockDownloadTimeoutPerPeerPercent | int64 | 50 | not set | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling per other peer with a block download outstanding. The total is floored at 30 minutes, so this only adds patience |
+| MultiPeerBlockDownload | bool | true | not set | legacy_multiPeerBlockDownload | Spread block requests over every eligible peer. False assigns them all to the sync peer, disconnects a stalled sync peer instead of demoting it, and ignores notfound |
+| MaxBlocksInTransitPerPeer | int | 16 | not set | legacy_maxBlocksInTransitPerPeer | Block bodies one peer may owe at once with multi-peer download on, speed-scaled per peer and at most 2 until a peer's speed is measured. Not reduced for large blocks: the 100 GiB park backstop (`parkBackstopBytes`) guards the disk instead. In every mode it also sizes the pipeline's admission budget, at four slots per peer, and the peer package's download-timeout budget |
+| BlockDownloadWindow | int | 1024 | not set | legacy_blockDownloadWindow | Block bodies the whole node may have outstanding, counting every peer together, and the read-ahead depth: how far above the committed tip a block may be asked for at all. A count, not svnode's per-peer height range |
+| ParkStoreTimeout | time.Duration | 10s | not set | legacy_parkStoreTimeout | Deadline on each park blob store operation, bounding the wait for the file store's shared permits. Values below 1s are raised to 1s |
+| PeerRegistryEnabled | bool | true | not set | legacy_peerRegistryEnabled | Mirror connected legacy peers into the centralized peer registry so the dashboard can show them |
+| PeerRegistrySyncInterval | time.Duration | 10s | not set | legacy_peerRegistrySyncInterval | How often that mirror reconciles connected legacy peers into the registry |
 
 ## Configuration Dependencies
 
@@ -123,17 +136,20 @@ and no loader line arrives as its zero value whatever an operator writes.
   depth: how far above the committed tip a block may be asked for at all, which
   is what decides how much disk the park needs.
 - Blocks are chosen by a pass over that range: drop what is already on disk, in
-  the park, given up on, inside its failure backoff or already owed, then hand the
-  rest to peers with budget. There is no header list and no download cursor, so
-  nothing carries a position between passes.
-- A block whose owner has gone quiet for longer than the 60-second retry window is
-  offered to another peer on the next pass.
-- A block still arriving is asked of a second peer when two things hold: its
-  estimated finish, from its declared size and the bytes and rate so far, is later
-  than when the chain will reach it, and its peer's rate is under half the median
-  of the other peers'. One block is raced at a time, the first request keeps
-  running, and whichever copy lands first is used. There is no setting for it; the
-  metric is `teranode_legacy_netsync_frontier_races_total`.
+  the park, arriving, being converted, given up on or already owed, then hand the
+  rest to peers with budget, each block to the fastest peer with room. Below the
+  last checkpoint the range comes from the header cache, which runs to the next
+  checkpoint; above it, blocks are asked for from invs and the pass re-asks from
+  the download ledger. There is no download cursor, so nothing carries a
+  position between passes.
+- A block whose owner has sent nothing for the 60-second retry window is offered
+  to another peer on the next pass, one block per quiet owner.
+- During headers-first sync, a block above the committed tip that has been
+  arriving for 30 seconds at under 100 KB/s, and will not finish before the
+  chain needs it, is asked of one other peer, and the slow peer is disconnected.
+  A block is raced at most once in 10 minutes. These are SV Node's slow-fetch
+  timeout and stalling rate. There is no setting for it; the metric is
+  `teranode_legacy_netsync_frontier_races_total`.
 - `MultiPeerBlockDownload` set to false keeps the pass but gives every block to
   the sync peer, bounded by the block-size ladder alone.
 
