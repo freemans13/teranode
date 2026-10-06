@@ -317,6 +317,12 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 
 	b.setCurrentRunningState(StateStarting)
 
+	// MoveForwardBlock and Reorg block the main loop for the whole call, so the
+	// processor beats on the loop's behalf at each step that proves the work is
+	// advancing. BeatIfStarted, not Beat: WaitForPendingBlocks also runs from
+	// Start, before the loop owns the heartbeat (issue 1447).
+	subtreeProcessor.SetProgressHook(b.heartbeat.BeatIfStarted)
+
 	return b, nil
 }
 
@@ -481,27 +487,17 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 		// variables are defined here to prevent unnecessary allocations
 		b.setCurrentRunningState(StateRunning)
 
-		// Beat on every pass of the select, including the idle tick below: this
-		// records that the loop can still be SERVICED, not that work arrived.
-		// A node with no blocks is healthy — on mainnet the gap between blocks
-		// is routinely tens of minutes — but a deadlocked loop cannot service
-		// the tick either, which is the freeze the liveness probe must catch.
+		// Beat on every pass of the select, including the idle tick below, so an
+		// idle loop still beats. Why that is the right signal: health.Heartbeat.
 		heartbeatTicker := time.NewTicker(heartbeatInterval)
 		defer heartbeatTicker.Stop()
 
-		// First beat happens HERE, not at construction: everything before this
-		// point is startup work that is legitimately unbounded (waiting on
-		// pending block validation, reloading a large unmined set), and the
-		// heartbeat must not age through it. The beat is at the top of the loop
-		// body, so the first pass is what claims the heartbeat for this
-		// goroutine and every later pass renews it.
-		//
-		// The first pass is not necessarily idle: triggerReconcile above queued
-		// a reconcile before this goroutine existed, so on a node that restarts
-		// behind the tip the loop claims the heartbeat and immediately runs a
-		// catch-up. getReorgBlocks beats once per block through the fetch, but
-		// subtreeProcessor.Reorg applies the whole set in one call and is not
-		// beaten — see the setting's "What it cannot bound".
+		// First beat happens HERE, not at construction, so the heartbeat does
+		// not age through the startup work before this point (health.Heartbeat
+		// explains why). The first pass claims the heartbeat and every later
+		// pass renews it. Work inside a single pass beats as it advances; which
+		// steps beat is listed once, in the blockassembly_livenessStallTimeout
+		// long description.
 		for {
 			b.heartbeat.Beat()
 
@@ -787,7 +783,15 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 		// transactions that appear in BOTH moveBack and moveForward as unmined
 		moveForwardTxMap := make(map[chainhash.Hash]struct{})
 		moveForwardMapComplete := true
+
+		// This loop and the moveBack one below run one GetSubtrees per block
+		// inside a single pass of the main select, so each iteration beats at the
+		// top, proving the previous block's read returned (issue 1447). A reset
+		// can move hundreds of blocks and persists state only at the end, so a
+		// probe kill part-way through would restart straight into the same reset.
 		for _, blockWithMeta := range moveForwardBlocksWithMeta {
+			b.heartbeat.BeatIfStarted()
+
 			if blockWithMeta.meta.Invalid {
 				continue
 			}
@@ -830,6 +834,8 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 			moveBackTxs := make([]chainhash.Hash, 0, len(moveBackBlocksWithMeta)*100)
 
 			for _, blockWithMeta := range moveBackBlocksWithMeta {
+				b.heartbeat.BeatIfStarted()
+
 				if blockWithMeta.meta.Invalid {
 					// Skip invalid blocks — BlockValidation has already handled them via
 					// setTxMinedStatus(unsetMined=true) which we waited for above.
@@ -857,6 +863,9 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 
 			// Mark net unmined transactions as NOT on longest chain (set unmined_since)
 			if len(moveBackTxs) > 0 {
+				// Proves the last moveBack read returned; the mark is one store call.
+				b.heartbeat.BeatIfStarted()
+
 				if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, moveBackTxs, false); err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error marking moveBack transactions as unmined: %v", err)
 				} else {
@@ -1059,6 +1068,13 @@ func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *ch
 
 	_, err := retry.Retry(retryCtx, b.logger, func() (bool, error) {
 		isMined, err := b.blockchainClient.GetBlockIsMined(retryCtx, blockHash)
+
+		// An answered poll is progress for liveness, a failed call is not: see
+		// the blockassembly_livenessStallTimeout long description (issue 1447).
+		if err == nil {
+			b.heartbeat.BeatIfStarted()
+		}
+
 		if err != nil {
 			// Short-circuit on non-retriable errors (block doesn't exist in DB)
 			if errors.Is(err, errors.ErrBlockNotFound) {
@@ -2376,19 +2392,11 @@ func (b *BlockAssembler) getReorgBlocks(ctx context.Context, header *model.Block
 	// moveBackBlocks will contain all blocks we need to move down to get to the common ancestor
 	moveBackBlocks := make([]blockWithMeta, 0, len(moveBackBlockHeadersWithMeta))
 
-	// Both loops below run one blockchainClient.GetBlock round trip per block, from
-	// inside a single pass of the main select, so without a beat a long-but-
-	// progressing catch-up is indistinguishable from a wedge. That is not a rare
-	// path: startChannelListeners queues an initial reconcile before the loop
-	// starts, so on any node that restarts behind the tip this is the FIRST thing
-	// the loop does after it claims the heartbeat, and a spurious restart would
-	// re-enter the same work (issue 1447).
-	//
-	// The beat sits at the top of the iteration, so for every block after the first
-	// it is proof the previous GetBlock returned: it tracks FORWARD PROGRESS, and a
-	// fetch that stops progressing still goes stale. BeatIfStarted, not Beat, for
-	// the same reason as validateParentChain — every caller today is inside the
-	// loop, but a future startup caller must not be able to arm the probe.
+	// Both loops below run one GetBlock round trip per block inside a single pass
+	// of the main select, so each iteration beats. The beat sits at the top, so for
+	// every block after the first it proves the previous fetch returned: a fetch
+	// that stops progressing still goes stale. BeatIfStarted so a future startup
+	// caller cannot arm the probe (issue 1447).
 	var block *model.Block
 	for _, headerWithMeta := range moveForwardBlockHeadersWithMeta {
 		b.heartbeat.BeatIfStarted()
@@ -2617,18 +2625,9 @@ func (b *BlockAssembler) validateParentChain(
 
 	// Process transactions in batches for performance
 	for i := 0; i < len(unminedTxs); i += batchSize {
-		// Beat once per batch: when this runs from the reset path it is inside a
-		// select case, so without it a large-but-progressing validation looks
-		// identical to a wedge. The beat sits at the top of the batch, which for
-		// every batch after the first is proof the previous one finished, so it
-		// tracks FORWARD PROGRESS: a run that stops progressing gets no further
-		// beats and still goes stale (issue 1447).
-		//
-		// BeatIfStarted, not Beat: this same code also runs from Start, before
-		// the main loop owns the heartbeat, and the rest of that startup path
-		// (bulk-loading the unmined set into the subtree processor) is
-		// legitimately unbounded. A plain Beat here would start the clock
-		// mid-startup and let the probe report a still-starting node as wedged.
+		// Beat once per batch, at the top, so for every batch after the first it
+		// proves the previous one finished (issue 1447). BeatIfStarted because
+		// this also runs from Start, before the main loop owns the heartbeat.
 		b.heartbeat.BeatIfStarted()
 
 		// Check for context cancellation at start of each batch
@@ -3132,7 +3131,13 @@ func (b *BlockAssembler) fixUnminedSinceInconsistencies(ctx context.Context) err
 
 	markAsMinedOnLongestChain := make([]chainhash.Hash, 0, 1024)
 
+	// The scan walks every record in the UTXO store inside one pass of the main
+	// select (the full-reset case), so each batch beats. The beat sits at the top,
+	// so for every batch after the first it proves the previous read returned: a
+	// scan that stops answering still goes stale (issue 1447).
 	for {
+		b.heartbeat.BeatIfStarted()
+
 		batch, err := it.Next(ctx)
 		if err != nil {
 			return errors.NewProcessingError("error during consistency scan", err)
@@ -3412,9 +3417,14 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 
 	b.logger.Infof("[loadUnminedTransactions] feeding unmined transactions to %d workers", numWorkers)
 
-	// Feed batches from the iterator to workers
+	// Feed batches from the iterator to workers. This runs inside reset's
+	// post-process step as well as at startup, and scales with the unmined set,
+	// so each batch beats (issue 1447). BeatIfStarted keeps the startup call
+	// from arming the probe.
 	lastLogTime := time.Now()
 	for {
+		b.heartbeat.BeatIfStarted()
+
 		batch, err := it.Next(ctx)
 		if err != nil {
 			close(workChan)
@@ -3554,6 +3564,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 				end = totalTxs
 			}
 
+			b.heartbeat.BeatIfStarted()
+
 			// Pass slice segment directly - no copy needed
 			batch := unminedTransactions[start:end]
 			if isReload {
@@ -3592,6 +3604,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 
 			// add every 10_000 transactions log the time taken
 			if (idx+1)%10_000 == 0 {
+				b.heartbeat.BeatIfStarted()
+
 				prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
 				prometheusBlockAssemblerAddDirectlyTotal.Add(addTxs)
 				addStart = time.Now()
@@ -3943,7 +3957,11 @@ func (b *BlockAssembler) loadUnminedSorted(ctx context.Context, it utxo.UnminedT
 	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] scanning unmined transactions (sort dirs %v, buffer %d records)",
 		unminedSortDirs(b.settings.BlockAssembly.UnminedTxDiskSortPaths), b.settings.BlockAssembly.UnminedTxSortBufferRecords)
 
+	// Process batches from iterator. Beats per batch for the same reason as
+	// loadUnminedTransactions: this also runs inside reset (issue 1447).
 	for {
+		b.heartbeat.BeatIfStarted()
+
 		batch, err := it.Next(ctx)
 		if err != nil {
 			return errors.NewProcessingError("error getting unmined transaction", err)
@@ -4026,6 +4044,10 @@ func (b *BlockAssembler) loadUnminedSorted(ctx context.Context, it utxo.UnminedT
 	addStart := time.Now()
 
 	err = sorter.Drain(ctx, batchSize, func(batch []*utxo.UnminedTransaction) error {
+		// One beat per drained batch (issue 1447): a 10M batch adds in about a
+		// second (BenchmarkAddNodesDirectly), well inside any stall timeout.
+		b.heartbeat.BeatIfStarted()
+
 		// Drain never splits an equal-CreatedAt group across batches, so the
 		// parents-first tiebreak sees every member of a group.
 		if storeTxInpoints {

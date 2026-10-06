@@ -388,6 +388,15 @@ func TestParkCommitFailure_AMissingSubtreeFileDropsTheRecordWithoutJudgingIt(t *
 			want: parkDispositionBlockInvalid,
 		},
 		{
+			// The shape upstream's batch path (SpendAndCreateMulti, PR 1875) returns for a parent
+			// read that failed on the store, wrapped as block validation and netsync's ProcessBlock
+			// wrap it: a local fault, so the block is kept and nobody is blamed.
+			name: "a store fault reading a parent output under two processing wraps",
+			err: parkCommitChain(errors.NewProcessingError("failed to process block",
+				errors.NewProcessingError("failed to read parent output", errors.NewStorageError("aerospike timeout")))),
+			want: parkDispositionRetryLater,
+		},
+		{
 			name: "a missing parent block carries code 3 inside code 10 and is the parent's row, not this one",
 			err:  errors.NewProcessingError("failed to get block header for previous block", errors.NewBlockNotFoundError("block not found", errors.ErrNotFound)),
 			want: parkDispositionParentGone,
