@@ -83,6 +83,7 @@ type probeUtxoStore struct {
 	utxo.Store
 	onMarkUnmined func()
 	iterator      utxo.UnminedTxIterator
+	scanIterator  utxo.ConsistencyScanIterator
 }
 
 func (s *probeUtxoStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
@@ -91,6 +92,16 @@ func (s *probeUtxoStore) MarkTransactionsOnLongestChain(ctx context.Context, txH
 	}
 
 	return s.Store.MarkTransactionsOnLongestChain(ctx, txHashes, onLongestChain)
+}
+
+// ScanInconsistentUnminedTxs stands in the synthetic scan when one is set. The
+// SQL store underneath returns nil, which would end the scan before it starts.
+func (s *probeUtxoStore) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
+	if s.scanIterator != nil {
+		return s.scanIterator, nil
+	}
+
+	return s.Store.ScanInconsistentUnminedTxs()
 }
 
 func (s *probeUtxoStore) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
@@ -390,4 +401,64 @@ func TestLivenessWaitForBlockMinedSetDoesNotBeatWhenTheCallFails(t *testing.T) {
 	require.Error(t, ba.waitForBlockMinedSet(t.Context(), &unknown))
 
 	require.Greater(t, ba.heartbeat.Age(), probeStaleBy/2, "a failed mined_set call must not beat")
+}
+
+// probeScanIterator serves fixed consistency-scan batches and observes each Next.
+type probeScanIterator struct {
+	batches [][]*utxo.InconsistentTxRecord
+	onNext  func()
+	scanned int64
+}
+
+func (it *probeScanIterator) Next(context.Context) ([]*utxo.InconsistentTxRecord, error) {
+	it.onNext()
+
+	if len(it.batches) == 0 {
+		return nil, nil
+	}
+
+	batch := it.batches[0]
+	it.batches = it.batches[1:]
+	it.scanned += int64(len(batch))
+
+	return batch, nil
+}
+
+func (it *probeScanIterator) TotalScanned() int64 { return it.scanned }
+func (it *probeScanIterator) Err() error          { return nil }
+func (it *probeScanIterator) Close() error        { return nil }
+
+// TestLivenessFullResetConsistencyScanBeatsPerBatch pins the per-batch beat in
+// the consistency scan that runs before a full reset. The scan reads every
+// record in the UTXO store inside one pass of the main select, so without the
+// beat the heartbeat ages by the whole scan. Every Next after the first proves
+// the previous batch was read and checked.
+func TestLivenessFullResetConsistencyScanBeatsPerBatch(t *testing.T) {
+	initPrometheusMetrics()
+
+	items := setupBlockAssemblyTest(t)
+	ba := items.blockAssembler
+
+	probe := &heartbeatProbe{ba: ba}
+
+	batches := make([][]*utxo.InconsistentTxRecord, 3)
+	for i := range batches {
+		batches[i] = []*utxo.InconsistentTxRecord{{Hash: chainhash.HashH([]byte{byte(i)})}}
+	}
+
+	ba.utxoStore = &probeUtxoStore{
+		Store:        items.utxoStore,
+		scanIterator: &probeScanIterator{batches: batches, onNext: probe.observe},
+	}
+
+	probe.backdate()
+
+	require.NoError(t, ba.fixUnminedSinceInconsistencies(t.Context()))
+
+	ages := probe.seen()
+	require.Len(t, ages, 4, "three batches and the empty read that ends them")
+
+	for i, age := range ages {
+		require.Less(t, age, time.Minute, "scan read %d must follow a beat", i)
+	}
 }

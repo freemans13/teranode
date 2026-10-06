@@ -3131,7 +3131,13 @@ func (b *BlockAssembler) fixUnminedSinceInconsistencies(ctx context.Context) err
 
 	markAsMinedOnLongestChain := make([]chainhash.Hash, 0, 1024)
 
+	// The scan walks every record in the UTXO store inside one pass of the main
+	// select (the full-reset case), so each batch beats. The beat sits at the top,
+	// so for every batch after the first it proves the previous read returned: a
+	// scan that stops answering still goes stale (issue 1447).
 	for {
+		b.heartbeat.BeatIfStarted()
+
 		batch, err := it.Next(ctx)
 		if err != nil {
 			return errors.NewProcessingError("error during consistency scan", err)

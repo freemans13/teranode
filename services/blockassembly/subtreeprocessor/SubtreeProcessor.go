@@ -4115,9 +4115,10 @@ func (stp *SubtreeProcessor) runHandlerWithRecover(name string, fn func() error)
 // post-process runs whatever the owner passed in, which beats on its own.
 //
 // An answered poll counts as progress even when the answer is "not mined yet":
-// block validation is responding and block assembly is waiting on it. A failed
+// the polls go to the blockchain service, which is answering, and block
+// assembly is waiting on block validation to mark the block mined. A failed
 // call does not count, so a wait whose calls keep failing goes stale and the
-// probe fires. Block validation that answers but never finishes is not block
+// probe fires. Block validation that never marks the block mined is not block
 // assembly's to catch; it belongs to block validation's own liveness, which is
 // tracked in issue 1840.
 //
