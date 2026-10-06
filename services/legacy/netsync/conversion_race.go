@@ -1,0 +1,263 @@
+package netsync
+
+import (
+	"bufio"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+)
+
+// When two copies of a block arrive at once, the first to complete is kept.
+//
+// The first copy to start takes the block's conversion slot and converts as it arrives. A second
+// copy used to be read off the wire and thrown away, however fast it was: on 2026-09-25 a complete
+// 4 GB copy of block 760,331 that arrived in 1m44s was drained because a copy at 2.7 MB/s had
+// started first, and the chain waited 26 minutes more.
+//
+// Now the second copy is written to a side file. If it completes while the first is still
+// converting, it takes over: the first stops at its next transaction, removes the subtree files it
+// wrote, and drains the rest of its peer's bytes, and only then is the block converted from the
+// side file. Two conversions of one block never write at the same time, because they share
+// content-addressed subtree files; that is what stopped the chain at 707,177. If the first has
+// already read its last transaction when the second completes, the first wins and the side file
+// is deleted.
+
+// duplicateCopySuffix names a side file in the park directory. Recover removes any left by a
+// crash.
+const duplicateCopySuffix = ".copy"
+
+const (
+	conversionRunning int32 = iota
+	conversionFinishing
+	conversionYielding
+)
+
+// admitKeptFaster is the admission path of a second copy that completed first and was converted.
+const admitKeptFaster = "converted from disk: it completed before the copy that started first"
+
+// conversionCtl lets a faster copy of a block stop the copy being converted.
+type conversionCtl struct {
+	state atomic.Int32
+	// cleaned is closed once the conversion will write nothing more and has removed what it
+	// wrote: on the yield path, and on every other exit, since a conversion can be taken over and
+	// then fail its own read before it gets back to the yield check.
+	cleaned   chan struct{}
+	cleanOnce sync.Once
+}
+
+// markCleaned releases a copy waiting to take over. Safe to call more than once.
+func (c *conversionCtl) markCleaned() {
+	c.cleanOnce.Do(func() { close(c.cleaned) })
+}
+
+// yielding reports whether a faster copy has taken over.
+func (c *conversionCtl) yielding() bool {
+	return c.state.Load() == conversionYielding
+}
+
+// finish claims the block for this conversion once its last transaction is read. False means a
+// faster copy took over first.
+func (c *conversionCtl) finish() bool {
+	return c.state.CompareAndSwap(conversionRunning, conversionFinishing)
+}
+
+// takeOver asks the conversion to yield. False means it has already claimed the finish.
+func (c *conversionCtl) takeOver() bool {
+	return c.state.CompareAndSwap(conversionRunning, conversionYielding)
+}
+
+// startConversion registers a conversion of hash, replacing any earlier one's registration.
+func (sm *SyncManager) startConversion(hash chainhash.Hash) *conversionCtl {
+	c := &conversionCtl{cleaned: make(chan struct{})}
+
+	sm.conversionsMu.Lock()
+	defer sm.conversionsMu.Unlock()
+
+	if sm.conversions == nil {
+		sm.conversions = make(map[chainhash.Hash]*conversionCtl)
+	}
+
+	sm.conversions[hash] = c
+
+	return c
+}
+
+// endConversion removes c's registration, unless a later conversion of the block has replaced it.
+func (sm *SyncManager) endConversion(hash chainhash.Hash, c *conversionCtl) {
+	sm.conversionsMu.Lock()
+	defer sm.conversionsMu.Unlock()
+
+	if sm.conversions[hash] == c {
+		delete(sm.conversions, hash)
+	}
+}
+
+// conversionOf returns the conversion of hash in progress, or nil.
+func (sm *SyncManager) conversionOf(hash chainhash.Hash) *conversionCtl {
+	sm.conversionsMu.Lock()
+	defer sm.conversionsMu.Unlock()
+
+	return sm.conversions[hash]
+}
+
+// yieldToFasterCopy stops a conversion a faster copy has taken over: it removes what this copy
+// wrote, lets the faster copy start, and reads the rest of this copy off the wire so the peer's
+// connection stays in step.
+func (sm *SyncManager) yieldToFasterCopy(hash chainhash.Hash, writer *subtreeWriter, rest io.Reader, ctl *conversionCtl, r io.Reader) (bool, error) {
+	sm.deleteWrittenOnFailure(hash, writer)
+	sm.streams.setStreamPath(r, admitRawDuplicate)
+	ctl.markCleaned()
+
+	sm.logger.Infof("[pipelineBlockSink][%s] another copy completed first; stopped converting this one and draining the rest", hash)
+
+	if _, err := io.Copy(io.Discard, rest); err != nil {
+		return false, err
+	}
+
+	sm.noteDrainedDuplicate(hash)
+
+	return false, nil
+}
+
+// raceDuplicateCopy handles a copy that arrives while another converts: it keeps the bytes in a
+// side file and, if this copy completes first, converts from it.
+//
+// Only a copy from a peer the download ledger says owes the block reaches here: admitPipelineSink
+// drains every other copy, first or racing, before it asks for an admission slot.
+func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64,
+	convert func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)) (bool, error) {
+	ctl := sm.conversionOf(hash)
+
+	var dir string
+	if sm.blockPark != nil {
+		dir = sm.blockPark.dir
+	}
+
+	if ctl == nil || dir == "" {
+		return sm.drainDuplicate(hash, r)
+	}
+
+	f, err := os.CreateTemp(dir, hash.String()+"-*"+duplicateCopySuffix)
+	if err != nil {
+		sm.logger.Warnf("[blockOnDisk][%s] could not keep a second copy on disk, draining it: %v", hash, err)
+
+		return sm.drainDuplicate(hash, r)
+	}
+
+	defer func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}()
+
+	// The side file lives on the park's disk, so a failed write to it is the same class of
+	// fault as a failed record write: ours, and never the peer's. The recorder tells the two
+	// sides of the copy apart; a read failure is the peer's socket and is returned as it is
+	// for the read loop, a write failure drops this copy and drains the rest, as the Flush
+	// branch below already does.
+	w := bufio.NewWriterSize(f, 1<<20)
+	rec := &errRecordingWriter{w: w}
+
+	if _, err = io.Copy(rec, r); err != nil {
+		if rec.err == nil {
+			return false, err
+		}
+
+		sm.logger.Warnf("[blockOnDisk][%s] could not write a second copy to disk, dropping it: %v", hash, rec.err)
+
+		return sm.drainDuplicate(hash, r)
+	}
+
+	if err = w.Flush(); err != nil {
+		sm.logger.Warnf("[blockOnDisk][%s] could not write a second copy to disk, dropping it: %v", hash, err)
+		sm.noteDrainedDuplicate(hash)
+
+		return false, nil
+	}
+
+	if !ctl.takeOver() {
+		// The copy that started first has read its last transaction: it wins.
+		sm.noteDrainedDuplicate(hash)
+
+		return false, nil
+	}
+
+	select {
+	case <-ctl.cleaned:
+	case <-sm.ctx.Done():
+		return false, sm.ctx.Err()
+	}
+
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		sm.logger.Warnf("[blockOnDisk][%s] could not reread a second copy from disk, dropping it: %v", hash, err)
+		sm.noteDrainedDuplicate(hash)
+
+		return false, nil
+	}
+
+	sm.streams.setStreamPath(r, admitKeptFaster)
+	sm.logger.Infof("[blockOnDisk][%s] a second copy completed before the copy being converted; converting it from disk", hash)
+
+	return convert(hash, header, bufio.NewReaderSize(f, 1<<20), n)
+}
+
+// deliveringPeerOwes reports whether the peer r's bytes come from is one the download ledger says
+// owes hash. The ledger is keyed by association primaries, so a stream sub-peer is resolved first,
+// as handleBlockOnDiskMsg resolves it. A reader that names no peer owes nothing.
+func (sm *SyncManager) deliveringPeerOwes(r io.Reader, hash chainhash.Hash) bool {
+	from := deliveringPeer(r)
+	if from == nil || sm.blockDownloads == nil {
+		return false
+	}
+
+	owner := from
+	if sm.peerStates != nil {
+		_, owner, _ = sm.peerStateResolvingPrimary(from)
+	}
+
+	return sm.blockDownloads.HasOwner(owner, hash)
+}
+
+// deliveringPeer returns the peer a sink's reader is reading from, through the stream tracker's
+// wrapper when there is one, or nil when none is known (peerpkg.DeliveredBy).
+func deliveringPeer(r io.Reader) *peerpkg.Peer {
+	if c, ok := r.(countingReader); ok {
+		r = c.r
+	}
+
+	return peerpkg.DeliveredBy(r)
+}
+
+// drainDuplicate reads a copy off the wire unwritten, as every second copy used to be.
+func (sm *SyncManager) drainDuplicate(hash chainhash.Hash, r io.Reader) (bool, error) {
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return false, err
+	}
+
+	sm.noteDrainedDuplicate(hash)
+
+	return false, nil
+}
+
+// setStreamPath records on a tracked stream which path its bytes finally took. r is the reader
+// trackBlockStreams handed down; any other reader is left alone.
+func (r *streamRegistry) setStreamPath(reader io.Reader, path string) {
+	c, ok := reader.(countingReader)
+	if r == nil || !ok || c.s == nil {
+		return
+	}
+
+	r.mu.Lock()
+	c.s.path = path
+	r.mu.Unlock()
+}
+
+// isDuplicateCopyFile reports whether a park directory entry is a side file a crash left behind.
+func isDuplicateCopyFile(name string) bool {
+	return strings.HasSuffix(name, duplicateCopySuffix)
+}

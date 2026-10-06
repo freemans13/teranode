@@ -2244,8 +2244,16 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 	return false
 }
 
-// isDeadlock checks if a database error is a PostgreSQL deadlock (SQLSTATE 40P01)
-// or a SQLite BUSY error that should be retried.
+// isDeadlock reports whether a database error is a lock the spend batch should
+// retry: a PostgreSQL deadlock (SQLSTATE 40P01), or a SQLite BUSY or LOCKED
+// result. The SQLite arm matches the result code, as isLockError below and
+// usql.isRetriable do, because the two codes carry different messages: BUSY is
+// "database is locked", while the shared-cache table lock the sqlitememory
+// engine raises when two transactions wait on each other is LOCKED, "database
+// table is locked: database is deadlocked". This used to match the BUSY message
+// alone, so a spend batch that collided with a create's transaction was aborted
+// instead of retried (see is_deadlock_sqlite_test.go). The message check stays
+// as the fallback for a driver error that is not a *sqlite.Error.
 func isDeadlock(err error) bool {
 	if err == nil {
 		return false
@@ -2269,6 +2277,20 @@ func isDeadlock(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
+}
+
+// isSQLiteLockCode reports whether a SQLite result code is a BUSY or LOCKED
+// condition. modernc.org/sqlite enables extended result codes on every
+// connection, so the primary code is the low byte and the detail sits above
+// it: SQLITE_BUSY_SNAPSHOT (517) is SQLITE_BUSY (5), SQLITE_LOCKED_SHAREDCACHE
+// (262) is SQLITE_LOCKED (6). Comparing the whole code against the two
+// primaries, as a first cut of this check did, dropped every extended variant
+// out of the retry that the earlier "database is locked" substring match had
+// kept. Same shape as usql.isRetriableSQLiteCode (util/usql/retry.go).
+func isSQLiteLockCode(code int) bool {
+	primary := code & 0xff
+
+	return primary == sqlite3.SQLITE_BUSY || primary == sqlite3.SQLITE_LOCKED
 }
 
 // sendSpendBatch is the batcher callback that processes a batch of spend operations
@@ -4539,7 +4561,14 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	}
 
 	if m := missingInputs.Load(); m > 0 {
-		return errors.NewProcessingError("failed to decorate previous outputs: %d inputs could not be resolved", m)
+		// ErrTxNotFound, not a generic processing error: a genuine query/connectivity fault
+		// above already returned via g.Wait() and never reaches here, so every path that lands
+		// on this line is "the store has no row for one of these outpoints" — the same class
+		// aerospike's own per-outpoint miss uses (aerospike/get.go sendOutpointBatch). Callers
+		// (quick validation's decorate in blockvalidation) tell a real backend fault, which
+		// stays fail-closed, apart from a plain not-found, by this class rather than by
+		// string-matching the message.
+		return errors.NewTxNotFoundError("failed to decorate previous outputs: %d inputs could not be resolved", m)
 	}
 
 	return nil
@@ -5944,9 +5973,9 @@ func isLockError(err error) bool {
 		return pqErr.Code == usql.PgErrSerializationFail || pqErr.Code == usql.PgErrDeadlockDetected || pqErr.Code == usql.PgErrLockNotAvailable
 	}
 
-	// SQLite busy/locked errors
+	// SQLite busy/locked errors, extended codes included
 	if sqliteErr, ok := err.(*sqlite.Error); ok {
-		return sqliteErr.Code() == sqlite3.SQLITE_BUSY || sqliteErr.Code() == sqlite3.SQLITE_LOCKED
+		return isSQLiteLockCode(sqliteErr.Code())
 	}
 
 	// Check error message for common lock patterns
