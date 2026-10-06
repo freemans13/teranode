@@ -468,6 +468,16 @@ func (sm *SyncManager) runParkSweep() {
 	}
 }
 
+// receiveParkCommit is the consumer's half of submitParkCommit. It puts the block back,
+// ending the hand-off, then queues the drain, so that the drain step claims it through the
+// one path every other drained block takes, with one admission test and one header-front
+// advance.
+func (sm *SyncManager) receiveParkCommit(commit parkCommit) {
+	sm.blockPark.Restore(commit.entry)
+	sm.clearHandedOver(commit.entry.hash)
+	sm.scheduleDrain(commit.entry.prevBlock, commit.parentHeight)
+}
+
 // submitParkCommit hands a parked block whose parent is in the chain to the
 // block-queue consumer to commit, or commits it here when there is no consumer
 // to hand it to.
@@ -482,12 +492,18 @@ func (sm *SyncManager) runParkSweep() {
 // this package's tests build one, and it is what the sweep did before it had a
 // goroutine of its own. A send on a nil channel would block forever.
 func (sm *SyncManager) submitParkCommit(commit parkCommit) {
+	// In use from here until it is back in the park, on every path below: the caller
+	// took it out to hand it over, so nothing else marks it, and a download pass in
+	// between would adopt it as stranded.
+	sm.markHandedOver(commit.entry.hash)
+
 	if sm.parkCommits == nil {
 		// Put back, then drained here and now, for the reason the consumers give: an
 		// entry the on-disk handler posts is still in the index, and committing it
 		// directly left it there. The drain walks synchronously, because the caller
 		// may be the sweep's own goroutine, and the consumer's queue is not its to touch.
 		sm.blockPark.Restore(commit.entry)
+		sm.clearHandedOver(commit.entry.hash)
 		sm.drainParkedDescendants(commit.entry.prevBlock)
 
 		return
@@ -499,6 +515,7 @@ func (sm *SyncManager) submitParkCommit(commit parkCommit) {
 	select {
 	case <-sm.quit:
 		sm.blockPark.Restore(commit.entry)
+		sm.clearHandedOver(commit.entry.hash)
 
 		return
 	default:
@@ -511,6 +528,7 @@ func (sm *SyncManager) submitParkCommit(commit parkCommit) {
 		// Nobody will commit it now. The caller took it out of the index, so put
 		// it back: its blob stays charged and Recover finds it on the next start.
 		sm.blockPark.Restore(commit.entry)
+		sm.clearHandedOver(commit.entry.hash)
 	}
 }
 

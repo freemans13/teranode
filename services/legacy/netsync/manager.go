@@ -814,6 +814,15 @@ type SyncManager struct {
 	// Read through blockCommitting.
 	parkCommitting atomic.Pointer[chainhash.Hash]
 
+	// handedOver counts the blocks submitParkCommit has handed to the consumer and the
+	// consumer has not yet put back in the park. The caller took each one out of the park
+	// to hand it over, so until the put-back it is out of the park and marked nowhere
+	// else; the sweep's own goroutine runs a download pass straight after, which would
+	// adopt it. A count, not a flag, because one block can be handed over twice. Guarded
+	// by handedOverMu; read through blockCommitting.
+	handedOverMu sync.Mutex
+	handedOver   map[chainhash.Hash]int
+
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
@@ -2081,8 +2090,7 @@ func (sm *SyncManager) dispatchBlocks() {
 			// the entry out of the index to hand it over, and restoring it means
 			// the drain step claims it through the one path every other drained
 			// block takes, with one admission test and one header-front advance.
-			sm.blockPark.Restore(commit.entry)
-			sm.scheduleDrain(commit.entry.prevBlock, commit.parentHeight)
+			sm.receiveParkCommit(commit)
 		}
 	}
 }
@@ -3569,7 +3577,44 @@ func (sm *SyncManager) blockCommitting(h chainhash.Hash) bool {
 		return true
 	}
 
+	if sm.isHandedOver(h) {
+		return true
+	}
+
 	return sm.dispatcher.inFlight(h)
+}
+
+// markHandedOver records that a block is on its way from submitParkCommit to the
+// consumer's put-back; clearHandedOver ends that once it is back in the park.
+func (sm *SyncManager) markHandedOver(h chainhash.Hash) {
+	sm.handedOverMu.Lock()
+	defer sm.handedOverMu.Unlock()
+
+	if sm.handedOver == nil {
+		sm.handedOver = make(map[chainhash.Hash]int)
+	}
+
+	sm.handedOver[h]++
+}
+
+func (sm *SyncManager) clearHandedOver(h chainhash.Hash) {
+	sm.handedOverMu.Lock()
+	defer sm.handedOverMu.Unlock()
+
+	if sm.handedOver[h] <= 1 {
+		delete(sm.handedOver, h)
+
+		return
+	}
+
+	sm.handedOver[h]--
+}
+
+func (sm *SyncManager) isHandedOver(h chainhash.Hash) bool {
+	sm.handedOverMu.Lock()
+	defer sm.handedOverMu.Unlock()
+
+	return sm.handedOver[h] > 0
 }
 
 // inFlightBlock marks that a block's hash currently holds the dedup half of
