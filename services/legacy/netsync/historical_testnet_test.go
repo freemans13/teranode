@@ -55,6 +55,12 @@ import (
 //     sink-written .subtreeToCheck files, spending coinbases and each other.
 //     Height 547 is refused, kept parked and stamped; the chain ends at 546.
 //
+// Each committed height asserts which route block validation took, by its
+// outpoint-only blocks counter (outpointOnlyBlocks): one more on the unified
+// subtest, none on the default one. Without it both subtests passed with the
+// server's unified route switched off, because a block that commits looks the
+// same in the chain on either route.
+//
 // The download ledger is bypassed on purpose: the test calls the sink and the
 // commit directly, never handleBlockOnDiskMsg, so the wanted-range pass that the
 // headers fill and each commit run never has its owners released and goes quiet
@@ -192,7 +198,17 @@ func runHistoricalTestnetSync(t *testing.T, unified bool) {
 
 		// The commit runs the disposition that deletes the record, so the park
 		// does not accumulate 547 entries over the run.
+		quickBefore := outpointOnlyBlocks(t)
+
 		require.True(t, sm.commitParkedBlock(entry), "height %d must commit", height)
+
+		// Which route block validation took for this height. The chain looks the
+		// same after either, so this is the one assertion that tells them apart.
+		if unified {
+			require.Equal(t, quickBefore+1, outpointOnlyBlocks(t), "height %d must take quickValidateBlock on the unified route", height)
+		} else {
+			require.Equal(t, quickBefore, outpointOnlyBlocks(t), "height %d must not take quickValidateBlock on the default route", height)
+		}
 
 		_, meta, err := stack.chain.GetBlockHeader(ctx, &hash)
 		require.NoError(t, err, "height %d must be in the chain", height)

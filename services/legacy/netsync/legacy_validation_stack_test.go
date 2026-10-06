@@ -30,6 +30,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/kafka"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
@@ -262,4 +263,36 @@ func requireBlockMinedByValidation(t *testing.T, stack *legacyValidationStack, h
 
 		return mined
 	}, 30*time.Second, 5*time.Millisecond, "block validation's setMined worker must stamp %s and set mined_set", hash)
+}
+
+// outpointOnlyBlocksMetric is block validation's count of blocks that entered the
+// below-checkpoint quick route (services/blockvalidation quickValidateBlock and
+// quickValidateBlockAsync, the only two places it is incremented). The full route
+// never touches it, which is what lets a test tell the two routes apart: a block
+// that commits on either route looks the same in the chain.
+const outpointOnlyBlocksMetric = "teranode_blockvalidation_outpoint_only_blocks_total"
+
+// outpointOnlyBlocks reads outpointOnlyBlocksMetric from the default Prometheus
+// registry, where block validation's promauto counters are registered when its
+// server is built. The counter is process-wide, so callers compare a reading
+// before and after the work they mean to measure.
+func outpointOnlyBlocks(t *testing.T) float64 {
+	t.Helper()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	for _, family := range families {
+		if family.GetName() != outpointOnlyBlocksMetric {
+			continue
+		}
+
+		require.Len(t, family.GetMetric(), 1, "%s is a plain counter with one series", outpointOnlyBlocksMetric)
+
+		return family.GetMetric()[0].GetCounter().GetValue()
+	}
+
+	require.Failf(t, "metric not registered", "%s is not in the default registry; a blockvalidation server must be built first", outpointOnlyBlocksMetric)
+
+	return 0
 }

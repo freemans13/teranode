@@ -182,8 +182,10 @@ func newSettingsForSeam(t *testing.T, unified bool) *settingsForSeam {
 //     spends by outpoint, promotes the .subtree itself and commits with
 //     mined_set.
 //
-// Both subtests assert the same end state, because "the chain has the block" is
-// not the claim. On the default route a .subtree written by netsync makes
+// Both subtests assert which route the server took, by block validation's
+// outpoint-only blocks counter: one entry to the quick route on the unified
+// subtest, none on the default one. Both also assert the same end state, because
+// "the chain has the block" is not the claim. On the default route a .subtree written by netsync makes
 // CheckBlockSubtrees skip every subtree, so no transaction is created and the
 // reward check reads the zero fees netsync wrote: with this fixture's coinbase,
 // which claims its fees, that rejects the honest block (observed with the writer
@@ -243,8 +245,21 @@ func runSeam(t *testing.T, unified bool) {
 		requireSeamFile(t, stack, *root, fileformat.FileTypeSubtree, false, "only block validation promotes a subtree")
 	}
 
+	quickBefore := outpointOnlyBlocks(t)
+
 	require.True(t, sm.commitParkedBlock(parkedBlock{hash: f.hash, prevBlock: *cfg.params.GenesisHash}),
 		"the converted record must commit through the real server")
+
+	// The route the server actually took. Both routes end with the block in the
+	// chain, so that alone cannot say which one ran; only the quick route counts
+	// the block on entry.
+	wantQuick := 0.0
+	if unified {
+		wantQuick = 1
+	}
+
+	require.Equal(t, quickBefore+wantQuick, outpointOnlyBlocks(t),
+		"the unified route must take quickValidateBlock exactly once, and the default route never")
 
 	// End state on the chain.
 	exists, err := stack.chain.GetBlockExists(ctx, &f.hash)
