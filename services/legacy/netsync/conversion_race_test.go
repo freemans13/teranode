@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/stretchr/testify/require"
 )
@@ -37,6 +39,9 @@ func TestASecondCopyThatCompletesFirstIsTheOneKept(t *testing.T) {
 	header := &blk.MsgBlock().Header
 	n := sinkPayloadLen(body)
 
+	// The second copy comes from a peer the ledger says owes the block, so it may race.
+	owner := owingPeer(t, sm, hash, 249)
+
 	// The first copy arrives slowly: half its bytes, then nothing until the test says so.
 	slowR, slowW := io.Pipe()
 	firstDone := make(chan sinkResult, 1)
@@ -56,7 +61,7 @@ func TestASecondCopyThatCompletesFirstIsTheOneKept(t *testing.T) {
 	secondDone := make(chan sinkResult, 1)
 
 	go func() {
-		converted, err := sm.raceDuplicateCopy(hash, header, bytes.NewReader(body), n, sm.pipelineBlockSink)
+		converted, err := sm.raceDuplicateCopy(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), n, sm.pipelineBlockSink)
 		secondDone <- sinkResult{converted, err}
 	}()
 
@@ -112,7 +117,9 @@ func TestAFirstCopyThatFinishesFirstIsTheOneKept(t *testing.T) {
 	ctl := sm.startConversion(hash)
 	require.True(t, ctl.finish())
 
-	converted, err := sm.raceDuplicateCopy(hash, header, bytes.NewReader(body), n, sm.pipelineBlockSink)
+	owner := owingPeer(t, sm, hash, 250)
+
+	converted, err := sm.raceDuplicateCopy(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), n, sm.pipelineBlockSink)
 	require.NoError(t, err)
 	require.False(t, converted)
 	require.True(t, sm.takeDrainedDuplicate(hash))
@@ -130,6 +137,96 @@ func TestConversionCtlHandsTheBlockToExactlyOneCopy(t *testing.T) {
 	c = &conversionCtl{cleaned: make(chan struct{})}
 	require.True(t, c.finish())
 	require.False(t, c.takeOver(), "a conversion that claimed the finish cannot be taken over")
+}
+
+// A copy from a peer that does not owe the block never interrupts the owner's conversion. The gate
+// admits a body for any requested hash from any peer, so a peer that knew a requested block's
+// header could otherwise make the honest multi-gigabyte stream stop and drain, then fail as corrupt
+// on its own junk and come back to do it again. The owner's copy converts and parks; the other
+// copy is drained, as every second copy was before the race existed.
+func TestANonOwnersCopyNeverInterruptsTheOwnersConversion(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.blockPark.dir = t.TempDir()
+
+	blk := wireBlockWithTxs(t, 40, false)
+	pipelineHeaderFixture(t, sm, blk)
+	proveBlockOrigin(t, sm, blk)
+
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+	header := &blk.MsgBlock().Header
+	n := sinkPayloadLen(body)
+
+	owner := owingPeer(t, sm, hash, 251)
+	stranger, _, _ := connectRacePeer(t, 252, 1000)
+
+	sink := sm.admitPipelineSink(sm.pipelineBlockSink)
+
+	// The owner's copy arrives slowly through the same admission path a peer's read loop uses.
+	slowR, slowW := io.Pipe()
+	firstDone := make(chan sinkResult, 1)
+
+	go func() {
+		converted, err := sink(hash, header, peerpkg.NewDeliveryReader(slowR, owner), n)
+		firstDone <- sinkResult{converted, err}
+	}()
+
+	_, err := slowW.Write(body[:len(body)/2])
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return sm.conversionOf(hash) != nil }, 5*time.Second, 10*time.Millisecond)
+
+	first := sm.conversionOf(hash)
+
+	// A whole copy from a peer the ledger does not hold the request with.
+	secondDone := make(chan sinkResult, 1)
+
+	go func() {
+		converted, err := sink(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), stranger), n)
+		secondDone <- sinkResult{converted, err}
+	}()
+
+	var second sinkResult
+
+	select {
+	case second = <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the stranger's copy is still running; it took over the owner's conversion: %v", first.yielding())
+	}
+
+	require.NoError(t, second.err)
+	require.False(t, second.converted, "the stranger's copy is drained")
+	require.False(t, first.yielding(), "the stranger's copy did not take over")
+	require.True(t, sm.takeDrainedDuplicate(hash), "the stranger's copy is accounted as drained")
+	requireNoSideFiles(t, sm.blockPark.dir)
+
+	go func() {
+		_, _ = slowW.Write(body[len(body)/2:])
+		_ = slowW.Close()
+	}()
+
+	got := <-firstDone
+	require.NoError(t, got.err)
+	require.True(t, got.converted, "the owner's copy converted")
+
+	record, err := sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees, "the owner's block is parked")
+}
+
+// owingPeer connects a peer and records in sm's download ledger that it owes hash.
+func owingPeer(t *testing.T, sm *SyncManager, hash chainhash.Hash, idx uint8) *peerpkg.Peer {
+	t.Helper()
+
+	if sm.blockDownloads == nil {
+		sm.blockDownloads = newBlockDownloadTracker(blockRequestAssignmentTTL)
+	}
+
+	p, _, _ := connectRacePeer(t, idx, 1000)
+	require.True(t, sm.blockDownloads.Add(p, hash))
+
+	return p
 }
 
 func requireNoSideFiles(t *testing.T, dir string) {

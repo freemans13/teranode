@@ -118,14 +118,15 @@ func (sm *SyncManager) installStreamingBlockPath(set func(
 // peer-agnostically via wire.SetExternalHandler(wire.CmdBlock, ...); go-wire
 // calls it with only (io.Reader, uint64, int) — no peer, no connection, no
 // context of any kind — because that registration is process-wide, shared by
-// every connected peer's read loop, not per-connection. There is no reader
-// identity or type assertion that reliably recovers "which peer is calling
-// this" from the io.Reader go-wire hands the external handler (it is go-wire's
-// own internal wrapper around the socket, not the socket itself), so closing
-// this gap for real means changing go-wire's SetExternalHandler/
-// ReadMessageStreamingN to pass per-call context through — an upstream change,
-// consistent with this codebase's own rule of fixing a dependency rather than
-// working around it in the wrapper, and out of scope for a same-branch fix.
+// every connected peer's read loop, not per-connection. go-wire does hand the
+// handler the caller's own reader unchanged, and the peer's read loop marks it
+// with the peer (peerpkg.NewDeliveryReader), which is how raceDuplicateCopy
+// learns who is sending; but a reader carries no quit channel and no way for
+// the idle timer to learn the read is blocked here, so closing this gap for
+// real means changing go-wire's SetExternalHandler/ReadMessageStreamingN to
+// pass per-call context through — an upstream change, consistent with this
+// codebase's own rule of fixing a dependency rather than working around it in
+// the wrapper, and out of scope for a same-branch fix.
 //
 // So: a bounded wait instead of an unbounded park. pipelineAdmissionAcquireTimeout
 // keeps the wait strictly below legacy_peerIdleTimeout; on that bound expiring,

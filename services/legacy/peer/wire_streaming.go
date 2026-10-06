@@ -219,10 +219,12 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 
 	// counted wraps the post-header stream only, so the first bytes it sees are
 	// the transaction count. The count is taken from the passing bytes rather
-	// than read here, because reading it here would mean putting it back.
+	// than read here, because reading it here would mean putting it back. It
+	// also carries the peer the bytes come from, for DeliveredBy.
 	var counted countingReader
 
 	counted.r = lr
+	counted.from = DeliveredBy(lr.R)
 
 	converted, err := blockBodySink(hash, &header, &counted, int64(length))
 	if err != nil {
@@ -315,10 +317,48 @@ func deleteOrphanedBody(hash chainhash.Hash, converted bool, err error) error {
 
 // countingReader passes bytes straight through while keeping the first nine,
 // which is enough to hold any transaction-count varint. That lets the count be
-// read without buffering the body or reading the file back.
+// read without buffering the body or reading the file back. from is the peer
+// the body is arriving from, or nil when the reader the wire layer handed the
+// handler carried none.
 type countingReader struct {
 	r     io.Reader
 	first []byte
+	from  *Peer
+}
+
+// deliveryReader is a peer's connection as it is handed to go-wire for one
+// message, marked with the peer. go-wire passes the caller's reader to an
+// external handler unchanged (go-wire v1.2.11 message.go:488-489 and
+// :639-640), so the global block handler can learn which peer is sending
+// without go-wire carrying any context of its own.
+type deliveryReader struct {
+	r    io.Reader
+	from *Peer
+}
+
+func (d *deliveryReader) Read(p []byte) (int, error) {
+	return d.r.Read(p)
+}
+
+// NewDeliveryReader returns r marked as bytes arriving from peer from. The
+// peer's read loop wraps its connection in one for every message it reads; a
+// test that drives a block sink directly uses it to say who is sending.
+func NewDeliveryReader(r io.Reader, from *Peer) io.Reader {
+	return &deliveryReader{r: r, from: from}
+}
+
+// DeliveredBy returns the peer a block body is arriving from: for the reader a
+// block sink is handed, or for a reader NewDeliveryReader made. It returns nil
+// for any other reader, so a caller must treat nil as "no peer known".
+func DeliveredBy(r io.Reader) *Peer {
+	switch v := r.(type) {
+	case *countingReader:
+		return v.from
+	case *deliveryReader:
+		return v.from
+	default:
+		return nil
+	}
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {

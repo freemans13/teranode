@@ -10,6 +10,7 @@ import (
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/file"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
@@ -116,10 +117,11 @@ func TestADuplicateConvertsWhenTheCopyItTookOverFromFails(t *testing.T) {
 
 	first := sm.conversionOf(hash)
 
+	owner := owingPeer(t, sm, hash, 253)
 	secondDone := make(chan sinkResult, 1)
 
 	go func() {
-		converted, err := sm.raceDuplicateCopy(hash, header, bytes.NewReader(body), n, sm.pipelineBlockSink)
+		converted, err := sm.raceDuplicateCopy(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), n, sm.pipelineBlockSink)
 		secondDone <- sinkResult{converted, err}
 	}()
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
 // When two copies of a block arrive at once, the first to complete is kept.
@@ -126,8 +127,18 @@ func (sm *SyncManager) yieldToFasterCopy(hash chainhash.Hash, writer *subtreeWri
 
 // raceDuplicateCopy handles a copy that arrives while another converts: it keeps the bytes in a
 // side file and, if this copy completes first, converts from it.
+//
+// Only a copy from a peer the download ledger says owes the block may race. The gate admits a body
+// for any hash the ledger holds a request for, from any peer, so without this a peer that knew a
+// requested block's header could send junk under it, make the honest copy stop and drain, and then
+// fail as corrupt on its own copy: disconnected without a ban, free to come back and do it again.
+// Any other copy is drained, as every second copy was before the race existed.
 func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64,
 	convert func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error)) (bool, error) {
+	if !sm.deliveringPeerOwes(r, hash) {
+		return sm.drainDuplicate(hash, r)
+	}
+
 	ctl := sm.conversionOf(hash)
 
 	var dir string
@@ -200,6 +211,33 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 	sm.logger.Infof("[blockOnDisk][%s] a second copy completed before the copy being converted; converting it from disk", hash)
 
 	return convert(hash, header, bufio.NewReaderSize(f, 1<<20), n)
+}
+
+// deliveringPeerOwes reports whether the peer r's bytes come from is one the download ledger says
+// owes hash. The ledger is keyed by association primaries, so a stream sub-peer is resolved first,
+// as handleBlockOnDiskMsg resolves it. A reader that names no peer owes nothing.
+func (sm *SyncManager) deliveringPeerOwes(r io.Reader, hash chainhash.Hash) bool {
+	from := deliveringPeer(r)
+	if from == nil || sm.blockDownloads == nil {
+		return false
+	}
+
+	owner := from
+	if sm.peerStates != nil {
+		_, owner, _ = sm.peerStateResolvingPrimary(from)
+	}
+
+	return sm.blockDownloads.HasOwner(owner, hash)
+}
+
+// deliveringPeer returns the peer a sink's reader is reading from, through the stream tracker's
+// wrapper when there is one, or nil when none is known (peerpkg.DeliveredBy).
+func deliveringPeer(r io.Reader) *peerpkg.Peer {
+	if c, ok := r.(countingReader); ok {
+		r = c.r
+	}
+
+	return peerpkg.DeliveredBy(r)
 }
 
 // drainDuplicate reads a copy off the wire unwritten, as every second copy used to be.
