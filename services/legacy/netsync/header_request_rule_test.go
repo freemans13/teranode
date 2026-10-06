@@ -287,9 +287,10 @@ func TestHeaderRequestRule_HeadersOutsideHeadersFirstModeKeepTheConnection(t *te
 	require.True(t, peer.Connected())
 }
 
-// Below the last checkpoint an inbound peer is never asked for headers: the
-// request is refused before anything is sent or recorded. Above it the rule
-// does not apply.
+// Below the last checkpoint an inbound peer that is not the sync peer is never
+// asked for headers: the request is refused before anything is sent or
+// recorded. At the last checkpoint the rule still applies while headers-first
+// mode is on, and not once the mode is left.
 func TestHeaderRequestRule_AnInboundPeerIsNeverAskedBelowTheCheckpoint(t *testing.T) {
 	sm := headerRuleManager(t)
 	inbound := inboundHeaderPeer(t, sm, 43)
@@ -305,7 +306,10 @@ func TestHeaderRequestRule_AnInboundPeerIsNeverAskedBelowTheCheckpoint(t *testin
 	require.False(t, state.headersAsked.Load(), "a refused request records nothing")
 
 	last := chaincfg.MainNetParams.Checkpoints[len(chaincfg.MainNetParams.Checkpoints)-1].Height
-	require.True(t, sm.mayAskForHeaders(inbound, last), "at the last checkpoint the rule no longer applies")
+	require.False(t, sm.mayAskForHeaders(inbound, last), "at the last checkpoint the rule holds while headers-first mode is on")
+
+	sm.headersFirstMode.Store(false)
+	require.True(t, sm.mayAskForHeaders(inbound, last), "at the last checkpoint, outside headers-first mode, the rule no longer applies")
 
 	outbound, _, _ := demotionPeer(t, sm, 44, 20000)
 	require.True(t, sm.mayAskForHeaders(outbound, 0))

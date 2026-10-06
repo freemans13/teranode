@@ -286,10 +286,10 @@ type peerSyncState struct {
 	demotedUntil atomic.Int64
 
 	// headersAsked is set by requestHeaders, before it sends this peer a
-	// getheaders, and never cleared: the state is dropped with the peer. Below
-	// the last checkpoint handleHeadersMsg reads a headers message only from a
+	// getheaders, and never cleared: the state is dropped with the peer. In
+	// headers-first mode handleHeadersMsg reads a headers message only from a
 	// peer with it set that mayAskForHeaders still allows, so only a peer this
-	// node asked, and may still ask, can create or extend a header branch there.
+	// node asked, and may still ask, can create or extend a header branch.
 	headersAsked atomic.Bool
 }
 
@@ -2416,11 +2416,17 @@ func (sm *SyncManager) allowedToRequestMoreHeadersNow(now time.Time) bool {
 }
 
 // mayAskForHeaders reports whether this node may send peer a getheaders while
-// its committed height is best. Above the last checkpoint it always may. Below
-// it, it may ask a preferred download peer, outbound or whitelisted, and an
-// inbound peer that is not whitelisted only when that peer is the sync peer and
-// no preferred peer is ahead of best. Judged on the primary peer a stream
-// connection belongs to.
+// its committed height is best. Outside headers-first mode and above the last
+// checkpoint it always may. Below the last checkpoint, or while headers-first
+// mode is on, it may ask a preferred download peer, outbound or whitelisted,
+// and an inbound peer that is not whitelisted only when that peer is the sync
+// peer and no preferred peer is ahead of best. Judged on the primary peer a
+// stream connection belongs to.
+//
+// The mode counts as well as the height because the mode outlives the last
+// checkpoint: the commit that reaches it does not leave the mode, which waits
+// for parkedBlockCommitted (block_park_drain.go), and handleHeadersMsg reads
+// headers into the cache for as long as the mode is on.
 //
 // This is SV Node's rule. A peer is a preferred download peer when it is
 // outbound or whitelisted (net_processing.cpp:120), and headers and blocks are
@@ -2430,7 +2436,7 @@ func (sm *SyncManager) allowedToRequestMoreHeadersNow(now time.Time) bool {
 // election here takes only peers ahead and a preferred peer that is not ahead
 // has nothing to give.
 //
-// Below the last checkpoint handleHeadersMsg reads headers only from a peer this
+// In headers-first mode handleHeadersMsg reads headers only from a peer this
 // node asked and may still ask, and each such peer holds at most one branch of
 // up to branchCap headers. So the branches are bounded by the outbound
 // connections this node makes (the automatic outbound target, 8 by default,
@@ -2445,7 +2451,7 @@ func (sm *SyncManager) mayAskForHeaders(peer *peerpkg.Peer, best int32) bool {
 // mayAskForHeadersAs is mayAskForHeaders with syncPeer standing as the sync
 // peer, for startSync, which asks the peer it elects before it stores it.
 func (sm *SyncManager) mayAskForHeadersAs(peer *peerpkg.Peer, best int32, syncPeer *peerpkg.Peer) bool {
-	if sm.chainParams == nil || sm.findNextHeaderCheckpoint(best) == nil {
+	if sm.chainParams == nil || (!sm.headersFirstMode.Load() && sm.findNextHeaderCheckpoint(best) == nil) {
 		return true
 	}
 
@@ -2483,7 +2489,7 @@ func (sm *SyncManager) preferredPeerAhead(best int32) bool {
 
 // requestHeaders sends peer a getheaders for locator and stopHash, and records
 // on the peer's state that this node asked it, which is what lets its headers
-// create or extend a branch below the last checkpoint (handleHeadersMsg). The
+// create or extend a branch in headers-first mode (handleHeadersMsg). The
 // record is made before the send, so a reply can never arrive ahead of it; a
 // send that then fails leaves an outbound peer marked, which only lets an
 // unrequested reply from it be read. best is the committed height the caller
@@ -2498,7 +2504,7 @@ func (sm *SyncManager) requestHeaders(peer *peerpkg.Peer, best int32, locator bl
 // (see mayAskForHeadersAs).
 func (sm *SyncManager) requestHeadersAs(peer *peerpkg.Peer, best int32, locator blockchain.BlockLocator, stopHash *chainhash.Hash, syncPeer *peerpkg.Peer) error {
 	if !sm.mayAskForHeadersAs(peer, best, syncPeer) {
-		return errors.NewProcessingError("peer %s is inbound, not whitelisted and not the fallback sync peer, and the committed height %d is below the last checkpoint, so it is not asked for headers", peer, best)
+		return errors.NewProcessingError("peer %s is inbound, not whitelisted and not the fallback sync peer, and the node is below the last checkpoint or in headers-first mode (committed height %d), so it is not asked for headers", peer, best)
 	}
 
 	if state, _, ok := sm.peerStateResolvingPrimary(peer); ok {
@@ -2518,8 +2524,9 @@ func (sm *SyncManager) headersAskedOf(peer *peerpkg.Peer) bool {
 
 // headerRequestPeers is eligibleBlockPeers less the peers mayAskForHeaders
 // refuses at best, the peers maybeRequestMoreHeaders rotates through. Below the
-// last checkpoint that is the preferred download peers, or the inbound fallback
-// sync peer alone when no preferred peer is ahead.
+// last checkpoint or in headers-first mode that is the preferred download
+// peers, or the inbound fallback sync peer alone when no preferred peer is
+// ahead.
 func (sm *SyncManager) headerRequestPeers(best int32) []blockPeer {
 	peers := sm.eligibleBlockPeers()
 	askable := peers[:0]
@@ -2607,8 +2614,9 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	// The preferred-peer rule. Below the last checkpoint a batch may create or
-	// extend a header branch only for a peer this node sent a getheaders to
+	// The preferred-peer rule. While headers-first mode is on (and this
+	// function returned above if it is not), a batch may create or extend a
+	// header branch only for a peer this node sent a getheaders to
 	// (requestHeaders records it) and may still ask (mayAskForHeaders): a
 	// preferred download peer, outbound or whitelisted, or the one inbound
 	// fallback sync peer while no preferred peer is ahead. Each such peer holds
@@ -2617,12 +2625,23 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// many peers connect to it. Anything else is dropped without blame: the
 	// cache asks again for whatever it needs.
 	//
-	// The tip is read once, here, and that one read serves both the rule and
-	// fillHeaderCacheAt, so a headers message costs one GetBestBlockHeader call
-	// (an uncached blockchain round trip). A failed read drops the batch: the
-	// rule cannot be judged without the committed height, and skipping it would
-	// let a later read inside the fill admit a batch the rule refuses.
-	asked := sm.headersAskedOf(peer)
+	// It holds for the whole mode, not only below the last checkpoint. The
+	// commit that reaches the last checkpoint does not leave the mode; that
+	// waits for parkedBlockCommitted (block_park_drain.go), and in between
+	// headers are still read into the cache.
+	//
+	// The asked check needs no blockchain read, so it runs first and an unasked
+	// batch costs nothing. The tip is then read once, and that one read serves
+	// both mayAskForHeaders and fillHeaderCacheAt, so a headers message costs at
+	// most one GetBestBlockHeader call (an uncached blockchain round trip). A
+	// failed read drops the batch: the rule cannot be judged without the
+	// committed height, and skipping it would let a later read inside the fill
+	// admit a batch the rule refuses.
+	if !sm.headersAskedOf(peer) {
+		sm.logger.Debugf("[handleHeadersMsg] dropping %d headers from %s, which was not asked for headers in headers-first mode", numHeaders, peer)
+
+		return
+	}
 
 	best, tipHash, ok := sm.committedTip()
 	if !ok {
@@ -2631,8 +2650,8 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	if sm.findNextHeaderCheckpoint(best) != nil && (!asked || !sm.mayAskForHeaders(peer, best)) {
-		sm.logger.Debugf("[handleHeadersMsg] dropping %d unsolicited headers from %s below the last checkpoint (committed height %d)", numHeaders, peer, best)
+	if !sm.mayAskForHeaders(peer, best) {
+		sm.logger.Debugf("[handleHeadersMsg] dropping %d headers from %s, which may no longer be asked for headers in headers-first mode (committed height %d)", numHeaders, peer, best)
 
 		return
 	}
@@ -3182,7 +3201,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			// own code: handleHeadersMsg drops every headers message while
 			// headersFirstMode is false, so a getheaders sent outside the mode
 			// would be answered into nothing. It goes through requestHeaders,
-			// so below the last checkpoint an inbound announcer is not asked.
+			// so in headers-first mode an inbound announcer is asked only if it is
+			// whitelisted or is the inbound fallback sync peer.
 			//
 			// headersRoundLocator anchored on the committed tip, the same
 			// locator startSync uses, rather than a header-list-anchored one:
