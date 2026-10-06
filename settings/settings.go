@@ -226,6 +226,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Rate limiting and access control
 			HTTPRateLimit:                getInt("asset_httpRateLimit", 1024, alternativeContext...),
 			HTTPHeavyRateLimit:           getInt("asset_httpHeavyRateLimit", 10, alternativeContext...),
+			HTTPHeavyRateBurst:           getInt("asset_httpHeavyRateBurst", 0, alternativeContext...),
 			HTTPPeerRateMultiplier:       getInt("asset_httpPeerRateMultiplier", 5, alternativeContext...),
 			HTTPMinerRateLimit:           getInt("asset_httpMinerRateLimit", 0, alternativeContext...),
 			HTTPBodyLimit:                getString("asset_httpBodyLimit", "100MB", alternativeContext...),
@@ -707,6 +708,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BatchMissingTransactions:                  getBool("subtreevalidation_batch_missing_transactions", true, alternativeContext...),
 			SpendBatcherSize:                          getInt("subtreevalidation_spendBatcherSize", 1024, alternativeContext...),
 			MissingTransactionsBatchSize:              getInt("subtreevalidation_missingTransactionsBatchSize", 16_384, alternativeContext...),
+			MissingTransactionsFetchTimeout:           getDuration("subtreevalidation_missingTransactionsFetchTimeout", DefaultMissingTransactionsFetchTimeout, alternativeContext...),
 			PercentageMissingGetFullData:              getFloat64("subtreevalidation_percentageMissingGetFullData", 20, alternativeContext...),
 			BlacklistedBaseURLs:                       blacklistMap,
 			BlockHeightRetentionAdjustment:            getInt32("subtreevalidation_blockHeightRetentionAdjustment", 0, alternativeContext...),
