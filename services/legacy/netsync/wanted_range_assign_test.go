@@ -169,16 +169,14 @@ func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 	sm := assignManager(t, 1, 20)
 	mockCommittedTip(t, sm, 10, 0)
 
-	// newDownloadAssigner's remaining budget — both the node-wide window and
-	// each peer's own share — is read BEFORE unownedBlocksUpTo forgives
-	// anything, so the harness defaults (window and per-peer cap both equal
-	// to assignPassDepth, exactly what the first pass consumes) compute zero
-	// room on the second pass and never place the re-ask this test is about.
-	// Both widened well past what the ten candidates in [1,20] above the
-	// committed tip of 10 could ever need, so the harness default's role —
-	// bounding the FIRST pass to assignPassDepth's worth of read-ahead — is
-	// carried by the header cache alone here; the assertions below already
-	// use >= rather than == for that reason.
+	// Both the node-wide window and each peer's own share are widened well
+	// past what the ten candidates in [1,20] above the committed tip of 10
+	// could ever need, so this pass has room before anything is forgiven.
+	// The pass that starts with no room at all is
+	// TestAssignWantedBlocks_ForgivesQuietOwnersWhenEveryPeerIsAtItsCap. The
+	// harness default's role, bounding the FIRST pass to assignPassDepth's
+	// worth of read-ahead, is carried by the header cache alone here; the
+	// assertions below already use >= rather than == for that reason.
 	sm.settings.Legacy.BlockDownloadWindow = 1024
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 20
 
@@ -284,4 +282,77 @@ func TestAReAskedBlockGoesToTheFastestPeerEvenWithAFullQueue(t *testing.T) {
 	require.NotNil(t, slow.getData, "an ordinary block still needs a peer with room")
 	require.Len(t, slow.getData.InvList, 1)
 	require.Equal(t, ordinary.hash, slow.getData.InvList[0].Hash)
+}
+
+// TestAssignWantedBlocks_ForgivesQuietOwnersWhenEveryPeerIsAtItsCap is the
+// stall the pass used to fall into: every eligible peer holds its full slice
+// and has gone quiet, so newDownloadAssigner finds no room, and the pass used
+// to return before ForgiveOwners ran. Nothing was re-asked until a stall
+// backstop fired. End state: the second pass forgives the quiet owners, finds
+// the room that frees, and asks each peer for the other's blocks, never its
+// own.
+func TestAssignWantedBlocks_ForgivesQuietOwnersWhenEveryPeerIsAtItsCap(t *testing.T) {
+	sm := assignManager(t, 1, 20)
+	mockCommittedTip(t, sm, 10, 0)
+
+	// The node-wide window is not what binds: each peer's own cap is. Three
+	// each leaves four of the ten wanted heights unplaced.
+	const perPeer = 3
+
+	sm.settings.Legacy.BlockDownloadWindow = 1024
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = perPeer
+
+	firstPeer, first := schedulerPeer(t, sm, 1, 1020)
+	secondPeer, second := schedulerPeer(t, sm, 2, 1020)
+	wireStreamingPath(sm, firstPeer, secondPeer)
+
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool { return first.count() == perPeer && second.count() == perPeer }, 5*time.Second),
+		"the first pass fills each peer to its cap")
+
+	firstOwed := first.all()
+	secondOwed := second.all()
+
+	require.Nil(t, sm.newDownloadAssigner(), "sanity: every eligible peer is at its cap")
+
+	first.reset()
+	second.reset()
+
+	sm.blockDownloads.now = func() time.Time {
+		return time.Now().Add(blockRequestRetryInterval + time.Second)
+	}
+
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool { return first.count() > 0 && second.count() > 0 }, 5*time.Second),
+		"a pass whose every peer is at its cap and quiet must forgive them and re-ask their blocks")
+
+	for _, h := range first.all() {
+		require.NotContains(t, firstOwed, h, "the first peer is never asked again for its own block")
+	}
+
+	for _, h := range second.all() {
+		require.NotContains(t, secondOwed, h, "and neither is the second")
+	}
+
+	reAsked := 0
+
+	for _, h := range append(first.all(), second.all()...) {
+		if slicesContains(firstOwed, h) || slicesContains(secondOwed, h) {
+			reAsked++
+		}
+	}
+
+	require.Positive(t, reAsked, "a quiet owner's block is asked of the other peer")
+}
+
+func slicesContains(hashes []chainhash.Hash, h chainhash.Hash) bool {
+	for _, x := range hashes {
+		if x == h {
+			return true
+		}
+	}
+
+	return false
 }

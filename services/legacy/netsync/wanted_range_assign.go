@@ -80,7 +80,18 @@ func (sm *SyncManager) assignWantedBlocks() {
 		wanted = sm.appendOutstandingAtTip(wanted)
 	}
 
+	// Nobody with budget is not yet nobody to assign to. A peer that has gone
+	// quiet holding a full slice keeps every one of those slots against its
+	// per-peer cap, and against the node-wide window, until its blocks are
+	// forgiven, and forgiveness otherwise happens only in unownedBlocksUpTo,
+	// below this return. So when no peer has room, the quiet owners are
+	// forgiven first and the budgets read again; without that nothing is
+	// re-asked until a stall backstop fires.
 	assigner := sm.newDownloadAssigner()
+	if assigner == nil && sm.forgiveQuietOwners(wanted) > 0 {
+		assigner = sm.newDownloadAssigner()
+	}
+
 	if assigner == nil {
 		return
 	}
@@ -240,13 +251,13 @@ func describeWantedHeight(height int32) string {
 // still, because forgiveness frees the owner's budget and the pass would then
 // hand the same peer the same block it is already carrying.
 //
-// Forgiveness runs before the budgets are read, not after. A peer that has gone
-// quiet holding a full slice keeps every one of those slots against its
-// per-peer cap until somebody releases them, so a pass that read the budgets
-// first would find that peer at zero and hand out nothing — the stall this rule
-// exists to break. ForgiveOwners keeps the ownership and drops only the
-// obligation, so a copy still on the wire from the quiet peer is admitted when
-// it lands.
+// The budgets are read before this runs, so a pass whose every peer is at its
+// cap would never get here: a peer that has gone quiet holding a full slice
+// keeps every one of those slots until somebody forgives it. assignWantedBlocks
+// covers that case by running forgiveQuietOwners when no peer has room and
+// reading the budgets again, so the stall this rule exists to break cannot
+// form. ForgiveOwners keeps the ownership and drops only the obligation, so a
+// copy still on the wire from the quiet peer is admitted when it lands.
 //
 // Takes no lock of its own beyond the download ledger's and the park store's,
 // neither of which is headerMu, so it is safe with headerMu released and must
@@ -350,28 +361,11 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 		// what was queued ahead of this one, and asking another peer then downloads
 		// it twice: 346 blocks in 11 hours at height 705,000, one of them 447 MB.
 		// SV Node does not re-ask a block from a peer that is still delivering.
-		if sm.blockDownloads.AnyOwner(block.hash, func(p *peerpkg.Peer) bool {
-			return time.Since(sm.streams.lastBlockBytes(p)) < blockRequestRetryInterval
-		}) {
+		if sm.ownerStillSending(block.hash) {
 			continue
 		}
 
-		if quiet := sm.blockDownloads.ForgiveOwners(block.hash, blockRequestRetryInterval); len(quiet) > 0 {
-			// Logged per block because it is what lets a block be asked of a second peer, and
-			// a duplicate copy can then only be traced back through this line.
-			sm.waste.reAskedQuiet.Add(1)
-
-			for _, p := range quiet {
-				last := sm.streams.lastBlockBytes(p)
-				since := "never"
-
-				if !last.IsZero() {
-					since = time.Since(last).Round(time.Second).String()
-				}
-
-				sm.logger.Infof("[reRequest][%s] %s: %s owed it and last sent block bytes %s ago; it may be asked of another peer", block.hash, describeWantedHeight(block.height), p, since)
-			}
-
+		if sm.forgiveQuietOwnersOf(block) {
 			block.reAsked = true
 		}
 
@@ -379,6 +373,71 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 	}
 
 	return candidates
+}
+
+// forgiveQuietOwners forgives every block in wanted whose owners have all gone
+// quiet past the retry window, and returns how many it forgave. It is the
+// forgiveness half of unownedBlocksUpTo for a pass that found no peer with
+// room: only blocks somebody owes are looked at, and only the checks that
+// answer from memory run, because this collects no candidate. The disk and
+// chain checks unownedBlocksUpTo makes before forgiving keep a held block from
+// being handed to another peer, and that pass still makes them before
+// anything forgiven here is asked for again.
+func (sm *SyncManager) forgiveQuietOwners(wanted []wantedBlock) int {
+	forgiven := 0
+
+	for _, block := range wanted {
+		if !sm.blockDownloads.Requested(block.hash) || sm.blockHeldLocally(block.hash) {
+			continue
+		}
+
+		if sm.blockDownloads.RequestedWithin(block.hash, blockRequestRetryInterval) || sm.ownerStillSending(block.hash) {
+			continue
+		}
+
+		// Not logged or counted here: the block is logged and counted as re-asked
+		// when unownedBlocksUpTo forgives it again and makes it a candidate,
+		// which is when it may actually go to another peer.
+		if len(sm.blockDownloads.ForgiveOwners(block.hash, blockRequestRetryInterval)) > 0 {
+			forgiven++
+		}
+	}
+
+	return forgiven
+}
+
+// ownerStillSending reports whether any owner of hash has sent block bytes
+// within the retry window.
+func (sm *SyncManager) ownerStillSending(hash chainhash.Hash) bool {
+	return sm.blockDownloads.AnyOwner(hash, func(p *peerpkg.Peer) bool {
+		return time.Since(sm.streams.lastBlockBytes(p)) < blockRequestRetryInterval
+	})
+}
+
+// forgiveQuietOwnersOf lets block's quiet owners off it, logs each, and reports
+// whether there was anybody to forgive.
+func (sm *SyncManager) forgiveQuietOwnersOf(block wantedBlock) bool {
+	quiet := sm.blockDownloads.ForgiveOwners(block.hash, blockRequestRetryInterval)
+	if len(quiet) == 0 {
+		return false
+	}
+
+	// Logged per block because it is what lets a block be asked of a second peer, and
+	// a duplicate copy can then only be traced back through this line.
+	sm.waste.reAskedQuiet.Add(1)
+
+	for _, p := range quiet {
+		last := sm.streams.lastBlockBytes(p)
+		since := "never"
+
+		if !last.IsZero() {
+			since = time.Since(last).Round(time.Second).String()
+		}
+
+		sm.logger.Infof("[reRequest][%s] %s: %s owed it and last sent block bytes %s ago; it may be asked of another peer", block.hash, describeWantedHeight(block.height), p, since)
+	}
+
+	return true
 }
 
 // requestBlocks places each candidate with a peer that has budget for it and
