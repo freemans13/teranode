@@ -113,7 +113,7 @@ func TestHeaderFork_AFailedLookupMidSearchIsNotAFork(t *testing.T) {
 	}
 
 	cache := newHeaderCache().WithCheckpoints(trunk.params.Checkpoints)
-	result := trunkFork(&headerRules{trunk: failing}, cache.checkpoints, 547, batch, mustLinked(t, batch))
+	result := trunkFork(context.Background(), &headerRules{trunk: failing}, cache.checkpoints, 547, batch, mustLinked(t, batch))
 	require.Equal(t, fillResult{}, result)
 	require.Equal(t, 2, failing.calls, "the search stopped at the failed lookup")
 }

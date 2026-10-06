@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -45,11 +46,30 @@ import (
 type headerCache struct {
 	mu sync.Mutex
 
-	// fillMu makes one structural change at a time: Fill, DropPeer, Discard and
-	// the physical sweep. A fill judges its headers against the tree outside mu,
-	// because the trunk half of that is a blockchain call, so it must know the
-	// tree cannot change under it. Readers take mu alone.
+	// fillMu makes one change to the index at a time: Fill, Discard, the
+	// physical sweep and the release of a dropped branch's headers. A fill
+	// judges its headers against the index outside mu, because the trunk half
+	// of that is a blockchain call, so it must know no header is added to or
+	// removed from the index under it. Readers take mu alone, and so does
+	// DropPeer, which only unlinks a branch and leaves its headers in released
+	// for the next holder of fillMu to free: the peer-departure path runs on
+	// the block handler's goroutine, which must not wait on a fill's store call.
 	fillMu sync.Mutex
+
+	// released holds the tips of branches DropPeer unlinked while it could not
+	// take fillMu. Their headers stay in the index, still counted, until
+	// reapLocked frees them. Guarded by mu; emptied only with fillMu held too.
+	released []*headerNode
+
+	// ownerLive reports whether an owner is still a connected peer. A fill
+	// checks it before installing a branch, so a fill that was running when
+	// its peer left, or that started after, never installs a branch no
+	// DropPeer will come for. nil means every owner is live.
+	ownerLive func(owner any) bool
+
+	// storeTimeout bounds every blockchain call one fill makes while it holds
+	// fillMu (see headerStoreTimeout).
+	storeTimeout time.Duration
 
 	// index is every held header by hash. A header is held while some branch's
 	// tip descends from it.
@@ -156,10 +176,35 @@ type defaultHeaderOwner struct{}
 
 func newHeaderCache() *headerCache {
 	return &headerCache{
-		index:     make(map[chainhash.Hash]*headerNode),
-		branches:  make(map[any]*headerBranch),
-		branchCap: capForCheckpoints(nil),
+		index:        make(map[chainhash.Hash]*headerNode),
+		branches:     make(map[any]*headerBranch),
+		branchCap:    capForCheckpoints(nil),
+		storeTimeout: headerStoreTimeout,
 	}
+}
+
+// headerStoreTimeout is the most one fill may spend in blockchain calls while
+// it holds fillMu. A fill makes a handful of them (the committed tip's header
+// and chain work, the ancestry the contextual rules read, and trunkFork's
+// binary search, about eleven lookups for a 2,000-header reply), each normally
+// a millisecond or two. A fill that runs out of time is refused as
+// unjudgeable, which keeps the headers judged before it and costs the peer
+// nothing; the next reply asks again.
+const headerStoreTimeout = 30 * time.Second
+
+// WithOwnerLive hands the cache the test a fill uses to decide whether its
+// owner is still connected (see ownerLive) and returns it.
+func (c *headerCache) WithOwnerLive(live func(owner any) bool) *headerCache {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.ownerLive = live
+
+	return c
 }
 
 // capForCheckpoints is the most headers above the committed tip a branch may
@@ -350,9 +395,16 @@ func (c *headerCache) FillFrom(owner any, parent chainhash.Hash, baseHeight int3
 	c.fillMu.Lock()
 	defer c.fillMu.Unlock()
 
+	// Whatever DropPeer unlinked while this fill waited is freed when it is
+	// done, still under fillMu.
+	defer c.reap()
+
 	c.mu.Lock()
-	ceiling := c.powLimit
+	ceiling, timeout := c.powLimit, c.storeTimeout
 	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
 	hashes, ok := linkedHashes(headers, ceiling)
 	if !ok {
@@ -374,10 +426,10 @@ func (c *headerCache) FillFrom(owner any, parent chainhash.Hash, baseHeight int3
 			return fillResult{}
 		}
 
-		return trunkFork(rules, checkpoints, floor, headers, hashes)
+		return trunkFork(ctx, rules, checkpoints, floor, headers, hashes)
 	}
 
-	nodes, result := c.judge(plan, headers, hashes)
+	nodes, result := c.judge(ctx, plan, headers, hashes)
 	if result.rejection.disconnects() {
 		return result
 	}
@@ -545,11 +597,10 @@ func (c *headerCache) heldLocked(hash chainhash.Hash) *headerNode {
 
 // judge makes the nodes for the new part of a placed batch, judging each header
 // before the next. It returns the nodes it passed and the refusal that stopped
-// it, if one did. It holds fillMu but not mu: the tree it reads cannot change,
-// because every writer of it holds fillMu.
-func (c *headerCache) judge(plan fillPlan, headers []*wire.BlockHeader, hashes []chainhash.Hash) ([]*headerNode, fillResult) {
-	ctx := context.Background()
-
+// it, if one did. It holds fillMu but not mu: the index and the nodes it reads
+// cannot change, because every writer of them holds fillMu. Its store calls
+// run under ctx, which carries the fill's deadline.
+func (c *headerCache) judge(ctx context.Context, plan fillPlan, headers []*wire.BlockHeader, hashes []chainhash.Hash) ([]*headerNode, fillResult) {
 	c.mu.Lock()
 	rules := c.rules
 	checkpoints := c.checkpoints
@@ -683,9 +734,7 @@ func (c *headerCache) judge(plan fillPlan, headers []*wire.BlockHeader, hashes [
 // header is not stored, and any other failure abandons the batch without
 // blame, because reading it as "not stored" would move the search and place
 // the fork lower than it is.
-func trunkFork(rules *headerRules, checkpoints []chaincfg.Checkpoint, floor int32, headers []*wire.BlockHeader, hashes []chainhash.Hash) fillResult {
-	ctx := context.Background()
-
+func trunkFork(ctx context.Context, rules *headerRules, checkpoints []chaincfg.Checkpoint, floor int32, headers []*wire.BlockHeader, hashes []chainhash.Hash) fillResult {
 	// stored reports whether hash is a stored block, and answered whether the
 	// store gave an answer at all.
 	stored := func(hash chainhash.Hash) (isStored, answered bool) {
@@ -755,6 +804,13 @@ func (n *headerNode) cached() *cachedHeader {
 // Called with mu and fillMu held.
 func (c *headerCache) installLocked(owner any, plan fillPlan, nodes []*headerNode, result fillResult) fillResult {
 	result.extended = plan.anchor != nil
+
+	// A departed owner gets no branch: DropPeer has already run for it, or
+	// runs after this under mu and finds the branch, because the peer is
+	// marked gone before DropPeer is called.
+	if c.ownerLive != nil && !c.ownerLive(owner) {
+		return result
+	}
 
 	var tip *headerNode
 
@@ -1485,27 +1541,37 @@ func (c *headerCache) Discard() {
 	c.index = make(map[chainhash.Hash]*headerNode)
 	c.branches = make(map[any]*headerBranch)
 	c.active, c.activeNodes = nil, nil
+	c.released = nil
 }
 
 // DropPeer drops owner's branch: SV Node forgets a peer's best known header
 // when the peer goes (FinalizeNode), and here that is also what releases the
 // headers only that peer sent.
+//
+// It takes mu alone, never waiting on fillMu: the branch is unlinked at once,
+// so no reader sees it again, and its headers are freed now if no fill is
+// running, or by the running fill when it finishes.
 func (c *headerCache) DropPeer(owner any) {
 	if c == nil {
 		return
 	}
 
-	c.fillMu.Lock()
-	defer c.fillMu.Unlock()
-
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.dropBranchLocked(owner)
 	c.selectLocked()
+	c.mu.Unlock()
+
+	if !c.fillMu.TryLock() {
+		return
+	}
+
+	defer c.fillMu.Unlock()
+
+	c.reap()
 }
 
-// dropBranchLocked removes owner's branch and releases what only it held.
+// dropBranchLocked unlinks owner's branch and queues its tip for reapLocked.
+// Called with mu held.
 func (c *headerCache) dropBranchLocked(owner any) {
 	branch := c.branches[owner]
 	if branch == nil {
@@ -1518,8 +1584,26 @@ func (c *headerCache) dropBranchLocked(owner any) {
 		c.active, c.activeNodes = nil, nil
 	}
 
-	branch.tip.refs--
-	c.releaseLocked(branch.tip)
+	c.released = append(c.released, branch.tip)
+}
+
+// reap takes mu and frees the dropped branches' headers. Called with fillMu held.
+func (c *headerCache) reap() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.reapLocked()
+}
+
+// reapLocked frees what only the dropped branches held. Called with fillMu and
+// mu held, because it removes headers from the index a fill reads without mu.
+func (c *headerCache) reapLocked() {
+	for _, tip := range c.released {
+		tip.refs--
+		c.releaseLocked(tip)
+	}
+
+	c.released = nil
 }
 
 // Prune is PruneTo without the committed tip's hash: it drops every height at
@@ -1575,6 +1659,8 @@ func (c *headerCache) sweepLocked() {
 			c.dropBranchLocked(owner)
 		}
 	}
+
+	c.reapLocked()
 
 	cut := c.floorHeight - int32(wire.MaxBlockHeadersPerMsg)
 

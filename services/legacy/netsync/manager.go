@@ -2606,6 +2606,21 @@ func (sm *SyncManager) fillHeaderCache(peer *peerpkg.Peer, msg *wire.MsgHeaders)
 	return true
 }
 
+// headerOwnerLive reports whether owner, a header cache branch key, is still a
+// peer this manager tracks. handleDonePeerMsg removes the peer from peerStates
+// before it drops the peer's branch, so a fill that installs after that sees
+// the peer gone and installs nothing (headerCache.ownerLive).
+func (sm *SyncManager) headerOwnerLive(owner any) bool {
+	peer, ok := owner.(*peerpkg.Peer)
+	if !ok || sm.peerStates == nil {
+		return true
+	}
+
+	_, exists := sm.peerStates.Get(peer)
+
+	return exists
+}
+
 // headerOwner is the key of peer's branch in the header cache: the primary
 // peer a stream connection belongs to, or peer itself.
 func (sm *SyncManager) headerOwner(peer *peerpkg.Peer) any {
@@ -4172,7 +4187,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		WithCheckpoints(config.ChainParams.Checkpoints).
 		WithPowLimit(model.PowLimitCeiling(config.ChainParams)).
 		WithHeaderRules(headerRules).
-		WithMinimumChainWork(minimumChainWork(config.ChainParams))
+		WithMinimumChainWork(minimumChainWork(config.ChainParams)).
+		WithOwnerLive(sm.headerOwnerLive)
 
 	// Tracks recently-failed block hashes so descendants of an unstored/rejected
 	// block are short-circuited rather than triggering a NOT_FOUND ERROR cascade
