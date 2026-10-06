@@ -194,3 +194,37 @@ func TestDownloadPassLeavesABlockTheParkSweepIsCommittingAlone(t *testing.T) {
 	require.False(t, adoptedMidCommit, "a block the park is committing is not put back in the park")
 	require.False(t, sm.blockCommitting(hash), "and is no longer being committed once the call returns")
 }
+
+// The sweep takes a block out of the park and queues it for the consumer, which puts it back and
+// drains it. Until the put-back, the block was out of the park and marked nowhere, and the sweep's
+// own goroutine runs a download pass straight after, which adopted it. The adopted copy could
+// then be committed and its record deleted before the consumer's put-back re-inserted a stale
+// entry, and that entry failed to read. Mainnet logged it once in 30 minutes on 2026-10-06, after
+// the dispatcher and commitParkedBlock windows were both closed.
+func TestDownloadPassLeavesABlockTheSweepHasQueuedAlone(t *testing.T) {
+	ctx := context.Background()
+	sm, park, subtreeStore := strandedRecordManager(t)
+	sm.parkCommits = make(chan parkCommit, 1)
+	sm.quit = make(chan struct{})
+	sm.drainAsync.Store(true)
+
+	blk, hash := convertedRecordWithSubtrees(t, 1, 650022)
+	require.NoError(t, park.WriteConvertedBlock(ctx, hash, blk))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeToCheck, []byte("structure")))
+	require.NoError(t, subtreeStore.Set(ctx, blk.Subtrees[0][:], fileformat.FileTypeSubtreeData, []byte("data")))
+	ageRecord(t, park, hash.String())
+
+	entry := parkedBlock{hash: hash, prevBlock: *blk.Header.HashPrevBlock, height: 650022}
+
+	// What the sweep does: take it out of the index and queue it for the consumer.
+	sm.submitParkCommit(parkCommit{entry: entry, parentHeight: 650021})
+
+	sm.unownedBlocks([]wantedBlock{{height: 650022, hash: hash}})
+	require.False(t, park.Has(hash), "a block queued for the consumer is not adopted back into the park")
+
+	// What the consumer does with it.
+	sm.receiveParkCommit(<-sm.parkCommits)
+
+	require.True(t, park.Has(hash), "the consumer puts it back for the drain to claim")
+	require.False(t, sm.blockCommitting(hash), "and from then on the park is what holds it")
+}
