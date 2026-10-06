@@ -454,6 +454,24 @@ func (c *headerCache) placeLocked(parent chainhash.Hash, baseHeight int32, heade
 		}
 	}
 
+	// A fill reads the committed tip before it waits for fillMu, and PruneTo can
+	// record a higher one in between. A batch built on that older tip then
+	// starts at or below the recorded floor, and those headers are committed
+	// history, not new ones: judged as new, they sit below any checkpoint the
+	// tree holds and would read as a fork from it. So the batch is clipped to
+	// the floor: it is placed on the floor when its header at the floor height
+	// is the recorded floor hash, and otherwise it is not placed, which leaves
+	// it to trunkFork to judge against the store, or to be dropped without
+	// blame. A batch that ends at or below the floor has nothing new.
+	if plan.anchor == nil && plan.anchorHeight < plan.floorHeight {
+		atFloor := plan.start + int(plan.floorHeight-plan.anchorHeight) - 1
+		if atFloor >= len(hashes)-1 || !c.floorHashKnown || hashes[atFloor] != c.floorHash {
+			return fillPlan{}, false
+		}
+
+		plan.parent, plan.anchorHeight, plan.start = c.floorHash, plan.floorHeight, atFloor+1
+	}
+
 	plan.heldCheckpoint = c.heldCheckpointLocked(plan.floorHeight)
 
 	// The cap counts from the committed tip: a branch may name at most
