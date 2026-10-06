@@ -161,7 +161,13 @@ func runHistoricalTestnetSync(t *testing.T, unified bool) {
 		require.NoError(t, err, "height %d must convert", height)
 		require.True(t, converted, "height %d must convert", height)
 
-		entry := parkedBlock{hash: hash, prevBlock: block.Header.PrevBlock, peer: p}
+		// Through the park, as the on-disk handler and the drain do: adopt the
+		// record, then take it. A commit's keep row puts back only a block that
+		// was taken from the park (blockPark.Restore).
+		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hash, prevBlock: block.Header.PrevBlock, peer: p}), "height %d must be adopted", height)
+
+		entry, ok := sm.blockPark.Take(hash)
+		require.True(t, ok, "height %d must be taken", height)
 
 		if unified && height == 547 {
 			// Below testnet's last pinned checkpoint and unproven, so the
