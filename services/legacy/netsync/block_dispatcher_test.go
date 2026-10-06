@@ -187,3 +187,33 @@ func TestDispatcher_InFlight(t *testing.T) {
 	bd.drainCompletions(t, rec, 1)
 	require.False(t, bd.inFlight(first.parked.hash))
 }
+
+// TestDispatcher_InFlightUntilItsTailHasRun pins that a block stays in flight while its
+// tail runs. The tail is what deletes a committed block's record, so a block that left
+// the frontier before its tail looked, to the wanted-range pass in that window, like a
+// record on disk that nothing owned: the pass adopted it into the park, and the park's
+// sweep then read it back after its files had gone. Mainnet logged that 82 times in four
+// hours on 2026-10-06, as a parked block that "could not be read back".
+//
+// The tail checks in flight itself because that is where the wanted-range pass runs:
+// a committed block's tail tops up block requests (fetchHeaderBlocks), which is what
+// reaches unownedBlocks.
+func TestDispatcher_InFlightUntilItsTailHasRun(t *testing.T) {
+	bd, rec := testDispatcher(t)
+	bd.parkedRun = func(context.Context, *blockDispatch) error { return nil }
+
+	var duringTail bool
+
+	bd.parkedTail = func(d *blockDispatch, err error) error {
+		duringTail = bd.inFlight(d.parked.hash)
+
+		return rec.tail(d, err)
+	}
+
+	first := dispatchAt(1)
+	bd.dispatch(first)
+	bd.drainCompletions(t, rec, 1)
+
+	require.True(t, duringTail, "a block whose tail is still deleting its record is in flight")
+	require.False(t, bd.inFlight(first.parked.hash), "and is not once the tail has run")
+}

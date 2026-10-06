@@ -120,10 +120,19 @@ type blockCompletion struct {
 type blockDispatcher struct {
 	sm *SyncManager
 
-	// frontierMu guards frontier alone. See the struct comment for why it exists and
-	// the reentrancy rule complete() observes to avoid deadlocking on its own tail call.
-	frontierMu  sync.Mutex
-	frontier    []*frontierEntry
+	// frontierMu guards frontier and settling. See the struct comment for why it exists
+	// and the reentrancy rule complete() observes to avoid deadlocking on its own tail call.
+	frontierMu sync.Mutex
+	frontier   []*frontierEntry
+
+	// settling is the entry complete has popped and whose tail is running: out of the
+	// frontier, so a block can be admitted behind it, but still in flight, because the
+	// tail is what deletes its record. Without it the block was on disk, out of the
+	// park and not in flight for the length of the tail, which is exactly what the
+	// wanted-range pass reads as a stranded record, so it adopted the block back into
+	// the park and the sweep later read it after its files had gone.
+	settling *frontierEntry
+
 	barrier     bool
 	completions chan *blockCompletion
 
@@ -278,6 +287,10 @@ func (bd *blockDispatcher) inFlight(hash chainhash.Hash) bool {
 
 	bd.frontierMu.Lock()
 	defer bd.frontierMu.Unlock()
+
+	if bd.settling != nil && bd.settling.hash.IsEqual(&hash) {
+		return true
+	}
 
 	for _, e := range bd.frontier {
 		if e.hash.IsEqual(&hash) {
@@ -434,9 +447,15 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 			bd.barrier = false
 		}
 
+		bd.settling = head
+
 		bd.frontierMu.Unlock()
 
 		_ = bd.parkedTail(head.d, err)
+
+		bd.frontierMu.Lock()
+		bd.settling = nil
+		bd.frontierMu.Unlock()
 	}
 }
 
