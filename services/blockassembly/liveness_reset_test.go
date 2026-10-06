@@ -265,6 +265,7 @@ func newReloadTest(t *testing.T, txs []*utxo.UnminedTransaction, perBatch int) (
 	}
 
 	mockStp := &subtreeprocessor.MockSubtreeProcessor{}
+	mockStp.On("FlushDiskTxMapForLoad", mock.Anything, mock.Anything).Return(nil).Maybe()
 	injectMockStp(t, items, mockStp)
 
 	probe.backdate()
@@ -345,16 +346,16 @@ func TestLivenessUnminedReloadBeatsInSequentialAdd(t *testing.T) {
 }
 
 // TestLivenessDiskSortReloadBeats pins the same two beats on the disk-sort
-// reload path: one per iterator batch, and one every 10,000 transactions read
-// back and added.
+// reload path: one per iterator batch, and one per sorted batch read back and
+// handed to the subtree processor.
 func TestLivenessDiskSortReloadBeats(t *testing.T) {
-	ba, probe, mockStp := newReloadTest(t, syntheticUnmined(10_001), 5_000)
+	ba, probe, mockStp := newReloadTest(t, syntheticUnmined(3), 1)
 	ba.settings.BlockAssembly.UnminedTxDiskSortEnabled = true
-	ba.settings.BlockAssembly.UnminedTxDiskSortPath = t.TempDir()
+	ba.settings.BlockAssembly.UnminedTxDiskSortPaths = []string{t.TempDir()}
+	ba.settings.BlockAssembly.UnminedLoadingBatchSize = 1
 
 	adds := &heartbeatProbe{ba: ba}
-	addDirectlyProbe(mockStp, adds)
-
+	mockStp.On("AddNodesDirectly", mock.Anything, mock.Anything).Run(func(mock.Arguments) { adds.observe() }).Return(nil)
 	require.NoError(t, ba.loadUnminedTransactions(t.Context(), false))
 
 	reads := probe.seen()
@@ -365,8 +366,11 @@ func TestLivenessDiskSortReloadBeats(t *testing.T) {
 	}
 
 	ages := adds.seen()
-	require.Len(t, ages, 1)
-	require.Less(t, ages[0], time.Minute, "the disk-sort read-back must beat every 10,000 transactions")
+	require.Len(t, ages, 3, "one sorted batch per transaction at a batch size of 1")
+
+	for i, age := range ages {
+		require.Less(t, age, time.Minute, "disk-sort add batch %d must follow a beat", i)
+	}
 }
 
 // TestLivenessWaitForBlockMinedSetDoesNotBeatWhenTheCallFails pins that only an
