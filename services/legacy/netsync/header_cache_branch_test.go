@@ -152,14 +152,19 @@ func TestHeaderBranches_LessWorkNeverWinsAndProofBeatsWork(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, int32(10), top)
 
-	require.True(t, cache.FillFrom("honest", tip, 1, honest[10:25]).accepted)
-	require.Equal(t, int32(20), cache.ProvenTo())
-
 	// 0x1d00ffff declares about 2^223 times the work of 0x207fffff per
 	// header: ten of them outweigh the whole honest branch. There is no
-	// proof-of-work ceiling here, so they need not be mined.
-	heavy, _ := saltedRun(tip, 10, 0x01, 0x1d00ffff)
+	// proof-of-work ceiling here, so they need not be mined. They arrive
+	// before any branch holds the checkpoint, so they are held, and read.
+	heavy, heavyHashes := saltedRun(tip, 10, 0x01, 0x1d00ffff)
 	require.True(t, cache.FillFrom("heavy", tip, 1, heavy).accepted)
+
+	got, ok = cache.At(1)
+	require.True(t, ok)
+	require.Equal(t, heavyHashes[0], got, "sanity: before any proof, the most work is read")
+
+	require.True(t, cache.FillFrom("honest", tip, 1, honest[10:25]).accepted)
+	require.Equal(t, int32(20), cache.ProvenTo())
 
 	for h := int32(1); h <= 25; h++ {
 		got, ok := cache.At(h)
@@ -202,7 +207,7 @@ func TestHeaderBranches_AContradictionFromOnePeerLeavesTheOtherBranchesIntact(t 
 		{Height: 100, Hash: &chainhash.Hash{0x77}},
 	})
 
-	require.True(t, cache.FillFrom("honest", tip, 1, honest).accepted)
+	require.True(t, cache.FillFrom("honest", tip, 1, honest[:15]).accepted)
 
 	fake, fakeHashes := forgedRun(tip, 15)
 	require.True(t, cache.FillFrom("attacker", tip, 1, fake).accepted, "fifteen fake headers stop short of the checkpoint")
@@ -214,7 +219,8 @@ func TestHeaderBranches_AContradictionFromOnePeerLeavesTheOtherBranchesIntact(t 
 	require.Equal(t, int32(20), result.rejectedHeight)
 	require.True(t, result.rejection.disconnects())
 
-	require.Equal(t, int32(20), cache.ProvenTo(), "the honest branch keeps its proof")
+	require.True(t, cache.FillFrom("honest", tip, 1, honest[15:]).accepted, "the honest walk goes on after another peer's lie")
+	require.Equal(t, int32(20), cache.ProvenTo(), "and reaches the checkpoint")
 
 	for h := int32(1); h <= 25; h++ {
 		got, ok := cache.At(h)

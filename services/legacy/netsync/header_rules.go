@@ -30,6 +30,12 @@ const (
 	// (validation.cpp:5757-5761, DoS 100).
 	rejectCheckpointMismatch
 
+	// rejectForkBeforeCheckpoint is CheckIndexAgainstCheckpoint's
+	// "bad-fork-prior-to-checkpoint": a header below the highest checkpoint this
+	// node holds that is not on that checkpoint's chain
+	// (validation.cpp:5763-5772, DoS 100).
+	rejectForkBeforeCheckpoint
+
 	// rejectBadDiffBits is ContextualCheckBlockHeader's "bad-diffbits": the
 	// header's nBits is not what the difficulty rules demand at its height
 	// (validation.cpp:5789-5793, DoS 100).
@@ -59,7 +65,7 @@ const (
 // costs the sender its connection. The rest refuse the header and keep the
 // peer, as SV Node's Invalid-without-DoS does.
 func (r headerRejection) disconnects() bool {
-	return r == rejectBadDiffBits || r == rejectCheckpointMismatch
+	return r == rejectBadDiffBits || r == rejectCheckpointMismatch || r == rejectForkBeforeCheckpoint
 }
 
 func (r headerRejection) String() string {
@@ -68,6 +74,8 @@ func (r headerRejection) String() string {
 		return "accepted"
 	case rejectCheckpointMismatch:
 		return "checkpoint mismatch"
+	case rejectForkBeforeCheckpoint:
+		return "bad-fork-prior-to-checkpoint"
 	case rejectBadDiffBits:
 		return "bad-diffbits"
 	case rejectTimeTooOld:

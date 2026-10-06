@@ -360,10 +360,20 @@ func (c *headerCache) FillFrom(owner any, parent chainhash.Hash, baseHeight int3
 
 	c.mu.Lock()
 	plan, ok := c.placeLocked(parent, baseHeight, headers, hashes)
+	rules, checkpoints := c.rules, c.checkpoints
+	floor := baseHeight - 1
+
+	if c.haveFloor && c.floorHeight > floor {
+		floor = c.floorHeight
+	}
 	c.mu.Unlock()
 
 	if !ok {
-		return fillResult{}
+		if rules == nil {
+			return fillResult{}
+		}
+
+		return trunkFork(rules, checkpoints, floor, headers, hashes)
 	}
 
 	nodes, result := c.judge(plan, headers, hashes)
@@ -392,6 +402,12 @@ type fillPlan struct {
 	// was given, or the one already recorded when that is higher (a fill's
 	// read of the tip can be older than PruneTo's).
 	floorHeight int32
+
+	// heldCheckpoint is the highest checkpoint height above the committed tip
+	// whose pinned hash the tree holds on a path down to the tip, 0 when none:
+	// SV Node's GetLastCheckpoint (checkpoints.cpp:24-36), the last checkpoint
+	// in its block index, for the part of the index this cache is.
+	heldCheckpoint int32
 }
 
 // placeLocked finds where a linked batch meets the tree. Called with mu held.
@@ -438,6 +454,8 @@ func (c *headerCache) placeLocked(parent chainhash.Hash, baseHeight int32, heade
 		}
 	}
 
+	plan.heldCheckpoint = c.heldCheckpointLocked(plan.floorHeight)
+
 	// The cap counts from the committed tip: a branch may name at most
 	// branchCap heights above it.
 	plan.cut = len(headers)
@@ -447,6 +465,52 @@ func (c *headerCache) placeLocked(parent chainhash.Hash, baseHeight int32, heade
 	}
 
 	return plan, true
+}
+
+// heldCheckpointLocked returns the highest checkpoint height above floor whose
+// pinned hash is a held node whose path reaches down to floor+1, or 0. Every
+// height from floor+1 to that checkpoint is then held on the checkpoint's own
+// chain, so a header at one of those heights that the tree does not already
+// hold is not on that chain. The checkpoint list is short (35 on mainnet) and
+// the walk is paid once per fill.
+func (c *headerCache) heldCheckpointLocked(floor int32) int32 {
+	for i := len(c.checkpoints) - 1; i >= 0; i-- {
+		cp := c.checkpoints[i]
+		if cp.Height <= floor || cp.Hash == nil {
+			continue
+		}
+
+		node, ok := c.index[*cp.Hash]
+		if !ok || node.height != cp.Height {
+			continue
+		}
+
+		for node.parent != nil && node.height > floor+1 {
+			node = node.parent
+		}
+
+		if node.height <= floor+1 {
+			return cp.Height
+		}
+	}
+
+	return 0
+}
+
+// committedCheckpoint returns the highest checkpoint height at or below the
+// committed tip, or 0. The committed chain passed every checkpoint at or below
+// its tip, so this is the last checkpoint SV Node would find in its index from
+// the committed chain alone.
+func committedCheckpoint(checkpoints []chaincfg.Checkpoint, tip int32) int32 {
+	var height int32
+
+	for _, cp := range checkpoints {
+		if cp.Hash != nil && cp.Height <= tip && cp.Height > height {
+			height = cp.Height
+		}
+	}
+
+	return height
 }
 
 // heldLocked returns the held node for hash, or nil when the cache does not
@@ -536,6 +600,13 @@ func (c *headerCache) judge(plan fillPlan, headers []*wire.BlockHeader, hashes [
 			return nil, fillResult{rejection: rejectCheckpointMismatch, rejectedHeight: height, detail: fmt.Sprintf("height %d carries %s, the pinned checkpoint is %s", height, hashes[i], cp.Hash)}
 		}
 
+		// Every new header is one the tree does not hold (placeLocked starts
+		// after the last held one), so below a held checkpoint it is a fork
+		// from that checkpoint's chain.
+		if height < plan.heldCheckpoint {
+			return nil, fillResult{rejection: rejectForkBeforeCheckpoint, rejectedHeight: height, detail: fmt.Sprintf("height %d forks below the held checkpoint at %d", height, plan.heldCheckpoint)}
+		}
+
 		if rules != nil {
 			var parentHeader *model.BlockHeader
 			if prev != nil {
@@ -574,6 +645,66 @@ func (c *headerCache) judge(plan fillPlan, headers []*wire.BlockHeader, hashes [
 	}
 
 	return nodes, fillResult{}
+}
+
+// trunkFork judges a batch that meets neither the committed tip nor a held
+// header, which needs the store: SV Node's index holds the committed chain too,
+// so a header forking from it below the last checkpoint is
+// bad-fork-prior-to-checkpoint there (validation.cpp:5763-5772), and one at a
+// checkpoint height with the wrong hash is checkpoint mismatch (5757-5761).
+//
+// The first header the store does not hold is found by binary search: a
+// stored block's ancestors are all stored, so the stored headers in a linked
+// batch are a prefix. A batch the store holds whole (an honest peer answering
+// an older locator) costs one lookup and is dropped without blame, as is one
+// whose fork point the store does not hold, and one forking above the last
+// committed checkpoint: SV Node would keep that header as a side branch, and
+// below the tip this cache holds none. Store lookups that fail say nothing
+// about the peer.
+func trunkFork(rules *headerRules, checkpoints []chaincfg.Checkpoint, floor int32, headers []*wire.BlockHeader, hashes []chainhash.Hash) fillResult {
+	ctx := context.Background()
+
+	stored := func(hash chainhash.Hash) bool {
+		header, meta, err := rules.trunk.GetBlockHeader(ctx, &hash)
+
+		return err == nil && header != nil && meta != nil
+	}
+
+	if stored(hashes[len(hashes)-1]) {
+		return fillResult{}
+	}
+
+	lo, hi := 0, len(hashes)-1 // hashes[hi] is not stored
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if stored(hashes[mid]) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+
+	parent := headers[0].PrevBlock
+	if lo > 0 {
+		parent = hashes[lo-1]
+	}
+
+	_, meta, err := rules.trunk.GetBlockHeader(ctx, &parent)
+	if err != nil || meta == nil {
+		return fillResult{}
+	}
+
+	height := int32(meta.Height) + 1 //nolint:gosec // a stored height fits a chain height
+
+	if cp := checkpointAt(checkpoints, height); cp != nil && !hashes[lo].IsEqual(cp.Hash) {
+		return fillResult{rejection: rejectCheckpointMismatch, rejectedHeight: height, detail: fmt.Sprintf("height %d carries %s, the pinned checkpoint is %s", height, hashes[lo], cp.Hash)}
+	}
+
+	if last := committedCheckpoint(checkpoints, floor); height < last {
+		return fillResult{rejection: rejectForkBeforeCheckpoint, rejectedHeight: height, detail: fmt.Sprintf("height %d forks from the committed chain below its checkpoint at %d", height, last)}
+	}
+
+	return fillResult{}
 }
 
 // cached is the node in the form branchSource reads.
