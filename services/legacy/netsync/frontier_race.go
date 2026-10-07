@@ -221,6 +221,28 @@ func (r *streamRegistry) arriving(h chainhash.Hash) bool {
 	return false
 }
 
+// arrivingStream reports the progress of block h's bytes from one peer: read so far, its declared
+// size, and when they began. ok is false when none are arriving, or more than one copy is.
+func (r *streamRegistry) arrivingStream(h chainhash.Hash) (read, total int64, start time.Time, ok bool) {
+	if r == nil {
+		return 0, 0, time.Time{}, false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	n := 0
+
+	for s := range r.active {
+		if s.hash == h {
+			read, total, start = s.read.Load(), s.total, s.start
+			n++
+		}
+	}
+
+	return read, total, start, n == 1
+}
+
 // arrivingBytes is the declared size of every block arriving now, and how many there are.
 func (r *streamRegistry) arrivingBytes() (int64, int) {
 	if r == nil {
@@ -620,7 +642,7 @@ func (sm *SyncManager) logDownloadQueues() {
 	}
 
 	w := &sm.waste
-	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d, behind a slow queue %d",
+	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d, behind a slow queue or arriving late %d",
 		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.localFaultDrained.Load(), w.streamsFailed.Load(),
 		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load(), w.reAskedQueued.Load())
 }

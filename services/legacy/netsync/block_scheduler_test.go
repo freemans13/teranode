@@ -40,8 +40,10 @@ func wireStreamingPath(sm *SyncManager, peers ...*peerpkg.Peer) {
 	sm.blockPark = &blockPark{}
 	sm.streams = newStreamRegistry()
 
+	// Fast enough that a peer's time-scaled queue is the full configured depth whatever the
+	// block size, as these tests' flat per-peer assertions assume.
 	for _, p := range peers {
-		sm.streams.rates[p] = 1
+		sm.streams.rates[p] = 1 << 40
 	}
 }
 

@@ -62,20 +62,70 @@ func speedScaledDepth(depth int, rate, fastest float64) int {
 	return max(1, int(math.Round(float64(depth)*rate/fastest)))
 }
 
-// unmeasuredPeerDepth is the most blocks a peer is given before its speed is known, as every peer
-// is straight after a restart. On 2026-09-25 after a restart every peer was given 16 before any
-// speed was known, and peers at 4 MB/s held 13 blocks against a speed-scaled depth of two or three.
-const unmeasuredPeerDepth = 2
+// unmeasuredPeerDepth is the most blocks a peer is given before its speed is known, and the most
+// every peer is given while the download warms up. A peer sends its queue in order, so whatever a
+// peer is given before its speed is known it delivers at that speed: on 2026-09-25 after a restart
+// every peer was given 16 and peers at 4 MB/s held 13 blocks against a speed-scaled depth of two
+// or three. One block each is how the speeds get measured without any slow peer holding a queue.
+const unmeasuredPeerDepth = 1
 
-// peerQueueDepth is how many blocks p may be asked for at once with the park on: its speed-scaled
-// share of depth once its speed is measured, and at most unmeasuredPeerDepth until then.
+// downloadWarming reports whether too few of the eligible peers have a measured rate to judge any
+// of them: fewer than half of them, or than two (or than one, with one peer). Until then every
+// peer holds one block. A speed is
+// relative: on 2026-10-07 straight after a restart the first peer measured ran at 1.2 MB/s, was
+// therefore the fastest, got the full depth of 16, and still held all 16 after a peer at 47 MB/s
+// was measured three seconds later. Half rather than all, so one peer that never delivers cannot
+// hold the warm-up open.
+func (sm *SyncManager) downloadWarming() bool {
+	if sm.streams == nil {
+		return false
+	}
+
+	eligible := sm.eligibleBlockPeers()
+
+	measured := 0
+
+	for _, bp := range eligible {
+		if sm.streams.peerRate(bp.peer) > 0 {
+			measured++
+		}
+	}
+
+	return measured < max(min(2, len(eligible)), (len(eligible)+1)/2)
+}
+
+// peerQueueSeconds is how much of its own delivery time a peer's queue holds beyond the block it
+// is sending. A peer sends its queue in order and a request cannot be withdrawn, so every block
+// queued is committed to that peer; the queue is there only to hide the gap between two blocks,
+// a round trip and the peer reading the next block from disk. Ten seconds covers that gap with
+// little committed: one extra 300 MB block at 30 MB/s, the cap of blocks a few hundred KB each.
+const peerQueueSeconds = 10
+
+// timeScaledDepth is a peer's queue by time: the block it sends and enough typical blocks to keep
+// it busy for peerQueueSeconds, at most depth. With no typical size it falls back to the share of
+// depth by speed against the fastest peer.
+func timeScaledDepth(depth int, rate, fastest float64, typical int64) int {
+	if typical <= 0 {
+		return speedScaledDepth(depth, rate, fastest)
+	}
+
+	return min(depth, 1+int(math.Ceil(rate*peerQueueSeconds/float64(typical))))
+}
+
+// peerQueueDepth is how many blocks p may be asked for at once with the park on: one while its
+// speed is unknown or the download is warming up, then its time-scaled depth (timeScaledDepth).
 func (sm *SyncManager) peerQueueDepth(p *peerpkg.Peer, depth int, fastest float64) int {
 	rate := sm.streams.peerRate(p)
-	if rate <= 0 {
+	if rate <= 0 || sm.downloadWarming() {
 		return min(depth, unmeasuredPeerDepth)
 	}
 
-	return speedScaledDepth(depth, rate, fastest)
+	var typical int64
+	if sm.blockSizeTracker != nil {
+		typical = sm.blockSizeTracker.getAverageSize()
+	}
+
+	return timeScaledDepth(depth, rate, fastest, typical)
 }
 
 // parkBackstopBytes is the most block bytes the node holds ahead of the chain, parked and
@@ -150,6 +200,8 @@ type downloadAssigner struct {
 	typical    int64
 	// now is the pass's clock, for the bench probe.
 	now time.Time
+	// warming says too few peers are measured to rank them (downloadWarming): every peer is active.
+	warming bool
 }
 
 // eligibleBlockPeers lists the peers that may be asked for a block body, sync
@@ -320,7 +372,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// able to take 16, sizing the round by the window would make 1024 round trips
 	// to place 16 blocks, on every arriving block.
 	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), overBackstop: overBackstop, full: full,
-		commitRate: sm.commitRate.rate(), typical: typical, now: time.Now()}
+		commitRate: sm.commitRate.rate(), typical: typical, now: time.Now(), warming: sm.downloadWarming()}
 }
 
 // bytesAhead is how many bytes of blocks the node really holds ahead of the chain: parked blocks
