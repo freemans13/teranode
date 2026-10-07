@@ -694,18 +694,19 @@ func (c *Client) IsPeerMalicious(ctx context.Context, peerID string) (bool, stri
 //   - bool: True if the peer is considered unhealthy
 //   - string: Reason why the peer is considered unhealthy (if applicable)
 //   - float32: The peer's current reputation score
+//   - bool: True if the peer is absent from the registry (no information, not a verdict)
 //   - error: Any error encountered during the operation
-func (c *Client) IsPeerUnhealthy(ctx context.Context, peerID string) (bool, string, float32, error) {
+func (c *Client) IsPeerUnhealthy(ctx context.Context, peerID string) (bool, string, float32, bool, error) {
 	req := &p2p_api.IsPeerUnhealthyRequest{
 		PeerId: peerID,
 	}
 
 	resp, err := c.client.IsPeerUnhealthy(ctx, req)
 	if err != nil {
-		return false, "", 0, err
+		return false, "", 0, false, err
 	}
 
-	return resp.IsUnhealthy, resp.Reason, resp.ReputationScore, nil
+	return resp.IsUnhealthy, resp.Reason, resp.ReputationScore, resp.Unknown, nil
 }
 
 // GetPeerRegistry retrieves the comprehensive peer registry data from the P2P service.
@@ -739,6 +740,12 @@ func (c *Client) GetPeerRegistry(ctx context.Context) ([]*PeerInfo, error) {
 // Returns:
 //   - error: Any error encountered during the operation
 func (c *Client) RecordBytesDownloaded(ctx context.Context, peerID string, bytesDownloaded uint64) error {
+	// Callers detach this call from their own cancellation and make it inline
+	// as a fetch closes, so bound it: a stuck p2p service must not hold block
+	// fetching or subtree checking.
+	ctx, cancel := context.WithTimeout(ctx, recordBytesDownloadedTimeout)
+	defer cancel()
+
 	req := &p2p_api.RecordBytesDownloadedRequest{
 		PeerId:          peerID,
 		BytesDownloaded: bytesDownloaded,
@@ -755,6 +762,10 @@ func (c *Client) RecordBytesDownloaded(ctx context.Context, peerID string, bytes
 
 	return nil
 }
+
+// recordBytesDownloadedTimeout bounds RecordBytesDownloaded. A var so tests
+// can shorten it.
+var recordBytesDownloadedTimeout = 5 * time.Second
 
 // GetPeer retrieves information about a specific peer from the P2P service.
 // Returns nil if the peer is not found in the registry.
