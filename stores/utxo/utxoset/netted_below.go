@@ -114,7 +114,26 @@ type netBelowTx struct {
 	// netted[vin] is true when input vin spends an output of an earlier transaction of the
 	// list that is not identity-held. nil when none does.
 	netted []bool
-	result utxo.SpendAndCreateMultiResult
+	// writesNothing is set for a transaction the chunk writes no row for at all; see
+	// dropWriteNothing.
+	writesNothing bool
+	result        utxo.SpendAndCreateMultiResult
+}
+
+// allInputsNetted reports whether every input of the transaction spends an output of an earlier
+// transaction of the list, so it deletes no coin.
+func (it *netBelowTx) allInputsNetted() bool {
+	if len(it.netted) == 0 {
+		return false
+	}
+
+	for _, n := range it.netted {
+		if !n {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndCreateMultiList,
@@ -308,6 +327,10 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 	// Outputs the list spends are never coins.
 	_ = plan.takeNetted(spender)
 
+	// Before the fence judge: it counts the records of the rows it is handed, and a transaction
+	// that writes nothing never has one.
+	plan = dropWriteNothing(chunk, plan)
+
 	var identRows, newRows []int
 
 	for i, owner := range plan.owner {
@@ -316,6 +339,20 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 		} else {
 			newRows = append(newRows, i)
 		}
+	}
+
+	// A chunk of transactions that all write nothing has nothing to commit, and needs neither
+	// a database transaction nor the fence lock.
+	if len(plan.owner) == 0 {
+		if err := s.netBelowFault(chunk); err != nil {
+			return err
+		}
+
+		for _, it := range chunk {
+			it.result = utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxCreated}
+		}
+
+		return nil
 	}
 
 	dbTx, err := s.pool.Begin(ctx)
@@ -367,15 +404,8 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 		return err
 	}
 
-	if nettedBelowFault != nil {
-		positions := make([]int, len(chunk))
-		for k, it := range chunk {
-			positions[k] = it.pos
-		}
-
-		if err = nettedBelowFault(positions); err != nil {
-			return err
-		}
+	if err = s.netBelowFault(chunk); err != nil {
+		return err
 	}
 
 	if err = dbTx.Commit(ctx); err != nil {
@@ -385,6 +415,13 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 	committed = true
 
 	for k, it := range chunk {
+		if it.writesNothing {
+			// No record, so no metadata to report. The caller needs only the status: a
+			// created transaction is neither stamped nor spent again.
+			it.result = utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxCreated}
+			continue
+		}
+
 		if !it.ident && claimed[string(it.txid[:])] {
 			it.result = utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxCreated, Meta: plan.perItem[k]}
 			continue
@@ -394,6 +431,69 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 	}
 
 	return nil
+}
+
+// netBelowFault calls the test hook, if one is set, with the list positions of the chunk.
+func (s *Store) netBelowFault(chunk []*netBelowTx) error {
+	if nettedBelowFault == nil {
+		return nil
+	}
+
+	positions := make([]int, len(chunk))
+	for k, it := range chunk {
+		positions[k] = it.pos
+	}
+
+	return nettedBelowFault(positions)
+}
+
+// dropWriteNothing takes out of the plan every transaction the chunk would write only a mined
+// record for, and marks it. Such a transaction W
+//
+//   - has no identity row, so it did not reach the store unmined;
+//   - spends only outputs of earlier transactions of the list, so it deletes no coin;
+//   - has no output left as a coin: each is spent in the list or is not spendable;
+//   - carries no body, which below the checkpoint means utxostore_skipTxBodyBelowCheckpoint.
+//
+// Its record would be the only row it writes, and nothing below the checkpoint reads it. The
+// record is the repeat detector, but W has nothing to repeat: writing nothing on every attempt is
+// already idempotent, and the netting of its parents and children is computed from the list,
+// never from the store. No later block can spend an output of W, because it has none left. A
+// later block that included W again would spend outputs that were never written as coins and
+// fail. W can never be the block's first non-coinbase transaction, whose record block-ID
+// recovery reads on a repeat: that one is at position 0 of the block's first list, and position 0
+// has no earlier transaction of the list to spend.
+//
+// W's classification depends on the list, the setting, and the identity rows of W and its
+// parents in the list. After a crash part-way through a list, a parent whose chunk did not commit
+// still has its inputs as coins, so propagation could store it, and then W, unmined before the
+// repeat. W is then not W on the repeat: it takes a record, or the identity route, and deletes the
+// parent's coin for real, which is the right answer either way. Once a list has fully applied the
+// classification cannot change, because every transaction in it has spent its inputs and W's
+// inputs were never coins. That is the only case the fence judge sees: a block can be behind the
+// stamp fence only once it has fully applied, so the rows it counts are the same rows the first
+// complete attempt wrote.
+func dropWriteNothing(chunk []*netBelowTx, plan *createPlan) *createPlan {
+	withCoin := make(map[string]struct{}, len(plan.utxoTxids))
+	for _, id := range plan.utxoTxids {
+		withCoin[string(id)] = struct{}{}
+	}
+
+	keep := make([]int, 0, len(plan.owner))
+
+	for i, owner := range plan.owner {
+		it := chunk[owner]
+
+		_, coin := withCoin[string(plan.txids[i])]
+		if it.ident || coin || plan.bodies[i] != nil || !it.allInputsNetted() {
+			keep = append(keep, i)
+			continue
+		}
+
+		it.writesNothing = true
+	}
+
+	return plan.subset(keep)
 }
 
 // netBelowClaim inserts the mined records and returns the txids whose record is new.
