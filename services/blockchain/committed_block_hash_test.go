@@ -13,8 +13,10 @@ import (
 )
 
 // TestCommittedBlockHashLookup: the lookup ConfirmLeftovers relies on must say
-// "no holder" for an id no committed block carries, name the block for one that
-// does, and pass any other failure through rather than reading it as no holder.
+// "no holder" for an id no committed block carries, and name the block for one
+// that does. That other errors are not read as "no holder" rests on the
+// errors.Is check, covered for the remote client's error mapping by
+// TestBlockNotFoundSurvivesGRPC; this test does not inject one.
 func TestCommittedBlockHashLookup(t *testing.T) {
 	ctx := context.Background()
 	tSettings := test.CreateBaseTestSettings(t)
