@@ -1,8 +1,10 @@
 package netsync
 
 import (
+	"slices"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
@@ -35,9 +37,12 @@ import (
 //
 // The owner keeps its request and its connection: it is working, and dropping it would lose
 // every block it is sending. Whichever copy lands first converts; the other is drained at the
-// sink. The re-ask shares the race's mark, so a block gets one extra request in raceExpiry
-// whichever rule asked. Headers-first mode only: the heights come from the header cache, which
-// is empty above the last checkpoint, where the quiet-owner re-ask covers the ledger's blocks.
+// sink. The re-ask shares the race's mark. A block with more than one owner is judged on every
+// owner's copy, and lands at the soonest of them. Another copy is asked for only when the newest
+// extra copy is at least raceSlowFetchAfter old, every copy is judged, and fewer than
+// maxBlockCopies peers owe the block, whichever rule asked. Headers-first mode only: the heights
+// come from the header cache, which is empty above the last checkpoint, where the quiet-owner
+// re-ask covers the ledger's blocks.
 
 // queuedReaskFasterBy is how many times sooner another peer must deliver the block, by the
 // estimate, before it is asked too. The estimate counts queued blocks at a typical size, so a
@@ -63,54 +68,40 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 
 	queues := sm.blockDownloads.Queues()
 
-	block, owner, height, found := sm.lowestOwedBlock(queues, tip)
+	block, _, height, found := sm.lowestOwedBlock(queues, tip)
 	if !found || sm.streams.wasRaced(block.hash, now) {
 		return
 	}
 
-	if owners := sm.blockDownloads.OwnersOf(block.hash); len(owners) != 1 {
+	owners := sm.blockDownloads.OwnersOf(block.hash)
+	if len(owners) == 0 || len(owners) >= maxBlockCopies {
 		return
 	}
 
-	// When it lands at its owner, and the size a fresh copy elsewhere would have to fetch.
+	// Every owner's copy is judged, and the block lands at the soonest of them. One owner whose
+	// copy has not had its time yet keeps the block from another peer, as SV Node gives each
+	// peer a block is in flight from its slow-fetch time.
 	var (
 		ownerETA time.Duration
+		soonest  *peerpkg.Peer
 		ownSize  = typical
 		state    = "waits behind"
 	)
 
-	if read, total, start, arriving := sm.streams.arrivingStream(block.hash); arriving {
-		// Arriving: judged on its own rate. Under the race's floor it is the race's, which
-		// drops the owner. A fresh copy must fetch the whole block, which is what keeps a
-		// large block at a healthy rate from ever being doubled.
-		elapsed := now.Sub(start)
-		if elapsed < raceSlowFetchAfter || read <= 0 {
+	for i, o := range owners {
+		eta, size, how, judged := sm.ownerArrival(o, block.hash, queues[o], typical, now)
+		if !judged {
 			return
 		}
 
-		rate := float64(read) / elapsed.Seconds()
-		if rate < raceStallRate {
-			return
+		if i == 0 || eta < ownerETA {
+			ownerETA, soonest, state = eta, o, how
 		}
 
-		ownerETA = time.Duration(float64(total-read) / rate * float64(time.Second))
-		ownSize = total
-		state = "arrives slowly from"
-	} else {
-		if now.Sub(block.at) < raceSlowFetchAfter {
-			return
+		// A copy arriving declares the block's size; a fresh copy must fetch all of it.
+		if size > 0 {
+			ownSize = size
 		}
-
-		ownerRate := sm.streams.peerRate(owner)
-		if ownerRate <= 0 {
-			ownerRate = sm.streams.medianRate()
-		}
-
-		if ownerRate <= 0 {
-			return
-		}
-
-		ownerETA = sm.queuedArrival(owner, queues[owner], block.seq, typical, typical, ownerRate)
 	}
 
 	var need time.Duration
@@ -122,7 +113,7 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 		return
 	}
 
-	racer, racerETA := sm.soonestOtherPeer(queues, owner, height, typical, ownSize)
+	racer, racerETA := sm.soonestOtherPeer(queues, owners, height, typical, ownSize)
 	if racer == nil || racerETA*queuedReaskFasterBy > ownerETA {
 		return
 	}
@@ -133,9 +124,69 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 
 	sm.waste.reAskedQueued.Add(1)
 
-	sm.logger.Infof("[queuedReask][%s] block %d, asked %s ago, %s %s: estimated %s there against %s at %s; the chain needs it in %s, so %s was asked too and %s keeps its request",
-		block.hash, height, now.Sub(block.at).Round(time.Second), state, owner, ownerETA.Round(time.Second), racerETA.Round(time.Second), racer,
-		need.Round(time.Second), racer, owner)
+	sm.logger.Infof("[queuedReask][%s] block %d, asked %s ago, %s %s, the soonest of %d owners: estimated %s there against %s at %s; the chain needs it in %s, so %s was asked too and the owners keep their requests",
+		block.hash, height, now.Sub(block.at).Round(time.Second), state, soonest, len(owners), ownerETA.Round(time.Second), racerETA.Round(time.Second), racer,
+		need.Round(time.Second), racer)
+}
+
+// farOff is an arrival estimate for an owner that will not deliver: a forgiven owner sending no
+// copy, or a copy that has stopped.
+const farOff = time.Duration(1<<63 - 1)
+
+// ownerArrival estimates when block h lands at owner o, and the block's declared size when its
+// bytes are arriving from o, zero otherwise. judged is false when the copy must be given more time or is the race's: its request or its
+// bytes are younger than raceSlowFetchAfter, or its bytes arrive under raceStallRate.
+//
+// A copy arriving from o is judged on its own rate: its remaining bytes at that rate, and a fresh
+// copy must fetch the whole block. A copy not yet started is judged by o's queue: the bytes o is
+// still sending, a typical block for each block ahead of it and its own typical size, at o's rate.
+// An owner let off the block (forgiven, so not in its queue) and sending no copy will not deliver.
+func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []queuedBlock, typical int64, now time.Time) (eta time.Duration, ownSize int64, state string, judged bool) {
+	if read, total, start, arriving := sm.streams.arrivingFrom(h, o); arriving {
+		elapsed := now.Sub(start)
+		if elapsed < raceSlowFetchAfter || read <= 0 {
+			return 0, 0, "", false
+		}
+
+		rate := float64(read) / elapsed.Seconds()
+		if rate < raceStallRate {
+			return 0, 0, "", false
+		}
+
+		return time.Duration(float64(total-read) / rate * float64(time.Second)), total, "arrives slowly from", true
+	}
+
+	var (
+		rec    queuedBlock
+		queued bool
+	)
+
+	for _, b := range queue {
+		if b.hash == h {
+			rec, queued = b, true
+
+			break
+		}
+	}
+
+	if !queued {
+		return farOff, 0, "was let off by", true
+	}
+
+	if now.Sub(rec.at) < raceSlowFetchAfter {
+		return 0, 0, "", false
+	}
+
+	rate := sm.streams.peerRate(o)
+	if rate <= 0 {
+		rate = sm.streams.medianRate()
+	}
+
+	if rate <= 0 {
+		return 0, 0, "", false
+	}
+
+	return sm.queuedArrival(o, queue, rec.seq, typical, typical, rate), 0, "waits behind", true
 }
 
 // lowestOwedBlock is the lowest block above tip that some peer owes, not let off, and that this
@@ -201,17 +252,17 @@ func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq u
 	return time.Duration(bytes / rate * float64(time.Second))
 }
 
-// soonestOtherPeer is the eligible peer, other than owner, that would deliver a block at height
-// soonest with it added at the back of its queue. A peer with no measured rate is not chosen:
-// its estimate would be a guess.
-func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owner *peerpkg.Peer, height int32, typical, ownSize int64) (*peerpkg.Peer, time.Duration) {
+// soonestOtherPeer is the eligible peer, other than the owners, that would deliver a block at
+// height soonest with it added at the back of its queue. A peer with no measured rate is not
+// chosen: its estimate would be a guess.
+func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owners []*peerpkg.Peer, height int32, typical, ownSize int64) (*peerpkg.Peer, time.Duration) {
 	var (
 		best    *peerpkg.Peer
 		bestETA time.Duration
 	)
 
 	for _, bp := range sm.eligibleBlockPeers() {
-		if bp.peer == owner {
+		if slices.Contains(owners, bp.peer) {
 			continue
 		}
 

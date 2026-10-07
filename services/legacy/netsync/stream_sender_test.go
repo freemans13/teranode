@@ -43,7 +43,7 @@ func TestACopyFromAPeerThatDoesNotOweTheBlockChangesNoPeersAccounting(t *testing
 
 	sink := sm.trackBlockStreams(drainingSink(func() {
 		require.False(t, sm.streams.arriving(block), "a copy nobody owes is not the block arriving")
-		_, _, _, ok := sm.streams.arrivingStream(block)
+		_, _, _, ok := sm.streams.arrivingFrom(block, stranger)
 		require.False(t, ok)
 		require.True(t, sm.streams.lastBlockBytes(owner).IsZero(), "the owner sends nothing")
 		require.False(t, sm.ownerStillSending(block), "so it does not look busy")
@@ -127,7 +127,7 @@ func TestTheStreamRegistryIsSafeToReadWhileStreamsStartAndFinish(t *testing.T) {
 			sm.streams.lastBlockBytes(owner)
 			sm.streams.pending(owner)
 			sm.streams.arriving(block)
-			sm.streams.arrivingStream(block)
+			sm.streams.arrivingFrom(block, owner)
 			sm.streams.arrivingBytes()
 			sm.streams.pickRace(time.Now().Add(time.Minute), 10, 0)
 		}

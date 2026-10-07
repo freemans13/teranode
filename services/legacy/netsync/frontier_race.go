@@ -17,10 +17,12 @@ import (
 // THE FRONTIER RACE, SV Node's rule. A block comes from one peer at a time. When the peer sending
 // the block the chain needs is struggling, delivering under raceStallRate after raceSlowFetchAfter,
 // one other peer is asked for it and the struggling peer is disconnected, as SV Node drops a
-// staller. Disconnecting stops its half-converted copy, so the one extra copy converts instead of
-// being drained as a duplicate. A block is raced at most once: on 2026-09-24 a race that re-armed
-// whenever a copy finished asked three peers for the same 2 GB block and threw all three copies
-// away while a 13 MB/s peer, which was not struggling at all, finished the first.
+// staller. Disconnecting stops its half-converted copy, so the extra copy converts instead of
+// being drained as a duplicate. A block is raced only when every copy of it is struggling, at most
+// once in raceSlowFetchAfter, and only while fewer than maxBlockCopies peers owe it: on 2026-09-24
+// a race that re-armed whenever a copy finished asked three peers for the same 2 GB block and
+// threw all three copies away while a 13 MB/s peer, which was not struggling at all, finished the
+// first.
 //
 // SV Node: DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT is 30 s, DEFAULT_MIN_BLOCK_STALLING_RATE is
 // 100 KB/s.
@@ -54,9 +56,16 @@ const (
 	raceStallRate = 100_000
 	// peerRateWeight is the weight of a peer's newest completed block in its rolling rate.
 	peerRateWeight = 0.5
-	// raceExpiry is how long a block's race mark lasts. It is never cleared sooner, so a block is
-	// raced at most once in that time.
+	// raceExpiry is how long a block's race mark is kept. The mark is when the block's newest
+	// extra copy was asked for; another copy is asked for only after raceSlowFetchAfter, and only
+	// when every copy is late (see maxBlockCopies).
 	raceExpiry = 10 * time.Minute
+	// maxBlockCopies is the most peers that may owe one block at once: the first request and at
+	// most two extra copies, from the race or the queued re-ask. SV Node fetches the first
+	// in-flight block from up to DEFAULT_MAX_BLOCK_PARALLEL_FETCH (3) peers, and asks for another
+	// copy only when every peer it is in flight from is stalling (net/net.h:167,
+	// net/net_processing.cpp:462-499).
+	maxBlockCopies = 3
 	// minRateSample is the least delivery time one rate sample covers. A block that took less is
 	// pooled with the peer's next blocks until together they took this long. A transfer that short
 	// is mostly round trip and buffering: on 2026-10-07 one 1 MB copy read in 5 ms gave a peer a
@@ -352,27 +361,23 @@ func (r *streamRegistry) arriving(h chainhash.Hash) bool {
 	return false
 }
 
-// arrivingStream reports the progress of block h's bytes from one peer that owes it: read so far,
-// its declared size, and when they began. ok is false when none are arriving, or more than one
-// copy is.
-func (r *streamRegistry) arrivingStream(h chainhash.Hash) (read, total int64, start time.Time, ok bool) {
-	if r == nil {
+// arrivingFrom reports the progress of block h's bytes from peer p, which owes it: read so far,
+// its declared size, and when they began. ok is false when none are arriving from p.
+func (r *streamRegistry) arrivingFrom(h chainhash.Hash, p *peerpkg.Peer) (read, total int64, start time.Time, ok bool) {
+	if r == nil || p == nil {
 		return 0, 0, time.Time{}, false
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	n := 0
-
 	for s := range r.active {
-		if s.hash == h && s.owner != nil {
-			read, total, start = s.read.Load(), s.total, s.start
-			n++
+		if s.hash == h && s.owner == p {
+			return s.read.Load(), s.total, s.start, true
 		}
 	}
 
-	return read, total, start, n == 1
+	return 0, 0, time.Time{}, false
 }
 
 // arrivingBytes is the declared size of every block arriving now from a peer that owes it, and how
@@ -437,17 +442,18 @@ func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
 	return r.rateLocked(p)
 }
 
-// wasRaced reports whether h has had its one extra request inside raceExpiry, from the race or
-// from the queued re-ask, which share the mark.
+// wasRaced reports whether h had an extra copy asked for, by the race or by the queued re-ask,
+// which share the mark, less than raceSlowFetchAfter ago. The newest copy then has not had SV
+// Node's slow-fetch time, and no further copy is asked for.
 func (r *streamRegistry) wasRaced(h chainhash.Hash, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.expireRacesLocked(now)
 
-	_, raced := r.raced[h]
+	at, raced := r.raced[h]
 
-	return raced
+	return raced && now.Sub(at) < raceSlowFetchAfter
 }
 
 func (r *streamRegistry) markRaced(h chainhash.Hash, now time.Time) {
@@ -508,10 +514,14 @@ func (r *streamRegistry) expireRacesLocked(now time.Time) {
 	}
 }
 
-// pickRace returns the lowest block above the tip whose one peer is struggling, if the chain will
-// reach it before it arrives. tip is the committed height and commitRate the blocks a second
-// joining the chain; with no rate measured the chain is taken to need the block now.
-func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) (*blockStream, raceCandidate, bool) {
+// pickRace returns the lowest block above the tip whose every copy is struggling, if the chain
+// will reach it before it arrives, and the peers sending those copies. Each copy from a peer that
+// owes the block is judged, as SV Node judges each peer a block is in flight from: one copy
+// younger than raceSlowFetchAfter or at raceStallRate or more keeps the block out of the race.
+// A block whose newest extra copy was asked for less than raceSlowFetchAfter ago is left alone
+// too. tip is the committed height and commitRate the blocks a second joining the chain; with no
+// rate measured the chain is taken to need the block now.
+func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) (*blockStream, raceCandidate, []*peerpkg.Peer, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -522,12 +532,20 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 		bestCand raceCandidate
 	)
 
+	healthy := make(map[chainhash.Hash]bool)
+
 	for s := range r.active {
-		if s.height <= tip || s.owner == nil || now.Sub(s.start) < raceSlowFetchAfter {
+		if s.owner != nil && (now.Sub(s.start) < raceSlowFetchAfter || s.rate(now) >= raceStallRate) {
+			healthy[s.hash] = true
+		}
+	}
+
+	for s := range r.active {
+		if s.height <= tip || s.owner == nil || healthy[s.hash] {
 			continue
 		}
 
-		if _, raced := r.raced[s.hash]; raced {
+		if at, raced := r.raced[s.hash]; raced && now.Sub(at) < raceSlowFetchAfter {
 			continue
 		}
 
@@ -556,7 +574,19 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 		}
 	}
 
-	return best, bestCand, best != nil
+	if best == nil {
+		return nil, raceCandidate{}, nil, false
+	}
+
+	var stalling []*peerpkg.Peer
+
+	for s := range r.active {
+		if s.hash == best.hash && s.owner != nil {
+			stalling = append(stalling, s.owner)
+		}
+	}
+
+	return best, bestCand, stalling, true
 }
 
 // chooseRacer picks who to ask: never an owner, the fastest measured peer first, then the peer
@@ -724,8 +754,15 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 		return
 	}
 
-	s, c, ok := sm.streams.pickRace(now, tip, sm.commitRate.rate())
+	s, c, stalling, ok := sm.streams.pickRace(now, tip, sm.commitRate.rate())
 	if !ok {
+		return
+	}
+
+	owners := sm.blockDownloads.OwnersOf(s.hash)
+	if len(owners) >= maxBlockCopies {
+		sm.logger.Debugf("[frontierRace][%s] block %d is arriving at %.0f KB/s but %d peers already owe it", s.hash, s.height, c.rate/1e3, len(owners))
+
 		return
 	}
 
@@ -740,7 +777,7 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 		candidates = append(candidates, bp.peer)
 	}
 
-	racer := sm.streams.chooseRacer(candidates, sm.blockDownloads.OwnersOf(s.hash), sm.blockDownloads.CountForPeer)
+	racer := sm.streams.chooseRacer(candidates, owners, sm.blockDownloads.CountForPeer)
 	if racer == nil {
 		sm.logger.Debugf("[frontierRace][%s] block %d is arriving at %.0f KB/s but there is no other peer to ask", s.hash, s.height, c.rate/1e3)
 
@@ -751,13 +788,15 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 		return
 	}
 
-	// Dropped as SV Node drops a staller. Its copy stops converting, which frees the block for
-	// the one extra copy; left connected, the extra copy would arrive as a duplicate and be
-	// drained unwritten.
-	s.owner.DisconnectWithInfo(fmt.Sprintf("stalling on block %d at %.0f KB/s", s.height, c.rate/1e3))
+	// Each peer sending a copy is struggling, and each is dropped as SV Node drops a staller. The
+	// copy converting stops, which frees the block for the extra copy; left connected, the extra
+	// copy would arrive as a duplicate and be drained unwritten.
+	for _, p := range stalling {
+		p.DisconnectWithInfo(fmt.Sprintf("stalling on block %d at under %.0f KB/s", s.height, float64(raceStallRate)/1e3))
+	}
 
-	sm.logger.Infof("[frontierRace][%s] asked %s for block %d and dropped %s, which was sending it at %.0f KB/s after %s",
-		s.hash, racer, s.height, s.owner, c.rate/1e3, now.Sub(s.start).Round(time.Second))
+	sm.logger.Infof("[frontierRace][%s] asked %s for block %d and dropped %v, which were sending it at under %.0f KB/s; one at %.0f KB/s after %s",
+		s.hash, racer, s.height, stalling, float64(raceStallRate)/1e3, c.rate/1e3, now.Sub(s.start).Round(time.Second))
 }
 
 // askRacer records racer as a second owner of h and sends it the getdata. Recording first means

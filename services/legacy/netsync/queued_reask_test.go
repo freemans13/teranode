@@ -12,9 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The queued re-ask: the lowest block owed and not yet arriving, held at a peer whose queue
-// will make the chain wait for it, is asked of one other peer that would deliver it at least
-// twice as soon. The owner keeps its request and its connection. A block that is arriving is
+// The queued re-ask: the lowest block owed, held at peers whose queues will make the chain wait
+// for it, is asked of one other peer that would deliver it at least twice as soon as the soonest
+// owner. The owner keeps its request and its connection. A block that is arriving is
 // the race's, never this rule's, so a large block coming in at a healthy rate is never doubled.
 
 const reaskTypicalBlock = 300_000_000
@@ -165,7 +165,8 @@ func TestQueuedReaskNeedsAPeerAtLeastTwiceAsFast(t *testing.T) {
 	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 }
 
-// One extra request per block. A second pass asks nobody else, whoever else is free.
+// One extra request per block while its owners are on time. A second pass judges both owners: the
+// fast peer just asked lands the block soonest, and a peer at 70 MB/s is not twice as soon.
 func TestQueuedReaskAsksOnce(t *testing.T) {
 	sm, owner, fast, _ := reaskSetup(t)
 	third, _ := schedulerPeer(t, sm, 3, 2000)
@@ -179,8 +180,11 @@ func TestQueuedReaskAsksOnce(t *testing.T) {
 	sm.maybeReaskQueuedBlock(now)
 	require.True(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 
+	sm.maybeReaskQueuedBlock(now.Add(10 * time.Second))
+	require.False(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 11)), "the extra copy has its 30 s")
+
 	sm.maybeReaskQueuedBlock(now.Add(time.Minute))
-	require.False(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 11)), "the block has had its one extra request")
+	require.False(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 11)), "the fast owner will land it soonest")
 }
 
 // A block owed by two peers, the owner and the peer the re-ask added, used to stream with no single
