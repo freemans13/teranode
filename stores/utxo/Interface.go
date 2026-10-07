@@ -312,6 +312,7 @@ var (
 	optSkipUTXOHashCheckTrue  CreateOption = func(o *CreateOptions) { o.IgnoreFlags.SkipUTXOHashCheck = true }
 	optSkipUTXOHashCheckFalse CreateOption = func(o *CreateOptions) { o.IgnoreFlags.SkipUTXOHashCheck = false }
 )
+
 // WithTXIDs supplies the txids of a SpendAndCreateMulti list, in the same order,
 // so the store does not rehash each transaction. It is the list form of WithTXID
 // and has no effect on SpendAndCreate.
