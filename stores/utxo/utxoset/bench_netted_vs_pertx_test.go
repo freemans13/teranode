@@ -169,6 +169,9 @@ func mainnetBatcherTune(ts *settings.Settings) {
 	ts.UtxoStore.BatcherMaxConcurrent = 64
 	ts.UtxoStore.GetBatcherSize = 500
 	ts.UtxoStore.GetBatcherDurationMillis = 1
+	// Mainnet runs with utxostore_skipTxBodyBelowCheckpoint=true, so below the checkpoint no
+	// tx_body row is written. Without it the bench pays ~29 us a row that mainnet never pays.
+	ts.UtxoStore.SkipTxBodyBelowCheckpoint = true
 }
 
 func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external map[chainhash.Hash]map[uint32]struct{}, nTx int) {
@@ -207,6 +210,38 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 	t.Logf("[%s] seeded %d external parents in %s", method, len(external), time.Since(seedStart).Round(time.Second))
 
 	perBlock := make([]time.Duration, 0, len(blocks))
+
+	// Postgres's per-table insert and delete counters before and after the timed applies, so the
+	// run reports the net work it did. Partitions are summed under their parent's name. An idle
+	// backend flushes its counters within about a second, hence the pause before each read.
+	countRows := func() map[string]int64 {
+		time.Sleep(3 * time.Second)
+
+		rows, err := s.pool.Query(ctx, `
+SELECT p, sum(n_tup_ins)::bigint, sum(n_tup_del)::bigint FROM (
+  SELECT CASE WHEN relname LIKE 'tx_mined%' AND relname NOT LIKE 'tx_mined_floor%' AND relname NOT LIKE 'tx_mined_stamped%' THEN 'tx_mined'
+              WHEN relname LIKE 'tx_body%' THEN 'tx_body'
+              WHEN relname LIKE 'spend_journal%' THEN 'spend_journal'
+              WHEN relname LIKE 'tx_ident%' THEN 'tx_ident'
+              WHEN relname = 'utxo' OR relname LIKE 'utxo\_p%' THEN 'utxo' END AS p, n_tup_ins, n_tup_del
+  FROM pg_stat_user_tables) x WHERE p IS NOT NULL GROUP BY p`)
+		require.NoError(t, err)
+		defer rows.Close()
+
+		out := map[string]int64{}
+		for rows.Next() {
+			var name string
+			var ins, del int64
+			require.NoError(t, rows.Scan(&name, &ins, &del))
+			out[name+".ins"] = ins
+			out[name+".del"] = del
+		}
+		require.NoError(t, rows.Err())
+
+		return out
+	}
+
+	rowsBefore := countRows()
 
 	// Write-ahead log volume over the timed applies only: the seed above is excluded.
 	var walStart string
@@ -300,6 +335,14 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 
 	t.Logf("[%s] WAL bytes=%d bytes_per_block=%d bytes_per_tx=%d", method, walBytes, walBytes/int64(len(blocks)), walBytes/int64(nTx))
 	t.Logf("[%s] WALRANGE %s %s", method, walStart, walEnd)
+
+	rowsAfter := countRows()
+	d := func(k string) int64 { return rowsAfter[k] - rowsBefore[k] }
+	netRows := d("tx_mined.ins") + d("utxo.ins") + d("utxo.del") + d("tx_body.ins") + d("spend_journal.ins") + d("tx_ident.ins")
+
+	t.Logf("[%s] NETWORK txs=%d mined_records=%d coin_inserts=%d coin_deletes=%d bodies=%d journal=%d ident=%d net_rows=%d us_per_tx=%.1f us_per_net_row=%.1f",
+		method, nTx, d("tx_mined.ins"), d("utxo.ins"), d("utxo.del"), d("tx_body.ins"), d("spend_journal.ins"), d("tx_ident.ins"), netRows,
+		float64(applyTotal.Microseconds())/float64(nTx), float64(applyTotal.Microseconds())/float64(max(netRows, 1)))
 
 	sorted := append([]time.Duration(nil), perBlock...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
