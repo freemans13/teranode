@@ -75,7 +75,11 @@ const (
 // ownerRecord is what one peer owes us for one block.
 type ownerRecord struct {
 	// at is when we last asked, and what the ownership ceiling is measured from.
+	// ReassertOwner moves it forward and ForgiveOwners back-dates it, for the retry window.
 	at time.Time
+	// asked is when the getdata for this record went out. Only Add sets it, the only path that
+	// sends one, so it is the time a peer could start the block (RequestedOf, couldStart).
+	asked time.Time
 	// seq orders this peer's requests as they went out: a peer answers getdata
 	// in the order it was asked (SV Node's ProcessGetData, one block at a time,
 	// first asked first sent), so the record with the lowest seq among a peer's
@@ -241,7 +245,7 @@ func (t *blockDownloadTracker) Add(p *peerpkg.Peer, h chainhash.Hash) bool {
 	}
 
 	t.seq++
-	owners[p] = ownerRecord{at: now, seq: t.seq}
+	owners[p] = ownerRecord{at: now, asked: now, seq: t.seq}
 
 	hashes := t.byPeer[p]
 	if hashes == nil {
@@ -646,8 +650,9 @@ func (t *blockDownloadTracker) AnyOwner(h chainhash.Hash, pred func(*peerpkg.Pee
 	return false
 }
 
-// RequestedOf is when p was last asked for h, and whether p owes it. A forgiven record reads at its
-// back-dated time (ForgiveOwners).
+// RequestedOf is when the getdata that p owes h for went out, and whether p owes it. Neither
+// ReassertOwner, which sends nothing, nor ForgiveOwners' back-dating moves it: couldStart times
+// the block from it, and a later time made the block look started later and delivered faster.
 func (t *blockDownloadTracker) RequestedOf(p *peerpkg.Peer, h chainhash.Hash) (time.Time, bool) {
 	if t == nil {
 		return time.Time{}, false
@@ -658,7 +663,7 @@ func (t *blockDownloadTracker) RequestedOf(p *peerpkg.Peer, h chainhash.Hash) (t
 
 	rec, ok := t.byHash[h][p]
 
-	return rec.at, ok
+	return rec.asked, ok
 }
 
 // RequestedAt is when a request for h was first recorded, across every peer that owes it, so a
