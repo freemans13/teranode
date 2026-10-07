@@ -193,9 +193,22 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 		return false, nil
 	}
 
-	root, mutated, err := streamedMerkleRoot(bufio.NewReaderSize(f, 1<<20), n)
+	// The side file is on this node's disk, so a failed read of it is ours and never the peer's.
+	// The block stream returns the bare *fs.PathError (countingSource), which isLocalSinkFault
+	// does not know as ours, and the read loop then rejected and disconnected the peer. The
+	// recorder tells a read fault from a body the peer got wrong.
+	side := sm.readSideCopy(f)
+
+	root, mutated, err := streamedMerkleRoot(bufio.NewReaderSize(side, 1<<20), n)
 	if err != nil {
-		return false, err
+		if side.err == nil {
+			return false, err
+		}
+
+		sm.logger.Warnf("[blockOnDisk][%s] could not read a second copy back from disk, dropping it: %v", hash, side.err)
+		sm.noteDrainedDuplicate(hash)
+
+		return false, nil
 	}
 
 	if !root.IsEqual(&header.MerkleRoot) {
@@ -234,7 +247,43 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 	sm.streams.setStreamPath(r, admitKeptFaster)
 	sm.logger.Infof("[blockOnDisk][%s] a second copy completed before the copy being converted; converting it from disk", hash)
 
-	return convert(hash, header, bufio.NewReaderSize(f, 1<<20), n)
+	side = sm.readSideCopy(f)
+
+	converted, err := convert(hash, header, bufio.NewReaderSize(side, 1<<20), n)
+	if err != nil && side.err != nil {
+		// The copy that started first has stopped, so the block is not held. A storage error is
+		// this node's fault (isLocalSinkFault): absorbLocalSinkFault keeps the peer and the
+		// block is asked for again.
+		return false, errors.NewStorageError("[blockOnDisk][%s] could not read a second copy back from disk", hash, side.err)
+	}
+
+	return converted, err
+}
+
+// readSideCopy reads a side file through a recorder of its read errors (errRecordingReader).
+func (sm *SyncManager) readSideCopy(f io.Reader) *errRecordingReader {
+	var r io.Reader = f
+	if sm.sideCopyReader != nil {
+		r = sm.sideCopyReader(f)
+	}
+
+	return &errRecordingReader{r: r}
+}
+
+// errRecordingReader remembers the first error its reader returned other than io.EOF, so a failed
+// read of a local file can be told apart from a body the peer got wrong.
+type errRecordingReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errRecordingReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+
+	return n, err
 }
 
 // streamedMerkleRoot reads a block body, from the transaction count on, whose wire payload is n

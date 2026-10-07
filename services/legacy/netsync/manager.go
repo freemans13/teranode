@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"net/url"
@@ -742,8 +743,11 @@ type SyncManager struct {
 	localFaultDrains map[chainhash.Hash]int
 	// conversions is the conversion in progress for each block, so a faster copy can take it
 	// over (conversion_race.go).
-	conversionsMu    sync.Mutex
-	conversions      map[chainhash.Hash]*conversionCtl
+	conversionsMu sync.Mutex
+	conversions   map[chainhash.Hash]*conversionCtl
+	// sideCopyReader wraps each read of a side file (raceDuplicateCopy), so a test can make the
+	// disk fail part way. nil reads the file as it is; nothing in production sets it.
+	sideCopyReader   func(io.Reader) io.Reader
 	inFlightBlocksMu sync.Mutex
 
 	// blockPrefetchWaiters counts read-loops currently blocked acquiring a
