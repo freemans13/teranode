@@ -219,3 +219,44 @@ func TestAPeerSendingABlockTwoPeersOweIsNotQuiet(t *testing.T) {
 	_, err := sink(block, &wire.BlockHeader{}, bytes.NewReader(nil), 0)
 	require.NoError(t, err)
 }
+
+// A block arriving at a steady rate above the race's 100 KB/s floor is still re-asked when it
+// will be late and a fresh copy from another peer, started from the first byte, would land in
+// half the time. On 2026-10-07 a peer at 1.9 MB/s had 1,083 MB left of a block while peers at 26
+// to 38 MB/s carried the rest. The owner keeps its copy; whichever completes first is converted.
+func TestQueuedReaskAsksForASlowArrivingBlockThatWillBeLate(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	next := heightHash(t, sm, 11)
+	askAt(t, sm, owner, next, now.Add(-2*time.Minute))
+
+	s := sm.streams.start(next, 11, owner, 1_083_000_000, now.Add(-95*time.Second))
+	s.read.Store(180_000_000)
+
+	sm.maybeReaskQueuedBlock(now)
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "1.9 MB/s with 903 MB left: 475 s, against about 14 s for a fresh copy")
+	require.True(t, sm.blockDownloads.HasOwner(owner, next), "and the owner keeps its copy")
+	require.True(t, owner.Connected())
+}
+
+// A block arriving at a healthy rate is not re-asked when a fresh copy would not land in half
+// the time, however late it is.
+func TestQueuedReaskLeavesAnArrivingBlockAFreshCopyWouldNotBeat(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	next := heightHash(t, sm, 11)
+	askAt(t, sm, owner, next, now.Add(-2*time.Minute))
+
+	// 2 GB at 30 MB/s, 1.05 GB in after 35 s: 32 s to go. A fresh copy at 80 MB/s needs 25 s,
+	// not half of 32.
+	sm.streams.rates[owner] = 30_000_000
+	s := sm.streams.start(next, 11, owner, 2_000_000_000, now.Add(-10*time.Second))
+	s.read.Store(1_050_000_000)
+
+	sm.maybeReaskQueuedBlock(now.Add(25 * time.Second))
+
+	require.False(t, sm.blockDownloads.HasOwner(fast, next))
+}

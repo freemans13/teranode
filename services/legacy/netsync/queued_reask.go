@@ -64,11 +64,7 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 	queues := sm.blockDownloads.Queues()
 
 	block, owner, height, found := sm.lowestOwedBlock(queues, tip)
-	if !found || sm.streams.arriving(block.hash) || sm.streams.wasRaced(block.hash, now) {
-		return
-	}
-
-	if now.Sub(block.at) < raceSlowFetchAfter {
+	if !found || sm.streams.wasRaced(block.hash, now) {
 		return
 	}
 
@@ -76,16 +72,46 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 		return
 	}
 
-	ownerRate := sm.streams.peerRate(owner)
-	if ownerRate <= 0 {
-		ownerRate = sm.streams.medianRate()
-	}
+	// When it lands at its owner, and the size a fresh copy elsewhere would have to fetch.
+	var (
+		ownerETA time.Duration
+		ownSize  = typical
+		state    = "waits behind"
+	)
 
-	if ownerRate <= 0 {
-		return
-	}
+	if read, total, start, arriving := sm.streams.arrivingStream(block.hash); arriving {
+		// Arriving: judged on its own rate. Under the race's floor it is the race's, which
+		// drops the owner. A fresh copy must fetch the whole block, which is what keeps a
+		// large block at a healthy rate from ever being doubled.
+		elapsed := now.Sub(start)
+		if elapsed < raceSlowFetchAfter || read <= 0 {
+			return
+		}
 
-	ownerETA := sm.queuedArrival(owner, queues[owner], block.seq, typical, ownerRate)
+		rate := float64(read) / elapsed.Seconds()
+		if rate < raceStallRate {
+			return
+		}
+
+		ownerETA = time.Duration(float64(total-read) / rate * float64(time.Second))
+		ownSize = total
+		state = "arrives slowly from"
+	} else {
+		if now.Sub(block.at) < raceSlowFetchAfter {
+			return
+		}
+
+		ownerRate := sm.streams.peerRate(owner)
+		if ownerRate <= 0 {
+			ownerRate = sm.streams.medianRate()
+		}
+
+		if ownerRate <= 0 {
+			return
+		}
+
+		ownerETA = sm.queuedArrival(owner, queues[owner], block.seq, typical, typical, ownerRate)
+	}
 
 	var need time.Duration
 	if rate := sm.commitRate.rate(); rate > 0 {
@@ -96,7 +122,7 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 		return
 	}
 
-	racer, racerETA := sm.soonestOtherPeer(queues, owner, height, typical)
+	racer, racerETA := sm.soonestOtherPeer(queues, owner, height, typical, ownSize)
 	if racer == nil || racerETA*queuedReaskFasterBy > ownerETA {
 		return
 	}
@@ -107,8 +133,8 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 
 	sm.waste.reAskedQueued.Add(1)
 
-	sm.logger.Infof("[queuedReask][%s] block %d, asked %s ago, waits behind %s's queue: estimated %s there against %s at %s; the chain needs it in %s, so %s was asked too and %s keeps its request",
-		block.hash, height, now.Sub(block.at).Round(time.Second), owner, ownerETA.Round(time.Second), racerETA.Round(time.Second), racer,
+	sm.logger.Infof("[queuedReask][%s] block %d, asked %s ago, %s %s: estimated %s there against %s at %s; the chain needs it in %s, so %s was asked too and %s keeps its request",
+		block.hash, height, now.Sub(block.at).Round(time.Second), state, owner, ownerETA.Round(time.Second), racerETA.Round(time.Second), racer,
 		need.Round(time.Second), racer, owner)
 }
 
@@ -134,7 +160,9 @@ func (sm *SyncManager) lowestOwedBlock(queues map[*peerpkg.Peer][]queuedBlock, t
 				continue
 			}
 
-			if sm.blockPark.Has(b.hash) || sm.blockCommitting(b.hash) || sm.conversionInFlight(b.hash) {
+			// Held: parked, committing, or converting a complete copy. A block converting as it
+			// arrives is not held yet; it is the one to judge.
+			if sm.blockPark.Has(b.hash) || sm.blockCommitting(b.hash) || (sm.conversionInFlight(b.hash) && !sm.streams.arriving(b.hash)) {
 				continue
 			}
 
@@ -151,7 +179,7 @@ func (sm *SyncManager) lowestOwedBlock(queues map[*peerpkg.Peer][]queuedBlock, t
 // now, one typical block for each block queued ahead of it (before seq) and not yet arriving,
 // and the block's own typical size, at rate. A seq of zero puts the block at the back of the
 // queue, as a new request is.
-func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq uint64, typical int64, rate float64) time.Duration {
+func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq uint64, typical, ownSize int64, rate float64) time.Duration {
 	sending, _ := sm.streams.pending(p)
 
 	var queued int64
@@ -168,7 +196,7 @@ func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq u
 		queued++
 	}
 
-	bytes := float64(sending + queued*typical + typical)
+	bytes := float64(sending + queued*typical + ownSize)
 
 	return time.Duration(bytes / rate * float64(time.Second))
 }
@@ -176,7 +204,7 @@ func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq u
 // soonestOtherPeer is the eligible peer, other than owner, that would deliver a block at height
 // soonest with it added at the back of its queue. A peer with no measured rate is not chosen:
 // its estimate would be a guess.
-func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owner *peerpkg.Peer, height int32, typical int64) (*peerpkg.Peer, time.Duration) {
+func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owner *peerpkg.Peer, height int32, typical, ownSize int64) (*peerpkg.Peer, time.Duration) {
 	var (
 		best    *peerpkg.Peer
 		bestETA time.Duration
@@ -196,7 +224,7 @@ func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, 
 			continue
 		}
 
-		eta := sm.queuedArrival(bp.peer, queues[bp.peer], 0, typical, rate)
+		eta := sm.queuedArrival(bp.peer, queues[bp.peer], 0, typical, ownSize, rate)
 		if best == nil || eta < bestETA {
 			best, bestETA = bp.peer, eta
 		}
