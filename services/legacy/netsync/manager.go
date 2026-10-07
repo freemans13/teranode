@@ -2841,18 +2841,28 @@ func (sm *SyncManager) fillHeaderCacheAt(peer *peerpkg.Peer, msg *wire.MsgHeader
 }
 
 // headerOwnerLive reports whether owner, a header cache branch key, is still a
-// peer this manager tracks. handleDonePeerMsg removes the peer from peerStates
-// before it drops the peer's branch, so a fill that installs after that sees
-// the peer gone and installs nothing (headerCache.ownerLive).
-func (sm *SyncManager) headerOwnerLive(owner any) bool {
+// peer this manager tracks and may still ask for headers at the committed
+// height committed (mayAskForHeaders). handleDonePeerMsg removes the peer from
+// peerStates before it drops the peer's branch, and demoteSyncPeer clears the
+// sync peer before it drops an inbound fallback's branch, so a fill that
+// installs after either sees the peer gone or no longer askable and installs
+// nothing (headerCache.ownerLive). Checking only peerStates let a fill that was
+// running when an inbound fallback was demoted give it its branch back, so one
+// inbound branch was not a hard bound.
+//
+// Called with the header cache's locks held: mayAskForHeaders reads only the
+// peer map and the sync peer, and makes no blockchain call.
+func (sm *SyncManager) headerOwnerLive(owner any, committed int32) bool {
 	peer, ok := owner.(*peerpkg.Peer)
 	if !ok || sm.peerStates == nil {
 		return true
 	}
 
-	_, exists := sm.peerStates.Get(peer)
+	if _, exists := sm.peerStates.Get(peer); !exists {
+		return false
+	}
 
-	return exists
+	return sm.mayAskForHeaders(peer, committed)
 }
 
 // headerOwner is the key of peer's branch in the header cache: the primary

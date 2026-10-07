@@ -10,6 +10,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
@@ -180,6 +181,28 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 		return false, nil
 	}
 
+	// The side copy's merkle root is checked before it stops the copy converting now. A block can
+	// have two owners (ForgiveOwners keeps a forgiven owner), and an owner's corrupt copy used to
+	// take over an honest conversion, fail its own root check after the honest copy had stopped,
+	// and leave the block to be asked for again. The check reads the side file once more, the
+	// same transactions the sink would hash, keeping O(log n) hashes.
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		sm.logger.Warnf("[blockOnDisk][%s] could not reread a second copy from disk, dropping it: %v", hash, err)
+		sm.noteDrainedDuplicate(hash)
+
+		return false, nil
+	}
+
+	root, err := streamedMerkleRoot(bufio.NewReaderSize(f, 1<<20), n)
+	if err != nil {
+		return false, err
+	}
+
+	if !root.IsEqual(&header.MerkleRoot) {
+		// The marker as the sink raises it for the same verdict (pipelineBlockSink).
+		return false, errors.NewBlockInvalidError("[blockOnDisk][%s] a second copy's merkle root %s does not match header's %s; the copy converting now keeps the block", hash, root, header.MerkleRoot, errors.ErrBlockBodyMismatch)
+	}
+
 	if !ctl.takeOver() {
 		// The copy that started first has read its last transaction: it wins.
 		sm.noteDrainedDuplicate(hash)
@@ -204,6 +227,77 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 	sm.logger.Infof("[blockOnDisk][%s] a second copy completed before the copy being converted; converting it from disk", hash)
 
 	return convert(hash, header, bufio.NewReaderSize(f, 1<<20), n)
+}
+
+// streamedMerkleRoot reads a block body, from the transaction count on, whose wire payload is n
+// bytes with the header, and returns its merkle root. It holds one transaction and O(log n) hashes
+// at a time: SV Node's ComputeMerkleRoot arithmetic (consensus/merkle.cpp:47-157),
+// which hashes the last node of an odd level with itself. A body that does not parse, or that is
+// longer or shorter than declared, is refused as the sink refuses it (blockTxStream).
+func streamedMerkleRoot(r io.Reader, n int64) (*chainhash.Hash, error) {
+	stream, err := newBlockTxStream(r, n-wire.MaxBlockHeaderPayload)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		inner [64]chainhash.Hash
+		count uint64
+	)
+
+	join := func(left, right chainhash.Hash) chainhash.Hash {
+		var buf [2 * chainhash.HashSize]byte
+
+		copy(buf[:chainhash.HashSize], left[:])
+		copy(buf[chainhash.HashSize:], right[:])
+
+		return chainhash.DoubleHashH(buf[:])
+	}
+
+	for {
+		_, txHash, nextErr := stream.Next()
+		if errors.Is(nextErr, errBlockTxStreamDone) {
+			break
+		}
+
+		if nextErr != nil {
+			return nil, nextErr
+		}
+
+		h := *txHash
+		count++
+
+		level := 0
+		for ; count&(1<<level) == 0; level++ {
+			h = join(inner[level], h)
+		}
+
+		inner[level] = h
+	}
+
+	if err = stream.RequireEnd(); err != nil {
+		return nil, err
+	}
+
+	level := 0
+	for count&(1<<level) == 0 {
+		level++
+	}
+
+	h := inner[level]
+
+	for count != 1<<level {
+		h = join(h, h)
+		count += 1 << level
+		level++
+
+		for count&(1<<level) == 0 {
+			h = join(inner[level], h)
+			level++
+		}
+	}
+
+	return &h, nil
 }
 
 // deliveringPeerOwes reports whether the peer r's bytes come from is one the download ledger says
