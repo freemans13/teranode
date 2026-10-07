@@ -399,6 +399,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 // outpoint set, so a spend needs nothing but the outpoint to be authorised.
 func (s *Store) SupportsOutpointOnlySpend() bool { return true }
 
+// NetsBelowCheckpoint is true: SpendAndCreateMulti writes a below-checkpoint outpoint-only list
+// through the order-free netted write, with no spend-journal rows (netted_below.go).
+func (s *Store) NetsBelowCheckpoint() bool { return true }
+
 // SetBlockHeight records the chain height.
 //
 // It deliberately does NOT decide whether spends are reversible. An earlier version of

@@ -241,7 +241,7 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 			batchEnd:   2,
 		}
 
-		// The batch is one netted list; through the mock's per-transaction default each
+		// The batch is one list; through the mock's per-transaction default each
 		// transaction is one combined call, which succeeds (no ErrTxExists).
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCombined()).
 			Return(&meta.Data{}, []*utxo.Spend{}, nil).Maybe()
@@ -571,20 +571,18 @@ func matchCreateOnly() interface{} {
 	return mock.MatchedBy(func(opts []utxo.CreateOption) bool { return parseCreateOptions(opts).CreateOnly })
 }
 
-// matchSpendOnly matches the spend-phase SpendAndCreate call (WithSpendOnly).
-func matchSpendOnly() interface{} {
-	return mock.MatchedBy(func(opts []utxo.CreateOption) bool { return parseCreateOptions(opts).SpendOnly })
-}
-
-// matchCombined matches the one-wave SpendAndCreate call: neither half suppressed, so the
-// store spends the transaction's inputs and creates its outputs in one go. Transactions with
-// no parent in this block take this call instead of the create/spend pair.
+// matchCombined matches a SpendAndCreate call that both spends and creates, as the batch
+// list's per-transaction default makes.
 func matchCombined() interface{} {
 	return mock.MatchedBy(func(opts []utxo.CreateOption) bool {
 		o := parseCreateOptions(opts)
-
 		return !o.CreateOnly && !o.SpendOnly
 	})
+}
+
+// matchSpendOnly matches the spend-phase SpendAndCreate call (WithSpendOnly).
+func matchSpendOnly() interface{} {
+	return mock.MatchedBy(func(opts []utxo.CreateOption) bool { return parseCreateOptions(opts).SpendOnly })
 }
 
 // countCombinedCalls counts recorded SpendAndCreate calls with neither half suppressed.
@@ -668,6 +666,7 @@ func assertCreatedLocked(t *testing.T, m *utxo.MockUtxostore, wantLocked bool) {
 		opts, ok := c.Arguments.Get(3).([]utxo.CreateOption)
 		require.True(t, ok, "SpendAndCreate 4th arg should be []utxo.CreateOption")
 		o := parseCreateOptions(opts)
+		// A create-phase call, or a list's combined call, which creates too.
 		if o.SpendOnly {
 			continue // this call creates nothing
 		}
@@ -690,6 +689,7 @@ func assertCreatedSkipExtended(t *testing.T, m *utxo.MockUtxostore, want bool) {
 		opts, ok := c.Arguments.Get(3).([]utxo.CreateOption)
 		require.True(t, ok, "SpendAndCreate 4th arg should be []utxo.CreateOption")
 		o := parseCreateOptions(opts)
+		// A create-phase call, or a list's combined call, which creates too.
 		if o.SpendOnly {
 			continue // this call creates nothing
 		}
@@ -712,6 +712,7 @@ func assertSpentSkipUTXOHashCheck(t *testing.T, m *utxo.MockUtxostore, want bool
 		opts, ok := c.Arguments.Get(3).([]utxo.CreateOption)
 		require.True(t, ok, "SpendAndCreate 4th arg should be []utxo.CreateOption")
 		o := parseCreateOptions(opts)
+		// A spend-phase call, or a list's combined call, which spends too.
 		if o.CreateOnly {
 			continue // this call spends nothing
 		}

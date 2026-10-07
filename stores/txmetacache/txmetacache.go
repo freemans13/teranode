@@ -899,6 +899,11 @@ func (t *TxMetaCache) SupportsOutpointOnlySpend() bool {
 	return t.utxoStore.SupportsOutpointOnlySpend()
 }
 
+// NetsBelowCheckpoint forwards the wrapped store's answer.
+func (t *TxMetaCache) NetsBelowCheckpoint() bool {
+	return utxo.NetsBelowCheckpoint(t.utxoStore)
+}
+
 // Close delegates to the wrapped UTXO store so its in-flight batched writes
 // are drained on shutdown. The cache itself holds only in-memory state; no
 // extra teardown is required here beyond letting it be garbage-collected

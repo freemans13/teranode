@@ -135,6 +135,11 @@ func (s *Store) SupportsOutpointOnlySpend() bool {
 	return s.store.SupportsOutpointOnlySpend()
 }
 
+// NetsBelowCheckpoint forwards the wrapped store's answer.
+func (s *Store) NetsBelowCheckpoint() bool {
+	return utxo.NetsBelowCheckpoint(s.store)
+}
+
 func (s *Store) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	s.logger.Debugf("[UTXOStore][logger][Health] : %s", caller())
 	return s.store.Health(ctx, checkLiveness)

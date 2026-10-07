@@ -74,6 +74,14 @@ func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeig
 		return []utxo.SpendAndCreateMultiResult{}, nil
 	}
 
+	if below, err := s.nettedBelowGate(list.Options); below {
+		if err != nil {
+			return nil, err
+		}
+
+		return s.netBelow(ctx, txs, list, blockHeight)
+	}
+
 	if !s.canNet(list.Options) {
 		return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiConcurrency(s.settings), txs, blockHeight, opts...)
 	}
