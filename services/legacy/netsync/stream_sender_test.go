@@ -143,3 +143,27 @@ func TestTheStreamRegistryIsSafeToReadWhileStreamsStartAndFinish(t *testing.T) {
 
 	require.Positive(t, sm.streams.peerRate(owner), "the owner's streams were measured")
 }
+
+// Only a converted copy from a peer that owes the block is a block size. An owed copy that is
+// drained, because another copy converted the block, would count the block twice.
+func TestOnlyAConvertedOwedCopySetsTheBlockSize(t *testing.T) {
+	sm, owner, _, _ := reaskSetup(t)
+	now := time.Now()
+
+	block := heightHash(t, sm, 11)
+	askAt(t, sm, owner, block, now.Add(-time.Minute))
+
+	drained := sm.trackBlockStreams(drainingSink(nil))
+	_, err := drained(block, &wire.BlockHeader{}, peerpkg.NewDeliveryReader(bytes.NewReader(make([]byte, 64)), owner), 2_000_000_000)
+	require.NoError(t, err)
+	require.Equal(t, int64(reaskTypicalBlock), sm.blockSizeTracker.largestRecentSize(), "a drained copy sets no size")
+
+	converted := sm.trackBlockStreams(func(_ chainhash.Hash, _ *wire.BlockHeader, r io.Reader, _ int64) (bool, error) {
+		_, err := io.Copy(io.Discard, r)
+
+		return true, err
+	})
+	_, err = converted(block, &wire.BlockHeader{}, peerpkg.NewDeliveryReader(bytes.NewReader(make([]byte, 64)), owner), 2_000_000_000)
+	require.NoError(t, err)
+	require.Equal(t, int64(2_000_000_000), sm.blockSizeTracker.largestRecentSize(), "the converted copy does")
+}

@@ -682,9 +682,10 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 
 		// The size ladder and the queue estimate read the average block size. Only the path
 		// that decodes a whole block used to feed it, and with the park on that path never
-		// runs, so every block has to feed it here. Only a copy from a peer that owes the
-		// block: any peer can declare any size for a block it was not asked for.
-		if complete && s.owner != nil && sm.blockSizeTracker != nil {
+		// runs, so every block has to feed it here. Only a converted copy from a peer that
+		// owes the block: any peer can declare any size for a block it was not asked for, and a
+		// drained copy of a block another copy converted would count that block twice.
+		if complete && converted && s.owner != nil && sm.blockSizeTracker != nil {
 			sm.blockSizeTracker.addBlockSize(n)
 		}
 
@@ -896,6 +897,7 @@ func (sm *SyncManager) logSchedulerQueues() {
 	eligible := sm.eligibleBlockPeers()
 	idle, short := 0, 0
 	depth := sm.streamingPeerDepth()
+	warming := sm.downloadWarming(time.Now())
 	var fastest float64
 	for _, bp := range eligible {
 		fastest = max(fastest, sm.streams.peerRate(bp.peer))
@@ -905,7 +907,7 @@ func (sm *SyncManager) logSchedulerQueues() {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
 		remaining, sending := sm.streams.pending(bp.peer)
 
-		peerDepth := sm.peerQueueDepth(bp.peer, depth, fastest)
+		peerDepth := sm.peerQueueDepth(bp.peer, depth, fastest, warming)
 
 		if owed == 0 && sending == 0 {
 			idle++

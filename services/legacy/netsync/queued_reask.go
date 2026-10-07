@@ -8,12 +8,13 @@ import (
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
-// THE QUEUED RE-ASK. The race judges a block whose bytes are arriving; this judges the one whose
-// bytes have not started because it sits behind other blocks at its owner. A peer sends its
-// queue in order, so a block asked of a slow peer early can become the block the chain needs
-// while that peer is still busy with the ones ahead of it. The peer is neither struggling on the
-// block, which has not started, nor quiet, because it is sending, so neither the race nor the
-// quiet-owner re-ask moves it. On 2026-10-07 block 705,725 waited 18 minutes 40 seconds for its
+// THE QUEUED RE-ASK. The race judges a block whose bytes arrive under 100 KB/s; this judges the
+// block the chain needs next when its owners will deliver it too late, whether its bytes have not
+// started because it sits behind other blocks at its owner, or arrive at 100 KB/s or more but
+// too slowly. A peer sends its queue in order, so a block asked of a slow peer early can become
+// the block the chain needs while that peer is still busy with the ones ahead of it. The peer is
+// neither struggling on the block, which has not started, nor quiet, because it is sending, so
+// neither the race nor the quiet-owner re-ask moves it. On 2026-10-07 block 705,725 waited 18 minutes 40 seconds for its
 // first byte at a peer delivering 3.5 MB/s, with the chain stopped behind it; asked of another
 // peer, it arrived in 8 seconds.
 //
@@ -22,18 +23,21 @@ import (
 // from the request, as SV Node's does, for DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT (30 s, the
 // race's raceSlowFetchAfter). Where it parts from SV Node is the test after that: SV Node asks
 // another peer only when the owner's whole block bandwidth is under 100 KB/s, which a busy peer
-// at 3.5 MB/s never is. Here the test is whether the block will be late. Its arrival at the
-// owner is estimated as the bytes still to come on what the owner is sending now, plus one
-// typical block for each block queued ahead of it, plus its own typical size, at the owner's
-// measured rate. If that is after the chain will need it, the fastest other peer is asked too,
-// but only if the same estimate for that peer, with the block at the back of its queue, is at
-// most half the owner's.
-//
-// It never looks at a block whose bytes are arriving. That is the race's, which judges the
-// block's own rate. A plain timer on an arriving block fired for every large block: a 4 GB
-// block at 40 MB/s takes 100 seconds, and each one was downloaded twice. The block's own size
-// counts the same against both peers here, so a large block alone never makes a second peer look
-// faster; only a long queue ahead of it at a slow peer does.
+// at 3.5 MB/s never is. Here the test is whether the block will be late, judged one of two ways
+// for each owner (ownerArrival):
+//   - Queued, its bytes not started: the bytes still to come on every copy the owner is sending,
+//     plus one typical block for each block queued ahead of it, plus its own typical size, at the
+//     owner's measured rate. A fresh copy elsewhere is costed at the typical size too, so the
+//     block's size counts the same against both peers, and only a long queue ahead of it at a
+//     slow owner makes another peer look faster.
+//   - Arriving at raceStallRate or more for raceSlowFetchAfter: its remaining bytes at its own
+//     rate, against a fresh copy elsewhere that must fetch its whole declared size from the
+//     first byte. That is what keeps a large block at a healthy rate from being doubled: a plain
+//     timer on an arriving block fired for every large block, and a 4 GB block at 40 MB/s,
+//     100 seconds, was downloaded twice each time. Under raceStallRate the block is the race's.
+// If the soonest owner lands it after the chain will need it, the soonest other peer is asked
+// too, but only if the same estimate for that peer, with the block at the back of its queue, is
+// at most half the owner's.
 //
 // The owner keeps its request and its connection: it is working, and dropping it would lose
 // every block it is sending. Whichever copy lands first converts; the other is drained at the

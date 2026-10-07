@@ -14,8 +14,9 @@ import (
 
 // The queued re-ask: the lowest block owed, held at peers whose queues will make the chain wait
 // for it, is asked of one other peer that would deliver it at least twice as soon as the soonest
-// owner. The owner keeps its request and its connection. A block that is arriving is
-// the race's, never this rule's, so a large block coming in at a healthy rate is never doubled.
+// owner. The owner keeps its request and its connection. A block arriving under 100 KB/s is the
+// race's. One arriving faster is judged on its own rate against a fresh copy of the whole block,
+// so a large block coming in at a healthy rate is never doubled.
 
 const reaskTypicalBlock = 300_000_000
 

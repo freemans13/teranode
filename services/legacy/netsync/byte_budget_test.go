@@ -498,10 +498,10 @@ func TestASinglePeerWarmsUpOnItsOwnMeasurement(t *testing.T) {
 	sm.streams = newStreamRegistry()
 
 	p, _ := schedulerPeer(t, sm, 1, 1000)
-	require.True(t, sm.downloadWarming(), "unmeasured")
+	require.True(t, sm.downloadWarming(time.Now()), "unmeasured")
 
 	sm.streams.rates[p] = float64(10 * qMB)
-	require.False(t, sm.downloadWarming(), "its one peer is measured")
+	require.False(t, sm.downloadWarming(time.Now()), "its one peer is measured")
 }
 
 // The queue is sized on the largest recent block, not the average. Sizes vary a hundredfold at
@@ -532,4 +532,44 @@ func TestTheQueueIsSizedOnTheLargestRecentBlock(t *testing.T) {
 	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second))
 	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 4 }, 300*time.Millisecond),
 		"ten seconds at 40 MB/s is less than one 2 GB block, so two each, not the cap the average would give")
+}
+
+// The largest recent block is the largest of the last hundred, not the last ten: ten small blocks
+// pushed a 1.8 GB block out of a ten-block window within 90 seconds on mainnet. Twenty 20 MB
+// blocks after a 2 GB one still leave a 40 MB/s peer at two blocks; a hundred do not.
+func TestTheQueueRemembersALargeBlockForAHundredBlocks(t *testing.T) {
+	sm, a, _, _, _ := budgetManager(t)
+	sm.streams.rates[a] = float64(40 * qMB)
+
+	recentBlocks(sm, 2<<30)
+
+	for range 20 {
+		sm.blockSizeTracker.addBlockSize(20 * qMB)
+	}
+
+	require.Equal(t, 2, sm.peerQueueDepth(a, 16, 0, false), "the 2 GB block is 21 blocks back")
+
+	for range 80 {
+		sm.blockSizeTracker.addBlockSize(20 * qMB)
+	}
+
+	require.Equal(t, 16, sm.peerQueueDepth(a, 16, 0, false), "a hundred small blocks later it is gone")
+}
+
+// The warm-up ends after downloadWarmupLimit even when too few peers are ever measured.
+func TestTheWarmUpEndsAfterAMinute(t *testing.T) {
+	sm := schedulerManager(t)
+	sm.streams = newStreamRegistry()
+
+	measured, _ := schedulerPeer(t, sm, 1, 1000)
+	schedulerPeer(t, sm, 2, 1000)
+	schedulerPeer(t, sm, 3, 1000)
+	schedulerPeer(t, sm, 4, 1000)
+	sm.streams.rates[measured] = float64(10 * qMB)
+
+	now := time.Now()
+	require.True(t, sm.downloadWarming(now), "one of four peers measured")
+	require.True(t, sm.downloadWarming(now.Add(59*time.Second)))
+	require.False(t, sm.downloadWarming(now.Add(downloadWarmupLimit)), "the warm-up lasts a minute at most")
+	require.Equal(t, time.Minute, downloadWarmupLimit)
 }

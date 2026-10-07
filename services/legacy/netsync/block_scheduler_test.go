@@ -30,12 +30,10 @@ func schedulerPeer(t *testing.T, sm *SyncManager, idx uint8, claimedHeight int32
 // wireStreamingPath gives sm the park and stream registry every multi-peer
 // pass now requires: newDownloadAssigner has only one route since the
 // ladder-based non-streaming path (park disabled) is gone, and that route
-// reads both. It also gives each of peers an equal, non-zero measured rate,
-// so peerQueueDepth's unmeasuredPeerDepth floor (2, for a peer whose speed is
-// not yet known) does not mask the flat per-peer/window assertions these
-// tests make: speedScaledDepth returns its depth argument unchanged whenever
-// a peer's own rate is at least the fastest peer's, which holds for every
-// peer here because all the rates are equal.
+// reads both. It also gives each of peers a very high measured rate, so
+// peerQueueDepth's unmeasuredPeerDepth (1, for a peer whose speed is not yet
+// known) does not mask the flat per-peer/window assertions these tests make:
+// timeScaledDepth then reaches its cap, the configured depth.
 func wireStreamingPath(sm *SyncManager, peers ...*peerpkg.Peer) {
 	sm.blockPark = &blockPark{}
 	sm.streams = newStreamRegistry()

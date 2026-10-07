@@ -39,8 +39,11 @@ import (
 // carries the same work as an honest one, so fakes that stop one short of the
 // checkpoint outrank the honest branch and an eviction by rank removes the
 // honest one. The number of branches is bounded instead by who may hold one:
-// below the last checkpoint only a peer this node asked for headers, and only
-// outbound peers are asked (SyncManager.handleHeadersMsg and requestHeaders).
+// while headers-first mode is on, only a peer this node asked for headers and
+// may still ask (SyncManager.handleHeadersMsg, requestHeaders and
+// mayAskForHeaders): an outbound peer, addnode and connect peers included, a
+// whitelisted inbound peer, or the one inbound fallback sync peer while no
+// preferred peer is ahead.
 //
 // It is still a cache and not a work queue. Everything in it can be asked for
 // again in one message, so a branch can be dropped at any instant: when its peer

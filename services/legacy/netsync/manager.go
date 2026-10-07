@@ -727,7 +727,11 @@ type SyncManager struct {
 	// park sweep each start one, and two running together could both find the same block
 	// unowned and both ask for it. It is taken before headerMu and never while holding it.
 	assignMu sync.Mutex
-	// benchProbes is when each benched peer was last given a probe block (in_time_assign.go).
+	// warmupStarted is when a download pass first found the download warming up, in unix
+	// nanoseconds, or zero (downloadWarming).
+	warmupStarted atomic.Int64
+	// benchProbes is when each standby peer was last given a probe block (probeBenchedPeers,
+	// standby_peers.go).
 	// Read and written only by download passes, which assignMu runs one at a time.
 	benchProbes map[*peerpkg.Peer]time.Time
 

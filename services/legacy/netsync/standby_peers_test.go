@@ -175,3 +175,27 @@ func TestStandbyAProbeIsNeverANearBlock(t *testing.T) {
 
 	require.Empty(t, placed(slow))
 }
+
+// An active peer that has not claimed the block's height does not come before a standby peer that
+// has. No active peer claims height 12 here, so the block goes to the standby peer at 1 MB/s that
+// claims 5,000, not to the fastest active peer, which claims only 5.
+func TestStandbyAPeerThatClaimsTheHeightComesBeforeAnActivePeerThatDoesNot(t *testing.T) {
+	sm := schedulerManager(t)
+
+	claiming := func(idx uint8, budget int, rate float64, claimed int32) *assignerPeer {
+		p, _ := schedulerPeer(t, sm, idx, claimed)
+		state, ok := sm.peerStates.Get(p)
+		require.True(t, ok)
+
+		return &assignerPeer{peer: p, state: state, budget: budget, rate: rate, measured: true}
+	}
+
+	short := claiming(1, 1, 80*mb, 5)
+	full := []*assignerPeer{claiming(2, 0, 70*mb, 5), claiming(3, 0, 60*mb, 5)}
+	standby := claiming(4, 1, 1*mb, 5000)
+
+	sm.requestBlocks(standbyAssigner([]*assignerPeer{short, standby}, full), []wantedBlock{wantedAt(12)}, 0)
+
+	require.Equal(t, []chainhash.Hash{wantedAt(12).hash}, placed(standby))
+	require.Empty(t, placed(short))
+}

@@ -117,12 +117,14 @@ func (p *assignerPeer) queue(typical int64) {
 	}
 }
 
-// inTimeAvoiding is takeAvoiding over the active peers; see ACTIVE AND STANDBY PEERS. wait
-// reports that the block is left for an active peer that is full now.
+// inTimeAvoiding is takeAvoiding over the active peers that can serve height; see ACTIVE AND
+// STANDBY PEERS. wait reports that the block is left for such a peer that is full now. When no
+// active peer can serve height, every peer is offered the block in takeAvoiding's tiers, so a
+// standby peer that claims the height comes before an active peer that does not.
 func (a *downloadAssigner) inTimeAvoiding(height int32, avoid func(*peerpkg.Peer) bool) (*assignerPeer, bool, bool) {
 	floor := a.activeFloor()
 
-	if p, ok := a.takeWhere(height, avoid, func(p *assignerPeer) bool { return p.active(floor) }); ok {
+	if p, ok := a.takeWhere(height, avoid, func(p *assignerPeer) bool { return p.active(floor) && p.canServe(height) }); ok {
 		return p, true, false
 	}
 
