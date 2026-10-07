@@ -30,6 +30,9 @@ type downloadWaste struct {
 	// reAskedQuiet is blocks made askable of another peer because the peers owing them sent no
 	// block bytes for the retry window. It is the one routine way a block reaches a second peer.
 	reAskedQuiet atomic.Int64
+	// reAskedQueued is blocks asked of a second peer because they waited behind a slow peer's
+	// queue and would have made the chain wait (see THE QUEUED RE-ASK).
+	reAskedQueued atomic.Int64
 
 	// lastReceived and lastAt are the received total at the previous report, for its rate. Only
 	// the report reads and writes them, from one goroutine.
