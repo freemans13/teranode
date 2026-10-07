@@ -221,8 +221,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 				}
 
 				// The read stopped for the takeover (yieldReader), maybe in the middle of a
-				// transaction.
-				if ctl.yielding() {
+				// transaction. A verdict on the bytes this peer sent is still judged: the encoding
+				// is the peer's fault whoever finishes the block. The takeover copy proved the
+				// block's body, so only the peer is judged. The read loop drops its association,
+				// an encoding fault carries no ErrBlockBodyMismatch so nobody is banned, and a
+				// delivery that converted nothing deletes nothing (pipelineBlockDelete). The test
+				// is the wire layer's own (peer/wire_streaming.go readBlockMessage).
+				if ctl.yielding() && !errors.Is(streamErr, errors.ErrBlockInvalid) && !errors.IsBlockCorrupt(streamErr) {
 					return sm.yieldToFasterCopy(hash, writer, stream.r, ctl, r)
 				}
 

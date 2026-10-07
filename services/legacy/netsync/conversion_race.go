@@ -168,9 +168,12 @@ func (y *yieldReader) Read(p []byte) (int, error) {
 }
 
 // awaitTakeover waits until the copy ctl controls has stopped and removed what it wrote. While
-// that copy waits for its peer's next byte for takeoverStallTimeout, its peer is disconnected,
-// which ends the read. A wait while the copy does this node's own work, such as a store write,
-// is not the peer's, and the wait continues. It gives an error only when sm.ctx ends.
+// that copy waits for its peer's next byte for takeoverStallTimeout, its peer's association is
+// disconnected, which ends the read. The association goes through its primary
+// (peer.DisconnectAssociation), as the park's drop does: when the copy's owner cannot be resolved
+// ctl.sender is the delivering sub-peer, and disconnecting it alone left the primary connected.
+// A wait while the copy does this node's own work, such as a store write, is not the peer's, and
+// the wait continues. It gives an error only when sm.ctx ends.
 func (sm *SyncManager) awaitTakeover(hash chainhash.Hash, ctl *conversionCtl) error {
 	after := sm.takeoverAfter
 	if after == nil {
@@ -198,7 +201,7 @@ func (sm *SyncManager) awaitTakeover(hash chainhash.Hash, ctl *conversionCtl) er
 			dropped = true
 
 			sm.logger.Infof("[blockOnDisk][%s] a complete copy waited %s for the copy it took over, whose peer %s sent no byte; disconnecting that peer", hash, takeoverStallTimeout, ctl.sender)
-			ctl.sender.DisconnectWithInfo(fmt.Sprintf("sent no byte of block %s for %s while a complete copy waited", hash, takeoverStallTimeout))
+			ctl.sender.DisconnectAssociation(fmt.Sprintf("sent no byte of block %s for %s while a complete copy waited", hash, takeoverStallTimeout))
 		}
 	}
 }
@@ -213,8 +216,13 @@ func (sm *SyncManager) yieldToFasterCopy(hash chainhash.Hash, writer *subtreeWri
 
 	sm.logger.Infof("[pipelineBlockSink][%s] another copy completed first; stopped converting this one and draining the rest", hash)
 
-	// The buffer over the reader can keep errYieldedToFasterCopy from a read ahead and give it to
-	// the drain. yieldReader gives it once and then passes each read, so the drain continues.
+	// yieldReader gives errYieldedToFasterCopy once, at the first read after the takeover, and then
+	// passes each read. When the sink saw the takeover before that read (the check at the top of
+	// its loop, or a finish the takeover won), or when a read already waiting at the takeover ended
+	// with an error of its own, that first read is the drain's. rest is a bufio.Reader, whose
+	// WriteTo gives io.Discard's ReadFrom the reader under it, so the first drain stops at the
+	// sentinel and a second one reads the rest. When the sink's own read already met the sentinel,
+	// the buffer keeps it as its stored error, which WriteTo ignores, and the first drain reads it all.
 	_, err := io.Copy(io.Discard, rest)
 	if stderrors.Is(err, errYieldedToFasterCopy) {
 		_, err = io.Copy(io.Discard, rest)
