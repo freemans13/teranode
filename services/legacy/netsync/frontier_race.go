@@ -3,6 +3,7 @@ package netsync
 import (
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -64,8 +65,13 @@ type blockStream struct {
 	height int32
 	// owner is the one peer the ledger says owes this block, or nil when it is not exactly one.
 	owner *peerpkg.Peer
-	total int64
-	read  atomic.Int64
+	// coOwners is every peer that owed the block when its bytes began, when that was more than
+	// one: a raced or re-asked block. The sink is not told which of them is sending, so each
+	// counts as sending while the bytes arrive (lastBlockBytes); otherwise the one that is
+	// sending looks silent and the quiet-owner rule lets it off its whole queue.
+	coOwners []*peerpkg.Peer
+	total    int64
+	read     atomic.Int64
 	// lastRead is when bytes last arrived for this block, in unix nanoseconds.
 	lastRead atomic.Int64
 	// received is the node-wide count of block bytes received, or nil.
@@ -307,7 +313,7 @@ func (r *streamRegistry) lastBlockBytes(p *peerpkg.Peer) time.Time {
 	latest := r.lastBlock[p]
 
 	for s := range r.active {
-		if s.owner != p {
+		if s.owner != p && !slices.Contains(s.coOwners, p) {
 			continue
 		}
 
@@ -421,12 +427,20 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 	return func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 		height, _ := sm.headerCache.HeightOf(hash)
 
-		var owner *peerpkg.Peer
-		if owners := sm.blockDownloads.OwnersOf(hash); len(owners) == 1 {
+		var (
+			owner    *peerpkg.Peer
+			coOwners []*peerpkg.Peer
+		)
+
+		switch owners := sm.blockDownloads.OwnersOf(hash); {
+		case len(owners) == 1:
 			owner = owners[0]
+		case len(owners) > 1:
+			coOwners = owners
 		}
 
 		s := sm.streams.start(hash, height, owner, n, time.Now())
+		s.coOwners = coOwners
 		s.received = &sm.waste.received
 		if at, ok := sm.blockDownloads.RequestedAt(hash); ok {
 			s.requestedAt = at
