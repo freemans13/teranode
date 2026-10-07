@@ -1,10 +1,13 @@
 package netsync
 
 import (
+	"bytes"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
@@ -178,4 +181,41 @@ func TestQueuedReaskAsksOnce(t *testing.T) {
 
 	sm.maybeReaskQueuedBlock(now.Add(time.Minute))
 	require.False(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 11)), "the block has had its one extra request")
+}
+
+// A block owed by two peers, the owner and the peer the re-ask added, streams with no single
+// owner, and its bytes used to count for nobody. On 2026-10-07 the fast peer sending re-asked
+// block 707,857, 2 GB in 64 s, therefore looked silent for a minute, and the quiet-owner rule let
+// it off all 15 blocks in its queue; it delivered them anyway and each was downloaded twice.
+// Every owner of an arriving block counts as sending.
+func TestAPeerSendingABlockTwoPeersOweIsNotQuiet(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	block := heightHash(t, sm, 11)
+	askAt(t, sm, owner, block, now.Add(-3*time.Minute))
+	askAt(t, sm, fast, block, now.Add(-2*time.Minute))
+
+	queued := heightHash(t, sm, 30)
+	askAt(t, sm, fast, queued, now.Add(-2*time.Minute))
+
+	var stream *blockStream
+
+	sink := sm.trackBlockStreams(func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+		sm.streams.mu.Lock()
+		for s := range sm.streams.active {
+			stream = s
+		}
+		sm.streams.mu.Unlock()
+
+		stream.lastRead.Store(time.Now().UnixNano())
+
+		require.False(t, sm.streams.lastBlockBytes(fast).IsZero(), "the peer sending a two-owner block is sending")
+		require.True(t, sm.ownerStillSending(queued), "so the rest of its queue is not let off")
+
+		return true, nil
+	})
+
+	_, err := sink(block, &wire.BlockHeader{}, bytes.NewReader(nil), 0)
+	require.NoError(t, err)
 }
