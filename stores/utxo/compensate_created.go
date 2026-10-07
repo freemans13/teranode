@@ -174,6 +174,8 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 // thing. A retry of the same block gets the same id: both paths reuse the id
 // recorded on the block's first non-coinbase record, and AssignBlockID is
 // idempotent per block hash while the blockchain service holds the reservation.
+// The reuse can also pick up another block's id from a shared transaction, so
+// callers pass the result through ConfirmLeftovers before trusting it.
 //
 // The lock alone is not enough, because other writers leave a record locked: a
 // different block validating concurrently that shares the transaction (its
@@ -249,6 +251,53 @@ func LeftoversAmong(ctx context.Context, store Store, existing []*chainhash.Hash
 	}
 
 	return leftovers, nil
+}
+
+// BlockIDAssigner is the blockchain service's per-hash block id authority
+// (blockchain.ClientI satisfies it). Declared here so this package need not
+// import the blockchain service.
+type BlockIDAssigner interface {
+	AssignBlockID(ctx context.Context, blockHash *chainhash.Hash) (uint64, error)
+}
+
+// ConfirmLeftovers keeps the leftovers LeftoversAmong found only when blockID
+// really is blockHash's id, and otherwise returns nil with mismatch set.
+//
+// LeftoversAmong's whole argument is that no other writer carries THIS block's
+// id. Both block paths may take that id from the mined-in ids already recorded
+// on the block's first non-coinbase transaction, and a transaction shared with
+// another block (a fork sibling below the checkpoint) carries the OTHER block's
+// id. Adopting it made every shared record that block left locked look like
+// this block's own leftover, so it was dropped from this block's
+// SetMinedMulti and became eligible for this block's compensating delete. The
+// blockchain service's AssignBlockID is idempotent per hash and durable (it
+// survives a restart), so its answer decides whose id this is. On a mismatch
+// the records are the other block's, and filing them as pre-existing is
+// correct. An error is returned rather than guessed at: treating a genuine
+// leftover as pre-existing would let the "already blessed" fallback bless a
+// replay on the strength of its own earlier write.
+//
+// It asks only when there are leftovers, so a first attempt never pays for it.
+func ConfirmLeftovers(ctx context.Context, assigner BlockIDAssigner, blockHash *chainhash.Hash, blockID uint32,
+	leftovers map[chainhash.Hash]struct{}) (confirmed map[chainhash.Hash]struct{}, mismatch bool, err error) {
+	if len(leftovers) == 0 {
+		return leftovers, false, nil
+	}
+
+	if assigner == nil {
+		return nil, false, errors.NewProcessingError("[ConfirmLeftovers] no block id authority to confirm %d leftovers of block %s", len(leftovers), blockHash.String())
+	}
+
+	assigned, err := assigner.AssignBlockID(ctx, blockHash)
+	if err != nil {
+		return nil, false, errors.NewProcessingError("[ConfirmLeftovers] could not confirm block id %d for block %s", blockID, blockHash.String(), err)
+	}
+
+	if assigned != uint64(blockID) {
+		return nil, true, nil
+	}
+
+	return leftovers, false, nil
 }
 
 // carriesBlockID reports whether blockIDs contains blockID.

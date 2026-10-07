@@ -2145,6 +2145,17 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to classify %d existing txs", block.Hash().String(), len(existingTxHashes), err)
 	}
 
+	// block.ID may have been taken from another block's mined-in id on a shared
+	// transaction; a leftover is only ours if the id really is this block's.
+	leftovers, idMismatch, err := utxo.ConfirmLeftovers(ctx, u.blockchainClient, block.Hash(), block.ID, leftovers)
+	if err != nil {
+		return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to confirm the leftovers' block id", block.Hash().String(), err)
+	}
+
+	if idMismatch {
+		u.logger.Warnf("[createAndSpendUTXOsForBatch][%s] block id %d is not this block's id; its locked existing transactions belong to another block and are filed as pre-existing", block.Hash().String(), block.ID)
+	}
+
 	if len(leftovers) > 0 {
 		u.logger.Warnf("[createAndSpendUTXOsForBatch][%s] %d of %d existing transactions are locked leftovers of an earlier attempt at this block", block.Hash().String(), len(leftovers), len(existingTxHashes))
 

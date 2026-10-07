@@ -17,7 +17,9 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -1050,9 +1052,18 @@ func newBlockValidationWithRealStore(t *testing.T) (*BlockValidation, utxo.Store
 	realStore, err := sql.New(ctx, logger, tSettings, storeURL)
 	require.NoError(t, err)
 
+	// A real blockchain service over its own in-memory store: the leftover
+	// tests need its per-hash block id authority (utxo.ConfirmLeftovers).
+	blockchainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+
+	blockchainClient, err := blockchain.NewLocalClient(logger, tSettings, blockchainStore, nil, nil)
+	require.NoError(t, err)
+
 	bv := &BlockValidation{
 		logger:                        logger,
 		settings:                      tSettings,
+		blockchainClient:              blockchainClient,
 		blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 		utxoStore:                     realStore,
@@ -1467,6 +1478,22 @@ func replayBatch(txs ...*bt.Tx) (*model.Block, *SubtreeProcessingBatch) {
 	}
 }
 
+// assignedReplayBatch is replayBatch with the id the blockchain service holds
+// for the block, which a retry of the same block gets back, so a leftover an
+// earlier attempt stamped with it is recognised as this block's own.
+func assignedReplayBatch(t *testing.T, bv *BlockValidation, txs ...*bt.Tx) (*model.Block, *SubtreeProcessingBatch) {
+	t.Helper()
+
+	block, batch := replayBatch(txs...)
+
+	id, err := bv.blockchainClient.AssignBlockID(context.Background(), block.Hash())
+	require.NoError(t, err)
+
+	block.ID = uint32(id)
+
+	return block, batch
+}
+
 // TestQuickValidateRemovesRecreatedDescendantsOfPrunedReplay: replaying C and D
 // together recreates both. C hits P's marker, but D successfully spends the
 // freshly recreated C, so only C is rejected. Without walking the block's
@@ -1849,10 +1876,12 @@ func TestQuickValidateLeftoverOfInterruptedAttemptIsNotBlessedOnRetry(t *testing
 	ctx := context.Background()
 	child, _, privateKey, publicKey := prunedChainEndToEnd(t, store, "QUICK_VALIDATE_LEFTOVER_KEY")
 
+	block, batch := assignedReplayBatch(t, bv, child)
+
 	// Attempt 1, phase 1 only: exactly what createAndSpendUTXOsForBatch writes
 	// for a locked below-checkpoint block, then the process dies.
 	_, _, err := store.SpendAndCreate(ctx, child, 1400, utxo.WithCreateOnly(),
-		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1400, BlockHeight: 1400}), utxo.WithLocked(true))
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: block.ID, BlockHeight: 1400}), utxo.WithLocked(true))
 	require.NoError(t, err)
 
 	meta, err := store.Get(ctx, child.TxIDChainHash(), fields.Locked)
@@ -1860,8 +1889,6 @@ func TestQuickValidateLeftoverOfInterruptedAttemptIsNotBlessedOnRetry(t *testing
 	require.True(t, meta.Locked, "precondition: the leftover is locked")
 
 	// Attempt 2.
-	block, batch := replayBatch(child)
-
 	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
 	require.Error(t, err, "the retry must not validate a replay of a fully pruned chain")
 	require.ErrorIs(t, err, errors.ErrTxNotFound)
@@ -1887,7 +1914,7 @@ func TestQuickValidateLeftoverAfterFailedDeleteIsNotBlessedOnRetry(t *testing.T)
 	flaky := &failingDeleteStore{Store: store}
 	bv.utxoStore = flaky
 
-	block, batch := replayBatch(child)
+	block, batch := assignedReplayBatch(t, bv, child)
 
 	flaky.failing.Store(true)
 
@@ -1924,13 +1951,13 @@ func TestQuickValidateLeftoverDependentIsRemovedOnRetry(t *testing.T) {
 	ctx := context.Background()
 	f := newPrunedChainFixture(t, store)
 
+	block, batch := assignedReplayBatch(t, bv, f.child, f.grandchild, f.sibling)
+
 	for _, tx := range []*bt.Tx{f.child, f.grandchild} {
 		_, _, err := store.SpendAndCreate(ctx, tx, 1400, utxo.WithCreateOnly(),
-			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1400, BlockHeight: 1400}), utxo.WithLocked(true))
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: block.ID, BlockHeight: 1400}), utxo.WithLocked(true))
 		require.NoError(t, err)
 	}
-
-	block, batch := replayBatch(f.child, f.grandchild, f.sibling)
 
 	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
 	require.Error(t, err)
@@ -1948,6 +1975,45 @@ func TestQuickValidateLeftoverDependentIsRemovedOnRetry(t *testing.T) {
 	meta, err := store.Get(ctx, f.sibling.TxIDChainHash())
 	require.NoError(t, err, "the valid sibling survives")
 	require.NotNil(t, meta)
+}
+
+// TestQuickValidateSiblingBlockIDIsNotAdoptedAsLeftover: a below-checkpoint
+// fork sibling X wrote a shared transaction locked with X's id and has not
+// committed. Block Y then took X's id, as the id-reuse lookup does when it reads
+// the mined-in ids of a shared first transaction. Every shared record then
+// looked like Y's own leftover (locked and carrying "this block's" id), so Y's
+// compensation deleted a record X wrote. The block id authority decides whose
+// id it is: Y's own id is different, so the record is X's and stays.
+func TestQuickValidateSiblingBlockIDIsNotAdoptedAsLeftover(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	siblingHash := chainhash.HashH([]byte("fork sibling X"))
+	siblingID, err := bv.blockchainClient.AssignBlockID(ctx, &siblingHash)
+	require.NoError(t, err)
+
+	// X's create phase: C written locked with X's id.
+	_, _, err = store.SpendAndCreate(ctx, f.child, 1400, utxo.WithCreateOnly(),
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: uint32(siblingID), BlockHeight: 1400}), utxo.WithLocked(true))
+	require.NoError(t, err)
+
+	// Y carries X's id, as if adopted from C's mined-in ids.
+	block, batch := replayBatch(f.child, f.sibling)
+	block.ID = uint32(siblingID)
+
+	ownID, err := bv.blockchainClient.AssignBlockID(ctx, block.Hash())
+	require.NoError(t, err)
+	require.NotEqual(t, siblingID, ownID, "precondition: Y's own id is not X's")
+
+	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "spending transaction was pruned")
+
+	_, err = store.Get(ctx, f.child.TxIDChainHash())
+	require.NoError(t, err, "the record X wrote must not be deleted by Y's compensation")
 }
 
 // failingDeleteStore fails DeleteComplete while failing is set. Everything else
@@ -2027,7 +2093,7 @@ func TestQuickValidateCompensationRecoversAfterFailedDelete(t *testing.T) {
 	flaky := &failingDeleteStore{Store: store}
 	bv.utxoStore = flaky
 
-	block, batch := replayBatch(f.child, f.sibling)
+	block, batch := assignedReplayBatch(t, bv, f.child, f.sibling)
 
 	flaky.failing.Store(true)
 

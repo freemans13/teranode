@@ -11,7 +11,9 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/validator"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -235,15 +237,28 @@ func TestLegacyLeftoverOfFullyPrunedChainIsNotBlessedOnRetry(t *testing.T) {
 	v, err := validator.New(ctx, logger, tSettings, store, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 
-	sm := &SyncManager{ctx: ctx, settings: tSettings, chainParams: params, logger: logger, utxoStore: store, validationClient: v}
+	// A real blockchain service over its own in-memory store: a leftover is
+	// recognised only under the id it holds for the block (utxo.ConfirmLeftovers).
+	blockchainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+
+	blockchainClient, err := blockchain.NewLocalClient(logger, tSettings, blockchainStore, nil, nil)
+	require.NoError(t, err)
+
+	sm := &SyncManager{ctx: ctx, settings: tSettings, chainParams: params, logger: logger, utxoStore: store, validationClient: v, blockchainClient: blockchainClient}
 
 	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper]()
 	txMap.Set(*child.TxIDChainHash(), &TxMapWrapper{Tx: child})
 
 	bi := blockIdent{hash: chainhash.HashH([]byte("replayed block 101, leftover")), prevBlock: chainhash.HashH([]byte("block 100")), height: 101, timestamp: time.Unix(1700000000, 0), origin: blockRequestOrigin{headerProven: true}}
 
+	assignedID, err := blockchainClient.AssignBlockID(ctx, &bi.hash)
+	require.NoError(t, err)
+
+	blockID := uint32(assignedID)
+
 	// Attempt 1: the create phase only, then the process dies.
-	created, err := sm.createUtxos(ctx, txMap, bi, 101, true)
+	created, err := sm.createUtxos(ctx, txMap, bi, blockID, true)
 	require.NoError(t, err)
 	require.Len(t, created, 1)
 
@@ -252,7 +267,7 @@ func TestLegacyLeftoverOfFullyPrunedChainIsNotBlessedOnRetry(t *testing.T) {
 	require.True(t, leftover.Locked, "precondition: the legacy create phase leaves the record locked until the block commits")
 
 	// Attempt 2.
-	blockErr := sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, 101)
+	blockErr := sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, blockID)
 	require.Error(t, blockErr, "the retry must not validate a replay of a fully pruned chain")
 	require.ErrorIs(t, blockErr, errors.ErrTxNotFound)
 

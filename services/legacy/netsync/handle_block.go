@@ -1522,6 +1522,17 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 		return nil, errors.NewProcessingError("failed to classify existing utxos", err)
 	}
 
+	// reuseBlockIDFromUTXO may have taken another block's id from a shared
+	// transaction; a leftover is only ours if blockID really is this block's.
+	leftovers, idMismatch, err := utxo.ConfirmLeftovers(ctx, sm.blockchainClient, &bi.hash, blockID, leftovers)
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to confirm the leftovers' block id", err)
+	}
+
+	if idMismatch {
+		sm.logger.Warnf("[createUtxos][%s] block id %d is not this block's id; its locked existing transactions belong to another block and are filed as pre-existing", bi.hash, blockID)
+	}
+
 	if len(leftovers) > 0 {
 		sm.logger.Warnf("[createUtxos][%s] %d of %d existing transactions are locked leftovers of an earlier attempt at this block", bi.hash, len(leftovers), len(existingTxHashes))
 
