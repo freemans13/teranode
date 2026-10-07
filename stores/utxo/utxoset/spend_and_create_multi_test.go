@@ -755,8 +755,6 @@ func outpointOnly(txs []*bt.Tx) []*bt.Tx {
 	return out
 }
 
-
-
 // When a parent in the list already exists, as on a repeat after a crash, the netted write hands
 // the rest of the list to the per-transaction default. That hand-off must carry each remaining
 // transaction's own subtree index, not refuse the shorter list or shift the indexes.
