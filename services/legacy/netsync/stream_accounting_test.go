@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -26,7 +27,8 @@ func TestAStreamedBlockRecordsItsSizeAndItsPeersRate(t *testing.T) {
 
 	owner := newTestPeer(t, "10.0.0.1:8333")
 	hash := chainhash.Hash{0x5a}
-	require.True(t, sm.blockDownloads.Add(owner, hash))
+	// Asked two seconds before its first byte: the block is timed from the request.
+	askAt(t, sm, owner, hash, time.Now().Add(-2*time.Second))
 
 	const payload = int64(1 << 20)
 
@@ -43,6 +45,6 @@ func TestAStreamedBlockRecordsItsSizeAndItsPeersRate(t *testing.T) {
 	require.True(t, converted)
 
 	require.Equal(t, payload, sm.blockSizeTracker.getAverageSize(), "the block's size feeds the average")
-	require.Positive(t, sm.streams.peerRate(owner), "its peer's rate is recorded")
+	require.InEpsilon(t, float64(len(body))/2, sm.streams.peerRate(owner), 0.1, "its peer's rate is recorded, timed from the request")
 	require.False(t, sm.streams.lastBlockBytes(owner).IsZero(), "and when that peer last delivered a block")
 }

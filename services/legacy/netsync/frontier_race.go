@@ -3,6 +3,7 @@ package netsync
 import (
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,21 @@ const (
 	// raceExpiry is how long a block's race mark lasts. It is never cleared sooner, so a block is
 	// raced at most once in that time.
 	raceExpiry = 10 * time.Minute
+	// minRateSample is the least delivery time one rate sample covers. A block that took less is
+	// pooled with the peer's next blocks until together they took this long. A transfer that short
+	// is mostly round trip and buffering: on 2026-10-07 one 1 MB copy read in 5 ms gave a peer a
+	// rate of 190 MB/s, and one such sample in the rolling rate made that peer most of the measured
+	// bandwidth. Pooling rather than dropping keeps small blocks measured: at early heights every
+	// block takes far less than a second, and a peer never measured holds one block.
+	minRateSample = time.Second
+	// rateDecayAfter is how long a peer that owes blocks may send no block bytes before its rate
+	// starts to fall: the peerQueueSeconds a peer's queue is sized to keep it busy for.
+	rateDecayAfter = peerQueueSeconds * time.Second
+	// rateDecayHalfLife is how long a silent peer's rate takes to halve after rateDecayAfter. SV
+	// Node averages each peer's block-stream bandwidth over its last 60 s in 5 s spots
+	// (net/stream.cpp:312-346, net/stream.h:173, net/net.cpp:2617), so a peer that stops sending is at half its rate
+	// 30 s later. The rate here never reaches zero, which would read as unmeasured.
+	rateDecayHalfLife = raceSlowFetchAfter
 )
 
 // blockStream is one block body arriving from the wire.
@@ -77,6 +93,10 @@ type blockStream struct {
 	start    time.Time
 	// requestedAt is when the ledger first recorded a request for this block, zero if none.
 	requestedAt time.Time
+	// from is when owner could start sending this block: the later of when it was asked for it and
+	// when it finished the block before, and never after the first byte. A completed block is timed
+	// from it, so a peer that takes long to start a block is not measured as fast.
+	from time.Time
 	// admitWait and path are set by admitPipelineSink under the registry's lock: how long this
 	// block waited for an admission slot, and which path its bytes took.
 	admitWait time.Duration
@@ -126,11 +146,24 @@ type streamRegistry struct {
 	raced  map[chainhash.Hash]time.Time
 	// lastBlock is when each peer last finished delivering a block.
 	lastBlock map[*peerpkg.Peer]time.Time
+	// pooled is each peer's completed blocks not yet in its rate, until they cover minRateSample.
+	pooled map[*peerpkg.Peer]rateSample
+	// decay is the factor a peer's rate is cut to while it owes blocks and sends none
+	// (decayQuiet). It stays until the peer's next rate sample.
+	decay map[*peerpkg.Peer]float64
+}
+
+// rateSample is block bytes delivered and the time they took.
+type rateSample struct {
+	bytes int64
+	took  time.Duration
 }
 
 func newStreamRegistry() *streamRegistry {
 	return &streamRegistry{
 		lastBlock: make(map[*peerpkg.Peer]time.Time),
+		pooled:    make(map[*peerpkg.Peer]rateSample),
+		decay:     make(map[*peerpkg.Peer]float64),
 		active:    make(map[*blockStream]struct{}),
 		rates:     make(map[*peerpkg.Peer]float64),
 		raced:     make(map[chainhash.Hash]time.Time),
@@ -153,8 +186,29 @@ func (r *streamRegistry) add(s *blockStream) {
 	r.mu.Unlock()
 }
 
-// finish removes a stream. A complete one records its owner's rate. The block's race mark is left
-// alone, so it is never raced twice.
+// couldStart is when p could start sending a block it was asked for at requested and whose first
+// byte came at firstByte: the later of the request and the end of p's block before, and never
+// after the first byte. A peer sends its queue one block at a time, so a block starts when the
+// one ahead of it ends.
+func (r *streamRegistry) couldStart(p *peerpkg.Peer, requested, firstByte time.Time) time.Time {
+	from := requested
+
+	r.mu.Lock()
+	if prev := r.lastBlock[p]; prev.After(from) {
+		from = prev
+	}
+	r.mu.Unlock()
+
+	if from.IsZero() || from.After(firstByte) {
+		return firstByte
+	}
+
+	return from
+}
+
+// finish removes a stream. A complete one adds its block to its owner's next rate sample, timed
+// from when the owner could start it (blockStream.from). The block's race mark is left alone, so
+// it is never raced twice.
 func (r *streamRegistry) finish(s *blockStream, now time.Time, complete bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -171,13 +225,86 @@ func (r *streamRegistry) finish(s *blockStream, now time.Time, complete bool) {
 
 	r.lastBlock[s.owner] = now
 
-	if bps := s.rate(now); bps > 0 {
-		if prev, ok := r.rates[s.owner]; ok {
-			bps = peerRateWeight*bps + (1-peerRateWeight)*prev
+	from := s.from
+	if from.IsZero() || from.After(s.start) {
+		from = s.start
+	}
+
+	took := now.Sub(from)
+	if took <= 0 {
+		return
+	}
+
+	pool := r.pooled[s.owner]
+	pool.bytes += s.read.Load()
+	pool.took += took
+
+	if pool.took < minRateSample {
+		r.pooled[s.owner] = pool
+
+		return
+	}
+
+	delete(r.pooled, s.owner)
+
+	bps := float64(pool.bytes) / pool.took.Seconds()
+	if bps <= 0 {
+		return
+	}
+
+	// The previous rate counts as decayed: a peer that went quiet and then sends again is
+	// judged on how it has delivered lately, not on the rate it had before it stopped.
+	if _, ok := r.rates[s.owner]; ok {
+		bps = peerRateWeight*bps + (1-peerRateWeight)*r.rateLocked(s.owner)
+	}
+
+	r.rates[s.owner] = bps
+	delete(r.decay, s.owner)
+}
+
+// decayQuiet cuts the rate of each peer that owes blocks and has sent no block bytes for more than
+// rateDecayAfter, halving it every rateDecayHalfLife after that. owedSince is, for each peer that
+// owes blocks, when it was asked for the block at the head of its queue; the silence runs from
+// the later of that and its last block bytes. A rate measured on blocks a peer no longer sends
+// otherwise stayed as it was: a peer that sent one fast block and then stopped kept the top rate,
+// kept most of the measured bandwidth, and kept every other peer on standby.
+func (r *streamRegistry) decayQuiet(now time.Time, owedSince map[*peerpkg.Peer]time.Time) {
+	if r == nil {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for p, since := range owedSince {
+		if r.rates[p] <= 0 {
+			continue
 		}
 
-		r.rates[s.owner] = bps
+		if last := r.lastBlockBytesLocked(p); last.After(since) {
+			since = last
+		}
+
+		quiet := now.Sub(since) - rateDecayAfter
+		if quiet <= 0 {
+			continue
+		}
+
+		f := math.Pow(0.5, quiet.Seconds()/rateDecayHalfLife.Seconds())
+		if cur, ok := r.decay[p]; !ok || f < cur {
+			r.decay[p] = f
+		}
 	}
+}
+
+// rateLocked is p's rate with any decay applied. Called with r.mu held.
+func (r *streamRegistry) rateLocked(p *peerpkg.Peer) float64 {
+	bps := r.rates[p]
+	if f, ok := r.decay[p]; ok {
+		bps *= f
+	}
+
+	return bps
 }
 
 // pending is how many bytes are still to come on the blocks p is sending now, and how many
@@ -286,8 +413,8 @@ func (r *streamRegistry) medianRate() float64 {
 	defer r.mu.Unlock()
 
 	rates := make([]float64, 0, len(r.rates))
-	for _, bps := range r.rates {
-		rates = append(rates, bps)
+	for p := range r.rates {
+		rates = append(rates, r.rateLocked(p))
 	}
 
 	if len(rates) == 0 {
@@ -307,7 +434,7 @@ func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return r.rates[p]
+	return r.rateLocked(p)
 }
 
 // wasRaced reports whether h has had its one extra request inside raceExpiry, from the race or
@@ -334,6 +461,8 @@ func (r *streamRegistry) forgetPeer(p *peerpkg.Peer) {
 	r.mu.Lock()
 	delete(r.rates, p)
 	delete(r.lastBlock, p)
+	delete(r.pooled, p)
+	delete(r.decay, p)
 	r.mu.Unlock()
 }
 
@@ -348,6 +477,11 @@ func (r *streamRegistry) lastBlockBytes(p *peerpkg.Peer) time.Time {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	return r.lastBlockBytesLocked(p)
+}
+
+// lastBlockBytesLocked is lastBlockBytes with r.mu held.
+func (r *streamRegistry) lastBlockBytesLocked(p *peerpkg.Peer) time.Time {
 	latest := r.lastBlock[p]
 
 	for s := range r.active {
@@ -439,7 +573,7 @@ func (r *streamRegistry) chooseRacer(candidates, owners []*peerpkg.Peer, queued 
 	var best *peerpkg.Peer
 
 	better := func(a, b *peerpkg.Peer) bool {
-		ra, rb := r.rates[a], r.rates[b]
+		ra, rb := r.rateLocked(a), r.rateLocked(b)
 		if ra != rb {
 			return ra > rb
 		}
@@ -468,16 +602,24 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		// The stream is the sender's, not the ledger owner's: a peer that does not owe the block
 		// could otherwise set an owner's rate, keep a stalled owner looking busy, and set the
 		// largest recent block size. owingSender names the sender only when it owes the block.
-		s := &blockStream{hash: hash, height: height, owner: sm.owingSender(r, hash), total: n, start: time.Now(), received: &sm.waste.received}
+		now := time.Now()
+		owner := sm.owingSender(r, hash)
+
+		s := &blockStream{hash: hash, height: height, owner: owner, total: n, start: now, received: &sm.waste.received}
 		if at, ok := sm.blockDownloads.RequestedAt(hash); ok {
 			s.requestedAt = at
+		}
+
+		if owner != nil {
+			asked, _ := sm.blockDownloads.RequestedOf(owner, hash)
+			s.from = sm.streams.couldStart(owner, asked, now)
 		}
 
 		sm.streams.add(s)
 
 		converted, err := inner(hash, header, countingReader{r: r, s: s}, n)
 
-		now := time.Now()
+		now = time.Now()
 
 		// Complete when the sink succeeded. The reader starts after the 80-byte header, so the
 		// bytes counted never reach n, and a test against n counted no stream as complete.
@@ -541,6 +683,7 @@ func (sm *SyncManager) runFrontierRace() {
 		case <-sm.quit:
 			return
 		case <-ticker.C:
+			sm.decayQuietRates(time.Now())
 			sm.maybeRaceSlowBlock(time.Now())
 			sm.maybeReaskQueuedBlock(time.Now())
 
@@ -549,6 +692,24 @@ func (sm *SyncManager) runFrontierRace() {
 			}
 		}
 	}
+}
+
+// decayQuietRates cuts the rate of each peer that owes blocks and has gone quiet
+// (streamRegistry.decayQuiet). It runs on the race's ticker, ahead of the rules that read rates.
+func (sm *SyncManager) decayQuietRates(now time.Time) {
+	if sm.streams == nil || sm.blockDownloads == nil {
+		return
+	}
+
+	owedSince := make(map[*peerpkg.Peer]time.Time)
+
+	for p, queue := range sm.blockDownloads.Queues() {
+		if len(queue) > 0 {
+			owedSince[p] = queue[0].at
+		}
+	}
+
+	sm.streams.decayQuiet(now, owedSince)
 }
 
 // maybeRaceSlowBlock asks a second peer for the block the chain is about to wait on, if one is

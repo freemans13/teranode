@@ -646,6 +646,21 @@ func (t *blockDownloadTracker) AnyOwner(h chainhash.Hash, pred func(*peerpkg.Pee
 	return false
 }
 
+// RequestedOf is when p was last asked for h, and whether p owes it. A forgiven record reads at its
+// back-dated time (ForgiveOwners).
+func (t *blockDownloadTracker) RequestedOf(p *peerpkg.Peer, h chainhash.Hash) (time.Time, bool) {
+	if t == nil {
+		return time.Time{}, false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	rec, ok := t.byHash[h][p]
+
+	return rec.at, ok
+}
+
 // RequestedAt is when a request for h was first recorded, across every peer that owes it, so a
 // race's later request does not hide how long ago the block was first asked for.
 func (t *blockDownloadTracker) RequestedAt(h chainhash.Hash) (time.Time, bool) {

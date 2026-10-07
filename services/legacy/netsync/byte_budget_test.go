@@ -467,14 +467,21 @@ func TestASlowPeerOutsideTheTopEightyPercentStandsBy(t *testing.T) {
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
 	recentBlocks(sm, 200*qMB)
 
+	// Three fast peers: at least three measured peers stay active (minActivePeers), so a
+	// fourth is the first that can stand by.
+	c, _ := schedulerPeer(t, sm, 132, 1000)
+	d, _ := schedulerPeer(t, sm, 133, 1000)
+
 	sm.streams.rates[a] = float64(5 * qMB)
 	sm.streams.rates[b] = float64(50 * qMB)
+	sm.streams.rates[c] = float64(50 * qMB)
+	sm.streams.rates[d] = float64(50 * qMB)
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
 	require.True(t, WaitUntil(func() bool { return bRec.count() == 4 }, 5*time.Second), "50 MB/s holds ten seconds of 200 MB blocks and the one it sends")
-	require.False(t, WaitUntil(func() bool { return aRec.count() > 0 }, 300*time.Millisecond), "5 MB/s stands by beside 50 MB/s")
+	require.False(t, WaitUntil(func() bool { return aRec.count() > 0 }, 300*time.Millisecond), "5 MB/s stands by beside three peers at 50 MB/s")
 }
 
 func TestTimeScaledDepth(t *testing.T) {

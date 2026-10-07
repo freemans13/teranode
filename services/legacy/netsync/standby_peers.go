@@ -18,7 +18,8 @@ import (
 // blocks as before, the fastest with room first. The rest are standby: connected, given no
 // blocks, so the chain never waits on them. When every active peer is full a block waits for one
 // of them. With the peers above, 80% of 105.9 MB/s is 84.7, and the top three give 91.8, so those
-// three are active. The set moves with the peers: if the active ones go, the next fastest make up
+// three are active. At least minActivePeers measured peers are always active, so one peer with a
+// rate far above the rest never takes every block alone. The set moves with the peers: if the active ones go, the next fastest make up
 // the share. A peer with no measured rate yet is active, so it gets measured, and so is every
 // peer before any is measured.
 //
@@ -37,6 +38,12 @@ const (
 	benchProbeInterval = 10 * time.Minute
 	// benchProbeSpeedup is how much faster than last measured a probe assumes the peer may now be.
 	benchProbeSpeedup = 4
+	// minActivePeers is the fewest measured peers kept active, however the bandwidth is shared.
+	// SV Node puts no peer on standby; it fetches a block the chain waits on from up to
+	// DEFAULT_MAX_BLOCK_PARALLEL_FETCH (3) peers at once (net/net.h:167,
+	// net/net_processing.cpp:462-499). Three active peers keep that many sources for every block,
+	// and stop one peer with an inflated rate from holding the whole 80% alone.
+	minActivePeers = 3
 )
 
 // activeFloor is the slowest rate an active peer of this pass may have; see activeFloorOf.
@@ -57,9 +64,14 @@ func (a *downloadAssigner) activeFloor() float64 {
 }
 
 // activeFloorOf is the slowest rate an active peer may have: walking the measured rates fastest
-// first, the rate that brings their running total to activeShareOfBandwidth of all of them. Zero,
-// so every peer is active, when none is measured.
+// first, the rate that brings their running total to activeShareOfBandwidth of all of them, and
+// never above the minActivePeers-th fastest rate. Zero, so every peer is active, when fewer than
+// minActivePeers are measured.
 func activeFloorOf(rates []float64) float64 {
+	if len(rates) < minActivePeers {
+		return 0
+	}
+
 	rates = append([]float64(nil), rates...)
 
 	var total float64
@@ -74,7 +86,7 @@ func activeFloorOf(rates []float64) float64 {
 	for _, r := range rates {
 		running += r
 		if running >= total*activeShareOfBandwidth {
-			return r
+			return min(r, rates[minActivePeers-1])
 		}
 	}
 
