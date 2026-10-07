@@ -175,7 +175,21 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 
 	t.Setenv("UTXOSET_TEST_DSN", dsn)
 
-	s, ctx := newTestStoreWith(t, mainnetBatcherTune)
+	// BENCH_ABOVE=1 runs the store's above-checkpoint route: a network with no checkpoints, so
+	// every height is above the checkpoint, and lists carry no mined block info, as the catch-up
+	// and legacy batch path sends them. The inputs are not extended (the bench blocks carry no
+	// previous outputs), so the UTXO hash check is skipped there too.
+	above := os.Getenv("BENCH_ABOVE") == "1"
+
+	tune := mainnetBatcherTune
+	if above {
+		tune = func(ts *settings.Settings) {
+			mainnetBatcherTune(ts)
+			withCheckpoints(ts, nil)
+		}
+	}
+
+	s, ctx := newTestStoreWith(t, tune)
 
 	seedStart := time.Now()
 	seedExternalParents(t, ctx, s, external, blocks[0].height-1)
@@ -211,6 +225,14 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 			utxo.WithIgnoreLocked(true),
 			utxo.WithSkipExtendedInputs(true),
 			utxo.WithSkipUTXOHashCheck(true),
+		}
+
+		if above {
+			opts = []utxo.CreateOption{
+				utxo.WithIgnoreLocked(true),
+				utxo.WithSkipExtendedInputs(true),
+				utxo.WithSkipUTXOHashCheck(true),
+			}
 		}
 
 		start := time.Now()
