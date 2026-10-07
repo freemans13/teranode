@@ -24,7 +24,9 @@ import (
 // maxBlockCopies live copies: on 2026-09-24 a race that re-armed whenever a copy finished asked
 // three peers for the same 2 GB block and threw all three copies away while a 13 MB/s peer, which
 // was not struggling at all, finished the first. At the cap the struggling peers are still
-// disconnected; only the extra request is skipped.
+// disconnected; only the extra request is skipped. In any raceExpiry a block gets at most
+// maxBlockCopies-1 extra copies and one round of disconnects, and nobody is disconnected while
+// this node itself is backpressured.
 //
 // SV Node: DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT is 30 s, DEFAULT_MIN_BLOCK_STALLING_RATE is
 // 100 KB/s.
@@ -58,9 +60,10 @@ const (
 	raceStallRate = 100_000
 	// peerRateWeight is the weight of a peer's newest completed block in its rolling rate.
 	peerRateWeight = 0.5
-	// raceExpiry is how long a block's race mark is kept. The mark is when the block's newest
-	// extra copy was asked for; another copy is asked for only after raceSlowFetchAfter, and only
-	// when every copy is late (see maxBlockCopies).
+	// raceExpiry is how long a block's race history is kept: when each extra copy was asked for
+	// and when the race last dropped its peers. Another copy is asked for only after
+	// raceSlowFetchAfter, only when every copy is late, and at most maxBlockCopies-1 times in
+	// raceExpiry; the race drops a block's peers at most once in raceExpiry (maybeRaceSlowBlock).
 	raceExpiry = 10 * time.Minute
 	// maxBlockCopies is the most live copies of one block at once: the first request and at most
 	// two extra copies, from the race or the queued re-ask. A live copy is an owner not let off
@@ -171,7 +174,9 @@ type streamRegistry struct {
 	mu     sync.Mutex
 	active map[*blockStream]struct{}
 	rates  map[*peerpkg.Peer]float64
-	raced  map[chainhash.Hash]time.Time
+	// raced is each block's race history over the last raceExpiry: when extra copies were asked
+	// for, by the race or the queued re-ask, and when the race last dropped its copies.
+	raced map[chainhash.Hash]*raceHistory
 	// lastBlock is when each peer last finished delivering a block.
 	lastBlock map[*peerpkg.Peer]time.Time
 	// pooled is each peer's completed blocks not yet in its rate, until they cover minRateSample.
@@ -179,6 +184,25 @@ type streamRegistry struct {
 	// decay is the factor a peer's rate is cut to while it owes blocks and sends none
 	// (decayQuiet). It stays until the peer's next rate sample.
 	decay map[*peerpkg.Peer]float64
+}
+
+// raceHistory is what the race and the queued re-ask did for one block in the last raceExpiry. It is
+// kept apart from the ledger: a dropped peer leaves the ledger (ClearPeer), so the live owners
+// cannot tell how many copies a block has already cost.
+type raceHistory struct {
+	// asked is when each extra copy was asked for, oldest first.
+	asked []time.Time
+	// dropped is when the race last disconnected the peers sending this block, or zero.
+	dropped time.Time
+}
+
+// newest is when the newest extra copy was asked for, or zero.
+func (h *raceHistory) newest() time.Time {
+	if h == nil || len(h.asked) == 0 {
+		return time.Time{}
+	}
+
+	return h.asked[len(h.asked)-1]
 }
 
 // rateSample is block bytes delivered and the time they took.
@@ -194,7 +218,7 @@ func newStreamRegistry() *streamRegistry {
 		decay:     make(map[*peerpkg.Peer]float64),
 		active:    make(map[*blockStream]struct{}),
 		rates:     make(map[*peerpkg.Peer]float64),
-		raced:     make(map[chainhash.Hash]time.Time),
+		raced:     make(map[chainhash.Hash]*raceHistory),
 	}
 }
 
@@ -552,15 +576,52 @@ func (r *streamRegistry) wasRaced(h chainhash.Hash, now time.Time) bool {
 
 	r.expireRacesLocked(now)
 
-	at, raced := r.raced[h]
+	at := r.raced[h].newest()
 
-	return raced && now.Sub(at) < raceSlowFetchAfter
+	return !at.IsZero() && now.Sub(at) < raceSlowFetchAfter
 }
 
+// markRaced records that an extra copy of h was asked for at now.
 func (r *streamRegistry) markRaced(h chainhash.Hash, now time.Time) {
 	r.mu.Lock()
-	r.raced[h] = now
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+
+	r.historyLocked(h).asked = append(r.historyLocked(h).asked, now)
+}
+
+// markDropped records that the race disconnected the peers sending h at now.
+func (r *streamRegistry) markDropped(h chainhash.Hash, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.historyLocked(h).dropped = now
+}
+
+// raceCost is how many extra copies of h were asked for in the last raceExpiry, and whether the
+// race disconnected the peers sending it in that time.
+func (r *streamRegistry) raceCost(h chainhash.Hash, now time.Time) (asked int, dropped bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.expireRacesLocked(now)
+
+	hist := r.raced[h]
+	if hist == nil {
+		return 0, false
+	}
+
+	return len(hist.asked), !hist.dropped.IsZero()
+}
+
+// historyLocked is h's race history, made on first use. Called with r.mu held.
+func (r *streamRegistry) historyLocked(h chainhash.Hash) *raceHistory {
+	hist := r.raced[h]
+	if hist == nil {
+		hist = &raceHistory{}
+		r.raced[h] = hist
+	}
+
+	return hist
 }
 
 // forgetPeer drops a departed peer's rate and activity.
@@ -608,8 +669,22 @@ func (r *streamRegistry) lastBlockBytesLocked(p *peerpkg.Peer) time.Time {
 
 // expireRacesLocked drops race marks past their expiry.
 func (r *streamRegistry) expireRacesLocked(now time.Time) {
-	for h, at := range r.raced {
-		if now.Sub(at) > raceExpiry {
+	for h, hist := range r.raced {
+		kept := hist.asked[:0]
+
+		for _, at := range hist.asked {
+			if now.Sub(at) <= raceExpiry {
+				kept = append(kept, at)
+			}
+		}
+
+		hist.asked = kept
+
+		if !hist.dropped.IsZero() && now.Sub(hist.dropped) > raceExpiry {
+			hist.dropped = time.Time{}
+		}
+
+		if len(hist.asked) == 0 && hist.dropped.IsZero() {
 			delete(r.raced, h)
 		}
 	}
@@ -648,7 +723,7 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 			continue
 		}
 
-		if at, raced := r.raced[s.hash]; raced && now.Sub(at) < raceSlowFetchAfter {
+		if at := r.raced[s.hash].newest(); !at.IsZero() && now.Sub(at) < raceSlowFetchAfter {
 			continue
 		}
 
@@ -868,14 +943,35 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 		return
 	}
 
+	// The race's cost to one block is bounded by its history over raceExpiry, not by who owes the
+	// block now: a dropped peer leaves the ledger (ClearPeer), so with this node's own sink slow,
+	// every copy under 100 KB/s, a cap on live owners never bound and an honest peer was dropped
+	// about every 30 to 35 s. A block gets at most maxBlockCopies-1 extra copies and one round of
+	// disconnects in raceExpiry.
+	//
+	// Nobody is dropped while this node is backpressured: a read loop waits for an admission slot
+	// (localReadBackpressured, the signal the peer stall detector reads), so the slow bytes are
+	// this node's. Only that signal is measured today. A slow disk with admission slots still
+	// free does not raise it; the history bound above is what limits the cost then.
+	asked, droppedRecently := sm.streams.raceCost(s.hash, now)
+	mayDrop := !droppedRecently && !sm.localReadBackpressured()
+
 	// At the cap no extra copy is asked for, but each stalling copy is still dropped, as SV Node's
 	// DetectStalling drops a staller whatever its parallel fetch count (net_processing.cpp:5446-5466).
 	// Before, the cap returned first: two forgiven owners and one copy at 50 KB/s left the block
 	// to the peer layer's deadline, an hour or more.
 	owners := sm.blockDownloads.OwnersOf(s.hash)
-	if copies := sm.blockCopies(s.hash, owners); copies >= maxBlockCopies {
-		sm.dropStallingCopies(s, stalling)
-		sm.logger.Infof("[frontierRace][%s] dropped %v, which were sending block %d at under %.0f KB/s; %d live copies, so no other peer was asked", s.hash, stalling, s.height, float64(raceStallRate)/1e3, copies)
+	if copies := sm.blockCopies(s.hash, owners); copies >= maxBlockCopies || asked >= maxBlockCopies-1 {
+		if !mayDrop {
+			sm.logger.Debugf("[frontierRace][%s] block %d is arriving at %.0f KB/s; %d live copies and %d extra copies asked in %s, and its peers were dropped in that time or this node is backpressured, so nothing was done",
+				s.hash, s.height, c.rate/1e3, copies, asked, raceExpiry)
+
+			return
+		}
+
+		sm.dropStallingCopies(s, stalling, now)
+		sm.logger.Infof("[frontierRace][%s] dropped %v, which were sending block %d at under %.0f KB/s; %d live copies and %d extra copies asked in %s, so no other peer was asked",
+			s.hash, stalling, s.height, float64(raceStallRate)/1e3, copies, asked, raceExpiry)
 
 		return
 	}
@@ -902,17 +998,27 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 		return
 	}
 
+	if !mayDrop {
+		sm.logger.Infof("[frontierRace][%s] asked %s for block %d, which is arriving at under %.0f KB/s; %v kept, as this block's peers were dropped in the last %s or this node is backpressured",
+			s.hash, racer, s.height, float64(raceStallRate)/1e3, stalling, raceExpiry)
+
+		return
+	}
+
 	// Each peer sending a copy is struggling, and each is dropped as SV Node drops a staller. The
 	// copy converting stops, which frees the block for the extra copy; left connected, the extra
 	// copy would arrive as a duplicate and be drained unwritten.
-	sm.dropStallingCopies(s, stalling)
+	sm.dropStallingCopies(s, stalling, now)
 
 	sm.logger.Infof("[frontierRace][%s] asked %s for block %d and dropped %v, which were sending it at under %.0f KB/s; one at %.0f KB/s after %s",
 		s.hash, racer, s.height, stalling, float64(raceStallRate)/1e3, c.rate/1e3, c.age.Round(time.Second))
 }
 
-// dropStallingCopies disconnects each peer sending a struggling copy of s's block.
-func (sm *SyncManager) dropStallingCopies(s *blockStream, stalling []*peerpkg.Peer) {
+// dropStallingCopies disconnects each peer sending a struggling copy of s's block, and records the
+// round in the block's race history.
+func (sm *SyncManager) dropStallingCopies(s *blockStream, stalling []*peerpkg.Peer, now time.Time) {
+	sm.streams.markDropped(s.hash, now)
+
 	for _, p := range stalling {
 		p.DisconnectWithInfo(fmt.Sprintf("stalling on block %d at under %.0f KB/s", s.height, float64(raceStallRate)/1e3))
 	}
