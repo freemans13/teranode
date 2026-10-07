@@ -147,6 +147,15 @@ type readSample struct {
 	read int64
 }
 
+// complete reports whether this node has read the copy's full declared length. total is the
+// block's wire payload with its header, and the reader starts after the wire.MaxBlockHeaderPayload
+// (80) header bytes, so the full length is total less the header. A complete copy is not judged:
+// its stream stays active while it waits to take over from a slower copy (raceDuplicateCopy) or
+// while it converts, and with no more bytes to read its live rate falls to zero.
+func (s *blockStream) complete() bool {
+	return s.total > wire.MaxBlockHeaderPayload && s.read.Load() >= s.total-wire.MaxBlockHeaderPayload
+}
+
 func (s *blockStream) rate(now time.Time) float64 {
 	elapsed := now.Sub(s.start).Seconds()
 	if elapsed <= 0 {
@@ -751,7 +760,7 @@ func (r *streamRegistry) lastLiveBytesLocked(p *peerpkg.Peer, now time.Time) tim
 			continue
 		}
 
-		if now.Sub(s.start) >= liveRateWindow && r.judgedRateLocked(s, now) < raceStallRate {
+		if !s.complete() && now.Sub(s.start) >= liveRateWindow && r.judgedRateLocked(s, now) < raceStallRate {
 			continue
 		}
 
@@ -810,8 +819,10 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 
 	for s := range r.active {
 		// A copy waiting for admission is not judged, and keeps its block out of the race: its
-		// bytes are not read because this node is busy.
-		if s.owner != nil && (s.awaiting.Load() || now.Sub(s.start) < raceSlowFetchAfter || r.judgedRateLocked(s, now) >= raceStallRate) {
+		// bytes are not read because this node is busy. A complete copy is not judged either, and
+		// keeps its block out of the race: the full body is here. A racer that took over waits
+		// with its full body in its side file, and its live rate of zero made it a staller.
+		if s.owner != nil && (s.awaiting.Load() || s.complete() || now.Sub(s.start) < raceSlowFetchAfter || r.judgedRateLocked(s, now) >= raceStallRate) {
 			healthy[s.hash] = true
 		}
 	}

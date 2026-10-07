@@ -748,7 +748,10 @@ type SyncManager struct {
 	conversions   map[chainhash.Hash]*conversionCtl
 	// sideCopyReader wraps each read of a side file (raceDuplicateCopy), so a test can make the
 	// disk fail part way. nil reads the file as it is; nothing in production sets it.
-	sideCopyReader   func(io.Reader) io.Reader
+	sideCopyReader func(io.Reader) io.Reader
+	// takeoverAfter is the timer of a copy that took over and waits for the copy it took over
+	// (awaitTakeover), so a test can fire it. nil is time.After; nothing in production sets it.
+	takeoverAfter    func(time.Duration) <-chan time.Time
 	inFlightBlocksMu sync.Mutex
 
 	// blockPrefetchWaiters counts read-loops currently blocked acquiring a

@@ -2,11 +2,14 @@ package netsync
 
 import (
 	"bufio"
+	stderrors "errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -22,9 +25,10 @@ import (
 // started first, and the chain waited 26 minutes more.
 //
 // Now the second copy is written to a side file. If it completes while the first is still
-// converting, it takes over: the first stops at its next transaction, removes the subtree files it
-// wrote, and drains the rest of its peer's bytes, and only then is the block converted from the
-// side file. Two conversions of one block never write at the same time, because they share
+// converting, it takes over: the first stops at its next read of its peer's bytes or its next
+// transaction, removes the subtree files it wrote, and drains the rest of its peer's bytes, and
+// only then is the block converted from the side file. A first copy whose peer sends no byte for
+// takeoverStallTimeout is disconnected (awaitTakeover). Two conversions of one block never write at the same time, because they share
 // content-addressed subtree files; that is what stopped the chain at 707,177. If the first has
 // already read its last transaction when the second completes, the first wins and the side file
 // is deleted.
@@ -42,9 +46,27 @@ const (
 // admitKeptFaster is the admission path of a second copy that completed first and was converted.
 const admitKeptFaster = "converted from disk: it completed before the copy that started first"
 
+// takeoverStallTimeout is how long a copy that took over waits for the copy it took over while
+// that copy waits for its peer's next byte. The converting copy stops at its next read, so only a
+// peer that sends no byte keeps it. At the timeout that peer is disconnected, which ends the read.
+// SV Node disconnects a peer that stalls the block download for DEFAULT_BLOCK_STALLING_TIMEOUT,
+// 10 s, at less than DEFAULT_MIN_BLOCK_STALLING_RATE (validation.h:124-129,
+// net_processing.cpp:5453-5467).
+const takeoverStallTimeout = 10 * time.Second
+
+// errYieldedToFasterCopy is what a converting copy's reader gives at its first read after a
+// faster copy took over (yieldReader).
+var errYieldedToFasterCopy = stderrors.New("a faster copy of the block took over")
+
 // conversionCtl lets a faster copy of a block stop the copy being converted.
 type conversionCtl struct {
 	state atomic.Int32
+	// inRead is true while the converting copy waits in a read of its peer's bytes (yieldReader).
+	inRead atomic.Bool
+	// sender is the peer the converting copy comes from, resolved to the peer that owes the
+	// block when there is one, or nil when the reader names no peer. Set before the conversion
+	// is registered.
+	sender *peerpkg.Peer
 	// cleaned is closed once the conversion will write nothing more and has removed what it
 	// wrote: on the yield path, and on every other exit, since a conversion can be taken over and
 	// then fail its own read before it gets back to the yield check.
@@ -55,6 +77,11 @@ type conversionCtl struct {
 // markCleaned releases a copy waiting to take over. Safe to call more than once.
 func (c *conversionCtl) markCleaned() {
 	c.cleanOnce.Do(func() { close(c.cleaned) })
+}
+
+// reading reports whether the converting copy waits in a read of its peer's bytes.
+func (c *conversionCtl) reading() bool {
+	return c.inRead.Load()
 }
 
 // yielding reports whether a faster copy has taken over.
@@ -73,9 +100,14 @@ func (c *conversionCtl) takeOver() bool {
 	return c.state.CompareAndSwap(conversionRunning, conversionYielding)
 }
 
-// startConversion registers a conversion of hash, replacing any earlier one's registration.
-func (sm *SyncManager) startConversion(hash chainhash.Hash) *conversionCtl {
+// startConversion registers a conversion of hash, from the copy r reads, replacing any earlier
+// one's registration.
+func (sm *SyncManager) startConversion(hash chainhash.Hash, r io.Reader) *conversionCtl {
 	c := &conversionCtl{cleaned: make(chan struct{})}
+
+	if c.sender = sm.owingSender(r, hash); c.sender == nil {
+		c.sender = deliveringPeer(r)
+	}
 
 	sm.conversionsMu.Lock()
 	defer sm.conversionsMu.Unlock()
@@ -107,6 +139,70 @@ func (sm *SyncManager) conversionOf(hash chainhash.Hash) *conversionCtl {
 	return sm.conversions[hash]
 }
 
+// yieldReader reads a converting copy's bytes and gives errYieldedToFasterCopy at its first read
+// after a faster copy took over, and passes each read after that, so the rest can be drained. The
+// takeover used to be examined only between transactions: a peer that trickled the middle of a
+// large transaction kept a complete copy waiting until that transaction ended. ctl is nil until
+// the conversion is registered, and then reads pass. One goroutine reads it.
+type yieldReader struct {
+	r       io.Reader
+	ctl     *conversionCtl
+	yielded bool
+}
+
+func (y *yieldReader) Read(p []byte) (int, error) {
+	if y.ctl == nil {
+		return y.r.Read(p)
+	}
+
+	if !y.yielded && y.ctl.yielding() {
+		y.yielded = true
+
+		return 0, errYieldedToFasterCopy
+	}
+
+	y.ctl.inRead.Store(true)
+	defer y.ctl.inRead.Store(false)
+
+	return y.r.Read(p)
+}
+
+// awaitTakeover waits until the copy ctl controls has stopped and removed what it wrote. While
+// that copy waits for its peer's next byte for takeoverStallTimeout, its peer is disconnected,
+// which ends the read. A wait while the copy does this node's own work, such as a store write,
+// is not the peer's, and the wait continues. It gives an error only when sm.ctx ends.
+func (sm *SyncManager) awaitTakeover(hash chainhash.Hash, ctl *conversionCtl) error {
+	after := sm.takeoverAfter
+	if after == nil {
+		after = time.After
+	}
+
+	dropped := false
+
+	for {
+		var timeout <-chan time.Time
+		if !dropped {
+			timeout = after(takeoverStallTimeout)
+		}
+
+		select {
+		case <-ctl.cleaned:
+			return nil
+		case <-sm.ctx.Done():
+			return sm.ctx.Err()
+		case <-timeout:
+			if !ctl.reading() || ctl.sender == nil {
+				continue
+			}
+
+			dropped = true
+
+			sm.logger.Infof("[blockOnDisk][%s] a complete copy waited %s for the copy it took over, whose peer %s sent no byte; disconnecting that peer", hash, takeoverStallTimeout, ctl.sender)
+			ctl.sender.DisconnectWithInfo(fmt.Sprintf("sent no byte of block %s for %s while a complete copy waited", hash, takeoverStallTimeout))
+		}
+	}
+}
+
 // yieldToFasterCopy stops a conversion a faster copy has taken over: it removes what this copy
 // wrote, lets the faster copy start, and reads the rest of this copy off the wire so the peer's
 // connection stays in step.
@@ -117,7 +213,14 @@ func (sm *SyncManager) yieldToFasterCopy(hash chainhash.Hash, writer *subtreeWri
 
 	sm.logger.Infof("[pipelineBlockSink][%s] another copy completed first; stopped converting this one and draining the rest", hash)
 
-	if _, err := io.Copy(io.Discard, rest); err != nil {
+	// The buffer over the reader can keep errYieldedToFasterCopy from a read ahead and give it to
+	// the drain. yieldReader gives it once and then passes each read, so the drain continues.
+	_, err := io.Copy(io.Discard, rest)
+	if stderrors.Is(err, errYieldedToFasterCopy) {
+		_, err = io.Copy(io.Discard, rest)
+	}
+
+	if err != nil {
 		return false, err
 	}
 
@@ -231,10 +334,8 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 		return false, nil
 	}
 
-	select {
-	case <-ctl.cleaned:
-	case <-sm.ctx.Done():
-		return false, sm.ctx.Err()
+	if err = sm.awaitTakeover(hash, ctl); err != nil {
+		return false, err
 	}
 
 	if _, err = f.Seek(0, io.SeekStart); err != nil {
