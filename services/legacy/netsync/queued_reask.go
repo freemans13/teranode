@@ -148,6 +148,11 @@ const farOff = time.Duration(1<<63 - 1)
 // still sending, a typical block for each block ahead of it and its own typical size, at o's rate.
 // An owner let off the block (forgiven, so not in its queue) and sending no copy will not deliver.
 func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []queuedBlock, typical int64, now time.Time) (eta time.Duration, ownSize int64, state string, judged bool) {
+	// A copy waiting for an admission slot is this node's delay, not the owner's.
+	if sm.streams.awaitingAdmission(h, o) {
+		return 0, 0, "", false
+	}
+
 	if read, total, start, arriving := sm.streams.arrivingFrom(h, o); arriving {
 		elapsed := now.Sub(start)
 		if elapsed < raceSlowFetchAfter || read <= 0 {

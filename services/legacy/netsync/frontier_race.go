@@ -105,11 +105,20 @@ type blockStream struct {
 	sender *peerpkg.Peer
 	total  int64
 	read   atomic.Int64
-	// lastRead is when bytes last arrived for this block, in unix nanoseconds.
+	// lastRead is when bytes last arrived for this block, or when its admission slot was granted
+	// if later (admit), in unix nanoseconds.
 	lastRead atomic.Int64
 	// received is the node-wide count of block bytes received, or nil.
 	received *atomic.Int64
-	start    time.Time
+	// start is when the copy's clock starts: its first byte, moved to when its admission slot
+	// was granted if it waited for one (admit). Written under the registry's lock after add.
+	start time.Time
+	// awaiting is true while the copy waits for an admission slot (admitPipelineSink). This node
+	// reads none of its bytes then, so the copy is not judged and its owner is not quiet.
+	awaiting atomic.Bool
+	// waited is how long the copy waited for admission, the amount start was moved forward.
+	// Written under the registry's lock.
+	waited time.Duration
 	// requestedAt is when the ledger first recorded a request for this block, zero if none.
 	requestedAt time.Time
 	// from is when owner could start sending this block: the later of when it was asked for it and
@@ -153,8 +162,8 @@ func (c countingReader) Read(p []byte) (int, error) {
 
 // raceCandidate is why a block was picked, for the log line.
 type raceCandidate struct {
-	eta, need time.Duration
-	rate      float64
+	eta, need, age time.Duration
+	rate           float64
 }
 
 // streamRegistry holds the blocks arriving now and each peer's rate on completed blocks.
@@ -205,6 +214,70 @@ func (r *streamRegistry) add(s *blockStream) {
 	r.mu.Unlock()
 }
 
+// awaitAdmission marks s as waiting for an admission slot.
+func (r *streamRegistry) awaitAdmission(s *blockStream) {
+	if r == nil || s == nil {
+		return
+	}
+
+	s.awaiting.Store(true)
+}
+
+// admit ends s's wait for admission at now. A copy that waited has its clock, and its owner's
+// silence, start again at now: the wait was this node's, not the peer's. A copy that did not wait
+// is left as it is.
+func (r *streamRegistry) admit(s *blockStream, now time.Time) {
+	if r == nil || s == nil || !s.awaiting.Load() {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if now.After(s.start) {
+		s.waited += now.Sub(s.start)
+		s.start = now
+	}
+
+	if at := s.lastRead.Load(); at < now.UnixNano() {
+		s.lastRead.Store(now.UnixNano())
+	}
+
+	s.awaiting.Store(false)
+}
+
+// awaitAdmissionOf and admitOf are awaitAdmission and admit for the stream behind a reader that
+// trackBlockStreams handed down. Any other reader is left alone.
+func (r *streamRegistry) awaitAdmissionOf(reader io.Reader) {
+	if c, ok := reader.(countingReader); ok {
+		r.awaitAdmission(c.s)
+	}
+}
+
+func (r *streamRegistry) admitOf(reader io.Reader, now time.Time) {
+	if c, ok := reader.(countingReader); ok {
+		r.admit(c.s, now)
+	}
+}
+
+// awaitingAdmission reports whether the copy of h from p waits for an admission slot.
+func (r *streamRegistry) awaitingAdmission(h chainhash.Hash, p *peerpkg.Peer) bool {
+	if r == nil || p == nil {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for s := range r.active {
+		if s.hash == h && s.owner == p && s.awaiting.Load() {
+			return true
+		}
+	}
+
+	return false
+}
+
 // couldStart is when p could start sending a block it was asked for at requested and whose first
 // byte came at firstByte: the later of the request and the end of p's block before, and never
 // after the first byte. A peer sends its queue one block at a time, so a block starts when the
@@ -244,12 +317,15 @@ func (r *streamRegistry) finish(s *blockStream, now time.Time, complete bool) {
 
 	r.lastBlock[s.owner] = now
 
+	// Timed from when the owner could start, less this node's own admission wait.
+	firstByte := s.start.Add(-s.waited)
+
 	from := s.from
-	if from.IsZero() || from.After(s.start) {
-		from = s.start
+	if from.IsZero() || from.After(firstByte) {
+		from = firstByte
 	}
 
-	took := now.Sub(from)
+	took := now.Sub(from) - s.waited
 	if took <= 0 {
 		return
 	}
@@ -296,7 +372,7 @@ func (r *streamRegistry) decayQuiet(now time.Time, owedSince map[*peerpkg.Peer]t
 	defer r.mu.Unlock()
 
 	for p, since := range owedSince {
-		if r.rates[p] <= 0 {
+		if r.rates[p] <= 0 || r.awaitingFromLocked(p) {
 			continue
 		}
 
@@ -314,6 +390,18 @@ func (r *streamRegistry) decayQuiet(now time.Time, owedSince map[*peerpkg.Peer]t
 			r.decay[p] = f
 		}
 	}
+}
+
+// awaitingFromLocked reports whether a copy from owner p waits for an admission slot: p is then
+// not quiet, this node is not reading. Called with r.mu held.
+func (r *streamRegistry) awaitingFromLocked(p *peerpkg.Peer) bool {
+	for s := range r.active {
+		if s.owner == p && s.awaiting.Load() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // rateLocked is p's rate with any decay applied. Called with r.mu held.
@@ -548,7 +636,9 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 	healthy := make(map[chainhash.Hash]bool)
 
 	for s := range r.active {
-		if s.owner != nil && (now.Sub(s.start) < raceSlowFetchAfter || s.rate(now) >= raceStallRate) {
+		// A copy waiting for admission is not judged, and keeps its block out of the race: its
+		// bytes are not read because this node is busy.
+		if s.owner != nil && (s.awaiting.Load() || now.Sub(s.start) < raceSlowFetchAfter || s.rate(now) >= raceStallRate) {
 			healthy[s.hash] = true
 		}
 	}
@@ -583,7 +673,7 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 
 		if best == nil || s.height < best.height {
 			best = s
-			bestCand = raceCandidate{eta: eta, need: need, rate: rate}
+			bestCand = raceCandidate{eta: eta, need: need, rate: rate, age: now.Sub(s.start)}
 		}
 	}
 
@@ -818,7 +908,7 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 	sm.dropStallingCopies(s, stalling)
 
 	sm.logger.Infof("[frontierRace][%s] asked %s for block %d and dropped %v, which were sending it at under %.0f KB/s; one at %.0f KB/s after %s",
-		s.hash, racer, s.height, stalling, float64(raceStallRate)/1e3, c.rate/1e3, now.Sub(s.start).Round(time.Second))
+		s.hash, racer, s.height, stalling, float64(raceStallRate)/1e3, c.rate/1e3, c.age.Round(time.Second))
 }
 
 // dropStallingCopies disconnects each peer sending a struggling copy of s's block.
