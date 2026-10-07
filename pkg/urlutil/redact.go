@@ -45,19 +45,99 @@ const unparseableURL = "<unparseable url>"
 // with no userinfo at all and the host set to "user:2024" or "user:", and with
 // an "@" before it, the userinfo ends at that "@". Either way the rest of the
 // password, up to the real "@", lands in the path, query or fragment, where
-// Redacted() prints it. The real "@" is what gives it away. A legitimate "@" in
-// a path or query is also masked, which errs in the safe direction for a log
-// line.
+// Redacted() prints it. The real "@" is what gives it away. A legitimate raw
+// "@" in a path or query is also masked, which errs in the safe direction for a
+// log line. The guard reads the escaped path and fragment, so a percent-encoded
+// "%40" there is left alone: the misread always leaves the real "@" raw.
+//
+// A query value can hold a whole URL of its own, and that URL can carry a
+// working credential: utxostore's externalStore parameter is a blob store URL,
+// and an http blob store sends its userinfo as a Basic header. A nested URL with
+// options of its own has to be percent-encoded to survive the outer query, so
+// its "@" arrives as "%40" and the guard above never sees it. Each query value
+// is therefore decoded the way url.Values decodes it for the consumer, and any
+// URL inside it is masked in turn; see redactQuery.
 func Redact(u *url.URL) string {
 	if u == nil {
 		return nilURL
 	}
 
-	if strings.Contains(u.Path+u.RawQuery+u.Fragment, "@") {
+	if strings.Contains(u.EscapedPath()+u.RawQuery+u.EscapedFragment(), "@") {
 		return unparseableURL
 	}
 
+	rawQuery, ok := redactQuery(u.RawQuery)
+	if !ok {
+		return unparseableURL
+	}
+
+	if rawQuery != u.RawQuery {
+		c := *u
+		c.RawQuery = rawQuery
+
+		return c.Redacted()
+	}
+
 	return u.Redacted()
+}
+
+// redactQuery masks the password of every URL nested in a value of rawQuery,
+// and reports false when it cannot vouch for the result.
+//
+// It works segment by segment on the raw string rather than through
+// url.Values.Encode, which sorts the keys and re-escapes every value, so a
+// query with nothing to mask comes back byte for byte. Only a value whose
+// decoded form holds an "@" is touched, because a userinfo cannot exist
+// without one; that keeps every credential-free value, including the committed
+// externalStore=file://${DATADIR}/... forms, out of the rewrite entirely.
+//
+// A value that will not decode reports false. url.Values drops such a pair, so
+// the consumer never uses it, but its raw bytes would still reach the log, and
+// there is no safe way to pick a secret out of something the decoder refused.
+// The same goes for a value with an "@" outside every URL token in it: that is
+// an "@" RedactText would not reach, such as one after a space in a password,
+// or a plain address like a@b, which the raw-"@" guard masks too.
+func redactQuery(rawQuery string) (string, bool) {
+	if rawQuery == "" {
+		return rawQuery, true
+	}
+
+	segments := strings.Split(rawQuery, "&")
+	changed := false
+
+	for i, segment := range segments {
+		key, rawValue, hasValue := strings.Cut(segment, "=")
+		if !hasValue {
+			continue
+		}
+
+		value, err := url.QueryUnescape(rawValue)
+		if err != nil {
+			return "", false
+		}
+
+		if !strings.Contains(value, "@") {
+			continue
+		}
+
+		if strings.Contains(urlToken.ReplaceAllString(value, ""), "@") {
+			return "", false
+		}
+
+		redacted := RedactText(value)
+		if redacted == value {
+			continue
+		}
+
+		segments[i] = key + "=" + url.QueryEscape(redacted)
+		changed = true
+	}
+
+	if !changed {
+		return rawQuery, true
+	}
+
+	return strings.Join(segments, "&"), true
 }
 
 // ParseErrorReason says why url.Parse refused a string without quoting any of
@@ -79,7 +159,7 @@ func ParseErrorReason(err error) error {
 		return parseReason("invalid character in host name")
 	}
 
-	return parseReason("malformed URL; percent-encode reserved characters in the userinfo")
+	return parseReason("malformed URL; check the scheme and port, and percent-encode any reserved characters in the userinfo")
 }
 
 // parseReason is a fixed, input-free parse failure reason. It is a type of its

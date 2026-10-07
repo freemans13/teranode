@@ -13,6 +13,12 @@ var (
 	gocoreStatsMux  *http.ServeMux
 
 	defaultMuxStatsOnce sync.Once
+
+	// statsMuxes records the non-default muxes the stats pages are already
+	// mounted on. A mux is held for the life of the process, which is the
+	// life of the listener that serves it.
+	statsMuxesMu sync.Mutex
+	statsMuxes   = map[*http.ServeMux]struct{}{}
 )
 
 // gocoreStatsHandler returns gocore's stats pages behind a guard that refuses
@@ -49,8 +55,9 @@ func gocoreStatsHandler() http.Handler {
 
 // RegisterGocoreStatsHandlers mounts gocore's stats pages on mux, leaving out
 // the configuration page, which would serve store credentials to anyone who
-// can reach the listener. A nil mux means http.DefaultServeMux, which is
-// mounted at most once per process however many times this is called.
+// can reach the listener. A nil mux means http.DefaultServeMux. Each mux is
+// mounted at most once however many times this is called, because
+// http.ServeMux panics when the same pattern is registered twice.
 //
 // Call this in place of gocore.RegisterStatsHandlers.
 func RegisterGocoreStatsHandlers(mux *http.ServeMux) {
@@ -62,5 +69,13 @@ func RegisterGocoreStatsHandlers(mux *http.ServeMux) {
 		return
 	}
 
+	statsMuxesMu.Lock()
+	defer statsMuxesMu.Unlock()
+
+	if _, mounted := statsMuxes[mux]; mounted {
+		return
+	}
+
 	mux.Handle(gocore.GetStatPrefix(), gocoreStatsHandler())
+	statsMuxes[mux] = struct{}{}
 }

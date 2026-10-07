@@ -258,10 +258,17 @@ func loggingCallName(fun ast.Expr, boundLoggers map[string]string) (string, bool
 var fprintCalls = regexp.MustCompile(`^Fprint(f|ln)?$`)
 
 // formatArgIndex reports which argument holds the format string, so a literal
-// one can be skipped without also skipping a real argument. The name may carry
-// the " (bound to X)" suffix loggingCallName adds for a function value.
+// one can be skipped without also skipping a real argument. For a function
+// value loggingCallName renders the name as "w (Fprintf)", and it is the bound
+// function in the parentheses, not the variable's own name, that decides where
+// the format string sits.
 func formatArgIndex(callName string) int {
-	if fprintCalls.MatchString(strings.SplitN(callName, " ", 2)[0]) {
+	name, bound, isBound := strings.Cut(callName, " (")
+	if isBound {
+		name = strings.TrimSuffix(bound, ")")
+	}
+
+	if fprintCalls.MatchString(name) {
 		return 1
 	}
 
@@ -425,4 +432,16 @@ func repoRoot(t *testing.T) string {
 
 		dir = parent
 	}
+}
+
+// TestFormatArgIndex pins where the guard looks for the format string,
+// including a variable bound to an Fprint function, whose own name says nothing
+// about which argument is the writer.
+func TestFormatArgIndex(t *testing.T) {
+	require.Equal(t, 0, formatArgIndex("Infof"))
+	require.Equal(t, 0, formatArgIndex("Sprintf"))
+	require.Equal(t, 1, formatArgIndex("Fprintf"))
+	require.Equal(t, 1, formatArgIndex("Fprint"))
+	require.Equal(t, 1, formatArgIndex("w (Fprintf)"))
+	require.Equal(t, 0, formatArgIndex("errFn (NewServiceError)"))
 }

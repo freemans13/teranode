@@ -1,6 +1,7 @@
 package teranode
 
 import (
+	"net/url"
 	"os"
 	"testing"
 
@@ -48,6 +49,19 @@ func TestConfigStatsDumpNeverLogsStoreCredentials(t *testing.T) {
 	require.Contains(t, cfg.Stats(), misreadURL,
 		"gocore's own dump no longer carries the misread URL, so this case is not exercising a leak")
 
+	// utxostore's externalStore parameter is a whole blob store URL, and an
+	// http blob store sends its userinfo as a Basic header. Percent-encoded, as
+	// a nested URL with options of its own has to be, its "@" is no longer raw.
+	const nestedKey = "utxostore_nested_redaction_canary"
+
+	nestedURL := "aerospike://nested.example:3000/utxo?set=utxo&externalStore=" +
+		url.QueryEscape("http://blob:"+dumpCanary+"@blob.example:8080/x?batch=true&sizeInBytes=100")
+	cfg.Set(nestedKey, nestedURL)
+	t.Cleanup(func() { cfg.Unset(nestedKey) })
+
+	require.Contains(t, cfg.Stats(), nestedURL,
+		"gocore's own dump no longer carries the nested URL, so this case is not exercising a leak")
+
 	// Stats() renders os.Args as its CMDLINE section, one bare entry per line
 	// with no "key=" in front. A line-splitting redactor would miss the second
 	// of these two, which is why RedactText works on tokens.
@@ -75,6 +89,7 @@ func TestConfigStatsDumpNeverLogsStoreCredentials(t *testing.T) {
 	require.Contains(t, redacted, "db.example:5432", "the settings row lost its host")
 	require.Contains(t, redacted, "flag.example:5432", "the key=value CMDLINE row lost its host")
 	require.Contains(t, redacted, "bare.example:5432", "the bare argv CMDLINE row lost its host")
+	require.Contains(t, redacted, "nested.example:3000", "the nested-store row lost its host")
 	require.Contains(t, redacted, storeKey, "the settings row lost its key")
 	require.Contains(t, redacted, "teranode:xxxxx@", "the username should survive redaction")
 }

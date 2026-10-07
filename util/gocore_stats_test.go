@@ -107,3 +107,26 @@ func TestRegisterGocoreStatsHandlersDefaultMuxIsIdempotent(t *testing.T) {
 	http.DefaultServeMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, gocore.GetStatPrefix()+"config", nil))
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
+
+// TestRegisterGocoreStatsHandlersOwnMuxIsIdempotent is the same pin for a mux
+// the caller owns, while a second mux still gets its own mount.
+func TestRegisterGocoreStatsHandlersOwnMuxIsIdempotent(t *testing.T) {
+	mux := http.NewServeMux()
+	other := http.NewServeMux()
+
+	require.NotPanics(t, func() {
+		RegisterGocoreStatsHandlers(mux)
+		RegisterGocoreStatsHandlers(mux)
+		RegisterGocoreStatsHandlers(other)
+	})
+
+	for _, m := range []*http.ServeMux{mux, other} {
+		rec := httptest.NewRecorder()
+		m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, gocore.GetStatPrefix()+"config", nil))
+		require.Equal(t, http.StatusNotFound, rec.Code)
+
+		rec = httptest.NewRecorder()
+		m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, gocore.GetStatPrefix()+"stats", nil))
+		require.Equal(t, http.StatusOK, rec.Code, "the stats pages are not mounted")
+	}
+}

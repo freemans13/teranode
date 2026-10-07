@@ -2,6 +2,9 @@ package urlutil
 
 import (
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -103,6 +106,50 @@ func TestRedactString(t *testing.T) {
 		// The price of the guard: a legitimate "@" after the authority is
 		// masked too. That errs in the safe direction for a log line.
 		{"@ in the query is over-redacted", "http://blob:8080/x?owner=a@b", "<unparseable url>"},
+		// The same plain address percent-encoded is masked the same way, so
+		// encoding is not a way round the guard.
+		{"encoded @ in a plain query value is over-redacted", "http://blob:8080/x?owner=a%40b", "<unparseable url>"},
+		// The guard reads the escaped path and fragment, so a correctly
+		// percent-encoded "@" there is not mistaken for a misread authority.
+		{"encoded @ in the path passes", "http://host/a%40b", "http://host/a%40b"},
+		{"encoded @ in the fragment passes", "http://h/p#f%40g", "http://h/p#f%40g"},
+		// An encoded "@" inside the password does not hide the real one, which
+		// is raw by definition, in the path or the fragment.
+		{"encoded @ before the real @, path", "postgres://user:2024/a%40b@db:5432/x", "<unparseable url>"},
+		{"encoded @ before the real @, fragment", "http://teranode:8080#s3%40c@blob:8080/x", "<unparseable url>"},
+		// externalStore carries a whole blob store URL, and an http blob store
+		// sends its userinfo as a Basic header. Once the nested URL is
+		// percent-encoded its "@" is no longer raw, so the guard above never
+		// fires and only the nested redaction stands between it and the log.
+		{
+			"nested store URL with an encoded @",
+			"aerospike://h:3000/ns?set=utxo&externalStore=http://user:hunter2%40blob:8080/x",
+			"aerospike://h:3000/ns?set=utxo&externalStore=http%3A%2F%2Fuser%3Axxxxx%40blob%3A8080%2Fx",
+		},
+		{
+			"nested store URL fully encoded",
+			"aerospike://h:3000/ns?set=utxo&externalStore=http%3A%2F%2Fuser%3Ahunter2%40blob%3A8080%2Fx%3Fbatch%3Dtrue%26sizeInBytes%3D100",
+			"aerospike://h:3000/ns?set=utxo&externalStore=http%3A%2F%2Fuser%3Axxxxx%40blob%3A8080%2Fx%3Fbatch%3Dtrue%26sizeInBytes%3D100",
+		},
+		{
+			"outer and nested credentials",
+			"aerospike://u:outer%2Fpw@h:3000/ns?externalStore=http%3A%2F%2Fuser%3Ahunter2%40blob%3A8080%2Fx",
+			"aerospike://u:xxxxx@h:3000/ns?externalStore=http%3A%2F%2Fuser%3Axxxxx%40blob%3A8080%2Fx",
+		},
+		// A nested URL with a username and no password has nothing to mask, so
+		// its bytes are left exactly as configured.
+		{
+			"nested store URL with username only",
+			"aerospike://h:3000/ns?externalStore=http://user%40blob:8080/x",
+			"aerospike://h:3000/ns?externalStore=http://user%40blob:8080/x",
+		},
+		// A "+" or "%20" decodes to a space, which ends the nested URL token
+		// before the "@", so RedactText would leave the rest of the password
+		// behind. The whole URL is masked instead.
+		{"nested password with a space", "aerospike://h:3000/ns?externalStore=http://u:pa+ss%40blob/x", "<unparseable url>"},
+		// url.Values drops a pair that will not decode, so its consumer never
+		// sees it, but its raw bytes would still reach the log.
+		{"malformed escape in the query", "aerospike://h:3000/ns?externalStore=http://u:pw%zz%40blob/x", "<unparseable url>"},
 	}
 
 	for _, tc := range tests {
@@ -150,4 +197,37 @@ func TestParseErrorReasonQuotesNoInput(t *testing.T) {
 			require.Contains(t, reason, tc.want)
 		})
 	}
+}
+
+// TestRedactLeavesCommittedQueriesAlone runs the nested-URL query redaction
+// over every URL in the committed settings.conf. None of them carries a
+// credential in its query, so each query must come back byte for byte: the
+// redaction must cost an operator nothing on a URL it has nothing to mask.
+func TestRedactLeavesCommittedQueriesAlone(t *testing.T) {
+	conf, err := os.ReadFile(filepath.Join("..", "..", "settings.conf"))
+	require.NoError(t, err)
+
+	checked := 0
+
+	// The query is cut out of the raw token rather than taken from a parsed
+	// URL, because many committed values hold ${...} placeholders that do not
+	// parse until they are expanded, and the expanded value keeps the query.
+	for _, token := range urlToken.FindAllString(string(conf), -1) {
+		_, rawQuery, hasQuery := strings.Cut(token, "?")
+		if !hasQuery {
+			continue
+		}
+
+		rawQuery, _, _ = strings.Cut(rawQuery, "#")
+
+		got, ok := redactQuery(rawQuery)
+		require.True(t, ok, "query of %q was refused", token)
+		require.Equal(t, rawQuery, got, "query of %q was rewritten", token)
+
+		checked++
+	}
+
+	// The externalStore and kafka URLs alone are well over this, so a smaller
+	// count means the scan stopped finding them rather than that they are fine.
+	require.Greater(t, checked, 20, "too few committed URLs with a query were checked")
 }
