@@ -92,7 +92,7 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 	var (
 		ownerETA time.Duration
 		soonest  *peerpkg.Peer
-		ownSize  = typical
+		ownSize  = sm.queuedBlockSize(typical)
 		state    = "waits behind"
 	)
 
@@ -121,7 +121,7 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 		return
 	}
 
-	racer, racerETA := sm.soonestOtherPeer(queues, owners, live, height, typical, ownSize)
+	racer, racerETA := sm.soonestOtherPeer(queues, owners, live, height, typical, ownSize, now)
 	if racer == nil || racerETA*queuedReaskFasterBy > ownerETA {
 		return
 	}
@@ -199,7 +199,10 @@ func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []q
 		return 0, 0, "", false
 	}
 
-	return sm.queuedArrival(o, queue, rec.seq, typical, typical, rate), 0, "waits behind", true
+	// The queued block's own size is not known. It is counted at the largest recent block, as the
+	// queue depth is: with the average, an idle slower peer looked sooner than a faster peer with
+	// a queue, and on 2026-10-07 a 2,131 MB block went to a 5.1 MB/s peer.
+	return sm.queuedArrival(o, queue, rec.seq, typical, sm.queuedBlockSize(typical), rate), 0, "waits behind", true
 }
 
 // lowestOwedBlock is the lowest block above tip that some peer owes, not let off, and that this
@@ -270,8 +273,22 @@ func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq u
 // at the back of its queue. A peer that does not owe the block is chosen first. Only when there is
 // none is a forgiven owner sending nothing chosen: it is not a live copy (liveCopies). An owner in
 // live is never chosen. A peer with no measured rate is not chosen: its estimate would be a guess.
-func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owners, live []*peerpkg.Peer, height int32, typical, ownSize int64) (*peerpkg.Peer, time.Duration) {
+func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owners, live []*peerpkg.Peer, height int32, typical, ownSize int64, now time.Time) (*peerpkg.Peer, time.Duration) {
 	eligible := sm.eligibleBlockPeers()
+
+	// Only an active peer is given the second copy (standby_peers.go). A standby peer's queue
+	// is empty, so it can look soonest, but it is on standby because it is slow.
+	rates := make([]float64, 0, len(eligible))
+	for _, bp := range eligible {
+		if r := sm.streams.peerRate(bp.peer); r > 0 {
+			rates = append(rates, r)
+		}
+	}
+
+	floor := activeFloorOf(rates)
+	if sm.downloadWarming(now) {
+		floor = 0
+	}
 
 	pick := func(skip []*peerpkg.Peer) (*peerpkg.Peer, time.Duration) {
 		var (
@@ -281,6 +298,10 @@ func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, 
 
 		for _, bp := range eligible {
 			if slices.Contains(skip, bp.peer) {
+				continue
+			}
+
+			if r := sm.streams.peerRate(bp.peer); r > 0 && r < floor {
 				continue
 			}
 
@@ -307,4 +328,14 @@ func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, 
 	}
 
 	return pick(live)
+}
+
+// queuedBlockSize is the size a block not yet arriving is counted at: the largest recent block,
+// or typical when no size has been recorded.
+func (sm *SyncManager) queuedBlockSize(typical int64) int64 {
+	if largest := sm.blockSizeTracker.largestRecentSize(); largest > 0 {
+		return largest
+	}
+
+	return typical
 }
