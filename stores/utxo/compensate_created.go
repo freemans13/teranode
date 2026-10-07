@@ -51,6 +51,18 @@ import (
 // whoever put it there and is left alone. The walk is transitive through ghosts
 // only.
 //
+// The walk starts from every rejected transaction, including one that is not
+// createdHere and so is not itself deleted. Such a root is a record this
+// attempt filed as pre-existing: a live child the pruner is holding behind its
+// marker, or a leftover of an earlier attempt that could not be recognised
+// (the catch-up lock switched off, or the restart/id-reuse limit described at
+// LeftoversAmong). The root stays, as above, but a dependent THIS attempt wrote
+// spending it is still this attempt's own write in a block that has already
+// failed, and left alone it would sit stored mined with no delete_at_height and
+// spendable outputs. Deleting it is safe for the same reason as every other
+// deletion here: it is this attempt's write, and a retry of the block writes it
+// again.
+//
 // "This attempt created it" includes records an EARLIER attempt at the same
 // block created and never finished with: see LeftoversAmong. Without that, a
 // crash or cancellation between the create phase and this compensation, a
@@ -60,7 +72,9 @@ import (
 // was then blessed on the strength of it. The callers pass createdHere
 // accordingly.
 //
-// txs need not be in dependency order; the walk repeats until it adds nothing.
+// txs need not be in dependency order. The walk indexes each transaction under
+// the parents its inputs name, once, and follows that index breadth first, so
+// it costs O(transactions + inputs) whatever the depth of the ghost chain.
 // Every hash in rejected must name a transaction in txs, which holds at both
 // call sites because the rejections came from spending exactly that list.
 func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere func(*chainhash.Hash) bool) []*bt.Tx {
@@ -71,48 +85,74 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 		return nil
 	}
 
-	// Hash once per transaction: the walk below may visit each several times.
 	hashes := make([]*chainhash.Hash, len(txs))
-	byHash := make(map[chainhash.Hash]*bt.Tx, len(txs))
+	index := make(map[chainhash.Hash]int, len(txs))
 
 	for i, tx := range txs {
 		hashes[i] = tx.TxIDChainHash()
-		byHash[*hashes[i]] = tx
+		index[*hashes[i]] = i
 	}
 
-	ghosts := make(map[chainhash.Hash]struct{}, len(rejected))
+	// spenders maps a transaction of this list to the indices of the
+	// transactions in it that spend one of its outputs.
+	spenders := make(map[chainhash.Hash][]int)
+
+	for i, tx := range txs {
+		for _, input := range tx.Inputs {
+			parent := *input.PreviousTxIDChainHash()
+			if _, inList := index[parent]; !inList {
+				continue
+			}
+
+			if list := spenders[parent]; len(list) > 0 && list[len(list)-1] == i {
+				continue // several inputs of one transaction on the same parent
+			}
+
+			spenders[parent] = append(spenders[parent], i)
+		}
+	}
+
+	// tainted holds every transaction the walk has reached: the rejected roots,
+	// deleted or not, and the ghosts found from them.
+	tainted := make(map[chainhash.Hash]struct{}, len(rejected))
+	queue := make([]chainhash.Hash, 0, len(rejected))
 	result := make([]*bt.Tx, 0, len(rejected))
 
 	for _, hash := range rejected {
-		if _, ok := ghosts[*hash]; ok {
+		if _, ok := tainted[*hash]; ok {
 			continue
 		}
 
-		tx, ok := byHash[*hash]
-		if !ok || !createdHere(hash) {
+		i, ok := index[*hash]
+		if !ok {
 			continue
 		}
 
-		ghosts[*hash] = struct{}{}
-		result = append(result, tx)
+		tainted[*hash] = struct{}{}
+		queue = append(queue, *hash)
+
+		if createdHere(hash) {
+			result = append(result, txs[i])
+		}
 	}
 
-	for added := true; added; {
-		added = false
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
 
-		for i, tx := range txs {
+		for _, i := range spenders[parent] {
 			txHash := hashes[i]
-			if _, ok := ghosts[*txHash]; ok {
+			if _, ok := tainted[*txHash]; ok {
 				continue
 			}
 
-			if !spendsAny(tx, ghosts) || !createdHere(txHash) {
+			if !createdHere(txHash) {
 				continue
 			}
 
-			ghosts[*txHash] = struct{}{}
-			result = append(result, tx)
-			added = true
+			tainted[*txHash] = struct{}{}
+			queue = append(queue, *txHash)
+			result = append(result, txs[i])
 		}
 	}
 
@@ -239,17 +279,6 @@ func IsPrunedReplayRejection(err error, createdHere bool) bool {
 	}
 
 	return createdHere && errors.Is(err, errors.ErrTxNotFound)
-}
-
-// spendsAny reports whether tx spends an output of any transaction in set.
-func spendsAny(tx *bt.Tx, set map[chainhash.Hash]struct{}) bool {
-	for _, input := range tx.Inputs {
-		if _, ok := set[*input.PreviousTxIDChainHash()]; ok {
-			return true
-		}
-	}
-
-	return false
 }
 
 // deleteCreatedAttempts and deleteCreatedBackoff bound the retry of one

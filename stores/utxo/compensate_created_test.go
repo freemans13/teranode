@@ -86,8 +86,44 @@ func TestPrunedReplayGhosts(t *testing.T) {
 		// leftover of an earlier attempt is still caught, through createdHere
 		// (LeftoversAmong: locked and carrying this block's id).
 		require.Empty(t, PrunedReplayGhosts(block, rejected, createdSet()))
-		require.Empty(t, PrunedReplayGhosts(block, rejected, createdSet(f.grandchild, f.greatGrandchild)),
-			"nor is anything that spends it, since it is not a ghost")
+	})
+
+	t.Run("dependents this attempt created are ghosts even when the rejected root is not", func(t *testing.T) {
+		// C was filed as pre-existing, so it stays: with the catch-up lock off,
+		// or after the restart/id-reuse limit, that is how an earlier attempt's
+		// leftover looks. D and E are this attempt's own writes in a block that
+		// has already failed. Left alone they stayed stored mined with no
+		// delete_at_height and spendable outputs; the walk must reach them from
+		// C even though C itself is not deleted.
+		ghosts := PrunedReplayGhosts(block, rejected, createdSet(f.grandchild, f.greatGrandchild))
+		require.ElementsMatch(t, hashesOf(f.grandchild, f.greatGrandchild), hashesOf(ghosts...))
+		require.NotContains(t, hashesOf(ghosts...), f.child.TxIDChainHash(), "the root this attempt did not write is never deleted")
+	})
+
+	t.Run("a long chain is walked in one pass whatever its order", func(t *testing.T) {
+		// A chain of 200 transactions, handed over in reverse order: the old
+		// walk rescanned the whole list once per link.
+		chain := make([]*bt.Tx, 0, 200)
+		prev := f.child
+
+		for i := 0; i < 200; i++ {
+			next := bt.NewTx()
+			require.NoError(t, next.From(prev.TxID(), 0, prev.Outputs[0].LockingScript.String(), prev.Outputs[0].Satoshis))
+			require.NoError(t, next.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", prev.Outputs[0].Satoshis-1))
+			chain = append(chain, next)
+			prev = next
+		}
+
+		reversed := make([]*bt.Tx, 0, len(chain)+1)
+		for i := len(chain) - 1; i >= 0; i-- {
+			reversed = append(reversed, chain[i])
+		}
+
+		reversed = append(reversed, f.child)
+
+		ghosts := PrunedReplayGhosts(reversed, rejected, createdSet(reversed...))
+		require.Len(t, ghosts, len(chain)+1)
+		require.Equal(t, f.child.TxIDChainHash(), ghosts[0].TxIDChainHash(), "the rejected transaction comes first")
 	})
 
 	t.Run("a rejected transaction this attempt created is a ghost", func(t *testing.T) {
