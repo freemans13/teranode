@@ -39,7 +39,9 @@ import (
 // rule is the looser cousin of SV Node's: any quiet owner rather than a bandwidth test, 60 s rather
 // than 30, one re-ask per owner per retry window rather than three parallel fetches.
 // blockRequestRetryInterval's comment explains what an SV Node peer is doing while it is quiet. Do
-// not extend the race to it.
+// not extend the race to it. A block that has not started because it waits behind other blocks
+// at a peer that is busy, neither quiet nor struggling on it, is the queued re-ask's
+// (queued_reask.go), which runs on this ticker, keeps the owner, and shares the race's mark.
 
 const (
 	// raceCheckInterval is how often the race is considered. It runs on its own ticker because
@@ -264,6 +266,19 @@ func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
 	return r.rates[p]
 }
 
+// wasRaced reports whether h has had its one extra request inside raceExpiry, from the race or
+// from the queued re-ask, which share the mark.
+func (r *streamRegistry) wasRaced(h chainhash.Hash, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.expireRacesLocked(now)
+
+	_, raced := r.raced[h]
+
+	return raced
+}
+
 func (r *streamRegistry) markRaced(h chainhash.Hash, now time.Time) {
 	r.mu.Lock()
 	r.raced[h] = now
@@ -483,6 +498,7 @@ func (sm *SyncManager) runFrontierRace() {
 			return
 		case <-ticker.C:
 			sm.maybeRaceSlowBlock(time.Now())
+			sm.maybeReaskQueuedBlock(time.Now())
 
 			if ticks++; ticks%queueReportEvery == 0 {
 				sm.logDownloadQueues()
@@ -590,9 +606,9 @@ func (sm *SyncManager) logDownloadQueues() {
 	}
 
 	w := &sm.waste
-	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d",
+	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d, behind a slow queue %d",
 		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.localFaultDrained.Load(), w.streamsFailed.Load(),
-		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load())
+		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load(), w.reAskedQueued.Load())
 }
 
 // publishDownloadMetrics sets the download gauges, blocks owed, heights the header cache names

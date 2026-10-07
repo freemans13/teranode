@@ -849,6 +849,45 @@ func (t *blockDownloadTracker) requestedWithinLocked(h chainhash.Hash, now time.
 	return false
 }
 
+// queuedBlock is one block a peer owes, with the request's place in that peer's queue.
+type queuedBlock struct {
+	hash chainhash.Hash
+	seq  uint64
+	at   time.Time
+}
+
+// Queues lists, for each peer, the blocks it owes and has not been let off, in the order they
+// were asked, which is the order the peer sends them (see ownerRecord.seq). Expired records are
+// left out, as everywhere else in this ledger. A nil receiver lists nothing.
+func (t *blockDownloadTracker) Queues() map[*peerpkg.Peer][]queuedBlock {
+	if t == nil {
+		return nil
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := t.clock()
+	t.maybeSweepLocked(now)
+
+	out := make(map[*peerpkg.Peer][]queuedBlock, len(t.byPeer))
+
+	for p, hashes := range t.byPeer {
+		for h := range hashes {
+			rec, ok := t.byHash[h][p]
+			if !ok || rec.forgiven || t.expiredAt(rec.at, now, t.ttl) {
+				continue
+			}
+
+			out[p] = append(out[p], queuedBlock{hash: h, seq: rec.seq, at: rec.at})
+		}
+
+		sort.Slice(out[p], func(i, j int) bool { return out[p][i].seq < out[p][j].seq })
+	}
+
+	return out
+}
+
 // clock reads the injected time source, tolerating a tracker built as a struct
 // literal without one.
 func (t *blockDownloadTracker) clock() time.Time {
