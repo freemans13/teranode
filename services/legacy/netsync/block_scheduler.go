@@ -3,6 +3,7 @@ package netsync
 import (
 	"math"
 	"sort"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -26,6 +27,22 @@ type assignerPeer struct {
 	// rate is the peer's measured delivery rate in bytes a second, or the median of the measured
 	// peers when it has none. The lowest block goes to the fastest peer with room.
 	rate float64
+	// measured says rate is the peer's own, not the median it was lent. Only a measured peer is
+	// judged on whether it would deliver in time.
+	measured bool
+	// backlog is how long the peer needs for what it already owes: the bytes still to come on what
+	// it is sending and a typical block for each block queued behind that, at rate. Each block
+	// this pass gives it adds a typical block.
+	backlog time.Duration
+}
+
+// eta is when a block given to p now would land: its backlog and one typical block.
+func (p *assignerPeer) eta(typical int64) time.Duration {
+	if p.rate <= 0 {
+		return time.Duration(math.MaxInt64)
+	}
+
+	return p.backlog + time.Duration(float64(typical)/p.rate*float64(time.Second))
 }
 
 // speedScaledDepth is a peer's share of depth by speed: depth times its rate over the fastest
@@ -124,6 +141,15 @@ type downloadAssigner struct {
 	// full holds the eligible peers with no room left, for fastestAvoiding: a block re-asked
 	// because its owner went quiet may go to one of them.
 	full []*assignerPeer
+
+	// tip, commitRate and typical time a standby peer's probe block (see ACTIVE AND STANDBY
+	// PEERS): the committed height, the blocks a second joining the chain, and the average recent
+	// block size. With any of them unknown no probe is given.
+	tip        int32
+	commitRate float64
+	typical    int64
+	// now is the pass's clock, for the bench probe.
+	now time.Time
 }
 
 // eligibleBlockPeers lists the peers that may be asked for a block body, sync
@@ -235,6 +261,20 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	var full []*assignerPeer
 
 	fallbackRate := sm.streams.medianRate()
+	typical := sm.blockSizeTracker.getAverageSize()
+
+	// backlogOf is how long p needs for what it owes now; see assignerPeer.backlog.
+	backlogOf := func(p *peerpkg.Peer, rate float64) time.Duration {
+		if rate <= 0 || typical <= 0 {
+			return 0
+		}
+
+		sending, arriving := sm.streams.pending(p)
+		queued := max(0, sm.blockDownloads.CountForPeer(p)-arriving)
+		bytes := float64(sending + int64(queued)*typical)
+
+		return time.Duration(bytes / rate * float64(time.Second))
+	}
 
 	var fastest float64
 	for _, candidate := range eligible {
@@ -247,20 +287,23 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		}
 
 		rate := sm.streams.peerRate(candidate.peer)
-		if rate <= 0 {
+		measured := rate > 0
+
+		if !measured {
 			rate = fallbackRate
 		}
 
 		depth := sm.peerQueueDepth(candidate.peer, perPeer, fastest)
+		backlog := backlogOf(candidate.peer, rate)
 
 		budget := depth - sm.blockDownloads.CountForPeer(candidate.peer)
 		if budget <= 0 {
-			full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate})
+			full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate, measured: measured, backlog: backlog})
 
 			continue
 		}
 
-		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, rate: rate})
+		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, rate: rate, measured: measured, backlog: backlog})
 		assignable += budget
 	}
 
@@ -276,7 +319,8 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// not the whole node-wide window: at the default window of 1024 and one peer
 	// able to take 16, sizing the round by the window would make 1024 round trips
 	// to place 16 blocks, on every arriving block.
-	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), overBackstop: overBackstop, full: full}
+	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), overBackstop: overBackstop, full: full,
+		commitRate: sm.commitRate.rate(), typical: typical, now: time.Now()}
 }
 
 // bytesAhead is how many bytes of blocks the node really holds ahead of the chain: parked blocks
@@ -358,6 +402,11 @@ func (sm *SyncManager) singlePeerAssigner(ladder int) *downloadAssigner {
 // Within each of those tiers the fastest peer wins, with more room left breaking
 // a tie, and then the earlier peer, the sync peer first.
 func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) bool) (*assignerPeer, bool) {
+	return a.takeWhere(height, avoid, nil)
+}
+
+// takeWhere is takeAvoiding over the peers keep accepts; a nil keep accepts every peer.
+func (a *downloadAssigner) takeWhere(height int32, avoid func(*peerpkg.Peer) bool, keep func(*assignerPeer) bool) (*assignerPeer, bool) {
 	if a == nil || a.remaining <= 0 {
 		return nil, false
 	}
@@ -366,7 +415,7 @@ func (a *downloadAssigner) takeAvoiding(height int32, avoid func(*peerpkg.Peer) 
 	var tiers [4]*assignerPeer
 
 	for _, p := range a.peers {
-		if p.budget <= 0 {
+		if p.budget <= 0 || (keep != nil && !keep(p)) {
 			continue
 		}
 

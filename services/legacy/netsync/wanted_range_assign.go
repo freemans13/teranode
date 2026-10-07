@@ -96,6 +96,8 @@ func (sm *SyncManager) assignWantedBlocks() {
 		return
 	}
 
+	assigner.tip = best
+
 	// Stop once there are as many candidates as the assigner can place, not after
 	// that many heights: the range starts at the block after the tip and runs
 	// through blocks already parked or owed. Trimming the range itself left only
@@ -464,6 +466,10 @@ func (sm *SyncManager) forgiveQuietOwnersOf(block wantedBlock) bool {
 // a second getdata could achieve is the disconnect above. Recovery is the peer's
 // own stall detection and the ledger's expiry.
 func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wantedBlock, highestHeld int32) {
+	var waited []wantedBlock
+
+	defer func() { sm.probeBenchedPeers(assigner, waited, highestHeld) }()
+
 	for _, block := range candidates {
 		// The disk backstop bounds how far ahead the node reaches, never a gap below
 		// blocks it already holds: on 2026-09-24 parked blocks over the budget
@@ -490,7 +496,16 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 		if block.reAsked {
 			target, ok = assigner.fastestAvoiding(block.height, owes)
 		} else {
-			target, ok = assigner.takeAvoiding(block.height, owes)
+			var wait bool
+
+			target, ok, wait = assigner.inTimeAvoiding(block.height, owes)
+			if !ok && wait {
+				// Left for an active peer that is full now rather than given to a standby
+				// peer; see ACTIVE AND STANDBY PEERS.
+				waited = append(waited, block)
+
+				continue
+			}
 		}
 
 		if !ok {
@@ -540,6 +555,8 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 
 			return
 		}
+
+		target.queue(assigner.typical)
 	}
 }
 
