@@ -481,6 +481,20 @@ func (s *Store) netBelowDeletes(ctx context.Context, dbTx pgx.Tx, chunk []*netBe
 		return nil
 	}
 
+	// A coin can be missing only because this same transaction already spent it through the
+	// build before version 2, which spent every outside input of a list before it created any
+	// transaction, and wrote a journal row naming the spender. A restart onto version 2 between
+	// those two steps leaves exactly that. Version 2 itself writes no journal rows, so a match
+	// here is always such a spend, and it is accepted as already made. Anything else missing
+	// is a store fault.
+	if err := s.acceptOldWriteSpends(ctx, dbTx, plan, done); err != nil {
+		return err
+	}
+
+	if len(done) == len(plan.idx) {
+		return nil
+	}
+
 	for i, k := range plan.idx {
 		if _, ok := done[k]; ok {
 			continue
@@ -491,6 +505,57 @@ func (s *Store) netBelowDeletes(ctx context.Context, dbTx pgx.Tx, chunk []*netBe
 
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] below the checkpoint, transaction %s spends %s:%d, which is not a spendable coin in the store; %d of %d spends of the chunk missing",
 			tx.TxIDChainHash().String(), in.PreviousTxIDChainHash().String(), in.PreviousTxOutIndex, len(plan.idx)-len(done), len(plan.idx))
+	}
+
+	return nil
+}
+
+// acceptOldWriteSpends marks done every missing input whose spend-journal row names the same
+// spender, the replay rule the per-transaction spend path uses (namePlanSpenders).
+func (s *Store) acceptOldWriteSpends(ctx context.Context, dbTx pgx.Tx, plan *spendPlan, done map[int32]struct{}) error {
+	var leaves []int16
+	var ukeys [][16]byte
+	var txids [][]byte
+	var idx []int32
+
+	for i, k := range plan.idx {
+		if _, ok := done[k]; ok {
+			continue
+		}
+
+		leaves = append(leaves, plan.leaves[i])
+		ukeys = append(ukeys, plan.ukeys[i])
+		txids = append(txids, plan.txids[i])
+		idx = append(idx, k)
+	}
+
+	rows, err := dbTx.Query(ctx, spenderSQL, leaves, ukeys, txids, idx)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] find spender of a missing coin", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			k            int32
+			spender      []byte
+			satoshis     int64
+			script       []byte
+			hashOverride []byte
+		)
+
+		if err := rows.Scan(&k, &spender, &satoshis, &script, &hashOverride); err != nil {
+			return errors.NewStorageError("[utxoset][SpendAndCreateMulti] spender scan", err)
+		}
+
+		if bytes.Equal(spender, plan.spenders[k]) {
+			done[k] = struct{}{}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] spender rows", err)
 	}
 
 	return nil

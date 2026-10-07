@@ -324,3 +324,63 @@ func TestNettedBelowKeepsEachSubtreeIdx(t *testing.T) {
 		require.Equal(t, int32(idxs[i]), idx, "tx %d", i) //nolint:gosec // test sizes
 	}
 }
+
+// The build before version 2 spent every outside input of a list first, deleting the coin and
+// writing a journal row that names the spender, and only then created the transactions. A
+// restart onto version 2 between those steps leaves transactions with their outside spends
+// made and no mined record. Version 2 must accept those spends as already made by the same
+// transaction, not fail the list for a missing coin. Mainnet stopped at block 701,233 on
+// 2026-10-07 on exactly this.
+func TestNettedBelowAcceptsOutsideSpendsTheOldWriteAlreadyMade(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	const height = 950
+
+	w := tests.BuildMultiWorkload(t, 0x7a, 4, 4)
+	w.StoreRoots(t, s, height-1)
+
+	list := outpointOnly(w.Txs)
+
+	inList := map[chainhash.Hash]bool{}
+	for _, tx := range list {
+		inList[*tx.TxIDChainHash()] = true
+	}
+
+	// The old write's first step: every transaction with an outside input spends it, through
+	// the per-transaction spend path, which writes the journal row naming it.
+	spent := 0
+
+	for _, tx := range list {
+		outside := false
+
+		for _, in := range tx.Inputs {
+			if !inList[*in.PreviousTxIDChainHash()] {
+				outside = true
+			}
+		}
+
+		if !outside {
+			continue
+		}
+
+		_, _, err := s.SpendAndCreate(ctx, tx, height, utxo.WithSpendOnly(), utxo.WithIgnoreLocked(true), utxo.WithSkipUTXOHashCheck(true))
+		require.NoError(t, err)
+
+		spent++
+	}
+
+	require.Positive(t, spent, "the workload must have transactions with outside inputs")
+
+	results, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, belowCheckpointOptions(height)...)
+	require.NoError(t, err, "spends the old write already made for the same transaction are accepted")
+
+	for i, r := range results {
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+	}
+
+	got := readNetState(t, s, ctx, w.Roots, list, height)
+	want := expectedNetState(w.Roots, list)
+	want.journal = got.journal // the old write's journal rows stay; version 2 adds none
+
+	require.Equal(t, want, got)
+}
