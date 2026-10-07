@@ -162,14 +162,22 @@ func TestChooseRacerPrefersTheFastestPeerThatDoesNotOwnTheBlock(t *testing.T) {
 
 	queued := func(*peerpkg.Peer) int { return 0 }
 
-	got := r.chooseRacer([]*peerpkg.Peer{owner, slowOther, fastOther, unknown}, []*peerpkg.Peer{owner}, queued)
+	got := r.chooseRacer([]*peerpkg.Peer{owner, slowOther, fastOther, unknown}, []*peerpkg.Peer{owner}, []*peerpkg.Peer{owner}, queued)
 	require.Same(t, fastOther, got, "the owner is never its own racer, and a measured fast peer beats an unmeasured one")
 
-	require.Nil(t, r.chooseRacer([]*peerpkg.Peer{owner}, []*peerpkg.Peer{owner}, queued), "no one else to ask")
+	require.Nil(t, r.chooseRacer([]*peerpkg.Peer{owner}, []*peerpkg.Peer{owner}, []*peerpkg.Peer{owner}, queued), "no one else to ask")
+
+	// An owner with no live copy, forgiven and sending nothing, is asked only when every other
+	// candidate owes the block too.
+	got = r.chooseRacer([]*peerpkg.Peer{owner, slowOther, fastOther}, []*peerpkg.Peer{owner, fastOther}, []*peerpkg.Peer{owner}, queued)
+	require.Same(t, slowOther, got, "a peer that does not owe the block goes before a forgiven owner")
+
+	got = r.chooseRacer([]*peerpkg.Peer{owner, fastOther}, []*peerpkg.Peer{owner, fastOther}, []*peerpkg.Peer{owner}, queued)
+	require.Same(t, fastOther, got, "with only owners left, the forgiven owner is asked")
 
 	// With no measurements at all, the peer with the fewest blocks queued goes first.
 	fresh := newStreamRegistry()
 	counts := map[*peerpkg.Peer]int{slowOther: 9, fastOther: 3, unknown: 5}
-	got = fresh.chooseRacer([]*peerpkg.Peer{slowOther, fastOther, unknown}, nil, func(p *peerpkg.Peer) int { return counts[p] })
+	got = fresh.chooseRacer([]*peerpkg.Peer{slowOther, fastOther, unknown}, nil, nil, func(p *peerpkg.Peer) int { return counts[p] })
 	require.Same(t, fastOther, got)
 }

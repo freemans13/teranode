@@ -44,7 +44,7 @@ import (
 // sink. The re-ask shares the race's mark. A block with more than one owner is judged on every
 // owner's copy, and lands at the soonest of them. Another copy is asked for only when the newest
 // extra copy is at least raceSlowFetchAfter old, every copy is judged, and the block has fewer than
-// maxBlockCopies live copies (blockCopies), whichever rule asked. Headers-first mode only: the heights
+// maxBlockCopies live copies (liveCopies), whichever rule asked. Headers-first mode only: the heights
 // come from the header cache, which is empty above the last checkpoint, where the quiet-owner
 // re-ask covers the ledger's blocks.
 
@@ -78,9 +78,11 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 	}
 
 	// Forgiven owners sending nothing are owners still, and are judged below, but are not live
-	// copies (blockCopies).
+	// copies (liveCopies), so they may be asked again.
 	owners := sm.blockDownloads.OwnersOf(block.hash)
-	if len(owners) == 0 || sm.blockCopies(block.hash, owners) >= maxBlockCopies {
+	live := sm.liveCopies(block.hash, owners)
+
+	if len(owners) == 0 || len(live) >= maxBlockCopies {
 		return
 	}
 
@@ -119,7 +121,7 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 		return
 	}
 
-	racer, racerETA := sm.soonestOtherPeer(queues, owners, height, typical, ownSize)
+	racer, racerETA := sm.soonestOtherPeer(queues, owners, live, height, typical, ownSize)
 	if racer == nil || racerETA*queuedReaskFasterBy > ownerETA {
 		return
 	}
@@ -264,34 +266,45 @@ func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq u
 	return time.Duration(bytes / rate * float64(time.Second))
 }
 
-// soonestOtherPeer is the eligible peer, other than the owners, that would deliver a block at
-// height soonest with it added at the back of its queue. A peer with no measured rate is not
-// chosen: its estimate would be a guess.
-func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owners []*peerpkg.Peer, height int32, typical, ownSize int64) (*peerpkg.Peer, time.Duration) {
-	var (
-		best    *peerpkg.Peer
-		bestETA time.Duration
-	)
+// soonestOtherPeer is the eligible peer that would deliver a block at height soonest with it added
+// at the back of its queue. A peer that does not owe the block is chosen first. Only when there is
+// none is a forgiven owner sending nothing chosen: it is not a live copy (liveCopies). An owner in
+// live is never chosen. A peer with no measured rate is not chosen: its estimate would be a guess.
+func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owners, live []*peerpkg.Peer, height int32, typical, ownSize int64) (*peerpkg.Peer, time.Duration) {
+	eligible := sm.eligibleBlockPeers()
 
-	for _, bp := range sm.eligibleBlockPeers() {
-		if slices.Contains(owners, bp.peer) {
-			continue
+	pick := func(skip []*peerpkg.Peer) (*peerpkg.Peer, time.Duration) {
+		var (
+			best    *peerpkg.Peer
+			bestETA time.Duration
+		)
+
+		for _, bp := range eligible {
+			if slices.Contains(skip, bp.peer) {
+				continue
+			}
+
+			if bp.state != nil && bp.state.BestKnownHeight() > 0 && bp.state.BestKnownHeight() < height {
+				continue
+			}
+
+			rate := sm.streams.peerRate(bp.peer)
+			if rate <= 0 {
+				continue
+			}
+
+			eta := sm.queuedArrival(bp.peer, queues[bp.peer], 0, typical, ownSize, rate)
+			if best == nil || eta < bestETA {
+				best, bestETA = bp.peer, eta
+			}
 		}
 
-		if bp.state != nil && bp.state.BestKnownHeight() > 0 && bp.state.BestKnownHeight() < height {
-			continue
-		}
-
-		rate := sm.streams.peerRate(bp.peer)
-		if rate <= 0 {
-			continue
-		}
-
-		eta := sm.queuedArrival(bp.peer, queues[bp.peer], 0, typical, ownSize, rate)
-		if best == nil || eta < bestETA {
-			best, bestETA = bp.peer, eta
-		}
+		return best, bestETA
 	}
 
-	return best, bestETA
+	if best, eta := pick(owners); best != nil {
+		return best, eta
+	}
+
+	return pick(live)
 }

@@ -67,7 +67,7 @@ const (
 	raceExpiry = 10 * time.Minute
 	// maxBlockCopies is the most live copies of one block at once: the first request and at most
 	// two extra copies, from the race or the queued re-ask. A live copy is an owner not let off
-	// the block, or one sending it now (blockCopies); a forgiven owner sending nothing is not a
+	// the block, or one sending it now (liveCopies); a forgiven owner sending nothing is not a
 	// copy. SV Node fetches the first in-flight block from up to DEFAULT_MAX_BLOCK_PARALLEL_FETCH
 	// (3) peers (net/net.h:167). It asks for another copy only when every connected peer the
 	// block is in flight from is stalling, and counts those stallers against the cap
@@ -865,18 +865,15 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 	return best, bestCand, stalling, true
 }
 
-// chooseRacer picks who to ask: never an owner, the fastest measured peer first, then the peer
-// with the fewest blocks already queued, because a request waits behind what a peer already owes.
-func (r *streamRegistry) chooseRacer(candidates, owners []*peerpkg.Peer, queued func(*peerpkg.Peer) int) *peerpkg.Peer {
+// chooseRacer picks who to ask: the fastest measured peer first, then the peer with the fewest
+// blocks already queued, because a request waits behind what a peer already owes. A peer that
+// does not owe the block is asked first. Only when there is none is a forgiven owner sending
+// nothing asked again: it was let off this block for its silence, but it is not a live copy
+// (liveCopies), and with only owners connected the race found nobody to ask and returned before
+// it dropped the stalling copy. An owner in live is never asked.
+func (r *streamRegistry) chooseRacer(candidates, owners, live []*peerpkg.Peer, queued func(*peerpkg.Peer) int) *peerpkg.Peer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	isOwner := make(map[*peerpkg.Peer]bool, len(owners))
-	for _, o := range owners {
-		isOwner[o] = true
-	}
-
-	var best *peerpkg.Peer
 
 	better := func(a, b *peerpkg.Peer) bool {
 		ra, rb := r.rateLocked(a), r.rateLocked(b)
@@ -887,17 +884,27 @@ func (r *streamRegistry) chooseRacer(candidates, owners []*peerpkg.Peer, queued 
 		return queued(a) < queued(b)
 	}
 
-	for _, p := range candidates {
-		if p == nil || isOwner[p] {
-			continue
+	pick := func(skip []*peerpkg.Peer) *peerpkg.Peer {
+		var best *peerpkg.Peer
+
+		for _, p := range candidates {
+			if p == nil || slices.Contains(skip, p) {
+				continue
+			}
+
+			if best == nil || better(p, best) {
+				best = p
+			}
 		}
 
-		if best == nil || better(p, best) {
-			best = p
-		}
+		return best
 	}
 
-	return best
+	if best := pick(owners); best != nil {
+		return best
+	}
+
+	return pick(live)
 }
 
 // trackBlockStreams wraps the installed block sink so every block body arriving is measured.
@@ -1060,7 +1067,8 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 	// Before, the cap returned first: two forgiven owners and one copy at 50 KB/s left the block
 	// to the peer layer's deadline, an hour or more.
 	owners := sm.blockDownloads.OwnersOf(s.hash)
-	if copies := sm.blockCopies(s.hash, owners); copies >= maxBlockCopies || asked >= maxBlockCopies-1 {
+	live := sm.liveCopies(s.hash, owners)
+	if copies := len(live); copies >= maxBlockCopies || asked >= maxBlockCopies-1 {
 		if !mayDrop {
 			sm.logger.Debugf("[frontierRace][%s] block %d is arriving at %.0f KB/s; %d live copies and %d extra copies asked in %s, and its peers were dropped in that time or this node is backpressured, so nothing was done",
 				s.hash, s.height, c.rate/1e3, copies, asked, raceExpiry)
@@ -1086,7 +1094,10 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 		candidates = append(candidates, bp.peer)
 	}
 
-	racer := sm.streams.chooseRacer(candidates, owners, sm.blockDownloads.CountForPeer)
+	// With nobody to ask, nobody is dropped, as in SV Node: SendGetDataBlocks marks a staller only
+	// when another peer has no block in flight to fetch it (net_processing.cpp:5532-5541), and
+	// otherwise only the block download timeout disconnects (net_processing.cpp:5481-5500).
+	racer := sm.streams.chooseRacer(candidates, owners, live, sm.blockDownloads.CountForPeer)
 	if racer == nil {
 		sm.logger.Debugf("[frontierRace][%s] block %d is arriving at %.0f KB/s but there is no other peer to ask", s.hash, s.height, c.rate/1e3)
 
@@ -1123,28 +1134,28 @@ func (sm *SyncManager) dropStallingCopies(s *blockStream, stalling []*peerpkg.Pe
 	}
 }
 
-// blockCopies is how many live copies of h there are among owners: an owner not let off the
-// block, or one whose copy is arriving now. A forgiven owner sending nothing will not deliver
-// (ownerArrival reads it as far off), and counting it held the race and the queued re-ask off a
-// block whose only copy was stalling.
-func (sm *SyncManager) blockCopies(h chainhash.Hash, owners []*peerpkg.Peer) int {
+// liveCopies is the owners of h with a live copy: an owner not let off the block, or one whose
+// copy is arriving now. A forgiven owner sending nothing will not deliver (ownerArrival reads it as
+// far off). Counting it held the race and the queued re-ask off a block whose only copy was
+// stalling, and leaving it out of the peers to ask let the race find nobody to ask.
+func (sm *SyncManager) liveCopies(h chainhash.Hash, owners []*peerpkg.Peer) []*peerpkg.Peer {
 	active, _ := sm.blockDownloads.ActiveOwners(h)
 
-	n := 0
+	live := make([]*peerpkg.Peer, 0, len(owners))
 
 	for _, o := range owners {
 		if slices.Contains(active, o) {
-			n++
+			live = append(live, o)
 
 			continue
 		}
 
 		if _, _, _, arriving := sm.streams.arrivingFrom(h, o); arriving {
-			n++
+			live = append(live, o)
 		}
 	}
 
-	return n
+	return live
 }
 
 // askRacer records racer as a second owner of h and sends it the getdata. Recording first means

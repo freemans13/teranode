@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 	"time"
 
@@ -291,4 +292,68 @@ func TestAQueuedBlockArrivingFromAnotherPeerStillCountsAtItsOwner(t *testing.T) 
 
 	eta := sm.queuedArrival(owner, queue, queue[1].seq, reaskTypicalBlock, reaskTypicalBlock, 3_000_000)
 	require.Equal(t, 200*time.Second, eta, "block 13 ahead and block 11 itself, 600 MB at 3 MB/s")
+}
+
+// Two forgiven owners sending nothing and one copy arriving at 50 KB/s, with no other peer
+// connected. A forgiven owner is not a live copy, so it is the race's racer: one race check sends
+// it a getdata and drops the stalling copy. The race used to skip every owner, find nobody to
+// ask, and return before the drop, and the 50 KB/s copy kept the block for the peer layer's
+// deadline.
+func TestRaceAsksAForgivenOwnerWhenNoOtherPeerIsConnected(t *testing.T) {
+	sm := assignManager(t, 1, 120)
+	sm.streams = newStreamRegistry()
+	mockCommittedTip(t, sm, 10, 0)
+
+	a, aRec := schedulerPeer(t, sm, 1, 2000)
+	b, bRec := schedulerPeer(t, sm, 2, 2000)
+	c, cRec := schedulerPeer(t, sm, 3, 2000)
+
+	next := heightHash(t, sm, 11)
+	require.True(t, sm.blockDownloads.Add(a, next))
+	require.True(t, sm.blockDownloads.Add(b, next))
+	require.Len(t, sm.blockDownloads.ForgiveOwners(next, blockRequestRetryInterval), 2)
+	require.True(t, sm.blockDownloads.Add(c, next))
+
+	now := time.Now()
+
+	s := sm.streams.start(next, 11, c, 300_000_000, now.Add(-40*time.Second))
+	s.read.Store(2_000_000)
+
+	sm.maybeRaceSlowBlock(now)
+
+	require.True(t, WaitUntil(func() bool { return aRec.count()+bRec.count() == 1 }, 5*time.Second), "one forgiven owner is sent a getdata")
+	require.True(t, WaitUntil(func() bool { return !c.Connected() }, 5*time.Second), "the copy at 50 KB/s is dropped")
+	require.Zero(t, cRec.count(), "the stalling peer is not asked again")
+
+	asked := a
+	if bRec.count() == 1 {
+		asked = b
+	}
+
+	active, _ := sm.blockDownloads.ActiveOwners(next)
+	require.True(t, slices.Contains(active, asked), "the owner asked again owes the block again")
+	require.True(t, a.Connected())
+	require.True(t, b.Connected())
+}
+
+// The queued re-ask asks a forgiven owner sending nothing too: it is not a live copy. The one live
+// copy waits behind a slow queue, and the forgiven owner, idle at 80 MB/s, is the only other peer.
+func TestQueuedReaskAsksAForgivenOwnerSendingNothing(t *testing.T) {
+	sm, owner, fast, fastRec := reaskSetup(t)
+	now := time.Now()
+
+	next := heightHash(t, sm, 11)
+	askAt(t, sm, fast, next, now.Add(-5*time.Minute))
+	require.Len(t, sm.blockDownloads.ForgiveOwners(next, blockRequestRetryInterval), 1)
+
+	for _, h := range []int32{13, 14, 15, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-3*time.Minute))
+	}
+
+	sm.maybeReaskQueuedBlock(now)
+
+	active, _ := sm.blockDownloads.ActiveOwners(next)
+	require.True(t, slices.Contains(active, fast), "the forgiven owner, idle at 80 MB/s, is asked again")
+	require.True(t, WaitUntil(func() bool { return fastRec.count() == 1 }, 5*time.Second), "with a real getdata")
+	require.True(t, owner.Connected())
 }
