@@ -219,7 +219,9 @@ func (p *spendPlan) sortRows() {
 
 // permute returns xs reordered so that the result's i-th element is xs[order[i]].
 func permute[T any](xs []T, order []int) []T {
-	out := make([]T, len(xs))
+	// Sized by order, not xs: order may select a subset, and the rows past it would otherwise
+	// be zero values, which an insert writes as nulls.
+	out := make([]T, len(order))
 	for i, from := range order {
 		out[i] = xs[from]
 	}

@@ -384,3 +384,58 @@ func TestNettedBelowAcceptsOutsideSpendsTheOldWriteAlreadyMade(t *testing.T) {
 
 	require.Equal(t, want, got)
 }
+
+// A chunk can hold transactions that already exist and transactions that are new: a repeat whose
+// chunks are cut differently from the first attempt's, or a block the build before version 2
+// part-wrote. Only the new transactions' coins are written, and nothing else is.
+func TestNettedBelowRepeatWithChunksMixingNewAndExisting(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	const height = 960
+
+	w := tests.BuildMultiWorkload(t, 0x7b, 4, 4)
+	w.StoreRoots(t, s, height-1)
+
+	list := outpointOnly(w.Txs)
+
+	// First attempt: one transaction per chunk, one chunk at a time, and the crash comes at the
+	// second chunk, so exactly the first transaction is written. Its output 1 is spent by no
+	// transaction of the list, so on the repeat it is an existing transaction with a coin.
+	withNettedBelowChunkTxs(t, 1)
+
+	workers := s.settings.UtxoStore.NettedBelowWorkers
+	s.settings.UtxoStore.NettedBelowWorkers = 1
+
+	t.Cleanup(func() { s.settings.UtxoStore.NettedBelowWorkers = workers })
+
+	crash := errors.NewProcessingError("injected crash")
+	nettedBelowFault = func(chunk []int) error {
+		if chunk[0] >= 1 {
+			return crash
+		}
+
+		return nil
+	}
+
+	t.Cleanup(func() { nettedBelowFault = nil })
+
+	_, err := s.SpendAndCreateMulti(ctx, list, height, belowCheckpointOptions(height)...)
+	require.Error(t, err)
+
+	var mined int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_mined WHERE mined_height = $1`, int32(height)).Scan(&mined))
+	require.Equal(t, 1, mined, "exactly the first transaction was written before the crash")
+
+	// Repeat with the whole list in one chunk, so the chunk mixes existing and new.
+	nettedBelowFault = nil
+	nettedBelowChunkTxs = len(list)
+
+	results, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, belowCheckpointOptions(height)...)
+	require.NoError(t, err)
+
+	for i, r := range results {
+		require.Contains(t, []utxo.SpendAndCreateMultiStatus{utxo.MultiTxCreated, utxo.MultiTxExisted}, r.Status, "tx %d: %v", i, r.Err)
+	}
+
+	require.Equal(t, expectedNetState(w.Roots, list), readNetState(t, s, ctx, w.Roots, list, height))
+}
