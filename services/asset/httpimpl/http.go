@@ -225,15 +225,21 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// Start() when a context is available.
 	//
 	// Tier elevation requires explicit operator opt-in via asset_peerAuthAllowlist.
-	// An empty allowlist (the default) means signatures are still verified
-	// (replay cache + body digest + freshness window all apply) but every
-	// authenticated peer is treated as tierUnverified for rate-limit purposes.
+	// An empty allowlist (the default) means a signed request is rejected at
+	// the allowlist membership check, before the replay claim, the signature
+	// verification and the body digest; every authenticated peer stays
+	// tierUnverified. See the asset_peerAuthAllowlist longdesc for detail.
+	//
+	// The signed-body cap tracks subtreevalidation's catchup batch size so a
+	// large but legitimate POST /subtree/:hash/txs from an allowlisted peer
+	// isn't rejected with 413 (see resolveMaxSignedBodyBytes).
 	var peerAuth *peerAuthVerifier
 	p2pClient := repo.GetP2PClient()
 	if p2pClient != nil {
 		peerCache := newPeerTierCache(logger, p2pClient, tSettings.Asset.PeerMinerReputationThreshold)
 		allowlist := parsePeerAuthAllowlist(logger, tSettings.Asset.PeerAuthAllowlist)
-		peerAuth = newPeerAuthVerifier(logger, peerCache, allowlist)
+		maxSignedBodyBytes := resolveMaxSignedBodyBytes(tSettings.SubtreeValidation.MissingTransactionsBatchSize)
+		peerAuth = newPeerAuthVerifierWithBodyCap(logger, peerCache, allowlist, maxSignedBodyBytes)
 		e.Use(peerAuth.Middleware())
 	}
 
@@ -412,7 +418,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/subtree_data/:hash", h.GetSubtreeData(), catchupHeavyMW()...)
 	apiGroup.POST(catchupTxsRoute, h.GetTransactions(), catchupHeavyMW()...) // BINARY_STREAM only
 
-	apiGroup.GET("/subtree/:hash/txs/json", h.GetSubtreeTxs(JSON))
+	apiGroup.GET("/subtree/:hash/txs/json", h.GetSubtreeTxs(JSON), heavyMW()...)
 
 	apiGroup.GET("/headers/:hash", h.GetBlockHeaders(BINARY_STREAM))
 	apiGroup.GET("/headers/:hash/hex", h.GetBlockHeaders(HEX))
@@ -463,7 +469,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	apiGroup.GET("/search", h.Search)
 	apiGroup.GET("/blockstats", h.GetBlockStats)
-	apiGroup.GET("/blockgraphdata/:period", h.GetBlockGraphData)
+	apiGroup.GET("/blockgraphdata/:period", h.GetBlockGraphData, heavyMW()...)
 	apiGroup.GET("/chainparams", h.GetChainParams)
 
 	// ARC-compatible policy endpoint (https://bitcoin-sv.github.io/arc/api.html)
@@ -475,7 +481,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/utxo/:hash/hex", h.GetUTXO(HEX))
 	apiGroup.GET("/utxo/:hash/json", h.GetUTXO(JSON))
 
-	apiGroup.GET("/utxos/:hash/json", h.GetUTXOsByTxID(JSON))
+	apiGroup.GET("/utxos/:hash/json", h.GetUTXOsByTxID(JSON), heavyMW()...)
 
 	// Bulk UTXO spend-status lookup. All three modes accept the same 36-byte
 	// binary request body; only the response format differs. Routed through
@@ -491,9 +497,9 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/bestblockheader/hex", h.GetBestBlockHeader(HEX))
 	apiGroup.GET("/bestblockheader/json", h.GetBestBlockHeader(JSON))
 
-	apiGroup.GET("/merkle_proof/:hash", h.GetMerkleProof(BINARY_STREAM))
-	apiGroup.GET("/merkle_proof/:hash/hex", h.GetMerkleProof(HEX))
-	apiGroup.GET("/merkle_proof/:hash/json", h.GetMerkleProof(JSON))
+	apiGroup.GET("/merkle_proof/:hash", h.GetMerkleProof(BINARY_STREAM), heavyMW()...)
+	apiGroup.GET("/merkle_proof/:hash/hex", h.GetMerkleProof(HEX), heavyMW()...)
+	apiGroup.GET("/merkle_proof/:hash/json", h.GetMerkleProof(JSON), heavyMW()...)
 
 	// Create auth handler for protecting admin endpoints (used regardless of dashboard state)
 	authHandler := dashboard.NewAuthHandler(h.logger, h.settings)
