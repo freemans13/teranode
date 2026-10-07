@@ -193,7 +193,7 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 		return false, nil
 	}
 
-	root, err := streamedMerkleRoot(bufio.NewReaderSize(f, 1<<20), n)
+	root, mutated, err := streamedMerkleRoot(bufio.NewReaderSize(f, 1<<20), n)
 	if err != nil {
 		return false, err
 	}
@@ -201,6 +201,14 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 	if !root.IsEqual(&header.MerkleRoot) {
 		// The marker as the sink raises it for the same verdict (pipelineBlockSink).
 		return false, errors.NewBlockInvalidError("[blockOnDisk][%s] a second copy's merkle root %s does not match header's %s; the copy converting now keeps the block", hash, root, header.MerkleRoot, errors.ErrBlockBodyMismatch)
+	}
+
+	// SV Node checks the root and then the flag, in this sequence (validation.cpp:5618-5627).
+	if mutated {
+		// A body with a repeated transaction can keep the header's root (CVE-2012-2459). The sink
+		// refuses it on the duplicate (blockStreamBuilder.AddTx), but only after this copy has
+		// stopped the honest one, which loses both. The marker is the one the sink raises.
+		return false, errors.NewBlockInvalidError("[blockOnDisk][%s] a second copy repeats a transaction (CVE-2012-2459); the copy converting now keeps the block", hash, errors.ErrBlockBodyMismatch)
 	}
 
 	if !ctl.takeOver() {
@@ -234,10 +242,14 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 // at a time: SV Node's ComputeMerkleRoot arithmetic (consensus/merkle.cpp:47-157),
 // which hashes the last node of an odd level with itself. A body that does not parse, or that is
 // longer or shorter than declared, is refused as the sink refuses it (blockTxStream).
-func streamedMerkleRoot(r io.Reader, n int64) (*chainhash.Hash, error) {
+//
+// mutated is SV Node's flag of the same name (consensus/merkle.cpp:86): two equal nodes joined in
+// the leaf pass. A body that repeats the last transactions of an odd level keeps the root of the
+// honest body and sets it, for example [cb, b, c, c] for [cb, b, c].
+func streamedMerkleRoot(r io.Reader, n int64) (root *chainhash.Hash, mutated bool, err error) {
 	stream, err := newBlockTxStream(r, n-wire.MaxBlockHeaderPayload)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var (
@@ -261,7 +273,7 @@ func streamedMerkleRoot(r io.Reader, n int64) (*chainhash.Hash, error) {
 		}
 
 		if nextErr != nil {
-			return nil, nextErr
+			return nil, false, nextErr
 		}
 
 		h := *txHash
@@ -269,6 +281,7 @@ func streamedMerkleRoot(r io.Reader, n int64) (*chainhash.Hash, error) {
 
 		level := 0
 		for ; count&(1<<level) == 0; level++ {
+			mutated = mutated || inner[level] == h
 			h = join(inner[level], h)
 		}
 
@@ -276,7 +289,7 @@ func streamedMerkleRoot(r io.Reader, n int64) (*chainhash.Hash, error) {
 	}
 
 	if err = stream.RequireEnd(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	level := 0
@@ -297,7 +310,7 @@ func streamedMerkleRoot(r io.Reader, n int64) (*chainhash.Hash, error) {
 		}
 	}
 
-	return &h, nil
+	return &h, mutated, nil
 }
 
 // deliveringPeerOwes reports whether the peer r's bytes come from is one the download ledger says
