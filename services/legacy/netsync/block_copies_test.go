@@ -295,10 +295,16 @@ func TestAQueuedBlockArrivingFromAnotherPeerStillCountsAtItsOwner(t *testing.T) 
 }
 
 // Two forgiven owners sending nothing and one copy arriving at 50 KB/s, with no other peer
-// connected. A forgiven owner is not a live copy, so it is the race's racer: one race check sends
-// it a getdata and drops the stalling copy. The race used to skip every owner, find nobody to
-// ask, and return before the drop, and the 50 KB/s copy kept the block for the peer layer's
-// deadline.
+// connected. A forgiven owner is not a live copy, so it is the race's racer: it is sent a
+// getdata. The race used to skip every owner, find nobody to ask, and leave the block to the peer
+// layer's deadline.
+//
+// The copy at 50 KB/s is the only peer sending the block, so it stays connected. The race used
+// to drop it in exchange for a peer already known to be silent: with a peer that takes blocks and
+// goes quiet, an honest slow peer was dropped each raceExpiry and a block that needs more than
+// that at its rate never arrived. SV Node marks a staller only for a peer with no block in flight
+// (net_processing.cpp:5532), and an owner asked again has the block in flight. The second round
+// asks the other owner, and the third, at the cap, still drops nobody: both are silent.
 func TestRaceAsksAForgivenOwnerWhenNoOtherPeerIsConnected(t *testing.T) {
 	sm := assignManager(t, 1, 120)
 	sm.streams = newStreamRegistry()
@@ -322,7 +328,7 @@ func TestRaceAsksAForgivenOwnerWhenNoOtherPeerIsConnected(t *testing.T) {
 	sm.maybeRaceSlowBlock(now)
 
 	require.True(t, WaitUntil(func() bool { return aRec.count()+bRec.count() == 1 }, 5*time.Second), "one forgiven owner is sent a getdata")
-	require.True(t, WaitUntil(func() bool { return !c.Connected() }, 5*time.Second), "the copy at 50 KB/s is dropped")
+	require.False(t, WaitUntil(func() bool { return !c.Connected() }, 300*time.Millisecond), "the only peer sending the block stays connected")
 	require.Zero(t, cRec.count(), "the stalling peer is not asked again")
 
 	asked := a
@@ -332,8 +338,56 @@ func TestRaceAsksAForgivenOwnerWhenNoOtherPeerIsConnected(t *testing.T) {
 
 	active, _ := sm.blockDownloads.ActiveOwners(next)
 	require.True(t, slices.Contains(active, asked), "the owner asked again owes the block again")
+
+	sm.maybeRaceSlowBlock(now.Add(31 * time.Second))
+	require.True(t, WaitUntil(func() bool { return aRec.count() == 1 && bRec.count() == 1 }, 5*time.Second), "the other forgiven owner is asked")
+
+	sm.maybeRaceSlowBlock(now.Add(62 * time.Second))
+
+	asks, _ := sm.streams.raceCost(next, now.Add(62*time.Second))
+	require.Equal(t, maxBlockCopies-1, asks, "the third round is at the cap")
+	require.False(t, WaitUntil(func() bool { return !c.Connected() }, 300*time.Millisecond), "at the cap, with both owners asked again silent, the copy at 50 KB/s stays connected")
 	require.True(t, a.Connected())
 	require.True(t, b.Connected())
+}
+
+// Once the owners asked again send the block, the race may drop the copies that stall. Each
+// round that asks a forgiven owner drops nobody. At the cap both owners asked again are sending,
+// each under 100 KB/s, so each stalling copy is dropped, the one at 50 KB/s included.
+func TestRaceDropsAStallingCopyOnceTheOwnersAskedAgainSend(t *testing.T) {
+	sm := assignManager(t, 1, 120)
+	sm.streams = newStreamRegistry()
+	mockCommittedTip(t, sm, 10, 0)
+
+	a, aRec := schedulerPeer(t, sm, 1, 2000)
+	b, bRec := schedulerPeer(t, sm, 2, 2000)
+	c, _ := schedulerPeer(t, sm, 3, 2000)
+
+	next := heightHash(t, sm, 11)
+	require.True(t, sm.blockDownloads.Add(a, next))
+	require.True(t, sm.blockDownloads.Add(b, next))
+	require.Len(t, sm.blockDownloads.ForgiveOwners(next, blockRequestRetryInterval), 2)
+	require.True(t, sm.blockDownloads.Add(c, next))
+
+	now := time.Now()
+
+	s := sm.streams.start(next, 11, c, 300_000_000, now.Add(-40*time.Second))
+	s.read.Store(2_000_000)
+
+	sm.maybeRaceSlowBlock(now)
+	sm.maybeRaceSlowBlock(now.Add(31 * time.Second))
+
+	require.True(t, WaitUntil(func() bool { return aRec.count() == 1 && bRec.count() == 1 }, 5*time.Second), "both forgiven owners are asked")
+	require.True(t, c.Connected(), "no round that asks a forgiven owner drops a peer")
+
+	for _, p := range []*peerpkg.Peer{a, b} {
+		sp := sm.streams.start(next, 11, p, 300_000_000, now.Add(32*time.Second))
+		sp.read.Store(1_000_000)
+	}
+
+	sm.maybeRaceSlowBlock(now.Add(70 * time.Second))
+
+	require.True(t, WaitUntil(func() bool { return !c.Connected() }, 5*time.Second), "both owners asked again are sending: the copy at 50 KB/s is dropped")
 }
 
 // The queued re-ask asks a forgiven owner sending nothing too: it is not a live copy. The one live

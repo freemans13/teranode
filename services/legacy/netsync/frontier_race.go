@@ -216,6 +216,8 @@ type raceHistory struct {
 	asked []time.Time
 	// dropped is when the race last disconnected the peers sending this block, or zero.
 	dropped time.Time
+	// reasked is each owner asked for this block again after it was forgiven, and when.
+	reasked map[*peerpkg.Peer]time.Time
 }
 
 // newest is when the newest extra copy was asked for, or zero.
@@ -671,6 +673,49 @@ func (r *streamRegistry) markRaced(h chainhash.Hash, now time.Time) {
 	r.historyLocked(h).asked = append(r.historyLocked(h).asked, now)
 }
 
+// markReasked records that owner p, forgiven for h, was asked for h again at now.
+func (r *streamRegistry) markReasked(h chainhash.Hash, p *peerpkg.Peer, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	hist := r.historyLocked(h)
+	if hist.reasked == nil {
+		hist.reasked = make(map[*peerpkg.Peer]time.Time)
+	}
+
+	hist.reasked[p] = now
+}
+
+// reaskedNotSending is each owner asked for h again after it was forgiven that has sent no copy
+// of h since. A peer has started to send when a stream of h from it is active.
+func (r *streamRegistry) reaskedNotSending(h chainhash.Hash) []*peerpkg.Peer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	hist := r.raced[h]
+	if hist == nil || len(hist.reasked) == 0 {
+		return nil
+	}
+
+	sending := make(map[*peerpkg.Peer]bool)
+
+	for s := range r.active {
+		if s.hash == h && s.owner != nil {
+			sending[s.owner] = true
+		}
+	}
+
+	var silent []*peerpkg.Peer
+
+	for p := range hist.reasked {
+		if !sending[p] {
+			silent = append(silent, p)
+		}
+	}
+
+	return silent
+}
+
 // markDropped records that the race disconnected the peers sending h at now.
 func (r *streamRegistry) markDropped(h chainhash.Hash, now time.Time) {
 	r.mu.Lock()
@@ -791,7 +836,13 @@ func (r *streamRegistry) expireRacesLocked(now time.Time) {
 			hist.dropped = time.Time{}
 		}
 
-		if len(hist.asked) == 0 && hist.dropped.IsZero() {
+		for p, at := range hist.reasked {
+			if now.Sub(at) > raceExpiry {
+				delete(hist.reasked, p)
+			}
+		}
+
+		if len(hist.asked) == 0 && hist.dropped.IsZero() && len(hist.reasked) == 0 {
 			delete(r.raced, h)
 		}
 	}
@@ -880,8 +931,8 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 // blocks already queued, because a request waits behind what a peer already owes. A peer that
 // does not owe the block is asked first. Only when there is none is a forgiven owner sending
 // nothing asked again: it was let off this block for its silence, but it is not a live copy
-// (liveCopies), and with only owners connected the race found nobody to ask and returned before
-// it dropped the stalling copy. An owner in live is never asked.
+// (liveCopies), and with only owners connected the race found nobody to ask. An owner asked again
+// drops no stalling copy (maybeRaceSlowBlock). An owner in live is never asked.
 func (r *streamRegistry) chooseRacer(candidates, owners, live []*peerpkg.Peer, queued func(*peerpkg.Peer) int) *peerpkg.Peer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1087,6 +1138,13 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 			return
 		}
 
+		if waiting := sm.reaskedOwnersNotSending(s.hash); len(waiting) > 0 {
+			sm.logger.Infof("[frontierRace][%s] block %d is arriving at %.0f KB/s; %d live copies and %d extra copies asked in %s, and %v, asked again, have sent nothing, so %v kept",
+				s.hash, s.height, c.rate/1e3, copies, asked, raceExpiry, waiting, stalling)
+
+			return
+		}
+
 		sm.dropStallingCopies(s, stalling, now)
 		sm.logger.Infof("[frontierRace][%s] dropped %v, which were sending block %d at under %.0f KB/s; %d live copies and %d extra copies asked in %s, so no other peer was asked",
 			s.hash, stalling, s.height, float64(raceStallRate)/1e3, copies, asked, raceExpiry)
@@ -1116,6 +1174,18 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 	}
 
 	if !sm.askRacer(racer, s.hash, now) {
+		return
+	}
+
+	// An owner asked again is not a peer with no block in flight, so it marks no staller (SV Node,
+	// net_processing.cpp:5532). The copies that stall are the only peers sending the block, and the
+	// owner asked again was let off it for its silence. Dropping them for it let a peer that takes
+	// blocks and goes quiet get an honest slow peer dropped each raceExpiry, and a block that needs
+	// more than that at its rate never arrived. A later round may drop once this owner sends.
+	if slices.Contains(owners, racer) {
+		sm.logger.Infof("[frontierRace][%s] asked %s again for block %d, which is arriving at under %.0f KB/s; %v kept, as %s was forgiven for its silence and sends nothing yet",
+			s.hash, racer, s.height, float64(raceStallRate)/1e3, stalling, racer)
+
 		return
 	}
 
@@ -1169,9 +1239,27 @@ func (sm *SyncManager) liveCopies(h chainhash.Hash, owners []*peerpkg.Peer) []*p
 	return live
 }
 
+// reaskedOwnersNotSending is each peer asked for h again after it was forgiven that is still
+// connected, still owes h, and sends no copy of h. While one exists, the race drops no copy of h
+// at the cap: it was asked for h in place of those copies, and it has not proved it will send.
+func (sm *SyncManager) reaskedOwnersNotSending(h chainhash.Hash) []*peerpkg.Peer {
+	var waiting []*peerpkg.Peer
+
+	for _, p := range sm.streams.reaskedNotSending(h) {
+		if p.Connected() && sm.blockDownloads.HasOwner(p, h) {
+			waiting = append(waiting, p)
+		}
+	}
+
+	return waiting
+}
+
 // askRacer records racer as a second owner of h and sends it the getdata. Recording first means
-// whichever copy lands second is still admitted rather than costing a peer its connection.
+// whichever copy lands second is still admitted rather than costing a peer its connection. A
+// racer that already owes h is a forgiven owner asked again, and is recorded as such.
 func (sm *SyncManager) askRacer(racer *peerpkg.Peer, h chainhash.Hash, now time.Time) bool {
+	reasked := sm.blockDownloads.HasOwner(racer, h)
+
 	if !sm.blockDownloads.Add(racer, h) {
 		return false
 	}
@@ -1184,6 +1272,11 @@ func (sm *SyncManager) askRacer(racer *peerpkg.Peer, h chainhash.Hash, now time.
 	}
 
 	sm.streams.markRaced(h, now)
+
+	if reasked {
+		sm.streams.markReasked(h, racer, now)
+	}
+
 	racer.QueueMessage(getData, nil)
 
 	if prometheusLegacyNetsyncFrontierRaces != nil {
