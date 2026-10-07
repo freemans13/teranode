@@ -1,10 +1,13 @@
 package netsync
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -164,4 +167,65 @@ func TestRaceNeverAsksForAFourthCopy(t *testing.T) {
 
 	require.False(t, WaitUntil(func() bool { return fourthRec.count() > 0 }, 300*time.Millisecond))
 	require.Len(t, sm.blockDownloads.OwnersOf(next), 3)
+}
+
+// A peer busy sending a large copy is not idle. Its bytes count in what it is sending whether or
+// not it owes the block, so the queued re-ask does not pick it over a peer that is free.
+func TestQueuedReaskDoesNotPickAPeerSendingALargeCopy(t *testing.T) {
+	for _, owed := range []bool{false, true} {
+		sm, owner, fast, _ := reaskSetup(t)
+		steady, _ := schedulerPeer(t, sm, 3, 2000)
+		sm.streams.rates[steady] = 30_000_000
+		now := time.Now()
+
+		for _, h := range []int32{13, 14, 15, 11} {
+			askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
+		}
+
+		// fast is sending a 4 GB copy of block 30: 50 s at 80 MB/s before it can start
+		// another block. As a duplicate it owes, or as a copy nobody asked it for.
+		large := heightHash(t, sm, 30)
+		if owed {
+			askAt(t, sm, owner, large, now.Add(-2*time.Minute))
+			askAt(t, sm, fast, large, now.Add(-time.Minute))
+		}
+
+		sink := sm.trackBlockStreams(drainingSink(func() {
+			sending, _ := sm.streams.pending(fast)
+			require.Equal(t, int64(4_000_000_000), sending, "owed %v: the 4 GB counts as fast sending", owed)
+
+			sm.maybeReaskQueuedBlock(now)
+		}))
+
+		_, err := sink(large, &wire.BlockHeader{}, peerpkg.NewDeliveryReader(bytes.NewReader(nil), fast), 4_000_000_000)
+		require.NoError(t, err)
+
+		next := heightHash(t, sm, 11)
+		require.False(t, sm.blockDownloads.HasOwner(fast, next), "owed %v: fast is 50 s from free", owed)
+		require.True(t, sm.blockDownloads.HasOwner(steady, next), "owed %v: steady at 30 MB/s is free and lands it in 10 s", owed)
+	}
+}
+
+// A peer sends its queue in order and cannot drop a request, so a block ahead in its queue counts
+// against it while another peer sends a copy of that block. Only a block the peer itself is
+// sending counts once, in its pending bytes.
+func TestAQueuedBlockArrivingFromAnotherPeerStillCountsAtItsOwner(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	ahead := heightHash(t, sm, 13)
+	next := heightHash(t, sm, 11)
+
+	askAt(t, sm, owner, ahead, now.Add(-2*time.Minute))
+	askAt(t, sm, owner, next, now.Add(-2*time.Minute))
+	askAt(t, sm, fast, ahead, now.Add(-time.Minute))
+
+	s := sm.streams.start(ahead, 13, fast, reaskTypicalBlock, now)
+	s.read.Store(0)
+
+	queue := sm.blockDownloads.Queues()[owner]
+	require.Len(t, queue, 2)
+
+	eta := sm.queuedArrival(owner, queue, queue[1].seq, reaskTypicalBlock, reaskTypicalBlock, 3_000_000)
+	require.Equal(t, 200*time.Second, eta, "block 13 ahead and block 11 itself, 600 MB at 3 MB/s")
 }

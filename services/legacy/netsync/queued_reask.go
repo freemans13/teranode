@@ -226,9 +226,10 @@ func (sm *SyncManager) lowestOwedBlock(queues map[*peerpkg.Peer][]queuedBlock, t
 	return best, bestOwner, bestHeight, found
 }
 
-// queuedArrival estimates when a block lands at p: the bytes still to come on what p is sending
-// now, one typical block for each block queued ahead of it (before seq) and not yet arriving,
-// and the block's own typical size, at rate. A seq of zero puts the block at the back of the
+// queuedArrival estimates when a block lands at p: the bytes still to come on every copy p is
+// sending now (pending), one typical block for each block queued ahead of it (before seq) and not
+// arriving from p, and the block's own typical size, at rate. A queued block arriving from another
+// peer still counts: p sends its own copy all the same. A seq of zero puts the block at the back of the
 // queue, as a new request is.
 func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq uint64, typical, ownSize int64, rate float64) time.Duration {
 	sending, _ := sm.streams.pending(p)
@@ -240,7 +241,7 @@ func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq u
 			continue
 		}
 
-		if sm.streams.arriving(b.hash) {
+		if _, _, _, from := sm.streams.arrivingFrom(b.hash, p); from {
 			continue
 		}
 

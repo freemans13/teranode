@@ -93,8 +93,12 @@ type blockStream struct {
 	// and does not count as the block arriving. Every field is set before the stream is published
 	// (add), because the sync manager reads them from other goroutines.
 	owner *peerpkg.Peer
-	total int64
-	read  atomic.Int64
+	// sender is the peer sending this copy, resolved to its association primary, owed or not, or
+	// nil when the reader names no peer. Its bytes keep that peer's connection busy whether or
+	// not they are kept, so they count in what it is sending (pending).
+	sender *peerpkg.Peer
+	total  int64
+	read   atomic.Int64
 	// lastRead is when bytes last arrived for this block, in unix nanoseconds.
 	lastRead atomic.Int64
 	// received is the node-wide count of block bytes received, or nil.
@@ -180,7 +184,7 @@ func newStreamRegistry() *streamRegistry {
 }
 
 func (r *streamRegistry) start(hash chainhash.Hash, height int32, owner *peerpkg.Peer, total int64, now time.Time) *blockStream {
-	s := &blockStream{hash: hash, height: height, owner: owner, total: total, start: now}
+	s := &blockStream{hash: hash, height: height, owner: owner, sender: owner, total: total, start: now}
 	r.add(s)
 
 	return s
@@ -316,8 +320,8 @@ func (r *streamRegistry) rateLocked(p *peerpkg.Peer) float64 {
 	return bps
 }
 
-// pending is how many bytes are still to come on the blocks p is sending now, and how many
-// blocks that is.
+// pending is how many bytes are still to come on every copy p is sending now, owed or not: they
+// all hold up what p sends next. n counts only the blocks p owes, the ones in its ledger queue.
 func (r *streamRegistry) pending(p *peerpkg.Peer) (int64, int) {
 	if r == nil || p == nil {
 		return 0, 0
@@ -332,11 +336,14 @@ func (r *streamRegistry) pending(p *peerpkg.Peer) (int64, int) {
 	)
 
 	for s := range r.active {
-		if s.owner != p {
+		if s.sender != p {
 			continue
 		}
 
-		n++
+		if s.owner == p {
+			n++
+		}
+
 		bytes += max(0, s.total-s.read.Load())
 	}
 
@@ -635,7 +642,12 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 		now := time.Now()
 		owner := sm.owingSender(r, hash)
 
-		s := &blockStream{hash: hash, height: height, owner: owner, total: n, start: now, received: &sm.waste.received}
+		sender := deliveringPeer(r)
+		if sender != nil && sm.peerStates != nil {
+			_, sender, _ = sm.peerStateResolvingPrimary(sender)
+		}
+
+		s := &blockStream{hash: hash, height: height, owner: owner, sender: sender, total: n, start: now, received: &sm.waste.received}
 		if at, ok := sm.blockDownloads.RequestedAt(hash); ok {
 			s.requestedAt = at
 		}
