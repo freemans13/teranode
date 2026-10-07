@@ -15,7 +15,7 @@ import (
 // the queued re-ask returned when a block had more than one owner, and the race skipped a stream
 // with no single owner. After one extra copy, the block the chain waited on could wait for the
 // peer layer's deadline. Each copy is judged now, as SV Node judges each peer a block is in flight
-// from, and a further copy is asked for when every copy is late, up to maxBlockCopies owners.
+// from, and a further copy is asked for when every copy is late, up to maxBlockCopies live copies.
 
 // Two owners, each with the block behind a slow queue, and the extra copy asked for a minute ago.
 // A fast idle peer is asked as the third owner. A fourth is never asked.
@@ -142,8 +142,9 @@ func TestRaceAsksAThirdPeerWhenEveryCopyStruggles(t *testing.T) {
 	require.True(t, WaitUntil(func() bool { return !a.Connected() && !b.Connected() }, 5*time.Second), "and both stalling owners are dropped")
 }
 
-// The race never asks a fourth peer.
-func TestRaceNeverAsksForAFourthCopy(t *testing.T) {
+// At the cap the race asks no fourth peer, but still drops each stalling copy, as SV Node's
+// DetectStalling drops a staller whatever its parallel fetch count.
+func TestRaceDropsStallingCopiesAtTheCapAndAsksNoFourthPeer(t *testing.T) {
 	sm := assignManager(t, 1, 120)
 	sm.streams = newStreamRegistry()
 	mockCommittedTip(t, sm, 10, 0)
@@ -153,20 +154,82 @@ func TestRaceNeverAsksForAFourthCopy(t *testing.T) {
 
 	// Three owners, SV Node's DEFAULT_MAX_BLOCK_PARALLEL_FETCH, written out so a changed bound
 	// fails here.
+	owners := make([]*peerpkg.Peer, 0, 3)
+
 	for i := range 3 {
 		p, _ := schedulerPeer(t, sm, uint8(i+1), 2000)
 		require.True(t, sm.blockDownloads.Add(p, next))
 
 		s := sm.streams.start(next, 11, p, 300_000_000, now.Add(-40*time.Second))
 		s.read.Store(1_000_000)
+
+		owners = append(owners, p)
 	}
 
 	_, fourthRec := schedulerPeer(t, sm, 9, 2000)
 
 	sm.maybeRaceSlowBlock(now)
 
-	require.False(t, WaitUntil(func() bool { return fourthRec.count() > 0 }, 300*time.Millisecond))
+	require.True(t, WaitUntil(func() bool {
+		return !owners[0].Connected() && !owners[1].Connected() && !owners[2].Connected()
+	}, 5*time.Second), "each stalling copy is dropped at the cap")
+	require.False(t, WaitUntil(func() bool { return fourthRec.count() > 0 }, 300*time.Millisecond), "no fourth peer is asked")
+}
+
+// Two forgiven owners sending nothing are not copies. The one copy arriving at 50 KB/s is
+// raced: its peer is dropped and another peer is asked. The race used to count the forgiven
+// owners, find three, and do nothing, and the block waited for the peer layer's deadline.
+func TestRaceDoesNotCountForgivenOwnersSendingNothing(t *testing.T) {
+	sm := assignManager(t, 1, 120)
+	sm.streams = newStreamRegistry()
+	mockCommittedTip(t, sm, 10, 0)
+
+	a, _ := schedulerPeer(t, sm, 1, 2000)
+	b, _ := schedulerPeer(t, sm, 2, 2000)
+	c, _ := schedulerPeer(t, sm, 3, 2000)
+	_, racerRec := schedulerPeer(t, sm, 4, 2000)
+
+	next := heightHash(t, sm, 11)
+	require.True(t, sm.blockDownloads.Add(a, next))
+	require.True(t, sm.blockDownloads.Add(b, next))
+	require.Len(t, sm.blockDownloads.ForgiveOwners(next, blockRequestRetryInterval), 2)
+	require.True(t, sm.blockDownloads.Add(c, next))
 	require.Len(t, sm.blockDownloads.OwnersOf(next), 3)
+
+	now := time.Now()
+
+	s := sm.streams.start(next, 11, c, 300_000_000, now.Add(-40*time.Second))
+	s.read.Store(2_000_000)
+
+	sm.maybeRaceSlowBlock(now)
+
+	require.True(t, WaitUntil(func() bool { return racerRec.count() == 1 }, 5*time.Second), "one live copy: another peer is asked")
+	require.True(t, WaitUntil(func() bool { return !c.Connected() }, 5*time.Second), "the copy at 50 KB/s is dropped")
+	require.True(t, a.Connected())
+	require.True(t, b.Connected())
+}
+
+// The queued re-ask does not count forgiven owners sending nothing either.
+func TestQueuedReaskDoesNotCountForgivenOwnersSendingNothing(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	x, _ := schedulerPeer(t, sm, 3, 2000)
+	y, _ := schedulerPeer(t, sm, 4, 2000)
+	now := time.Now()
+
+	next := heightHash(t, sm, 11)
+	askAt(t, sm, x, next, now.Add(-5*time.Minute))
+	askAt(t, sm, y, next, now.Add(-5*time.Minute))
+	require.Len(t, sm.blockDownloads.ForgiveOwners(next, blockRequestRetryInterval), 2)
+
+	for _, h := range []int32{13, 14, 15, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-3*time.Minute))
+	}
+
+	require.Len(t, sm.blockDownloads.OwnersOf(next), 3)
+
+	sm.maybeReaskQueuedBlock(now)
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "one live copy, minutes away: the idle fast peer is asked")
 }
 
 // A peer busy sending a large copy is not idle. Its bytes count in what it is sending whether or

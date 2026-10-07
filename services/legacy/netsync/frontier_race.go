@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -19,10 +20,11 @@ import (
 // one other peer is asked for it and the struggling peer is disconnected, as SV Node drops a
 // staller. Disconnecting stops its half-converted copy, so the extra copy converts instead of
 // being drained as a duplicate. A block is raced only when every copy of it is struggling, at most
-// once in raceSlowFetchAfter, and only while fewer than maxBlockCopies peers owe it: on 2026-09-24
-// a race that re-armed whenever a copy finished asked three peers for the same 2 GB block and
-// threw all three copies away while a 13 MB/s peer, which was not struggling at all, finished the
-// first.
+// once in raceSlowFetchAfter, and another peer is asked only while the block has fewer than
+// maxBlockCopies live copies: on 2026-09-24 a race that re-armed whenever a copy finished asked
+// three peers for the same 2 GB block and threw all three copies away while a 13 MB/s peer, which
+// was not struggling at all, finished the first. At the cap the struggling peers are still
+// disconnected; only the extra request is skipped.
 //
 // SV Node: DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT is 30 s, DEFAULT_MIN_BLOCK_STALLING_RATE is
 // 100 KB/s.
@@ -60,11 +62,15 @@ const (
 	// extra copy was asked for; another copy is asked for only after raceSlowFetchAfter, and only
 	// when every copy is late (see maxBlockCopies).
 	raceExpiry = 10 * time.Minute
-	// maxBlockCopies is the most peers that may owe one block at once: the first request and at
-	// most two extra copies, from the race or the queued re-ask. SV Node fetches the first
-	// in-flight block from up to DEFAULT_MAX_BLOCK_PARALLEL_FETCH (3) peers, and asks for another
-	// copy only when every peer it is in flight from is stalling (net/net.h:167,
-	// net/net_processing.cpp:462-499).
+	// maxBlockCopies is the most live copies of one block at once: the first request and at most
+	// two extra copies, from the race or the queued re-ask. A live copy is an owner not let off
+	// the block, or one sending it now (blockCopies); a forgiven owner sending nothing is not a
+	// copy. SV Node fetches the first in-flight block from up to DEFAULT_MAX_BLOCK_PARALLEL_FETCH
+	// (3) peers (net/net.h:167). It asks for another copy only when every connected peer the
+	// block is in flight from is stalling, and counts those stallers against the cap
+	// (stallerCount < maxParallelFetch, net/net_processing.cpp:464-496). Its DetectStalling then
+	// disconnects a staller (net_processing.cpp:5446-5466), which takes it out of the count. A
+	// forgiven owner here is never disconnected for its silence, so it is not counted.
 	maxBlockCopies = 3
 	// minRateSample is the least delivery time one rate sample covers. A block that took less is
 	// pooled with the peer's next blocks until together they took this long. A transfer that short
@@ -772,9 +778,14 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 		return
 	}
 
+	// At the cap no extra copy is asked for, but each stalling copy is still dropped, as SV Node's
+	// DetectStalling drops a staller whatever its parallel fetch count (net_processing.cpp:5446-5466).
+	// Before, the cap returned first: two forgiven owners and one copy at 50 KB/s left the block
+	// to the peer layer's deadline, an hour or more.
 	owners := sm.blockDownloads.OwnersOf(s.hash)
-	if len(owners) >= maxBlockCopies {
-		sm.logger.Debugf("[frontierRace][%s] block %d is arriving at %.0f KB/s but %d peers already owe it", s.hash, s.height, c.rate/1e3, len(owners))
+	if copies := sm.blockCopies(s.hash, owners); copies >= maxBlockCopies {
+		sm.dropStallingCopies(s, stalling)
+		sm.logger.Infof("[frontierRace][%s] dropped %v, which were sending block %d at under %.0f KB/s; %d live copies, so no other peer was asked", s.hash, stalling, s.height, float64(raceStallRate)/1e3, copies)
 
 		return
 	}
@@ -804,12 +815,41 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 	// Each peer sending a copy is struggling, and each is dropped as SV Node drops a staller. The
 	// copy converting stops, which frees the block for the extra copy; left connected, the extra
 	// copy would arrive as a duplicate and be drained unwritten.
-	for _, p := range stalling {
-		p.DisconnectWithInfo(fmt.Sprintf("stalling on block %d at under %.0f KB/s", s.height, float64(raceStallRate)/1e3))
-	}
+	sm.dropStallingCopies(s, stalling)
 
 	sm.logger.Infof("[frontierRace][%s] asked %s for block %d and dropped %v, which were sending it at under %.0f KB/s; one at %.0f KB/s after %s",
 		s.hash, racer, s.height, stalling, float64(raceStallRate)/1e3, c.rate/1e3, now.Sub(s.start).Round(time.Second))
+}
+
+// dropStallingCopies disconnects each peer sending a struggling copy of s's block.
+func (sm *SyncManager) dropStallingCopies(s *blockStream, stalling []*peerpkg.Peer) {
+	for _, p := range stalling {
+		p.DisconnectWithInfo(fmt.Sprintf("stalling on block %d at under %.0f KB/s", s.height, float64(raceStallRate)/1e3))
+	}
+}
+
+// blockCopies is how many live copies of h there are among owners: an owner not let off the
+// block, or one whose copy is arriving now. A forgiven owner sending nothing will not deliver
+// (ownerArrival reads it as far off), and counting it held the race and the queued re-ask off a
+// block whose only copy was stalling.
+func (sm *SyncManager) blockCopies(h chainhash.Hash, owners []*peerpkg.Peer) int {
+	active, _ := sm.blockDownloads.ActiveOwners(h)
+
+	n := 0
+
+	for _, o := range owners {
+		if slices.Contains(active, o) {
+			n++
+
+			continue
+		}
+
+		if _, _, _, arriving := sm.streams.arrivingFrom(h, o); arriving {
+			n++
+		}
+	}
+
+	return n
 }
 
 // askRacer records racer as a second owner of h and sends it the getdata. Recording first means

@@ -43,8 +43,8 @@ import (
 // every block it is sending. Whichever copy lands first converts; the other is drained at the
 // sink. The re-ask shares the race's mark. A block with more than one owner is judged on every
 // owner's copy, and lands at the soonest of them. Another copy is asked for only when the newest
-// extra copy is at least raceSlowFetchAfter old, every copy is judged, and fewer than
-// maxBlockCopies peers owe the block, whichever rule asked. Headers-first mode only: the heights
+// extra copy is at least raceSlowFetchAfter old, every copy is judged, and the block has fewer than
+// maxBlockCopies live copies (blockCopies), whichever rule asked. Headers-first mode only: the heights
 // come from the header cache, which is empty above the last checkpoint, where the quiet-owner
 // re-ask covers the ledger's blocks.
 
@@ -77,8 +77,10 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 		return
 	}
 
+	// Forgiven owners sending nothing are owners still, and are judged below, but are not live
+	// copies (blockCopies).
 	owners := sm.blockDownloads.OwnersOf(block.hash)
-	if len(owners) == 0 || len(owners) >= maxBlockCopies {
+	if len(owners) == 0 || sm.blockCopies(block.hash, owners) >= maxBlockCopies {
 		return
 	}
 
