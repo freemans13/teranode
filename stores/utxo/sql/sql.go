@@ -2288,8 +2288,6 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	return spends, nil
 }
 
-// needsSpendRollback returns true if any spend failed due to a validation error
-// that indicates the transaction is genuinely invalid. Mirrors aerospike/spend.go.
 // spendRollbackSet is what a failed batched Spend reverses: nothing unless an
 // input failed with a genuine validation error (needsSpendRollback), and then
 // the inputs this call wrote plus, when that is safe, its idempotent matches
@@ -2310,6 +2308,8 @@ func spendRollbackSet(spends, written, idempotent []*utxo.Spend, unresolved int)
 	return utxo.RollbackSet(written, idempotent, utxo.AnyPrunedReplay(spends) || unresolved > 0)
 }
 
+// needsSpendRollback returns true if any spend failed due to a validation error
+// that indicates the transaction is genuinely invalid. Mirrors aerospike/spend.go.
 func needsSpendRollback(spends []*utxo.Spend) bool {
 	for _, spend := range spends {
 		if spend.Err == nil {

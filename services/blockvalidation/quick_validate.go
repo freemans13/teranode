@@ -2147,13 +2147,13 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	// block.ID may have been taken from another block's mined-in id on a shared
 	// transaction; a leftover is only ours if the id really is this block's.
-	leftovers, idMismatch, err := utxo.ConfirmLeftovers(ctx, u.blockchainClient, block.Hash(), block.ID, leftovers)
+	leftovers, idMismatch, err := utxo.ConfirmLeftovers(ctx, blockchain.CommittedBlockHashLookup(u.blockchainClient), block.Hash(), block.ID, leftovers)
 	if err != nil {
 		return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to confirm the leftovers' block id", block.Hash().String(), err)
 	}
 
 	if idMismatch {
-		u.logger.Warnf("[createAndSpendUTXOsForBatch][%s] block id %d is not this block's id; its locked existing transactions belong to another block and are filed as pre-existing", block.Hash().String(), block.ID)
+		u.logger.Warnf("[createAndSpendUTXOsForBatch][%s] block id %d is held by another committed block; its locked existing transactions belong to that block and are filed as pre-existing", block.Hash().String(), block.ID)
 	}
 
 	if len(leftovers) > 0 {

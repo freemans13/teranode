@@ -253,47 +253,58 @@ func LeftoversAmong(ctx context.Context, store Store, existing []*chainhash.Hash
 	return leftovers, nil
 }
 
-// BlockIDAssigner is the blockchain service's per-hash block id authority
-// (blockchain.ClientI satisfies it). Declared here so this package need not
-// import the blockchain service.
-type BlockIDAssigner interface {
-	AssignBlockID(ctx context.Context, blockHash *chainhash.Hash) (uint64, error)
-}
+// CommittedBlockHashFunc answers which block, if any, is committed under a
+// block id: its hash, or nil when no committed block holds the id. It must be
+// read-only. Callers build it from the blockchain service's GetBlockByID; it is
+// a function rather than that interface so this package need not import model.
+type CommittedBlockHashFunc func(ctx context.Context, id uint64) (*chainhash.Hash, error)
 
-// ConfirmLeftovers keeps the leftovers LeftoversAmong found only when blockID
-// really is blockHash's id, and otherwise returns nil with mismatch set.
+// ConfirmLeftovers keeps the leftovers LeftoversAmong found unless a different
+// block is committed under blockID, in which case it returns nil with mismatch
+// set.
 //
 // LeftoversAmong's whole argument is that no other writer carries THIS block's
 // id. Both block paths may take that id from the mined-in ids already recorded
 // on the block's first non-coinbase transaction, and a transaction shared with
-// another block (a fork sibling below the checkpoint) carries the OTHER block's
-// id. Adopting it made every shared record that block left locked look like
-// this block's own leftover, so it was dropped from this block's
-// SetMinedMulti and became eligible for this block's compensating delete. The
-// blockchain service's AssignBlockID is idempotent per hash and durable (it
-// survives a restart), so its answer decides whose id this is. On a mismatch
-// the records are the other block's, and filing them as pre-existing is
-// correct. An error is returned rather than guessed at: treating a genuine
-// leftover as pre-existing would let the "already blessed" fallback bless a
-// replay on the strength of its own earlier write.
+// another block carries the OTHER block's id. When that other block is
+// committed and its post-commit unlock failed, its records are still locked
+// under its id, so adopting the id made them look like this block's own
+// leftovers: dropped from this block's SetMinedMulti and eligible for this
+// block's compensating delete. A committed block naming a different hash under
+// the id settles that the records are its, and filing them as pre-existing is
+// correct.
 //
-// It asks only when there are leftovers, so a first attempt never pays for it.
-func ConfirmLeftovers(ctx context.Context, assigner BlockIDAssigner, blockHash *chainhash.Hash, blockID uint32,
+// The question is asked read-only on purpose. AssignBlockID is not usable here:
+// the blockchain store sweeps reservations older than an hour, and a block
+// retried after that reads its id back from its own records with no
+// reservation left. AssignBlockID would then reserve a fresh id as a side
+// effect, the real leftovers would be filed as pre-existing (re-opening the
+// bless of a replay by its own earlier write), and AddBlock would refuse the
+// block's own id against the new reservation on every retry.
+//
+// The limit, stated: a sibling that is still in flight holds the id only as a
+// reservation, which this lookup does not see, so that case is not caught here.
+// Closing it needs a read-only "who holds this id, committed or reserved"
+// lookup on the blockchain service.
+//
+// An error is returned rather than guessed at. It asks only when there are
+// leftovers, so a first attempt never pays for it.
+func ConfirmLeftovers(ctx context.Context, committedHash CommittedBlockHashFunc, blockHash *chainhash.Hash, blockID uint32,
 	leftovers map[chainhash.Hash]struct{}) (confirmed map[chainhash.Hash]struct{}, mismatch bool, err error) {
 	if len(leftovers) == 0 {
 		return leftovers, false, nil
 	}
 
-	if assigner == nil {
-		return nil, false, errors.NewProcessingError("[ConfirmLeftovers] no block id authority to confirm %d leftovers of block %s", len(leftovers), blockHash.String())
+	if committedHash == nil {
+		return nil, false, errors.NewProcessingError("[ConfirmLeftovers] no block lookup to confirm %d leftovers of block %s", len(leftovers), blockHash.String())
 	}
 
-	assigned, err := assigner.AssignBlockID(ctx, blockHash)
+	holder, err := committedHash(ctx, uint64(blockID))
 	if err != nil {
-		return nil, false, errors.NewProcessingError("[ConfirmLeftovers] could not confirm block id %d for block %s", blockID, blockHash.String(), err)
+		return nil, false, errors.NewProcessingError("[ConfirmLeftovers] could not look up which block holds id %d (block %s)", blockID, blockHash.String(), err)
 	}
 
-	if assigned != uint64(blockID) {
+	if holder != nil && !holder.IsEqual(blockHash) {
 		return nil, true, nil
 	}
 

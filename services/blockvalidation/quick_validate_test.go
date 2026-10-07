@@ -1478,9 +1478,9 @@ func replayBatch(txs ...*bt.Tx) (*model.Block, *SubtreeProcessingBatch) {
 	}
 }
 
-// assignedReplayBatch is replayBatch with the id the blockchain service holds
-// for the block, which a retry of the same block gets back, so a leftover an
-// earlier attempt stamped with it is recognised as this block's own.
+// assignedReplayBatch is replayBatch with an id from the blockchain service, as
+// a first attempt gets it, so the leftover tests stamp their records with an id
+// no other committed block holds (utxo.ConfirmLeftovers).
 func assignedReplayBatch(t *testing.T, bv *BlockValidation, txs ...*bt.Tx) (*model.Block, *SubtreeProcessingBatch) {
 	t.Helper()
 
@@ -1977,13 +1977,13 @@ func TestQuickValidateLeftoverDependentIsRemovedOnRetry(t *testing.T) {
 	require.NotNil(t, meta)
 }
 
-// TestQuickValidateSiblingBlockIDIsNotAdoptedAsLeftover: a below-checkpoint
-// fork sibling X wrote a shared transaction locked with X's id and has not
-// committed. Block Y then took X's id, as the id-reuse lookup does when it reads
-// the mined-in ids of a shared first transaction. Every shared record then
-// looked like Y's own leftover (locked and carrying "this block's" id), so Y's
-// compensation deleted a record X wrote. The block id authority decides whose
-// id it is: Y's own id is different, so the record is X's and stays.
+// TestQuickValidateSiblingBlockIDIsNotAdoptedAsLeftover: block X shares a
+// transaction with block Y, X is committed under id N, and X's post-commit
+// unlock failed, so its record is still locked under N. Block Y then took N, as
+// the id-reuse lookup does when it reads the mined-in ids of a shared first
+// transaction. The record looked like Y's own leftover (locked and carrying
+// "this block's" id), so Y's compensation deleted a record X wrote. A committed
+// block other than Y holds N, so the record is X's and stays.
 func TestQuickValidateSiblingBlockIDIsNotAdoptedAsLeftover(t *testing.T) {
 	bv, store, cleanup := newBlockValidationWithRealStore(t)
 	defer cleanup()
@@ -1991,22 +1991,25 @@ func TestQuickValidateSiblingBlockIDIsNotAdoptedAsLeftover(t *testing.T) {
 	ctx := context.Background()
 	f := newPrunedChainFixture(t, store)
 
-	siblingHash := chainhash.HashH([]byte("fork sibling X"))
-	siblingID, err := bv.blockchainClient.AssignBlockID(ctx, &siblingHash)
+	tip, _, err := bv.blockchainClient.GetBestBlockHeader(ctx)
 	require.NoError(t, err)
 
-	// X's create phase: C written locked with X's id.
+	sibling := testhelpers.CreateTestBlocksWithPrev(t, 1, tip.Hash())[0]
+	require.NoError(t, bv.blockchainClient.AddBlock(ctx, sibling, "test-peer"))
+
+	_, siblingMeta, err := bv.blockchainClient.GetBlockHeader(ctx, sibling.Hash())
+	require.NoError(t, err)
+
+	siblingID := siblingMeta.ID
+
+	// X's record, still locked under X's id after its unlock failed.
 	_, _, err = store.SpendAndCreate(ctx, f.child, 1400, utxo.WithCreateOnly(),
-		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: uint32(siblingID), BlockHeight: 1400}), utxo.WithLocked(true))
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: siblingID, BlockHeight: 1400}), utxo.WithLocked(true))
 	require.NoError(t, err)
 
 	// Y carries X's id, as if adopted from C's mined-in ids.
 	block, batch := replayBatch(f.child, f.sibling)
-	block.ID = uint32(siblingID)
-
-	ownID, err := bv.blockchainClient.AssignBlockID(ctx, block.Hash())
-	require.NoError(t, err)
-	require.NotEqual(t, siblingID, ownID, "precondition: Y's own id is not X's")
+	block.ID = siblingID
 
 	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
 	require.Error(t, err)
