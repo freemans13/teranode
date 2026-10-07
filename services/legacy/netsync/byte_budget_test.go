@@ -496,3 +496,33 @@ func TestASinglePeerWarmsUpOnItsOwnMeasurement(t *testing.T) {
 	sm.streams.rates[p] = float64(10 * qMB)
 	require.False(t, sm.downloadWarming(), "its one peer is measured")
 }
+
+// The queue is sized on the largest recent block, not the average. Sizes vary a hundredfold at
+// these heights: on 2026-10-07 near 714,500, with nine small blocks and one large among the last
+// ten, the average sized every fast peer's queue near the cap of 16, and peers whose speed then
+// fell held 13 to 15 blocks against an allowance of two, each starting two minutes or more after it
+// was asked for.
+func TestTheQueueIsSizedOnTheLargestRecentBlock(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xf1}
+	msg, _ := linkedHeaders(anchor, 40, &nonce)
+
+	sm, a, aRec, b, bRec := budgetManager(t)
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+
+	recentBlocks(sm, 2<<30)
+	for range 9 {
+		sm.blockSizeTracker.addBlockSize(20 * qMB)
+	}
+
+	sm.streams.rates[a] = float64(40 * qMB)
+	sm.streams.rates[b] = float64(40 * qMB)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 4 }, 300*time.Millisecond),
+		"ten seconds at 40 MB/s is less than one 2 GB block, so two each, not the cap the average would give")
+}
