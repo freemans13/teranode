@@ -41,12 +41,7 @@ func TestBenchNettedVsPerTx(t *testing.T) {
 	methods := strings.Split(envOr("BENCH_METHODS", "pertx,netted"), ",")
 
 	blocks := loadBenchBlocks(t, dir)
-	external := externalParents(blocks)
-
-	var nTx int
-	for _, b := range blocks {
-		nTx += len(b.txs)
-	}
+	external, nTx := externalParents(t, blocks)
 
 	t.Logf("loaded %d blocks (%d to %d), %d transactions, %d external parent transactions",
 		len(blocks), blocks[0].height, blocks[len(blocks)-1].height, nTx, len(external))
@@ -56,10 +51,42 @@ func TestBenchNettedVsPerTx(t *testing.T) {
 	}
 }
 
+// benchBlock is one block file. Its transactions are parsed when it is applied and dropped after,
+// as the node holds one block at a time, so a set of large blocks fits in memory.
 type benchBlock struct {
 	height   uint32
+	path     string
 	coinbase *bt.Tx
 	txs      []*bt.Tx
+}
+
+func (b benchBlock) load(t *testing.T) benchBlock {
+	t.Helper()
+
+	raw, err := os.ReadFile(b.path)
+	require.NoError(t, err)
+
+	var msg wire.MsgBlock
+	require.NoError(t, msg.Deserialize(bytes.NewReader(raw)))
+
+	out := benchBlock{height: b.height, path: b.path}
+
+	for i, wtx := range msg.Transactions {
+		var buf bytes.Buffer
+		require.NoError(t, wtx.Serialize(&buf))
+
+		tx, err := bt.NewTxFromBytes(buf.Bytes())
+		require.NoError(t, err)
+
+		if i == 0 {
+			out.coinbase = tx
+			continue
+		}
+
+		out.txs = append(out.txs, tx)
+	}
+
+	return out
 }
 
 func envOr(k, d string) string {
@@ -87,28 +114,7 @@ func loadBenchBlocks(t *testing.T, dir string) []benchBlock {
 		h, err := strconv.Atoi(strings.TrimSuffix(name, ".bin"))
 		require.NoError(t, err)
 
-		raw, err := os.ReadFile(filepath.Join(dir, name))
-		require.NoError(t, err)
-
-		var msg wire.MsgBlock
-		require.NoError(t, msg.Deserialize(bytes.NewReader(raw)))
-
-		b := benchBlock{height: uint32(h)} //nolint:gosec // block heights
-
-		for i, wtx := range msg.Transactions {
-			var buf bytes.Buffer
-			require.NoError(t, wtx.Serialize(&buf))
-
-			tx, err := bt.NewTxFromBytes(buf.Bytes())
-			require.NoError(t, err)
-
-			if i == 0 {
-				b.coinbase = tx
-				continue
-			}
-
-			b.txs = append(b.txs, tx)
-		}
+		b := benchBlock{height: uint32(h), path: filepath.Join(dir, name)} //nolint:gosec // block heights
 
 		blocks = append(blocks, b)
 	}
@@ -120,11 +126,16 @@ func loadBenchBlocks(t *testing.T, dir string) []benchBlock {
 
 // externalParents returns, for each transaction the blocks spend from but do not create, the
 // output indexes they spend.
-func externalParents(blocks []benchBlock) map[chainhash.Hash]map[uint32]struct{} {
+func externalParents(t *testing.T, files []benchBlock) (map[chainhash.Hash]map[uint32]struct{}, int) {
+	t.Helper()
+
 	created := map[chainhash.Hash]struct{}{}
 	external := map[chainhash.Hash]map[uint32]struct{}{}
+	nTx := 0
 
-	for _, b := range blocks {
+	for _, f := range files {
+		b := f.load(t)
+		nTx += len(b.txs)
 		created[*b.coinbase.TxIDChainHash()] = struct{}{}
 
 		for _, tx := range b.txs {
@@ -145,7 +156,7 @@ func externalParents(blocks []benchBlock) map[chainhash.Hash]map[uint32]struct{}
 		}
 	}
 
-	return external
+	return external, nTx
 }
 
 func mainnetBatcherTune(ts *settings.Settings) {
@@ -203,7 +214,9 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 
 	var applyTotal time.Duration
 
-	for _, b := range blocks {
+	for _, file := range blocks {
+		b := file.load(t)
+
 		cbOpts := []utxo.CreateOption{
 			utxo.WithCreateOnly(),
 			utxo.WithSetCoinbase(true),
@@ -213,52 +226,67 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 		_, _, err := s.SpendAndCreate(ctx, b.coinbase, b.height, cbOpts...)
 		require.NoError(t, err, "coinbase at %d", b.height)
 
-		idxs := make([]int, len(b.txs))
-		for i := range idxs {
-			idxs[i] = (i + 1) / 4096
-		}
+		// Quick validation hands the store one range of benchRange transaction positions at a time
+		// (position 0 is the coinbase), so the bench does the same, for every method.
+		const benchRange = 65536
 
-		opts := []utxo.CreateOption{
-			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: b.height, BlockHeight: b.height}),
-			utxo.WithSubtreeIdxs(idxs),
-			utxo.WithLocked(false),
-			utxo.WithIgnoreLocked(true),
-			utxo.WithSkipExtendedInputs(true),
-			utxo.WithSkipUTXOHashCheck(true),
-		}
+		start := time.Now()
 
-		if above {
-			opts = []utxo.CreateOption{
+		for lo := 0; lo < len(b.txs); {
+			hi := lo
+			for hi < len(b.txs) && (hi+1)/benchRange == (lo+1)/benchRange {
+				hi++
+			}
+
+			txs := b.txs[lo:hi]
+
+			idxs := make([]int, len(txs))
+			for k := range idxs {
+				idxs[k] = (lo + k + 1) / 4096
+			}
+
+			opts := []utxo.CreateOption{
+				utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: b.height, BlockHeight: b.height}),
+				utxo.WithSubtreeIdxs(idxs),
+				utxo.WithLocked(false),
 				utxo.WithIgnoreLocked(true),
 				utxo.WithSkipExtendedInputs(true),
 				utxo.WithSkipUTXOHashCheck(true),
 			}
-		}
 
-		start := time.Now()
+			if above {
+				opts = []utxo.CreateOption{
+					utxo.WithIgnoreLocked(true),
+					utxo.WithSkipExtendedInputs(true),
+					utxo.WithSkipUTXOHashCheck(true),
+				}
+			}
 
-		var results []utxo.SpendAndCreateMultiResult
+			var results []utxo.SpendAndCreateMultiResult
 
-		switch method {
-		case "pertx":
-			results, err = utxo.DefaultSpendAndCreateMulti(ctx, s, 3200, b.txs, b.height, opts...)
-		case "netted":
-			results, err = s.SpendAndCreateMulti(ctx, b.txs, b.height, opts...)
-		case "twophase":
-			results, err = benchTwoPhase(ctx, s, b, idxs)
-		default:
-			t.Fatalf("unknown method %q", method)
+			switch method {
+			case "pertx":
+				results, err = utxo.DefaultSpendAndCreateMulti(ctx, s, 3200, txs, b.height, opts...)
+			case "netted":
+				results, err = s.SpendAndCreateMulti(ctx, txs, b.height, opts...)
+			case "twophase":
+				results, err = benchTwoPhase(ctx, s, benchBlock{height: b.height, txs: txs}, idxs)
+			default:
+				t.Fatalf("unknown method %q", method)
+			}
+
+			require.NoError(t, err, "[%s] block %d range at %d", method, b.height, lo)
+
+			for k, r := range results {
+				if r.Status != utxo.MultiTxCreated {
+					t.Fatalf("[%s] block %d tx %d status %d: %v", method, b.height, lo+k, r.Status, r.Err)
+				}
+			}
+
+			lo = hi
 		}
 
 		d := time.Since(start)
-
-		require.NoError(t, err, "[%s] block %d", method, b.height)
-
-		for i, r := range results {
-			if r.Status != utxo.MultiTxCreated {
-				t.Fatalf("[%s] block %d tx %d status %d: %v", method, b.height, i, r.Status, r.Err)
-			}
-		}
 
 		perBlock = append(perBlock, d)
 		applyTotal += d
