@@ -120,12 +120,16 @@ func (sm *SyncManager) peerQueueDepth(p *peerpkg.Peer, depth int, fastest float6
 		return min(depth, unmeasuredPeerDepth)
 	}
 
-	var typical int64
+	// The largest recent block, not the average: sizes vary a hundredfold at some heights, and on
+	// 2026-10-07 an average dragged down by small blocks sized every fast peer's queue near the cap.
+	// A peer whose rolling speed then fell kept those blocks. largestRecentSize records the same
+	// lesson from an earlier queue estimate.
+	var size int64
 	if sm.blockSizeTracker != nil {
-		typical = sm.blockSizeTracker.getAverageSize()
+		size = sm.blockSizeTracker.largestRecentSize()
 	}
 
-	return timeScaledDepth(depth, rate, fastest, typical)
+	return timeScaledDepth(depth, rate, fastest, size)
 }
 
 // parkBackstopBytes is the most block bytes the node holds ahead of the chain, parked and
