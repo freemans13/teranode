@@ -2104,7 +2104,11 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		succeeded        int
 		spentSpends      = make([]*utxo.Spend, 0, len(spends)) // written by this call
 		idempotentSpends = make([]*utxo.Spend, 0, len(spends)) // already recorded; this call wrote nothing
-		g                errgroup.Group
+		// unresolved counts inputs that stopped waiting before their batch
+		// answered (context cancelled, or the wait timed out). Their real answer
+		// is unknown and may be the pruned-replay marker; see spendRollbackSet.
+		unresolved int
+		g          errgroup.Group
 	)
 
 	// Cap per-tx concurrency into the spend batcher. Without this, a single tx
@@ -2170,10 +2174,20 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 				// Batch completed successfully or with error
 			case <-ctx.Done():
 				spends[idx].Err = errors.NewContextCanceledError("[SPEND][%s:%d] context canceled while waiting for batch response", spend.TxID.String(), spend.Vout)
+
+				mu.Lock()
+				unresolved++
+				mu.Unlock()
+
 				return nil
 			case <-timer.C:
 				prometheusUtxoErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
 				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND][%s:%d] batch operation timed out after %s", spend.TxID.String(), spend.Vout, spendTimeout)
+
+				mu.Lock()
+				unresolved++
+				mu.Unlock()
+
 				return nil
 			}
 
@@ -2249,11 +2263,9 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// opens a database transaction even for an empty set, so without it a
 		// call that failed with nothing to reverse, such as a transaction none of
 		// whose parents is present, paid a round trip for nothing.
-		if needsSpendRollback(spends) {
-			if rollback := utxo.RollbackSet(spentSpends, idempotentSpends, utxo.AnyPrunedReplay(spends)); len(rollback) > 0 {
-				if unspendErr := s.Unspend(context.Background(), rollback); unspendErr != nil {
-					s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
-				}
+		if rollback := spendRollbackSet(spends, spentSpends, idempotentSpends, unresolved); len(rollback) > 0 {
+			if unspendErr := s.Unspend(context.Background(), rollback); unspendErr != nil {
+				s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
 			}
 		}
 
@@ -2278,6 +2290,26 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 // needsSpendRollback returns true if any spend failed due to a validation error
 // that indicates the transaction is genuinely invalid. Mirrors aerospike/spend.go.
+// spendRollbackSet is what a failed batched Spend reverses: nothing unless an
+// input failed with a genuine validation error (needsSpendRollback), and then
+// the inputs this call wrote plus, when that is safe, its idempotent matches
+// (utxo.RollbackSet).
+//
+// Both halves of RollbackSet's historical contract apply, as on Aerospike
+// (spendCompletionResult.rollbackSet): an idempotent match is held back when an
+// answered input hit the pruned-replay marker, AND when any input stopped
+// waiting before its batch answered. Such an input's slot holds the
+// cancellation or timeout error the wait wrote, neither of which is a replay
+// answer, while its real answer may be the marker; reversing the idempotent
+// matches then would release a confirmed historical spend to anyone.
+func spendRollbackSet(spends, written, idempotent []*utxo.Spend, unresolved int) []*utxo.Spend {
+	if !needsSpendRollback(spends) {
+		return nil
+	}
+
+	return utxo.RollbackSet(written, idempotent, utxo.AnyPrunedReplay(spends) || unresolved > 0)
+}
+
 func needsSpendRollback(spends []*utxo.Spend) bool {
 	for _, spend := range spends {
 		if spend.Err == nil {
@@ -2531,6 +2563,11 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 	// are exclusively routed through setDAH — no duplication, no risk of
 	// calling setDAH for a parent whose items all ended up in validationErrors.
 
+	// idempotentAtSelect are the items the SELECT already found spent by this
+	// exact spender. They take no part in the UPDATE, so its marker guard never
+	// sees them; they get their own re-check before the commit.
+	var idempotentAtSelect []int
+
 	for i, item := range batch {
 		spend := item.spend
 		r, found := resultMap[i]
@@ -2593,8 +2630,10 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			// Idempotent re-spend: same spending data — treat as success without UPDATE.
 			// Record the parent so DAH can still be (re)evaluated and heal NULL DAHs
 			// left by spends that happened before the DAH-on-spend fix landed.
+			// The marker is re-checked for it below, like every other outcome.
 			idempotentParentIDs[r.transactionID] = struct{}{}
 			item.idempotent = true
+			idempotentAtSelect = append(idempotentAtSelect, i)
 			continue
 		}
 
@@ -2970,15 +3009,48 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				validationErrors[u.batchIdx] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
 			}
 		}
-		// Mark idempotent duplicate batch entries as successful (same UTXO, same spending data).
-		// Double-spend duplicates (different spending data) are already in validationErrors — skip them.
+		// A duplicate (same UTXO, same spending data) takes its representative's
+		// answer, whatever it was. Double-spend duplicates (different spending
+		// data) are already in validationErrors and are skipped. The
+		// representative can be refused after the dedup: as a pruned replay by
+		// the re-check above, or as spent by a concurrent spender. Promoting only
+		// successes left a refused representative's duplicate with no entry, so
+		// it was signalled nil, and a second concurrent Spend of the same
+		// replayed transaction went on to recreate the pruned transaction.
 		for _, u := range toUpdate {
 			key := utxoKey{u.transactionID, u.vout}
 			if entry, ok := seenKeys[key]; ok && entry.batchIdx != u.batchIdx {
-				if bytes.Equal(entry.spendingData, u.spendingData) && updatedSet[entry.batchIdx] {
+				if !bytes.Equal(entry.spendingData, u.spendingData) {
+					continue
+				}
+
+				if updatedSet[entry.batchIdx] {
 					updatedSet[u.batchIdx] = true
+					// The duplicate wrote nothing itself; it is idempotent exactly
+					// when its representative is, which decides its rollback.
+					batch[u.batchIdx].idempotent = batch[entry.batchIdx].idempotent
+				} else if repErr, refused := validationErrors[entry.batchIdx]; refused {
+					validationErrors[u.batchIdx] = repErr
 				}
 			}
+		}
+	}
+
+	// Marker re-check for the idempotent-at-SELECT items. Every other outcome of
+	// this batch reads the marker after the SELECT too (the UPDATE's NOT EXISTS
+	// guard, the missed-row re-check above), and the per-row path re-checks an
+	// idempotent row with q3. Without this, a pruner commit landing between the
+	// SELECT and here let a replay through on this arm alone: the output already
+	// recorded the pruned transaction's spend, so the replay was answered as a
+	// success and its create was blessed. This statement takes a fresh snapshot.
+	if len(idempotentAtSelect) > 0 {
+		retryable, aborted := s.recheckIdempotentMarkers(txn, batch, resultMap, idempotentAtSelect, validationErrors)
+		if retryable {
+			return true
+		}
+
+		if aborted {
+			return false
 		}
 	}
 
@@ -3065,6 +3137,82 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		}
 	}
 	return false
+}
+
+// recheckIdempotentMarkers answers as a pruned replay every item in idxs whose
+// spender a replay marker now names, and clears its idempotent flag. retryable
+// reports a deadlock to retry the batch on; aborted reports that every item has
+// already been answered with a storage error.
+func (s *Store) recheckIdempotentMarkers(txn *sql.Tx, batch []*batchSpend, resultMap map[int]*spendSelectResult, idxs []int, validationErrors map[int]error) (retryable, aborted bool) {
+	var sb strings.Builder
+
+	sb.WriteString(`SELECT v.batch_idx FROM (VALUES `)
+
+	args := make([]interface{}, 0, len(idxs)*3)
+	pidx := 1
+
+	for i, bIdx := range idxs {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+
+		sb.WriteString(fmt.Sprintf("($%d::int,$%d::bytea,$%d::int)", pidx, pidx+1, pidx+2))
+		args = append(args, resultMap[bIdx].transactionID, batch[bIdx].spend.SpendingData.Bytes(), bIdx)
+		pidx += 3
+	}
+
+	sb.WriteString(`) AS v(transaction_id,spending_data,batch_idx)
+		WHERE EXISTS (SELECT 1 FROM deleted_children d
+		              WHERE d.parent_id = v.transaction_id
+		                AND d.child_hash = substring(v.spending_data from 1 for 32))`)
+
+	failAll := func(err error) {
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] failed: idempotent marker re-check", err)
+		}
+	}
+
+	rows, err := txn.QueryContext(s.ctx, sb.String(), args...)
+	if err != nil {
+		if isDeadlock(err) {
+			return true, false
+		}
+
+		failAll(err)
+
+		return false, true
+	}
+
+	for rows.Next() {
+		var bIdx int
+		if err := rows.Scan(&bIdx); err != nil {
+			rows.Close()
+
+			if isDeadlock(err) {
+				return true, false
+			}
+
+			failAll(err)
+
+			return false, true
+		}
+
+		spend := batch[bIdx].spend
+		batch[bIdx].idempotent = false
+		validationErrors[bIdx] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
+	}
+
+	if err := rows.Close(); err != nil {
+		if isDeadlock(err) {
+			return true, false
+		}
+
+		failAll(err)
+
+		return false, true
+	}
+
+	return false, false
 }
 
 // trySendSpendBatchPerRow processes a spend batch with per-row SELECT+UPDATE (original behavior).

@@ -851,3 +851,36 @@ func TestRejectedReplayRollsBackFreshSpendsAtZeroRetention(t *testing.T) {
 		_ = p
 	})
 }
+
+// TestSpendRollbackSetHoldsIdempotentWhenAnInputIsUnresolved pins the
+// unknown-answer half of utxo.RollbackSet's contract on the SQL store. Input A
+// failed ErrSpent, so the call rolls back. Input B matched idempotently: the
+// output already recorded this exact spend. Input C stopped waiting (timeout or
+// cancellation) before its batch answered, so its slot holds an error that is
+// not a replay answer while its real answer may have been the marker. B's match
+// may then be a confirmed historical spend, and reversing it would hand that
+// output to anyone, so only A's own write may be reversed.
+//
+// Unit-level on purpose: the spend batcher runs its batches one at a time, so a
+// Spend call cannot be made to leave exactly one input unanswered while the
+// others are answered without depending on goroutine order.
+func TestSpendRollbackSetHoldsIdempotentWhenAnInputIsUnresolved(t *testing.T) {
+	written := &utxo.Spend{Vout: 0}
+	idempotent := &utxo.Spend{Vout: 1}
+	spent := &utxo.Spend{Vout: 2, Err: errors.NewUtxoSpentError(chainhash.Hash{}, 2, chainhash.Hash{}, nil)}
+	timedOut := &utxo.Spend{Vout: 3, Err: errors.NewServiceUnavailableError("batch operation timed out")}
+
+	spends := []*utxo.Spend{written, idempotent, spent, timedOut}
+
+	require.Equal(t, []*utxo.Spend{written},
+		spendRollbackSet(spends, []*utxo.Spend{written}, []*utxo.Spend{idempotent}, 1),
+		"an unanswered input may be the marker hit, so the idempotent match is held back")
+
+	require.Equal(t, []*utxo.Spend{written, idempotent},
+		spendRollbackSet(spends, []*utxo.Spend{written}, []*utxo.Spend{idempotent}, 0),
+		"control: with every input answered and no replay answer, the idempotent match is reversed (self-healing)")
+
+	require.Nil(t,
+		spendRollbackSet([]*utxo.Spend{written, timedOut}, []*utxo.Spend{written}, nil, 1),
+		"control: a call that failed only on a transient error reverses nothing")
+}
