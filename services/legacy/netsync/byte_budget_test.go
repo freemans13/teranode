@@ -166,14 +166,15 @@ func TestTheLowestBlockGoesToTheFastestPeerWithRoom(t *testing.T) {
 	sm, a, aRec, b, bRec := budgetManager(t)
 	recentBlocks(sm, 200*qMB)
 
-	sm.streams.rates[a] = float64(10 * qMB)
+	// 30 and 50 MB/s: the faster peer alone is short of 80% of 80, so both are active.
+	sm.streams.rates[a] = float64(30 * qMB)
 	sm.streams.rates[b] = float64(50 * qMB)
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	// The slower peer runs at a fifth of the speed, so its queue is a fifth of the depth of two,
-	// which rounds to the floor of one.
+	// The slower peer runs at three fifths of the speed, so its queue is three fifths of the
+	// depth of two, which rounds to one.
 	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 3 }, 5*time.Second))
 	require.Equal(t, hashes[0:2], bRec.all(), "the faster peer takes the lowest blocks until it is full")
 	require.Equal(t, hashes[2:3], aRec.all())
@@ -365,16 +366,17 @@ func TestASlowPeersQueueIsShorterInProportionToItsSpeed(t *testing.T) {
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
 	recentBlocks(sm, 200*qMB)
 
-	sm.streams.rates[a] = float64(5 * qMB)
+	// 20 and 50 MB/s: the faster peer alone is short of 80% of 70, so both are active.
+	sm.streams.rates[a] = float64(20 * qMB)
 	sm.streams.rates[b] = float64(50 * qMB)
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 18 }, 5*time.Second))
-	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 18 }, 300*time.Millisecond))
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 22 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 22 }, 300*time.Millisecond))
 	require.Equal(t, 16, bRec.count(), "the fastest peer keeps the full depth")
-	require.Equal(t, 2, aRec.count(), "a tenth of the speed, a tenth of the depth, rounded")
+	require.Equal(t, 6, aRec.count(), "two fifths of the speed, two fifths of the depth, rounded")
 }
 
 func TestSpeedScaledDepth(t *testing.T) {
@@ -427,4 +429,26 @@ func TestEveryPeerStartsAtTwoWhenNoneIsMeasured(t *testing.T) {
 
 	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second))
 	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 4 }, 300*time.Millisecond))
+}
+
+// Through the whole pass: a peer at a tenth of the speed of the other is the last fifth of the
+// bandwidth, so it stands by and the fast peer takes the full depth (standby_peers.go).
+func TestASlowPeerOutsideTheTopEightyPercentStandsBy(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xee}
+	msg, _ := linkedHeaders(anchor, 40, &nonce)
+
+	sm, a, aRec, b, bRec := budgetManager(t)
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+	recentBlocks(sm, 200*qMB)
+
+	sm.streams.rates[a] = float64(5 * qMB)
+	sm.streams.rates[b] = float64(50 * qMB)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return bRec.count() == 16 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return aRec.count() > 0 }, 300*time.Millisecond), "5 MB/s stands by beside 50 MB/s")
 }
