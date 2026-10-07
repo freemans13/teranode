@@ -6,6 +6,7 @@ import (
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/stretchr/testify/require"
 )
 
@@ -310,6 +311,31 @@ func TestNamesSpender(t *testing.T) {
 	require.False(t, namesSpender(utxos, []uint32{7}, &winner), "an offset past the page names nobody")
 	require.True(t, namesSpender(utxos, []uint32{1, 0}, &winner), "any claimed offset that names the child is enough")
 	require.False(t, namesSpender(nil, []uint32{0}, &winner), "a record with no utxos bin names nobody")
+}
+
+// TestSpendHolderFrozenOutputIsUnverified: spendHolder is the one place that
+// decides a child may be deleted with no marker (holderNamesOther, a
+// conflicting loser). A frozen output stores the 36-byte all-0xFF sentinel
+// where the spending data goes, which names no transaction, so it must hold the
+// child back like any other output that says nothing about it, not read as
+// "spent by someone else".
+func TestSpendHolderFrozenOutputIsUnverified(t *testing.T) {
+	var child, other chainhash.Hash
+	child[0] = 0xAA
+	other[0] = 0xBB
+
+	frozen := make([]byte, 68)
+	copy(frozen[32:], subtree.FrozenBytes[:])
+
+	spentByOther := make([]byte, 68)
+	copy(spentByOther[32:64], other[:])
+
+	require.Equal(t, holderUnverified, spendHolder([]interface{}{frozen}, []uint32{0}, &child),
+		"a frozen output names no spender, so the child is held back")
+	require.Equal(t, holderUnverified, spendHolder([]interface{}{spentByOther, frozen}, []uint32{0, 1}, &child),
+		"one frozen output among the claimed ones is enough to hold the child back")
+	require.Equal(t, holderNamesOther, spendHolder([]interface{}{spentByOther}, []uint32{0}, &child),
+		"control: an output spent by a different, well-formed spender is still a conflicting loser")
 }
 
 // okRecord / notFoundRecord / brokenRecord build the three parent-update results

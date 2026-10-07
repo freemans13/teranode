@@ -255,6 +255,47 @@ func TestDeleteRefused(t *testing.T) {
 	}
 }
 
+// TestClassifyDeletionResults pins how a deletion batch's per-record answers
+// are read. The case that matters is a record the server never answered: the
+// client leaves it with ResultCode NO_RESPONSE and a nil Err, and reading the
+// nil Err as success let the caller delete the external blob of a child whose
+// record and markers were still in place. Such a master is unanswered (markers
+// stay, blob stays), and every record not definitely deleted is a failure.
+func TestClassifyDeletionResults(t *testing.T) {
+	deleted := chainhash.HashH([]byte("deleted"))
+	gone := chainhash.HashH([]byte("gone"))
+	silent := chainhash.HashH([]byte("silent"))
+	inDoubt := chainhash.HashH([]byte("in doubt"))
+	refused := chainhash.HashH([]byte("refused"))
+	paged := chainhash.HashH([]byte("paged"))
+
+	records := []*aerospike.BatchRecord{
+		{ResultCode: types.OK}, // 0: deleted master
+		{ResultCode: types.KEY_NOT_FOUND_ERROR, Err: aerospike.ErrKeyNotFound}, // 1: already-gone master
+		{ResultCode: types.NO_RESPONSE},                                        // 2: never-answered master, nil Err
+		{ResultCode: types.TIMEOUT, Err: aerospike.ErrTimeout, InDoubt: true},  // 3: in-doubt master
+		{ResultCode: types.INVALID_USER, Err: aerospike.ErrInvalidUser},        // 4: refused master
+		{ResultCode: types.OK},          // 5: paged child's master
+		{ResultCode: types.NO_RESPONSE}, // 6: paged child's pagination record, never answered
+	}
+
+	batch := make([]aerospike.BatchRecordIfc, len(records))
+	for i, rec := range records {
+		batch[i] = rec
+	}
+
+	masters := map[int]*chainhash.Hash{0: &deleted, 1: &gone, 2: &silent, 3: &inDoubt, 4: &refused, 5: &paged}
+
+	results := classifyDeletionResults(batch, masters)
+
+	require.Equal(t, map[chainhash.Hash]struct{}{refused: {}}, results.survivors,
+		"only a definite refusal withdraws the markers")
+	require.Equal(t, map[chainhash.Hash]struct{}{silent: {}, inDoubt: {}}, results.unanswered,
+		"a master the server never answered, or answered in doubt, keeps its markers and its blob")
+	require.Equal(t, []*aerospike.BatchRecord{records[2], records[3], records[4], records[6]}, results.failedRecords,
+		"every record not definitely deleted fails the cycle, a pagination record included")
+}
+
 // TestProcessSingleRecord_ReportsWhenNothingWasMarked: the manual entry point
 // must not return success when a parent is present and nothing was written.
 func TestProcessSingleRecord_ReportsWhenNothingWasMarked(t *testing.T) {

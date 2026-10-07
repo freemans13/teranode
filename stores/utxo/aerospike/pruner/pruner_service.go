@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -1675,9 +1676,9 @@ const (
 	// well-formed element naming a different transaction. That is what a
 	// conflicting loser looks like, and it needs no marker here.
 	holderNamesOther
-	// holderUnverified: at least one named output is unspent, missing or
-	// malformed, and none names the child. Nothing can be said about the
-	// child's claim to it, so the child is held back rather than deleted
+	// holderUnverified: at least one named output is unspent, missing,
+	// malformed or frozen, and none names the child. Nothing can be said about
+	// the child's claim to it, so the child is held back rather than deleted
 	// unmarked.
 	holderUnverified
 )
@@ -1864,6 +1865,15 @@ func spendHolder(utxos []interface{}, offsets []uint32, childHash *chainhash.Has
 		if bytes.Equal(utxoBytes[32:64], childHash[:]) {
 			return holderNamesChild
 		}
+
+		// A frozen output carries the freeze sentinel (all 0xFF) where the
+		// spending data goes. That names no transaction, so it is not the
+		// well-formed "spent by someone else" a conflicting loser leaves, and
+		// reading it as one deleted the child with no replay protection. It is
+		// unverified: the child is held back until the output says something.
+		if bytes.Equal(utxoBytes[32:68], subtree.FrozenBytes[:]) {
+			namesOther = false
+		}
 	}
 
 	if namesOther {
@@ -1930,14 +1940,15 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 		toDelete = append(toDelete, deletion)
 	}
 
-	// survivors are the children whose record delete the server refused. Their
-	// records are still present, so their external blobs must stay too.
-	var survivors map[chainhash.Hash]struct{}
+	// survivors are the children whose record delete the server refused, and
+	// unanswered those whose delete may not have happened. Either way the record
+	// may still be present, so its external blob must stay too.
+	var survivors, unanswered map[chainhash.Hash]struct{}
 
 	if len(toDelete) > 0 {
 		var err error
 
-		survivors, err = s.executeBatchDeletions(ctx, toDelete)
+		survivors, unanswered, err = s.executeBatchDeletions(ctx, toDelete)
 
 		// A child whose delete definitely did not happen is still present with
 		// its markers already on every parent, which is the same poison as a
@@ -1958,12 +1969,13 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 	if len(externalFiles) > 0 {
 		remaining := externalFiles
 
-		// A blob goes only with its record: never for a held-back child, and
-		// never for a survivor. Today a survivor also makes executeBatchDeletions
-		// return an error, so the return above already skips this block, but
-		// that is a property of the error handling, not a rule about blobs, and
-		// relaxing the cycle-fails-on-refusal behaviour must not orphan a record.
-		if len(blocked) > 0 || len(survivors) > 0 {
+		// A blob goes only with its record: never for a held-back child, never
+		// for a survivor, and never for a child whose delete went unanswered.
+		// Today the last two also make executeBatchDeletions return an error, so
+		// the return above already skips this block, but that is a property of
+		// the error handling, not a rule about blobs, and relaxing the
+		// cycle-fails-on-refusal behaviour must not orphan a record.
+		if len(blocked) > 0 || len(survivors) > 0 || len(unanswered) > 0 {
 			remaining = make([]*externalFileInfo, 0, len(externalFiles))
 
 			for _, file := range externalFiles {
@@ -1972,6 +1984,10 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 				}
 
 				if _, survived := survivors[*file.txHash]; survived {
+					continue
+				}
+
+				if _, unknown := unanswered[*file.txHash]; unknown {
 					continue
 				}
 
@@ -2633,18 +2649,27 @@ func (s *Service) executeBatchParentUpdatesBatchWrite(ctx context.Context, updat
 //
 // Parents must be updated first (Phase 2a) before calling this function.
 //
-// It returns the children whose master record definitely survived: nothing was
-// sent because the context was already done, or the server refused the master
-// record's delete. Their parent markers must be withdrawn by the caller. A
-// master record whose outcome is unknown (no response, or an in-doubt error) is
-// not returned: withdrawing its markers after a delete that did land would
-// leave exactly the unmarked deletion this package exists to prevent, so the
-// marker stays and the next cycle, which re-finds the child if it is still
-// present, marks and deletes it again. A failed pagination-record delete does
-// not keep its child: the master is what the spend path and the next scan see.
-func (s *Service) executeBatchDeletions(ctx context.Context, deletions []*pendingDeletion) (map[chainhash.Hash]struct{}, error) {
+// It returns two sets of children, both of which must keep their external blob.
+//
+// survivors are the children whose master record definitely survived: nothing
+// was sent because the context was already done, or the server refused the
+// master record's delete. Their parent markers must be withdrawn by the caller.
+//
+// unanswered are the children whose master record's outcome is unknown: the
+// server never answered it (NO_RESPONSE, which the client reports with a nil
+// Err), or answered in doubt. Their markers are NOT withdrawn: withdrawing
+// them after a delete that did land would leave exactly the unmarked deletion
+// this package exists to prevent, so the marker stays and the next cycle,
+// which re-finds the child if it is still present, marks and deletes it again.
+// Their blobs stay because the record may still be there, and a record whose
+// blob is gone can never be read back or pruned.
+//
+// A failed pagination-record delete does not keep its child in either set: the
+// master is what the spend path and the next scan see. Every record whose
+// delete did not definitely succeed is counted in the returned error.
+func (s *Service) executeBatchDeletions(ctx context.Context, deletions []*pendingDeletion) (survivors, unanswered map[chainhash.Hash]struct{}, err error) {
 	if len(deletions) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	keys := make([]*aerospike.Key, 0, len(deletions))
@@ -2662,7 +2687,7 @@ func (s *Service) executeBatchDeletions(ctx context.Context, deletions []*pendin
 	}
 
 	if len(keys) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	batchRecords := buildDeletionBatchRecords(keys, s.utxoSetTTL, s.removalCommitLevel)
@@ -2672,12 +2697,12 @@ func (s *Service) executeBatchDeletions(ctx context.Context, deletions []*pendin
 	case <-ctx.Done():
 		s.logger.Infof("Context cancelled, skipping deletion batch")
 
-		survivors := make(map[chainhash.Hash]struct{}, len(masters))
+		survivors = make(map[chainhash.Hash]struct{}, len(masters))
 		for _, txHash := range masters {
 			survivors[*txHash] = struct{}{}
 		}
 
-		return survivors, ctx.Err()
+		return survivors, nil, ctx.Err()
 	default:
 	}
 
@@ -2688,39 +2713,82 @@ func (s *Service) executeBatchDeletions(ctx context.Context, deletions []*pendin
 		s.logger.Errorf("Batch deletion failed for %d records: %v", len(keys), batchErr)
 	}
 
-	survivors := make(map[chainhash.Hash]struct{})
-
-	for i, txHash := range masters {
-		if deleteRefused(batchRecords[i].BatchRec()) {
-			survivors[*txHash] = struct{}{}
-		}
-	}
-
-	// Check for errors and count successes
-	errorCount := 0
-
-	for _, rec := range batchRecords {
-		batchRec := rec.BatchRec()
-
-		if batchRec.Err != nil && !batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
-			if batchErr == nil {
-				s.logger.Errorf("Deletion error for key %v: %v", batchRec.Key, batchRec.Err)
-			}
-
-			errorCount++
-		}
-	}
+	results := classifyDeletionResults(batchRecords, masters)
 
 	if batchErr != nil {
-		return survivors, errors.NewStorageError("batch deletion failed", batchErr)
+		return results.survivors, results.unanswered, errors.NewStorageError("batch deletion failed", batchErr)
+	}
+
+	for _, rec := range results.failedRecords {
+		s.logger.Errorf("Deletion error for key %v: result code %v, err %v", rec.Key, rec.ResultCode, rec.Err)
 	}
 
 	// Return error if any individual record operations failed
-	if errorCount > 0 {
-		return survivors, errors.NewStorageError("%d deletion operations failed", errorCount)
+	if len(results.failedRecords) > 0 {
+		return results.survivors, results.unanswered, errors.NewStorageError("%d deletion operations failed", len(results.failedRecords))
 	}
 
-	return survivors, nil
+	return results.survivors, results.unanswered, nil
+}
+
+// deletionResults is what one deletion batch's per-record answers say.
+type deletionResults struct {
+	// survivors: children whose master delete definitely did not happen.
+	survivors map[chainhash.Hash]struct{}
+	// unanswered: children whose master delete may or may not have happened.
+	unanswered map[chainhash.Hash]struct{}
+	// failedRecords: every record, master or pagination, whose delete did not
+	// definitely succeed.
+	failedRecords []*aerospike.BatchRecord
+}
+
+// classifyDeletionResults sorts a deletion batch's per-record answers. A record
+// counts as deleted only on an OK answer or KEY_NOT_FOUND. The result code is
+// read as well as Err, as classifyParentUpdateResult and keepSpendHolders do:
+// a record the server never answered keeps the NO_RESPONSE it was prepared
+// with and a nil Err, and reading that as success let the caller delete the
+// blob of a child whose record, and its markers, were still in place, leaving
+// it unspendable and unprunable while the cycle reported it pruned.
+//
+// masters maps the batch index of each child's master record to the child.
+func classifyDeletionResults(batchRecords []aerospike.BatchRecordIfc, masters map[int]*chainhash.Hash) deletionResults {
+	results := deletionResults{
+		survivors:  make(map[chainhash.Hash]struct{}),
+		unanswered: make(map[chainhash.Hash]struct{}),
+	}
+
+	for i, rec := range batchRecords {
+		batchRec := rec.BatchRec()
+
+		if deleteDone(batchRec) {
+			continue
+		}
+
+		results.failedRecords = append(results.failedRecords, batchRec)
+
+		txHash, isMaster := masters[i]
+		if !isMaster {
+			continue
+		}
+
+		if deleteRefused(batchRec) {
+			results.survivors[*txHash] = struct{}{}
+		} else {
+			results.unanswered[*txHash] = struct{}{}
+		}
+	}
+
+	return results
+}
+
+// deleteDone reports whether the record is definitely gone: the server
+// answered OK, or answered that the record was not there.
+func deleteDone(rec *aerospike.BatchRecord) bool {
+	if rec.Err != nil {
+		return rec.Err.Matches(types.KEY_NOT_FOUND_ERROR)
+	}
+
+	return rec.ResultCode == types.OK || rec.ResultCode == types.KEY_NOT_FOUND_ERROR
 }
 
 // deleteRefused reports whether the server definitely did not remove the
