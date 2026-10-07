@@ -183,6 +183,10 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 
 	perBlock := make([]time.Duration, 0, len(blocks))
 
+	// Write-ahead log volume over the timed applies only: the seed above is excluded.
+	var walStart string
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&walStart))
+
 	var applyTotal time.Duration
 
 	for _, b := range blocks {
@@ -237,6 +241,11 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 		perBlock = append(perBlock, d)
 		applyTotal += d
 	}
+
+	var walBytes int64
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), $1::pg_lsn)::bigint`, walStart).Scan(&walBytes))
+
+	t.Logf("[%s] WAL bytes=%d bytes_per_block=%d bytes_per_tx=%d", method, walBytes, walBytes/int64(len(blocks)), walBytes/int64(nTx))
 
 	sorted := append([]time.Duration(nil), perBlock...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
