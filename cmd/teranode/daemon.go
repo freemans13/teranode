@@ -21,17 +21,19 @@ import (
 // past, and masks only values still carrying gocore's literal "*EHE*" prefix.
 // A plaintext postgres://user:password@host store URL therefore reaches the log
 // verbatim, and docs/howto/bugReporting.md asks operators to paste this output
-// into a bug report. Redact the URLs before either happens.
+// into a bug report. Redact before either happens.
 //
-// This masks URL userinfo and nothing else. Secrets that are not URLs, such as
-// p2p_private_key, coinbase_p2p_private_key, miner_wallet_private_keys and
-// p2p_shared_key, still appear in this dump verbatim, so the dump is not safe
-// to share on the strength of this function alone.
+// Two passes, because each catches what the other cannot.
+// settings.RedactConfigStats masks every redact-tagged key by name and
+// redacts a key=value row whose whole value is a URL. urlutil.RedactText then
+// works on tokens, so it also reaches the bare argv entries of the CMDLINE
+// section, which have no "key=" in front, and a password holding a raw "/"
+// that url.Parse misreads as host, port and path.
 //
 // It is a named function rather than an expression so a test can assert what
 // RunDaemon actually logs.
 func redactedConfigDump() string {
-	return urlutil.RedactText(gocore.Config().Stats())
+	return urlutil.RedactText(settings.RedactConfigStats(gocore.Config().Stats()))
 }
 
 // configAdvertisingPayload is what RunDaemon registers as gocore's "CONFIG"
@@ -41,10 +43,9 @@ func redactedConfigDump() string {
 // their password in the userinfo, so the raw map is a set of working
 // credentials leaving the node over HTTP.
 //
-// As with redactedConfigDump, only URL userinfo is masked: the non-URL secrets
-// listed there are still sent in this payload unchanged.
+// It applies the same two passes as redactedConfigDump.
 func configAdvertisingPayload() interface{} {
-	return urlutil.RedactMapValues(gocore.Config().GetAll())
+	return urlutil.RedactMapValues(settings.RedactConfigMap(gocore.Config().GetAll()))
 }
 
 // RunDaemon starts the teranode daemon with all necessary initialization

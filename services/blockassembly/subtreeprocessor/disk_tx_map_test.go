@@ -1,6 +1,7 @@
 package subtreeprocessor
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 
@@ -13,9 +14,8 @@ import (
 func newTestDiskTxMap(t *testing.T) *DiskTxMap {
 	t.Helper()
 	m, err := NewDiskTxMap(DiskTxMapOptions{
-		BasePath:       t.TempDir(),
-		Prefix:         "test",
-		FilterCapacity: 10_000,
+		BasePath: t.TempDir(),
+		Prefix:   "test",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { m.Close() })
@@ -100,6 +100,35 @@ func TestDiskTxMap_Clear(t *testing.T) {
 	require.Equal(t, 0, m.Length())
 }
 
+// TestDiskTxMap_ClearEmptiesEveryShardWithUnevenWorkers pins that the
+// parallel shard clear reaches every shard when GOMAXPROCS does not divide
+// the shard count, so the last worker gets a shorter run of shards, as it
+// does with 94 or 192 procs in production.
+func TestDiskTxMap_ClearEmptiesEveryShardWithUnevenWorkers(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(7))
+
+	m := newTestDiskTxMap(t)
+
+	filled := make(map[uint16]bool, numIndexShards)
+
+	for i := 0; len(filled) < numIndexShards; i++ {
+		hash := chainhash.HashH([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+		if filled[shardOf(hash)] {
+			continue
+		}
+
+		filled[shardOf(hash)] = true
+		m.SetIfNotExists(hash, makeInpoints(-1))
+	}
+
+	require.Equal(t, numIndexShards, m.Length())
+
+	m.Clear()
+
+	require.NoError(t, m.TakeErr())
+	require.Zero(t, m.Length())
+}
+
 func TestDiskTxMap_Set(t *testing.T) {
 	m := newTestDiskTxMap(t)
 
@@ -172,10 +201,21 @@ func TestDiskTxMap_SerializationRoundtrip(t *testing.T) {
 	built.SubtreeIndex = 42
 	ip := &built
 
-	serialized := serializeTxMapValue(ip)
-	deserialized := deserializeTxMapValue(serialized)
+	m := newTestDiskTxMap(t)
+	hash := chainhash.HashH([]byte("child"))
+	m.Set(hash, ip)
 
-	require.NotNil(t, deserialized)
-	require.Equal(t, int16(42), deserialized.SubtreeIndex)
-	require.Equal(t, len(ip.ParentTxHashes), len(deserialized.ParentTxHashes))
+	for _, flush := range []bool{false, true} {
+		if flush {
+			require.NoError(t, m.Flush())
+		}
+
+		deserialized, ok := m.Get(hash)
+		require.True(t, ok)
+		require.Equal(t, int16(42), deserialized.SubtreeIndex)
+		require.Equal(t, ip.GetParentTxHashes(), deserialized.GetParentTxHashes())
+		require.Equal(t, ip.GetTxInpoints(), deserialized.GetTxInpoints())
+	}
+
+	require.NoError(t, m.TakeErr())
 }

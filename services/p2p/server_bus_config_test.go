@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -219,6 +220,84 @@ func TestBuildP2PMessageBusConfig_MeshProtection(t *testing.T) {
 		conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, build(true, true, false), privKey, "proto", "off", nil)
 		require.NoError(t, err)
 		require.Empty(t, conf.AllowedPublisherIDs)
+	})
+}
+
+// TestBuildP2PMessageBusConfig_RegtestBootstrap guards against regtest nodes
+// dialling the BSVA-managed bootstrap domain or the public IPFS network.
+// settings.conf templates p2p_bootstrap_peers from ${network}, but BSVA
+// publishes no regtest record. Dropping the entry alone is not enough: the
+// message bus treats an empty list as "use the IPFS bootstrap peers" unless
+// DisableDefaultBootstrapPeers is set. The bus skips that fallback under
+// testing.Testing(), so asserting the flag here is the only guard.
+func TestBuildP2PMessageBusConfig_RegtestBootstrap(t *testing.T) {
+	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+
+	const (
+		bsvaRegtest = "/dnsaddr/regtest.bootstrap.teranode.bsvb.tech"
+		custom      = "/ip4/10.0.0.5/tcp/9905/p2p/12D3KooWSoovh3vMWJpTMqC1Fj4X7Ywb58L2Wmaa968PG3oHrYjq"
+	)
+
+	build := func(params *chaincfg.Params, peers ...string) *settings.Settings {
+		s := settings.NewSettings()
+		s.ChainCfgParams = params
+		s.P2P.BootstrapPeers = peers
+		return s
+	}
+
+	t.Run("regtest drops BSVA bootstrap domain, keeps operator peers", func(t *testing.T) {
+		conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, build(&chaincfg.RegressionNetParams, bsvaRegtest, custom), privKey, "proto", "off", nil)
+		require.NoError(t, err)
+		require.Equal(t, []string{custom}, conf.BootstrapPeers)
+		require.True(t, conf.DisableDefaultBootstrapPeers)
+	})
+
+	t.Run("regtest with only the default disables the IPFS fallback", func(t *testing.T) {
+		conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, build(&chaincfg.RegressionNetParams, bsvaRegtest), privKey, "proto", "off", nil)
+		require.NoError(t, err)
+		require.Empty(t, conf.BootstrapPeers)
+		require.True(t, conf.DisableDefaultBootstrapPeers)
+	})
+
+	t.Run("regtest drops BSVA entry variants", func(t *testing.T) {
+		variants := []string{
+			"/dnsaddr/regtest.bootstrap.teranode.bsvb.tech.",
+			"/dnsaddr/REGTEST.Bootstrap.Teranode.BSVB.tech",
+			"/dnsaddr/regtest.bootstrap.teranode.bsvb.tech/p2p/12D3KooWSoovh3vMWJpTMqC1Fj4X7Ywb58L2Wmaa968PG3oHrYjq",
+			"/dnsaddr/bootstrap.teranode.bsvb.tech",
+		}
+		for _, v := range variants {
+			conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, build(&chaincfg.RegressionNetParams, v), privKey, "proto", "off", nil)
+			require.NoError(t, err)
+			require.Empty(t, conf.BootstrapPeers, v)
+		}
+	})
+
+	t.Run("regtest keeps lookalike and operator dnsaddr entries", func(t *testing.T) {
+		keep := []string{
+			"/dnsaddr/evilbootstrap.teranode.bsvb.tech",
+			"/dnsaddr/seed.example.com",
+			"/dns4/regtest.bootstrap.teranode.bsvb.tech/tcp/9905",
+		}
+		conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, build(&chaincfg.RegressionNetParams, keep...), privKey, "proto", "off", nil)
+		require.NoError(t, err)
+		require.Equal(t, keep, conf.BootstrapPeers)
+	})
+
+	t.Run("public networks keep BSVA bootstrap domain and the fallback", func(t *testing.T) {
+		mainnet := "/dnsaddr/mainnet.bootstrap.teranode.bsvb.tech"
+		conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, build(&chaincfg.MainNetParams, mainnet), privKey, "proto", "off", nil)
+		require.NoError(t, err)
+		require.Equal(t, []string{mainnet}, conf.BootstrapPeers)
+		require.False(t, conf.DisableDefaultBootstrapPeers)
+	})
+
+	t.Run("nil chain params are left untouched", func(t *testing.T) {
+		conf, err := buildP2PMessageBusConfig(ulogger.TestLogger{}, build(nil, bsvaRegtest), privKey, "proto", "off", nil)
+		require.NoError(t, err)
+		require.Equal(t, []string{bsvaRegtest}, conf.BootstrapPeers)
+		require.False(t, conf.DisableDefaultBootstrapPeers)
 	})
 }
 

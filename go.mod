@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260918043653-4eab3acdbbb9
-	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv5
+	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv6
 	github.com/bsv-blockchain/go-bt/v2 v2.7.1
 	github.com/bsv-blockchain/go-chaincfg v1.6.2
 	github.com/bsv-blockchain/go-sdk v1.4.1
@@ -199,7 +199,7 @@ require (
 	github.com/bsv-blockchain/go-bc v1.1.8
 	github.com/bsv-blockchain/go-bn v1.1.7
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
-	github.com/bsv-blockchain/go-p2p-message-bus v0.1.27
+	github.com/bsv-blockchain/go-p2p-message-bus v0.1.28
 	github.com/bsv-blockchain/go-safe-conversion v1.2.0
 	github.com/bsv-blockchain/go-tx-map v1.4.1
 	github.com/bsv-blockchain/go-wire v1.2.11
