@@ -729,7 +729,8 @@ type SyncManager struct {
 	// unowned and both ask for it. It is taken before headerMu and never while holding it.
 	assignMu sync.Mutex
 	// warmupStarted is when a download pass first found the download warming up, in unix
-	// nanoseconds, or zero (downloadWarming).
+	// nanoseconds, or zero (downloadWarming). A pass that finds enough peers measured sets it
+	// back to zero, so the next warm-up starts its own limit.
 	warmupStarted atomic.Int64
 	// benchProbes is when each standby peer was last given a probe block (probeBenchedPeers,
 	// standby_peers.go).

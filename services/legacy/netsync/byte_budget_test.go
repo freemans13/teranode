@@ -573,3 +573,34 @@ func TestTheWarmUpEndsAfterAMinute(t *testing.T) {
 	require.False(t, sm.downloadWarming(now.Add(downloadWarmupLimit)), "the warm-up lasts a minute at most")
 	require.Equal(t, time.Minute, downloadWarmupLimit)
 }
+
+// A warm-up that ended because enough peers were measured starts again when too few are measured,
+// as after peers leave and new ones connect. It used to run once in the life of the process: after
+// churn, the first new peer measured was the fastest by default and got the full depth, the
+// 2026-10-07 incident again.
+func TestTheWarmUpStartsAgainWhenTooFewPeersAreMeasured(t *testing.T) {
+	sm := schedulerManager(t)
+	sm.streams = newStreamRegistry()
+
+	a, _ := schedulerPeer(t, sm, 1, 1000)
+	b, _ := schedulerPeer(t, sm, 2, 1000)
+	schedulerPeer(t, sm, 3, 1000)
+	schedulerPeer(t, sm, 4, 1000)
+	sm.streams.rates[a] = float64(10 * qMB)
+
+	now := time.Now()
+	require.True(t, sm.downloadWarming(now), "one of four peers measured")
+
+	sm.streams.rates[b] = float64(10 * qMB)
+	require.False(t, sm.downloadWarming(now.Add(20*time.Second)), "two of four measured: warm")
+
+	// Ten minutes later four new peers connect: two of eight measured.
+	for i := range 4 {
+		schedulerPeer(t, sm, uint8(5+i), 1000)
+	}
+
+	later := now.Add(10 * time.Minute)
+	require.True(t, sm.downloadWarming(later), "too few measured again: a new warm-up")
+	require.True(t, sm.downloadWarming(later.Add(59*time.Second)))
+	require.False(t, sm.downloadWarming(later.Add(downloadWarmupLimit)), "the new warm-up lasts a minute at most")
+}

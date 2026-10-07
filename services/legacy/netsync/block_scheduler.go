@@ -78,6 +78,11 @@ const unmeasuredPeerDepth = 1
 // hold the warm-up open, and never longer than downloadWarmupLimit from the first pass that found
 // it warming, so peers that never deliver cannot hold it open either.
 //
+// A warm-up ends for good only while enough peers stay measured. A pass that finds enough measured
+// clears the start, so when too few are measured again, after peers leave and new ones connect, a
+// new warm-up starts, of at most downloadWarmupLimit too. A warm-up that ran out its limit with too
+// few measured does not start again until enough have been measured once.
+//
 // A download pass computes it once (newDownloadAssigner) and gives the same answer to every peer.
 func (sm *SyncManager) downloadWarming(now time.Time) bool {
 	if sm.streams == nil {
@@ -95,6 +100,10 @@ func (sm *SyncManager) downloadWarming(now time.Time) bool {
 	}
 
 	if measured >= max(min(2, len(eligible)), (len(eligible)+1)/2) {
+		// Warm. The next time too few peers are measured, after peers leave and new ones
+		// connect, a new warm-up starts with its own limit.
+		sm.warmupStarted.Store(0)
+
 		return false
 	}
 
