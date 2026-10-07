@@ -549,10 +549,8 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	//
 	// A failure here is logged and counted, not returned. AddBlock above has
 	// already committed the block, so returning made the caller treat a stored
-	// block as a failed one, and it also skipped the two steps below: the
-	// subtree DAH update (so BlockSubtreesSet never fired and the subtrees were
-	// never given a DAH) and the block-exists cache. None of that re-runs the
-	// unlock, so returning bought nothing. Because nothing re-runs it,
+	// block as a failed one, and it also skipped the block-exists cache below.
+	// Nothing re-runs the unlock, so returning bought nothing. Because nothing re-runs it,
 	// unlockSubtreeTransactions detaches from ctx and retries each subtree
 	// itself before giving up, as the legacy route's unlockBlockTransactions
 	// does for HandleBlockDirect.

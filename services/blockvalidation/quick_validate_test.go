@@ -1037,6 +1037,13 @@ func newBlockValidationWithRealStore(t *testing.T) (*BlockValidation, utxo.Store
 	logger := ulogger.TestLogger{}
 	tSettings := testutil.CreateBaseTestSettings(t)
 
+	// Pinned, not inherited. Several tests here run the SQL pruner and assert
+	// how many records it removes, and defensive mode keeps a parent whose
+	// spender is already gone (the non-retroactive limit), so a developer's
+	// settings_local.conf with pruner_utxoDefensiveEnabled=true changed the
+	// count and failed them. The store and its pruner read this same pointer.
+	tSettings.Pruner.UTXODefensiveEnabled = false
+
 	storeURL, err := url.Parse("sqlitememory:///skip_unspendable_test")
 	require.NoError(t, err)
 

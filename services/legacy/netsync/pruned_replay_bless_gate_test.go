@@ -282,6 +282,9 @@ func TestLegacyRemovesRecreatedDescendantsOfPrunedReplay(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}
 	tSettings, params := newOutpointOnlySettings(t, true, true, 1000)
+	// Pinned rather than inherited from settings_local.conf: the fixture
+	// depends on which records the pruner removes.
+	tSettings.Pruner.UTXODefensiveEnabled = false
 
 	storeURL, err := url.Parse("sqlitememory:///legacy_pruned_descendant")
 	require.NoError(t, err)
