@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 // TestBenchNettedVsPerTx applies real mainnet blocks below the checkpoint the two ways quick
@@ -217,6 +218,8 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 			results, err = utxo.DefaultSpendAndCreateMulti(ctx, s, 3200, b.txs, b.height, opts...)
 		case "netted":
 			results, err = s.SpendAndCreateMulti(ctx, b.txs, b.height, opts...)
+		case "twophase":
+			results, err = benchTwoPhase(ctx, s, b, idxs)
 		default:
 			t.Fatalf("unknown method %q", method)
 		}
@@ -247,6 +250,58 @@ func runBenchMethod(t *testing.T, method string, blocks []benchBlock, external m
 
 	fmt.Fprintf(os.Stderr, "RESULT %s %.1f ms/block %.0f tx/s\n", method,
 		float64(applyTotal.Milliseconds())/float64(len(blocks)), float64(nTx)/applyTotal.Seconds())
+}
+
+// benchTwoPhase applies a block the way quick validation on main does: every transaction created
+// at once (create-only, 3,200 callers, as StoreBatcherSize 50 x BatcherMaxConcurrent 64 allowed),
+// then every transaction's inputs spent at once (spend-only, SpendBatcherSize 500 x
+// SpendBatcherConcurrency 32 x 2 callers). No dependency order at all.
+func benchTwoPhase(ctx context.Context, s *Store, b benchBlock, idxs []int) ([]utxo.SpendAndCreateMultiResult, error) {
+	results := make([]utxo.SpendAndCreateMultiResult, len(b.txs))
+
+	run := func(limit int, call func(i int) error) error {
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(limit)
+
+		for i := range b.txs {
+			g.Go(func() error {
+				if gCtx.Err() != nil {
+					return gCtx.Err()
+				}
+
+				return call(i)
+			})
+		}
+
+		return g.Wait()
+	}
+
+	err := run(3200, func(i int) error {
+		_, _, err := s.SpendAndCreate(ctx, b.txs[i], b.height, utxo.WithCreateOnly(),
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: b.height, BlockHeight: b.height, SubtreeIdx: idxs[i]}),
+			utxo.WithLocked(false), utxo.WithSkipExtendedInputs(true))
+
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = run(500*32*2, func(i int) error {
+		_, _, err := s.SpendAndCreate(ctx, b.txs[i], b.height, utxo.WithSpendOnly(),
+			utxo.WithIgnoreLocked(true), utxo.WithSkipUTXOHashCheck(true))
+
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range results {
+		results[i].Status = utxo.MultiTxCreated
+	}
+
+	return results, nil
 }
 
 // seedExternalParents writes, for each parent transaction outside the range, one coin at each
