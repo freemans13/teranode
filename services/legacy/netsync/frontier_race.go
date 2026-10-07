@@ -90,6 +90,10 @@ const (
 	// (net/stream.cpp:312-346, net/stream.h:173, net/net.cpp:2617), so a peer that stops sending is at half its rate
 	// 30 s later. The rate here never reaches zero, which would read as unmeasured.
 	rateDecayHalfLife = raceSlowFetchAfter
+	// liveRateWindow is the window of a copy's live rate (judgedRateLocked). A copy is judged on
+	// the lower of its average and its rate over this window once it is this old, as SV Node
+	// judges a peer on its block-stream bandwidth over a recent window (net/stream.cpp:312-346).
+	liveRateWindow = raceSlowFetchAfter
 )
 
 // blockStream is one block body arriving from the wire.
@@ -122,6 +126,9 @@ type blockStream struct {
 	// waited is how long the copy waited for admission, the amount start was moved forward.
 	// Written under the registry's lock.
 	waited time.Duration
+	// samples is the bytes read at moments in the last liveRateWindow and the newest moment
+	// before it, oldest first (sampleStreams). Written under the registry's lock.
+	samples []readSample
 	// requestedAt is when the ledger first recorded a request for this block, zero if none.
 	requestedAt time.Time
 	// from is when owner could start sending this block: the later of when it was asked for it and
@@ -132,6 +139,12 @@ type blockStream struct {
 	// block waited for an admission slot, and which path its bytes took.
 	admitWait time.Duration
 	path      string
+}
+
+// readSample is the bytes a copy had read at a moment.
+type readSample struct {
+	at   time.Time
+	read int64
 }
 
 func (s *blockStream) rate(now time.Time) float64 {
@@ -234,8 +247,66 @@ func (r *streamRegistry) start(hash chainhash.Hash, height int32, owner *peerpkg
 // admitWait are.
 func (r *streamRegistry) add(s *blockStream) {
 	r.mu.Lock()
+	s.samples = []readSample{{at: s.start, read: s.read.Load()}}
 	r.active[s] = struct{}{}
 	r.mu.Unlock()
+}
+
+// sampleStreams records the bytes each copy has read at now, for its live rate. The race's ticker
+// calls it every raceCheckInterval.
+func (r *streamRegistry) sampleStreams(now time.Time) {
+	if r == nil {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for s := range r.active {
+		s.samples = append(s.samples, readSample{at: now, read: s.read.Load()})
+
+		// Keep the newest sample at or before the window's start and each one after it.
+		cut := 0
+
+		for i, smp := range s.samples {
+			if now.Sub(smp.at) >= liveRateWindow {
+				cut = i
+			}
+		}
+
+		s.samples = s.samples[cut:]
+	}
+}
+
+// judgedRateLocked is the rate s is judged on: its average, or once it is liveRateWindow old, the
+// lower of that and its rate since the newest sample at least liveRateWindow before now. A burst
+// then a stall stayed above raceStallRate on the average alone for hours. Called with r.mu held.
+func (r *streamRegistry) judgedRateLocked(s *blockStream, now time.Time) float64 {
+	rate := s.rate(now)
+	if now.Sub(s.start) < liveRateWindow {
+		return rate
+	}
+
+	var (
+		ref   readSample
+		found bool
+	)
+
+	for _, smp := range s.samples {
+		if now.Sub(smp.at) >= liveRateWindow {
+			ref, found = smp, true
+		}
+	}
+
+	if !found {
+		return rate
+	}
+
+	if live := float64(s.read.Load()-ref.read) / now.Sub(ref.at).Seconds(); live < rate {
+		return live
+	}
+
+	return rate
 }
 
 // awaitAdmission marks s as waiting for an admission slot.
@@ -262,6 +333,8 @@ func (r *streamRegistry) admit(s *blockStream, now time.Time) {
 		s.waited += now.Sub(s.start)
 		s.start = now
 	}
+
+	s.samples = []readSample{{at: s.start, read: s.read.Load()}}
 
 	if at := s.lastRead.Load(); at < now.UnixNano() {
 		s.lastRead.Store(now.UnixNano())
@@ -400,7 +473,7 @@ func (r *streamRegistry) decayQuiet(now time.Time, owedSince map[*peerpkg.Peer]t
 			continue
 		}
 
-		if last := r.lastBlockBytesLocked(p); last.After(since) {
+		if last := r.lastLiveBytesLocked(p, now); last.After(since) {
 			since = last
 		}
 
@@ -667,6 +740,31 @@ func (r *streamRegistry) lastBlockBytesLocked(p *peerpkg.Peer) time.Time {
 	return latest
 }
 
+// lastLiveBytesLocked is lastBlockBytesLocked for the rate decay: a copy whose judged rate is
+// under raceStallRate once it is liveRateWindow old does not count as activity. A trickle of one
+// byte every 10 s kept its owner's rate from the decay. Called with r.mu held.
+func (r *streamRegistry) lastLiveBytesLocked(p *peerpkg.Peer, now time.Time) time.Time {
+	latest := r.lastBlock[p]
+
+	for s := range r.active {
+		if s.owner != p {
+			continue
+		}
+
+		if now.Sub(s.start) >= liveRateWindow && r.judgedRateLocked(s, now) < raceStallRate {
+			continue
+		}
+
+		if at := s.lastRead.Load(); at > 0 {
+			if t := time.Unix(0, at); t.After(latest) {
+				latest = t
+			}
+		}
+	}
+
+	return latest
+}
+
 // expireRacesLocked drops race marks past their expiry.
 func (r *streamRegistry) expireRacesLocked(now time.Time) {
 	for h, hist := range r.raced {
@@ -713,7 +811,7 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 	for s := range r.active {
 		// A copy waiting for admission is not judged, and keeps its block out of the race: its
 		// bytes are not read because this node is busy.
-		if s.owner != nil && (s.awaiting.Load() || now.Sub(s.start) < raceSlowFetchAfter || s.rate(now) >= raceStallRate) {
+		if s.owner != nil && (s.awaiting.Load() || now.Sub(s.start) < raceSlowFetchAfter || r.judgedRateLocked(s, now) >= raceStallRate) {
 			healthy[s.hash] = true
 		}
 	}
@@ -727,7 +825,7 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 			continue
 		}
 
-		rate := s.rate(now)
+		rate := r.judgedRateLocked(s, now)
 		if rate >= raceStallRate {
 			continue
 		}
@@ -897,6 +995,7 @@ func (sm *SyncManager) runFrontierRace() {
 		case <-sm.quit:
 			return
 		case <-ticker.C:
+			sm.streams.sampleStreams(time.Now())
 			sm.decayQuietRates(time.Now())
 			sm.maybeRaceSlowBlock(time.Now())
 			sm.maybeReaskQueuedBlock(time.Now())
