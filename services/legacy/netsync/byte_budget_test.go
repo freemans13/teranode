@@ -36,6 +36,11 @@ func budgetManager(t *testing.T) (*SyncManager, *peerpkg.Peer, *getDataRecorder,
 
 	b, bRec := schedulerPeer(t, sm, 131, 1000)
 
+	// Both measured and fast, so each queue is the configured depth whatever the block size and
+	// the download has warmed up. Tests about speed set their own rates.
+	sm.streams.rates[a] = float64(1 << 40)
+	sm.streams.rates[b] = float64(1 << 40)
+
 	return sm, a, aRec, b, bRec
 }
 
@@ -173,11 +178,10 @@ func TestTheLowestBlockGoesToTheFastestPeerWithRoom(t *testing.T) {
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	// The slower peer runs at three fifths of the speed, so its queue is three fifths of the
-	// depth of two, which rounds to one.
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 3 }, 5*time.Second))
+	// Ten seconds of either peer is more than one 200 MB block, so both hold the configured two.
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second))
 	require.Equal(t, hashes[0:2], bRec.all(), "the faster peer takes the lowest blocks until it is full")
-	require.Equal(t, hashes[2:3], aRec.all())
+	require.Equal(t, hashes[2:4], aRec.all())
 }
 
 // At 07:35Z on 2026-09-24 three peers sat idle with 7 blocks parked and 5 owed: the pass trimmed
@@ -328,8 +332,17 @@ func TestARecoveredBlockCountsAtTheSizeItsRecordCarries(t *testing.T) {
 // A peer is asked for legacy_maxBlocksInTransitPerPeer blocks, 16 by default as SV Node's
 // MAX_BLOCKS_IN_TRANSIT_PER_PEER, whatever the size of the recent blocks. It was fixed at 2, which
 // left a peer idle for a round trip after every pair of small blocks.
-func TestAPeerHoldsTheConfiguredDepthWhateverTheBlockSize(t *testing.T) {
-	for _, size := range []int64{200 << 10, 2 << 30} {
+// A peer's queue holds about peerQueueSeconds of its own delivery beyond the block it is sending,
+// at most the configured depth: the full 16 of 200 KB blocks at 20 MB/s, and two of 2 GB blocks,
+// which take 100 s each. The queue is there to hide the gap between two blocks, and every block in
+// it is committed to that peer.
+func TestAPeerHoldsAboutTenSecondsOfBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		size  int64
+		depth int
+	}{{200 << 10, 16}, {2 << 30, 2}} {
+		size := tc.size
+
 		var nonce uint32
 
 		anchor := chainhash.Hash{0xec, byte(size >> 20)}
@@ -345,17 +358,18 @@ func TestAPeerHoldsTheConfiguredDepthWhateverTheBlockSize(t *testing.T) {
 		seedFetchHeaders(t, sm, a, anchor, msg)
 		sm.fetchHeaderBlocks()
 
-		require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 32 }, 5*time.Second), "size %d", size)
-		require.Equal(t, 16, aRec.count(), "size %d", size)
-		require.Equal(t, 16, bRec.count(), "size %d", size)
+		require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 2*tc.depth }, 5*time.Second), "size %d", size)
+		require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 2*tc.depth }, 300*time.Millisecond), "size %d", size)
+		require.Equal(t, tc.depth, aRec.count(), "size %d", size)
+		require.Equal(t, tc.depth, bRec.count(), "size %d", size)
 	}
 }
 
-// A peer's queue is its share of the depth by speed: 16 times its rate over the fastest peer's,
-// never below one. A peer sends its queue in order, so a slow peer with a full queue buries blocks
-// the chain will soon need: on 2026-09-25 blocks 755,236 and 755,244 started 11 and 22 minutes
-// after they were asked for, behind multi-GB blocks at peers delivering 5 to 10 MB/s, while
-// peers at 50 MB/s had fetched 800 blocks further ahead.
+// A peer's queue follows its own speed: ten seconds of 200 MB blocks is one at 20 MB/s and three
+// at 50 MB/s, plus the block each is sending. A peer sends its queue in order, so a slow peer with
+// a full queue buries blocks the chain will soon need: on 2026-09-25 blocks 755,236 and 755,244
+// started 11 and 22 minutes after they were asked for, behind multi-GB blocks at peers delivering
+// 5 to 10 MB/s, while peers at 50 MB/s had fetched 800 blocks further ahead.
 func TestASlowPeersQueueIsShorterInProportionToItsSpeed(t *testing.T) {
 	var nonce uint32
 
@@ -373,10 +387,10 @@ func TestASlowPeersQueueIsShorterInProportionToItsSpeed(t *testing.T) {
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 22 }, 5*time.Second))
-	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 22 }, 300*time.Millisecond))
-	require.Equal(t, 16, bRec.count(), "the fastest peer keeps the full depth")
-	require.Equal(t, 6, aRec.count(), "two fifths of the speed, two fifths of the depth, rounded")
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 6 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 6 }, 300*time.Millisecond))
+	require.Equal(t, 4, bRec.count(), "50 MB/s: the block it sends and three more")
+	require.Equal(t, 2, aRec.count(), "20 MB/s: the block it sends and one more")
 }
 
 func TestSpeedScaledDepth(t *testing.T) {
@@ -387,11 +401,11 @@ func TestSpeedScaledDepth(t *testing.T) {
 	require.Equal(t, 16, speedScaledDepth(16, 0, 50), "an unmeasured peer is scaled by the caller's fallback, not here")
 }
 
-// A peer whose speed is not yet measured, as every peer is straight after a restart, gets at most
-// two blocks until it has delivered one. On 2026-09-25 after a restart every peer was given 16
-// before any speed was known, and peers at 4 MB/s held 13 blocks against a speed-scaled depth of
-// two or three.
-func TestAnUnmeasuredPeerGetsAtMostTwoBlocks(t *testing.T) {
+// While fewer than half the peers have a measured speed, every peer holds one block, measured or
+// not. On 2026-10-07 straight after a restart the first peer measured ran at 1.2 MB/s, was
+// therefore the fastest, got the full 16, and still held them when a 47 MB/s peer was measured
+// three seconds later.
+func TestEveryPeerHoldsOneBlockWhileTheDownloadWarmsUp(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xee}
@@ -401,34 +415,44 @@ func TestAnUnmeasuredPeerGetsAtMostTwoBlocks(t *testing.T) {
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
 	recentBlocks(sm, 200*qMB)
 
-	// b is measured and fast; a has not delivered anything yet.
+	// b is measured and fast; a has not delivered anything yet: one of two measured.
+	delete(sm.streams.rates, a)
 	sm.streams.rates[b] = float64(50 * qMB)
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 18 }, 5*time.Second))
-	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 18 }, 300*time.Millisecond))
-	require.Equal(t, 16, bRec.count())
-	require.Equal(t, 2, aRec.count(), "unmeasured, so two until its speed is known")
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 2 }, 5*time.Second))
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 2 }, 300*time.Millisecond))
+	require.Equal(t, 1, bRec.count(), "even the measured peer holds one while half are unmeasured")
+	require.Equal(t, 1, aRec.count())
 }
 
-// Straight after a restart no peer is measured, so every peer starts at two.
-func TestEveryPeerStartsAtTwoWhenNoneIsMeasured(t *testing.T) {
+// Once the download has warmed up, a peer still unmeasured, such as one that has just connected,
+// holds one block until it has delivered one.
+func TestAnUnmeasuredPeerGetsOneBlockOnceWarm(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xef}
 	msg, _ := linkedHeaders(anchor, 40, &nonce)
 
-	sm, a, aRec, _, bRec := budgetManager(t)
+	sm, a, aRec, b, bRec := budgetManager(t)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
 	recentBlocks(sm, 200*qMB)
+
+	c, cRec := schedulerPeer(t, sm, 132, 1000)
+
+	sm.streams.rates[a] = float64(50 * qMB)
+	sm.streams.rates[b] = float64(50 * qMB)
+	delete(sm.streams.rates, c)
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second))
-	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 4 }, 300*time.Millisecond))
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec, cRec) == 9 }, 5*time.Second))
+	require.Equal(t, 1, cRec.count(), "unmeasured, so one until its speed is known")
+	require.Equal(t, 4, aRec.count())
+	require.Equal(t, 4, bRec.count())
 }
 
 // Through the whole pass: a peer at a tenth of the speed of the other is the last fifth of the
@@ -449,6 +473,26 @@ func TestASlowPeerOutsideTheTopEightyPercentStandsBy(t *testing.T) {
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return bRec.count() == 16 }, 5*time.Second))
+	require.True(t, WaitUntil(func() bool { return bRec.count() == 4 }, 5*time.Second), "50 MB/s holds ten seconds of 200 MB blocks and the one it sends")
 	require.False(t, WaitUntil(func() bool { return aRec.count() > 0 }, 300*time.Millisecond), "5 MB/s stands by beside 50 MB/s")
+}
+
+func TestTimeScaledDepth(t *testing.T) {
+	require.Equal(t, 2, timeScaledDepth(16, float64(30*qMB), 0, 300*qMB), "one more 300 MB block covers ten seconds at 30 MB/s")
+	require.Equal(t, 16, timeScaledDepth(16, float64(30*qMB), 0, 200<<10), "the cap, for blocks of a few hundred KB")
+	require.Equal(t, 2, timeScaledDepth(16, float64(1*qMB), 0, 2<<30), "never below the block it sends and one more")
+	require.Equal(t, 2, timeScaledDepth(16, 5, 50, 0), "with no typical size, the share of depth by speed")
+}
+
+// A node with one peer leaves the warm-up once that peer is measured. Requiring two measured
+// peers would hold a one-peer node at one block for ever.
+func TestASinglePeerWarmsUpOnItsOwnMeasurement(t *testing.T) {
+	sm := schedulerManager(t)
+	sm.streams = newStreamRegistry()
+
+	p, _ := schedulerPeer(t, sm, 1, 1000)
+	require.True(t, sm.downloadWarming(), "unmeasured")
+
+	sm.streams.rates[p] = float64(10 * qMB)
+	require.False(t, sm.downloadWarming(), "its one peer is measured")
 }

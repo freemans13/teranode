@@ -39,19 +39,32 @@ const (
 	benchProbeSpeedup = 4
 )
 
-// activeFloor is the slowest rate an active peer may have: walking the measured peers fastest
-// first, the rate of the one that brings their running total to activeShareOfBandwidth of all of
-// them. Zero, so every peer is active, when no peer is measured.
+// activeFloor is the slowest rate an active peer of this pass may have; see activeFloorOf.
 func (a *downloadAssigner) activeFloor() float64 {
-	var rates []float64
+	if a.warming {
+		return 0
+	}
 
-	var total float64
+	var rates []float64
 
 	for _, p := range append(append([]*assignerPeer(nil), a.peers...), a.full...) {
 		if p.measured && p.rate > 0 {
 			rates = append(rates, p.rate)
-			total += p.rate
 		}
+	}
+
+	return activeFloorOf(rates)
+}
+
+// activeFloorOf is the slowest rate an active peer may have: walking the measured rates fastest
+// first, the rate that brings their running total to activeShareOfBandwidth of all of them. Zero,
+// so every peer is active, when none is measured.
+func activeFloorOf(rates []float64) float64 {
+	rates = append([]float64(nil), rates...)
+
+	var total float64
+	for _, r := range rates {
+		total += r
 	}
 
 	sort.Sort(sort.Reverse(sort.Float64Slice(rates)))

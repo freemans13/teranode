@@ -356,6 +356,14 @@ func newParkPropertyManager(t *testing.T, blocks []*bsvutil.Block) (*SyncManager
 	peer, rec := schedulerPeer(t, sm, 1, int32(len(blocks))+1000)
 	sm.storeSyncPeer(peer, &syncPeerState{})
 
+	// Measured and fast, so a pass hands out a full run and blocks arrive out of order to park.
+	// An unmeasured peer holds one block, which always arrives next and never parks.
+	if sm.streams == nil {
+		sm.streams = newStreamRegistry()
+	}
+
+	sm.streams.rates[peer] = float64(1 << 40)
+
 	// parkOrphanBlock's own top-up (fetchMoreHeaderBlocks) can also fire a pass
 	// as each block below is delivered, alongside the explicit ones the loop
 	// below drives. That is harmless to what is asserted here: blockDownloads.Len
