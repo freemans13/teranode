@@ -210,9 +210,16 @@ func (sm *SyncManager) raceDuplicateCopy(hash chainhash.Hash, header *wire.Block
 // owes hash. The ledger is keyed by association primaries, so a stream sub-peer is resolved first,
 // as handleBlockOnDiskMsg resolves it. A reader that names no peer owes nothing.
 func (sm *SyncManager) deliveringPeerOwes(r io.Reader, hash chainhash.Hash) bool {
+	return sm.owingSender(r, hash) != nil
+}
+
+// owingSender returns the peer r's bytes come from, resolved to its association primary as the
+// ledger keys it, when the ledger says that peer owes hash. It returns nil for a reader that names
+// no peer and for a sender that does not owe the block.
+func (sm *SyncManager) owingSender(r io.Reader, hash chainhash.Hash) *peerpkg.Peer {
 	from := deliveringPeer(r)
 	if from == nil || sm.blockDownloads == nil {
-		return false
+		return nil
 	}
 
 	owner := from
@@ -220,7 +227,11 @@ func (sm *SyncManager) deliveringPeerOwes(r io.Reader, hash chainhash.Hash) bool
 		_, owner, _ = sm.peerStateResolvingPrimary(from)
 	}
 
-	return sm.blockDownloads.HasOwner(owner, hash)
+	if !sm.blockDownloads.HasOwner(owner, hash) {
+		return nil
+	}
+
+	return owner
 }
 
 // deliveringPeer returns the peer a sink's reader is reading from, through the stream tracker's

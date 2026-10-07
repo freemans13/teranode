@@ -3,7 +3,6 @@ package netsync
 import (
 	"fmt"
 	"io"
-	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -63,15 +62,14 @@ const (
 type blockStream struct {
 	hash   chainhash.Hash
 	height int32
-	// owner is the one peer the ledger says owes this block, or nil when it is not exactly one.
+	// owner is the peer sending this copy, when the download ledger says that peer owes the
+	// block. It is nil for a copy from a peer that does not owe the block: such a copy is drained
+	// unwritten (admitPipelineSink), and gives no peer a rate, an activity time or a size sample,
+	// and does not count as the block arriving. Every field is set before the stream is published
+	// (add), because the sync manager reads them from other goroutines.
 	owner *peerpkg.Peer
-	// coOwners is every peer that owed the block when its bytes began, when that was more than
-	// one: a raced or re-asked block. The sink is not told which of them is sending, so each
-	// counts as sending while the bytes arrive (lastBlockBytes); otherwise the one that is
-	// sending looks silent and the quiet-owner rule lets it off its whole queue.
-	coOwners []*peerpkg.Peer
-	total    int64
-	read     atomic.Int64
+	total int64
+	read  atomic.Int64
 	// lastRead is when bytes last arrived for this block, in unix nanoseconds.
 	lastRead atomic.Int64
 	// received is the node-wide count of block bytes received, or nil.
@@ -141,12 +139,18 @@ func newStreamRegistry() *streamRegistry {
 
 func (r *streamRegistry) start(hash chainhash.Hash, height int32, owner *peerpkg.Peer, total int64, now time.Time) *blockStream {
 	s := &blockStream{hash: hash, height: height, owner: owner, total: total, start: now}
+	r.add(s)
 
+	return s
+}
+
+// add publishes s. Readers take r.mu and the sink goroutine that built s does not, so a field
+// that is not atomic must not change after this unless it is written under r.mu, as path and
+// admitWait are.
+func (r *streamRegistry) add(s *blockStream) {
 	r.mu.Lock()
 	r.active[s] = struct{}{}
 	r.mu.Unlock()
-
-	return s
 }
 
 // finish removes a stream. A complete one records its owner's rate. The block's race mark is left
@@ -203,7 +207,7 @@ func (r *streamRegistry) pending(p *peerpkg.Peer) (int64, int) {
 	return bytes, n
 }
 
-// arriving reports whether bytes of block h are arriving now, from any peer.
+// arriving reports whether bytes of block h are arriving now from a peer that owes it.
 func (r *streamRegistry) arriving(h chainhash.Hash) bool {
 	if r == nil {
 		return false
@@ -213,7 +217,7 @@ func (r *streamRegistry) arriving(h chainhash.Hash) bool {
 	defer r.mu.Unlock()
 
 	for s := range r.active {
-		if s.hash == h {
+		if s.hash == h && s.owner != nil {
 			return true
 		}
 	}
@@ -221,8 +225,9 @@ func (r *streamRegistry) arriving(h chainhash.Hash) bool {
 	return false
 }
 
-// arrivingStream reports the progress of block h's bytes from one peer: read so far, its declared
-// size, and when they began. ok is false when none are arriving, or more than one copy is.
+// arrivingStream reports the progress of block h's bytes from one peer that owes it: read so far,
+// its declared size, and when they began. ok is false when none are arriving, or more than one
+// copy is.
 func (r *streamRegistry) arrivingStream(h chainhash.Hash) (read, total int64, start time.Time, ok bool) {
 	if r == nil {
 		return 0, 0, time.Time{}, false
@@ -234,7 +239,7 @@ func (r *streamRegistry) arrivingStream(h chainhash.Hash) (read, total int64, st
 	n := 0
 
 	for s := range r.active {
-		if s.hash == h {
+		if s.hash == h && s.owner != nil {
 			read, total, start = s.read.Load(), s.total, s.start
 			n++
 		}
@@ -243,7 +248,9 @@ func (r *streamRegistry) arrivingStream(h chainhash.Hash) (read, total int64, st
 	return read, total, start, n == 1
 }
 
-// arrivingBytes is the declared size of every block arriving now, and how many there are.
+// arrivingBytes is the declared size of every block arriving now from a peer that owes it, and how
+// many there are. A copy from a peer that does not owe the block is drained, not held, so its
+// declared size is not counted against the disk.
 func (r *streamRegistry) arrivingBytes() (int64, int) {
 	if r == nil {
 		return 0, 0
@@ -252,12 +259,21 @@ func (r *streamRegistry) arrivingBytes() (int64, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	var total int64
+	var (
+		total int64
+		n     int
+	)
+
 	for s := range r.active {
+		if s.owner == nil {
+			continue
+		}
+
 		total += s.total
+		n++
 	}
 
-	return total, len(r.active)
+	return total, n
 }
 
 // medianRate is the median of the peers' measured rates on completed blocks, or zero with none.
@@ -335,7 +351,7 @@ func (r *streamRegistry) lastBlockBytes(p *peerpkg.Peer) time.Time {
 	latest := r.lastBlock[p]
 
 	for s := range r.active {
-		if s.owner != p && !slices.Contains(s.coOwners, p) {
+		if s.owner != p {
 			continue
 		}
 
@@ -449,24 +465,15 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 	return func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reader, n int64) (bool, error) {
 		height, _ := sm.headerCache.HeightOf(hash)
 
-		var (
-			owner    *peerpkg.Peer
-			coOwners []*peerpkg.Peer
-		)
-
-		switch owners := sm.blockDownloads.OwnersOf(hash); {
-		case len(owners) == 1:
-			owner = owners[0]
-		case len(owners) > 1:
-			coOwners = owners
-		}
-
-		s := sm.streams.start(hash, height, owner, n, time.Now())
-		s.coOwners = coOwners
-		s.received = &sm.waste.received
+		// The stream is the sender's, not the ledger owner's: a peer that does not owe the block
+		// could otherwise set an owner's rate, keep a stalled owner looking busy, and set the
+		// largest recent block size. owingSender names the sender only when it owes the block.
+		s := &blockStream{hash: hash, height: height, owner: sm.owingSender(r, hash), total: n, start: time.Now(), received: &sm.waste.received}
 		if at, ok := sm.blockDownloads.RequestedAt(hash); ok {
 			s.requestedAt = at
 		}
+
+		sm.streams.add(s)
 
 		converted, err := inner(hash, header, countingReader{r: r, s: s}, n)
 
@@ -491,8 +498,9 @@ func (sm *SyncManager) trackBlockStreams(inner func(chainhash.Hash, *wire.BlockH
 
 		// The size ladder and the queue estimate read the average block size. Only the path
 		// that decodes a whole block used to feed it, and with the park on that path never
-		// runs, so every block has to feed it here.
-		if complete && sm.blockSizeTracker != nil {
+		// runs, so every block has to feed it here. Only a copy from a peer that owes the
+		// block: any peer can declare any size for a block it was not asked for.
+		if complete && s.owner != nil && sm.blockSizeTracker != nil {
 			sm.blockSizeTracker.addBlockSize(n)
 		}
 

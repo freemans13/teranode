@@ -183,11 +183,11 @@ func TestQueuedReaskAsksOnce(t *testing.T) {
 	require.False(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 11)), "the block has had its one extra request")
 }
 
-// A block owed by two peers, the owner and the peer the re-ask added, streams with no single
-// owner, and its bytes used to count for nobody. On 2026-10-07 the fast peer sending re-asked
-// block 707,857, 2 GB in 64 s, therefore looked silent for a minute, and the quiet-owner rule let
-// it off all 15 blocks in its queue; it delivered them anyway and each was downloaded twice.
-// Every owner of an arriving block counts as sending.
+// A block owed by two peers, the owner and the peer the re-ask added, used to stream with no single
+// owner, and its bytes counted for nobody. On 2026-10-07 the fast peer sending re-asked block
+// 707,857, 2 GB in 64 s, therefore looked silent for a minute, and the quiet-owner rule let it off
+// all 15 blocks in its queue; it delivered them anyway and each was downloaded twice. The peer
+// sending the copy counts as sending, and the other owner, which sends nothing, does not.
 func TestAPeerSendingABlockTwoPeersOweIsNotQuiet(t *testing.T) {
 	sm, owner, fast, _ := reaskSetup(t)
 	now := time.Now()
@@ -210,13 +210,14 @@ func TestAPeerSendingABlockTwoPeersOweIsNotQuiet(t *testing.T) {
 
 		stream.lastRead.Store(time.Now().UnixNano())
 
-		require.False(t, sm.streams.lastBlockBytes(fast).IsZero(), "the peer sending a two-owner block is sending")
+		require.False(t, sm.streams.lastBlockBytes(fast).IsZero(), "the peer sending a block two peers owe is sending")
 		require.True(t, sm.ownerStillSending(queued), "so the rest of its queue is not let off")
+		require.True(t, sm.streams.lastBlockBytes(owner).IsZero(), "the other owner sends nothing and does not look busy")
 
 		return true, nil
 	})
 
-	_, err := sink(block, &wire.BlockHeader{}, bytes.NewReader(nil), 0)
+	_, err := sink(block, &wire.BlockHeader{}, peerpkg.NewDeliveryReader(bytes.NewReader(nil), fast), 0)
 	require.NoError(t, err)
 }
 

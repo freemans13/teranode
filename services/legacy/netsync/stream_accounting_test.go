@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,7 +38,7 @@ func TestAStreamedBlockRecordsItsSizeAndItsPeersRate(t *testing.T) {
 		return true, err
 	})
 
-	converted, err := sink(hash, &wire.BlockHeader{}, bytes.NewReader(body), payload)
+	converted, err := sink(hash, &wire.BlockHeader{}, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), payload)
 	require.NoError(t, err)
 	require.True(t, converted)
 
