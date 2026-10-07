@@ -110,7 +110,15 @@ func (sm *SyncManager) maybeReaskQueuedBlock(now time.Time) {
 			return
 		}
 
-		ownerETA = sm.queuedArrival(owner, queues[owner], block.seq, typical, typical, ownerRate)
+		// The queued block's own size is not known. It is counted at the largest recent block, as
+		// the queue depth is: with the average, an idle slower peer looked sooner than a faster
+		// peer with a queue, and on 2026-10-07 a 2,131 MB block went to a 5.1 MB/s peer.
+		ownSize = typical
+		if largest := sm.blockSizeTracker.largestRecentSize(); largest > 0 {
+			ownSize = largest
+		}
+
+		ownerETA = sm.queuedArrival(owner, queues[owner], block.seq, typical, ownSize, ownerRate)
 	}
 
 	var need time.Duration
@@ -210,8 +218,28 @@ func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, 
 		bestETA time.Duration
 	)
 
-	for _, bp := range sm.eligibleBlockPeers() {
+	eligible := sm.eligibleBlockPeers()
+
+	// Only an active peer is given the second copy (standby_peers.go). A standby peer's queue
+	// is empty, so it can look soonest, but it is on standby because it is slow.
+	rates := make([]float64, 0, len(eligible))
+	for _, bp := range eligible {
+		if r := sm.streams.peerRate(bp.peer); r > 0 {
+			rates = append(rates, r)
+		}
+	}
+
+	floor := activeFloorOf(rates)
+	if sm.downloadWarming() {
+		floor = 0
+	}
+
+	for _, bp := range eligible {
 		if bp.peer == owner {
+			continue
+		}
+
+		if r := sm.streams.peerRate(bp.peer); r > 0 && r < floor {
 			continue
 		}
 
