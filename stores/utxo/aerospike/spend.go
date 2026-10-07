@@ -988,7 +988,7 @@ func (s *Store) processSingleBatchResult(ctx context.Context, batchRecord aerosp
 	// Handle signals
 	// Flag idempotent matches before any item is completed: the rollback
 	// decision reads the flag once the item is published.
-	markIdempotentSpends(res.Idempotent, batch)
+	markIdempotentSpends(res.Idempotent, batchByKey, batch)
 
 	if res.Signal != "" {
 		s.handleSpendSignal(ctx, res.Signal, txID, res.ChildCount, thisBlockHeight)
@@ -1074,18 +1074,41 @@ func (s *Store) handleSpendSignal(ctx context.Context, signal LuaSignal, txID *c
 	}
 }
 
-// handleSuccessfulSpends handles successful spend operations
 // markIdempotentSpends flags the batch items the Lua reported as idempotent
 // matches. Must run before the items are completed, since resolveSpendCompletions
 // reads the flag once the item is published.
-func markIdempotentSpends(idempotent []int, batch []*batchSpend) {
+//
+// Only indices this record was asked about (batchByKey) are accepted. The answer
+// may come from the native dispatcher, which lives outside this repo, and an
+// index that belongs to another record's spends names an item that may already
+// have been completed and published in an earlier iteration: writing its flag
+// then is an unsynchronised write, and it changes the rollback set of an
+// unrelated transaction. Bounding against the whole batch did not catch that.
+func markIdempotentSpends(idempotent []int, batchByKey []aerospike.MapValue, batch []*batchSpend) {
+	if len(idempotent) == 0 {
+		return
+	}
+
+	asked := make(map[int]struct{}, len(batchByKey))
+
+	for _, batchItem := range batchByKey {
+		if idx, ok := batchItem["idx"].(int); ok {
+			asked[idx] = struct{}{}
+		}
+	}
+
 	for _, idx := range idempotent {
+		if _, ok := asked[idx]; !ok {
+			continue
+		}
+
 		if idx >= 0 && idx < len(batch) && batch[idx] != nil {
 			batch[idx].idempotent = true
 		}
 	}
 }
 
+// handleSuccessfulSpends handles successful spend operations
 func (s *Store) handleSuccessfulSpends(batchByKey []aerospike.MapValue, batch []*batchSpend) {
 	for _, batchItem := range batchByKey {
 		idx := batchItem["idx"].(int)
