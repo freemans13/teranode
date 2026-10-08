@@ -390,3 +390,64 @@ func TestAQuietOwnerIsNotReAskedBelowTheCheckpoint(t *testing.T) {
 	require.NotContains(t, otherRec.all(), next, "the quiet owner's block is not asked of another peer")
 	require.True(t, sm.blockDownloads.HasOwner(quiet, next), "and the quiet owner keeps it")
 }
+
+// Mainnet, 2026-10-08 10:59 to 12:11: the pass looked only at the lowest unowned blocks, about 110,
+// and at a pace of 2.4 blocks a second each of them was due within 45 s. A 4 GB block at 16.6 MB/s
+// takes 241 s, so no slow peer was in time for any of them: six of seven peers stayed idle and the
+// chain waited 89% of the time. An idle peer gets the lowest block of the full window that it can
+// land in time.
+func TestAnIdleSlowPeerGetsABlockItCanLandInTimeFromTheFullWindow(t *testing.T) {
+	sm := assignManager(t, 1, 900)
+	mockCommittedTip(t, sm, 10, 0)
+
+	sm.settings.Legacy.BlockDownloadWindow = 1024
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+
+	sm.commitRate = newCommitRateTracker()
+	now := time.Now()
+
+	for i := range 10 {
+		sm.commitRate.note(now.Add(time.Duration(i-9) * 500 * time.Millisecond))
+	}
+
+	for range 10 {
+		sm.blockSizeTracker.addBlockSize(4_000_000_000)
+	}
+
+	fast, fastRec := schedulerPeer(t, sm, 1, 1000)
+	slow, slowRec := schedulerPeer(t, sm, 2, 1000)
+	wireStreamingPath(sm)
+	sm.streams.rates[fast] = 50_000_000
+	sm.streams.rates[slow] = 16_600_000
+
+	// The fast peer already owes two blocks: near blocks wait for it (lateQueueLimit).
+	for _, h := range []int32{11, 12} {
+		block, ok := sm.headerCache.At(h)
+		require.True(t, ok)
+		require.True(t, sm.blockDownloads.Add(fast, block))
+	}
+
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool { return slowRec.count() > 0 }, 5*time.Second), "the idle slow peer gets a far block")
+
+	// 4 GB at 16.6 MB/s is 241 s; at 2 blocks a second that is block 10 + 1 + 482 or later. The
+	// fast peer owes two near blocks it cannot land in time, so it gets no more near blocks, only
+	// a far block it can land in time: 160 s for its two and 80 s for a new one is block 491 or
+	// later.
+	lowest := func(hashes []chainhash.Hash) int32 {
+		low := int32(1 << 30)
+		for _, h := range hashes {
+			height, ok := sm.headerCache.HeightOf(h)
+			require.True(t, ok)
+			low = min(low, height)
+		}
+
+		return low
+	}
+
+	// After the in-time blocks are given, a peer can also be the earliest arrival for a block just
+	// past its reach. No peer gets a block near the tip.
+	require.GreaterOrEqual(t, lowest(slowRec.all()), int32(490))
+	require.GreaterOrEqual(t, lowest(fastRec.all()), int32(490))
+}
