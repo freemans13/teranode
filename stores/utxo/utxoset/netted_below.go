@@ -56,9 +56,11 @@ var nettedBelowChunkTxs = 0
 // holds; a chunk has one transaction at least. The chunks run in parallel and each holds its
 // outputs several times while it writes: in its plan, in the sorted copies and in the encoded
 // statement. On mainnet at block 814,043 on 2026-10-08 the chunks of a 30,595-transaction block
-// held about 28 million outputs, the write used 13 GB, and the OOM killer stopped the node. A
-// variable so a test can set a small limit.
-var nettedBelowMaxChunkOutputs = 200_000
+// held about 28 million outputs, the write used 13 GB, and the OOM killer stopped the node. At
+// 200,000 the same block still peaked at about 7.7 GB, against the 6 GB target: 16 chunks held
+// 3.2 million outputs at about 1.4 KB each. At 50,000 they hold 800,000, about 1.1 GB. A variable
+// so a test can set a small limit.
+var nettedBelowMaxChunkOutputs = 50_000
 
 // nettedCoinsBatchRows is the most coin rows one statement of netBelowCoins writes, so a single
 // transaction with millions of outputs does not build one statement of all of them. A variable
