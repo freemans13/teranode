@@ -8,7 +8,7 @@ import (
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
-// THE WATCHER (docs/superpowers/specs/2026-10-08-legacy-simple-schedule-watch-design.md 3.2). The
+// THE WATCHER (PR 1699, 2026-10-08). The
 // schedule gives blocks by rate and queue with no block size, because a size is not known before
 // the download. The watcher corrects the blocks that turn out late. Each tick it examines up to
 // watchBlocks owed blocks from the tip, in height sequence, and estimates when each lands

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -202,4 +203,31 @@ func TestScheduleTheBackstopStopsAPassPartWay(t *testing.T) {
 	sm.requestBlocks(a, []wantedBlock{wantedAt(11), wantedAt(12), wantedAt(13)}, 0)
 
 	require.Len(t, placed(p), 2, "two blocks at the 500 MB mean reach the backstop")
+}
+
+// A slow peer holds blocks in proportion to its rate against the fastest peer: 16 x 5 / 50 is 1.6,
+// so 2. With 16 each, the slow peers' blocks sat near the tip behind 16 fast blocks, and on
+// 2026-10-08 from 13:14 to 14:14 the chain waited for six blocks at peers of 2.8 to 7.9 MB/s whose
+// first bytes came 3 to 8 minutes after the getdata.
+func TestASlowPeerHoldsBlocksInProportionToItsRate(t *testing.T) {
+	sm := schedulerManager(t)
+	wireStreamingPath(sm)
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
+	sm.blockSizeTracker.addBlockSize(10 * mb)
+
+	fast, _ := schedulerPeer(t, sm, 1, 5000)
+	slow, _ := schedulerPeer(t, sm, 2, 5000)
+	sm.streams.rates[fast] = 50 * mb
+	sm.streams.rates[slow] = 5 * mb
+
+	a := sm.newDownloadAssigner()
+	require.NotNil(t, a)
+
+	budgets := map[*peerpkg.Peer]int{}
+	for _, p := range a.peers {
+		budgets[p.peer] = p.budget
+	}
+
+	require.Equal(t, 16, budgets[fast])
+	require.Equal(t, 2, budgets[slow])
 }

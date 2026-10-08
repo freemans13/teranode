@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"math"
 	"sort"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -39,14 +40,21 @@ type assignerPeer struct {
 const unmeasuredPeerDepth = 1
 
 // peerQueueDepth is how many blocks p may owe at once: one while its rate is unknown, else depth
-// (streamingPeerDepth, 16, as SV Node). The deadline rule limits a slow peer's queue before that: a
-// peer gets a block only if it can send it in time (THE DEADLINE RULE).
-func (sm *SyncManager) peerQueueDepth(p *peerpkg.Peer, depth int) int {
-	if sm.streams.peerRate(p) <= 0 {
+// (streamingPeerDepth, 16, as SV Node) scaled by its rate against the fastest peer's, rounded up,
+// at least one. A peer sends its queue in sequence, so with 16 each a slow peer's blocks sat near
+// the tip behind 16 fast blocks: on 2026-10-08 from 13:14 to 14:14 the chain waited for six blocks
+// at peers of 2.8 to 7.9 MB/s whose first bytes came 3 to 8 minutes after the getdata.
+func (sm *SyncManager) peerQueueDepth(p *peerpkg.Peer, depth int, fastest float64) int {
+	rate := sm.streams.peerRate(p)
+	if rate <= 0 {
 		return min(depth, unmeasuredPeerDepth)
 	}
 
-	return depth
+	if fastest <= rate {
+		return depth
+	}
+
+	return max(1, int(math.Ceil(float64(depth)*rate/fastest)))
 }
 
 // parkBackstopBytes is the most block bytes the node holds ahead of the chain, parked and
@@ -233,6 +241,11 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 
 	fallbackRate := sm.streams.medianRate()
 
+	var fastest float64
+	for _, candidate := range eligible {
+		fastest = max(fastest, sm.streams.peerRate(candidate.peer))
+	}
+
 	for _, candidate := range eligible {
 		if len(peers) == fanout {
 			break
@@ -245,7 +258,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 			rate = fallbackRate
 		}
 
-		depth := sm.peerQueueDepth(candidate.peer, perPeer)
+		depth := sm.peerQueueDepth(candidate.peer, perPeer, fastest)
 
 		owed := sm.blockDownloads.CountForPeer(candidate.peer)
 

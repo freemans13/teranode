@@ -534,9 +534,9 @@ func (bst *blockSizeTracker) largestRecentSize() int64 {
 // seedBlockSizes fills the size tracker with the sizes of the last largestSizeSamples blocks of the
 // chain, oldest first, before the first download pass. Without it the tracker held only the blocks
 // completed since the start: on 2026-10-08 after a restart its largest block was 193 MB at heights
-// where blocks are up to 4 GB, and the deadline rule gave a 4 MB/s peer 16 far blocks that each
-// took more than an hour. A failed read leaves the tracker empty; the deadline rule then places
-// blocks fastest first until a block completes.
+// where blocks are up to 4 GB, and a 4 MB/s peer got 16 far blocks that each took more than an
+// hour. The backstop and the watcher count unknown sizes at the tracker's mean. A failed read
+// leaves the tracker empty until blocks complete.
 func (sm *SyncManager) seedBlockSizes(ctx context.Context) {
 	if sm.blockchainClient == nil || sm.blockSizeTracker == nil {
 		return
@@ -4425,7 +4425,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 	}
 
-	// Before the first download pass: the deadline rule needs the block sizes of this part of the
+	// Before the first download pass: the backstop and the watcher need the block sizes of this part of the
 	// chain, not only of the blocks that complete after the start.
 	sm.seedBlockSizes(ctx)
 

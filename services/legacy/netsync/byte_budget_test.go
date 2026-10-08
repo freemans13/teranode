@@ -99,6 +99,31 @@ func TestTheBackstopStopsRequestsAtOneHundredGiBHeld(t *testing.T) {
 	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 0 }, 300*time.Millisecond))
 }
 
+// A block only asked for is not held. On 2026-10-08 a new peer got the top block of the window,
+// which then counted as held for an hour, so each block below it counted as a gap and the
+// backstop never applied: the node could fetch the full window, far more than 100 GiB at 4 GB
+// blocks. Over the backstop, a request at the top of the window lets no block below it be asked.
+func TestARequestAtTheTopOfTheWindowDoesNotTurnOffTheBackstop(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xe9}
+	msg, hashes := linkedHeaders(anchor, 10, &nonce)
+
+	sm, a, aRec, _, bRec := budgetManager(t)
+	recentBlocks(sm, 1<<30)
+
+	sm.streams.start(chainhash.Hash{0xe8}, 0, newTestPeer(t, "10.0.0.9:8333"), 101<<30, time.Now())
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+
+	far := newTestPeer(t, "10.0.0.8:8333")
+	require.True(t, sm.blockDownloads.Add(far, hashes[9]))
+
+	sm.fetchHeaderBlocks()
+
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 0 }, 300*time.Millisecond), "over the backstop with nothing parked, no block is asked for")
+}
+
 // A block asked for but not yet arriving holds no bytes, so it does not count, however large the
 // recent blocks were. It used to count at the largest recent block: after a 2.3 GB block on
 // 2026-09-25 a few unstarted requests filled the budget with bytes that did not exist, and four
