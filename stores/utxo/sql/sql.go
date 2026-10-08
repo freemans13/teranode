@@ -2262,7 +2262,7 @@ func isDeadlock(err error) bool {
 	// parent in one joined statement. SQLite's remedy is to roll back and retry,
 	// which is what a true return here does.
 	var sqliteErr *sqlite.Error
-	if errors.As(err, &sqliteErr) && isSQLiteLockCode(sqliteErr.Code()) {
+	if errors.As(err, &sqliteErr) && usql.IsSQLiteLockCode(sqliteErr.Code()) {
 		return true
 	}
 	msg := err.Error()
@@ -5925,20 +5925,6 @@ func buildMultiValueInsert(baseSQL string, colsPerRow, numRows, startIdx int) st
 	return sb.String()
 }
 
-// isSQLiteLockCode reports whether a SQLite result code is a BUSY or LOCKED
-// condition. modernc.org/sqlite enables extended result codes on every
-// connection, so the primary code is the low byte and the detail sits above
-// it: SQLITE_BUSY_SNAPSHOT (517) is SQLITE_BUSY (5), SQLITE_LOCKED_SHAREDCACHE
-// (262) is SQLITE_LOCKED (6). Comparing the whole code against the two
-// primaries drops every extended variant out of the retry. isDeadlock and
-// isLockError both use it; usql.isRetriableSQLiteCode (util/usql/retry.go) has
-// the same shape.
-func isSQLiteLockCode(code int) bool {
-	primary := code & 0xff
-
-	return primary == sqlite3.SQLITE_BUSY || primary == sqlite3.SQLITE_LOCKED
-}
-
 // isLockError checks if the error is a database lock/deadlock error
 func isLockError(err error) bool {
 	if err == nil {
@@ -5959,7 +5945,7 @@ func isLockError(err error) bool {
 	// SQLite busy/locked errors, extended codes included
 	var sqliteErr *sqlite.Error
 	if errors.As(err, &sqliteErr) {
-		return isSQLiteLockCode(sqliteErr.Code())
+		return usql.IsSQLiteLockCode(sqliteErr.Code())
 	}
 
 	// Check error message for common lock patterns. teranode's errors package

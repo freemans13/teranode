@@ -34,7 +34,8 @@ import (
 // the plain primary code 6, not an extended LOCKED_SHAREDCACHE (262), so both
 // classifiers already matched it before the mask was added to isLockError, and
 // this test stays green with the mask removed.
-// TestIsSQLiteLockCode_ExtendedCodesAreStillLocks below is the test that pins
+// TestIsSQLiteLockCode_ExtendedCodesAreStillLocks in util/usql and
+// TestIsLockError_SQLiteBusySnapshotIsRetryable below are the tests that pin
 // the mask. String fixtures for the same message are in spend_order_test.go and
 // parent_outputs_test.go; this test exists because only a real *sqlite.Error
 // reaches the typed code arms.
@@ -43,7 +44,7 @@ func TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable(t *testing.T) {
 
 	db, err := usql.Open("sqlite", "file:is_deadlock_sqlite_test?mode=memory&cache=shared")
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	t.Cleanup(func() { closeWithin(t, "database", db.Close) })
 
 	db.SetMaxOpenConns(5)
 
@@ -59,7 +60,7 @@ func TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable(t *testing.T) {
 	begin := func(table string) *sql.Tx {
 		conn, err := db.Conn(ctx)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = conn.Close() })
+		t.Cleanup(func() { closeWithin(t, "connection", conn.Close) })
 
 		txn, err := conn.BeginTx(ctx, nil)
 		require.NoError(t, err)
@@ -117,31 +118,26 @@ func TestIsDeadlock_SQLiteSharedCacheTableLockIsRetryable(t *testing.T) {
 	require.True(t, isLockError(refused.err), "the create path must retry the same shared-cache table lock as the spend path, got a non-retryable classification for: %v", refused.err)
 }
 
-// TestIsSQLiteLockCode_ExtendedCodesAreStillLocks pins the primary-code
-// comparison that isDeadlock and isLockError share. isLockError's *sqlite.Error
-// arm used to compare the whole code against SQLITE_BUSY and SQLITE_LOCKED and
-// return without reaching its string fallback, so a BUSY_SNAPSHOT (517) from a
-// WAL snapshot conflict or a LOCKED_SHAREDCACHE (262) was not retried while the
-// plain codes were. Reverting isSQLiteLockCode to a whole-code compare fails
-// the three extended rows below.
-func TestIsSQLiteLockCode_ExtendedCodesAreStillLocks(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		code int
-		want bool
-	}{
-		{"busy", sqlite3.SQLITE_BUSY, true},
-		{"locked", sqlite3.SQLITE_LOCKED, true},
-		{"busy_snapshot 517", sqlite3.SQLITE_BUSY_SNAPSHOT, true},
-		{"busy_recovery 261", sqlite3.SQLITE_BUSY_RECOVERY, true},
-		{"locked_sharedcache 262", sqlite3.SQLITE_LOCKED_SHAREDCACHE, true},
-		{"error 1", sqlite3.SQLITE_ERROR, false},
-		{"constraint 19", sqlite3.SQLITE_CONSTRAINT, false},
-		{"constraint_unique 2067", sqlite3.SQLITE_CONSTRAINT_UNIQUE, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, isSQLiteLockCode(tc.code))
-		})
+// closeWithin runs a cleanup close but gives up after a bounded wait, so a
+// failed lock-cycle test cannot hang the package. A writer waiting on a
+// shared-cache table lock is parked in modernc.org/sqlite until SQLite's
+// unlock-notify callback releases it, and a cancelled or expired context does
+// not wake it (v1.54.0 conn.go retry). Closing its connection, or the
+// database, waits for that statement, so an unbounded close would block
+// forever. On a timeout the close is left running and the goroutine leaks; the
+// test has already failed by then.
+func closeWithin(t *testing.T, what string, closeFn func() error) {
+	t.Helper()
+
+	done := make(chan error, 1)
+
+	go func() { done <- closeFn() }()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err, "closing the %s", what)
+	case <-time.After(5 * time.Second):
+		t.Logf("the %s did not close within 5s: a writer is still parked in the engine, leaving it behind", what)
 	}
 }
 
