@@ -156,8 +156,8 @@ func TestDeadlineAnUnmeasuredPeerGetsTheFarBlock(t *testing.T) {
 }
 
 // A queued block counts at the recent mean size, and only the new block at the largest size. A
-// fast peer with small blocks queued is then still earlier than an idle slow peer, which the
-// largest size for each queued block hid (replay of heights 755,000 to 760,000).
+// fast peer with a block queued is then still earlier than an idle slower peer, which the largest
+// size for each queued block hid (replay of heights 755,000 to 760,000).
 func TestDeadlineAQueueOfSmallBlocksDoesNotHideAFastPeer(t *testing.T) {
 	sm := schedulerManager(t)
 	wireStreamingPath(sm)
@@ -171,11 +171,9 @@ func TestDeadlineAQueueOfSmallBlocksDoesNotHideAFastPeer(t *testing.T) {
 	fast, _ := schedulerPeer(t, sm, 1, 5000)
 	slow, _ := schedulerPeer(t, sm, 2, 5000)
 	sm.streams.rates[fast] = 50 * mb
-	sm.streams.rates[slow] = 6 * mb
+	sm.streams.rates[slow] = 30 * mb
 
-	for i := range 10 {
-		require.True(t, sm.blockDownloads.Add(fast, chainhash.Hash{byte(i), 0x55}))
-	}
+	require.True(t, sm.blockDownloads.Add(fast, chainhash.Hash{0x55}))
 
 	a := sm.newDownloadAssigner()
 	require.NotNil(t, a)
@@ -185,7 +183,7 @@ func TestDeadlineAQueueOfSmallBlocksDoesNotHideAFastPeer(t *testing.T) {
 
 	for _, p := range a.peers {
 		if p.peer == fast {
-			require.Equal(t, []chainhash.Hash{wantedAt(12).hash}, placed(p), "10 queued at the 418 MB mean and 4 GB, at 50 MB/s, is 164 s, earlier than 667 s at 6 MB/s; at 4 GB each it was 880 s")
+			require.Equal(t, []chainhash.Hash{wantedAt(12).hash}, placed(p), "one queued at the 418 MB mean and 4 GB, at 50 MB/s, is 88 s, earlier than 133 s at 30 MB/s; at 4 GB each it was 160 s")
 		}
 	}
 }
@@ -236,4 +234,52 @@ func TestDeadlineAnUnmeasuredPeerDoesNotGetANearBlock(t *testing.T) {
 	sm.requestBlocks(deadlineAssigner([]*assignerPeer{np}, []*assignerPeer{fast}), []wantedBlock{wantedAt(12)}, 0)
 
 	require.Empty(t, placed(np), "block 12 is needed in 0.5 s; the fast peer lands 4 GB in 80 s")
+}
+
+// Mainnet, 2026-10-08 09:49: after a restart the only remembered peer that came back ran at
+// 3.9 MB/s. As the only measured peer it was the earliest arrival for each near block and took 16
+// of them, each 4 GB. A peer that cannot land a block in time holds two blocks at most; the
+// others wait for a peer with room or a better rate.
+func TestDeadlineALatePeerHoldsAtMostTwoBlocks(t *testing.T) {
+	sm := schedulerManager(t)
+	slow := measuredPeer(t, sm, 1, 16, 3.9*mb)
+
+	var blocks []wantedBlock
+	for h := int32(11); h <= 20; h++ {
+		blocks = append(blocks, wantedAt(h))
+	}
+
+	sm.requestBlocks(deadlineAssigner([]*assignerPeer{slow}, nil), blocks, 0)
+
+	require.Len(t, placed(slow), 2)
+}
+
+// The same restart: the six new peers got no block, because the candidates of a pass are the
+// lowest unowned blocks. A new peer gets the highest unowned block of the full window.
+func TestDeadlineAnUnmeasuredPeerGetsABlockFromTheTopOfTheWindow(t *testing.T) {
+	sm := schedulerManager(t)
+	slow := measuredPeer(t, sm, 1, 16, 3.9*mb)
+	newcomer, _ := schedulerPeer(t, sm, 2, 5000)
+	np := &assignerPeer{peer: newcomer, budget: 1}
+
+	a := deadlineAssigner([]*assignerPeer{slow, np}, nil)
+	a.far = []wantedBlock{wantedAt(900)}
+
+	sm.requestBlocks(a, []wantedBlock{wantedAt(11), wantedAt(12)}, 0)
+
+	require.Equal(t, []chainhash.Hash{wantedAt(900).hash}, placed(np))
+}
+
+// A slow measured peer does not keep new peers off far blocks: the test is a fixed lead of
+// unmeasuredMinLead, not the arrival at the measured peers, which was 40 to 60 minutes.
+func TestDeadlineAnUnmeasuredPeerGetsAFarBlockBesideASlowPeer(t *testing.T) {
+	sm := schedulerManager(t)
+	slow := measuredPeer(t, sm, 1, 0, 3.9*mb)
+	slow.backlog = time.Hour
+	newcomer, _ := schedulerPeer(t, sm, 2, 5000)
+	np := &assignerPeer{peer: newcomer, budget: 1}
+
+	sm.requestBlocks(deadlineAssigner([]*assignerPeer{np}, []*assignerPeer{slow}), []wantedBlock{wantedAt(12), wantedAt(900)}, 0)
+
+	require.Equal(t, []chainhash.Hash{wantedAt(900).hash}, placed(np))
 }

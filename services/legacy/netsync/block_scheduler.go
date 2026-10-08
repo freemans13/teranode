@@ -30,6 +30,8 @@ type assignerPeer struct {
 	// measured says rate is the peer's own, not the median it was lent. Only a measured peer is
 	// judged on whether it would deliver in time.
 	measured bool
+	// owed is how many blocks the peer owes, with each block this pass gives it.
+	owed int
 	// backlog is how long the peer needs for what it already owes: the bytes still to come on what
 	// it is sending and a typical block for each block queued behind that, at rate. Each block
 	// this pass gives it adds a typical block.
@@ -90,6 +92,7 @@ func (sm *SyncManager) streamingPeerDepth() int {
 // charge records one more block asked of this peer.
 func (p *assignerPeer) charge() {
 	p.budget--
+	p.owed++
 }
 
 // before reports whether p should be offered a block ahead of q: faster first, then more room,
@@ -134,6 +137,10 @@ type downloadAssigner struct {
 	// which each block a peer already owes counts at.
 	size    int64
 	typical int64
+	// far is the highest unowned blocks of the full download window, for peers with no rate
+	// (placeUnmeasured). The candidates of a pass are the lowest unowned blocks, and on 2026-10-08
+	// they held no far block to measure a new peer on.
+	far []wantedBlock
 }
 
 // eligibleBlockPeers lists the peers that may be asked for a block body, sync
@@ -275,14 +282,16 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		depth := sm.peerQueueDepth(candidate.peer, perPeer)
 		backlog := backlogOf(candidate.peer, rate)
 
-		budget := depth - sm.blockDownloads.CountForPeer(candidate.peer)
+		owed := sm.blockDownloads.CountForPeer(candidate.peer)
+
+		budget := depth - owed
 		if budget <= 0 {
-			full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate, measured: measured, backlog: backlog})
+			full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate, measured: measured, backlog: backlog, owed: owed})
 
 			continue
 		}
 
-		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, rate: rate, measured: measured, backlog: backlog})
+		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, rate: rate, measured: measured, backlog: backlog, owed: owed})
 		assignable += budget
 	}
 
