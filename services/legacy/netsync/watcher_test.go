@@ -393,3 +393,30 @@ func TestWatchLeavesABlockThatLandsWithinThirtySeconds(t *testing.T) {
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 }
+
+// A block gets a helper only when it lands watchMinETA or more after each block below it: that is
+// the time it adds to the chain's wait. On mainnet at 13:06 on 2026-10-08 the watcher asked 50
+// helpers in two minutes, for blocks that landed a few seconds after the block below them, and
+// 8% of the bytes received were discarded. Block 11 lands in about 171 s, behind one 300 MB block
+// at 3.5 MB/s; block 12 lands in about 185 s, behind one block at 3.24 MB/s, so 14 s later.
+func TestWatchLeavesABlockThatLandsSoonAfterTheBlockBelowIt(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	other, _ := schedulerPeer(t, sm, 3, 2000)
+	fast2, _ := schedulerPeer(t, sm, 4, 2000)
+	sm.streams.rates[other] = 3_240_000
+	sm.streams.rates[fast2] = 80_000_000
+	now := time.Now()
+
+	for _, h := range []int32{20, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-time.Minute))
+	}
+
+	for _, h := range []int32{21, 12} {
+		askAt(t, sm, other, heightHash(t, sm, h), now.Add(-time.Minute))
+	}
+
+	sm.watchOwedBlocks(now)
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)) || sm.blockDownloads.HasOwner(fast2, heightHash(t, sm, 11)), "block 11 adds about 171 s to the wait")
+	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 12)) || sm.blockDownloads.HasOwner(fast2, heightHash(t, sm, 12)), "block 12 adds about 14 s more")
+}
