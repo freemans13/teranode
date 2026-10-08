@@ -5,12 +5,12 @@ import (
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
-// THE SIMPLE SCHEDULE (docs/superpowers/specs/2026-10-08-legacy-simple-schedule-watch-design.md).
+// THE SIMPLE SCHEDULE (PR 1699, 2026-10-08).
 // A block size is not known before the download: the header has no size, and go-wire has no
 // hdrsen. So the scheduler uses no size, no pace and no deadline. In height sequence, each block
 // goes to the measured peer with the lowest (blocks owed + 1) / rate, the peer with more room on a
 // tie: a fast peer gets more blocks and the nearer ones, and each peer with room gets work. No
-// block waits for a full peer. A late block is the watcher's (THE WATCHER, rescue.go), which knows
+// block waits for a full peer. A late block is the watcher's (THE WATCHER, watcher.go), which knows
 // a block's size from its first bytes.
 //
 // It replaces the deadline rule. With a 4 GB block after each 5 to 10 blocks of 254 bytes, that

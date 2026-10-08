@@ -46,7 +46,7 @@ import (
 // than 30, one re-ask per owner per retry window rather than three parallel fetches.
 // blockRequestRetryInterval's comment explains what an SV Node peer is doing while it is quiet. Do
 // not extend the race to it. Below the last checkpoint a block that has not started, because it
-// waits behind other blocks at a busy peer or its owner is quiet, is the rescue rule's (rescue.go),
+// waits behind other blocks at a busy peer or its owner is quiet, is the watcher's (watcher.go),
 // which runs on this ticker, keeps the owner, and shares the race's mark.
 
 const (
@@ -65,7 +65,7 @@ const (
 	// raceExpiry; the race drops a block's peers at most once in raceExpiry (maybeRaceSlowBlock).
 	raceExpiry = 10 * time.Minute
 	// maxBlockCopies is the most live copies of one block at once: the first request and at most
-	// two extra copies, from the race or the rescue rule. A live copy is an owner not let off
+	// two extra copies, from the race or the watcher. A live copy is an owner not let off
 	// the block, or one sending it now (liveCopies); a forgiven owner sending nothing is not a
 	// copy. SV Node fetches the first in-flight block from up to DEFAULT_MAX_BLOCK_PARALLEL_FETCH
 	// (3) peers (net/net.h:167). It asks for another copy only when every connected peer the
@@ -196,7 +196,7 @@ type streamRegistry struct {
 	active map[*blockStream]struct{}
 	rates  map[*peerpkg.Peer]float64
 	// raced is each block's race history over the last raceExpiry: when extra copies were asked
-	// for, by the race or the rescue rule, and when the race last dropped its copies.
+	// for, by the race or the watcher, and when the race last dropped its copies.
 	raced map[chainhash.Hash]*raceHistory
 	// lastBlock is when each peer last finished delivering a block.
 	lastBlock map[*peerpkg.Peer]time.Time
@@ -210,7 +210,7 @@ type streamRegistry struct {
 	remembered map[string]float64
 }
 
-// raceHistory is what the race and the rescue rule did for one block in the last raceExpiry. It is
+// raceHistory is what the race and the watcher did for one block in the last raceExpiry. It is
 // kept apart from the ledger: a dropped peer leaves the ledger (ClearPeer), so the live owners
 // cannot tell how many copies a block has already cost.
 type raceHistory struct {
@@ -738,7 +738,7 @@ func (r *streamRegistry) rememberedRates() map[string]float64 {
 	return out
 }
 
-// wasRaced reports whether h had an extra copy asked for, by the race or by the rescue rule,
+// wasRaced reports whether h had an extra copy asked for, by the race or by the watcher,
 // which share the mark, less than raceSlowFetchAfter ago. The newest copy then has not had SV
 // Node's slow-fetch time, and no further copy is asked for.
 func (r *streamRegistry) wasRaced(h chainhash.Hash, now time.Time) bool {
@@ -1313,7 +1313,7 @@ func (sm *SyncManager) dropStallingCopies(s *blockStream, stalling []*peerpkg.Pe
 
 // liveCopies is the owners of h with a live copy: an owner not let off the block, or one whose
 // copy is arriving now. A forgiven owner sending nothing will not deliver (ownerArrival reads it as
-// far off). Counting it held the race and the rescue rule off a block whose only copy was
+// far off). Counting it held the race and the watcher off a block whose only copy was
 // stalling, and leaving it out of the peers to ask let the race find nobody to ask.
 func (sm *SyncManager) liveCopies(h chainhash.Hash, owners []*peerpkg.Peer) []*peerpkg.Peer {
 	active, _ := sm.blockDownloads.ActiveOwners(h)
@@ -1444,12 +1444,17 @@ func (sm *SyncManager) logSchedulerQueues() {
 	idle, short := 0, 0
 	depth := sm.streamingPeerDepth()
 
+	var fastest float64
+	for _, bp := range eligible {
+		fastest = max(fastest, sm.streams.peerRate(bp.peer))
+	}
+
 	for _, bp := range eligible {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
 		remaining, sending := sm.streams.pending(bp.peer)
 		rate := sm.streams.peerRate(bp.peer)
 
-		peerDepth := sm.peerQueueDepth(bp.peer, depth)
+		peerDepth := sm.peerQueueDepth(bp.peer, depth, fastest)
 
 		if owed == 0 && sending == 0 {
 			idle++
@@ -1471,6 +1476,6 @@ func (sm *SyncManager) logSchedulerQueues() {
 			bp.peer, owed, peerDepth, sending, float64(remaining)/1e6, rate/1e6, float64(largest)/1e6, landing)
 	}
 
-	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below the cap of %d requests; pace %.2f blocks/s; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
+	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below their depth of up to %d requests; pace %.2f blocks/s; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
 		len(eligible), idle, short, depth, sm.commitRate.pace(), float64(sm.bytesAhead(largest))/1e9, float64(parkBackstopBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
 }

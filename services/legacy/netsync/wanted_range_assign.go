@@ -387,7 +387,7 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 			continue
 		}
 
-		// Below the last checkpoint an owed block stays with its owner: the rescue rule judges
+		// Below the last checkpoint an owed block stays with its owner: the watcher judges
 		// the lowest one when it will be late, and a quiet peer's rate decays, so it gets no more
 		// blocks. Letting a quiet owner off here released 15 blocks of a busy peer on 2026-10-07,
 		// and each was downloaded two times. Above it, at the tip, the quiet-owner rule stays. A
@@ -580,13 +580,16 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 	}
 }
 
-// highestHeld is the height of the highest wanted block that is parked or already asked for, or
-// zero if none is.
+// highestHeld is the height of the highest wanted block that is parked or arriving, or zero if
+// none is. A block below it is a gap, which the disk backstop never stops.
 func (sm *SyncManager) highestHeld(wanted []wantedBlock) int32 {
 	var highest int32
 
 	for _, block := range wanted {
-		if sm.blockPark.Has(block.hash) || sm.blockDownloads.RequestedWithin(block.hash, blockRequestAssignmentTTL) {
+		// Parked or arriving only. A block only asked for holds no bytes, and on 2026-10-08 a
+		// request for the top block of the window made each block below it a gap for an hour, so
+		// the backstop never applied.
+		if sm.blockPark.Has(block.hash) || sm.streams.arriving(block.hash) {
 			highest = max(highest, block.height)
 		}
 	}

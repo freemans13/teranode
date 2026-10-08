@@ -8,7 +8,7 @@ import (
 )
 
 // peerRatesFile keeps each peer address's last measured download rate across a restart, beside
-// the address manager's peers.json. The deadline rule then starts known peers at their speed
+// the address manager's peers.json. The schedule then starts known peers at their speed
 // instead of handing near blocks to a peer that turns out to be slow.
 const peerRatesFile = "legacy-peer-rates.json"
 

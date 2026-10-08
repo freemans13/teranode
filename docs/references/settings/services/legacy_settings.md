@@ -48,7 +48,7 @@ context), and `${LEGACY_GRPC_PORT}` is `8099`.
 | BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | not set | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up. Also floored at 30 minutes, which the 600 default clears on a 10-minute chain |
 | BlockDownloadTimeoutPerPeerPercent | int64 | 50 | not set | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling per other peer with a block download outstanding. The total is floored at 30 minutes, so this only adds patience |
 | MultiPeerBlockDownload | bool | true | not set | legacy_multiPeerBlockDownload | Spread block requests over every eligible peer. False assigns them all to the sync peer, disconnects a stalled sync peer instead of demoting it, and ignores notfound |
-| MaxBlocksInTransitPerPeer | int | 16 | not set | legacy_maxBlocksInTransitPerPeer | Most block bodies one measured peer may owe at once with multi-peer download on; a peer whose speed is not measured holds 1. Below the last checkpoint the deadline rule limits a slow peer's queue before this: a peer gets a block only if it can land it before the chain needs it, or if it lands it earliest. Not reduced for large blocks: the 100 GiB park backstop (`parkBackstopBytes`) guards the disk instead. In every mode it also sizes the pipeline's admission budget, at four slots per peer, and the peer package's download-timeout budget |
+| MaxBlocksInTransitPerPeer | int | 16 | not set | legacy_maxBlocksInTransitPerPeer | Most block bodies one measured peer may owe at once with multi-peer download on; a peer whose speed is not measured holds 1. A measured peer holds this value scaled by its rate against the fastest peer's, rounded up, at least 1. Not reduced for large blocks: the 100 GiB park backstop (`parkBackstopBytes`) guards the disk instead. In every mode it also sizes the pipeline's admission budget, at four slots per peer, and the peer package's download-timeout budget |
 | BlockDownloadWindow | int | 1024 | not set | legacy_blockDownloadWindow | Block bodies the whole node may have outstanding, counting every peer together, and the read-ahead depth: how far above the committed tip a block may be asked for at all. A count, not svnode's per-peer height range |
 | ParkStoreTimeout | time.Duration | 10s | not set | legacy_parkStoreTimeout | Deadline on each park blob store operation, bounding the wait for the file store's shared permits. Values below 1s are raised to 1s |
 | PeerRegistryEnabled | bool | true | not set | legacy_peerRegistryEnabled | Mirror connected legacy peers into the centralized peer registry so the dashboard can show them |
@@ -137,12 +137,13 @@ context), and `${LEGACY_GRPC_PORT}` is `8099`.
   is what decides how much disk the park needs.
 - Blocks are chosen by a pass over that range: drop what is already on disk, in
   the park, arriving, being converted, given up on or already owed, then hand the
-  rest to peers with budget. Below the last checkpoint each block goes by its
-  deadline, the time until the chain needs it at the chain's pace: to the
-  slowest measured peer that can land a block of the largest recent size before
-  then, or else to the peer that lands it earliest, waiting if that peer is
-  full. A peer with no rate gets one far block. Measured rates are kept by
-  address in `legacy-peer-rates.json` in the working directory. Below the
+  rest to peers with budget. Below the last checkpoint each block goes to the
+  measured peer with the lowest (blocks owed + 1) / rate: a block size is not
+  known before the download, so the schedule uses none, and no block waits while
+  a peer has room. A peer holds the per-peer depth scaled by its rate against
+  the fastest peer's. A peer with no rate gets one block from the top of the
+  window. Measured rates are kept by address in `legacy-peer-rates.json` in the
+  working directory. Below the
   last checkpoint the range comes from the header cache, which runs to the next
   checkpoint; above it, blocks are asked for from invs and the pass re-asks from
   the download ledger. There is no download cursor, so nothing carries a
@@ -156,10 +157,12 @@ context), and `${LEGACY_GRPC_PORT}` is `8099`.
   Every copy of the block must be that slow, a further copy waits 30 seconds
   after the last one, and at most three peers owe a block at once. These are SV
   Node's slow-fetch timeout, stalling rate and parallel-fetch limit.
-- During headers-first sync, the lowest block owed by one peer is also asked of
-  one other peer when, 30 seconds after the request, its owner will deliver it
-  after the chain needs it and that peer would deliver it in half the time (the
-  rescue rule). A block gets one such extra request. There is no setting for it; the metric is
+- During headers-first sync, the watcher examines up to 64 owed blocks from the
+  tip every 5 seconds. A block that will land 30 seconds or more after each block
+  below it is also asked of one other peer: for a block arriving, whose size its
+  first bytes declare, the peer that lands a full copy in half the owner's time;
+  for a queued block, the fastest peer that starts before the owner at twice its
+  rate. A block gets one such extra request. There is no setting for it; the metric is
   `teranode_legacy_netsync_frontier_races_total`.
 - `MultiPeerBlockDownload` set to false keeps the pass but gives every block to
   the sync peer, bounded by the block-size ladder alone.
