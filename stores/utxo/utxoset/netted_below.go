@@ -52,6 +52,19 @@ import (
 // transaction per chunk.
 var nettedBelowChunkTxs = 0
 
+// nettedBelowMaxChunkOutputs is the most outputs a chunk of the below-checkpoint netted write
+// holds; a chunk has one transaction at least. The chunks run in parallel and each holds its
+// outputs several times while it writes: in its plan, in the sorted copies and in the encoded
+// statement. On mainnet at block 814,043 on 2026-10-08 the chunks of a 30,595-transaction block
+// held about 28 million outputs, the write used 13 GB, and the OOM killer stopped the node. A
+// variable so a test can set a small limit.
+var nettedBelowMaxChunkOutputs = 200_000
+
+// nettedCoinsBatchRows is the most coin rows one statement of netBelowCoins writes, so a single
+// transaction with millions of outputs does not build one statement of all of them. A variable
+// so a test can set a small limit.
+var nettedCoinsBatchRows = 50_000
+
 // nettedBelowFault is a test hook called before each chunk of the below-checkpoint netted write
 // commits, with the list positions of the chunk's transactions. An error from it stops that
 // chunk there, as a crash would. nil in production.
@@ -104,6 +117,33 @@ func nettedBelowChunkSize(n, workers int) int {
 	size := (n + workers - 1) / workers
 
 	return max(nettedBelowMinChunk, min(nettedBelowMaxChunk, size))
+}
+
+// netBelowChunks cuts items, in list order, into chunks of at most size transactions and at most
+// maxOutputs outputs; a chunk has one transaction at least.
+func netBelowChunks(items []*netBelowTx, size, maxOutputs int) [][]*netBelowTx {
+	var (
+		chunks  [][]*netBelowTx
+		start   int
+		outputs int
+	)
+
+	for i, it := range items {
+		n := len(it.tx.Outputs)
+
+		if i > start && (i-start >= size || outputs+n > maxOutputs) {
+			chunks = append(chunks, items[start:i])
+			start, outputs = i, 0
+		}
+
+		outputs += n
+	}
+
+	if start < len(items) {
+		chunks = append(chunks, items[start:])
+	}
+
+	return chunks
 }
 
 type netBelowTx struct {
@@ -200,8 +240,7 @@ func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndC
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(workers)
 
-	for start := 0; start < len(items); start += size {
-		chunk := items[start:min(start+size, len(items))]
+	for _, chunk := range netBelowChunks(items, size, nettedBelowMaxChunkOutputs) {
 		g.Go(func() error { return s.netBelowChunk(gCtx, chunk, list, blockHeight, spender) })
 	}
 
@@ -682,12 +721,18 @@ func (s *Store) netBelowCoins(ctx context.Context, dbTx pgx.Tx, p *createPlan, c
 			return bytes.Compare(p.utxoUkeys[x][:], p.utxoUkeys[y][:]) < 0
 		})
 
-		if _, err := dbTx.Exec(ctx, nettedCoinsSQL,
-			permute(p.utxoSats, rows), permute(p.utxoHeights, rows), permute(p.utxoSpendable, rows),
-			permute(p.utxoMined, rows), permute(p.utxoBlockIDs, rows), permute(p.utxoLeaves, rows),
-			permute(p.utxoFlags, rows), permute(p.utxoUkeys, rows), permute(p.utxoTxids, rows),
-			permute(p.utxoScripts, rows)); err != nil {
-			return errors.NewStorageError("[utxoset][SpendAndCreateMulti] coins of netted chunk", err)
+		// In batches of nettedCoinsBatchRows, in the sorted sequence: the driver builds each
+		// statement in memory, several times the size of its rows.
+		for from := 0; from < len(rows); from += nettedCoinsBatchRows {
+			batch := rows[from:min(from+nettedCoinsBatchRows, len(rows))]
+
+			if _, err := dbTx.Exec(ctx, nettedCoinsSQL,
+				permute(p.utxoSats, batch), permute(p.utxoHeights, batch), permute(p.utxoSpendable, batch),
+				permute(p.utxoMined, batch), permute(p.utxoBlockIDs, batch), permute(p.utxoLeaves, batch),
+				permute(p.utxoFlags, batch), permute(p.utxoUkeys, batch), permute(p.utxoTxids, batch),
+				permute(p.utxoScripts, batch)); err != nil {
+				return errors.NewStorageError("[utxoset][SpendAndCreateMulti] coins of netted chunk", err)
+			}
 		}
 	}
 
