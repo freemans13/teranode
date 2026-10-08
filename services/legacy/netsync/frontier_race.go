@@ -1159,7 +1159,7 @@ func (sm *SyncManager) runFrontierRace() {
 			sm.streams.sampleStreams(time.Now())
 			sm.decayQuietRates(time.Now())
 			sm.maybeRaceSlowBlock(time.Now())
-			sm.maybeRescueLowestBlock(time.Now())
+			sm.watchOwedBlocks(time.Now())
 
 			if ticks++; ticks%queueReportEvery == 0 {
 				sm.logDownloadQueues()

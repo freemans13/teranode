@@ -571,6 +571,24 @@ func (sm *SyncManager) seedBlockSizes(ctx context.Context) {
 		seeded, float64(sm.blockSizeTracker.largestRecentSize())/1e6, float64(sm.blockSizeTracker.getAverageSize())/1e6)
 }
 
+// meanRecentSize is the mean of the last largestSizeSamples block sizes, or zero with none. The
+// backstop counts each block a pass gives at it (downloadAssigner.overBackstop).
+func (bst *blockSizeTracker) meanRecentSize() int64 {
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
+
+	if len(bst.largestWindow) == 0 {
+		return 0
+	}
+
+	var sum int64
+	for _, s := range bst.largestWindow {
+		sum += s
+	}
+
+	return sum / int64(len(bst.largestWindow))
+}
+
 // getAverageSize returns the current rolling average block size.
 func (bst *blockSizeTracker) getAverageSize() int64 {
 	bst.mu.RLock()

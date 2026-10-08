@@ -80,7 +80,7 @@ func TestRescueAsksAFastPeerForTheBlockBehindASlowQueue(t *testing.T) {
 	s := sm.streams.start(heightHash(t, sm, 13), 13, owner, reaskTypicalBlock, now.Add(-15*time.Second))
 	s.read.Store(50_000_000)
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 
 	next := heightHash(t, sm, 11)
 	require.True(t, sm.blockDownloads.HasOwner(fast, next), "the fast peer is asked for the block the chain needs")
@@ -103,7 +103,7 @@ func TestRescueNeverDoublesALargeBlockThatIsArriving(t *testing.T) {
 	s := sm.streams.start(next, 11, owner, 4_000_000_000, now.Add(-60*time.Second))
 	s.read.Store(2_400_000_000)
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 	sm.maybeRaceSlowBlock(now)
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, next), "a 4 GB block arriving at 40 MB/s is never asked of a second peer")
@@ -126,23 +126,23 @@ func TestRescueLeavesABlockThatArrivesInTime(t *testing.T) {
 		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-time.Minute))
 	}
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 32)))
 }
 
-// SV Node's timer runs from the request, for 30 s.
-func TestRescueWaitsThirtySecondsFromTheRequest(t *testing.T) {
+// The watcher gives a request watchMinAge (10 s) before it judges it.
+func TestRescueWaitsTenSecondsFromTheRequest(t *testing.T) {
 	sm, owner, fast, _ := reaskSetup(t)
 	now := time.Now()
 
 	for _, h := range []int32{13, 14, 15, 11} {
-		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-20*time.Second))
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-5*time.Second))
 	}
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 
-	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)), "20 s after the request is too soon")
+	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)), "5 s after the request is too soon")
 }
 
 // Another copy only helps if it comes clearly sooner. A fast peer with a long queue of its own
@@ -161,7 +161,7 @@ func TestRescueNeedsAPeerAtLeastTwiceAsFast(t *testing.T) {
 		askAt(t, sm, fast, heightHash(t, sm, h), now.Add(-time.Minute))
 	}
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 }
@@ -177,13 +177,13 @@ func TestRescueAsksOnce(t *testing.T) {
 		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
 	}
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 	require.True(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 
-	sm.maybeRescueLowestBlock(now.Add(10 * time.Second))
+	sm.watchOwedBlocks(now.Add(10 * time.Second))
 	require.False(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 11)), "the extra copy has its 30 s")
 
-	sm.maybeRescueLowestBlock(now.Add(time.Minute))
+	sm.watchOwedBlocks(now.Add(time.Minute))
 	require.False(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 11)), "one more getdata at the maximum")
 }
 
@@ -239,7 +239,7 @@ func TestRescueAsksForASlowArrivingBlockThatWillBeLate(t *testing.T) {
 	s := sm.streams.start(next, 11, owner, 1_083_000_000, now.Add(-95*time.Second))
 	s.read.Store(180_000_000)
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 
 	require.True(t, sm.blockDownloads.HasOwner(fast, next), "1.9 MB/s with 903 MB left: 475 s, against about 14 s for a fresh copy")
 	require.True(t, sm.blockDownloads.HasOwner(owner, next), "and the owner keeps its copy")
@@ -261,15 +261,15 @@ func TestRescueLeavesAnArrivingBlockAFreshCopyWouldNotBeat(t *testing.T) {
 	s := sm.streams.start(next, 11, owner, 2_000_000_000, now.Add(-10*time.Second))
 	s.read.Store(1_050_000_000)
 
-	sm.maybeRescueLowestBlock(now.Add(25 * time.Second))
+	sm.watchOwedBlocks(now.Add(25 * time.Second))
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, next))
 }
 
-// A queued block's own size is not known, so it is counted at the largest recent block, not the
-// average. With the average small, an idle slower peer looked sooner than a faster peer with a
-// queue, though for a large block the faster peer is far sooner.
-func TestRescueCountsTheQueuedBlockAtTheLargestRecentSize(t *testing.T) {
+// A queued block's size is not known, so the helper is the fastest peer that starts before the
+// owner and has at least twice its rate: an idle 12 MB/s peer starts first, but for a 2 GB block
+// the 50 MB/s peer behind five blocks lands it far sooner.
+func TestWatchAsksTheFastestPeerThatStartsBeforeTheOwner(t *testing.T) {
 	sm, owner, fast, _ := reaskSetup(t)
 	medium, _ := schedulerPeer(t, sm, 3, 2000)
 	now := time.Now()
@@ -292,38 +292,11 @@ func TestRescueCountsTheQueuedBlockAtTheLargestRecentSize(t *testing.T) {
 		askAt(t, sm, fast, heightHash(t, sm, h), now.Add(-time.Minute))
 	}
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 
 	next := heightHash(t, sm, 11)
-	require.True(t, sm.blockDownloads.HasOwner(fast, next), "a 2 GB block lands in about 41 s at 50 MB/s behind five blocks")
-	require.False(t, sm.blockDownloads.HasOwner(medium, next), "and in about 167 s at the idle 12 MB/s peer")
-}
-
-// The deadline is judged at the chain's pace when it does not wait, not its mean rate. A stop of
-// 10 minutes makes the mean rate one block in 10 s, and block 16 then looks needed in 50 s. At the
-// pace of 2 blocks a second it is needed in 2.5 s.
-func TestRescueJudgesTheDeadlineAtThePace(t *testing.T) {
-	sm, owner, fast, _ := reaskSetup(t)
-	now := time.Now()
-
-	at := now.Add(-631 * time.Second)
-	for range 62 {
-		sm.commitRate.note(at)
-		at = at.Add(500 * time.Millisecond)
-	}
-
-	sm.commitRate.note(now)
-
-	// 30 MB/s with one 300 MB block ahead: 20 s.
-	sm.streams.rates[owner] = 30_000_000
-
-	for _, h := range []int32{17, 16} {
-		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-time.Minute))
-	}
-
-	sm.maybeRescueLowestBlock(now)
-
-	require.True(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 16)), "late at the pace: 20 s against 2.5 s, and 3.75 s at 80 MB/s")
+	require.True(t, sm.blockDownloads.HasOwner(fast, next))
+	require.False(t, sm.blockDownloads.HasOwner(medium, next))
 }
 
 // The rescue judges a block with one owner only. A block with two owners has had its one extra
@@ -340,7 +313,7 @@ func TestRescueLeavesABlockWithTwoOwners(t *testing.T) {
 
 	askAt(t, sm, other, heightHash(t, sm, 11), now.Add(-2*time.Minute))
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 }
@@ -354,7 +327,7 @@ func TestRescueTreatsAnUnmeasuredOwnerAsLate(t *testing.T) {
 
 	askAt(t, sm, owner, heightHash(t, sm, 11), now.Add(-time.Minute))
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
 
 	require.True(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 }
@@ -363,7 +336,7 @@ func TestRescueTreatsAnUnmeasuredOwnerAsLate(t *testing.T) {
 func TestRescueLeavesABlockWithNoOwner(t *testing.T) {
 	sm, _, fast, _ := reaskSetup(t)
 
-	sm.maybeRescueLowestBlock(time.Now())
+	sm.watchOwedBlocks(time.Now())
 
 	require.Zero(t, sm.blockDownloads.CountForPeer(fast))
 }
@@ -378,7 +351,45 @@ func TestRescueNeverAsksAnUnmeasuredPeer(t *testing.T) {
 		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
 	}
 
-	sm.maybeRescueLowestBlock(now)
+	sm.watchOwedBlocks(now)
+
+	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
+}
+
+// The watcher examines each owed block near the tip, not only the lowest. Block 11 lands in time
+// at a fast peer; block 12 waits behind a 3.5 MB/s queue and will stop the chain after block 11.
+// The rescue rule examined only block 11.
+func TestWatchHelpsALateBlockThatIsNotTheLowest(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	third, _ := schedulerPeer(t, sm, 3, 2000)
+	sm.streams.rates[third] = 80 * mb
+	now := time.Now()
+
+	askAt(t, sm, fast, heightHash(t, sm, 11), now.Add(-time.Minute))
+
+	for _, h := range []int32{13, 14, 15, 12} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
+	}
+
+	sm.watchOwedBlocks(now)
+
+	require.False(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 11)), "block 11 lands in about 4 s")
+	require.True(t, sm.blockDownloads.HasOwner(third, heightHash(t, sm, 12)), "block 12 waits behind about 1.2 GB at 3.5 MB/s")
+}
+
+// A block that will land within watchMinETA (30 s) gets no help: the copy would cost more than
+// the wait. The owner at 30 MB/s starts block 11 in 10 s and lands it in 20 s; the 80 MB/s peer
+// starts first and is more than twice as fast, so only the floor keeps it off.
+func TestWatchLeavesABlockThatLandsWithinThirtySeconds(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	sm.streams.rates[owner] = 30 * mb
+	now := time.Now()
+
+	for _, h := range []int32{12, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-time.Minute))
+	}
+
+	sm.watchOwedBlocks(now)
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 }
