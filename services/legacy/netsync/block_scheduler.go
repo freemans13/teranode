@@ -75,8 +75,16 @@ const unmeasuredPeerDepth = 1
 // relative: on 2026-10-07 straight after a restart the first peer measured ran at 1.2 MB/s, was
 // therefore the fastest, got the full depth of 16, and still held all 16 after a peer at 47 MB/s
 // was measured three seconds later. Half rather than all, so one peer that never delivers cannot
-// hold the warm-up open.
-func (sm *SyncManager) downloadWarming() bool {
+// hold the warm-up open, and never longer than downloadWarmupLimit from the first pass that found
+// it warming, so peers that never deliver cannot hold it open either.
+//
+// A warm-up ends for good only while enough peers stay measured. A pass that finds enough measured
+// clears the start, so when too few are measured again, after peers leave and new ones connect, a
+// new warm-up starts, of at most downloadWarmupLimit too. A warm-up that ran out its limit with too
+// few measured does not start again until enough have been measured once.
+//
+// A download pass computes it once (newDownloadAssigner) and gives the same answer to every peer.
+func (sm *SyncManager) downloadWarming(now time.Time) bool {
 	if sm.streams == nil {
 		return false
 	}
@@ -91,39 +99,65 @@ func (sm *SyncManager) downloadWarming() bool {
 		}
 	}
 
-	return measured < max(min(2, len(eligible)), (len(eligible)+1)/2)
+	if measured >= max(min(2, len(eligible)), (len(eligible)+1)/2) {
+		// Warm. The next time too few peers are measured, after peers leave and new ones
+		// connect, a new warm-up starts with its own limit.
+		sm.warmupStarted.Store(0)
+
+		return false
+	}
+
+	started := sm.warmupStarted.Load()
+	if started == 0 {
+		sm.warmupStarted.CompareAndSwap(0, now.UnixNano())
+
+		return true
+	}
+
+	return now.Sub(time.Unix(0, started)) < downloadWarmupLimit
 }
+
+// downloadWarmupLimit is the longest the warm-up lasts. If fewer than half the peers ever deliver
+// a block, pruned peers or peers far behind, every peer held one block for good, one round trip
+// a block. A peer delivers its one block within a minute unless it is slower than a 300 MB block
+// in 60 s, 5 MB/s, and such a peer is a standby candidate anyway. After the limit an unmeasured
+// peer still holds one block (unmeasuredPeerDepth), and a measured peer its time-scaled depth.
+const downloadWarmupLimit = time.Minute
 
 // peerQueueSeconds is how much of its own delivery time a peer's queue holds beyond the block it
 // is sending. A peer sends its queue in order and a request cannot be withdrawn, so every block
 // queued is committed to that peer; the queue is there only to hide the gap between two blocks,
 // a round trip and the peer reading the next block from disk. Ten seconds covers that gap with
-// little committed: one extra 300 MB block at 30 MB/s, the cap of blocks a few hundred KB each.
+// little committed: one extra 300 MB block at 30 MB/s, the cap of blocks a few hundred KB each
+// once no large block is among the last largestSizeSamples.
 const peerQueueSeconds = 10
 
-// timeScaledDepth is a peer's queue by time: the block it sends and enough typical blocks to keep
-// it busy for peerQueueSeconds, at most depth. With no typical size it falls back to the share of
-// depth by speed against the fastest peer.
-func timeScaledDepth(depth int, rate, fastest float64, typical int64) int {
-	if typical <= 0 {
+// timeScaledDepth is a peer's queue by time: the block it sends and enough blocks of size to keep
+// it busy for peerQueueSeconds, at most depth. With no size it falls back to the share of depth by
+// speed against the fastest peer.
+func timeScaledDepth(depth int, rate, fastest float64, size int64) int {
+	if size <= 0 {
 		return speedScaledDepth(depth, rate, fastest)
 	}
 
-	return min(depth, 1+int(math.Ceil(rate*peerQueueSeconds/float64(typical))))
+	return min(depth, 1+int(math.Ceil(rate*peerQueueSeconds/float64(size))))
 }
 
 // peerQueueDepth is how many blocks p may be asked for at once with the park on: one while its
-// speed is unknown or the download is warming up, then its time-scaled depth (timeScaledDepth).
-func (sm *SyncManager) peerQueueDepth(p *peerpkg.Peer, depth int, fastest float64) int {
+// speed is unknown or the download is warming up (warming, from downloadWarming), then its
+// time-scaled depth (timeScaledDepth).
+func (sm *SyncManager) peerQueueDepth(p *peerpkg.Peer, depth int, fastest float64, warming bool) int {
 	rate := sm.streams.peerRate(p)
-	if rate <= 0 || sm.downloadWarming() {
+	if rate <= 0 || warming {
 		return min(depth, unmeasuredPeerDepth)
 	}
 
-	// The largest recent block, not the average: sizes vary a hundredfold at some heights, and on
-	// 2026-10-07 an average dragged down by small blocks sized every fast peer's queue near the cap.
-	// A peer whose rolling speed then fell kept those blocks. largestRecentSize records the same
-	// lesson from an earlier queue estimate.
+	// The largest of the last largestSizeSamples (100) blocks, not the average and not the last
+	// ten: sizes vary a hundredfold at some heights, and on 2026-10-07 an average dragged down by
+	// small blocks sized every fast peer's queue near the cap. A peer whose rolling speed then fell
+	// kept those blocks. A window of ten was tried before and was too short: ten small blocks
+	// pushed a 1.8 GB block out of it within 90 seconds (see largestSizeSamples). The cost: after one 2 GB block, a fast peer holds two blocks for the
+	// next hundred, however small they are.
 	var size int64
 	if sm.blockSizeTracker != nil {
 		size = sm.blockSizeTracker.largestRecentSize()
@@ -337,6 +371,9 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		fastest = max(fastest, sm.streams.peerRate(candidate.peer))
 	}
 
+	now := time.Now()
+	warming := sm.downloadWarming(now)
+
 	for _, candidate := range eligible {
 		if len(peers) == fanout {
 			break
@@ -349,7 +386,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 			rate = fallbackRate
 		}
 
-		depth := sm.peerQueueDepth(candidate.peer, perPeer, fastest)
+		depth := sm.peerQueueDepth(candidate.peer, perPeer, fastest, warming)
 		backlog := backlogOf(candidate.peer, rate)
 
 		budget := depth - sm.blockDownloads.CountForPeer(candidate.peer)
@@ -376,7 +413,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// able to take 16, sizing the round by the window would make 1024 round trips
 	// to place 16 blocks, on every arriving block.
 	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), overBackstop: overBackstop, full: full,
-		commitRate: sm.commitRate.rate(), typical: typical, now: time.Now(), warming: sm.downloadWarming()}
+		commitRate: sm.commitRate.rate(), typical: typical, now: now, warming: warming}
 }
 
 // bytesAhead is how many bytes of blocks the node really holds ahead of the chain: parked blocks

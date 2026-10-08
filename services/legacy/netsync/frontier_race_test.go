@@ -33,7 +33,7 @@ func TestRaceFiresOnAStrugglingPeer(t *testing.T) {
 	// 2 MB of 300 MB in 40 s: 50 KB/s.
 	slow := streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 300_000_000, 2_000_000, now.Add(-40*time.Second))
 
-	got, c, ok := r.pickRace(now, 1000, 1)
+	got, c, _, ok := r.pickRace(now, 1000, 1)
 	require.True(t, ok)
 	require.Same(t, slow, got)
 	require.Less(t, c.rate, float64(raceStallRate))
@@ -47,7 +47,7 @@ func TestRaceLeavesAHealthyPeerAlone(t *testing.T) {
 
 	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 2_000_000_000, 520_000_000, now.Add(-40*time.Second))
 
-	_, _, ok := r.pickRace(now, 1000, 1)
+	_, _, _, ok := r.pickRace(now, 1000, 1)
 	require.False(t, ok, "13 MB/s is not struggling")
 }
 
@@ -57,7 +57,7 @@ func TestRaceWaitsThirtySeconds(t *testing.T) {
 
 	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.1:8333"), 300_000_000, 0, now.Add(-20*time.Second))
 
-	_, _, ok := r.pickRace(now, 1000, 1)
+	_, _, _, ok := r.pickRace(now, 1000, 1)
 	require.False(t, ok, "SV Node judges a fetch after 30 s")
 }
 
@@ -68,12 +68,13 @@ func TestRaceLeavesABlockTheChainDoesNotNeedYet(t *testing.T) {
 	// 50 KB/s with 1 MB left: 20 s to go, and the chain reaches it in 500 s.
 	streamAt(r, 1, 1500, newTestPeer(t, "10.0.0.1:8333"), 3_000_000, 2_000_000, now.Add(-40*time.Second))
 
-	_, _, ok := r.pickRace(now, 1000, 1)
+	_, _, _, ok := r.pickRace(now, 1000, 1)
 	require.False(t, ok)
 }
 
-// A block is raced once. Nothing clears its mark before it expires, not a finished copy and not a
-// drained one: clearing it on every finished copy is what let the race fire again and again.
+// A block is not raced again while its newest extra copy is younger than raceSlowFetchAfter.
+// Nothing clears the mark, not a finished copy and not a drained one: clearing it on every
+// finished copy is what let the race fire again and again.
 func TestABlockIsRacedOnce(t *testing.T) {
 	r := newStreamRegistry()
 	now := time.Now()
@@ -84,11 +85,14 @@ func TestABlockIsRacedOnce(t *testing.T) {
 
 	streamAt(r, 1, 1001, newTestPeer(t, "10.0.0.2:8333"), 300_000_000, 1_000_000, now.Add(-40*time.Second))
 
-	_, _, ok := r.pickRace(now, 1000, 1)
+	_, _, _, ok := r.pickRace(now, 1000, 1)
 	require.False(t, ok, "the same block is not raced a second time")
 
-	_, _, ok = r.pickRace(now.Add(raceExpiry+time.Second), 1000, 1)
-	require.True(t, ok, "until its mark expires")
+	_, _, _, ok = r.pickRace(now.Add(raceSlowFetchAfter-time.Second), 1000, 1)
+	require.False(t, ok, "nor while the extra copy has had less than 30 s")
+
+	_, _, _, ok = r.pickRace(now.Add(raceSlowFetchAfter), 1000, 1)
+	require.True(t, ok, "but once it has, a copy still struggling is raced again")
 }
 
 func TestRacingDropsTheStrugglingPeer(t *testing.T) {
@@ -158,14 +162,22 @@ func TestChooseRacerPrefersTheFastestPeerThatDoesNotOwnTheBlock(t *testing.T) {
 
 	queued := func(*peerpkg.Peer) int { return 0 }
 
-	got := r.chooseRacer([]*peerpkg.Peer{owner, slowOther, fastOther, unknown}, []*peerpkg.Peer{owner}, queued)
+	got := r.chooseRacer([]*peerpkg.Peer{owner, slowOther, fastOther, unknown}, []*peerpkg.Peer{owner}, []*peerpkg.Peer{owner}, queued)
 	require.Same(t, fastOther, got, "the owner is never its own racer, and a measured fast peer beats an unmeasured one")
 
-	require.Nil(t, r.chooseRacer([]*peerpkg.Peer{owner}, []*peerpkg.Peer{owner}, queued), "no one else to ask")
+	require.Nil(t, r.chooseRacer([]*peerpkg.Peer{owner}, []*peerpkg.Peer{owner}, []*peerpkg.Peer{owner}, queued), "no one else to ask")
+
+	// An owner with no live copy, forgiven and sending nothing, is asked only when every other
+	// candidate owes the block too.
+	got = r.chooseRacer([]*peerpkg.Peer{owner, slowOther, fastOther}, []*peerpkg.Peer{owner, fastOther}, []*peerpkg.Peer{owner}, queued)
+	require.Same(t, slowOther, got, "a peer that does not owe the block goes before a forgiven owner")
+
+	got = r.chooseRacer([]*peerpkg.Peer{owner, fastOther}, []*peerpkg.Peer{owner, fastOther}, []*peerpkg.Peer{owner}, queued)
+	require.Same(t, fastOther, got, "with only owners left, the forgiven owner is asked")
 
 	// With no measurements at all, the peer with the fewest blocks queued goes first.
 	fresh := newStreamRegistry()
 	counts := map[*peerpkg.Peer]int{slowOther: 9, fastOther: 3, unknown: 5}
-	got = fresh.chooseRacer([]*peerpkg.Peer{slowOther, fastOther, unknown}, nil, func(p *peerpkg.Peer) int { return counts[p] })
+	got = fresh.chooseRacer([]*peerpkg.Peer{slowOther, fastOther, unknown}, nil, nil, func(p *peerpkg.Peer) int { return counts[p] })
 	require.Same(t, fastOther, got)
 }

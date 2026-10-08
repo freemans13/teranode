@@ -39,8 +39,22 @@ import (
 // carries the same work as an honest one, so fakes that stop one short of the
 // checkpoint outrank the honest branch and an eviction by rank removes the
 // honest one. The number of branches is bounded instead by who may hold one:
-// below the last checkpoint only a peer this node asked for headers, and only
-// outbound peers are asked (SyncManager.handleHeadersMsg and requestHeaders).
+// while headers-first mode is on, only a peer this node asked for headers and
+// may still ask (SyncManager.handleHeadersMsg, requestHeaders and
+// mayAskForHeaders): an outbound peer, addnode and connect peers included, a
+// whitelisted inbound peer, or the one inbound fallback sync peer while no
+// preferred peer is ahead.
+//
+// What that costs, measured on 2026-10-07 on darwin/arm64: a held header is
+// 240 to 270 bytes of heap, its headerNode (176 bytes) and its entry in the
+// index map, by TestHeaderBranches_MemoryStaysBoundedWithTwentyCappedPeers and
+// by the same measurement at mainnet's cap of 52,000 headers a branch. One
+// full mainnet branch is 12.8 MB. Nine distinct full branches, the default 8
+// outbound peers and the inbound fallback, are 468,000 headers and 126 MB;
+// thirteen, with 4 whitelisted or addnode peers more, are 676,000 headers and
+// 170 MB. Each further outbound or whitelisted peer adds about 13 MB. Honest
+// branches share their headers, so these are the bounds for distinct, fake
+// branches.
 //
 // It is still a cache and not a work queue. Everything in it can be asked for
 // again in one message, so a branch can be dropped at any instant: when its peer
@@ -71,11 +85,12 @@ type headerCache struct {
 	// reapLocked frees them. Guarded by mu; emptied only with fillMu held too.
 	released []*headerNode
 
-	// ownerLive reports whether an owner is still a connected peer. A fill
-	// checks it before installing a branch, so a fill that was running when
-	// its peer left, or that started after, never installs a branch no
-	// DropPeer will come for. nil means every owner is live.
-	ownerLive func(owner any) bool
+	// ownerLive reports whether an owner is still a connected peer this node
+	// may ask for headers at the committed height it is given. A fill checks it
+	// before installing a branch, so a fill that was running when its peer left
+	// or lost the right to be asked, or that started after, never installs a
+	// branch no DropPeer will come for. nil means every owner is live.
+	ownerLive func(owner any, committed int32) bool
 
 	// storeTimeout bounds every blockchain call one fill makes while it holds
 	// fillMu (see headerStoreTimeout).
@@ -254,7 +269,7 @@ const headerStoreTimeout = 30 * time.Second
 
 // WithOwnerLive hands the cache the test a fill uses to decide whether its
 // owner is still connected (see ownerLive) and returns it.
-func (c *headerCache) WithOwnerLive(live func(owner any) bool) *headerCache {
+func (c *headerCache) WithOwnerLive(live func(owner any, committed int32) bool) *headerCache {
 	if c == nil {
 		return nil
 	}
@@ -865,10 +880,11 @@ func (n *headerNode) cached() *cachedHeader {
 func (c *headerCache) installLocked(owner any, plan fillPlan, nodes []*headerNode, result fillResult) fillResult {
 	result.extended = plan.anchor != nil
 
-	// A departed owner gets no branch: DropPeer has already run for it, or
-	// runs after this under mu and finds the branch, because the peer is
-	// marked gone before DropPeer is called.
-	if c.ownerLive != nil && !c.ownerLive(owner) {
+	// A departed owner, or one this node may no longer ask for headers, gets
+	// no branch: DropPeer has already run for it, or runs after this under mu
+	// and finds the branch, because the peer is marked gone, or the sync peer
+	// cleared, before DropPeer is called.
+	if c.ownerLive != nil && !c.ownerLive(owner, plan.floorHeight) {
 		return result
 	}
 

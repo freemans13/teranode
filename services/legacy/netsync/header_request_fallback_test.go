@@ -245,3 +245,42 @@ func TestHeaderRequestRule_AWhitelistedInboundPeerIsPreferred(t *testing.T) {
 	sendHeadersInReplies(t, sm, whitelisted, honest)
 	requireHonestWalkReachedTheCheckpoint(t, sm, whitelisted, honest)
 }
+
+// A fill that was running when the inbound fallback sync peer was demoted does not give it its
+// branch back. The install used to check only that the peer was still connected, so the demoted
+// peer could hold a branch beside the next fallback's, and one inbound branch was not a bound.
+func TestHeaderRequestRule_AFillAfterDemotionGivesTheInboundFallbackNoBranch(t *testing.T) {
+	sm := headerRuleManager(t)
+	sm.headersFirstMode.Store(false)
+
+	honest := mainnetFirstCheckpointHeaders(t)
+
+	fallback := inboundSyncPeer(t, sm, 72, 20000, false)
+	require.True(t, electSyncPeer(sm) == fallback)
+
+	// A second inbound peer for the role to move to.
+	inboundSyncPeer(t, sm, 74, 20000, false)
+
+	_, tip, ok := sm.committedTip()
+	require.True(t, ok)
+
+	// The fill passed the read rule while the peer was the sync peer; it installs after the
+	// demotion, as a fill holding the cache's locks across a store call can.
+	state, ok := sm.peerStates.Get(fallback)
+	require.True(t, ok)
+	sm.demoteSyncPeer(fallback, state)
+	// Compared as pointers: require.NotEqual reads every field of a live peer.
+	require.False(t, sm.loadSyncPeer() == fallback, "the role moved on")
+
+	sm.headerCache.FillFrom(sm.headerOwner(fallback), tip, 1, honest[:wire.MaxBlockHeadersPerMsg])
+
+	_, _, held := sm.headerCache.PeerTop(fallback)
+	require.False(t, held, "the demoted inbound fallback holds no branch")
+	require.Zero(t, sm.headerCache.heldHeaders())
+
+	outbound, _, _ := demotionPeer(t, sm, 73, 20000)
+	sm.headerCache.FillFrom(sm.headerOwner(outbound), tip, 1, honest[:wire.MaxBlockHeadersPerMsg])
+
+	_, _, held = sm.headerCache.PeerTop(outbound)
+	require.True(t, held, "an outbound peer the node may ask still gets one")
+}

@@ -88,19 +88,42 @@ func TestStandbyAnActivePeerWithRoomTakesTheBlock(t *testing.T) {
 	require.Empty(t, placed(slow))
 }
 
-// The set follows the peers connected. With the top three gone, 80% of the 12.2 MB/s left is 9.8,
-// which 8.2 and 2.5 make up between them.
+// The set follows the peers connected. With the top three gone, 80% of the 14.1 MB/s left is
+// 11.3, which 8.2, 2.5 and 1.9 make up between them.
 func TestStandbyPeersTakeOverWhenTheFastOnesGo(t *testing.T) {
 	sm := schedulerManager(t)
 	eight := measuredPeer(t, sm, 1, 1, 8.2*mb)
 	two := measuredPeer(t, sm, 2, 1, 2.5*mb)
-	one := measuredPeer(t, sm, 3, 1, 1.5*mb)
+	nineteen := measuredPeer(t, sm, 3, 1, 1.9*mb)
+	one := measuredPeer(t, sm, 4, 1, 1.5*mb)
 
-	sm.requestBlocks(standbyAssigner([]*assignerPeer{eight, two, one}, nil), []wantedBlock{wantedAt(12), wantedAt(13), wantedAt(14)}, 0)
+	sm.requestBlocks(standbyAssigner([]*assignerPeer{eight, two, nineteen, one}, nil),
+		[]wantedBlock{wantedAt(12), wantedAt(13), wantedAt(14), wantedAt(15)}, 0)
 
 	require.Equal(t, []chainhash.Hash{wantedAt(12).hash}, placed(eight))
 	require.Equal(t, []chainhash.Hash{wantedAt(13).hash}, placed(two), "8.2 alone is short of 80%")
-	require.Empty(t, placed(one), "and 1.5 MB/s is the last fifth")
+	require.Equal(t, []chainhash.Hash{wantedAt(14).hash}, placed(nineteen), "and 8.2 and 2.5 are too")
+	require.Empty(t, placed(one), "1.5 MB/s is the last fifth")
+}
+
+// At least three measured peers stay active, however the bandwidth is shared. One peer with a
+// rate far above the rest, true or inflated, used to make up 80% alone and put every other peer
+// on standby.
+func TestStandbyAtLeastThreePeersStayActive(t *testing.T) {
+	sm := schedulerManager(t)
+	captor := measuredPeer(t, sm, 1, 0, 190*mb)
+	second := measuredPeer(t, sm, 2, 1, 2*mb)
+	third := measuredPeer(t, sm, 3, 1, 1.5*mb)
+	fourth := measuredPeer(t, sm, 4, 1, 1*mb)
+
+	sm.requestBlocks(standbyAssigner([]*assignerPeer{second, third, fourth}, []*assignerPeer{captor}),
+		[]wantedBlock{wantedAt(12), wantedAt(13), wantedAt(14)}, 0)
+
+	require.Equal(t, []chainhash.Hash{wantedAt(12).hash}, placed(second), "190 MB/s is 98% alone, and the next two still take blocks")
+	require.Equal(t, []chainhash.Hash{wantedAt(13).hash}, placed(third))
+	require.Empty(t, placed(fourth), "the fourth peer stands by")
+	require.InDelta(t, 1.5*mb, activeFloorOf([]float64{190 * mb, 2 * mb, 1.5 * mb, 1 * mb}), 0)
+	require.Zero(t, activeFloorOf([]float64{190 * mb, 1 * mb}), "with two measured peers both are active")
 }
 
 // A peer with no measured rate takes blocks, so it gets measured.
@@ -123,8 +146,8 @@ func TestStandbyAPeerIsProbedOnTheFarBlockOnce(t *testing.T) {
 	now := time.Now()
 
 	newPass := func(slow *assignerPeer) *downloadAssigner {
-		fast := measuredPeer(t, sm, 2, 0, 80*mb)
-		a := standbyAssigner([]*assignerPeer{slow}, []*assignerPeer{fast})
+		fast := []*assignerPeer{measuredPeer(t, sm, 2, 0, 80*mb), measuredPeer(t, sm, 3, 0, 70*mb), measuredPeer(t, sm, 4, 0, 60*mb)}
+		a := standbyAssigner([]*assignerPeer{slow}, fast)
 		a.now = now
 
 		return a
@@ -146,9 +169,33 @@ func TestStandbyAPeerIsProbedOnTheFarBlockOnce(t *testing.T) {
 func TestStandbyAProbeIsNeverANearBlock(t *testing.T) {
 	sm := schedulerManager(t)
 	slow := measuredPeer(t, sm, 1, 1, 1*mb)
-	fast := measuredPeer(t, sm, 2, 0, 80*mb)
+	fast := []*assignerPeer{measuredPeer(t, sm, 2, 0, 80*mb), measuredPeer(t, sm, 3, 0, 70*mb), measuredPeer(t, sm, 4, 0, 60*mb)}
 
-	sm.requestBlocks(standbyAssigner([]*assignerPeer{slow}, []*assignerPeer{fast}), []wantedBlock{wantedAt(12), wantedAt(40)}, 0)
+	sm.requestBlocks(standbyAssigner([]*assignerPeer{slow}, fast), []wantedBlock{wantedAt(12), wantedAt(40)}, 0)
 
 	require.Empty(t, placed(slow))
+}
+
+// An active peer that has not claimed the block's height does not come before a standby peer that
+// has. No active peer claims height 12 here, so the block goes to the standby peer at 1 MB/s that
+// claims 5,000, not to the fastest active peer, which claims only 5.
+func TestStandbyAPeerThatClaimsTheHeightComesBeforeAnActivePeerThatDoesNot(t *testing.T) {
+	sm := schedulerManager(t)
+
+	claiming := func(idx uint8, budget int, rate float64, claimed int32) *assignerPeer {
+		p, _ := schedulerPeer(t, sm, idx, claimed)
+		state, ok := sm.peerStates.Get(p)
+		require.True(t, ok)
+
+		return &assignerPeer{peer: p, state: state, budget: budget, rate: rate, measured: true}
+	}
+
+	short := claiming(1, 1, 80*mb, 5)
+	full := []*assignerPeer{claiming(2, 0, 70*mb, 5), claiming(3, 0, 60*mb, 5)}
+	standby := claiming(4, 1, 1*mb, 5000)
+
+	sm.requestBlocks(standbyAssigner([]*assignerPeer{short, standby}, full), []wantedBlock{wantedAt(12)}, 0)
+
+	require.Equal(t, []chainhash.Hash{wantedAt(12).hash}, placed(standby))
+	require.Empty(t, placed(short))
 }

@@ -124,7 +124,17 @@ func TestTheSubtreeDataFileIsWrittenAsAStream(t *testing.T) {
 	got, err := store.Get(ctx, root[:], fileformat.FileTypeSubtreeData)
 	require.NoError(t, err)
 	require.Equal(t, want, got, "the same bytes as the whole-buffer serialization")
-	require.Less(t, n, uint64(len(want))/2, "streamed to the file, never assembled in memory")
+
+	// The race detector allocates for its own bookkeeping: Emit measured up to 4.01 MB under it,
+	// against a bound of len(want)/2, 3.67 MB. Assembling the file in one buffer, the regression
+	// this guards, allocates at least len(want), so that bound still catches it under -race.
+	bound := uint64(len(want)) / 2
+	if raceDetectorEnabled {
+		bound = uint64(len(want))
+	}
+
+	t.Logf("Emit allocated %d bytes against a bound of %d", n, bound)
+	require.Less(t, n, bound, "streamed to the file, never assembled in memory")
 }
 
 // streamingWriter is a subtree writer over a real file store, which is what lets the builder

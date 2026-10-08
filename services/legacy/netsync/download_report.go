@@ -49,7 +49,9 @@ func (r *streamRegistry) noteAdmission(hash chainhash.Hash, wait time.Duration, 
 // the header cache is empty; the line then leaves the height and the lead out rather than
 // claim a block at height 0 hundreds of thousands of blocks behind the chain.
 func (s *blockStream) report(now time.Time, tip int32) (string, bool) {
-	took := now.Sub(s.start)
+	// From the first byte, the admission wait included, as the line reports that wait too.
+	firstByte := s.start.Add(-s.waited)
+	took := now.Sub(firstByte)
 	path := s.path
 
 	if path == "" {
@@ -63,7 +65,7 @@ func (s *blockStream) report(now time.Time, tip int32) (string, bool) {
 
 	requested := "no request on record"
 	if !s.requestedAt.IsZero() {
-		requested = fmt.Sprintf("bytes began %s after it was requested", s.start.Sub(s.requestedAt).Round(time.Second))
+		requested = fmt.Sprintf("bytes began %s after it was requested", firstByte.Sub(s.requestedAt).Round(time.Second))
 	}
 
 	rate := 0.0

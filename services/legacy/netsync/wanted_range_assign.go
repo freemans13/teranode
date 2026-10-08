@@ -48,8 +48,17 @@ func (sm *SyncManager) assignWantedBlocks() {
 
 	// Read here, before wantedBlocks takes headerMu: committedTip makes a
 	// blocking blockchain call, and this package's lock rule has no exception
-	// for one made while the header lock is held.
-	best, _, _ := sm.committedTip()
+	// for one made while the header lock is held. A failed read ends the pass:
+	// its zero height reported to the header cache below would be taken as a
+	// reorg to genesis, moving the floor down, clearing every branch's
+	// diverged mark and unhooking every branch from the tip until the next good
+	// pass, and the range would be named from height 1.
+	best, _, ok := sm.committedTip()
+	if !ok {
+		sm.logger.Debugf("[assignWantedBlocks] the committed tip could not be read; no download pass this time")
+
+		return
+	}
 
 	// The header cache is told the committed height on every pass, not only
 	// after a fill, because most passes here are driven by a commit, not a

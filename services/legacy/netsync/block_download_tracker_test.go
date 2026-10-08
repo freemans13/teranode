@@ -462,3 +462,30 @@ func TestOutstandingAtTip_IgnoresExpiredRecordsAndANilLedger(t *testing.T) {
 	var none *blockDownloadTracker
 	require.Nil(t, none.OutstandingAtTip(blockRequestRetryInterval))
 }
+
+// ReassertOwner re-arms a request it does not send again, so it must not move the time the peer
+// was asked. couldStart times a block from RequestedOf: a moved time made the block start later
+// than the peer could start it, and its rate too high.
+func TestReassertOwnerKeepsTheTimeThePeerWasAsked(t *testing.T) {
+	tr := newBlockDownloadTracker(blockRequestAssignmentTTL)
+	p := newTestPeer(t, "10.0.0.1:8333")
+	h := hashN(41)
+
+	asked := time.Now().Add(-2 * time.Minute)
+	tr.now = func() time.Time { return asked }
+	require.True(t, tr.Add(p, h))
+
+	tr.now = time.Now
+	require.True(t, tr.ReassertOwner(p, h))
+
+	at, ok := tr.RequestedOf(p, h)
+	require.True(t, ok)
+	require.Equal(t, asked, at, "no getdata went out: the request time is the first one")
+	require.True(t, tr.RequestedWithin(h, time.Minute), "the retry window is re-armed")
+
+	// A forgiven record is back-dated for the retry window only.
+	require.Len(t, tr.ForgiveOwners(h, blockRequestRetryInterval), 1)
+
+	at, _ = tr.RequestedOf(p, h)
+	require.Equal(t, asked, at)
+}

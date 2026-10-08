@@ -108,7 +108,11 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 	// n is the block's declared wire payload, header included; r starts after the header, which
 	// the wire layer has already read, so the stream is held to what is left.
-	stream, err := newBlockTxStream(r, n-wire.MaxBlockHeaderPayload)
+	//
+	// yieldReader lets a faster copy stop this one at its next read (conversion_race.go).
+	yr := &yieldReader{r: r}
+
+	stream, err := newBlockTxStream(yr, n-wire.MaxBlockHeaderPayload)
 	if err != nil {
 		return false, err
 	}
@@ -196,7 +200,9 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		}
 
 		// A faster copy of this block may complete first and take over (conversion_race.go).
-		ctl := sm.startConversion(hash)
+		ctl := sm.startConversion(hash, r)
+		yr.ctl = ctl
+
 		defer sm.endConversion(hash, ctl)
 		// Every failure path below has removed this copy's files before it returns, so a copy that
 		// took over can start once this runs. Without it a failed read after a takeover left that
@@ -212,6 +218,17 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 			if streamErr != nil {
 				if errors.Is(streamErr, errBlockTxStreamDone) {
 					break
+				}
+
+				// The read stopped for the takeover (yieldReader), maybe in the middle of a
+				// transaction. A verdict on the bytes this peer sent is still judged: the encoding
+				// is the peer's fault whoever finishes the block. The takeover copy proved the
+				// block's body, so only the peer is judged. The read loop drops its association,
+				// an encoding fault carries no ErrBlockBodyMismatch so nobody is banned, and a
+				// delivery that converted nothing deletes nothing (pipelineBlockDelete). The test
+				// is the wire layer's own (peer/wire_streaming.go readBlockMessage).
+				if ctl.yielding() && !errors.Is(streamErr, errors.ErrBlockInvalid) && !errors.IsBlockCorrupt(streamErr) {
+					return sm.yieldToFasterCopy(hash, writer, stream.r, ctl, r)
 				}
 
 				sm.deleteWrittenOnFailure(hash, writer)

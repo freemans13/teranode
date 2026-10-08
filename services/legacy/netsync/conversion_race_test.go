@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/stretchr/testify/require"
@@ -114,7 +116,7 @@ func TestAFirstCopyThatFinishesFirstIsTheOneKept(t *testing.T) {
 	n := sinkPayloadLen(body)
 
 	// Stand in for a first copy that has claimed the finish.
-	ctl := sm.startConversion(hash)
+	ctl := sm.startConversion(hash, nil)
 	require.True(t, ctl.finish())
 
 	owner := owingPeer(t, sm, hash, 250)
@@ -310,4 +312,169 @@ func requireNoSideFiles(t *testing.T, dir string) {
 	for _, e := range entries {
 		require.False(t, isDuplicateCopyFile(e.Name()), "side file %s left behind", e.Name())
 	}
+}
+
+// midTxOffset is the offset in body of the middle of transaction i: the count varint, the
+// transactions before i, and half of i.
+func midTxOffset(t *testing.T, blk *bsvutil.Block, i int) int {
+	t.Helper()
+
+	txs := blk.Transactions()
+	off := wire.VarIntSerializeSize(uint64(len(txs)))
+
+	for _, tx := range txs[:i] {
+		off += tx.MsgTx().SerializeSize()
+	}
+
+	size := txs[i].MsgTx().SerializeSize()
+	require.Greater(t, size, 2)
+
+	return off + size/2
+}
+
+// A takeover starts at the converting copy's next read, not at its next transaction. A slow
+// peer that trickled the middle of a large transaction kept a complete copy waiting until the
+// transaction ended. Here the slow copy stops in the middle of a transaction, and one more byte
+// is enough to let the complete copy convert.
+func TestATakeoverDoesNotWaitForTheSlowCopysNextTransaction(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.blockPark.dir = t.TempDir()
+
+	blk := wireBlockWithTxs(t, 40, false)
+	pipelineHeaderFixture(t, sm, blk)
+	proveBlockOrigin(t, sm, blk)
+
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+	header := &blk.MsgBlock().Header
+	n := sinkPayloadLen(body)
+	owner := owingPeer(t, sm, hash, 245)
+
+	cut := midTxOffset(t, blk, 20)
+
+	slowR, slowW := io.Pipe()
+	firstDone := make(chan sinkResult, 1)
+
+	go func() {
+		converted, err := sm.pipelineBlockSink(hash, header, slowR, n)
+		firstDone <- sinkResult{converted, err}
+	}()
+
+	_, err := slowW.Write(body[:cut])
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return sm.conversionOf(hash) != nil }, 5*time.Second, 10*time.Millisecond)
+
+	first := sm.conversionOf(hash)
+
+	secondDone := make(chan sinkResult, 1)
+
+	go func() {
+		converted, err := sm.raceDuplicateCopy(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), n, sm.pipelineBlockSink)
+		secondDone <- sinkResult{converted, err}
+	}()
+
+	require.Eventually(t, first.yielding, 5*time.Second, 10*time.Millisecond, "the second copy takes over")
+
+	// One byte more, still in the middle of transaction 20.
+	_, err = slowW.Write(body[cut : cut+1])
+	require.NoError(t, err)
+
+	select {
+	case got := <-secondDone:
+		require.NoError(t, got.err)
+		require.True(t, got.converted, "the complete copy converted while the slow copy was in the middle of a transaction")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the complete copy waited for the slow copy's next transaction")
+	}
+
+	go func() {
+		_, _ = slowW.Write(body[cut+1:])
+		_ = slowW.Close()
+	}()
+
+	got := <-firstDone
+	require.NoError(t, got.err)
+	require.False(t, got.converted)
+
+	_, err = sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err)
+	requireNoSideFiles(t, sm.blockPark.dir)
+}
+
+// A converting copy whose peer sends no byte at all cannot get to its next read. The complete copy
+// waits takeoverStallTimeout for it and then disconnects that peer, which ends its read, and then
+// converts. It used to wait until shutdown.
+func TestATakeoverDisconnectsAConvertingCopyThatSendsNoByte(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.blockPark.dir = t.TempDir()
+
+	timer := make(chan time.Time, 1)
+
+	var waited []time.Duration
+
+	sm.takeoverAfter = func(d time.Duration) <-chan time.Time {
+		waited = append(waited, d)
+
+		return timer
+	}
+
+	blk := wireBlockWithTxs(t, 40, false)
+	pipelineHeaderFixture(t, sm, blk)
+	proveBlockOrigin(t, sm, blk)
+
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+	header := &blk.MsgBlock().Header
+	n := sinkPayloadLen(body)
+	slowPeer := owingPeer(t, sm, hash, 246)
+	owner := owingPeer(t, sm, hash, 247)
+
+	slowR, slowW := io.Pipe()
+	firstDone := make(chan sinkResult, 1)
+
+	go func() {
+		converted, err := sm.pipelineBlockSink(hash, header, peerpkg.NewDeliveryReader(slowR, slowPeer), n)
+		firstDone <- sinkResult{converted, err}
+	}()
+
+	_, err := slowW.Write(body[:midTxOffset(t, blk, 20)])
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return sm.conversionOf(hash) != nil }, 5*time.Second, 10*time.Millisecond)
+
+	first := sm.conversionOf(hash)
+	require.Eventually(t, first.reading, 5*time.Second, 10*time.Millisecond, "the slow copy waits for its peer's next byte")
+
+	secondDone := make(chan sinkResult, 1)
+
+	go func() {
+		converted, err := sm.raceDuplicateCopy(hash, header, peerpkg.NewDeliveryReader(bytes.NewReader(body), owner), n, sm.pipelineBlockSink)
+		secondDone <- sinkResult{converted, err}
+	}()
+
+	require.Eventually(t, first.yielding, 5*time.Second, 10*time.Millisecond, "the second copy takes over")
+	require.True(t, slowPeer.Connected(), "the slow peer is kept until the bound")
+
+	timer <- time.Now()
+
+	require.True(t, WaitUntil(func() bool { return !slowPeer.Connected() }, 5*time.Second), "at the bound the peer that sends no byte is disconnected")
+	require.Equal(t, []time.Duration{takeoverStallTimeout}, waited)
+	require.True(t, owner.Connected(), "the peer of the complete copy is kept")
+
+	// The disconnect closes the socket the slow copy reads, as here.
+	_ = slowW.CloseWithError(io.ErrClosedPipe)
+
+	got := <-secondDone
+	require.NoError(t, got.err)
+	require.True(t, got.converted, "the complete copy converted")
+
+	got = <-firstDone
+	require.False(t, got.converted)
+
+	_, err = sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err)
+	requireNoSideFiles(t, sm.blockPark.dir)
 }

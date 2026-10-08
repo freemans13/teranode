@@ -28,10 +28,11 @@ type downloadWaste struct {
 	droppedOwing     atomic.Int64
 	blocksOwedAtDrop atomic.Int64
 	// reAskedQuiet is blocks made askable of another peer because the peers owing them sent no
-	// block bytes for the retry window. It is the one routine way a block reaches a second peer.
+	// block bytes for the retry window. With reAskedQueued and the frontier race, these are the
+	// routine ways a block reaches a second peer.
 	reAskedQuiet atomic.Int64
-	// reAskedQueued is blocks asked of a second peer because they waited behind a slow peer's
-	// queue and would have made the chain wait (see THE QUEUED RE-ASK).
+	// reAskedQueued is blocks asked of another peer because every owner would deliver them later
+	// than the chain needs them: behind a slow queue, or arriving slowly (see THE QUEUED RE-ASK).
 	reAskedQueued atomic.Int64
 
 	// lastReceived and lastAt are the received total at the previous report, for its rate. Only

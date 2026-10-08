@@ -105,3 +105,35 @@ func TestHeaderRequestRule_OneHeadersMessageReadsTheTipOnce(t *testing.T) {
 	require.Zero(t, sm.headerCache.heldHeaders(), "a batch that connects to nothing is held nowhere")
 	require.True(t, peer.Connected())
 }
+
+// A download pass whose read of the committed tip fails does nothing. It used to report height
+// zero to the header cache as the tip, which the cache takes as a reorg to genesis: the floor
+// moved down from 11,000 and the honest branch above it no longer connected to it.
+func TestAssignWantedBlocks_AFailedTipReadLeavesTheHeaderCacheAlone(t *testing.T) {
+	sm := windowManager(t)
+	honest := mainnetFirstCheckpointHeaders(t)
+
+	outbound, rec, _ := demotionPeer(t, sm, 102, 20000)
+	askForHeaders(t, sm, outbound)
+	sendHeadersInReplies(t, sm, outbound, honest[windowCheckpoint:])
+
+	top, ok := sm.headerCache.Top()
+	require.True(t, ok)
+	require.Equal(t, int32(11111), top)
+
+	client := wrapTipFaults(sm)
+	client.failures.Store(1)
+
+	sm.assignWantedBlocks()
+
+	top, ok = sm.headerCache.Top()
+	require.True(t, ok, "the branch still connects to the committed tip")
+	require.Equal(t, int32(11111), top)
+
+	sm.headerCache.mu.Lock()
+	floor := sm.headerCache.floorHeight
+	sm.headerCache.mu.Unlock()
+	require.Equal(t, int32(windowCheckpoint), floor, "the floor is still the committed tip")
+	require.Zero(t, rec.count(), "and nobody was asked for a block")
+	require.Equal(t, int32(1), client.calls.Load(), "the pass read the tip once and stopped")
+}

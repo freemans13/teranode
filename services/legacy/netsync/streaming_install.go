@@ -156,9 +156,15 @@ func (sm *SyncManager) admitPipelineSink(inner func(chainhash.Hash, *wire.BlockH
 		acquireCtx, cancel := context.WithTimeout(sm.ctx, sm.pipelineAdmissionAcquireTimeout())
 		defer cancel()
 
+		// The copy's clock and its owner's silence stop while it waits here: the race and the
+		// rate decay do not judge it, and both start again when the slot is granted (admit).
+		sm.streams.awaitAdmissionOf(r)
+
 		acquireStart := time.Now()
 		err := sm.AcquireBlockPrefetch(acquireCtx, hash)
 		admitWait := time.Since(acquireStart)
+
+		sm.streams.admitOf(r, time.Now())
 
 		switch {
 		case err == nil:
