@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/url"
@@ -528,6 +529,46 @@ func (bst *blockSizeTracker) largestRecentSize() int64 {
 	}
 
 	return largest
+}
+
+// seedBlockSizes fills the size tracker with the sizes of the last largestSizeSamples blocks of the
+// chain, oldest first, before the first download pass. Without it the tracker held only the blocks
+// completed since the start: on 2026-10-08 after a restart its largest block was 193 MB at heights
+// where blocks are up to 4 GB, and the deadline rule gave a 4 MB/s peer 16 far blocks that each
+// took more than an hour. A failed read leaves the tracker empty; the deadline rule then places
+// blocks fastest first until a block completes.
+func (sm *SyncManager) seedBlockSizes(ctx context.Context) {
+	if sm.blockchainClient == nil || sm.blockSizeTracker == nil {
+		return
+	}
+
+	tip, _, err := sm.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil || tip == nil {
+		sm.logger.Warnf("[legacy] could not read the tip to seed the block sizes: %v", err)
+
+		return
+	}
+
+	_, metas, err := sm.blockchainClient.GetBlockHeaders(ctx, tip.Hash(), largestSizeSamples)
+	if err != nil {
+		sm.logger.Warnf("[legacy] could not read the last %d block sizes: %v", largestSizeSamples, err)
+
+		return
+	}
+
+	seeded := 0
+
+	for i := len(metas) - 1; i >= 0; i-- {
+		if metas[i] == nil || metas[i].SizeInBytes == 0 || metas[i].SizeInBytes > math.MaxInt64 {
+			continue
+		}
+
+		sm.blockSizeTracker.addBlockSize(int64(metas[i].SizeInBytes))
+		seeded++
+	}
+
+	sm.logger.Infof("[legacy] seeded the block size tracker with %d block sizes from the chain: largest %.0f MB, mean of the last 10 %.0f MB",
+		seeded, float64(sm.blockSizeTracker.largestRecentSize())/1e6, float64(sm.blockSizeTracker.getAverageSize())/1e6)
 }
 
 // getAverageSize returns the current rolling average block size.
@@ -4365,6 +4406,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 			sm.logger.Infof("[legacy] remembered the download rates of %d peer addresses from %s", len(rates), sm.peerRatesPath)
 		}
 	}
+
+	// Before the first download pass: the deadline rule needs the block sizes of this part of the
+	// chain, not only of the blocks that complete after the start.
+	sm.seedBlockSizes(ctx)
 
 	// Now the park exists, the wire layer can be told where to put a block body
 	// it reads straight off the socket. Before this call the streaming handler

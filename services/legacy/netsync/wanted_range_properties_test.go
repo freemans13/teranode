@@ -255,6 +255,8 @@ func TestNew_CommittedTipReadsTheChainThroughTheConstructor(t *testing.T) {
 	// of what this test is pinning; without a stub the mock panics the whole
 	// test binary the first time it fires.
 	client.Mock.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(false, nil)
+	// New seeds the block-size tracker from the last blocks of the chain (seedBlockSizes).
+	client.Mock.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil)
 
 	config := &Config{
 		ChainParams: &chaincfg.MainNetParams,
