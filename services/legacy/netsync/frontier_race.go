@@ -47,7 +47,7 @@ import (
 // than 30, one re-ask per owner per retry window rather than three parallel fetches.
 // blockRequestRetryInterval's comment explains what an SV Node peer is doing while it is quiet. Do
 // not extend the race to it. A block that has not started because it waits behind other blocks
-// at a peer that is busy, neither quiet nor struggling on it, is the queued re-ask's
+// at a peer that is busy, neither quiet nor struggling on it, is the rescue rule's
 // (queued_reask.go), which runs on this ticker, keeps the owner, and shares the race's mark.
 
 const (
@@ -66,7 +66,7 @@ const (
 	// raceExpiry; the race drops a block's peers at most once in raceExpiry (maybeRaceSlowBlock).
 	raceExpiry = 10 * time.Minute
 	// maxBlockCopies is the most live copies of one block at once: the first request and at most
-	// two extra copies, from the race or the queued re-ask. A live copy is an owner not let off
+	// two extra copies, from the race or the rescue rule. A live copy is an owner not let off
 	// the block, or one sending it now (liveCopies); a forgiven owner sending nothing is not a
 	// copy. SV Node fetches the first in-flight block from up to DEFAULT_MAX_BLOCK_PARALLEL_FETCH
 	// (3) peers (net/net.h:167). It asks for another copy only when every connected peer the
@@ -197,7 +197,7 @@ type streamRegistry struct {
 	active map[*blockStream]struct{}
 	rates  map[*peerpkg.Peer]float64
 	// raced is each block's race history over the last raceExpiry: when extra copies were asked
-	// for, by the race or the queued re-ask, and when the race last dropped its copies.
+	// for, by the race or the rescue rule, and when the race last dropped its copies.
 	raced map[chainhash.Hash]*raceHistory
 	// lastBlock is when each peer last finished delivering a block.
 	lastBlock map[*peerpkg.Peer]time.Time
@@ -211,7 +211,7 @@ type streamRegistry struct {
 	remembered map[string]float64
 }
 
-// raceHistory is what the race and the queued re-ask did for one block in the last raceExpiry. It is
+// raceHistory is what the race and the rescue rule did for one block in the last raceExpiry. It is
 // kept apart from the ledger: a dropped peer leaves the ledger (ClearPeer), so the live owners
 // cannot tell how many copies a block has already cost.
 type raceHistory struct {
@@ -729,7 +729,7 @@ func (r *streamRegistry) rememberedRates() map[string]float64 {
 	return out
 }
 
-// wasRaced reports whether h had an extra copy asked for, by the race or by the queued re-ask,
+// wasRaced reports whether h had an extra copy asked for, by the race or by the rescue rule,
 // which share the mark, less than raceSlowFetchAfter ago. The newest copy then has not had SV
 // Node's slow-fetch time, and no further copy is asked for.
 func (r *streamRegistry) wasRaced(h chainhash.Hash, now time.Time) bool {
@@ -1150,7 +1150,7 @@ func (sm *SyncManager) runFrontierRace() {
 			sm.streams.sampleStreams(time.Now())
 			sm.decayQuietRates(time.Now())
 			sm.maybeRaceSlowBlock(time.Now())
-			sm.maybeReaskQueuedBlock(time.Now())
+			sm.maybeRescueLowestBlock(time.Now())
 
 			if ticks++; ticks%queueReportEvery == 0 {
 				sm.logDownloadQueues()
@@ -1304,7 +1304,7 @@ func (sm *SyncManager) dropStallingCopies(s *blockStream, stalling []*peerpkg.Pe
 
 // liveCopies is the owners of h with a live copy: an owner not let off the block, or one whose
 // copy is arriving now. A forgiven owner sending nothing will not deliver (ownerArrival reads it as
-// far off). Counting it held the race and the queued re-ask off a block whose only copy was
+// far off). Counting it held the race and the rescue rule off a block whose only copy was
 // stalling, and leaving it out of the peers to ask let the race find nobody to ask.
 func (sm *SyncManager) liveCopies(h chainhash.Hash, owners []*peerpkg.Peer) []*peerpkg.Peer {
 	active, _ := sm.blockDownloads.ActiveOwners(h)
@@ -1400,9 +1400,9 @@ func (sm *SyncManager) logDownloadQueues() {
 	}
 
 	w := &sm.waste
-	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d, behind a slow queue or arriving late %d",
+	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d, rescued %d",
 		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.localFaultDrained.Load(), w.streamsFailed.Load(),
-		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load(), w.reAskedQueued.Load())
+		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load(), w.rescued.Load())
 }
 
 // publishDownloadMetrics sets the download gauges, blocks owed, heights the header cache names

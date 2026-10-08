@@ -28,12 +28,12 @@ type downloadWaste struct {
 	droppedOwing     atomic.Int64
 	blocksOwedAtDrop atomic.Int64
 	// reAskedQuiet is blocks made askable of another peer because the peers owing them sent no
-	// block bytes for the retry window. With reAskedQueued and the frontier race, these are the
+	// block bytes for the retry window. With rescued and the frontier race, these are the
 	// routine ways a block reaches a second peer.
 	reAskedQuiet atomic.Int64
-	// reAskedQueued is blocks asked of another peer because every owner would deliver them later
-	// than the chain needs them: behind a slow queue, or arriving slowly (see THE QUEUED RE-ASK).
-	reAskedQueued atomic.Int64
+	// rescued is blocks asked of another peer because their owner would land them later than the
+	// chain needs them: behind a slow queue, or arriving slowly (see THE RESCUE RULE).
+	rescued atomic.Int64
 
 	// lastReceived and lastAt are the received total at the previous report, for its rate. Only
 	// the report reads and writes them, from one goroutine.
