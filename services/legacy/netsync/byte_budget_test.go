@@ -69,8 +69,9 @@ func TestEveryPeerHoldsTwoRequestsUnderTheBackstop(t *testing.T) {
 	sm, a, aRec, _, bRec := budgetManager(t)
 	recentBlocks(sm, 1<<30)
 
-	// 99 GiB is arriving from a third peer already: under the backstop.
-	sm.streams.start(chainhash.Hash{0xe2}, 0, newTestPeer(t, "10.0.0.9:8333"), 99<<30, time.Now())
+	// 95 GiB is arriving from a third peer already: with the four blocks this pass gives, each at
+	// the 1 GiB mean, still under the backstop.
+	sm.streams.start(chainhash.Hash{0xe2}, 0, newTestPeer(t, "10.0.0.9:8333"), 95<<30, time.Now())
 
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
@@ -162,11 +163,11 @@ func TestAPeerHoldsAtMostTwoLargeBlocks(t *testing.T) {
 	require.Equal(t, 2, bRec.count())
 }
 
-// Each block goes to the peer that lands it first, counting what that peer already owes. With 200
-// MB blocks and no pace yet, block 0 lands at 50 MB/s in 4 s; block 1 lands at 30 MB/s in 6.7 s,
-// earlier than 8 s behind block 0 at 50 MB/s; block 2 at 50 MB/s in 8 s. Block 3 lands first at
-// the 50 MB/s peer, which is full, and waits for it (THE DEADLINE RULE).
-func TestEachBlockGoesToItsEarliestArrival(t *testing.T) {
+// Each block goes to the peer with the lowest (blocks owed + 1) / rate (THE SIMPLE SCHEDULE): block
+// 0 to the 50 MB/s peer (1/50), block 1 to the 30 MB/s peer (1/30 against 2/50), block 2 to the
+// 50 MB/s peer (2/50 against 2/30), and block 3 to the 30 MB/s peer, because the other is full. No
+// block waits.
+func TestEachBlockGoesToThePeerWithTheLowestRank(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xe7}
@@ -181,10 +182,9 @@ func TestEachBlockGoesToItsEarliestArrival(t *testing.T) {
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 3 }, 5*time.Second))
-	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 3 }, 300*time.Millisecond))
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 4 }, 5*time.Second))
 	require.Equal(t, []chainhash.Hash{hashes[0], hashes[2]}, bRec.all())
-	require.Equal(t, hashes[1:2], aRec.all())
+	require.Equal(t, []chainhash.Hash{hashes[1], hashes[3]}, aRec.all())
 }
 
 // At 07:35Z on 2026-09-24 three peers sat idle with 7 blocks parked and 5 owed: the pass trimmed

@@ -1,9 +1,7 @@
 package netsync
 
 import (
-	"math"
 	"sort"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -28,23 +26,10 @@ type assignerPeer struct {
 	// peers when it has none. The lowest block goes to the fastest peer with room.
 	rate float64
 	// measured says rate is the peer's own, not the median it was lent. Only a measured peer is
-	// judged on whether it would deliver in time.
+	// ranked by the schedule (THE SIMPLE SCHEDULE).
 	measured bool
 	// owed is how many blocks the peer owes, with each block this pass gives it.
 	owed int
-	// backlog is how long the peer needs for what it already owes: the bytes still to come on what
-	// it is sending and a typical block for each block queued behind that, at rate. Each block
-	// this pass gives it adds a typical block.
-	backlog time.Duration
-}
-
-// eta is when a block given to p now would land: its backlog and one typical block.
-func (p *assignerPeer) eta(typical int64) time.Duration {
-	if p.rate <= 0 {
-		return time.Duration(math.MaxInt64)
-	}
-
-	return p.backlog + time.Duration(float64(typical)/p.rate*float64(time.Second))
 }
 
 // unmeasuredPeerDepth is the most blocks a peer is given before its rate is known. A peer sends its
@@ -121,22 +106,17 @@ type downloadAssigner struct {
 	peers []*assignerPeer
 	// remaining is the node-wide budget left in this pass.
 	remaining int
-	// overBackstop says the bytes really held ahead of the chain have reached parkBackstopBytes,
-	// so nothing above the highest held block is asked for in this pass. Blocks below it fill
-	// gaps and are never stopped: filling a gap is what lets the park drain.
-	overBackstop bool
+	// held is the bytes held in front of the chain at the start of the pass, parked and arriving;
+	// given is the blocks the pass gave; mean is the recent mean block size (overBackstop).
+	held  int64
+	given int
+	mean  int64
 	// full holds the eligible peers with no room left, for fastestAvoiding: a block re-asked
 	// because its owner went quiet may go to one of them.
 	full []*assignerPeer
 
-	// tip and pace give each block its deadline (THE DEADLINE RULE): the committed height, and the
-	// blocks a second the chain applies when it does not wait (commitRateTracker.pace).
-	tip  int32
-	pace float64
-	// size is the largest recent block, which each new block counts at; typical is the recent mean,
-	// which each block a peer already owes counts at.
-	size    int64
-	typical int64
+	// tip is the committed height.
+	tip int32
 	// far is the highest unowned blocks of the full download window, for peers with no rate
 	// (placeUnmeasured). The candidates of a pass are the lowest unowned blocks, and on 2026-10-08
 	// they held no far block to measure a new peer on.
@@ -244,7 +224,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// arriving holds nothing and is not counted. It used to count at the
 	// largest recent block, and after a 2.3 GB block on 2026-09-25 that filled
 	// the budget with bytes that did not exist while four of eight peers idled.
-	overBackstop := sm.bytesAhead(largest) >= parkBackstopBytes
+	held := sm.bytesAhead(largest)
 
 	peers := make([]*assignerPeer, 0, fanout)
 	assignable := 0
@@ -252,20 +232,6 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	var full []*assignerPeer
 
 	fallbackRate := sm.streams.medianRate()
-	typical := sm.blockSizeTracker.getAverageSize()
-
-	// backlogOf is how long p needs for what it owes now; see assignerPeer.backlog.
-	backlogOf := func(p *peerpkg.Peer, rate float64) time.Duration {
-		if rate <= 0 || typical <= 0 {
-			return 0
-		}
-
-		sending, arriving := sm.streams.pending(p)
-		queued := max(0, sm.blockDownloads.CountForPeer(p)-arriving)
-		bytes := float64(sending + int64(queued)*typical)
-
-		return time.Duration(bytes / rate * float64(time.Second))
-	}
 
 	for _, candidate := range eligible {
 		if len(peers) == fanout {
@@ -280,18 +246,17 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		}
 
 		depth := sm.peerQueueDepth(candidate.peer, perPeer)
-		backlog := backlogOf(candidate.peer, rate)
 
 		owed := sm.blockDownloads.CountForPeer(candidate.peer)
 
 		budget := depth - owed
 		if budget <= 0 {
-			full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate, measured: measured, backlog: backlog, owed: owed})
+			full = append(full, &assignerPeer{peer: candidate.peer, state: candidate.state, rate: rate, measured: measured, owed: owed})
 
 			continue
 		}
 
-		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, rate: rate, measured: measured, backlog: backlog, owed: owed})
+		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget, rate: rate, measured: measured, owed: owed})
 		assignable += budget
 	}
 
@@ -307,8 +272,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	// not the whole node-wide window: at the default window of 1024 and one peer
 	// able to take 16, sizing the round by the window would make 1024 round trips
 	// to place 16 blocks, on every arriving block.
-	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), overBackstop: overBackstop, full: full,
-		pace: sm.commitRate.pace(), size: largest, typical: typical}
+	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable), full: full, held: held, mean: sm.blockSizeTracker.meanRecentSize()}
 }
 
 // bytesAhead is how many bytes of blocks the node really holds ahead of the chain: parked blocks
@@ -506,6 +470,7 @@ func (a *downloadAssigner) recordRequest(p *assignerPeer, hash *chainhash.Hash, 
 	}
 
 	p.charge()
+	a.given++
 
 	// A re-ask placed over a full peer's depth does not use the pass's room.
 	if !overDepth {

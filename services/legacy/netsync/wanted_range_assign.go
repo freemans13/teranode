@@ -114,29 +114,8 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// blocks parked and five owed.
 	candidates := sm.unownedBlocksUpTo(wanted, assigner.remaining)
 
-	// The lowest candidates can all be due before a slow peer could land one, and then the slow
-	// peers stay idle (2026-10-08 10:59 to 12:11: six of seven peers idle). The blocks from the
-	// first height a measured peer with room can land in time are candidates too, from the full
-	// window; the deadline rule gives each to the slowest peer that is in time.
-	if from, ok := assigner.inTimeFrom(); ok && sm.headersFirstMode.Load() {
-		var last int32
-		if len(candidates) > 0 {
-			last = candidates[len(candidates)-1].height
-		}
-
-		beyond := make([]wantedBlock, 0, len(wanted))
-
-		for _, block := range wanted {
-			if block.height > last && block.height >= from {
-				beyond = append(beyond, block)
-			}
-		}
-
-		candidates = append(candidates, sm.unownedBlocksUpTo(beyond, assigner.remaining)...)
-	}
-
 	// The far blocks for peers with no rate, from the top of the full window (placeUnmeasured).
-	if n := assigner.unmeasuredWithRoom(); n > 0 && sm.headersFirstMode.Load() {
+	if n := assigner.unmeasuredWithRoom(); n > 0 {
 		top := make([]wantedBlock, 0, len(wanted))
 		for i := len(wanted) - 1; i >= 0; i-- {
 			top = append(top, wanted[i])
@@ -527,7 +506,7 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 		// stopped the one missing block above the tip being asked for, and the
 		// chain stopped with them.
 		extends := block.height > highestHeld
-		if assigner.overBackstop && extends {
+		if extends && assigner.overBackstop() {
 			return
 		}
 
@@ -547,14 +526,7 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 		if block.reAsked {
 			target, ok = assigner.fastestAvoiding(block.height, owes)
 		} else {
-			var wait bool
-
-			target, ok, wait = assigner.deadlinePick(block.height, owes)
-			if !ok && wait {
-				// Left for the earliest arrival, which is full now, rather than given to a
-				// peer that would land it later; see THE DEADLINE RULE.
-				continue
-			}
+			target, ok = assigner.schedulePick(block.height, owes)
 		}
 
 		if !ok {
@@ -605,7 +577,6 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 			return
 		}
 
-		target.queue(assigner.typical)
 	}
 }
 
