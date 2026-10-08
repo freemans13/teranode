@@ -338,7 +338,7 @@ func TestAnUnmeasuredPeerGetsOneBlock(t *testing.T) {
 	var nonce uint32
 
 	anchor := chainhash.Hash{0xef}
-	msg, _ := linkedHeaders(anchor, 40, &nonce)
+	msg, _ := linkedHeaders(anchor, 200, &nonce)
 
 	sm, a, aRec, b, bRec := budgetManager(t)
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 16
@@ -362,9 +362,9 @@ func TestAnUnmeasuredPeerGetsOneBlock(t *testing.T) {
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 
-	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec, cRec) == 33 }, 5*time.Second),
-		"a and b take 16 each, c one: got %d, %d, %d", aRec.count(), bRec.count(), cRec.count())
-	require.Equal(t, 1, cRec.count(), "unmeasured, so one until its speed is known")
-	require.Equal(t, 16, aRec.count())
-	require.Equal(t, 16, bRec.count())
+	require.True(t, WaitUntil(func() bool { return cRec.count() == 1 }, 5*time.Second),
+		"c gets one block: got %d, %d, %d", aRec.count(), bRec.count(), cRec.count())
+	require.False(t, WaitUntil(func() bool { return cRec.count() > 1 }, 300*time.Millisecond), "unmeasured, so one until its speed is known")
+	require.Positive(t, aRec.count())
+	require.Positive(t, bRec.count())
 }

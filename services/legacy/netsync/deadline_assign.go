@@ -4,6 +4,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
@@ -122,43 +123,49 @@ func (a *downloadAssigner) deadlinePick(height int32, avoid func(*peerpkg.Peer) 
 		return p, ok, false
 	}
 
-	if earliest.budget <= 0 {
+	if earliest.budget <= 0 || earliest.owed >= lateQueueLimit {
 		return nil, false, true
 	}
 
 	return earliest, true, false
 }
 
-// placeUnmeasured gives each peer with no rate and room the highest candidate of the pass, before
-// the deadline rule places the others, so it is measured on a block the chain will not need soon.
-// It gives no block the chain needs before a measured peer could land it.
-// It gives nothing when no peer has a rate: then each peer takes one block in height sequence.
-// It returns the candidates left. On 2026-10-08 after a restart, blocks near the tip given to
-// unmeasured peers at 0.0 MB/s let the chain apply 4 blocks in 10 minutes.
+// lateQueueLimit is the most blocks a peer may owe and still be given a block it cannot land in
+// time. A peer sends its queue in order, so each late block queued at it is later again. On
+// 2026-10-08 after a restart the only measured peer ran at 3.9 MB/s and, as the earliest arrival
+// for each near block, took 16 blocks of up to 4 GB. Two keeps the peer busy while SV Node reads
+// the next block from disk before its first byte (PopulateBlockIndexBlockDiskMetaDataNL).
+const lateQueueLimit = 2
+
+// unmeasuredMinLead is the least time before the chain needs a block for it to go to a peer with
+// no rate: a copy gets a rate after liveRateWindow of transfer, and the rescue rule examines a block
+// raceSlowFetchAfter after its getdata.
+const unmeasuredMinLead = liveRateWindow + raceSlowFetchAfter
+
+// placeUnmeasured gives each peer with no rate and room one far block, before the deadline rule
+// places the others, so it is measured on a block the chain will not need soon. The block is the
+// highest unowned block of the full window (a.far) or else of the pass's candidates, and only one
+// the chain needs unmeasuredMinLead or more from now; with no pace yet, any. It gives nothing when no
+// peer has a rate: then each peer takes one block in height sequence. It returns the candidates
+// left. On 2026-10-08 after a restart, blocks near the tip given to unmeasured peers at 0.0 MB/s
+// let the chain apply 4 blocks in 10 minutes.
 func (sm *SyncManager) placeUnmeasured(a *downloadAssigner, candidates []wantedBlock, highestHeld int32) []wantedBlock {
 	if a == nil || !a.anyMeasured() {
 		return candidates
 	}
 
-	// The earliest a measured peer can land a block. A candidate the chain needs before that is a
-	// near block, not a block to measure a new peer on: when the measured peers are full, the
-	// highest candidate of the pass can be the next block the chain needs.
-	soonest := time.Duration(math.MaxInt64)
-
-	for _, set := range [][]*assignerPeer{a.peers, a.full} {
-		for _, p := range set {
-			if p.measured {
-				soonest = min(soonest, p.arrival(a.size))
-			}
+	far := a.far
+	if len(far) == 0 {
+		far = []wantedBlock{}
+		for i := len(candidates) - 1; i >= 0; i-- {
+			far = append(far, candidates[i])
 		}
 	}
 
-	for _, p := range a.peers {
-		if len(candidates) == 0 || a.remaining <= 0 {
-			break
-		}
+	placedHashes := make(map[chainhash.Hash]struct{})
 
-		if a.deadline(candidates[len(candidates)-1].height) < soonest {
+	for _, p := range a.peers {
+		if len(far) == 0 || a.remaining <= 0 {
 			break
 		}
 
@@ -166,7 +173,11 @@ func (sm *SyncManager) placeUnmeasured(a *downloadAssigner, candidates []wantedB
 			continue
 		}
 
-		block := candidates[len(candidates)-1]
+		block := far[0]
+		if a.pace > 0 && a.deadline(block.height) < unmeasuredMinLead {
+			break
+		}
+
 		if a.overBackstop && block.height > highestHeld {
 			break
 		}
@@ -182,10 +193,40 @@ func (sm *SyncManager) placeUnmeasured(a *downloadAssigner, candidates []wantedB
 			continue
 		}
 
-		candidates = candidates[:len(candidates)-1]
+		far = far[1:]
+		placedHashes[block.hash] = struct{}{}
 
 		sm.logger.Infof("[deadline] %s has no rate yet: asked it for block %d, %s before the chain needs it", p.peer, block.height, a.deadline(block.height).Round(time.Second))
 	}
 
-	return candidates
+	if len(placedHashes) == 0 {
+		return candidates
+	}
+
+	left := candidates[:0:0]
+	for _, c := range candidates {
+		if _, ok := placedHashes[c.hash]; !ok {
+			left = append(left, c)
+		}
+	}
+
+	return left
+}
+
+// unmeasuredWithRoom is how many peers of the pass have no rate and room, when one or more peers
+// have a rate: the number of far blocks placeUnmeasured can give.
+func (a *downloadAssigner) unmeasuredWithRoom() int {
+	if a == nil || !a.anyMeasured() {
+		return 0
+	}
+
+	n := 0
+
+	for _, p := range a.peers {
+		if !p.measured && p.budget > 0 {
+			n++
+		}
+	}
+
+	return n
 }

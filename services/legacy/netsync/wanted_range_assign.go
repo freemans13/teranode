@@ -113,7 +113,18 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// held blocks to look at, and on 2026-09-24 three peers sat idle with seven
 	// blocks parked and five owed.
 	candidates := sm.unownedBlocksUpTo(wanted, assigner.remaining)
-	if len(candidates) == 0 {
+
+	// The far blocks for peers with no rate, from the top of the full window (placeUnmeasured).
+	if n := assigner.unmeasuredWithRoom(); n > 0 && sm.headersFirstMode.Load() {
+		top := make([]wantedBlock, 0, len(wanted))
+		for i := len(wanted) - 1; i >= 0; i-- {
+			top = append(top, wanted[i])
+		}
+
+		assigner.far = sm.unownedBlocksUpTo(top, n)
+	}
+
+	if len(candidates) == 0 && len(assigner.far) == 0 {
 		return
 	}
 
