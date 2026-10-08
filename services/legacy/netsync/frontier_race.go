@@ -1429,8 +1429,8 @@ func (sm *SyncManager) publishDownloadMetrics() {
 // logSchedulerQueues is logDownloadQueues' per-peer lines and summary, for the headers-first
 // scheduler.
 func (sm *SyncManager) logSchedulerQueues() {
-
 	largest := sm.blockSizeTracker.largestRecentSize()
+	typical := sm.blockSizeTracker.getAverageSize()
 	eligible := sm.eligibleBlockPeers()
 	idle, short := 0, 0
 	depth := sm.streamingPeerDepth()
@@ -1438,6 +1438,7 @@ func (sm *SyncManager) logSchedulerQueues() {
 	for _, bp := range eligible {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
 		remaining, sending := sm.streams.pending(bp.peer)
+		rate := sm.streams.peerRate(bp.peer)
 
 		peerDepth := sm.peerQueueDepth(bp.peer, depth)
 
@@ -1449,10 +1450,18 @@ func (sm *SyncManager) logSchedulerQueues() {
 			short++
 		}
 
-		sm.logger.Infof("[downloadQueue] %s owes %d of %d, sending %d with %.0f MB left, rate %.1f MB/s",
-			bp.peer, owed, peerDepth, sending, float64(remaining)/1e6, sm.streams.peerRate(bp.peer)/1e6)
+		// When a new block of the largest recent size would land at this peer: what the deadline
+		// rule compares with each block's deadline.
+		landing := "unknown, no rate"
+		if rate > 0 {
+			bytes := float64(remaining + int64(max(0, owed-sending))*typical + largest)
+			landing = time.Duration(bytes / rate * float64(time.Second)).Round(time.Second).String()
+		}
+
+		sm.logger.Infof("[downloadQueue] %s owes %d of %d, sending %d with %.0f MB left, rate %.1f MB/s, a %.0f MB block lands in %s",
+			bp.peer, owed, peerDepth, sending, float64(remaining)/1e6, rate/1e6, float64(largest)/1e6, landing)
 	}
 
-	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below their speed-scaled depth of up to %d requests; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
-		len(eligible), idle, short, depth, float64(sm.bytesAhead(largest))/1e9, float64(parkBackstopBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
+	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below the cap of %d requests; pace %.2f blocks/s; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
+		len(eligible), idle, short, depth, sm.commitRate.pace(), float64(sm.bytesAhead(largest))/1e9, float64(parkBackstopBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
 }
