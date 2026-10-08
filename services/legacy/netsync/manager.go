@@ -728,16 +728,7 @@ type SyncManager struct {
 	// assignMu runs download passes one at a time. Commits, arrivals, header replies and the
 	// park sweep each start one, and two running together could both find the same block
 	// unowned and both ask for it. It is taken before headerMu and never while holding it.
-	assignMu sync.Mutex
-	// warmupStarted is when a download pass first found the download warming up, in unix
-	// nanoseconds, or zero (downloadWarming). A pass that finds enough peers measured sets it
-	// back to zero, so the next warm-up starts its own limit.
-	warmupStarted atomic.Int64
-	// benchProbes is when each standby peer was last given a probe block (probeBenchedPeers,
-	// standby_peers.go).
-	// Read and written only by download passes, which assignMu runs one at a time.
-	benchProbes map[*peerpkg.Peer]time.Time
-
+	assignMu            sync.Mutex
 	drainedDuplicatesMu sync.Mutex
 	drainedDuplicates   map[chainhash.Hash]int
 	// localFaultDrains counts, per block, copies drained because this node failed to store

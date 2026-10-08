@@ -83,8 +83,8 @@ const (
 	// block takes far less than a second, and a peer never measured holds one block.
 	minRateSample = time.Second
 	// rateDecayAfter is how long a peer that owes blocks may send no block bytes before its rate
-	// starts to fall: the peerQueueSeconds a peer's queue is sized to keep it busy for.
-	rateDecayAfter = peerQueueSeconds * time.Second
+	// starts to fall: a round trip and SV Node reading the next block from disk fit in it.
+	rateDecayAfter = 10 * time.Second
 	// rateDecayHalfLife is how long a silent peer's rate takes to halve after rateDecayAfter. SV
 	// Node averages each peer's block-stream bandwidth over its last 60 s in 5 s spots
 	// (net/stream.cpp:312-346, net/stream.h:173, net/net.cpp:2617), so a peer that stops sending is at half its rate
@@ -1434,17 +1434,12 @@ func (sm *SyncManager) logSchedulerQueues() {
 	eligible := sm.eligibleBlockPeers()
 	idle, short := 0, 0
 	depth := sm.streamingPeerDepth()
-	warming := sm.downloadWarming(time.Now())
-	var fastest float64
-	for _, bp := range eligible {
-		fastest = max(fastest, sm.streams.peerRate(bp.peer))
-	}
 
 	for _, bp := range eligible {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
 		remaining, sending := sm.streams.pending(bp.peer)
 
-		peerDepth := sm.peerQueueDepth(bp.peer, depth, fastest, warming)
+		peerDepth := sm.peerQueueDepth(bp.peer, depth)
 
 		if owed == 0 && sending == 0 {
 			idle++

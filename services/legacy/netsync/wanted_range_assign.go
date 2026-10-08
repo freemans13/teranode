@@ -475,9 +475,7 @@ func (sm *SyncManager) forgiveQuietOwnersOf(block wantedBlock) bool {
 // a second getdata could achieve is the disconnect above. Recovery is the peer's
 // own stall detection and the ledger's expiry.
 func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wantedBlock, highestHeld int32) {
-	var waited []wantedBlock
-
-	defer func() { sm.probeBenchedPeers(assigner, waited, highestHeld) }()
+	candidates = sm.placeUnmeasured(assigner, candidates, highestHeld)
 
 	for _, block := range candidates {
 		// The disk backstop bounds how far ahead the node reaches, never a gap below
@@ -507,12 +505,10 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 		} else {
 			var wait bool
 
-			target, ok, wait = assigner.inTimeAvoiding(block.height, owes)
+			target, ok, wait = assigner.deadlinePick(block.height, owes)
 			if !ok && wait {
-				// Left for an active peer that is full now rather than given to a standby
-				// peer; see ACTIVE AND STANDBY PEERS.
-				waited = append(waited, block)
-
+				// Left for the earliest arrival, which is full now, rather than given to a
+				// peer that would land it later; see THE DEADLINE RULE.
 				continue
 			}
 		}

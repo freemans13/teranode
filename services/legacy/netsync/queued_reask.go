@@ -276,20 +276,6 @@ func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq u
 func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, owners, live []*peerpkg.Peer, height int32, typical, ownSize int64, now time.Time) (*peerpkg.Peer, time.Duration) {
 	eligible := sm.eligibleBlockPeers()
 
-	// Only an active peer is given the second copy (standby_peers.go). A standby peer's queue
-	// is empty, so it can look soonest, but it is on standby because it is slow.
-	rates := make([]float64, 0, len(eligible))
-	for _, bp := range eligible {
-		if r := sm.streams.peerRate(bp.peer); r > 0 {
-			rates = append(rates, r)
-		}
-	}
-
-	floor := activeFloorOf(rates)
-	if sm.downloadWarming(now) {
-		floor = 0
-	}
-
 	pick := func(skip []*peerpkg.Peer) (*peerpkg.Peer, time.Duration) {
 		var (
 			best    *peerpkg.Peer
@@ -298,10 +284,6 @@ func (sm *SyncManager) soonestOtherPeer(queues map[*peerpkg.Peer][]queuedBlock, 
 
 		for _, bp := range eligible {
 			if slices.Contains(skip, bp.peer) {
-				continue
-			}
-
-			if r := sm.streams.peerRate(bp.peer); r > 0 && r < floor {
 				continue
 			}
 
