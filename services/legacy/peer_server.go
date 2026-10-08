@@ -3581,6 +3581,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 			DisableCheckpoints:      cfg.DisableCheckpoints,
 			MaxPeers:                cfg.MaxPeers,
 			MinSyncPeerNetworkSpeed: cfg.MinSyncPeerNetworkSpeed,
+			DataDir:                 cfg.DataDir,
 		},
 	)
 	if err != nil {

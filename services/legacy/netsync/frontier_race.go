@@ -206,6 +206,9 @@ type streamRegistry struct {
 	// decay is the factor a peer's rate is cut to while it owes blocks and sends none
 	// (decayQuiet). It stays until the peer's next rate sample.
 	decay map[*peerpkg.Peer]float64
+	// remembered is the last rate of each peer address this process has not measured since it
+	// started, from the rates file (peerRatesFile) or from a peer that disconnected.
+	remembered map[string]float64
 }
 
 // raceHistory is what the race and the queued re-ask did for one block in the last raceExpiry. It is
@@ -237,12 +240,13 @@ type rateSample struct {
 
 func newStreamRegistry() *streamRegistry {
 	return &streamRegistry{
-		lastBlock: make(map[*peerpkg.Peer]time.Time),
-		pooled:    make(map[*peerpkg.Peer]rateSample),
-		decay:     make(map[*peerpkg.Peer]float64),
-		active:    make(map[*blockStream]struct{}),
-		rates:     make(map[*peerpkg.Peer]float64),
-		raced:     make(map[chainhash.Hash]*raceHistory),
+		lastBlock:  make(map[*peerpkg.Peer]time.Time),
+		pooled:     make(map[*peerpkg.Peer]rateSample),
+		decay:      make(map[*peerpkg.Peer]float64),
+		active:     make(map[*blockStream]struct{}),
+		rates:      make(map[*peerpkg.Peer]float64),
+		raced:      make(map[chainhash.Hash]*raceHistory),
+		remembered: make(map[string]float64),
 	}
 }
 
@@ -640,15 +644,89 @@ func (r *streamRegistry) medianRate() float64 {
 	return rates[len(rates)/2]
 }
 
+// peerRate is p's download rate: the rate of the last liveRateWindow of a copy p sends, when one
+// has samples over that window; else its rate on completed blocks; else the rate remembered for its
+// address; else zero, which means unmeasured. A 4 GB block at a slow peer takes half an hour, and
+// a rate from completed blocks alone stays at the peer's earlier speed for all that time.
 func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
-	if r == nil {
+	if r == nil || p == nil {
 		return 0
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return r.rateLocked(p)
+	if live, ok := r.liveRateLocked(p); ok {
+		return live
+	}
+
+	if bps := r.rateLocked(p); bps > 0 {
+		return bps
+	}
+
+	return r.remembered[p.Addr()]
+}
+
+// liveRateLocked is the highest rate over the sampled window of a copy p sends, when a copy has
+// samples over the full liveRateWindow. A copy that is complete, or waits for admission, reads no
+// bytes and is not counted. A copy that sends nothing gives 1 byte a second, not zero, which
+// reads as unmeasured. Called with r.mu held.
+func (r *streamRegistry) liveRateLocked(p *peerpkg.Peer) (float64, bool) {
+	var (
+		best  float64
+		found bool
+	)
+
+	for s := range r.active {
+		if s.sender != p || s.awaiting.Load() || s.complete() || len(s.samples) < 2 {
+			continue
+		}
+
+		first, last := s.samples[0], s.samples[len(s.samples)-1]
+
+		span := last.at.Sub(first.at)
+		if span < liveRateWindow {
+			continue
+		}
+
+		if rate := max(1, float64(last.read-first.read)/span.Seconds()); !found || rate > best {
+			best, found = rate, true
+		}
+	}
+
+	return best, found
+}
+
+// remember loads rates by peer address, for peers this process has not measured yet.
+func (r *streamRegistry) remember(rates map[string]float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for addr, bps := range rates {
+		if bps > 0 {
+			r.remembered[addr] = bps
+		}
+	}
+}
+
+// rememberedRates is each measured peer's rate by address, plus the remembered rates of peers not
+// connected now, for the rates file.
+func (r *streamRegistry) rememberedRates() map[string]float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make(map[string]float64, len(r.remembered)+len(r.rates))
+	for addr, bps := range r.remembered {
+		out[addr] = bps
+	}
+
+	for p := range r.rates {
+		if bps := r.rateLocked(p); bps > 0 {
+			out[p.Addr()] = bps
+		}
+	}
+
+	return out
 }
 
 // wasRaced reports whether h had an extra copy asked for, by the race or by the queued re-ask,
@@ -751,9 +829,14 @@ func (r *streamRegistry) historyLocked(h chainhash.Hash) *raceHistory {
 	return hist
 }
 
-// forgetPeer drops a departed peer's rate and activity.
+// forgetPeer drops a departed peer's rate and activity, and keeps its rate by address for the
+// rates file.
 func (r *streamRegistry) forgetPeer(p *peerpkg.Peer) {
 	r.mu.Lock()
+	if bps := r.rateLocked(p); bps > 0 {
+		r.remembered[p.Addr()] = bps
+	}
+
 	delete(r.rates, p)
 	delete(r.lastBlock, p)
 	delete(r.pooled, p)
@@ -1071,6 +1154,10 @@ func (sm *SyncManager) runFrontierRace() {
 
 			if ticks++; ticks%queueReportEvery == 0 {
 				sm.logDownloadQueues()
+			}
+
+			if ticks%peerRatesSaveEvery == 0 {
+				sm.savePeerRates()
 			}
 		}
 	}

@@ -15,6 +15,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/url"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -821,6 +822,7 @@ type SyncManager struct {
 	blockSizeTracker    *blockSizeTracker  // tracks block sizes for dynamic in-flight adjustment
 	commitRate          *commitRateTracker // blocks a second joining the chain, for the frontier race
 	streams             *streamRegistry    // block bodies arriving now and peers' delivery rates, for the frontier race
+	peerRatesPath       string             // the rates file (peerRatesFile), or empty to keep no rates
 
 	// dispatcher runs each parked block's work on a worker, one block at a time,
 	// and every chain-order step in dispatch order. Built in New(); nil when
@@ -4120,6 +4122,8 @@ func (sm *SyncManager) Stop() error {
 	close(sm.quit)
 	<-sm.handlerDone
 
+	sm.savePeerRates()
+
 	// The block-queue consumer's quit arm is what restores a park entry whose
 	// dispatch was still in flight, and the restore is only a guarantee if
 	// somebody waits for it. Bounded by the deadlined client calls the consumer
@@ -4359,6 +4363,17 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	sm.blockPark = park
+
+	if config.DataDir != "" {
+		sm.peerRatesPath = filepath.Join(config.DataDir, peerRatesFile)
+
+		if rates, err := loadPeerRates(sm.peerRatesPath); err != nil {
+			sm.logger.Warnf("[legacy] could not read %s, starting with no remembered peer rates: %v", sm.peerRatesPath, err)
+		} else {
+			sm.streams.remember(rates)
+			sm.logger.Infof("[legacy] remembered the download rates of %d peer addresses from %s", len(rates), sm.peerRatesPath)
+		}
+	}
 
 	// Now the park exists, the wire layer can be told where to put a block body
 	// it reads straight off the socket. Before this call the streaming handler
