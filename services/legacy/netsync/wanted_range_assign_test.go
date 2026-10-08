@@ -167,6 +167,8 @@ func TestAssignWantedBlocks_DoesNotReAskForABlockAlreadyOwed(t *testing.T) {
 // second copy arrive unowned and lose its association for it.
 func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 	sm := assignManager(t, 1, 20)
+	// Above the last checkpoint: below it a quiet owner keeps its blocks (TestAQuietOwnerIsNotReAskedBelowTheCheckpoint).
+	sm.headersFirstMode.Store(false)
 	mockCommittedTip(t, sm, 10, 0)
 
 	// Both the node-wide window and each peer's own share are widened well
@@ -293,6 +295,8 @@ func TestAReAskedBlockGoesToTheFastestPeerEvenWithAFullQueue(t *testing.T) {
 // own.
 func TestAssignWantedBlocks_ForgivesQuietOwnersWhenEveryPeerIsAtItsCap(t *testing.T) {
 	sm := assignManager(t, 1, 20)
+	// Above the last checkpoint: below it a quiet owner keeps its blocks (TestAQuietOwnerIsNotReAskedBelowTheCheckpoint).
+	sm.headersFirstMode.Store(false)
 	mockCommittedTip(t, sm, 10, 0)
 
 	// The node-wide window is not what binds: each peer's own cap is. Three
@@ -355,4 +359,34 @@ func slicesContains(hashes []chainhash.Hash, h chainhash.Hash) bool {
 	}
 
 	return false
+}
+
+// Below the last checkpoint the rescue rule judges a late block, so the download pass does not let
+// a quiet owner off and does not ask another peer; above it, at the tip, the quiet-owner rule
+// stays. The quiet-owner rule let a busy peer off 15 blocks on 2026-10-07, and each was downloaded
+// two times.
+func TestAQuietOwnerIsNotReAskedBelowTheCheckpoint(t *testing.T) {
+	sm := assignManager(t, 1, 20)
+	mockCommittedTip(t, sm, 10, 0)
+	require.True(t, sm.headersFirstMode.Load(), "harness check: below the last checkpoint")
+
+	sm.settings.Legacy.BlockDownloadWindow = 1024
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 20
+
+	quiet, _ := schedulerPeer(t, sm, 1, 1020)
+	other, otherRec := schedulerPeer(t, sm, 2, 1020)
+	wireStreamingPath(sm, quiet, other)
+
+	next, ok := sm.headerCache.At(11)
+	require.True(t, ok)
+
+	sm.blockDownloads.now = func() time.Time { return time.Now().Add(-5 * time.Minute) }
+	require.True(t, sm.blockDownloads.Add(quiet, next))
+	sm.blockDownloads.now = time.Now
+
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool { return otherRec.count() > 0 }, 5*time.Second), "the pass places other blocks")
+	require.NotContains(t, otherRec.all(), next, "the quiet owner's block is not asked of another peer")
+	require.True(t, sm.blockDownloads.HasOwner(quiet, next), "and the quiet owner keeps it")
 }

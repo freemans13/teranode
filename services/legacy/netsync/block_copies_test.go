@@ -1,100 +1,20 @@
 package netsync
 
 import (
-	"bytes"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/go-wire"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
 
 // A block more than one peer owes. Both rules that ask another peer for a block used to skip it:
-// the queued re-ask returned when a block had more than one owner, and the race skipped a stream
+// the rescue rule returned when a block had more than one owner, and the race skipped a stream
 // with no single owner. After one extra copy, the block the chain waited on could wait for the
 // peer layer's deadline. Each copy is judged now, as SV Node judges each peer a block is in flight
 // from, and a further copy is asked for when every copy is late, up to maxBlockCopies live copies.
-
-// Two owners, each with the block behind a slow queue, and the extra copy asked for a minute ago.
-// A fast idle peer is asked as the third owner. A fourth is never asked.
-func TestQueuedReaskAsksAThirdPeerWhenBothOwnersAreLate(t *testing.T) {
-	sm, owner, fast, _ := reaskSetup(t)
-	second, _ := schedulerPeer(t, sm, 3, 2000)
-	fourth, _ := schedulerPeer(t, sm, 4, 2000)
-	sm.streams.rates[second] = 3_000_000
-	now := time.Now()
-
-	for _, h := range []int32{13, 14, 15, 11} {
-		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-3*time.Minute))
-	}
-
-	for _, h := range []int32{20, 21, 22, 11} {
-		askAt(t, sm, second, heightHash(t, sm, h), now.Add(-time.Minute))
-	}
-
-	next := heightHash(t, sm, 11)
-	sm.streams.markRaced(next, now.Add(-time.Minute))
-
-	sm.maybeReaskQueuedBlock(now)
-
-	require.True(t, sm.blockDownloads.HasOwner(fast, next), "both owners are minutes away; the idle fast peer is asked")
-	require.True(t, sm.blockDownloads.HasOwner(owner, next))
-	require.True(t, sm.blockDownloads.HasOwner(second, next))
-	require.True(t, owner.Connected())
-	require.True(t, second.Connected())
-
-	// The third owner turns out slow too, and a fourth peer would land the block in 3 s.
-	sm.streams.rates[fast] = 1_000_000
-	sm.streams.rates[fourth] = 90_000_000
-
-	sm.maybeReaskQueuedBlock(now.Add(time.Minute))
-	require.False(t, sm.blockDownloads.HasOwner(fourth, next), "three peers owe the block: no fourth copy")
-	require.Len(t, sm.blockDownloads.OwnersOf(next), 3)
-}
-
-// One owner that will land the block soon keeps every other peer from being asked, however late the
-// other owner is.
-func TestQueuedReaskLeavesABlockOneOwnerWillLandSoon(t *testing.T) {
-	sm, owner, fast, _ := reaskSetup(t)
-	quick, _ := schedulerPeer(t, sm, 3, 2000)
-	sm.streams.rates[quick] = 80_000_000
-	now := time.Now()
-
-	for _, h := range []int32{13, 14, 15, 11} {
-		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-3*time.Minute))
-	}
-
-	next := heightHash(t, sm, 11)
-	askAt(t, sm, quick, next, now.Add(-time.Minute))
-	sm.streams.markRaced(next, now.Add(-time.Minute))
-
-	sm.maybeReaskQueuedBlock(now)
-
-	require.False(t, sm.blockDownloads.HasOwner(fast, next), "quick has it at the head of its queue at 80 MB/s")
-}
-
-// Each copy gets SV Node's 30 s: a second owner asked 10 s ago is not judged yet.
-func TestQueuedReaskGivesEachCopyThirtySeconds(t *testing.T) {
-	sm, owner, fast, _ := reaskSetup(t)
-	second, _ := schedulerPeer(t, sm, 3, 2000)
-	sm.streams.rates[second] = 3_000_000
-	now := time.Now()
-
-	for _, h := range []int32{13, 14, 15, 11} {
-		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-3*time.Minute))
-	}
-
-	for _, h := range []int32{20, 21, 22, 11} {
-		askAt(t, sm, second, heightHash(t, sm, h), now.Add(-10*time.Second))
-	}
-
-	sm.maybeReaskQueuedBlock(now)
-
-	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
-}
 
 // A block with one healthy copy is not raced, whatever its other copy does.
 func TestRaceLeavesABlockWhileOneCopyIsHealthy(t *testing.T) {
@@ -208,66 +128,6 @@ func TestRaceDoesNotCountForgivenOwnersSendingNothing(t *testing.T) {
 	require.True(t, WaitUntil(func() bool { return !c.Connected() }, 5*time.Second), "the copy at 50 KB/s is dropped")
 	require.True(t, a.Connected())
 	require.True(t, b.Connected())
-}
-
-// The queued re-ask does not count forgiven owners sending nothing either.
-func TestQueuedReaskDoesNotCountForgivenOwnersSendingNothing(t *testing.T) {
-	sm, owner, fast, _ := reaskSetup(t)
-	x, _ := schedulerPeer(t, sm, 3, 2000)
-	y, _ := schedulerPeer(t, sm, 4, 2000)
-	now := time.Now()
-
-	next := heightHash(t, sm, 11)
-	askAt(t, sm, x, next, now.Add(-5*time.Minute))
-	askAt(t, sm, y, next, now.Add(-5*time.Minute))
-	require.Len(t, sm.blockDownloads.ForgiveOwners(next, blockRequestRetryInterval), 2)
-
-	for _, h := range []int32{13, 14, 15, 11} {
-		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-3*time.Minute))
-	}
-
-	require.Len(t, sm.blockDownloads.OwnersOf(next), 3)
-
-	sm.maybeReaskQueuedBlock(now)
-
-	require.True(t, sm.blockDownloads.HasOwner(fast, next), "one live copy, minutes away: the idle fast peer is asked")
-}
-
-// A peer busy sending a large copy is not idle. Its bytes count in what it is sending whether or
-// not it owes the block, so the queued re-ask does not pick it over a peer that is free.
-func TestQueuedReaskDoesNotPickAPeerSendingALargeCopy(t *testing.T) {
-	for _, owed := range []bool{false, true} {
-		sm, owner, fast, _ := reaskSetup(t)
-		steady, _ := schedulerPeer(t, sm, 3, 2000)
-		sm.streams.rates[steady] = 30_000_000
-		now := time.Now()
-
-		for _, h := range []int32{13, 14, 15, 11} {
-			askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
-		}
-
-		// fast is sending a 4 GB copy of block 30: 50 s at 80 MB/s before it can start
-		// another block. As a duplicate it owes, or as a copy nobody asked it for.
-		large := heightHash(t, sm, 30)
-		if owed {
-			askAt(t, sm, owner, large, now.Add(-2*time.Minute))
-			askAt(t, sm, fast, large, now.Add(-time.Minute))
-		}
-
-		sink := sm.trackBlockStreams(drainingSink(func() {
-			sending, _ := sm.streams.pending(fast)
-			require.Equal(t, int64(4_000_000_000), sending, "owed %v: the 4 GB counts as fast sending", owed)
-
-			sm.maybeReaskQueuedBlock(now)
-		}))
-
-		_, err := sink(large, &wire.BlockHeader{}, peerpkg.NewDeliveryReader(bytes.NewReader(nil), fast), 4_000_000_000)
-		require.NoError(t, err)
-
-		next := heightHash(t, sm, 11)
-		require.False(t, sm.blockDownloads.HasOwner(fast, next), "owed %v: fast is 50 s from free", owed)
-		require.True(t, sm.blockDownloads.HasOwner(steady, next), "owed %v: steady at 30 MB/s is free and lands it in 10 s", owed)
-	}
 }
 
 // A peer sends its queue in order and cannot drop a request, so a block ahead in its queue counts
@@ -388,26 +248,4 @@ func TestRaceDropsAStallingCopyOnceTheOwnersAskedAgainSend(t *testing.T) {
 	sm.maybeRaceSlowBlock(now.Add(70 * time.Second))
 
 	require.True(t, WaitUntil(func() bool { return !c.Connected() }, 5*time.Second), "both owners asked again are sending: the copy at 50 KB/s is dropped")
-}
-
-// The queued re-ask asks a forgiven owner sending nothing too: it is not a live copy. The one live
-// copy waits behind a slow queue, and the forgiven owner, idle at 80 MB/s, is the only other peer.
-func TestQueuedReaskAsksAForgivenOwnerSendingNothing(t *testing.T) {
-	sm, owner, fast, fastRec := reaskSetup(t)
-	now := time.Now()
-
-	next := heightHash(t, sm, 11)
-	askAt(t, sm, fast, next, now.Add(-5*time.Minute))
-	require.Len(t, sm.blockDownloads.ForgiveOwners(next, blockRequestRetryInterval), 1)
-
-	for _, h := range []int32{13, 14, 15, 11} {
-		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-3*time.Minute))
-	}
-
-	sm.maybeReaskQueuedBlock(now)
-
-	active, _ := sm.blockDownloads.ActiveOwners(next)
-	require.True(t, slices.Contains(active, fast), "the forgiven owner, idle at 80 MB/s, is asked again")
-	require.True(t, WaitUntil(func() bool { return fastRec.count() == 1 }, 5*time.Second), "with a real getdata")
-	require.True(t, owner.Connected())
 }

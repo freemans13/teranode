@@ -39,16 +39,15 @@ import (
 // rate, bytes started or not (FindNextBlocksToDownload, net_processing.cpp:462-507, capped at
 // DEFAULT_MAX_BLOCK_PARALLEL_FETCH, 3). A peer that has not started sending a block is not
 // struggling with it here: it may be sending blocks queued ahead of it, or reading it from disk
-// before its first byte. That case is handled in both modes by the download pass,
+// before its first byte. Above the last checkpoint that case is handled by the download pass,
 // assignWantedBlocks, which after blockRequestRetryInterval lets a quiet owner off and asks another
-// peer: below the last checkpoint the pass names blocks from the header cache, above it from the
-// ledger, one head-of-queue block per quiet owner (appendOutstandingAtTip). The 60-second quiet
+// peer, one head-of-queue block per quiet owner (appendOutstandingAtTip). The 60-second quiet
 // rule is the looser cousin of SV Node's: any quiet owner rather than a bandwidth test, 60 s rather
 // than 30, one re-ask per owner per retry window rather than three parallel fetches.
 // blockRequestRetryInterval's comment explains what an SV Node peer is doing while it is quiet. Do
-// not extend the race to it. A block that has not started because it waits behind other blocks
-// at a peer that is busy, neither quiet nor struggling on it, is the queued re-ask's
-// (queued_reask.go), which runs on this ticker, keeps the owner, and shares the race's mark.
+// not extend the race to it. Below the last checkpoint a block that has not started, because it
+// waits behind other blocks at a busy peer or its owner is quiet, is the rescue rule's (rescue.go),
+// which runs on this ticker, keeps the owner, and shares the race's mark.
 
 const (
 	// raceCheckInterval is how often the race is considered. It runs on its own ticker because
@@ -66,7 +65,7 @@ const (
 	// raceExpiry; the race drops a block's peers at most once in raceExpiry (maybeRaceSlowBlock).
 	raceExpiry = 10 * time.Minute
 	// maxBlockCopies is the most live copies of one block at once: the first request and at most
-	// two extra copies, from the race or the queued re-ask. A live copy is an owner not let off
+	// two extra copies, from the race or the rescue rule. A live copy is an owner not let off
 	// the block, or one sending it now (liveCopies); a forgiven owner sending nothing is not a
 	// copy. SV Node fetches the first in-flight block from up to DEFAULT_MAX_BLOCK_PARALLEL_FETCH
 	// (3) peers (net/net.h:167). It asks for another copy only when every connected peer the
@@ -83,8 +82,8 @@ const (
 	// block takes far less than a second, and a peer never measured holds one block.
 	minRateSample = time.Second
 	// rateDecayAfter is how long a peer that owes blocks may send no block bytes before its rate
-	// starts to fall: the peerQueueSeconds a peer's queue is sized to keep it busy for.
-	rateDecayAfter = peerQueueSeconds * time.Second
+	// starts to fall: a round trip and SV Node reading the next block from disk fit in it.
+	rateDecayAfter = 10 * time.Second
 	// rateDecayHalfLife is how long a silent peer's rate takes to halve after rateDecayAfter. SV
 	// Node averages each peer's block-stream bandwidth over its last 60 s in 5 s spots
 	// (net/stream.cpp:312-346, net/stream.h:173, net/net.cpp:2617), so a peer that stops sending is at half its rate
@@ -197,7 +196,7 @@ type streamRegistry struct {
 	active map[*blockStream]struct{}
 	rates  map[*peerpkg.Peer]float64
 	// raced is each block's race history over the last raceExpiry: when extra copies were asked
-	// for, by the race or the queued re-ask, and when the race last dropped its copies.
+	// for, by the race or the rescue rule, and when the race last dropped its copies.
 	raced map[chainhash.Hash]*raceHistory
 	// lastBlock is when each peer last finished delivering a block.
 	lastBlock map[*peerpkg.Peer]time.Time
@@ -206,9 +205,12 @@ type streamRegistry struct {
 	// decay is the factor a peer's rate is cut to while it owes blocks and sends none
 	// (decayQuiet). It stays until the peer's next rate sample.
 	decay map[*peerpkg.Peer]float64
+	// remembered is the last rate of each peer address this process has not measured since it
+	// started, from the rates file (peerRatesFile) or from a peer that disconnected.
+	remembered map[string]float64
 }
 
-// raceHistory is what the race and the queued re-ask did for one block in the last raceExpiry. It is
+// raceHistory is what the race and the rescue rule did for one block in the last raceExpiry. It is
 // kept apart from the ledger: a dropped peer leaves the ledger (ClearPeer), so the live owners
 // cannot tell how many copies a block has already cost.
 type raceHistory struct {
@@ -237,12 +239,13 @@ type rateSample struct {
 
 func newStreamRegistry() *streamRegistry {
 	return &streamRegistry{
-		lastBlock: make(map[*peerpkg.Peer]time.Time),
-		pooled:    make(map[*peerpkg.Peer]rateSample),
-		decay:     make(map[*peerpkg.Peer]float64),
-		active:    make(map[*blockStream]struct{}),
-		rates:     make(map[*peerpkg.Peer]float64),
-		raced:     make(map[chainhash.Hash]*raceHistory),
+		lastBlock:  make(map[*peerpkg.Peer]time.Time),
+		pooled:     make(map[*peerpkg.Peer]rateSample),
+		decay:      make(map[*peerpkg.Peer]float64),
+		active:     make(map[*blockStream]struct{}),
+		rates:      make(map[*peerpkg.Peer]float64),
+		raced:      make(map[chainhash.Hash]*raceHistory),
+		remembered: make(map[string]float64),
 	}
 }
 
@@ -640,18 +643,102 @@ func (r *streamRegistry) medianRate() float64 {
 	return rates[len(rates)/2]
 }
 
+// peerRate is p's download rate: the rate of the last liveRateWindow of a copy p sends, when one
+// has samples over that window; else its rate on completed blocks; else the rate remembered for its
+// address; else zero, which means unmeasured. A 4 GB block at a slow peer takes half an hour, and
+// a rate from completed blocks alone stays at the peer's earlier speed for all that time.
 func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
-	if r == nil {
+	if r == nil || p == nil {
 		return 0
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return r.rateLocked(p)
+	if live, ok := r.liveRateLocked(p); ok {
+		return live
+	}
+
+	if bps := r.rateLocked(p); bps > 0 {
+		return bps
+	}
+
+	// A remembered rate becomes the peer's rate the first time it is read, so it decays while the
+	// peer owes blocks and sends none (decayQuiet), as a measured rate does. A rate read only from
+	// the file did not, and a silent remembered peer kept its rate until the getdata deadline.
+	if bps, ok := r.remembered[p.Addr()]; ok && bps > 0 {
+		r.rates[p] = bps
+		delete(r.remembered, p.Addr())
+
+		return r.rateLocked(p)
+	}
+
+	return 0
 }
 
-// wasRaced reports whether h had an extra copy asked for, by the race or by the queued re-ask,
+// liveRateLocked is the highest rate over the sampled window of a copy p sends, when a copy has
+// samples over the full liveRateWindow. A copy that is complete, or waits for admission, reads no
+// bytes and is not counted. A copy that sends nothing gives 1 byte a second, not zero, which
+// reads as unmeasured. Called with r.mu held.
+func (r *streamRegistry) liveRateLocked(p *peerpkg.Peer) (float64, bool) {
+	var (
+		best  float64
+		found bool
+	)
+
+	for s := range r.active {
+		if s.sender != p || s.awaiting.Load() || s.complete() || len(s.samples) < 2 {
+			continue
+		}
+
+		first, last := s.samples[0], s.samples[len(s.samples)-1]
+
+		span := last.at.Sub(first.at)
+		if span < liveRateWindow {
+			continue
+		}
+
+		if rate := max(1, float64(last.read-first.read)/span.Seconds()); !found || rate > best {
+			best, found = rate, true
+		}
+	}
+
+	return best, found
+}
+
+// remember loads rates by peer address, for peers this process has not measured yet.
+func (r *streamRegistry) remember(rates map[string]float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for addr, bps := range rates {
+		if bps > 0 {
+			r.remembered[addr] = bps
+		}
+	}
+}
+
+// rememberedRates is each measured peer's rate by address, plus the remembered rates of peers not
+// connected now, for the rates file.
+func (r *streamRegistry) rememberedRates() map[string]float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make(map[string]float64, len(r.remembered)+len(r.rates))
+	for addr, bps := range r.remembered {
+		out[addr] = bps
+	}
+
+	for p := range r.rates {
+		if bps := r.rateLocked(p); bps > 0 {
+			out[p.Addr()] = bps
+		}
+	}
+
+	return out
+}
+
+// wasRaced reports whether h had an extra copy asked for, by the race or by the rescue rule,
 // which share the mark, less than raceSlowFetchAfter ago. The newest copy then has not had SV
 // Node's slow-fetch time, and no further copy is asked for.
 func (r *streamRegistry) wasRaced(h chainhash.Hash, now time.Time) bool {
@@ -751,9 +838,14 @@ func (r *streamRegistry) historyLocked(h chainhash.Hash) *raceHistory {
 	return hist
 }
 
-// forgetPeer drops a departed peer's rate and activity.
+// forgetPeer drops a departed peer's rate and activity, and keeps its rate by address for the
+// rates file.
 func (r *streamRegistry) forgetPeer(p *peerpkg.Peer) {
 	r.mu.Lock()
+	if bps := r.rateLocked(p); bps > 0 {
+		r.remembered[p.Addr()] = bps
+	}
+
 	delete(r.rates, p)
 	delete(r.lastBlock, p)
 	delete(r.pooled, p)
@@ -1067,10 +1159,14 @@ func (sm *SyncManager) runFrontierRace() {
 			sm.streams.sampleStreams(time.Now())
 			sm.decayQuietRates(time.Now())
 			sm.maybeRaceSlowBlock(time.Now())
-			sm.maybeReaskQueuedBlock(time.Now())
+			sm.maybeRescueLowestBlock(time.Now())
 
 			if ticks++; ticks%queueReportEvery == 0 {
 				sm.logDownloadQueues()
+			}
+
+			if ticks%peerRatesSaveEvery == 0 {
+				sm.savePeerRates()
 			}
 		}
 	}
@@ -1217,7 +1313,7 @@ func (sm *SyncManager) dropStallingCopies(s *blockStream, stalling []*peerpkg.Pe
 
 // liveCopies is the owners of h with a live copy: an owner not let off the block, or one whose
 // copy is arriving now. A forgiven owner sending nothing will not deliver (ownerArrival reads it as
-// far off). Counting it held the race and the queued re-ask off a block whose only copy was
+// far off). Counting it held the race and the rescue rule off a block whose only copy was
 // stalling, and leaving it out of the peers to ask let the race find nobody to ask.
 func (sm *SyncManager) liveCopies(h chainhash.Hash, owners []*peerpkg.Peer) []*peerpkg.Peer {
 	active, _ := sm.blockDownloads.ActiveOwners(h)
@@ -1313,9 +1409,9 @@ func (sm *SyncManager) logDownloadQueues() {
 	}
 
 	w := &sm.waste
-	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d, behind a slow queue or arriving late %d",
+	sm.logger.Infof("[downloadWaste] since start: received %.1f GB; duplicate copies drained %d, converted %d; copies drained for this node's own store faults %d; streams cut part way %d; %.1f GB wasted; peers dropped owing blocks %d (%d blocks); blocks re-asked after a quiet peer %d, rescued %d",
 		float64(w.received.Load())/1e9, w.dupDrained.Load(), w.dupConverted.Load(), w.localFaultDrained.Load(), w.streamsFailed.Load(),
-		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load(), w.reAskedQueued.Load())
+		float64(w.bytesWasted.Load())/1e9, w.droppedOwing.Load(), w.blocksOwedAtDrop.Load(), w.reAskedQuiet.Load(), w.rescued.Load())
 }
 
 // publishDownloadMetrics sets the download gauges, blocks owed, heights the header cache names
@@ -1342,22 +1438,18 @@ func (sm *SyncManager) publishDownloadMetrics() {
 // logSchedulerQueues is logDownloadQueues' per-peer lines and summary, for the headers-first
 // scheduler.
 func (sm *SyncManager) logSchedulerQueues() {
-
 	largest := sm.blockSizeTracker.largestRecentSize()
+	typical := sm.blockSizeTracker.getAverageSize()
 	eligible := sm.eligibleBlockPeers()
 	idle, short := 0, 0
 	depth := sm.streamingPeerDepth()
-	warming := sm.downloadWarming(time.Now())
-	var fastest float64
-	for _, bp := range eligible {
-		fastest = max(fastest, sm.streams.peerRate(bp.peer))
-	}
 
 	for _, bp := range eligible {
 		owed := sm.blockDownloads.CountForPeer(bp.peer)
 		remaining, sending := sm.streams.pending(bp.peer)
+		rate := sm.streams.peerRate(bp.peer)
 
-		peerDepth := sm.peerQueueDepth(bp.peer, depth, fastest, warming)
+		peerDepth := sm.peerQueueDepth(bp.peer, depth)
 
 		if owed == 0 && sending == 0 {
 			idle++
@@ -1367,10 +1459,18 @@ func (sm *SyncManager) logSchedulerQueues() {
 			short++
 		}
 
-		sm.logger.Infof("[downloadQueue] %s owes %d of %d, sending %d with %.0f MB left, rate %.1f MB/s",
-			bp.peer, owed, peerDepth, sending, float64(remaining)/1e6, sm.streams.peerRate(bp.peer)/1e6)
+		// When a new block of the largest recent size would land at this peer: what the deadline
+		// rule compares with each block's deadline.
+		landing := "unknown, no rate"
+		if rate > 0 {
+			bytes := float64(remaining + int64(max(0, owed-sending))*typical + largest)
+			landing = time.Duration(bytes / rate * float64(time.Second)).Round(time.Second).String()
+		}
+
+		sm.logger.Infof("[downloadQueue] %s owes %d of %d, sending %d with %.0f MB left, rate %.1f MB/s, a %.0f MB block lands in %s",
+			bp.peer, owed, peerDepth, sending, float64(remaining)/1e6, rate/1e6, float64(largest)/1e6, landing)
 	}
 
-	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below their speed-scaled depth of up to %d requests; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
-		len(eligible), idle, short, depth, float64(sm.bytesAhead(largest))/1e9, float64(parkBackstopBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
+	sm.logger.Infof("[downloadQueue] %d eligible peers, %d idle; %d below the cap of %d requests; pace %.2f blocks/s; %.1f GB held ahead of the chain, parked and arriving, against a %.1f GB backstop; %d blocks owed; receiving %.1f MB/s",
+		len(eligible), idle, short, depth, sm.commitRate.pace(), float64(sm.bytesAhead(largest))/1e9, float64(parkBackstopBytes)/1e9, sm.blockDownloads.Len(), sm.waste.rateSinceLast(time.Now())/1e6)
 }

@@ -97,7 +97,7 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// forgiven first and the budgets read again; without that nothing is
 	// re-asked until a stall backstop fires.
 	assigner := sm.newDownloadAssigner()
-	if assigner == nil && sm.forgiveQuietOwners(wanted) > 0 {
+	if assigner == nil && !sm.headersFirstMode.Load() && sm.forgiveQuietOwners(wanted) > 0 {
 		assigner = sm.newDownloadAssigner()
 	}
 
@@ -376,6 +376,18 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 			continue
 		}
 
+		// Below the last checkpoint an owed block stays with its owner: the rescue rule judges
+		// the lowest one when it will be late, and a quiet peer's rate decays, so it gets no more
+		// blocks. Letting a quiet owner off here released 15 blocks of a busy peer on 2026-10-07,
+		// and each was downloaded two times. Above it, at the tip, the quiet-owner rule stays. A
+		// block whose owners were let off already, a demoted sync peer's (demoteSyncPeer), has no
+		// active owner and is asked of another peer.
+		if sm.headersFirstMode.Load() {
+			if active, _ := sm.blockDownloads.ActiveOwners(block.hash); len(active) > 0 {
+				continue
+			}
+		}
+
 		if sm.forgiveQuietOwnersOf(block) {
 			block.reAsked = true
 		}
@@ -475,9 +487,7 @@ func (sm *SyncManager) forgiveQuietOwnersOf(block wantedBlock) bool {
 // a second getdata could achieve is the disconnect above. Recovery is the peer's
 // own stall detection and the ledger's expiry.
 func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wantedBlock, highestHeld int32) {
-	var waited []wantedBlock
-
-	defer func() { sm.probeBenchedPeers(assigner, waited, highestHeld) }()
+	candidates = sm.placeUnmeasured(assigner, candidates, highestHeld)
 
 	for _, block := range candidates {
 		// The disk backstop bounds how far ahead the node reaches, never a gap below
@@ -507,12 +517,10 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 		} else {
 			var wait bool
 
-			target, ok, wait = assigner.inTimeAvoiding(block.height, owes)
+			target, ok, wait = assigner.deadlinePick(block.height, owes)
 			if !ok && wait {
-				// Left for an active peer that is full now rather than given to a standby
-				// peer; see ACTIVE AND STANDBY PEERS.
-				waited = append(waited, block)
-
+				// Left for the earliest arrival, which is full now, rather than given to a
+				// peer that would land it later; see THE DEADLINE RULE.
 				continue
 			}
 		}
