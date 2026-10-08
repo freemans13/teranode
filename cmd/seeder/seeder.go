@@ -615,6 +615,15 @@ func importUTXOSet(ctx context.Context, logger ulogger.Logger, store utxo.Store,
 		return errors.NewConfigurationError("workerCount (%d) and multiRecordWorkerCount (%d) must both be between 1 and %d", opts.workerCount, opts.multiRecordWorkerCount, maxWorkerCount)
 	}
 
+	// A named pipe delivers each byte to one reader only, so two passes would
+	// split the stream between them and each would parse the other's gaps as
+	// records. Refuse it before reading anything.
+	if opts.utxoBatchSize > 0 {
+		if info, err := os.Stat(utxoFile); err == nil && info.Mode()&os.ModeNamedPipe != 0 {
+			return errors.NewConfigurationError("%s is a named pipe, but utxostore_utxoBatchSize %d makes the import read it in two concurrent passes; a pipe needs a single pass (utxostore_utxoBatchSize 0, on a store that accepts it) or the file unpacked to disk", utxoFile, opts.utxoBatchSize)
+		}
+	}
+
 	g, gCtx := errgroup.WithContext(ctx)
 
 	startPass := func(name string, workerCount int, accept func(maxIndex uint32) bool) {
@@ -802,9 +811,11 @@ func seedingExternalStoreURL(utxoStoreURL *url.URL, fsyncMode string) (*url.URL,
 // reason, that footer is compared against what was actually read, and a
 // mismatch is reported as an error instead of silently treated as success.
 // The footer is taken from the stream when the records end exactly at it
-// (utxopersister.ErrRecordBoundary), so a pipe works; otherwise it is read by
-// seeking (utxopersister.GetFooter). A stream that cannot seek and did not end
-// at a footer is reported as truncated.
+// (utxopersister.ErrRecordBoundary), so this reader can validate a pipe;
+// otherwise it is read by seeking (utxopersister.GetFooter). A stream that
+// cannot seek and did not end at a footer is reported as truncated. Whether
+// the seeder as a whole can take a pipe is decided in importUTXOSet, which
+// refuses one when the import would need two passes.
 //
 // Only frames for which accept returns true (all, when accept is nil) are
 // sent; accept gets the record's highest output index. Every record is still
