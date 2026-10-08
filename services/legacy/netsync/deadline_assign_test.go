@@ -201,3 +201,39 @@ func TestDeadlineEqualPeersShareTheBlocks(t *testing.T) {
 	require.Equal(t, []chainhash.Hash{wantedAt(12).hash}, placed(a))
 	require.Equal(t, []chainhash.Hash{wantedAt(13).hash}, placed(b))
 }
+
+// After a restart the rates file gives peers their rates, but no block has completed, so no size
+// is known. Every peer then looked in time, and the slowest took the 16 nearest blocks (review of
+// 2026-10-08). With no size the fastest peer takes the near blocks.
+func TestDeadlineWithNoSizeTheFastestPeerTakesTheNearBlocks(t *testing.T) {
+	sm := schedulerManager(t)
+	slow := measuredPeer(t, sm, 1, 16, 0.5*mb)
+	fast := measuredPeer(t, sm, 2, 16, 50*mb)
+
+	a := deadlineAssigner([]*assignerPeer{slow, fast}, nil)
+	a.size = 0
+
+	var blocks []wantedBlock
+	for h := int32(11); h <= 26; h++ {
+		blocks = append(blocks, wantedAt(h))
+	}
+
+	sm.requestBlocks(a, blocks, 0)
+
+	require.Len(t, placed(fast), 16)
+	require.Empty(t, placed(slow))
+}
+
+// A new peer does not get a block the chain needs before a measured peer could land it: when the
+// measured peers are full, the highest candidate of the pass can be the next block (review of
+// 2026-10-08).
+func TestDeadlineAnUnmeasuredPeerDoesNotGetANearBlock(t *testing.T) {
+	sm := schedulerManager(t)
+	fast := measuredPeer(t, sm, 1, 0, 50*mb)
+	newcomer, _ := schedulerPeer(t, sm, 2, 5000)
+	np := &assignerPeer{peer: newcomer, budget: 1}
+
+	sm.requestBlocks(deadlineAssigner([]*assignerPeer{np}, []*assignerPeer{fast}), []wantedBlock{wantedAt(12)}, 0)
+
+	require.Empty(t, placed(np), "block 12 is needed in 0.5 s; the fast peer lands 4 GB in 80 s")
+}

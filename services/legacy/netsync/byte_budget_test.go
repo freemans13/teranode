@@ -350,6 +350,15 @@ func TestAnUnmeasuredPeerGetsOneBlock(t *testing.T) {
 	sm.streams.rates[b] = float64(50 * qMB)
 	delete(sm.streams.rates, c)
 
+	// A pace of 2 blocks a second, so the highest block is far enough ahead for a new peer. With
+	// no pace a new peer gets no block: near and far cannot be told apart.
+	sm.commitRate = newCommitRateTracker()
+	now := time.Now()
+
+	for i := range 10 {
+		sm.commitRate.note(now.Add(time.Duration(i-9) * 500 * time.Millisecond))
+	}
+
 	seedFetchHeaders(t, sm, a, anchor, msg)
 	sm.fetchHeaderBlocks()
 

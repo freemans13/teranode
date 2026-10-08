@@ -75,7 +75,11 @@ func (a *downloadAssigner) deadlinePick(height int32, avoid func(*peerpkg.Peer) 
 		return nil, false, false
 	}
 
-	if !a.anyMeasured() {
+	// With no rates, or no block size yet (no block has completed since the start), no arrival
+	// can be estimated: each peer takes blocks in height sequence, the fastest first. With a size
+	// of zero each remembered peer looked in time after a restart, and the slowest took the
+	// nearest blocks.
+	if !a.anyMeasured() || a.size <= 0 {
 		p, ok := a.takeAvoiding(height, avoid)
 
 		return p, ok, false
@@ -127,6 +131,7 @@ func (a *downloadAssigner) deadlinePick(height int32, avoid func(*peerpkg.Peer) 
 
 // placeUnmeasured gives each peer with no rate and room the highest candidate of the pass, before
 // the deadline rule places the others, so it is measured on a block the chain will not need soon.
+// It gives no block the chain needs before a measured peer could land it.
 // It gives nothing when no peer has a rate: then each peer takes one block in height sequence.
 // It returns the candidates left. On 2026-10-08 after a restart, blocks near the tip given to
 // unmeasured peers at 0.0 MB/s let the chain apply 4 blocks in 10 minutes.
@@ -135,8 +140,25 @@ func (sm *SyncManager) placeUnmeasured(a *downloadAssigner, candidates []wantedB
 		return candidates
 	}
 
+	// The earliest a measured peer can land a block. A candidate the chain needs before that is a
+	// near block, not a block to measure a new peer on: when the measured peers are full, the
+	// highest candidate of the pass can be the next block the chain needs.
+	soonest := time.Duration(math.MaxInt64)
+
+	for _, set := range [][]*assignerPeer{a.peers, a.full} {
+		for _, p := range set {
+			if p.measured {
+				soonest = min(soonest, p.arrival(a.size))
+			}
+		}
+	}
+
 	for _, p := range a.peers {
 		if len(candidates) == 0 || a.remaining <= 0 {
+			break
+		}
+
+		if a.deadline(candidates[len(candidates)-1].height) < soonest {
 			break
 		}
 

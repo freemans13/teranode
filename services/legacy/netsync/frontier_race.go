@@ -39,16 +39,15 @@ import (
 // rate, bytes started or not (FindNextBlocksToDownload, net_processing.cpp:462-507, capped at
 // DEFAULT_MAX_BLOCK_PARALLEL_FETCH, 3). A peer that has not started sending a block is not
 // struggling with it here: it may be sending blocks queued ahead of it, or reading it from disk
-// before its first byte. That case is handled in both modes by the download pass,
+// before its first byte. Above the last checkpoint that case is handled by the download pass,
 // assignWantedBlocks, which after blockRequestRetryInterval lets a quiet owner off and asks another
-// peer: below the last checkpoint the pass names blocks from the header cache, above it from the
-// ledger, one head-of-queue block per quiet owner (appendOutstandingAtTip). The 60-second quiet
+// peer, one head-of-queue block per quiet owner (appendOutstandingAtTip). The 60-second quiet
 // rule is the looser cousin of SV Node's: any quiet owner rather than a bandwidth test, 60 s rather
 // than 30, one re-ask per owner per retry window rather than three parallel fetches.
 // blockRequestRetryInterval's comment explains what an SV Node peer is doing while it is quiet. Do
-// not extend the race to it. A block that has not started because it waits behind other blocks
-// at a peer that is busy, neither quiet nor struggling on it, is the rescue rule's
-// (queued_reask.go), which runs on this ticker, keeps the owner, and shares the race's mark.
+// not extend the race to it. Below the last checkpoint a block that has not started, because it
+// waits behind other blocks at a busy peer or its owner is quiet, is the rescue rule's (rescue.go),
+// which runs on this ticker, keeps the owner, and shares the race's mark.
 
 const (
 	// raceCheckInterval is how often the race is considered. It runs on its own ticker because
@@ -664,7 +663,17 @@ func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
 		return bps
 	}
 
-	return r.remembered[p.Addr()]
+	// A remembered rate becomes the peer's rate the first time it is read, so it decays while the
+	// peer owes blocks and sends none (decayQuiet), as a measured rate does. A rate read only from
+	// the file did not, and a silent remembered peer kept its rate until the getdata deadline.
+	if bps, ok := r.remembered[p.Addr()]; ok && bps > 0 {
+		r.rates[p] = bps
+		delete(r.remembered, p.Addr())
+
+		return r.rateLocked(p)
+	}
+
+	return 0
 }
 
 // liveRateLocked is the highest rate over the sampled window of a copy p sends, when a copy has

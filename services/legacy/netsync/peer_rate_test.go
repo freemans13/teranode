@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -88,4 +89,20 @@ func TestPeerRatesRoundTripThroughTheFile(t *testing.T) {
 	missing, err := loadPeerRates(filepath.Join(t.TempDir(), "absent.json"))
 	require.NoError(t, err, "no file is an empty memory, not an error")
 	require.Empty(t, missing)
+}
+
+// A rate from the rates file decays like a measured rate while the peer owes blocks and sends
+// nothing. It did not, and a silent remembered peer held 16 near blocks until the getdata deadline
+// (review of 2026-10-08).
+func TestARememberedRateDecaysWhileThePeerIsSilent(t *testing.T) {
+	r := newStreamRegistry()
+	p := newTestPeer(t, "10.0.0.1:8333")
+	r.remember(map[string]float64{p.Addr(): 40_000_000})
+
+	require.InDelta(t, 40_000_000.0, r.peerRate(p), 1)
+
+	now := time.Now()
+	r.decayQuiet(now, map[*peerpkg.Peer]time.Time{p: now.Add(-30 * time.Minute)})
+
+	require.Less(t, r.peerRate(p), float64(raceStallRate))
 }
