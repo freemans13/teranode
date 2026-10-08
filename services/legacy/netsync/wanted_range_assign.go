@@ -114,6 +114,27 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// blocks parked and five owed.
 	candidates := sm.unownedBlocksUpTo(wanted, assigner.remaining)
 
+	// The lowest candidates can all be due before a slow peer could land one, and then the slow
+	// peers stay idle (2026-10-08 10:59 to 12:11: six of seven peers idle). The blocks from the
+	// first height a measured peer with room can land in time are candidates too, from the full
+	// window; the deadline rule gives each to the slowest peer that is in time.
+	if from, ok := assigner.inTimeFrom(); ok && sm.headersFirstMode.Load() {
+		var last int32
+		if len(candidates) > 0 {
+			last = candidates[len(candidates)-1].height
+		}
+
+		beyond := make([]wantedBlock, 0, len(wanted))
+
+		for _, block := range wanted {
+			if block.height > last && block.height >= from {
+				beyond = append(beyond, block)
+			}
+		}
+
+		candidates = append(candidates, sm.unownedBlocksUpTo(beyond, assigner.remaining)...)
+	}
+
 	// The far blocks for peers with no rate, from the top of the full window (placeUnmeasured).
 	if n := assigner.unmeasuredWithRoom(); n > 0 && sm.headersFirstMode.Load() {
 		top := make([]wantedBlock, 0, len(wanted))

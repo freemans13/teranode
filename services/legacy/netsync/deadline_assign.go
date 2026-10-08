@@ -230,3 +230,25 @@ func (a *downloadAssigner) unmeasuredWithRoom() int {
 
 	return n
 }
+
+// inTimeFrom is the lowest height that a measured peer with room can land in time, at the pace and
+// the largest recent size. ok is false with no pace, no size, or no such peer.
+func (a *downloadAssigner) inTimeFrom() (int32, bool) {
+	if a == nil || a.pace <= 0 || a.size <= 0 {
+		return 0, false
+	}
+
+	soonest := time.Duration(math.MaxInt64)
+
+	for _, p := range a.peers {
+		if p.measured && p.budget > 0 {
+			soonest = min(soonest, p.arrival(a.size))
+		}
+	}
+
+	if soonest == time.Duration(math.MaxInt64) {
+		return 0, false
+	}
+
+	return a.tip + 1 + int32(math.Ceil(soonest.Seconds()*a.pace)), true
+}
