@@ -420,3 +420,22 @@ func TestWatchLeavesABlockThatLandsSoonAfterTheBlockBelowIt(t *testing.T) {
 	require.True(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)) || sm.blockDownloads.HasOwner(fast2, heightHash(t, sm, 11)), "block 11 adds about 171 s to the wait")
 	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 12)) || sm.blockDownloads.HasOwner(fast2, heightHash(t, sm, 12)), "block 12 adds about 14 s more")
 }
+
+// A copy that has more than half its bytes gets no helper: the helper must send the full block,
+// and the owner's copy, nearly complete, is discarded if the helper wins. On mainnet from 14:31 to
+// 14:49 on 2026-10-08, 8% of the bytes received were discarded, over the 5% accepted. Here 600 of
+// 1,000 MB are in after 200 s at 3 MB/s: 133 s to go, and a fresh copy at 80 MB/s needs 12.5 s.
+func TestWatchLeavesACopyThatHasMoreThanHalfItsBytes(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	next := heightHash(t, sm, 11)
+	askAt(t, sm, owner, next, now.Add(-4*time.Minute))
+
+	s := sm.streams.start(next, 11, owner, 1_000_000_000, now.Add(-200*time.Second))
+	s.read.Store(600_000_000)
+
+	sm.watchOwedBlocks(now)
+
+	require.False(t, sm.blockDownloads.HasOwner(fast, next))
+}

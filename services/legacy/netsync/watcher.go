@@ -20,7 +20,8 @@ import (
 // The chain applies a block only after each block below it, so a block that lands after each
 // block below it adds to the chain's wait. When it adds watchMinETA or more, its request is
 // watchMinAge old, and it has one owner, one more peer is asked:
-//   - Arriving: the peer that lands a full copy soonest, if in half the owner's time or less.
+//   - Arriving, with half its bytes or fewer: the peer that lands a full copy soonest, if in half
+//     the owner's time or less. A copy with more than half its bytes gets no helper.
 //   - Queued: the fastest peer that starts before the owner and has rescueFasterBy times its rate.
 //     It lands the block sooner whatever its size.
 // The owner keeps its request and its connection; the first complete copy converts and the other
@@ -107,6 +108,13 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 		}
 
 		owner := owners[0]
+
+		// A copy with more than half its bytes gets no helper: the helper must send the full
+		// block, and the owner's nearly complete copy is discarded if the helper wins. On
+		// 2026-10-08 from 14:31 to 14:49, 8% of the bytes received were discarded.
+		if read, total, _, arriving := sm.streams.arrivingFrom(b.rec.hash, owner); arriving && total > 0 && read*2 > total {
+			continue
+		}
 
 		helper, helperETA := sm.watchHelper(queues, owner, b, size, typical, eta, used)
 		if helper == nil || !sm.askRacer(helper, b.rec.hash, now) {
