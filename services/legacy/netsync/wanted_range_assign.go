@@ -97,7 +97,7 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// forgiven first and the budgets read again; without that nothing is
 	// re-asked until a stall backstop fires.
 	assigner := sm.newDownloadAssigner()
-	if assigner == nil && sm.forgiveQuietOwners(wanted) > 0 {
+	if assigner == nil && !sm.headersFirstMode.Load() && sm.forgiveQuietOwners(wanted) > 0 {
 		assigner = sm.newDownloadAssigner()
 	}
 
@@ -374,6 +374,18 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 		// SV Node does not re-ask a block from a peer that is still delivering.
 		if sm.ownerStillSending(block.hash) {
 			continue
+		}
+
+		// Below the last checkpoint an owed block stays with its owner: the rescue rule judges
+		// the lowest one when it will be late, and a quiet peer's rate decays, so it gets no more
+		// blocks. Letting a quiet owner off here released 15 blocks of a busy peer on 2026-10-07,
+		// and each was downloaded two times. Above it, at the tip, the quiet-owner rule stays. A
+		// block whose owners were let off already, a demoted sync peer's (demoteSyncPeer), has no
+		// active owner and is asked of another peer.
+		if sm.headersFirstMode.Load() {
+			if active, _ := sm.blockDownloads.ActiveOwners(block.hash); len(active) > 0 {
+				continue
+			}
 		}
 
 		if sm.forgiveQuietOwnersOf(block) {
