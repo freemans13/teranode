@@ -803,7 +803,8 @@ func seedingExternalStoreURL(utxoStoreURL *url.URL, fsyncMode string) (*url.URL,
 // mismatch is reported as an error instead of silently treated as success.
 // The footer is taken from the stream when the records end exactly at it
 // (utxopersister.ErrRecordBoundary), so a pipe works; otherwise it is read by
-// seeking (utxopersister.GetFooter).
+// seeking (utxopersister.GetFooter). A stream that cannot seek and did not end
+// at a footer is reported as truncated.
 //
 // Only frames for which accept returns true (all, when accept is nil) are
 // sent; accept gets the record's highest output index. Every record is still
@@ -819,6 +820,7 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 		txsSent        uint64
 		scratch        []byte
 		footerBytes    []byte
+		endErr         error
 	)
 
 	for {
@@ -841,6 +843,7 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 			}
 
 			if errors.Is(err, io.EOF) {
+				endErr = err
 				break
 			}
 
@@ -888,12 +891,19 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 
 	if footerBytes != nil {
 		expectedTxCount, expectedUTXOCount, footerErr = utxopersister.DecodeFooter(footerBytes)
+		if footerErr != nil {
+			return errors.NewProcessingError("failed to read snapshot footer", footerErr)
+		}
 	} else {
 		expectedTxCount, expectedUTXOCount, footerErr = utxopersister.GetFooter(f)
-	}
-
-	if footerErr != nil {
-		return errors.NewProcessingError("failed to read snapshot footer", footerErr)
+		if footerErr != nil {
+			// The stream did not end at a footer, and there is none to seek to,
+			// as on a pipe. Either way the snapshot is incomplete, so say that
+			// rather than surfacing the seek error.
+			return errors.NewProcessingError(
+				"snapshot file truncated: the records ended without a footer after %d transactions/%d UTXOs (%v), and the footer could not be read by seeking",
+				txProcessed, utxosProcessed, endErr, footerErr)
+		}
 	}
 
 	if expectedTxCount != txProcessed || expectedUTXOCount != utxosProcessed {

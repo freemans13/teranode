@@ -117,3 +117,40 @@ func TestReadUTXOFrames_StreamedSnapshot_FooterMismatch_ReturnsError(t *testing.
 	err := readUTXOFrames(context.Background(), ulogger.TestLogger{}, f, reader, frameCh, "all", nil)
 	require.ErrorContains(t, err, "snapshot file truncated")
 }
+
+// TestReadUTXOFrames_StreamedSnapshot_TruncatedIsRejected: a pipe cannot seek
+// to the footer, so a stream that does not end in exactly one footer after the
+// last record must be reported as truncated, however it was cut.
+func TestReadUTXOFrames_StreamedSnapshot_TruncatedIsRejected(t *testing.T) {
+	_, wrapperBytes, txCount, utxoCount := buildSnapshotWrappers(t)
+	full := buildStreamedSnapshot(t, txCount, utxoCount)
+	recordsEnd := len(full) - 16
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{"cut mid-record", full[:recordsEnd-len(wrapperBytes[len(wrapperBytes)-1])/2]},
+		{"cut at a record boundary with no footer", full[:recordsEnd]},
+		{"8 bytes of the footer", full[:recordsEnd+8]},
+		{"15 bytes of the footer", full[:recordsEnd+15]},
+		{"footer followed by 8 bytes of garbage", append(append([]byte{}, full...), make([]byte, 8)...)},
+		{"footer followed by 40 bytes of garbage", append(append([]byte{}, full...), make([]byte, 40)...)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f, reader := streamSnapshotThroughFIFO(t, tt.data)
+
+			frameCh := make(chan []byte, 10)
+
+			go func() {
+				for range frameCh { //nolint:revive // drain channel
+				}
+			}()
+
+			err := readUTXOFrames(context.Background(), ulogger.TestLogger{}, f, reader, frameCh, "all", nil)
+			require.ErrorContains(t, err, "snapshot file truncated")
+		})
+	}
+}
