@@ -18,8 +18,8 @@ import (
 //   - Queued: the bytes its owner sends first and the block, a recent mean block for each block of
 //     unknown size, at the owner's rate.
 // The chain applies a block only after each block below it, so a block that lands after each
-// block below it is the one the chain will wait for. When such a block lands watchMinETA or more
-// from now, its request is watchMinAge old, and it has one owner, one more peer is asked:
+// block below it adds to the chain's wait. When it adds watchMinETA or more, its request is
+// watchMinAge old, and it has one owner, one more peer is asked:
 //   - Arriving: the peer that lands a full copy soonest, if in half the owner's time or less.
 //   - Queued: the fastest peer that starts before the owner and has rescueFasterBy times its rate.
 //     It lands the block sooner whatever its size.
@@ -37,8 +37,10 @@ const (
 	watchBlocks = 64
 	// watchMinAge is how long a request runs before the watcher judges it.
 	watchMinAge = 10 * time.Second
-	// watchMinETA is the least time to landing for which a block gets a helper: a copy for a block
-	// that lands sooner costs more than the wait.
+	// watchMinETA is the least time a block must add to the chain's wait, landing after each block
+	// below it, to get a helper: a copy for less costs more than the wait. On 2026-10-08 a helper
+	// for each block that landed after the blocks below it, by any margin, discarded 8% of the
+	// bytes received.
 	watchMinETA = 30 * time.Second
 )
 
@@ -95,10 +97,12 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 			continue
 		}
 
-		late := eta > latest
+		// The time this block adds to the chain's wait: how much later it lands than each block
+		// below it. A few seconds is noise between peers, not a block that stops the chain.
+		adds := eta - latest
 		latest = max(latest, eta)
 
-		if !late || eta < watchMinETA || len(owners) != 1 || sm.streams.wasRaced(b.rec.hash, now) {
+		if adds < watchMinETA || len(owners) != 1 || sm.streams.wasRaced(b.rec.hash, now) {
 			continue
 		}
 
