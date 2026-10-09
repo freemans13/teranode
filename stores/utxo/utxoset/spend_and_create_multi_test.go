@@ -57,6 +57,16 @@ func TestSpendAndCreateMultiUtxoset(t *testing.T) {
 			s, _ := newTestStore(t)
 			tests.SpendAndCreateMultiSubtreeIdxs(t, s)
 		})
+		// Both of these assert, through GetSpend, which INPUT of the spender took each coin,
+		// one for spends of stored UTXOs and one for outputs netted inside the list.
+		t.Run("result mapping", func(t *testing.T) {
+			s, _ := newUncheckpointedStore(t)
+			tests.SpendAndCreateMultiResultMapping(t, s)
+		})
+		t.Run("parents deduplicated", func(t *testing.T) {
+			s, _ := newUncheckpointedStore(t)
+			tests.SpendAndCreateMultiParentsDeduplicated(t, s)
+		})
 	}
 
 	t.Run("one spend chunk", suite)

@@ -70,6 +70,36 @@ func TestSchemaAssertionNamesTheJournalColumns(t *testing.T) {
 	require.Contains(t, err.Error(), "spend_journal.mined_height")
 }
 
+// TestCreateSchemaAddsTheSpendingInputColumnToAnOlderJournal: spending_vin arrived after
+// databases running this schema already existed, and it is the one column this store adds in
+// place rather than demanding a re-sync for, because adding a column with a constant default is
+// a catalog change with no rewrite. A journal with an attached leaf and a row in it, created
+// without the column, must come out of CreateSchema with the column on the leaf, the old row
+// reading 0, and the spend path able to write it.
+func TestCreateSchemaAddsTheSpendingInputColumnToAnOlderJournal(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	_, err = spendOnly(ctx, s, spendOutput(t, parent, 0, 1), 101)
+	require.NoError(t, err)
+
+	_, err = s.pool.Exec(ctx, `ALTER TABLE spend_journal DROP COLUMN spending_vin`)
+	require.NoError(t, err)
+
+	require.NoError(t, CreateSchema(ctx, s.pool), "an older journal is upgraded in place, not refused")
+
+	var vin int32
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT spending_vin FROM spend_journal WHERE txid = $1`, hashBytes(parent)).Scan(&vin))
+	require.Equal(t, int32(0), vin, "a row journaled before the column reads 0")
+
+	_, err = spendOnly(ctx, s, spendOutput(t, parent, 1, 1), 102)
+	require.NoError(t, err, "the spend path writes the added column")
+}
+
 // TestSchemaAssertionRefusesADatabaseThatStillHasTheDeletedColumns is the gate for the
 // containment change, whose distinguishing edits are DELETIONS. A database written by the
 // schema before it has every column this binary requires, so the required-columns loop passes

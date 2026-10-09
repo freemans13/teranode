@@ -45,8 +45,11 @@ type spendPlan struct {
 	spenders [][]byte
 	owner    []int // global index -> which item in the batch
 	ownerVin []int // global index -> which input of that item
-	perItem  [][]*utxo.Spend
-	itemTxs  []*bt.Tx
+	// vins[k] is ownerVin[k] in the statement's type: the input of the spender that takes row
+	// k's UTXO, written to the journal so GetSpend can name it.
+	vins    []int32
+	perItem [][]*utxo.Spend
+	itemTxs []*bt.Tx
 	// masks[k] is the set of UTXO flags that refuse row k's spend, derived from the option
 	// its own caller passed. Per row rather than per plan, because a batch can mix a conflict
 	// resolution's waived spend with an ordinary one.
@@ -99,6 +102,7 @@ func planSpends(items []*spendItem) *spendPlan {
 		masks:    make([]int16, 0, total),
 		owner:    make([]int, 0, total),
 		ownerVin: make([]int, 0, total),
+		vins:     make([]int32, 0, total),
 		perItem:  make([][]*utxo.Spend, len(items)),
 		itemTxs:  make([]*bt.Tx, len(items)),
 
@@ -148,6 +152,7 @@ func planSpends(items []*spendItem) *spendPlan {
 			p.masks = append(p.masks, mask)
 			p.owner = append(p.owner, i)
 			p.ownerVin = append(p.ownerVin, vin)
+			p.vins = append(p.vins, int32(vin)) //nolint:gosec // an input index fits int32
 
 			// The spender belongs on the record from the moment the record exists. Conflict
 			// resolution hands these same records straight back to this store's Unspend,
@@ -211,6 +216,7 @@ func (p *spendPlan) sortRows() {
 	p.masks = permute(p.masks, order)
 	p.owner = permute(p.owner, order)
 	p.ownerVin = permute(p.ownerVin, order)
+	p.vins = permute(p.vins, order)
 
 	for k := range p.idx {
 		p.idx[k] = int32(k) //nolint:gosec // bounded by batch size
@@ -368,7 +374,7 @@ func (s *Store) runSpendPlan(ctx context.Context, q pgx.Tx, p *spendPlan) error 
 	}
 
 	rows, err := q.Query(ctx, spendJournalSQL, p.leaves, p.ukeys, p.txids, p.idx,
-		p.heights, p.spenders, p.masks)
+		p.heights, p.spenders, p.masks, p.vins)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Spend] delete", err)
 	}

@@ -94,11 +94,11 @@ func (s *Store) setFlags(ctx context.Context, spends []*utxo.Spend, orMask, andM
 // into, and the same column carries coinbase maturity, so reading it here is what makes this
 // report IMMATURE for both without a second rule.
 const getSpendSQL = `
-SELECT 'live'::text, u.flags, NULL::bytea, u.hash_override, u.spendable_from
+SELECT 'live'::text, u.flags, NULL::bytea, 0::int, u.hash_override, u.spendable_from
   FROM utxo u
  WHERE u.leaf = $1 AND u.ukey = $2 AND u.txid = $3
 UNION ALL
-SELECT 'spent'::text, j.flags, j.spending_txid, j.hash_override, j.spendable_from
+SELECT 'spent'::text, j.flags, j.spending_txid, j.spending_vin, j.hash_override, j.spendable_from
   FROM spend_journal j
  WHERE j.ukey = $2 AND j.txid = $3
  LIMIT 1`
@@ -122,11 +122,12 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 			where         string
 			flags         int16
 			spender       []byte
+			spenderVin    int32
 			hashOverride  []byte
 			spendableFrom int32
 		)
 
-		if err := rows.Scan(&where, &flags, &spender, &hashOverride, &spendableFrom); err != nil {
+		if err := rows.Scan(&where, &flags, &spender, &spenderVin, &hashOverride, &spendableFrom); err != nil {
 			return nil, errors.NewStorageError("[utxoset][GetSpend] scan", err)
 		}
 
@@ -148,7 +149,7 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 
 		return &utxo.SpendResponse{
 			Status:       int(utxo.Status_SPENT),
-			SpendingData: spendpkg.NewSpendingData(hash, 0),
+			SpendingData: spendpkg.NewSpendingData(hash, int(spenderVin)),
 		}, nil
 	}
 

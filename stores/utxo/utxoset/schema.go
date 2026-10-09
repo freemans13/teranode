@@ -222,6 +222,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS spend_journal (
     spent_height    INTEGER  NOT NULL,
+    spending_vin    INTEGER  NOT NULL DEFAULT 0,
     satoshis        BIGINT   NOT NULL,
     created_height  INTEGER  NOT NULL,
     spendable_from  INTEGER  NOT NULL,
@@ -234,6 +235,19 @@ CREATE TABLE IF NOT EXISTS spend_journal (
     script          BYTEA    NOT NULL,
     hash_override   BYTEA
 ) PARTITION BY RANGE (spent_height);
+
+-- spending_vin is WHICH INPUT of spending_txid took the UTXO. GetSpend publishes it through the
+-- asset API, and nothing else in the store can recover it: the inpoints on the spender's
+-- identity row are parent-major and deduplicated, so they do not keep the input order, and the
+-- body is optional and ages out on its own clock.
+--
+-- It sits second so it costs NO bytes on a fresh table: satoshis is 8-aligned, so the four
+-- bytes after spent_height were alignment padding. The ALTER below is for a database created
+-- before the column existed. Adding a column with a constant default is a catalog change in
+-- PostgreSQL 11 and later, with no rewrite, and it reaches every attached leaf; there it lands
+-- at the end of the row and costs up to 4 bytes plus alignment. Rows written before it read
+-- back 0, which is what GetSpend reported for every row until then.
+ALTER TABLE spend_journal ADD COLUMN IF NOT EXISTS spending_vin INTEGER NOT NULL DEFAULT 0;
 
 -- ---------------------------------------------------------------------------
 -- CONFLICT BOOKKEEPING. One row per (contested parent, losing child).
@@ -681,6 +695,7 @@ var requiredColumns = []struct{ table, column string }{
 	{"tx_mined_stamped", ""},
 	{"spend_journal", "mined_height"},
 	{"spend_journal", "block_id"},
+	{"spend_journal", "spending_vin"},
 	{"conflict_intents", ""},
 }
 

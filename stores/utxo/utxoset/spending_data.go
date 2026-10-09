@@ -26,11 +26,11 @@ import (
 // would name a stranger as the spender of this transaction's UTXO, and the conflict walk would
 // then mark that stranger conflicting along with everything descended from it.
 const spendingDataSQL = `
-SELECT 'live'::text AS kind, u.ukey, NULL::bytea AS spender
+SELECT 'live'::text AS kind, u.ukey, NULL::bytea AS spender, 0::int AS spender_vin
   FROM utxo u
  WHERE u.leaf = $1 AND u.ukey BETWEEN $2 AND $3 AND u.txid = $4
 UNION ALL
-SELECT 'spent'::text, j.ukey, j.spending_txid
+SELECT 'spent'::text, j.ukey, j.spending_txid, j.spending_vin
   FROM spend_journal j
  WHERE j.ukey BETWEEN $2 AND $3 AND j.txid = $4`
 
@@ -83,10 +83,8 @@ func wantsConflictingChildren(fieldNames []fields.FieldName) bool {
 // caller's own range check reports it rather than this silently reporting the output as
 // unspent, which is the answer that would let a double spend through.
 //
-// The input index on each entry is left at zero. The journal does not record which input of the
-// spending transaction consumed the UTXO, and nothing that reads this field uses it: the two
-// places that read an input index take it from the single-outpoint spend lookup instead. It is
-// stated here so a later reader does not mistake the zero for a fact.
+// The input index on each entry is the journal's spending_vin, which input of the spending
+// transaction consumed the UTXO. Rows journaled before that column existed read back 0.
 //
 // Bounded by the journal's retention, like every other spender-identity answer in this store.
 // Beyond it a spent output looks the same as one that never existed.
@@ -98,8 +96,9 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 	}
 
 	type entry struct {
-		vout    uint32
-		spender []byte
+		vout       uint32
+		spender    []byte
+		spenderVin int32
 	}
 
 	found := make([]entry, 0, 8)
@@ -107,12 +106,13 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 
 	for rows.Next() {
 		var (
-			kind    string
-			ukey    [16]byte
-			spender []byte
+			kind       string
+			ukey       [16]byte
+			spender    []byte
+			spenderVin int32
 		)
 
-		if err := rows.Scan(&kind, &ukey, &spender); err != nil {
+		if err := rows.Scan(&kind, &ukey, &spender, &spenderVin); err != nil {
 			rows.Close()
 			return errors.NewStorageError("[utxoset][Get] spending data scan %s", hash.String(), err)
 		}
@@ -122,7 +122,7 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 			maxVout = int(vout)
 		}
 
-		found = append(found, entry{vout: vout, spender: spender})
+		found = append(found, entry{vout: vout, spender: spender, spenderVin: spenderVin})
 	}
 
 	rows.Close()
@@ -147,7 +147,7 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 			return errors.NewStorageError("[utxoset][Get] spender hash %s", hash.String(), herr)
 		}
 
-		out[e.vout] = spendpkg.NewSpendingData(h, 0)
+		out[e.vout] = spendpkg.NewSpendingData(h, int(e.spenderVin))
 	}
 
 	data.SpendingDatas = out
