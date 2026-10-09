@@ -67,6 +67,43 @@ var nettedBelowMaxChunkOutputs = 50_000
 // so a test can set a small limit.
 var nettedCoinsBatchRows = 50_000
 
+// nettedCoinsBatchBytes is the most bytes one statement of netBelowCoins sends, each row counted at
+// its script and coinRowOverhead. Postgres refuses a protocol message of 1 GB or more: on mainnet
+// at block 863,817 on 2026-10-09, 50,000 rows with large scripts failed with "message body too
+// large" on every attempt. A variable so a test can set a small limit.
+var nettedCoinsBatchBytes int64 = 256 << 20
+
+// coinRowOverhead is the bytes of a coin row beside its script: the fixed columns, the txid and
+// the array framing of each value.
+const coinRowOverhead = 128
+
+// coinBatches cuts rows, in sequence, into batches of at most maxRows rows and maxBytes bytes; a
+// batch has one row at least.
+func coinBatches(rows []int, scripts [][]byte, maxRows int, maxBytes int64) [][]int {
+	var (
+		batches [][]int
+		start   int
+		bytes   int64
+	)
+
+	for i, r := range rows {
+		n := int64(len(scripts[r])) + coinRowOverhead
+
+		if i > start && (i-start >= maxRows || bytes+n > maxBytes) {
+			batches = append(batches, rows[start:i])
+			start, bytes = i, 0
+		}
+
+		bytes += n
+	}
+
+	if start < len(rows) {
+		batches = append(batches, rows[start:])
+	}
+
+	return batches
+}
+
 // nettedBelowFault is a test hook called before each chunk of the below-checkpoint netted write
 // commits, with the list positions of the chunk's transactions. An error from it stops that
 // chunk there, as a crash would. nil in production.
@@ -723,11 +760,10 @@ func (s *Store) netBelowCoins(ctx context.Context, dbTx pgx.Tx, p *createPlan, c
 			return bytes.Compare(p.utxoUkeys[x][:], p.utxoUkeys[y][:]) < 0
 		})
 
-		// In batches of nettedCoinsBatchRows, in the sorted sequence: the driver builds each
-		// statement in memory, several times the size of its rows.
-		for from := 0; from < len(rows); from += nettedCoinsBatchRows {
-			batch := rows[from:min(from+nettedCoinsBatchRows, len(rows))]
-
+		// In batches of nettedCoinsBatchRows rows and nettedCoinsBatchBytes bytes, in the sorted
+		// sequence: the driver builds each statement in memory, several times the size of its
+		// rows, and Postgres refuses a message of 1 GB or more.
+		for _, batch := range coinBatches(rows, p.utxoScripts, nettedCoinsBatchRows, nettedCoinsBatchBytes) {
 			if _, err := dbTx.Exec(ctx, nettedCoinsSQL,
 				permute(p.utxoSats, batch), permute(p.utxoHeights, batch), permute(p.utxoSpendable, batch),
 				permute(p.utxoMined, batch), permute(p.utxoBlockIDs, batch), permute(p.utxoLeaves, batch),
