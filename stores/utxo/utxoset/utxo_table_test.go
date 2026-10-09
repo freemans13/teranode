@@ -77,7 +77,8 @@ func newTestStoreWith(t *testing.T, tune func(*settings.Settings)) (*Store, cont
 	                       DROP TABLE IF EXISTS tx_mined_stamped CASCADE;
 	                       DROP TABLE IF EXISTS conflict_children CASCADE;
 	                       DROP TABLE IF EXISTS conflict_intents CASCADE;
-	                       DROP TABLE IF EXISTS preserved_parent CASCADE;`)
+	                       DROP TABLE IF EXISTS preserved_parent CASCADE;
+	                       DROP TABLE IF EXISTS tx_body_carry CASCADE;`)
 
 	// Sweep up detached partitions the parent drop cannot reach. DROP TABLE removes a
 	// partitioned parent and everything still ATTACHED to it; anything detached is an

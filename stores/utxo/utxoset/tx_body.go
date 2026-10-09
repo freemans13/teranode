@@ -119,7 +119,17 @@ SELECT c.relname,
 // the bytes is its only source. Dropping ahead of it would wedge it permanently, with no
 // fallback. If pruner_force_ignore_block_persister_height is ever set, that protection is
 // gone and this becomes unsafe.
+//
+// Before any window goes, the bodies of transactions still waiting to be mined are carried into
+// tx_body_carry (carryBodiesAhead), and after the drops the carried bodies that are no longer
+// needed are deleted (reclaimCarriedBodies). A carry that fails stops the pass before anything
+// is dropped: a dropped body cannot be brought back.
 func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int, error) {
+	carried, err := s.carryBodiesAhead(ctx, height, false)
+	if err != nil {
+		return 0, err
+	}
+
 	if height <= s.bodyRetention {
 		return 0, nil
 	}
@@ -169,6 +179,14 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 	// progress measure at all.
 	sort.Slice(windows, func(i, j int) bool { return windows[i].window < windows[j].window })
 
+	// A drop is due, so carry again unless this pass already did: a transaction un-mined by a
+	// reorg since the window entered the carry band is waiting again and needs its body.
+	if !carried && len(windows) > 0 && windows[0].window < cutoff {
+		if _, err := s.carryBodiesAhead(ctx, height, true); err != nil {
+			return 0, err
+		}
+	}
+
 	dropped := 0
 
 	for _, w := range windows {
@@ -206,5 +224,131 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 		dropped++
 	}
 
+	if err := s.reclaimCarriedBodies(ctx, height); err != nil {
+		return dropped, err
+	}
+
 	return dropped, nil
+}
+
+// carryBodiesAhead runs carryUnminedBodies for every window that drops within one window of
+// the tip, once per new window, or now when force is set. It reports whether it ran.
+//
+// The bound is measured from the TIP, one window ahead of the drop, and that is what makes it
+// safe against the persister lagging. The drop is measured from the pruner's height, which is
+// the persister's archived height, so a waiting transaction mined in a block the persister
+// has not reached yet has already lost its unmined marker by the time its window drops. A
+// carry that looked only at drop time would let that body go and wedge the persister on the
+// block. Carried while the tip enters the band, the transaction was still waiting, or it was
+// mined at or below that tip, which is at least one window below the height its window
+// drops at, so the persister has archived it by then.
+//
+// The band is entered once per 48 blocks, and that is the only time the unmined set is read
+// for it; the drop pass reads it a second time (see dropTxBodyWindowsBelow).
+func (s *Store) carryBodiesAhead(ctx context.Context, height uint32, force bool) (bool, error) {
+	tip := max(s.GetBlockHeight(), height)
+
+	if tip+TxBodyPartitionBlocks <= s.bodyRetention {
+		return false, nil
+	}
+
+	// Every window below bound drops once the tip is one more window along.
+	bound := (tip + TxBodyPartitionBlocks - s.bodyRetention) / TxBodyPartitionBlocks
+	if bound == 0 || (!force && s.carryBound.Load() == bound+1) {
+		return false, nil
+	}
+
+	if _, err := s.carryUnminedBodies(ctx, bound*TxBodyPartitionBlocks); err != nil {
+		return false, err
+	}
+
+	// Cached only once the copy has committed, so a failure is retried on the next pass.
+	s.carryBound.Store(bound + 1)
+
+	return true, nil
+}
+
+// carryUnminedBodySQL copies, into tx_body_carry, the body of every transaction still waiting
+// to be mined whose body lives below $1, a height.
+//
+// "Waiting" is the identity row's unmined marker, the predicate copyForwardUnminedSpends uses
+// (unminedInpointsSQL), and the scan is driven by the marker's partial index for the same
+// reason: it reads the waiting population and nothing else, whatever the size of the windows.
+//
+// Crash safety. The copy commits on its own and the drop comes later, so a crash between them
+// carries the same window again on the next pass. The NOT EXISTS skips a transaction already
+// carried before its body is read, and ON CONFLICT is the backstop: the table's key is the
+// txid, so a second copy cannot be a second row. Until the window drops a carried body exists
+// twice, once in its window and once here, and the reader takes the window's and consults this
+// table only when that is gone (readCarriedBodies), so two copies are never two answers.
+//
+// The body is read through the parent tx_body, so only an attached window is carried from.
+// That is enough: a window is detached only by a pass that has already carried it.
+const carryUnminedBodySQL = `
+INSERT INTO tx_body_carry (txid, raw_tx)
+SELECT i.txid, b.raw_tx
+  FROM tx_ident i
+ CROSS JOIN LATERAL (
+   SELECT b.raw_tx
+     FROM tx_body b
+    WHERE b.created_height = i.created_height
+      AND b.txid = i.txid
+   OFFSET 0
+ ) AS b
+ WHERE i.off_chain_since IS NOT NULL
+   AND i.created_height < $1::int
+   AND b.raw_tx IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM tx_body_carry c WHERE c.txid = i.txid)
+ON CONFLICT (txid) DO NOTHING`
+
+// carryUnminedBodies carries the body of every waiting transaction created below bound into
+// tx_body_carry, and returns how many it copied. See carryUnminedBodySQL.
+func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, error) {
+	tag, err := s.pool.Exec(ctx, carryUnminedBodySQL, int32(bound)) //nolint:gosec // a height fits int32
+	if err != nil {
+		return 0, errors.NewStorageError("[utxoset] carry bodies of unmined transactions below height %d", bound, err)
+	}
+
+	if n := tag.RowsAffected(); n > 0 {
+		s.logger.Infof("[utxoset] carried the bodies of %d unmined transactions created below height %d past their window", n, bound)
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+// reclaimCarriedBodySQL deletes the carried bodies nothing needs any more: the transaction is
+// not waiting, and no block that contains it is above $1, the pruner's height less the body
+// horizon. A carried transaction therefore keeps its body while it waits and for 288 blocks
+// after it is mined, and a transaction deleted outright loses it here too.
+//
+// Both tests read one snapshot, and SetMined records the block and clears the marker in one
+// transaction, so a transaction being mined as this runs matches one of them either way.
+const reclaimCarriedBodySQL = `
+DELETE FROM tx_body_carry c
+ WHERE NOT EXISTS (
+       SELECT 1 FROM tx_ident i
+        WHERE i.leaf = (get_byte(c.txid, 0) & 7)::smallint
+          AND i.txid = c.txid
+          AND i.off_chain_since IS NOT NULL)
+   AND NOT EXISTS (
+       SELECT 1 FROM tx_mined m
+        WHERE m.txid = c.txid
+          AND m.mined_height > $1::int)`
+
+// reclaimCarriedBodies applies reclaimCarriedBodySQL at the pruner height.
+func (s *Store) reclaimCarriedBodies(ctx context.Context, height uint32) error {
+	if height <= s.bodyRetention {
+		return nil
+	}
+
+	tag, err := s.pool.Exec(ctx, reclaimCarriedBodySQL, int32(height-s.bodyRetention)) //nolint:gosec // a height fits int32
+	if err != nil {
+		return errors.NewStorageError("[utxoset] reclaim carried bodies at height %d", height, err)
+	}
+
+	if n := tag.RowsAffected(); n > 0 {
+		s.logger.Infof("[utxoset] dropped %d carried bodies of transactions mined %d or more blocks ago", n, s.bodyRetention)
+	}
+
+	return nil
 }

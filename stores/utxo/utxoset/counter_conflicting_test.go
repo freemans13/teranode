@@ -41,6 +41,7 @@ func TestCounterConflictingSurvivesABodyThatHasAgedOut(t *testing.T) {
 	dropped, err := s.dropTxBodyWindowsBelow(ctx, 100_000)
 	require.NoError(t, err)
 	require.Positive(t, dropped, "the body windows must actually have been dropped")
+	forgetCarriedBodies(t, s, ctx)
 
 	ch := child.TxIDChainHash()
 
@@ -98,6 +99,7 @@ func TestReverseConflictReachesATransactionWhoseBytesHaveGone(t *testing.T) {
 	dropped, err := s.dropTxBodyWindowsBelow(ctx, 100_000)
 	require.NoError(t, err)
 	require.Positive(t, dropped, "the bytes must actually be gone for this to test anything")
+	forgetCarriedBodies(t, s, ctx)
 
 	lh := loser.TxIDChainHash()
 

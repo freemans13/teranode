@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/jackc/pgx/v5"
 )
@@ -415,6 +416,11 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 		}
 	}
 
+	// The carried body, for a transaction whose window has aged out while it waited.
+	if err := s.readCarriedBodies(ctx, uniq, &res); err != nil {
+		return lookupResult{}, err
+	}
+
 	// The contest, if the caller asked for it, for every transaction ANY step answered. A
 	// mined parent is contested exactly as a mempool one is, so this cannot be folded into
 	// the identity read: the parents that matter most are the ones that left it.
@@ -557,6 +563,107 @@ func stillMissing(hashes []chainhash.Hash, res *lookupResult) []chainhash.Hash {
 	}
 
 	return rest
+}
+
+// carriedBodySQL reads the carried bodies of a set of transactions, one primary-key probe each,
+// through the same LATERAL fence preservedByTxidSQL uses and for the same reason: written as
+// `txid = ANY($1)` against a small table the planner reads the whole table instead.
+const carriedBodySQL = `
+SELECT k.txid, c.raw_tx
+  FROM unnest($1::bytea[]) AS k(txid)
+ CROSS JOIN LATERAL (
+   SELECT c.raw_tx
+     FROM tx_body_carry c
+    WHERE c.txid = k.txid
+   OFFSET 0
+ ) AS c`
+
+// mayHaveCarriedBody reports whether a record with no body could have one in tx_body_carry. It
+// is the reclaim rule's keep condition widened by one window, so a body the table still holds
+// is always looked for, and it is what keeps the probe off the common read: an old parent whose
+// window aged out in the ordinary way is mined far below the tip, and below the checkpoint,
+// where bodies may never have been written at all, nothing was ever carried.
+func (s *Store) mayHaveCarriedBody(d *meta.Data, tip uint32) bool {
+	if d.UnminedSince != 0 {
+		return true
+	}
+
+	var highest uint32
+
+	for _, h := range d.BlockHeights {
+		highest = max(highest, h)
+	}
+
+	if highest == 0 {
+		return false
+	}
+
+	if s.bodyCheckpoints != nil && model.BelowCheckpoint(s.bodyCheckpoints, highest) {
+		return false
+	}
+
+	return highest+s.bodyRetention+TxBodyPartitionBlocks > tip
+}
+
+// readCarriedBodies fills in the body of every answered transaction that came back without one
+// and could have been carried past its window (see tx_body_carry in schema.go). The window's
+// own copy always wins: this runs only where the window's join found nothing, so a body that
+// exists in both places during the interval between the carry and the drop is read once.
+func (s *Store) readCarriedBodies(ctx context.Context, hashes []chainhash.Hash, res *lookupResult) error {
+	tip := s.GetBlockHeight()
+
+	var txids [][]byte
+
+	for i := range hashes {
+		d, ok := res.found[hashes[i]]
+		if !ok || d.Tx != nil || !s.mayHaveCarriedBody(d, tip) {
+			continue
+		}
+
+		txids = append(txids, hashes[i][:])
+	}
+
+	if len(txids) == 0 {
+		return nil
+	}
+
+	rows, err := s.pool.Query(ctx, carriedBodySQL, txids)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][lookup] carried bodies", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var txid, raw []byte
+
+		if err := rows.Scan(&txid, &raw); err != nil {
+			return errors.NewStorageError("[utxoset][lookup] carried body scan", err)
+		}
+
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		tx, terr := bt.NewTxFromBytes(raw)
+		if terr != nil {
+			// This transaction's fault alone, as a corrupt row is everywhere else.
+			delete(res.found, h)
+			res.fail(h, errors.NewStorageError("[utxoset][lookup] decode carried body %s", h.String(), terr))
+
+			continue
+		}
+
+		if d := res.found[h]; d != nil {
+			d.Tx = tx
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][lookup] carried bodies", err)
+	}
+
+	return nil
 }
 
 // readIdentRows fills in every transaction that still holds an identity row: a mempool

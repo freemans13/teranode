@@ -574,6 +574,31 @@ CREATE TABLE IF NOT EXISTS tx_body (
     raw_tx          BYTEA,
     PRIMARY KEY (created_height, txid)
 ) PARTITION BY RANGE (created_height);
+
+-- ---------------------------------------------------------------------------
+-- THE CARRIED BODY. The bytes of a transaction that is still waiting to be mined when its
+-- tx_body window ages out.
+--
+-- A waiting transaction can still be mined, and for a block this node assembled no subtree
+-- data file exists until the block persister builds one from this store's bodies. Dropping
+-- the bytes with the window failed that block for good. SQL and Aerospike keep an unmined
+-- transaction's body for as long as it waits; this table is how this store does the same.
+--
+-- A side table, not a copy into a newer tx_body window, because a body is found by
+-- (created_height, txid) from the identity or containment row, and created_height is
+-- immutable there: a copy under a newer height would be unreachable, and moving the pointer
+-- instead races SetMined, which copies created_height into tx_mined in its own statement.
+--
+-- Keyed by txid alone, so a second carry of the same transaction is a conflict rather than a
+-- second row, and a read is one primary-key probe. The pruner writes it (carryUnminedBodies)
+-- and deletes from it (reclaimCarriedBodies); nothing on the block or validator path does. It
+-- holds the transactions that waited longer than the body horizon, which an ordinary mempool
+-- that keeps up leaves empty. NOT partitioned, for the reasons preserved_parent gives.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tx_body_carry (
+    txid    BYTEA PRIMARY KEY CHECK (length(txid) = 32),
+    raw_tx  BYTEA NOT NULL
+);
 `
 
 // partitionSQL is applied per leaf.
