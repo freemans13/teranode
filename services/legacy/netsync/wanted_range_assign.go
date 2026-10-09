@@ -9,6 +9,9 @@ import (
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
+// slowPassThreshold is how long a download pass may take before it is logged.
+const slowPassThreshold = 5 * time.Second
+
 // assignWantedBlocks asks peers for the blocks this node wants next.
 //
 // There is no loop and no cursor. The pass computes the wanted range from the
@@ -45,6 +48,16 @@ func (sm *SyncManager) assignWantedBlocks() {
 	// mainnet on 2026-09-24 had no other cause.
 	sm.assignMu.Lock()
 	defer sm.assignMu.Unlock()
+
+	// A pass holds assignMu, so a slow pass holds up every pass behind it. On 2026-10-09 from
+	// 06:36 to 06:46 no block was asked for while 1,900 were wanted, and nothing in the log said
+	// why.
+	passStart := time.Now()
+	defer func() {
+		if took := time.Since(passStart); took > slowPassThreshold {
+			sm.logger.Warnf("[assignWantedBlocks] a download pass took %s, holding the passes behind it", took.Round(time.Millisecond))
+		}
+	}()
 
 	// Read here, before wantedBlocks takes headerMu: committedTip makes a
 	// blocking blockchain call, and this package's lock rule has no exception
@@ -335,6 +348,21 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 			continue
 		}
 
+		// Below the last checkpoint a block with one active owner stays with it: the watcher
+		// judges it when it will be late, and a quiet peer's rate decays, so it gets no more
+		// blocks. Letting a quiet owner off here released 15 blocks of a busy peer on 2026-10-07,
+		// and each was downloaded two times. Skipped here, ahead of the disk and chain checks,
+		// which each pass otherwise made for each such block. A block with two or more active
+		// owners has had the watcher's one extra copy; when none of them sends, the quiet-owner
+		// rule below asks another peer. A block whose owners were let off already, a demoted
+		// sync peer's (demoteSyncPeer), has no active owner and is asked of another peer. Above
+		// the checkpoint, at the tip, the quiet-owner rule applies to each block.
+		if sm.headersFirstMode.Load() {
+			if active, _ := sm.blockDownloads.ActiveOwners(block.hash); len(active) == 1 {
+				continue
+			}
+		}
+
 		// A block already on disk is not wanted, whatever any index says. This
 		// is what makes a restart free: the files survive it, so a node comes
 		// back and asks only for what it genuinely lacks.
@@ -385,18 +413,6 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 		// SV Node does not re-ask a block from a peer that is still delivering.
 		if sm.ownerStillSending(block.hash) {
 			continue
-		}
-
-		// Below the last checkpoint an owed block stays with its owner: the watcher judges
-		// the lowest one when it will be late, and a quiet peer's rate decays, so it gets no more
-		// blocks. Letting a quiet owner off here released 15 blocks of a busy peer on 2026-10-07,
-		// and each was downloaded two times. Above it, at the tip, the quiet-owner rule stays. A
-		// block whose owners were let off already, a demoted sync peer's (demoteSyncPeer), has no
-		// active owner and is asked of another peer.
-		if sm.headersFirstMode.Load() {
-			if active, _ := sm.blockDownloads.ActiveOwners(block.hash); len(active) > 0 {
-				continue
-			}
 		}
 
 		if sm.forgiveQuietOwnersOf(block) {
