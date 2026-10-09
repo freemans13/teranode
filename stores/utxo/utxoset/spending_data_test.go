@@ -3,9 +3,75 @@ package utxoset
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
 )
+
+// TestGetReportsAFrozenOutputWithTheFrozenSentinel.
+//
+// The conflict walks recognise a frozen output by the sentinel spender both reference stores
+// put in its slot, and conflict resolution refuses to demote a transaction with a frozen
+// descendant on that evidence alone. This store answered a frozen output exactly as an unspent
+// one, nil, so the walk came back empty and the refusal could not fire.
+//
+// The frozen output is vout 1, so the sentinel's input index, which both reference stores set
+// to the output number, is distinguishable from the zero a careless answer would give.
+func TestGetReportsAFrozenOutputWithTheFrozenSentinel(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 3, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	ph := parent.TxIDChainHash()
+
+	require.NoError(t, s.FreezeUTXOs(ctx, []*utxo.Spend{{TxID: ph, Vout: 1}}, nil))
+
+	got, err := s.Get(ctx, ph, fields.Utxos)
+	require.NoError(t, err)
+	require.Len(t, got.SpendingDatas, 3)
+	require.Nil(t, got.SpendingDatas[0], "output 0 is unspent and not frozen")
+	require.NotNil(t, got.SpendingDatas[1], "output 1 is frozen and must say so")
+	require.Equal(t, subtree.FrozenBytesTxHash.String(), got.SpendingDatas[1].TxID.String())
+	require.Equal(t, 1, got.SpendingDatas[1].Vin, "the sentinel carries the output number, as in sql and aerospike")
+	require.Nil(t, got.SpendingDatas[2])
+
+	walk, err := utxo.GetConflictingChildren(ctx, s, *ph, 0)
+	require.NoError(t, err)
+	require.Contains(t, walk, subtree.FrozenBytesTxHash, "the conflict walk must see the frozen output")
+}
+
+// TestCounterConflictingRefusesAWinnerWithAFrozenDescendant drives the consumer of the sentinel.
+// The winner took the contested UTXO and one of the winner's own outputs is frozen, so demoting
+// the winner would demote a frozen coin; the shared walk refuses that with "tx has frozen
+// child", and it can only do so if the store reports the freeze.
+func TestCounterConflictingRefusesAWinnerWithAFrozenDescendant(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	winner := spendOutput(t, parent, 0, 2)
+	_, err = s.Create(ctx, winner, 101)
+	require.NoError(t, err)
+
+	spends, err := spendOnly(ctx, s, winner, 101)
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+
+	require.NoError(t, s.FreezeUTXOs(ctx, []*utxo.Spend{{TxID: winner.TxIDChainHash(), Vout: 1}}, nil))
+
+	loser := spendOutput(t, parent, 0, 3)
+	_, err = s.Create(ctx, loser, 101, utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	_, err = s.GetCounterConflicting(ctx, *loser.TxIDChainHash())
+	require.Error(t, err, "a winner with a frozen output must not be offered for demotion")
+	require.Contains(t, err.Error(), "frozen child")
+}
 
 // TestGetNamesWhoSpentEachOutputWhenAsked.
 //
