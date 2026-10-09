@@ -550,3 +550,96 @@ func TestSetConflictingRefusesABlockPathMinedRow(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrTxNotFound), "got %v", err)
 }
+
+// TestUnspendKeepsALosersOutputConflicting is P -> A -> B with A and B losing a double spend.
+//
+// Marking them conflicting flags their LIVE UTXOs, and A's only output is not live: B spent it,
+// so it exists only as B's journal row, which carries the flags A:0 had when B took it. The
+// conflict walk then hands that row back for Unspend to restore, and the driver's closing
+// SetLocked(false) releases the hold Unspend put on it. If the restore copied the journal's
+// flags, A:0 came back with no conflicting bit and the release left it spendable while A is
+// still a loser. The restore must take A's conflict state as it stands now.
+//
+// P is innocent and its output must come back spendable.
+func TestUnspendKeepsALosersOutputConflicting(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	p := mkTx(t, 1, 50_000)
+	_, err := s.Create(ctx, p, 100)
+	require.NoError(t, err)
+
+	a := spendOutput(t, p, 0, 1)
+	_, err = s.Create(ctx, a, 101)
+	require.NoError(t, err)
+
+	spends, err := spendOnly(ctx, s, a, 101)
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+
+	b := spendOutput(t, a, 0, 1)
+	_, err = s.Create(ctx, b, 102)
+	require.NoError(t, err)
+
+	spends, err = spendOnly(ctx, s, b, 102)
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+
+	// Steps 1, 2 and 5 of ProcessConflicting, through the shared helpers it uses.
+	affected, marked, err := utxo.MarkConflictingRecursively(ctx, s, []chainhash.Hash{*a.TxIDChainHash()})
+	require.NoError(t, err)
+	require.Len(t, marked, 2, "A and B")
+	require.Len(t, affected, 2, "P:0 taken by A, A:0 taken by B")
+
+	require.NoError(t, s.Unspend(ctx, affected, true))
+	require.NoError(t, s.SetLocked(ctx, []chainhash.Hash{*p.TxIDChainHash(), *a.TxIDChainHash()}, false))
+
+	meta, err := s.Get(ctx, a.TxIDChainHash())
+	require.NoError(t, err)
+	require.True(t, meta.Conflicting, "A is still a loser")
+
+	fresh := spendOutput(t, a, 0, 2)
+	spends, err = spendOnly(ctx, s, fresh, 103)
+	require.Error(t, err, "a loser's restored output must not be spendable")
+	require.True(t, errors.Is(spends[0].Err, errors.ErrTxConflicting),
+		"refused as conflicting, got %v", spends[0].Err)
+
+	innocent := spendOutput(t, p, 0, 3)
+	spends, err = spendOnly(ctx, s, innocent, 103)
+	require.NoError(t, err, "P is not a loser, so its restored output is spendable")
+	require.NoError(t, spends[0].Err)
+}
+
+// TestUnspendClearsAStaleConflictingBit is the other direction. A UTXO of a transaction that
+// was conflicting when it was spent through IgnoreConflicting carries the bit in its journal
+// row. If the transaction is cleared before the spend is undone, the restored UTXO must come
+// back without it, or a winner's output is refused for a contest it has already won.
+func TestUnspendClearsAStaleConflictingBit(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	p := mkTx(t, 1, 50_000)
+	_, err := s.Create(ctx, p, 100)
+	require.NoError(t, err)
+
+	ph := p.TxIDChainHash()
+
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*ph}, true)
+	require.NoError(t, err)
+
+	child := spendOutput(t, p, 0, 1)
+	_, err = s.Create(ctx, child, 101)
+	require.NoError(t, err)
+
+	spends, err := spendOnly(ctx, s, child, 101, utxo.WithIgnoreConflicting(true))
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*ph}, false)
+	require.NoError(t, err)
+
+	require.NoError(t, s.Unspend(ctx, spends))
+
+	other := spendOutput(t, p, 0, 2)
+	spends, err = spendOnly(ctx, s, other, 102)
+	require.NoError(t, err, "P is no longer conflicting, so its restored output is spendable")
+	require.NoError(t, spends[0].Err)
+}

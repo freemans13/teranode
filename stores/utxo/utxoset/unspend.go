@@ -76,6 +76,26 @@ import (
 // pre-statement snapshot, so the rows this arm can see are precisely the ones `restored`
 // excluded itself from touching.
 //
+// THE CONFLICTING BIT IS READ AT RESTORE TIME, never copied off the journal row. The row holds
+// the flags the UTXO had when it was spent, and SetConflicting cannot reach it: it flags a
+// transaction's LIVE UTXOs, and a spent one is not live. So for P -> A -> B with A and B both
+// losing, A's output taken by B comes back from B's journal row carrying whatever A was when B
+// spent it, normally not conflicting, and the driver's closing SetLocked(false) then left it
+// spendable while A was still a loser. The other direction is the same fault: a UTXO spent
+// through IgnoreConflicting while its transaction was conflicting, restored after the mark was
+// cleared, came back refused. $7 is FlagConflicting, and the `cf` LATERAL asks the identity row
+// and every containment row from the dropped floor up, the same three places SetConflicting
+// writes, whether the transaction is conflicting now. A transaction found in none of them keeps
+// the journal's bit, which is what this did before: nothing can mark it, since SetConflicting
+// refuses a transaction it does not hold.
+//
+// The locked bit is still copied off the row, and it can be stale the same way: a winner spends
+// a parent through IgnoreLocked while conflict resolution's hold is on it, so the row records
+// the lock, and a later ReverseProcessConflicting restore brings the parent back locked. The
+// counter's re-spend straight after normally consumes it; when that re-spend is skipped (a
+// counter with no body) the parent stays locked. Deriving the lock needs the lookup floor,
+// because SetLocked leaves containment rows below it stale, and is left for its own change.
+//
 // The restored UTXO's pair is the copy's own, verbatim, whenever it is non-zero: a non-zero
 // pair was final when it was copied and stays final. A copy at (0,0) is the REPAIR's case. The
 // UTXO was spent while still unstamped, and if its window has since been stamped, the stamp
@@ -132,13 +152,29 @@ restored AS (
     INSERT INTO utxo (leaf, txid, ukey, satoshis, script, created_height,
                       spendable_from, flags, hash_override, mined_height, block_id)
     SELECT (get_byte(t.txid, 0) & 7)::smallint, t.txid, t.ukey, t.satoshis, t.script,
-           t.created_height, t.spendable_from, t.flags | $4::smallint, t.hash_override,
+           t.created_height, t.spendable_from,
+           CASE WHEN cf.known
+                THEN (t.flags & ~$7::smallint)
+                     | CASE WHEN cf.conflicting THEN $7::smallint ELSE 0::smallint END
+                ELSE t.flags END | $4::smallint,
+           t.hash_override,
            CASE WHEN t.mined_height > 0 THEN t.mined_height
                 WHEN w.n = 1 THEN w.mined_height ELSE 0 END,
            CASE WHEN t.mined_height > 0 THEN t.block_id
                 WHEN w.n = 1 THEN w.block_id ELSE 0 END
       FROM one t
       LEFT JOIN won w ON w.ukey = t.ukey AND w.txid = t.txid
+     CROSS JOIN LATERAL (
+       SELECT count(*) > 0 AS known, coalesce(bool_or((x.flags & $7::smallint) <> 0), false) AS conflicting
+         FROM (SELECT i.flags FROM tx_ident i
+                WHERE i.leaf = (get_byte(t.txid, 0) & 7)::smallint
+                  AND i.txid = t.txid
+               UNION ALL
+               SELECT m.flags FROM tx_mined m
+                WHERE m.txid = t.txid
+                  AND m.mined_height >= $5::int) AS x
+       OFFSET 0
+     ) AS cf
      WHERE NOT EXISTS (
            SELECT 1 FROM utxo u
             WHERE u.leaf = (get_byte(t.txid, 0) & 7)::smallint
@@ -258,7 +294,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	)
 
 	if err := dbTx.QueryRow(ctx, unspendSQL, ukeys, ptxids, stxids, extraFlags,
-		int32(fence.droppedFloor), int32(fence.fence)). //nolint:gosec // heights fit int32
+		int32(fence.droppedFloor), int32(fence.fence), FlagConflicting). //nolint:gosec // heights fit int32
 		Scan(&restored, &requested, &alreadyLive, &repaired, &noSource, &ambiguous, &offending); err != nil {
 		return errors.NewStorageError("[utxoset][Unspend] restore", err)
 	}
