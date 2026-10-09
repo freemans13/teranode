@@ -2262,10 +2262,8 @@ func isDeadlock(err error) bool {
 	// parent in one joined statement. SQLite's remedy is to roll back and retry,
 	// which is what a true return here does.
 	var sqliteErr *sqlite.Error
-	if errors.As(err, &sqliteErr) {
-		if code := sqliteErr.Code() & 0xff; code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED {
-			return true
-		}
+	if errors.As(err, &sqliteErr) && usql.IsSQLiteLockCode(sqliteErr.Code()) {
+		return true
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
@@ -5944,14 +5942,20 @@ func isLockError(err error) bool {
 		return pqErr.Code == usql.PgErrSerializationFail || pqErr.Code == usql.PgErrDeadlockDetected || pqErr.Code == usql.PgErrLockNotAvailable
 	}
 
-	// SQLite busy/locked errors
-	if sqliteErr, ok := err.(*sqlite.Error); ok {
-		return sqliteErr.Code() == sqlite3.SQLITE_BUSY || sqliteErr.Code() == sqlite3.SQLITE_LOCKED
+	// SQLite busy/locked errors, extended codes included
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return usql.IsSQLiteLockCode(sqliteErr.Code())
 	}
 
-	// Check error message for common lock patterns
+	// Check error message for common lock patterns. teranode's errors package
+	// keeps only the message of a driver error it wraps, so an insert failure
+	// wrapped by NewStorageError reaches here, not the typed arm above.
+	// "database table is locked" is SQLITE_LOCKED's message, matched as in
+	// isDeadlock.
 	errStr := err.Error()
 	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "database table is locked") ||
 		strings.Contains(errStr, "deadlock") ||
 		strings.Contains(errStr, "lock timeout")
 }
