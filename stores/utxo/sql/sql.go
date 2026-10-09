@@ -2270,27 +2270,11 @@ func isDeadlock(err error) bool {
 	// parent in one joined statement. SQLite's remedy is to roll back and retry,
 	// which is what a true return here does.
 	var sqliteErr *sqlite.Error
-	if errors.As(err, &sqliteErr) {
-		if code := sqliteErr.Code() & 0xff; code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED {
-			return true
-		}
+	if errors.As(err, &sqliteErr) && usql.IsSQLiteLockCode(sqliteErr.Code()) {
+		return true
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
-}
-
-// isSQLiteLockCode reports whether a SQLite result code is a BUSY or LOCKED
-// condition. modernc.org/sqlite enables extended result codes on every
-// connection, so the primary code is the low byte and the detail sits above
-// it: SQLITE_BUSY_SNAPSHOT (517) is SQLITE_BUSY (5), SQLITE_LOCKED_SHAREDCACHE
-// (262) is SQLITE_LOCKED (6). Comparing the whole code against the two
-// primaries, as a first cut of this check did, dropped every extended variant
-// out of the retry that the earlier "database is locked" substring match had
-// kept. Same shape as usql.isRetriableSQLiteCode (util/usql/retry.go).
-func isSQLiteLockCode(code int) bool {
-	primary := code & 0xff
-
-	return primary == sqlite3.SQLITE_BUSY || primary == sqlite3.SQLITE_LOCKED
 }
 
 // sendSpendBatch is the batcher callback that processes a batch of spend operations
@@ -5974,13 +5958,19 @@ func isLockError(err error) bool {
 	}
 
 	// SQLite busy/locked errors, extended codes included
-	if sqliteErr, ok := err.(*sqlite.Error); ok {
-		return isSQLiteLockCode(sqliteErr.Code())
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return usql.IsSQLiteLockCode(sqliteErr.Code())
 	}
 
-	// Check error message for common lock patterns
+	// Check error message for common lock patterns. teranode's errors package
+	// keeps only the message of a driver error it wraps, so an insert failure
+	// wrapped by NewStorageError reaches here, not the typed arm above.
+	// "database table is locked" is SQLITE_LOCKED's message, matched as in
+	// isDeadlock.
 	errStr := err.Error()
 	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "database table is locked") ||
 		strings.Contains(errStr, "deadlock") ||
 		strings.Contains(errStr, "lock timeout")
 }
