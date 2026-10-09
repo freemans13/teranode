@@ -996,6 +996,29 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 		return newPoisonedSubtreeDataError(peerID, baseURL, subtreeHash, missing, subtree.Length(), bytesRead)
 	}
 
+	// A complete body can still be the wrong body, and this is the one boundary where
+	// the party responsible is known (bitcoin-sv/teranode#4838). The reader above stores
+	// one slot per subtree without ever comparing it to a node — the coinbase diversion
+	// model.FirstMismatchedSubtreeDataTx documents — so a peer can drop a
+	// header-committed transaction, put a fabricated one in its place, and leave a body
+	// that satisfies every length and nil check. Nothing downstream can attribute it:
+	// once these bytes are on disk the read side sees only a local file, and the catch-up
+	// primary it would otherwise be charged to need not be the peer that served this
+	// subtree. So the tie is established here, against the peer holding it, before the
+	// body is stored.
+	//
+	// The exemption argument matches the MissingSubtreeDataTxs call above and must:
+	// index 0 under a coinbase placeholder holds the coinbase, which no node names.
+	if idx, expected, got, mismatched := model.FirstMismatchedSubtreeDataTx(subtree, subtreeData, true); mismatched {
+		// Struck only on the cache-busted retry, for the reason the wrong-root check in
+		// fetchAndStoreSubtree sets out.
+		if bypassCache && u.blockValidation != nil {
+			u.blockValidation.penalizeCorruptBlockPeer(ctx, peerID, block, "subtree_data transaction mismatch on catchup fetch")
+		}
+
+		return newMismatchedSubtreeDataError(peerID, baseURL, subtreeHash, idx, expected, got)
+	}
+
 	// Stream the transactions straight into the store instead of building a second complete
 	// in-memory copy with Serialize() and handing that to Set: the parsed []*bt.Tx is already
 	// resident, and one more full serialized copy per in-flight subtree_data is exactly the
@@ -1274,7 +1297,10 @@ func (u *Server) fetchSubtreeFromPeer(ctx context.Context, subtreeHash *chainhas
 	defer deferFn()
 
 	// Construct URL for subtree endpoint (for subtreeToCheck)
-	url := u.peerResourceURL(baseURL, "subtree", subtreeHash, bypassCache)
+	url, err := u.peerResourceURL(baseURL, "subtree", subtreeHash, bypassCache)
+	if err != nil {
+		return nil, errors.NewServiceError("[catchup:fetchSubtreeFromPeer] invalid peer base URL for subtree %s", subtreeHash.String(), err)
+	}
 
 	u.logger.Debugf("[catchup:fetchSubtreeFromPeer] fetching subtree from %s", url)
 
@@ -1342,7 +1368,10 @@ func (u *Server) fetchSubtreeDataFromPeer(ctx context.Context, subtreeHash *chai
 
 	// peerResourceURL builds <baseURL>/subtree_data/<hash>, appending the cachebust
 	// query parameter when bypassCache is set.
-	url := u.peerResourceURL(baseURL, "subtree_data", subtreeHash, bypassCache)
+	url, err := u.peerResourceURL(baseURL, "subtree_data", subtreeHash, bypassCache)
+	if err != nil {
+		return nil, errors.NewServiceError("[catchup:fetchSubtreeDataFromPeer] invalid peer base URL for subtree %s", subtreeHash.String(), err)
+	}
 
 	u.logger.Debugf("[catchup:fetchSubtreeDataFromPeer] fetching subtree data from %s", url)
 
@@ -1390,7 +1419,12 @@ func (u *Server) fetchBlocksBatch(ctx context.Context, hash *chainhash.Hash, n u
 	)
 	defer deferFn()
 
-	url := fmt.Sprintf("%s/blocks/%s?n=%d", baseURL, hash.String(), n)
+	blocksURL, err := util.JoinPeerURL(baseURL, "blocks", hash.String())
+	if err != nil {
+		return nil, errors.NewProcessingError("[catchup:fetchBlocksBatch][%s] invalid peer base URL", hash.String(), err)
+	}
+
+	url := fmt.Sprintf("%s?n=%d", blocksURL, n)
 
 	// Stream and parse incrementally rather than io.ReadAll-ing the whole response: a block
 	// carries no consensus-defined maximum size, so there is no byte cap to apply to the HTTP
@@ -1505,11 +1539,14 @@ func (u *Server) fetchSingleBlock(ctx context.Context, hash *chainhash.Hash, pee
 	)
 	defer deferFn()
 
-	url := fmt.Sprintf("%s/block/%s", baseURL, hash.String())
+	blockURL, err := util.JoinPeerURL(baseURL, "block", hash.String())
+	if err != nil {
+		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] invalid peer base URL", hash.String(), err)
+	}
 
 	// Stream and parse incrementally rather than io.ReadAll-ing the whole response - see the
 	// comment on fetchBlocksBatch's DoHTTPRequestBodyReader call (bitcoin-sv/teranode#4742).
-	bodyReader, err := util.DoHTTPRequestBodyReader(ctx, url)
+	bodyReader, err := util.DoHTTPRequestBodyReader(ctx, blockURL)
 	if err != nil {
 		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] failed to get block from peer", hash.String(), err)
 	}

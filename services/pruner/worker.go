@@ -123,7 +123,8 @@ func (s *Server) waitForBlockMinedStatus(ctx context.Context, blockHash *chainha
 //
 // CATCHUP SKIP MODE:
 // When SkipDuringCatchup is enabled (default: false), the pruner skips all operations
-// during FSMStateCATCHINGBLOCKS state. This prevents race conditions where block
+// in any state other than FSMStateRUNNING (CATCHINGBLOCKS, or IDLE after an operator
+// STOP mid-catchup). This prevents race conditions where block
 // validation marks transactions as mined faster than the pruner can preserve their parents.
 // Once the node transitions to FSMStateRUNNING, the pruner resumes normal operation.
 //
@@ -177,7 +178,9 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					prunerSkipped.WithLabelValues("fsm_error").Inc()
 					continue
 				}
-				if fsmState != nil && *fsmState == blockchain.FSMStateCATCHINGBLOCKS {
+				// Only RUNNING proves no catchup is in flight: an operator STOP
+				// parks a catching-up node in IDLE while its batch still runs.
+				if fsmState == nil || *fsmState != blockchain.FSMStateRUNNING {
 					s.logger.Debugf("[pruner][%s:%d] skipping during catchup", blockHashStr, blockHeight)
 					prunerSkipped.WithLabelValues("catchup_mode").Inc()
 					continue

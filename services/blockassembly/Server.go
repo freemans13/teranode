@@ -36,6 +36,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -191,9 +192,31 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, txStore blob.Store
 //   - error: Any error encountered during health check
 func (ba *BlockAssembly) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	if checkLiveness {
-		// Add liveness checks here. Don't include dependency checks.
-		// If the service is stuck return http.StatusServiceUnavailable
-		// to indicate a restart is needed
+		// Liveness answers one question: is this service WEDGED, such that a
+		// restart is the only way out? An idle node still beats, so a
+		// dependency that is down while the loop is idle stays a readiness
+		// matter. A wait inside a block move, reorg or reset beats only on
+		// answered calls to the blockchain service, so an outage that lasts
+		// through such a wait ages the heartbeat and trips liveness by design.
+		// Opt-in, off by default: see the blockassembly_livenessStallTimeout
+		// long description (issue 1447).
+		if ba.blockAssembler != nil {
+			stallTimeout := ba.settings.BlockAssembly.LivenessStallTimeout
+			if age, stalled := ba.blockAssembler.heartbeat.Stalled(stallTimeout); stalled {
+				// The state names the select case the loop is stuck in
+				// (resetting, reorging, reconciling, ...). The 503 body lands
+				// nested in the daemon's aggregate JSON, which the kubelet event
+				// truncates, so the same line goes to the log as well: it is the
+				// trace an operator reads after the restart.
+				state := StateStrings[ba.blockAssembler.GetCurrentRunningState()]
+				msg := fmt.Sprintf("block assembly main loop has not made progress for %s (limit %s, state %s)", age, stallTimeout, state)
+
+				ba.logger.Warnf("[BlockAssembly][Health] liveness failing: %s", msg)
+
+				return http.StatusServiceUnavailable, msg, nil
+			}
+		}
+
 		return http.StatusOK, "OK", nil
 	}
 
@@ -311,6 +334,11 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 				// stall-state computation, and its unit tests mock only the reads
 				// that computation makes.
 				prometheusBlockAssemblyQueueHeadAge.Set(ba.blockAssembler.QueueHeadAge().Seconds())
+
+				// Published whether or not the liveness timeout is set, so an
+				// operator can measure the worst case the documented rollout asks
+				// for before choosing a timeout.
+				prometheusBlockAssemblerLivenessHeartbeatAge.Set(ba.blockAssembler.heartbeat.Age().Seconds())
 			}
 		}
 	}()
@@ -853,7 +881,7 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "storeSubtreeData",
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblerSubtreeStoredHist),
-		tracing.WithLogMessage(ba.logger, "[BlockAssembly:storeSubtreeData][%s] storing subtree: len %d", subtree.RootHash().String(), subtree.Length()),
+		tracing.WithDebugLogMessage(ba.logger, "[BlockAssembly:storeSubtreeData][%s] storing subtree: len %d", subtree.RootHash().String(), subtree.Length()),
 	)
 	defer deferFn()
 
@@ -889,9 +917,33 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 			defer close(metaDoneCh)
 			subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
 
+			// DiskTxMap satisfies this so a read error here is returned to us
+			// instead of being recorded on the map, where it would be
+			// misattributed to whichever subtree processor operation happens to
+			// check the map's pending error next (this runs in a background
+			// goroutine, concurrently with the processor).
+			parentTxMapWithErr, parentTxMapSupportsErr := subtreeRequest.ParentTxMap.(interface {
+				GetWithErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool, error)
+			})
+
 			for idx, node := range subtreeRequest.Subtree.Nodes {
 				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
+					var (
+						txInpoints *subtreepkg.TxInpoints
+						found      bool
+					)
+
+					if parentTxMapSupportsErr {
+						var getErr error
+
+						txInpoints, found, getErr = parentTxMapWithErr.GetWithErr(node.Hash)
+						if getErr != nil {
+							ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] error reading parent tx hashes for node %s: %s", subtreeRequest.Subtree.RootHash().String(), node.Hash.String(), getErr)
+						}
+					} else {
+						txInpoints, found = subtreeRequest.ParentTxMap.Get(node.Hash)
+					}
+
 					if !found && subtreeRequest.DeletedTxs != nil {
 						// Fallback: check if transaction was deleted during async storage
 						var deletedTxInpoints subtreepkg.TxInpoints
@@ -1112,7 +1164,7 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyAddTx),
 		tracing.WithTag("txid", util.ReverseAndHexEncodeSlice(req.Txid)),
-		tracing.WithLogMessage(ba.logger, "[AddTx][%s] add tx called", util.ReverseAndHexEncodeSlice(req.Txid)),
+		tracing.WithDebugLogMessage(ba.logger, "[AddTx][%s] add tx called", util.ReverseAndHexEncodeSlice(req.Txid)),
 	)
 
 	defer func() {
@@ -1183,7 +1235,7 @@ func (ba *BlockAssembly) RemoveTx(ctx context.Context, req *blockassembly_api.Re
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "RemoveTx",
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyRemoveTx),
-		tracing.WithLogMessage(ba.logger, "[RemoveTx][%s] called", util.ReverseAndHexEncodeSlice(req.Txid)),
+		tracing.WithDebugLogMessage(ba.logger, "[RemoveTx][%s] called", util.ReverseAndHexEncodeSlice(req.Txid)),
 	)
 	defer deferFn()
 
@@ -1562,7 +1614,7 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 	ctx, _, endSpan := tracing.Tracer("blockassembly").Start(ctx, "GetMiningCandidate",
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyGetMiningCandidateDuration),
-		tracing.WithLogMessage(ba.logger, "[GetMiningCandidate] called"),
+		tracing.WithDebugLogMessage(ba.logger, "[GetMiningCandidate] called"),
 	)
 	defer endSpan()
 
@@ -1801,9 +1853,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	// prevent. The comparison is against the consensus floor rather than the
 	// candidate's own Time, which is usually just the wall clock: rolling ntime
 	// back a few seconds within a job is normal pool behaviour and must stay
-	// legal. Rejecting here rather than letting it reach block.Valid matters
-	// because that failure path treats an invalid block as a subtree-processor
-	// fault and resets block assembly; a bad miner timestamp is not that. The
+	// legal. The
 	// floor is the memoized value the candidate was built from, so this costs no
 	// round-trip, and when it is unknown there is nothing to enforce.
 	if minTime, ok := ba.blockAssembler.MinCandidateTime(hashPrevBlock); ok && int64(nTime) < minTime {
@@ -1841,11 +1891,9 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		}
 
 		// The submitted coinbase must have the shape consensus requires — a null prevout,
-		// not merely a null prevout hash. block.Valid below applies the same predicate, and
-		// a failure there is treated as "the subtreeprocessor created an invalid block" and
-		// resets block assembly. Rejecting the submission here keeps a malformed coinbase
-		// from a local miner out of that path: it is the submitter's input that is wrong,
-		// not assembly's state.
+		// not merely a null prevout hash. block.Valid below applies the same predicate and
+		// would also reject it, without resetting block assembly, but rejecting here fails
+		// fast with a message that names the submitter's input as the fault.
 		if !model.IsConsensusCoinbase(coinbaseTx) {
 			return nil, errors.NewProcessingError("[BlockAssembly][%s] submitted coinbase transaction is not a valid coinbase", jobID)
 		}
@@ -1917,10 +1965,12 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 
 	// Compute coinbase BUMP (merkle proof in BRC-74 format) while subtree data is in memory.
 	// This is a best-effort operation — failure does not block block submission.
-	_, currentHeight := ba.blockAssembler.CurrentBlock()
+	// The proof's height is the candidate's height, the same value the block below carries. The
+	// live tip is the wrong source: a candidate can be more than one block behind it, and the tip
+	// can move between reads, so tip+1 would stamp the proof with a height that is not this block's.
 	var coinbaseBUMP []byte
 	if len(subtreesInJob) > 0 {
-		coinbaseBUMP = ba.computeCoinbaseBUMP(jobID, subtreesInJob, subtreeHashes, currentHeight+1)
+		coinbaseBUMP = ba.computeCoinbaseBUMP(jobID, subtreesInJob, subtreeHashes, job.MiningCandidate.Height)
 	}
 
 	// sizeInBytes from the subtrees, 80 byte header and varint bytes for txcount
@@ -1950,7 +2000,16 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		CoinbaseTx:       coinbaseTx,
 		TransactionCount: transactionCount,
 		SizeInBytes:      blockSize,
-		Subtrees:         jobSubtreeHashes, // we need to store the hashes of the subtrees in the block, without the coinbase
+		// The height this candidate was issued for (GetMiningCandidate sets it to best+1).
+		// block.Valid below is height-dependent and reads it: CoinbaseCommonRuleViolation picks the
+		// pre- or post-Genesis coinbase limits from it, and the BIP34 and reward checks are guarded
+		// on it being non-zero. Leaving it unset judged every submitted block at height 0, which is
+		// below every network's Genesis activation, so a coinbase over 1MB or over the pre-Genesis
+		// 20,000-sigop limit was rejected here while every peer would accept it, and the BIP34 and
+		// reward checks never ran at all. GetBlockAssemblyBlockCandidate builds its block from the
+		// same candidate field.
+		Height:   job.MiningCandidate.Height,
+		Subtrees: jobSubtreeHashes, // we need to store the hashes of the subtrees in the block, without the coinbase
 		// Aliases the subtree processor's live slice rather than copying it, so
 		// this block shares both the backing array and the *Subtree values with
 		// whatever else holds the job. Block.Valid must therefore not mutate
@@ -1982,9 +2041,25 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	// check fully valid, including whether difficulty in header is low enough
 	// TODO add more checks to the Valid function, like whether the parent/child relationships are OK
 	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, ba.settings, nil); !ok {
+		// ErrBlockInvalid here means the submission breaks a consensus rule on data the miner
+		// chose: the proof of work, the timestamp, the block version, or the coinbase (its shape,
+		// BIP34 height, transaction rules or reward). Local assembly state did not cause it and a
+		// reset would not stop it recurring, so reject the submission and keep assembly running.
+		// Every other failure (corrupt body, duplicate transaction, merkle mismatch, processing or
+		// storage error) points at what this node built, so those still reset.
+		if errors.Is(err, errors.ErrBlockInvalid) {
+			ba.logger.Warnf("[BlockAssembly][%s][%s] rejected mining solution, block breaks a consensus rule: %v", jobID, block.Hash().String(), err)
+
+			// remove the job, the same solution would be rejected again
+			ba.jobStore.Delete(*storeID)
+
+			return nil, errors.NewProcessingError("[BlockAssembly][%s][%s] invalid block", jobID, block.Hash().String(), err)
+		}
+
 		ba.logger.Errorf("[BlockAssembly][%s][%s] invalid block: %v - %v", jobID, block.Hash().String(), block.Header, err)
 
-		// the subtreeprocessor created an invalid block, we must reset
+		// block assembly built a block that fails validation for a reason not attributable to the
+		// submitter, so its state is suspect and we must reset
 		ba.blockAssembler.Reset(false)
 
 		// remove the job, we cannot use it anymore
@@ -2014,14 +2089,31 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	bestBlockHeader, _ = ba.blockAssembler.CurrentBlock()
 	ba.logger.Debugf("[BlockAssembly][%s][%s] time since previous block: %s", jobID, block.Header.Hash(), time.Since(time.Unix(int64(bestBlockHeader.Timestamp), 0)).String())
 
-	// add the new block to the blockchain
-	if err = ba.blockchainClient.AddBlock(callerCtx, block, ""); err != nil {
+	// Add the new block to the blockchain with subtrees_set already true:
+	// block.Valid() above already ran synchronously and passed, so — unlike a
+	// peer block accepted via optimistic mining, whose equivalent background
+	// integrity check (blockvalidation's block.Valid goroutine) has not run
+	// yet at AddBlock time — there is no outstanding validation this node
+	// still owes the network for this block. Without this, p2p would defer
+	// announcing a locally mined block until the SetBlockSubtreesSet call
+	// below fires its own notification, delaying the announcement by one
+	// extra RPC round trip for no reason.
+	if err = ba.blockchainClient.AddBlock(callerCtx, block, "", blockchainoptions.WithSubtreesSet(true)); err != nil {
 		return nil, errors.NewProcessingError("[BlockAssembly][%s][%s] failed to add block", jobID, block.Hash().String(), err)
 	}
 
-	// Mark subtrees as set — block assembly built and validated these subtrees,
-	// so they are ready for setTxMined processing. Without this, locally mined
-	// blocks would never complete the mining lifecycle.
+	// Still call SetBlockSubtreesSet even though subtrees_set is already true:
+	// it is the trigger blockvalidation's setMined listener waits on
+	// (BlockValidation.go's setMined subscription loop only acts on
+	// NotificationType_BlockSubtreesSet, never on NotificationType_Block), so
+	// without this call a locally mined block would never complete the mining
+	// lifecycle. The store update is idempotent on an already-true flag
+	// (SetBlockSubtreesSet.go: an UPDATE ... SET subtrees_set = true that
+	// matches the row still reports rows affected), so this costs one extra
+	// UPDATE and notification, not a second real state change. p2p's
+	// announceBlock dedupes the resulting second notification against the one
+	// already sent by AddBlock above, so this does not double-announce the
+	// block either.
 	if err = ba.blockchainClient.SetBlockSubtreesSet(callerCtx, block.Hash()); err != nil {
 		ba.logger.Errorf("[BlockAssembly][%s][%s] failed to set block subtrees_set: %v", jobID, block.Header.Hash(), err)
 	}
@@ -2125,7 +2217,7 @@ func (ba *BlockAssembly) GetCandidateBlock(ctx context.Context, req *blockassemb
 
 	_, _, endSpan := tracing.Tracer("blockassembly").Start(ctx, "GetCandidateBlock",
 		tracing.WithParentStat(ba.stats),
-		tracing.WithLogMessage(ba.logger, "[GetCandidateBlock] called for candidate %s", candidateID),
+		tracing.WithDebugLogMessage(ba.logger, "[GetCandidateBlock] called for candidate %s", candidateID),
 	)
 	defer endSpan()
 
@@ -2431,7 +2523,7 @@ func (ba *BlockAssembly) GetBlockAssemblyQueueStats(_ context.Context, _ *blocka
 func (ba *BlockAssembly) GetBlockAssemblyTxs(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.GetBlockAssemblyTxsResponse, error) {
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "GetBlockAssemblyTxsResponse",
 		tracing.WithParentStat(ba.stats),
-		tracing.WithLogMessage(ba.logger, "[GetBlockAssemblyTxsResponse] called"),
+		tracing.WithDebugLogMessage(ba.logger, "[GetBlockAssemblyTxsResponse] called"),
 	)
 	defer deferFn()
 
@@ -2867,14 +2959,20 @@ func (ba *BlockAssembly) tipWaitExpiredError(ctx context.Context, timeout time.D
 // assemblerReady reports whether block assembly is level with bestHeader and has
 // finished whatever transition brought it there. A nil current header means the
 // assembler has not loaded its best block yet, which is a wait condition rather
-// than a failure.
+// than a failure. The transition includes the queue drain the subtree processor
+// runs after answering MoveForwardBlock: a candidate taken before it finishes
+// has none of the queued transactions.
 func (ba *BlockAssembly) assemblerReady(bestHeader *model.BlockHeader) bool {
 	currentHeader, _ := ba.blockAssembler.CurrentBlock()
 	if currentHeader == nil || !currentHeader.Hash().IsEqual(bestHeader.Hash()) {
 		return false
 	}
 
-	return ba.blockAssembler.GetCurrentRunningState() == StateRunning
+	if ba.blockAssembler.GetCurrentRunningState() != StateRunning {
+		return false
+	}
+
+	return ba.blockAssembler.subtreeProcessor == nil || !ba.blockAssembler.subtreeProcessor.DrainingAfterBlock()
 }
 
 // waitForBestBlockHeaderUpdate waits for the best block header to be updated after block submission

@@ -139,7 +139,7 @@ pruner_grpcListenAddress.docker.host = localhost:${PORT_PREFIX}${PRUNER_GRPC_POR
 
 **Description**: Skip pruning during blockchain catchup
 
-When enabled, the pruner checks FSM state and skips all deletion operations during catchup. This prevents race conditions where block validation marks transactions as mined faster than the pruner can preserve their parents.
+When enabled, the pruner checks FSM state and skips all deletion operations unless the node is RUNNING, which covers catchup and IDLE after an operator STOP mid-catchup. This prevents race conditions where block validation marks transactions as mined faster than the pruner can preserve their parents.
 
 **Values:**
 
@@ -283,7 +283,7 @@ Limits deletions per cycle to prevent overwhelming the blob store. Remaining del
 
 **Environment Variable**: `pruner_blobDeletionMaxRetries`
 
-**Description**: Maximum retry attempts for failed blob deletions
+**Description**: Maximum retry attempts for failed blob deletions. A deletion refused as a configuration error (for example an HTTP blob store answering 401) is not counted against this limit: it stays queued and is logged as an error until the configuration is fixed. Deletions for other store types keep being processed.
 
 ### pruner_skipPreserveParents
 
