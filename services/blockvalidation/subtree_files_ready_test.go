@@ -195,15 +195,22 @@ func TestProcessSubtreesNotSet_SetsFlagOnLaterSweepOnceFileAppears(t *testing.T)
 
 // TestProcessSubtreesNotSet_ExcludesInvalidBlocks pins the regression found in review of
 // #1829: storeInvalidBlock persists a rejected block with subtrees_set=false and
-// invalid=true, and its subtree files are usually never written. Before the
-// "invalid = false" filter in GetBlocksSubtreesNotSet, such a block could never satisfy
-// subtreeFilesReady, so it stayed in the sweep's result set and was re-fetched (and
-// re-warned about) every minute forever. Asserted via the store, not a log capture: the
+// invalid=true. A record that names subtrees is written only after validateBlockSubtrees
+// has stored their files (see subtreeFilesReady in BlockValidation.go), so those files are
+// normally present until retention expires them. Without the "invalid = false" filter in
+// GetBlocksSubtreesNotSet such a block stays in the sweep's result set: while its files
+// exist the sweep would set subtrees_set on a block judged invalid, and once they expire it
+// can never satisfy subtreeFilesReady and is re-fetched every minute forever. The test
+// writes every file, so the subtrees_set assertion below holds only because of the filter,
+// not because a file happens to be missing. Asserted via the store, not a log capture: the
 // block must never even be a candidate the sweep sees, which is what actually stops the
 // loop.
 func TestProcessSubtreesNotSet_ExcludesInvalidBlocks(t *testing.T) {
-	bv, block, _, ctx := newSubtreesNotSetHarness(t, 2, blockchainoptions.WithInvalid(true))
-	// No subtree files are written - storeInvalidBlock's block usually has none.
+	bv, block, subtreeStore, ctx := newSubtreesNotSetHarness(t, 2, blockchainoptions.WithInvalid(true))
+
+	for _, h := range block.Subtrees {
+		require.NoError(t, subtreeStore.Set(ctx, h[:], fileformat.FileTypeSubtree, []byte("subtree-bytes")))
+	}
 
 	blocksBefore, err := bv.blockchainClient.GetBlocksSubtreesNotSet(ctx)
 	require.NoError(t, err)
@@ -212,7 +219,7 @@ func TestProcessSubtreesNotSet_ExcludesInvalidBlocks(t *testing.T) {
 	runSweep(ctx, bv)
 
 	require.False(t, subtreesSetFlag(t, ctx, bv, block.Hash()),
-		"subtrees_set must stay false for an invalid block with no subtree files")
+		"subtrees_set must stay false for an invalid block even when every subtree file exists")
 
 	blocksAfter, err := bv.blockchainClient.GetBlocksSubtreesNotSet(ctx)
 	require.NoError(t, err)
