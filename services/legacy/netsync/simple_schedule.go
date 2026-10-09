@@ -1,6 +1,8 @@
 package netsync
 
 import (
+	"sync"
+
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
@@ -119,6 +121,7 @@ func (sm *SyncManager) placeUnmeasured(a *downloadAssigner, candidates []wantedB
 
 		far = far[1:]
 		placedHashes[block.hash] = struct{}{}
+		sm.farProbes.add(block.hash)
 
 		sm.logger.Infof("[schedule] %s has no rate yet: asked it for block %d, %d above the chain", p.peer, block.height, block.height-a.tip)
 	}
@@ -136,6 +139,54 @@ func (sm *SyncManager) placeUnmeasured(a *downloadAssigner, candidates []wantedB
 	}
 
 	return left
+}
+
+// farProbeSet is the blocks placeUnmeasured gave a peer with no rate, from the top of the window.
+// highestHeld does not count them: once such a block arrives or parks, each block below it would
+// count as a gap, and the disk backstop would stop nothing in the whole window. The mark is in
+// memory only, so a probe parked before a restart counts again until the chain reaches it.
+type farProbeSet struct {
+	mu     sync.Mutex
+	hashes map[chainhash.Hash]struct{}
+}
+
+func (f *farProbeSet) add(h chainhash.Hash) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.hashes == nil {
+		f.hashes = make(map[chainhash.Hash]struct{})
+	}
+
+	f.hashes[h] = struct{}{}
+}
+
+// within returns the probes among wanted, and forgets each probe not in wanted: a block the chain
+// has reached, or one that has left the window.
+func (f *farProbeSet) within(wanted []wantedBlock) map[chainhash.Hash]struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(f.hashes) == 0 {
+		return nil
+	}
+
+	in := make(map[chainhash.Hash]struct{}, len(f.hashes))
+
+	for _, b := range wanted {
+		if _, ok := f.hashes[b.hash]; ok {
+			in[b.hash] = struct{}{}
+		}
+	}
+
+	f.hashes = in
+
+	out := make(map[chainhash.Hash]struct{}, len(in))
+	for h := range in {
+		out[h] = struct{}{}
+	}
+
+	return out
 }
 
 // unmeasuredWithRoom is how many peers of the pass have no rate and room, when one or more peers

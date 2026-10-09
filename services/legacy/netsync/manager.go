@@ -872,6 +872,7 @@ type SyncManager struct {
 	blockSizeTracker    *blockSizeTracker  // tracks block sizes for dynamic in-flight adjustment
 	commitRate          *commitRateTracker // blocks a second joining the chain, for the frontier race
 	streams             *streamRegistry    // block bodies arriving now and peers' delivery rates, for the frontier race
+	farProbes           farProbeSet        // blocks placeUnmeasured gave from the top of the window, which highestHeld does not count
 	peerRatesPath       string             // the rates file (peerRatesFile), or empty to keep no rates
 
 	// dispatcher runs each parked block's work on a worker, one block at a time,

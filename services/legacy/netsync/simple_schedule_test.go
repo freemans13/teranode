@@ -231,3 +231,22 @@ func TestASlowPeerHoldsBlocksInProportionToItsRate(t *testing.T) {
 	require.Equal(t, 16, budgets[fast])
 	require.Equal(t, 2, budgets[slow])
 }
+
+// The far block a peer with no rate is given is marked as a probe, so highestHeld does not count
+// it, and the mark is dropped once the block leaves the window.
+func TestAFarBlockGivenToAnUnmeasuredPeerIsMarkedAsAProbe(t *testing.T) {
+	sm := schedulerManager(t)
+	slow := measuredPeer(t, sm, 1, 16, 3.9*mb)
+	newcomer, _ := schedulerPeer(t, sm, 2, 5000)
+	np := &assignerPeer{peer: newcomer, budget: 1}
+
+	a := deadlineAssigner([]*assignerPeer{slow, np}, nil)
+	a.far = []wantedBlock{wantedAt(900)}
+
+	sm.requestBlocks(a, []wantedBlock{wantedAt(11), wantedAt(12)}, 0)
+
+	require.Equal(t, []chainhash.Hash{wantedAt(900).hash}, placed(np))
+	require.Contains(t, sm.farProbes.within([]wantedBlock{wantedAt(11), wantedAt(900)}), wantedAt(900).hash)
+	require.Empty(t, sm.farProbes.within([]wantedBlock{wantedAt(11)}), "the block left the window")
+	require.Empty(t, sm.farProbes.within([]wantedBlock{wantedAt(900)}), "and its mark with it")
+}

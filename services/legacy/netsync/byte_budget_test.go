@@ -393,3 +393,57 @@ func TestAnUnmeasuredPeerGetsOneBlock(t *testing.T) {
 	require.Positive(t, aRec.count())
 	require.Positive(t, bRec.count())
 }
+
+// A far block a peer with no rate was given (placeUnmeasured) sits at the top of the window. Once
+// its bytes arrive, or it parks, it is held, and counted as the highest held block it made each
+// block below it a gap, so over the backstop every block of the window could still be asked for.
+// A probe is not counted: over the backstop, only the lowest block is asked for, which the chain
+// needs before it can reach the probe.
+func TestAFarProbeArrivingAtTheTopOfTheWindowDoesNotTurnOffTheBackstop(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xec}
+	msg, hashes := linkedHeaders(anchor, 10, &nonce)
+
+	sm, a, aRec, _, bRec := budgetManager(t)
+	recentBlocks(sm, 1<<30)
+
+	sm.streams.start(chainhash.Hash{0xed}, 0, newTestPeer(t, "10.0.0.9:8333"), 101<<30, time.Now())
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+
+	far := newTestPeer(t, "10.0.0.8:8333")
+	require.True(t, sm.blockDownloads.Add(far, hashes[9]))
+	sm.farProbes.add(hashes[9])
+	sm.streams.start(hashes[9], 10, far, 4<<30, time.Now())
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 1 }, 5*time.Second), "the lowest block is asked for")
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 1 }, 300*time.Millisecond), "over the backstop, an arriving probe makes no other block below it a gap")
+	require.Equal(t, []chainhash.Hash{hashes[0]}, append(aRec.all(), bRec.all()...))
+}
+
+// The same probe once it has parked, and holding the backstop's 100 GiB on its own. Nothing else
+// is held, so without the lowest block being asked for the chain could never reach the probe and
+// its bytes would never fall: the backstop would stop the chain for good.
+func TestAFarProbeParkedAtTheTopOfTheWindowDoesNotTurnOffTheBackstop(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xee}
+	msg, hashes := linkedHeaders(anchor, 10, &nonce)
+
+	sm, a, aRec, _, bRec := budgetManager(t)
+	recentBlocks(sm, 1<<30)
+
+	seedFetchHeaders(t, sm, a, anchor, msg)
+
+	sm.farProbes.add(hashes[9])
+	require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hashes[9], prevBlock: hashes[8], size: 300, wireSize: 101 << 30}))
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return requested(aRec, bRec) == 1 }, 5*time.Second), "the lowest block is asked for")
+	require.False(t, WaitUntil(func() bool { return requested(aRec, bRec) > 1 }, 300*time.Millisecond), "over the backstop, a parked probe makes no other block below it a gap")
+	require.Equal(t, []chainhash.Hash{hashes[0]}, append(aRec.all(), bRec.all()...))
+}

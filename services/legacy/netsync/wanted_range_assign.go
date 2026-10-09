@@ -599,15 +599,44 @@ func (sm *SyncManager) requestBlocks(assigner *downloadAssigner, candidates []wa
 // highestHeld is the height of the highest wanted block that is parked or arriving, or zero if
 // none is. A block below it is a gap, which the disk backstop never stops.
 func (sm *SyncManager) highestHeld(wanted []wantedBlock) int32 {
-	var highest int32
+	var (
+		highest   int32
+		lowest    int32
+		probeHeld bool
+	)
+
+	probes := sm.farProbes.within(wanted)
 
 	for _, block := range wanted {
+		if block.height > 0 && (lowest == 0 || block.height < lowest) {
+			lowest = block.height
+		}
+
 		// Parked or arriving only. A block only asked for holds no bytes, and on 2026-10-08 a
 		// request for the top block of the window made each block below it a gap for an hour, so
 		// the backstop never applied.
-		if sm.blockPark.Has(block.hash) || sm.streams.arriving(block.hash) {
-			highest = max(highest, block.height)
+		if !sm.blockPark.Has(block.hash) && !sm.streams.arriving(block.hash) {
+			continue
 		}
+
+		// A far block given to a peer with no rate (placeUnmeasured) is not counted: it sits at
+		// the top of the window, so once it arrives or parks each block below it would be a gap
+		// and the backstop would stop nothing in the window. Its bytes still count toward the
+		// backstop.
+		if _, probe := probes[block.hash]; probe {
+			probeHeld = true
+
+			continue
+		}
+
+		highest = max(highest, block.height)
+	}
+
+	// A held probe still needs the lowest wanted block before the chain can reach it. Were probes
+	// alone over the backstop, nothing else held, that block would extend and never be asked: the
+	// chain would stop with the bytes that stop it waiting on the chain.
+	if probeHeld {
+		highest = max(highest, lowest)
 	}
 
 	return highest
