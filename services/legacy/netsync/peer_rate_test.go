@@ -1,11 +1,15 @@
 package netsync
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -105,4 +109,52 @@ func TestARememberedRateDecaysWhileThePeerIsSilent(t *testing.T) {
 	r.decayQuiet(now, map[*peerpkg.Peer]time.Time{p: now.Add(-30 * time.Minute)})
 
 	require.Less(t, r.peerRate(p), float64(raceStallRate))
+}
+
+// An inbound peer's rate is not remembered: it connects from a different port each time, so its
+// address never matches again, and each entry stayed in the rates file for good (review of
+// 2026-10-09).
+func TestAnInboundPeerIsNotRemembered(t *testing.T) {
+	r := newStreamRegistry()
+	p := peerpkg.NewInboundPeer(ulogger.TestLogger{}, test.CreateBaseTestSettings(t), &peerpkg.Config{})
+	require.True(t, p.Inbound())
+	r.rates[p] = 12_000_000
+
+	r.forgetPeer(p)
+
+	require.Empty(t, r.rememberedRates())
+
+	out := newTestPeer(t, "10.0.0.7:8333")
+	r.rates[out] = 12_000_000
+
+	r.forgetPeer(out)
+
+	require.Contains(t, r.rememberedRates(), out.Addr(), "an outbound peer is remembered")
+}
+
+// Two saves at the same time each leave a whole file: the stop and the 10-minute save wrote the
+// same temporary file (review of 2026-10-09).
+func TestTwoSavesAtOnceLeaveAWholeFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), peerRatesFile)
+	rates := map[string]float64{}
+
+	for i := range 2000 {
+		rates[fmt.Sprintf("10.0.%d.%d:8333", i/250, i%250)] = float64(i + 1)
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			require.NoError(t, savePeerRates(path, rates))
+		}()
+	}
+
+	wg.Wait()
+
+	got, err := loadPeerRates(path)
+	require.NoError(t, err)
+	require.Equal(t, rates, got)
 }

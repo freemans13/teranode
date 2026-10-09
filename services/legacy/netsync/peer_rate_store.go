@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 )
 
 // peerRatesFile keeps each peer address's last measured download rate across a restart, beside
@@ -38,12 +39,35 @@ func savePeerRates(path string, rates map[string]float64) error {
 		return err
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	// A temporary file of its own for each save: the stop and the 10-minute save can run at the
+	// same time, and with one shared name one save renamed the other's half-written file.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
 
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+
+		return err
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+
+		return err
+	}
+
+	return nil
 }
 
 // peerRatesSaveEvery is how many race ticks (raceCheckInterval, 5 s) go between two writes of the
