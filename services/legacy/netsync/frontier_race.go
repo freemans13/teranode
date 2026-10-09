@@ -986,15 +986,15 @@ func (r *streamRegistry) pickRace(now time.Time, tip int32, commitRate float64) 
 			continue
 		}
 
+		// Both through estimate: a copy trickling under 1 B/s with gigabytes to come is past the
+		// int64 limit as nanoseconds, and on amd64 the conversion wrapped negative, so eta <= need
+		// held and the race skipped the staller.
 		var need time.Duration
 		if commitRate > 0 {
-			need = time.Duration(float64(s.height-tip) / commitRate * float64(time.Second))
+			need = estimate(float64(s.height-tip), commitRate)
 		}
 
-		eta := time.Duration(1<<63 - 1)
-		if remaining := s.total - s.read.Load(); rate > 0 {
-			eta = time.Duration(float64(remaining) / rate * float64(time.Second))
-		}
+		eta := estimate(float64(s.total-s.read.Load()), rate)
 
 		if eta <= need {
 			continue
