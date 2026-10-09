@@ -81,3 +81,45 @@ func TestNettedBelowWritesTheCoinsInBatches(t *testing.T) {
 
 	require.Equal(t, expectedNetState(w.Roots, list), readNetState(t, s, ctx, w.Roots, list, height))
 }
+
+// A coin statement ends at nettedCoinsBatchBytes as well as at nettedCoinsBatchRows. On mainnet at
+// block 863,817 on 2026-10-09, 50,000 rows with large scripts went past the Postgres limit of 1 GB
+// for one protocol message ("write failed: message body too large"), and the block failed on
+// every attempt.
+func TestCoinBatchesEndAtTheByteLimit(t *testing.T) {
+	scripts := [][]byte{make([]byte, 100), make([]byte, 100), make([]byte, 100), make([]byte, 10), make([]byte, 10)}
+	rows := []int{0, 1, 2, 3, 4}
+
+	// Each row costs its script and coinRowOverhead bytes. With room for two 100-byte rows, rows 2
+	// and 3 fit together and row 4 does not.
+	batches := coinBatches(rows, scripts, 10, 2*(100+coinRowOverhead))
+	require.Equal(t, [][]int{{0, 1}, {2, 3}, {4}}, batches)
+
+	require.Equal(t, [][]int{{0, 1}, {2, 3}, {4}}, coinBatches(rows, scripts, 2, 1<<30), "the row limit still applies")
+
+	require.Equal(t, [][]int{{0}, {1}, {2}, {3}, {4}}, coinBatches(rows, scripts, 10, 1), "a row larger than the limit is a batch of its own")
+
+	require.Empty(t, coinBatches(nil, scripts, 10, 1<<30))
+}
+
+// Coins written in batches cut by bytes give the same net effect.
+func TestNettedBelowWritesTheCoinsInByteBoundedBatches(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	const height = 970
+
+	old := nettedCoinsBatchBytes
+	nettedCoinsBatchBytes = 1
+
+	t.Cleanup(func() { nettedCoinsBatchBytes = old })
+
+	w := tests.BuildMultiWorkload(t, 0x7c, 3, 4)
+	w.StoreRoots(t, s, height-1)
+
+	list := outpointOnly(w.Txs)
+
+	_, err := s.SpendAndCreateMulti(ctx, list, height, belowCheckpointOptions(height)...)
+	require.NoError(t, err)
+
+	require.Equal(t, expectedNetState(w.Roots, list), readNetState(t, s, ctx, w.Roots, list, height))
+}
