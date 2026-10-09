@@ -20,13 +20,13 @@ import (
 // The chain applies a block only after each block below it, so a block that lands after each
 // block below it adds to the chain's wait. When it adds watchMinETA or more, its request is
 // watchMinAge old, and it has one owner, one more peer is asked:
-//   - Arriving, with half its bytes or fewer: the peer that lands a full copy soonest, if in half
-//     the owner's time or less. A copy with more than half its bytes gets no helper unless it
-//     will take longer than watchPastHalfWait.
-// A block whose every copy is stalled is the race's; no block above it counts as late until it is
-// resolved, since the chain waits on it whatever lands above.
+//   - Arriving: the peer that lands a full copy soonest, if in half the owner's time or less. A
+//     copy with more than half its bytes gets no helper while it will land within
+//     watchPastHalfWait.
 //   - Queued: the fastest peer with rescueFasterBy times the owner's rate that lands the block
 //     at the recent mean size in half the owner's time.
+// A block whose every copy is stalled is the race's; no block above it counts as late until it is
+// resolved, since the chain waits on it whatever lands above.
 // The owner keeps its request and its connection; the first complete copy converts and the other
 // drains at the sink. One block gets one more getdata at the maximum. Headers-first mode only: the
 // heights come from the header cache, which is empty above the last checkpoint.
