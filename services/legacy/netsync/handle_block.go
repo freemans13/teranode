@@ -1350,11 +1350,16 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	// existing tx in the block overruns the aerospike client connection pool on fat
 	// blocks (e.g. mainnet 755880 = 2.87M txs).
 	if len(existingTxHashes) > 0 {
+		onLongestChain, chainErr := sm.extendsBestBlock(ctx, bi)
+		if chainErr != nil {
+			return chainErr
+		}
+
 		minedBlockInfo := utxo.MinedBlockInfo{
 			BlockID:        blockID,
 			BlockHeight:    blockHeightUint32,
 			SubtreeIdx:     0,
-			OnLongestChain: true,
+			OnLongestChain: onLongestChain,
 		}
 
 		if err = utxo.SetMinedMultiChunked(ctx, sm.logger, sm.utxoStore, existingTxHashes, minedBlockInfo,
@@ -1364,6 +1369,46 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	}
 
 	return nil
+}
+
+// extendsBestBlock reports whether the block being applied extends the current best
+// chain, which is the OnLongestChain value createUtxos stamps on transactions that were
+// already in the UTXO store.
+//
+// The flag is not cosmetic on any store. True clears the transaction's unmined marker
+// and lets the store set its delete-at-height once its outputs are spent; false leaves
+// the marker alone. Block assembly reloads transactions that still carry the marker
+// when it resets, and the pruner treats a cleared marker as settled on the main chain.
+// Stamping true for a block that is not on the best chain therefore tells the store
+// that a transaction only a losing block mined is settled. Block validation already
+// passes an honest flag on its own SetMinedMulti calls; this path used to hard-code true.
+//
+// The question cannot be asked about the block itself. createUtxos runs inside
+// prepareSubtrees, before ProcessBlock reaches AddBlock, so this block is not in the
+// blockchain store yet: its id, if it has one, is allocated but uncommitted, and
+// CheckBlockIsInCurrentChain answers false for every such id.
+//
+// Asking whether the PARENT is on the current chain is not enough either. Once block A
+// at height h has been applied and become the tip, a same-height sibling B with the
+// same parent P can still arrive. P is on the current chain, so that test answers true
+// for B as well, although B is the losing block.
+//
+// The exact test is that the parent IS the current best block. bi.prevBlock already
+// carries the parent's hash, so this costs one GetBestBlockHeader call and needs no
+// block id. It holds only while this block has not been added, which is the case for
+// every createUtxos call: legacy blocks are handled one at a time, the previous
+// block's ProcessBlock has returned (and so stored it) before this one starts, and
+// HandleBlockDirect returns early for a block the store already has.
+//
+// An error is returned rather than a guessed flag, so a block is never stamped on an
+// assumption about the chain.
+func (sm *SyncManager) extendsBestBlock(ctx context.Context, bi blockIdent) (bool, error) {
+	bestHeader, _, err := sm.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return false, errors.NewServiceError("[createUtxos][%s] error getting best block header", bi.hash.String(), err)
+	}
+
+	return bestHeader.Hash().IsEqual(&bi.prevBlock), nil
 }
 
 // reuseBlockIDFromUTXO returns an already-recorded block id for this block by
