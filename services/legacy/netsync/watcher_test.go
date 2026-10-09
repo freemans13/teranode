@@ -439,3 +439,26 @@ func TestWatchLeavesACopyThatHasMoreThanHalfItsBytes(t *testing.T) {
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, next))
 }
+
+// A queued block's helper must also land it in half the owner's estimated time, as for an
+// arriving block. On mainnet from 23:30 on 2026-10-08 the watcher asked helpers that started
+// first at twice the rate but had long queues of their own (8m21s against 5m36s), and the share
+// of discarded bytes rose from 4.0% to 7.5%. Here the owner at 3.5 MB/s lands block 11 in about
+// 514 s, and the 8 MB/s peer, behind 11 blocks, in about 450 s.
+func TestWatchAsksNoHelperThatSavesLessThanHalf(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	sm.streams.rates[fast] = 8_000_000
+	now := time.Now()
+
+	for _, h := range []int32{13, 14, 15, 16, 17, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
+	}
+
+	for h := int32(40); h < 51; h++ {
+		askAt(t, sm, fast, heightHash(t, sm, h), now.Add(-time.Minute))
+	}
+
+	sm.watchOwedBlocks(now)
+
+	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
+}
