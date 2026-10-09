@@ -478,3 +478,23 @@ func TestWatchHelpsTheFirstBlockOfASilentOwner(t *testing.T) {
 
 	require.True(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 }
+
+// An estimate stays positive and bounded at any rate. A stopped copy counts at 1 byte a second,
+// and with about 21 GB to come the conversion to a duration went past the int64 limit and turned
+// negative: the stalled peer then looked like the fastest one (review of 2026-10-09).
+func TestAnEstimateAtOneBytePerSecondStaysPositive(t *testing.T) {
+	sm, owner, _, _ := reaskSetup(t)
+	now := time.Now()
+
+	var queue []queuedBlock
+	for h := int32(11); h < 32; h++ {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-time.Minute))
+	}
+
+	queue = sm.blockDownloads.Queues()[owner]
+
+	eta := sm.queuedArrival(owner, queue, 0, 1_000_000_000, 1_000_000_000, 1)
+	require.Positive(t, eta)
+	require.LessOrEqual(t, eta, maxEstimate)
+	require.Positive(t, eta*rescueFasterBy, "doubling an estimate does not overflow")
+}
