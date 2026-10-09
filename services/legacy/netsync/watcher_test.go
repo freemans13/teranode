@@ -462,3 +462,19 @@ func TestWatchAsksNoHelperThatSavesLessThanHalf(t *testing.T) {
 
 	require.False(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
 }
+
+// A silent owner's first queued block gets a helper. Its owner has sent nothing, so its estimated
+// start is 0 s, and the rule "the helper starts before the owner" refused every helper; with the
+// quiet-owner re-ask off below the checkpoint, the block waited for the peer's download timeout,
+// about an hour (review of 2026-10-09). The half-time test already proves the gain.
+func TestWatchHelpsTheFirstBlockOfASilentOwner(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	sm.streams.rates[owner] = 10_000
+	now := time.Now()
+
+	askAt(t, sm, owner, heightHash(t, sm, 11), now.Add(-10*time.Minute))
+
+	sm.watchOwedBlocks(now)
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, heightHash(t, sm, 11)))
+}
