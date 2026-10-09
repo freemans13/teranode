@@ -2,12 +2,10 @@ package netsync
 
 import (
 	"context"
-	"net/url"
 	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
-	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
@@ -15,7 +13,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
-	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -28,6 +25,10 @@ type countingStore struct {
 	mu      sync.Mutex
 	lookups int
 	stamped []chainhash.Hash
+
+	// entryErr, when set, replaces the store's answer on that hash's entry, the way aerospike
+	// reports a record timeout on one entry of a batch that otherwise succeeded.
+	entryErr map[chainhash.Hash]error
 }
 
 func (s *countingStore) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, f ...fields.FieldName) error {
@@ -35,7 +36,17 @@ func (s *countingStore) BatchDecorate(ctx context.Context, items []*utxo.Unresol
 	s.lookups++
 	s.mu.Unlock()
 
-	return s.Store.BatchDecorate(ctx, items, f...)
+	if err := s.Store.BatchDecorate(ctx, items, f...); err != nil {
+		return err
+	}
+
+	for _, it := range items {
+		if err, ok := s.entryErr[it.Hash]; ok {
+			it.Data, it.Err = nil, err
+		}
+	}
+
+	return nil
 }
 
 func (s *countingStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
@@ -62,28 +73,12 @@ type retryFixture struct {
 func newRetryFixture(t *testing.T, name string) *retryFixture {
 	t.Helper()
 
-	ctx := context.Background()
-
 	tSettings, params := newOutpointOnlySettings(t, true, true, 1000)
 	tSettings.BlockValidation.SkipUnspendableTxStorageDuringCatchup = true
 
-	storeURL, err := url.Parse("sqlitememory:///" + name)
-	require.NoError(t, err)
+	store := &countingStore{Store: newSQLiteMemoryStore(t, tSettings, name)}
 
-	sqlStore, err := utxosql.New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
-	require.NoError(t, err)
-
-	store := &countingStore{Store: sqlStore}
-
-	normal, data, _ := twoTxMap(t)
-	// The SQL store will not take an input without an unlocking script. Setting one changes the
-	// txid, so the map is built afterwards.
-	normal.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x00})
-	data.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x00})
-
-	m := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](2)
-	m.Set(*normal.TxIDChainHash(), &TxMapWrapper{Tx: normal})
-	m.Set(*data.TxIDChainHash(), &TxMapWrapper{Tx: data})
+	normal, data, m := twoTxMap(t)
 
 	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1}})
 	block.SetHeight(500)
@@ -137,4 +132,32 @@ func TestCreateUtxos_FirstAttemptOnlyAsksAboutSkippedTransactions(t *testing.T) 
 	normal, err := f.store.Get(ctx, f.normal.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
 	require.Contains(t, normal.BlockIDs, uint32(7))
+}
+
+// A store that fails to answer for one skipped transaction has not said the transaction is
+// absent. Reading that as absent would leave a transaction an earlier attempt stored unmined
+// for good, so the block fails and is retried instead.
+func TestCreateUtxos_FailsWhenTheStoreCannotAnswerForASkippedTransaction(t *testing.T) {
+	ctx := context.Background()
+	f := newRetryFixture(t, "entry_error")
+
+	// The failed first attempt stored the data transaction, unmined.
+	_, _, err := f.store.SpendAndCreate(ctx, f.data, 500, utxo.WithCreateOnly())
+	require.NoError(t, err)
+
+	f.store.entryErr = map[chainhash.Hash]error{
+		*f.data.TxIDChainHash(): errors.NewStorageError("record timeout"),
+	}
+
+	err = f.sm.createUtxos(ctx, f.m, testBlockIdent(f.block), 7, true)
+	require.Error(t, err, "an unanswered lookup must fail the block, not pass as a miss")
+	require.True(t, errors.Is(err, errors.ErrStorageError), "the store's own error is carried, got %v", err)
+
+	// The block is retried once the store answers, and then the transaction is marked mined.
+	f.store.entryErr = nil
+	require.NoError(t, f.sm.createUtxos(ctx, f.m, testBlockIdent(f.block), 7, true))
+
+	post, err := f.store.Get(ctx, f.data.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Contains(t, post.BlockIDs, uint32(7))
 }

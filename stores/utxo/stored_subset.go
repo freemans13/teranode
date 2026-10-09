@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 )
 
@@ -16,7 +17,8 @@ import (
 // through BatchDecorate. A wrapper store forwards it to the store it wraps.
 type StoredTxProber interface {
 	// StoredTxs returns the members of hashes the store holds a record of, in any order. A
-	// hash it has never seen is left out, not reported as an error.
+	// hash it has never seen is left out, not reported as an error. hashes can be every skipped
+	// transaction in a block, so an implementation splits it into reads its backend can take.
 	StoredTxs(ctx context.Context, hashes []*chainhash.Hash) ([]chainhash.Hash, error)
 }
 
@@ -32,9 +34,9 @@ type StoredTxProber interface {
 // Whether any were stored cannot be read off the rest of the block: an earlier attempt may have
 // got only as far as a skipped transaction, so every skipped hash is asked about, on every
 // attempt. A store that implements StoredTxProber answers that itself. Any other store is asked
-// with one BatchDecorate, which every store answers with a miss on the entry itself rather than
-// by failing the call. Either way a first attempt pays one batched read and no write. A store
-// failure is returned.
+// through BatchDecorate, in batches of storedSubsetDecorateBatchSize, and every store answers a
+// miss on the entry itself rather than by failing the call. Either way a first attempt pays
+// batched reads and no write. A store failure, whole-call or on one entry, is returned.
 func StoredSubset(ctx context.Context, store Store, hashes []*chainhash.Hash) ([]*chainhash.Hash, error) {
 	if prober, ok := store.(StoredTxProber); ok {
 		return storedSubsetByProbe(ctx, prober, hashes)
@@ -81,9 +83,20 @@ func storedSubsetByProbe(ctx context.Context, prober StoredTxProber, hashes []*c
 	return stored, nil
 }
 
+// storedSubsetDecorateBatchSize bounds one BatchDecorate call. A legacy block can skip hundreds
+// of thousands of transactions, and every other block-sized BatchDecorate caller splits its
+// reads the same way, at the default of blockvalidation_processTxMetaUsingStore_BatchSize, so
+// that one call never becomes a single aerospike batch the size of the block.
+const storedSubsetDecorateBatchSize = 1024
+
 // StoredSubsetByDecorate is StoredSubset through BatchDecorate alone. It is what a store
 // without StoredTxProber gets, and what a wrapper store uses to forward StoredTxs to a store it
 // wraps that has no prober of its own.
+//
+// Only a not-found answer on an entry means the store does not hold that transaction. Any other
+// error on an entry, such as an aerospike record timeout, is returned rather than read as
+// absent: reading it as absent would leave a stored transaction unmined for good, which is the
+// failure this lookup exists to prevent.
 func StoredSubsetByDecorate(ctx context.Context, store Store, hashes []*chainhash.Hash) ([]*chainhash.Hash, error) {
 	items := make([]*UnresolvedMetaData, 0, len(hashes))
 
@@ -99,15 +112,27 @@ func StoredSubsetByDecorate(ctx context.Context, store Store, hashes []*chainhas
 		return nil, nil
 	}
 
-	if err := store.BatchDecorate(ctx, items, fields.BlockIDs); err != nil {
-		return nil, err
+	for start := 0; start < len(items); start += storedSubsetDecorateBatchSize {
+		end := min(start+storedSubsetDecorateBatchSize, len(items))
+
+		if err := store.BatchDecorate(ctx, items[start:end], fields.BlockIDs); err != nil {
+			return nil, err
+		}
 	}
 
 	var stored []*chainhash.Hash
 
 	for _, it := range items {
-		// Data as well as Err: a store that answers nothing at all has not found it either.
-		if it.Err == nil && it.Data != nil {
+		if it.Err != nil {
+			if errors.Is(it.Err, errors.ErrTxNotFound) {
+				continue
+			}
+
+			return nil, errors.NewProcessingError("failed to look up transaction %s", it.Hash.String(), it.Err)
+		}
+
+		// A store that answers nothing at all, with no error either, has not found it.
+		if it.Data != nil {
 			stored = append(stored, hashes[it.Idx])
 		}
 	}

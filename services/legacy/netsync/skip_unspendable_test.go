@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"context"
+	"net/url"
 	"sync"
 	"testing"
 
@@ -10,17 +11,33 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
-	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
+	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
-// createSpyStore records which transactions createUtxos asked the store to create.
+// newSQLiteMemoryStore is a real sqlitememory UTXO store, a separate database per name.
+func newSQLiteMemoryStore(t *testing.T, tSettings *settings.Settings, name string) utxo.Store {
+	t.Helper()
+
+	storeURL, err := url.Parse("sqlitememory:///" + name)
+	require.NoError(t, err)
+
+	store, err := utxosql.New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+
+	return store
+}
+
+// createSpyStore is a real store that records which transactions createUtxos asked it to create.
 type createSpyStore struct {
-	*nullstore.NullStore
+	utxo.Store
 	mu      sync.Mutex
 	created map[chainhash.Hash]bool
 }
@@ -30,10 +47,8 @@ func (s *createSpyStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHei
 	s.created[*tx.TxIDChainHash()] = true
 	s.mu.Unlock()
 
-	return s.NullStore.SpendAndCreate(ctx, tx, blockHeight, opts...)
+	return s.Store.SpendAndCreate(ctx, tx, blockHeight, opts...)
 }
-
-func (s *createSpyStore) SupportsOutpointOnlySpend() bool { return true }
 
 func (s *createSpyStore) was(tx *bt.Tx) bool {
 	s.mu.Lock()
@@ -43,18 +58,21 @@ func (s *createSpyStore) was(tx *bt.Tx) bool {
 }
 
 // twoTxMap holds one ordinary transaction and one whose only output is OP_FALSE OP_RETURN
-// data, which is provably unspendable in every era.
+// data, which is provably unspendable in every era. Each input carries an unlocking script,
+// because the SQL store will not take an input without one.
 func twoTxMap(t *testing.T) (normal, data *bt.Tx, m *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) {
 	t.Helper()
 
-	in := &bt.Input{PreviousTxOutIndex: 0, SequenceNumber: 0xffffffff, PreviousTxSatoshis: 5_000}
+	in := &bt.Input{PreviousTxOutIndex: 0, SequenceNumber: 0xffffffff, PreviousTxSatoshis: 5_000,
+		UnlockingScript: bscript.NewFromBytes([]byte{0x00})}
 	require.NoError(t, in.PreviousTxIDAdd(&chainhash.Hash{1}))
 
 	normal = &bt.Tx{Version: 1, Inputs: []*bt.Input{in}, Outputs: []*bt.Output{
 		{Satoshis: 1_000, LockingScript: &bscript.Script{bscript.OpDUP, bscript.OpHASH160}},
 	}}
 
-	in2 := &bt.Input{PreviousTxOutIndex: 1, SequenceNumber: 0xffffffff, PreviousTxSatoshis: 5_000}
+	in2 := &bt.Input{PreviousTxOutIndex: 1, SequenceNumber: 0xffffffff, PreviousTxSatoshis: 5_000,
+		UnlockingScript: bscript.NewFromBytes([]byte{0x00})}
 	require.NoError(t, in2.PreviousTxIDAdd(&chainhash.Hash{2}))
 
 	data = &bt.Tx{Version: 1, Inputs: []*bt.Input{in2}}
@@ -81,13 +99,13 @@ func TestCreateUtxos_SkipsUnspendableTransactionsBelowTheCheckpointWhenAsked(t *
 	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1}})
 	block.SetHeight(500)
 
-	run := func(t *testing.T, skipSetting, outpointOnly bool) (*bt.Tx, *bt.Tx, *createSpyStore) {
+	run := func(t *testing.T, name string, skipSetting, outpointOnly bool) (*bt.Tx, *bt.Tx, *createSpyStore) {
 		t.Helper()
 
 		tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
 		tSettings.BlockValidation.SkipUnspendableTxStorageDuringCatchup = skipSetting
 
-		spy := &createSpyStore{NullStore: &nullstore.NullStore{}, created: map[chainhash.Hash]bool{}}
+		spy := &createSpyStore{Store: newSQLiteMemoryStore(t, tSettings, name), created: map[chainhash.Hash]bool{}}
 		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{}, utxoStore: spy}
 
 		normal, data, m := twoTxMap(t)
@@ -96,21 +114,41 @@ func TestCreateUtxos_SkipsUnspendableTransactionsBelowTheCheckpointWhenAsked(t *
 		return normal, data, spy
 	}
 
+	stored := func(t *testing.T, store utxo.Store, tx *bt.Tx) bool {
+		t.Helper()
+
+		md, err := store.Get(context.Background(), tx.TxIDChainHash(), fields.BlockIDs)
+		if errors.Is(err, errors.ErrTxNotFound) {
+			return false
+		}
+
+		require.NoError(t, err)
+		require.Contains(t, md.BlockIDs, uint32(7), "a stored transaction is stored mined in the block")
+
+		return true
+	}
+
 	t.Run("setting on, below checkpoint: data transaction is not stored", func(t *testing.T) {
-		normal, data, spy := run(t, true, true)
+		normal, data, spy := run(t, "skip_on", true, true)
 		require.True(t, spy.was(normal), "a transaction with a spendable output is always stored")
 		require.False(t, spy.was(data), "nothing can ever spend it and no persister needs it")
+		require.True(t, stored(t, spy, normal))
+		require.False(t, stored(t, spy, data))
 	})
 
 	t.Run("setting off: both are stored", func(t *testing.T) {
-		normal, data, spy := run(t, false, true)
+		normal, data, spy := run(t, "skip_off", false, true)
 		require.True(t, spy.was(normal))
 		require.True(t, spy.was(data))
+		require.True(t, stored(t, spy, normal))
+		require.True(t, stored(t, spy, data))
 	})
 
 	t.Run("above the checkpoint the setting does not apply", func(t *testing.T) {
-		normal, data, spy := run(t, true, false)
+		normal, data, spy := run(t, "above_checkpoint", true, false)
 		require.True(t, spy.was(normal))
 		require.True(t, spy.was(data), "at the tip the mempool, the stamp and the persister may all need the row")
+		require.True(t, stored(t, spy, normal))
+		require.True(t, stored(t, spy, data))
 	})
 }
