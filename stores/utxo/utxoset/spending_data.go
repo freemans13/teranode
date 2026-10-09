@@ -89,7 +89,7 @@ func wantsConflictingChildren(fieldNames []fields.FieldName) bool {
 // unspent, which is the answer that would let a double spend through.
 //
 // The input index on each entry is the journal's spending_vin, which input of the spending
-// transaction consumed the UTXO. Rows journaled before that column existed read back 0.
+// transaction consumed the UTXO.
 //
 // A FROZEN output gets the frozen sentinel, subtree.FrozenBytesTxHash, as its spender, with the
 // output number as the input index, which is what both reference stores put there. It is not

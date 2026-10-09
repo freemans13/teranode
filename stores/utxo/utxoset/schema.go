@@ -56,6 +56,7 @@ import (
 	"fmt"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -241,9 +242,10 @@ CREATE TABLE IF NOT EXISTS spend_journal (
 -- identity row are parent-major and deduplicated, so they do not keep the input order, and the
 -- body is optional and ages out on its own clock.
 --
--- It sits second so it costs NO bytes on a fresh table: satoshis is 8-aligned, so the four
--- bytes after spent_height were alignment padding. A database created before the column
--- existed gets it from addSpendingVin, which CreateSchema runs after this.
+-- It sits second so it costs NO bytes: satoshis is 8-aligned, so the four bytes after
+-- spent_height were alignment padding. There is no migration for it, like every other column
+-- here: a database whose journal predates it is refused at startup (assertJournalHasVin) and
+-- needs a fresh sync.
 
 -- ---------------------------------------------------------------------------
 -- CONFLICT BOOKKEEPING. One row per (contested parent, losing child).
@@ -672,18 +674,16 @@ func CreateSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 
-	if err := addSpendingVin(ctx, pool); err != nil {
-		return err
-	}
-
 	return assertSchemaShape(ctx, pool)
 }
 
-// spendJournalLeavesMissingVinSQL names every spend-journal table that has no spending_vin
-// column and is not a partition: the parent, and any leaf left standalone. An attached leaf,
-// including one mid-detach, gets the column from the parent's ALTER, and PostgreSQL refuses an
-// ADD COLUMN aimed at a partition directly.
-const spendJournalLeavesMissingVinSQL = `
+// spendJournalTablesMissingVinSQL names every spend-journal table that has no spending_vin
+// column and is not a partition: the parent, and any leaf left standalone by a pruner pass
+// interrupted between its DETACH and its DROP. An attached leaf always has its parent's columns.
+// The standalone leaf matters because the next pruner pass copies forward out of it by name,
+// reading spending_vin, so a database that passed on the parent alone would fail on that pass
+// instead of at startup.
+const spendJournalTablesMissingVinSQL = `
 SELECT c.relname
   FROM pg_class c
   JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -693,57 +693,28 @@ SELECT c.relname
    AND NOT c.relispartition
    AND NOT EXISTS (SELECT 1 FROM pg_attribute a
                     WHERE a.attrelid = c.oid AND a.attname = 'spending_vin' AND NOT a.attisdropped)
- ORDER BY c.relkind DESC, c.relname`
+ ORDER BY c.relkind DESC, c.relname
+ LIMIT 1`
 
-// addSpendingVin adds spending_vin to a journal created before the column existed. It is the
-// one column this store adds in place rather than demanding a re-sync for, because adding a
-// column with a constant default is a catalog change in PostgreSQL 11 and later, with no
-// rewrite. On such a table the column lands at the end of the row and costs 4 bytes plus
-// alignment; rows written before it read back 0, which is what GetSpend reported for every row
-// until then.
-//
-// GATED, never run unconditionally. ALTER TABLE ... ADD COLUMN takes ACCESS EXCLUSIVE before it
-// looks at IF NOT EXISTS, so an ungated ALTER would stall every spend behind every store open,
-// which is the lock partition_attach.go exists to keep off the parent. The check is a catalog
-// read; the ALTER runs only on a table that lacks the column, so once per database.
-//
-// The parent comes first, which reaches every attached leaf. A leaf left STANDALONE by a pruner
-// pass interrupted between its DETACH and its DROP does not inherit it, and the next pass runs
-// copy-forward on that leaf by name before dropping it, so it gets the column too.
-func addSpendingVin(ctx context.Context, pool *pgxpool.Pool) error {
-	rows, err := pool.Query(ctx, spendJournalLeavesMissingVinSQL)
+// assertJournalHasVin refuses a database whose spend journal predates spending_vin. Without
+// the column every spend fails on its journal insert, so the refusal belongs at startup, with a
+// message that says what to do. There is no in-place migration, by the same rule as every other
+// column in this schema.
+func assertJournalHasVin(ctx context.Context, pool *pgxpool.Pool) error {
+	var name string
+
+	err := pool.QueryRow(ctx, spendJournalTablesMissingVinSQL).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+
 	if err != nil {
-		return errors.NewStorageError("[utxoset] find journal tables without spending_vin", err)
+		return errors.NewStorageError("[utxoset] check spend_journal for spending_vin", err)
 	}
 
-	var names []string
-
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			return errors.NewStorageError("[utxoset] scan journal table name", err)
-		}
-
-		names = append(names, name)
-	}
-
-	rows.Close()
-
-	if err := rows.Err(); err != nil {
-		return errors.NewStorageError("[utxoset] journal table names", err)
-	}
-
-	for _, name := range names {
-		// The parent sorts first, and its ALTER reaches every attached leaf. A standalone
-		// leaf's ALTER locks only that leaf, which nothing but the pruner reads.
-		if _, err := pool.Exec(ctx, fmt.Sprintf(
-			`ALTER TABLE %s ADD COLUMN IF NOT EXISTS spending_vin INTEGER NOT NULL DEFAULT 0`, name)); err != nil {
-			return errors.NewStorageError("[utxoset] add spending_vin to %s", name, err)
-		}
-	}
-
-	return nil
+	return errors.NewConfigurationError(
+		"[utxoset] this database's schema predates spend_journal.spending_vin (%s has no such column); there is no migration by design, so the node needs a fresh sync into a new database",
+		name)
 }
 
 // requiredColumns are the facts that distinguish this schema from the one before it. A
@@ -762,7 +733,6 @@ var requiredColumns = []struct{ table, column string }{
 	{"tx_mined_stamped", ""},
 	{"spend_journal", "mined_height"},
 	{"spend_journal", "block_id"},
-	{"spend_journal", "spending_vin"},
 	{"conflict_intents", ""},
 }
 
@@ -825,7 +795,7 @@ func assertSchemaShape(ctx context.Context, pool *pgxpool.Pool) error {
 			schemaName(gone.table, gone.column))
 	}
 
-	return nil
+	return assertJournalHasVin(ctx, pool)
 }
 
 // schemaHas reports whether the current schema holds the table, or the column of the table
