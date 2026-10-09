@@ -1556,6 +1556,55 @@ func SpendAndCreate(t *testing.T, db utxostore.Store) {
 	require.Equal(t, spendingTx.TxIDChainHash().String(), created.Tx.TxID())
 }
 
+// CreateReturnsWrittenState proves the record a create hands back says what was written: the
+// Locked and Conflicting state the options asked for, and the parent inpoints.
+//
+// Callers act on that record without reading the row back. The validator unlocks a
+// transaction after delivering it to block assembly only when the returned record says
+// Locked; a store that locked the row but returned Locked=false left it locked, and the next
+// child spending it was refused with ErrTxLocked. Subtree validation reads Conflicting from
+// the same record, and the txmeta cache treats a non-coinbase entry with no parents as a miss.
+//
+// SpendAndCreate with WithCreateOnly is the create entry point of the Store interface. Each case
+// deletes its transaction first so the function also runs against a store shared between
+// subtests.
+func CreateReturnsWrittenState(t *testing.T, db utxostore.Store) {
+	ctx := context.Background()
+
+	// The parent has to exist: a conflicting create notes itself on its parents, and the sql
+	// store refuses that note for a parent it does not hold.
+	if _, _, err := db.SpendAndCreate(ctx, Tx, 1000, utxostore.WithCreateOnly()); err != nil {
+		require.ErrorIs(t, err, errors.ErrTxExists)
+	}
+
+	for i, tc := range []struct {
+		name        string
+		opts        []utxostore.CreateOption
+		locked      bool
+		conflicting bool
+	}{
+		{"plain", nil, false, false},
+		{"locked", []utxostore.CreateOption{utxostore.WithLocked(true)}, true, false},
+		{"conflicting", []utxostore.CreateOption{utxostore.WithConflicting(true)}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A distinct satoshi amount gives each case its own txid.
+			tx := newSpendAndCreateTx(t, 0, uint64(3000+i)) //nolint:gosec // small test index
+			_ = db.Delete(ctx, tx.TxIDChainHash())
+
+			md, _, err := db.SpendAndCreate(ctx, tx, db.GetBlockHeight()+1,
+				append([]utxostore.CreateOption{utxostore.WithCreateOnly()}, tc.opts...)...)
+			require.NoError(t, err)
+			require.NotNil(t, md)
+
+			require.Equal(t, tc.locked, md.Locked, "returned Locked must match what was written")
+			require.Equal(t, tc.conflicting, md.Conflicting, "returned Conflicting must match what was written")
+			require.Equal(t, []chainhash.Hash{*Tx.TxIDChainHash()}, md.TxInpoints.ParentTxHashes,
+				"returned record must carry the parent inpoints")
+		})
+	}
+}
+
 // SpendAndCreateCreateOnly proves WithCreateOnly skips the spend phase entirely.
 func SpendAndCreateCreateOnly(t *testing.T, db utxostore.Store) {
 	ctx := context.Background()

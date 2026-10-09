@@ -121,6 +121,11 @@ func TestConformance(t *testing.T) {
 		tests.SpendAndCreateCreateOnly(t, db)
 	})
 
+	t.Run("CreateReturnsWrittenState", func(t *testing.T) {
+		db, _ := newUncheckpointedStore(t)
+		tests.CreateReturnsWrittenState(t, db)
+	})
+
 	t.Run("SpendAndCreateSpendOnly", func(t *testing.T) {
 		db, _ := newUncheckpointedStore(t)
 		tests.SpendAndCreateSpendOnly(t, db)
