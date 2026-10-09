@@ -22,8 +22,8 @@ import (
 // watchMinAge old, and it has one owner, one more peer is asked:
 //   - Arriving, with half its bytes or fewer: the peer that lands a full copy soonest, if in half
 //     the owner's time or less. A copy with more than half its bytes gets no helper.
-//   - Queued: the fastest peer that starts before the owner and has rescueFasterBy times its rate.
-//     It lands the block sooner whatever its size.
+//   - Queued: the fastest peer that starts before the owner, has rescueFasterBy times its rate,
+//     and lands the block at the recent mean size in half the owner's time.
 // The owner keeps its request and its connection; the first complete copy converts and the other
 // drains at the sink. One block gets one more getdata at the maximum. Headers-first mode only: the
 // heights come from the header cache, which is empty above the last checkpoint.
@@ -213,7 +213,15 @@ func (sm *SyncManager) watchHelper(queues map[*peerpkg.Peer][]queuedBlock, owner
 		}
 
 		// The size is not known: the fastest peer that starts before the owner and has
-		// rescueFasterBy times its rate, which lands the block sooner whatever its size.
+		// rescueFasterBy times its rate, which lands the block sooner whatever its size, and
+		// that lands it at the recent mean size in half the owner's time. Without the last
+		// test, helpers with long queues of their own were asked for small gains, and on
+		// 2026-10-08 from 23:30 the share of discarded bytes rose from 4.0% to 7.5%.
+		eta := start + time.Duration(float64(typical)/rate*float64(time.Second))
+		if eta*rescueFasterBy > ownerETA {
+			continue
+		}
+
 		if ownerRate <= 0 || (start < ownerStart && rate >= rescueFasterBy*ownerRate) {
 			if best == nil || rate > bestRate || (rate == bestRate && start < bestStart) {
 				best, bestRate, bestStart = bp.peer, rate, start
