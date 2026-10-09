@@ -21,7 +21,10 @@ import (
 // block below it adds to the chain's wait. When it adds watchMinETA or more, its request is
 // watchMinAge old, and it has one owner, one more peer is asked:
 //   - Arriving, with half its bytes or fewer: the peer that lands a full copy soonest, if in half
-//     the owner's time or less. A copy with more than half its bytes gets no helper.
+//     the owner's time or less. A copy with more than half its bytes gets no helper unless it
+//     will take longer than watchPastHalfWait.
+// A block whose every copy is stalled is the race's; no block above it counts as late until it is
+// resolved, since the chain waits on it whatever lands above.
 //   - Queued: the fastest peer with rescueFasterBy times the owner's rate that lands the block
 //     at the recent mean size in half the owner's time.
 // The owner keeps its request and its connection; the first complete copy converts and the other
@@ -43,6 +46,23 @@ const (
 	// for each block that landed after the blocks below it, by any margin, discarded 8% of the
 	// bytes received.
 	watchMinETA = 30 * time.Second
+	// watchPastHalfWait is the longest a copy with more than half its bytes may still take and get
+	// no helper. Below it the bytes a helper discards cost more than the wait it saves; above it
+	// the chain waits on one slow copy for longer than any helper costs.
+	watchPastHalfWait = 5 * time.Minute
+)
+
+// arrivalVerdict is how ownerArrival judged one owner's copy of a block.
+type arrivalVerdict int
+
+const (
+	// arrivalJudged: the estimate holds.
+	arrivalJudged arrivalVerdict = iota
+	// arrivalTooEarly: the request or its bytes are younger than watchMinAge, or the copy waits for
+	// an admission slot. The block is left for a later tick.
+	arrivalTooEarly
+	// arrivalStalled: the copy arrives under raceStallRate, so it is the race's.
+	arrivalStalled
 )
 
 // maxEstimate is the longest arrival estimate the watcher uses: 1,000 hours. A stopped copy counts
@@ -99,22 +119,45 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 			continue
 		}
 
-		eta, size, state, judged := farOff, int64(0), "", true
+		eta, size, state := farOff, int64(0), ""
+		judged, anyJudged, stalled := true, false, false
 
 		for _, o := range owners {
-			e, sz, st, ok := sm.ownerArrival(o, b.rec.hash, queues[o], typical, now)
-			if !ok {
-				judged = false
+			e, sz, st, v := sm.ownerArrival(o, b.rec.hash, queues[o], typical, now)
 
-				break
+			switch v {
+			case arrivalStalled:
+				// The race's copy. Another owner's copy may still judge the block.
+				stalled = true
+
+				continue
+			case arrivalTooEarly:
+				judged = false
+			case arrivalJudged:
+				anyJudged = true
+
+				if e < eta {
+					eta, size, state = e, sz, st
+				}
 			}
 
-			if e < eta {
-				eta, size, state = e, sz, st
+			if !judged {
+				break
 			}
 		}
 
 		if !judged {
+			continue
+		}
+
+		if !anyJudged {
+			// Every copy is stalled: the block is the race's, and the chain waits on it whatever
+			// lands above it, so no block above it counts as late until it is resolved. A helper
+			// for one of those would not move the chain.
+			if stalled {
+				latest = farOff
+			}
+
 			continue
 		}
 
@@ -129,10 +172,12 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 
 		owner := owners[0]
 
-		// A copy with more than half its bytes gets no helper: the helper must send the full
-		// block, and the owner's nearly complete copy is discarded if the helper wins. On
-		// 2026-10-08 from 14:31 to 14:49, 8% of the bytes received were discarded.
-		if read, total, _, arriving := sm.streams.arrivingFrom(b.rec.hash, owner); arriving && total > 0 && read*2 > total {
+		// A copy with more than half its bytes gets no helper while it lands within
+		// watchPastHalfWait: the helper must send the full block, and the owner's nearly complete
+		// copy is discarded if the helper wins. On 2026-10-08 from 14:31 to 14:49, 8% of the bytes
+		// received were discarded. A copy past half that will take longer is helped all the same:
+		// at 150 KB/s with 900 MB to come the chain would wait 100 minutes on it.
+		if read, total, _, arriving := sm.streams.arrivingFrom(b.rec.hash, owner); arriving && total > 0 && read*2 > total && eta <= watchPastHalfWait {
 			continue
 		}
 
@@ -249,10 +294,11 @@ func (sm *SyncManager) watchHelper(queues map[*peerpkg.Peer][]queuedBlock, owner
 	return best, bestETA
 }
 
-// fmtETA prints an arrival estimate, farOff as "never".
+// fmtETA prints an arrival estimate. farOff equals maxEstimate, so a capped real estimate and an
+// owner that will not deliver print the same; the log line's state names which it is.
 func fmtETA(d time.Duration) string {
-	if d == farOff {
-		return "never"
+	if d >= maxEstimate {
+		return "over " + maxEstimate.String()
 	}
 
 	return d.Round(time.Second).String()
@@ -263,32 +309,34 @@ func fmtETA(d time.Duration) string {
 const farOff = maxEstimate
 
 // ownerArrival estimates when block h lands at owner o, and the block's declared size when its
-// bytes are arriving from o, zero otherwise. judged is false when the copy must be given more
-// time or is the race's: its request or its bytes are younger than watchMinAge, or its bytes
-// arrive under raceStallRate.
+// bytes are arriving from o, zero otherwise. The verdict is arrivalTooEarly when the copy must be
+// given more time (its request or its bytes are younger than watchMinAge, or it waits for an
+// admission slot), and arrivalStalled when its bytes arrive under raceStallRate, so it is the
+// race's.
 //
 // A copy arriving from o is judged on its own rate: its remaining bytes at that rate, and a fresh
 // copy must fetch the whole block. A copy not yet started is judged by o's queue: the bytes o is
 // still sending, a typical block for each block ahead of it and its own typical size, at o's rate.
 // An owner let off the block (forgiven, so not in its queue) and sending no copy will not deliver.
-func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []queuedBlock, typical int64, now time.Time) (eta time.Duration, ownSize int64, state string, judged bool) {
+func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []queuedBlock, typical int64, now time.Time) (eta time.Duration, ownSize int64, state string, verdict arrivalVerdict) {
 	// A copy waiting for an admission slot is this node's delay, not the owner's.
 	if sm.streams.awaitingAdmission(h, o) {
-		return 0, 0, "", false
+		return 0, 0, "", arrivalTooEarly
 	}
 
 	if read, total, start, arriving := sm.streams.arrivingFrom(h, o); arriving {
 		elapsed := now.Sub(start)
-		if elapsed < watchMinAge || read <= 0 {
-			return 0, 0, "", false
+		if elapsed < watchMinAge {
+			return 0, 0, "", arrivalTooEarly
+		}
+
+		if read <= 0 || float64(read)/elapsed.Seconds() < raceStallRate {
+			return 0, 0, "", arrivalStalled
 		}
 
 		rate := float64(read) / elapsed.Seconds()
-		if rate < raceStallRate {
-			return 0, 0, "", false
-		}
 
-		return estimate(float64(total-read), rate), total, "arrives slowly from", true
+		return estimate(float64(total-read), rate), total, "arrives slowly from", arrivalJudged
 	}
 
 	var (
@@ -305,23 +353,23 @@ func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []q
 	}
 
 	if !queued {
-		return farOff, 0, "was let off by", true
+		return farOff, 0, "was let off by", arrivalJudged
 	}
 
 	if now.Sub(rec.at) < watchMinAge {
-		return 0, 0, "", false
+		return 0, 0, "", arrivalTooEarly
 	}
 
 	// An owner with no rate has sent no block bytes: it lands the block very late. The median rate
 	// made it look as fast as the fastest peer.
 	rate := sm.streams.peerRate(o)
 	if rate <= 0 {
-		return farOff, 0, "has no rate at", true
+		return farOff, 0, "has no rate at", arrivalJudged
 	}
 
 	// The queued block's own size is not known: it counts at the recent mean, as each block ahead
 	// of it does.
-	return sm.queuedArrival(o, queue, rec.seq, typical, typical, rate), 0, "waits behind", true
+	return sm.queuedArrival(o, queue, rec.seq, typical, typical, rate), 0, "waits behind", arrivalJudged
 }
 
 // queuedArrival estimates when a block lands at p: the bytes still to come on every copy p is

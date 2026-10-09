@@ -498,3 +498,49 @@ func TestAnEstimateAtOneBytePerSecondStaysPositive(t *testing.T) {
 	require.LessOrEqual(t, eta, maxEstimate)
 	require.Positive(t, eta*rescueFasterBy, "doubling an estimate does not overflow")
 }
+
+// A copy past half its bytes that will still take longer than watchPastHalfWait gets a helper.
+// The byte test alone left it to arrive however slowly it came, as long as it stayed above the
+// race's 100 KB/s. The review's case was 1.1 of 2 GB in at 150 KB/s, 100 minutes to go; here 110
+// of 200 MB are in at 150 KB/s, 10 minutes to go, against under 3 s for a fresh copy at 80 MB/s
+// (review of 2026-10-09).
+func TestWatchHelpsACopyPastHalfThatWillTakeLong(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	next := heightHash(t, sm, 11)
+	askAt(t, sm, owner, next, now.Add(-13*time.Minute))
+
+	s := sm.streams.start(next, 11, owner, 200_000_000, now.Add(-733*time.Second))
+	s.read.Store(110_000_000)
+
+	sm.watchOwedBlocks(now)
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "10 minutes to go is past watchPastHalfWait")
+	require.True(t, sm.blockDownloads.HasOwner(owner, next), "and the owner keeps its copy")
+}
+
+// A block whose only copy is stalled, under the race's 100 KB/s, is the race's, and the chain
+// waits on it whatever lands above it. So a block above it is not late against it: here block 11
+// arrives at 50 KB/s and block 12, queued at a 3.5 MB/s peer, lands in about 86 s, and a helper
+// for 12 would not move the chain (review of 2026-10-09).
+func TestWatchHelpsNoBlockAboveAStalledOne(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	other, _ := schedulerPeer(t, sm, 3, 2000)
+	sm.streams.rates[other] = 3_500_000
+	now := time.Now()
+
+	stalled := heightHash(t, sm, 11)
+	askAt(t, sm, owner, stalled, now.Add(-2*time.Minute))
+
+	s := sm.streams.start(stalled, 11, owner, reaskTypicalBlock, now.Add(-100*time.Second))
+	s.read.Store(5_000_000)
+
+	above := heightHash(t, sm, 12)
+	askAt(t, sm, other, above, now.Add(-time.Minute))
+
+	sm.watchOwedBlocks(now)
+
+	require.False(t, sm.blockDownloads.HasOwner(fast, stalled), "the stalled block is the race's")
+	require.False(t, sm.blockDownloads.HasOwner(fast, above), "the chain waits on block 11 anyway")
+}
