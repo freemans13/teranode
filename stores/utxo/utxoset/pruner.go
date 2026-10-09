@@ -97,7 +97,7 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	// gated on journalRetention: below it nothing has aged out. That gate does NOT extend to
 	// the UTXO-index rebuild -- a UTXO index can already be bloated on a chain three blocks
 	// deep, and every dev/test net and every from-scratch sync spends most of its life below
-	// DefaultSpendJournalRetentionBlocks (1440).
+	// the journal retention.
 	if !p.store.retainIndefinitely && height > p.store.journalRetention {
 		leaves, err := p.store.dropSpendJournalPartitionsBelow(ctx, height-p.store.journalRetention)
 		if err != nil {

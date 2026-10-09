@@ -119,6 +119,18 @@ SELECT i.txid, i.created_height, i.off_chain_since, i.fee, i.size_in_bytes,
 // pulling the subquery up into the outer join, which is what re-admits the hash join. The
 // inner ORDER BY walks the primary key in order; the outer one is what actually guarantees the
 // grouping the reader relies on, because the LEFT JOIN to the body may reorder rows.
+//
+// Both tables are fenced, tx_mined AND tx_body. The body used to be a plain
+// `LEFT JOIN tx_body b ON b.created_height = m.created_height AND b.txid = k.txid` outside
+// the fence, and that left the planner free to join it to the fenced containment rows any way
+// it liked. With good estimates it chose a nested loop of primary-key probes. With bad ones, as
+// on mainnet right after a fresh 288-block containment window opened with no statistics, it
+// hash-joined and seq-scanned every live body window for each 1024-key batch: 30 to 260
+// seconds per batch, temp spills to the point of ENOSPC, and SetMinedMulti's read-back, which
+// went through this statement, stalled setTxMined long enough for the waiting child block to
+// be given up. A LATERAL reference can only be satisfied by a nested loop, so the body is now
+// one (created_height, txid) primary-key probe per containment row whatever the estimates say.
+// TestMinedReadsNeverScanEveryBodyWindow pins both fences with nested loops switched off.
 const minedByTxidSQL = `
 SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes, m.fee,
        m.tx_inpoints, m.locktime, m.created_at, m.flags, b.raw_tx
@@ -132,7 +144,13 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes, m.fee
     ORDER BY m.mined_height, m.block_id
    OFFSET 0
  ) AS m
-  LEFT JOIN tx_body b ON b.created_height = m.created_height AND b.txid = k.txid
+  LEFT JOIN LATERAL (
+   SELECT b.raw_tx
+     FROM tx_body b
+    WHERE b.created_height = m.created_height
+      AND b.txid = k.txid
+   OFFSET 0
+ ) AS b ON true
  ORDER BY k.txid, m.mined_height, m.block_id`
 
 // preservedByTxidSQL reads the preserved copies of a set of transactions' membership rows,

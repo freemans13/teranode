@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -126,11 +125,11 @@ func TestSideChainCreateIsCorrectedWhenTheMainChainBlockStampsIt(t *testing.T) {
 // stamped_at, and never while an undo partition covering a height below stamped_at is
 // attached.
 //
-// Three states. While the undo copy lives, the parent answers: its window is below the lookup
-// floor by then, so the answer comes through the second tier, triggered by the (0,0) undo copy.
-// Once the undo copy's partition has dropped, nothing triggers a read of the window even though
-// it is still attached, and not found is the correct answer, because nothing can spend or
-// unspend this parent any more. Once the window is gone too, the same.
+// While the undo copy lives, the parent answers: its window is below the lookup floor by then,
+// so the answer comes through the second tier, triggered by the (0,0) undo copy. The spender
+// here never gets mined, so when the undo copy's partition drops the spend is carried forward
+// with the parent's block filled in from the stamped window, and the parent keeps answering,
+// and can still be unspent with its block, after the window itself has gone.
 func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -141,7 +140,7 @@ func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *te
 	_, err = s.SetMinedMulti(ctx, hashes(parent), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
 	require.NoError(t, err)
 
-	spendOneOutput(t, s, ctx, parent, 0, 101)
+	child := spendOneOutput(t, s, ctx, parent, 0, 101)
 
 	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
 	require.Equal(t, uint32(575), tip)
@@ -159,20 +158,35 @@ func TestParentSpentWhileUnconfirmedIsStillAnswerableAfterItsWindowRetires(t *te
 	require.Equal(t, []uint32{7}, got.BlockIDs)
 	require.Equal(t, tier2Before+1, testutil.ToFloat64(lookupTier2Keys.WithLabelValues("undo_zero")), "through the second tier")
 
-	// The undo copy's partition drops at 1,728. The window is still attached, and nothing
-	// triggers a read of it.
+	// The undo copy's original partition drops at 1,728. The spender is still unmined, so the
+	// spend is carried forward, and because the parent's window is stamped the carried row takes
+	// the parent's block, 7, instead of the (0,0) the original held. The parent stays answerable,
+	// which it must: the unmined child can still lose its coin and be unspent.
 	require.NoError(t, s.SetBlockHeight(1728))
 	_, err = s.dropSpendJournalPartitionsBelow(ctx, 1728-s.journalRetention)
 	require.NoError(t, err)
 	require.True(t, windowAttached(t, s, ctx, 0))
 
-	_, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
-	require.True(t, errors.Is(err, errors.ErrTxNotFound), "no trigger is left, and nothing can ask")
+	got, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err, "the carried spend keeps the parent answerable while its child waits")
+	require.Equal(t, []uint32{7}, got.BlockIDs)
 
-	require.Equal(t, 1, dropStamped(t, s, ctx, tip), "the window drops once every undo copy of its UTXOs is gone")
+	// The carried copy sits above stamped_at, so it does not hold the window; the window drops,
+	// and the parent still answers from the carried copy's own block.
+	require.Equal(t, 1, dropStamped(t, s, ctx, tip), "the window drops once every undo copy below its stamped_at is gone")
 
-	_, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
-	require.True(t, errors.Is(err, errors.ErrTxNotFound), "nothing names block 7 any more, and nothing can ask")
+	got, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err, "the carried copy names block 7 itself, so the parent outlives its window")
+	require.Equal(t, []uint32{7}, got.BlockIDs)
+
+	// And the unspend the carried copy exists for rebuilds the coin with its block.
+	spends, err := utxo.GetSpends(child)
+	require.NoError(t, err)
+	require.NoError(t, s.Unspend(ctx, spends))
+
+	h, b := utxoFacts(t, s, ctx, parent)
+	require.Equal(t, int32(100), h, "the restored coin carries the parent's block, not (0,0)")
+	require.Equal(t, int32(7), b)
 }
 
 // TestUnspendOfAnUnminedParentRestoresAnUnconfirmedUTXO: a parent seen before its block is

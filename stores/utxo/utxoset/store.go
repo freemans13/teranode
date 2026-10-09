@@ -40,6 +40,10 @@ type Store struct {
 	settings *settings.Settings
 	pool     *pgxpool.Pool
 
+	// seeding is set by seeding=true on the store URL, for a seed from a UTXO snapshot only.
+	// See seedingCreate.
+	seeding bool
+
 	// utxo.BlockStateFields supplies the chain-tip pair — block height and median
 	// block time — and the six Store methods that read and write it, over a single
 	// atomic snapshot. Embedding the shared implementation rather than carrying two
@@ -70,8 +74,19 @@ type Store struct {
 	// catalog is only touched when it changes. Holds window+1 so zero means "nothing yet".
 	minedWindow atomic.Uint32
 
+	// leadingSkipLogged is set once the stamp has logged that it is skipping the windows below
+	// the lowest containment window, so a seeded store says so once rather than per window.
+	leadingSkipLogged atomic.Bool
+
 	// minedDDL serialises tx_mined window creation within this process.
 	minedDDL sync.Mutex
+
+	// indexMaintenance keeps the pruner's REINDEX CONCURRENTLY and the stamp worker's
+	// statistics refresh from running against the database at the same time, which
+	// deadlocks: the rebuild waits for the ANALYZE's transaction and the ANALYZE waits for
+	// the partition lock the rebuild holds. See rebuildOneBloatedUTXOIndex and
+	// refreshStatistics.
+	indexMaintenance sync.Mutex
 
 	// bodyRetention is how long the serialized transaction bytes are kept, in blocks.
 	bodyRetention uint32
@@ -205,6 +220,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		dsn.Scheme = "postgres"
 	}
 
+	// seeding is this store's own argument, not the driver's: left on the URL, the driver would
+	// send it to the server as a runtime parameter, which the server refuses.
+	q := dsn.Query()
+	seeding := q.Get("seeding") == "true"
+	q.Del("seeding")
+	dsn.RawQuery = q.Encode()
+
 	cfg, err := pgxpool.ParseConfig(dsn.String())
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset] parse dsn", err)
@@ -272,7 +294,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
 		journalRetention: DefaultSpendJournalRetentionBlocks,
 		bodyRetention:    DefaultTxBodyRetentionBlocks,
-		utxoIndexDecider: utxoIndexNeedsRebuild}
+		utxoIndexDecider: utxoIndexNeedsRebuild,
+		seeding:          seeding}
+
+	if seeding {
+		logger.Warnf("[utxoset] seeding mode is on (seeding=true on the store URL): seeded creates write coins only, with their block height and no containment or identity row. Use it only for a seed from a UTXO snapshot, never for a running node")
+	}
 
 	// The SAME checkpoint list the outpoint-only spend gate tests against
 	// (model.OutpointOnlyEligible -> model.BelowCheckpoint), so the heights at which this store
@@ -294,6 +321,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	s.stampDepth = StampDepthFor(maturity)
+
+	s.journalRetention = spendJournalRetention(logger, tSettings.UtxoStore.SpendJournalRetentionBlocks)
 
 	if tSettings.UtxoStore.RetainWindowsIndefinitely {
 		s.retainIndefinitely = true
@@ -429,4 +458,21 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	}
 
 	return 200, "utxoset: ok", nil
+}
+
+// spendJournalRetention resolves utxostore_spendJournalRetentionBlocks: zero is the default,
+// and anything above MaxSpendJournalRetentionBlocks is clamped to it, with a warning, because
+// the create claims' probe must reach past every undo copy.
+func spendJournalRetention(logger ulogger.Logger, configured uint32) uint32 {
+	switch {
+	case configured == 0:
+		return DefaultSpendJournalRetentionBlocks
+	case configured > MaxSpendJournalRetentionBlocks:
+		logger.Warnf("[utxoset] utxostore_spendJournalRetentionBlocks=%d is above the %d the create probe can cover; using %d",
+			configured, MaxSpendJournalRetentionBlocks, MaxSpendJournalRetentionBlocks)
+
+		return MaxSpendJournalRetentionBlocks
+	default:
+		return configured
+	}
 }

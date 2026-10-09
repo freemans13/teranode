@@ -204,6 +204,14 @@ type Interface interface {
 	// or Stop) can be the one that observes the error.
 	TakeResetRequested() bool
 
+	// TakeDrainResetRequested reports, and clears, whether the queue drain the
+	// processor runs after answering MoveForwardBlock failed part-way. The txs
+	// it had taken off the queue are then in no subtree, and only a reset,
+	// which reloads unmined transactions from the UTXO store, brings them
+	// back. Unlike TakeResetRequested this is not a storage fault, so it is
+	// acted on even while the disk tx map is degraded.
+	TakeDrainResetRequested() bool
+
 	// Remove removes a specific transaction from the processor by its hash.
 	// This is used when transactions become invalid or need to be excluded.
 	//
@@ -434,6 +442,12 @@ type Interface interface {
 	// from the processing goroutine. Called on-demand when no complete subtrees exist.
 	// The context is used for cancellation/timeout to prevent blocking indefinitely.
 	GetIncompleteSubtreeMiningData(ctx context.Context) *PrecomputedMiningData
+
+	// DrainingAfterBlock reports whether the processor is still running the
+	// work it deferred past a MoveForwardBlock response: the drain of the
+	// queue that built up while the block was applied. Mining data taken
+	// while it is true misses those transactions.
+	DrainingAfterBlock() bool
 
 	// WaitForPendingBlocks waits for any pending block operations to complete.
 	// This ensures that all block-related processing is finalized before proceeding.

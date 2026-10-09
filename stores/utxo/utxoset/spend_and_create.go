@@ -51,6 +51,13 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		return nil, nil, errors.NewInvalidArgumentError("[utxoset][SpendAndCreate] WithCreateOnly and WithSpendOnly are mutually exclusive")
 	}
 
+	// No transaction is refused rather than read as one with nothing to spend. It used to
+	// return no spends and no error, which a caller takes as every input spent: conflict
+	// promotion did exactly that with a winner whose body had aged out.
+	if tx == nil {
+		return nil, nil, errors.NewInvalidArgumentError("[utxoset][SpendAndCreate] no transaction")
+	}
+
 	// Batched when configured, which is the production path: see spend_and_create_batch.go.
 	// Callers arriving together share one transaction, one spend statement and one create
 	// statement, and each still gets the answer this function alone would have given it.
@@ -103,7 +110,7 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 
 	notedHeight := s.GetBlockHeight()
 
-	if !options.SpendOnly {
+	if !options.SpendOnly && !s.seedingCreate(options) {
 		if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 			return nil, nil, err
 		}

@@ -337,8 +337,9 @@ func isUnboundTxInvalidVerdict(err error) bool {
 // isLocalCatchupFault reports whether a catchup failure is this node's own doing
 // rather than anything the serving peer did, so no reputation charge is warranted.
 //
-// The predicate is the union of two errors-package helpers because neither covers
-// this on its own, and they are disjoint on exactly the cases that matter here.
+// The predicate is the union of two errors-package helpers and one error code. The
+// two helpers are both needed because neither covers this on its own, and they are
+// disjoint on exactly the cases that matter here; the code is explained below.
 // IsLocalError - what recordCatchupPeerFailure uses - is context errors plus
 // ErrStorageError, and misses the *Unavailable codes. IsTransientLocalError is
 // {ServiceError, StorageError, ServiceUnavailable, StorageUnavailable}, and misses
@@ -355,8 +356,16 @@ func isUnboundTxInvalidVerdict(err error) bool {
 // wrapped case whatever the wrapper says. That chain is the one this predicate
 // exists for, since shouldReportConsensusMalicious is only ever asked about errors
 // that already carry a consensus code on the outside.
+//
+// ErrServiceRateLimited (an HTTP 429 from the serving peer) is local here too. The
+// peer's per-IP bucket is shared with this node's own subtree fan-out, so a 429 on
+// /blocks is our collision, not the peer's fault; before the dedicated code existed
+// a 429 was ErrServiceError and already landed in this set. It is deliberately NOT
+// added to IsTransientLocalError, which legacy netsync uses to decide whether to keep
+// a delivering peer.
 func isLocalCatchupFault(err error) bool {
 	return errors.IsTransientLocalError(err) ||
+		errors.Is(err, errors.ErrServiceRateLimited) ||
 		errors.IsContextError(err) ||
 		errors.Is(err, errors.ErrContextCanceled)
 }

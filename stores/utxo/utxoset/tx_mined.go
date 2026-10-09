@@ -267,7 +267,7 @@ func (s *Store) dropStampedTxMinedWindows(ctx context.Context, height uint32) (i
 				return dropped, nil
 			}
 
-			if height < stampedAt+undoMaxLifeBlocks {
+			if height < stampedAt+s.undoMaxLife() {
 				return dropped, nil
 			}
 

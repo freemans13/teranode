@@ -193,11 +193,13 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, txStore blob.Store
 func (ba *BlockAssembly) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	if checkLiveness {
 		// Liveness answers one question: is this service WEDGED, such that a
-		// restart is the only way out? It must never fail for a dependency
-		// being down (that is readiness) nor for the node simply being idle —
-		// a spurious restart of a healthy node is worse than the stall this
-		// exists to catch, which is why the timeout is opt-in and defaults to
-		// disabled (issue 1447).
+		// restart is the only way out? An idle node still beats, so a
+		// dependency that is down while the loop is idle stays a readiness
+		// matter. A wait inside a block move, reorg or reset beats only on
+		// answered calls to the blockchain service, so an outage that lasts
+		// through such a wait ages the heartbeat and trips liveness by design.
+		// Opt-in, off by default: see the blockassembly_livenessStallTimeout
+		// long description (issue 1447).
 		if ba.blockAssembler != nil {
 			stallTimeout := ba.settings.BlockAssembly.LivenessStallTimeout
 			if age, stalled := ba.blockAssembler.heartbeat.Stalled(stallTimeout); stalled {
@@ -2957,14 +2959,20 @@ func (ba *BlockAssembly) tipWaitExpiredError(ctx context.Context, timeout time.D
 // assemblerReady reports whether block assembly is level with bestHeader and has
 // finished whatever transition brought it there. A nil current header means the
 // assembler has not loaded its best block yet, which is a wait condition rather
-// than a failure.
+// than a failure. The transition includes the queue drain the subtree processor
+// runs after answering MoveForwardBlock: a candidate taken before it finishes
+// has none of the queued transactions.
 func (ba *BlockAssembly) assemblerReady(bestHeader *model.BlockHeader) bool {
 	currentHeader, _ := ba.blockAssembler.CurrentBlock()
 	if currentHeader == nil || !currentHeader.Hash().IsEqual(bestHeader.Hash()) {
 		return false
 	}
 
-	return ba.blockAssembler.GetCurrentRunningState() == StateRunning
+	if ba.blockAssembler.GetCurrentRunningState() != StateRunning {
+		return false
+	}
+
+	return ba.blockAssembler.subtreeProcessor == nil || !ba.blockAssembler.subtreeProcessor.DrainingAfterBlock()
 }
 
 // waitForBestBlockHeaderUpdate waits for the best block header to be updated after block submission

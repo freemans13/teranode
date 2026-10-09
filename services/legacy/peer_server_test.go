@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -355,7 +356,7 @@ func newRelayTestServerPeer(t *testing.T, onInv func(*peer.Peer, *wire.MsgInv)) 
 // QueueInventory drops any later attempt, so a rebroadcast used to reach only
 // peers that connected after the first announce. Drives the real announce and
 // rebroadcast paths (RelayInventory, rebroadcastQueue.retry with
-// relayRebroadcastBatch, handleRelayInvMsg) over a real connected peer.
+// relayTxBatch, handleRelayInvMsg) over a real connected peer.
 func TestRebroadcastTickReachesPeerThatAlreadySawInv(t *testing.T) {
 	invReceived := make(chan *wire.MsgInv, 10)
 
@@ -412,7 +413,7 @@ func TestRebroadcastTickReachesPeerThatAlreadySawInv(t *testing.T) {
 	mustAdd(t, queue, *iv, data)
 
 	for retry := 1; retry <= 2; retry++ {
-		relayed, _ := queue.retry(maxRebroadcastTips, s.relayRebroadcastBatch)
+		relayed, _ := queue.retry(maxRebroadcastTips, s.relayTxBatch)
 		require.Equal(t, 1, relayed)
 		deliver()
 		expectInv(fmt.Sprintf("rebroadcast retry %d did not reach the peer", retry))
@@ -688,6 +689,14 @@ func TestShouldDisconnectOnBlockErr_CorruptDoesNotDisconnect(t *testing.T) {
 
 	// Genuine consensus failure — must disconnect (rotate the peer).
 	require.True(t, shouldDisconnectOnBlockErr(errors.NewBlockInvalidError("invalid")))
+	// The two shapes a catch-up block gets back from block validation's batch path,
+	// each wrapped twice as block validation and netsync's ProcessBlock wrap them:
+	// a consensus failure over an invalid transaction disconnects, a parent read
+	// that failed on the store does not.
+	require.True(t, shouldDisconnectOnBlockErr(errors.NewProcessingError("failed to process block",
+		errors.NewBlockInvalidError("block invalid", errors.NewTxInvalidError("spends output 7 of a parent that has 1")))))
+	require.False(t, shouldDisconnectOnBlockErr(errors.NewProcessingError("failed to process block",
+		errors.NewProcessingError("failed to read parent output", errors.NewStorageError("aerospike timeout")))))
 	// Transient local infra — must NOT disconnect (existing behaviour, guarded here too).
 	require.False(t, shouldDisconnectOnBlockErr(errors.NewServiceError("service down")))
 	require.False(t, shouldDisconnectOnBlockErr(nil))
@@ -1941,4 +1950,65 @@ func TestAwaitBlockResult_ReleasesAndExitsOnTeardown(t *testing.T) {
 
 		require.Nil(t, <-panicked, "awaitBlockResult must not disconnect (panic) a torn-down peer")
 	})
+}
+
+// TestAnnounceNewTransactionsReachesPeerInBatchOrder checks that a first
+// announce reaches a real peer in batch order, which netsync sorts parents
+// first. It used to go out through a goroutine per inv, in no set order.
+func TestAnnounceNewTransactionsReachesPeerInBatchOrder(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen []chainhash.Hash
+	)
+
+	s, state, _ := newRelayTestServerPeer(t, func(_ *peer.Peer, msg *wire.MsgInv) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		for _, iv := range msg.InvList {
+			seen = append(seen, iv.Hash)
+		}
+	})
+	s.modifyRebroadcastInv = make(chan interface{}, modifyRebroadcastInvBuffer)
+
+	// Play the peerHandler's part until the test ends.
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+
+	go func() {
+		for {
+			select {
+			case msg := <-s.relayInv:
+				s.handleRelayInvMsg(state, msg)
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	const n = 200
+
+	txns := make([]*netsync.TxHashAndFee, n)
+	want := make([]chainhash.Hash, n)
+
+	for i := range txns {
+		// Hash order differs from batch order.
+		want[i] = chainhash.Hash{byte(n - i), byte(i * 7), 0xab}
+		txns[i] = &netsync.TxHashAndFee{TxHash: want[i], Fee: 1, Size: 100}
+	}
+
+	s.AnnounceNewTransactions(txns[:n/2])
+	s.AnnounceNewTransactions(txns[n/2:])
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return len(seen) == n
+	}, 10*time.Second, 10*time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.Equal(t, want, seen)
 }

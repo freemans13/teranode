@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/util/chainancestry"
 	"github.com/bsv-blockchain/teranode/util/chainancestry/chainancestrytest"
@@ -92,12 +93,12 @@ func retireWindows(t *testing.T, s *Store, ctx context.Context, through uint32, 
 }
 
 // dropStamped drops the windows stamped at tip at the earliest height the rule allows: the tip
-// moved to stamped_at + 1,728, undo partitions due at that height dropped first, then the
+// moved to stamped_at + the undo lifetime, undo partitions due at that height dropped first, then the
 // containment windows. The store's height is left at the drop height.
 func dropStamped(t *testing.T, s *Store, ctx context.Context, tip uint32) int {
 	t.Helper()
 
-	dropAt := tip + stampMarginBlocks + undoMaxLifeBlocks
+	dropAt := tip + stampMarginBlocks + s.undoMaxLife()
 	require.NoError(t, s.SetBlockHeight(dropAt))
 
 	if dropAt > s.journalRetention {
@@ -145,9 +146,10 @@ func TestStampDepthIsDerivedFromCoinbaseMaturity(t *testing.T) {
 	s, _ := newTestStore(t)
 	require.Equal(t, uint32(288), s.stampDepth, "mainnet's maturity of 100")
 
-	require.Equal(t, uint32(1728), uint32(undoMaxLifeBlocks), "retention plus one undo partition")
+	require.Equal(t, uint32(576), s.undoMaxLife(), "retention plus one undo partition")
 	require.Equal(t, uint32(SpendJournalPartitionBlocks), uint32(stampMarginBlocks), "the margin is one undo partition")
-	require.Greater(t, uint32(claimReach), uint32(undoMaxLifeBlocks), "the create claim reaches past every undo copy")
+	require.Greater(t, uint32(claimReach), uint32(MaxSpendJournalRetentionBlocks+SpendJournalPartitionBlocks),
+		"the create claim reaches past every undo copy even at the largest retention the setting allows")
 }
 
 // TestStampWritesTheWinnerAndDeletesTheIdentityRow is the ordinary case at the tip: a
@@ -183,14 +185,15 @@ func TestStampWritesTheWinnerAndDeletesTheIdentityRow(t *testing.T) {
 	require.Equal(t, uint32(288), floors.StampFence)
 	require.Equal(t, uint32(0), floors.DroppedFloor)
 
-	// Not droppable until 1,728 past stamped_at.
-	require.NoError(t, s.SetBlockHeight(863+1727))
-	dropped, err := s.dropStampedTxMinedWindows(ctx, 863+1727)
+	// Not droppable until the undo lifetime, 576 blocks, has passed stamped_at.
+	life := s.undoMaxLife()
+	require.NoError(t, s.SetBlockHeight(863+life-1))
+	dropped, err := s.dropStampedTxMinedWindows(ctx, 863+life-1)
 	require.NoError(t, err)
 	require.Equal(t, 0, dropped)
 
-	require.NoError(t, s.SetBlockHeight(863+1728))
-	dropped, err = s.dropStampedTxMinedWindows(ctx, 863+1728)
+	require.NoError(t, s.SetBlockHeight(863+life))
+	dropped, err = s.dropStampedTxMinedWindows(ctx, 863+life)
 	require.NoError(t, err)
 	require.Equal(t, 1, dropped)
 
@@ -200,6 +203,15 @@ func TestStampWritesTheWinnerAndDeletesTheIdentityRow(t *testing.T) {
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
 	require.Equal(t, []uint32{7}, got.BlockIDs, "the UTXO answers once the window is gone")
+
+	// GetMeta is what the validator asks when a resubmitted transaction finds its coins gone
+	// (Validator.knownTxResubmission). The identity row went with the stamp and the window has
+	// dropped, so the answer has to come from the unspent coin, and it must say mined.
+	var md meta.Data
+
+	require.NoError(t, s.GetMeta(ctx, tx.TxIDChainHash(), &md))
+	require.Equal(t, []uint32{7}, md.BlockIDs, "a mined transaction is still known as mined from its unspent coin")
+	require.False(t, md.Conflicting)
 }
 
 // TestStampDeletesLosersAndLeavesForkOnlyTransactionsWaiting: a window with a fork block. The
@@ -334,7 +346,7 @@ func TestStampBelowTheCheckpointHasNoWorkAndStillCompletes(t *testing.T) {
 	_, ok = stampedAtOf(t, s, ctx, 288)
 	require.False(t, ok, "window 1 was not deep enough at tip %d", tip)
 
-	dropAt := tip + stampMarginBlocks + undoMaxLifeBlocks
+	dropAt := tip + stampMarginBlocks + s.undoMaxLife()
 	require.NoError(t, s.SetBlockHeight(dropAt))
 
 	dropped, err := s.dropStampedTxMinedWindows(ctx, dropAt)
@@ -428,8 +440,10 @@ func TestStampResumesAfterACrashMidWindow(t *testing.T) {
 	require.Zero(t, testutil.ToFloat64(stampCompletionMissing))
 }
 
-// TestStampTreatsAWindowWithNoTableAsEmpty is decision 8: a missing window is counted, both
-// stamp floors move past it, and the pass carries on to the next window.
+// TestStampTreatsAWindowWithNoTableAsEmpty is decision 8: both stamp floors move past a missing
+// window and the pass carries on to the next. Windows below the lowest window that exists are
+// what a seed leaves (it writes no containment rows), so they are skipped without being counted
+// as missing.
 func TestStampTreatsAWindowWithNoTableAsEmpty(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
@@ -444,7 +458,7 @@ func TestStampTreatsAWindowWithNoTableAsEmpty(t *testing.T) {
 
 	stampThrough(t, s, ctx, 3, map[uint32]uint32{1000: 30})
 
-	require.Equal(t, before+3, testutil.ToFloat64(stampMissingWindows), "windows 0, 1 and 2")
+	require.Equal(t, before, testutil.ToFloat64(stampMissingWindows), "windows 0, 1 and 2 lie below the lowest window, as after a seed")
 	require.Equal(t, [][2]int32{{1000, 30}}, pairsOf(t, s, ctx, tx))
 
 	for _, w := range []uint32{0, 288, 576} {
@@ -498,7 +512,10 @@ func TestWindowDropWaitsForTheUndoPartitionsBelowItsStampedAt(t *testing.T) {
 	require.NoError(t, err)
 
 	require.False(t, windowAttached(t, s, ctx, 0))
-	require.Equal(t, 0, journalLeaves(t, s, ctx), "undo partition 0 went first")
+
+	// Undo partition 0 went first. The one leaf left is where the spend was carried: its spender
+	// is still unmined, so the copy-forward keeps it (TestJournalDropCarriesForward...).
+	require.Equal(t, 1, journalLeaves(t, s, ctx), "undo partition 0 went first; only the carried copy's leaf remains")
 }
 
 // TestWindowDropIsRefusedWhileAnIdentityRowIsJoinedToIt is the design's ST-4: the pre-drop
@@ -630,4 +647,34 @@ func TestNoIndexOnUTXONamesMinedHeight(t *testing.T) {
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'utxo%' AND indexdef LIKE '%mined_height%'`).Scan(&n))
 	require.Zero(t, n)
+}
+
+// A window missing above one that exists is not what a seed leaves: it can be a window dropped by
+// mistake, so it is still counted. The floors move past it either way.
+func TestStampCountsAMissingWindowAboveAnExistingOne(t *testing.T) {
+	s, ctx := newUncheckpointedStore(t)
+
+	// Windows 3 and 5 exist; 4 does not.
+	early := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, early, 999)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(early), utxo.MinedBlockInfo{BlockID: 30, BlockHeight: 1000, OnLongestChain: true})
+	require.NoError(t, err)
+
+	late := mkTx(t, 1, 6_000)
+	_, err = s.Create(ctx, late, 1599)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(late), utxo.MinedBlockInfo{BlockID: 50, BlockHeight: 1600, OnLongestChain: true})
+	require.NoError(t, err)
+
+	before := testutil.ToFloat64(stampMissingWindows)
+
+	stampThrough(t, s, ctx, 5, map[uint32]uint32{1000: 30, 1600: 50})
+
+	require.Equal(t, before+1, testutil.ToFloat64(stampMissingWindows), "window 4 only; 0, 1 and 2 lie below the lowest window")
+	require.Equal(t, [][2]int32{{1600, 50}}, pairsOf(t, s, ctx, late))
+
+	floors, err := s.Floors(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(6*288), floors.StampCompleteFloor)
 }

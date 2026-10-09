@@ -553,39 +553,71 @@ func leafGroups(txids [][]byte) []leafBatch {
 	return out
 }
 
-// minedIDsByTxid reads the block ids tx_mined records for a set of transactions, in
-// (mined_height, block_id) order. It goes through the read path's own containment step rather
-// than a bespoke query, so the ids SetMinedMulti hands back and the ids an ordinary Get would
-// report can never disagree about the order.
+// minedIDsByTxidSQL reads the block ids tx_mined holds for a set of transactions at or above a
+// height floor, $2, in (mined_height, block_id) order. Every column it names is in the
+// primary key (txid, mined_height, block_id), so each key is one index descent per live
+// window and, once the visibility map is set, never a heap fetch.
 //
-// A row that will not decode fails THIS CALL rather than being reported as a transaction
-// claiming no blocks, which is the conservative reading here: refusing the record is
-// recoverable, quietly recording nothing is not. That is why the per-transaction failures are
-// collected and returned instead of being handed back alongside the answers, as they are on
-// the BatchDecorate path this result type was written for.
-func (s *Store) minedIDsByTxid(ctx context.Context, txids [][]byte, floor int32) (map[chainhash.Hash][]uint32, error) {
-	hashes := make([]chainhash.Hash, 0, len(txids))
+// It is minedByTxidSQL's containment step with nothing joined to it, and the keys sit outside
+// the same LATERAL with OFFSET 0 fence for the same reason: without the fence the planner may
+// hash-join the keys against every live window. It does not touch tx_body at all, because
+// SetMinedMulti's read-back wants only the ids; reading the body there is what put a seq scan
+// of every live body window on setTxMined's path on mainnet. The floor is a scalar bind
+// parameter, so partitions below it are pruned at plan time.
+const minedIDsByTxidSQL = `
+SELECT k.txid, m.block_id
+  FROM unnest($1::bytea[]) AS k(txid)
+ CROSS JOIN LATERAL (
+   SELECT m.mined_height, m.block_id
+     FROM tx_mined m
+    WHERE m.txid = k.txid
+      AND m.mined_height >= $2::int
+    ORDER BY m.mined_height, m.block_id
+   OFFSET 0
+ ) AS m
+ ORDER BY k.txid, m.mined_height, m.block_id`
 
-	for _, txid := range txids {
+// minedIDsByTxid reads the block ids tx_mined records for a set of transactions at or above
+// floor, in (mined_height, block_id) order: the same rows, the same floor and the same order as
+// the read path's containment step (minedByTxidSQL), so the ids SetMinedMulti hands back and
+// the ids an ordinary Get would report can never disagree about the order.
+//
+// It has its own query rather than going through readMinedInto because it needs nothing but
+// the ids. It reads only primary-key columns of tx_mined, never tx_body, and decodes no payload
+// column, so a transaction whose inpoints or body would not decode still reports its blocks
+// here; the read path is where that fault surfaces. See minedIDsByTxidSQL for why reading the
+// body here stalled setTxMined on mainnet.
+//
+// A transaction with no containment row at or above the floor is absent from the answer.
+func (s *Store) minedIDsByTxid(ctx context.Context, txids [][]byte, floor int32) (map[chainhash.Hash][]uint32, error) {
+	rows, err := s.pool.Query(ctx, minedIDsByTxidSQL, txids, floor)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] read back block ids", err)
+	}
+
+	defer rows.Close()
+
+	out := make(map[chainhash.Hash][]uint32, len(txids))
+
+	for rows.Next() {
+		var (
+			txid    []byte
+			blockID int32
+		)
+
+		if err := rows.Scan(&txid, &blockID); err != nil {
+			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] read back block ids scan", err)
+		}
+
 		var h chainhash.Hash
 
 		copy(h[:], txid)
 
-		hashes = append(hashes, h)
+		out[h] = append(out[h], uint32(blockID)) //nolint:gosec // a block id is never negative
 	}
 
-	res := newLookupResult(len(hashes))
-	if err := s.readMinedInto(ctx, hashes, &res, floor); err != nil {
-		return nil, err
-	}
-
-	for _, err := range res.failed {
-		return nil, err
-	}
-
-	out := make(map[chainhash.Hash][]uint32, len(res.found))
-	for h, d := range res.found {
-		out[h] = d.BlockIDs
+	if err := rows.Err(); err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] read back block ids", err)
 	}
 
 	return out, nil
