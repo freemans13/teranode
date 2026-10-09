@@ -615,6 +615,15 @@ func importUTXOSet(ctx context.Context, logger ulogger.Logger, store utxo.Store,
 		return errors.NewConfigurationError("workerCount (%d) and multiRecordWorkerCount (%d) must both be between 1 and %d", opts.workerCount, opts.multiRecordWorkerCount, maxWorkerCount)
 	}
 
+	// A named pipe delivers each byte to one reader only, so two passes would
+	// split the stream between them and each would parse the other's gaps as
+	// records. Refuse it before reading anything.
+	if opts.utxoBatchSize > 0 {
+		if info, err := os.Stat(utxoFile); err == nil && info.Mode()&os.ModeNamedPipe != 0 {
+			return errors.NewConfigurationError("%s is a named pipe, but utxostore_utxoBatchSize %d makes the import read it in two concurrent passes; a pipe needs a single pass (utxostore_utxoBatchSize 0, on a store that accepts it) or the file unpacked to disk", utxoFile, opts.utxoBatchSize)
+		}
+	}
+
 	g, gCtx := errgroup.WithContext(ctx)
 
 	startPass := func(name string, workerCount int, accept func(maxIndex uint32) bool) {
@@ -797,10 +806,16 @@ func seedingExternalStoreURL(utxoStoreURL *url.URL, fsyncMode string) (*url.URL,
 // io.ErrUnexpectedEOF, whose message "unexpected EOF" contains "EOF" as a
 // substring), so errors.Is treats them identically via this package's
 // substring-matching Is fallback. To make truncation detection exact, every
-// snapshot file carries a trailing 16-byte footer (utxopersister.GetFooter)
-// recording the txCount/utxoCount it was written with; once the read loop ends
-// for any reason, that footer is compared against what was actually read, and
-// a mismatch is reported as an error instead of silently treated as success.
+// snapshot file carries a trailing 16-byte footer recording the
+// txCount/utxoCount it was written with; once the read loop ends for any
+// reason, that footer is compared against what was actually read, and a
+// mismatch is reported as an error instead of silently treated as success.
+// The footer is taken from the stream when the records end exactly at it
+// (utxopersister.ErrRecordBoundary), so this reader can validate a pipe;
+// otherwise it is read by seeking (utxopersister.GetFooter). A stream that
+// cannot seek and did not end at a footer is reported as truncated. Whether
+// the seeder as a whole can take a pipe is decided in importUTXOSet, which
+// refuses one when the import would need two passes.
 //
 // Only frames for which accept returns true (all, when accept is nil) are
 // sent; accept gets the record's highest output index. Every record is still
@@ -815,6 +830,8 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 		utxosProcessed uint64
 		txsSent        uint64
 		scratch        []byte
+		footerBytes    []byte
+		endErr         error
 	)
 
 	for {
@@ -827,7 +844,17 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 		// exactly-sized copy, so skipped records cost no allocation.
 		frame, maxIndex, err := utxopersister.ReadUTXOWrapperFrame(reader, scratch)
 		if err != nil {
+			// The records end where exactly the 16-byte footer remains, and the
+			// reader hands those bytes back. Keeping them means a stream that
+			// cannot seek, such as a pipe, is validated just like a file.
+			var boundary *utxopersister.ErrRecordBoundary
+			if errors.As(err, &boundary) {
+				footerBytes = boundary.FooterBytes[:]
+				break
+			}
+
 			if errors.Is(err, io.EOF) {
+				endErr = err
 				break
 			}
 
@@ -868,9 +895,26 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 	// doc comment above). Validate against the file's own footer counts so
 	// a genuinely truncated snapshot is reported as an error rather than
 	// silently accepted.
-	expectedTxCount, expectedUTXOCount, footerErr := utxopersister.GetFooter(f)
-	if footerErr != nil {
-		return errors.NewProcessingError("failed to read snapshot footer", footerErr)
+	var (
+		expectedTxCount, expectedUTXOCount uint64
+		footerErr                          error
+	)
+
+	if footerBytes != nil {
+		expectedTxCount, expectedUTXOCount, footerErr = utxopersister.DecodeFooter(footerBytes)
+		if footerErr != nil {
+			return errors.NewProcessingError("failed to read snapshot footer", footerErr)
+		}
+	} else {
+		expectedTxCount, expectedUTXOCount, footerErr = utxopersister.GetFooter(f)
+		if footerErr != nil {
+			// The stream did not end at a footer, and there is none to seek to,
+			// as on a pipe. Either way the snapshot is incomplete, so say that
+			// rather than surfacing the seek error.
+			return errors.NewProcessingError(
+				"snapshot file truncated: the records ended without a footer after %d transactions/%d UTXOs (%v), and the footer could not be read by seeking",
+				txProcessed, utxosProcessed, endErr, footerErr)
+		}
 	}
 
 	if expectedTxCount != txProcessed || expectedUTXOCount != utxosProcessed {
