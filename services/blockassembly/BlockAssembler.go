@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -3436,6 +3437,10 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 		unminedTxs              []*utxo.UnminedTransaction
 		lockedTxs               []chainhash.Hash
 		markAsMinedOnLongestTxs []chainhash.Hash
+		// conflictingTxs are the transactions input validation found must be
+		// marked conflicting. The workers only collect them: the marks are
+		// written after the iterator is closed (see applyDeferredConflictMarks).
+		conflictingTxs []chainhash.Hash
 	}
 	workerResults := make([]workerResult, numWorkers)
 
@@ -3488,7 +3493,15 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 							b.logger.Infof("[loadUnminedTransactions] input validation progress: %d txs checked, %d invalid", validatedCount, invalidInputCount.Load())
 						}
 
-						valid, validateErr := b.validateUnminedTxInputs(ctx, unminedTransaction.Hash, bestBlockHeaderIDsMap, false)
+						// Read-only here: a conflicting mark written while the
+						// iterator's cursor is open deadlocks the SQL store on
+						// SQLite, so the mark is collected and written after the
+						// iterator is closed.
+						valid, conflicting, validateErr := b.checkUnminedTxInputs(ctx, unminedTransaction.Hash, bestBlockHeaderIDsMap)
+						if conflicting {
+							localResult.conflictingTxs = append(localResult.conflictingTxs, unminedTransaction.Hash)
+						}
+
 						if validateErr != nil {
 							// Undecidable, not decided. The transaction is still
 							// left out of this candidate -- there is nothing else
@@ -3536,6 +3549,10 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 		if err != nil {
 			close(workChan)
 			wg.Wait()
+
+			// Conflicting marks the workers collected are dropped with the
+			// failed load: nothing was loaded from it, and the next load finds
+			// the same transactions and marks them then.
 			return errors.NewProcessingError("error getting unmined transaction", err)
 		}
 
@@ -3561,10 +3578,34 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	close(workChan)
 	wg.Wait()
 
+	// The loop above only exits once Next has returned an empty batch, and the
+	// SQL iterator closes its read cursor at that point, so no cursor is open
+	// for the conflicting marks written below.
+
 	b.logger.Infof("[loadUnminedTransactions] completed processing unmined transactions from iterator, merging results")
 
-	// Merge per-worker results into final slices
+	conflictingTxs := make([]chainhash.Hash, 0)
 	for idx := range workerResults {
+		conflictingTxs = append(conflictingTxs, workerResults[idx].conflictingTxs...)
+		workerResults[idx].conflictingTxs = nil
+	}
+
+	markedConflicting := b.applyDeferredConflictMarks(ctx, conflictingTxs, numWorkers)
+
+	// Merge per-worker results into final slices, leaving out anything the marks
+	// above made conflicting (see applyDeferredConflictMarks).
+	for idx := range workerResults {
+		if len(markedConflicting) > 0 {
+			workerResults[idx].unminedTxs = slices.DeleteFunc(workerResults[idx].unminedTxs, func(tx *utxo.UnminedTransaction) bool {
+				_, marked := markedConflicting[tx.Hash]
+				return marked
+			})
+			workerResults[idx].lockedTxs = slices.DeleteFunc(workerResults[idx].lockedTxs, func(h chainhash.Hash) bool {
+				_, marked := markedConflicting[h]
+				return marked
+			})
+		}
+
 		unminedTransactions = append(unminedTransactions, workerResults[idx].unminedTxs...)
 		workerResults[idx].unminedTxs = nil // Clear slice to release memory
 
@@ -3785,6 +3826,27 @@ func clearUnminedTxInpoints(tx *utxo.UnminedTransaction) {
 // on chain, so skipping it on a transient failure failed OPEN and let exactly that
 // transaction into the candidate.
 func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash chainhash.Hash, bestBlockIDsMap map[uint32]bool, dryRun bool) (bool, error) {
+	valid, conflicting, err := b.checkUnminedTxInputs(ctx, txHash, bestBlockIDsMap)
+	if conflicting && !dryRun {
+		b.markAsConflicting(ctx, txHash)
+	}
+
+	return valid, err
+}
+
+// checkUnminedTxInputs is validateUnminedTxInputs without the write: it reports
+// whether the transaction must be marked conflicting instead of marking it, and
+// only ever reads the store. loadUnminedTransactions calls it from its workers
+// while the unmined iterator is still open, and applies the marks itself once
+// the iterator is closed. On the SQL store over SQLite that ordering is
+// load-bearing: the iterator holds a read cursor on the transactions table, a
+// SetConflicting UPDATE on that table waits for the cursor, and the iterator's
+// own next read then waits behind the pending write, so marking from a worker
+// wedged the reload for good.
+//
+// It returns (valid, conflicting, err); conflicting is true only together with
+// valid == false and a nil error.
+func (b *BlockAssembler) checkUnminedTxInputs(ctx context.Context, txHash chainhash.Hash, bestBlockIDsMap map[uint32]bool) (bool, bool, error) {
 	// TxInpoints, not the body: the parent hashes and their vouts are on the
 	// identity record, so this neither loads heavy output data nor depends on a
 	// body the store may no longer hold. spentOutpointsFromStore fetches the body
@@ -3794,18 +3856,18 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 		if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
 			// No record at all: there is nothing to mine, and that is a decision,
 			// not a failure to make one.
-			return false, nil
+			return false, false, nil
 		}
 
-		return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load tx", txHash.String(), err)
+		return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load tx", txHash.String(), err)
 	}
 
 	if txMeta == nil {
-		return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] store returned no record and no error", txHash.String())
+		return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] store returned no record and no error", txHash.String())
 	}
 
 	if txMeta.Conflicting {
-		return false, nil
+		return false, false, nil
 	}
 
 	inpoints, err := b.spentOutpointsFromStore(ctx, &txHash, txMeta, "validateUnminedTxInputs")
@@ -3813,10 +3875,10 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 		if errors.Is(err, errors.ErrTxNotFound) {
 			// The record went away between the two reads: nothing to mine, and
 			// that is a decision rather than a failure to make one.
-			return false, nil
+			return false, false, nil
 		}
 
-		return false, err
+		return false, false, err
 	}
 
 	for _, inpoint := range inpoints {
@@ -3832,17 +3894,17 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 				b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d parent could not be loaded (%v) — counting as invalid",
 					txHash.String(), parentHash.String(), inpoint.Index, err)
 
-				return false, nil
+				return false, false, nil
 			}
 
 			// Anything else is the store failing to answer. Reporting that as
 			// "invalid" is the same conflation the inpoint resolution above stopped
 			// making, one loop iteration later.
-			return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load parent %s", txHash.String(), parentHash.String(), err)
+			return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load parent %s", txHash.String(), parentHash.String(), err)
 		}
 
 		if parentMeta == nil {
-			return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] store returned no record and no error for parent %s", txHash.String(), parentHash.String())
+			return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] store returned no record and no error for parent %s", txHash.String(), parentHash.String())
 		}
 
 		vout := int(inpoint.Index)
@@ -3860,11 +3922,7 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 			b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d is spent by different tx %s — marking conflicting",
 				txHash.String(), parentHash.String(), vout, spendingData.TxID.String())
 
-			if !dryRun {
-				b.markAsConflicting(ctx, txHash)
-			}
-
-			return false, nil
+			return false, true, nil
 		}
 
 		// Case 2: spending data matches, but check if the counter-conflicting tx
@@ -3882,7 +3940,7 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 			// transaction whose counter-conflict is confirmed on chain, so a
 			// transient error would let exactly that transaction into the
 			// candidate. Fail closed by reporting it instead.
-			return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load the contest on parent %s", txHash.String(), parentHash.String(), err)
+			return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load the contest on parent %s", txHash.String(), parentHash.String(), err)
 		}
 
 		if counterTxMeta == nil {
@@ -3903,7 +3961,7 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 
 				// Same fail-open hazard as the read above: this is the lookup that
 				// decides whether the counter is confirmed on the current chain.
-				return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load counter-conflicting tx %s", txHash.String(), counterChild.String(), err)
+				return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load counter-conflicting tx %s", txHash.String(), counterChild.String(), err)
 			}
 
 			if counterMeta == nil {
@@ -3915,32 +3973,36 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 					b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d has counter-conflicting tx %s confirmed on chain (blockID %d) — marking conflicting",
 						txHash.String(), parentHash.String(), vout, counterChild.String(), blockID)
 
-					if !dryRun {
-						b.markAsConflicting(ctx, txHash)
-					}
-
-					return false, nil
+					return false, true, nil
 				}
 			}
 		}
 	}
 
-	return true, nil
+	return true, false, nil
 }
 
 func (b *BlockAssembler) markAsConflicting(ctx context.Context, txHash chainhash.Hash) {
-	_, cascadedHashes, err := utxo.MarkConflictingRecursively(ctx, b.utxoStore, []chainhash.Hash{txHash})
-	if err != nil {
-		b.logger.Errorf("[validateUnminedTxInputs][%s] failed to mark as conflicting: %v", txHash.String(), err)
-		return
-	}
+	cascadedHashes := b.markConflictingCascade(ctx, txHash)
 
 	// Stash cascade hashes for the post-load DrainQueue call. Safe because
-	// loadUnminedTransactions is serialised by unminedTransactionsLoading.
+	// loadUnminedTransactions is serialised by unminedTransactionsLoading, and
+	// its own marks are stashed by applyDeferredConflictMarks from one goroutine.
 	if b.unminedDropHashes != nil {
 		for _, h := range cascadedHashes {
 			b.unminedDropHashes[h] = struct{}{}
 		}
+	}
+}
+
+// markConflictingCascade is markAsConflicting without the drop-filter stash, so
+// it is safe to call from several goroutines at once. It returns every hash it
+// marked, txHash first, or nil when the store write failed.
+func (b *BlockAssembler) markConflictingCascade(ctx context.Context, txHash chainhash.Hash) []chainhash.Hash {
+	_, cascadedHashes, err := utxo.MarkConflictingRecursively(ctx, b.utxoStore, []chainhash.Hash{txHash})
+	if err != nil {
+		b.logger.Errorf("[validateUnminedTxInputs][%s] failed to mark as conflicting: %v", txHash.String(), err)
+		return nil
 	}
 
 	for _, h := range cascadedHashes {
@@ -3948,6 +4010,81 @@ func (b *BlockAssembler) markAsConflicting(ctx context.Context, txHash chainhash
 			b.logger.Warnf("[validateUnminedTxInputs][%s] failed to evict cascaded tx from subtree processor: %v", h.String(), removeErr)
 		}
 	}
+
+	return cascadedHashes
+}
+
+// applyDeferredConflictMarks writes the conflicting marks input validation
+// collected during an unmined load and returns every hash those marks covered:
+// the roots and their spending descendants. What was marked is also added to
+// b.unminedDropHashes for the post-load queue drain.
+//
+// It runs after the unmined iterator is closed, so no mark is written while
+// the SQL store's read cursor is open. The cost of deferring is that the
+// workers no longer see a mark an earlier transaction's cascade would have
+// written: a descendant of a conflicting transaction can read as not
+// conflicting and pass validation. The caller closes that gap by dropping
+// every returned hash from what it loads, and from what it unlocks. That is
+// tighter than marking inline ever was, since there whether a descendant was
+// dropped depended on which worker reached it first.
+//
+// The marks are written by up to `workers` goroutines, the same concurrency
+// the load's workers wrote them with before: each one waits on the store's
+// read batchers, so writing them one at a time made a large conflicting set
+// several times slower to clear. Two roots that share descendants mark them
+// twice, which is idempotent. A root whose mark fails is logged by
+// markConflictingCascade and stays out of the load, as it did when it was
+// marked inline.
+func (b *BlockAssembler) applyDeferredConflictMarks(ctx context.Context, roots []chainhash.Hash, workers int) map[chainhash.Hash]struct{} {
+	if len(roots) == 0 {
+		return nil
+	}
+
+	cascades := make([][]chainhash.Hash, len(roots))
+	next := atomic.Int64{}
+
+	var wg sync.WaitGroup
+
+	for w := 0; w < min(workers, len(roots)); w++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for {
+				idx := int(next.Add(1) - 1)
+				if idx >= len(roots) {
+					return
+				}
+
+				// Scales with the conflicting set and runs inside reset's
+				// post-process step, so it beats like the feed loop does
+				// (issue 1447).
+				b.heartbeat.BeatIfStarted()
+
+				cascades[idx] = b.markConflictingCascade(ctx, roots[idx])
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	marked := make(map[chainhash.Hash]struct{}, len(roots))
+
+	for idx, root := range roots {
+		marked[root] = struct{}{}
+
+		// Only what was actually marked goes to the queue drain, as before.
+		for _, h := range cascades[idx] {
+			marked[h] = struct{}{}
+
+			if b.unminedDropHashes != nil {
+				b.unminedDropHashes[h] = struct{}{}
+			}
+		}
+	}
+
+	return marked
 }
 
 // CheckInputValidation iterates all unmined transactions and checks whether their inputs
