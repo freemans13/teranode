@@ -13,6 +13,13 @@ import (
 // the output" is an assertion about this test's own input rather than a guess.
 const dumpCanary = "canary-boot-dump-password"
 
+// taggedSecretKey is a redact-tagged setting whose value is not a URL.
+// settings.conf leaves it commented out, so Unset restores the default state.
+const (
+	taggedSecretKey    = "blockpersister_httpAuthToken"
+	taggedSecretCanary = "canary-tagged-auth-token"
+)
+
 // TestConfigStatsDumpNeverLogsStoreCredentials pins the boot-time dump that
 // RunDaemon logs at cmd/teranode/daemon.go and that cmd/settings.PrintSettings
 // logs again.
@@ -78,11 +85,24 @@ func TestConfigStatsDumpNeverLogsStoreCredentials(t *testing.T) {
 	require.Contains(t, cfg.Stats(), dumpCanary,
 		"gocore's own dump no longer carries the credential, so this test is not exercising a leak")
 
+	// A redact-tagged setting that is not a URL. Only settings.RedactConfigStats
+	// masks it, by key name; urlutil.RedactText sees no "scheme://" and leaves it
+	// alone. Every other canary here is a URL, which RedactText alone catches, so
+	// without this one dropping the settings pass from redactedConfigDump keeps
+	// the test green.
+	cfg.Set(taggedSecretKey, taggedSecretCanary)
+	t.Cleanup(func() { cfg.Unset(taggedSecretKey) })
+
+	require.Contains(t, cfg.Stats(), taggedSecretCanary,
+		"gocore's own dump no longer carries the tagged secret, so this case is not exercising a leak")
+
 	// redactedConfigDump, not urlutil.RedactText: the assertion has to fail if
 	// RunDaemon stops redacting, not merely if the redactor stops working.
 	redacted := redactedConfigDump()
 
 	require.NotContains(t, redacted, dumpCanary, "the boot dump still carries a store password")
+	require.NotContains(t, redacted, taggedSecretCanary, "the boot dump still carries a redact-tagged secret")
+	require.Contains(t, redacted, taggedSecretKey, "the tagged secret's row lost its key")
 
 	// The operator has to keep being able to read this dump, so redaction must
 	// cost only the password.
@@ -111,13 +131,24 @@ func TestConfigPayloadNeverAdvertisesStoreCredentials(t *testing.T) {
 	require.Contains(t, cfg.GetAll()[storeKey], dumpCanary,
 		"gocore's GetAll no longer carries the credential, so this test is not exercising a leak")
 
+	// The non-URL secret that only settings.RedactConfigMap masks; see the dump
+	// test above.
+	cfg.Set(taggedSecretKey, taggedSecretCanary)
+	t.Cleanup(func() { cfg.Unset(taggedSecretKey) })
+
+	require.Equal(t, taggedSecretCanary, cfg.GetAll()[taggedSecretKey],
+		"gocore's GetAll no longer carries the tagged secret, so this case is not exercising a leak")
+
 	// The exact function value RunDaemon registers with gocore.
 	redacted, ok := configAdvertisingPayload().(map[string]string)
 	require.True(t, ok, "the advertising payload is no longer a map[string]string")
 
 	for key, value := range redacted {
 		require.NotContains(t, value, dumpCanary, "advertised setting %q still carries a store password", key)
+		require.NotContains(t, value, taggedSecretCanary, "advertised setting %q still carries a redact-tagged secret", key)
 	}
+
+	require.Contains(t, redacted, taggedSecretKey, "the tagged secret's key was dropped rather than masked")
 
 	require.Contains(t, redacted[storeKey], "aero.example:3000", "the advertised value lost its host")
 	require.Contains(t, redacted[storeKey], "teranode:xxxxx@", "the username should survive redaction")

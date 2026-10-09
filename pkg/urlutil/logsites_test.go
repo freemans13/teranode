@@ -39,7 +39,12 @@ import (
 var loggingCalls = regexp.MustCompile(`^(Debugf|Infof|Warnf|Errorf|Fatalf|Panicf|Print|Printf|Println|Sprint|Sprintf|Sprintln|Fprint|Fprintf|Fprintln|New[A-Za-z]*Error)$`)
 
 // urlish matches an argument expression that names itself as a URL.
-var urlish = regexp.MustCompile(`(?i)(url|dsn|connstr)`)
+//
+// A bare identifier named raw is here because that is the conventional name
+// for the unparsed string handed to url.Parse, as in the seeder's
+// externalStore check, which echoed it and slipped past the guard. It is
+// anchored so rawTx, rawBlock and the like do not match.
+var urlish = regexp.MustCompile(`(?i)(url|dsn|connstr|^raw$)`)
 
 // storeSetting matches a settings field reached through a settings value whose
 // name does not say URL, such as appSettings.UtxoStore.UtxoStore or

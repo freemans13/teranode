@@ -817,6 +817,15 @@ func executeHTTPRequest(ctx context.Context, cancelFn context.CancelFunc, rawURL
 func buildOutboundRequest(ctx context.Context, rawURL string, requestBody ...[]byte) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
+		// A URL that will not parse comes back as a *url.Error that quotes rawURL
+		// whole, password included. DoLocalServiceHTTPRequestBodyReader reaches
+		// here without ValidateURL in front of it, so this is the only place that
+		// path can strip it. Any other failure (a nil ctx) quotes no URL.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return nil, errors.NewServiceError("failed to create http request", urlutil.ParseErrorReason(urlErr))
+		}
+
 		return nil, errors.NewServiceError("failed to create http request", err)
 	}
 

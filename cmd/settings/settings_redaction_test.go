@@ -56,6 +56,21 @@ func TestPrintSettingsNeverLogsStoreCredentials(t *testing.T) {
 	require.Contains(t, cfg.Stats(), password,
 		"gocore's own dump no longer carries the credential, so this test is not exercising a leak")
 
+	// A redact-tagged setting that is not a URL, which only
+	// settings.RedactConfigStats masks. The URL canary above is caught by
+	// urlutil.RedactText alone, so without this one dropping the settings pass
+	// keeps the test green. settings.conf leaves this key commented out.
+	const taggedKey = "blockpersister_httpAuthToken"
+
+	const taggedSecret = "canary-print-settings-auth-token"
+
+	cfg.Set(taggedKey, taggedSecret)
+
+	t.Cleanup(func() { cfg.Unset(taggedKey) })
+
+	require.Contains(t, cfg.Stats(), taggedSecret,
+		"gocore's own dump no longer carries the tagged secret, so this case is not exercising a leak")
+
 	logger := &capturingLogger{}
 
 	s := &settings.Settings{Version: "1.0.0", ChainCfgParams: &chaincfg.MainNetParams}
@@ -65,6 +80,7 @@ func TestPrintSettingsNeverLogsStoreCredentials(t *testing.T) {
 	require.NotEmpty(t, out, "PrintSettings logged nothing, so this test proves nothing")
 
 	require.NotContains(t, out, password, "the settings dump still carries a store password")
+	require.NotContains(t, out, taggedSecret, "the settings dump still carries a redact-tagged secret")
 	require.Contains(t, out, "db.example:5432", "the settings row lost its host")
 	require.Contains(t, out, "teranode:xxxxx@", "the username should survive redaction")
 }

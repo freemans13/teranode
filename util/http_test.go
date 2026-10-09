@@ -1790,6 +1790,32 @@ func TestValidateURLRejectsUnparseableURLWithoutEchoingIt(t *testing.T) {
 	require.Contains(t, err.Error(), "invalid URL")
 }
 
+// TestDoLocalServiceHTTPRequestRejectsUnparseableURLWithoutEchoingIt covers the
+// one request path that runs no ValidateURL before building the request, so the
+// *url.Error from http.NewRequestWithContext is the first thing to see a bad URL.
+// That error quotes the URL whole. The local service URLs come from this node's
+// settings, where userinfo is a working credential.
+func TestDoLocalServiceHTTPRequestRejectsUnparseableURLWithoutEchoingIt(t *testing.T) {
+	// A space in the host is what makes url.Parse refuse it; the password is
+	// intact in the string and in a leaking error.
+	const password = "canary-localservice-password"
+
+	_, err := DoLocalServiceHTTPRequestBodyReader(context.Background(), "http://teranode:"+password+"@asset server:8090/block")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), password, "the URL password reached the error message")
+	require.NotContains(t, err.Error(), "teranode:", "the URL userinfo reached the error message")
+	require.Contains(t, err.Error(), "failed to create http request")
+	require.Contains(t, strings.ToLower(err.Error()), "invalid character",
+		"expected the parse failure reason to survive, got: %v", err)
+
+	// A raw "/" in the password ends the authority there, and net/url's own
+	// reason quotes ":canary-local" as an invalid port.
+	_, err = DoLocalServiceHTTPRequestBodyReader(context.Background(), "http://teranode:canary-local/url-password@asset:8090/block")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "canary-local", "the start of the URL password reached the error message")
+	require.NotContains(t, err.Error(), "url-password", "the URL reached the error message")
+}
+
 func TestBuildHTTPError_429MapsToRateLimited(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)

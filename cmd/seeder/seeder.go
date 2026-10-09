@@ -768,7 +768,9 @@ func seedingExternalStoreURL(utxoStoreURL *url.URL, fsyncMode string) (*url.URL,
 
 	externalURL, err := url.Parse(raw)
 	if err != nil {
-		return nil, "", errors.NewConfigurationError("invalid externalStore URL %q", raw, err)
+		// raw is a whole blob store URL and can carry a working credential, and
+		// url.Parse's error quotes it, so neither goes into the message.
+		return nil, "", errors.NewConfigurationError("invalid externalStore URL", urlutil.ParseErrorReason(err))
 	}
 
 	if externalURL.Scheme != "file" {
