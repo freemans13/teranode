@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-bn/models"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -64,6 +65,12 @@ func TestAlertActsOnUnspentOutputsWhoseBodyHasAgedOut(t *testing.T) {
 	require.NoError(t, store.SetBlockHeight(createdAt))
 
 	_, err = store.Create(ctx, tx, createdAt)
+	require.NoError(t, err)
+
+	// Mined, as the coins an alert targets are. The store keeps the body of a transaction
+	// still waiting to be mined past its window, so only a mined one loses it.
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: createdAt + 1, OnLongestChain: true})
 	require.NoError(t, err)
 
 	require.NoError(t, store.SetBlockHeight(prunedAt))
