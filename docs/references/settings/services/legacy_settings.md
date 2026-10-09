@@ -148,21 +148,31 @@ context), and `${LEGACY_GRPC_PORT}` is `8099`.
   checkpoint; above it, blocks are asked for from invs and the pass re-asks from
   the download ledger. There is no download cursor, so nothing carries a
   position between passes.
-- Above the last checkpoint, a block whose owner has sent nothing for the
-  60-second retry window is offered to another peer on the next pass, one block
-  per quiet owner.
+- A block whose owners have sent nothing for the 60-second retry window is
+  offered to another peer on the next pass. Above the last checkpoint this
+  applies to every block, one block per quiet owner. Below it, it applies only to a
+  block with two or more active owners: a block with one active owner stays
+  with it, and the watcher judges it.
 - During headers-first sync, a block above the committed tip that has been
   arriving for 30 seconds at under 100 KB/s, and will not finish before the
   chain needs it, is asked of one other peer, and the slow peer is disconnected.
   Every copy of the block must be that slow, a further copy waits 30 seconds
-  after the last one, and at most three peers owe a block at once. These are SV
-  Node's slow-fetch timeout, stalling rate and parallel-fetch limit.
+  after the last one, and at most three peers send or are expected to send a
+  block at once. A peer let off a block that sends nothing is not counted. The
+  slow peer is kept connected when the peer asked is one that was let off the
+  block and asked again, or, at the three-copy limit, when such a peer is still
+  connected and sends nothing. These are SV Node's slow-fetch timeout, stalling
+  rate and parallel-fetch limit.
 - During headers-first sync, the watcher examines up to 64 owed blocks from the
   tip every 5 seconds. A block that will land 30 seconds or more after each block
   below it is also asked of one other peer: for a block arriving, whose size its
   first bytes declare, the peer that lands a full copy in half the owner's time;
-  for a queued block, the fastest peer that starts before the owner at twice its
-  rate. A block gets one such extra request. There is no setting for it; the metric is
+  for a queued block, the fastest peer with twice the owner's rate that lands
+  the block, at the recent mean size, in half the owner's time. A copy with more
+  than half its bytes gets no extra request unless it will take more than 5
+  minutes, and a block whose every copy arrives under 100 KB/s is left to the
+  race, with no block above it counted as late. A block gets one such extra
+  request. There is no setting for it; the metric is
   `teranode_legacy_netsync_frontier_races_total`.
 - `MultiPeerBlockDownload` set to false keeps the pass but gives every block to
   the sync peer, bounded by the block-size ladder alone.

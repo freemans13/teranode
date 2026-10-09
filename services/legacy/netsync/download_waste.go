@@ -32,7 +32,7 @@ type downloadWaste struct {
 	// routine ways a block reaches a second peer.
 	reAskedQuiet atomic.Int64
 	// rescued is blocks asked of another peer because their owner would land them later than the
-	// chain needs them: behind a slow queue, or arriving slowly (see THE RESCUE RULE).
+	// chain needs them: behind a slow queue, or arriving slowly (see THE WATCHER, watcher.go).
 	rescued atomic.Int64
 
 	// lastReceived and lastAt are the received total at the previous report, for its rate. Only

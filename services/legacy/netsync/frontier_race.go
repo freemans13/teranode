@@ -23,8 +23,14 @@ import (
 // once in raceSlowFetchAfter, and another peer is asked only while the block has fewer than
 // maxBlockCopies live copies: on 2026-09-24 a race that re-armed whenever a copy finished asked
 // three peers for the same 2 GB block and threw all three copies away while a 13 MB/s peer, which
-// was not struggling at all, finished the first. At the cap the struggling peers are still
-// disconnected; only the extra request is skipped. In any raceExpiry a block gets at most
+// was not struggling at all, finished the first. A live copy is an owner not let off the block or
+// one sending it now (liveCopies), so a forgiven owner that sends nothing still owes the block but
+// is not counted, and more than maxBlockCopies peers can owe it. At the cap the struggling peers
+// are still disconnected and only the extra request is skipped, unless an owner asked again after
+// it was let off is still connected, still owes the block and sends nothing
+// (reaskedOwnersNotSending). Below the cap the struggling peers are kept when the peer just asked
+// is itself an owner asked again. Both keep an honest slow peer connected while the only other
+// peer for the block is one that went quiet on it. In any raceExpiry a block gets at most
 // maxBlockCopies-1 extra copies and one round of disconnects, and nobody is disconnected while
 // this node itself is backpressured.
 //
