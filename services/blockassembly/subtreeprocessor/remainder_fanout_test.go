@@ -103,8 +103,14 @@ func TestProcessRemainderTxHashes_BoundedFanOut(t *testing.T) {
 	stop.Store(true)
 	<-done
 
-	// The sampler itself, plus the bounded workers; a little slack for
-	// runtime goroutines that come and go.
-	limit := int64(baseline + 1 + remainderWorkers(stp.settings.BlockAssembly.ProcessRemainderTxHashesConcurrency) + 4)
+	// The sampler itself, plus the bounded workers, plus slack: NumGoroutine
+	// counts the whole test binary, and goroutines left winding down by earlier
+	// tests in the package (about a thousand on CI) come and go while this
+	// runs. The unbounded fan-out this guards against started subtrees x
+	// NumCPU goroutines (512 on a 4-core runner), so 64 of slack still
+	// separates the two by a wide margin.
+	const slack = 64
+
+	limit := int64(baseline + 1 + remainderWorkers(stp.settings.BlockAssembly.ProcessRemainderTxHashesConcurrency) + slack)
 	require.LessOrEqual(t, peak.Load(), limit, "the lookup phase must not start more goroutines than its worker bound")
 }
