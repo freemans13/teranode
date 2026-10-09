@@ -1,6 +1,7 @@
 package utxoset
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -98,6 +99,30 @@ func TestCreateSchemaAddsTheSpendingInputColumnToAnOlderJournal(t *testing.T) {
 
 	_, err = spendOnly(ctx, s, spendOutput(t, parent, 1, 1), 102)
 	require.NoError(t, err, "the spend path writes the added column")
+}
+
+// TestCreateSchemaAddsTheSpendingInputColumnToAStandaloneLeaf: a pruner pass interrupted between
+// DETACH and DROP leaves a standalone journal leaf, and the next pass copies forward out of it
+// by name, reading spending_vin. A leaf detached before the upgrade never got the column from
+// the parent, so CreateSchema has to add it there too, or the copy fails on every pass.
+func TestCreateSchemaAddsTheSpendingInputColumnToAStandaloneLeaf(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 101))
+
+	leaf := fmt.Sprintf("spend_journal_%d", 101/SpendJournalPartitionBlocks)
+
+	_, err := s.pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE spend_journal DETACH PARTITION %s`, leaf))
+	require.NoError(t, err)
+
+	_, err = s.pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DROP COLUMN spending_vin`, leaf))
+	require.NoError(t, err)
+
+	require.NoError(t, CreateSchema(ctx, s.pool))
+
+	found, err := schemaHas(ctx, s.pool, leaf, "spending_vin")
+	require.NoError(t, err)
+	require.True(t, found, "the standalone leaf must get the column")
 }
 
 // TestSchemaAssertionRefusesADatabaseThatStillHasTheDeletedColumns is the gate for the

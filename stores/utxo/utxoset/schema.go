@@ -242,12 +242,8 @@ CREATE TABLE IF NOT EXISTS spend_journal (
 -- body is optional and ages out on its own clock.
 --
 -- It sits second so it costs NO bytes on a fresh table: satoshis is 8-aligned, so the four
--- bytes after spent_height were alignment padding. The ALTER below is for a database created
--- before the column existed. Adding a column with a constant default is a catalog change in
--- PostgreSQL 11 and later, with no rewrite, and it reaches every attached leaf; there it lands
--- at the end of the row and costs up to 4 bytes plus alignment. Rows written before it read
--- back 0, which is what GetSpend reported for every row until then.
-ALTER TABLE spend_journal ADD COLUMN IF NOT EXISTS spending_vin INTEGER NOT NULL DEFAULT 0;
+-- bytes after spent_height were alignment padding. A database created before the column
+-- existed gets it from addSpendingVin, which CreateSchema runs after this.
 
 -- ---------------------------------------------------------------------------
 -- CONFLICT BOOKKEEPING. One row per (contested parent, losing child).
@@ -676,7 +672,78 @@ func CreateSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 
+	if err := addSpendingVin(ctx, pool); err != nil {
+		return err
+	}
+
 	return assertSchemaShape(ctx, pool)
+}
+
+// spendJournalLeavesMissingVinSQL names every spend-journal table that has no spending_vin
+// column and is not a partition: the parent, and any leaf left standalone. An attached leaf,
+// including one mid-detach, gets the column from the parent's ALTER, and PostgreSQL refuses an
+// ADD COLUMN aimed at a partition directly.
+const spendJournalLeavesMissingVinSQL = `
+SELECT c.relname
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = current_schema()
+   AND c.relkind IN ('r', 'p')
+   AND c.relname ~ '^spend_journal(_[0-9]+)?$'
+   AND NOT c.relispartition
+   AND NOT EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'spending_vin' AND NOT a.attisdropped)
+ ORDER BY c.relkind DESC, c.relname`
+
+// addSpendingVin adds spending_vin to a journal created before the column existed. It is the
+// one column this store adds in place rather than demanding a re-sync for, because adding a
+// column with a constant default is a catalog change in PostgreSQL 11 and later, with no
+// rewrite. On such a table the column lands at the end of the row and costs 4 bytes plus
+// alignment; rows written before it read back 0, which is what GetSpend reported for every row
+// until then.
+//
+// GATED, never run unconditionally. ALTER TABLE ... ADD COLUMN takes ACCESS EXCLUSIVE before it
+// looks at IF NOT EXISTS, so an ungated ALTER would stall every spend behind every store open,
+// which is the lock partition_attach.go exists to keep off the parent. The check is a catalog
+// read; the ALTER runs only on a table that lacks the column, so once per database.
+//
+// The parent comes first, which reaches every attached leaf. A leaf left STANDALONE by a pruner
+// pass interrupted between its DETACH and its DROP does not inherit it, and the next pass runs
+// copy-forward on that leaf by name before dropping it, so it gets the column too.
+func addSpendingVin(ctx context.Context, pool *pgxpool.Pool) error {
+	rows, err := pool.Query(ctx, spendJournalLeavesMissingVinSQL)
+	if err != nil {
+		return errors.NewStorageError("[utxoset] find journal tables without spending_vin", err)
+	}
+
+	var names []string
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return errors.NewStorageError("[utxoset] scan journal table name", err)
+		}
+
+		names = append(names, name)
+	}
+
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset] journal table names", err)
+	}
+
+	for _, name := range names {
+		// The parent sorts first, and its ALTER reaches every attached leaf. A standalone
+		// leaf's ALTER locks only that leaf, which nothing but the pruner reads.
+		if _, err := pool.Exec(ctx, fmt.Sprintf(
+			`ALTER TABLE %s ADD COLUMN IF NOT EXISTS spending_vin INTEGER NOT NULL DEFAULT 0`, name)); err != nil {
+			return errors.NewStorageError("[utxoset] add spending_vin to %s", name, err)
+		}
+	}
+
+	return nil
 }
 
 // requiredColumns are the facts that distinguish this schema from the one before it. A
