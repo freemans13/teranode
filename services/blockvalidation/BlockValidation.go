@@ -1141,13 +1141,15 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 					// height a missing file usually means a genuine anomaly on a validation path
 					// that already wrote its files before the block was added (see
 					// subtreeFilesReady) - a transient storage error, or a write still in flight -
-					// so it is still worth a Warn. One path breaks that assumption: the blockchain
-					// service's raw RevalidateBlock (its /revalidate/:hash endpoint, or a direct
-					// gRPC call; RevalidateBlock.go) clears invalid without writing any file, so a
-					// storeInvalidBlock record un-invalidated that way usually has files missing.
-					// While it is still inside the retention height above it gets this same Warn
-					// on every sweep, then drops to Debug like any other stuck block once it ages
-					// past it.
+					// so it is still worth a Warn. One path skips validation entirely: the
+					// blockchain service's raw RevalidateBlock (its /revalidate/:hash endpoint, or
+					// a direct gRPC call; RevalidateBlock.go) clears invalid without writing or
+					// checking any file. That does not usually land here, though. Every
+					// storeInvalidBlock record that names subtrees is written only after
+					// validateBlockSubtrees has stored its files, so inside the retention window
+					// the files are normally still present and the sweep sets the flag (see
+					// subtreeFilesReady); past it they have normally expired and the miss is
+					// logged at Debug like any other stuck block.
 					logf := u.logger.Warnf
 					if haveHeight && currentHeight > block.Height+u.subtreeBlockHeightRetention {
 						logf = u.logger.Debugf
@@ -1192,18 +1194,23 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 // inserts a non-invalid block with subtrees_set=false (ValidateBlock, both optimistic and not,
 // which the legacy-sync route also uses, always non-optimistically) writes the subtree files
 // synchronously, BEFORE the block is added, so they are normally already present the instant the
-// sweep would see the block. Block assembly's own insert never reaches the sweep at all: it
-// inserts with subtrees_set already true (services/blockassembly/Server.go). One route bypasses all of
-// this: the blockchain service's raw RevalidateBlock, reached through its HTTP /revalidate/:hash
-// endpoint or by calling the gRPC method of that name directly (services/blockchain/Server.go ->
+// sweep would see the block. Two inserts never reach the sweep at all, because they write
+// subtrees_set=true in the insert itself: block assembly's own (services/blockassembly/Server.go)
+// and quick validation's commitBlock, which catch-up and the legacy unified route use. One route bypasses validation altogether: the blockchain
+// service's raw RevalidateBlock, reached through its HTTP /revalidate/:hash endpoint or by
+// calling the gRPC method of that name directly (services/blockchain/Server.go ->
 // Blockchain.RevalidateBlock -> stores/blockchain/sql/RevalidateBlock.go). It clears invalid
-// without fetching or checking a single file, so a storeInvalidBlock record un-invalidated through
-// that route can reach the sweep with its files still missing - see the Warnf/Debugf choice above
-// for how that is logged. (blockvalidation's own reconsider path also ends in that gRPC call, but
-// only after ValidateBlock has validated the block and written its files.) Elsewhere, what optimistic mining defers to a background goroutine is the
-// later, heavier block.Valid() consensus check, not subtree file writing - so a missing file on a
-// validation-path block almost always means a genuine anomaly (crash mid-write, storage error,
-// expired retention), not "still validating." See the KNOWN LIMITATION note on updateSubtreesDAH
+// without fetching or checking a single file. Every storeInvalidBlock record that names subtrees
+// was written only after validateBlockSubtrees stored them (a coinbase-only record names none),
+// so inside the retention window the sweep normally finds every file and sets subtrees_set on a
+// block whose last verdict was invalid and that nothing has validated since; past the window the
+// files have normally expired and the block stays at subtrees_set=false, logged at Debug - see
+// the Warnf/Debugf choice above. (blockvalidation's own reconsider path also ends in that gRPC
+// call, but only after ValidateBlock has validated the block and written its files.) Elsewhere,
+// what optimistic mining defers to a background goroutine is the later, heavier block.Valid()
+// consensus check, not subtree file writing - so a missing file on a validation-path block
+// almost always means a genuine anomaly (crash mid-write, storage error, expired retention),
+// not "still validating." See the KNOWN LIMITATION note on updateSubtreesDAH
 // for the real, still-open gap this does NOT close: the files existing is not proof that
 // block.Valid() - including any revalidation it takes to reach a verdict - ever succeeded.
 func (u *BlockValidation) subtreeFilesReady(ctx context.Context, block *model.Block) (ready bool, missing int, err error) {
