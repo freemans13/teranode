@@ -1199,29 +1199,7 @@ func TestSyncManager_createUtxos_StampsLongestChainFromBestBlock(t *testing.T) {
 		ctx, sm, utxoStore, chainClient, genesisHash := newFixture(t)
 
 		// The winner at height 1 is applied first and becomes the best block.
-		coinbase, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff17030100002f6d312d65752f29c267ffea1adb87f33b398fffffffff03ac505763000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88acaa505763000000001976a9143c22b6d9ba7b50b6d6e615c69d11ecb2ba3db14588acaa505763000000001976a914b7177c7deb43f3869eabc25cfd9f618215f34d5588ac00000000")
-		require.NoError(t, err)
-
-		bits, err := model.NewNBitFromString("207fffff")
-		require.NoError(t, err)
-
-		winner := &model.Block{
-			Header: &model.BlockHeader{
-				Version:        1,
-				Timestamp:      1729259727,
-				HashPrevBlock:  &genesisHash,
-				HashMerkleRoot: coinbase.TxIDChainHash(),
-				Bits:           *bits,
-			},
-			Height:           1,
-			CoinbaseTx:       coinbase,
-			TransactionCount: 1,
-		}
-		require.NoError(t, chainClient.AddBlock(ctx, winner, "test"))
-
-		best, _, err := chainClient.GetBestBlockHeader(ctx)
-		require.NoError(t, err)
-		require.Equal(t, *winner.Hash(), *best.Hash(), "precondition: the winner is the best block")
+		addWinner(t, ctx, chainClient, genesisHash)
 
 		// The sibling shares the winner's parent, which is still on the current chain, so
 		// a parent-is-on-the-chain test would wrongly answer true for it.
@@ -1239,15 +1217,44 @@ func TestSyncManager_createUtxos_StampsLongestChainFromBestBlock(t *testing.T) {
 			"a losing sibling must not settle its transactions on the main chain")
 	})
 
+	t.Run("transaction the winner already settled stays settled when the sibling stamps false", func(t *testing.T) {
+		ctx, sm, utxoStore, chainClient, genesisHash := newFixture(t)
+
+		// Competing blocks usually share most of their transactions. The winner is applied
+		// first, while genesis is still the best block, so it settles the shared one.
+		txHash, txMap := preExistingTx(t, ctx, utxoStore, 4000)
+
+		const (
+			winnerBlockID  = uint32(42)
+			siblingBlockID = uint32(43)
+		)
+
+		winnerBi := blockIdent{hash: chainhash.HashH([]byte("winner at height 1")), prevBlock: genesisHash, height: 1}
+		require.NoError(t, sm.createUtxos(ctx, txMap, winnerBi, winnerBlockID, false))
+
+		settled, err := utxoStore.Get(ctx, &txHash, fields.UnminedSince)
+		require.NoError(t, err)
+		require.Zero(t, settled.UnminedSince, "precondition: the winner settled the transaction")
+
+		addWinner(t, ctx, chainClient, genesisHash)
+
+		// The sibling stamps false. False must leave the winner's settlement alone rather
+		// than mark the transaction unmined again.
+		siblingBi := blockIdent{hash: chainhash.HashH([]byte("sibling at height 1")), prevBlock: genesisHash, height: 1}
+		require.NoError(t, sm.createUtxos(ctx, txMap, siblingBi, siblingBlockID, false))
+
+		post, err := utxoStore.Get(ctx, &txHash, fields.BlockIDs, fields.UnminedSince)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []uint32{winnerBlockID, siblingBlockID}, post.BlockIDs)
+		require.Zero(t, post.UnminedSince, "the sibling's false stamp must not un-settle a transaction the winner mined")
+	})
+
 	t.Run("best block cannot be read: the block fails and nothing is stamped", func(t *testing.T) {
 		ctx, sm, utxoStore, _, genesisHash := newFixture(t)
 		txHash, txMap := preExistingTx(t, ctx, utxoStore, 3000)
 
-		// A real store cannot be made to fail this one call on demand, so this case uses
-		// the mock client.
-		failingChain := &blockchain.Mock{}
-		failingChain.On("GetBestBlockHeader", mock.Anything).Return(nil, nil, errors.NewServiceError("blockchain unavailable"))
-		sm.blockchainClient = failingChain
+		// Wrap the real client so only GetBestBlockHeader fails.
+		sm.blockchainClient = failingBestBlockClient{ClientI: sm.blockchainClient}
 
 		bi := blockIdent{hash: chainhash.HashH([]byte("block extending genesis")), prevBlock: genesisHash, height: 1}
 		require.Error(t, sm.createUtxos(ctx, txMap, bi, 44, false))
@@ -1257,6 +1264,47 @@ func TestSyncManager_createUtxos_StampsLongestChainFromBestBlock(t *testing.T) {
 		require.Empty(t, post.BlockIDs, "no stamp may be written on a guess")
 		require.Equal(t, preCreateHeight, post.UnminedSince)
 	})
+}
+
+// failingBestBlockClient wraps a real blockchain client and fails only
+// GetBestBlockHeader, for the case where the best block cannot be read.
+type failingBestBlockClient struct {
+	blockchain.ClientI
+}
+
+func (failingBestBlockClient) GetBestBlockHeader(context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	return nil, nil, errors.NewServiceError("blockchain unavailable")
+}
+
+// addWinner adds a block at height 1 on genesis to the blockchain store and checks it
+// became the best block. A same-height sibling arriving after it shares its parent but
+// does not extend the best block.
+func addWinner(t *testing.T, ctx context.Context, chainClient blockchain.ClientI, genesisHash chainhash.Hash) {
+	t.Helper()
+
+	coinbase, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff17030100002f6d312d65752f29c267ffea1adb87f33b398fffffffff03ac505763000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88acaa505763000000001976a9143c22b6d9ba7b50b6d6e615c69d11ecb2ba3db14588acaa505763000000001976a914b7177c7deb43f3869eabc25cfd9f618215f34d5588ac00000000")
+	require.NoError(t, err)
+
+	bits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+
+	winner := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			Timestamp:      1729259727,
+			HashPrevBlock:  &genesisHash,
+			HashMerkleRoot: coinbase.TxIDChainHash(),
+			Bits:           *bits,
+		},
+		Height:           1,
+		CoinbaseTx:       coinbase,
+		TransactionCount: 1,
+	}
+	require.NoError(t, chainClient.AddBlock(ctx, winner, "test"))
+
+	best, _, err := chainClient.GetBestBlockHeader(ctx)
+	require.NoError(t, err)
+	require.Equal(t, *winner.Hash(), *best.Hash(), "precondition: the winner is the best block")
 }
 
 // newChunkingTestSetup builds the boilerplate shared by the createUtxos chunking
