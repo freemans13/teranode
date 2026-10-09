@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -912,5 +913,80 @@ func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
 		md, err := s.Get(ctx, tx.TxIDChainHash(), fields.SubtreeIdxs)
 		require.NoError(t, err, "tx %d", i)
 		require.Equal(t, []int{idxs[i]}, md.SubtreeIdxs, "tx %d keeps its own subtree index", i)
+	}
+}
+
+// When a level is split into parallel chunks and one chunk finds a parent that already exists,
+// the other chunks of that level must still commit. They used to share a context the failing
+// chunk cancelled, and a sibling caught at its commit was either abandoned or, when the server had
+// already committed it, left without a result, so the hand-off found the record this call had
+// just written and reported it MultiTxExisted. This holds transaction 0's chunk at its commit
+// until either its context is cancelled or a second passes, which makes the old race certain.
+func TestSpendAndCreateMultiSplitLevelSiblingIsNotCancelled(t *testing.T) {
+	old := multiCreateChunkTxs
+	multiCreateChunkTxs = 1
+
+	t.Cleanup(func() {
+		multiCreateChunkTxs = old
+		multiCreateBeforeCommit = nil
+	})
+
+	s, ctx := newTestStore(t)
+
+	const height = 950
+
+	w := tests.BuildMultiWorkload(t, 0x53, 2, 3)
+	w.StoreRoots(t, s, height-1)
+
+	list := outpointOnly(w.Txs)
+
+	idxs := make([]int, len(list))
+	for i := range idxs {
+		idxs[i] = 10 + i
+	}
+
+	// Transaction 1 already exists, and a child in the list spends it, so its chunk stops the
+	// netted write with errNettedParentExists.
+	_, _, err := s.SpendAndCreate(ctx, list[1], height, belowCheckpointOptionsAt(height, idxs[1])...)
+	require.NoError(t, err)
+
+	var (
+		mu        sync.Mutex
+		reached   bool
+		cancelled error
+	)
+
+	tx0 := *list[0].TxIDChainHash()
+
+	multiCreateBeforeCommit = func(commitCtx context.Context, txids []chainhash.Hash) {
+		for _, h := range txids {
+			if h != tx0 {
+				continue
+			}
+
+			select {
+			case <-commitCtx.Done():
+			case <-time.After(time.Second):
+			}
+
+			mu.Lock()
+			reached, cancelled = true, commitCtx.Err()
+			mu.Unlock()
+		}
+	}
+
+	results, err := s.SpendAndCreateMulti(ctx, list, height, append(belowCheckpointOptions(height), utxo.WithSubtreeIdxs(idxs))...)
+	require.NoError(t, err)
+
+	mu.Lock()
+	require.True(t, reached, "transaction 0's chunk must reach its commit")
+	require.NoError(t, cancelled, "a sibling chunk's errNettedParentExists must not cancel transaction 0's commit")
+	mu.Unlock()
+
+	require.Equal(t, utxo.MultiTxCreated, results[0].Status, "transaction 0 was created by this call: %v", results[0].Err)
+	require.Equal(t, utxo.MultiTxExisted, results[1].Status)
+
+	for i, r := range results[2:] {
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i+2, r.Err)
 	}
 }

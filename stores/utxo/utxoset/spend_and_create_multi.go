@@ -110,6 +110,10 @@ var multiFault func(stage string) error
 // transaction that commits. nil in production.
 var multiCreateCommitted func(txs int)
 
+// multiCreateBeforeCommit is a test hook called just before each step-2 chunk transaction
+// commits, with the context the commit will run under and the chunk's txids. nil in production.
+var multiCreateBeforeCommit func(ctx context.Context, txids []chainhash.Hash)
+
 // multiConcurrency is how many chunk transactions run at once. Each holds one pool connection
 // and takes no second one, so at most half the pool, leaving the rest of the node its share,
 // and at most 8, which with multiCreateChunkTxs bounds the advisory locks held at once.
@@ -692,9 +696,17 @@ func (w *nettedWrite) createLevels(ctx context.Context) error {
 
 // createSplitLevel writes one level too wide for a single chunk: cut into chunks by the chunk
 // bounds, multiConcurrency in flight, and every one committed before it returns.
+//
+// The chunks share the caller's context, not one derived from the group, so a chunk that fails
+// does not cancel its siblings. They are independent, each safe to commit on its own by the crash
+// argument above, and the commonest failure, errNettedParentExists, is not a fault at all. A
+// cancelled sibling caught mid-commit could be committed on the server while its client saw only
+// the cancellation; it then never got a result, and the per-transaction hand-off found the record
+// this very call had written and reported it MultiTxExisted. Wait still returns the first error.
 func (w *nettedWrite) createSplitLevel(ctx context.Context, members []*multiTx, sizes map[*multiTx]int,
 	spender map[nettedKey][]byte) error {
-	g, gCtx := errgroup.WithContext(ctx)
+	var g errgroup.Group
+
 	g.SetLimit(w.s.multiConcurrency())
 
 	start, size := 0, 0
@@ -704,7 +716,7 @@ func (w *nettedWrite) createSplitLevel(ctx context.Context, members []*multiTx, 
 
 		if i > start && (size+txSize > spendAndCreateBatchByteBudget || i-start >= multiCreateChunkTxs) {
 			chunk := members[start:i]
-			g.Go(func() error { return w.createChunk(gCtx, chunk, spender) })
+			g.Go(func() error { return w.createChunk(ctx, chunk, spender) })
 			start, size = i, 0
 		}
 
@@ -713,7 +725,7 @@ func (w *nettedWrite) createSplitLevel(ctx context.Context, members []*multiTx, 
 
 	if start < len(members) {
 		chunk := members[start:]
-		g.Go(func() error { return w.createChunk(gCtx, chunk, spender) })
+		g.Go(func() error { return w.createChunk(ctx, chunk, spender) })
 	}
 
 	return g.Wait()
@@ -872,6 +884,15 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 
 	t3 := time.Now()
 	w.journalNs.Add(int64(t3.Sub(t2)))
+
+	if multiCreateBeforeCommit != nil {
+		txids := make([]chainhash.Hash, len(chunk))
+		for k, it := range chunk {
+			txids[k] = it.txid
+		}
+
+		multiCreateBeforeCommit(ctx, txids)
+	}
 
 	if err = dbTx.Commit(ctx); err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] commit create chunk", err)
