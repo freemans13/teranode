@@ -53,6 +53,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -314,6 +315,60 @@ func privateIPColocationWhitelist() []*net.IPNet {
 	return nets
 }
 
+// bsvaBootstrapDomain is the BSVA-managed DNS zone behind the committed
+// p2p_bootstrap_peers default (/dnsaddr/${network}.bootstrap.teranode.bsvb.tech).
+const bsvaBootstrapDomain = "bootstrap.teranode.bsvb.tech"
+
+// isRegtest reports whether the node runs on regtest, a local chain with no
+// public network to join.
+func isRegtest(tSettings *settings.Settings) bool {
+	return tSettings.ChainCfgParams != nil && tSettings.ChainCfgParams.Name == chaincfg.RegressionNetParams.Name
+}
+
+// isBSVABootstrapPeer reports whether addr is a /dnsaddr/ entry in the
+// BSVA-managed bootstrap zone. Unparseable entries are not matched: the message
+// bus logs and skips them itself.
+func isBSVABootstrapPeer(addr string) bool {
+	maddr, err := ma.NewMultiaddr(addr)
+	if err != nil {
+		return false
+	}
+
+	host, err := maddr.ValueForProtocol(ma.P_DNSADDR)
+	if err != nil {
+		return false
+	}
+
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+
+	return host == bsvaBootstrapDomain || strings.HasSuffix(host, "."+bsvaBootstrapDomain)
+}
+
+// bootstrapPeersForNetwork returns the configured bootstrap peers, minus any
+// BSVA-managed bootstrap entries on regtest. The committed default is templated
+// from ${network}, so a regtest node would otherwise try to resolve
+// regtest.bootstrap.teranode.bsvb.tech: BSVA publishes no such record.
+// Operator-supplied peers are kept so private multi-node regtest clusters can
+// still bootstrap.
+func bootstrapPeersForNetwork(logger ulogger.Logger, tSettings *settings.Settings) []string {
+	peers := tSettings.P2P.BootstrapPeers
+	if !isRegtest(tSettings) {
+		return peers
+	}
+
+	kept := make([]string, 0, len(peers))
+	for _, p := range peers {
+		if isBSVABootstrapPeer(p) {
+			logger.Infof("[p2p] skipping BSVA bootstrap peer %s on regtest", p)
+			continue
+		}
+
+		kept = append(kept, p)
+	}
+
+	return kept
+}
+
 // buildP2PMessageBusConfig maps Teranode P2P settings onto the message bus config.
 //
 // GossipSub mesh protection: peer scoring penalizes IP-colocated Sybil swarms and
@@ -344,7 +399,7 @@ func buildP2PMessageBusConfig(logger ulogger.Logger, tSettings *settings.Setting
 		Name:                tSettings.ClientName,
 		Logger:              logger,
 		PeerCacheFile:       p2pCacheFilePath(tSettings.P2P.PeerCacheDir),
-		BootstrapPeers:      tSettings.P2P.BootstrapPeers,
+		BootstrapPeers:      bootstrapPeersForNetwork(logger, tSettings),
 		StaticPeers:         tSettings.P2P.StaticPeers,
 		AllowedPublisherIDs: tSettings.P2P.AllowedPublisherIDs,
 		ProtocolVersion:     protocolVersion,
@@ -356,6 +411,10 @@ func buildP2PMessageBusConfig(logger ulogger.Logger, tSettings *settings.Setting
 		EnablePeerScoring:   tSettings.P2P.EnablePeerScoring,
 		DisablePeerExchange: !tSettings.P2P.EnablePeerExchange,
 	}
+
+	// An empty bootstrap list otherwise falls back to the public IPFS bootstrap
+	// peers; regtest must never dial, relay through or join the DHT of those.
+	conf.DisableDefaultBootstrapPeers = isRegtest(tSettings)
 
 	if tSettings.P2P.EnablePeerScoring {
 		params := p2pMessageBus.DefaultPeerScoreParams()
@@ -982,6 +1041,13 @@ func (s *Server) setupHTTPServer() *echo.Echo {
 		},
 		AllowMethods: []string{echo.GET},
 	}))
+
+	httpRateLimit := 0
+	if s.settings != nil {
+		httpRateLimit = s.settings.P2P.HTTPRateLimit
+	}
+
+	e.Use(newIPRateLimiter(httpRateLimit).Middleware())
 
 	e.GET("/health", func(c echo.Context) error {
 		return c.String(http.StatusOK, "OK")
