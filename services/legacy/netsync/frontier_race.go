@@ -842,7 +842,9 @@ func (r *streamRegistry) historyLocked(h chainhash.Hash) *raceHistory {
 // rates file.
 func (r *streamRegistry) forgetPeer(p *peerpkg.Peer) {
 	r.mu.Lock()
-	if bps := r.rateLocked(p); bps > 0 {
+	// An inbound peer connects from a different port each time, so its address never comes
+	// back, and its entry stayed in the rates file for good.
+	if bps := r.rateLocked(p); bps > 0 && !p.Inbound() {
 		r.remembered[p.Addr()] = bps
 	}
 

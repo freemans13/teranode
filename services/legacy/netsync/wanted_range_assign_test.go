@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/stretchr/testify/require"
 )
 
@@ -389,4 +390,78 @@ func TestAQuietOwnerIsNotReAskedBelowTheCheckpoint(t *testing.T) {
 	require.True(t, WaitUntil(func() bool { return otherRec.count() > 0 }, 5*time.Second), "the pass places other blocks")
 	require.NotContains(t, otherRec.all(), next, "the quiet owner's block is not asked of another peer")
 	require.True(t, sm.blockDownloads.HasOwner(quiet, next), "and the quiet owner keeps it")
+}
+
+// A block that two peers owe, and that neither sends, is asked of another peer below the last
+// checkpoint. The watcher gives a block one extra copy and then leaves it, and the download pass
+// skipped any block with an active owner, so such a block waited for a peer's download timeout
+// (review of 2026-10-09). With two or more owners, the quiet-owner rule applies again.
+func TestABlockWithTwoQuietOwnersIsAskedOfAnotherPeer(t *testing.T) {
+	sm := assignManager(t, 1, 20)
+	mockCommittedTip(t, sm, 10, 0)
+	require.True(t, sm.headersFirstMode.Load(), "harness check: below the last checkpoint")
+
+	sm.settings.Legacy.BlockDownloadWindow = 1024
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 20
+
+	quiet1, _ := schedulerPeer(t, sm, 1, 1020)
+	quiet2, _ := schedulerPeer(t, sm, 2, 1020)
+	other, otherRec := schedulerPeer(t, sm, 3, 1020)
+	wireStreamingPath(sm, quiet1, quiet2, other)
+
+	next, ok := sm.headerCache.At(11)
+	require.True(t, ok)
+
+	sm.blockDownloads.now = func() time.Time { return time.Now().Add(-5 * time.Minute) }
+	require.True(t, sm.blockDownloads.Add(quiet1, next))
+	require.True(t, sm.blockDownloads.Add(quiet2, next))
+	sm.blockDownloads.now = time.Now
+
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool {
+		for _, h := range otherRec.all() {
+			if h == next {
+				return true
+			}
+		}
+
+		return false
+	}, 5*time.Second), "the third peer is asked for the block both owners stopped sending")
+}
+
+// The download pass skips a block with one active owner before its disk check and its blockchain
+// call: below the checkpoint such a block is the watcher's, and each pass made both for each block
+// owed longer than the retry window (review of 2026-10-09).
+func TestAnOwedBlockMakesNoBlockchainCallBelowTheCheckpoint(t *testing.T) {
+	sm := assignManager(t, 1, 20)
+	mockCommittedTip(t, sm, 10, 0)
+
+	sm.settings.Legacy.BlockDownloadWindow = 1024
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 20
+
+	owner, _ := schedulerPeer(t, sm, 1, 1020)
+	wireStreamingPath(sm, owner)
+
+	next, ok := sm.headerCache.At(11)
+	require.True(t, ok)
+
+	sm.blockDownloads.now = func() time.Time { return time.Now().Add(-5 * time.Minute) }
+	require.True(t, sm.blockDownloads.Add(owner, next))
+	sm.blockDownloads.now = time.Now
+
+	sm.assignWantedBlocks()
+
+	client, ok := sm.blockchainClient.(*blockchain2.Mock)
+	require.True(t, ok)
+
+	for _, call := range client.Calls {
+		if call.Method != "GetBlockHeader" {
+			continue
+		}
+
+		if h, isHash := call.Arguments.Get(1).(*chainhash.Hash); isHash {
+			require.NotEqual(t, next, *h, "no blockchain call for a block its owner holds")
+		}
+	}
 }

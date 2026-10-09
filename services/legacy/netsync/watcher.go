@@ -22,8 +22,8 @@ import (
 // watchMinAge old, and it has one owner, one more peer is asked:
 //   - Arriving, with half its bytes or fewer: the peer that lands a full copy soonest, if in half
 //     the owner's time or less. A copy with more than half its bytes gets no helper.
-//   - Queued: the fastest peer that starts before the owner, has rescueFasterBy times its rate,
-//     and lands the block at the recent mean size in half the owner's time.
+//   - Queued: the fastest peer with rescueFasterBy times the owner's rate that lands the block
+//     at the recent mean size in half the owner's time.
 // The owner keeps its request and its connection; the first complete copy converts and the other
 // drains at the sink. One block gets one more getdata at the maximum. Headers-first mode only: the
 // heights come from the header cache, which is empty above the last checkpoint.
@@ -44,6 +44,26 @@ const (
 	// bytes received.
 	watchMinETA = 30 * time.Second
 )
+
+// maxEstimate is the longest arrival estimate the watcher uses: 1,000 hours. A stopped copy counts
+// at 1 byte a second, and with gigabytes to come the conversion to a duration went past the int64
+// limit and turned negative, so the stalled peer looked like the fastest one. The bound leaves room
+// to double an estimate.
+const maxEstimate = 1000 * time.Hour
+
+// estimate is the time to send bytes at rate, at most maxEstimate.
+func estimate(bytes, rate float64) time.Duration {
+	if rate <= 0 {
+		return maxEstimate
+	}
+
+	secs := bytes / rate
+	if secs >= maxEstimate.Seconds() {
+		return maxEstimate
+	}
+
+	return time.Duration(secs * float64(time.Second))
+}
 
 // watchedBlock is an owed block the watcher examines.
 type watchedBlock struct {
@@ -173,11 +193,6 @@ func (sm *SyncManager) owedBlocksFromTip(queues map[*peerpkg.Peer][]queuedBlock,
 // advertised height is below the block are not helpers.
 func (sm *SyncManager) watchHelper(queues map[*peerpkg.Peer][]queuedBlock, owner *peerpkg.Peer, b watchedBlock, size, typical int64, ownerETA time.Duration, used map[*peerpkg.Peer]bool) (*peerpkg.Peer, time.Duration) {
 	ownerRate := sm.streams.peerRate(owner)
-	ownerStart := time.Duration(0)
-
-	if size <= 0 && ownerRate > 0 {
-		ownerStart = sm.queuedArrival(owner, queues[owner], b.rec.seq, typical, 0, ownerRate)
-	}
 
 	var (
 		best      *peerpkg.Peer
@@ -204,7 +219,7 @@ func (sm *SyncManager) watchHelper(queues map[*peerpkg.Peer][]queuedBlock, owner
 
 		if size > 0 {
 			// The size is known: the peer that lands a full copy soonest, in half the owner's time.
-			eta := start + time.Duration(float64(size)/rate*float64(time.Second))
+			eta := start + estimate(float64(size), rate)
 			if eta*rescueFasterBy <= ownerETA && (best == nil || eta < bestETA) {
 				best, bestETA = bp.peer, eta
 			}
@@ -212,20 +227,21 @@ func (sm *SyncManager) watchHelper(queues map[*peerpkg.Peer][]queuedBlock, owner
 			continue
 		}
 
-		// The size is not known: the fastest peer that starts before the owner and has
-		// rescueFasterBy times its rate, which lands the block sooner whatever its size, and
-		// that lands it at the recent mean size in half the owner's time. Without the last
-		// test, helpers with long queues of their own were asked for small gains, and on
-		// 2026-10-08 from 23:30 the share of discarded bytes rose from 4.0% to 7.5%.
-		eta := start + time.Duration(float64(typical)/rate*float64(time.Second))
+		// The size is not known: the fastest peer with rescueFasterBy times the owner's rate
+		// that lands the block at the recent mean size in half the owner's time. Without the
+		// time test, helpers with long queues of their own were asked for small gains, and on
+		// 2026-10-08 from 23:30 the share of discarded bytes rose from 4.0% to 7.5%. There is
+		// no test that the helper starts before the owner: a silent owner's first block starts
+		// at 0 s by the estimate, and that test refused every helper for it.
+		eta := start + estimate(float64(typical), rate)
 		if eta*rescueFasterBy > ownerETA {
 			continue
 		}
 
-		if ownerRate <= 0 || (start < ownerStart && rate >= rescueFasterBy*ownerRate) {
+		if ownerRate <= 0 || rate >= rescueFasterBy*ownerRate {
 			if best == nil || rate > bestRate || (rate == bestRate && start < bestStart) {
 				best, bestRate, bestStart = bp.peer, rate, start
-				bestETA = start + time.Duration(float64(typical)/rate*float64(time.Second))
+				bestETA = start + estimate(float64(typical), rate)
 			}
 		}
 	}
@@ -244,7 +260,7 @@ func fmtETA(d time.Duration) string {
 
 // farOff is an arrival estimate for an owner that will not deliver: a forgiven owner sending no
 // copy, or a copy that has stopped.
-const farOff = time.Duration(1<<63 - 1)
+const farOff = maxEstimate
 
 // ownerArrival estimates when block h lands at owner o, and the block's declared size when its
 // bytes are arriving from o, zero otherwise. judged is false when the copy must be given more
@@ -272,7 +288,7 @@ func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []q
 			return 0, 0, "", false
 		}
 
-		return time.Duration(float64(total-read) / rate * float64(time.Second)), total, "arrives slowly from", true
+		return estimate(float64(total-read), rate), total, "arrives slowly from", true
 	}
 
 	var (
@@ -332,5 +348,5 @@ func (sm *SyncManager) queuedArrival(p *peerpkg.Peer, queue []queuedBlock, seq u
 
 	bytes := float64(sending + queued*typical + ownSize)
 
-	return time.Duration(bytes / rate * float64(time.Second))
+	return estimate(bytes, rate)
 }
