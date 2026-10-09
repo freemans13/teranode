@@ -94,7 +94,24 @@ SELECT DISTINCT $1::int, p.ptxid, p.child
   FROM unnest($2::bytea[], $3::bytea[]) AS p(ptxid, child)
 ON CONFLICT DO NOTHING`
 
-// setConflictingSQL flips the flag on both rows and reports both answers the caller needs.
+// setConflictingSQL flips the flag on every row that carries it. conflictingReadSQL then reports
+// both answers the caller needs.
+//
+// TWO STATEMENTS, NOT ONE, and the split is a correctness requirement. A child whose spend of
+// one of these UTXOs is in flight holds that UTXO's row lock, so the UTXO update below waits for
+// it; when the child commits, the row is gone and the update skips it. The child's journal row
+// committed in the same instant, and the read that names the children has to see it. Inside one
+// statement it cannot: every part of a statement reads the snapshot taken when the statement
+// began, and READ COMMITTED's re-check after a lock wait covers only the row being updated, not
+// the other parts of the statement. Measured with the child's spend held open in a transaction
+// (TestSetConflictingSeesAChildWhoseSpendCommitsWhileItWaits): the one-statement form marked the
+// parent and returned no children, so the child stayed spendable and unmarked with nothing left
+// to find it. As a second statement in the same READ COMMITTED transaction the read takes a
+// fresh snapshot, taken after the update finished waiting, so every child whose spend committed
+// before the update is seen. A spend that comes later finds the conflicting bit set and is
+// refused by its own flag mask, including one that was waiting on the update's row lock, whose
+// predicate READ COMMITTED re-evaluates against the new row version
+// (TestSpendWaitingOnSetConflictingIsRefused).
 //
 // BOTH rows, for the reason setLockedSQL gives: the identity row is what a metadata read
 // shows, the UTXO row is what the spend path reads, and the spend path never looks at the
@@ -105,6 +122,48 @@ ON CONFLICT DO NOTHING`
 // The UTXO update is bounded by a key RANGE rather than by transaction id alone. The packed key
 // carries the id prefix first precisely so this is an index range scan, and the full 32-byte id
 // is still rechecked because the prefix is non-unique by design.
+//
+// The flag is flipped on THREE things, not two, for the same reason setLockedSQL flips three.
+// A transaction lives in exactly one of tx_ident and tx_mined and this statement does not know
+// which; a contested parent is very often mined, which is the whole reason the note itself
+// became a side table. minedRow.toMeta reads Conflicting straight off tx_mined.flags, copied
+// once by the move and updated by nothing afterwards, so without the membership arm marking a
+// mined transaction conflicting set the UTXO bit and not the bit Get reports -- the mirror
+// image of the failure setLockedSQL's own comment warns about. The membership arm is a plain
+// txid equality because tx_mined's primary key leads with txid.
+const setConflictingSQL = `
+WITH k AS (
+    SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[])
+        AS t(leaf, txid, lo, hi)
+),
+ident AS (
+    UPDATE tx_ident i
+       SET flags = CASE WHEN $5::boolean THEN i.flags |  $6::smallint
+                                         ELSE i.flags & ~$6::smallint END
+      FROM k
+     WHERE i.leaf = k.leaf AND i.txid = k.txid
+),
+mined AS (
+    UPDATE tx_mined m
+       SET flags = CASE WHEN $5::boolean THEN m.flags |  $6::smallint
+                                         ELSE m.flags & ~$6::smallint END
+      FROM k
+     WHERE m.txid = k.txid
+),
+UTXOs AS (
+    UPDATE utxo u
+       SET flags = CASE WHEN $5::boolean THEN u.flags |  $6::smallint
+                                         ELSE u.flags & ~$6::smallint END
+      FROM k
+     WHERE u.leaf  = k.leaf
+       AND u.ukey BETWEEN k.lo AND k.hi
+       AND u.txid  = k.txid
+)
+SELECT 1`
+
+// conflictingReadSQL reads back the spends to undo and the next level of the cascade, after
+// setConflictingSQL has run in the same transaction. See setConflictingSQL for why it is a
+// separate statement.
 //
 // The 'parent' rows are the spends to be undone, and the join to the journal is OUTER with a
 // guard, in two parts, for two different reasons.
@@ -142,46 +201,14 @@ ON CONFLICT DO NOTHING`
 //
 // The 'child' rows are the next level of the cascade. The journal is the only place this store
 // can answer "who took this UTXO", because the UTXO row is destroyed the moment it is spent.
-//
-// The flag is flipped on THREE things, not two, for the same reason setLockedSQL flips three.
-// A transaction lives in exactly one of tx_ident and tx_mined and this statement does not know
-// which; a contested parent is very often mined, which is the whole reason the note itself
-// became a side table. minedRow.toMeta reads Conflicting straight off tx_mined.flags, copied
-// once by the move and updated by nothing afterwards, so without the membership arm marking a
-// mined transaction conflicting set the UTXO bit and not the bit Get reports -- the mirror
-// image of the failure setLockedSQL's own comment warns about. The membership arm is a plain
-// txid equality because tx_mined's primary key leads with txid.
-const setConflictingSQL = `
+const conflictingReadSQL = `
 WITH k AS (
-    SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::uuid[], $5::uuid[])
-        AS t(ref, leaf, txid, lo, hi)
+    SELECT * FROM unnest($1::int[], $2::bytea[], $3::uuid[], $4::uuid[])
+        AS t(ref, txid, lo, hi)
 ),
 p AS (
-    SELECT * FROM unnest($6::int[], $7::bytea[], $8::smallint[], $9::bytea[], $10::uuid[], $11::int[])
+    SELECT * FROM unnest($5::int[], $6::bytea[], $7::smallint[], $8::bytea[], $9::uuid[], $10::int[])
         AS t(ref, child, pleaf, ptxid, pukey, pvout)
-),
-ident AS (
-    UPDATE tx_ident i
-       SET flags = CASE WHEN $12::boolean THEN i.flags |  $13::smallint
-                                          ELSE i.flags & ~$13::smallint END
-      FROM k
-     WHERE i.leaf = k.leaf AND i.txid = k.txid
-),
-mined AS (
-    UPDATE tx_mined m
-       SET flags = CASE WHEN $12::boolean THEN m.flags |  $13::smallint
-                                          ELSE m.flags & ~$13::smallint END
-      FROM k
-     WHERE m.txid = k.txid
-),
-UTXOs AS (
-    UPDATE utxo u
-       SET flags = CASE WHEN $12::boolean THEN u.flags |  $13::smallint
-                                          ELSE u.flags & ~$13::smallint END
-      FROM k
-     WHERE u.leaf  = k.leaf
-       AND u.ukey BETWEEN k.lo AND k.hi
-       AND u.txid  = k.txid
 )
 SELECT 'parent'::text AS kind, p.ref, p.ptxid, p.pvout,
        j.satoshis, j.script, j.hash_override, NULL::bytea AS spender
@@ -446,15 +473,21 @@ func (s *Store) planConflicting(named []chainhash.Hash,
 	return p
 }
 
-// runConflictingPlan flips the flags and reads back both answers.
+// runConflictingPlan flips the flags and then reads back both answers, as two statements so the
+// read sees every spend that committed while the flip waited on its row locks. q must be a
+// transaction for the pair to be atomic; SetConflicting always passes one.
 func (s *Store) runConflictingPlan(ctx context.Context, q querier, p *conflictingPlan,
 	value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
-	rows, err := q.Query(ctx, setConflictingSQL,
-		p.kRef, p.kLeaf, p.kTxid, p.kLo, p.kHi,
-		p.pRef, p.pChild, p.pLeaf, p.pTxid, p.pUkey, p.pVout,
-		value, FlagConflicting)
-	if err != nil {
+	if _, err := q.Exec(ctx, setConflictingSQL,
+		p.kLeaf, p.kTxid, p.kLo, p.kHi, value, FlagConflicting); err != nil {
 		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] set", err)
+	}
+
+	rows, err := q.Query(ctx, conflictingReadSQL,
+		p.kRef, p.kTxid, p.kLo, p.kHi,
+		p.pRef, p.pChild, p.pLeaf, p.pTxid, p.pUkey, p.pVout)
+	if err != nil {
+		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] read", err)
 	}
 
 	var (
