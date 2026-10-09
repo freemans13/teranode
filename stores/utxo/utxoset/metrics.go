@@ -36,6 +36,10 @@ var (
 		Name: "utxoset_stamp_pages_total",
 		Help: "Stamp pages committed",
 	})
+	stampPagesNoIdentity = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "utxoset_stamp_pages_no_identity_total",
+		Help: "Stamp pages skipped because their slab has no identity row; also counted in utxoset_stamp_pages_total",
+	})
 	stampUTXOs = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_utxos_total",
 		Help: "Live UTXOs the stamp wrote a block onto",
