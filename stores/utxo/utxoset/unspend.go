@@ -49,6 +49,13 @@ import (
 // The NOT EXISTS guard is belt-and-braces: with a non-unique key a concurrent re-create
 // could otherwise produce a duplicate live row for one outpoint, which is counterfeit.
 //
+// It does not cover two journal rows for the same spend, and that case is real: the pruner's
+// copy-forward commits a carried copy before it detaches the original partition, so for that
+// interval both rows match all three predicates. Both are consumed, which is right, since a
+// copy left behind would be a second authorisation. But the guard reads the pre-statement
+// snapshot, in which the UTXO is absent for both, so both used to insert and one spent output
+// came back as two live ones. The `one` CTE collapses them to one row per UTXO first.
+//
 // $4 carries the flags to OR in, so a caller asking for flagAsLocked gets the UTXO back
 // already locked rather than briefly spendable. IT REACHES BOTH OUTCOMES, the UTXO this call
 // restores and the UTXO it found already live, and the second arm was missing.
@@ -95,12 +102,22 @@ taken AS (
     RETURNING j.ukey, j.txid, j.satoshis, j.script, j.created_height,
               j.spendable_from, j.flags, j.hash_override, j.mined_height, j.block_id
 ),
+one AS (
+    -- One row per UTXO, whatever the journal held. Two rows for one spend is the pruner's
+    -- copy-forward window: the carried copy has committed and the original partition is not
+    -- yet detached, so both match and both are consumed above. The NOT EXISTS below cannot
+    -- collapse them, because it reads the same pre-statement snapshot for both. A filled-in
+    -- pair beats an unfilled one, which is the only way the two can differ.
+    SELECT DISTINCT ON (t.ukey, t.txid) t.*
+      FROM taken t
+     ORDER BY t.ukey, t.txid, t.mined_height DESC
+),
 won AS (
     SELECT t.ukey, t.txid, c.n, c.mined_height, c.block_id,
            EXISTS (SELECT 1 FROM tx_ident i
                     WHERE i.leaf = (get_byte(t.txid, 0) & 7)::smallint
                       AND i.txid = t.txid) AS has_ident
-      FROM taken t
+      FROM one t
      CROSS JOIN LATERAL (
        SELECT count(*) AS n, min(m.mined_height) AS mined_height, min(m.block_id) AS block_id
          FROM tx_mined m
@@ -120,7 +137,7 @@ restored AS (
                 WHEN w.n = 1 THEN w.mined_height ELSE 0 END,
            CASE WHEN t.mined_height > 0 THEN t.block_id
                 WHEN w.n = 1 THEN w.block_id ELSE 0 END
-      FROM taken t
+      FROM one t
       LEFT JOIN won w ON w.ukey = t.ukey AND w.txid = t.txid
      WHERE NOT EXISTS (
            SELECT 1 FROM utxo u
@@ -247,7 +264,9 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	}
 
 	// One bad UTXO fails the whole call, before the commit, so no UTXO of the call is restored
-	// and no undo copy is consumed. That matches how the accounting failure below behaves.
+	// and no undo copy is consumed. The accounting check below runs after the commit and so
+	// does NOT behave this way: what it reports missing was never restored, and what was
+	// restored stays restored.
 	if noSource > 0 || ambiguous > 0 {
 		names := ""
 		if offending != nil {
