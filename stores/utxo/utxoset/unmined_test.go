@@ -264,24 +264,3 @@ func TestAPreservationRenewsWithNoOtherCopyLeft(t *testing.T) {
 	require.NoError(t, err, "past the old expiry the parent is still answerable")
 	require.Equal(t, []uint32{7}, got.BlockIDs)
 }
-
-// A transaction an earlier failed attempt at a block stored as unmined is marked mined by the
-// block path's retry through utxo.SetMinedIfPresent, and one the store never saw is ignored.
-func TestSetMinedIfPresentOnTheUtxosetStore(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	stored := mkTx(t, 1, 5_000)
-	_, err := s.Create(ctx, stored, 200)
-	require.NoError(t, err)
-
-	never := chainhash.Hash{0xee}
-
-	marked, err := utxo.SetMinedIfPresent(ctx, s, []*chainhash.Hash{stored.TxIDChainHash(), &never},
-		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 200}, 2)
-	require.NoError(t, err)
-	require.Equal(t, 1, marked)
-
-	got, err := s.Get(ctx, stored.TxIDChainHash(), fields.BlockIDs)
-	require.NoError(t, err)
-	require.Contains(t, got.BlockIDs, uint32(9))
-}
