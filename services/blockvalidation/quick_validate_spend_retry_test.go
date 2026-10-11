@@ -31,9 +31,8 @@ type spendRetrySpyStore struct {
 	spendCalls   atomic.Int64
 }
 
-// SpendAndCreateMulti runs the list one transaction at a time through this store's
-// SpendAndCreate, so the wrapper sees every call quick validation makes when it applies a
-// batch as one list.
+// SpendAndCreateMulti runs the list one transaction at a time through the spy's SpendAndCreate,
+// so the spy sees every call quick validation makes when it applies a batch as one list.
 func (s *spendRetrySpyStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
 	return utxo.DefaultSpendAndCreateMulti(ctx, s, 1, txs, blockHeight, opts...)
 }
@@ -82,6 +81,71 @@ func newSpendRetryHarness(t *testing.T, spy *spendRetrySpyStore) (*BlockValidati
 	block := &model.Block{Height: 100, Header: model.GenesisBlockHeader}
 
 	return u, block, txs
+}
+
+// A hard failure must fail the wave without tearing down the store calls already running
+// beside it. errgroup.WithContext cancels its context on the first non-nil return, and that
+// context is the one the store call runs under; SpendAndCreate is not atomic on any backend,
+// so a cancel landing between its spend and its create is how a transaction ends up with its
+// inputs spent and no row of its own. The goroutines therefore record their outcome and return
+// nil, and this pins that: a sibling that is mid-call when another item hard-fails still sees a
+// live context and still completes, and the wave still returns the hard failure.
+func TestApplyTxsWithRetry_HardFailDoesNotCancelSiblingsMidCall(t *testing.T) {
+	spy := &spendRetrySpyStore{failuresLeft: map[chainhash.Hash]int{}, failErr: map[chainhash.Hash]error{}}
+	u, block, txs := newSpendRetryHarness(t, spy)
+
+	items := make([]txApply, len(txs))
+	for i, tx := range txs {
+		items[i] = txApply{tx: tx, subtreeIdx: 0}
+	}
+
+	failing := *txs[0].TxIDChainHash()
+
+	// Cancellations come back over a buffered channel rather than a shared variable: every
+	// sibling would write it at once if the guard ever regressed, which is a data race in the
+	// very run that is supposed to report the regression.
+	var (
+		siblingStarted = make(chan struct{})
+		failed         = make(chan struct{})
+		siblingCtxErrs = make(chan error, len(txs))
+		siblingDone    atomic.Int64
+		startOnce      sync.Once
+	)
+
+	err := u.applyTxsWithRetry(context.Background(), block, "test", items, 3,
+		func(ctx context.Context, item txApply) error {
+			if *item.tx.TxIDChainHash() == failing {
+				// Wait until a sibling is genuinely inside its call, so the cancel this test
+				// is looking for would land mid-call rather than before one starts.
+				<-siblingStarted
+				close(failed)
+
+				return errors.NewTxInvalidError("hard fail")
+			}
+
+			startOnce.Do(func() { close(siblingStarted) })
+			<-failed
+
+			// The sibling is mid-call at the instant the hard failure is recorded. Give the
+			// cancellation a real chance to arrive rather than racing it: if the failing
+			// goroutine returned its error to the errgroup, applyCtx is cancelled within
+			// microseconds and Done fires long before this timer.
+			select {
+			case <-ctx.Done():
+				siblingCtxErrs <- ctx.Err()
+			case <-time.After(250 * time.Millisecond):
+			}
+
+			siblingDone.Add(1)
+
+			return nil
+		})
+
+	close(siblingCtxErrs)
+
+	require.Error(t, err, "the wave fails on the hard error")
+	require.Empty(t, siblingCtxErrs, "a hard failure must not cancel a sibling that is mid store call")
+	require.Equal(t, int64(len(txs)-1), siblingDone.Load(), "every sibling ran to completion")
 }
 
 func TestSpendBatchWithRetry(t *testing.T) {
