@@ -417,6 +417,17 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 		return nil
 	}
 
+	// A copy of a block the park holds converts over the parked record with an identical one
+	// and finds every subtree file already on disk, so it creates none. The files the record
+	// names are the parked copy's, and deleting them left a record whose files were gone: the
+	// parent's commit then dropped it (970,503 on 2026-10-10). A file this copy did create is
+	// left to its delete-at-height.
+	if sm.blockPark.Has(hash) || sm.blockPark.HandedOut(hash) {
+		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked block; keeping the parked copy's subtree files", hash)
+
+		return nil
+	}
+
 	var firstErr error
 
 	record, err := sm.blockPark.ReadConverted(sm.ctx, hash)
