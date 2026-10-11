@@ -239,6 +239,17 @@ func (sm *SyncManager) parkedRecordIncomplete(entry parkedBlock, checkErr error)
 	sm.logger.Warnf("[commitParkedBlock][%s] %s; dropping the record so the next wanted-range pass downloads the block again", entry.hash, parkDispositionFilesGone.reason)
 	sm.applyParkDisposition(entry, parkDispositionFilesGone)
 
+	// Above the last checkpoint no wanted-range pass names a block: announcements and the
+	// download ledger do, and a dropped record is in neither. Ask again now, with the getblocks
+	// a missing parent gets, so the peer re-announces the block. On 2026-10-10 the chain
+	// waited 13 minutes at 970,502 for the next announcement instead.
+	if !sm.headersFirstMode.Load() {
+		if peer := sm.livePeer(entry.peer); peer != nil {
+			sm.logger.Infof("[commitParkedBlock][%s] asking %s again for the block above the last checkpoint", entry.hash, peer)
+			sm.requestMissingBlocks(peer, entry.hash)
+		}
+	}
+
 	return false
 }
 

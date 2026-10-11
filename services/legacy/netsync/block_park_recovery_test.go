@@ -659,3 +659,36 @@ func TestSyncManager_AnInvalidTransactionVerdictFromTheFullRouteIsAJudgementOnTh
 	require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, time.Second),
 		"a block written off must not be downloaded again while recentlyFailedBlocks names it; that re-ask is the loop this closes")
 }
+
+// Above the last checkpoint no wanted-range pass names a block: blocks are named by
+// announcements and the download ledger. A record dropped because its subtree files are gone was
+// then in neither, and nothing asked for it again until the next block was announced: on
+// 2026-10-10 the chain waited 13 minutes at 970,502 with five children parked. The drop now sends
+// a getblocks from the best block to the peer that delivered it, the re-ask a missing parent
+// already gets, so the peer re-announces the block and the inv path fetches it.
+func TestSyncManager_AParkedRecordWhoseFilesAreGoneIsAskedForAgainAboveTheCheckpoint(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+	h.sm.headersFirstMode.Store(false)
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len())
+
+	record, err := h.sm.blockPark.ReadConverted(h.sm.ctx, child)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees)
+
+	require.NoError(t, h.store.Del(h.sm.ctx, record.Subtrees[0][:], fileformat.FileTypeSubtreeData))
+
+	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+
+	before := h.rec.getBlocksCount()
+
+	require.NoError(t, h.deliver(t, 0))
+	h.drainOneParkCommit(t)
+
+	require.Zero(t, h.sm.blockPark.Len(), "the record is dropped")
+	require.True(t, WaitUntil(func() bool { return h.rec.getBlocksCount() > before }, 5*time.Second),
+		"above the checkpoint a dropped record must be asked for again at once")
+}
