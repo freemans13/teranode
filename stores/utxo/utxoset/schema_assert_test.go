@@ -1,6 +1,7 @@
 package utxoset
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -68,6 +69,47 @@ func TestSchemaAssertionNamesTheJournalColumns(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrConfiguration))
 	require.Contains(t, err.Error(), "spend_journal.mined_height")
+}
+
+// TestSchemaAssertionRefusesAJournalWithoutTheSpendingInput: spending_vin has no migration, like
+// every other column here, so a database whose journal predates it must be refused at startup
+// with a message that says a fresh sync is needed, rather than opening and failing every spend
+// on its journal insert. Both places the column can be missing are covered: the parent, and a
+// leaf left standalone by a pruner pass interrupted between DETACH and DROP, which the next
+// pass copies forward out of by name.
+func TestSchemaAssertionRefusesAJournalWithoutTheSpendingInput(t *testing.T) {
+	t.Run("parent", func(t *testing.T) {
+		s, ctx := newTestStore(t)
+
+		_, err := s.pool.Exec(ctx, `ALTER TABLE spend_journal DROP COLUMN spending_vin`)
+		require.NoError(t, err)
+
+		err = CreateSchema(ctx, s.pool)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrConfiguration))
+		require.Contains(t, err.Error(), "predates spend_journal.spending_vin")
+		require.Contains(t, err.Error(), "fresh sync")
+	})
+
+	t.Run("standalone leaf", func(t *testing.T) {
+		s, ctx := newTestStore(t)
+
+		require.NoError(t, s.ensureSpendJournalPartition(ctx, 101))
+
+		leaf := fmt.Sprintf("spend_journal_%d", 101/SpendJournalPartitionBlocks)
+
+		_, err := s.pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE spend_journal DETACH PARTITION %s`, leaf))
+		require.NoError(t, err)
+
+		_, err = s.pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DROP COLUMN spending_vin`, leaf))
+		require.NoError(t, err)
+
+		err = CreateSchema(ctx, s.pool)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrConfiguration))
+		require.Contains(t, err.Error(), leaf)
+		require.Contains(t, err.Error(), "fresh sync")
+	})
 }
 
 // TestSchemaAssertionRefusesADatabaseThatStillHasTheDeletedColumns is the gate for the

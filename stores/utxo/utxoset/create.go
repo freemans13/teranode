@@ -272,6 +272,19 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		flags |= FlagLocked
 	}
 
+	// The inputs, parsed for the metadata returned to the caller. See the return below for who
+	// reads it. The serialized form is built further down, only for the claim that stores it.
+	var txInpoints subtree.TxInpoints
+
+	if !isCoinbase {
+		ip, ierr := subtree.NewTxInpointsFromTx(tx)
+		if ierr != nil {
+			return nil, errors.NewProcessingError("[utxoset][Create] inpoints %s", txHash.String(), ierr)
+		}
+
+		txInpoints = ip
+	}
+
 	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
 
 	// The block this create says contains the transaction, if it says so at all, and which of
@@ -308,17 +321,13 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	// from the fee, the size and these, never from the serialized transaction, which is what
 	// lets the body age out of its window while the transaction stays mineable. Only the
 	// identity claim stores them: the block-path and seed claims write none (see
-	// createMinedPlanSQL), so a create that takes either is not made to build them. Below the
-	// checkpoint that is every transaction of every block.
+	// createMinedPlanSQL), so a create that takes either is not made to serialize them. Below
+	// the checkpoint that is every transaction of every block.
 	var inpoints []byte
 
 	if !isCoinbase && !atBirth {
-		ip, ierr := subtree.NewTxInpointsFromTx(tx)
-		if ierr != nil {
-			return nil, errors.NewProcessingError("[utxoset][Create] inpoints %s", txHash.String(), ierr)
-		}
-
-		if inpoints, ierr = ip.Serialize(); ierr != nil {
+		var ierr error
+		if inpoints, ierr = txInpoints.Serialize(); ierr != nil {
 			return nil, errors.NewProcessingError("[utxoset][Create] serialise inpoints %s", txHash.String(), ierr)
 		}
 	}
@@ -422,11 +431,30 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		fee = uint64(*f) //nolint:gosec // txFee never returns a negative fee
 	}
 
+	// The returned record has to say what was written, not just what the transaction is. Its
+	// callers act on it without reading the row back, and the sql and aerospike stores return
+	// the same three fields from their own Create.
+	//
+	// Locked: the validator creates a transaction locked, hands it to block assembly, and then
+	// unlocks it, but only when the record it got back from the create says Locked. Without it
+	// the unlock was skipped, the row stayed locked, and every child spending it was refused
+	// with ErrTxLocked until the next block.
+	//
+	// Conflicting: subtree validation, blessing a missing transaction, checks the
+	// counter-conflicting set only when the validator's returned record says Conflicting, and
+	// the txmeta Kafka message the validator publishes carries the bit into the cache.
+	//
+	// TxInpoints: published in the same txmeta message. A cached entry for a non-coinbase with
+	// no parents is treated as a miss (processTxMetaUsingCache), so leaving them out turned
+	// every cache entry this store produced into a store read.
 	return &meta.Data{
 		Tx:          tx,
+		TxInpoints:  txInpoints,
 		Fee:         fee,
 		SizeInBytes: uint64(txSize(tx)), //nolint:gosec // a size is never negative
 		IsCoinbase:  isCoinbase,
+		Conflicting: options.Conflicting,
+		Locked:      options.Locked,
 	}, nil
 }
 

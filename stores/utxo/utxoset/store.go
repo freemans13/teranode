@@ -66,6 +66,11 @@ type Store struct {
 	// touched when it changes.
 	bodyWindow atomic.Uint32
 
+	// carryBound is the carry bound, a window number plus one, that carryUnminedBodies last
+	// ran to completion for, so the unmined set is read once per new window rather than per
+	// block. Zero means not yet in this process.
+	carryBound atomic.Uint32
+
 	// bodyDDL serialises tx_body partition creation within this process, for the same
 	// reason journalDDL does: CREATE TABLE IF NOT EXISTS is not concurrency-safe.
 	bodyDDL sync.Mutex

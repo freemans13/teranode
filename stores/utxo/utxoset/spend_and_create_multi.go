@@ -118,6 +118,10 @@ var multiFault func(stage string) error
 // transaction that commits. nil in production.
 var multiCreateCommitted func(txs int)
 
+// multiCreateBeforeCommit is a test hook called just before each step-2 chunk transaction
+// commits, with the context the commit will run under and the chunk's txids. nil in production.
+var multiCreateBeforeCommit func(ctx context.Context, txids []chainhash.Hash)
+
 // multiConcurrency is how many chunk transactions run at once. Each holds one pool connection
 // and takes no second one, so at most half the pool, leaving the rest of the node its share,
 // and at most 8, which with multiCreateChunkTxs bounds the advisory locks held at once.
@@ -541,6 +545,13 @@ var errNettedParentExists error = nettedParentExists{}
 // nettedKey names one output by its parent's txid and its packed key.
 type nettedKey [48]byte
 
+// nettedSpender is the transaction in the list that spends a netted output, and which of its
+// inputs does it. The input index goes into the journal row, so GetSpend names it.
+type nettedSpender struct {
+	txid []byte
+	vin  int32
+}
+
 func newNettedKey(txid []byte, ukey [16]byte) nettedKey {
 	var k nettedKey
 
@@ -570,7 +581,7 @@ func newNettedKey(txid []byte, ukey [16]byte) nettedKey {
 // still MultiTxNotAttempted, hands the group and everything after it to the per-transaction
 // default. Results are only set after a commit, so a rolled-back group leaves none behind.
 func (w *nettedWrite) createLevels(ctx context.Context) error {
-	spender := make(map[nettedKey][]byte)
+	spender := make(map[nettedKey]nettedSpender)
 	level := make([]int, len(w.items))
 	maxLevel := 0
 
@@ -585,7 +596,8 @@ func (w *nettedWrite) createLevels(ctx context.Context) error {
 			}
 
 			parent := in.PreviousTxIDChainHash()
-			spender[newNettedKey(parent[:], Pack(parent[:], in.PreviousTxOutIndex))] = it.txid[:]
+			spender[newNettedKey(parent[:], Pack(parent[:], in.PreviousTxOutIndex))] =
+				nettedSpender{txid: it.txid[:], vin: int32(vin)} //nolint:gosec // an input index fits int32
 		}
 
 		for _, p := range it.parents {
@@ -700,9 +712,17 @@ func (w *nettedWrite) createLevels(ctx context.Context) error {
 
 // createSplitLevel writes one level too wide for a single chunk: cut into chunks by the chunk
 // bounds, multiConcurrency in flight, and every one committed before it returns.
+//
+// The chunks share the caller's context, not one derived from the group, so a chunk that fails
+// does not cancel its siblings. They are independent, each safe to commit on its own by the crash
+// argument above, and the commonest failure, errNettedParentExists, is not a fault at all. A
+// cancelled sibling caught mid-commit could be committed on the server while its client saw only
+// the cancellation; it then never got a result, and the per-transaction hand-off found the record
+// this very call had written and reported it MultiTxExisted. Wait still returns the first error.
 func (w *nettedWrite) createSplitLevel(ctx context.Context, members []*multiTx, sizes map[*multiTx]int,
-	spender map[nettedKey][]byte) error {
-	g, gCtx := errgroup.WithContext(ctx)
+	spender map[nettedKey]nettedSpender) error {
+	var g errgroup.Group
+
 	g.SetLimit(w.s.multiConcurrency())
 
 	start, size := 0, 0
@@ -712,7 +732,7 @@ func (w *nettedWrite) createSplitLevel(ctx context.Context, members []*multiTx, 
 
 		if i > start && (size+txSize > spendAndCreateBatchByteBudget || i-start >= multiCreateChunkTxs) {
 			chunk := members[start:i]
-			g.Go(func() error { return w.createChunk(gCtx, chunk, spender) })
+			g.Go(func() error { return w.createChunk(ctx, chunk, spender) })
 			start, size = i, 0
 		}
 
@@ -721,7 +741,7 @@ func (w *nettedWrite) createSplitLevel(ctx context.Context, members []*multiTx, 
 
 	if start < len(members) {
 		chunk := members[start:]
-		g.Go(func() error { return w.createChunk(gCtx, chunk, spender) })
+		g.Go(func() error { return w.createChunk(ctx, chunk, spender) })
 	}
 
 	return g.Wait()
@@ -738,13 +758,14 @@ type nettedRows struct {
 	ukeys     [][16]byte
 	txids     [][]byte
 	spenders  [][]byte
+	vins      []int32
 	scripts   [][]byte
 }
 
 // takeNetted removes from the plan every UTXO a child in the list spends and returns the
 // spend-journal row each becomes: the UTXO as the create would have written it, spent at the
 // list's height by that child.
-func (p *createPlan) takeNetted(spender map[nettedKey][]byte) *nettedRows {
+func (p *createPlan) takeNetted(spender map[nettedKey]nettedSpender) *nettedRows {
 	j := &nettedRows{}
 	keep := 0
 
@@ -774,7 +795,8 @@ func (p *createPlan) takeNetted(spender map[nettedKey][]byte) *nettedRows {
 		j.blockIDs = append(j.blockIDs, p.utxoBlockIDs[c])
 		j.ukeys = append(j.ukeys, p.utxoUkeys[c])
 		j.txids = append(j.txids, p.utxoTxids[c])
-		j.spenders = append(j.spenders, by)
+		j.spenders = append(j.spenders, by.txid)
+		j.vins = append(j.vins, by.vin)
 		j.scripts = append(j.scripts, p.utxoScripts[c])
 	}
 
@@ -796,20 +818,20 @@ func (p *createPlan) takeNetted(spender map[nettedKey][]byte) *nettedRows {
 // The columns are the ones spendJournalSQL copies off a deleted UTXO, with no hash_override: a
 // UTXO this list creates has never been reassigned.
 const nettedJournalSQL = `
-INSERT INTO spend_journal (spent_height, satoshis, created_height, spendable_from, flags,
+INSERT INTO spend_journal (spent_height, spending_vin, satoshis, created_height, spendable_from, flags,
                            mined_height, block_id, ukey, txid, spending_txid, script)
-SELECT $1::int, j.satoshis, j.created_height, j.spendable_from, j.flags,
+SELECT $1::int, j.spending_vin, j.satoshis, j.created_height, j.spendable_from, j.flags,
        j.mined_height, j.block_id, j.ukey, j.txid, j.spending_txid, j.script
   FROM unnest($2::bigint[], $3::int[], $4::int[], $5::smallint[], $6::int[], $7::int[],
-              $8::uuid[], $9::bytea[], $10::bytea[], $11::bytea[])
+              $8::uuid[], $9::bytea[], $10::bytea[], $11::bytea[], $12::int[])
     AS j(satoshis, created_height, spendable_from, flags, mined_height, block_id,
-         ukey, txid, spending_txid, script)`
+         ukey, txid, spending_txid, script, spending_vin)`
 
 // createChunk creates one chunk in one database transaction: the claims, the bodies and
 // surviving UTXOs, and the spend-journal rows of the netted ones. The chunk is part of one level
 // or several whole consecutive levels, parents before children. Results are set only after the
 // commit.
-func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender map[nettedKey][]byte) error {
+func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender map[nettedKey]nettedSpender) error {
 	items := make([]*createItem, len(chunk))
 	for k, it := range chunk {
 		items[k] = &createItem{tx: it.tx, blockHeight: w.blockHeight, options: w.list.Options.ItemOptions(it.pos)}
@@ -881,6 +903,15 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 	t3 := time.Now()
 	w.journalNs.Add(int64(t3.Sub(t2)))
 
+	if multiCreateBeforeCommit != nil {
+		txids := make([]chainhash.Hash, len(chunk))
+		for k, it := range chunk {
+			txids[k] = it.txid
+		}
+
+		multiCreateBeforeCommit(ctx, txids)
+	}
+
 	if err = dbTx.Commit(ctx); err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] commit create chunk", err)
 	}
@@ -912,7 +943,7 @@ func (w *nettedWrite) writeNettedJournal(ctx context.Context, dbTx pgx.Tx, j *ne
 	}
 
 	if _, err := dbTx.Exec(ctx, nettedJournalSQL, int32(w.blockHeight), //nolint:gosec // a height fits int32
-		j.sats, j.created, j.spendable, j.flags, j.mined, j.blockIDs, j.ukeys, j.txids, j.spenders, j.scripts); err != nil {
+		j.sats, j.created, j.spendable, j.flags, j.mined, j.blockIDs, j.ukeys, j.txids, j.spenders, j.scripts, j.vins); err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] journal netted spends", err)
 	}
 

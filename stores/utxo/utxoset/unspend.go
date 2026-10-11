@@ -49,6 +49,13 @@ import (
 // The NOT EXISTS guard is belt-and-braces: with a non-unique key a concurrent re-create
 // could otherwise produce a duplicate live row for one outpoint, which is counterfeit.
 //
+// It does not cover two journal rows for the same spend, and that case is real: the pruner's
+// copy-forward commits a carried copy before it detaches the original partition, so for that
+// interval both rows match all three predicates. Both are consumed, which is right, since a
+// copy left behind would be a second authorisation. But the guard reads the pre-statement
+// snapshot, in which the UTXO is absent for both, so both used to insert and one spent output
+// came back as two live ones. The `one` CTE collapses them to one row per UTXO first.
+//
 // $4 carries the flags to OR in, so a caller asking for flagAsLocked gets the UTXO back
 // already locked rather than briefly spendable. IT REACHES BOTH OUTCOMES, the UTXO this call
 // restores and the UTXO it found already live, and the second arm was missing.
@@ -68,6 +75,26 @@ import (
 // access -- and it cannot collide with the INSERT above: every CTE here reads the same
 // pre-statement snapshot, so the rows this arm can see are precisely the ones `restored`
 // excluded itself from touching.
+//
+// THE CONFLICTING BIT IS READ AT RESTORE TIME, never copied off the journal row. The row holds
+// the flags the UTXO had when it was spent, and SetConflicting cannot reach it: it flags a
+// transaction's LIVE UTXOs, and a spent one is not live. So for P -> A -> B with A and B both
+// losing, A's output taken by B comes back from B's journal row carrying whatever A was when B
+// spent it, normally not conflicting, and the driver's closing SetLocked(false) then left it
+// spendable while A was still a loser. The other direction is the same fault: a UTXO spent
+// through IgnoreConflicting while its transaction was conflicting, restored after the mark was
+// cleared, came back refused. $7 is FlagConflicting, and the `cf` LATERAL asks the identity row
+// and every containment row from the dropped floor up, the same three places SetConflicting
+// writes, whether the transaction is conflicting now. A transaction found in none of them keeps
+// the journal's bit, which is what this did before: nothing can mark it, since SetConflicting
+// refuses a transaction it does not hold.
+//
+// The locked bit is still copied off the row, and it can be stale the same way: a winner spends
+// a parent through IgnoreLocked while conflict resolution's hold is on it, so the row records
+// the lock, and a later ReverseProcessConflicting restore brings the parent back locked. The
+// counter's re-spend straight after normally consumes it; when that re-spend is skipped (a
+// counter with no body) the parent stays locked. Deriving the lock needs the lookup floor,
+// because SetLocked leaves containment rows below it stale, and is left for its own change.
 //
 // The restored UTXO's pair is the copy's own, verbatim, whenever it is non-zero: a non-zero
 // pair was final when it was copied and stays final. A copy at (0,0) is the REPAIR's case. The
@@ -95,12 +122,22 @@ taken AS (
     RETURNING j.ukey, j.txid, j.satoshis, j.script, j.created_height,
               j.spendable_from, j.flags, j.hash_override, j.mined_height, j.block_id
 ),
+one AS (
+    -- One row per UTXO, whatever the journal held. Two rows for one spend is the pruner's
+    -- copy-forward window: the carried copy has committed and the original partition is not
+    -- yet detached, so both match and both are consumed above. The NOT EXISTS below cannot
+    -- collapse them, because it reads the same pre-statement snapshot for both. A filled-in
+    -- pair beats an unfilled one, which is the only way the two can differ.
+    SELECT DISTINCT ON (t.ukey, t.txid) t.*
+      FROM taken t
+     ORDER BY t.ukey, t.txid, t.mined_height DESC
+),
 won AS (
     SELECT t.ukey, t.txid, c.n, c.mined_height, c.block_id,
            EXISTS (SELECT 1 FROM tx_ident i
                     WHERE i.leaf = (get_byte(t.txid, 0) & 7)::smallint
                       AND i.txid = t.txid) AS has_ident
-      FROM taken t
+      FROM one t
      CROSS JOIN LATERAL (
        SELECT count(*) AS n, min(m.mined_height) AS mined_height, min(m.block_id) AS block_id
          FROM tx_mined m
@@ -115,13 +152,29 @@ restored AS (
     INSERT INTO utxo (leaf, txid, ukey, satoshis, script, created_height,
                       spendable_from, flags, hash_override, mined_height, block_id)
     SELECT (get_byte(t.txid, 0) & 7)::smallint, t.txid, t.ukey, t.satoshis, t.script,
-           t.created_height, t.spendable_from, t.flags | $4::smallint, t.hash_override,
+           t.created_height, t.spendable_from,
+           CASE WHEN cf.known
+                THEN (t.flags & ~$7::smallint)
+                     | CASE WHEN cf.conflicting THEN $7::smallint ELSE 0::smallint END
+                ELSE t.flags END | $4::smallint,
+           t.hash_override,
            CASE WHEN t.mined_height > 0 THEN t.mined_height
                 WHEN w.n = 1 THEN w.mined_height ELSE 0 END,
            CASE WHEN t.mined_height > 0 THEN t.block_id
                 WHEN w.n = 1 THEN w.block_id ELSE 0 END
-      FROM taken t
+      FROM one t
       LEFT JOIN won w ON w.ukey = t.ukey AND w.txid = t.txid
+     CROSS JOIN LATERAL (
+       SELECT count(*) > 0 AS known, coalesce(bool_or((x.flags & $7::smallint) <> 0), false) AS conflicting
+         FROM (SELECT i.flags FROM tx_ident i
+                WHERE i.leaf = (get_byte(t.txid, 0) & 7)::smallint
+                  AND i.txid = t.txid
+               UNION ALL
+               SELECT m.flags FROM tx_mined m
+                WHERE m.txid = t.txid
+                  AND m.mined_height >= $5::int) AS x
+       OFFSET 0
+     ) AS cf
      WHERE NOT EXISTS (
            SELECT 1 FROM utxo u
             WHERE u.leaf = (get_byte(t.txid, 0) & 7)::smallint
@@ -241,13 +294,15 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	)
 
 	if err := dbTx.QueryRow(ctx, unspendSQL, ukeys, ptxids, stxids, extraFlags,
-		int32(fence.droppedFloor), int32(fence.fence)). //nolint:gosec // heights fit int32
+		int32(fence.droppedFloor), int32(fence.fence), FlagConflicting). //nolint:gosec // heights fit int32
 		Scan(&restored, &requested, &alreadyLive, &repaired, &noSource, &ambiguous, &offending); err != nil {
 		return errors.NewStorageError("[utxoset][Unspend] restore", err)
 	}
 
 	// One bad UTXO fails the whole call, before the commit, so no UTXO of the call is restored
-	// and no undo copy is consumed. That matches how the accounting failure below behaves.
+	// and no undo copy is consumed. The accounting check below runs after the commit and so
+	// does NOT behave this way: what it reports missing was never restored, and what was
+	// restored stays restored.
 	if noSource > 0 || ambiguous > 0 {
 		names := ""
 		if offending != nil {

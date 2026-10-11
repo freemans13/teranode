@@ -102,12 +102,14 @@ const MaxSpendJournalRetentionBlocks = 1440
 // fully-spent parent older than the membership retention still answerable -- see
 // readSpentParents in lookup.go and the spend_journal comment in schema.go. They add no
 // placeholder, because both values come off the deleted row rather than from the caller.
-// $7 is the per-key flag mask, and it is the only placeholder added since.
+// $7 is the per-key flag mask. $8 is the spending input index, which is NOT k.vin: k.vin is the
+// row's position in the batch, used to map RETURNING back to the caller, while $8 is which input
+// of spending_txid took the UTXO, stored so GetSpend can name it.
 const spendJournalSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[],
-                         $5::int[], $6::bytea[], $7::smallint[])
-        AS t(leaf, ukey, txid, vin, spent_height, spending_txid, mask)
+                         $5::int[], $6::bytea[], $7::smallint[], $8::int[])
+        AS t(leaf, ukey, txid, vin, spent_height, spending_txid, mask, spending_vin)
 ),
 del AS (
     DELETE FROM utxo u USING k
@@ -116,15 +118,15 @@ del AS (
        AND u.txid           = k.txid
        AND (u.flags & k.mask) < 1
        AND u.spendable_from <= k.spent_height
-    RETURNING k.vin, k.spent_height, k.spending_txid, u.satoshis, u.created_height,
+    RETURNING k.vin, k.spent_height, k.spending_txid, k.spending_vin, u.satoshis, u.created_height,
               u.spendable_from, u.flags, u.mined_height, u.block_id, u.ukey, u.txid,
               u.script, u.hash_override
 ),
 journal AS (
-    INSERT INTO spend_journal (spent_height, satoshis, created_height, spendable_from,
+    INSERT INTO spend_journal (spent_height, spending_vin, satoshis, created_height, spendable_from,
                            flags, mined_height, block_id, ukey, txid, spending_txid,
                            script, hash_override)
-    SELECT d.spent_height, d.satoshis, d.created_height, d.spendable_from, d.flags,
+    SELECT d.spent_height, d.spending_vin, d.satoshis, d.created_height, d.spendable_from, d.flags,
            d.mined_height, d.block_id, d.ukey, d.txid, d.spending_txid, d.script,
            d.hash_override
       FROM del d
@@ -518,9 +520,9 @@ SELECT txid, tx_inpoints
 // hand Unspend two rows for one spend. It looks only at partitions from $5 up, the ones the
 // copies land in.
 const copyForwardSQL = `
-INSERT INTO spend_journal (spent_height, satoshis, created_height, spendable_from, flags,
+INSERT INTO spend_journal (spent_height, spending_vin, satoshis, created_height, spendable_from, flags,
                            mined_height, block_id, ukey, txid, spending_txid, script, hash_override)
-SELECT $4::int, j.satoshis, j.created_height, j.spendable_from, j.flags,
+SELECT $4::int, j.spending_vin, j.satoshis, j.created_height, j.spendable_from, j.flags,
        CASE WHEN j.mined_height = 0 THEN coalesce(w.h, 0) ELSE j.mined_height END,
        CASE WHEN j.mined_height = 0 THEN coalesce(w.b, 0) ELSE j.block_id END,
        j.ukey, j.txid, j.spending_txid, j.script, j.hash_override

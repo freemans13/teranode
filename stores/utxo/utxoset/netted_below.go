@@ -236,7 +236,7 @@ func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndC
 	}
 
 	items := make([]*netBelowTx, len(txs))
-	spender := make(map[nettedKey][]byte)
+	spender := make(map[nettedKey]nettedSpender)
 
 	for i, tx := range txs {
 		it := &netBelowTx{pos: i, tx: tx, txid: list.TxIDs[i], ident: ident[list.TxIDs[i]]}
@@ -259,7 +259,8 @@ func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndC
 			it.netted[vin] = true
 
 			parent := list.TxIDs[p]
-			spender[newNettedKey(parent[:], Pack(parent[:], in.PreviousTxOutIndex))] = it.txid[:]
+			spender[newNettedKey(parent[:], Pack(parent[:], in.PreviousTxOutIndex))] =
+				nettedSpender{txid: it.txid[:], vin: int32(vin)} //nolint:gosec // an input index fits int32
 		}
 
 		items[i] = it
@@ -382,7 +383,7 @@ INSERT INTO tx_body (created_height, txid, raw_tx)
 SELECT * FROM unnest($1::int[], $2::bytea[], $3::bytea[])`
 
 func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *utxo.SpendAndCreateMultiList,
-	blockHeight uint32, spender map[nettedKey][]byte) error {
+	blockHeight uint32, spender map[nettedKey]nettedSpender) error {
 	createItems := make([]*createItem, len(chunk))
 	for k, it := range chunk {
 		createItems[k] = &createItem{tx: it.tx, blockHeight: blockHeight, options: list.Options.ItemOptions(it.pos)}

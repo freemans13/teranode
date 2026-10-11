@@ -678,3 +678,42 @@ func TestStampCountsAMissingWindowAboveAnExistingOne(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint32(6*288), floors.StampCompleteFloor)
 }
+
+// A page whose slab has no identity row reads nothing from tx_mined. Below the checkpoint every
+// create carries its block and tx_ident is empty, yet each of the 256 pages read the window's
+// tx_mined slab before the identity delete found nothing: on mainnet at height 875,000 on
+// 2026-10-09 that was about 30 GB of reads for each window, to change no row. Rows is the count
+// of tx_mined rows the page read, so a skipped page reports 0.
+func TestStampPageWithNoIdentityRowReadsNoContainmentRows(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 9_000)
+	_, err := s.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	var identRows int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_ident`).Scan(&identRows))
+	require.Zero(t, identRows, "harness check: a create with its block makes no identity row")
+
+	tip := TxMinedPartitionBlocks - 1 + s.stampDepth
+	require.NoError(t, s.SetBlockHeight(tip))
+
+	anc := chainancestrytest.Chain(t, 0, tip, map[uint32]uint32{100: 7})
+
+	drain, _, err := s.OpenDrain(ctx)
+	require.NoError(t, err)
+
+	defer func() { require.NoError(t, drain.Close()) }()
+
+	state, err := drain.BeginWindow(ctx, 0, anc)
+	require.NoError(t, err)
+	require.Equal(t, pruner.StampWindowReady, state)
+
+	page := int(tx.TxIDChainHash()[0])
+	res, err := drain.StampPage(ctx, 0, anc, page)
+	require.NoError(t, err)
+	require.Zero(t, res.Rows, "the page read the window's tx_mined slab with no identity row to stamp")
+	require.Zero(t, res.UTXOs)
+	require.Zero(t, res.Transactions)
+}

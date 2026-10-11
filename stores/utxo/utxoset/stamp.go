@@ -38,8 +38,9 @@ import (
 //
 // The work list is the identity table (decision 2): only a transaction seen before its block can
 // own a UTXO at (0,0). Below the checkpoint every create carries its block, tx_ident is empty,
-// and a window costs one loser scan and one completion record. That is what lets the pruner keep
-// up during sync.
+// and a window costs one loser scan, one identity probe for each page, and one completion record:
+// a page whose slab has no identity row reads nothing from tx_mined (slabHasIdentitySQL). That is
+// what lets the pruner keep up during sync.
 //
 // The page statement lives in ONE place, stampPageSQL, so the page driver can be swapped. This
 // build drives pages by txid slab. The bench measured a heap-order driver 25% faster on writes
@@ -695,6 +696,14 @@ SELECT (SELECT count(*) FROM m),
        (SELECT count(*) FROM w WHERE marker_set),
        (SELECT count(DISTINCT txid) FROM w)`
 
+// slabHasIdentitySQL is true when one page's slab has an identity row: one probe of the
+// identity primary key, (leaf, txid).
+const slabHasIdentitySQL = `
+SELECT EXISTS (
+    SELECT 1 FROM tx_ident i
+     WHERE i.leaf = $3::smallint AND i.txid >= $1::bytea AND i.txid <= $2::bytea
+)`
+
 // suspectsInSlabSQL names the identity rows of one page's slab that have no winner in this
 // window, believe themselves mined (marker NULL), and were first seen before the window. It
 // runs after the page's delete in the same transaction, so a row stamped by this page is gone.
@@ -759,6 +768,33 @@ func (d *stampDrain) StampPage(ctx context.Context, wLo uint32, anc *chainancest
 
 	var res pruner.StampPageResult
 	var distinct int64
+
+	// A slab with no identity row has nothing to stamp, delete or judge, so the page reads
+	// nothing from tx_mined. The check reads the snapshot the page statement would read, so
+	// skipping changes no row the statement would have changed. Below the checkpoint every
+	// create carries its block and tx_ident is empty: on mainnet near height 875,000 the
+	// statement read about 30 GB of tx_mined for each window, to change no row.
+	var hasIdentity bool
+	if err := dbTx.QueryRow(ctx, slabHasIdentitySQL, lo, hi, leaf).Scan(&hasIdentity); err != nil {
+		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] identity check for page %d of window %d", page, wLo, err)
+	}
+
+	if !hasIdentity {
+		if err := dbTx.Commit(ctx); err != nil {
+			return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] commit page %d of window %d", page, wLo, err)
+		}
+
+		stampPages.Inc()
+		stampPagesNoIdentity.Inc()
+
+		if s.stampPageHook != nil {
+			if err := s.stampPageHook(wLo, page); err != nil {
+				return res, err
+			}
+		}
+
+		return res, nil
+	}
 
 	if err := dbTx.QueryRow(ctx, stampPageSQL, lo, hi, leaf, heights, ids, int32(wLo), int32(wHi)). //nolint:gosec // heights fit int32
 													Scan(&res.Rows, &res.Transactions, &res.UTXOs, &res.MarkerSetWinners, &distinct); err != nil {

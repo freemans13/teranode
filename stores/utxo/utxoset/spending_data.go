@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -25,12 +26,16 @@ import (
 // but that prefix is 96 bits and non-unique by design. Without the recheck a prefix collision
 // would name a stranger as the spender of this transaction's UTXO, and the conflict walk would
 // then mark that stranger conflicting along with everything descended from it.
+//
+// The live arm carries the UTXO's flags because a FROZEN output is not answered as unspent: see
+// decorateSpendingData. The journal arm's flags are the spent UTXO's last state and mean nothing
+// here, so it reports 0.
 const spendingDataSQL = `
-SELECT 'live'::text AS kind, u.ukey, NULL::bytea AS spender
+SELECT 'live'::text AS kind, u.ukey, NULL::bytea AS spender, 0::int AS spender_vin, u.flags
   FROM utxo u
  WHERE u.leaf = $1 AND u.ukey BETWEEN $2 AND $3 AND u.txid = $4
 UNION ALL
-SELECT 'spent'::text, j.ukey, j.spending_txid
+SELECT 'spent'::text, j.ukey, j.spending_txid, j.spending_vin, 0::smallint
   FROM spend_journal j
  WHERE j.ukey BETWEEN $2 AND $3 AND j.txid = $4`
 
@@ -83,10 +88,15 @@ func wantsConflictingChildren(fieldNames []fields.FieldName) bool {
 // caller's own range check reports it rather than this silently reporting the output as
 // unspent, which is the answer that would let a double spend through.
 //
-// The input index on each entry is left at zero. The journal does not record which input of the
-// spending transaction consumed the UTXO, and nothing that reads this field uses it: the two
-// places that read an input index take it from the single-outpoint spend lookup instead. It is
-// stated here so a later reader does not mistake the zero for a fact.
+// The input index on each entry is the journal's spending_vin, which input of the spending
+// transaction consumed the UTXO.
+//
+// A FROZEN output gets the frozen sentinel, subtree.FrozenBytesTxHash, as its spender, with the
+// output number as the input index, which is what both reference stores put there. It is not
+// spent, but the shared conflict walk recognises a frozen coin by that sentinel and nothing
+// else: GetConflictingChildren keeps it in the walk's result, and GetCounterConflictingTxHashes
+// refuses to demote a transaction with a frozen descendant on seeing it. Reporting a frozen
+// output as nil, like an unspent one, hid it from both.
 //
 // Bounded by the journal's retention, like every other spender-identity answer in this store.
 // Beyond it a spent output looks the same as one that never existed.
@@ -98,8 +108,10 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 	}
 
 	type entry struct {
-		vout    uint32
-		spender []byte
+		vout       uint32
+		spender    []byte
+		spenderVin int32
+		frozen     bool
 	}
 
 	found := make([]entry, 0, 8)
@@ -107,12 +119,14 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 
 	for rows.Next() {
 		var (
-			kind    string
-			ukey    [16]byte
-			spender []byte
+			kind       string
+			ukey       [16]byte
+			spender    []byte
+			spenderVin int32
+			flags      int16
 		)
 
-		if err := rows.Scan(&kind, &ukey, &spender); err != nil {
+		if err := rows.Scan(&kind, &ukey, &spender, &spenderVin, &flags); err != nil {
 			rows.Close()
 			return errors.NewStorageError("[utxoset][Get] spending data scan %s", hash.String(), err)
 		}
@@ -122,7 +136,8 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 			maxVout = int(vout)
 		}
 
-		found = append(found, entry{vout: vout, spender: spender})
+		found = append(found, entry{vout: vout, spender: spender, spenderVin: spenderVin,
+			frozen: len(spender) == 0 && flags&FlagFrozen != 0})
 	}
 
 	rows.Close()
@@ -138,6 +153,11 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 	out := make([]*spendpkg.SpendingData, maxVout+1)
 
 	for _, e := range found {
+		if e.frozen {
+			out[e.vout] = spendpkg.NewSpendingData(&subtree.FrozenBytesTxHash, int(e.vout))
+			continue
+		}
+
 		if len(e.spender) == 0 {
 			continue // a live UTXO: still unspent, so no entry
 		}
@@ -147,7 +167,7 @@ func (s *Store) decorateSpendingData(ctx context.Context, hash *chainhash.Hash, 
 			return errors.NewStorageError("[utxoset][Get] spender hash %s", hash.String(), herr)
 		}
 
-		out[e.vout] = spendpkg.NewSpendingData(h, 0)
+		out[e.vout] = spendpkg.NewSpendingData(h, int(e.spenderVin))
 	}
 
 	data.SpendingDatas = out

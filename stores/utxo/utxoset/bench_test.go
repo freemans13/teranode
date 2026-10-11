@@ -101,7 +101,7 @@ func benchStore(b *testing.B) (*Store, context.Context) {
 // twice per transaction. Attributing a measured slowdown found that the missing truncate
 // accounted for two thirds of it. A benchmark whose setup leaks state is measuring the leak.
 const truncateAllSQL = `TRUNCATE utxo, tx_ident, tx_body, tx_mined, spend_journal,
-                                 conflict_children, preserved_parent CASCADE`
+                                 conflict_children, preserved_parent, tx_body_carry CASCADE`
 
 // wipe returns the store to empty without dropping the schema, so setup cost stays out of
 // the timed section.

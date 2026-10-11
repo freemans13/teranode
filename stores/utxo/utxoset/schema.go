@@ -56,6 +56,7 @@ import (
 	"fmt"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -222,6 +223,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS spend_journal (
     spent_height    INTEGER  NOT NULL,
+    spending_vin    INTEGER  NOT NULL DEFAULT 0,
     satoshis        BIGINT   NOT NULL,
     created_height  INTEGER  NOT NULL,
     spendable_from  INTEGER  NOT NULL,
@@ -234,6 +236,16 @@ CREATE TABLE IF NOT EXISTS spend_journal (
     script          BYTEA    NOT NULL,
     hash_override   BYTEA
 ) PARTITION BY RANGE (spent_height);
+
+-- spending_vin is WHICH INPUT of spending_txid took the UTXO. GetSpend publishes it through the
+-- asset API, and nothing else in the store can recover it: the inpoints on the spender's
+-- identity row are parent-major and deduplicated, so they do not keep the input order, and the
+-- body is optional and ages out on its own clock.
+--
+-- It sits second so it costs NO bytes: satoshis is 8-aligned, so the four bytes after
+-- spent_height were alignment padding. There is no migration for it, like every other column
+-- here: a database whose journal predates it is refused at startup (assertJournalHasVin) and
+-- needs a fresh sync.
 
 -- ---------------------------------------------------------------------------
 -- CONFLICT BOOKKEEPING. One row per (contested parent, losing child).
@@ -562,6 +574,31 @@ CREATE TABLE IF NOT EXISTS tx_body (
     raw_tx          BYTEA,
     PRIMARY KEY (created_height, txid)
 ) PARTITION BY RANGE (created_height);
+
+-- ---------------------------------------------------------------------------
+-- THE CARRIED BODY. The bytes of a transaction that is still waiting to be mined when its
+-- tx_body window ages out.
+--
+-- A waiting transaction can still be mined, and for a block this node assembled no subtree
+-- data file exists until the block persister builds one from this store's bodies. Dropping
+-- the bytes with the window failed that block for good. SQL and Aerospike keep an unmined
+-- transaction's body for as long as it waits; this table is how this store does the same.
+--
+-- A side table, not a copy into a newer tx_body window, because a body is found by
+-- (created_height, txid) from the identity or containment row, and created_height is
+-- immutable there: a copy under a newer height would be unreachable, and moving the pointer
+-- instead races SetMined, which copies created_height into tx_mined in its own statement.
+--
+-- Keyed by txid alone, so a second carry of the same transaction is a conflict rather than a
+-- second row, and a read is one primary-key probe. The pruner writes it (carryUnminedBodies)
+-- and deletes from it (reclaimCarriedBodies); nothing on the block or validator path does. It
+-- holds the transactions that waited longer than the body horizon, which an ordinary mempool
+-- that keeps up leaves empty. NOT partitioned, for the reasons preserved_parent gives.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tx_body_carry (
+    txid    BYTEA PRIMARY KEY CHECK (length(txid) = 32),
+    raw_tx  BYTEA NOT NULL
+);
 `
 
 // partitionSQL is applied per leaf.
@@ -665,6 +702,46 @@ func CreateSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return assertSchemaShape(ctx, pool)
 }
 
+// spendJournalTablesMissingVinSQL names every spend-journal table that has no spending_vin
+// column and is not a partition: the parent, and any leaf left standalone by a pruner pass
+// interrupted between its DETACH and its DROP. An attached leaf always has its parent's columns.
+// The standalone leaf matters because the next pruner pass copies forward out of it by name,
+// reading spending_vin, so a database that passed on the parent alone would fail on that pass
+// instead of at startup.
+const spendJournalTablesMissingVinSQL = `
+SELECT c.relname
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = current_schema()
+   AND c.relkind IN ('r', 'p')
+   AND c.relname ~ '^spend_journal(_[0-9]+)?$'
+   AND NOT c.relispartition
+   AND NOT EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'spending_vin' AND NOT a.attisdropped)
+ ORDER BY c.relkind DESC, c.relname
+ LIMIT 1`
+
+// assertJournalHasVin refuses a database whose spend journal predates spending_vin. Without
+// the column every spend fails on its journal insert, so the refusal belongs at startup, with a
+// message that says what to do. There is no in-place migration, by the same rule as every other
+// column in this schema.
+func assertJournalHasVin(ctx context.Context, pool *pgxpool.Pool) error {
+	var name string
+
+	err := pool.QueryRow(ctx, spendJournalTablesMissingVinSQL).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+
+	if err != nil {
+		return errors.NewStorageError("[utxoset] check spend_journal for spending_vin", err)
+	}
+
+	return errors.NewConfigurationError(
+		"[utxoset] this database's schema predates spend_journal.spending_vin (%s has no such column); there is no migration by design, so the node needs a fresh sync into a new database",
+		name)
+}
+
 // requiredColumns are the facts that distinguish this schema from the one before it. A
 // database missing any of them cannot serve this binary.
 //
@@ -743,7 +820,7 @@ func assertSchemaShape(ctx context.Context, pool *pgxpool.Pool) error {
 			schemaName(gone.table, gone.column))
 	}
 
-	return nil
+	return assertJournalHasVin(ctx, pool)
 }
 
 // schemaHas reports whether the current schema holds the table, or the column of the table

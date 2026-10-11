@@ -72,6 +72,7 @@ func TestSpendsMadeByStillAnswersOnceTheTransactionHasAgedOut(t *testing.T) {
 	dropped, err := s.dropTxBodyWindowsBelow(ctx, 100_000)
 	require.NoError(t, err)
 	require.Positive(t, dropped)
+	forgetCarriedBodies(t, s, ctx)
 
 	ch := child.TxIDChainHash()
 
