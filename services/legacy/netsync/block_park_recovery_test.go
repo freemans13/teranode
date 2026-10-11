@@ -659,3 +659,67 @@ func TestSyncManager_AnInvalidTransactionVerdictFromTheFullRouteIsAJudgementOnTh
 	require.False(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, time.Second),
 		"a block written off must not be downloaded again while recentlyFailedBlocks names it; that re-ask is the loop this closes")
 }
+
+// Above the last checkpoint no wanted-range pass names a block: blocks are named by
+// announcements and the download ledger. A record dropped because its subtree files are gone was
+// then in neither, and nothing asked for it again until the next block was announced: on
+// 2026-10-10 the chain waited 13 minutes at 970,502 with five children parked. The drop now sends
+// a getblocks from the best block to the peer that delivered it, the re-ask a missing parent
+// already gets, so the peer re-announces the block and the inv path fetches it.
+func TestSyncManager_AParkedRecordWhoseFilesAreGoneIsAskedForAgainAboveTheCheckpoint(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+	h.sm.headersFirstMode.Store(false)
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+
+	require.NoError(t, h.deliver(t, 1))
+	require.Equal(t, 1, h.sm.blockPark.Len())
+
+	record, err := h.sm.blockPark.ReadConverted(h.sm.ctx, child)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees)
+
+	require.NoError(t, h.store.Del(h.sm.ctx, record.Subtrees[0][:], fileformat.FileTypeSubtreeData))
+
+	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
+
+	before := h.rec.getBlocksCount()
+
+	require.NoError(t, h.deliver(t, 0))
+	h.drainOneParkCommit(t)
+
+	require.Zero(t, h.sm.blockPark.Len(), "the record is dropped")
+	require.True(t, WaitUntil(func() bool { return h.rec.getBlocksCount() > before }, 5*time.Second),
+		"above the checkpoint a dropped record must be asked for again at once")
+}
+
+// A second copy of a block that is parked converts over the parked record with an identical one,
+// finds every subtree file already on disk, and so creates none. If the wire layer then refuses that
+// copy, pipelineBlockDelete gets converted=true, reads the record back and used to delete every
+// subtree file it names: the parked copy's files, while the record stayed. The parent's commit then
+// found the files gone and dropped the record, as at 970,503 on 2026-10-10. The files of a block the
+// park holds belong to the parked copy, so the discard removes none of them.
+func TestSyncManager_ARefusedSecondCopyKeepsTheParkedCopysSubtreeFiles(t *testing.T) {
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING, withTransactions(1))
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+
+	require.NoError(t, h.deliver(t, 1))
+	require.True(t, h.sm.blockPark.Has(child))
+
+	record, err := h.sm.blockPark.ReadConverted(h.sm.ctx, child)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Subtrees)
+
+	require.NoError(t, h.sm.pipelineBlockDelete(child, true))
+
+	for _, root := range record.Subtrees {
+		exists, err := h.store.Exists(h.sm.ctx, root[:], fileformat.FileTypeSubtreeToCheck)
+		require.NoError(t, err)
+		require.True(t, exists, "a refused second copy must not delete the parked copy's subtree files")
+
+		exists, err = h.store.Exists(h.sm.ctx, root[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, err)
+		require.True(t, exists, "a refused second copy must not delete the parked copy's data files")
+	}
+}
