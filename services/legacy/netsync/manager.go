@@ -4737,6 +4737,14 @@ func (sm *SyncManager) processBlocksFinalMessage(msg *kafka.KafkaMessage) error 
 	sm.peerNotifier.RelayInventory(wire.NewInvVect(wire.InvTypeBlock, hash), wireBlockHeader)
 	sm.peerNotifier.BlockConnected()
 
+	// Raise the known height of every peer that announced this block, as btcd's handleBlockMsg
+	// does. Without it a peer's height moved only when it announced a block whose header this
+	// node already had, so at the tip startSync could find no peer ahead and nothing re-asked a
+	// block whose park record was dropped (2026-10-10, 13 minutes at 970,502).
+	if height, err := safeconversion.Uint32ToInt32(blockMsg.Height); err == nil && height > 0 {
+		sm.peerNotifier.UpdatePeerHeights(hash, height, nil)
+	}
+
 	return nil
 }
 
