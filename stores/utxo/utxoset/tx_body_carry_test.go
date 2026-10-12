@@ -151,6 +151,36 @@ func TestBodyOfTransactionMinedAheadOfThePersisterSurvivesTheDrop(t *testing.T) 
 	require.NoError(t, archivable(t, s, ctx, tx))
 }
 
+// TestBodyOfTransactionMinedBeforeTheFirstCarrySurvivesTheDrop is the same lag with the
+// pruner's earlier sessions skipped: nothing ran while the transaction waited, so the first
+// carry that sees it runs after it was mined. It was mined in a block the persister has not
+// archived, so its body is still needed, and the carry must copy it because it is not yet
+// archived, whether or not it is still waiting.
+func TestBodyOfTransactionMinedBeforeTheFirstCarrySurvivesTheDrop(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, carryTestHeight)
+	require.NoError(t, err)
+
+	dropAt := uint32(carryTestHeight/TxBodyPartitionBlocks+1)*TxBodyPartitionBlocks + s.bodyRetention
+
+	// Mined above the persister's archived height, which is the height the one session runs at.
+	minedAt := dropAt + 5
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: minedAt, OnLongestChain: true})
+	require.NoError(t, err)
+
+	pruneAt(t, s, ctx, dropAt, minedAt+5)
+
+	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation window is gone")
+	require.NoError(t, archivable(t, s, ctx, tx), "the persister cannot build the subtree data file for the block")
+
+	// Once the persister has archived the block and it is 288 deep, the body goes.
+	pruneAt(t, s, ctx, minedAt+s.bodyRetention, minedAt+s.bodyRetention+1)
+	require.Equal(t, 0, carriedBodies(t, s, ctx))
+}
+
 // TestBodyCarryIsIdempotent pins the crash window between the carry and the drop. The carry
 // commits on its own and the drop comes after it, so a restart there carries the same window
 // again, and a read must still see exactly one body.

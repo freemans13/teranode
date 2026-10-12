@@ -179,10 +179,19 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 	// progress measure at all.
 	sort.Slice(windows, func(i, j int) bool { return windows[i].window < windows[j].window })
 
-	// A drop is due, so carry again unless this pass already did: a transaction un-mined by a
-	// reorg since the window entered the carry band is waiting again and needs its body.
-	if !carried && len(windows) > 0 && windows[0].window < cutoff {
-		if _, err := s.carryBodiesAhead(ctx, height, true); err != nil {
+	if len(windows) > 0 && windows[0].window < cutoff {
+		// A drop is due, so carry the waiting set again unless this pass already did: a
+		// transaction un-mined by a reorg since the window entered the carry band is waiting
+		// again and needs its body.
+		if !carried {
+			if _, err := s.carryBodiesAhead(ctx, height, true); err != nil {
+				return 0, err
+			}
+		}
+
+		// And carry every body the persister has not archived yet, on every pass that drops,
+		// whatever ran before it. See carryUnarchivedBodySQL.
+		if _, err := s.carryUnarchivedBodies(ctx, cutoff*TxBodyPartitionBlocks, height); err != nil {
 			return 0, err
 		}
 	}
@@ -234,14 +243,10 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 // carryBodiesAhead runs carryUnminedBodies for every window that drops within one window of
 // the tip, once per new window, or now when force is set. It reports whether it ran.
 //
-// The bound is measured from the TIP, one window ahead of the drop, and that is what makes it
-// safe against the persister lagging. The drop is measured from the pruner's height, which is
-// the persister's archived height, so a waiting transaction mined in a block the persister
-// has not reached yet has already lost its unmined marker by the time its window drops. A
-// carry that looked only at drop time would let that body go and wedge the persister on the
-// block. Carried while the tip enters the band, the transaction was still waiting, or it was
-// mined at or below that tip, which is at least one window below the height its window
-// drops at, so the persister has archived it by then.
+// The bound is measured from the TIP, one window ahead of the drop. It is not what keeps the
+// body of a transaction mined in a block the persister has not archived: that transaction has
+// lost its unmined marker, and this pass sees it while it waits only if the pruner happened to
+// run then. The drop pass carries those by their block instead (carryUnarchivedBodySQL).
 //
 // The band is entered once per 48 blocks, and that is the only time the unmined set is read
 // for it; the drop pass reads it a second time (see dropTxBodyWindowsBelow).
@@ -311,6 +316,61 @@ func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, er
 
 	if n := tag.RowsAffected(); n > 0 {
 		s.logger.Infof("[utxoset] carried the bodies of %d unmined transactions created below height %d past their window", n, bound)
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+// carryUnarchivedBodySQL copies, into tx_body_carry, the body of every transaction created below
+// $1, a height, that a block above $2 contains. $2 is the pruner's height, the last height the
+// block persister has archived, so these are the transactions whose block the persister has
+// still to archive, and whose body it will read from this store to do it.
+//
+// This is the carry's second predicate, beside carryUnminedBodySQL's "still waiting", and it is
+// the one that does not depend on when the carry runs. The waiting predicate only holds for a
+// transaction carried before it was mined: the tip-ahead pass (carryBodiesAhead) is meant to see
+// it while it waits, but that pass runs only when the pruner does, and a pruner whose sessions
+// were skipped, or that first runs after the mining, finds a mined transaction with its marker
+// already clear. Its window then dropped under it while its block was unarchived, and the
+// persister failed that block for good. "Not yet archived" is a fact about the transaction's
+// block and the persister alone, so a drop pass that applies it carries every body the
+// persister still needs, whatever the pruner did before.
+//
+// It reads only the windows about to drop ($1 is the drop cutoff), and for each of their rows
+// probes tx_mined on its txid-leading primary key for a block above $2, through the fenced
+// LATERAL every by-txid probe of tx_mined takes. A drop pass therefore costs one probe per
+// transaction in the windows it drops, once per window. NOT EXISTS and ON CONFLICT make a
+// repeat after a crash between the carry and the drop copy nothing twice, as for the waiting
+// set. reclaimCarriedBodySQL keeps the copy until the block is 288 blocks below the pruner's
+// height, so it outlives the persister's archive of that block.
+const carryUnarchivedBodySQL = `
+INSERT INTO tx_body_carry (txid, raw_tx)
+SELECT b.txid, b.raw_tx
+  FROM tx_body b
+ CROSS JOIN LATERAL (
+   SELECT 1
+     FROM tx_mined m
+    WHERE m.txid = b.txid
+      AND m.mined_height > $2::int
+    LIMIT 1
+   OFFSET 0
+ ) AS m
+ WHERE b.created_height < $1::int
+   AND b.raw_tx IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM tx_body_carry c WHERE c.txid = b.txid)
+ON CONFLICT (txid) DO NOTHING`
+
+// carryUnarchivedBodies carries the body of every transaction created below bound and contained
+// in a block above archived into tx_body_carry, and returns how many it copied. See
+// carryUnarchivedBodySQL.
+func (s *Store) carryUnarchivedBodies(ctx context.Context, bound, archived uint32) (int64, error) {
+	tag, err := s.pool.Exec(ctx, carryUnarchivedBodySQL, int32(bound), int32(archived)) //nolint:gosec // heights fit int32
+	if err != nil {
+		return 0, errors.NewStorageError("[utxoset] carry bodies of transactions created below height %d and mined above the archived height %d", bound, archived, err)
+	}
+
+	if n := tag.RowsAffected(); n > 0 {
+		s.logger.Infof("[utxoset] carried the bodies of %d transactions created below height %d and mined above the archived height %d past their window", n, bound, archived)
 	}
 
 	return tag.RowsAffected(), nil
