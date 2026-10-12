@@ -62,7 +62,8 @@ func TestARememberedRateIsUsedUntilThePeerIsMeasured(t *testing.T) {
 
 	r.remember(map[string]peerRateRecord{known.Addr(): {BPS: 40_000_000, At: time.Now()}})
 
-	require.InDelta(t, 40_000_000.0, r.peerRate(known), 1)
+	// Relative: the remembered rate is discounted by its age, see the decay test below.
+	require.InEpsilon(t, 40_000_000.0, r.peerRate(known), 0.001)
 	require.Zero(t, r.peerRate(unknown))
 
 	r.rates[known] = 3_000_000
@@ -110,7 +111,10 @@ func TestARememberedRateDecaysWhileThePeerIsSilent(t *testing.T) {
 	p := newTestPeer(t, "10.0.0.1:8333")
 	r.remember(map[string]peerRateRecord{p.Addr(): {BPS: 40_000_000, At: time.Now()}})
 
-	require.InDelta(t, 40_000_000.0, r.peerRate(p), 1)
+	// Relative, not absolute: the rate is discounted by its age (half-life one hour), so an
+	// absolute tolerance of 1 B/s held only if this read came within about 0.13 ms of the
+	// record, which a loaded CI runner does not guarantee. 0.1% allows about five seconds.
+	require.InEpsilon(t, 40_000_000.0, r.peerRate(p), 0.001)
 
 	now := time.Now()
 	r.decayQuiet(now, map[*peerpkg.Peer]time.Time{p: now.Add(-30 * time.Minute)})
