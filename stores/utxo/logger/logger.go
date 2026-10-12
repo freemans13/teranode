@@ -38,13 +38,16 @@ type Store struct {
 // New creates a new logging wrapper around the provided UTXO store.
 // All operations on the returned store will be logged with detailed information
 // including method names, parameters, return values, and execution times.
+//
+// The returned wrapper also offers every optional capability of the wrapped store that a
+// caller finds by type assertion (see capabilities.go), and only those.
 func New(ctx context.Context, logger ulogger.Logger, store utxo.Store) utxo.Store {
 	s := &Store{
 		logger: logger,
 		store:  store,
 	}
 
-	return s
+	return withCapabilities(s, store)
 }
 
 func caller() string {

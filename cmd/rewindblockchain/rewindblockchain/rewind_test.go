@@ -27,6 +27,7 @@ import (
 	blockchainsql "github.com/bsv-blockchain/teranode/stores/blockchain/sql"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxofields "github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	storelogger "github.com/bsv-blockchain/teranode/stores/utxo/logger"
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -1730,4 +1731,47 @@ func TestRewindBlockchain_RefusesToExposeAStampedHeight(t *testing.T) {
 	t.Run("accepted at the boundary", func(t *testing.T) {
 		require.NoError(t, run(t, 191))
 	})
+}
+
+// fullStamperUTXOStore is stampedUTXOStore with the rest of pruner.Stamper, which is the whole
+// interface the utxoset store implements. A rewind never opens a drain, so it is refused.
+type fullStamperUTXOStore struct {
+	stampedUTXOStore
+}
+
+func (fullStamperUTXOStore) WindowBlocks() uint32 { return 96 }
+
+func (fullStamperUTXOStore) OpenDrain(context.Context) (pruner.StampDrain, pruner.StampFloors, error) {
+	return nil, pruner.StampFloors{}, errors.NewProcessingError("a rewind never opens a stamp drain")
+}
+
+// TestRewindBlockchain_RefusesToExposeAStampedHeightThroughTheLoggingWrapper: a store opened with
+// logging=true reaches the tool wrapped in stores/utxo/logger. The wrapper must still offer the
+// stamp boundary, or the preflight cannot see it and lets a prohibited target through.
+func TestRewindBlockchain_RefusesToExposeAStampedHeightThroughTheLoggingWrapper(t *testing.T) {
+	const chainHeight = 200
+
+	ctx := context.Background()
+	bcStore, utxoStore, subtreeStore, tSettings := newTestStores(t, ctx)
+
+	bits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+	buildLinearChain(t, ctx, bcStore, chainHeight, bits, tSettings.ChainCfgParams.GenesisHash)
+	require.NoError(t, bcStore.SetFSMState(ctx, "IDLE"))
+
+	wrapped := storelogger.New(ctx, logger(), fullStamperUTXOStore{stampedUTXOStore{Store: utxoStore, fence: 96, depth: 96}})
+
+	_, err = Rewind(ctx, logger(), tSettings, Options{
+		TargetHeight: 190,
+		DryRun:       true,
+		AssumeYes:    true,
+		ForceDeep:    true,
+		Stores: &Stores{
+			Blockchain: bcStore,
+			UTXO:       wrapped,
+			Subtree:    subtreeStore,
+		},
+	})
+	require.Error(t, err, "the logging wrapper hid the stamp boundary from the preflight")
+	require.Contains(t, err.Error(), "lowest safe target is 191")
 }
