@@ -266,6 +266,7 @@ The download gauges and the `download_*_total` counters are published from the 3
 | `teranode_legacy_netsync_handle_block_direct` | Histogram | The time taken to commit a converted block (HandleConvertedBlock); the name predates the converted-record route |
 | `teranode_legacy_netsync_process_block` | Histogram | The time taken to process a block |
 | `teranode_legacy_netsync_orphans` | Gauge | The number of orphan transactions |
+| `teranode_legacy_netsync_orphans_abandoned_total` | Counter | Orphan transactions dropped for good: evicted from the orphan pool and still invalid on the final validation attempt |
 | `teranode_legacy_netsync_orphan_time` | Histogram | The time taken to process an orphan transaction |
 | `teranode_legacy_netsync_parked_blocks` | Gauge | The number of downloaded blocks held on disk waiting for their parent |
 | `teranode_legacy_netsync_parked_bytes` | Gauge | Bytes the park bills for the blocks it holds: a block parked off the wire at its wire size, a block recovered from disk after a restart at its converted record's size; `bytes_ahead` is what the backstop reads |
