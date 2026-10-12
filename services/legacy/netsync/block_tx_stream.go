@@ -195,7 +195,7 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 
 		// Corrupt, not invalid: the transaction ids, and so the header, match the block whatever
 		// the encoding, so the refusal is about this delivery, not the block.
-		if stderrors.Is(err, txstream.ErrExtendedForm) {
+		if stderrors.As(err, new(txstream.ExtendedFormError)) {
 			return nil, nil, 0, errors.NewBlockCorruptError("[blockTxStream] transaction %d of the %d declared is in the extended form, which a block on the wire never carries", s.read, s.txCount)
 		}
 

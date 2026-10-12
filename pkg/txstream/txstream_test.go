@@ -155,6 +155,6 @@ func TestStandardOnlyRefusesTheExtendedForm(t *testing.T) {
 		called = true
 		return nil, nil
 	}})
-	require.ErrorIs(t, err, ErrExtendedForm)
+	require.ErrorAs(t, err, new(ExtendedFormError))
 	require.False(t, called, "refused before any output is read")
 }
