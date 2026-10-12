@@ -24,13 +24,15 @@ const (
 	MultiTxCreated
 	// MultiTxExisted means a record for the transaction already existed. Nothing
 	// was written to it, and its children in the list spend it as an outside
-	// parent.
+	// parent. For a WithBelowCheckpoint list its inputs were spent again; see
+	// writeCreateThenSpend.
 	MultiTxExisted
 	// MultiTxFailed means the transaction's SpendAndCreate failed; Err says why,
 	// and Spends is what SpendAndCreate returned alongside the error.
 	MultiTxFailed
 	// MultiTxParentFailed means the transaction was not written, because a parent
-	// earlier in the list failed.
+	// earlier in the list failed. For a WithBelowCheckpoint list its record may
+	// exist, though its inputs were not spent; see writeCreateThenSpend.
 	MultiTxParentFailed
 )
 
