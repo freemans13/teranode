@@ -410,7 +410,13 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // copy of the block can convert after this copy's sink returned and before
 // this verdict arrived. When two wait, this function cannot tell which copy it
 // was called for, and it deletes nothing at all, the record included, rather
-// than risk the copy about to be accepted. Without a waiting writer (a record
+// than risk the copy about to be accepted. If both copies are then refused,
+// the record stays on disk, and a restart's park recovery picks it up; its
+// subtree files may have reached their delete-at-height by then, and the
+// commit's completeness check drops the record so the block is downloaded
+// again (FilesGone). A copy accepted and not yet parked counts as parked
+// (acceptanceQueued), so a refusal of the other copy in that gap keeps the
+// accepted copy's record too. Without a waiting writer (a record
 // not written by this process's sink just now) it falls back to the record:
 // ReadConverted hands back the subtrees the record names, and a file a writer
 // is writing or holds is skipped.
@@ -471,8 +477,10 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 		return nil
 	}
 
-	if sm.blockPark.Has(hash) || sm.blockPark.HandedOut(hash) {
-		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked block; keeping the parked copy's subtree files", hash)
+	// A copy accepted but not yet parked (acceptanceQueued) counts as parked: the record under the
+	// hash is the accepted copy's.
+	if sm.blockPark.Has(hash) || sm.blockPark.HandedOut(hash) || sm.acceptancePending(hash) {
+		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked or accepted block; keeping the other copy's subtree files", hash)
 
 		if writer != nil {
 			writer.finish()

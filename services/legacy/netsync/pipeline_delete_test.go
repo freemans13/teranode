@@ -380,3 +380,52 @@ func TestPipelineBlockDelete_DoesNotTouchAnotherDeliverysSubtreeFiles(t *testing
 		}
 	}
 }
+
+// Two copies of one block convert through the real sink, one after the other, so two writers
+// wait for verdicts (the second copy is admitted as soon as the first copy's sink returns). The
+// first copy is accepted and queued for the consumer; before the consumer parks it, the other
+// copy is refused. That refusal finds one writer, so it is not ambiguous, and the park does not
+// know the block yet. It must still keep the record and the subtree files, which the accepted
+// copy needs: the accepted-but-unparked copy counts as parked.
+func TestPipelineBlockDelete_ARefusalBeforeTheAcceptedCopyIsParkedKeepsTheRecord(t *testing.T) {
+	ctx := t.Context()
+
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.msgChan = make(chan interface{}, 4)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+
+	for range 2 {
+		converted, err := sm.pipelineBlockSink(hash, &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
+		require.NoError(t, err)
+		require.True(t, converted)
+	}
+
+	require.Equal(t, 2, waitingFor(sm, hash), "sanity: both copies' writers wait for verdicts")
+
+	record, err := sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err)
+
+	sm.QueueBlockOnDisk(peerpkg.BlockBody{Hash: hash, Converted: true}, nil)
+	require.Equal(t, 1, waitingFor(sm, hash), "the accepted copy is settled")
+	require.False(t, sm.blockPark.Has(hash), "sanity: the consumer has not parked it yet")
+
+	require.NoError(t, sm.pipelineBlockDelete(hash, true))
+
+	_, err = sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err, "the accepted copy's record survives the other copy's refusal")
+
+	for _, root := range record.Subtrees {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+			exists, existsErr := store.Exists(ctx, root[:], ft)
+			require.NoError(t, existsErr)
+			require.True(t, exists, "and so does its %s for subtree %s", ft, root)
+		}
+	}
+
+	require.Zero(t, waitingFor(sm, hash), "the refused copy's writer is settled")
+}

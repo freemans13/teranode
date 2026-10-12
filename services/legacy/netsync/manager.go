@@ -646,6 +646,10 @@ type SyncManager struct {
 	// the park sweep as a backstop. Guarded by settlingMu; see holdUntilSettled.
 	settlingMu sync.Mutex
 	settling   map[chainhash.Hash][]settlingWriter
+	// accepting records, per hash, when each accepted copy was queued and not yet handled by
+	// handleBlockOnDiskMsg; pipelineBlockDelete treats such a block as parked. Guarded by
+	// settlingMu.
+	accepting map[chainhash.Hash][]time.Time
 
 	ctx          context.Context
 	logger       ulogger.Logger

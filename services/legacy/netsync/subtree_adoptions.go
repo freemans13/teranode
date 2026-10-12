@@ -257,10 +257,61 @@ func (sm *SyncManager) settleAccepted(hash chainhash.Hash) {
 	oldest.finish()
 }
 
-// settleStale finishes every writer that has waited longer than settleBackstop.
+// acceptanceQueued records that an accepted copy of hash is on its way to handleBlockOnDiskMsg.
+// Until that handler has run, the park does not know the block, yet the record under the hash
+// is the accepted copy's: a refusal of another copy that lands in between must not delete it.
+func (sm *SyncManager) acceptanceQueued(hash chainhash.Hash) {
+	sm.settlingMu.Lock()
+	defer sm.settlingMu.Unlock()
+
+	if sm.accepting == nil {
+		sm.accepting = make(map[chainhash.Hash][]time.Time)
+	}
+
+	sm.accepting[hash] = append(sm.accepting[hash], time.Now())
+}
+
+// acceptanceHandled clears one acceptanceQueued mark once handleBlockOnDiskMsg is done with it.
+func (sm *SyncManager) acceptanceHandled(hash chainhash.Hash) {
+	sm.settlingMu.Lock()
+	defer sm.settlingMu.Unlock()
+
+	if marks := sm.accepting[hash]; len(marks) > 1 {
+		sm.accepting[hash] = marks[1:]
+	} else {
+		delete(sm.accepting, hash)
+	}
+}
+
+// acceptancePending reports whether an accepted copy of hash is queued and not yet handled.
+func (sm *SyncManager) acceptancePending(hash chainhash.Hash) bool {
+	sm.settlingMu.Lock()
+	defer sm.settlingMu.Unlock()
+
+	return len(sm.accepting[hash]) > 0
+}
+
+// settleStale finishes every writer that has waited longer than settleBackstop, and drops
+// acceptance marks as old, whose message was never handled (a shutdown, say).
 func (sm *SyncManager) settleStale(now time.Time) {
 	sm.settlingMu.Lock()
 	defer sm.settlingMu.Unlock()
+
+	for hash, marks := range sm.accepting {
+		kept := marks[:0]
+
+		for _, at := range marks {
+			if now.Sub(at) < settleBackstop {
+				kept = append(kept, at)
+			}
+		}
+
+		if len(kept) == 0 {
+			delete(sm.accepting, hash)
+		} else {
+			sm.accepting[hash] = kept
+		}
+	}
 
 	for hash, waiting := range sm.settling {
 		kept := waiting[:0]

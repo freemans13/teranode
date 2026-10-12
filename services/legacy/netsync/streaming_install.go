@@ -484,6 +484,13 @@ func (sm *SyncManager) QueueBlockOnDisk(body peerpkg.BlockBody, peer *peerpkg.Pe
 		return
 	}
 
+	// Until the consumer parks it, the block is known only by this message, so a refusal of
+	// another copy of it must keep the record (pipelineBlockDelete); handleBlockOnDiskMsg
+	// clears the mark.
+	if body.Converted {
+		sm.acceptanceQueued(body.Hash)
+	}
+
 	sm.msgChan <- &blockOnDiskMsg{body: body, peer: peer}
 }
 
@@ -501,6 +508,12 @@ func (sm *SyncManager) QueueBlockOnDisk(body peerpkg.BlockBody, peer *peerpkg.Pe
 func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	if msg == nil {
 		return
+	}
+
+	// QueueBlockOnDisk's mark: by the time this returns the park holds the block or this
+	// handler chose to drop it.
+	if msg.body.Converted {
+		defer sm.acceptanceHandled(msg.body.Hash)
 	}
 
 	// Every block arrives on this on-disk route, so this is where the download
