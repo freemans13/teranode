@@ -7,6 +7,7 @@ import (
 
 	subtree "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // SpendJournalPartitionBlocks is the width of one journal leaf. The pruner drops whole leaves,
@@ -499,6 +500,33 @@ SELECT txid, tx_inpoints
   FROM tx_ident
  WHERE off_chain_since IS NOT NULL`
 
+// recentlyMinedInpointsSQL reads, with its inputs, every transaction contained in a block at or
+// above $1 that was first written below $2, the lowest height the journal keeps.
+//
+// These are the spenders a reorg can still take back: their block is inside the journal's
+// retention, so un-mining it and then giving the spender's coins back needs the journal rows of
+// their spends. Their spends sit below $2, in the partition about to drop. The waiting set's
+// copy does not see them, because mining cleared their marker.
+//
+// The created_height test rests on one assumption, stated here because nothing enforces it: a
+// spend is journaled at the height of the call that spends, and the spender's identity row at
+// the height of the call that creates it, and the second is never above the first. SpendAndCreate
+// takes one height for both, which is the validator's path, and a create-only followed by a
+// spend-only spends at the same or a later tip. A spender whose spend was journaled below $2 and
+// whose identity was first written at or above $2 (a spend and its create split across a
+// partition boundary, the create retried a partition later) is not found here, and a reorg of
+// its block within retention could not give its coins back.
+//
+// tx_mined is RANGE partitioned on mined_height, so only the windows at or above $1 are read: the
+// containment rows of the last retention's worth of blocks, once per journal partition drop.
+// created_height is the identity row's, copied at record-mined, so a transaction seen before its
+// block keeps the height it spent at.
+const recentlyMinedInpointsSQL = `
+SELECT m.txid, m.tx_inpoints
+  FROM tx_mined m
+ WHERE m.mined_height >= $1::int
+   AND m.created_height < $2::int`
+
 // copyForwardSQL copies the named spends out of one retiring partition into the live journal,
 // re-stamped to $4 so they land in a partition that is not about to drop.
 //
@@ -544,6 +572,70 @@ SELECT $4::int, j.spending_vin, j.satoshis, j.created_height, j.spendable_from, 
 // copyForwardBatch bounds one statement's arrays.
 const copyForwardBatch = 10_000
 
+// copyForwardSet is the (parent output, spender) list the copy-forward probes the retiring
+// partition for, each spender listed once however many of the reads name it.
+type copyForwardSet struct {
+	ukeys, parents, spenders [][]byte
+	seen                     map[string]struct{}
+}
+
+// collectSpenders runs stmt, whose rows are a spender's txid and its packed inputs, and adds
+// every input of every spender not already in c. A spender with no inputs recorded is counted
+// and logged, because its spends cannot be carried.
+func (s *Store) collectSpenders(ctx context.Context, c *copyForwardSet, what, stmt string, args ...any) error {
+	rows, err := s.pool.Query(ctx, stmt, args...)
+	if err != nil {
+		return errors.NewStorageError("[utxoset] list %s transactions for the journal copy-forward", what, err)
+	}
+
+	defer rows.Close()
+
+	noInpoints := 0
+
+	for rows.Next() {
+		var txid, raw []byte
+
+		if err := rows.Scan(&txid, &raw); err != nil {
+			return errors.NewStorageError("[utxoset] scan %s transaction for the journal copy-forward", what, err)
+		}
+
+		if _, dup := c.seen[string(txid)]; dup {
+			continue
+		}
+
+		c.seen[string(txid)] = struct{}{}
+
+		if len(raw) == 0 {
+			noInpoints++
+			continue
+		}
+
+		ip, err := subtree.NewTxInpointsFromBytes(raw)
+		if err != nil {
+			return errors.NewStorageError("[utxoset] decode inputs of %s transaction %x for the journal copy-forward", what, txid, err)
+		}
+
+		for _, in := range ip.GetTxInpoints() {
+			k := Pack(in.Hash[:], in.Index)
+			parent := in.Hash
+
+			c.ukeys = append(c.ukeys, k[:])
+			c.parents = append(c.parents, parent[:])
+			c.spenders = append(c.spenders, txid)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset] list %s transactions for the journal copy-forward", what, err)
+	}
+
+	if noInpoints > 0 {
+		s.logger.Warnf("[utxoset] journal copy-forward: %d %s transactions carry no inputs, so their spends cannot be carried forward", noInpoints, what)
+	}
+
+	return nil
+}
+
 // copyForwardUnminedSpends carries forward, from the journal partition for leaf, every spend
 // whose spending transaction is still waiting to be mined, and returns how many rows it copied.
 // keepFrom is the lowest height the pass keeps; copies are stamped at the store's height, or
@@ -559,54 +651,32 @@ const copyForwardBatch = 10_000
 //
 // Recognising a resubmitted transaction does not need these rows: the validator answers that
 // from the transaction's own txid (Validator.knownTxResubmission).
+//
+// The spends of a transaction mined at or above keepFrom are carried too (see
+// recentlyMinedInpointsSQL). Retention is kept by the height the spender was mined at, not the
+// height it spent at: a spender that waited across the partition's top and was then mined has
+// its block inside the journal's retention, and a shallow reorg that takes the block back and
+// then gives its coins back needs these rows exactly as a waiting spender's loss does. The copy
+// lands at the store's height, so it is kept for another retention's worth of blocks and then
+// goes, once its block is below keepFrom. Below the highest checkpoint no block can be un-mined,
+// so nothing mined there is carried.
 func (s *Store) copyForwardUnminedSpends(ctx context.Context, leaf, keepFrom uint32) (int64, error) {
-	rows, err := s.pool.Query(ctx, unminedInpointsSQL)
-	if err != nil {
-		return 0, errors.NewStorageError("[utxoset] list unmined transactions for the journal copy-forward", err)
+	c := &copyForwardSet{seen: make(map[string]struct{})}
+
+	if err := s.collectSpenders(ctx, c, "unmined", unminedInpointsSQL); err != nil {
+		return 0, err
 	}
 
-	var ukeys, parents, spenders [][]byte
+	// A block at or below the highest checkpoint is never un-mined (unMine refuses it), so the
+	// read starts above it. During a sync below the checkpoint it reads no window at all.
+	minedFrom := max(keepFrom, model.HighestCheckpointHeight(s.checkpoints)+1)
 
-	noInpoints := 0
-
-	for rows.Next() {
-		var txid, raw []byte
-
-		if err := rows.Scan(&txid, &raw); err != nil {
-			rows.Close()
-			return 0, errors.NewStorageError("[utxoset] scan unmined transaction for the journal copy-forward", err)
-		}
-
-		if len(raw) == 0 {
-			noInpoints++
-			continue
-		}
-
-		ip, err := subtree.NewTxInpointsFromBytes(raw)
-		if err != nil {
-			rows.Close()
-			return 0, errors.NewStorageError("[utxoset] decode inputs of unmined transaction %x for the journal copy-forward", txid, err)
-		}
-
-		for _, in := range ip.GetTxInpoints() {
-			k := Pack(in.Hash[:], in.Index)
-			parent := in.Hash
-
-			ukeys = append(ukeys, k[:])
-			parents = append(parents, parent[:])
-			spenders = append(spenders, txid)
-		}
+	if err := s.collectSpenders(ctx, c, "recently mined", recentlyMinedInpointsSQL,
+		int32(minedFrom), int32(keepFrom)); err != nil { //nolint:gosec // heights fit int32
+		return 0, err
 	}
 
-	rows.Close()
-
-	if err := rows.Err(); err != nil {
-		return 0, errors.NewStorageError("[utxoset] list unmined transactions for the journal copy-forward", err)
-	}
-
-	if noInpoints > 0 {
-		s.logger.Warnf("[utxoset] journal copy-forward: %d unmined transactions carry no inputs, so their spends cannot be carried forward", noInpoints)
-	}
+	ukeys, parents, spenders := c.ukeys, c.parents, c.spenders
 
 	if len(ukeys) == 0 {
 		return 0, nil

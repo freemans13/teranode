@@ -66,6 +66,47 @@ func TestJournalDropCarriesForwardSpendsOfUnminedTransactions(t *testing.T) {
 	require.Equal(t, 1, utxoCount(t, s, ctx, parent), "the carried row rebuilds the coin")
 }
 
+// TestJournalKeepsTheSpendsOfARecentlyMinedTransaction is the review's reproduction: spend at
+// 1151, mine at 1439, prune at 1440. The spend sits in the partition covering 864-1151, which a
+// pruner session at 1440 drops (1440 less 288 retention is 1152). The spender is no longer
+// waiting, so the waiting set's copy skips it, but its block is one deep, and a shallow reorg
+// that takes the block back and then gives the spender's coin back needs that row. Undo history
+// has to be kept by the height the spender was mined at, not the height it spent at.
+func TestJournalKeepsTheSpendsOfARecentlyMinedTransaction(t *testing.T) {
+	s, ctx := newUncheckpointedStore(t)
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 1_000, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 1_000, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	spender := spendOneOutput(t, s, ctx, parent, 0, 1_151)
+
+	mined := utxo.MinedBlockInfo{BlockID: 2, BlockHeight: 1_439, OnLongestChain: true}
+	_, err = s.SetMinedMulti(ctx, hashes(spender), mined)
+	require.NoError(t, err)
+
+	require.NoError(t, s.SetBlockHeight(1_440))
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	_, err = svc.Prune(ctx, 1_440, "deadbeef")
+	require.NoError(t, err)
+
+	require.Equal(t, 1, journalRowsFor(t, s, ctx, parent, 0), "the spend of a transaction mined one block ago was dropped")
+
+	// The shallow reorg: block 2 is taken back, and the spender then gives its coin back.
+	mined.UnsetMined = true
+	_, err = s.SetMinedMulti(ctx, hashes(spender), mined)
+	require.NoError(t, err)
+
+	spends, err := utxo.GetSpends(spender)
+	require.NoError(t, err)
+	require.NoError(t, s.Unspend(ctx, spends))
+	require.Equal(t, 2, utxoCount(t, s, ctx, parent), "the reorg could not restore the parent's output")
+}
+
 // TestJournalCopyForwardIsIdempotent pins the crash window between the copy and the drop. The
 // copy commits on its own, so a restart there copies the same partition again on the next
 // pass, and that must not leave two rows: Unspend consumes one row per restore.
