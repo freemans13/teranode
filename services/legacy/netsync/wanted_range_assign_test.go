@@ -500,15 +500,20 @@ func TestABlockWithTwoQuietOwnersIsAskedOfAnotherPeer(t *testing.T) {
 	}, 5*time.Second), "the third peer is asked for the block both owners stopped sending")
 }
 
-// The download pass skips a block with one active owner before its disk check and its blockchain
-// call: below the checkpoint such a block is the watcher's, and each pass made both for each block
-// owed longer than the retry window (review of 2026-10-09).
+// The download pass skips a block with one active owner that is still sending before its disk
+// check and its blockchain call: below the checkpoint such a block is the watcher's, and each pass
+// made both for each block owed longer than the retry window (review of 2026-10-09). A silent
+// single owner is re-asked instead (TestASilentSingleOwnerIsReAskedBelowTheCheckpoint).
 func TestAnOwedBlockMakesNoBlockchainCallBelowTheCheckpoint(t *testing.T) {
 	sm := assignManager(t, 1, 20)
 	mockCommittedTip(t, sm, 10, 0)
 
 	sm.settings.Legacy.BlockDownloadWindow = 1024
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 20
+
+	if sm.streams == nil {
+		sm.streams = newStreamRegistry()
+	}
 
 	owner, _ := schedulerPeer(t, sm, 1, 1020)
 	wireStreamingPath(sm, owner)
@@ -519,6 +524,11 @@ func TestAnOwedBlockMakesNoBlockchainCallBelowTheCheckpoint(t *testing.T) {
 	sm.blockDownloads.now = func() time.Time { return time.Now().Add(-5 * time.Minute) }
 	require.True(t, sm.blockDownloads.Add(owner, next))
 	sm.blockDownloads.now = time.Now
+
+	// The owner is busy: it sent block bytes a moment ago.
+	sm.streams.mu.Lock()
+	sm.streams.lastBlock[owner] = time.Now()
+	sm.streams.mu.Unlock()
 
 	sm.assignWantedBlocks()
 
