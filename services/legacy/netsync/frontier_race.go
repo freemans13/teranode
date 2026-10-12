@@ -226,6 +226,9 @@ type raceHistory struct {
 	dropped time.Time
 	// reasked is each owner asked for this block again after it was forgiven, and when.
 	reasked map[*peerpkg.Peer]time.Time
+	// spared is when the race first left this block's stalling copies connected because this
+	// node was backpressured, or zero (backpressureSpares).
+	spared time.Time
 }
 
 // newest is when the newest extra copy was asked for, or zero.
@@ -995,7 +998,11 @@ func (r *streamRegistry) expireRacesLocked(now time.Time) {
 			}
 		}
 
-		if len(hist.asked) == 0 && hist.dropped.IsZero() && len(hist.reasked) == 0 {
+		if !hist.spared.IsZero() && now.Sub(hist.spared) > raceExpiry {
+			hist.spared = time.Time{}
+		}
+
+		if len(hist.asked) == 0 && hist.dropped.IsZero() && len(hist.reasked) == 0 && hist.spared.IsZero() {
 			delete(r.raced, h)
 		}
 	}
@@ -1251,6 +1258,37 @@ func (sm *SyncManager) decayQuietRates(now time.Time) {
 	sm.streams.decayQuiet(now, owedSince)
 }
 
+// raceBackpressureGrace is how long the race leaves a block's stalling copies connected because
+// this node is backpressured, from the first time it does.
+const raceBackpressureGrace = 5 * time.Minute
+
+// backpressureSpares reports whether h's stalling copies are left connected because this node is
+// backpressured: while localReadBackpressured holds, for at most raceBackpressureGrace from the
+// first time they were spared, within raceExpiry.
+func (sm *SyncManager) backpressureSpares(h chainhash.Hash, now time.Time) bool {
+	if !sm.localReadBackpressured() {
+		return false
+	}
+
+	return sm.streams.spare(h, now)
+}
+
+// spare records that h's stalling copies were spared at now, unless they already were, and
+// reports whether that was less than raceBackpressureGrace ago.
+func (r *streamRegistry) spare(h chainhash.Hash, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.expireRacesLocked(now)
+
+	hist := r.historyLocked(h)
+	if hist.spared.IsZero() {
+		hist.spared = now
+	}
+
+	return now.Sub(hist.spared) < raceBackpressureGrace
+}
+
 // maybeRaceSlowBlock asks a second peer for the block the chain is about to wait on, if one is
 // arriving from a slow peer. The committed tip is read here, outside any lock.
 func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
@@ -1277,9 +1315,12 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 	// Nobody is dropped while this node is backpressured: a read loop waits for an admission slot
 	// (localReadBackpressured, the signal the peer stall detector reads), so the slow bytes are
 	// this node's. Only that signal is measured today. A slow disk with admission slots still
-	// free does not raise it; the history bound above is what limits the cost then.
+	// free does not raise it; the history bound above is what limits the cost then. The
+	// exemption lasts raceBackpressureGrace for each block: during sync with every slot full
+	// the signal holds almost all the time, and a staller at the copy cap was never dropped
+	// (backpressureSpares).
 	asked, droppedRecently := sm.streams.raceCost(s.hash, now)
-	mayDrop := !droppedRecently && !sm.localReadBackpressured()
+	mayDrop := !droppedRecently && !sm.backpressureSpares(s.hash, now)
 
 	// At the cap no extra copy is asked for, but each stalling copy is still dropped, as SV Node's
 	// DetectStalling drops a staller whatever its parallel fetch count (net_processing.cpp:5446-5466).
