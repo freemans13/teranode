@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -76,6 +77,89 @@ func TestWatchHelpsABlockItsOwnerPassedOver(t *testing.T) {
 
 	require.True(t, sm.blockDownloads.HasOwner(fast, next), "the passed-over block gets a helper")
 	require.True(t, sm.blockDownloads.HasOwner(owner, next), "and the owner keeps its request")
+}
+
+// A block with a forgiven owner that sends nothing and one active owner is still judged. The
+// owner count included the forgiven owner, so once a block had one the watcher never judged it
+// again (review of 2026-10-12).
+func TestWatchJudgesABlockWhoseOtherOwnerWasLetOff(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	letOff, _ := schedulerPeer(t, sm, 3, 2000)
+	now := time.Now()
+
+	for _, h := range []int32{13, 14, 15, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
+	}
+
+	next := heightHash(t, sm, 11)
+	askAt(t, sm, letOff, next, now.Add(-5*time.Minute))
+
+	// Let only the earlier owner off: forgive both, then put the slow owner back on the hook.
+	sm.blockDownloads.ForgiveOwners(next, blockRequestRetryInterval)
+
+	sm.blockDownloads.now = func() time.Time { return now.Add(-2 * time.Minute) }
+	require.True(t, sm.blockDownloads.ReassertOwner(owner, next))
+	sm.blockDownloads.now = time.Now
+
+	active, _ := sm.blockDownloads.ActiveOwners(next)
+	require.Equal(t, []*peerpkg.Peer{owner}, active, "harness check: one active owner, one let off")
+
+	sm.watchOwedBlocks(now)
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "the slow active owner's block gets a helper")
+}
+
+// The watcher shares the race's cap on extra copies of a block over raceExpiry. It checked only
+// the live owner count and wasRaced's 30 s, so a helper that disconnected, leaving the ledger,
+// let it ask a new one every 30 s (review of 2026-10-12).
+func TestWatchKeepsTheRaceCapOnExtraCopies(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	for _, h := range []int32{13, 14, 15, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
+	}
+
+	next := heightHash(t, sm, 11)
+
+	// Two extra copies were asked a minute ago, and both helpers have since gone.
+	for range maxBlockCopies - 1 {
+		sm.streams.markRaced(next, now.Add(-time.Minute))
+	}
+
+	sm.watchOwedBlocks(now)
+
+	require.False(t, sm.blockDownloads.HasOwner(fast, next), "the cap is spent for raceExpiry")
+}
+
+// The watcher asks under assignMu, so a download pass never asks for a block beside it. It ran
+// without the lock (review of 2026-10-12).
+func TestWatchAsksOnlyBetweenDownloadPasses(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	for _, h := range []int32{13, 14, 15, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
+	}
+
+	next := heightHash(t, sm, 11)
+
+	sm.assignMu.Lock()
+
+	done := make(chan struct{})
+
+	go func() {
+		sm.watchOwedBlocks(now)
+		close(done)
+	}()
+
+	require.Never(t, func() bool { return sm.blockDownloads.HasOwner(fast, next) }, 300*time.Millisecond, 10*time.Millisecond,
+		"no helper is asked while a pass holds assignMu")
+
+	sm.assignMu.Unlock()
+	<-done
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "and it is asked once the pass is done")
 }
 
 // The ledger's passed-over mark: a peer that delivered a block asked after h, while it still

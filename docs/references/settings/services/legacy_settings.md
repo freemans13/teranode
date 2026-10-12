@@ -176,8 +176,9 @@ context), and `${LEGACY_GRPC_PORT}` is `8099`.
   the block, at the recent mean size, in half the owner's time. A copy with more
   than half its bytes gets no extra request unless it will take more than 5
   minutes, and a block whose every copy arrives under 100 KB/s is left to the
-  race, with no block above it counted as late. A block gets one such extra
-  request. There is no setting for it; the metric is
+  race, with no block above it counted as late. A block is judged while it has
+  one live copy, and the watcher and the race together ask for at most two extra
+  copies of a block in 10 minutes. There is no setting for it; the metric is
   `teranode_legacy_netsync_frontier_races_total`.
 - `MultiPeerBlockDownload` set to false keeps the pass but gives every block to
   the sync peer, bounded by the block-size ladder alone.

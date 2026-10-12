@@ -29,7 +29,9 @@ import (
 // A block whose every copy is stalled is the race's; no block above it counts as late until it is
 // resolved, since the chain waits on it whatever lands above.
 // The owner keeps its request and its connection; the first complete copy converts and the other
-// drains at the sink. One block gets one more getdata at the maximum. Headers-first mode only: the
+// drains at the sink. A block is judged only while it has one live copy, and gets no more than the
+// race's cap of extra getdatas (maxBlockCopies-1) in raceExpiry, counted with the race's. It runs
+// under assignMu, so no download pass asks for a block beside it. Headers-first mode only: the
 // heights come from the header cache, which is empty above the last checkpoint.
 //
 // It replaces the rescue rule, which examined only the lowest owed block, 30 s after its getdata,
@@ -118,6 +120,11 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 		return
 	}
 
+	// One asker at a time: a download pass that ran beside the watcher could find the same late
+	// block and ask a peer for it too, as two passes once did (assignWantedBlocks).
+	sm.assignMu.Lock()
+	defer sm.assignMu.Unlock()
+
 	queues := sm.blockDownloads.Queues()
 	used := make(map[*peerpkg.Peer]bool)
 
@@ -176,11 +183,26 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 		adds := eta - latest
 		latest = max(latest, eta)
 
-		if adds < watchMinETA || len(owners) != 1 || sm.streams.wasRaced(b.rec.hash, now) {
+		if adds < watchMinETA || sm.streams.wasRaced(b.rec.hash, now) {
 			continue
 		}
 
-		owner := owners[0]
+		// One live copy: an owner not let off the block, or one let off that still sends it. A
+		// forgiven owner sending nothing used to count, and once a block had one the watcher never
+		// judged it again (review of 2026-10-12).
+		live := sm.liveCopies(b.rec.hash, owners)
+		if len(live) != 1 {
+			continue
+		}
+
+		// The race's cap on extra copies, by the block's history over raceExpiry rather than by
+		// who owes it now: a helper that disconnects leaves the ledger, and the watcher then asked
+		// a new one every 30 s (review of 2026-10-12).
+		if asked, _ := sm.streams.raceCost(b.rec.hash, now); asked >= maxBlockCopies-1 {
+			continue
+		}
+
+		owner := live[0]
 
 		// A copy with more than half its bytes gets no helper while it lands within
 		// watchPastHalfWait: the helper must send the full block, and the owner's nearly complete
