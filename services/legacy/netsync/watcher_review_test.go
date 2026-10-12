@@ -134,7 +134,9 @@ func TestWatchKeepsTheRaceCapOnExtraCopies(t *testing.T) {
 }
 
 // The watcher asks under assignMu, so a download pass never asks for a block beside it. It ran
-// without the lock (review of 2026-10-12).
+// without the lock (review of 2026-10-12). It takes the lock with TryLock and skips the tick
+// while a pass holds it, because it runs on the frontier-race ticker and waiting out a slow
+// pass would stop everything else on that ticker too (review of 2026-10-12, 16:58).
 func TestWatchAsksOnlyBetweenDownloadPasses(t *testing.T) {
 	sm, owner, fast, _ := reaskSetup(t)
 	now := time.Now()
@@ -154,13 +156,20 @@ func TestWatchAsksOnlyBetweenDownloadPasses(t *testing.T) {
 		close(done)
 	}()
 
-	require.Never(t, func() bool { return sm.blockDownloads.HasOwner(fast, next) }, 300*time.Millisecond, 10*time.Millisecond,
-		"no helper is asked while a pass holds assignMu")
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		sm.assignMu.Unlock()
+		t.Fatal("the watcher must skip the tick while a pass holds assignMu, not wait for the pass")
+	}
+
+	require.False(t, sm.blockDownloads.HasOwner(fast, next), "no helper is asked while a pass holds assignMu")
 
 	sm.assignMu.Unlock()
-	<-done
 
-	require.True(t, sm.blockDownloads.HasOwner(fast, next), "and it is asked once the pass is done")
+	sm.watchOwedBlocks(now)
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "and the next tick asks once the pass is done")
 }
 
 // A copy whose bytes have all arrived and that this node is still converting is this node's

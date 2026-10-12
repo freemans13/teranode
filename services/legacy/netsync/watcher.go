@@ -121,8 +121,14 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 	}
 
 	// One asker at a time: a download pass that ran beside the watcher could find the same late
-	// block and ask a peer for it too, as two passes once did (assignWantedBlocks).
-	sm.assignMu.Lock()
+	// block and ask a peer for it too, as two passes once did (assignWantedBlocks). TryLock, not
+	// Lock: this runs on the frontier-race ticker, and a pass can take minutes (assignWantedBlocks
+	// records ten), during which waiting here would also stop stream sampling, rate decay, the
+	// stall drops and the rates-file save. A tick that finds a pass running is skipped; the next
+	// one, raceCheckInterval later, tries again.
+	if !sm.assignMu.TryLock() {
+		return
+	}
 	defer sm.assignMu.Unlock()
 
 	queues := sm.blockDownloads.Queues()
