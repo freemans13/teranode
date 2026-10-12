@@ -70,6 +70,118 @@ UPDATE tx_ident i
  WHERE i.leaf = $1::smallint
    AND i.txid = ANY($2::bytea[])`
 
+// releaseIdentLockSQL clears the locked bit of every listed identity row that still has it, and
+// returns the transactions it released. Same key shape as clearMarkerSQL. A row already
+// unlocked, which is every row once the two-phase-commit release has run, matches nothing and
+// is not written.
+const releaseIdentLockSQL = `
+UPDATE tx_ident i
+   SET flags = i.flags & ~$3::smallint
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])
+   AND (i.flags & $3::smallint) <> 0
+RETURNING i.txid`
+
+// releaseMinedLockSQL does the same for containment rows at or above the lookup floor, for a
+// transaction that has no identity row: a block-path create below the checkpoint is written
+// with its block and, from quick validation, locked, and a retry of that block reaches it
+// through SetMinedMulti. The probe is the txid-leading primary key behind a fenced LATERAL, the
+// shape every by-txid probe of tx_mined takes.
+const releaseMinedLockSQL = `
+WITH hit AS (
+    SELECT c.txid, c.mined_height, c.block_id
+      FROM unnest($1::bytea[]) AS k(txid)
+     CROSS JOIN LATERAL (
+       SELECT m.txid, m.mined_height, m.block_id
+         FROM tx_mined m
+        WHERE m.txid = k.txid
+          AND m.mined_height >= $3::int
+          AND (m.flags & $2::smallint) <> 0
+       OFFSET 0
+     ) AS c
+)
+UPDATE tx_mined m
+   SET flags = m.flags & ~$2::smallint
+  FROM hit
+ WHERE m.txid = hit.txid
+   AND m.mined_height = hit.mined_height
+   AND m.block_id = hit.block_id
+RETURNING m.txid`
+
+// releaseLocksOnMine releases the lock of every listed transaction that a block now contains,
+// on its identity row and its containment rows, and returns the transactions it released.
+//
+// TX_LOCKED has one producer on the spend path, the locked bit on the UTXO row
+// (classifyPlanMisses), and the metadata reads take it from the identity row or a containment
+// row. The bit is set by a locked create and by SetLocked, and the two-phase-commit release
+// clears it. When that release never runs, the transaction used to stay locked through its
+// mining, so every child spending it was refused with TX_LOCKED while the mine took the
+// transaction out of unmined recovery, the one path left that would have released it. Both
+// reference stores release the lock in setMined, on and off the longest chain: the sql store
+// sets locked = false, and the aerospike UDF clears the bin. This store does the same, in the
+// mine's own transaction, so a reader never sees a transaction contained in a block and still
+// locked. The UTXO rows follow in releaseUTXOLocks.
+func releaseLocksOnMine(ctx context.Context, q querier, txids [][]byte, floor int32) ([][]byte, error) {
+	seen := make(map[chainhash.Hash]struct{})
+
+	var released [][]byte
+
+	add := func(hs []chainhash.Hash) {
+		for _, h := range hs {
+			if _, dup := seen[h]; dup {
+				continue
+			}
+
+			seen[h] = struct{}{}
+			released = append(released, h[:])
+		}
+	}
+
+	for _, g := range leafGroups(txids) {
+		hs, err := queryTxids(ctx, q, releaseIdentLockSQL, g.leaf, g.txids, FlagLocked)
+		if err != nil {
+			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] release identity lock", err)
+		}
+
+		add(hs)
+	}
+
+	hs, err := queryTxids(ctx, q, releaseMinedLockSQL, txids, FlagLocked, floor)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] release containment lock", err)
+	}
+
+	add(hs)
+
+	return released, nil
+}
+
+// releaseUTXOLocks clears the locked bit on the UTXOs of the transactions releaseLocksOnMine
+// released, through setLockedSQL, which also covers every containment row they have at or above
+// the floor, including the one this mine inserted. Nothing is run when nothing was locked, so a
+// block whose transactions were all released by the two-phase commit pays no UTXO probe.
+func releaseUTXOLocks(ctx context.Context, q querier, txids [][]byte, floor int32) error {
+	if len(txids) == 0 {
+		return nil
+	}
+
+	leaves := make([]int16, 0, len(txids))
+	los := make([][16]byte, 0, len(txids))
+	his := make([][16]byte, 0, len(txids))
+
+	for _, txid := range txids {
+		leaves = append(leaves, LeafFor(txid))
+		los = append(los, Pack(txid, 0))
+		his = append(his, Pack(txid, ^uint32(0)))
+	}
+
+	if _, err := q.Exec(ctx, setLockedSQL, leaves, txids, los, his, false, FlagLocked, floor); err != nil {
+		return errors.NewStorageError("[utxoset][SetMinedMulti] release UTXO lock", err)
+	}
+
+	return nil
+}
+
 // unMineSQL is the un-mine: a POINT DELETE on the full containment key, for the one block the
 // caller has stopped believing in. It cannot reach another block's row, so a transaction that
 // is also contained in a sibling block keeps that sibling's row, and a transaction the caller
@@ -291,6 +403,12 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 
 	floor := s.lookupFloor()
 
+	// The lock goes first, so the containment rows inserted below copy an unlocked payload.
+	released, err := releaseLocksOnMine(ctx, dbTx, txids, floor)
+	if err != nil {
+		return false, err
+	}
+
 	for _, g := range leafGroups(txids) {
 		if insert {
 			if _, err := dbTx.Exec(ctx, recordMinedSQL, g.leaf, g.txids,
@@ -306,6 +424,10 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 		if _, err := dbTx.Exec(ctx, clearMarkerSQL, g.leaf, g.txids); err != nil {
 			return false, errors.NewStorageError("[utxoset][SetMinedMulti] clear marker", err)
 		}
+	}
+
+	if err := releaseUTXOLocks(ctx, dbTx, released, floor); err != nil {
+		return false, err
 	}
 
 	if err := dbTx.Commit(ctx); err != nil {
