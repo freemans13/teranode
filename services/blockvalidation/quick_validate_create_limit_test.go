@@ -32,4 +32,28 @@ func TestQuickValidateCreateLimit(t *testing.T) {
 
 		require.Equal(t, 50*8, quickValidateCreateLimit(bv, store))
 	})
+
+	// At the default batch size of 2048 and 64 batcher workers the product is 131,072 callers
+	// per wave, each a goroutine holding a transaction, and quick validation runs two waves at
+	// once. The derived value stops at the ceiling (review of 2026-10-12).
+	t.Run("derived value is capped at the ceiling", func(t *testing.T) {
+		bv := &settings.BlockValidationSettings{QuickValidateCreateConcurrency: 0}
+		store := &settings.UtxoStoreSettings{StoreBatcherSize: 2048, BatcherMaxConcurrent: 64}
+
+		require.Equal(t, quickValidateDerivedCreateCeiling, quickValidateCreateLimit(bv, store))
+	})
+
+	t.Run("the ceiling never goes below the 8x floor", func(t *testing.T) {
+		bv := &settings.BlockValidationSettings{QuickValidateCreateConcurrency: 0}
+		store := &settings.UtxoStoreSettings{StoreBatcherSize: 4096, BatcherMaxConcurrent: 64}
+
+		require.Equal(t, 4096*8, quickValidateCreateLimit(bv, store))
+	})
+
+	t.Run("an explicit setting is not capped", func(t *testing.T) {
+		bv := &settings.BlockValidationSettings{QuickValidateCreateConcurrency: 100_000}
+		store := &settings.UtxoStoreSettings{StoreBatcherSize: 2048, BatcherMaxConcurrent: 64}
+
+		require.Equal(t, 100_000, quickValidateCreateLimit(bv, store))
+	})
 }

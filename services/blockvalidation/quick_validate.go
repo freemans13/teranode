@@ -2193,12 +2193,20 @@ func (u *BlockValidation) processSubtreeBatch(
 // can have a full batch of callers queued behind it, floored at
 // StoreBatcherSize * 8 for a store whose BatcherMaxConcurrent is 0 (unbounded
 // workers) — the flat multiplier the derivation replaces.
+//
+// The derived value is capped at quickValidateDerivedCreateCeiling, unless the
+// floor is higher. Each caller is a goroutine holding a transaction, and at the
+// default batch size of 2048 and 64 batcher workers the product is 131,072
+// callers per wave, two waves at once, against 16,384 on main. The cap keeps
+// the gain this derivation was for, more callers on a store with a small batch
+// size, and never goes below the floor, so no store gets fewer callers than the
+// flat multiplier gave it.
 func quickValidateCreateLimit(bv *settings.BlockValidationSettings, store *settings.UtxoStoreSettings) int {
 	if bv.QuickValidateCreateConcurrency > 0 {
 		return bv.QuickValidateCreateConcurrency
 	}
 
-	derived := store.StoreBatcherSize * store.BatcherMaxConcurrent
+	derived := min(store.StoreBatcherSize*store.BatcherMaxConcurrent, quickValidateDerivedCreateCeiling)
 	floor := store.StoreBatcherSize * 8
 
 	if derived > floor {
@@ -2207,6 +2215,10 @@ func quickValidateCreateLimit(bv *settings.BlockValidationSettings, store *setti
 
 	return floor
 }
+
+// quickValidateDerivedCreateCeiling bounds the derived per-wave caller count:
+// the flat 8x multiplier's value at the default batch size of 2048.
+const quickValidateDerivedCreateCeiling = 16384
 
 // createAndSpendUTXOsForBatch creates and spends UTXOs for all transactions in a batch.
 // This is used by quick validation for checkpoint-verified blocks.
