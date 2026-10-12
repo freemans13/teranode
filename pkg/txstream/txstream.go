@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	stderrors "errors"
 	"hash"
 	"io"
 
@@ -27,6 +28,10 @@ import (
 // extendedMarker follows the version in an extended transaction. go-bt reads it as an input count of
 // zero, an output count of zero and a lock time whose big-endian value is 0xEF, and so does this.
 var extendedMarker = []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0xEF}
+
+// ErrExtendedForm is returned by Next, with Options.StandardOnly set, for a transaction in the
+// extended form. It is a plain sentinel, matched with the standard library's errors.Is.
+var ErrExtendedForm = stderrors.New("transaction is in the extended form")
 
 // maxScriptAlloc is the largest script this reader will allocate, the same bound go-bt applies.
 const maxScriptAlloc = bt.MaxArenaAlloc
@@ -50,6 +55,10 @@ type Options struct {
 	// applies while there is such a writer, since otherwise the bytes would be lost. Such an output
 	// can never be spent, and at recent heights these scripts are most of a block's bytes.
 	SkipDataScripts bool
+	// StandardOnly refuses a transaction in the extended form with ErrExtendedForm, as soon as
+	// its marker is read. A block on the wire carries the standard form only: SV Node reads the
+	// marker as an input count of zero and rejects the transaction.
+	StandardOnly bool
 }
 
 // Reader reads transactions one after another from one stream.
@@ -120,6 +129,10 @@ func (t *Reader) Next(opts Options) (*bt.Tx, *chainhash.Hash, int64, error) {
 
 	extended := false
 	if marker, err := t.src.Peek(len(extendedMarker)); err == nil && bytes.Equal(marker, extendedMarker) {
+		if opts.StandardOnly {
+			return nil, nil, 0, ErrExtendedForm
+		}
+
 		if _, err = t.src.Discard(len(extendedMarker)); err != nil {
 			return nil, nil, 0, unexpected(err)
 		}

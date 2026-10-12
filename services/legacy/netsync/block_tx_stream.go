@@ -164,7 +164,10 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 		sink     *errRecordingWriter
 	)
 
-	opts := txstream.Options{SkipDataScripts: true}
+	// StandardOnly: an id is defined over the standard form, so an extended copy of a valid block
+	// still matches its header, but SV Node rejects the encoding, and the previous outputs it
+	// carries would land in the .subtreeData file.
+	opts := txstream.Options{SkipDataScripts: true, StandardOnly: true}
 	if beforeOutputs != nil {
 		opts.BeforeOutputs = func(tx *bt.Tx) (io.Writer, error) {
 			w, err := beforeOutputs(tx)
@@ -188,6 +191,12 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 	if err != nil {
 		if localErr != nil {
 			return nil, nil, 0, localErr
+		}
+
+		// Corrupt, not invalid: the transaction ids, and so the header, match the block whatever
+		// the encoding, so the refusal is about this delivery, not the block.
+		if stderrors.Is(err, txstream.ErrExtendedForm) {
+			return nil, nil, 0, errors.NewBlockCorruptError("[blockTxStream] transaction %d of the %d declared is in the extended form, which a block on the wire never carries", s.read, s.txCount)
 		}
 
 		if sink != nil && sink.err != nil {
