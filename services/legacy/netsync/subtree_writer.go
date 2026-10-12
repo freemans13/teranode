@@ -70,9 +70,13 @@ type subtreeWriter struct {
 	// block adopted is never deleted by its creator's cleanup, nor the reverse. Nil gives the
 	// writer a registry of its own (tests that build one writer alone).
 	adoptions *subtreeAdoptions
-	// adopted is every file this writer found already published and relies on. Its marks
-	// stay in adoptions until DeleteAll, which a block that commits never calls.
+	// adopted is every file this writer found already published while a creator of it was
+	// still converting, so it holds the file against that creator's cleanup. DeleteAll gives
+	// the holds back; otherwise they end when the last such creator finishes.
 	adopted []writtenSubtree
+	// live is every file this writer created, until finish closes its window: while it is
+	// open, a writer that adopts one of them holds it.
+	live []writtenSubtree
 	// pending holds each subtree's data file while the builder streams transactions
 	// into it, by subtree index. Its name is the subtree root hash, which is unknown
 	// until the subtree is complete, so it is written under a temporary name and
@@ -214,16 +218,16 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 			delete(w.pending, index)
 
 			key := writtenSubtree{Hash: *root, FileType: fileformat.FileTypeSubtreeData}
-			w.registry().mark(key)
+			w.registry().attempt(key)
 
 			switch err = file.Commit(ctx, root[:], options.WithDeleteAt(w.deleteAt()), options.WithExclusivePublish()); {
 			case err == nil:
 				w.created(key)
 			case errors.Is(err, errors.ErrBlobAlreadyExists):
 				// Another block's file: Commit has discarded ours, and theirs is left alone.
-				w.adopted = append(w.adopted, key)
+				w.adopt(key)
 			default:
-				w.registry().unmark(key)
+				w.registry().abandoned(key)
 				return errors.NewStorageError("[subtreeWriter][%s] failed committing %s", root, fileformat.FileTypeSubtreeData, err)
 			}
 		} else {
@@ -235,18 +239,18 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 
 		for _, artefact := range artefacts {
 			key := writtenSubtree{Hash: *root, FileType: artefact.fileType}
-			w.registry().mark(key)
+			w.registry().attempt(key)
 
 			created, putErr := w.put(ctx, *root, artefact.fileType, artefact.write)
 			if putErr != nil {
-				w.registry().unmark(key)
+				w.registry().abandoned(key)
 				return putErr
 			}
 
 			if created {
 				w.created(key)
 			} else {
-				w.adopted = append(w.adopted, key)
+				w.adopt(key)
 			}
 		}
 
@@ -263,11 +267,30 @@ func (w *subtreeWriter) registry() *subtreeAdoptions {
 	return w.adoptions
 }
 
-// created records key as this writer's own and drops the mark taken before writing it: the
-// writer is the file's creator, so only its own DeleteAll may remove it.
+// created records key as this writer's own, and opens its window as the file's live creator.
 func (w *subtreeWriter) created(key writtenSubtree) {
 	w.written = append(w.written, key)
-	w.registry().unmark(key)
+	w.live = append(w.live, key)
+	w.registry().created(key)
+}
+
+// adopt records that key was already published, keeping the hold the registry gives while a
+// creator of it is still converting.
+func (w *subtreeWriter) adopt(key writtenSubtree) {
+	if w.registry().adopted(key) {
+		w.adopted = append(w.adopted, key)
+	}
+}
+
+// finish closes this writer's window on every file it created: its conversion is over, so it
+// will not delete them, and a hold another writer took against it is no longer needed.
+// pipelineBlockSink defers it; it is safe to call more than once.
+func (w *subtreeWriter) finish() {
+	for _, key := range w.live {
+		w.registry().finished(key)
+	}
+
+	w.live = w.live[:0]
 }
 
 // writeBytes is an artefact already serialised, written as it is.
@@ -344,7 +367,8 @@ func (w *subtreeWriter) deleteAt() uint32 {
 // alone, because another block may reference them (see writtenSubtree). So are files this
 // writer created that another writer has since adopted, which may belong to a block that has
 // already committed (see subtreeAdoptions); they are left to their delete-at-height. The
-// marks this writer took as an adopter are dropped, since its record will not be read.
+// holds this writer took as an adopter are given back, since its record will not be read, and
+// its window as a creator closes.
 func (w *subtreeWriter) DeleteAll(ctx context.Context) error {
 	var firstErr error
 
@@ -356,12 +380,14 @@ func (w *subtreeWriter) DeleteAll(ctx context.Context) error {
 
 	reg := w.registry()
 
-	// This writer's own adopter marks go first, so they never shield a file from itself.
+	// This writer's own holds go first, so they never shield a file from itself.
 	for _, entry := range w.adopted {
-		reg.unmark(entry)
+		reg.release(entry)
 	}
 
 	w.adopted = w.adopted[:0]
+
+	defer w.finish()
 
 	for _, entry := range w.written {
 		left, err := reg.deleteUnlessAdopted(ctx, w.store, entry)

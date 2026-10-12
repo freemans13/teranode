@@ -158,7 +158,10 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	}
 
 	// One registry for every conversion, so no block's cleanup removes a file another adopted.
+	// The writer's window as a creator closes when this conversion is over, whatever the
+	// outcome: from then on nothing of this copy deletes a file it created.
 	writer.adoptions = sm.subtreeAdoptionsFor()
+	defer writer.finish()
 
 	var (
 		root          *chainhash.Hash
@@ -453,7 +456,11 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 	case err == nil && record != nil:
 		for _, root := range record.Subtrees {
 			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtree} {
-				// A file another block adopted stays, as in subtreeWriter.DeleteAll.
+				// A file a writer is writing or holds stays, as in subtreeWriter.DeleteAll. This
+				// runs after the sink's writer has finished, so it sees only holds taken against
+				// creators still converting; that is the most a deleter of a whole record can
+				// check, and the sink's own length check keeps a converted copy from reaching
+				// here at all.
 				delErr := sm.deleteSubtreeFileUnlessAdopted(*root, ft)
 				if delErr != nil && !errors.Is(delErr, errors.ErrNotFound) && firstErr == nil {
 					firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
