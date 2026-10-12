@@ -22,8 +22,46 @@ func TestARejectedBodyDropsAPeerThatStoppedReading(t *testing.T) {
 		return false, terrors.NewBlockInvalidError("merkle root does not match header's", terrors.ErrBlockBodyMismatch)
 	}
 
+	// Every write either peer starts must end before the test returns, or its goroutine is
+	// still reading go-wire's package state when the next test (FuzzReadWireMessage) sets it.
+	// Each peer queues a protoconf 10 ms after the handshake, the sender answers each ping with
+	// a pong, and the reject is written to a sender that has stopped reading. So the test waits
+	// for both protoconfs before it starts, for both pongs before the block (the receiver stops
+	// reading after it), and for the reject's write to end, failed by the disconnect.
+	rejectWritten := make(chan struct{}, 1)
+	protoconfs := make(chan struct{}, 2)
+	pongs := make(chan struct{}, 2)
+
 	sender, receiver, pings := blockStreamingPairWithSink(t, func(chainhash.Hash, *wire.BlockHeader, uint64) error { return nil },
-		refusingSink, peer.MessageListeners{})
+		refusingSink, peer.MessageListeners{
+			OnWrite: func(_ *peer.Peer, _ int, msg wire.Message, _ error) {
+				switch msg.(type) {
+				case *wire.MsgReject:
+					select {
+					case rejectWritten <- struct{}{}:
+					default:
+					}
+				case *wire.MsgProtoconf:
+					select {
+					case protoconfs <- struct{}{}:
+					default:
+					}
+				case *wire.MsgPong:
+					select {
+					case pongs <- struct{}{}:
+					default:
+					}
+				}
+			},
+		})
+
+	for range 2 {
+		select {
+		case <-protoconfs:
+		case <-time.After(2 * time.Second):
+			t.Fatal("a peer never wrote its protoconf")
+		}
+	}
 
 	// The ping listener hands each ping to a channel that holds one, so the second ping leaves
 	// the sender's read loop stuck in the listener: it reads nothing more until the test drains
@@ -48,6 +86,14 @@ func TestARejectedBodyDropsAPeerThatStoppedReading(t *testing.T) {
 		}
 	}
 
+	for range 2 {
+		select {
+		case <-pongs:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the sender never answered a ping")
+		}
+	}
+
 	sender.QueueMessage(streamingTestBlock(), nil)
 
 	done := make(chan struct{})
@@ -66,4 +112,10 @@ func TestARejectedBodyDropsAPeerThatStoppedReading(t *testing.T) {
 	}
 
 	require.Less(t, time.Since(start), 10*time.Second)
+
+	select {
+	case <-rejectWritten:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hung reject write never ended after the disconnect")
+	}
 }
