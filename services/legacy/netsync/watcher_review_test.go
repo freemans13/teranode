@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,4 +52,52 @@ func TestWatchSaysOnceThatItHasNoBlockSize(t *testing.T) {
 	sm.blockSizeTracker.addBlockSize(reaskTypicalBlock)
 	sm.watchOwedBlocks(now.Add(10 * time.Second))
 	require.False(t, sm.watchNoSizeLogged.Load(), "cleared once a size is known, so a later episode is said again")
+}
+
+// A fast owner that ignored one getdata entry and delivered the blocks asked after it has passed
+// the block over. Its queue estimate stayed at a typical block at its rate, under watchMinETA,
+// and any block it delivered kept its deadline and rate up, so nothing helped the block until the
+// ledger's TTL (review of 2026-10-12). The watcher counts it as one the owner will not deliver.
+func TestWatchHelpsABlockItsOwnerPassedOver(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	sm.streams.rates[owner] = 80_000_000
+	sm.streams.rates[fast] = 200_000_000
+
+	next := heightHash(t, sm, 11)
+	later := heightHash(t, sm, 12)
+
+	askAt(t, sm, owner, next, now.Add(-2*time.Minute))
+	askAt(t, sm, owner, later, now.Add(-2*time.Minute))
+	sm.blockDownloads.Delivered(owner, later)
+
+	sm.watchOwedBlocks(now)
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "the passed-over block gets a helper")
+	require.True(t, sm.blockDownloads.HasOwner(owner, next), "and the owner keeps its request")
+}
+
+// The ledger's passed-over mark: a peer that delivered a block asked after h, while it still
+// owes h, passed h over. A block asked after the delivered one is not passed over, and the mark
+// goes with the peer.
+func TestTheLedgerKnowsABlockAPeerPassedOver(t *testing.T) {
+	ledger := newBlockDownloadTracker(time.Hour)
+	p := newTestPeer(t, "10.0.0.1:8333")
+
+	first, second, third := chainhash.Hash{1}, chainhash.Hash{2}, chainhash.Hash{3}
+
+	require.True(t, ledger.Add(p, first))
+	require.True(t, ledger.Add(p, second))
+	require.False(t, ledger.PassedOver(p, first), "nothing delivered yet")
+
+	ledger.Delivered(p, second)
+	require.False(t, ledger.HasOwner(p, second), "a delivered block is discharged")
+	require.True(t, ledger.PassedOver(p, first), "second was asked after first and came first")
+
+	require.True(t, ledger.Add(p, third))
+	require.False(t, ledger.PassedOver(p, third), "asked after the delivered block")
+
+	ledger.ClearPeer(p)
+	require.False(t, ledger.PassedOver(p, first))
 }

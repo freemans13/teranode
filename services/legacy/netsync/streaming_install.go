@@ -548,7 +548,9 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		_, primary, _ = sm.peerStateResolvingPrimary(msg.peer)
 	}
 
-	sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
+	// Delivered, not RemoveOwner: the ledger remembers where in the peer's queue this request
+	// was, so a block asked of the peer earlier and not sent reads as passed over.
+	sm.blockDownloads.Delivered(primary, msg.body.Hash)
 
 	// The delivering peer has room again, so ask it for more now. Only a commit
 	// used to, and while download is the limit blocks arrive out of order and

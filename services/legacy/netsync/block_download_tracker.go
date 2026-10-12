@@ -140,6 +140,10 @@ type blockDownloadTracker struct {
 	lastSweep time.Time
 	// seq is the last request sequence number handed out; see ownerRecord.seq.
 	seq uint64
+	// delivered is, for each peer, the highest seq of a request the peer has delivered
+	// (Delivered). A peer answers getdata in the order it was asked, so a record of its with a
+	// lower seq that it still owes was passed over (PassedOver).
+	delivered map[*peerpkg.Peer]uint64
 }
 
 // blockRequestAssignmentCeiling is how long a peer stays on the hook for a block
@@ -466,6 +470,50 @@ func (t *blockDownloadTracker) RemoveOwner(p *peerpkg.Peer, h chainhash.Hash) {
 	t.removeOwnerLocked(p, h)
 }
 
+// Delivered discharges p's request for h because p delivered the block, and remembers the
+// request's place in p's queue for PassedOver. A request the ledger no longer holds changes
+// nothing.
+func (t *blockDownloadTracker) Delivered(p *peerpkg.Peer, h chainhash.Hash) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if rec, ok := t.byHash[h][p]; ok {
+		if t.delivered == nil {
+			t.delivered = make(map[*peerpkg.Peer]uint64)
+		}
+
+		if rec.seq > t.delivered[p] {
+			t.delivered[p] = rec.seq
+		}
+	}
+
+	t.removeOwnerLocked(p, h)
+}
+
+// PassedOver reports whether p still owes h, unforgiven, and has delivered a block it was asked
+// for after h. A peer answers getdata in the order it was asked (SV Node's ProcessGetData), so it
+// skipped h: it is still sending, but not this block, and its bytes say nothing about h. Whether
+// h is arriving from p now is the caller's to check.
+func (t *blockDownloadTracker) PassedOver(p *peerpkg.Peer, h chainhash.Hash) bool {
+	if t == nil {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	rec, ok := t.byHash[h][p]
+	if !ok || rec.forgiven || t.expiredAt(rec.at, t.clock(), t.ttl) {
+		return false
+	}
+
+	return t.delivered[p] > rec.seq
+}
+
 // CountForPeer returns how many blocks this peer still owes us, ignoring
 // assignments that have aged out. This feeds the per-peer in-flight budget, so
 // counting a dead assignment would spend budget on a block that is never coming.
@@ -540,6 +588,7 @@ func (t *blockDownloadTracker) ClearPeer(p *peerpkg.Peer) []chainhash.Hash {
 	}
 
 	delete(t.byPeer, p)
+	delete(t.delivered, p)
 
 	return released
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -168,7 +169,7 @@ func TestAssignWantedBlocks_DoesNotReAskForABlockAlreadyOwed(t *testing.T) {
 // second copy arrive unowned and lose its association for it.
 func TestAssignWantedBlocks_ReAsksWhenTheOwnerHasGoneQuiet(t *testing.T) {
 	sm := assignManager(t, 1, 20)
-	// Above the last checkpoint: below it a quiet owner keeps its blocks (TestAQuietOwnerIsNotReAskedBelowTheCheckpoint).
+	// Above the last checkpoint: below it a busy single owner keeps its blocks (TestABusyOwnerKeepsItsBlockBelowTheCheckpoint).
 	sm.headersFirstMode.Store(false)
 	mockCommittedTip(t, sm, 10, 0)
 
@@ -296,7 +297,7 @@ func TestAReAskedBlockGoesToTheFastestPeerEvenWithAFullQueue(t *testing.T) {
 // own.
 func TestAssignWantedBlocks_ForgivesQuietOwnersWhenEveryPeerIsAtItsCap(t *testing.T) {
 	sm := assignManager(t, 1, 20)
-	// Above the last checkpoint: below it a quiet owner keeps its blocks (TestAQuietOwnerIsNotReAskedBelowTheCheckpoint).
+	// Above the last checkpoint: below it a busy single owner keeps its blocks (TestABusyOwnerKeepsItsBlockBelowTheCheckpoint).
 	sm.headersFirstMode.Store(false)
 	mockCommittedTip(t, sm, 10, 0)
 
@@ -362,34 +363,103 @@ func slicesContains(hashes []chainhash.Hash, h chainhash.Hash) bool {
 	return false
 }
 
-// Below the last checkpoint the rescue rule judges a late block, so the download pass does not let
-// a quiet owner off and does not ask another peer; above it, at the tip, the quiet-owner rule
-// stays. The quiet-owner rule let a busy peer off 15 blocks on 2026-10-07, and each was downloaded
-// two times.
-func TestAQuietOwnerIsNotReAskedBelowTheCheckpoint(t *testing.T) {
-	sm := assignManager(t, 1, 20)
+// Below the last checkpoint a block with one active owner that is busy, sending block bytes,
+// stays with it: the watcher judges it when it will be late. Letting a busy owner off released
+// 15 blocks of a peer on 2026-10-07, and each was downloaded two times.
+func TestABusyOwnerKeepsItsBlockBelowTheCheckpoint(t *testing.T) {
+	sm, next, quiet, otherRec := singleOwnerSetup(t)
+
+	sm.streams.mu.Lock()
+	sm.streams.lastBlock[quiet] = time.Now()
+	sm.streams.mu.Unlock()
+
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool { return otherRec.count() > 0 }, 5*time.Second), "the pass places other blocks")
+	require.NotContains(t, otherRec.all(), next, "the busy owner's block is not asked of another peer")
+	require.True(t, sm.blockDownloads.HasOwner(quiet, next), "and the busy owner keeps it")
+}
+
+// Below the last checkpoint a block whose one owner has sent no block bytes for the retry window
+// is asked of another peer, whatever the block size. It used to be left to the watcher, which
+// reaches a silent owner only through rate decay, and at small-block heights the next block then
+// waited minutes where c2697896 re-asked it after 60 s (review of 2026-10-12).
+func TestASilentSingleOwnerIsReAskedBelowTheCheckpoint(t *testing.T) {
+	sm, next, _, otherRec := singleOwnerSetup(t)
+
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool { return containsHash(otherRec.all(), next) }, 5*time.Second),
+		"the silent owner's block is asked of another peer")
+}
+
+// An owner still sending other blocks, which has delivered a block asked after this one, has
+// passed this one over: SV Node answers getdata in the order asked. Its bytes counted as
+// sending this block too, so a withheld block was never re-asked (review of 2026-10-12). Below
+// the checkpoint the block is asked of another peer.
+func TestABlockItsBusyOwnerPassedOverIsReAsked(t *testing.T) {
+	sm, next, quiet, otherRec := singleOwnerSetup(t)
+
+	later, ok := sm.headerCache.At(12)
+	require.True(t, ok)
+
+	sm.blockDownloads.now = func() time.Time { return time.Now().Add(-4 * time.Minute) }
+	require.True(t, sm.blockDownloads.Add(quiet, later))
+	sm.blockDownloads.now = time.Now
+
+	sm.blockDownloads.Delivered(quiet, later)
+	require.True(t, sm.blockDownloads.PassedOver(quiet, next))
+
+	sm.streams.mu.Lock()
+	sm.streams.lastBlock[quiet] = time.Now()
+	sm.streams.mu.Unlock()
+
+	require.False(t, sm.ownerStillSending(next), "its bytes are other blocks' bytes")
+
+	sm.assignWantedBlocks()
+
+	require.True(t, WaitUntil(func() bool { return containsHash(otherRec.all(), next) }, 5*time.Second),
+		"the passed-over block is asked of another peer")
+}
+
+// singleOwnerSetup is a pass below the last checkpoint with block 11 asked of one peer five
+// minutes ago, and a second peer with room.
+func singleOwnerSetup(t *testing.T) (sm *SyncManager, next chainhash.Hash, owner *peerpkg.Peer, otherRec *getDataRecorder) {
+	t.Helper()
+
+	sm = assignManager(t, 1, 20)
 	mockCommittedTip(t, sm, 10, 0)
 	require.True(t, sm.headersFirstMode.Load(), "harness check: below the last checkpoint")
 
 	sm.settings.Legacy.BlockDownloadWindow = 1024
 	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 20
 
-	quiet, _ := schedulerPeer(t, sm, 1, 1020)
+	if sm.streams == nil {
+		sm.streams = newStreamRegistry()
+	}
+
+	owner, _ = schedulerPeer(t, sm, 1, 1020)
 	other, otherRec := schedulerPeer(t, sm, 2, 1020)
-	wireStreamingPath(sm, quiet, other)
+	wireStreamingPath(sm, owner, other)
 
 	next, ok := sm.headerCache.At(11)
 	require.True(t, ok)
 
 	sm.blockDownloads.now = func() time.Time { return time.Now().Add(-5 * time.Minute) }
-	require.True(t, sm.blockDownloads.Add(quiet, next))
+	require.True(t, sm.blockDownloads.Add(owner, next))
 	sm.blockDownloads.now = time.Now
 
-	sm.assignWantedBlocks()
+	return sm, next, owner, otherRec
+}
 
-	require.True(t, WaitUntil(func() bool { return otherRec.count() > 0 }, 5*time.Second), "the pass places other blocks")
-	require.NotContains(t, otherRec.all(), next, "the quiet owner's block is not asked of another peer")
-	require.True(t, sm.blockDownloads.HasOwner(quiet, next), "and the quiet owner keeps it")
+func containsHash(hashes []chainhash.Hash, h chainhash.Hash) bool {
+	for _, x := range hashes {
+		if x == h {
+			return true
+		}
+	}
+
+	return false
 }
 
 // A block that two peers owe, and that neither sends, is asked of another peer below the last

@@ -16,7 +16,8 @@ import (
 //   - Arriving: the declared size is known from the first bytes, so the time is its remaining
 //     bytes at the copy's rate. Under raceStallRate the block is the race's.
 //   - Queued: the bytes its owner sends first and the block, a recent mean block for each block of
-//     unknown size, at the owner's rate.
+//     unknown size, at the owner's rate. A block the owner passed over, delivering a block asked
+//     after it, never lands from that owner.
 // The chain applies a block only after each block below it, so a block that lands after each
 // block below it adds to the chain's wait. When it adds watchMinETA or more, its request is
 // watchMinAge old, and it has one owner, one more peer is asked:
@@ -367,6 +368,14 @@ func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []q
 
 	if now.Sub(rec.at) < watchMinAge {
 		return 0, 0, "", arrivalTooEarly
+	}
+
+	// The owner delivered a block asked after this one and has not started this one: it passed
+	// it over, and will not deliver it from its queue. A fast owner that ignored one getdata
+	// entry kept the estimate here at a typical block at its rate, under watchMinETA, while any
+	// block it delivered cleared its deadline and kept its rate up (review of 2026-10-12).
+	if sm.blockDownloads.PassedOver(o, h) {
+		return farOff, 0, "was passed over by", arrivalJudged
 	}
 
 	// An owner with no rate has sent no block bytes: it lands the block very late. The median rate
