@@ -272,7 +272,7 @@ func (m *MockUtxostore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) 
 // time, through this mock's SpendAndCreate and whatever expectations the test set on that.
 func (m *MockUtxostore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...CreateOption) ([]SpendAndCreateMultiResult, error) {
 	if !m.expects("SpendAndCreateMulti") {
-		return DefaultSpendAndCreateMulti(ctx, m, 1, txs, blockHeight, opts...)
+		return DefaultSpendAndCreateMulti(ctx, m, UniformSpendAndCreateMultiWidths(1), txs, blockHeight, opts...)
 	}
 
 	args := m.Called(ctx, txs, blockHeight, opts)

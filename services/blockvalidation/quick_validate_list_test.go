@@ -63,17 +63,18 @@ type applyRecorder struct {
 
 // recordedList is one SpendAndCreateMulti the batch made.
 type recordedList struct {
-	txids       []chainhash.Hash
-	subtreeIdxs []int
-	results     []utxo.SpendAndCreateMultiResult
-	err         error
+	txids           []chainhash.Hash
+	subtreeIdxs     []int
+	belowCheckpoint bool
+	results         []utxo.SpendAndCreateMultiResult
+	err             error
 }
 
 func (a *applyRecorder) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
 	options := parseCreateOptions(opts)
 
-	rec := recordedList{subtreeIdxs: options.SubtreeIdxs}
+	rec := recordedList{subtreeIdxs: options.SubtreeIdxs, belowCheckpoint: options.BelowCheckpoint}
 	for _, tx := range txs {
 		rec.txids = append(rec.txids, *tx.TxIDChainHash())
 	}
@@ -406,6 +407,51 @@ func TestBatchList_ChainedAndIndependentMix(t *testing.T) {
 	})
 }
 
+// TestBatchList_DeepChainIsBelowCheckpoint: a chain 50 deep goes to the store as one list marked
+// below-checkpoint, which lets the SQL store write it in two waves rather than one round per link
+// (the store contract test SpendAndCreateMultiBelowCheckpointTwoWaves pins the waves themselves).
+// Every link ends spent by its child.
+func TestBatchList_DeepChainIsBelowCheckpoint(t *testing.T) {
+	listModes(t, "netted_deep_chain", func(t *testing.T, dbName string, outpointOnly bool) {
+		bv, recorder, cleanup := newListHarness(t, dbName, outpointOnly)
+		defer cleanup()
+
+		ctx := context.Background()
+
+		const depth = 50
+
+		root, key := seedRoot(t, recorder.Store, 1, "NETTED_DEEP_CHAIN_KEY")
+
+		txs := make([]*bt.Tx, 0, depth)
+		parent := root
+
+		for i := 0; i < depth; i++ {
+			tx := spendOf(t, key, parent, 0, uint64(100_000-1_000*(i+1))) //nolint:gosec // test amounts
+			txs = append(txs, tx)
+			parent = tx
+		}
+
+		block := &model.Block{Height: 100, ID: 42}
+		batch := listBatchFor(t, bv, block, txs, outpointOnly)
+
+		recorder.reset()
+
+		start := time.Now()
+		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, batch))
+		t.Logf("a chain %d deep applied in %v", depth, time.Since(start))
+
+		lists := recorder.recordedLists()
+		require.Len(t, lists, 1)
+		require.True(t, lists[0].belowCheckpoint, "quick validation marks its list below-checkpoint")
+
+		requireSpentBy(t, recorder.Store, root, 0, txs[0])
+
+		for i := 1; i < depth; i++ {
+			requireSpentBy(t, recorder.Store, txs[i-1], 0, txs[i])
+		}
+	})
+}
+
 // listModes runs a test once in decorate mode and once in the outpoint-only mode that ships,
 // each over its own database.
 func listModes(t *testing.T, dbName string, run func(t *testing.T, dbName string, outpointOnly bool)) {
@@ -461,7 +507,7 @@ func TestBatchList_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
 }
 
 // TestBatchList_MissingParentFailsTheBlock: a transaction whose parent is in neither the block nor
-// the store fails the block with the not-found class naming the outpoint, and is not created.
+// the store fails the block with the not-found class naming the outpoint.
 //
 // Outpoint-only mode only: in the normal mode the extension step reads every parent first, so a
 // missing parent fails there, before the list reaches the store.
@@ -492,8 +538,12 @@ func TestBatchList_MissingParentFailsTheBlock(t *testing.T) {
 		require.Contains(t, err.Error(), fmt.Sprintf("%s:0", ghost.TxIDChainHash().String()),
 			"the failure must name the missing outpoint, got: %v", err)
 
+		// The list is written create-then-spend below a checkpoint, so the orphan's record is
+		// created before its spend fails. What matters is that the block fails rather than passes:
+		// the spend wave carries RequireParentOutputs, so the store does not take the record it
+		// just created as proof the missing parent was spent long ago.
 		_, err = recorder.Store.Get(ctx, orphan.TxIDChainHash())
-		require.True(t, errors.Is(err, errors.ErrTxNotFound), "the orphan must not have been created, got: %v", err)
+		require.NoError(t, err, "create-then-spend writes the orphan's record before its spend fails")
 	}
 }
 
