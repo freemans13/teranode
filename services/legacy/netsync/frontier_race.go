@@ -213,7 +213,7 @@ type streamRegistry struct {
 	decay map[*peerpkg.Peer]float64
 	// remembered is the last rate of each peer address this process has not measured since it
 	// started, from the rates file (peerRatesFile) or from a peer that disconnected.
-	remembered map[string]float64
+	remembered map[string]peerRateRecord
 }
 
 // raceHistory is what the race and the watcher did for one block in the last raceExpiry. It is
@@ -251,7 +251,7 @@ func newStreamRegistry() *streamRegistry {
 		active:     make(map[*blockStream]struct{}),
 		rates:      make(map[*peerpkg.Peer]float64),
 		raced:      make(map[chainhash.Hash]*raceHistory),
-		remembered: make(map[string]float64),
+		remembered: make(map[string]peerRateRecord),
 	}
 }
 
@@ -672,11 +672,16 @@ func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
 	// A remembered rate becomes the peer's rate the first time it is read, so it decays while the
 	// peer owes blocks and sends none (decayQuiet), as a measured rate does. A rate read only from
 	// the file did not, and a silent remembered peer kept its rate until the getdata deadline.
-	if bps, ok := r.remembered[p.Addr()]; ok && bps > 0 {
-		r.rates[p] = bps
+	// It is weighed down by its age (peerRateHalfLife), so a peer that was fast before a long
+	// stop does not take the near blocks at its old speed.
+	if rec, ok := r.remembered[p.Addr()]; ok {
 		delete(r.remembered, p.Addr())
 
-		return r.rateLocked(p)
+		if bps := rec.discountedRate(time.Now()); bps > 0 {
+			r.rates[p] = bps
+
+			return r.rateLocked(p)
+		}
 	}
 
 	return 0
@@ -713,31 +718,46 @@ func (r *streamRegistry) liveRateLocked(p *peerpkg.Peer) (float64, bool) {
 }
 
 // remember loads rates by peer address, for peers this process has not measured yet.
-func (r *streamRegistry) remember(rates map[string]float64) {
+func (r *streamRegistry) remember(rates map[string]peerRateRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for addr, bps := range rates {
-		if bps > 0 {
-			r.remembered[addr] = bps
+	for addr, rec := range rates {
+		if rec.BPS > 0 {
+			r.remembered[addr] = rec
 		}
 	}
 }
 
-// rememberedRates is each measured peer's rate by address, plus the remembered rates of peers not
-// connected now, for the rates file.
-func (r *streamRegistry) rememberedRates() map[string]float64 {
+// rememberedRates is each measured outbound peer's rate by address, stamped now, plus the
+// remembered rates of peers not connected now, for the rates file. An inbound peer connects from
+// a different port each time, so its address never matches again and is left out. Old entries are
+// dropped and the rest bounded (prunePeerRates), in memory as well as in the result, so neither
+// grows across restarts.
+func (r *streamRegistry) rememberedRates(now time.Time) map[string]peerRateRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	out := make(map[string]float64, len(r.remembered)+len(r.rates))
-	for addr, bps := range r.remembered {
-		out[addr] = bps
+	out := make(map[string]peerRateRecord, len(r.remembered)+len(r.rates))
+	for addr, rec := range r.remembered {
+		out[addr] = rec
 	}
 
 	for p := range r.rates {
+		if p.Inbound() {
+			continue
+		}
+
 		if bps := r.rateLocked(p); bps > 0 {
-			out[p.Addr()] = bps
+			out[p.Addr()] = peerRateRecord{BPS: bps, At: now}
+		}
+	}
+
+	out = prunePeerRates(out, now)
+
+	for addr := range r.remembered {
+		if _, kept := out[addr]; !kept {
+			delete(r.remembered, addr)
 		}
 	}
 
@@ -851,7 +871,7 @@ func (r *streamRegistry) forgetPeer(p *peerpkg.Peer) {
 	// An inbound peer connects from a different port each time, so its address never comes
 	// back, and its entry stayed in the rates file for good.
 	if bps := r.rateLocked(p); bps > 0 && !p.Inbound() {
-		r.remembered[p.Addr()] = bps
+		r.remembered[p.Addr()] = peerRateRecord{BPS: bps, At: time.Now()}
 	}
 
 	delete(r.rates, p)

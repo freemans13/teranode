@@ -142,8 +142,10 @@ context), and `${LEGACY_GRPC_PORT}` is `8099`.
   known before the download, so the schedule uses none, and no block waits while
   a peer has room. A peer holds the per-peer depth scaled by its rate against
   the fastest peer's. A peer with no rate gets one block from the top of the
-  window. Measured rates are kept by address in `legacy-peer-rates.json` in the
-  working directory. Below the
+  window. Measured rates of outbound peers are kept by address, with the time
+  each was measured, in `legacy-peer-rates.json` in the working directory. A
+  remembered rate loses half its weight per hour of age, an entry older than
+  24 hours is dropped, and the file keeps at most the 1,000 newest. Below the
   last checkpoint the range comes from the header cache, which runs to the next
   checkpoint; above it, blocks are asked for from invs and the pass re-asks from
   the download ledger. There is no download cursor, so nothing carries a
