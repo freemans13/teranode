@@ -201,6 +201,17 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 		// A faster copy of this block may complete first and take over (conversion_race.go).
 		ctl := sm.startConversion(hash, r)
+		if ctl == nil {
+			// Another conversion of this block is live: one that took over converts outside the
+			// admission slot, so this copy was admitted beside it. Nothing of this copy has been
+			// written yet; it is read off the wire and the block is left to the other.
+			sm.deleteWrittenOnFailure(hash, writer)
+			sm.streams.setStreamPath(r, admitRawDuplicate)
+			sm.logger.Infof("[pipelineBlockSink][%s] another copy is converting this block; draining this one", hash)
+
+			return sm.drainDuplicate(hash, r)
+		}
+
 		yr.ctl = ctl
 
 		defer sm.endConversion(hash, ctl)

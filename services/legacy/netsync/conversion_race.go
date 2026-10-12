@@ -100,8 +100,12 @@ func (c *conversionCtl) takeOver() bool {
 	return c.state.CompareAndSwap(conversionRunning, conversionYielding)
 }
 
-// startConversion registers a conversion of hash, from the copy r reads, replacing any earlier
-// one's registration.
+// startConversion registers a conversion of hash, from the copy r reads, replacing the
+// registration of a conversion that a faster copy took over. It returns nil, registering nothing,
+// while another conversion of hash is live, running or finishing: two conversions of one block
+// must never write at the same time, because they share content-addressed subtree files. A copy
+// that took over converts from its side file outside the admission slot, so the slot alone does
+// not keep a later copy from converting beside it.
 func (sm *SyncManager) startConversion(hash chainhash.Hash, r io.Reader) *conversionCtl {
 	c := &conversionCtl{cleaned: make(chan struct{})}
 
@@ -114,6 +118,10 @@ func (sm *SyncManager) startConversion(hash chainhash.Hash, r io.Reader) *conver
 
 	if sm.conversions == nil {
 		sm.conversions = make(map[chainhash.Hash]*conversionCtl)
+	}
+
+	if live := sm.conversions[hash]; live != nil && !live.yielding() {
+		return nil
 	}
 
 	sm.conversions[hash] = c
