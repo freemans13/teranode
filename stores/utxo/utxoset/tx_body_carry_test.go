@@ -181,6 +181,37 @@ func TestBodyOfTransactionMinedBeforeTheFirstCarrySurvivesTheDrop(t *testing.T) 
 	require.Equal(t, 0, carriedBodies(t, s, ctx))
 }
 
+// TestCarriedBodyIsFoundWhileThePersisterLags: a carried body stays until its block is 288
+// blocks below the pruner's height, which is the persister's archived height, so it is still
+// stored however far the tip runs ahead of a stalled persister. The lookup has to look for it
+// on the same terms, not by the block's distance from the tip, or the persister asks for a
+// body the store holds and gets nil once the tip is 336 blocks past the block.
+func TestCarriedBodyIsFoundWhileThePersisterLags(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, carryTestHeight)
+	require.NoError(t, err)
+
+	dropAt := uint32(carryTestHeight/TxBodyPartitionBlocks+1)*TxBodyPartitionBlocks + s.bodyRetention
+	pruneAt(t, s, ctx, dropAt, dropAt+1)
+	require.Equal(t, 1, carriedBodies(t, s, ctx), "carried while it waited")
+
+	minedAt := dropAt + 2
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 11, BlockHeight: minedAt, OnLongestChain: true})
+	require.NoError(t, err)
+
+	// The persister stalls below the block and the tip runs on; no pruner session reclaims.
+	require.NoError(t, s.SetBlockHeight(minedAt+TxBodyPartitionBlocks+s.bodyRetention+64))
+	require.Equal(t, 1, carriedBodies(t, s, ctx), "the body is still stored")
+
+	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.Tx)
+	require.NoError(t, err)
+	require.NotNil(t, got.Tx, "the lookup did not look for a carried body the store still holds")
+	require.NoError(t, archivable(t, s, ctx, tx))
+}
+
 // TestBodyCarryIsIdempotent pins the crash window between the carry and the drop. The carry
 // commits on its own and the drop comes after it, so a restart there carries the same window
 // again, and a read must still see exactly one body.

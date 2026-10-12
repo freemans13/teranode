@@ -599,6 +599,18 @@ CREATE TABLE IF NOT EXISTS tx_body_carry (
     txid    BYTEA PRIMARY KEY CHECK (length(txid) = 32),
     raw_tx  BYTEA NOT NULL
 );
+
+-- The height below which the last reclaim of tx_body_carry deleted the carried bodies of mined
+-- transactions: the pruner's height, which is the block persister's archived height, less the
+-- body horizon. One row, held to one by CHECK (id = 0), written by the reclaim in the statement
+-- that deletes. A carried body of a transaction that is not waiting exists only if one of its
+-- blocks is above this height, so the lookup reads it to decide whether a body-less record is
+-- worth a probe of the carry table, in place of the chain tip, which a lagging persister leaves
+-- arbitrarily far ahead of the reclaim. Absent until the first reclaim, which reads as 0.
+CREATE TABLE IF NOT EXISTS tx_body_carry_floor (
+    id               SMALLINT PRIMARY KEY CHECK (id = 0),
+    reclaimed_below  INTEGER  NOT NULL
+);
 `
 
 // partitionSQL is applied per leaf.

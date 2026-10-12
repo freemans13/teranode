@@ -579,11 +579,18 @@ SELECT k.txid, c.raw_tx
  ) AS c`
 
 // mayHaveCarriedBody reports whether a record with no body could have one in tx_body_carry. It
-// is the reclaim rule's keep condition widened by one window, so a body the table still holds
-// is always looked for, and it is what keeps the probe off the common read: an old parent whose
-// window aged out in the ordinary way is mined far below the tip, and below the checkpoint,
-// where bodies may never have been written at all, nothing was ever carried.
-func (s *Store) mayHaveCarriedBody(d *meta.Data, tip uint32) bool {
+// is the reclaim rule's keep condition, read against the floor the reclaim itself recorded
+// (carryFloor): a waiting transaction keeps its carried body, and a mined one keeps it while one
+// of its blocks is above the floor. So a body the table still holds is always looked for, and
+// the probe stays off the common read: an old parent whose window aged out in the ordinary way
+// is mined below the floor, and below the checkpoint, where bodies may never have been written
+// at all, nothing was ever carried.
+//
+// The floor is the pruner's height less the body horizon, and the pruner's height is the block
+// persister's archived height. It used to be the chain tip less the horizon and one window,
+// which was the same thing only while the persister kept up: with the persister stalled 336
+// blocks behind the tip, the persister asked for a body the store still held and got nil.
+func (s *Store) mayHaveCarriedBody(d *meta.Data, floor uint32) bool {
 	if d.UnminedSince != 0 {
 		return true
 	}
@@ -602,7 +609,7 @@ func (s *Store) mayHaveCarriedBody(d *meta.Data, tip uint32) bool {
 		return false
 	}
 
-	return highest+s.bodyRetention+TxBodyPartitionBlocks > tip
+	return highest > floor
 }
 
 // readCarriedBodies fills in the body of every answered transaction that came back without one
@@ -610,13 +617,30 @@ func (s *Store) mayHaveCarriedBody(d *meta.Data, tip uint32) bool {
 // own copy always wins: this runs only where the window's join found nothing, so a body that
 // exists in both places during the interval between the carry and the drop is read once.
 func (s *Store) readCarriedBodies(ctx context.Context, hashes []chainhash.Hash, res *lookupResult) error {
-	tip := s.GetBlockHeight()
-
-	var txids [][]byte
+	var (
+		txids     [][]byte
+		floor     uint32
+		haveFloor bool
+	)
 
 	for i := range hashes {
 		d, ok := res.found[hashes[i]]
-		if !ok || d.Tx != nil || !s.mayHaveCarriedBody(d, tip) {
+		if !ok || d.Tx != nil {
+			continue
+		}
+
+		// The floor is read only for a read that has a body-less record, so a read whose
+		// records all carry their body costs nothing more.
+		if !haveFloor {
+			f, err := s.carryFloor(ctx)
+			if err != nil {
+				return err
+			}
+
+			floor, haveFloor = f, true
+		}
+
+		if !s.mayHaveCarriedBody(d, floor) {
 			continue
 		}
 

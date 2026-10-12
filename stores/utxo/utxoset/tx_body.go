@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5"
 )
 
 // TxBodyPartitionBlocks is the width of one body window. Reclaim drops whole windows, so
@@ -383,17 +384,33 @@ func (s *Store) carryUnarchivedBodies(ctx context.Context, bound, archived uint3
 //
 // Both tests read one snapshot, and SetMined records the block and clears the marker in one
 // transaction, so a transaction being mined as this runs matches one of them either way.
+//
+// The same statement records $1 in tx_body_carry_floor, which is what the lookup gates its probe
+// of this table on (mayHaveCarriedBody). The latest value is written, not the highest ever: a
+// pruner height that went back (a rewind) lowers it, and a lower floor only costs the lookup a
+// probe that finds nothing.
 const reclaimCarriedBodySQL = `
-DELETE FROM tx_body_carry c
- WHERE NOT EXISTS (
-       SELECT 1 FROM tx_ident i
-        WHERE i.leaf = (get_byte(c.txid, 0) & 7)::smallint
-          AND i.txid = c.txid
-          AND i.off_chain_since IS NOT NULL)
-   AND NOT EXISTS (
-       SELECT 1 FROM tx_mined m
-        WHERE m.txid = c.txid
-          AND m.mined_height > $1::int)`
+WITH reclaimed AS (
+    DELETE FROM tx_body_carry c
+     WHERE NOT EXISTS (
+           SELECT 1 FROM tx_ident i
+            WHERE i.leaf = (get_byte(c.txid, 0) & 7)::smallint
+              AND i.txid = c.txid
+              AND i.off_chain_since IS NOT NULL)
+       AND NOT EXISTS (
+           SELECT 1 FROM tx_mined m
+            WHERE m.txid = c.txid
+              AND m.mined_height > $1::int)
+    RETURNING 1
+),
+floor AS (
+    INSERT INTO tx_body_carry_floor (id, reclaimed_below) VALUES (0, $1::int)
+    ON CONFLICT (id) DO UPDATE SET reclaimed_below = EXCLUDED.reclaimed_below
+)
+SELECT count(*) FROM reclaimed`
+
+// carryFloorSQL reads the floor reclaimCarriedBodySQL last recorded.
+const carryFloorSQL = `SELECT reclaimed_below FROM tx_body_carry_floor WHERE id = 0`
 
 // reclaimCarriedBodies applies reclaimCarriedBodySQL at the pruner height.
 func (s *Store) reclaimCarriedBodies(ctx context.Context, height uint32) error {
@@ -401,14 +418,43 @@ func (s *Store) reclaimCarriedBodies(ctx context.Context, height uint32) error {
 		return nil
 	}
 
-	tag, err := s.pool.Exec(ctx, reclaimCarriedBodySQL, int32(height-s.bodyRetention)) //nolint:gosec // a height fits int32
-	if err != nil {
+	var n int64
+
+	if err := s.pool.QueryRow(ctx, reclaimCarriedBodySQL, int32(height-s.bodyRetention)).Scan(&n); err != nil { //nolint:gosec // a height fits int32
 		return errors.NewStorageError("[utxoset] reclaim carried bodies at height %d", height, err)
 	}
 
-	if n := tag.RowsAffected(); n > 0 {
+	if n > 0 {
 		s.logger.Infof("[utxoset] dropped %d carried bodies of transactions mined %d or more blocks ago", n, s.bodyRetention)
 	}
 
 	return nil
+}
+
+// carryFloor returns the floor the last reclaim of tx_body_carry recorded, read again whenever
+// the tip has moved since the last read in this process. The reclaim runs in the pruner, which
+// may be another process, so the value is read from the database rather than kept from the
+// reclaim. A stale value is never higher than the current one unless a rewind lowered it, and
+// either way a floor that is too low only costs the lookup a probe that finds nothing.
+func (s *Store) carryFloor(ctx context.Context) (uint32, error) {
+	tip := s.GetBlockHeight()
+	if s.carryFloorTip.Load() == uint64(tip)+1 {
+		return s.carryFloorValue.Load(), nil
+	}
+
+	var floor int32
+
+	err := s.pool.QueryRow(ctx, carryFloorSQL).Scan(&floor)
+
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		floor = 0
+	case err != nil:
+		return 0, errors.NewStorageError("[utxoset][lookup] read the carried-body floor", err)
+	}
+
+	s.carryFloorValue.Store(uint32(max(floor, 0))) //nolint:gosec // non-negative by max
+	s.carryFloorTip.Store(uint64(tip) + 1)
+
+	return s.carryFloorValue.Load(), nil
 }

@@ -71,6 +71,12 @@ type Store struct {
 	// block. Zero means not yet in this process.
 	carryBound atomic.Uint32
 
+	// carryFloorValue is the tx_body_carry_floor height last read, and carryFloorTip the tip it
+	// was read at plus one, so the lookup reads the floor again once per tip at most. Zero means
+	// not yet read in this process. See carryFloor.
+	carryFloorValue atomic.Uint32
+	carryFloorTip   atomic.Uint64
+
 	// bodyDDL serialises tx_body partition creation within this process, for the same
 	// reason journalDDL does: CREATE TABLE IF NOT EXISTS is not concurrency-safe.
 	bodyDDL sync.Mutex
