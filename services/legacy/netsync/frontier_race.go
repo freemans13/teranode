@@ -924,6 +924,13 @@ func (r *streamRegistry) lastBlockBytesLocked(p *peerpkg.Peer) time.Time {
 			continue
 		}
 
+		// A complete copy still active is being converted: the wait is this node's, not the
+		// peer's, so the peer counts as sending now. From its last byte it looked silent while a
+		// 2 GB takeover converted for 90 s (review of 2026-10-12).
+		if s.complete() {
+			return time.Now()
+		}
+
 		if at := s.lastRead.Load(); at > 0 {
 			if t := time.Unix(0, at); t.After(latest) {
 				latest = t
@@ -945,7 +952,13 @@ func (r *streamRegistry) lastLiveBytesLocked(p *peerpkg.Peer, now time.Time) tim
 			continue
 		}
 
-		if !s.complete() && now.Sub(s.start) >= liveRateWindow && r.judgedRateLocked(s, now) < raceStallRate {
+		// A complete copy still active is being converted, which is this node's time, not the
+		// peer's: the peer is active now (lastBlockBytesLocked).
+		if s.complete() {
+			return now
+		}
+
+		if now.Sub(s.start) >= liveRateWindow && r.judgedRateLocked(s, now) < raceStallRate {
 			continue
 		}
 

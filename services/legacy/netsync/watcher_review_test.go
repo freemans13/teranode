@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
@@ -160,6 +161,28 @@ func TestWatchAsksOnlyBetweenDownloadPasses(t *testing.T) {
 	<-done
 
 	require.True(t, sm.blockDownloads.HasOwner(fast, next), "and it is asked once the pass is done")
+}
+
+// A copy whose bytes have all arrived and that this node is still converting is this node's
+// wait, not the peer's. From its last byte the peer looked silent: its rate decayed, and after
+// the retry window its other blocks could be re-asked, while a 2 GB takeover converted for 90 s
+// (review of 2026-10-12).
+func TestAPeerWhoseCopyIsBeingConvertedIsNotQuiet(t *testing.T) {
+	sm, _, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	askAt(t, sm, fast, heightHash(t, sm, 13), now.Add(-10*time.Minute))
+
+	h := heightHash(t, sm, 12)
+	s := sm.streams.start(h, 12, fast, 2_000_000_000, now.Add(-3*time.Minute))
+	s.read.Store(2_000_000_000 - wire.MaxBlockHeaderPayload)
+	s.lastRead.Store(now.Add(-90 * time.Second).UnixNano())
+	require.True(t, s.complete(), "harness check: every byte has arrived")
+
+	sm.decayQuietRates(now)
+
+	require.InDelta(t, 80_000_000.0, sm.streams.peerRate(fast), 1, "no decay while its copy converts")
+	require.Less(t, time.Since(sm.streams.lastBlockBytes(fast)), time.Second, "and it counts as sending now")
 }
 
 // The ledger's passed-over mark: a peer that delivered a block asked after h, while it still
