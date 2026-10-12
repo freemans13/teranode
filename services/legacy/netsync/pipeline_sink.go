@@ -157,6 +157,9 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		writer = newSubtreeWriterUnresolvedHeight(sm.logger, sm.settings, sm.subtreeStore, sm.fallbackSubtreeDAH())
 	}
 
+	// One registry for every conversion, so no block's cleanup removes a file another adopted.
+	writer.adoptions = sm.subtreeAdoptionsFor()
+
 	var (
 		root          *chainhash.Hash
 		subtreeHashes []chainhash.Hash
@@ -450,7 +453,8 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 	case err == nil && record != nil:
 		for _, root := range record.Subtrees {
 			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtree} {
-				delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft)
+				// A file another block adopted stays, as in subtreeWriter.DeleteAll.
+				delErr := sm.deleteSubtreeFileUnlessAdopted(*root, ft)
 				if delErr != nil && !errors.Is(delErr, errors.ErrNotFound) && firstErr == nil {
 					firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
 				}
@@ -602,7 +606,8 @@ func newPipelineDedupMap(declared uint64) txmap.TxMap {
 // fails, logs a single-line warning naming the block hash rather than
 // discarding the error silently. subtreeWriter's own doc comment explains why
 // an orphaned subtree file is dangerous (it is content-addressed and shared
-// with any other block carrying the same run of transactions); a cleanup
+// with any other block carrying the same run of transactions, which is also
+// why DeleteAll leaves a file another block adopted); a cleanup
 // failure that goes unlogged defeats the point of calling DeleteAll at all,
 // since nothing else will ever tell an operator those files are still there.
 func (sm *SyncManager) deleteWrittenOnFailure(hash chainhash.Hash, writer *subtreeWriter) {

@@ -217,7 +217,8 @@ var (
 	// parkDispositionFilesGone — the record names subtree files that are no
 	// longer on disk. The record carries no delete-at-height of its own while
 	// every subtree file does (subtree_writer.go), so expiry removes the files
-	// from under it; a concurrent conversion's cleanup can do the same. Drop
+	// from under it. A concurrent conversion's cleanup no longer can: it leaves
+	// a file another block adopted (subtreeAdoptions). Drop
 	// the record, mark nothing, blame nobody: the next wanted-range pass sees
 	// the block as not held and downloads it again (above the last checkpoint
 	// reAsk asks a peer for it instead), and the sink rewrites

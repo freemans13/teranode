@@ -636,6 +636,11 @@ func maxInFlightForSize(avgSize int64) int {
 // chain is in sync, the SyncManager handles incoming block and header
 // notifications and relays announcements of new blocks to peers.
 type SyncManager struct {
+	// adoptions is the registry of subtree files a block relies on but did not create, shared by
+	// every subtree writer this manager makes; see subtreeAdoptions. Read through
+	// subtreeAdoptionsFor, which creates it on first use.
+	adoptions atomic.Pointer[subtreeAdoptions]
+
 	ctx          context.Context
 	logger       ulogger.Logger
 	settings     *settings.Settings

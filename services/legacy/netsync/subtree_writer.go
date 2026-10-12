@@ -23,7 +23,9 @@ import (
 // of transactions and so the same subtree under the same key, and the file then
 // belongs to whichever block created it. Removing it would leave that block's
 // record pointing at subtree data that is gone, and there is no second source
-// (see subtreeWriter).
+// (see subtreeWriter). The reverse holds too: a file this block created that
+// another block has since adopted is not removed by this block's cleanup (see
+// subtreeAdoptions).
 type writtenSubtree struct {
 	Hash     chainhash.Hash
 	FileType fileformat.FileType
@@ -64,6 +66,13 @@ type subtreeWriter struct {
 	heightUnknown bool
 	dahOverride   uint32
 	written       []writtenSubtree
+	// adoptions is the registry shared by every writer of the same manager, so a file this
+	// block adopted is never deleted by its creator's cleanup, nor the reverse. Nil gives the
+	// writer a registry of its own (tests that build one writer alone).
+	adoptions *subtreeAdoptions
+	// adopted is every file this writer found already published and relies on. Its marks
+	// stay in adoptions until DeleteAll, which a block that commits never calls.
+	adopted []writtenSubtree
 	// pending holds each subtree's data file while the builder streams transactions
 	// into it, by subtree index. Its name is the subtree root hash, which is unknown
 	// until the subtree is complete, so it is written under a temporary name and
@@ -204,12 +213,17 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 		if file, ok := w.pending[index]; ok {
 			delete(w.pending, index)
 
+			key := writtenSubtree{Hash: *root, FileType: fileformat.FileTypeSubtreeData}
+			w.registry().mark(key)
+
 			switch err = file.Commit(ctx, root[:], options.WithDeleteAt(w.deleteAt()), options.WithExclusivePublish()); {
 			case err == nil:
-				w.written = append(w.written, writtenSubtree{Hash: *root, FileType: fileformat.FileTypeSubtreeData})
+				w.created(key)
 			case errors.Is(err, errors.ErrBlobAlreadyExists):
 				// Another block's file: Commit has discarded ours, and theirs is left alone.
+				w.adopted = append(w.adopted, key)
 			default:
+				w.registry().unmark(key)
 				return errors.NewStorageError("[subtreeWriter][%s] failed committing %s", root, fileformat.FileTypeSubtreeData, err)
 			}
 		} else {
@@ -220,18 +234,40 @@ func (w *subtreeWriter) Emit(ctx context.Context) subtreeEmitFunc {
 		}
 
 		for _, artefact := range artefacts {
+			key := writtenSubtree{Hash: *root, FileType: artefact.fileType}
+			w.registry().mark(key)
+
 			created, putErr := w.put(ctx, *root, artefact.fileType, artefact.write)
 			if putErr != nil {
+				w.registry().unmark(key)
 				return putErr
 			}
 
 			if created {
-				w.written = append(w.written, writtenSubtree{Hash: *root, FileType: artefact.fileType})
+				w.created(key)
+			} else {
+				w.adopted = append(w.adopted, key)
 			}
 		}
 
 		return nil
 	}
+}
+
+// registry is the adoption registry this writer marks in: the manager's, or one of its own.
+func (w *subtreeWriter) registry() *subtreeAdoptions {
+	if w.adoptions == nil {
+		w.adoptions = newSubtreeAdoptions()
+	}
+
+	return w.adoptions
+}
+
+// created records key as this writer's own and drops the mark taken before writing it: the
+// writer is the file's creator, so only its own DeleteAll may remove it.
+func (w *subtreeWriter) created(key writtenSubtree) {
+	w.written = append(w.written, key)
+	w.registry().unmark(key)
 }
 
 // writeBytes is an artefact already serialised, written as it is.
@@ -302,11 +338,13 @@ func (w *subtreeWriter) deleteAt() uint32 {
 	return w.height + w.settings.GetSubtreeValidationBlockHeightRetention()
 }
 
-// DeleteAll removes everything this writer created. It is what a failed block
-// calls: nothing is reading these files, because no block references them until
-// the block is handed over. Files that were already in the store when this writer
-// met them are left alone, because another block may reference them (see
-// writtenSubtree).
+// DeleteAll removes everything this writer created that no other block has adopted. It is
+// what a failed block calls: this block's record is never handed over, so nothing reads these
+// files through it. Files that were already in the store when this writer met them are left
+// alone, because another block may reference them (see writtenSubtree). So are files this
+// writer created that another writer has since adopted, which may belong to a block that has
+// already committed (see subtreeAdoptions); they are left to their delete-at-height. The
+// marks this writer took as an adopter are dropped, since its record will not be read.
 func (w *subtreeWriter) DeleteAll(ctx context.Context) error {
 	var firstErr error
 
@@ -316,9 +354,23 @@ func (w *subtreeWriter) DeleteAll(ctx context.Context) error {
 		delete(w.pending, index)
 	}
 
+	reg := w.registry()
+
+	// This writer's own adopter marks go first, so they never shield a file from itself.
+	for _, entry := range w.adopted {
+		reg.unmark(entry)
+	}
+
+	w.adopted = w.adopted[:0]
+
 	for _, entry := range w.written {
-		if err := w.store.Del(ctx, entry.Hash[:], entry.FileType); err != nil && firstErr == nil {
+		left, err := reg.deleteUnlessAdopted(ctx, w.store, entry)
+		if err != nil && firstErr == nil {
 			firstErr = errors.NewStorageError("[subtreeWriter][%s] failed deleting %s", entry.Hash, entry.FileType, err)
+		}
+
+		if left {
+			w.logger.Debugf("[subtreeWriter][%s] leaving %s: another block adopted it", entry.Hash, entry.FileType)
 		}
 	}
 
