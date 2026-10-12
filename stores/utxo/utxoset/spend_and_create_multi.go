@@ -987,7 +987,41 @@ func (w *nettedWrite) finishPerTransaction(ctx context.Context) error {
 		rest[k].result = r
 	}
 
-	return err
+	if err != nil {
+		return err
+	}
+
+	return w.undoOutsideSpendsOfFailures(ctx, rest)
+}
+
+// undoOutsideSpendsOfFailures restores the outside spends step 1 committed for every
+// transaction the per-transaction default then failed or skipped.
+//
+// The default runs each transaction's spends in its own database transaction and rolls that
+// back when the transaction fails, but its outside spends were not made there: step 1
+// committed them before step 2 began, and the default repeats them as the same spend, which
+// writes nothing. Without this a child rejected by the default, for instance because a parent
+// in the list already existed and its output had been taken, kept every independent input it
+// spent in step 1 marked spent by a transaction that has no record. The rest of the netted
+// write already holds the rule this restores: a failed transaction never leaves a spend behind.
+func (w *nettedWrite) undoOutsideSpendsOfFailures(ctx context.Context, items []*multiTx) error {
+	var undo []*utxo.Spend
+
+	for _, it := range items {
+		if it.spent && it.dead() {
+			undo = append(undo, it.outsideSpends()...)
+		}
+	}
+
+	if len(undo) == 0 {
+		return nil
+	}
+
+	if err := w.s.Unspend(ctx, undo); err != nil {
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] restoring the outside spends of transactions the per-transaction default rejected", err)
+	}
+
+	return nil
 }
 
 // logIfSlow writes one line for a list that took longer than multiSlowListLog, saying how big
