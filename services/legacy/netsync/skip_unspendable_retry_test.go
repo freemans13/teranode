@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -11,15 +12,17 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
-// countingStore is a real store that counts the reads and stamps createUtxos makes on the
-// skipped transactions' account: BatchDecorate is how StoredSubset asks a store without its
-// own probe, and SetMinedMulti is the stamp.
+// countingStore is a real store that counts the reads and stamps made on the skipped
+// transactions' account: BatchDecorate is how StoredSubset asks a store without its own probe,
+// and SetMinedMulti is the stamp.
 type countingStore struct {
 	utxo.Store
 	mu      sync.Mutex
@@ -88,6 +91,16 @@ func newRetryFixture(t *testing.T, name string) *retryFixture {
 	return &retryFixture{sm: sm, store: store, normal: normal, data: data, m: m, block: block}
 }
 
+// createAndMark runs the two steps of ValidateTransactionsLegacyMode that touch the skipped
+// transactions, without the pre-validation between them.
+func (f *retryFixture) createAndMark(ctx context.Context) error {
+	if err := f.sm.createUtxos(ctx, f.m, testBlockIdent(f.block), 7, true); err != nil {
+		return err
+	}
+
+	return f.sm.markStoredSkippedMined(ctx, f.m, testBlockIdent(f.block), 7, true)
+}
+
 // An earlier attempt at a block can fail after storing some of its transactions as unmined,
 // and if it got only as far as a data-only transaction, the retry creates the ordinary
 // transaction fresh and finds nothing else already stored. The retry skips the data
@@ -104,7 +117,7 @@ func TestCreateUtxos_RetryMarksMinedASkippedTransactionAnEarlierAttemptStored(t 
 	require.NoError(t, err)
 	require.Empty(t, pre.BlockIDs, "the earlier attempt left it unmined")
 
-	require.NoError(t, f.sm.createUtxos(ctx, f.m, testBlockIdent(f.block), 7, true))
+	require.NoError(t, f.createAndMark(ctx))
 
 	post, err := f.store.Get(ctx, f.data.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
@@ -122,7 +135,9 @@ func TestCreateUtxos_FirstAttemptOnlyAsksAboutSkippedTransactions(t *testing.T) 
 	f := newRetryFixture(t, "first_attempt")
 
 	require.NoError(t, f.sm.createUtxos(ctx, f.m, testBlockIdent(f.block), 7, true))
+	require.Zero(t, f.store.lookups, "createUtxos does not ask; the lookup waits for pre-validation")
 
+	require.NoError(t, f.sm.markStoredSkippedMined(ctx, f.m, testBlockIdent(f.block), 7, true))
 	require.Equal(t, 1, f.store.lookups, "one batched read over the skipped transactions")
 	require.Empty(t, f.store.stamped, "nothing was stored before, so nothing is stamped")
 
@@ -149,15 +164,56 @@ func TestCreateUtxos_FailsWhenTheStoreCannotAnswerForASkippedTransaction(t *test
 		*f.data.TxIDChainHash(): errors.NewStorageError("record timeout"),
 	}
 
-	err = f.sm.createUtxos(ctx, f.m, testBlockIdent(f.block), 7, true)
+	err = f.createAndMark(ctx)
 	require.Error(t, err, "an unanswered lookup must fail the block, not pass as a miss")
 	require.True(t, errors.Is(err, errors.ErrStorageError), "the store's own error is carried, got %v", err)
 
 	// The block is retried once the store answers, and then the transaction is marked mined.
 	f.store.entryErr = nil
-	require.NoError(t, f.sm.createUtxos(ctx, f.m, testBlockIdent(f.block), 7, true))
+	require.NoError(t, f.createAndMark(ctx))
 
 	post, err := f.store.Get(ctx, f.data.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
 	require.Contains(t, post.BlockIDs, uint32(7))
+}
+
+// A spend clash in pre-validation stores a skipped transaction after createUtxos has run: with
+// WithCreateConflicting the validator creates it as a conflicting record with no block
+// information. Nothing else would ever mark that record mined, so the lookup runs after
+// pre-validation and finds it. The validator here stores the transaction with no block
+// information and reports the clash, as the real one does. The real one also flags the record
+// conflicting, which the sqlite store refuses here because the transaction's parents are not
+// stored; the flag does not change what the lookup finds.
+func TestValidateTransactionsLegacyMode_MarksMinedASkippedTransactionPreValidationStored(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	f := newRetryFixture(t, "prevalidate_conflict")
+
+	dataHash := *f.data.TxIDChainHash()
+
+	mv := &validator.MockValidator{}
+	mv.ValidateFunc = func(ctx context.Context, tx *bt.Tx) (*meta.Data, error) {
+		if *tx.TxIDChainHash() != dataHash {
+			return &meta.Data{}, nil
+		}
+
+		if _, _, err := f.store.SpendAndCreate(ctx, tx, 500, utxo.WithCreateOnly(), utxo.WithSkipExtendedInputs(true)); err != nil {
+			return nil, err
+		}
+
+		return nil, errors.NewTxConflictingError("spend clash on %s", tx.TxIDChainHash().String())
+	}
+
+	f.sm.validationClient = mv
+
+	bi := testBlockIdent(f.block)
+	bi.origin = blockRequestOrigin{headerProven: true}
+	bi.timestamp = time.Unix(1_600_000_000, 0) // pre-CSV, so the header time is the finality source
+
+	require.NoError(t, f.sm.ValidateTransactionsLegacyMode(ctx, f.m, bi, 7))
+
+	post, err := f.store.Get(ctx, &dataHash, fields.BlockIDs)
+	require.NoError(t, err, "pre-validation stored the skipped transaction")
+	require.Contains(t, post.BlockIDs, uint32(7), "and marked mined in the block, like the ordinary transaction")
 }

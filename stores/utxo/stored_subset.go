@@ -6,6 +6,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"golang.org/x/sync/errgroup"
 )
 
 // StoredTxProber is an optional store capability: a cheap answer to "which of these
@@ -34,7 +35,8 @@ type StoredTxProber interface {
 // Whether any were stored cannot be read off the rest of the block: an earlier attempt may have
 // got only as far as a skipped transaction, so every skipped hash is asked about, on every
 // attempt. A store that implements StoredTxProber answers that itself. Any other store is asked
-// through BatchDecorate, in batches of storedSubsetDecorateBatchSize, and every store answers a
+// through BatchDecorate, in batches of storedSubsetDecorateBatchSize with up to
+// storedSubsetDecorateConcurrency in flight, and every store answers a
 // miss on the entry itself rather than by failing the call. Either way a first attempt pays
 // batched reads and no write. A store failure, whole-call or on one entry, is returned.
 func StoredSubset(ctx context.Context, store Store, hashes []*chainhash.Hash) ([]*chainhash.Hash, error) {
@@ -89,6 +91,13 @@ func storedSubsetByProbe(ctx context.Context, prober StoredTxProber, hashes []*c
 // that one call never becomes a single aerospike batch the size of the block.
 const storedSubsetDecorateBatchSize = 1024
 
+// storedSubsetDecorateConcurrency bounds how many of those batches are in flight at once. The
+// lookup sits on the block's critical path, so a block that skips 200,000 transactions would
+// otherwise wait on about 200 reads one after another. It is a fixed, conservative bound rather
+// than a setting, so that a single-node aerospike is not handed more concurrent batches than it
+// takes, and StoredSubset and the wrapper stores' forwarding need no settings passed in.
+const storedSubsetDecorateConcurrency = 4
+
 // StoredSubsetByDecorate is StoredSubset through BatchDecorate alone. It is what a store
 // without StoredTxProber gets, and what a wrapper store uses to forward StoredTxs to a store it
 // wraps that has no prober of its own.
@@ -112,12 +121,20 @@ func StoredSubsetByDecorate(ctx context.Context, store Store, hashes []*chainhas
 		return nil, nil
 	}
 
-	for start := 0; start < len(items); start += storedSubsetDecorateBatchSize {
-		end := min(start+storedSubsetDecorateBatchSize, len(items))
+	// Each batch fills in only its own items, so the batches share no state.
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(storedSubsetDecorateConcurrency)
 
-		if err := store.BatchDecorate(ctx, items[start:end], fields.BlockIDs); err != nil {
-			return nil, err
-		}
+	for start := 0; start < len(items); start += storedSubsetDecorateBatchSize {
+		batch := items[start:min(start+storedSubsetDecorateBatchSize, len(items))]
+
+		g.Go(func() error {
+			return store.BatchDecorate(gCtx, batch, fields.BlockIDs)
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	var stored []*chainhash.Hash

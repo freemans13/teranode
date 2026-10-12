@@ -3,7 +3,10 @@ package utxo_test
 import (
 	"context"
 	"net/url"
+	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -21,17 +24,53 @@ import (
 // countedStore is a real sqlitememory store that counts BatchDecorate calls and the entries in
 // each, and can fail a call or answer one entry with an error the way aerospike reports a
 // record timeout inside a batch that otherwise succeeded.
+//
+// The batches of one lookup run concurrently, so the counters are guarded. When rendezvous is
+// set, each call waits up to rendezvousWait for that many calls to have been in flight together,
+// and maxInFlight records the most it saw, which shows whether the batches overlapped at all.
 type countedStore struct {
 	utxo.Store
-	calls    int
-	sizes    []int
-	fail     error
-	entryErr map[chainhash.Hash]error
+	mu          sync.Mutex
+	calls       int
+	sizes       []int
+	fail        error
+	entryErr    map[chainhash.Hash]error
+	rendezvous  int
+	inFlight    int
+	maxInFlight int
 }
 
+const rendezvousWait = 5 * time.Second
+
 func (s *countedStore) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, f ...fields.FieldName) error {
+	s.mu.Lock()
 	s.calls++
 	s.sizes = append(s.sizes, len(items))
+	s.inFlight++
+	s.maxInFlight = max(s.maxInFlight, s.inFlight)
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.inFlight--
+		s.mu.Unlock()
+	}()
+
+	if s.rendezvous > 0 {
+		deadline := time.Now().Add(rendezvousWait)
+
+		for time.Now().Before(deadline) {
+			s.mu.Lock()
+			seen := s.maxInFlight
+			s.mu.Unlock()
+
+			if seen >= s.rendezvous {
+				break
+			}
+
+			time.Sleep(time.Millisecond)
+		}
+	}
 
 	if s.fail != nil {
 		return s.fail
@@ -141,7 +180,31 @@ func TestStoredSubsetSplitsALargeSetIntoBoundedReads(t *testing.T) {
 	got, err := utxo.StoredSubset(context.Background(), store, hashes)
 	require.NoError(t, err)
 	require.Equal(t, []*chainhash.Hash{&held}, got, "the one stored transaction, found in the last read")
-	require.Equal(t, []int{1024, 1024, 452}, store.sizes)
+
+	slices.Sort(store.sizes)
+	require.Equal(t, []int{452, 1024, 1024}, store.sizes)
+}
+
+// The batches of one lookup sit on the block's critical path, so they are read concurrently
+// rather than one after another.
+func TestStoredSubsetReadsItsBatchesConcurrently(t *testing.T) {
+	store := newCountedStore(t, "stored_subset_concurrent")
+	store.rendezvous = 3
+	held := storeTx(t, store, 1)
+
+	hashes := make([]*chainhash.Hash, 0, 2500)
+	for i := 0; i < 2499; i++ {
+		h := chainhash.Hash{0xab, byte(i), byte(i >> 8)}
+		hashes = append(hashes, &h)
+	}
+
+	hashes = append(hashes, &held)
+
+	got, err := utxo.StoredSubset(context.Background(), store, hashes)
+	require.NoError(t, err)
+	require.Equal(t, []*chainhash.Hash{&held}, got)
+	require.Equal(t, 3, store.calls)
+	require.Equal(t, 3, store.maxInFlight, "all three batches in flight together")
 }
 
 // A store that answers nothing at all, as the null store does, holds nothing.
