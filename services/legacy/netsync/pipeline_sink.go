@@ -394,18 +394,21 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // HTTP each treat a missing key as deleted), and ErrNotFound is tolerated for
 // any that does not.
 //
-// That guarantee has one hole, and pipelineBlockSink closes it rather than this
-// function. The record is written with overwrite allowed, so a redelivery of a
-// block already parked converts, overwrites the parked record with an identical
-// one, and reports converted. If the wire layer then refused it, this function
-// would delete the parked block's record and every subtree file it names. The
-// refusals left after a successful sink are both about length: declared bytes
-// after the last transaction, and a body that stops short of its declared length
-// and then hits EOF (the peer declares more than it sends and closes). The sink
-// now refuses both itself, before writing the record, by holding the stream to
-// exactly the declared body length (blockTxStream.RequireEnd). The wire layer's
+// That guarantee has one hole, and two things close it. The record is written
+// with overwrite allowed, so a redelivery of a block already parked converts,
+// overwrites the parked record with an identical one, and reports converted. If
+// the wire layer then refused it, deleting under the hash would take the parked
+// block's record and every subtree file it names. The refusals left after a
+// successful sink are both about length: declared bytes after the last
+// transaction, and a body that stops short of its declared length and then hits
+// EOF (the peer declares more than it sends and closes). The sink refuses both
+// itself, before writing the record, by holding the stream to exactly the
+// declared body length (blockTxStream.RequireEnd). The wire layer's
 // transaction-count read cannot fail after a successful sink, because the sink
-// has already read the same count.
+// has already read the same count. As a backstop for any refusal that still
+// gets through, this function returns early, deleting nothing, while the park
+// holds the block or has handed it out, so a refused copy cannot remove the
+// parked copy's files.
 //
 // The converted record itself is deleted by blockPark.Delete, which every path
 // that retires a park entry goes through, not only this discard path.

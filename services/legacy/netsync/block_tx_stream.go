@@ -225,8 +225,9 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 //
 // The wire layer refuses both too, but only after the sink has reported success (readBlockMessage,
 // services/legacy/peer/wire_streaming.go). By then the converted record is written, possibly over
-// a parked copy of the same block, and the refusal's cleanup, pipelineBlockDelete, takes that
-// parked copy's subtree files with it, because they are keyed by root and shared by every copy.
+// a parked copy of the same block, whose subtree files are keyed by root and shared by every copy.
+// The refusal's cleanup, pipelineBlockDelete, now leaves those files alone while the park holds or
+// has handed out the block, but refusing here first keeps the record from being written at all.
 func (s *blockTxStream) RequireEnd() error {
 	// Corrupt, not invalid, here and below: the transactions matched the header, so a length
 	// that disagrees says nothing about the block, only about this delivery of it.
