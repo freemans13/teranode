@@ -351,9 +351,11 @@ func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
 // read instead of after the whole download. After the asked-for check on
 // purpose, so an unrequested oversize body is still only discarded. This is a
 // decline, not a verdict: the error carries ErrBlockPolicyDeclined, which the
-// wire layer turns into a discard with the connection kept, and the hash is
-// marked in recentlyFailedBlocks so the wanted-range pass does not ask for it
-// again and drain it in a loop. At shipped defaults this arm never fires:
+// wire layer turns into a discard with the connection kept. The hash is not
+// marked in recentlyFailedBlocks: the length is the sender's claim, not the
+// block's, and the gate does not know whether the sender owes the block, so a
+// mark let any peer that knew a requested hash stop this node asking anyone for
+// it for the mark's lifetime, at no cost to itself. At shipped defaults this arm never fires:
 // go-wire refuses a payload above maxWireBlockPayload (4,000,000,000,
 // services/legacy/config.go) before this handler runs, and the default
 // excessiveblocksize is 4,294,967,296; it exists for an operator who lowers
@@ -381,16 +383,10 @@ func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.Bloc
 		return &peerpkg.BlockNotRequestedError{Hash: hash}
 	}
 
-	// sm.settings is nil on struct-literal managers in tests; recentlyFailedBlocks
-	// likewise. Policy.ExcessiveBlockSize is 0 when the operator disabled the
-	// limit. The map is guarded by its own lock (util/expiringmap), so writing it
-	// from the read loop is safe.
+	// sm.settings is nil on struct-literal managers in tests. Policy.ExcessiveBlockSize
+	// is 0 when the operator disabled the limit.
 	if sm.settings != nil && sm.settings.Policy.ExcessiveBlockSize > 0 {
 		if limit, err := safeconversion.IntToUint64(sm.settings.Policy.ExcessiveBlockSize); err == nil && length > limit {
-			if sm.recentlyFailedBlocks != nil {
-				sm.recentlyFailedBlocks.Set(hash, struct{}{})
-			}
-
 			sm.logger.Warnf("[streamingBlockGate][%s] declared %d-byte body exceeds excessiveblocksize %d (local policy); not read", hash, length, limit)
 
 			return errors.NewBlockPolicyDeclinedError("[streamingBlockGate][%s] declared %d-byte body exceeds excessiveblocksize %d (local policy)", hash, length, limit)

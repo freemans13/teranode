@@ -202,10 +202,11 @@ func TestStreamingBlockGate(t *testing.T) {
 // too large for this node's own block policy is refused before the first byte
 // of it is read instead of after the whole download. The refusal is a decline
 // (ErrBlockPolicyDeclined, which the wire layer discards with the connection
-// kept), the hash is marked in recentlyFailedBlocks so the wanted-range pass
-// does not re-ask and drain it in a loop, and the arm sits after the asked-for
-// check so an unrequested oversize body is still only discarded. A policy of 0
-// is "no limit".
+// kept), and the arm sits after the asked-for check so an unrequested oversize
+// body is still only discarded. A policy of 0 is "no limit". The hash is not
+// marked in recentlyFailedBlocks: the declared length is the sender's claim and
+// the gate cannot tell whether the sender owes the block, so the mark let any
+// peer that knew a requested hash stop it being asked for (review of 2026-10-12).
 func TestStreamingBlockGate_RefusesADeclaredPayloadAboveTheExcessiveBlockSize(t *testing.T) {
 	newSM := func(t *testing.T, limit int) *SyncManager {
 		t.Helper()
@@ -238,7 +239,7 @@ func TestStreamingBlockGate_RefusesADeclaredPayloadAboveTheExcessiveBlockSize(t 
 		}
 	}
 
-	t.Run("a requested body declared above the limit is declined and marked", func(t *testing.T) {
+	t.Run("a requested body declared above the limit is declined and not marked", func(t *testing.T) {
 		sm := newSM(t, 1000)
 		h, hash := minedHeader(t, sm)
 
@@ -248,7 +249,7 @@ func TestStreamingBlockGate_RefusesADeclaredPayloadAboveTheExcessiveBlockSize(t 
 		require.False(t, errors.Is(err, errors.ErrBlockInvalid))
 
 		_, marked := sm.recentlyFailedBlocks.Get(hash)
-		require.True(t, marked, "marked so the wanted-range pass does not ask for it again and drain it in a loop")
+		require.False(t, marked, "a sender's declared length must not stop the block being asked of anyone")
 	})
 
 	t.Run("a body declared at the limit passes and is not marked", func(t *testing.T) {
