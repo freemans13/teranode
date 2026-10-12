@@ -598,6 +598,26 @@ func (r *streamRegistry) arrivingFrom(h chainhash.Hash, p *peerpkg.Peer) (read, 
 	return 0, 0, time.Time{}, false
 }
 
+// judgedArrivalFrom is arrivingFrom with the rate the copy is judged on at now (judgedRateLocked):
+// once the copy is liveRateWindow old, the lower of its average and its rate over the last
+// window. The average alone kept a copy that was fast early and slow later looking healthy.
+func (r *streamRegistry) judgedArrivalFrom(h chainhash.Hash, p *peerpkg.Peer, now time.Time) (read, total int64, start time.Time, rate float64, ok bool) {
+	if r == nil || p == nil {
+		return 0, 0, time.Time{}, 0, false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for s := range r.active {
+		if s.hash == h && s.owner == p {
+			return s.read.Load(), s.total, s.start, r.judgedRateLocked(s, now), true
+		}
+	}
+
+	return 0, 0, time.Time{}, 0, false
+}
+
 // arrivingBytes is the declared size of every block arriving now from a peer that owes it, and how
 // many there are. A copy from a peer that does not owe the block is drained, not held, so its
 // declared size is not counted against the disk.

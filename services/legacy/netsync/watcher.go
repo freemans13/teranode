@@ -314,8 +314,8 @@ const farOff = maxEstimate
 // admission slot), and arrivalStalled when its bytes arrive under raceStallRate, so it is the
 // race's.
 //
-// A copy arriving from o is judged on its own rate: its remaining bytes at that rate, and a fresh
-// copy must fetch the whole block. A copy not yet started is judged by o's queue: the bytes o is
+// A copy arriving from o is judged on its own rate, the lower of its average and its live rate:
+// its remaining bytes at that rate, and a fresh copy must fetch the whole block. A copy not yet started is judged by o's queue: the bytes o is
 // still sending, a typical block for each block ahead of it and its own typical size, at o's rate.
 // An owner let off the block (forgiven, so not in its queue) and sending no copy will not deliver.
 func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []queuedBlock, typical int64, now time.Time) (eta time.Duration, ownSize int64, state string, verdict arrivalVerdict) {
@@ -324,17 +324,17 @@ func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []q
 		return 0, 0, "", arrivalTooEarly
 	}
 
-	if read, total, start, arriving := sm.streams.arrivingFrom(h, o); arriving {
-		elapsed := now.Sub(start)
-		if elapsed < watchMinAge {
+	// The copy's rate is the one the race judges it on (judgedRateLocked): the lower of its
+	// average and its live rate. On the average alone a copy that was fast early and slow past
+	// half kept a short estimate and got no helper (review of 2026-10-12).
+	if read, total, start, rate, arriving := sm.streams.judgedArrivalFrom(h, o, now); arriving {
+		if now.Sub(start) < watchMinAge {
 			return 0, 0, "", arrivalTooEarly
 		}
 
-		if read <= 0 || float64(read)/elapsed.Seconds() < raceStallRate {
+		if read <= 0 || rate < raceStallRate {
 			return 0, 0, "", arrivalStalled
 		}
-
-		rate := float64(read) / elapsed.Seconds()
 
 		return estimate(float64(total-read), rate), total, "arrives slowly from", arrivalJudged
 	}
