@@ -95,6 +95,17 @@ type parkDisposition struct {
 	// strands the node where a wrong disconnect costs a reconnect;
 	// recentlyFailedBlocks already stops the hash being re-asked.
 	dropPeer bool
+
+	// reAsk sends the delivering peer (or the sync peer) a getblocks from the best
+	// block once the record is dropped, so the block is announced and fetched again.
+	// Set on every row that drops the record without writing the block off and that
+	// wants the block back. Below the last checkpoint the wanted-range pass names a
+	// dropped block anyway; above it nothing does, because blocks there are named by
+	// announcements and the download ledger and a dropped record is in neither. On
+	// 2026-10-10 the chain waited 13 minutes at 970,502 for the next announcement.
+	// Not set on committed (the block is in the chain) or abandoned (its parent is
+	// never coming, so the block is not wanted).
+	reAsk bool
 }
 
 // The table. Read down the columns: keep-or-drop, rewind-or-not, blame-or-not.
@@ -147,13 +158,16 @@ var (
 
 	// parkDispositionBlobUnusable — the blob is gone, or will not decode, or
 	// decodes into some other block. That is evidence about the file and not
-	// about the peer: we wrote it, so a bad blob is our fault. Delete it; the
-	// block is still in the wanted range and now unowed, so the next
-	// wanted-range pass downloads it again.
+	// about the peer: we wrote it, so a bad blob is our fault. Delete it; below
+	// the last checkpoint the block is still in the wanted range and now
+	// unowed, so the next wanted-range pass downloads it again, and above it
+	// reAsk asks a peer for it.
 	parkDispositionBlobUnusable = parkDisposition{
 		name:   "blob_unusable",
 		reason: "the parked blob is not the block it claims to be",
 		blob:   parkBlobDrop,
+
+		reAsk: true,
 	}
 
 	// parkDispositionRecordCorrupt — block validation returned a corrupt
@@ -163,7 +177,8 @@ var (
 	// wrote before the record existed, so a corrupt verdict afterwards is about
 	// this node's own files, never about the peer's bytes. Drop the record,
 	// mark nothing, blame nobody; the block is unowed on the next wanted-range
-	// pass and is downloaded again.
+	// pass and is downloaded again, or, above the last checkpoint, reAsk asks a
+	// peer for it.
 	//
 	// Dropping repairs the one case it is written for: on the unified route a
 	// structure file that does not hash to its key is deleted by
@@ -195,6 +210,8 @@ var (
 		name:   "record_corrupt",
 		reason: "a corrupt verdict on a record this node wrote; the body was verified against the header at the sink, so the fault is local",
 		blob:   parkBlobDrop,
+
+		reAsk: true,
 	}
 
 	// parkDispositionFilesGone — the record names subtree files that are no
@@ -202,7 +219,8 @@ var (
 	// every subtree file does (subtree_writer.go), so expiry removes the files
 	// from under it; a concurrent conversion's cleanup can do the same. Drop
 	// the record, mark nothing, blame nobody: the next wanted-range pass sees
-	// the block as not held and downloads it again, and the sink rewrites
+	// the block as not held and downloads it again (above the last checkpoint
+	// reAsk asks a peer for it instead), and the sink rewrites
 	// whichever files are missing (put skips the ones still there).
 	//
 	// Reached two ways. hasCompleteRecord on the commit path finds the files
@@ -221,6 +239,8 @@ var (
 		name:   "files_gone",
 		reason: "the record names subtree files that are no longer on disk",
 		blob:   parkBlobDrop,
+
+		reAsk: true,
 	}
 
 	// parkDispositionLocalUtxoFault — a parent output this block spends is
@@ -474,7 +494,7 @@ const parkRejectWriteBound = 2 * time.Second
 
 // applyParkDisposition carries out one row of the table. It is the ONLY place
 // that deletes a parked blob, restores a parked entry, rejects one to a peer,
-// or drops the peer that delivered one.
+// drops the peer that delivered one, or asks a peer again for a dropped one.
 //
 // It runs on the in-order commit goroutine (parkedBlockFailed, from the drain),
 // so nothing here may wait on a peer: a reject is queued, never awaited, and
@@ -497,6 +517,16 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 
 	if d.markFailed && sm.recentlyFailedBlocks != nil {
 		sm.recentlyFailedBlocks.Set(entry.hash, struct{}{})
+	}
+
+	// In headers-first mode the wanted-range pass names the dropped block, so only
+	// above the last checkpoint is the re-ask needed. livePeer may fall back to the
+	// sync peer: a re-ask is a sync action, not a misbehaviour signal.
+	if d.reAsk && !sm.headersFirstMode.Load() {
+		if peer := sm.livePeer(entry.peer); peer != nil {
+			sm.logger.Infof("[applyParkDisposition][%s] asking %s again for the dropped block above the last checkpoint", entry.hash, peer)
+			sm.requestMissingBlocks(peer, entry.hash)
+		}
 	}
 
 	if !d.blamePeer && !d.dropPeer {
