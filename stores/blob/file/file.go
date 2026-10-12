@@ -873,12 +873,12 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 	keyHex := formatKeyHex(key)
 	s.debugf("[File] SetFromReader start key=%s type=%s", keyHex, fileType)
 
-	filename, err := s.constructFilename(key, fileType, opts)
+	merged := options.MergeOptions(s.options, opts)
+
+	filename, err := s.publishFilename(key, fileType, merged, opts)
 	if err != nil {
 		return errors.NewStorageError("[File][SetFromReader] [%s] failed to get file name", util.ReverseAndHexEncodeSlice(key), err)
 	}
-
-	merged := options.MergeOptions(s.options, opts)
 
 	if err := s.errorOnOverwrite(filename, merged); err != nil {
 		return err
@@ -948,6 +948,10 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 		return err
 	}
 	cleanupTmpFile = false
+
+	if err = s.scheduleAfterExclusivePublish(key, fileType, filename, merged); err != nil {
+		return err
+	}
 
 	s.debugf("[File] SetFromReader completed key=%s type=%s filename=%s", keyHex, fileType, filename)
 	return nil
@@ -1097,21 +1101,36 @@ func (s *File) Set(ctx context.Context, key []byte, fileType fileformat.FileType
 func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts []options.FileOption) (string, error) {
 	merged := options.MergeOptions(s.options, opts)
 
+	fileName, err := s.filenameFor(key, fileType, merged)
+	if err != nil {
+		return "", err
+	}
+
+	if err := s.scheduleDAH(key, fileType, merged); err != nil {
+		return "", err
+	}
+
+	return fileName, nil
+}
+
+// filenameFor is the blob's file name, creating its sub directory if it has one. Unlike
+// constructFilename it schedules no deletion.
+func (s *File) filenameFor(key []byte, fileType fileformat.FileType, merged *options.Options) (string, error) {
 	if merged.SubDirectory != "" {
 		if err := os.MkdirAll(filepath.Join(s.path, merged.SubDirectory), 0755); err != nil {
 			return "", errors.NewStorageError("[File] failed to create sub directory", err)
 		}
 	}
 
-	fileName, err := merged.ConstructFilename(s.path, key, fileType)
-	if err != nil {
-		return "", err
-	}
+	return merged.ConstructFilename(s.path, key, fileType)
+}
 
+// scheduleDAH schedules the blob's deletion at its delete-at-height, when merged gives one.
+func (s *File) scheduleDAH(key []byte, fileType fileformat.FileType, merged *options.Options) error {
 	// Skip DAH functionality entirely if disabled for this store
 	// Lifecycle is managed externally (e.g., by Aerospike pruner)
 	if merged.DisableDAH {
-		return fileName, nil
+		return nil
 	}
 
 	dah := merged.DAH
@@ -1125,18 +1144,57 @@ func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts 
 	if dah > 0 {
 		// Schedule deletion via blockchain service
 		if s.blobDeletionScheduler == nil {
-			return "", errors.NewConfigurationError("cannot schedule blob deletion: blob deletion scheduler not configured")
+			return errors.NewConfigurationError("cannot schedule blob deletion: blob deletion scheduler not configured")
 		}
 
 		// Use background context since SetFromReader might be cancelled
 		// but we still want the deletion to be scheduled
 		bgCtx := context.Background()
 		if _, _, err := s.blobDeletionScheduler.ScheduleBlobDeletion(bgCtx, key, string(fileType), s.storeType, dah); err != nil {
-			return "", errors.NewStorageError("failed to schedule blob deletion", err)
+			return errors.NewStorageError("failed to schedule blob deletion", err)
 		}
 	}
 
-	return fileName, nil
+	return nil
+}
+
+// publishFilename is the name a streamed write publishes under. A plain write schedules its
+// delete-at-height here, before the publish, as constructFilename always has. An exclusive
+// publish (options.WithExclusivePublish) does not: the scheduler's upsert is last-writer-wins,
+// so a writer that then loses the publish would replace the winner's delete-at-height with its
+// own, undoing a later SetDAH(0) that keeps the blob. scheduleAfterExclusivePublish schedules it
+// once the publish has succeeded.
+func (s *File) publishFilename(key []byte, fileType fileformat.FileType, merged *options.Options, opts []options.FileOption) (string, error) {
+	if merged.ExclusivePublish {
+		return s.filenameFor(key, fileType, merged)
+	}
+
+	return s.constructFilename(key, fileType, opts)
+}
+
+// scheduleAfterExclusivePublish schedules the delete-at-height of a blob that an exclusive
+// publish has just created, and does nothing for any other write. If scheduling fails the blob
+// is removed, as a plain write that fails to schedule never publishes: the exclusive publish
+// proves this writer created the file, so removing it touches no one else's blob.
+func (s *File) scheduleAfterExclusivePublish(key []byte, fileType fileformat.FileType, filename string, merged *options.Options) error {
+	if !merged.ExclusivePublish {
+		return nil
+	}
+
+	err := s.scheduleDAH(key, fileType, merged)
+	if err == nil {
+		return nil
+	}
+
+	if removeErr := s.removeStorePath(filename); removeErr != nil && !os.IsNotExist(removeErr) {
+		s.logger.Warnf("[File] failed to remove blob file %s after its deletion could not be scheduled: %v", filename, removeErr)
+	}
+
+	if removeErr := os.Remove(filename + checksumExtension); removeErr != nil && !os.IsNotExist(removeErr) {
+		s.logger.Warnf("[File] failed to remove checksum file for %s after its deletion could not be scheduled: %v", filename, removeErr)
+	}
+
+	return err
 }
 
 // SetDAH sets the Delete-At-Height (DAH) value for a blob in the file store.
@@ -1662,9 +1720,9 @@ func (s *File) syncParentDirBestEffort(filename string) {
 //     returned as ErrBlobAlreadyExists, and the temp name is then unlinked. Of two writers
 //     that both passed errorOnOverwrite's Stat, exactly one is told it created the blob,
 //     which is what the legacy subtree writer's DeleteAll relies on (services/legacy/netsync/
-//     subtree_writer.go), the only caller that asks for it. What the exclusive publish does
-//     not decide is the blob's delete-at-height: constructFilename schedules it before the
-//     publish, from both writers, last writer wins.
+//     subtree_writer.go), the only caller that asks for it. The blob's delete-at-height is
+//     scheduled only after this succeeds (scheduleAfterExclusivePublish), so the writer
+//     that is refused never schedules one over the winner's.
 //   - otherwise: rename(2). On POSIX (Linux, macOS, *BSD) rename atomically replaces an
 //     existing regular file, so the "destination exists" branch below is unreachable there
 //     and the no-overwrite contract rests on SetFromReader's earlier call to
