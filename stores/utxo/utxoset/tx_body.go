@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -344,6 +345,12 @@ func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, er
 // repeat after a crash between the carry and the drop copy nothing twice, as for the waiting
 // set. reclaimCarriedBodySQL keeps the copy until the block is 288 blocks below the pruner's
 // height, so it outlives the persister's archive of that block.
+//
+// Rows created at or below $3, the highest checkpoint, are not read. Nothing there qualifies: a
+// transaction this node mines was first seen at the tip, above the checkpoint, and a block-path
+// create carries its own block's height as created_height, which can never be 288 blocks below a
+// block above the archived height. Without the bound a sync that writes bodies below the
+// checkpoint would pay one containment probe per transaction at every window drop for nothing.
 const carryUnarchivedBodySQL = `
 INSERT INTO tx_body_carry (txid, raw_tx)
 SELECT b.txid, b.raw_tx
@@ -357,6 +364,7 @@ SELECT b.txid, b.raw_tx
    OFFSET 0
  ) AS m
  WHERE b.created_height < $1::int
+   AND b.created_height > $3::int
    AND b.raw_tx IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM tx_body_carry c WHERE c.txid = b.txid)
 ON CONFLICT (txid) DO NOTHING`
@@ -365,7 +373,8 @@ ON CONFLICT (txid) DO NOTHING`
 // in a block above archived into tx_body_carry, and returns how many it copied. See
 // carryUnarchivedBodySQL.
 func (s *Store) carryUnarchivedBodies(ctx context.Context, bound, archived uint32) (int64, error) {
-	tag, err := s.pool.Exec(ctx, carryUnarchivedBodySQL, int32(bound), int32(archived)) //nolint:gosec // heights fit int32
+	tag, err := s.pool.Exec(ctx, carryUnarchivedBodySQL, int32(bound), int32(archived), //nolint:gosec // heights fit int32
+		int32(model.HighestCheckpointHeight(s.checkpoints))) //nolint:gosec // a height fits int32
 	if err != nil {
 		return 0, errors.NewStorageError("[utxoset] carry bodies of transactions created below height %d and mined above the archived height %d", bound, archived, err)
 	}
