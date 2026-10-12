@@ -875,6 +875,10 @@ type SyncManager struct {
 	farProbes           farProbeSet        // blocks placeUnmeasured gave from the top of the window, which highestHeld does not count
 	peerRatesPath       string             // the rates file (peerRatesFile), or empty to keep no rates
 
+	// watchNoSizeLogged is set once the watcher has logged that it has no block size to judge
+	// by, and cleared when it has one again, so the line is written once per episode.
+	watchNoSizeLogged atomic.Bool
+
 	// dispatcher runs each parked block's work on a worker, one block at a time,
 	// and every chain-order step in dispatch order. Built in New(); nil when
 	// SyncManager was built as a struct literal in a test, which every dispatcher

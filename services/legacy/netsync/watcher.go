@@ -98,10 +98,19 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 		return
 	}
 
+	// With no block size the watcher cannot estimate a queued block, and does nothing until the
+	// first block converts: seeding the tracker failed, or the chain starts at genesis. That is
+	// said once, not left silent (review of 2026-10-12).
 	typical := sm.blockSizeTracker.meanRecentSize()
 	if typical <= 0 {
+		if sm.watchNoSizeLogged.CompareAndSwap(false, true) {
+			sm.logger.Warnf("[watch] no recent block size to judge late blocks by; the watcher waits for the first block to convert")
+		}
+
 		return
 	}
+
+	sm.watchNoSizeLogged.Store(false)
 
 	tip, _, ok := sm.committedTip()
 	if !ok {

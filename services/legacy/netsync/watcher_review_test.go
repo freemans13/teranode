@@ -29,3 +29,26 @@ func TestWatchJudgesACopyPastHalfOnItsLiveRate(t *testing.T) {
 	require.True(t, sm.blockDownloads.HasOwner(fast, next), "50 MB at 150 KB/s is past watchPastHalfWait")
 	require.True(t, sm.blockDownloads.HasOwner(owner, next), "and the owner keeps its copy")
 }
+
+// With no block size, seeding failed or the chain starts at genesis, the watcher cannot judge a
+// queued block and does nothing until the first block converts. It says so once rather than
+// silently (review of 2026-10-12).
+func TestWatchSaysOnceThatItHasNoBlockSize(t *testing.T) {
+	sm, owner, _, _ := reaskSetup(t)
+	logs := &warnCaptureLogger{}
+	sm.logger = logs
+	sm.blockSizeTracker = newBlockSizeTracker(10)
+	now := time.Now()
+
+	askAt(t, sm, owner, heightHash(t, sm, 11), now.Add(-2*time.Minute))
+
+	sm.watchOwedBlocks(now)
+	sm.watchOwedBlocks(now.Add(5 * time.Second))
+
+	require.Len(t, logs.warnings, 1, "said once, not on every tick")
+	require.Contains(t, logs.warnings[0], "no recent block size")
+
+	sm.blockSizeTracker.addBlockSize(reaskTypicalBlock)
+	sm.watchOwedBlocks(now.Add(10 * time.Second))
+	require.False(t, sm.watchNoSizeLogged.Load(), "cleared once a size is known, so a later episode is said again")
+}
