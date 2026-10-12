@@ -474,6 +474,12 @@ type blockOnDiskMsg struct {
 // read loop is already free by the time this is called, because the bytes went
 // to disk as they arrived rather than into a buffer somebody has to release.
 func (sm *SyncManager) QueueBlockOnDisk(body peerpkg.BlockBody, peer *peerpkg.Peer) {
+	// The wire layer accepted the copy, so its cleanup will not run: the converting writer's
+	// window as a creator closes here (holdUntilSettled).
+	if body.Converted {
+		sm.settleAccepted(body.Hash)
+	}
+
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		return
 	}

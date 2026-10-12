@@ -3,6 +3,7 @@ package netsync
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -173,6 +174,73 @@ func (a *subtreeAdoptions) size() int {
 	defer a.mu.Unlock()
 
 	return len(a.files)
+}
+
+// settleBackstop is how long a converted copy's writer may wait to be settled before the park
+// sweep settles it. The wire layer settles a copy in the same read that converted it, so any
+// writer still waiting this long was settled by a message that never arrived.
+const settleBackstop = time.Minute
+
+// settlingWriter is a converted copy's writer waiting for the wire layer's verdict on the copy.
+type settlingWriter struct {
+	writer *subtreeWriter
+	since  time.Time
+}
+
+// holdUntilSettled keeps a converted copy's writer, and so its window as a creator, open past
+// the sink. The wire layer can still refuse the copy after the sink succeeded, and its
+// cleanup, pipelineBlockDelete, must then delete what this copy created while holds other
+// blocks took on those files still stand. Only one copy of a block converts at a time
+// (startConversion), so a writer already waiting under the hash belongs to an earlier copy
+// that was settled without a word; it is finished here.
+func (sm *SyncManager) holdUntilSettled(hash chainhash.Hash, w *subtreeWriter) {
+	sm.settlingMu.Lock()
+	defer sm.settlingMu.Unlock()
+
+	if sm.settling == nil {
+		sm.settling = make(map[chainhash.Hash]settlingWriter)
+	}
+
+	if prev, ok := sm.settling[hash]; ok {
+		prev.writer.finish()
+	}
+
+	sm.settling[hash] = settlingWriter{writer: w, since: time.Now()}
+}
+
+// takeSettling removes and returns the writer waiting under hash, or nil.
+func (sm *SyncManager) takeSettling(hash chainhash.Hash) *subtreeWriter {
+	sm.settlingMu.Lock()
+	defer sm.settlingMu.Unlock()
+
+	s, ok := sm.settling[hash]
+	if !ok {
+		return nil
+	}
+
+	delete(sm.settling, hash)
+
+	return s.writer
+}
+
+// settleAccepted closes the window of a copy the wire layer accepted.
+func (sm *SyncManager) settleAccepted(hash chainhash.Hash) {
+	if w := sm.takeSettling(hash); w != nil {
+		w.finish()
+	}
+}
+
+// settleStale finishes every writer that has waited longer than settleBackstop.
+func (sm *SyncManager) settleStale(now time.Time) {
+	sm.settlingMu.Lock()
+	defer sm.settlingMu.Unlock()
+
+	for hash, s := range sm.settling {
+		if now.Sub(s.since) >= settleBackstop {
+			s.writer.finish()
+			delete(sm.settling, hash)
+		}
+	}
 }
 
 // subtreeAdoptionsFor returns the manager's registry, creating it on first use. Lazy so a

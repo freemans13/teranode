@@ -158,10 +158,20 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 	}
 
 	// One registry for every conversion, so no block's cleanup removes a file another adopted.
-	// The writer's window as a creator closes when this conversion is over, whatever the
-	// outcome: from then on nothing of this copy deletes a file it created.
+	// A copy that fails closes its writer's window as a creator here. One that converts keeps
+	// it open until the wire layer settles the copy (holdUntilSettled), because a refusal after
+	// the sink still runs this copy's cleanup in pipelineBlockDelete.
 	writer.adoptions = sm.subtreeAdoptionsFor()
-	defer writer.finish()
+
+	sinkConverted := false
+
+	defer func() {
+		if sinkConverted {
+			sm.holdUntilSettled(hash, writer)
+		} else {
+			writer.finish()
+		}
+	}()
 
 	var (
 		root          *chainhash.Hash
@@ -365,6 +375,8 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		return false, errors.NewStorageError("[pipelineBlockSink][%s] failed to write the converted record", hash, err)
 	}
 
+	sinkConverted = true
+
 	return true, nil
 }
 
@@ -442,12 +454,35 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 	// names are the parked copy's, and deleting them left a record whose files were gone: the
 	// parent's commit then dropped it (970,503 on 2026-10-10). A file this copy did create is
 	// left to its delete-at-height.
+	// The copy's writer, kept open by the sink until now (holdUntilSettled).
+	writer := sm.takeSettling(hash)
+
 	if sm.blockPark.Has(hash) || sm.blockPark.HandedOut(hash) {
 		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked block; keeping the parked copy's subtree files", hash)
+
+		if writer != nil {
+			writer.finish()
+		}
 
 		return nil
 	}
 
+	// The writer knows exactly which files this copy created, and its window as a creator is
+	// still open, so holds other blocks took on them still stand: DeleteAll removes the files
+	// this copy created that nobody holds, and nothing this copy merely adopted.
+	if writer != nil {
+		firstErr := writer.DeleteAll(sm.ctx)
+		if firstErr != nil {
+			firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting the subtree files this copy wrote", hash, firstErr)
+		}
+
+		sm.blockPark.Delete(sm.ctx, parkedBlock{hash: hash})
+
+		return firstErr
+	}
+
+	// No writer is waiting: the record was not written by a sink of this process just now.
+	// Fall back to what the record names, skipping any file a writer is writing or holds.
 	var firstErr error
 
 	record, err := sm.blockPark.ReadConverted(sm.ctx, hash)
@@ -456,11 +491,6 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 	case err == nil && record != nil:
 		for _, root := range record.Subtrees {
 			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtree} {
-				// A file a writer is writing or holds stays, as in subtreeWriter.DeleteAll. This
-				// runs after the sink's writer has finished, so it sees only holds taken against
-				// creators still converting; that is the most a deleter of a whole record can
-				// check, and the sink's own length check keeps a converted copy from reaching
-				// here at all.
 				delErr := sm.deleteSubtreeFileUnlessAdopted(*root, ft)
 				if delErr != nil && !errors.Is(delErr, errors.ErrNotFound) && firstErr == nil {
 					firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)

@@ -284,7 +284,8 @@ func (w *subtreeWriter) adopt(key writtenSubtree) {
 
 // finish closes this writer's window on every file it created: its conversion is over, so it
 // will not delete them, and a hold another writer took against it is no longer needed.
-// pipelineBlockSink defers it; it is safe to call more than once.
+// pipelineBlockSink calls it when a copy fails; a copy that converted is finished when the wire
+// layer settles it (holdUntilSettled). It is safe to call more than once.
 func (w *subtreeWriter) finish() {
 	for _, key := range w.live {
 		w.registry().finished(key)

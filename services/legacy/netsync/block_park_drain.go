@@ -453,6 +453,10 @@ func (sm *SyncManager) runParkSweep() {
 		case <-ticker.C:
 			sm.sweepParkedBlocks(time.Now())
 
+			// A converted copy whose verdict never reached QueueBlockOnDisk or
+			// pipelineBlockDelete still holds its writer open; close it.
+			sm.settleStale(time.Now())
+
 			// A block given up on since the last tick has nothing put back for
 			// it: the wanted-range pass recomputes what it wants and who owes
 			// it from the committed tip on every call, so this periodic pass is

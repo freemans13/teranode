@@ -2,9 +2,13 @@ package netsync
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -138,31 +142,119 @@ func TestSubtreeWriter_ACleanupStillRemovesFilesNoLiveBlockAdopted(t *testing.T)
 	}
 }
 
-// pipelineBlockDelete removes every file a refused record names, whoever created it, so it goes
-// through the same registry: a file another block adopted is left.
-func TestSyncManager_ARefusedRecordsDeleteLeavesAnAdoptedFile(t *testing.T) {
-	ctx := context.Background()
-	store := exclusiveFileStore(t)
+// convertedCopy stands in for one pipelineBlockSink call that converted: a writer of the
+// manager's registry emits the subtree and is then held open until settled, as the sink's
+// deferred holdUntilSettled does.
+func convertedCopy(t *testing.T, ctx context.Context, sm *SyncManager, hash chainhash.Hash) *subtreeWriter {
+	t.Helper()
 
-	sm := &SyncManager{ctx: ctx, subtreeStore: store}
+	w := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), sm.subtreeStore, 800000)
+	w.adoptions = sm.subtreeAdoptionsFor()
 
-	b := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800001)
-	b.adoptions = sm.subtreeAdoptionsFor()
+	emitSubtree(t, ctx, w, 8)
+	sm.holdUntilSettled(hash, w)
 
-	a := newSubtreeWriter(ulogger.TestLogger{}, settings.NewSettings(), store, 800000)
-	a.adoptions = sm.subtreeAdoptionsFor()
+	return w
+}
 
-	emitSubtree(t, ctx, a, 8)
-	emitSubtree(t, ctx, b, 8)
+func requireSubtreeFiles(t *testing.T, ctx context.Context, sm *SyncManager, want bool, msg string) {
+	t.Helper()
 
 	st, _, _ := oneSubtree(t, 8)
 	root := st.RootHash()
 
 	for _, ft := range subtreeArtefactTypes {
-		require.NoError(t, sm.deleteSubtreeFileUnlessAdopted(*root, ft))
-
-		exists, err := store.Exists(ctx, root[:], ft)
+		exists, err := sm.subtreeStore.Exists(ctx, root[:], ft)
 		require.NoError(t, err)
-		require.True(t, exists, "a refused record's delete must leave the %s another block adopted", ft)
+		require.Equal(t, want, exists, "%s: %s", msg, ft)
 	}
+}
+
+// pipelineBlockDelete runs after the sink, in the same wire read, when the wire layer refuses a
+// copy that converted. It runs in the order production uses: the copy's writer is still held
+// open (holdUntilSettled), so a hold another block took on a file this copy created stands, and
+// the files that block adopted are left. Before, the sink finished its writer first and this
+// delete removed them.
+func TestPipelineBlockDelete_ARefusedCopyLeavesTheFilesAnotherBlockAdopted(t *testing.T) {
+	ctx := context.Background()
+	sm := &SyncManager{ctx: ctx, subtreeStore: exclusiveFileStore(t)}
+
+	refused, adopter := chainhash.Hash{1}, chainhash.Hash{2}
+
+	convertedCopy(t, ctx, sm, refused)
+
+	b := convertedCopy(t, ctx, sm, adopter)
+	require.Len(t, b.adopted, len(subtreeArtefactTypes), "B adopted while the refused copy was still open")
+
+	sm.settleAccepted(adopter)
+
+	require.NoError(t, sm.pipelineBlockDelete(refused, true))
+
+	requireSubtreeFiles(t, ctx, sm, true, "the refused copy's cleanup must leave the file B adopted")
+	require.Zero(t, sm.subtreeAdoptionsFor().size(), "both copies are settled, so nothing is tracked")
+}
+
+// A refused copy deletes only what it created, never a file it adopted from a block whose
+// conversion has already finished.
+func TestPipelineBlockDelete_ARefusedCopyLeavesTheFilesItAdopted(t *testing.T) {
+	ctx := context.Background()
+	sm := &SyncManager{ctx: ctx, subtreeStore: exclusiveFileStore(t)}
+
+	creator, refused := chainhash.Hash{1}, chainhash.Hash{2}
+
+	convertedCopy(t, ctx, sm, creator)
+	sm.settleAccepted(creator)
+
+	d := convertedCopy(t, ctx, sm, refused)
+	require.Empty(t, d.written, "the refused copy created nothing")
+
+	require.NoError(t, sm.pipelineBlockDelete(refused, true))
+
+	requireSubtreeFiles(t, ctx, sm, true, "the refused copy must leave the files it only adopted")
+}
+
+// A refused copy that created its files and that nobody adopted still removes them.
+func TestPipelineBlockDelete_ARefusedCopyRemovesWhatOnlyItUsed(t *testing.T) {
+	ctx := context.Background()
+	sm := &SyncManager{ctx: ctx, subtreeStore: exclusiveFileStore(t)}
+
+	refused := chainhash.Hash{1}
+
+	convertedCopy(t, ctx, sm, refused)
+
+	require.NoError(t, sm.pipelineBlockDelete(refused, true))
+
+	requireSubtreeFiles(t, ctx, sm, false, "a refused copy's own files are removed")
+	require.Zero(t, sm.subtreeAdoptionsFor().size())
+}
+
+// A converted copy's writer is held open until the wire layer settles it. An accepted copy is
+// settled by QueueBlockOnDisk; a copy whose verdict never arrives is settled by the park sweep
+// once settleBackstop has passed. Either way nothing is left tracked.
+func TestSyncManager_AConvertedCopyIsAlwaysSettled(t *testing.T) {
+	ctx := context.Background()
+	sm := &SyncManager{ctx: ctx, subtreeStore: exclusiveFileStore(t)}
+
+	accepted := chainhash.Hash{1}
+
+	convertedCopy(t, ctx, sm, accepted)
+	require.Positive(t, sm.subtreeAdoptionsFor().size(), "the converted copy's files are live until it is settled")
+
+	// Shutdown set only so the queue send is skipped; the settle comes before it.
+	atomic.StoreInt32(&sm.shutdown, 1)
+	sm.QueueBlockOnDisk(peerpkg.BlockBody{Hash: accepted, Converted: true}, nil)
+	require.Nil(t, sm.takeSettling(accepted), "an accepted copy is settled when it is queued")
+	require.Zero(t, sm.subtreeAdoptionsFor().size())
+
+	other := &SyncManager{ctx: ctx, subtreeStore: exclusiveFileStore(t)}
+	lost := chainhash.Hash{2}
+
+	convertedCopy(t, ctx, other, lost)
+
+	other.settleStale(time.Now())
+	require.Positive(t, other.subtreeAdoptionsFor().size(), "a copy converted moments ago is not stale yet")
+
+	other.settleStale(time.Now().Add(settleBackstop))
+	require.Nil(t, other.takeSettling(lost), "the sweep settles a copy whose verdict never arrived")
+	require.Zero(t, other.subtreeAdoptionsFor().size())
 }

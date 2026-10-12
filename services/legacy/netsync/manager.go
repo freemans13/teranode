@@ -641,6 +641,12 @@ type SyncManager struct {
 	// subtreeAdoptionsFor, which creates it on first use.
 	adoptions atomic.Pointer[subtreeAdoptions]
 
+	// settling holds the writer of each copy that converted until the wire layer has settled
+	// it: pipelineBlockDelete for a refused copy, handleBlockOnDiskMsg for an accepted one, or
+	// the park sweep as a backstop. Guarded by settlingMu; see holdUntilSettled.
+	settlingMu sync.Mutex
+	settling   map[chainhash.Hash]settlingWriter
+
 	ctx          context.Context
 	logger       ulogger.Logger
 	settings     *settings.Settings

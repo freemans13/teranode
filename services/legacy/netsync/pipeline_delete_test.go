@@ -307,6 +307,11 @@ func TestPipelineBlockDelete_LogsARealReadFailureInsteadOfSwallowingIt(t *testin
 
 	require.Empty(t, warnings.warnings, "sanity: nothing has failed yet")
 
+	// The record is read only when no converting writer is waiting for the copy, the path
+	// for a record this process's sink did not just write. Settle the writer so the delete
+	// takes that path.
+	sm.settleAccepted(*blk.Hash())
+
 	// converted: true — this delivery's own sink call above genuinely
 	// converted blk, so the read failure below (the store now holds a foreign
 	// block's bytes under blk's key) must still be treated as THIS call's own
