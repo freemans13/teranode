@@ -415,7 +415,7 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // subtree files may have reached their delete-at-height by then, and the
 // commit's completeness check drops the record so the block is downloaded
 // again (FilesGone). A copy accepted and not yet parked counts as parked
-// (acceptanceQueued), so a refusal of the other copy in that gap keeps the
+// (settleAccepted), so a refusal of the other copy in that gap keeps the
 // accepted copy's record too. Without a waiting writer (a record
 // not written by this process's sink just now) it falls back to the record:
 // ReadConverted hands back the subtrees the record names, and a file a writer
@@ -477,7 +477,7 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 		return nil
 	}
 
-	// A copy accepted but not yet parked (acceptanceQueued) counts as parked: the record under the
+	// A copy accepted but not yet parked (settleAccepted) counts as parked: the record under the
 	// hash is the accepted copy's.
 	if sm.blockPark.Has(hash) || sm.blockPark.HandedOut(hash) || sm.acceptancePending(hash) {
 		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked or accepted block; keeping the other copy's subtree files", hash)

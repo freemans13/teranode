@@ -6,6 +6,7 @@ import (
 	"io"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -310,7 +311,7 @@ func TestPipelineBlockDelete_LogsARealReadFailureInsteadOfSwallowingIt(t *testin
 	// The record is read only when no converting writer is waiting for the copy, the path
 	// for a record this process's sink did not just write. Settle the writer so the delete
 	// takes that path.
-	sm.settleAccepted(*blk.Hash())
+	sm.settleAccepted(*blk.Hash(), false)
 
 	// converted: true — this delivery's own sink call above genuinely
 	// converted blk, so the read failure below (the store now holds a foreign
@@ -428,4 +429,22 @@ func TestPipelineBlockDelete_ARefusalBeforeTheAcceptedCopyIsParkedKeepsTheRecord
 	}
 
 	require.Zero(t, waitingFor(sm, hash), "the refused copy's writer is settled")
+}
+
+// An acceptance mark lasts until the consumer has handled the copy's message, however far behind
+// the consumer is: the consumer handles every queued message, so time is no evidence the message
+// was lost. It used to expire after settleBackstop, and a consumer more than a minute behind then
+// lost the protection before it parked the block.
+func TestSyncManager_AnAcceptanceMarkLastsUntilTheConsumerHandlesIt(t *testing.T) {
+	sm := &SyncManager{msgChan: make(chan interface{}, 1)}
+	hash := chainhash.Hash{7}
+
+	sm.QueueBlockOnDisk(peerpkg.BlockBody{Hash: hash, Converted: true}, nil)
+	require.True(t, sm.acceptancePending(hash))
+
+	sm.settleStale(time.Now().Add(10 * settleBackstop))
+	require.True(t, sm.acceptancePending(hash), "a queued copy stays marked however long the consumer takes")
+
+	sm.acceptanceHandled(hash)
+	require.False(t, sm.acceptancePending(hash), "the handler clears it")
 }

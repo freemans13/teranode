@@ -474,21 +474,18 @@ type blockOnDiskMsg struct {
 // read loop is already free by the time this is called, because the bytes went
 // to disk as they arrived rather than into a buffer somebody has to release.
 func (sm *SyncManager) QueueBlockOnDisk(body peerpkg.BlockBody, peer *peerpkg.Peer) {
+	shuttingDown := atomic.LoadInt32(&sm.shutdown) != 0
+
 	// The wire layer accepted the copy, so its cleanup will not run: the converting writer's
-	// window as a creator closes here (holdUntilSettled).
+	// window as a creator closes here (holdUntilSettled). Unless the manager is stopping, the
+	// copy is also marked as accepting until the consumer has parked it, so a refusal of another
+	// copy keeps its record (pipelineBlockDelete); handleBlockOnDiskMsg clears the mark.
 	if body.Converted {
-		sm.settleAccepted(body.Hash)
+		sm.settleAccepted(body.Hash, !shuttingDown)
 	}
 
-	if atomic.LoadInt32(&sm.shutdown) != 0 {
+	if shuttingDown {
 		return
-	}
-
-	// Until the consumer parks it, the block is known only by this message, so a refusal of
-	// another copy of it must keep the record (pipelineBlockDelete); handleBlockOnDiskMsg
-	// clears the mark.
-	if body.Converted {
-		sm.acceptanceQueued(body.Hash)
 	}
 
 	sm.msgChan <- &blockOnDiskMsg{body: body, peer: peer}

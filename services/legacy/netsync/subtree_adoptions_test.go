@@ -186,7 +186,7 @@ func TestPipelineBlockDelete_ARefusedCopyLeavesTheFilesAnotherBlockAdopted(t *te
 	b := convertedCopy(t, ctx, sm, adopter)
 	require.Len(t, b.adopted, len(subtreeArtefactTypes), "B adopted while the refused copy was still open")
 
-	sm.settleAccepted(adopter)
+	sm.settleAccepted(adopter, false)
 
 	require.NoError(t, sm.pipelineBlockDelete(refused, true))
 
@@ -203,7 +203,7 @@ func TestPipelineBlockDelete_ARefusedCopyLeavesTheFilesItAdopted(t *testing.T) {
 	creator, refused := chainhash.Hash{1}, chainhash.Hash{2}
 
 	convertedCopy(t, ctx, sm, creator)
-	sm.settleAccepted(creator)
+	sm.settleAccepted(creator, false)
 
 	d := convertedCopy(t, ctx, sm, refused)
 	require.Empty(t, d.written, "the refused copy created nothing")
@@ -290,7 +290,7 @@ func TestPipelineBlockDelete_ARefusalThatCannotNameItsCopyDeletesNothing(t *test
 	requireSubtreeFiles(t, ctx, sm, true, "a refusal that cannot name its copy deletes nothing")
 	require.Equal(t, 2, waitingFor(sm, hash), "and settles neither writer")
 
-	sm.settleAccepted(hash)
+	sm.settleAccepted(hash, false)
 	require.Equal(t, 1, waitingFor(sm, hash), "acceptance settles the oldest")
 
 	sm.settleStale(time.Now().Add(settleBackstop))
