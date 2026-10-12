@@ -599,7 +599,7 @@ func TestSyncManager_AMissingParentOutputKeepsTheParkedBlock(t *testing.T) {
 }
 
 // TestSyncManager_AnInvalidTransactionVerdictFromTheFullRouteIsAJudgementOnTheBlock
-// is the BlockRejected row for the shape the full route now returns for a legacy
+// is the BlockInvalid row for the shape the full route now returns for a legacy
 // block with a consensus-invalid transaction: ErrBlockInvalid around subtree
 // validation's processing wrap around ErrTxInvalid, with no corrupt code in the
 // chain. Before the producer was corrected the same block came back corrupt and

@@ -2146,11 +2146,13 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// with no mark and no blame so the block is downloaded again, and the same block
 				// would then be downloaded, validated in full and dropped on every wanted-range
 				// pass. A judgement goes back as one. The hash is still not persisted as invalid
-				// from here: the caller's BlockRejected row remembers it for recentlyFailedBlocksTTL
-				// and rejects it to the peer once RUNNING, the same bound the legacy route's own
+				// from here: ErrBlockInvalid lands on the caller's BlockInvalid row
+				// (block_park_policy.go), which remembers the hash for recentlyFailedBlocksTTL,
+				// rejects it to the peer once RUNNING and drops the delivering association, as the
+				// base did for an invalid block. That is the same bound the legacy route's own
 				// unpersisted invalid verdicts (proof of work in commitPreparedBlock, height in
-				// processBlockFound) have today. No strike either: the serving connection is the legacy
-				// service's to judge, and penalizeCorruptBlockPeer is a no-op for its peer IDs.
+				// processBlockFound) have today. No strike from here: the serving connection is the
+				// legacy service's to judge, and penalizeCorruptBlockPeer is a no-op for its peer IDs.
 				if baseURL == "legacy" {
 					ctxLogger.Warnf("[ValidateBlock][%s] invalid transaction in a sink-bound subtree list on the legacy route, rejecting without persisting: %s", block.Hash().String(), err)
 

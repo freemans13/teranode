@@ -188,7 +188,7 @@ var (
 	// full-route verdict a legacy block CAN reach on an honest run, an invalid
 	// transaction in a subtree, is returned as ErrBlockInvalid for baseURL
 	// "legacy" (BlockValidation.go, the ErrTxInvalid branch) because the sink
-	// bound the list, so it lands on BlockRejected below and not here. A new
+	// bound the list, so it lands on BlockInvalid below and not here. A new
 	// corrupt producer on either route has to answer the same question before
 	// this row is right for it: does the re-download rewrite the file?
 	parkDispositionRecordCorrupt = parkDisposition{
