@@ -3205,12 +3205,26 @@ func (s *server) NetTotals() (uint64, uint64) {
 // the latest connected main chain block, or a recognized orphan. These height
 // updates allow us to dynamically refresh peer heights, ensuring sync peer
 // selection has access to the latest block heights for each peer.
+//
+// It never blocks the caller. The Kafka blocks-final consumer calls it for every finalised
+// block, and peerHeightsUpdate is unbuffered and read only by peerHandler, so a plain send
+// would hold block processing behind whatever peerHandler is doing, and would block forever
+// once peerHandler has drained its channels and returned on s.quit. The send runs on its own
+// goroutine, as relayInventory's does, and gives up when the server quits. Order does not
+// matter: handleUpdatePeerHeights matches each peer's last announced block by hash.
 func (s *server) UpdatePeerHeights(latestBlkHash *chainhash.Hash, latestHeight int32, updateSource *peer.Peer) {
-	s.peerHeightsUpdate <- updatePeerHeightsMsg{
+	msg := updatePeerHeightsMsg{
 		newHash:    latestBlkHash,
 		newHeight:  latestHeight,
 		originPeer: updateSource,
 	}
+
+	go func() {
+		select {
+		case s.peerHeightsUpdate <- msg:
+		case <-s.quit:
+		}
+	}()
 }
 
 // Start begins accepting connections from peers.
