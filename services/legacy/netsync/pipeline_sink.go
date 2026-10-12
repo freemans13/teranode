@@ -403,14 +403,17 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // when THIS call is known, from its own return value, to have written a
 // record does this function go looking for what it wrote.
 //
-// This task also retired the in-memory pipelineVerified map that used to tell
-// this function which subtree files to remove. It is not replaced with a
-// second map — a second map keyed by hash would have exactly the same
-// cross-delivery problem converted exists to avoid. Instead, when converted is
-// true, the record ReadConverted hands back names every subtree THIS call's
-// own sink wrote (record.Subtrees) — true only because converted being true
-// guarantees this call was the one that just wrote whatever sits under hash
-// right now, with nothing else able to have raced in between.
+// The converting copy's writer, which holdUntilSettled keeps open until this
+// verdict or the copy's acceptance, says exactly which subtree files this copy
+// created, and DeleteAll removes those that no other block holds. The writers
+// wait in a queue keyed by hash, which is not a delivery identity: a second
+// copy of the block can convert after this copy's sink returned and before
+// this verdict arrived. When two wait, this function cannot tell which copy it
+// was called for, and it deletes nothing at all, the record included, rather
+// than risk the copy about to be accepted. Without a waiting writer (a record
+// not written by this process's sink just now) it falls back to the record:
+// ReadConverted hands back the subtrees the record names, and a file a writer
+// is writing or holds is skipped.
 //
 // The delete probes all four file types under each root rather than
 // recomputing which structure type the sink chose. subtreeWriter always writes
@@ -455,7 +458,18 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 	// parent's commit then dropped it (970,503 on 2026-10-10). A file this copy did create is
 	// left to its delete-at-height.
 	// The copy's writer, kept open by the sink until now (holdUntilSettled).
-	writer := sm.takeSettling(hash)
+	writer, ambiguous := sm.takeSettling(hash)
+
+	// Two converted copies of the block are waiting for their verdicts, and nothing says which
+	// one this refusal is about. Both wrote the same record under the hash, so deleting it, or
+	// either copy's files, could remove the copy that is about to be accepted. Leave all of it:
+	// the files keep their delete-at-height, and the other verdict or the park sweep settles
+	// both writers.
+	if ambiguous {
+		sm.logger.Warnf("[pipelineBlockDelete][%s] two converted copies are waiting and this refusal cannot say which; deleting nothing", hash)
+
+		return nil
+	}
 
 	if sm.blockPark.Has(hash) || sm.blockPark.HandedOut(hash) {
 		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked block; keeping the parked copy's subtree files", hash)

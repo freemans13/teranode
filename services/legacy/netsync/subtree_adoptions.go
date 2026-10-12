@@ -190,44 +190,71 @@ type settlingWriter struct {
 // holdUntilSettled keeps a converted copy's writer, and so its window as a creator, open past
 // the sink. The wire layer can still refuse the copy after the sink succeeded, and its
 // cleanup, pipelineBlockDelete, must then delete what this copy created while holds other
-// blocks took on those files still stand. Only one copy of a block converts at a time
-// (startConversion), so a writer already waiting under the hash belongs to an earlier copy
-// that was settled without a word; it is finished here.
+// blocks took on those files still stand.
+//
+// Writers wait in a queue per block hash, because neither verdict carries anything that names
+// the delivery: pipelineBlockDelete gets the hash, QueueBlockOnDisk the hash and the peer. One
+// writer is the usual case. A second copy of the same block can convert as soon as the first
+// copy's sink has returned and before its verdict arrives (endConversion runs at the end of
+// the sink, and the gate admits the hash until the park takes the block), so two can wait at
+// once. A verdict then cannot be told apart from the other copy's, and the two settle paths
+// treat that as such (takeSettling).
 func (sm *SyncManager) holdUntilSettled(hash chainhash.Hash, w *subtreeWriter) {
 	sm.settlingMu.Lock()
 	defer sm.settlingMu.Unlock()
 
 	if sm.settling == nil {
-		sm.settling = make(map[chainhash.Hash]settlingWriter)
+		sm.settling = make(map[chainhash.Hash][]settlingWriter)
 	}
 
-	if prev, ok := sm.settling[hash]; ok {
-		prev.writer.finish()
-	}
-
-	sm.settling[hash] = settlingWriter{writer: w, since: time.Now()}
+	sm.settling[hash] = append(sm.settling[hash], settlingWriter{writer: w, since: time.Now()})
 }
 
-// takeSettling removes and returns the writer waiting under hash, or nil.
-func (sm *SyncManager) takeSettling(hash chainhash.Hash) *subtreeWriter {
+// takeSettling removes and returns the writer waiting under hash when there is exactly one.
+// With more than one waiting it removes nothing and reports the hash ambiguous: a refusal
+// cannot know which copy it is about.
+func (sm *SyncManager) takeSettling(hash chainhash.Hash) (w *subtreeWriter, ambiguous bool) {
 	sm.settlingMu.Lock()
 	defer sm.settlingMu.Unlock()
 
-	s, ok := sm.settling[hash]
-	if !ok {
-		return nil
+	waiting := sm.settling[hash]
+
+	switch len(waiting) {
+	case 0:
+		return nil, false
+	case 1:
+		delete(sm.settling, hash)
+
+		return waiting[0].writer, false
+	default:
+		return nil, true
 	}
-
-	delete(sm.settling, hash)
-
-	return s.writer
 }
 
-// settleAccepted closes the window of a copy the wire layer accepted.
+// settleAccepted closes the window of a copy the wire layer accepted. With more than one copy
+// waiting it closes the oldest: verdicts on one peer's copies come in the order they were read,
+// and if it is the other copy's window that closes early, the cost is only that copy's
+// refusal, which RequireEnd keeps from happening, losing the holds it would have kept.
 func (sm *SyncManager) settleAccepted(hash chainhash.Hash) {
-	if w := sm.takeSettling(hash); w != nil {
-		w.finish()
+	sm.settlingMu.Lock()
+
+	waiting := sm.settling[hash]
+	if len(waiting) == 0 {
+		sm.settlingMu.Unlock()
+		return
 	}
+
+	oldest := waiting[0].writer
+
+	if len(waiting) == 1 {
+		delete(sm.settling, hash)
+	} else {
+		sm.settling[hash] = waiting[1:]
+	}
+
+	sm.settlingMu.Unlock()
+
+	oldest.finish()
 }
 
 // settleStale finishes every writer that has waited longer than settleBackstop.
@@ -235,10 +262,21 @@ func (sm *SyncManager) settleStale(now time.Time) {
 	sm.settlingMu.Lock()
 	defer sm.settlingMu.Unlock()
 
-	for hash, s := range sm.settling {
-		if now.Sub(s.since) >= settleBackstop {
-			s.writer.finish()
+	for hash, waiting := range sm.settling {
+		kept := waiting[:0]
+
+		for _, s := range waiting {
+			if now.Sub(s.since) >= settleBackstop {
+				s.writer.finish()
+			} else {
+				kept = append(kept, s)
+			}
+		}
+
+		if len(kept) == 0 {
 			delete(sm.settling, hash)
+		} else {
+			sm.settling[hash] = kept
 		}
 	}
 }

@@ -645,7 +645,7 @@ type SyncManager struct {
 	// it: pipelineBlockDelete for a refused copy, handleBlockOnDiskMsg for an accepted one, or
 	// the park sweep as a backstop. Guarded by settlingMu; see holdUntilSettled.
 	settlingMu sync.Mutex
-	settling   map[chainhash.Hash]settlingWriter
+	settling   map[chainhash.Hash][]settlingWriter
 
 	ctx          context.Context
 	logger       ulogger.Logger

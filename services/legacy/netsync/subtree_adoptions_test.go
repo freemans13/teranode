@@ -243,7 +243,7 @@ func TestSyncManager_AConvertedCopyIsAlwaysSettled(t *testing.T) {
 	// Shutdown set only so the queue send is skipped; the settle comes before it.
 	atomic.StoreInt32(&sm.shutdown, 1)
 	sm.QueueBlockOnDisk(peerpkg.BlockBody{Hash: accepted, Converted: true}, nil)
-	require.Nil(t, sm.takeSettling(accepted), "an accepted copy is settled when it is queued")
+	require.Zero(t, waitingFor(sm, accepted), "an accepted copy is settled when it is queued")
 	require.Zero(t, sm.subtreeAdoptionsFor().size())
 
 	other := &SyncManager{ctx: ctx, subtreeStore: exclusiveFileStore(t)}
@@ -255,6 +255,45 @@ func TestSyncManager_AConvertedCopyIsAlwaysSettled(t *testing.T) {
 	require.Positive(t, other.subtreeAdoptionsFor().size(), "a copy converted moments ago is not stale yet")
 
 	other.settleStale(time.Now().Add(settleBackstop))
-	require.Nil(t, other.takeSettling(lost), "the sweep settles a copy whose verdict never arrived")
+	require.Zero(t, waitingFor(other, lost), "the sweep settles a copy whose verdict never arrived")
 	require.Zero(t, other.subtreeAdoptionsFor().size())
+}
+
+// waitingFor is the number of converted copies of hash whose writers wait for a verdict.
+func waitingFor(sm *SyncManager, hash chainhash.Hash) int {
+	sm.settlingMu.Lock()
+	defer sm.settlingMu.Unlock()
+
+	return len(sm.settling[hash])
+}
+
+// A second copy of a block can convert after the first copy's sink returned and before the
+// first copy's verdict arrives, so two writers can wait under one hash. A refusal then cannot
+// say which copy it is about. It used to take whichever writer was waiting, which could be the
+// second copy's, and delete that copy's files and its fresh record. Now it deletes nothing and
+// leaves both writers waiting; acceptance settles the oldest, and the sweep the rest.
+func TestPipelineBlockDelete_ARefusalThatCannotNameItsCopyDeletesNothing(t *testing.T) {
+	ctx := context.Background()
+	sm := &SyncManager{ctx: ctx, subtreeStore: exclusiveFileStore(t), logger: ulogger.TestLogger{}}
+
+	hash := chainhash.Hash{1}
+
+	first := convertedCopy(t, ctx, sm, hash)
+	require.Len(t, first.written, len(subtreeArtefactTypes), "the first copy created the files")
+
+	second := convertedCopy(t, ctx, sm, hash)
+	require.Len(t, second.adopted, len(subtreeArtefactTypes), "the second copy adopted them while the first was open")
+	require.Equal(t, 2, waitingFor(sm, hash))
+
+	require.NoError(t, sm.pipelineBlockDelete(hash, true))
+
+	requireSubtreeFiles(t, ctx, sm, true, "a refusal that cannot name its copy deletes nothing")
+	require.Equal(t, 2, waitingFor(sm, hash), "and settles neither writer")
+
+	sm.settleAccepted(hash)
+	require.Equal(t, 1, waitingFor(sm, hash), "acceptance settles the oldest")
+
+	sm.settleStale(time.Now().Add(settleBackstop))
+	require.Zero(t, waitingFor(sm, hash))
+	require.Zero(t, sm.subtreeAdoptionsFor().size())
 }
