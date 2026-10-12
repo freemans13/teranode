@@ -1194,9 +1194,11 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 // inserts a non-invalid block with subtrees_set=false (ValidateBlock, both optimistic and not,
 // which the legacy-sync route also uses, always non-optimistically) writes the subtree files
 // synchronously, BEFORE the block is added, so they are normally already present the instant the
-// sweep would see the block. Two inserts never reach the sweep at all, because they write
-// subtrees_set=true in the insert itself: block assembly's own (services/blockassembly/Server.go)
-// and quick validation's commitBlock, which catch-up and the legacy unified route use. One route
+// sweep would see the block. Two block-arrival inserts never reach the sweep at all, because they
+// write subtrees_set=true in the insert itself: block assembly's own
+// (services/blockassembly/Server.go) and quick validation's commitBlock, which catch-up and the
+// legacy unified route use. (The genesis insert in stores/blockchain/sql/sql.go and the
+// cmd/seeder headers-only import do the same, but neither block names any subtrees.) One route
 // bypasses validation altogether: the blockchain service's raw RevalidateBlock, reached through
 // its HTTP /revalidate/:hash endpoint or by calling the gRPC method of that name directly
 // (services/blockchain/Server.go -> Blockchain.RevalidateBlock ->
