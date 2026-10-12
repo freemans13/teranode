@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
-	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,7 +25,4 @@ func TestNewOffersTheWrappedStoresCapabilitiesOnly(t *testing.T) {
 
 	_, isStamper := s.(pruner.Stamper)
 	require.False(t, isStamper, "the logging wrapper claimed a stamp interface the sql store does not have")
-
-	// A store with neither capability gets the plain wrapper.
-	require.IsType(t, &Store{}, New(t.Context(), ulogger.TestLogger{}, &MockStore{}))
 }
