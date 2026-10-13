@@ -17,10 +17,13 @@ import (
 	blockchainsql "github.com/bsv-blockchain/teranode/stores/blockchain/sql"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
+	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/chainancestry"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -523,18 +526,103 @@ func TestPrunerProcessorForwardsTheWakeToTheStampWorker(t *testing.T) {
 	}
 }
 
-// The worker exists only for a store that implements the stamp interface, found by type
-// assertion exactly as the pruner provider is.
-func TestFindStamperUsesATypeAssertion(t *testing.T) {
+// The worker asks every store for its stamp with the same call. A store that answers with a
+// zero window width, as pruner.NoStamp does, gets no stamp worker; any other answer is the
+// stamper the worker drives.
+func TestFindStamperAsksTheStoreForItsStamp(t *testing.T) {
 	s := &Server{utxoStore: &utxo.MockUtxostore{}}
-	require.Nil(t, s.findStamper(), "the mock store does not stamp")
+	require.Nil(t, s.findStamper(), "the mock store has nothing to stamp")
 
-	s = &Server{utxoStore: stampingStore{&utxo.MockUtxostore{}, newFakeStamper(1)}}
-	require.NotNil(t, s.findStamper())
+	fake := newFakeStamper(1)
+	s = &Server{utxoStore: stampingStore{Store: &utxo.MockUtxostore{}, stamp: fake}}
+	require.Same(t, fake, s.findStamper())
 }
 
-// stampingStore is a utxo store that also stamps, for the type-assertion test only.
+// stampingStore is a utxo store whose stamp is the fake, for the findStamper test only.
 type stampingStore struct {
 	utxo.Store
-	pruner.Stamper
+	stamp pruner.Stamper
+}
+
+func (s stampingStore) Stamper() pruner.Stamper { return s.stamp }
+
+// On a sql store, which has nothing to stamp, there is no stamp worker and the pruner processor
+// forwards no wake to one, so a block costs no drain, no chain read and no stamp metric. The
+// store is a real sqlitememory sql store and the chain client is the real one over a real
+// blockchain store, counted.
+func TestNoStampWorkOnASQLStore(t *testing.T) {
+	chain := newTestChain(t, 300)
+	client := &countingClient{ClientI: chain.client}
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	storeURL, err := url.Parse("sqlitememory:///" + t.Name())
+	require.NoError(t, err)
+
+	store, err := utxosql.New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+
+	s := newStampTestServer(t, client, nil)
+	s.utxoStore = store
+	s.stamper = s.findStamper()
+	require.Nil(t, s.stamper, "the sql store has nothing to stamp, so no stamp worker")
+
+	drainsBefore := counterVecSum(t, stampDrains)
+	skipsBefore := counterVecSum(t, stampWakesSkipped)
+
+	go s.prunerProcessor(s.ctx)
+
+	s.pruneNotify <- *notificationAt(chain, 150)
+
+	require.Eventually(t, func() bool { return s.lastProcessedHeight.Load() == 150 }, 5*time.Second, 10*time.Millisecond)
+
+	select {
+	case sig := <-s.stampNotify:
+		t.Fatalf("a wake was forwarded to a stamp worker the sql store does not have, height %d", sig.blockHeight)
+	default:
+	}
+
+	require.Zero(t, client.parentLinkFetches.Load(), "no chain walk for a store with nothing to stamp")
+	require.Equal(t, drainsBefore, counterVecSum(t, stampDrains), "no drain counted")
+	require.Equal(t, skipsBefore, counterVecSum(t, stampWakesSkipped), "no skipped wake counted")
+}
+
+// counterVecSum is the total of a counter vector across every label value.
+func counterVecSum(t *testing.T, cv *prometheus.CounterVec) float64 {
+	t.Helper()
+
+	ch := make(chan prometheus.Metric, 64)
+	go func() {
+		cv.Collect(ch)
+		close(ch)
+	}()
+
+	var sum float64
+
+	for m := range ch {
+		var pb dto.Metric
+		require.NoError(t, m.Write(&pb))
+		sum += pb.GetCounter().GetValue()
+	}
+
+	return sum
+}
+
+// pruner.NoStamp is the answer of every store with nothing to stamp. Its floors are zero, which
+// the rewind preflight reads as no stamp boundary, and a drain opened on it anyway has no pages.
+func TestNoStampAnswersZero(t *testing.T) {
+	ctx := context.Background()
+
+	require.Zero(t, pruner.NoStamp.WindowBlocks())
+	require.Zero(t, pruner.NoStamp.StampDepth())
+
+	floors, err := pruner.NoStamp.Floors(ctx)
+	require.NoError(t, err)
+	require.Equal(t, pruner.StampFloors{}, floors)
+
+	drain, floors, err := pruner.NoStamp.OpenDrain(ctx)
+	require.NoError(t, err)
+	require.Equal(t, pruner.StampFloors{}, floors)
+	require.Zero(t, drain.PagesPerWindow())
+	require.NoError(t, drain.Close())
 }

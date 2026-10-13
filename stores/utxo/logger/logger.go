@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
@@ -38,16 +39,13 @@ type Store struct {
 // New creates a new logging wrapper around the provided UTXO store.
 // All operations on the returned store will be logged with detailed information
 // including method names, parameters, return values, and execution times.
-//
-// The returned wrapper also offers every optional capability of the wrapped store that a
-// caller finds by type assertion (see capabilities.go), and only those.
 func New(ctx context.Context, logger ulogger.Logger, store utxo.Store) utxo.Store {
 	s := &Store{
 		logger: logger,
 		store:  store,
 	}
 
-	return withCapabilities(s, store)
+	return s
 }
 
 func caller() string {
@@ -131,6 +129,10 @@ func (s *Store) GetBlockState() utxo.BlockState {
 	s.logger.Debugf("[UTXOStore][logger][GetBlockState] height: %d, medianTime: %d : %s", blockState.Height, blockState.MedianTime, caller())
 
 	return blockState
+}
+
+func (s *Store) Stamper() pruner.Stamper {
+	return s.store.Stamper()
 }
 
 // SupportsOutpointOnlySpend delegates to the wrapped store.

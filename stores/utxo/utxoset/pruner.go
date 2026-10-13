@@ -138,6 +138,12 @@ func (journalPruner) AddObserver(_ pruner.Observer) {
 	// state that reads as a working notification path.
 }
 
+// Stamper returns the store itself: its UTXOs get their block from the deep pass that the
+// pruner service's stamp worker drives, and the store implements every step of it.
+func (s *Store) Stamper() pruner.Stamper {
+	return s
+}
+
 // GetPrunerService satisfies pruner.PrunerServiceProvider.
 //
 // The pruner service is mandatory: services/pruner/server.go type-asserts the UTXO store

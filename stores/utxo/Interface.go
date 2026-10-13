@@ -41,6 +41,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 )
 
@@ -803,4 +804,11 @@ type Store interface {
 	// its writer — SetBlockState publishes both fields from one tip
 	// atomically, while the individual setters update one field at a time.
 	GetBlockState() BlockState
+
+	// Stamper returns the store's stamp: the deep pass that writes each UTXO's block onto it
+	// once its containment window is deep enough. Every store answers, so no caller has to test
+	// the store's type to find it, and a wrapper forwards it like any other method. A store
+	// whose UTXOs carry their block from the moment they are mined has nothing to stamp and
+	// returns pruner.NoStamp, whose WindowBlocks is zero.
+	Stamper() pruner.Stamper
 }

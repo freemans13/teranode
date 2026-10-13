@@ -13,9 +13,9 @@ import (
 )
 
 // THE STAMP WORKER. A second goroutine in the pruner service, beside the pruner processor and
-// never in front of it. It exists only for a UTXO store that implements pruner.Stamper, which
-// today is the utxoset store: its UTXOs get their block written once, by a pass that runs when
-// a 288-block window is 288 blocks deep, and this worker is what drives that pass.
+// never in front of it. It exists only for a UTXO store whose Stamper has a non-zero window
+// width, which today is the utxoset store: its UTXOs get their block written once, by a pass
+// that runs when a 288-block window is 288 blocks deep, and this worker is what drives that pass.
 //
 // The store cannot see the chain. This worker holds the blockchain client, reads the best tip
 // past the response cache, builds one proven chain answer per drain by walking parent links,
@@ -71,15 +71,17 @@ func (r stampDrainReport) rearm() bool {
 	}
 }
 
-// findStamper finds the stamp side of the UTXO store by type assertion, exactly as Init finds
-// the pruner provider. A store that does not implement it gets no stamp worker.
+// findStamper asks the UTXO store for its stamp, the same call on every store, and returns nil
+// when the store has nothing to stamp. That answer is a window width of zero, which pruner.NoStamp
+// gives: the worker then never starts and no wake is ever forwarded, so a store without a stamp
+// costs no chain read, no database call and no stamp metric. Asked once, at Init.
 func (s *Server) findStamper() pruner.Stamper {
 	if s.utxoStore == nil {
 		return nil
 	}
 
-	st, ok := s.utxoStore.(pruner.Stamper)
-	if !ok {
+	st := s.utxoStore.Stamper()
+	if st == nil || st.WindowBlocks() == 0 {
 		return nil
 	}
 
