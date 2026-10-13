@@ -357,9 +357,9 @@ func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
 // mark let any peer that knew a requested hash stop this node asking anyone for
 // it for the mark's lifetime, at no cost to itself. The wire layer reports the
 // declining peer to notePolicyDecline instead, which marks the hash once
-// policyDeclinePeers different peers have declared it above policy, so an
-// honest oversize block is not drained again on every pass while one peer's
-// claim still stops nothing. At shipped defaults this arm never fires:
+// policyDeclinePeers different hosts this node asked for the block have
+// declared it above policy, so an honest oversize block is not drained again on
+// every pass while one host's claim still stops nothing. At shipped defaults this arm never fires:
 // go-wire refuses a payload above maxWireBlockPayload (4,000,000,000,
 // services/legacy/config.go) before this handler runs, and the default
 // excessiveblocksize is 4,294,967,296; it exists for an operator who lowers

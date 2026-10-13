@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"net"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -8,7 +9,7 @@ import (
 )
 
 const (
-	// policyDeclinePeers is how many different peers must declare a block's body above this
+	// policyDeclinePeers is how many different hosts, each asked for the block, must declare a block's body above this
 	// node's block policy before the block is written off for recentlyFailedBlocksTTL. One peer's
 	// declared length is only its claim, and one liar must not stop this node asking anyone for a
 	// block (streamingBlockGate); every honest peer declares the same length for the same block.
@@ -19,11 +20,23 @@ const (
 	maxTrackedPolicyDeclines = 1024
 )
 
-// policyDecline is the peers that declared one block's body above this node's block policy,
+// policyDecline is the hosts that declared one block's body above this node's block policy,
 // within recentlyFailedBlocksTTL of the first.
 type policyDecline struct {
 	first time.Time
-	peers map[*peerpkg.Peer]struct{}
+	hosts map[string]struct{}
+}
+
+// declineHost is the remote host a decline is counted under: the address without its port, so
+// two connections from one host are one vote.
+func declineHost(p *peerpkg.Peer) string {
+	addr := p.Addr()
+
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+
+	return addr
 }
 
 // notePolicyDecline counts a decline of hash's body on this node's block policy, declared by
@@ -31,7 +44,7 @@ type policyDecline struct {
 // connection kept, and nothing marked: a block declined that way was asked for again and drained
 // again on every pass that wanted it, gigabytes each time for the oversize block an operator who
 // lowered excessiveblocksize cannot commit (review of 76be891d6). Once policyDeclinePeers
-// different peers have declared it, the block is marked in recentlyFailedBlocks, as the park's
+// different hosts that owe the block have declared it, the block is marked in recentlyFailedBlocks, as the park's
 // policy_declined row marks it, so the wanted-range pass does not ask for it while the mark
 // stands.
 func (sm *SyncManager) notePolicyDecline(hash chainhash.Hash, from *peerpkg.Peer, now time.Time) {
@@ -40,6 +53,15 @@ func (sm *SyncManager) notePolicyDecline(hash chainhash.Hash, from *peerpkg.Peer
 	}
 
 	_, primary, _ := sm.peerStateResolvingPrimary(from)
+
+	// Only a peer this node asked for the block counts. The gate admits a body for any
+	// requested hash whoever sends it, so without this any peer could vote on a block it was
+	// never asked for (review of c1f4e9202). This node chooses whom it asks.
+	if sm.blockDownloads == nil || !sm.blockDownloads.HasOwner(primary, hash) {
+		return
+	}
+
+	host := declineHost(primary)
 
 	sm.policyDeclinesMu.Lock()
 
@@ -61,13 +83,13 @@ func (sm *SyncManager) notePolicyDecline(hash chainhash.Hash, from *peerpkg.Peer
 			sm.policyDeclines = make(map[chainhash.Hash]*policyDecline)
 		}
 
-		rec = &policyDecline{first: now, peers: make(map[*peerpkg.Peer]struct{})}
+		rec = &policyDecline{first: now, hosts: make(map[string]struct{})}
 		sm.policyDeclines[hash] = rec
 	}
 
-	rec.peers[primary] = struct{}{}
+	rec.hosts[host] = struct{}{}
 
-	declared := len(rec.peers)
+	declared := len(rec.hosts)
 	if declared >= policyDeclinePeers {
 		delete(sm.policyDeclines, hash)
 	}
@@ -80,5 +102,5 @@ func (sm *SyncManager) notePolicyDecline(hash chainhash.Hash, from *peerpkg.Peer
 
 	sm.recentlyFailedBlocks.Set(hash, struct{}{})
 
-	sm.logger.Warnf("[streamingBlockGate][%s] %d peers declared the block above excessiveblocksize; not asking for it again for %s. This node cannot sync past it unless excessiveblocksize is raised", hash, declared, recentlyFailedBlocksTTL)
+	sm.logger.Warnf("[streamingBlockGate][%s] %d hosts asked for the block declared it above excessiveblocksize; not asking for it again for %s. This node cannot sync past it unless excessiveblocksize is raised", hash, declared, recentlyFailedBlocksTTL)
 }
