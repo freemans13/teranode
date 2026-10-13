@@ -21,7 +21,6 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -40,6 +39,10 @@ type Store struct {
 // The pruner service finds a store's pruner by type assertion, so the wrapper
 // must expose it or turning logging on would switch pruning off.
 var _ pruner.PrunerServiceProvider = (*Store)(nil)
+
+// Callers that check the store for other optional methods use utxo.As, which
+// looks through the wrapper by way of Unwrap.
+var _ utxo.Unwrapper = (*Store)(nil)
 
 // New creates a new logging wrapper around the provided UTXO store.
 // All operations on the returned store will be logged with detailed information
@@ -422,12 +425,17 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	return err
 }
 
+// Unwrap returns the wrapped store.
+func (s *Store) Unwrap() utxo.Store {
+	return s.store
+}
+
 // GetPrunerService forwards to the wrapped store's pruner service. A wrapped
-// store without one returns the same error the pruner service reports for it.
+// store without one returns pruner.ErrNoPrunerService.
 func (s *Store) GetPrunerService() (pruner.Service, error) {
 	provider, ok := s.store.(pruner.PrunerServiceProvider)
 	if !ok {
-		return nil, errors.NewServiceError("UTXO store does not provide pruner service")
+		return nil, pruner.ErrNoPrunerService
 	}
 
 	service, err := provider.GetPrunerService()

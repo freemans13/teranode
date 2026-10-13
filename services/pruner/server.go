@@ -115,7 +115,7 @@ func (s *Server) Init(ctx context.Context) error {
 	// Initialize pruner service from UTXO store
 	prunerProvider, ok := s.utxoStore.(pruner.PrunerServiceProvider)
 	if !ok {
-		return errors.NewServiceError("UTXO store does not provide pruner service")
+		return pruner.ErrNoPrunerService
 	}
 
 	var err error

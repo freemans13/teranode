@@ -47,8 +47,8 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	utxopruner "github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/test/utils/containers"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/teranode/test/utils/wait"
@@ -705,13 +705,12 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		td.prunerObserver = prunerObserver
 
 		// Register the observer with the pruner service
-		aerospikeStore, ok := utxoStore.(*aerospike.Store)
+		prunerProvider, ok := utxo.As[utxopruner.PrunerServiceProvider](utxoStore)
 		if !ok {
-			t.Logf("Warning: UtxoStore is not an Aerospike store, cannot register pruner observer")
-			t.Fail()
+			t.Fatalf("UtxoStore does not provide a pruner service, cannot register pruner observer")
 		}
 
-		prunerService, err := aerospikeStore.GetPrunerService()
+		prunerService, err := prunerProvider.GetPrunerService()
 		if err != nil {
 			t.Logf("Warning: Failed to get pruner service: %v", err)
 		} else if prunerService != nil {
