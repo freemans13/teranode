@@ -662,6 +662,13 @@ type SyncManager struct {
 	handlerDone  chan struct{}
 	quit         chan struct{}
 
+	// handlerLoops counts the ticker loops blockHandler starts beside itself (the park sweep
+	// and the frontier race). blockHandler waits for them before it closes handlerDone, so
+	// Stop, which waits on handlerDone, runs after both have returned: neither is mid-tick
+	// while Stop tears state down, and the race loop's rates-file save never runs beside
+	// Stop's own.
+	handlerLoops sync.WaitGroup
+
 	// TERANODE services
 	blockchainClient  teranodeblockchain.ClientI
 	validationClient  validator.Interface
@@ -3687,9 +3694,19 @@ func (sm *SyncManager) blockHandler() {
 	// that have nothing to do with the park. The sweep decides, looks parents up,
 	// evicts and deletes on its own; the one thing it may not do is commit, and
 	// it posts those back to the consumer through parkCommits.
-	go sm.runParkSweep()
+	sm.handlerLoops.Add(2)
 
-	go sm.runFrontierRace()
+	go func() {
+		defer sm.handlerLoops.Done()
+
+		sm.runParkSweep()
+	}()
+
+	go func() {
+		defer sm.handlerLoops.Done()
+
+		sm.runFrontierRace()
+	}()
 
 out:
 	for {
@@ -3775,6 +3792,10 @@ out:
 			break out
 		}
 	}
+
+	// Both loops return on quit. Waiting for them here, not in Stop, is what makes every
+	// waiter on handlerDone (Stop, and the tests that run the handler) see them finished.
+	sm.handlerLoops.Wait()
 
 	close(sm.handlerDone)
 	sm.logger.Infof("Block handler done")

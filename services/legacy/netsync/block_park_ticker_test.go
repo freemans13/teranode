@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -113,4 +114,64 @@ func TestSyncManager_TheBlockHandlerAsksForAGivenUpBlockAgain(t *testing.T) {
 
 	require.True(t, WaitUntil(func() bool { return sm.blockDownloads.RequestedWithin(hashes[0], time.Minute) }, 5*time.Second),
 		"the block handler's own ticker must ask for the block again, or nothing ever does once sync has stopped moving")
+}
+
+// TestSyncManager_TheBlockHandlerWaitsForItsLoopsBeforeItIsDone pins the join: the park sweep
+// and the frontier race run beside the block handler, and Stop waits only on handlerDone, so
+// the handler must not close it while either loop is still inside a tick. Unjoined, Stop tore
+// state down under a sweep mid-tick, the race loop's rates save ran beside Stop's own, and the
+// fast-sweep tests restored parkSweepInterval while the sweep goroutine was still starting
+// (a -race report in TestSyncManager_TheBlockHandlerRunsTheParkSweep).
+//
+// The sweep's own clock is the hold: the first call inside a tick parks until the test lets go.
+func TestSyncManager_TheBlockHandlerWaitsForItsLoopsBeforeItIsDone(t *testing.T) {
+	sm := schedulerManager(t)
+
+	inTick := make(chan struct{})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	sm.parkSweepNow = func() time.Time {
+		once.Do(func() {
+			close(inTick)
+			<-release
+		})
+
+		return time.Now()
+	}
+
+	previous := parkSweepInterval
+	parkSweepInterval = 10 * time.Millisecond
+
+	t.Cleanup(func() { parkSweepInterval = previous })
+
+	sm.quit = make(chan struct{})
+	sm.handlerDone = make(chan struct{})
+	sm.msgChan = make(chan interface{}, 1)
+
+	go sm.blockHandler()
+
+	select {
+	case <-inTick:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the park sweep never ticked")
+	}
+
+	close(sm.quit)
+
+	select {
+	case <-sm.handlerDone:
+		close(release)
+		t.Fatal("handlerDone closed while the park sweep was still inside a tick; Stop would tear state down under it")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-sm.handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never finished once the sweep's tick returned")
+	}
 }
