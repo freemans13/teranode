@@ -32,11 +32,10 @@ import (
 // TestRetiringWindowStampsTheBlockThatWonTheReorg is reproduction 1: the transaction is mined
 // in M, a competing block F also includes it, and F's chain then wins.
 //
-// This is the call sequence block assembly makes. F arrives as a fork, so recording it adds a
-// containment row. When F's branch becomes the longest chain, Reset keeps the transaction out
-// of the mark-off because it is in a move-forward block, and stampMoveForwardBlockAsMined
-// records F again with OnLongestChain set. M stays a valid block on a side chain, so nothing
-// un-mines it.
+// This is the call sequence the node makes. Block validation records M, and then F as a fork,
+// so each adds a containment row. When F's branch becomes the longest chain, block assembly
+// keeps the transaction out of the mark-off because it is in a move-forward block, and writes
+// no block facts. M stays a valid block on a side chain, so nothing un-mines it.
 //
 // The retirement stamp that used to take the earliest row, and so stamped M onto the UTXO, is
 // gone. The stamp is told which block won by the chain answer the pruner service builds, and
@@ -52,10 +51,6 @@ func TestRetiringWindowStampsTheBlockThatWonTheReorg(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 8, BlockHeight: 100})
-	require.NoError(t, err)
-
-	// F's branch wins, and the move-forward stamp names F on the longest chain.
-	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 8, BlockHeight: 100, OnLongestChain: true})
 	require.NoError(t, err)
 
 	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 8})
