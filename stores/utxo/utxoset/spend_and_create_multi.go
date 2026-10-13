@@ -134,8 +134,12 @@ type multiTx struct {
 	claims     []inputClaim
 	spends     []*utxo.Spend
 	// spent is true once its step-1 chunk committed.
-	spent  bool
-	result utxo.SpendAndCreateMultiResult
+	spent bool
+	// journaled is true once its step-2 chunk committed, and with it a spend-journal row for
+	// every output of it a child in the list spends, naming that child. Unlike result, which
+	// the per-transaction default overwrites, it says the netted write itself made those rows.
+	journaled bool
+	result    utxo.SpendAndCreateMultiResult
 }
 
 func (it *multiTx) dead() bool {
@@ -171,6 +175,8 @@ type nettedWrite struct {
 	blockHeight uint32
 	opts        []utxo.CreateOption
 	items       []*multiTx
+	// position is each transaction's index in items, by txid.
+	position map[chainhash.Hash]int
 
 	// What the write did and where its time went, for the slow-list log line. The chunk
 	// timings are summed across chunks that run in parallel, so they can exceed wall time.
@@ -190,12 +196,13 @@ const multiSlowListLog = time.Second
 
 func (s *Store) newNettedWrite(txs []*bt.Tx, list *utxo.SpendAndCreateMultiList, blockHeight uint32,
 	opts []utxo.CreateOption) *nettedWrite {
-	w := &nettedWrite{s: s, txs: txs, list: list, blockHeight: blockHeight, opts: opts, items: make([]*multiTx, len(txs))}
-
 	position := make(map[chainhash.Hash]int, len(txs))
 	for i := range txs {
 		position[list.TxIDs[i]] = i
 	}
+
+	w := &nettedWrite{s: s, txs: txs, list: list, blockHeight: blockHeight, opts: opts, items: make([]*multiTx, len(txs)),
+		position: position}
 
 	for i, tx := range txs {
 		it := &multiTx{pos: i, tx: tx, txid: list.TxIDs[i], parents: list.ParentsInList[i], claims: captureClaims(tx),
@@ -279,11 +286,6 @@ func (w *nettedWrite) results() []utxo.SpendAndCreateMultiResult {
 // RETURNING decorates a spent input.
 func (w *nettedWrite) checkNettedInputs() {
 	genesis := w.s.settings.ChainCfgParams.GenesisActivationHeight
-	position := make(map[chainhash.Hash]int, len(w.items))
-
-	for i, it := range w.items {
-		position[it.txid] = i
-	}
 
 	for _, it := range w.items {
 		if it.netted == nil {
@@ -299,7 +301,7 @@ func (w *nettedWrite) checkNettedInputs() {
 				continue
 			}
 
-			parent := w.items[position[*in.PreviousTxIDChainHash()]]
+			parent := w.items[w.position[*in.PreviousTxIDChainHash()]]
 			rec := &utxo.Spend{TxID: &parent.txid, Vout: in.PreviousTxOutIndex,
 				SpendingData: &spendpkg.SpendingData{TxID: &it.txid, Vin: vin}}
 			it.spends[vin] = rec
@@ -923,6 +925,7 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 			continue
 		}
 
+		it.journaled = true
 		it.result = utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxCreated, Meta: plan.perItem[k], Spends: it.spends}
 	}
 
@@ -991,25 +994,44 @@ func (w *nettedWrite) finishPerTransaction(ctx context.Context) error {
 		return err
 	}
 
-	return w.undoOutsideSpendsOfFailures(ctx, rest)
+	return w.undoSpendsOfFailures(ctx, rest)
 }
 
-// undoOutsideSpendsOfFailures restores the outside spends step 1 committed for every
-// transaction the per-transaction default then failed or skipped.
+// undoSpendsOfFailures restores every spend the netted write committed for a
+// transaction the per-transaction default then failed or skipped: its outside spends from step
+// 1, and its spends of parents an earlier step-2 chunk created.
 //
 // The default runs each transaction's spends in its own database transaction and rolls that
-// back when the transaction fails, but its outside spends were not made there: step 1
-// committed them before step 2 began, and the default repeats them as the same spend, which
-// writes nothing. Without this a child rejected by the default, for instance because a parent
-// in the list already existed and its output had been taken, kept every independent input it
-// spent in step 1 marked spent by a transaction that has no record. The rest of the netted
-// write already holds the rule this restores: a failed transaction never leaves a spend behind.
-func (w *nettedWrite) undoOutsideSpendsOfFailures(ctx context.Context, items []*multiTx) error {
+// back when the transaction fails, but neither kind was made there. Step 1 committed the outside
+// spends before step 2 began. A parent's step-2 chunk committed, with the parent, a
+// spend-journal row naming the child for each output the child nets, and no UTXO row for it at
+// all. The default repeats both as the same spend, which writes nothing. Without this a child
+// rejected by the default, for instance because a parent in the list already existed and its
+// output had been taken, kept every independent input it spent in step 1 marked spent by a
+// transaction that has no record, and every output it netted from a parent created in an
+// earlier chunk was gone from the UTXO set: in the journal under a spender that never existed,
+// unspendable by anyone. Unspend restores both kinds the same way, from the journal row that
+// names the spender. A netted spend of a parent the default itself created needs nothing: that
+// parent's outputs are real UTXOs and the child's spend of them rolled back with the child. The
+// rest of the netted write already holds the rule this restores: a failed transaction never
+// leaves a spend behind.
+func (w *nettedWrite) undoSpendsOfFailures(ctx context.Context, items []*multiTx) error {
 	var undo []*utxo.Spend
 
 	for _, it := range items {
-		if it.spent && it.dead() {
+		if !it.dead() {
+			continue
+		}
+
+		if it.spent {
 			undo = append(undo, it.outsideSpends()...)
+		}
+
+		for vin, in := range it.tx.Inputs {
+			if it.netted != nil && it.netted[vin] && it.spends[vin] != nil &&
+				w.items[w.position[*in.PreviousTxIDChainHash()]].journaled {
+				undo = append(undo, it.spends[vin])
+			}
 		}
 	}
 
@@ -1018,7 +1040,7 @@ func (w *nettedWrite) undoOutsideSpendsOfFailures(ctx context.Context, items []*
 	}
 
 	if err := w.s.Unspend(ctx, undo); err != nil {
-		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] restoring the outside spends of transactions the per-transaction default rejected", err)
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] restoring the spends of transactions the per-transaction default rejected", err)
 	}
 
 	return nil
