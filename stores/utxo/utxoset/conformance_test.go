@@ -39,6 +39,16 @@ func TestConformance(t *testing.T) {
 		tests.Spend(t, db)
 	})
 
+	// AtomicSpends, not the PerInputSpends the sql and aerospike stores run: this store
+	// spends all the inputs of one transaction in one database transaction, so a failed
+	// spend leaves no partial spend and no dangling spender ref, and a replay of spends
+	// already made answers success. tests.SpendModel gives the full reasoning; the
+	// assertions differ in three subtests only.
+	t.Run("PartialSpendRollback", func(t *testing.T) {
+		db, _ := newUncheckpointedStore(t)
+		tests.PartialSpendRollbackFor(t, db, tests.AtomicSpends)
+	})
+
 	t.Run("Freeze", func(t *testing.T) {
 		db, _ := newUncheckpointedStore(t)
 		tests.Freeze(t, db)
