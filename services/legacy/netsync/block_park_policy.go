@@ -188,7 +188,7 @@ var (
 	// validation returns a ServiceError instead, which lands on retryLater
 	// above. subtreeWriter.put never rewrites a key that is already there, so
 	// no other corrupt verdict is repaired by a re-download, and for every
-	// other one this row is a loop (drop, re-ask, same verdict). What those
+	// other one this row is a loop (drop, re-ask, same verdict), paced by reAskDroppedBlock's backoff. What those
 	// others are, and why none is reachable for a sink-written record except
 	// through a bug or a damaged file: quick validation's own corrupt verdicts
 	// after the anchor (coinbase placeholder outside [0][0], subtree size
@@ -526,6 +526,11 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 		sm.reAskDroppedBlock(entry)
 	}
 
+	// A block in the chain or written off is not wanted back, so its re-ask pacing ends here.
+	if !d.reAsk && (d.name == parkDispositionCommitted.name || d.markFailed) {
+		sm.forgetDroppedReAsk(entry.hash)
+	}
+
 	if !d.blamePeer && !d.dropPeer {
 		return
 	}
@@ -591,7 +596,23 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 // own in-flight entry for this block is not asked, because this disposition is how that entry
 // ends. livePeer may fall back to the sync peer: a re-ask is a sync action, not a misbehaviour
 // signal.
+//
+// A drop whose cause survives a re-download (a persistent record_corrupt, say) would re-download
+// and drop the block in a loop at network speed, so the asks are paced per block
+// (admitDroppedReAsk): the first reAskFreeAttempts go at once, every later one waits a backoff
+// that doubles up to reAskBackoffMax, and the park sweep sends it when it is due
+// (sendDueReAsks).
 func (sm *SyncManager) reAskDroppedBlock(entry parkedBlock) {
+	if !sm.admitDroppedReAsk(entry, time.Now()) {
+		return
+	}
+
+	sm.askDroppedBlockAgain(entry)
+}
+
+// askDroppedBlockAgain sends the re-ask for a dropped block now, unless the block is already
+// on its way (see reAskDroppedBlock).
+func (sm *SyncManager) askDroppedBlockAgain(entry parkedBlock) {
 	peer := sm.livePeer(entry.peer)
 	if peer == nil {
 		return

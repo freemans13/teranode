@@ -814,6 +814,10 @@ type SyncManager struct {
 	// localFaultDrains counts, per block, copies drained because this node failed to store
 	// them (absorbLocalSinkFault). Guarded by drainedDuplicatesMu; made on first use.
 	localFaultDrains map[chainhash.Hash]int
+	// reAsks paces the re-asks of each dropped block above the last checkpoint
+	// (block_park_reask_backoff.go). Guarded by reAsksMu; made on first use.
+	reAsksMu sync.Mutex
+	reAsks   map[chainhash.Hash]*droppedReAsk
 	// conversions is the conversion in progress for each block, so a faster copy can take it
 	// over (conversion_race.go).
 	conversionsMu sync.Mutex

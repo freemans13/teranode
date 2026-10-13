@@ -457,6 +457,9 @@ func (sm *SyncManager) runParkSweep() {
 			// pipelineBlockDelete still holds its writer open; close it.
 			sm.settleStale(time.Now())
 
+			// A dropped block's paced re-ask whose wait has passed (reAskDroppedBlock).
+			sm.sendDueReAsks(time.Now())
+
 			// A block given up on since the last tick has nothing put back for
 			// it: the wanted-range pass recomputes what it wants and who owes
 			// it from the committed tip on every call, so this periodic pass is
