@@ -123,8 +123,9 @@ SELECT c.relname,
 // gone and this becomes unsafe.
 //
 // Before any window goes, the bodies of transactions still waiting to be mined are carried into
-// tx_body_carry (carryBodiesAhead), and after the drops the carried bodies that are no longer
-// needed are deleted (reclaimCarriedBodies). A carry that fails stops the pass before anything
+// tx_body_carry (carryBodiesAhead), and so are the bodies of transactions mined in a block still
+// inside the body horizon of the pruner's height (carryRecentlyMinedBodies). After the drops the
+// carried bodies that are no longer needed are deleted (reclaimCarriedBodies). A carry that fails stops the pass before anything
 // is dropped: a dropped body cannot be brought back.
 func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int, error) {
 	carried, err := s.carryBodiesAhead(ctx, height, false)
@@ -191,9 +192,10 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 			}
 		}
 
-		// And carry every body the persister has not archived yet, on every pass that drops,
-		// whatever ran before it. See carryUnarchivedBodySQL.
-		if _, err := s.carryUnarchivedBodies(ctx, cutoff*TxBodyPartitionBlocks, height); err != nil {
+		// And carry every body whose block is still inside the body horizon of the pruner's
+		// height, on every pass that drops, whatever ran before it. See
+		// carryRecentlyMinedBodySQL.
+		if _, err := s.carryRecentlyMinedBodies(ctx, cutoff*TxBodyPartitionBlocks, height-s.bodyRetention); err != nil {
 			return 0, err
 		}
 	}
@@ -248,7 +250,7 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 // The bound is measured from the TIP, one window ahead of the drop. It is not what keeps the
 // body of a transaction mined in a block the persister has not archived: that transaction has
 // lost its unmined marker, and this pass sees it while it waits only if the pruner happened to
-// run then. The drop pass carries those by their block instead (carryUnarchivedBodySQL).
+// run then. The drop pass carries those by their block instead (carryRecentlyMinedBodySQL).
 //
 // The band is entered once per 48 blocks, and that is the only time the unmined set is read
 // for it; the drop pass reads it a second time (see dropTxBodyWindowsBelow).
@@ -323,20 +325,30 @@ func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, er
 	return tag.RowsAffected(), nil
 }
 
-// carryUnarchivedBodySQL copies, into tx_body_carry, the body of every transaction created below
-// $1, a height, that a block above $2 contains. $2 is the pruner's height, the last height the
-// block persister has archived, so these are the transactions whose block the persister has
-// still to archive, and whose body it will read from this store to do it.
+// carryRecentlyMinedBodySQL copies, into tx_body_carry, the body of every transaction created
+// below $1, a height, that a block above $2 contains. $2 is the floor reclaimCarriedBodySQL
+// applies, the pruner's height less the body horizon, so this carries exactly the mined
+// transactions the reclaim would keep: the ones whose block the block persister has still to
+// archive, and the ones whose block it archived fewer than 288 blocks ago, which a reorg can
+// still un-mine and a remine send back to the persister for the body a second time.
 //
 // This is the carry's second predicate, beside carryUnminedBodySQL's "still waiting", and it is
 // the one that does not depend on when the carry runs. The waiting predicate only holds for a
 // transaction carried before it was mined: the tip-ahead pass (carryBodiesAhead) is meant to see
 // it while it waits, but that pass runs only when the pruner does, and a pruner whose sessions
 // were skipped, or that first runs after the mining, finds a mined transaction with its marker
-// already clear. Its window then dropped under it while its block was unarchived, and the
-// persister failed that block for good. "Not yet archived" is a fact about the transaction's
-// block and the persister alone, so a drop pass that applies it carries every body the
-// persister still needs, whatever the pruner did before.
+// already clear. Its window then dropped under it while its block was within the horizon, and
+// the persister failed that block for good, either at once or after a shallow reorg and a
+// remine of the transaction. "Mined above the reclaim floor" is a fact about the transaction's
+// block and the pruner's height alone, so a drop pass that applies it carries every body the
+// node can still need, whatever the pruner did before.
+//
+// The floor used to be the pruner's height itself, "not yet archived". That kept the body for
+// the first archive but not for a remine: a transaction mined a block or two below the archived
+// height lost its body to a delayed drop, and when a reorg un-mined that block and the
+// transaction was mined again above the archived height, the persister got a nil body. The
+// carry and the reclaim now apply one rule, so a body is never dropped that the reclaim would
+// have kept.
 //
 // It reads only the windows about to drop ($1 is the drop cutoff), and for each of their rows
 // probes tx_mined on its txid-leading primary key for a block above $2, through the fenced
@@ -344,14 +356,14 @@ func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, er
 // transaction in the windows it drops, once per window. NOT EXISTS and ON CONFLICT make a
 // repeat after a crash between the carry and the drop copy nothing twice, as for the waiting
 // set. reclaimCarriedBodySQL keeps the copy until the block is 288 blocks below the pruner's
-// height, so it outlives the persister's archive of that block.
+// height.
 //
 // Rows created at or below $3, the highest checkpoint, are not read. Nothing there qualifies: a
 // transaction this node mines was first seen at the tip, above the checkpoint, and a block-path
-// create carries its own block's height as created_height, which can never be 288 blocks below a
-// block above the archived height. Without the bound a sync that writes bodies below the
-// checkpoint would pay one containment probe per transaction at every window drop for nothing.
-const carryUnarchivedBodySQL = `
+// create carries its own block's height as created_height, which is below $1 and so can never
+// be above $2. Without the bound a sync that writes bodies below the checkpoint would pay one
+// containment probe per transaction at every window drop for nothing.
+const carryRecentlyMinedBodySQL = `
 INSERT INTO tx_body_carry (txid, raw_tx)
 SELECT b.txid, b.raw_tx
   FROM tx_body b
@@ -369,18 +381,18 @@ SELECT b.txid, b.raw_tx
    AND NOT EXISTS (SELECT 1 FROM tx_body_carry c WHERE c.txid = b.txid)
 ON CONFLICT (txid) DO NOTHING`
 
-// carryUnarchivedBodies carries the body of every transaction created below bound and contained
-// in a block above archived into tx_body_carry, and returns how many it copied. See
-// carryUnarchivedBodySQL.
-func (s *Store) carryUnarchivedBodies(ctx context.Context, bound, archived uint32) (int64, error) {
-	tag, err := s.pool.Exec(ctx, carryUnarchivedBodySQL, int32(bound), int32(archived), //nolint:gosec // heights fit int32
+// carryRecentlyMinedBodies carries the body of every transaction created below bound and
+// contained in a block above floor into tx_body_carry, and returns how many it copied. See
+// carryRecentlyMinedBodySQL.
+func (s *Store) carryRecentlyMinedBodies(ctx context.Context, bound, floor uint32) (int64, error) {
+	tag, err := s.pool.Exec(ctx, carryRecentlyMinedBodySQL, int32(bound), int32(floor), //nolint:gosec // heights fit int32
 		int32(model.HighestCheckpointHeight(s.checkpoints))) //nolint:gosec // a height fits int32
 	if err != nil {
-		return 0, errors.NewStorageError("[utxoset] carry bodies of transactions created below height %d and mined above the archived height %d", bound, archived, err)
+		return 0, errors.NewStorageError("[utxoset] carry bodies of transactions created below height %d and mined above height %d", bound, floor, err)
 	}
 
 	if n := tag.RowsAffected(); n > 0 {
-		s.logger.Infof("[utxoset] carried the bodies of %d transactions created below height %d and mined above the archived height %d past their window", n, bound, archived)
+		s.logger.Infof("[utxoset] carried the bodies of %d transactions created below height %d and mined above height %d past their window", n, bound, floor)
 	}
 
 	return tag.RowsAffected(), nil

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -283,4 +284,85 @@ func carriedBodies(t *testing.T, s *Store, ctx context.Context) int {
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_body_carry`).Scan(&n))
 
 	return n
+}
+
+// TestBodyOfRecentlyMinedTransactionSurvivesADelayedDropForARemine is the reorg the 288-block
+// horizon exists for. A transaction waited past its window with no pruner session to carry it,
+// was mined, and the persister archived its block before the delayed session dropped the window.
+// A shallow reorg then un-mines that block and the transaction is mined again in a block the
+// persister has not archived, so the persister needs the body a second time. The block was 288
+// blocks deep nowhere near the drop, and a carried body is kept for exactly that long
+// (reclaimCarriedBodySQL), so the drop must carry it too.
+func TestBodyOfRecentlyMinedTransactionSurvivesADelayedDropForARemine(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, carryTestHeight)
+	require.NoError(t, err)
+
+	dropAt := uint32(carryTestHeight/TxBodyPartitionBlocks+1)*TxBodyPartitionBlocks + s.bodyRetention
+
+	// Mined one block below the persister's archived height, which is the height the one
+	// delayed session runs at.
+	minedAt := dropAt - 1
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: minedAt, OnLongestChain: true})
+	require.NoError(t, err)
+
+	pruneAt(t, s, ctx, dropAt, dropAt+1)
+	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation window is gone")
+
+	// A two-block reorg un-mines the block, and the transaction is mined again above the
+	// archived height.
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, false))
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: minedAt, UnsetMined: true})
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.Tx)
+	require.NoError(t, err)
+	require.NotNil(t, got.Tx, "the waiting transaction lost its body to the delayed drop")
+
+	remineAt := dropAt + 2
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 12, BlockHeight: remineAt, OnLongestChain: true})
+	require.NoError(t, err)
+	require.NoError(t, s.SetBlockHeight(remineAt))
+
+	require.NoError(t, archivable(t, s, ctx, tx), "the persister cannot build the subtree data file for the remined block")
+
+	// Once the new block is archived and 288 deep, the body goes.
+	pruneAt(t, s, ctx, remineAt+s.bodyRetention, remineAt+s.bodyRetention+1)
+	require.Equal(t, 0, carriedBodies(t, s, ctx))
+}
+
+// TestBodyMinedPastItsWindowIsCarriedUntilItsBlockIs288Deep pins what the drop pass carries
+// with the reclaim's floor: a transaction created near the top of its window and mined a few
+// blocks later is mined in a block that is still inside the 288-block horizon when its window
+// drops, so a reorg can still un-mine it and its body is carried. This is not only the
+// long-waiting transaction; it is every transaction whose block is above its creation window's
+// top, a fraction of ordinary tip traffic. The copy lives until the block is 288 deep.
+func TestBodyMinedPastItsWindowIsCarriedUntilItsBlockIs288Deep(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	windowTop := uint32(carryTestHeight/TxBodyPartitionBlocks+1)*TxBodyPartitionBlocks - 1
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, windowTop)
+	require.NoError(t, err)
+
+	// Mined two blocks after it arrived, in the next window.
+	minedAt := windowTop + 2
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 5, BlockHeight: minedAt, OnLongestChain: true})
+	require.NoError(t, err)
+
+	dropAt := windowTop + 1 + s.bodyRetention
+	pruneAt(t, s, ctx, dropAt, dropAt+1)
+	require.False(t, bodyWindowExists(t, s, ctx, windowTop), "the creation window is gone")
+	require.Equal(t, 1, carriedBodies(t, s, ctx), "its block is 287 deep, inside the horizon")
+	require.NoError(t, archivable(t, s, ctx, tx))
+
+	pruneAt(t, s, ctx, minedAt+s.bodyRetention, minedAt+s.bodyRetention+1)
+	require.Equal(t, 0, carriedBodies(t, s, ctx), "288 deep, the carried copy goes")
 }
