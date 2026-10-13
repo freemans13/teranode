@@ -46,6 +46,17 @@ var blockBodySink func(hash chainhash.Hash, header *wire.BlockHeader, r io.Reade
 // block policy can be refused without reading it.
 var blockBodyGate func(hash chainhash.Hash, header *wire.BlockHeader, length uint64) error
 
+// blockPolicyDeclined, when set, is told each time the gate declines a body on this node's own
+// block policy, and by which peer, before the body is drained. The gate's signature carries no
+// peer, and the sync manager needs one to tell a block every peer declares too large (an operator
+// who lowered excessiveblocksize) from one peer's claim. Nil until the sync manager installs it.
+var blockPolicyDeclined func(hash chainhash.Hash, from *Peer)
+
+// SetBlockPolicyDeclinedHook installs blockPolicyDeclined; nil removes it.
+func SetBlockPolicyDeclinedHook(fn func(hash chainhash.Hash, from *Peer)) {
+	blockPolicyDeclined = fn
+}
+
 // blockBodyDelete removes a block body already written under hash. It is
 // installed alongside blockBodySink and blockBodyGate. A body can be fully
 // written and only then found unusable, for example a peer's stream ending
@@ -204,6 +215,10 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 		// the unrequested case, with the connection kept. Matched on the code,
 		// which the gate raises for this one refusal.
 		if errors.Is(err, errors.ErrBlockPolicyDeclined) {
+			if blockPolicyDeclined != nil {
+				blockPolicyDeclined(hash, DeliveredBy(lr.R))
+			}
+
 			return &MsgBlockDiscarded{Hash: hash, Size: int64(length), Reason: "its declared size is above this node's own block policy"}, nil
 		}
 

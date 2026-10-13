@@ -818,6 +818,10 @@ type SyncManager struct {
 	// (block_park_reask_backoff.go). Guarded by reAsksMu; made on first use.
 	reAsksMu sync.Mutex
 	reAsks   map[chainhash.Hash]*droppedReAsk
+	// policyDeclines counts, per block, the peers that declared its body above this node's
+	// block policy (block_policy_decline.go). Guarded by policyDeclinesMu; made on first use.
+	policyDeclinesMu sync.Mutex
+	policyDeclines   map[chainhash.Hash]*policyDecline
 	// conversions is the conversion in progress for each block, so a faster copy can take it
 	// over (conversion_race.go).
 	conversionsMu sync.Mutex
@@ -4567,6 +4571,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// neither, so every block took the decoding path. See streaming_install.go
 	// for why that mattered beyond the allocation.
 	sm.installStreamingBlockPath(peerpkg.SetBlockBodyStreaming)
+	peerpkg.SetBlockPolicyDeclinedHook(func(hash chainhash.Hash, from *peerpkg.Peer) {
+		sm.notePolicyDecline(hash, from, time.Now())
+	})
 
 	// Bounded async block prefetch: admitPipelineSink admits a block against
 	// this global weighted semaphore and returns, so the read-loop reads the
