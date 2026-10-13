@@ -14,6 +14,8 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
@@ -1162,4 +1164,45 @@ func TestParentOutputsForValidation_Forwards(t *testing.T) {
 	require.Equal(t, root.Outputs[1].Satoshis, answers[0].Satoshis)
 	require.Equal(t, root.Outputs[1].LockingScript.Bytes(), answers[0].LockingScript.Bytes())
 	require.Equal(t, utxo.ParentOutputTxNotFound, answers[1].Status)
+}
+
+// The pruner service finds a store's pruner by type assertion. Wrapping a sql
+// store in the logger must keep that assertion and the pruner it returns.
+func TestGetPrunerService_ForwardsToWrappedStore(t *testing.T) {
+	sql.ResetPrunerServiceForTests()
+	t.Cleanup(sql.ResetPrunerServiceForTests)
+
+	s, base := newLoggedSQLiteStore(t)
+
+	provider, ok := s.(pruner.PrunerServiceProvider)
+	require.True(t, ok, "logged store must implement pruner.PrunerServiceProvider")
+
+	service, err := provider.GetPrunerService()
+	require.NoError(t, err)
+	require.NotNil(t, service)
+
+	inner, err := base.(pruner.PrunerServiceProvider).GetPrunerService()
+	require.NoError(t, err)
+	require.Same(t, inner, service, "logger must return the wrapped store's pruner service")
+}
+
+// A wrapped store with no pruner keeps the behaviour it had before the logger
+// exposed GetPrunerService: the caller gets the pruner service's own error.
+func TestGetPrunerService_WrappedStoreWithoutPruner(t *testing.T) {
+	inner, err := nullstore.NewNullStore()
+	require.NoError(t, err)
+
+	_, hasPruner := utxo.Store(inner).(pruner.PrunerServiceProvider)
+	require.False(t, hasPruner, "test needs a store without a pruner")
+
+	s := New(context.Background(), ulogger.TestLogger{}, inner)
+
+	provider, ok := s.(pruner.PrunerServiceProvider)
+	require.True(t, ok, "logged store must implement pruner.PrunerServiceProvider")
+
+	service, err := provider.GetPrunerService()
+	require.Error(t, err)
+	require.Nil(t, service)
+	require.True(t, errors.Is(err, errors.ErrServiceError))
+	require.Contains(t, err.Error(), "UTXO store does not provide pruner service")
 }
