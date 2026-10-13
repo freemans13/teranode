@@ -169,7 +169,7 @@ func (f *utxosetReorgFixture) applyAsTip(t *testing.T, block *model.Block) {
 	f.stp.InitCurrentBlockHeader(block.Header)
 }
 
-// stamp runs the pruner's stamp over the reorg height's window, with a chain that names
+// stamp runs the pruner's stamp over the reorg height's partition, with a chain that names
 // winnerID at the reorg height, the way the pruner service's stamp worker drives it.
 func (f *utxosetReorgFixture) stamp(t *testing.T, winnerID uint32) {
 	t.Helper()
@@ -188,7 +188,7 @@ func (f *utxosetReorgFixture) stamp(t *testing.T, winnerID uint32) {
 	state, err := drain.BeginWindow(f.ctx, floors.StampCompleteFloor, anc)
 	require.NoError(t, err)
 	require.Contains(t, []pruner.StampWindowState{pruner.StampWindowReady, pruner.StampWindowResumed}, state,
-		"the window holding the reorg height must be deep enough to stamp")
+		"the partition holding the reorg height must be deep enough to stamp")
 
 	for page := 0; page < drain.PagesPerWindow(); page++ {
 		_, err = drain.StampPage(f.ctx, floors.StampCompleteFloor, anc, page)

@@ -11,7 +11,7 @@ import (
 )
 
 // TestGetServesAMinedTransactionFromTheMembershipTable: no identity row exists, so the
-// block ids, heights and subtree index come from tx_mined, and the body from its window.
+// block ids, heights and subtree index come from tx_mined, and the body from its partition.
 func TestGetServesAMinedTransactionFromTheMembershipTable(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -25,11 +25,11 @@ func TestGetServesAMinedTransactionFromTheMembershipTable(t *testing.T) {
 	require.Equal(t, []uint32{42}, got.BlockIDs)
 	require.Equal(t, []uint32{700_100}, got.BlockHeights)
 	require.Equal(t, []int{3}, got.SubtreeIdxs)
-	require.NotNil(t, got.Tx, "the body is inside its window")
+	require.NotNil(t, got.Tx, "the body is inside its partition")
 	require.Equal(t, uint32(0), got.UnminedSince)
 }
 
-// TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone: the membership window was dropped,
+// TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone: the tx_mined partition was dropped,
 // the transaction still has a live UTXO, and the UTXO's block facts are the answer. Fee,
 // size, inputs and subtree index are zero, which is what a pruned SV Node can say too.
 func TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone(t *testing.T) {
@@ -53,7 +53,7 @@ func TestGetServesAnOldParentFromItsUTXOOnceTheWindowIsGone(t *testing.T) {
 
 // TestGetNeverAnswersBlockIdsFromTheUTXOWhileAMembershipRowExists pins the read order. A
 // UTXO holds one block id; a transaction stamped into two blocks must report both while
-// the window lives, which only the membership table can do.
+// the partition lives, which only the membership table can do.
 func TestGetNeverAnswersBlockIdsFromTheUTXOWhileAMembershipRowExists(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -77,7 +77,7 @@ func TestGetNeverAnswersBlockIdsFromTheUTXOWhileAMembershipRowExists(t *testing.
 // This test used to assert ErrTxNotFound for exactly this state, and that was wrong by design:
 // membership retires 1440 blocks after the parent was MINED and the journal 1440 blocks after
 // the UTXO was SPENT, so the two are counted from different clocks and a parent can lose its
-// window while its journal row still stands. During that window the store CAN answer, and it
+// partition while its journal row still stands. During that window the store CAN answer, and it
 // must: the alternative is a BlockIncompleteError the caller retries forever. Both the base
 // branch and aerospike keep a fully-spent parent answerable for a window after the spend.
 //
@@ -92,14 +92,14 @@ func TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives(t 
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// The child is mined at 900, past the height window 0 will be stamped at (863): a window
+	// The child is mined at 900, past the height partition 0 will be stamped at (863): a partition
 	// cannot drop while an undo partition covering a height below its stamped_at is attached,
-	// so a spend inside window 0 would keep the window alive for as long as the journal row,
-	// and this test needs the window gone with the journal row still there.
+	// so a spend inside partition 0 would keep the partition alive for as long as the journal row,
+	// and this test needs the partition gone with the journal row still there.
 	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 8)
 
 	dropped := retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7})
-	require.Equal(t, 1, dropped, "the window has to be gone for this test to mean anything")
+	require.Equal(t, 1, dropped, "the partition has to be gone for this test to mean anything")
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
 	require.NoError(t, err)

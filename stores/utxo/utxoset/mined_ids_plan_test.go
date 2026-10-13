@@ -32,7 +32,7 @@ func walkPlan(n planNode, visit func(planNode)) {
 // switched nested loops off, and returns the root plan node.
 //
 // enable_nestloop = off is how the test stands in for the bad row estimates mainnet produced
-// at a 288-block window boundary: a fresh partition with no statistics makes a hash join look
+// at a 288-block partition boundary: a fresh partition with no statistics makes a hash join look
 // cheap, and the planner is then free to build one wherever the statement lets it. A fenced
 // LATERAL leaves it no such freedom, because a lateral reference can only be satisfied by a
 // nested loop, so the setting changes the plan of an unfenced join and of nothing else.
@@ -60,9 +60,9 @@ func explainUnderNoNestloop(t *testing.T, s *Store, ctx context.Context, sql str
 }
 
 // populateMembershipWindows writes n synthetic transactions straight into tx_mined and
-// tx_body, spread evenly over six 288-block containment windows (and so 36 body windows),
+// tx_body, spread evenly over six 288-block tx_mined partitions (and so 36 tx_body partitions),
 // and returns their ids. Raw SQL rather than the store's write path, because the test needs
-// enough live windows for a seq scan of every one to be visible in a plan, and nothing about
+// enough live partitions for a seq scan of every one to be visible in a plan, and nothing about
 // the rows' payload matters to the planner.
 func populateMembershipWindows(t *testing.T, s *Store, ctx context.Context, base uint32, n int) [][]byte {
 	t.Helper()
@@ -111,8 +111,8 @@ func populateMembershipWindows(t *testing.T, s *Store, ctx context.Context, base
 // reads under the condition that stalled setTxMined on mainnet for minutes at a time.
 //
 // minedByTxidSQL fenced tx_mined behind a LATERAL with OFFSET 0 but joined tx_body outside the
-// fence. When the estimates went wrong at a window boundary, Postgres hash-joined the keys'
-// containment rows against tx_body and seq-scanned every live body window for each 1024-key
+// fence. When the estimates went wrong at a partition boundary, Postgres hash-joined the keys'
+// containment rows against tx_body and seq-scanned every live tx_body partition for each 1024-key
 // batch: 30 to 260 seconds, temp spills, and once ENOSPC. SetMinedMulti's read-back went
 // through that statement, and only wanted block ids. Both statements are now held to: no hash
 // or merge join anywhere, and no seq scan of any tx_body or tx_mined partition. The block-id
@@ -182,12 +182,12 @@ func minedIDsViaLookup(t *testing.T, s *Store, ctx context.Context, txids [][]by
 
 // TestMinedIDsByTxidMatchesTheFullContainmentRead holds the block-id read-back to the answer
 // the full containment read gives, for transactions mined in several blocks, across a
-// containment window boundary, at a floor that excludes the lower window, and after an
+// tx_mined partition boundary, at a floor that excludes the lower partition, and after an
 // un-mine. Same keys, same ids, same (mined_height, block_id) order.
 func TestMinedIDsByTxidMatchesTheFullContainmentRead(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
-	const base = 700_000 // window 2430 covers 699,840 to 700,127
+	const base = 700_000 // partition 2430 covers 699,840 to 700,127
 
 	txs := mkStoredTxs(t, s, base, 1_000, 6)
 
@@ -218,7 +218,7 @@ func TestMinedIDsByTxidMatchesTheFullContainmentRead(t *testing.T) {
 		{BlockID: 90, BlockHeight: base + 5, SubtreeIdx: 1, OnLongestChain: true},
 		{BlockID: 80, BlockHeight: base + 5, SubtreeIdx: 2},
 		{BlockID: 70, BlockHeight: base + 100, SubtreeIdx: 0},
-		{BlockID: 60, BlockHeight: base + 200, SubtreeIdx: 3}, // next containment window
+		{BlockID: 60, BlockHeight: base + 200, SubtreeIdx: 3}, // next tx_mined partition
 	}
 
 	for i, b := range blocks {
@@ -226,7 +226,7 @@ func TestMinedIDsByTxidMatchesTheFullContainmentRead(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	check("several blocks across a window boundary", 0)
+	check("several blocks across a partition boundary", 0)
 
 	got, err := s.minedIDsByTxid(ctx, txids, 0)
 	require.NoError(t, err)
@@ -234,11 +234,11 @@ func TestMinedIDsByTxidMatchesTheFullContainmentRead(t *testing.T) {
 		"(mined_height, block_id) order: block id breaks the tie at one height, height wins otherwise")
 
 	upper := int32((base + 200) / TxMinedPartitionBlocks * TxMinedPartitionBlocks)
-	check("floor above the lower window", upper)
+	check("floor above the lower partition", upper)
 
 	got, err = s.minedIDsByTxid(ctx, txids, upper)
 	require.NoError(t, err)
-	require.Equal(t, []uint32{60}, got[*txs[0].TxIDChainHash()], "the floor hides the lower window")
+	require.Equal(t, []uint32{60}, got[*txs[0].TxIDChainHash()], "the floor hides the lower partition")
 
 	_, err = s.SetMinedMulti(ctx, txHashes(txs[:2]),
 		utxo.MinedBlockInfo{BlockID: 80, BlockHeight: base + 5, UnsetMined: true})

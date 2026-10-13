@@ -88,7 +88,7 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 // is narrow, but narrow and silent is the combination worth closing.
 //
 // The membership arm is a plain txid equality because tx_mined's primary key LEADS with txid,
-// so it is one descent per key per live window, and the update touches every membership row the
+// so it is one descent per key per live partition, and the update touches every membership row the
 // transaction has -- a transaction stamped into two blocks is one transaction and one flag.
 //
 // The UTXO UPDATE carries the packed-key range, AND it locates its rows through a fenced

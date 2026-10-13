@@ -214,7 +214,7 @@ func TestDeleteLeavesOtherTransactionsAlone(t *testing.T) {
 // It also asserts the body, because a block-path transaction has no tx_ident row to gate a
 // body join through -- createMinedPlanSQL claims on tx_mined instead -- so a body join that
 // only ever looked at what ident deleted left a mined-only transaction's tx_body row behind
-// until its window aged out on its own, rather than going with everything else Delete removes.
+// until its partition aged out on its own, rather than going with everything else Delete removes.
 func TestDeleteRemovesMembershipRows(t *testing.T) {
 	s, ctx := newTestStore(t)
 

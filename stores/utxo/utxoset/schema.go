@@ -41,13 +41,13 @@
 //     the index write, it defers it to vacuum. Quote no ratio here until one is measured.
 //
 // M1 scope: the UTXO table, the spend journal and the block/chunk ledger. The tx_meta
-// window arrives in M3.
+// partition arrives in M3.
 //
 // The journal is undo insurance and nothing else. It once doubled as the prune engine --
 // a retiring partition was the list of parents to re-examine -- which made it load-bearing
 // from genesis even below the hardcoded checkpoint, where a reorg is impossible by rule.
 // It no longer is: a mined transaction claims on tx_mined, its UTXOs carry the height and
-// block that made them, and retiring its identity is dropping the window it lives in. See
+// block that made them, and retiring its identity is dropping the partition it lives in. See
 // the spend_journal DDL comment below for what that leaves the journal doing.
 package utxoset
 
@@ -126,7 +126,7 @@ const schemaSQL = `
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS utxo (
     satoshis        BIGINT   NOT NULL,
-    created_height  INTEGER  NOT NULL,   -- first sight; keys the body window; restored verbatim
+    created_height  INTEGER  NOT NULL,   -- first sight; keys the tx_body partition; restored verbatim
     spendable_from  INTEGER  NOT NULL,   -- coinbase maturity and ReAssignUTXO delay
     mined_height    INTEGER  NOT NULL DEFAULT 0, -- height of the block containing the creating tx; 0 = unconfirmed
     block_id        INTEGER  NOT NULL DEFAULT 0, -- blockchain store id of that block; 0 is legitimate (genesis, seeder)
@@ -185,9 +185,9 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- list, so the journal was load-bearing even below the hardcoded checkpoint where a reorg
 -- is impossible by rule.
 --
--- It is not any more. A mined transaction claims on tx_mined, in 288-block windows, and its
+-- It is not any more. A mined transaction claims on tx_mined, in 288-block partitions, and its
 -- UTXOs carry the height and block of the transaction that made them, so retiring its
--- identity is dropping a window and nothing has to be re-examined at all. What is left here
+-- identity is dropping a partition and nothing has to be re-examined at all. What is left here
 -- is a restore, by outpoint, of a spend inside the retention window. Measured cost of
 -- keeping it: 354.8 bytes of WAL and 12.9 microseconds per spend, about 6% of the per-block
 -- budget in the worst band. Cheap enough that it stays on below the checkpoint too, rather
@@ -200,7 +200,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- that rule is about the RESTORE, which must keep re-resolving block facts at restore time
 -- because a reorg can move a still-live parent to a different block. It is not about the
 -- READ. These two columns are settled facts by the time anything reads them: a UTXO carries
--- them only once the block path wrote them or window retirement stamped them, and the only
+-- them only once the block path wrote them or partition retirement stamped them, and the only
 -- reader is the lookup step that runs when identity, membership, preservation and the UTXO
 -- have ALL missed. That is exactly the fully-spent parent older than the membership
 -- retention, whose block is at least 1440 deep and cannot change.
@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 --
 -- The two retentions are counted from DIFFERENT clocks and the sets are not nested: membership
 -- retires 1440 blocks after the parent was MINED, the journal 1440 blocks after the UTXO was
--- SPENT. A parent mined at 500,000 and spent at 900,001 lost its window at 501,440 and keeps
+-- SPENT. A parent mined at 500,000 and spent at 900,001 lost its partition at 501,440 and keeps
 -- its journal row until 901,441.
 --
 -- DEFAULT 0 on both is the unconfirmed sentinel, and the read step filters mined_height > 0
@@ -262,8 +262,8 @@ CREATE TABLE IF NOT EXISTS spend_journal (
 -- any row carrying the column, pinning contested transactions in the mempool table forever.
 -- Keyed on the txid alone, this answers for a parent in either table, or in neither.
 --
--- RANGE partitioned on noted_height, in the SAME 288-block windows as the spend journal and
--- created by the same DDL statement, so a window exists whenever its journal leaf does. It is
+-- RANGE partitioned on noted_height, in the SAME 288-block partitions as the spend journal and
+-- created by the same DDL statement, so a partition exists whenever its journal leaf does. It is
 -- dropped in the same pass and on the same cutoff, which is the honest retention: the journal
 -- is what conflict resolution restores the losing spends FROM, so a note whose journal leaf
 -- has gone can no longer be acted on.
@@ -271,15 +271,15 @@ CREATE TABLE IF NOT EXISTS spend_journal (
 -- noted_height is the store's CURRENT chain height at the moment of noting, not a property of
 -- either transaction. It is bookkeeping about a race happening now.
 --
--- The uniqueness is PER WINDOW, deliberately, and the reader deduplicates. A unique index on
+-- The uniqueness is PER PARTITION, deliberately, and the reader deduplicates. A unique index on
 -- a partitioned table must include the partition key, so a global UNIQUE (parent_txid,
 -- child_txid) is not available without noted_height in it -- which would defeat the purpose,
 -- since the same pair noted at two heights would then be two legal rows anyway. So each
--- window carries a plain UNIQUE (parent_txid, child_txid), the inserts are ON CONFLICT DO
--- NOTHING against it, and the read is SELECT DISTINCT: a repeated note inside one window
--- writes nothing, and the same pair noted in two windows reads back once.
+-- partition carries a plain UNIQUE (parent_txid, child_txid), the inserts are ON CONFLICT DO
+-- NOTHING against it, and the read is SELECT DISTINCT: a repeated note inside one partition
+-- writes nothing, and the same pair noted in two partitions reads back once.
 --
--- That pair index is the window's ONLY index, and it serves the reads too, because
+-- That pair index is the partition's ONLY index, and it serves the reads too, because
 -- parent_txid leads it and every read here is by parent_txid. See ensureSpendJournalPartition
 -- for the DDL and the measurement.
 --
@@ -352,15 +352,15 @@ CREATE TABLE IF NOT EXISTS applied_chunk (
 -- records it; the two coexist until the deep stamp of build step 5 writes the block onto the
 -- transaction's UTXOs and deletes the identity row.
 --
--- It is RANGE partitioned by mined_height in 288-block windows and dropped whole, so reclaim
--- is a catalog operation with nothing to fall behind on. Until the stamp exists a window
+-- It is RANGE partitioned by mined_height in 288-block partitions and dropped whole, so reclaim
+-- is a catalog operation with nothing to fall behind on. Until the stamp exists a partition
 -- drops on the old rule (upper bound 1440 blocks below the pruner's height) and only while
 -- tx_ident is empty; see dropTxMinedWindowsBelow.
 --
 -- The primary key LEADS with txid. PostgreSQL requires the partition key inside a partitioned
 -- table's primary key but not at its head, and a height-leading key cannot be probed by
 -- transaction id: on 18 it becomes a skip scan over every distinct height in the partition.
--- Every by-id lookup here is one descent per live window, six at 288-block windows.
+-- Every by-id lookup here is one descent per live partition, six at 288-block partitions.
 --
 -- There is deliberately NO insertion counter. Reads return a transaction's rows in
 -- (mined_height, block_id) order, which for one transaction id is the primary key's own order.
@@ -395,14 +395,14 @@ CREATE TABLE IF NOT EXISTS tx_mined (
 
 -- The three floors of the containment table, on one row held to one by CHECK (id = 0).
 --
--- floor is the highest containment window ever dropped, plus one, and it is a WINDOW NUMBER.
--- ensureTxMinedPartition refuses to create a window at or below it: a block re-offered more
--- than 1440 blocks after its first application would otherwise recreate its window and claim
+-- floor is the highest tx_mined partition ever dropped, plus one, and it is a PARTITION NUMBER.
+-- ensureTxMinedPartition refuses to create a partition at or below it: a block re-offered more
+-- than 1440 blocks after its first application would otherwise recreate its partition and claim
 -- every transaction in it afresh, and the UTXO table has no uniqueness on the outpoint to
 -- stop the UTXOs doubling.
 --
 -- stamp_fence and stamp_complete_floor are HEIGHTS, the exclusive upper bound of the highest
--- window whose deep stamp has started and completed respectively. They are created now and
+-- partition whose deep stamp has started and completed respectively. They are created now and
 -- written by nothing until the stamp of build step 5 exists, except by the interim drop, which
 -- raises all three together so that the ordering constraint holds on a database the interim
 -- build made: 288 x floor <= stamp_complete_floor <= stamp_fence. The constraint is in the DDL
@@ -418,10 +418,10 @@ CREATE TABLE IF NOT EXISTS tx_mined_floor (
 );
 INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
 
--- One row per containment window that has been stamped and not yet dropped: the tip height
--- at which the window's stamp completed, plus the margin section 6 of the design defines.
+-- One row per tx_mined partition that has been stamped and not yet dropped: the tip height
+-- at which the partition's stamp completed, plus the margin section 6 of the design defines.
 -- Only the stamp writes it and only the drop reads and deletes it; no reorg, un-mine,
--- invalidation or unspend path touches it, which is what keeps it from being the per-window
+-- invalidation or unspend path touches it, which is what keeps it from being the per-partition
 -- marker table that was rejected. Created now, unused until the stamp of build step 5.
 CREATE TABLE IF NOT EXISTS tx_mined_stamped (
     window_start  INTEGER PRIMARY KEY CHECK (window_start >= 0 AND window_start % 288 = 0),
@@ -430,9 +430,9 @@ CREATE TABLE IF NOT EXISTS tx_mined_stamped (
 
 -- ---------------------------------------------------------------------------
 -- THE PRESERVED PARENT. One row per transaction the pruner asked to keep alive past the
--- membership window that would otherwise have retired it.
+-- tx_mined partition that would otherwise have retired it.
 --
--- It exists for one case, the lingering unmined child. A parent whose window has been dropped
+-- It exists for one case, the lingering unmined child. A parent whose partition has been dropped
 -- and whose UTXOs are all spent is GONE, and that is right: nothing on the consensus path can
 -- ask about a transaction that is 1440 blocks buried and has no live output. The exception is
 -- an unmined child still sitting in block assembly, which will be validated again the day it
@@ -457,7 +457,7 @@ CREATE TABLE IF NOT EXISTS tx_mined_stamped (
 -- ProcessExpiredPreservations deletes every row that has reached it.
 --
 -- NOT partitioned, deliberately. It is keyed by transaction id alone and read by primary key,
--- its rows leave by an expiry height that has nothing to do with any window's bounds, and it
+-- its rows leave by an expiry height that has nothing to do with any partition's bounds, and it
 -- is small enough that a delete plus autovacuum costs nothing worth a catalog operation.
 --
 -- The primary key is its ONLY index. Every read is by transaction id, which the key serves,
@@ -577,14 +577,14 @@ CREATE TABLE IF NOT EXISTS tx_body (
 
 -- ---------------------------------------------------------------------------
 -- THE CARRIED BODY. The bytes of a transaction that is still waiting to be mined when its
--- tx_body window ages out.
+-- tx_body partition ages out.
 --
 -- A waiting transaction can still be mined, and for a block this node assembled no subtree
 -- data file exists until the block persister builds one from this store's bodies. Dropping
--- the bytes with the window failed that block for good. SQL and Aerospike keep an unmined
+-- the bytes with the partition failed that block for good. SQL and Aerospike keep an unmined
 -- transaction's body for as long as it waits; this table is how this store does the same.
 --
--- A side table, not a copy into a newer tx_body window, because a body is found by
+-- A side table, not a copy into a newer tx_body partition, because a body is found by
 -- (created_height, txid) from the identity or containment row, and created_height is
 -- immutable there: a copy under a newer height would be unreachable, and moving the pointer
 -- instead races SetMined, which copies created_height into tx_mined in its own statement.

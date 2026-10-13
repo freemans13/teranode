@@ -18,9 +18,9 @@ import (
 // that were never an entry, corrupting both neighbours and leaving a length the reader
 // rejects. One row per (parent, child) makes that entire class of defect impossible.
 //
-// The pairs arrive as two parallel arrays, one element per removal, and every window is
+// The pairs arrive as two parallel arrays, one element per removal, and every partition is
 // searched: a pair can have been noted at any height still inside the journal's retention, and
-// the caller does not know which. Each window carries an index on (parent_txid).
+// the caller does not know which. Each partition carries an index on (parent_txid).
 //
 // Idempotence is free, and a no-op costs nothing. A parent the store never held, a pair that
 // was never noted, and a second run after the first succeeded all match no row, so they write
@@ -39,7 +39,7 @@ DELETE FROM conflict_children c
 // statement stripped in the same transaction; that column is gone, containment has one home,
 // and the identity row of a transaction seen before its block is untouched by a rewind.
 //
-// tx_mined's primary key leads with txid, so this is one descent per pair per live window. It
+// tx_mined's primary key leads with txid, so this is one descent per pair per live partition. It
 // deliberately carries no height bound: the tool runs offline with the node stopped and names
 // blocks the caller has stopped believing in at any depth.
 //

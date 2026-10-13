@@ -30,7 +30,7 @@ var (
 	// soak.
 	stampWindows = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_windows_total",
-		Help: "Containment windows whose stamp completed",
+		Help: "tx_mined partitions whose stamp completed",
 	})
 	stampPages = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_pages_total",
@@ -52,7 +52,7 @@ var (
 		Name: "utxoset_stamp_losers_deleted_total",
 		Help: "Containment rows of blocks that lost a fork, deleted by the stamp's first step",
 	})
-	// stampNoWinner splits a transaction with no winner in its window by marker. Set is normal:
+	// stampNoWinner splits a transaction with no winner in its partition by marker. Set is normal:
 	// the transaction is unmined again. Null alarms: the transaction believes itself mined and
 	// no chain-confirmed row exists for it anywhere, so the stamp set its marker.
 	stampNoWinner = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -65,7 +65,7 @@ var (
 	})
 	stampSuspectsDeferred = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_suspects_deferred_total",
-		Help: "Suspects not judged because a block between the window and the anchor had mined_set false",
+		Help: "Suspects not judged because a block between the partition and the anchor had mined_set false",
 	})
 	stampFenceLockTimeouts = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_fence_lock_timeouts_total",
@@ -73,19 +73,19 @@ var (
 	})
 	stampMissingWindows = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_missing_window_total",
-		Help: "Windows with no table that the stamp advanced past as empty",
+		Help: "Partitions with no table that the stamp advanced past as empty",
 	})
 	stampNotMinedAborts = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_not_mined_aborts_total",
-		Help: "Windows not stamped this drain because a main-chain block in them had mined_set false",
+		Help: "Partitions not stamped this drain because a main-chain block in them had mined_set false",
 	})
 	stampTwoWinners = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_two_winners_total",
-		Help: "Pages rolled back because a transaction had two winning containment rows in one window",
+		Help: "Pages rolled back because a transaction had two winning containment rows in one partition",
 	})
 	stampAuditViolations = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_audit_violations_total",
-		Help: "Sampled winners found with an identity row left or a live UTXO at (0,0) after the stamp; the window does not complete",
+		Help: "Sampled winners found with an identity row left or a live UTXO at (0,0) after the stamp; the partition does not complete",
 	})
 	stampAuditDisagreements = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_audit_disagreements_total",
@@ -93,7 +93,7 @@ var (
 	})
 	stampCompletionMissing = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_stamp_completion_missing_total",
-		Help: "Windows below the stamp-complete floor with no completion record, or a completion floor that moved under a drain; must stay at zero",
+		Help: "Partitions below the stamp-complete floor with no completion record, or a completion floor that moved under a drain; must stay at zero",
 	})
 	stampDrainsSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "utxoset_stamp_drains_skipped_total",
@@ -103,19 +103,19 @@ var (
 	// The drop's counters.
 	dropHeldByUndo = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_window_drop_held_by_undo_total",
-		Help: "Containment windows due to drop but held because an attached undo partition covers a height below their stamped_at",
+		Help: "tx_mined partitions due to drop but held because an attached undo partition covers a height below their stamped_at",
 	})
 	dropRefused = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_window_drop_refused_total",
-		Help: "Containment window drops refused by the pre-drop check: an identity row is still joined to a row of the window",
+		Help: "tx_mined partition drops refused by the pre-drop check: an identity row is still joined to a row of the partition",
 	})
 	dropDetachWaits = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_window_detach_waits_total",
-		Help: "Containment window detaches that did not finish within the timeout and were retried next block",
+		Help: "tx_mined partition detaches that did not finish within the timeout and were retried next block",
 	})
 	dropDetachRecovered = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_window_detach_recovered_total",
-		Help: "Containment windows found pending detach or already detached by an interrupted drop, and finished",
+		Help: "tx_mined partitions found pending detach or already detached by an interrupted drop, and finished",
 	})
 	pruneStepErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "utxoset_prune_step_errors_total",
@@ -123,6 +123,6 @@ var (
 	}, []string{"step"})
 	retainIndefinitelyGauge = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "utxoset_retain_indefinitely",
-		Help: "1 while the operator has asked for every containment window and undo partition to be kept; the stamp still runs",
+		Help: "1 while the operator has asked for every tx_mined partition and undo partition to be kept; the stamp still runs",
 	})
 )

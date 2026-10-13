@@ -806,7 +806,7 @@ type Store interface {
 	GetBlockState() BlockState
 
 	// Stamper returns the store's stamp: the deep pass that writes each UTXO's block onto it
-	// once its containment window is deep enough. Every store answers, so no caller has to test
+	// once its tx_mined partition is deep enough. Every store answers, so no caller has to test
 	// the store's type to find it, and a wrapper forwards it like any other method. A store
 	// whose UTXOs carry their block from the moment they are mined has nothing to stamp and
 	// returns pruner.NoStamp, whose WindowBlocks is zero.

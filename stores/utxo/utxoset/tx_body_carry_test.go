@@ -17,7 +17,7 @@ import (
 // the below-checkpoint body skip.
 const carryTestHeight = 1_000_000
 
-// bodyWindowExists reports whether the tx_body window covering height is still a table.
+// bodyWindowExists reports whether the tx_body partition covering height is still a table.
 func bodyWindowExists(t *testing.T, s *Store, ctx context.Context, height uint32) bool {
 	t.Helper()
 
@@ -68,7 +68,7 @@ func archivable(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) error {
 }
 
 // TestUnminedBodyOutlivesItsWindow pins review finding on PR 1663: the body of a transaction
-// still waiting to be mined was dropped with its creation window, 288 blocks after it arrived.
+// still waiting to be mined was dropped with its creation partition, 288 blocks after it arrived.
 //
 // Block assembly never writes a subtree data file, so for a block this node mines the block
 // persister builds that file from the store, asking BatchDecorate for fields.Tx. A transaction
@@ -76,7 +76,7 @@ func archivable(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) error {
 // persister failed the block, every retry, with "transaction is nil". SQL and Aerospike keep an
 // unmined transaction's body for as long as it waits; this store has to as well.
 //
-// The end state, all through the real pruner: the body survives the drop of its window while
+// The end state, all through the real pruner: the body survives the drop of its partition while
 // the transaction waits, survives its mining, and goes once it is mined and 288 blocks deep.
 func TestUnminedBodyOutlivesItsWindow(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -84,19 +84,19 @@ func TestUnminedBodyOutlivesItsWindow(t *testing.T) {
 	tx := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, tx, carryTestHeight)
 	require.NoError(t, err)
-	require.NoError(t, archivable(t, s, ctx, tx), "inside its window the body is there")
+	require.NoError(t, archivable(t, s, ctx, tx), "inside its partition the body is there")
 
-	// Its window, 999,984 to 1,000,031, drops once the pruner height is 288 past its top.
+	// Its partition, 999,984 to 1,000,031, drops once the pruner height is 288 past its top.
 	dropAt := uint32(carryTestHeight/TxBodyPartitionBlocks+1)*TxBodyPartitionBlocks + s.bodyRetention
 	pruneAt(t, s, ctx, dropAt, dropAt+1)
-	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation window is gone")
+	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation partition is gone")
 
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.Tx)
 	require.NoError(t, err)
-	require.NotNil(t, got.Tx, "a waiting transaction keeps its body past its window")
+	require.NotNil(t, got.Tx, "a waiting transaction keeps its body past its partition")
 	require.Equal(t, tx.TxID(), got.Tx.TxID())
 
-	// Mined well after its window went, and the persister has not archived that block yet.
+	// Mined well after its partition went, and the persister has not archived that block yet.
 	minedAt := dropAt + 100
 	_, err = s.SetMinedMulti(ctx, hashes(tx),
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: minedAt, OnLongestChain: true})
@@ -123,7 +123,7 @@ func TestUnminedBodyOutlivesItsWindow(t *testing.T) {
 // marker when the drop runs, so a carry that looked only at the marker at drop time would let
 // the body go and wedge the persister on that block.
 //
-// The carry runs a window ahead of the drop, measured from the tip, so the transaction was
+// The carry runs a partition ahead of the drop, measured from the tip, so the transaction was
 // carried while it was still waiting.
 func TestBodyOfTransactionMinedAheadOfThePersisterSurvivesTheDrop(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -135,7 +135,7 @@ func TestBodyOfTransactionMinedAheadOfThePersisterSurvivesTheDrop(t *testing.T) 
 	dropAt := uint32(carryTestHeight/TxBodyPartitionBlocks+1)*TxBodyPartitionBlocks + s.bodyRetention
 
 	// Every block from well before the drop, persister one block behind the tip, with the
-	// transaction mined in the block at the tip two blocks before the window drops.
+	// transaction mined in the block at the tip two blocks before the partition drops.
 	minedAt := dropAt - 1
 
 	for p := dropAt - TxBodyPartitionBlocks - 2; p <= dropAt; p++ {
@@ -148,7 +148,7 @@ func TestBodyOfTransactionMinedAheadOfThePersisterSurvivesTheDrop(t *testing.T) 
 		pruneAt(t, s, ctx, p, p+1)
 	}
 
-	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation window is gone")
+	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation partition is gone")
 	require.NoError(t, archivable(t, s, ctx, tx))
 }
 
@@ -174,7 +174,7 @@ func TestBodyOfTransactionMinedBeforeTheFirstCarrySurvivesTheDrop(t *testing.T) 
 
 	pruneAt(t, s, ctx, dropAt, minedAt+5)
 
-	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation window is gone")
+	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation partition is gone")
 	require.NoError(t, archivable(t, s, ctx, tx), "the persister cannot build the subtree data file for the block")
 
 	// Once the persister has archived the block and it is 288 deep, the body goes.
@@ -214,7 +214,7 @@ func TestCarriedBodyIsFoundWhileThePersisterLags(t *testing.T) {
 }
 
 // TestBodyCarryIsIdempotent pins the crash window between the carry and the drop. The carry
-// commits on its own and the drop comes after it, so a restart there carries the same window
+// commits on its own and the drop comes after it, so a restart there carries the same partition
 // again, and a read must still see exactly one body.
 func TestBodyCarryIsIdempotent(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -238,7 +238,7 @@ func TestBodyCarryIsIdempotent(t *testing.T) {
 
 	require.Equal(t, 1, carriedBodies(t, s, ctx))
 
-	// Both copies are live until the window drops, and the read returns the one transaction.
+	// Both copies are live until the partition drops, and the read returns the one transaction.
 	require.NoError(t, archivable(t, s, ctx, tx))
 }
 
@@ -267,7 +267,7 @@ func TestMinedBodyIsNotCarried(t *testing.T) {
 
 // forgetCarriedBodies empties the carry table, for a test of the readers that answer about a
 // waiting transaction with no body. The pruner no longer produces that state, since it carries
-// a waiting transaction's body past its window; a body that was never written, which a create
+// a waiting transaction's body past its partition; a body that was never written, which a create
 // that is not faithful to its hash skips, still does.
 func forgetCarriedBodies(t *testing.T, s *Store, ctx context.Context) {
 	t.Helper()
@@ -287,8 +287,8 @@ func carriedBodies(t *testing.T, s *Store, ctx context.Context) int {
 }
 
 // TestBodyOfRecentlyMinedTransactionSurvivesADelayedDropForARemine is the reorg the 288-block
-// horizon exists for. A transaction waited past its window with no pruner session to carry it,
-// was mined, and the persister archived its block before the delayed session dropped the window.
+// horizon exists for. A transaction waited past its partition with no pruner session to carry it,
+// was mined, and the persister archived its block before the delayed session dropped the partition.
 // A shallow reorg then un-mines that block and the transaction is mined again in a block the
 // persister has not archived, so the persister needs the body a second time. The block was 288
 // blocks deep nowhere near the drop, and a carried body is kept for exactly that long
@@ -310,7 +310,7 @@ func TestBodyOfRecentlyMinedTransactionSurvivesADelayedDropForARemine(t *testing
 	require.NoError(t, err)
 
 	pruneAt(t, s, ctx, dropAt, dropAt+1)
-	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation window is gone")
+	require.False(t, bodyWindowExists(t, s, ctx, carryTestHeight), "the creation partition is gone")
 
 	// A two-block reorg un-mines the block, and the transaction is mined again above the
 	// archived height.
@@ -337,10 +337,10 @@ func TestBodyOfRecentlyMinedTransactionSurvivesADelayedDropForARemine(t *testing
 }
 
 // TestBodyMinedPastItsWindowIsCarriedUntilItsBlockIs288Deep pins what the drop pass carries
-// with the reclaim's floor: a transaction created near the top of its window and mined a few
-// blocks later is mined in a block that is still inside the 288-block horizon when its window
+// with the reclaim's floor: a transaction created near the top of its partition and mined a few
+// blocks later is mined in a block that is still inside the 288-block horizon when its partition
 // drops, so a reorg can still un-mine it and its body is carried. This is not only the
-// long-waiting transaction; it is every transaction whose block is above its creation window's
+// long-waiting transaction; it is every transaction whose block is above its creation partition's
 // top, a fraction of ordinary tip traffic. The copy lives until the block is 288 deep.
 func TestBodyMinedPastItsWindowIsCarriedUntilItsBlockIs288Deep(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -351,7 +351,7 @@ func TestBodyMinedPastItsWindowIsCarriedUntilItsBlockIs288Deep(t *testing.T) {
 	_, err := s.Create(ctx, tx, windowTop)
 	require.NoError(t, err)
 
-	// Mined two blocks after it arrived, in the next window.
+	// Mined two blocks after it arrived, in the next partition.
 	minedAt := windowTop + 2
 	_, err = s.SetMinedMulti(ctx, hashes(tx),
 		utxo.MinedBlockInfo{BlockID: 5, BlockHeight: minedAt, OnLongestChain: true})
@@ -359,7 +359,7 @@ func TestBodyMinedPastItsWindowIsCarriedUntilItsBlockIs288Deep(t *testing.T) {
 
 	dropAt := windowTop + 1 + s.bodyRetention
 	pruneAt(t, s, ctx, dropAt, dropAt+1)
-	require.False(t, bodyWindowExists(t, s, ctx, windowTop), "the creation window is gone")
+	require.False(t, bodyWindowExists(t, s, ctx, windowTop), "the creation partition is gone")
 	require.Equal(t, 1, carriedBodies(t, s, ctx), "its block is 287 deep, inside the horizon")
 	require.NoError(t, archivable(t, s, ctx, tx))
 

@@ -24,7 +24,7 @@ func liveRows(t *testing.T, s *Store, ctx context.Context, txid []byte) int {
 //
 // The UTXO table's ukey is a 96-bit prefix and is deliberately NON-UNIQUE, so createSQL
 // has no ON CONFLICT to make an insert idempotent. Replay is routine — catchup, a
-// restart mid-window, the post-restart unrequested-block storm — so without a durable
+// restart mid-partition, the post-restart unrequested-block storm — so without a durable
 // record of which blocks have been applied, re-offering a block inserts every output a
 // second time and nothing rejects it. Those duplicate rows are independently spendable.
 //

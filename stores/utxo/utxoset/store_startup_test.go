@@ -12,7 +12,7 @@ import (
 )
 
 // TestStoreRefusesToStartWithThePrunerSkippingCatchup: on this store the pruner also runs the
-// deep stamp, so pruner_skipDuringCatchup would switch off both the stamp and every window
+// deep stamp, so pruner_skipDuringCatchup would switch off both the stamp and every partition
 // drop for the whole of catch-up and fill the disk in silence. The store refuses to open rather
 // than run that way, before any write, and the message names the lever an operator who wants
 // an archive should use instead.

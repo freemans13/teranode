@@ -100,7 +100,7 @@ func spendOneOutputInBlock(t *testing.T, s *Store, ctx context.Context, parent *
 	return child
 }
 
-// plantMined inserts one containment row directly, creating its window first, so a test can
+// plantMined inserts one containment row directly, creating its partition first, so a test can
 // build the exact combination of identity row and containment it needs without driving the
 // whole write path. The payload columns are left NULL, as a block-path row's are.
 func plantMined(t *testing.T, s *Store, ctx context.Context, txid []byte, blockID, height, subtreeIdx uint32) {
@@ -191,7 +191,7 @@ func utxoFactsOf(t *testing.T, s *Store, ctx context.Context, txid []byte) (mine
 	return minedHeight, blockID
 }
 
-// plantConflictNote records one (parent, child) contest directly, at a height whose window it
+// plantConflictNote records one (parent, child) contest directly, at a height whose partition it
 // creates first. Setup that went through SetConflicting would depend on the code under test.
 func plantConflictNote(t *testing.T, s *Store, ctx context.Context, height uint32,
 	parent, child []byte) {
@@ -205,7 +205,7 @@ func plantConflictNote(t *testing.T, s *Store, ctx context.Context, height uint3
 	require.NoError(t, err)
 }
 
-// conflictChildrenOf reads the children recorded against one parent, across every live window,
+// conflictChildrenOf reads the children recorded against one parent, across every live partition,
 // deduplicated the way the read path deduplicates them.
 func conflictChildrenOf(t *testing.T, s *Store, ctx context.Context, parent []byte) [][]byte {
 	t.Helper()

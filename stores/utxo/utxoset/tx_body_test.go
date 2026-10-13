@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestTxBodyIsRangePartitionedOnCreatedHeight pins the shape that makes the body window
+// TestTxBodyIsRangePartitionedOnCreatedHeight pins the shape that makes the tx_body partition
 // droppable.
 //
 // The body is the only part of a transaction whose life is bounded by a horizon rather than
@@ -28,7 +28,7 @@ func TestTxBodyIsRangePartitionedOnCreatedHeight(t *testing.T) {
 	var strategy string
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT partstrat::text FROM pg_partitioned_table WHERE partrelid = 'tx_body'::regclass`).Scan(&strategy))
-	require.Equal(t, "r", strategy, "range partitioned, so a whole window can be dropped at once")
+	require.Equal(t, "r", strategy, "range partitioned, so a whole partition can be dropped at once")
 }
 
 // TestTxBodyHasASentinelPartitionBelowEveryLiveWindow covers the case that takes transaction
@@ -52,10 +52,10 @@ func TestTxBodyHasASentinelPartitionBelowEveryLiveWindow(t *testing.T) {
                AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT')`).Scan(&isDefault))
 	require.False(t, isDefault, "a DEFAULT partition blocks concurrent detach on every sibling")
 
-	// A create far below any live window must still land somewhere.
+	// A create far below any live partition must still land somewhere.
 	tx := mkTx(t, 1, 1_000)
 	_, err := s.Create(ctx, tx, 1)
-	require.NoError(t, err, "a create below the lowest live window must not be refused")
+	require.NoError(t, err, "a create below the lowest live partition must not be refused")
 
 	h := tx.TxIDChainHash()
 
@@ -114,17 +114,17 @@ func TestCreateDoesNotWriteASecondBodyForADuplicate(t *testing.T) {
 // each commits separately, so a failure partway leaves the earlier writes standing.
 //
 // The damaging case is an identity row with no bytes. A read cannot tell that apart from a
-// transaction whose bytes have aged out of their window, because both are a row with no body
+// transaction whose bytes have aged out of their partition, because both are a row with no body
 // row beside it. And a retry is refused, because the identity claim reports the transaction
 // as already present, so the bytes are never written. The transaction stays body-less
 // permanently and nothing reports it.
 //
-// The forced failure here is a body window that does not exist. Detaching one leaves the
+// The forced failure here is a tx_body partition that does not exist. Detaching one leaves the
 // range unrouted, so the body insert fails while the identity claim has already succeeded.
 func TestCreateIsAtomicAcrossItsThreeWrites(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	// Make the window for height 700_000 exist, then take it away, so the body insert fails
+	// Make the partition for height 700_000 exist, then take it away, so the body insert fails
 	// after the claim has been made.
 	require.NoError(t, s.ensureTxBodyPartition(ctx, 700_000))
 
@@ -181,9 +181,9 @@ func tableExists(t *testing.T, s *Store, ctx context.Context, name string) bool 
 // TestTxBodyReclaimRecoversAnOrphanedWindow covers the crash window that the listing query used
 // to be blind to.
 //
-// Discarding a window is two statements: DETACH PARTITION ... CONCURRENTLY, then DROP TABLE. A
+// Discarding a partition is two statements: DETACH PARTITION ... CONCURRENTLY, then DROP TABLE. A
 // crash between them leaves a fully standalone table, and PostgreSQL removes its pg_inherits row
-// when it detaches. The listing used to INNER JOIN pg_inherits, so from that moment the window
+// when it detaches. The listing used to INNER JOIN pg_inherits, so from that moment the partition
 // was invisible to every future session and its disk was never returned. Nothing reported it
 // either, because the only symptom is free disk shrinking.
 //
@@ -194,10 +194,10 @@ func TestTxBodyReclaimRecoversAnOrphanedWindow(t *testing.T) {
 
 	s.bodyRetention = 96
 
-	require.NoError(t, s.ensureTxBodyPartition(ctx, 100)) // window 2
-	require.NoError(t, s.ensureTxBodyPartition(ctx, 500)) // window 10
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 100)) // partition 2
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 500)) // partition 10
 
-	// Simulate the crash: detach window 2 and stop, exactly as a kill between the two
+	// Simulate the crash: detach partition 2 and stop, exactly as a kill between the two
 	// statements would leave it.
 	_, err := s.pool.Exec(ctx, `ALTER TABLE tx_body DETACH PARTITION tx_body_w2 CONCURRENTLY`)
 	require.NoError(t, err)
@@ -212,16 +212,16 @@ func TestTxBodyReclaimRecoversAnOrphanedWindow(t *testing.T) {
 	require.Positive(t, dropped)
 
 	require.False(t, tableExists(t, s, ctx, "tx_body_w2"),
-		"an orphaned window must be reclaimed by the next session, or its disk is lost for good")
+		"an orphaned partition must be reclaimed by the next session, or its disk is lost for good")
 }
 
 // TestTxBodyReclaimRecoversAWindowStuckMidDetach is the worse of the two crash states, because
-// it does not leak one window, it stops the entire cleanup.
+// it does not leak one partition, it stops the entire cleanup.
 //
-// A crash DURING a concurrent detach leaves the window marked detach-pending. PostgreSQL then
+// A crash DURING a concurrent detach leaves the partition marked detach-pending. PostgreSQL then
 // refuses every further attach and detach on tx_body. So the detach in this loop fails on every
 // call, the call returns an error, and Prune returns before it reaches the journal loop at all.
-// Discarding transaction bytes AND discarding undo history both stop. Creating a new window at
+// Discarding transaction bytes AND discarding undo history both stop. Creating a new partition at
 // the next 48-block rollover would fail too.
 //
 // Reaching this state on purpose needs a catalog write, because the only natural route is an
@@ -234,9 +234,9 @@ func TestTxBodyReclaimRecoversAWindowStuckMidDetach(t *testing.T) {
 
 	s.bodyRetention = 96
 
-	require.NoError(t, s.ensureTxBodyPartition(ctx, 100)) // window 2
-	require.NoError(t, s.ensureTxBodyPartition(ctx, 200)) // window 4
-	require.NoError(t, s.ensureTxBodyPartition(ctx, 500)) // window 10
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 100)) // partition 2
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 200)) // partition 4
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 500)) // partition 10
 
 	if _, err := s.pool.Exec(ctx, `UPDATE pg_inherits SET inhdetachpending = true
          WHERE inhrelid = 'tx_body_w2'::regclass AND inhparent = 'tx_body'::regclass`); err != nil {
@@ -251,22 +251,22 @@ func TestTxBodyReclaimRecoversAWindowStuckMidDetach(t *testing.T) {
 
 	dropped, err := s.dropTxBodyWindowsBelow(ctx, 500+96)
 	require.NoError(t, err,
-		"a window stuck mid-detach must be finalised, not returned as an error that stops the whole prune")
+		"a partition stuck mid-detach must be finalised, not returned as an error that stops the whole prune")
 	require.Positive(t, dropped)
 
 	var stuck bool
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT COALESCE(bool_or(i.inhdetachpending), false) FROM pg_inherits i
           WHERE i.inhparent = 'tx_body'::regclass`).Scan(&stuck))
-	require.False(t, stuck, "leaving it pending stops every later detach and every new window")
+	require.False(t, stuck, "leaving it pending stops every later detach and every new partition")
 }
 
 // TestTxBodyReclaimTakesTheOldestWindowFirst.
 //
-// The listing query has no ORDER BY, so without an explicit sort the catalog hands windows back
-// in whatever order it scanned them. With one window retiring every 48 blocks and nothing behind,
+// The listing query has no ORDER BY, so without an explicit sort the catalog hands partitions back
+// in whatever order it scanned them. With one partition retiring every 48 blocks and nothing behind,
 // that does not matter. With a backlog, and the mainnet box reached 601 of these holding 14 GB,
-// it decides which disk comes back first and whether the oldest surviving window is a usable
+// it decides which disk comes back first and whether the oldest surviving partition is a usable
 // measure of progress at all.
 func TestTxBodyReclaimTakesTheOldestWindowFirst(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -279,12 +279,12 @@ func TestTxBodyReclaimTakesTheOldestWindowFirst(t *testing.T) {
 		require.NoError(t, s.ensureTxBodyPartition(ctx, h))
 	}
 
-	// A cutoff that retires windows 2 and 4 but not 7 and 10.
+	// A cutoff that retires partitions 2 and 4 but not 7 and 10.
 	dropped, err := s.dropTxBodyWindowsBelow(ctx, 250+96)
 	require.NoError(t, err)
 	require.Equal(t, 2, dropped)
 
-	require.False(t, tableExists(t, s, ctx, "tx_body_w2"), "window 2 is the oldest and must go first")
+	require.False(t, tableExists(t, s, ctx, "tx_body_w2"), "partition 2 is the oldest and must go first")
 	require.False(t, tableExists(t, s, ctx, "tx_body_w4"))
 	require.True(t, tableExists(t, s, ctx, "tx_body_w7"), "still inside the horizon")
 	require.True(t, tableExists(t, s, ctx, "tx_body_w10"))
@@ -301,7 +301,7 @@ func bodyExists(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) bool {
 }
 
 // TestBodyWindowsBelowRetentionAreDropped. The transaction bytes are the one part with a
-// horizon rather than a dependency, so their windows go wholesale.
+// horizon rather than a dependency, so their partitions go wholesale.
 func TestBodyWindowsBelowRetentionAreDropped(t *testing.T) {
 	s, ctx := newTestStore(t)
 

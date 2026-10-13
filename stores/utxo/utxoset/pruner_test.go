@@ -41,8 +41,8 @@ func TestPrunerServiceContract(t *testing.T) {
 	require.Zero(t, n, "no transaction records are deleted yet, and journal rows do not belong in that counter")
 }
 
-// TestPrunerDropsAContainmentWindowOnlyOnceStamped: the prune pass drops a containment window
-// on the stamp's rule and never on the journal cutoff. A window with no completion record is
+// TestPrunerDropsAContainmentWindowOnlyOnceStamped: the prune pass drops a tx_mined partition
+// on the stamp's rule and never on the journal cutoff. A partition with no completion record is
 // not due however old it is; a stamped one drops once the tip is the undo lifetime, 576 blocks
 // at the default retention, past its stamped_at.
 func TestPrunerDropsAContainmentWindowOnlyOnceStamped(t *testing.T) {
@@ -61,14 +61,14 @@ func TestPrunerDropsAContainmentWindowOnlyOnceStamped(t *testing.T) {
 	svc, err := s.GetPrunerService()
 	require.NoError(t, err)
 
-	// Far past any age rule, and nothing drops: no window has been stamped.
+	// Far past any age rule, and nothing drops: no partition has been stamped.
 	require.NoError(t, s.SetBlockHeight(100_000))
 	_, err = svc.Prune(ctx, 100_000, "deadbeef")
 	require.NoError(t, err)
 	require.Equal(t, 1, minedRows(t, s, ctx, old), "unstamped, so not due")
 	require.Equal(t, 1, minedRows(t, s, ctx, young))
 
-	// Window 0 stamped at tip 575: stamped_at 863, due at 1,439. Window 3 is not deep enough.
+	// Partition 0 stamped at tip 575: stamped_at 863, due at 1,439. Partition 3 is not deep enough.
 	// The chain answer names both blocks, or the stamp would delete their rows as fork losers.
 	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 1, 900: 2})
 
@@ -80,8 +80,8 @@ func TestPrunerDropsAContainmentWindowOnlyOnceStamped(t *testing.T) {
 	require.NoError(t, s.SetBlockHeight(1_439))
 	_, err = svc.Prune(ctx, 1_439, "deadbeef")
 	require.NoError(t, err)
-	require.Equal(t, 0, minedRows(t, s, ctx, old), "window 0 dropped at stamped_at + 576")
-	require.Equal(t, 1, minedRows(t, s, ctx, young), "window 3 has no completion record")
+	require.Equal(t, 0, minedRows(t, s, ctx, old), "partition 0 dropped at stamped_at + 576")
+	require.Equal(t, 1, minedRows(t, s, ctx, young), "partition 3 has no completion record")
 
 	floor, err := s.txMinedFloor(ctx)
 	require.NoError(t, err)
@@ -90,7 +90,7 @@ func TestPrunerDropsAContainmentWindowOnlyOnceStamped(t *testing.T) {
 
 // TestPrunerRebuildsUTXOIndexBelowJournalRetention pins a review finding: the UTXO-index
 // rebuild step must not sit inside the "height > journalRetention" gate that guards the
-// window and spend-journal drops. That gate exists because there is nothing aged out to
+// partition and spend-journal drops. That gate exists because there is nothing aged out to
 // drop below it; it has no bearing on the UTXO index, which can already be churned on a
 // chain three blocks deep. Every dev/test net and every from-scratch sync spends most of
 // its life below the journal retention, so a rebuild gated on it would

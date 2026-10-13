@@ -18,8 +18,8 @@ import (
 // every live leaf, and the store re-plans every execution, so the live leaf count is a
 // direct cost on the block path: MEASURED on mainnet 2026-09-16, the spent-parent lookup
 // planned in 59 ms and took 2,023 locks across 850 leaves. At 288 the steady state is six
-// live leaves against 31, the same cadence as the membership windows, and a conflict note's
-// window always exists whenever its journal leaf does, exactly as before. The price is that
+// live leaves against 31, the same cadence as the tx_mined partitions, and a conflict note's
+// partition always exists whenever its journal leaf does, exactly as before. The price is that
 // a spend stays undoable for up to 287 blocks longer than retention, INFERRED at about
 // 2.2 GB at tip rates. A wider leaf is also more rows for one autovacuum to clear; the
 // per-leaf autovacuum threshold below was sized for 48 blocks and is a soak-set value.
@@ -139,7 +139,7 @@ SELECT d.vin, d.satoshis, d.script, d.hash_override FROM del d`
 // Each leaf gets ONE index, the packed-key btree, which is what every restore probes. There
 // was a second, a block-range summary over a block-applied mark, and it existed only for a
 // question the reclaimer asked once per retiring leaf. Nothing asks it now: retiring a
-// transaction's identity is dropping the tx_mined window it lives in, so the journal is read
+// transaction's identity is dropping the tx_mined partition it lives in, so the journal is read
 // only by a restore, and only by outpoint.
 //
 // Called on the spend path, so it must be cheap and idempotent. CREATE TABLE IF NOT
@@ -175,27 +175,27 @@ func (s *Store) ensureSpendJournalPartition(ctx context.Context, height uint32) 
 	lo := leaf * SpendJournalPartitionBlocks
 	hi := lo + SpendJournalPartitionBlocks
 
-	// The conflict-bookkeeping window is created in the SAME statement, over the SAME range,
+	// The conflict-bookkeeping partition is created in the SAME statement, over the SAME range,
 	// and that is the invariant it rests on: a note lands at the store's current height, which
-	// is the height whose journal leaf the spend path has already ensured, so the window a
-	// note needs exists whenever its journal leaf does. Two separate ensure calls, or a window
+	// is the height whose journal leaf the spend path has already ensured, so the partition a
+	// note needs exists whenever its journal leaf does. Two separate ensure calls, or a partition
 	// created on first note, would leave the one case that matters -- a conflict noted at a
 	// height nothing has spent at -- failing with "no partition found for row".
 	//
-	// The unique index is PER WINDOW rather than on the parent. A unique index on a
+	// The unique index is PER PARTITION rather than on the parent. A unique index on a
 	// partitioned table must include the partition key, and (noted_height, parent_txid,
 	// child_txid) would admit the same pair twice at two heights, so it would buy nothing the
-	// reader's DISTINCT does not already have to do. Per window it makes the repeated note
-	// inside one window -- the common case, since a losing transaction is re-offered -- an
+	// reader's DISTINCT does not already have to do. Per partition it makes the repeated note
+	// inside one partition -- the common case, since a losing transaction is re-offered -- an
 	// ON CONFLICT DO NOTHING that writes nothing at all.
 	//
 	// It is also the ONE index, and that is deliberate rather than an omission. Every read of
 	// this table is by parent_txid, which LEADS the pair, so a second index on (parent_txid)
 	// alone can only duplicate work the planner already does here: measured at 500 keys
-	// against 40,000 rows in six windows, with both indexes present, the read and the removal
+	// against 40,000 rows in six partitions, with both indexes present, the read and the removal
 	// both chose the pair index and neither touched the parent-only one. A second index on a
 	// table written on every double-spend is write amplification for nothing.
-	// Both windows are built standalone and attached, so the spend path never takes either
+	// Both partitions are built standalone and attached, so the spend path never takes either
 	// parent's strongest lock at a leaf boundary. See ensureAttachedPartition.
 	journal := fmt.Sprintf("spend_journal_%d", leaf)
 
@@ -350,12 +350,12 @@ func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	return s.dropSpendJournalPartitionsBelow(ctx, height)
 }
 
-// dropSpendJournalPartitionsBelow drops journal leaves, and the conflict-bookkeeping windows
+// dropSpendJournalPartitionsBelow drops journal leaves, and the conflict-bookkeeping partitions
 // that retire with them, below height.
 //
 // Both parents are listed and merged into ONE ordered pass rather than dropped in two loops.
 // The three-state handling is per table, because a crash between detaching the journal leaf
-// and detaching its conflict window leaves the two in different states, and the ordering
+// and detaching its conflict-bookkeeping partition leaves the two in different states, and the ordering
 // argument below is about age rather than about which parent a table belongs to.
 //
 // The count returned is the number of tables dropped across both parents, which is what the
@@ -517,7 +517,7 @@ SELECT txid, tx_inpoints
 // partition boundary, the create retried a partition later) is not found here, and a reorg of
 // its block within retention could not give its coins back.
 //
-// tx_mined is RANGE partitioned on mined_height, so only the windows at or above $1 are read: the
+// tx_mined is RANGE partitioned on mined_height, so only the partitions at or above $1 are read: the
 // containment rows of the last retention's worth of blocks, once per journal partition drop.
 // created_height is the identity row's, copied at record-mined, so a transaction seen before its
 // block keeps the height it spent at.
@@ -548,12 +548,12 @@ SELECT m.txid, m.tx_inpoints
 // delete works whether the partition is attached, detach-pending or already standalone.
 //
 // A carried row whose parent coin carried no block, (0,0), gets the parent's block filled in from
-// its stamped containment window. Such a row can only exist because the spend came before the
-// parent's window was stamped, so the original sits below the window's stamped_at and the drop
-// rule has kept the window attached until now; stamped, the window names only the winner, and a
+// its stamped tx_mined partition. Such a row can only exist because the spend came before the
+// parent's partition was stamped, so the original sits below the partition's stamped_at and the drop
+// rule has kept the partition attached until now; stamped, the partition names only the winner, and a
 // stamped pair is final. Without the fill the carried row would land above stamped_at, where the
-// drop rule does not look, the window would drop, and Unspend would rebuild the coin with no
-// block. A parent whose window is not stamped yet keeps (0,0): its window cannot drop before its
+// drop rule does not look, the partition would drop, and Unspend would rebuild the coin with no
+// block. A parent whose partition is not stamped yet keeps (0,0): its partition cannot drop before its
 // stamp, and the stamp's stamped_at lies above the carried row, so the drop rule holds it too.
 //
 // The NOT EXISTS keeps it idempotent, and it does not gate the delete. Every original matched
@@ -695,7 +695,7 @@ func (s *Store) copyForwardUnminedSpends(ctx context.Context, leaf, keepFrom uin
 	}
 
 	// A block at or below the highest checkpoint is never un-mined (unMine refuses it), so the
-	// read starts above it. During a sync below the checkpoint it reads no window at all.
+	// read starts above it. During a sync below the checkpoint it reads no partition at all.
 	minedFrom := max(keepFrom, model.HighestCheckpointHeight(s.checkpoints)+1)
 
 	if err := s.collectSpenders(ctx, c, "recently mined", recentlyMinedInpointsSQL,

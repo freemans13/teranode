@@ -100,17 +100,17 @@ import (
 //
 // The restored UTXO's pair is the copy's own, verbatim, whenever it is non-zero: a non-zero
 // pair was final when it was copied and stays final. A copy at (0,0) is the REPAIR's case. The
-// UTXO was spent while still unstamped, and if its window has since been stamped, the stamp
+// UTXO was spent while still unstamped, and if its partition has since been stamped, the stamp
 // found no live UTXO to write onto and has deleted the identity row, so nothing would ever
 // come back for it. The repair reads the copy's containment rows below the stamp fence ($6),
 // at or above the dropped floor ($5). Below the fence every row left names a winner, because
 // the stamp deleted the losers in the same transaction that raised the fence, so exactly one
 // row means its pair is written onto the restored UTXO here, with no chain access. No row and
-// an identity row means the transaction is unmined, or its window is not yet stamped: (0,0) is
+// an identity row means the transaction is unmined, or its partition is not yet stamped: (0,0) is
 // kept and the stamp will reach it through the identity row. No row and no identity row, or
 // more than one row, are the two failures the wrapper turns into a rolled-back storage error.
 // The fence itself is read after the shared fence lock, in the same transaction, so it cannot
-// move under this statement. Both floors are scalars, so the planner reads only the windows
+// move under this statement. Both floors are scalars, so the planner reads only the partitions
 // between them.
 const unspendSQL = `
 WITH items AS (

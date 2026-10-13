@@ -28,7 +28,7 @@ import (
 )
 
 // The stamp depth every test below assumes: twice a coinbase maturity of 100, rounded up to a
-// whole 288-block window. Window w is stampable once the tip is at least 288*w + 287 + 288.
+// whole 288-block partition. Partition w is stampable once the tip is at least 288*w + 287 + 288.
 const testStampDepth = 288
 
 // testChain is a sqlitememory blockchain store with a linked chain stored into it, and a
@@ -98,7 +98,7 @@ func (c *testChain) storeBlock(prev chainhash.Hash, height, salt uint32) (uint32
 	require.Equal(c.t, height, gotHeight)
 
 	// Block validation marks a block mined once its containment is recorded, and the store
-	// refuses to stamp a window with a main-chain block still unmarked. Every block here is.
+	// refuses to stamp a partition with a main-chain block still unmarked. Every block here is.
 	require.NoError(c.t, c.store.SetBlockMinedSet(context.Background(), blk.Hash()))
 
 	return uint32(id), *blk.Hash() //nolint:gosec // a test id is small
@@ -141,7 +141,7 @@ func (c *countingClient) GetBlockHeadersByParentLinks(ctx context.Context, hash 
 
 // fakeStamper stands in for the utxoset store's stamp side. It records the exact call
 // sequence the worker makes and advances its floors the way the store does, so a test can
-// assert on which windows and pages ran, with which ancestry and which live tip. It is a fake
+// assert on which partitions and pages ran, with which ancestry and which live tip. It is a fake
 // of the store the worker drives, not of the chain the worker reads.
 type fakeStamper struct {
 	mu        sync.Mutex
@@ -202,7 +202,7 @@ func (f *fakeStamper) BeginWindow(_ context.Context, wLo uint32, anc *chainances
 	defer f.mu.Unlock()
 
 	if wLo != f.floors.StampCompleteFloor {
-		return 0, errors.NewProcessingError("window %d is not the next to stamp; the floor is %d", wLo, f.floors.StampCompleteFloor)
+		return 0, errors.NewProcessingError("partition %d is not the next to stamp; the floor is %d", wLo, f.floors.StampCompleteFloor)
 	}
 
 	if anc.Hi() < wLo+287+f.depth {
@@ -285,7 +285,7 @@ func notificationAt(c *testChain, height uint32) *pruneSignal {
 	return &pruneSignal{blockHeight: height, blockHash: c.hashes[height]}
 }
 
-// A tip at 1151 makes windows 0, 1 and 2 stampable and leaves window 3 short. One wake drains
+// A tip at 1151 makes partitions 0, 1 and 2 stampable and leaves partition 3 short. One wake drains
 // all three, lowest first, completes each with the tip it read just before, and exits with
 // nothing left to stamp.
 func TestStampDrainStampsEveryStampableWindowAndExitsWithZeroLag(t *testing.T) {
@@ -312,7 +312,7 @@ func TestStampDrainStampsEveryStampableWindowAndExitsWithZeroLag(t *testing.T) {
 	require.Equal(t, float64(0), testutil.ToFloat64(stampResidualLag))
 }
 
-// ST-13: one ancestry per drain, however many windows it covers. Every store call of the drain
+// ST-13: one ancestry per drain, however many partitions it covers. Every store call of the drain
 // receives the same value, built from one walk of parent links from the tip down to the
 // completion floor.
 func TestStampDrainBuildsOneAncestryHoweverManyWindows(t *testing.T) {
@@ -364,9 +364,9 @@ func TestStampDrainAbandonsWhenTheChainSwitchesBetweenPages(t *testing.T) {
 	report := s.runStampDrain(s.ctx, notificationAt(chain, 575), false)
 
 	require.Equal(t, "abandoned", report.outcome)
-	require.Equal(t, 0, report.windows, "no window completed")
+	require.Equal(t, 0, report.windows, "no partition completed")
 	require.Equal(t, 2, report.pages, "pages 0 and 1 committed before the switch was seen")
-	require.Equal(t, uint32(1), report.residualLag, "window 0 is still stampable at the new tip")
+	require.Equal(t, uint32(1), report.residualLag, "partition 0 is still stampable at the new tip")
 	require.True(t, report.rearm())
 
 	_, pages, completes, _, closed := fake.snapshot()
@@ -401,7 +401,7 @@ func TestStampDrainCarriesOnWhenTheChainOnlyGrew(t *testing.T) {
 }
 
 // ST-14: a service with no blockchain client counts the wake and stamps nothing. The store
-// is never opened, so no window gets a completion record and none can drop.
+// is never opened, so no partition gets a completion record and none can drop.
 func TestStampWakeWithNoBlockchainClientStampsNothing(t *testing.T) {
 	fake := newFakeStamper(2)
 	s := newStampTestServer(t, nil, fake)
@@ -464,7 +464,7 @@ func TestStampDrainCountsAStaleAnchorHint(t *testing.T) {
 
 // A drain that ends early arms a 60-second timer, and the timer runs a drain with no
 // notification. Here the first drain is abandoned by a chain switch, so nothing else would
-// ever wake the worker; the timer does, and the second drain completes the window on the new
+// ever wake the worker; the timer does, and the second drain completes the partition on the new
 // branch.
 func TestStampWorkerRetriesOnItsTimerAfterAnAbandonedDrain(t *testing.T) {
 	chain := newTestChain(t, 575)
@@ -529,7 +529,7 @@ func TestPrunerProcessorForwardsTheWakeToTheStampWorker(t *testing.T) {
 }
 
 // The worker asks every store for its stamp with the same call. A store that answers with a
-// zero window width, as pruner.NoStamp does, gets no stamp worker; any other answer is the
+// zero partition width, as pruner.NoStamp does, gets no stamp worker; any other answer is the
 // stamper the worker drives.
 func TestFindStamperAsksTheStoreForItsStamp(t *testing.T) {
 	s := &Server{utxoStore: &utxo.MockUtxostore{}}

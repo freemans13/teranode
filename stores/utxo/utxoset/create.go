@@ -34,8 +34,8 @@ import (
 // guarded. One row per child cannot be matched straddling its neighbours, so the whole class
 // of defect no longer exists rather than being defended against.
 //
-// ON CONFLICT DO NOTHING against the window's own unique index is what makes re-offering the
-// same losing transaction free. See the schema comment for why that index is per window and
+// ON CONFLICT DO NOTHING against the partition's own unique index is what makes re-offering the
+// same losing transaction free. See the schema comment for why that index is per partition and
 // why the reader still has to say DISTINCT.
 //
 // One ARRAY of parents, so a transaction reaching for UTXOs of twenty parents is one
@@ -117,7 +117,7 @@ func minedBlock(infos []utxo.MinedBlockInfo) (utxo.MinedBlockInfo, bool) {
 func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
 	// Parsed up front rather than only on the batched path, because the single path now needs
 	// to know whether this create carries block information before it opens its transaction:
-	// that is what decides which membership window has to exist.
+	// that is what decides which tx_mined partition has to exist.
 	options := &utxo.CreateOptions{}
 	for _, opt := range opts {
 		opt(options)
@@ -150,7 +150,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		}
 	}
 
-	// Both windows BEFORE the transaction is opened, never inside it: the DDL needs its own
+	// Both partitions BEFORE the transaction is opened, never inside it: the DDL needs its own
 	// pool connection, and taking one while holding a transaction from the same pool
 	// deadlocks the pool under concurrency, with no timeout.
 	if !s.seedingCreate(options) {
@@ -166,7 +166,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	}
 
 	// A conflicting create notes the contest on its parents, and that note lands in a
-	// height-partitioned window created alongside the spend journal's leaf. It is ensured
+	// height-partitioned partition created alongside the spend journal's leaf. It is ensured
 	// HERE, before the transaction opens, for the same reason the two above are: the DDL
 	// needs its own pool connection, and taking one while holding a transaction from the same
 	// pool deadlocks the pool under concurrency, with no timeout.
@@ -274,7 +274,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 
 	// The inputs, stored rather than re-derived. Block assembly rebuilds a mining candidate
 	// from the fee, the size and these, never from the serialized transaction, which is what
-	// lets the body age out of its window while the transaction stays mineable.
+	// lets the body age out of its partition while the transaction stays mineable.
 	//
 	// The parsed form is kept as well, for the metadata returned to the caller. See the return
 	// below for who reads it.
@@ -498,7 +498,7 @@ func txFee(tx *bt.Tx) *int64 {
 // edited alone.
 // notedHeight is the height a conflict note is stamped with, and it is a PARAMETER rather
 // than a read of s.GetBlockHeight() here so that it cannot differ from the height whose
-// window the caller ensured. The note lands in a height-partitioned window that only the
+// partition the caller ensured. The note lands in a height-partitioned partition that only the
 // caller can create -- the DDL needs its own pool connection, and this function already holds
 // a transaction from the same pool -- so a second read of the tip that crossed a leaf
 // boundary in between would insert into a partition that does not exist. It is ignored unless
@@ -534,7 +534,7 @@ func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeigh
 // noteConflictOnParents tells every parent of a losing transaction that it is being contested.
 //
 // One statement for the whole input set, not one per parent. notedHeight is the store's
-// current chain height as the CALLER read it, so the window it lands in is the one the caller
+// current chain height as the CALLER read it, so the partition it lands in is the one the caller
 // ensured; see createIn for why that cannot be re-read here.
 func (s *Store) noteConflictOnParents(ctx context.Context, q querier, tx *bt.Tx, txid []byte,
 	notedHeight uint32) error {

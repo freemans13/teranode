@@ -247,7 +247,7 @@ func BenchmarkSpendAndCreate(b *testing.B) {
 }
 
 // BenchmarkGet measures the read path: one probe on the identity row, left-joined to the
-// body if it is still inside its window.
+// body if it is still inside its partition.
 func BenchmarkGet(b *testing.B) {
 	s, ctx := benchStore(b)
 

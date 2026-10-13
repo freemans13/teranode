@@ -13,7 +13,7 @@ import (
 // TestGetServesAFullySpentOldParentFromTheJournal is the case block validation asks about on
 // most blocks above the highest checkpoint, and the one no other step can answer.
 //
-// The parent was mined longer ago than the membership retention, so its window is gone. Its
+// The parent was mined longer ago than the membership retention, so its partition is gone. Its
 // last output has been spent, so there is no UTXO. Nothing preserved it, because preservation
 // names parents of children that have been UNMINED for 144 blocks, and this child is mined in
 // the next block. Identity, membership, preservation and UTXO all miss. The journal row from
@@ -27,7 +27,7 @@ func TestGetServesAFullySpentOldParentFromTheJournal(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// The membership window retires while the UTXO is still live, so the UTXO -- and only the
+	// The tx_mined partition retires while the UTXO is still live, so the UTXO -- and only the
 	// UTXO -- carries the block facts by the time the spend happens.
 	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))
 	require.Equal(t, 0, minedRows(t, s, ctx, parent))
@@ -42,7 +42,7 @@ func TestGetServesAFullySpentOldParentFromTheJournal(t *testing.T) {
 	require.Equal(t, []int{0}, got.SubtreeIdxs)
 }
 
-// TestUnspendRestoresBlockFactsFromTheJournalCopy: with the membership window gone, tx_mined
+// TestUnspendRestoresBlockFactsFromTheJournalCopy: with the tx_mined partition gone, tx_mined
 // has nothing to re-resolve the restored UTXO's block from. The journal's copy is the
 // fallback, and it is preferred to the unconfirmed sentinel.
 func TestUnspendRestoresBlockFactsFromTheJournalCopy(t *testing.T) {
@@ -103,8 +103,8 @@ func TestGetStillReportsNotFoundOnceTheJournalLeafIsGoneToo(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// The child spends at 900, past the height window 0 is stamped at, so the undo copy sits
-	// in a partition the window drop does not have to wait for.
+	// The child spends at 900, past the height partition 0 is stamped at, so the undo copy sits
+	// in a partition the partition drop does not have to wait for.
 	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 8)
 
 	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7}))

@@ -24,7 +24,7 @@ import (
 
 // The worker against the real utxoset store on a real postgres, with the chain in the
 // sqlitememory blockchain store. The worker asks the store for its stamp, one drain runs all 256
-// pages of window 0, the transaction seen at 99 and mined at 100 gets the block that the
+// pages of partition 0, the transaction seen at 99 and mined at 100 gets the block that the
 // blockchain store actually holds at height 100 written onto its UTXO, its identity row is
 // deleted, and the completion floor advances. This is the wiring the unit tests fake.
 func TestStampWorkerDrainsTheRealUTXOSetStore(t *testing.T) {

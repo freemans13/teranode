@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// TxBodyPartitionBlocks is the width of one body window. Reclaim drops whole windows, so
+// TxBodyPartitionBlocks is the width of one tx_body partition. Reclaim drops whole partitions, so
 // retention is granular to this. It matches the spend journal's width deliberately: the two
 // are reclaimed by the same pruner session and there is no reason for them to disagree.
 const TxBodyPartitionBlocks = 48
@@ -25,7 +25,7 @@ const TxBodyPartitionBlocks = 48
 // still functions.
 const DefaultTxBodyRetentionBlocks = 288
 
-// ensureTxBodyPartition creates the body window covering height, if absent.
+// ensureTxBodyPartition creates the tx_body partition covering height, if absent.
 //
 // It MUST be called before the caller opens its transaction, for the same reason
 // ensureSpendJournalPartition must: the DDL needs its own pool connection, and taking one
@@ -35,9 +35,9 @@ const DefaultTxBodyRetentionBlocks = 288
 func (s *Store) ensureTxBodyPartition(ctx context.Context, height uint32) error {
 	window := height / TxBodyPartitionBlocks
 
-	// Only touch the catalog when the window actually changes. The cache holds window+1 so
-	// its zero value means "nothing cached yet" rather than "window 0 is already created",
-	// which would make window 0 permanently unreachable on a fresh store.
+	// Only touch the catalog when the partition actually changes. The cache holds its number plus one, so
+	// its zero value means "nothing cached yet" rather than "partition 0 is already created",
+	// which would make partition 0 permanently unreachable on a fresh store.
 	if s.bodyWindow.Load() == window+1 {
 		return nil
 	}
@@ -59,7 +59,7 @@ func (s *Store) ensureTxBodyPartition(ctx context.Context, height uint32) error 
 	// the toaster does not stop at raw_tx, it keeps going and externalises txid too.
 	//
 	// Built standalone and attached, so the block path never takes the parent's strongest
-	// lock at a window boundary. See ensureAttachedPartition.
+	// lock at a partition boundary. See ensureAttachedPartition.
 	child := fmt.Sprintf("tx_body_w%d", window)
 	if err := s.ensureAttachedPartition(ctx, partitionSpec{
 		parent: "tx_body",
@@ -69,7 +69,7 @@ func (s *Store) ensureTxBodyPartition(ctx context.Context, height uint32) error 
 		hi:     hi,
 		after:  []string{fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN raw_tx SET STORAGE EXTERNAL`, child)},
 	}); err != nil {
-		return errors.NewStorageError("[utxoset] create tx_body window %d", window, err)
+		return errors.NewStorageError("[utxoset] create tx_body partition %d", window, err)
 	}
 
 	// Only cache once the DDL has actually succeeded, or a transient failure becomes
@@ -80,7 +80,7 @@ func (s *Store) ensureTxBodyPartition(ctx context.Context, height uint32) error 
 	return nil
 }
 
-// txBodyWindowSQL lists the body windows this store owns, in whichever state they are in.
+// txBodyWindowSQL lists the tx_body partitions this store owns, in whichever state they are in.
 //
 // This used to INNER JOIN pg_inherits, which made it blind to the very state a crash produces.
 // The three states, all verified against PostgreSQL rather than assumed, and all of them handled
@@ -98,10 +98,10 @@ func (s *Store) ensureTxBodyPartition(ctx context.Context, height uint32) error 
 //     would also fail the CREATE TABLE ... PARTITION OF that the create path runs at each
 //     48-block rollover.
 //
-// Resolved through regclass so it finds windows of the SAME table the DROP below will name.
+// Resolved through regclass so it finds partitions of the SAME table the DROP below will name.
 // Matching on a bare name would search every schema in the database, and an unqualified drop
 // would then resolve against the search path and fail, aborting the loop before a single real
-// window went.
+// partition went.
 const txBodyWindowSQL = `
 SELECT c.relname,
        c.relispartition,
@@ -122,7 +122,7 @@ SELECT c.relname,
 // fallback. If pruner_force_ignore_block_persister_height is ever set, that protection is
 // gone and this becomes unsafe.
 //
-// Before any window goes, the bodies of transactions still waiting to be mined are carried into
+// Before any partition goes, the bodies of transactions still waiting to be mined are carried into
 // tx_body_carry (carryBodiesAhead), and so are the bodies of transactions mined in a block still
 // inside the body horizon of the pruner's height (carryRecentlyMinedBodies). After the drops the
 // carried bodies that are no longer needed are deleted (reclaimCarriedBodies). A carry that fails stops the pass before anything
@@ -141,7 +141,7 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 
 	rows, err := s.pool.Query(ctx, txBodyWindowSQL)
 	if err != nil {
-		return 0, errors.NewStorageError("[utxoset] list tx_body windows", err)
+		return 0, errors.NewStorageError("[utxoset] list tx_body partitions", err)
 	}
 
 	type windowState struct {
@@ -157,12 +157,12 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 		var w windowState
 		if err := rows.Scan(&w.name, &w.attached, &w.detachPending); err != nil {
 			rows.Close()
-			return 0, errors.NewStorageError("[utxoset] scan tx_body window", err)
+			return 0, errors.NewStorageError("[utxoset] scan tx_body partition", err)
 		}
 
-		// A name carrying no window number is not one of ours. Parsing it here rather than in
+		// A name carrying no partition number is not one of ours. Parsing it here rather than in
 		// the drop loop keeps it in one place, so the ordering below and the cutoff test can
-		// never disagree about which window a table is.
+		// never disagree about which partition a table is.
 		if _, err := fmt.Sscanf(w.name, "tx_body_w%d", &w.window); err != nil {
 			continue
 		}
@@ -173,18 +173,18 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 	rows.Close()
 
 	if err := rows.Err(); err != nil {
-		return 0, errors.NewStorageError("[utxoset] list tx_body windows", err)
+		return 0, errors.NewStorageError("[utxoset] list tx_body partitions", err)
 	}
 
 	// Oldest first, for the reason the journal's own loop sorts: the listing query has no
 	// ORDER BY, so the catalog returns whatever order it scanned, and with a backlog that
-	// decides which disk comes back first and whether the oldest surviving window is a usable
+	// decides which disk comes back first and whether the oldest surviving partition is a usable
 	// progress measure at all.
 	sort.Slice(windows, func(i, j int) bool { return windows[i].window < windows[j].window })
 
 	if len(windows) > 0 && windows[0].window < cutoff {
 		// A drop is due, so carry the waiting set again unless this pass already did: a
-		// transaction un-mined by a reorg since the window entered the carry band is waiting
+		// transaction un-mined by a reorg since the partition entered the carry band is waiting
 		// again and needs its body.
 		if !carried {
 			if _, err := s.carryBodiesAhead(ctx, height, true); err != nil {
@@ -209,11 +209,11 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 
 		switch {
 		case w.detachPending:
-			// FINALIZE is the only way out of this state, and until it runs no other window of
+			// FINALIZE is the only way out of this state, and until it runs no other partition of
 			// this table can be detached either, and no new one can be created.
 			if _, err := s.pool.Exec(ctx,
 				fmt.Sprintf(`ALTER TABLE tx_body DETACH PARTITION %s FINALIZE`, w.name)); err != nil {
-				return dropped, errors.NewStorageError("[utxoset] finalize detach of tx_body window %s", w.name, err)
+				return dropped, errors.NewStorageError("[utxoset] finalize detach of tx_body partition %s", w.name, err)
 			}
 
 		case w.attached:
@@ -222,7 +222,7 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 			// would stall every concurrent create.
 			if _, err := s.pool.Exec(ctx,
 				fmt.Sprintf(`ALTER TABLE tx_body DETACH PARTITION %s CONCURRENTLY`, w.name)); err != nil {
-				return dropped, errors.NewStorageError("[utxoset] detach tx_body window %s", w.name, err)
+				return dropped, errors.NewStorageError("[utxoset] detach tx_body partition %s", w.name, err)
 			}
 
 		default:
@@ -231,7 +231,7 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 		}
 
 		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, w.name)); err != nil {
-			return dropped, errors.NewStorageError("[utxoset] drop tx_body window %s", w.name, err)
+			return dropped, errors.NewStorageError("[utxoset] drop tx_body partition %s", w.name, err)
 		}
 
 		dropped++
@@ -244,10 +244,10 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 	return dropped, nil
 }
 
-// carryBodiesAhead runs carryUnminedBodies for every window that drops within one window of
-// the tip, once per new window, or now when force is set. It reports whether it ran.
+// carryBodiesAhead runs carryUnminedBodies for every partition that drops within one partition of
+// the tip, once per new partition, or now when force is set. It reports whether it ran.
 //
-// The bound is measured from the TIP, one window ahead of the drop. It is not what keeps the
+// The bound is measured from the TIP, one partition ahead of the drop. It is not what keeps the
 // body of a transaction mined in a block the persister has not archived: that transaction has
 // lost its unmined marker, and this pass sees it while it waits only if the pruner happened to
 // run then. The drop pass carries those by their block instead (carryRecentlyMinedBodySQL).
@@ -261,7 +261,7 @@ func (s *Store) carryBodiesAhead(ctx context.Context, height uint32, force bool)
 		return false, nil
 	}
 
-	// Every window below bound drops once the tip is one more window along.
+	// Every partition below bound drops once the tip is one more partition along.
 	bound := (tip + TxBodyPartitionBlocks - s.bodyRetention) / TxBodyPartitionBlocks
 	if bound == 0 || (!force && s.carryBound.Load() == bound+1) {
 		return false, nil
@@ -282,17 +282,17 @@ func (s *Store) carryBodiesAhead(ctx context.Context, height uint32, force bool)
 //
 // "Waiting" is the identity row's unmined marker, the predicate copyForwardUnminedSpends uses
 // (unminedInpointsSQL), and the scan is driven by the marker's partial index for the same
-// reason: it reads the waiting population and nothing else, whatever the size of the windows.
+// reason: it reads the waiting population and nothing else, whatever the size of the partitions.
 //
 // Crash safety. The copy commits on its own and the drop comes later, so a crash between them
-// carries the same window again on the next pass. The NOT EXISTS skips a transaction already
+// carries the same partition again on the next pass. The NOT EXISTS skips a transaction already
 // carried before its body is read, and ON CONFLICT is the backstop: the table's key is the
-// txid, so a second copy cannot be a second row. Until the window drops a carried body exists
-// twice, once in its window and once here, and the reader takes the window's and consults this
+// txid, so a second copy cannot be a second row. Until the partition drops a carried body exists
+// twice, once in its partition and once here, and the reader takes the partition's and consults this
 // table only when that is gone (readCarriedBodies), so two copies are never two answers.
 //
-// The body is read through the parent tx_body, so only an attached window is carried from.
-// That is enough: a window is detached only by a pass that has already carried it.
+// The body is read through the parent tx_body, so only an attached partition is carried from.
+// That is enough: a partition is detached only by a pass that has already carried it.
 const carryUnminedBodySQL = `
 INSERT INTO tx_body_carry (txid, raw_tx)
 SELECT i.txid, b.raw_tx
@@ -319,7 +319,7 @@ func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, er
 	}
 
 	if n := tag.RowsAffected(); n > 0 {
-		s.logger.Infof("[utxoset] carried the bodies of %d unmined transactions created below height %d past their window", n, bound)
+		s.logger.Infof("[utxoset] carried the bodies of %d unmined transactions created below height %d past their partition", n, bound)
 	}
 
 	return tag.RowsAffected(), nil
@@ -337,7 +337,7 @@ func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, er
 // transaction carried before it was mined: the tip-ahead pass (carryBodiesAhead) is meant to see
 // it while it waits, but that pass runs only when the pruner does, and a pruner whose sessions
 // were skipped, or that first runs after the mining, finds a mined transaction with its marker
-// already clear. Its window then dropped under it while its block was within the horizon, and
+// already clear. Its partition then dropped under it while its block was within the horizon, and
 // the persister failed that block for good, either at once or after a shallow reorg and a
 // remine of the transaction. "Mined above the reclaim floor" is a fact about the transaction's
 // block and the pruner's height alone, so a drop pass that applies it carries every body the
@@ -350,10 +350,10 @@ func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, er
 // carry and the reclaim now apply one rule, so a body is never dropped that the reclaim would
 // have kept.
 //
-// It reads only the windows about to drop ($1 is the drop cutoff), and for each of their rows
+// It reads only the partitions about to drop ($1 is the drop cutoff), and for each of their rows
 // probes tx_mined on its txid-leading primary key for a block above $2, through the fenced
 // LATERAL every by-txid probe of tx_mined takes. A drop pass therefore costs one probe per
-// transaction in the windows it drops, once per window. NOT EXISTS and ON CONFLICT make a
+// transaction in the partitions it drops, once per partition. NOT EXISTS and ON CONFLICT make a
 // repeat after a crash between the carry and the drop copy nothing twice, as for the waiting
 // set. reclaimCarriedBodySQL keeps the copy until the block is 288 blocks below the pruner's
 // height.
@@ -362,7 +362,7 @@ func (s *Store) carryUnminedBodies(ctx context.Context, bound uint32) (int64, er
 // transaction this node mines was first seen at the tip, above the checkpoint, and a block-path
 // create carries its own block's height as created_height, which is below $1 and so can never
 // be above $2. Without the bound a sync that writes bodies below the checkpoint would pay one
-// containment probe per transaction at every window drop for nothing.
+// containment probe per transaction at every partition drop for nothing.
 const carryRecentlyMinedBodySQL = `
 INSERT INTO tx_body_carry (txid, raw_tx)
 SELECT b.txid, b.raw_tx
@@ -392,7 +392,7 @@ func (s *Store) carryRecentlyMinedBodies(ctx context.Context, bound, floor uint3
 	}
 
 	if n := tag.RowsAffected(); n > 0 {
-		s.logger.Infof("[utxoset] carried the bodies of %d transactions created below height %d and mined above height %d past their window", n, bound, floor)
+		s.logger.Infof("[utxoset] carried the bodies of %d transactions created below height %d and mined above height %d past their partition", n, bound, floor)
 	}
 
 	return tag.RowsAffected(), nil

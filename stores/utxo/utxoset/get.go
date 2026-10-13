@@ -27,7 +27,7 @@ import (
 // table (see attachConflictingChildren). Both are answered only when asked for.
 //
 // A NIL Tx IS A LEGAL ANSWER, and fields.Tx does not change that. It happens for a transaction
-// whose body window has aged out, and, when utxostore_skipTxBodyBelowCheckpoint is on, for
+// whose tx_body partition has aged out, and, when utxostore_skipTxBodyBelowCheckpoint is on, for
 // every transaction mined at or below the hardcoded checkpoint, whose bytes were never written
 // (see bodyFloor on Store). Both cases return the metadata with Tx nil and NO error: the
 // transaction exists and its UTXOs are live, so ErrTxNotFound would be a lie, and a caller
@@ -175,7 +175,7 @@ func (r *metaRow) toMeta(hash *chainhash.Hash) (*meta.Data, error) {
 		data.TxInpoints = ip
 	}
 
-	// A body-less row is expected once its window has aged out, so this is a nil transaction
+	// A body-less row is expected once its partition has aged out, so this is a nil transaction
 	// rather than an error. Callers that genuinely need the bytes have to check.
 	if len(r.rawTx) > 0 {
 		tx, terr := bt.NewTxFromBytes(r.rawTx)

@@ -26,7 +26,7 @@ const unminedBatchSize = 1_000
 // transactions, and the 499 it dropped were exactly the fork-mined ones.
 //
 // The block ids come from tx_mined, in (mined_height, block_id) order, one probe per row per
-// live window. They used to be unpacked from a column on the identity row; that column is gone
+// live partition. They used to be unpacked from a column on the identity row; that column is gone
 // so that containment has one home. Block assembly's load fix-up depends on them: on the reset
 // route of a reorg it is the only thing that clears the marker of a transaction mined in a
 // move-forward block that first arrived as a fork, so this is load-bearing and not a backstop.

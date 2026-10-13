@@ -14,7 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// THE STAMP. Once per containment window, when the window's last block is stampDepth deep, this
+// THE STAMP. Once per tx_mined partition, when the partition's last block is stampDepth deep, this
 // pass writes the block that won at each height onto the UTXOs of the transactions that were
 // seen before their block, and deletes their identity rows. It is the ONLY order-sensitive
 // decision about a UTXO's block anywhere in the store, and it is made from a chain answer the
@@ -22,23 +22,23 @@ import (
 //
 // Four calls, one transaction each, so the caller can re-read the chain between them.
 //
-//  1. BeginWindow. Preconditions, then step 1: find the window's losing containment rows with NO
-//     lock held, take the exclusive fence lock, raise stamp_fence to the window's upper bound,
+//  1. BeginWindow. Preconditions, then step 1: find the partition's losing containment rows with NO
+//     lock held, take the exclusive fence lock, raise stamp_fence to the partition's upper bound,
 //     delete the known losers, re-check for rows that landed since the scan, commit. After this
-//     commit the window is frozen and every row left in it names a winner (invariant I3).
-//  2. StampPage, 256 times. A page is every winning containment row of the window whose txid
+//     commit the partition is frozen and every row left in it names a winner (invariant I3).
+//  2. StampPage, 256 times. A page is every winning containment row of the partition whose txid
 //     begins with one byte, read from the primary key in txid order; its identity rows live in
 //     one identity leaf and its UTXOs in one UTXO leaf, so a page touches one partition of each.
 //     Stamp the UTXOs, then delete the identity rows, in ONE statement, so a crash can never
 //     leave a UTXO at (0,0) with no identity row behind it.
 //  3. CompleteWindow. A sampled audit, then the completion record and the completion floor in
-//     one transaction. The record carries the tip at which the window was stamped, and the drop
+//     one transaction. The record carries the tip at which the partition was stamped, and the drop
 //     waits 1,728 blocks past it, which is what keeps a UTXO spent before its stamp answerable
 //     for as long as its undo copy can live.
 //
 // The work list is the identity table (decision 2): only a transaction seen before its block can
 // own a UTXO at (0,0). Below the checkpoint every create carries its block, tx_ident is empty,
-// and a window costs one loser scan, one identity probe for each page, and one completion record:
+// and a partition costs one loser scan, one identity probe for each page, and one completion record:
 // a page whose slab has no identity row reads nothing from tx_mined (slabHasIdentitySQL). That is
 // what lets the pruner keep up during sync.
 //
@@ -47,10 +47,10 @@ import (
 // and 3x heavier on reads; which wins on the mainnet box depends on whether the identity key and
 // the UTXO index fit its buffer pool, and that is unmeasured, so the slab driver ships first.
 
-// StampDepthFor is the depth, in blocks, at which a window may be stamped: twice the coinbase
-// maturity, rounded up to a whole window. Maturity is the depth past which the node already
+// StampDepthFor is the depth, in blocks, at which a partition may be stamped: twice the coinbase
+// maturity, rounded up to a whole partition. Maturity is the depth past which the node already
 // refuses a chain switch, so twice it is room for an operator invalidation or a block on an
-// uncapped path to reach deeper than maturity and be admitted, and a whole window because the
+// uncapped path to reach deeper than maturity and be admitted, and a whole partition because the
 // stamp works one partition at a time. On every network with a maturity of 100 that is 288.
 func StampDepthFor(coinbaseMaturity uint32) uint32 {
 	depth := 2 * coinbaseMaturity
@@ -58,13 +58,13 @@ func StampDepthFor(coinbaseMaturity uint32) uint32 {
 	return (depth + TxMinedPartitionBlocks - 1) / TxMinedPartitionBlocks * TxMinedPartitionBlocks
 }
 
-// stampMarginBlocks is added to the tip at which a window completes to give stamped_at: one undo
+// stampMarginBlocks is added to the tip at which a partition completes to give stamped_at: one undo
 // partition, which is how far above the tip a spend's undo copy can be journalled while the
-// window is being published. It is defined as the undo width so the two change together.
+// partition is being published. It is defined as the undo width so the two change together.
 const stampMarginBlocks = SpendJournalPartitionBlocks
 
 // undoMaxLife is the longest an undo copy can live with an on-time pruner: retention plus one
-// partition width. A window drops no earlier than stamped_at plus this.
+// partition width. A partition drops no earlier than stamped_at plus this.
 func (s *Store) undoMaxLife() uint32 {
 	return s.journalRetention + SpendJournalPartitionBlocks
 }
@@ -98,7 +98,7 @@ const (
 // stampPagesPerWindow is the slab count: one page per value of the txid's first byte.
 const stampPagesPerWindow = 256
 
-// stampAuditSampleRows is how many rows of the window the completion audit reads, in
+// stampAuditSampleRows is how many rows of the partition the completion audit reads, in
 // stampAuditSampleRuns runs from random starting txids. A judgement, not a measurement.
 const (
 	stampAuditSampleRows = 1_000
@@ -111,14 +111,14 @@ var ErrStampDrainBusy = pruner.ErrStampDrainBusy
 
 var _ pruner.Stamper = (*Store)(nil)
 
-// floorsSQL reads the three floors. floor is a window number and the other two are heights.
+// floorsSQL reads the three floors. floor is a partition number and the other two are heights.
 const floorsSQL = `SELECT floor, stamp_fence, stamp_complete_floor FROM tx_mined_floor WHERE id = 0`
 
 // StampDepth is the depth, in blocks, below the tip at which this store's UTXOs get their block
 // written permanently. Nothing may change the chain below it; the rewind tool asks.
 func (s *Store) StampDepth() uint32 { return s.stampDepth }
 
-// WindowBlocks is the containment window width.
+// WindowBlocks is the tx_mined partition width.
 func (s *Store) WindowBlocks() uint32 { return TxMinedPartitionBlocks }
 
 // Floors is one read of the tx_mined_floor row, as heights.
@@ -134,7 +134,7 @@ func readFloors(ctx context.Context, q querier) (pruner.StampFloors, error) {
 	}
 
 	return pruner.StampFloors{
-		DroppedFloor:       uint32(floor) * TxMinedPartitionBlocks, //nolint:gosec // a window number is never negative
+		DroppedFloor:       uint32(floor) * TxMinedPartitionBlocks, //nolint:gosec // a partition number is never negative
 		StampFence:         uint32(fence),                          //nolint:gosec // a height is never negative
 		StampCompleteFloor: uint32(complete),                       //nolint:gosec // a height is never negative
 	}, nil
@@ -183,10 +183,10 @@ func (s *Store) OpenDrain(ctx context.Context) (pruner.StampDrain, pruner.StampF
 	return d, floors, nil
 }
 
-// checkCompletionRecords is the alarm for the impossible state: an attached window whose upper
+// checkCompletionRecords is the alarm for the impossible state: an attached partition whose upper
 // bound is at or below stamp_complete_floor and which has no completion record. The completion
 // record and the floor advance commit together, so this can only mean a hand edit or a bug, and
-// such a window can never drop. It counts and carries on; the drop refuses the window on its own.
+// such a partition can never drop. It counts and carries on; the drop refuses the partition on its own.
 func (s *Store) checkCompletionRecords(ctx context.Context) (pruner.StampFloors, error) {
 	floors, err := s.Floors(ctx)
 	if err != nil {
@@ -215,14 +215,14 @@ func (s *Store) checkCompletionRecords(ctx context.Context) (pruner.StampFloors,
 
 		if _, ok := records[w.window*TxMinedPartitionBlocks]; !ok {
 			stampCompletionMissing.Inc()
-			s.logger.Errorf("[utxoset][stamp] window %s is below the stamp-complete floor %d and has no completion record; it can never drop", w.name, floors.StampCompleteFloor)
+			s.logger.Errorf("[utxoset][stamp] partition %s is below the stamp-complete floor %d and has no completion record; it can never drop", w.name, floors.StampCompleteFloor)
 		}
 	}
 
 	return floors, nil
 }
 
-// completionRecords reads every completion record: window start height to stamped_at.
+// completionRecords reads every completion record: partition start height to stamped_at.
 func (s *Store) completionRecords(ctx context.Context) (map[uint32]uint32, error) {
 	rows, err := s.pool.Query(ctx, `SELECT window_start, stamped_at FROM tx_mined_stamped`)
 	if err != nil {
@@ -282,9 +282,9 @@ func (d *stampDrain) Close() error {
 	return nil
 }
 
-// findLosersSQL names every row of the window whose (height, block id) is not the ancestry's
+// findLosersSQL names every row of the partition whose (height, block id) is not the ancestry's
 // pair for that height. A row naming block id 0 names no block and is neither a winner nor a
-// loser. The window bounds are scalars so the planner reads one partition.
+// loser. The partition bounds are scalars so the planner reads one partition.
 const findLosersSQL = `
 SELECT m.txid, m.mined_height, m.block_id
   FROM tx_mined m
@@ -311,7 +311,7 @@ func (d *stampDrain) BeginWindow(ctx context.Context, wLo uint32, anc *chainance
 	s := d.store
 
 	if wLo%TxMinedPartitionBlocks != 0 {
-		return 0, errors.NewProcessingError("[utxoset][stamp] %d is not a window start", wLo)
+		return 0, errors.NewProcessingError("[utxoset][stamp] %d is not a partition start", wLo)
 	}
 
 	wEnd := wLo + TxMinedPartitionBlocks - 1
@@ -322,9 +322,9 @@ func (d *stampDrain) BeginWindow(ctx context.Context, wLo uint32, anc *chainance
 		return 0, err
 	}
 
-	// Precondition 1: the lowest window with no completion record, and never a skip.
+	// Precondition 1: the lowest partition with no completion record, and never a skip.
 	if wLo != floors.StampCompleteFloor {
-		return 0, errors.NewProcessingError("[utxoset][stamp] window %d is not the next to stamp; the stamp-complete floor is %d", wLo, floors.StampCompleteFloor)
+		return 0, errors.NewProcessingError("[utxoset][stamp] partition %d is not the next to stamp; the stamp-complete floor is %d", wLo, floors.StampCompleteFloor)
 	}
 
 	// Precondition 2: deep enough. The anchor's height is the tip the ancestry was built from.
@@ -332,23 +332,23 @@ func (d *stampDrain) BeginWindow(ctx context.Context, wLo uint32, anc *chainance
 		return pruner.StampWindowNotDeep, nil
 	}
 
-	// Precondition 3: the ancestry speaks for the whole window.
+	// Precondition 3: the ancestry speaks for the whole partition.
 	if !anc.Covers(wLo) || !anc.Covers(wEnd) {
-		return 0, errors.NewProcessingError("[utxoset][stamp] ancestry [%d, %d] does not cover window %d-%d", anc.Lo(), anc.Hi(), wLo, wEnd)
+		return 0, errors.NewProcessingError("[utxoset][stamp] ancestry [%d, %d] does not cover partition %d-%d", anc.Lo(), anc.Hi(), wLo, wEnd)
 	}
 
-	// Precondition 4: every main-chain block of the window has its containment recorded.
+	// Precondition 4: every main-chain block of the partition has its containment recorded.
 	if h, ok := anc.NotMined(wLo, wEnd); ok {
 		stampNotMinedAborts.Inc()
 
-		return 0, errors.NewProcessingError("[utxoset][stamp] block at height %d of window %d has mined_set false; its containment may be incomplete, so the window is not stamped this drain", h, wLo)
+		return 0, errors.NewProcessingError("[utxoset][stamp] block at height %d of partition %d has mined_set false; its containment may be incomplete, so the partition is not stamped this drain", h, wLo)
 	}
 
-	// Precondition 5: the partition is attached. A window with no table at all is empty by
-	// decision: both stamp floors move past it. Below the lowest window that exists that is
-	// what a seed leaves, since a seed writes no containment rows, so those windows are skipped
-	// quietly. A missing window above an existing one is counted and logged, because it can
-	// also be a window dropped by mistake.
+	// Precondition 5: the partition is attached. A partition with no table at all is empty by
+	// decision: both stamp floors move past it. Below the lowest partition that exists that is
+	// what a seed leaves, since a seed writes no containment rows, so those partitions are skipped
+	// quietly. A missing partition above an existing one is counted and logged, because it can
+	// also be a partition dropped by mistake.
 	state, err := s.txMinedWindowState(ctx, wLo/TxMinedPartitionBlocks)
 	if err != nil {
 		return 0, err
@@ -367,11 +367,11 @@ func (d *stampDrain) BeginWindow(ctx context.Context, wLo uint32, anc *chainance
 
 		return pruner.StampWindowSkipped, nil
 	case !state.attached && !state.detachPending:
-		return 0, errors.NewProcessingError("[utxoset][stamp] window %s is detached and has no completion record, which the drop rule makes impossible", state.name)
+		return 0, errors.NewProcessingError("[utxoset][stamp] partition %s is detached and has no completion record, which the drop rule makes impossible", state.name)
 	}
 
-	// Resume: the fence is only ever the completion floor or one window above it. At or above
-	// this window's upper bound means step 1 committed for it in an earlier drain.
+	// Resume: the fence is only ever the completion floor or one partition above it. At or above
+	// this partition's upper bound means step 1 committed for it in an earlier drain.
 	if floors.StampFence >= wHi {
 		return pruner.StampWindowResumed, nil
 	}
@@ -383,7 +383,7 @@ func (d *stampDrain) BeginWindow(ctx context.Context, wLo uint32, anc *chainance
 	return pruner.StampWindowReady, nil
 }
 
-// belowLowestTxMinedWindow reports whether no containment window exists at or below window, which
+// belowLowestTxMinedWindow reports whether no tx_mined partition exists at or below window, which
 // is how a seeded store looks below the first block applied after its seed.
 func (s *Store) belowLowestTxMinedWindow(ctx context.Context, window uint32) (bool, error) {
 	windows, err := s.listTxMinedWindows(ctx)
@@ -400,10 +400,10 @@ func (s *Store) belowLowestTxMinedWindow(ctx context.Context, window uint32) (bo
 	return true, nil
 }
 
-// skipMissingWindow advances both stamp floors past a window that has no table. The completion
+// skipMissingWindow advances both stamp floors past a partition that has no table. The completion
 // floor is advanced by compare-and-set against the value BeginWindow read, so a second drain
-// that somehow got past the session lock cannot advance it twice. A leading window, one below
-// every window that exists, is expected after a seed and is not counted as missing.
+// that somehow got past the session lock cannot advance it twice. A leading partition, one below
+// every partition that exists, is expected after a seed and is not counted as missing.
 func (s *Store) skipMissingWindow(ctx context.Context, wLo, wHi uint32, leading bool) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE tx_mined_floor
@@ -412,7 +412,7 @@ func (s *Store) skipMissingWindow(ctx context.Context, wLo, wHi uint32, leading 
 		 WHERE id = 0 AND stamp_complete_floor = $2::int`,
 		int32(wHi), int32(wLo)) //nolint:gosec // heights fit int32
 	if err != nil {
-		return errors.NewStorageError("[utxoset][stamp] advance floors past missing window %d", wLo, err)
+		return errors.NewStorageError("[utxoset][stamp] advance floors past missing partition %d", wLo, err)
 	}
 
 	if tag.RowsAffected() != 1 {
@@ -421,14 +421,14 @@ func (s *Store) skipMissingWindow(ctx context.Context, wLo, wHi uint32, leading 
 
 	if leading {
 		if s.leadingSkipLogged.CompareAndSwap(false, true) {
-			s.logger.Infof("[utxoset][stamp] no containment window exists from window %d-%d down, as after a seed; skipping up to the lowest window without counting them as missing", wLo, wHi-1)
+			s.logger.Infof("[utxoset][stamp] no tx_mined partition exists from partition %d-%d down, as after a seed; skipping up to the lowest partition without counting them as missing", wLo, wHi-1)
 		}
 
 		return nil
 	}
 
 	stampMissingWindows.Inc()
-	s.logger.Warnf("[utxoset][stamp] window %d-%d has no table and is treated as empty; both stamp floors advanced to %d", wLo, wHi-1, wHi)
+	s.logger.Warnf("[utxoset][stamp] partition %d-%d has no table and is treated as empty; both stamp floors advanced to %d", wLo, wHi-1, wHi)
 
 	return nil
 }
@@ -438,7 +438,7 @@ func (s *Store) skipMissingWindow(ctx context.Context, wLo, wHi uint32, leading 
 // known list, and re-check: the re-check is the same scan run again, exact now because the
 // fence is up and every earlier writer has committed, and warm because the unlocked scan has
 // just read the same index pages. During sync there are no losers and the whole hold is the
-// warm scan, measured at 0.43 s on a 5.57M-row window and 1.25 s at 16.1M.
+// warm scan, measured at 0.43 s on a 5.57M-row partition and 1.25 s at 16.1M.
 func (d *stampDrain) raiseFenceAndDeleteLosers(ctx context.Context, wLo, wHi uint32, anc *chainancestry.Ancestry) error {
 	s := d.store
 
@@ -456,7 +456,7 @@ func (d *stampDrain) raiseFenceAndDeleteLosers(ctx context.Context, wLo, wHi uin
 		if err == nil {
 			if deleted > 0 {
 				stampLosersDeleted.Add(float64(deleted))
-				s.logger.Infof("[utxoset][stamp] window %d-%d: fence raised to %d and %d losing containment rows deleted", wLo, wHi-1, wHi, deleted)
+				s.logger.Infof("[utxoset][stamp] partition %d-%d: fence raised to %d and %d losing containment rows deleted", wLo, wHi-1, wHi, deleted)
 			}
 
 			return s.countForkOnly(ctx, wLo, wHi, heights, ids, known)
@@ -467,7 +467,7 @@ func (d *stampDrain) raiseFenceAndDeleteLosers(ctx context.Context, wLo, wHi uin
 		}
 
 		stampFenceLockTimeouts.Inc()
-		s.logger.Warnf("[utxoset][stamp] window %d-%d: fence lock not granted within %s, retrying in %s", wLo, wHi-1, fenceLockTimeout, backoff)
+		s.logger.Warnf("[utxoset][stamp] partition %d-%d: fence lock not granted within %s, retrying in %s", wLo, wHi-1, fenceLockTimeout, backoff)
 
 		select {
 		case <-ctx.Done():
@@ -483,7 +483,7 @@ func (d *stampDrain) raiseFenceAndDeleteLosers(ctx context.Context, wLo, wHi uin
 }
 
 // forkOnlySQL counts, among the transactions whose losing rows were just deleted, the ones with
-// no winner left in the window and an identity row whose unmined marker is set. That is the
+// no winner left in the partition and an identity row whose unmined marker is set. That is the
 // transaction only a fork block contained, still waiting for a block: normal, and gauged so a
 // pass that resumes after a crash, which skips step 1, is the only one that misses it.
 const forkOnlySQL = `
@@ -583,7 +583,7 @@ func (d *stampDrain) tryRaiseFence(ctx context.Context, wLo, wHi uint32, heights
 func (s *Store) findLosers(ctx context.Context, q querier, wLo, wHi uint32, heights, ids []int32) ([]loser, error) {
 	rows, err := q.Query(ctx, findLosersSQL, int32(wLo), int32(wHi), heights, ids) //nolint:gosec // heights fit int32
 	if err != nil {
-		return nil, errors.NewStorageError("[utxoset][stamp] find losers in window %d", wLo, err)
+		return nil, errors.NewStorageError("[utxoset][stamp] find losers in partition %d", wLo, err)
 	}
 
 	defer rows.Close()
@@ -600,7 +600,7 @@ func (s *Store) findLosers(ctx context.Context, q querier, wLo, wHi uint32, heig
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, errors.NewStorageError("[utxoset][stamp] find losers in window %d", wLo, err)
+		return nil, errors.NewStorageError("[utxoset][stamp] find losers in partition %d", wLo, err)
 	}
 
 	return out, nil
@@ -631,9 +631,9 @@ func (s *Store) deleteLosers(ctx context.Context, q querier, losers []loser) (in
 
 // stampPageSQL is the page statement, and the ONE place the page shape lives.
 //
-// $1 and $2 are the page's txid bounds, $3 its leaf, $4 and $5 the window's 288 (height, block
-// id) pairs from the ancestry, $6 and $7 the window's height bounds. The scan of m joins the
-// window's rows to the pairs, so only winners are in the page; losers were deleted by step 1
+// $1 and $2 are the page's txid bounds, $3 its leaf, $4 and $5 the partition's 288 (height, block
+// id) pairs from the ancestry, $6 and $7 the partition's height bounds. The scan of m joins the
+// partition's rows to the pairs, so only winners are in the page; losers were deleted by step 1
 // and a stray survivor cannot put a wrong pair on a UTXO here either. The identity delete
 // RETURNING is the work list: a transaction with no identity row is not stamped, because under
 // decision 2 only a transaction with one can own a UTXO at (0,0). The UTXO read is the fenced
@@ -643,7 +643,7 @@ func (s *Store) deleteLosers(ctx context.Context, q querier, losers []loser) (in
 // with its pair, or already stamped, untouched.
 //
 // The last column is the count of distinct transactions in the work list. If it is below the
-// row count, one transaction had two winners in the window, which consensus forbids outside
+// row count, one transaction had two winners in the partition, which consensus forbids outside
 // the two historic duplicate coinbases, and those have no identity row. The caller rolls the
 // page back on it.
 const stampPageSQL = `
@@ -705,7 +705,7 @@ SELECT EXISTS (
 )`
 
 // suspectsInSlabSQL names the identity rows of one page's slab that have no winner in this
-// window, believe themselves mined (marker NULL), and were first seen before the window. It
+// partition, believe themselves mined (marker NULL), and were first seen before the partition. It
 // runs after the page's delete in the same transaction, so a row stamped by this page is gone.
 const suspectsInSlabSQL = `
 SELECT i.txid
@@ -716,7 +716,7 @@ SELECT i.txid
    AND i.created_height < $4::int`
 
 // judgeSuspectsSQL keeps the suspects that have NO containment row the chain confirms: every
-// row below $3, the window's upper bound, is a winner because losers below the fence are
+// row below $3, the partition's upper bound, is a winner because losers below the fence are
 // deleted; a row above $6, the anchor, is not judged on this pass; a row between is judged
 // against the ancestry's pairs. $2 is the dropped floor as a height.
 const judgeSuspectsSQL = `
@@ -773,15 +773,15 @@ func (d *stampDrain) StampPage(ctx context.Context, wLo uint32, anc *chainancest
 	// nothing from tx_mined. The check reads the snapshot the page statement would read, so
 	// skipping changes no row the statement would have changed. Below the checkpoint every
 	// create carries its block and tx_ident is empty: on mainnet near height 875,000 the
-	// statement read about 30 GB of tx_mined for each window, to change no row.
+	// statement read about 30 GB of tx_mined for each partition, to change no row.
 	var hasIdentity bool
 	if err := dbTx.QueryRow(ctx, slabHasIdentitySQL, lo, hi, leaf).Scan(&hasIdentity); err != nil {
-		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] identity check for page %d of window %d", page, wLo, err)
+		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] identity check for page %d of partition %d", page, wLo, err)
 	}
 
 	if !hasIdentity {
 		if err := dbTx.Commit(ctx); err != nil {
-			return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] commit page %d of window %d", page, wLo, err)
+			return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] commit page %d of partition %d", page, wLo, err)
 		}
 
 		stampPages.Inc()
@@ -798,13 +798,13 @@ func (d *stampDrain) StampPage(ctx context.Context, wLo uint32, anc *chainancest
 
 	if err := dbTx.QueryRow(ctx, stampPageSQL, lo, hi, leaf, heights, ids, int32(wLo), int32(wHi)). //nolint:gosec // heights fit int32
 													Scan(&res.Rows, &res.Transactions, &res.UTXOs, &res.MarkerSetWinners, &distinct); err != nil {
-		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] page %d of window %d", page, wLo, err)
+		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] page %d of partition %d", page, wLo, err)
 	}
 
 	if distinct != res.Transactions {
 		stampTwoWinners.Inc()
 
-		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] page %d of window %d: a transaction has two winning containment rows in one window; the page is rolled back", page, wLo)
+		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] page %d of partition %d: a transaction has two winning containment rows in one partition; the page is rolled back", page, wLo)
 	}
 
 	marked, err := d.judgeSuspects(ctx, dbTx, wLo, wHi, anc, lo, hi, leaf)
@@ -815,7 +815,7 @@ func (d *stampDrain) StampPage(ctx context.Context, wLo uint32, anc *chainancest
 	res.SuspectsMarked = marked
 
 	if err := dbTx.Commit(ctx); err != nil {
-		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] commit page %d of window %d", page, wLo, err)
+		return pruner.StampPageResult{}, errors.NewStorageError("[utxoset][stamp] commit page %d of partition %d", page, wLo, err)
 	}
 
 	stampPages.Inc()
@@ -833,11 +833,11 @@ func (d *stampDrain) StampPage(ctx context.Context, wLo uint32, anc *chainancest
 }
 
 // judgeSuspects is the second case of a transaction with no winner: an identity row that
-// believes itself mined, was first seen before this window, and has no containment row the
+// believes itself mined, was first seen before this partition, and has no containment row the
 // chain confirms anywhere. Left alone it leaks for ever, because the stamp never matches it and
 // the unmined iterator never sees it. The pass sets its marker so block assembly picks it up
 // again, and alarms. It runs only in a drain whose ancestry reads mined_set true from the
-// window's upper bound to the anchor; otherwise a record-mined call for a block in that span
+// partition's upper bound to the anchor; otherwise a record-mined call for a block in that span
 // may still be running, its rows not all visible, and the step is deferred to a later drain.
 func (d *stampDrain) judgeSuspects(ctx context.Context, dbTx pgx.Tx, wLo, wHi uint32, anc *chainancestry.Ancestry, lo, hi []byte, leaf int16) (int64, error) {
 	s := d.store
@@ -909,12 +909,12 @@ func (d *stampDrain) judgeSuspects(ctx context.Context, dbTx pgx.Tx, wLo, wHi ui
 	}
 
 	stampNoWinner.WithLabelValues("null").Add(float64(tag.RowsAffected()))
-	s.logger.Warnf("[utxoset][stamp] window %d-%d: %d transactions believed mined have no chain-confirmed containment row anywhere; their unmined marker is set so block assembly reconsiders them", wLo, wHi-1, tag.RowsAffected())
+	s.logger.Warnf("[utxoset][stamp] partition %d-%d: %d transactions believed mined have no chain-confirmed containment row anywhere; their unmined marker is set so block assembly reconsiders them", wLo, wHi-1, tag.RowsAffected())
 
 	return tag.RowsAffected(), nil
 }
 
-// CompleteWindow runs the sampled audit and then publishes the window: the completion record
+// CompleteWindow runs the sampled audit and then publishes the partition: the completion record
 // and the completion floor in one transaction, or neither.
 func (d *stampDrain) CompleteWindow(ctx context.Context, wLo uint32, anc *chainancestry.Ancestry, liveTip uint32) error {
 	s := d.store
@@ -932,7 +932,7 @@ func (d *stampDrain) CompleteWindow(ctx context.Context, wLo uint32, anc *chaina
 
 	// T is the larger of the tip the service read uncached after the last page and the store's
 	// own height. Reading it after the last page's commit can only make it larger, which is
-	// the safe direction: every UTXO of the window now carries a pair, so no later spend can
+	// the safe direction: every UTXO of the partition now carries a pair, so no later spend can
 	// copy (0,0) into an undo row above T.
 	tip := liveTip
 	if h := s.GetBlockHeight(); h > tip {
@@ -950,7 +950,7 @@ func (d *stampDrain) CompleteWindow(ctx context.Context, wLo uint32, anc *chaina
 
 	if _, err := dbTx.Exec(ctx, `INSERT INTO tx_mined_stamped (window_start, stamped_at) VALUES ($1::int, $2::int)`,
 		int32(wLo), int32(stampedAt)); err != nil { //nolint:gosec // heights fit int32
-		return errors.NewStorageError("[utxoset][stamp] write completion record for window %d", wLo, err)
+		return errors.NewStorageError("[utxoset][stamp] write completion record for partition %d", wLo, err)
 	}
 
 	tag, err := dbTx.Exec(ctx, `UPDATE tx_mined_floor SET stamp_complete_floor = $1::int WHERE id = 0 AND stamp_complete_floor = $2::int`,
@@ -966,28 +966,28 @@ func (d *stampDrain) CompleteWindow(ctx context.Context, wLo uint32, anc *chaina
 	}
 
 	if err := dbTx.Commit(ctx); err != nil {
-		return errors.NewStorageError("[utxoset][stamp] commit completion of window %d", wLo, err)
+		return errors.NewStorageError("[utxoset][stamp] commit completion of partition %d", wLo, err)
 	}
 
 	stampWindows.Inc()
-	s.logger.Infof("[utxoset][stamp] window %d-%d complete at tip %d, stamped_at %d", wLo, wHi-1, tip, stampedAt)
+	s.logger.Infof("[utxoset][stamp] partition %d-%d complete at tip %d, stamped_at %d", wLo, wHi-1, tip, stampedAt)
 
 	s.refreshStatistics(ctx, wLo)
 
 	return nil
 }
 
-// refreshStatistics analyzes tx_ident and utxo after a stamped window, and reports whether
+// refreshStatistics analyzes tx_ident and utxo after a stamped partition, and reports whether
 // it ran. Stale statistics flipped the UTXO probe to a bitmap plan 5.7x slower in the bench.
 // ANALYZE samples, so it is cheap on any size.
 //
 // It is skipped while the pruner is rebuilding a UTXO index. Run alongside that rebuild it
 // deadlocks, and PostgreSQL kills the rebuild: five times in three hours on mainnet on
 // 2026-09-26. Waiting instead would hold the stamp worker for the rebuild's fifteen
-// minutes, and the next stamped window analyzes anyway.
+// minutes, and the next stamped partition analyzes anyway.
 func (s *Store) refreshStatistics(ctx context.Context, window uint32) bool {
 	if !s.indexMaintenance.TryLock() {
-		s.logger.Infof("[utxoset][stamp] statistics refresh after window %d skipped: a UTXO index rebuild is running", window)
+		s.logger.Infof("[utxoset][stamp] statistics refresh after partition %d skipped: a UTXO index rebuild is running", window)
 
 		return false
 	}
@@ -995,13 +995,13 @@ func (s *Store) refreshStatistics(ctx context.Context, window uint32) bool {
 	defer s.indexMaintenance.Unlock()
 
 	if _, err := s.pool.Exec(ctx, `ANALYZE tx_ident; ANALYZE utxo`); err != nil {
-		s.logger.Warnf("[utxoset][stamp] analyze after window %d: %v", window, err)
+		s.logger.Warnf("[utxoset][stamp] analyze after partition %d: %v", window, err)
 	}
 
 	return true
 }
 
-// auditSampleSQL reads a short run of the window's primary key from a random starting txid.
+// auditSampleSQL reads a short run of the partition's primary key from a random starting txid.
 const auditSampleSQL = `
 SELECT m.txid, m.mined_height, m.block_id, m.flags
   FROM tx_mined m
@@ -1025,7 +1025,7 @@ SELECT k.txid, u.mined_height, u.block_id
 // completion record. For each sampled winner it checks that no identity row is left and that
 // every live UTXO carries the winner's pair, or (h, 0) with h above zero, which is the
 // legitimate "restored, known on chain" value. A UTXO at (0,0) is an I1 violation: it alarms
-// and the window does not complete, because a window dropped over such a UTXO would leave it
+// and the partition does not complete, because a partition dropped over such a UTXO would leave it
 // with nothing behind it. Any other pair is counted as a disagreement, except on a coinbase,
 // whose pair is written at birth and can name the first of two blocks that carry it. The audit
 // repairs nothing.
@@ -1106,7 +1106,7 @@ func (s *Store) auditWindow(ctx context.Context, wLo, wHi uint32, anc *chainance
 		if n > 0 {
 			stampAuditViolations.Inc()
 
-			return errors.NewProcessingError("[utxoset][stamp] audit of window %d: %d sampled winners still have an identity row; the window does not complete", wLo, n)
+			return errors.NewProcessingError("[utxoset][stamp] audit of partition %d: %d sampled winners still have an identity row; the partition does not complete", wLo, n)
 		}
 	}
 
@@ -1150,13 +1150,13 @@ func (s *Store) auditWindow(ctx context.Context, wLo, wHi uint32, anc *chainance
 
 	if disagreements > 0 {
 		stampAuditDisagreements.Add(float64(disagreements))
-		s.logger.Errorf("[utxoset][stamp] audit of window %d: %d live UTXOs of sampled winners carry a pair that is not the winner's", wLo, disagreements)
+		s.logger.Errorf("[utxoset][stamp] audit of partition %d: %d live UTXOs of sampled winners carry a pair that is not the winner's", wLo, disagreements)
 	}
 
 	if violations > 0 {
 		stampAuditViolations.Add(float64(violations))
 
-		return errors.NewProcessingError("[utxoset][stamp] audit of window %d: %d live UTXOs of sampled winners are still at (0,0) with no identity row; the window does not complete", wLo, violations)
+		return errors.NewProcessingError("[utxoset][stamp] audit of partition %d: %d live UTXOs of sampled winners are still at (0,0) with no identity row; the partition does not complete", wLo, violations)
 	}
 
 	return nil

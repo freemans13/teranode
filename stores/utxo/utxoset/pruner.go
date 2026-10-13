@@ -15,12 +15,12 @@ import (
 // statement write-ahead log volume, with the watermark thousands of blocks behind the tip.
 //
 // What is left is catalog operations on two horizons. Transaction bodies retire on
-// DefaultTxBodyRetentionBlocks; containment windows, the spend journal and the
-// conflict-bookkeeping windows created alongside its leaves retire on
+// DefaultTxBodyRetentionBlocks; tx_mined partitions, the spend journal and the
+// conflict-bookkeeping partitions created alongside its leaves retire on
 // DefaultSpendJournalRetentionBlocks. Each is a DROP TABLE of partitions that have aged out,
 // so there is no work list, no probe and no per-row cost that can fall behind.
 //
-// A containment window drops on the four-part rule of dropStampedTxMinedWindows, which needs
+// A tx_mined partition drops on the four-part rule of dropStampedTxMinedWindows, which needs
 // the completion record the stamp writes. The stamp itself runs on the pruner service's own
 // worker through the Stamper interface in stamp.go, never in front of a drop.
 //
@@ -50,7 +50,7 @@ func (journalPruner) Start(_ context.Context) {
 	// goroutine, so there is nothing for this store to start and nothing to stop.
 }
 
-// Prune drops the bodies, undo partitions and containment windows that are due at this height,
+// Prune drops the bodies, undo partitions and tx_mined partitions that are due at this height,
 // then rebuilds at most one bloated UTXO index.
 //
 // The height is the tip, not a retention-adjusted one, so the retention is applied here.
@@ -58,7 +58,7 @@ func (journalPruner) Start(_ context.Context) {
 // The steps do not gate each other. Each runs even when an earlier one failed; the errors are
 // logged, counted by step, and the first one is returned at the end. Deferring reclaim is the
 // shape that filled the volume in September. The one ordering that matters is undo before
-// containment: the window drop's third condition reads which undo partitions are still attached,
+// containment: the partition drop's third condition reads which undo partitions are still attached,
 // so the undo drop in the same pass is what lets a containment drop succeed.
 //
 // The stamp is NOT here. It runs on the pruner service's own worker through the Stamper
@@ -89,11 +89,11 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	if err != nil {
 		fail("bodies", err)
 	} else if bodies > 0 {
-		p.store.logger.Infof("[utxoset] pruner dropped %d transaction-body windows past the %d-block horizon",
+		p.store.logger.Infof("[utxoset] pruner dropped %d tx_body partitions past the %d-block horizon",
 			bodies, p.store.bodyRetention)
 	}
 
-	// Undo partitions first, then containment windows, for the reason above. The undo drop is
+	// Undo partitions first, then tx_mined partitions, for the reason above. The undo drop is
 	// gated on journalRetention: below it nothing has aged out. That gate does NOT extend to
 	// the UTXO-index rebuild -- a UTXO index can already be bloated on a chain three blocks
 	// deep, and every dev/test net and every from-scratch sync spends most of its life below
@@ -112,7 +112,7 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	if err != nil {
 		fail("containment", err)
 	} else if windows > 0 {
-		p.store.logger.Infof("[utxoset] pruner dropped %d containment windows at height %d", windows, height)
+		p.store.logger.Infof("[utxoset] pruner dropped %d tx_mined partitions at height %d", windows, height)
 	}
 
 	// LAST, and unconditional: every session reaches this, regardless of height or

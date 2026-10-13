@@ -30,7 +30,7 @@ ON CONFLICT (block_hash) DO NOTHING`
 // supply. The UTXO table's ukey is a 96-bit prefix and deliberately NON-UNIQUE, so
 // the UTXO insert in createPlanSQL has no ON CONFLICT that could make it idempotent, and re-applying a
 // block would insert every output a second time as independently spendable rows. Replay
-// is routine rather than exotic: catchup, a restart mid-window, and the documented
+// is routine rather than exotic: catchup, a restart mid-partition, and the documented
 // post-restart unrequested-block storm all re-offer blocks. The ledger is therefore
 // ground truth written in the SAME transaction as the work it describes, so the claim
 // and the rows it authorises commit or roll back together.
@@ -47,7 +47,7 @@ func (s *Store) ApplyBlock(ctx context.Context, blockHash *chainhash.Hash, heigh
 	}
 
 	// BEFORE the transaction, never inside it. The callback writes transaction bodies, and
-	// the window they land in is created by DDL that needs its own pool connection. Taking
+	// the partition they land in is created by DDL that needs its own pool connection. Taking
 	// one while holding a transaction borrowed from the same pool is a nested acquire, and
 	// at pool_max_conns concurrent appliers every connection ends up held by a transaction
 	// waiting for a connection. That deadlock has no timeout.

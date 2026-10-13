@@ -38,7 +38,7 @@ func newCheckpointStore(t *testing.T, skip bool) (*Store, context.Context) {
 	})
 }
 
-// bodyRows counts the tx_body rows a transaction holds, across every live window.
+// bodyRows counts the tx_body rows a transaction holds, across every live partition.
 func bodyRows(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) int {
 	t.Helper()
 

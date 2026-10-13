@@ -18,7 +18,7 @@ import (
 // the last 200 blocks after a chain switch. A flag left wrong deeper than that makes the fast
 // path return a chain that fails hash linkage, and a caller that proves the result by linkage
 // then fails on every attempt. The pruner's stamp reads 288 to 575 blocks deep, and a fetch it
-// cannot ever prove would stop a containment window from stamping, so from dropping, so the
+// cannot ever prove would stop a tx_mined partition from stamping, so from dropping, so the
 // disk would grow without limit. This walk cannot be steered by the flag at all.
 //
 // It also takes no cache and fills none. GetBlockHeaders caches every answer under the start

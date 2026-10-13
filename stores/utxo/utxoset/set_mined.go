@@ -37,7 +37,7 @@ import (
 // the batch rather than of the identity table. The two arms sit inside a LATERAL with an
 // OFFSET 0 fence, which is the shape every other by-txid probe of tx_mined in this store takes,
 // and for the same reason: written as a join the planner is free to hash the keys against a
-// whole window.
+// whole partition.
 const recordMinedSQL = `
 INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
                       size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
@@ -256,9 +256,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		return map[chainhash.Hash][]uint32{}, nil
 	}
 
-	// The read-back's floor is the lower of the lookup floor and the start of the window
+	// The read-back's floor is the lower of the lookup floor and the start of the partition
 	// holding this block, so the call always sees the row it has just written, or the row a
-	// fenced replay found, even when the stamp is more than a window late.
+	// fenced replay found, even when the stamp is more than a partition late.
 	floor := s.lookupFloor()
 	if w := int32(info.BlockHeight / TxMinedPartitionBlocks * TxMinedPartitionBlocks); w < floor { //nolint:gosec // a height fits int32
 		floor = w
@@ -333,7 +333,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 // reports quiet = true when it wrote no containment row on purpose, below the fence.
 //
 // ensureTxMinedPartition runs BEFORE the transaction opens, because the DDL needs its own pool
-// connection; the same rule the create path follows. It refuses a dropped window, so a call
+// connection; the same rule the create path follows. It refuses a dropped partition, so a call
 // that names one never reaches the fence.
 //
 // The fence lock is the transaction's first statement, and the fence is read as its second.
@@ -371,7 +371,7 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 
 	if fence.dropped(info.BlockHeight) {
 		if info.OnLongestChain {
-			return false, boundaryError("record_mined", "block %d at height %d is on the longest chain and its window is dropped; its mined status was never written, so a refusal above was bypassed",
+			return false, boundaryError("record_mined", "block %d at height %d is on the longest chain and its partition is dropped; its mined status was never written, so a refusal above was bypassed",
 				info.BlockID, info.BlockHeight)
 		}
 
@@ -452,9 +452,9 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 // UTXO reset the un-mine used to run is gone rather than narrowed.
 //
 // No ensureTxMinedPartition, and that is not an omission. The un-mine only DELETES from
-// tx_mined; the window it deletes from either exists, or the block was never recorded at that
-// height and there is nothing to un-mine. Creating a window here would be actively wrong -- the
-// floor exists to stop a retired window being recreated.
+// tx_mined; the partition it deletes from either exists, or the block was never recorded at that
+// height and there is nothing to un-mine. Creating a partition here would be actively wrong -- the
+// floor exists to stop a retired partition being recreated.
 //
 // The marker is set on every listed identity row, whether or not this block's row was there to
 // delete, as the un-mine has always done: setting it wrongly costs a mined transaction reloaded
@@ -487,7 +487,7 @@ func (s *Store) unMine(ctx context.Context, txids [][]byte, info utxo.MinedBlock
 	// Below the fence a row that exists is a winner, and deleting it would take the chain
 	// out from under a stamped UTXO: the boundary error. An un-mine that finds no row there
 	// is an invalid deep fork block whose row was a loser and is already gone: allowed and
-	// counted, so its mined status can settle. A dropped window is skipped the same way.
+	// counted, so its mined status can settle. A dropped partition is skipped the same way.
 	fence, err := s.takeFenceShared(ctx, dbTx)
 	if err != nil {
 		return err
@@ -678,13 +678,13 @@ func leafGroups(txids [][]byte) []leafBatch {
 // minedIDsByTxidSQL reads the block ids tx_mined holds for a set of transactions at or above a
 // height floor, $2, in (mined_height, block_id) order. Every column it names is in the
 // primary key (txid, mined_height, block_id), so each key is one index descent per live
-// window and, once the visibility map is set, never a heap fetch.
+// partition and, once the visibility map is set, never a heap fetch.
 //
 // It is minedByTxidSQL's containment step with nothing joined to it, and the keys sit outside
 // the same LATERAL with OFFSET 0 fence for the same reason: without the fence the planner may
-// hash-join the keys against every live window. It does not touch tx_body at all, because
+// hash-join the keys against every live partition. It does not touch tx_body at all, because
 // SetMinedMulti's read-back wants only the ids; reading the body there is what put a seq scan
-// of every live body window on setTxMined's path on mainnet. The floor is a scalar bind
+// of every live tx_body partition on setTxMined's path on mainnet. The floor is a scalar bind
 // parameter, so partitions below it are pruned at plan time.
 const minedIDsByTxidSQL = `
 SELECT k.txid, m.block_id

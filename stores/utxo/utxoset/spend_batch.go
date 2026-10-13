@@ -670,7 +670,7 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 //
 // The UTXO probe is bounded by the packed-key RANGE and rechecked on the full 32-byte txid,
 // which schema.go requires of every by-txid UTXO access, and it asks about ANY output of the
-// parent rather than the one being spent: a parent whose membership window has retired is
+// parent rather than the one being spent: a parent whose tx_mined partition has retired is
 // known to this store only through a surviving UTXO, which is exactly what a pruned SV Node
 // can say about one.
 const parentKnownSQL = `
@@ -708,7 +708,7 @@ SELECT k.vin
 // asked only here, for the inputs nothing else could explain: no live UTXO, and no journal row
 // naming a spender. That is the error path, never the hot one.
 //
-// ONE CASE STAYS AMBIGUOUS. A parent whose membership window has retired, whose UTXOs are all
+// ONE CASE STAYS AMBIGUOUS. A parent whose tx_mined partition has retired, whose UTXOs are all
 // gone, and whose spend is older than journal retention leaves no trace here at all, so it is
 // indistinguishable from one that never arrived, and it is reported as NOT FOUND like the rest.
 // That is the conservative choice: it asks the caller to fetch a parent rather than to condemn a

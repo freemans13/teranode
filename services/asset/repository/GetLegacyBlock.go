@@ -600,7 +600,7 @@ func (repo *Repository) writeChunkToWriter(ctx context.Context, w io.Writer, blo
 			continue
 		} else {
 			// A record with no serialized body is a legal answer from the UTXO store
-			// — the body window has aged out, or utxostore_skipTxBodyBelowCheckpoint
+			// — the tx_body partition has aged out, or utxostore_skipTxBodyBelowCheckpoint
 			// meant the bytes below the checkpoint were never written — and getTxs
 			// does not count it as missed, because the record IS there.
 			//
