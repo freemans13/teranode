@@ -30,6 +30,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"golang.org/x/sync/errgroup"
@@ -1253,6 +1254,11 @@ func (t *TxMetaCache) SetBlockState(height, medianTime uint32) error {
 
 func (t *TxMetaCache) GetBlockState() utxo.BlockState {
 	return t.utxoStore.GetBlockState()
+}
+
+// Stamper forwards to the underlying UTXO store, whose stamp it is.
+func (t *TxMetaCache) Stamper() pruner.Stamper {
+	return t.utxoStore.Stamper()
 }
 
 // QueryOldUnminedTransactions forwards the query request to the underlying UTXO store.

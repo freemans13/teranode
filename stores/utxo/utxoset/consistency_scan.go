@@ -39,7 +39,7 @@ const consistencyBatchSize = 1_000
 // table, which is hundreds of millions of rows on the mainnet box, to return the same answer.
 //
 // The block ids come from tx_mined, aggregated per identity row in (mined_height, block_id)
-// order, one probe per waiting row per live window. They used to be unpacked from a column on
+// order, one probe per waiting row per live partition. They used to be unpacked from a column on
 // the identity row; that column is gone so that containment has one home. A waiting row with
 // no containment row at all aggregates to NULL and is excluded, because it names no block and
 // there is nothing for the caller to repair.

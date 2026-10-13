@@ -230,7 +230,7 @@ func SpendAndCreateMultiLevelsParallelAndOrdered(t *testing.T, db utxostore.Stor
 
 	rec := newRecordingStore(db, 20*time.Millisecond)
 
-	results, err := utxostore.DefaultSpendAndCreateMulti(context.Background(), rec, width, w.Txs, height, utxostore.WithIgnoreLocked(true))
+	results, err := utxostore.DefaultSpendAndCreateMulti(context.Background(), rec, utxostore.UniformSpendAndCreateMultiWidths(width), w.Txs, height, utxostore.WithIgnoreLocked(true))
 	require.NoError(t, err)
 	require.Len(t, results, len(w.Txs))
 	requireAllStatus(t, results, utxostore.MultiTxCreated)
@@ -281,7 +281,7 @@ func SpendAndCreateMultiConcurrencyBound(t *testing.T, db utxostore.Store) {
 
 	rec := newRecordingStore(db, 10*time.Millisecond)
 
-	results, err := utxostore.DefaultSpendAndCreateMulti(context.Background(), rec, bound, w.Txs, height, utxostore.WithIgnoreLocked(true))
+	results, err := utxostore.DefaultSpendAndCreateMulti(context.Background(), rec, utxostore.UniformSpendAndCreateMultiWidths(bound), w.Txs, height, utxostore.WithIgnoreLocked(true))
 	require.NoError(t, err)
 	requireAllStatus(t, results, utxostore.MultiTxCreated)
 
@@ -439,7 +439,7 @@ func SpendAndCreateMultiCancelledBetweenLevels(t *testing.T, db utxostore.Store)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	results, err := utxostore.DefaultSpendAndCreateMulti(ctx, &cancellingStore{Store: db, cancel: cancel}, 4, w.Txs, height, utxostore.WithIgnoreLocked(true))
+	results, err := utxostore.DefaultSpendAndCreateMulti(ctx, &cancellingStore{Store: db, cancel: cancel}, utxostore.UniformSpendAndCreateMultiWidths(4), w.Txs, height, utxostore.WithIgnoreLocked(true))
 	require.ErrorIs(t, err, context.Canceled)
 	require.Len(t, results, 2)
 	require.Equal(t, utxostore.MultiTxCreated, results[0].Status)

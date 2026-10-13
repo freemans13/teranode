@@ -89,7 +89,7 @@ func preservedRows(t *testing.T, s *Store, ctx context.Context) int {
 
 // TestPreservedParentOutlivesItsMembershipWindow: the pruner's parent-preservation phase names
 // the parents of old unmined transactions; a preserved parent still answers a lookup after
-// its membership window has been dropped and its UTXOs are gone.
+// its tx_mined partition has been dropped and its UTXOs are gone.
 func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -99,8 +99,8 @@ func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 	require.NoError(t, err)
 
 	// The child of the story stays unmined, and the store does not check that: preservation is
-	// keyed on the list the pruner hands over. The spend is at 900, past the height window 0
-	// is stamped at, so its undo copy does not hold the window drop back.
+	// keyed on the list the pruner hands over. The spend is at 900, past the height partition 0
+	// is stamped at, so its undo copy does not hold the partition drop back.
 	spendOneOutputInBlock(t, s, ctx, parent, 0, 900, 9)
 
 	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
@@ -108,7 +108,7 @@ func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
 	dropped := dropStamped(t, s, ctx, tip)
-	require.Equal(t, 1, dropped, "the window has to be gone for this test to mean anything")
+	require.Equal(t, 1, dropped, "the partition has to be gone for this test to mean anything")
 
 	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
@@ -202,7 +202,7 @@ func TestPreservingASecondTimeKeepsTheLongerPromise(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// Preservation copies only from a window the stamp has completed.
+	// Preservation copies only from a partition the stamp has completed.
 	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
 
 	preserved := []chainhash.Hash{*parent.TxIDChainHash()}
@@ -225,7 +225,7 @@ func TestPreservingASecondTimeKeepsTheLongerPromise(t *testing.T) {
 }
 
 // A preservation is renewed while the pruner keeps naming its parent, even after every other
-// copy of the parent is gone. It used to renew only while the parent's block window, a live
+// copy of the parent is gone. It used to renew only while the tx_mined partition of the parent's block, a live
 // UTXO or a spend-journal copy still existed, so a parent fully spent in its block lapsed 1,440
 // blocks after its last copy went, while its child still waited: on 2026-09-24 that left 283
 // parents unpreserved on mainnet and the pruner logged it eight times a block. The spec

@@ -39,6 +39,16 @@ func TestConformance(t *testing.T) {
 		tests.Spend(t, db)
 	})
 
+	// AtomicSpends, not the PerInputSpends the sql and aerospike stores run: this store
+	// spends all the inputs of one transaction in one database transaction, so a failed
+	// spend leaves no partial spend and no dangling spender ref, and a replay of spends
+	// already made answers success. tests.SpendModel gives the full reasoning; the
+	// assertions differ in three subtests only.
+	t.Run("PartialSpendRollback", func(t *testing.T) {
+		db, _ := newUncheckpointedStore(t)
+		tests.PartialSpendRollbackFor(t, db, tests.AtomicSpends)
+	})
+
 	t.Run("Freeze", func(t *testing.T) {
 		db, _ := newUncheckpointedStore(t)
 		tests.Freeze(t, db)
@@ -91,7 +101,7 @@ func TestConformance(t *testing.T) {
 	// make it unfindable. On this store that takes the stamp, which the pruner service drives
 	// on its own worker through the Stamper interface, and which the shared case knows nothing
 	// about. stampingPruner is the harness's stand-in for that worker: on Prune it drains every
-	// stampable window with a hand-built chain answer, moves the tip past stamped_at + 1,728
+	// stampable partition with a hand-built chain answer, moves the tip past stamped_at + 1,728
 	// and then runs the real Prune, which is how one call comes to satisfy a case whose drop
 	// rule needs two conditions.
 	t.Run("MinedThenSpendAllPrunes", func(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 )
 
 // THE FENCE. Below stamp_fence, containment is read-only: the stamp has raised the fence and
-// deleted the window's losing rows in one transaction, so from the moment a writer can see the
+// deleted the partition's losing rows in one transaction, so from the moment a writer can see the
 // raised fence, a row that exists below it is a winner and a row that does not exist is not
 // (invariant I3). Nothing may add a row on the longest chain there, and nothing may delete one.
 //
@@ -31,11 +31,11 @@ import (
 
 // fenceState is what a writer sees after taking the fence lock shared.
 type fenceState struct {
-	droppedFloor uint32 // a HEIGHT: 288 x the stored window number
+	droppedFloor uint32 // a HEIGHT: 288 x the stored partition number
 	fence        uint32 // a HEIGHT
 }
 
-// dropped reports whether height h is in a window that has been dropped.
+// dropped reports whether height h is in a partition that has been dropped.
 func (f fenceState) dropped(h uint32) bool { return h < f.droppedFloor }
 
 // fenced reports whether height h is below the fence and not dropped.
@@ -79,7 +79,7 @@ func fencedRowCount(ctx context.Context, q querier, txids [][]byte, height, bloc
 	return n, nil
 }
 
-// boundaryError is the refusal of a containment write that would change a stamped window.
+// boundaryError is the refusal of a containment write that would change a stamped partition.
 // The design asks for one named error code that crosses gRPC so the receiver can tell it from
 // a storage error and escalate; that code, and the escalation, belong with the cross-service
 // half of the boundary and are not built here. Until then it is a storage error carrying a
@@ -93,11 +93,11 @@ func boundaryError(site, format string, args ...any) error {
 var (
 	boundaryRefusals = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "utxoset_boundary_refusals_total",
-		Help: "Containment writes refused because they would add or delete a row in a window the stamp has fenced, by site",
+		Help: "Containment writes refused because they would add or delete a row in a partition the stamp has fenced, by site",
 	}, []string{"site"})
 
 	// fenceNoops counts the quiet outcomes below the fence: an off-chain insert not made, an
-	// un-mine of rows that do not exist, and a write skipped in a dropped window. Each returns
+	// un-mine of rows that do not exist, and a write skipped in a dropped partition. Each returns
 	// success so that a deep fork block's mined status can settle instead of retrying for ever.
 	fenceNoops = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "utxoset_fence_noops_total",
@@ -106,7 +106,7 @@ var (
 
 	createAheadOfTip = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_create_ahead_of_tip_total",
-		Help: "Block-path creates applying a block more than 287 heights above the store's height, which the window drop rule assumes never happens",
+		Help: "Block-path creates applying a block more than 287 heights above the store's height, which the partition drop rule assumes never happens",
 	})
 
 	unspendRepaired = promauto.NewCounter(prometheus.CounterOpts{
@@ -145,6 +145,6 @@ var (
 	})
 	preserveWaiting = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "utxoset_preserve_waiting_total",
-		Help: "Parents named for preservation whose only containment row is in a window the stamp has not completed, retried next cycle",
+		Help: "Parents named for preservation whose only containment row is in a partition the stamp has not completed, retried next cycle",
 	})
 )

@@ -103,7 +103,7 @@ func TestGetReportsWhetherTheTransactionIsWaitingToBeMined(t *testing.T) {
 // TestGetSurvivesABodyThatHasAgedOut is the case that panics on this branch today, in the
 // asset repository, because a body-less row is dereferenced with no nil check.
 //
-// The body window is dropped after 288 blocks while the identity row lives as long as any
+// The tx_body partition is dropped after 288 blocks while the identity row lives as long as any
 // output is unspent, so a body-less row is the ordinary steady state for an old transaction,
 // not an error. Get must return what it has.
 func TestGetSurvivesABodyThatHasAgedOut(t *testing.T) {

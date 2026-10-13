@@ -15,7 +15,7 @@ func withMined(blockID, height uint32) utxo.CreateOption {
 }
 
 // partitionEnsurers names the three block-path partition creators, each with the parent it
-// adds to and a height that opens a window none of the tests have touched.
+// adds to and a height that opens a partition none of the tests have touched.
 var partitionEnsurers = []struct {
 	name   string
 	parent string
@@ -32,7 +32,7 @@ var partitionEnsurers = []struct {
 //
 // CREATE TABLE ... PARTITION OF takes the strongest lock on the parent, so it queues behind
 // every reader and every later reader queues behind it. MEASURED on mainnet: 939 to 1,004 ms
-// per window boundary, on the block path, waiting for the pruner's stamp query to finish.
+// per partition boundary, on the block path, waiting for the pruner's stamp query to finish.
 // ATTACH PARTITION takes a lock that ordinary readers and writers do not conflict with.
 //
 // The reader here holds its lock in an open transaction for the whole test, the way the
@@ -61,19 +61,19 @@ func TestPartitionCreationDoesNotWaitForReaders(t *testing.T) {
 	}
 }
 
-// TestPartitionCreationRefusesAStandaloneTableOfThatName: only the pruner leaves a window
+// TestPartitionCreationRefusesAStandaloneTableOfThatName: only the pruner leaves a partition
 // as a standalone table, between detaching it and dropping it. The block path must never
-// re-attach it, because its rows belong to a window the pruner has already stamped and is
+// re-attach it, because its rows belong to a partition the pruner has already stamped and is
 // discarding. Failing loudly here is what stops that.
 func TestPartitionCreationRefusesAStandaloneTableOfThatName(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	// A standalone table shaped like a window, as a crash between detach and drop leaves it.
+	// A standalone table shaped like a partition, as a crash between detach and drop leaves it.
 	_, err := s.pool.Exec(ctx, `CREATE TABLE tx_mined_w2430 (LIKE tx_mined INCLUDING ALL)`)
 	require.NoError(t, err)
 
 	err = s.ensureTxMinedPartition(ctx, 2430*TxMinedPartitionBlocks)
-	require.Error(t, err, "a standalone table of the window's name must not be adopted")
+	require.Error(t, err, "a standalone table of the partition's name must not be adopted")
 
 	var isPartition bool
 	require.NoError(t, s.pool.QueryRow(ctx,
@@ -81,8 +81,8 @@ func TestPartitionCreationRefusesAStandaloneTableOfThatName(t *testing.T) {
 	require.False(t, isPartition, "the table must be left exactly as it was found")
 }
 
-// TestPartitionCreationIsIdempotentAcrossACacheLoss: after a restart the in-memory window
-// cache is empty, so the ensure runs again for a window that already exists. It must find
+// TestPartitionCreationIsIdempotentAcrossACacheLoss: after a restart the in-memory partition
+// cache is empty, so the ensure runs again for a partition that already exists. It must find
 // the attached partition and do nothing.
 func TestPartitionCreationIsIdempotentAcrossACacheLoss(t *testing.T) {
 	for _, tc := range partitionEnsurers {
@@ -95,7 +95,7 @@ func TestPartitionCreationIsIdempotentAcrossACacheLoss(t *testing.T) {
 			s.bodyWindow.Store(0)
 			s.journalLeaf.Store(0)
 
-			require.NoError(t, tc.ensure(s, ctx, tc.height), "a second ensure for an existing window is a no-op")
+			require.NoError(t, tc.ensure(s, ctx, tc.height), "a second ensure for an existing partition is a no-op")
 		})
 	}
 }

@@ -1747,7 +1747,7 @@ func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utx
 //
 // The two carry the same set, but only the inpoints survive the loss of the
 // body, and a UTXO store may legitimately hold a transaction with Tx nil: once
-// its body window has aged out, and, with utxostore_skipTxBodyBelowCheckpoint
+// its tx_body partition has aged out, and, with utxostore_skipTxBodyBelowCheckpoint
 // on, for every transaction mined at or below the hardcoded checkpoint, whose
 // bytes were never written. Reading the body alone meant every such record
 // yielded no outpoints and was skipped in silence.
@@ -1776,7 +1776,7 @@ func spentOutpoints(hash *chainhash.Hash, txMeta *meta.Data, caller string) ([]s
 	}
 
 	if txMeta.Tx == nil {
-		return nil, errors.NewProcessingError("[%s][%s] record carries neither stored inpoints nor a transaction body, so its parents cannot be resolved (a body-less record is the steady state once the body window has aged out, or below the boundary when utxostore_skipTxBodyBelowCheckpoint is on)", caller, hash.String())
+		return nil, errors.NewProcessingError("[%s][%s] record carries neither stored inpoints nor a transaction body, so its parents cannot be resolved (a body-less record is the steady state once the tx_body partition has aged out, or below the boundary when utxostore_skipTxBodyBelowCheckpoint is on)", caller, hash.String())
 	}
 
 	inpoints := make([]subtree.Inpoint, 0, len(txMeta.Tx.Inputs))

@@ -1743,7 +1743,7 @@ func (s *server) pushTxMsg(sp *serverPeer, hash *chainhash.Hash, doneChan chan<-
 	}
 
 	// A record with no serialized body is a legal answer from the UTXO store — the
-	// body window has aged out, or utxostore_skipTxBodyBelowCheckpoint meant the
+	// tx_body partition has aged out, or utxostore_skipTxBodyBelowCheckpoint meant the
 	// bytes below the checkpoint were never written — and the peer asked for the
 	// transaction itself, which this node cannot produce. Refuse, and say why:
 	// "nil from transaction pool" reads like a store fault for something that is

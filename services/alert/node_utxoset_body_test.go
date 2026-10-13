@@ -57,7 +57,7 @@ func TestAlertActsOnUnspentOutputsWhoseBodyHasAgedOut(t *testing.T) {
 
 	const (
 		createdAt = uint32(1_000)
-		// Far enough past createdAt that the body window holding it is below the
+		// Far enough past createdAt that the tx_body partition holding it is below the
 		// 288-block retention cutoff.
 		prunedAt = createdAt + 1_000
 	)
@@ -68,7 +68,7 @@ func TestAlertActsOnUnspentOutputsWhoseBodyHasAgedOut(t *testing.T) {
 	require.NoError(t, err)
 
 	// Mined, as the coins an alert targets are. The store keeps the body of a transaction
-	// still waiting to be mined past its window, so only a mined one loses it.
+	// still waiting to be mined past its partition, so only a mined one loses it.
 	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()},
 		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: createdAt + 1, OnLongestChain: true})
 	require.NoError(t, err)

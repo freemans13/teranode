@@ -207,7 +207,7 @@ func TestUnspendRefusesARestoreItCannotRepair(t *testing.T) {
 }
 
 // TestSecondTierAnswersAnUnstampedParentBelowTheLookupFloor is the stamp-backlog case: the
-// stamp is three windows late, a transaction seen before its block sits below the lookup floor
+// stamp is three partitions late, a transaction seen before its block sits below the lookup floor
 // with its identity row and no containment in the first tier, and the second tier answers.
 func TestSecondTierAnswersAnUnstampedParentBelowTheLookupFloor(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
@@ -218,7 +218,7 @@ func TestSecondTierAnswersAnUnstampedParentBelowTheLookupFloor(t *testing.T) {
 	_, err = s.SetMinedMulti(ctx, hashes(parent), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
 	require.NoError(t, err)
 
-	// Lookup floor: (1440 - 576) aligned down = 864. Window 0 is out of the first tier.
+	// Lookup floor: (1440 - 576) aligned down = 864. Partition 0 is out of the first tier.
 	require.NoError(t, s.SetBlockHeight(1440))
 	require.Equal(t, int32(864), s.lookupFloor())
 
@@ -248,7 +248,7 @@ func TestSecondTierAnswersAnUnstampedParentBelowTheLookupFloor(t *testing.T) {
 }
 
 // TestPreservationSkipsAParentInAnUncompletedWindow is the design's CT-4, and its complement:
-// preservation copies nothing while the parent's only containment row is in a window the stamp
+// preservation copies nothing while the parent's only containment row is in a partition the stamp
 // has not completed, and copies the surviving row once it has.
 func TestPreservationSkipsAParentInAnUncompletedWindow(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
@@ -266,7 +266,7 @@ func TestPreservationSkipsAParentInAnUncompletedWindow(t *testing.T) {
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
 	_, ok := preservedPairOf(t, s, ctx, parent)
-	require.False(t, ok, "skipped: a row in an uncompleted window can still be a loser")
+	require.False(t, ok, "skipped: a row in an uncompleted partition can still be a loser")
 	require.Equal(t, waitingBefore+1, testutil.ToFloat64(preserveWaiting))
 
 	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 8})
@@ -383,7 +383,7 @@ func mkSpender(t *testing.T, parent *bt.Tx, vout uint32) *bt.Tx {
 	return child
 }
 
-// TestBlockPathCreateAheadOfTheTipIsCounted is decision 1: the window drop rule assumes no block
+// TestBlockPathCreateAheadOfTheTipIsCounted is decision 1: the partition drop rule assumes no block
 // is applied more than 287 heights ahead of the store's height, and the block-path create counts
 // every block that breaks the assumption rather than enforcing it.
 func TestBlockPathCreateAheadOfTheTipIsCounted(t *testing.T) {

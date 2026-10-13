@@ -16,7 +16,9 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 
 // SpendAndCreateMulti implements utxo.Store through the shared
 // DefaultSpendAndCreateMulti, writing each dependency level's transactions
-// concurrently, as wide as subtree validation writes a level today.
+// concurrently, as wide as subtree validation writes a level today. A
+// WithBelowCheckpoint list goes in two waves, every create and then every
+// spend, as wide as quick validation's create and spend phases were.
 func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
-	return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiConcurrency(s.settings), txs, blockHeight, opts...)
+	return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiWidthsFor(s.settings), txs, blockHeight, opts...)
 }

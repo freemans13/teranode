@@ -2,27 +2,75 @@ package pruner
 
 import (
 	"context"
+	"fmt"
 	"net/url"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	storelogger "github.com/bsv-blockchain/teranode/stores/utxo/logger"
 	"github.com/bsv-blockchain/teranode/stores/utxo/utxoset"
 	tpostgres "github.com/bsv-blockchain/teranode/test/utils/postgres"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
 // The worker against the real utxoset store on a real postgres, with the chain in the
-// sqlitememory blockchain store. The store is found by type assertion, one drain runs all 256
-// pages of window 0, the transaction seen at 99 and mined at 100 gets the block that the
+// sqlitememory blockchain store. The worker asks the store for its stamp, one drain runs all 256
+// pages of partition 0, the transaction seen at 99 and mined at 100 gets the block that the
 // blockchain store actually holds at height 100 written onto its UTXO, its identity row is
 // deleted, and the completion floor advances. This is the wiring the unit tests fake.
 func TestStampWorkerDrainsTheRealUTXOSetStore(t *testing.T) {
+	drainTheRealUTXOSetStore(t, func(store utxo.Store) utxo.Store { return store })
+}
+
+// The same drain with the store held through stores/utxo/logger, as every caller holds it when
+// logging=true. The wrapper forwards Stamper like any other method, so the worker reaches the
+// real store's stamp and stamps it. Nothing finds the stamp by asserting the type of the store
+// it holds, which is the step a wrapper used to defeat.
+func TestStampWorkerDrainsTheRealUTXOSetStoreThroughTheLoggingWrapper(t *testing.T) {
+	drainTheRealUTXOSetStore(t, func(store utxo.Store) utxo.Store {
+		return storelogger.New(context.Background(), ulogger.TestLogger{}, store)
+	})
+}
+
+// freshUTXOSetDSN returns a DSN for an empty database. With UTXOSET_TEST_DSN set, as the utxoset
+// package's own tests honour it, it creates a database of its own on that server and drops it
+// afterwards, so a machine without Docker still runs these tests against a real postgres.
+// Otherwise it takes one from the shared test container, and skips when Docker is absent.
+func freshUTXOSetDSN(t *testing.T) string {
+	t.Helper()
+
+	if base := os.Getenv("UTXOSET_TEST_DSN"); base != "" {
+		ctx := context.Background()
+
+		admin, err := pgx.Connect(ctx, base)
+		require.NoError(t, err)
+
+		t.Cleanup(func() { _ = admin.Close(ctx) })
+
+		name := fmt.Sprintf("stamp_worker_%d", time.Now().UnixNano())
+
+		_, err = admin.Exec(ctx, "CREATE DATABASE "+name)
+		require.NoError(t, err)
+
+		t.Cleanup(func() { _, _ = admin.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)") })
+
+		u, err := url.Parse(base)
+		require.NoError(t, err)
+
+		u.Path = "/" + name
+
+		return u.String()
+	}
+
 	dsn, cleanup, err := tpostgres.SetupTestPostgresContainer()
 	if err != nil {
 		test.SkipIfContainerUnavailable(t, err)
@@ -30,6 +78,14 @@ func TestStampWorkerDrainsTheRealUTXOSetStore(t *testing.T) {
 	}
 
 	t.Cleanup(func() { _ = cleanup() })
+
+	return dsn
+}
+
+func drainTheRealUTXOSetStore(t *testing.T, wrap func(utxo.Store) utxo.Store) {
+	t.Helper()
+
+	dsn := freshUTXOSetDSN(t)
 
 	ctx := context.Background()
 	chain := newTestChain(t, 575)
@@ -65,9 +121,9 @@ func TestStampWorkerDrainsTheRealUTXOSetStore(t *testing.T) {
 	require.NoError(t, store.SetBlockHeight(575))
 
 	s := newStampTestServer(t, chain.client, nil)
-	s.utxoStore = store
+	s.utxoStore = wrap(store)
 	s.stamper = s.findStamper()
-	require.NotNil(t, s.stamper, "the utxoset store stamps")
+	require.Same(t, store, s.stamper, "the worker drives the utxoset store's own stamp")
 
 	report := s.runStampDrain(s.ctx, notificationAt(chain, 575), false)
 

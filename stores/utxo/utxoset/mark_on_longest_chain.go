@@ -35,7 +35,7 @@ RETURNING i.txid`
 // the flags of one such row.
 //
 // The keys sit outside a LATERAL with an OFFSET 0 fence, the same fence minedByTxidSQL needs,
-// so this is one index descent per key per live window rather than a read of the whole
+// so this is one index descent per key per live partition rather than a read of the whole
 // containment set. It runs only when a mark call missed a hash, so it is off the ordinary path.
 const minedPresentSQL = `
 SELECT k.txid, p.flags

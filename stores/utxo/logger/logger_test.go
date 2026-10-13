@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
@@ -64,6 +65,8 @@ func (m *MockStore) GetBlockState() utxo.BlockState {
 		MedianTime: m.GetMedianBlockTime(),
 	}
 }
+
+func (m *MockStore) Stamper() pruner.Stamper { return pruner.NoStamp }
 
 func (m *MockStore) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	args := m.Called(ctx, checkLiveness)
@@ -1128,6 +1131,15 @@ func newLoggedSQLiteStore(t *testing.T) (utxo.Store, utxo.Store) {
 	require.NoError(t, err)
 
 	return New(ctx, ulogger.TestLogger{}, base), base
+}
+
+// The logger store forwards Stamper to the inner store. A sql store has nothing to stamp, so
+// what comes back is pruner.NoStamp, and the wrapper does not invent a stamp of its own.
+func TestStamper_Forwards(t *testing.T) {
+	s, base := newLoggedSQLiteStore(t)
+
+	require.Equal(t, base.Stamper(), s.Stamper())
+	require.Equal(t, pruner.NoStamp, s.Stamper())
 }
 
 // The logger store forwards a list to the inner store's SpendAndCreateMulti,

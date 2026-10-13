@@ -11,7 +11,7 @@ import (
 )
 
 // TestWriteChunkToWriter_BodylessTxIsRefusedNotPanicked covers the record that
-// exists with no serialized body — the steady state once a body window has aged
+// exists with no serialized body — the steady state once a tx_body partition has aged
 // out, and for every transaction mined at or below the checkpoint when
 // utxostore_skipTxBodyBelowCheckpoint is on. getTxs does not count such a record
 // as missed, because the record is there, so it reaches this writer with Tx nil

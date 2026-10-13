@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -272,7 +273,7 @@ func (m *MockUtxostore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) 
 // time, through this mock's SpendAndCreate and whatever expectations the test set on that.
 func (m *MockUtxostore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...CreateOption) ([]SpendAndCreateMultiResult, error) {
 	if !m.expects("SpendAndCreateMulti") {
-		return DefaultSpendAndCreateMulti(ctx, m, 1, txs, blockHeight, opts...)
+		return DefaultSpendAndCreateMulti(ctx, m, UniformSpendAndCreateMultiWidths(1), txs, blockHeight, opts...)
 	}
 
 	args := m.Called(ctx, txs, blockHeight, opts)
@@ -415,6 +416,13 @@ func (m *MockUtxostore) SetBlockState(height, medianTime uint32) error {
 func (m *MockUtxostore) GetBlockState() BlockState {
 	args := m.Called()
 	return args.Get(0).(BlockState)
+}
+
+// Stamper returns pruner.NoStamp without consulting the mock's expectations: the mock stands in
+// for a store with nothing to stamp, and every test that holds one would otherwise have to set up
+// a call it never cares about.
+func (m *MockUtxostore) Stamper() pruner.Stamper {
+	return pruner.NoStamp
 }
 
 // QueryOldUnminedTransactions mocks the querying of old unmined transactions before a cutoff height.

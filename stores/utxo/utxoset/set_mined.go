@@ -37,7 +37,7 @@ import (
 // the batch rather than of the identity table. The two arms sit inside a LATERAL with an
 // OFFSET 0 fence, which is the shape every other by-txid probe of tx_mined in this store takes,
 // and for the same reason: written as a join the planner is free to hash the keys against a
-// whole window.
+// whole partition.
 const recordMinedSQL = `
 INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
                       size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
@@ -69,6 +69,118 @@ UPDATE tx_ident i
    SET off_chain_since = NULL
  WHERE i.leaf = $1::smallint
    AND i.txid = ANY($2::bytea[])`
+
+// releaseIdentLockSQL clears the locked bit of every listed identity row that still has it, and
+// returns the transactions it released. Same key shape as clearMarkerSQL. A row already
+// unlocked, which is every row once the two-phase-commit release has run, matches nothing and
+// is not written.
+const releaseIdentLockSQL = `
+UPDATE tx_ident i
+   SET flags = i.flags & ~$3::smallint
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])
+   AND (i.flags & $3::smallint) <> 0
+RETURNING i.txid`
+
+// releaseMinedLockSQL does the same for containment rows at or above the lookup floor, for a
+// transaction that has no identity row: a block-path create below the checkpoint is written
+// with its block and, from quick validation, locked, and a retry of that block reaches it
+// through SetMinedMulti. The probe is the txid-leading primary key behind a fenced LATERAL, the
+// shape every by-txid probe of tx_mined takes.
+const releaseMinedLockSQL = `
+WITH hit AS (
+    SELECT c.txid, c.mined_height, c.block_id
+      FROM unnest($1::bytea[]) AS k(txid)
+     CROSS JOIN LATERAL (
+       SELECT m.txid, m.mined_height, m.block_id
+         FROM tx_mined m
+        WHERE m.txid = k.txid
+          AND m.mined_height >= $3::int
+          AND (m.flags & $2::smallint) <> 0
+       OFFSET 0
+     ) AS c
+)
+UPDATE tx_mined m
+   SET flags = m.flags & ~$2::smallint
+  FROM hit
+ WHERE m.txid = hit.txid
+   AND m.mined_height = hit.mined_height
+   AND m.block_id = hit.block_id
+RETURNING m.txid`
+
+// releaseLocksOnMine releases the lock of every listed transaction that a block now contains,
+// on its identity row and its containment rows, and returns the transactions it released.
+//
+// TX_LOCKED has one producer on the spend path, the locked bit on the UTXO row
+// (classifyPlanMisses), and the metadata reads take it from the identity row or a containment
+// row. The bit is set by a locked create and by SetLocked, and the two-phase-commit release
+// clears it. When that release never runs, the transaction used to stay locked through its
+// mining, so every child spending it was refused with TX_LOCKED while the mine took the
+// transaction out of unmined recovery, the one path left that would have released it. Both
+// reference stores release the lock in setMined, on and off the longest chain: the sql store
+// sets locked = false, and the aerospike UDF clears the bin. This store does the same, in the
+// mine's own transaction, so a reader never sees a transaction contained in a block and still
+// locked. The UTXO rows follow in releaseUTXOLocks.
+func releaseLocksOnMine(ctx context.Context, q querier, txids [][]byte, floor int32) ([][]byte, error) {
+	seen := make(map[chainhash.Hash]struct{})
+
+	var released [][]byte
+
+	add := func(hs []chainhash.Hash) {
+		for _, h := range hs {
+			if _, dup := seen[h]; dup {
+				continue
+			}
+
+			seen[h] = struct{}{}
+			released = append(released, h[:])
+		}
+	}
+
+	for _, g := range leafGroups(txids) {
+		hs, err := queryTxids(ctx, q, releaseIdentLockSQL, g.leaf, g.txids, FlagLocked)
+		if err != nil {
+			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] release identity lock", err)
+		}
+
+		add(hs)
+	}
+
+	hs, err := queryTxids(ctx, q, releaseMinedLockSQL, txids, FlagLocked, floor)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] release containment lock", err)
+	}
+
+	add(hs)
+
+	return released, nil
+}
+
+// releaseUTXOLocks clears the locked bit on the UTXOs of the transactions releaseLocksOnMine
+// released, through setLockedSQL, which also covers every containment row they have at or above
+// the floor, including the one this mine inserted. Nothing is run when nothing was locked, so a
+// block whose transactions were all released by the two-phase commit pays no UTXO probe.
+func releaseUTXOLocks(ctx context.Context, q querier, txids [][]byte, floor int32) error {
+	if len(txids) == 0 {
+		return nil
+	}
+
+	leaves := make([]int16, 0, len(txids))
+	los := make([][16]byte, 0, len(txids))
+	his := make([][16]byte, 0, len(txids))
+
+	for _, txid := range txids {
+		leaves = append(leaves, LeafFor(txid))
+		los = append(los, Pack(txid, 0))
+		his = append(his, Pack(txid, ^uint32(0)))
+	}
+
+	if _, err := q.Exec(ctx, setLockedSQL, leaves, txids, los, his, false, FlagLocked, floor); err != nil {
+		return errors.NewStorageError("[utxoset][SetMinedMulti] release UTXO lock", err)
+	}
+
+	return nil
+}
 
 // unMineSQL is the un-mine: a POINT DELETE on the full containment key, for the one block the
 // caller has stopped believing in. It cannot reach another block's row, so a transaction that
@@ -144,9 +256,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		return map[chainhash.Hash][]uint32{}, nil
 	}
 
-	// The read-back's floor is the lower of the lookup floor and the start of the window
+	// The read-back's floor is the lower of the lookup floor and the start of the partition
 	// holding this block, so the call always sees the row it has just written, or the row a
-	// fenced replay found, even when the stamp is more than a window late.
+	// fenced replay found, even when the stamp is more than a partition late.
 	floor := s.lookupFloor()
 	if w := int32(info.BlockHeight / TxMinedPartitionBlocks * TxMinedPartitionBlocks); w < floor { //nolint:gosec // a height fits int32
 		floor = w
@@ -221,7 +333,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 // reports quiet = true when it wrote no containment row on purpose, below the fence.
 //
 // ensureTxMinedPartition runs BEFORE the transaction opens, because the DDL needs its own pool
-// connection; the same rule the create path follows. It refuses a dropped window, so a call
+// connection; the same rule the create path follows. It refuses a dropped partition, so a call
 // that names one never reaches the fence.
 //
 // The fence lock is the transaction's first statement, and the fence is read as its second.
@@ -259,7 +371,7 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 
 	if fence.dropped(info.BlockHeight) {
 		if info.OnLongestChain {
-			return false, boundaryError("record_mined", "block %d at height %d is on the longest chain and its window is dropped; its mined status was never written, so a refusal above was bypassed",
+			return false, boundaryError("record_mined", "block %d at height %d is on the longest chain and its partition is dropped; its mined status was never written, so a refusal above was bypassed",
 				info.BlockID, info.BlockHeight)
 		}
 
@@ -291,6 +403,12 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 
 	floor := s.lookupFloor()
 
+	// The lock goes first, so the containment rows inserted below copy an unlocked payload.
+	released, err := releaseLocksOnMine(ctx, dbTx, txids, floor)
+	if err != nil {
+		return false, err
+	}
+
 	for _, g := range leafGroups(txids) {
 		if insert {
 			if _, err := dbTx.Exec(ctx, recordMinedSQL, g.leaf, g.txids,
@@ -306,6 +424,10 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 		if _, err := dbTx.Exec(ctx, clearMarkerSQL, g.leaf, g.txids); err != nil {
 			return false, errors.NewStorageError("[utxoset][SetMinedMulti] clear marker", err)
 		}
+	}
+
+	if err := releaseUTXOLocks(ctx, dbTx, released, floor); err != nil {
+		return false, err
 	}
 
 	if err := dbTx.Commit(ctx); err != nil {
@@ -330,9 +452,9 @@ func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.Mined
 // UTXO reset the un-mine used to run is gone rather than narrowed.
 //
 // No ensureTxMinedPartition, and that is not an omission. The un-mine only DELETES from
-// tx_mined; the window it deletes from either exists, or the block was never recorded at that
-// height and there is nothing to un-mine. Creating a window here would be actively wrong -- the
-// floor exists to stop a retired window being recreated.
+// tx_mined; the partition it deletes from either exists, or the block was never recorded at that
+// height and there is nothing to un-mine. Creating a partition here would be actively wrong -- the
+// floor exists to stop a retired partition being recreated.
 //
 // The marker is set on every listed identity row, whether or not this block's row was there to
 // delete, as the un-mine has always done: setting it wrongly costs a mined transaction reloaded
@@ -365,7 +487,7 @@ func (s *Store) unMine(ctx context.Context, txids [][]byte, info utxo.MinedBlock
 	// Below the fence a row that exists is a winner, and deleting it would take the chain
 	// out from under a stamped UTXO: the boundary error. An un-mine that finds no row there
 	// is an invalid deep fork block whose row was a loser and is already gone: allowed and
-	// counted, so its mined status can settle. A dropped window is skipped the same way.
+	// counted, so its mined status can settle. A dropped partition is skipped the same way.
 	fence, err := s.takeFenceShared(ctx, dbTx)
 	if err != nil {
 		return err
@@ -556,13 +678,13 @@ func leafGroups(txids [][]byte) []leafBatch {
 // minedIDsByTxidSQL reads the block ids tx_mined holds for a set of transactions at or above a
 // height floor, $2, in (mined_height, block_id) order. Every column it names is in the
 // primary key (txid, mined_height, block_id), so each key is one index descent per live
-// window and, once the visibility map is set, never a heap fetch.
+// partition and, once the visibility map is set, never a heap fetch.
 //
 // It is minedByTxidSQL's containment step with nothing joined to it, and the keys sit outside
 // the same LATERAL with OFFSET 0 fence for the same reason: without the fence the planner may
-// hash-join the keys against every live window. It does not touch tx_body at all, because
+// hash-join the keys against every live partition. It does not touch tx_body at all, because
 // SetMinedMulti's read-back wants only the ids; reading the body there is what put a seq scan
-// of every live body window on setTxMined's path on mainnet. The floor is a scalar bind
+// of every live tx_body partition on setTxMined's path on mainnet. The floor is a scalar bind
 // parameter, so partitions below it are pruned at plan time.
 const minedIDsByTxidSQL = `
 SELECT k.txid, m.block_id

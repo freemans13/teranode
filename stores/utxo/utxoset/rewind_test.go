@@ -52,7 +52,7 @@ func TestRemoveFromConflictingChildrenDropsOnlyWhatIsNamed(t *testing.T) {
 
 // TestRemoveFromConflictingChildrenSearchesEveryWindow. The pair can have been noted at any
 // height still inside the journal's retention, and the caller has no way to know which, so a
-// removal that only looked in the current window would silently leave the route in place.
+// removal that only looked in the current partition would silently leave the route in place.
 func TestRemoveFromConflictingChildrenSearchesEveryWindow(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -62,7 +62,7 @@ func TestRemoveFromConflictingChildrenSearchesEveryWindow(t *testing.T) {
 	plantConflictNote(t, s, ctx, 100, parent, child)
 	plantConflictNote(t, s, ctx, 5_000, parent, child)
 	require.Equal(t, [][]byte{child}, conflictChildrenOf(t, s, ctx, parent),
-		"the same pair in two windows reads back once")
+		"the same pair in two partitions reads back once")
 
 	require.NoError(t, s.RemoveFromConflictingChildren(ctx, []utxo.ConflictingChildRemoval{
 		{ParentHash: hashOf(parent), ChildHash: hashOf(child)},

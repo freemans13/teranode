@@ -62,28 +62,34 @@ type Store struct {
 	// journalRetention is how far back spends stay undoable, in blocks.
 	journalRetention uint32
 
-	// bodyWindow is the tx_body window the last create landed in, so the catalog is only
+	// bodyWindow is the tx_body partition the last create landed in, so the catalog is only
 	// touched when it changes.
 	bodyWindow atomic.Uint32
 
-	// carryBound is the carry bound, a window number plus one, that carryUnminedBodies last
-	// ran to completion for, so the unmined set is read once per new window rather than per
+	// carryBound is the carry bound, a partition number plus one, that carryUnminedBodies last
+	// ran to completion for, so the unmined set is read once per new partition rather than per
 	// block. Zero means not yet in this process.
 	carryBound atomic.Uint32
+
+	// carryFloorValue is the tx_body_carry_floor height last read, and carryFloorTip the tip it
+	// was read at plus one, so the lookup reads the floor again once per tip at most. Zero means
+	// not yet read in this process. See carryFloor.
+	carryFloorValue atomic.Uint32
+	carryFloorTip   atomic.Uint64
 
 	// bodyDDL serialises tx_body partition creation within this process, for the same
 	// reason journalDDL does: CREATE TABLE IF NOT EXISTS is not concurrency-safe.
 	bodyDDL sync.Mutex
 
-	// minedWindow is the tx_mined window the last block-path create landed in, so the
-	// catalog is only touched when it changes. Holds window+1 so zero means "nothing yet".
+	// minedWindow is the tx_mined partition the last block-path create landed in, so the
+	// catalog is only touched when it changes. Holds its number plus one, so zero means "nothing yet".
 	minedWindow atomic.Uint32
 
-	// leadingSkipLogged is set once the stamp has logged that it is skipping the windows below
-	// the lowest containment window, so a seeded store says so once rather than per window.
+	// leadingSkipLogged is set once the stamp has logged that it is skipping the partitions below
+	// the lowest tx_mined partition, so a seeded store says so once rather than per partition.
 	leadingSkipLogged atomic.Bool
 
-	// minedDDL serialises tx_mined window creation within this process.
+	// minedDDL serialises tx_mined partition creation within this process.
 	minedDDL sync.Mutex
 
 	// indexMaintenance keeps the pruner's REINDEX CONCURRENTLY and the stamp worker's
@@ -139,12 +145,12 @@ type Store struct {
 	// this store's decorate reads the UTXO row.
 	bodyCheckpoints []chaincfg.Checkpoint
 
-	// stampDepth is how many blocks deep a containment window must be before the stamp writes
+	// stampDepth is how many blocks deep a tx_mined partition must be before the stamp writes
 	// its blocks onto UTXOs: twice the network's coinbase maturity, rounded up to a whole
-	// window. See StampDepthFor.
+	// partition. See StampDepthFor.
 	stampDepth uint32
 
-	// retainIndefinitely is the operator's explicit request to keep every containment window
+	// retainIndefinitely is the operator's explicit request to keep every tx_mined partition
 	// and undo partition. The stamp still runs; only the drops are skipped, and a gauge shows
 	// the request so the growth is visible.
 	retainIndefinitely bool
@@ -155,7 +161,7 @@ type Store struct {
 	// would. It performs no write.
 	stampPageHook func(wLo uint32, page int) error
 
-	// dropHook, when set by a test in this package, is called between a containment window's
+	// dropHook, when set by a test in this package, is called between a tx_mined partition's
 	// detach and its drop, so a test can record the order of drops or stand in for a crash.
 	dropHook func(window string)
 
@@ -333,7 +339,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.retainIndefinitely = true
 		retainIndefinitelyGauge.Set(1)
 
-		logger.Warnf("[utxoset] utxostore_retainWindowsIndefinitely is on: no containment window and no undo partition will be dropped; the stamp still runs and the disk grows without bound")
+		logger.Warnf("[utxoset] utxostore_retainWindowsIndefinitely is on: no tx_mined partition and no undo partition will be dropped; the stamp still runs and the disk grows without bound")
 	} else {
 		retainIndefinitelyGauge.Set(0)
 	}
@@ -342,15 +348,15 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// this store the pruner is not only the drop: under the block-facts design it also runs
 	// the deep stamp, the pass that writes each block onto the UTXOs of transactions seen
 	// before their block and deletes their identity rows. Skipping the pruner during catch-up
-	// would switch off both the stamp and every window drop for the whole of catch-up, and
+	// would switch off both the stamp and every partition drop for the whole of catch-up, and
 	// the disk would fill in silence. The stamp always runs on this store and has no off
-	// switch. An operator who wants to keep every window has a different lever:
+	// switch. An operator who wants to keep every partition has a different lever:
 	// utxostore_retainWindowsIndefinitely, which skips the drops and nothing else.
 	if tSettings.Pruner.SkipDuringCatchup {
 		pool.Close()
 
 		return nil, errors.NewConfigurationError(
-			"[utxoset] pruner_skipDuringCatchup is true, and the utxoset store refuses to start with it: on this store the pruner also runs the stamp, so skipping it during catch-up switches off the stamp and every window drop for the whole catch-up and fills the disk in silence. The stamp always runs and has no off switch. To keep windows past their retention set utxostore_retainWindowsIndefinitely instead of skipping the pruner")
+			"[utxoset] pruner_skipDuringCatchup is true, and the utxoset store refuses to start with it: on this store the pruner also runs the stamp, so skipping it during catch-up switches off the stamp and every partition drop for the whole catch-up and fills the disk in silence. The stamp always runs and has no off switch. To keep partitions past their retention set utxostore_retainWindowsIndefinitely instead of skipping the pruner")
 	}
 
 	if err := CreateSchema(ctx, pool); err != nil {

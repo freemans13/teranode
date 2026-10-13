@@ -124,7 +124,7 @@ func (b *BlockAssembler) chainStopsBelow(ctx context.Context, height uint32) boo
 // body-less record's coins are as live as any other's.
 //
 // Reading it the other way was a real outage. A UTXO store may legitimately hold
-// a transaction with Tx nil -- once the body window has aged out, and, with
+// a transaction with Tx nil -- once the tx_body partition has aged out, and, with
 // utxostore_skipTxBodyBelowCheckpoint on, for every transaction mined at or below
 // the hardcoded checkpoint, whose bytes are never written at all. Both return the
 // metadata with Tx nil and NO error (see stores/utxo/utxoset.Store.Get). While

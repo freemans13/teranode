@@ -222,7 +222,7 @@ func (s *Store) applyChunk(chunk []*spendAndCreateItem, delivered []bool) {
 
 	// Partitions BEFORE any transaction is opened. The DDL needs its own pool connection, and
 	// taking one while holding a transaction from the same pool deadlocks the pool under
-	// concurrency, with no timeout. A chunk can span journal leaves and body windows, so every
+	// concurrency, with no timeout. A chunk can span journal leaves and tx_body partitions, so every
 	// distinct one is prepared. A failure here is reported to every item, as the create batcher
 	// does: it is a catalog failure that a retry through the single path would only repeat.
 	if err := s.ensurePartitionsFor(ctx, chunk); err != nil {
@@ -280,7 +280,7 @@ func (s *Store) applyChunk(chunk []*spendAndCreateItem, delivered []bool) {
 	}
 }
 
-// ensurePartitionsFor creates every journal leaf, body window and membership window the batch
+// ensurePartitionsFor creates every journal leaf, tx_body partition and tx_mined partition the batch
 // will write into.
 func (s *Store) ensurePartitionsFor(ctx context.Context, batch []*spendAndCreateItem) error {
 	leaves := make(map[uint32]struct{}, 2)

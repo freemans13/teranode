@@ -31,20 +31,20 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 // first of four sources that has them, or extends the life of a copy already there.
 //
 // The sources, in order, are what makes a preserved row never name a loser. First, the parent's
-// surviving containment row in a window the stamp has COMPLETED, below $7: the stamp deleted
-// that window's losers, so the row left is the winner, and it carries the full payload. Second,
-// a containment row at or above $7 means the parent's window is not yet completed: the parent is
+// surviving containment row in a partition the stamp has COMPLETED, below $7: the stamp deleted
+// that partition's losers, so the row left is the winner, and it carries the full payload. Second,
+// a containment row at or above $7 means the parent's partition is not yet completed: the parent is
 // SKIPPED this cycle, not preserved, and retried next cycle, because a row there can still be a
 // loser and a thin copy written first would never be upgraded (the conflict clause updates only
-// the expiry). Third and fourth, only when no attached window holds a row for the parent at all:
+// the expiry). Third and fourth, only when no attached partition holds a row for the parent at all:
 // a live UTXO with a non-zero pair, then an undo copy with one. Those two give a thin row, the
 // pair and the flags with no fee, size or inputs, which is what the read path was answering for
 // this parent the moment before anyway. The locked bit is masked with $8, because a row this
 // deep never supplies it.
 //
-// $6 is the dropped floor. Skipping a parent is safe only until its window drops, and a window
+// $6 is the dropped floor. Skipping a parent is safe only until its partition drops, and a partition
 // cannot drop without a completion record, which the stamp writes only after it has run; after
-// that the window lives at least 1,728 more blocks and this pass runs every cycle.
+// that the partition lives at least 1,728 more blocks and this pass runs every cycle.
 //
 // ON CONFLICT takes the GREATEST of the two heights rather than the new one. The pruner names
 // a parent again on every cycle its child is still waiting, each time with a further-out
@@ -52,8 +52,8 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 // expiry over the longer one would retire the parent while the older child still needed it.
 //
 // The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the shape minedByTxidSQL
-// uses and for the identical reason: one primary-key descent per key per attached window
-// rather than a hash join against every window read whole.
+// uses and for the identical reason: one primary-key descent per key per attached partition
+// rather than a hash join against every partition read whole.
 const preserveParentSQL = `
 INSERT INTO preserved_parent (txid, mined_height, block_id, subtree_idx, created_height,
                               fee, size_in_bytes, tx_inpoints, locktime, created_at, flags,
@@ -98,8 +98,8 @@ SELECT k.txid, s.mined_height, s.block_id, s.subtree_idx, s.created_height,
    SET preserve_until = GREATEST(preserved_parent.preserve_until, EXCLUDED.preserve_until)`
 
 // renewPreservedSQL extends the preservation of every named parent that already has one. The
-// insert above copies a parent only from its block window, a live UTXO or a spend-journal row,
-// and a parent fully spent in its block loses all three once its window and journal partitions
+// insert above copies a parent only from its block's tx_mined partition, a live UTXO or a spend-journal row,
+// and a parent fully spent in its block loses all three once its partition and journal partitions
 // drop. Without this the row stopped renewing then, and lapsed while its child still waited:
 // on 2026-09-24 that left 283 parents unpreserved on mainnet. The row itself is the source for
 // its own renewal, as the preserveUntil on the protected record is on the other stores.
@@ -113,7 +113,7 @@ UPDATE preserved_parent p
 // the ones that are held elsewhere or will be reached, and the ones with no source at all. It
 // runs once per leaf group with the leaf as a scalar. A parent with an identity row is held by
 // it; a parent with a containment row at or above the completion floor, $3, will be reached
-// when its window completes. Any other is a hole in the retention arithmetic, and counted.
+// when its partition completes. Any other is a hole in the retention arithmetic, and counted.
 const preserveClassifySQL = `
 SELECT k.txid,
        EXISTS (SELECT 1 FROM tx_ident i
@@ -125,14 +125,14 @@ SELECT k.txid,
   FROM unnest($2::bytea[]) AS k(txid)
  WHERE NOT EXISTS (SELECT 1 FROM preserved_parent p WHERE p.txid = k.txid)`
 
-// PreserveTransactions keeps a parent answerable past the containment window that would
+// PreserveTransactions keeps a parent answerable past the tx_mined partition that would
 // otherwise have retired it, because a still-unmined child needs its facts to be validated
 // against on the day it is finally mined.
 //
 // The old justification for doing nothing here was that this store's reclaim consults the
 // spender's status rather than racing a clock, so a parent with a live child could never be
 // deleted out from under it. That is still true of the UTXO, and it is not enough. Containment
-// is dropped by height, whole windows at a time, and a parent whose UTXOs are all spent has no
+// is dropped by height, whole partitions at a time, and a parent whose UTXOs are all spent has no
 // UTXO left to answer from either: 1440 blocks after its block, the parent is simply gone. That
 // is the right answer for every parent except the one whose child never got mined, and the
 // pruner names exactly those (PreserveParentsOfOldUnminedTransactions). This is where the
@@ -245,7 +245,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 //
 // There is nothing to re-stamp, unlike the aerospike store, whose Phase 1b has to hand the
 // parent back to the delete-at-height pruner. Here the row IS the preservation: once it is
-// gone the parent is reclaimed by the same dropped window every other transaction is, with no
+// gone the parent is reclaimed by the same dropped partition every other transaction is, with no
 // second mechanism to hand it to.
 //
 // This runs on a background timer, so an error is not fatal but is logged on every cycle.

@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/util"
 )
 
@@ -33,6 +34,11 @@ type NullStore struct {
 	// it satisfies the interface contract rather than being a laxer special
 	// case that the shared test suite would let through.
 	utxo.BlockStateFields
+}
+
+// Stamper implements utxo.Store. The null store keeps nothing, so it has nothing to stamp.
+func (m *NullStore) Stamper() pruner.Stamper {
+	return pruner.NoStamp
 }
 
 // BatchDecorate implements utxo.Store.
@@ -172,7 +178,7 @@ func (m *NullStore) ParentOutputsForValidation(ctx context.Context, outpoints []
 
 // SpendAndCreateMulti writes the list through DefaultSpendAndCreateMulti.
 func (m *NullStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
-	return utxo.DefaultSpendAndCreateMulti(ctx, m, 1, txs, blockHeight, opts...)
+	return utxo.DefaultSpendAndCreateMulti(ctx, m, utxo.UniformSpendAndCreateMultiWidths(1), txs, blockHeight, opts...)
 }
 
 func (m *NullStore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {

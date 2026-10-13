@@ -23,6 +23,8 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 // recognises that error and sendSpendBatch retries it. Writing a level one
 // transaction at a time instead made every spend wait out the batcher timer on
 // its own: 300 independent transactions took 3.1s against 56ms concurrently.
+// A WithBelowCheckpoint list goes in two waves, every create and then every
+// spend, as wide as quick validation's create and spend phases were.
 func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
-	return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiConcurrency(s.settings), txs, blockHeight, opts...)
+	return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiWidthsFor(s.settings), txs, blockHeight, opts...)
 }

@@ -34,7 +34,7 @@ import (
 // The three writes a create makes used to be three separate statements on the pool. That cost
 // three commits each and was not atomic. A failure between them left an identity row with no
 // serialized bytes, which is indistinguishable from a transaction whose bytes have aged out
-// of their window, so it read as normal forever. Worse, the retry was refused, because the
+// of their partition, so it read as normal forever. Worse, the retry was refused, because the
 // identity claim reported the transaction as already present, so the bytes were never
 // written. Folding them into one statement fixes both at once: data-modifying common table
 // expressions run in a single snapshot, so either all land or none do, and both the body and
@@ -60,16 +60,16 @@ import (
 //
 // The tx_mined probe is bounded below by $25, claim_floor, a SCALAR bind parameter, and the
 // bound is what keeps the probe's cost flat as the stamp falls behind: without it the probe
-// takes one index descent in every attached window for every key, and attached windows grow by
+// takes one index descent in every attached partition for every key, and attached partitions grow by
 // one for every 288 blocks of stamp lag. Under force_custom_plan the planner sees the scalar as
-// a constant and prunes every window below it before taking a lock. See claimFloor for the
+// a constant and prunes every partition below it before taking a lock. See claimFloor for the
 // value and why it is deep enough, and why the lookup floor is NOT safe here.
 //
 // The own-output UTXO probe is the identical statement createMinedPlanSQL carries, LIMIT 1
 // OFFSET 0 fence and all, for the identical reason: a bare NOT EXISTS is flattened into an
 // anti-join, and the fence keeps it a per-row subplan on the UTXO's packed-key range. The
 // tx_mined probe has the same OFFSET 0 fence, because tx_mined's primary key LEADS with txid
-// and a hash anti-join over a whole window is the plan the planner otherwise reaches for at
+// and a hash anti-join over a whole partition is the plan the planner otherwise reaches for at
 // batch widths: measured at 500 keys against 40,000 containment rows, 9.4 ms.
 //
 // The mined CTE is the containment row for a block-carrying create above the checkpoint. It is
@@ -267,7 +267,7 @@ UTXOs AS (
 SELECT k FROM claim`
 
 // claimReach is how far below the store's height the create claims' containment probe reads,
-// in blocks: 2,016, which is seven 288-block windows.
+// in blocks: 2,016, which is seven 288-block partitions.
 //
 // The danger the probe guards against is a fully spent transaction being re-offered as
 // unmined and created a second time. For that its spend phase has to pass as a replay of its
@@ -280,12 +280,12 @@ SELECT k FROM claim`
 const claimReach = 2_016
 
 // claimFloor is the lower bound, a height, of the create claims' containment probe: a scalar
-// bind parameter, never a join variable, so the planner prunes every window below it at plan
+// bind parameter, never a join variable, so the planner prunes every partition below it at plan
 // time.
 //
 // It is the lower of two values. The first is the store's height less claimReach, aligned
-// down to a window edge; H is the height the node last gave the store, and a stale H only
-// lowers the floor, which reads more windows and never fewer. The second is the window edge at
+// down to a partition edge; H is the height the node last gave the store, and a stale H only
+// lowers the floor, which reads more partitions and never fewer. The second is the partition edge at
 // or below the first height of the oldest attached undo partition. That second bound is what
 // makes the guard sound however late the undo drops run: a replay needs its undo copies, the
 // undo copies live in the attached undo partitions, so a containment row the probe must see
@@ -590,7 +590,7 @@ func (s *Store) runCreatePlan(ctx context.Context, q querier, p *createPlan) err
 
 // createSeedPlanSQL is the seeding route: the coins of each transaction, with their block height
 // and block id already set, and nothing else. No containment row, no identity row, no body: a
-// seeded transaction is answered from its coins, as any transaction whose window has retired is.
+// seeded transaction is answered from its coins, as any transaction whose partition has retired is.
 //
 // The claim is that the transaction has no coin yet, the own-output probe the other two
 // statements also carry, with the same fence. A snapshot holds every transaction once and only
@@ -658,7 +658,7 @@ func (s *Store) runIdentPlan(ctx context.Context, q querier, p *createPlan) erro
 // is judged per block by the fenced rule before the claim runs: every row present means a
 // re-offered block, which the claim then refuses with ErrTxExists as it does above the fence;
 // any row absent is the boundary error, because a create there would add a row where every
-// row is a winner. A dropped window is refused as it always was.
+// row is a winner. A dropped partition is refused as it always was.
 func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) error {
 	dbTx, ok := q.(pgx.Tx)
 	if !ok {
@@ -689,9 +689,9 @@ func (s *Store) runMinedPlan(ctx context.Context, q querier, p *createPlan) erro
 }
 
 // lookaheadBlocks is how far above the store's own height a block may be applied under the drop
-// rule's premise. The window drop waits one undo partition, 288 blocks, of margin past the tip
+// rule's premise. The partition drop waits one undo partition, 288 blocks, of margin past the tip
 // the stamp completed at, so that a spend journalled above that tip cannot leave a (0,0) undo
-// copy the window no longer covers. The margin holds while no block is applied more than 287
+// copy the partition no longer covers. The margin holds while no block is applied more than 287
 // heights ahead of the tip the store was last told. A store instance cannot see a block another
 // process is applying, so the premise is not enforced; it is counted, and a non-zero count is
 // the signal that the margin needs revisiting.
@@ -719,7 +719,7 @@ func (s *Store) countCreatesAheadOfTip(p *createPlan) {
 
 		seen[p.minedHeight[i]] = struct{}{}
 		createAheadOfTip.Inc()
-		s.logger.Warnf("[utxoset][Create] block %d at height %d is being applied %d heights ahead of the store's height %d, past the %d the window drop rule assumes", p.blockID[i], mh, mh-h, h, lookaheadBlocks)
+		s.logger.Warnf("[utxoset][Create] block %d at height %d is being applied %d heights ahead of the store's height %d, past the %d the partition drop rule assumes", p.blockID[i], mh, mh-h, h, lookaheadBlocks)
 	}
 }
 
@@ -737,7 +737,7 @@ func (s *Store) judgeFencedCreates(ctx context.Context, q querier, p *createPlan
 		}
 
 		if fence.dropped(h) {
-			return boundaryError("create", "block %d at height %d is in a dropped window; re-creating it would claim every transaction in it afresh",
+			return boundaryError("create", "block %d at height %d is in a dropped partition; re-creating it would claim every transaction in it afresh",
 				p.blockID[i], p.minedHeight[i])
 		}
 
@@ -847,8 +847,8 @@ func (s *Store) lockTxids(ctx context.Context, q pgx.Tx, txids [][]byte) error {
 // nothing here needed to move when that choice stopped being fixed.
 //
 // The sql store's create callback issues statements and nothing else, so two batches running
-// at once cannot interfere. This one may also run DDL: a create at a height whose body window
-// does not exist yet has to make the window first, and a batch can span several. Concurrent
+// at once cannot interfere. This one may also run DDL: a create at a height whose tx_body partition
+// does not exist yet has to make the partition first, and a batch can span several. Concurrent
 // batches doing DDL against the same parent table, coordinated through a one-entry cache, is
 // far more machinery than the win justifies.
 //
@@ -909,10 +909,10 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 	// would be the nested-acquire hazard in a different disguise.
 	plan := s.planCreates(batch)
 
-	// The body window has to exist before the statement runs, for the same reason the spend
+	// The tx_body partition has to exist before the statement runs, for the same reason the spend
 	// journal's does: the DDL needs its own connection, and taking one while holding a
 	// transaction from the same pool deadlocks with no timeout once writers reach the pool
-	// limit. A batch can span windows, so every distinct one is prepared.
+	// limit. A batch can span partitions, so every distinct one is prepared.
 	seen := make(map[int32]struct{}, 4)
 
 	for i, h := range plan.heights {
@@ -933,7 +933,7 @@ func (s *Store) sendCreateBatch(batch []*createItem) {
 		}
 	}
 
-	// The containment window of every distinct block height the batch records, whichever
+	// The tx_mined partition of every distinct block height the batch records, whichever
 	// claim the row takes, for the same reason and with the same before-the-transaction rule.
 	minedSeen := make(map[int32]struct{}, 4)
 

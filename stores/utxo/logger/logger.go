@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
@@ -128,6 +129,10 @@ func (s *Store) GetBlockState() utxo.BlockState {
 	s.logger.Debugf("[UTXOStore][logger][GetBlockState] height: %d, medianTime: %d : %s", blockState.Height, blockState.MedianTime, caller())
 
 	return blockState
+}
+
+func (s *Store) Stamper() pruner.Stamper {
+	return s.store.Stamper()
 }
 
 // SupportsOutpointOnlySpend delegates to the wrapped store.

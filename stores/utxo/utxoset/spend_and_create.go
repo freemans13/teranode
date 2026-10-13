@@ -122,9 +122,9 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 		}
 
 		// The conflict note lands at the store's CURRENT height, which need not be in the
-		// same window as blockHeight: a block being applied is behind the tip, and the ensure
+		// same partition as blockHeight: a block being applied is behind the tip, and the ensure
 		// above is for the block's height. Asked for explicitly so the note cannot fail on a
-		// window nothing created, and the height read here is the one createIn is given.
+		// partition nothing created, and the height read here is the one createIn is given.
 		if options.Conflicting {
 			if err := s.ensureSpendJournalPartition(ctx, notedHeight); err != nil {
 				return nil, nil, err

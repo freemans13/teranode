@@ -51,8 +51,8 @@ import (
 //     cap on the table that holds UTXO state, because removing it would quietly change
 //     the workload. The run logs how often it fired so a reader can check it did not.
 //
-//  3. This store's pruner reclaims retired spend-journal leaves and aged transaction-body
-//     windows, on horizons of 1440 and 288 blocks. A run of this length never reaches
+//  3. This store's pruner reclaims retired spend-journal leaves and aged tx_body
+//     partitions, on horizons of 1440 and 288 blocks. A run of this length never reaches
 //     them, so the pruner spins and finds nothing. Growth in tx_ident and tx_body over
 //     the run is logged for exactly that reason: it is the cost this measurement does
 //     not charge.

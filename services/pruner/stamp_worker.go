@@ -13,13 +13,13 @@ import (
 )
 
 // THE STAMP WORKER. A second goroutine in the pruner service, beside the pruner processor and
-// never in front of it. It exists only for a UTXO store that implements pruner.Stamper, which
-// today is the utxoset store: its UTXOs get their block written once, by a pass that runs when
-// a 288-block window is 288 blocks deep, and this worker is what drives that pass.
+// never in front of it. It exists only for a UTXO store whose Stamper has a non-zero partition
+// width, which today is the utxoset store: its UTXOs get their block written once, by a pass
+// that runs when a 288-block partition is 288 blocks deep, and this worker is what drives that pass.
 //
 // The store cannot see the chain. This worker holds the blockchain client, reads the best tip
 // past the response cache, builds one proven chain answer per drain by walking parent links,
-// and hands both to the store one transaction at a time: open the drain, then for each window
+// and hands both to the store one transaction at a time: open the drain, then for each partition
 // lowest first, begin it, stamp its pages, complete it. Between every one of those store calls
 // it re-reads the tip and checks that the drain's anchor is still an ancestor of it. A chain
 // that only grew keeps the same answer; a chain that switched branches abandons the drain with
@@ -27,13 +27,13 @@ import (
 //
 // Two things wake it. The pruner processor forwards its notification after the four start
 // conditions have passed, on a channel that keeps only the latest signal. And a retry timer,
-// armed whenever a drain ends with windows still stampable or fails to start for any reason
+// armed whenever a drain ends with partitions still stampable or fails to start for any reason
 // but "nothing to stamp", runs a drain with no notification at all. That second route is what
 // lets a node that has stopped accepting blocks, and so receives no notifications, still work
 // off its backlog.
 //
 // A service with no blockchain client keeps the worker: each wake counts and stamps nothing.
-// No window then gets a completion record, so no containment window drops, and the counter is
+// No partition then gets a completion record, so no tx_mined partition drops, and the counter is
 // how that shows.
 
 // stampRetryInterval is how long after a short drain the worker tries again. A compile-time
@@ -48,7 +48,7 @@ type bestTip struct {
 }
 
 // stampDrainReport is what one wake did. outcome is the label counted on stampDrains or
-// stampWakesSkipped; residualLag is the number of windows still stampable at the last tip read
+// stampWakesSkipped; residualLag is the number of partitions still stampable at the last tip read
 // with no completion record, which is zero when the drain caught up.
 type stampDrainReport struct {
 	outcome     string
@@ -71,15 +71,17 @@ func (r stampDrainReport) rearm() bool {
 	}
 }
 
-// findStamper finds the stamp side of the UTXO store by type assertion, exactly as Init finds
-// the pruner provider. A store that does not implement it gets no stamp worker.
+// findStamper asks the UTXO store for its stamp, the same call on every store, and returns nil
+// when the store has nothing to stamp. That answer is a partition width of zero, which pruner.NoStamp
+// gives: the worker then never starts and no wake is ever forwarded, so a store without a stamp
+// costs no chain read, no database call and no stamp metric. Asked once, at Init.
 func (s *Server) findStamper() pruner.Stamper {
 	if s.utxoStore == nil {
 		return nil
 	}
 
-	st, ok := s.utxoStore.(pruner.Stamper)
-	if !ok {
+	st := s.utxoStore.Stamper()
+	if st == nil || st.WindowBlocks() == 0 {
 		return nil
 	}
 
@@ -138,7 +140,7 @@ func (s *Server) stampWorker(ctx context.Context) {
 func (s *Server) runStampDrain(ctx context.Context, sig *pruneSignal, timerDriven bool) stampDrainReport {
 	if s.blockchainClient == nil {
 		stampWakesSkipped.WithLabelValues("no_chain_client").Inc()
-		s.logger.Warnf("[pruner][stamp] wake with no blockchain client: nothing stamped, so no window can drop")
+		s.logger.Warnf("[pruner][stamp] wake with no blockchain client: nothing stamped, so no partition can drop")
 
 		return stampDrainReport{outcome: "no_chain_client"}
 	}
@@ -184,7 +186,7 @@ func (s *Server) runStampDrain(ctx context.Context, sig *pruneSignal, timerDrive
 		stampWakesSkipped.WithLabelValues(report.outcome).Inc()
 	}
 
-	s.logger.Infof("[pruner][stamp] drain %s: %d windows, %d pages, %d windows still stampable, %s", report.outcome, report.windows, report.pages, report.residualLag, time.Since(started).Round(time.Millisecond))
+	s.logger.Infof("[pruner][stamp] drain %s: %d partitions, %d pages, %d partitions still stampable, %s", report.outcome, report.windows, report.pages, report.residualLag, time.Since(started).Round(time.Millisecond))
 
 	return report
 }
@@ -269,7 +271,7 @@ func (s *Server) drainWindows(ctx context.Context, drain pruner.StampDrain, floo
 
 	abandon := func() stampDrainReport {
 		stampDrainsAbandoned.Inc()
-		s.logger.Warnf("[pruner][stamp] drain abandoned at window %d after %d windows and %d pages: the best chain left anchor %s at %d", wLo, windows, pages, anchor.hash, anchor.height)
+		s.logger.Warnf("[pruner][stamp] drain abandoned at partition %d after %d partitions and %d pages: the best chain left anchor %s at %d", wLo, windows, pages, anchor.hash, anchor.height)
 
 		return report("abandoned", windows, pages)
 	}
@@ -281,7 +283,7 @@ func (s *Server) drainWindows(ctx context.Context, drain pruner.StampDrain, floo
 
 		state, err := drain.BeginWindow(ctx, wLo, anc)
 		if err != nil {
-			s.logger.Errorf("[pruner][stamp] begin window %d: %v", wLo, err)
+			s.logger.Errorf("[pruner][stamp] begin partition %d: %v", wLo, err)
 
 			return report("error", windows, pages)
 		}
@@ -302,7 +304,7 @@ func (s *Server) drainWindows(ctx context.Context, drain pruner.StampDrain, floo
 			}
 
 			if _, err := drain.StampPage(ctx, wLo, anc, page); err != nil {
-				s.logger.Errorf("[pruner][stamp] window %d page %d: %v", wLo, page, err)
+				s.logger.Errorf("[pruner][stamp] partition %d page %d: %v", wLo, page, err)
 
 				return report("error", windows, pages)
 			}
@@ -316,7 +318,7 @@ func (s *Server) drainWindows(ctx context.Context, drain pruner.StampDrain, floo
 		}
 
 		if err := drain.CompleteWindow(ctx, wLo, anc, last.height); err != nil {
-			s.logger.Errorf("[pruner][stamp] complete window %d: %v", wLo, err)
+			s.logger.Errorf("[pruner][stamp] complete partition %d: %v", wLo, err)
 
 			return report("error", windows, pages)
 		}
@@ -326,8 +328,8 @@ func (s *Server) drainWindows(ctx context.Context, drain pruner.StampDrain, floo
 	}
 }
 
-// stampableWindows counts the windows from completeFloor upward whose last block is at least
-// depth below tip: the windows a drain at tip could stamp.
+// stampableWindows counts the partitions from completeFloor upward whose last block is at least
+// depth below tip: the partitions a drain at tip could stamp.
 func stampableWindows(completeFloor, tip, width, depth uint32) uint32 {
 	if tip < width-1+depth {
 		return 0
@@ -402,7 +404,7 @@ func (s *Server) checkAnchorHint(ctx context.Context, hint chainhash.Hash, ancho
 // stampStartConditions re-runs, for a timer-driven drain, the start conditions a
 // notification-driven drain got from the pruner processor. It returns the skip reason, or ""
 // to proceed. The mined-status wait is not re-run, because there is no notified block to wait
-// on; the store checks the window's own mined flags inside every pass.
+// on; the store checks the partition's own mined flags inside every pass.
 func (s *Server) stampStartConditions(ctx context.Context, height uint32) string {
 	if s.settings.Pruner.MinBlockHeight > 0 && height <= s.settings.Pruner.MinBlockHeight {
 		return "below_min_height"

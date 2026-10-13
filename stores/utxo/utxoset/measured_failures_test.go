@@ -197,7 +197,7 @@ func TestEveryLiveUTXOOfOneTransactionCarriesTheSamePair(t *testing.T) {
 // TestPreservedCopyNamesTheBlockThatWon is measured failure 4, decision site 3 of the design's
 // earliest-row rule. The preserve pass used to copy the parent's first containment row in
 // (mined_height, block_id) order, which here is the fork block with the lower id rather than
-// the block the caller said is on the longest chain. Preservation now reads only windows the
+// the block the caller said is on the longest chain. Preservation now reads only partitions the
 // stamp has completed, where the losing rows are already deleted, and skips the parent until
 // then.
 func TestPreservedCopyNamesTheBlockThatWon(t *testing.T) {
@@ -216,20 +216,20 @@ func TestPreservedCopyNamesTheBlockThatWon(t *testing.T) {
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
 	_, ok := preservedPairOf(t, s, ctx, parent)
-	require.False(t, ok, "not yet: the window is not completed, so either row could still be the loser")
+	require.False(t, ok, "not yet: the partition is not completed, so either row could still be the loser")
 
 	stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 8})
 
 	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
 
 	pair, ok := preservedPairOf(t, s, ctx, parent)
-	require.True(t, ok, "a parent with containment in a completed window is preserved")
+	require.True(t, ok, "a parent with containment in a completed partition is preserved")
 	require.Equal(t, [2]int32{100, 8}, pair, "the block on the longest chain, not the loser")
 }
 
 // TestPreservedCopyNeverOutranksACorrectUTXO is measured failure 5. The read order used to try
 // the identity row and containment, then the preserved copy, then the UTXO, then the undo
-// copy. A preserved copy taken under the interim rule could name a loser, and once the window
+// copy. A preserved copy taken under the interim rule could name a loser, and once the partition
 // was gone it then answered ahead of a UTXO that carries the correct pair. The preserved copy
 // is now read LAST, behind the UTXO and the undo copy, which removes the failure even if a
 // wrong copy is ever written. The store's own preservation can no longer write one, so the
@@ -250,7 +250,7 @@ func TestPreservedCopyNeverOutranksACorrectUTXO(t *testing.T) {
 	require.NoError(t, err)
 
 	dropped := retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 8})
-	require.Equal(t, 1, dropped, "the window has to be gone for the preserved copy to be consulted at all")
+	require.Equal(t, 1, dropped, "the partition has to be gone for the preserved copy to be consulted at all")
 
 	h, b := utxoFacts(t, s, ctx, parent)
 	require.Equal(t, int32(100), h)
