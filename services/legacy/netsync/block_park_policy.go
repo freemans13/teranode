@@ -95,6 +95,17 @@ type parkDisposition struct {
 	// strands the node where a wrong disconnect costs a reconnect;
 	// recentlyFailedBlocks already stops the hash being re-asked.
 	dropPeer bool
+
+	// reAsk sends the delivering peer (or the sync peer) a getblocks from the best
+	// block once the record is dropped, so the block is announced and fetched again.
+	// Set on every row that drops the record without writing the block off and that
+	// wants the block back. Below the last checkpoint the wanted-range pass names a
+	// dropped block anyway; above it nothing does, because blocks there are named by
+	// announcements and the download ledger and a dropped record is in neither. On
+	// 2026-10-10 the chain waited 13 minutes at 970,502 for the next announcement.
+	// Not set on committed (the block is in the chain) or abandoned (its parent is
+	// never coming, so the block is not wanted).
+	reAsk bool
 }
 
 // The table. Read down the columns: keep-or-drop, rewind-or-not, blame-or-not.
@@ -147,13 +158,16 @@ var (
 
 	// parkDispositionBlobUnusable — the blob is gone, or will not decode, or
 	// decodes into some other block. That is evidence about the file and not
-	// about the peer: we wrote it, so a bad blob is our fault. Delete it; the
-	// block is still in the wanted range and now unowed, so the next
-	// wanted-range pass downloads it again.
+	// about the peer: we wrote it, so a bad blob is our fault. Delete it; below
+	// the last checkpoint the block is still in the wanted range and now
+	// unowed, so the next wanted-range pass downloads it again, and above it
+	// reAsk asks a peer for it.
 	parkDispositionBlobUnusable = parkDisposition{
 		name:   "blob_unusable",
 		reason: "the parked blob is not the block it claims to be",
 		blob:   parkBlobDrop,
+
+		reAsk: true,
 	}
 
 	// parkDispositionRecordCorrupt — block validation returned a corrupt
@@ -163,7 +177,8 @@ var (
 	// wrote before the record existed, so a corrupt verdict afterwards is about
 	// this node's own files, never about the peer's bytes. Drop the record,
 	// mark nothing, blame nobody; the block is unowed on the next wanted-range
-	// pass and is downloaded again.
+	// pass and is downloaded again, or, above the last checkpoint, reAsk asks a
+	// peer for it.
 	//
 	// Dropping repairs the one case it is written for: on the unified route a
 	// structure file that does not hash to its key is deleted by
@@ -173,7 +188,7 @@ var (
 	// validation returns a ServiceError instead, which lands on retryLater
 	// above. subtreeWriter.put never rewrites a key that is already there, so
 	// no other corrupt verdict is repaired by a re-download, and for every
-	// other one this row is a loop (drop, re-ask, same verdict). What those
+	// other one this row is a loop (drop, re-ask, same verdict), paced by reAskDroppedBlock's backoff. What those
 	// others are, and why none is reachable for a sink-written record except
 	// through a bug or a damaged file: quick validation's own corrupt verdicts
 	// after the anchor (coinbase placeholder outside [0][0], subtree size
@@ -188,21 +203,25 @@ var (
 	// full-route verdict a legacy block CAN reach on an honest run, an invalid
 	// transaction in a subtree, is returned as ErrBlockInvalid for baseURL
 	// "legacy" (BlockValidation.go, the ErrTxInvalid branch) because the sink
-	// bound the list, so it lands on BlockRejected below and not here. A new
+	// bound the list, so it lands on BlockInvalid below and not here. A new
 	// corrupt producer on either route has to answer the same question before
 	// this row is right for it: does the re-download rewrite the file?
 	parkDispositionRecordCorrupt = parkDisposition{
 		name:   "record_corrupt",
 		reason: "a corrupt verdict on a record this node wrote; the body was verified against the header at the sink, so the fault is local",
 		blob:   parkBlobDrop,
+
+		reAsk: true,
 	}
 
 	// parkDispositionFilesGone — the record names subtree files that are no
 	// longer on disk. The record carries no delete-at-height of its own while
 	// every subtree file does (subtree_writer.go), so expiry removes the files
-	// from under it; a concurrent conversion's cleanup can do the same. Drop
+	// from under it. A concurrent conversion's cleanup no longer can: it leaves
+	// a file another block adopted (subtreeAdoptions). Drop
 	// the record, mark nothing, blame nobody: the next wanted-range pass sees
-	// the block as not held and downloads it again, and the sink rewrites
+	// the block as not held and downloads it again (above the last checkpoint
+	// reAsk asks a peer for it instead), and the sink rewrites
 	// whichever files are missing (put skips the ones still there).
 	//
 	// Reached two ways. hasCompleteRecord on the commit path finds the files
@@ -221,6 +240,8 @@ var (
 		name:   "files_gone",
 		reason: "the record names subtree files that are no longer on disk",
 		blob:   parkBlobDrop,
+
+		reAsk: true,
 	}
 
 	// parkDispositionLocalUtxoFault — a parent output this block spends is
@@ -474,7 +495,7 @@ const parkRejectWriteBound = 2 * time.Second
 
 // applyParkDisposition carries out one row of the table. It is the ONLY place
 // that deletes a parked blob, restores a parked entry, rejects one to a peer,
-// or drops the peer that delivered one.
+// drops the peer that delivered one, or asks a peer again for a dropped one.
 //
 // It runs on the in-order commit goroutine (parkedBlockFailed, from the drain),
 // so nothing here may wait on a peer: a reject is queued, never awaited, and
@@ -497,6 +518,17 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 
 	if d.markFailed && sm.recentlyFailedBlocks != nil {
 		sm.recentlyFailedBlocks.Set(entry.hash, struct{}{})
+	}
+
+	// In headers-first mode the wanted-range pass names the dropped block, so only
+	// above the last checkpoint is the re-ask needed.
+	if d.reAsk && !sm.headersFirstMode.Load() {
+		sm.reAskDroppedBlock(entry)
+	}
+
+	// A block in the chain or written off is not wanted back, so its re-ask pacing ends here.
+	if !d.reAsk && (d.name == parkDispositionCommitted.name || d.markFailed) {
+		sm.forgetDroppedReAsk(entry.hash)
 	}
 
 	if !d.blamePeer && !d.dropPeer {
@@ -536,6 +568,67 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 		// waited on.
 		entry.peer.DisconnectAssociation(dropReason)
 	}
+}
+
+// reAskDroppedBlock asks a peer again for a block whose parked record a reAsk row has just
+// dropped, above the last checkpoint, where nothing else will.
+//
+// A request for a block passes several suppression layers, and a re-ask has to get through
+// every one that would swallow it while a real duplicate is still stopped:
+//
+//   - PushGetBlocksMsg drops a getblocks that repeats the last (locator[0], stop hash) pair
+//     sent to that peer. The re-ask used to be a getblocks from the best block with a zero stop
+//     hash, which is exactly the request that fetched the block whenever the tip has not moved
+//     since, so it never left the node (external review of e4698b219). It is a getdata for the
+//     one block now, which no filter on the peer touches.
+//   - handleInvMsg ignores invs from anyone but the sync peer while the node is not current,
+//     and drainRequestQueue skips a block held locally or requested within the retry window.
+//     A getdata needs no inv, so none of that is in the way.
+//   - The streaming gate takes a body only if the download ledger says it was requested.
+//     reAskBlockFromPeer records the request first, against the primary peer, because the
+//     ledger is keyed by primary: entry.peer is the DATA1 sub-peer when the body streamed, and
+//     Delivered(primary, hash) would never discharge a record kept on the sub-peer.
+//   - recentlyFailedBlocks: no reAsk row marks the block failed (pinned by
+//     TestParkDispositions_ReAskIsSetOnTheDropRowsThatWantTheBlockBack).
+//
+// What still stops it is a request that would really be a duplicate: the block parked again,
+// arriving, being converted, or asked of any peer within the retry window. The dispatcher's
+// own in-flight entry for this block is not asked, because this disposition is how that entry
+// ends. livePeer may fall back to the sync peer: a re-ask is a sync action, not a misbehaviour
+// signal.
+//
+// A drop whose cause survives a re-download (a persistent record_corrupt, say) would re-download
+// and drop the block in a loop at network speed, so the asks are paced per block
+// (admitDroppedReAsk): the first reAskFreeAttempts go at once, every later one waits a backoff
+// that doubles up to reAskBackoffMax, and the park sweep sends it when it is due
+// (sendDueReAsks).
+func (sm *SyncManager) reAskDroppedBlock(entry parkedBlock) {
+	if !sm.admitDroppedReAsk(entry, time.Now()) {
+		return
+	}
+
+	sm.askDroppedBlockAgain(entry)
+}
+
+// askDroppedBlockAgain sends the re-ask for a dropped block now, unless the block is already
+// on its way (see reAskDroppedBlock).
+func (sm *SyncManager) askDroppedBlockAgain(entry parkedBlock) {
+	peer := sm.livePeer(entry.peer)
+	if peer == nil {
+		return
+	}
+
+	_, peer, _ = sm.peerStateResolvingPrimary(peer)
+
+	if sm.blockPark.Has(entry.hash) || sm.streams.arriving(entry.hash) || sm.conversionInFlight(entry.hash) ||
+		sm.blockDownloads.RequestedWithin(entry.hash, blockRequestRetryInterval) {
+		sm.logger.Infof("[applyParkDisposition][%s] not asking again for the dropped block: it is already parked, arriving, converting or requested", entry.hash)
+
+		return
+	}
+
+	sm.logger.Infof("[applyParkDisposition][%s] asking %s again for the dropped block above the last checkpoint", entry.hash, peer)
+	sm.reAskBlockFromPeer(peer, entry.hash)
 }
 
 // rejectThenDropPeer queues the reject for entry to the peer that delivered it,

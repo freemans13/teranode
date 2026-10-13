@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -307,6 +310,11 @@ func TestPipelineBlockDelete_LogsARealReadFailureInsteadOfSwallowingIt(t *testin
 
 	require.Empty(t, warnings.warnings, "sanity: nothing has failed yet")
 
+	// The record is read only when no converting writer is waiting for the copy, the path
+	// for a record this process's sink did not just write. Settle the writer so the delete
+	// takes that path.
+	sm.settleAccepted(*blk.Hash(), false)
+
 	// converted: true — this delivery's own sink call above genuinely
 	// converted blk, so the read failure below (the store now holds a foreign
 	// block's bytes under blk's key) must still be treated as THIS call's own
@@ -374,4 +382,159 @@ func TestPipelineBlockDelete_DoesNotTouchAnotherDeliverysSubtreeFiles(t *testing
 				"peer B's own failed delivery (converted=false) must never delete peer A's DIFFERENT, still-parked delivery's subtree file %s for subtree %s", ft, h)
 		}
 	}
+}
+
+// Two copies of one block convert through the real sink, one after the other, so two writers
+// wait for verdicts (the second copy is admitted as soon as the first copy's sink returns). The
+// first copy is accepted and queued for the consumer; before the consumer parks it, the other
+// copy is refused. That refusal finds one writer, so it is not ambiguous, and the park does not
+// know the block yet. It must still keep the record and the subtree files, which the accepted
+// copy needs: the accepted-but-unparked copy counts as parked.
+func TestPipelineBlockDelete_ARefusalBeforeTheAcceptedCopyIsParkedKeepsTheRecord(t *testing.T) {
+	ctx := t.Context()
+
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.msgChan = make(chan interface{}, 4)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+
+	for range 2 {
+		converted, err := sm.pipelineBlockSink(hash, &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
+		require.NoError(t, err)
+		require.True(t, converted)
+	}
+
+	require.Equal(t, 2, waitingFor(sm, hash), "sanity: both copies' writers wait for verdicts")
+
+	record, err := sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err)
+
+	sm.QueueBlockOnDisk(peerpkg.BlockBody{Hash: hash, Converted: true}, nil)
+	require.Equal(t, 1, waitingFor(sm, hash), "the accepted copy is settled")
+	require.False(t, sm.blockPark.Has(hash), "sanity: the consumer has not parked it yet")
+
+	require.NoError(t, sm.pipelineBlockDelete(hash, true))
+
+	_, err = sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err, "the accepted copy's record survives the other copy's refusal")
+
+	for _, root := range record.Subtrees {
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta} {
+			exists, existsErr := store.Exists(ctx, root[:], ft)
+			require.NoError(t, existsErr)
+			require.True(t, exists, "and so does its %s for subtree %s", ft, root)
+		}
+	}
+
+	require.Zero(t, waitingFor(sm, hash), "the refused copy's writer is settled")
+}
+
+// An acceptance mark lasts until the consumer has handled the copy's message, however far behind
+// the consumer is: the consumer handles every queued message, so time is no evidence the message
+// was lost. It used to expire after settleBackstop, and a consumer more than a minute behind then
+// lost the protection before it parked the block.
+func TestSyncManager_AnAcceptanceMarkLastsUntilTheConsumerHandlesIt(t *testing.T) {
+	sm := &SyncManager{msgChan: make(chan interface{}, 1)}
+	hash := chainhash.Hash{7}
+
+	sm.QueueBlockOnDisk(peerpkg.BlockBody{Hash: hash, Converted: true}, nil)
+	require.True(t, sm.acceptancePending(hash))
+
+	sm.settleStale(time.Now().Add(10 * settleBackstop))
+	require.True(t, sm.acceptancePending(hash), "a queued copy stays marked however long the consumer takes")
+
+	sm.acceptanceHandled(hash)
+	require.False(t, sm.acceptancePending(hash), "the handler clears it")
+}
+
+// blockedIn reports whether some goroutine's stack is currently inside fn, which is how the test
+// below holds pipelineBlockDelete between two of its reads without a hook in production code.
+func blockedIn(fn string) bool {
+	// The whole dump: with -count, goroutines other tests left behind can fill a fixed buffer
+	// and push the one asked about out of it.
+	buf := make([]byte, 1<<20)
+
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Contains(string(buf[:n]), fn)
+		}
+
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// The refusal read the park before the acceptance mark (review of 76be891d6). The consumer parks
+// an accepted copy and then clears its mark, so a refusal that read "not parked", then lost the
+// race to the consumer, then read "no mark", deleted the accepted copy's record. The test holds
+// the refusal at each read in turn with the locks the reads take: the park's lock while it reads
+// the park, then settlingMu while the consumer parks the block and clears the mark. Read mark
+// first, the refusal sees the mark and returns before it ever reads the park.
+func TestPipelineBlockDelete_ARefusalThatLosesTheRaceToTheConsumerKeepsTheRecord(t *testing.T) {
+	ctx := t.Context()
+
+	store := memory.New()
+	sm := newPipelineParkManager(t, store, 8)
+	sm.msgChan = make(chan interface{}, 4)
+
+	blk := wireBlockWithTxs(t, 20, false)
+	pipelineHeaderFixture(t, sm, blk)
+	body := blockBodyBytes(t, blk)
+	hash := *blk.Hash()
+
+	for range 2 {
+		converted, err := sm.pipelineBlockSink(hash, &blk.MsgBlock().Header, bytes.NewReader(body), sinkPayloadLen(body))
+		require.NoError(t, err)
+		require.True(t, converted)
+	}
+
+	// The first copy is accepted and queued: the mark is set and the park does not know it yet.
+	sm.QueueBlockOnDisk(peerpkg.BlockBody{Hash: hash, Converted: true}, nil)
+	require.True(t, sm.acceptancePending(hash))
+
+	sm.blockPark.mu.Lock()
+
+	done := make(chan error, 1)
+
+	go func() { done <- sm.pipelineBlockDelete(hash, true) }()
+
+	// Either the refusal has read the mark and returned, or it waits on the park's lock.
+	require.Eventually(t, func() bool {
+		select {
+		case err := <-done:
+			done <- err
+
+			return true
+		default:
+			return blockedIn("netsync.(*blockPark).")
+		}
+	}, 5*time.Second, time.Millisecond)
+
+	select {
+	case err := <-done:
+		sm.blockPark.mu.Unlock()
+		require.NoError(t, err)
+	default:
+		// The refusal is reading the park before the mark. Let it read the park, which does not
+		// know the block yet, and stop it at the mark.
+		sm.settlingMu.Lock()
+		sm.blockPark.mu.Unlock()
+
+		require.Eventually(t, func() bool { return blockedIn("netsync.(*SyncManager).acceptancePending") }, 5*time.Second, time.Millisecond)
+
+		// The consumer parks the accepted copy and clears its mark.
+		require.True(t, sm.blockPark.AdoptWritten(parkedBlock{hash: hash, prevBlock: blk.MsgBlock().Header.PrevBlock}))
+		delete(sm.accepting, hash)
+
+		sm.settlingMu.Unlock()
+
+		require.NoError(t, <-done)
+	}
+
+	_, err := sm.blockPark.ReadConverted(ctx, hash)
+	require.NoError(t, err, "the accepted copy's record survives a refusal that raced the consumer")
 }

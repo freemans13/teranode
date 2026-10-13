@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -1244,22 +1245,75 @@ func TestServerTransactionConfirmed(t *testing.T) {
 func TestServerUpdatePeerHeights(t *testing.T) {
 	s := &server{
 		peerHeightsUpdate: make(chan updatePeerHeightsMsg, 1),
+		quit:              make(chan struct{}),
 	}
 
 	hash := &chainhash.Hash{4, 5, 6}
 	height := int32(12345)
 
-	// Test updating peer heights (should not panic)
 	s.UpdatePeerHeights(hash, height, nil)
 
-	// Verify a message was sent to the channel
 	select {
 	case msg := <-s.peerHeightsUpdate:
-		assert.Equal(t, hash, msg.newHash)
-		assert.Equal(t, height, msg.newHeight)
-	default:
-		t.Error("Expected message to be sent to peerHeightsUpdate channel")
+		require.Equal(t, hash, msg.newHash)
+		require.Equal(t, height, msg.newHeight)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Expected message to be sent to peerHeightsUpdate channel")
 	}
+}
+
+// The Kafka blocks-final consumer calls UpdatePeerHeights for every finalised block. The
+// channel is unbuffered and only peerHandler reads it, so the call must return while nobody is
+// reading, deliver once peerHandler reads, and, after the server quits (peerHandler gone), leave
+// no goroutine waiting on a send that nobody will ever take.
+func TestServerUpdatePeerHeightsNeverBlocksCaller(t *testing.T) {
+	s := &server{
+		peerHeightsUpdate: make(chan updatePeerHeightsMsg),
+		quit:              make(chan struct{}),
+	}
+
+	hash := &chainhash.Hash{7, 8, 9}
+
+	returned := make(chan struct{})
+
+	go func() {
+		s.UpdatePeerHeights(hash, 42, nil)
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UpdatePeerHeights blocked the caller while peerHandler was not reading")
+	}
+
+	// peerHandler reads later and still gets the update.
+	select {
+	case msg := <-s.peerHeightsUpdate:
+		require.Equal(t, hash, msg.newHash)
+		require.Equal(t, int32(42), msg.newHeight)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the height update was lost instead of being delivered to a late reader")
+	}
+
+	// After quit, nobody reads the channel again. The call must still return and its sender
+	// must exit rather than wait forever.
+	before := runtime.NumGoroutine()
+
+	close(s.quit)
+
+	for i := 0; i < 50; i++ {
+		s.UpdatePeerHeights(hash, 43, nil)
+	}
+
+	// Polled by hand: require.Eventually runs its condition on a goroutine of its own, which
+	// would count against the total.
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	require.LessOrEqual(t, runtime.NumGoroutine(), before, "senders left waiting on peerHeightsUpdate after the server quit")
 }
 
 // TestServerAddPeer tests the AddPeer method

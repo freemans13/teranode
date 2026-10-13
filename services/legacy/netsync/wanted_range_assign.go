@@ -357,8 +357,14 @@ func (sm *SyncManager) unownedBlocksUpTo(wanted []wantedBlock, limit int) []want
 		// rule below asks another peer. A block whose owners were let off already, a demoted
 		// sync peer's (demoteSyncPeer), has no active owner and is asked of another peer. Above
 		// the checkpoint, at the tip, the quiet-owner rule applies to each block.
+		//
+		// The exception is an owner that has sent no block bytes for the retry window, or that
+		// has passed this block over (ownerSendingBlock): the watcher reaches it only through
+		// rate decay, and at small-block heights a silent owner held the next block for minutes
+		// where the quiet-owner rule had re-asked after 60 s (review of 2026-10-12). It falls
+		// through to that rule, which is size-independent.
 		if sm.headersFirstMode.Load() {
-			if active, _ := sm.blockDownloads.ActiveOwners(block.hash); len(active) == 1 {
+			if active, _ := sm.blockDownloads.ActiveOwners(block.hash); len(active) == 1 && sm.ownerSendingBlock(active[0], block.hash) {
 				continue
 			}
 		}
@@ -456,12 +462,30 @@ func (sm *SyncManager) forgiveQuietOwners(wanted []wantedBlock) int {
 	return forgiven
 }
 
-// ownerStillSending reports whether any owner of hash has sent block bytes
-// within the retry window.
+// ownerStillSending reports whether any owner of hash may still be sending it
+// (ownerSendingBlock).
 func (sm *SyncManager) ownerStillSending(hash chainhash.Hash) bool {
 	return sm.blockDownloads.AnyOwner(hash, func(p *peerpkg.Peer) bool {
-		return time.Since(sm.streams.lastBlockBytes(p)) < blockRequestRetryInterval
+		return sm.ownerSendingBlock(p, hash)
 	})
+}
+
+// ownerSendingBlock reports whether owner p may still be sending hash: it has sent block bytes
+// within the retry window, and it has not passed hash over, delivering a block asked after it,
+// unless hash is arriving from p now. Bytes of any block used to count, so an owner that withheld
+// one block and kept sending the others was never re-asked for it (review of 2026-10-12).
+func (sm *SyncManager) ownerSendingBlock(p *peerpkg.Peer, hash chainhash.Hash) bool {
+	if time.Since(sm.streams.lastBlockBytes(p)) >= blockRequestRetryInterval {
+		return false
+	}
+
+	if !sm.blockDownloads.PassedOver(p, hash) {
+		return true
+	}
+
+	_, _, _, arriving := sm.streams.arrivingFrom(hash, p)
+
+	return arriving
 }
 
 // forgiveQuietOwnersOf lets block's quiet owners off it, logs each, and reports

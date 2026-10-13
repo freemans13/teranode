@@ -599,7 +599,7 @@ func TestSyncManager_AMissingParentOutputKeepsTheParkedBlock(t *testing.T) {
 }
 
 // TestSyncManager_AnInvalidTransactionVerdictFromTheFullRouteIsAJudgementOnTheBlock
-// is the BlockRejected row for the shape the full route now returns for a legacy
+// is the BlockInvalid row for the shape the full route now returns for a legacy
 // block with a consensus-invalid transaction: ErrBlockInvalid around subtree
 // validation's processing wrap around ErrTxInvalid, with no corrupt code in the
 // chain. Before the producer was corrected the same block came back corrupt and
@@ -683,13 +683,13 @@ func TestSyncManager_AParkedRecordWhoseFilesAreGoneIsAskedForAgainAboveTheCheckp
 
 	h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
 
-	before := h.rec.getBlocksCount()
+	before := h.rec.getDataCount()
 
 	require.NoError(t, h.deliver(t, 0))
 	h.drainOneParkCommit(t)
 
 	require.Zero(t, h.sm.blockPark.Len(), "the record is dropped")
-	require.True(t, WaitUntil(func() bool { return h.rec.getBlocksCount() > before }, 5*time.Second),
+	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
 		"above the checkpoint a dropped record must be asked for again at once")
 }
 

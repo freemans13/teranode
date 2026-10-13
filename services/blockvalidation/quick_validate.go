@@ -2480,6 +2480,29 @@ func (u *BlockValidation) applyOneByOne(ctx context.Context, block *model.Block,
 	return nil
 }
 
+// detachedStoreCallBoundDefault is detachedStoreCallBound when no settings are wired: the
+// settings defaults of utxostore_spendWaitTimeout (30s) and utxostore_spendRollbackTimeout
+// (120s).
+const detachedStoreCallBoundDefault = 150 * time.Second
+
+// detachedStoreCallBound is how long one store call of applyTxsWithRetry may run once it no
+// longer follows its caller's cancellation. A combined SpendAndCreate is a spend, a create and,
+// when the create fails, a rollback of the spend, so the bound is the spend's own budget
+// (SpendWaitTimeout) plus the rollback's (SpendRollbackTimeout). The latter's documentation
+// already names it the longest a failed or cancelled spend can block its caller.
+func (u *BlockValidation) detachedStoreCallBound() time.Duration {
+	if u.settings == nil {
+		return detachedStoreCallBoundDefault
+	}
+
+	bound := u.settings.UtxoStore.SpendWaitTimeout + u.settings.UtxoStore.SpendRollbackTimeout
+	if bound <= 0 {
+		return detachedStoreCallBoundDefault
+	}
+
+	return bound
+}
+
 // spendRetryBackoffDefault is the pause between spend retry attempts. Matches the
 // legacy path's retryBackoff (services/legacy/netsync PreValidateTransactions).
 const spendRetryBackoffDefault = 2 * time.Second
@@ -2512,9 +2535,14 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 	pending := items
 	total := len(items)
 
+	storeCallBound := u.detachedStoreCallBound()
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if ctx.Err() != nil {
-			return errors.NewProcessingError("[%s][%s] context cancelled", stage, block.Hash().String())
+		// A context error, not a processing one: a caller that classifies the failure (the
+		// legacy park's parkCommitFailure) must read a cancel as a retry, not as a judgement
+		// on the block that writes its hash off.
+		if err := ctx.Err(); err != nil {
+			return errors.NewContextCanceledError("[%s][%s] context cancelled", stage, block.Hash().String(), err)
 		}
 
 		if attempt > 0 {
@@ -2532,25 +2560,44 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 			hardFail  error
 		)
 
-		// Every goroutine below records its outcome in retryable or hardFail and returns nil.
-		// That is deliberate, and it is the one thing about this loop worth spelling out.
+		// A store call, once started, runs to its end. SpendAndCreate is not atomic on any
+		// backend: utxo.SequentialSpendAndCreate spends and then creates, and both the SQL and
+		// Aerospike stores delegate to it. Cancelling it between those two is precisely how a
+		// transaction ends up with its inputs spent and no row of its own, and the rollback
+		// that would repair it runs under the same cancelled context. A cancel can come from
+		// three places, and none of them may land mid-call:
 		//
-		// errgroup.WithContext cancels applyCtx as soon as a goroutine returns non-nil, and
-		// applyCtx is the context the store call runs under. SpendAndCreate is not atomic on
-		// any backend: utxo.SequentialSpendAndCreate spends and then creates, and both the SQL
-		// and Aerospike stores delegate to it. Cancelling it between those two is precisely how
-		// a transaction ends up with its inputs spent and no row of its own, and the rollback
-		// that would repair it runs under the same cancelled context. So a hard failure must
-		// not tear down its siblings mid-call.
+		//   - this errgroup, if a goroutine returned non-nil. None does: every goroutine below
+		//     records its outcome in retryable or hardFail and returns nil, and hardFail is
+		//     checked straight after Wait, so the wave still fails on the first hard error.
+		//   - the caller's errgroups: the sibling wave in createAndSpendUTXOsForBatch (a
+		//     failed chained create cancels gCtx under the one-wave apply) and batchCtx around
+		//     it (the subtree file write, the prefetch).
+		//   - shutdown.
 		//
-		// Nothing is lost by not cancelling. hardFail is checked immediately after Wait, so the
-		// wave still fails on the first hard error; the only cost is the queued applies that
-		// still run, which are bounded by this batch and converge on replay through the store's
-		// own create and spend guards.
+		// So each store call runs under context.WithoutCancel(applyCtx), bounded by
+		// detachedStoreCallBound so a wedged store cannot hold the wave forever, and a call
+		// that has not started by the time applyCtx is cancelled never starts: the wave fails
+		// with a context error instead of running the rest of a cancelled batch. What a cancel
+		// still costs is the calls already in flight, up to limit of them, finishing first.
 		for _, item := range pending {
 			applyG.Go(func() error {
+				if err := applyCtx.Err(); err != nil {
+					mu.Lock()
+					if hardFail == nil {
+						hardFail = errors.NewContextCanceledError("[%s][%s] context cancelled before applying tx %s", stage, block.Hash().String(), item.tx.TxIDChainHash().String(), err)
+					}
+					mu.Unlock()
 
-				if err := apply(applyCtx, item); err != nil {
+					return nil
+				}
+
+				storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(applyCtx), storeCallBound)
+				err := apply(storeCtx, item)
+
+				cancelStore()
+
+				if err != nil {
 					if errors.IsRetryableError(err) {
 						mu.Lock()
 						retryable = append(retryable, item)

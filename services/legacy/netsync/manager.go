@@ -636,6 +636,20 @@ func maxInFlightForSize(avgSize int64) int {
 // chain is in sync, the SyncManager handles incoming block and header
 // notifications and relays announcements of new blocks to peers.
 type SyncManager struct {
+	// adoptions is the registry of subtree files a block relies on but did not create, shared by
+	// every subtree writer this manager makes; see subtreeAdoptions. Read through
+	// subtreeAdoptionsFor, which creates it on first use.
+	adoptions atomic.Pointer[subtreeAdoptions]
+
+	// settling holds the writer of each copy that converted until the wire layer has settled
+	// it: pipelineBlockDelete for a refused copy, handleBlockOnDiskMsg for an accepted one, or
+	// the park sweep as a backstop. Guarded by settlingMu; see holdUntilSettled.
+	settlingMu sync.Mutex
+	settling   map[chainhash.Hash][]settlingWriter
+	// accepting counts, per hash, the accepted copies queued for handleBlockOnDiskMsg and not yet
+	// handled; pipelineBlockDelete treats such a block as parked. Guarded by settlingMu.
+	accepting map[chainhash.Hash]int
+
 	ctx          context.Context
 	logger       ulogger.Logger
 	settings     *settings.Settings
@@ -647,6 +661,13 @@ type SyncManager struct {
 	msgChan      chan interface{}
 	handlerDone  chan struct{}
 	quit         chan struct{}
+
+	// handlerLoops counts the ticker loops blockHandler starts beside itself (the park sweep
+	// and the frontier race). blockHandler waits for them before it closes handlerDone, so
+	// Stop, which waits on handlerDone, runs after both have returned: neither is mid-tick
+	// while Stop tears state down, and the race loop's rates-file save never runs beside
+	// Stop's own.
+	handlerLoops sync.WaitGroup
 
 	// TERANODE services
 	blockchainClient  teranodeblockchain.ClientI
@@ -793,6 +814,14 @@ type SyncManager struct {
 	// localFaultDrains counts, per block, copies drained because this node failed to store
 	// them (absorbLocalSinkFault). Guarded by drainedDuplicatesMu; made on first use.
 	localFaultDrains map[chainhash.Hash]int
+	// reAsks paces the re-asks of each dropped block above the last checkpoint
+	// (block_park_reask_backoff.go). Guarded by reAsksMu; made on first use.
+	reAsksMu sync.Mutex
+	reAsks   map[chainhash.Hash]*droppedReAsk
+	// policyDeclines counts, per block, the peers that declared its body above this node's
+	// block policy (block_policy_decline.go). Guarded by policyDeclinesMu; made on first use.
+	policyDeclinesMu sync.Mutex
+	policyDeclines   map[chainhash.Hash]*policyDecline
 	// conversions is the conversion in progress for each block, so a faster copy can take it
 	// over (conversion_race.go).
 	conversionsMu sync.Mutex
@@ -811,6 +840,11 @@ type SyncManager struct {
 	// hold the resulting zero throughput against the sync peer — the prefetch
 	// analogue of the blockBacklog guard. Read by handleCheckSyncPeer.
 	blockPrefetchWaiters atomic.Int64
+
+	// lastChainProgress is the UnixNano time a block last joined the chain (noteChainProgress),
+	// zero before the first. It bounds the stall check's backpressure skip
+	// (stallCheckSuppressed).
+	lastChainProgress atomic.Int64
 
 	// blockPrefetchReserved shadows how many slots of blockPrefetchBudget are
 	// currently reserved, purely so the figure can be reported.
@@ -874,6 +908,16 @@ type SyncManager struct {
 	streams             *streamRegistry    // block bodies arriving now and peers' delivery rates, for the frontier race
 	farProbes           farProbeSet        // blocks placeUnmeasured gave from the top of the window, which highestHeld does not count
 	peerRatesPath       string             // the rates file (peerRatesFile), or empty to keep no rates
+
+	// watchNoSizeLogged is set once the watcher has logged that it has no block size to judge
+	// by, and cleared when it has one again, so the line is written once per episode.
+	watchNoSizeLogged atomic.Bool
+	// watchSkips counts the race ticks in a row on which the watcher found assignMu taken
+	// (lockForWatch).
+	watchSkips atomic.Int32
+	// watchLastReseed is the UnixNano time the watcher last tried to seed an empty block size
+	// tracker (reseedBlockSizes), zero before the first try.
+	watchLastReseed atomic.Int64
 
 	// dispatcher runs each parked block's work on a worker, one block at a time,
 	// and every chain-order step in dispatch order. Built in New(); nil when
@@ -1526,8 +1570,15 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// validation speed, not the peer. A genuinely stalled peer stops feeding the
 	// queue, the backlog drains, and the check resumes — so this delays, but does
 	// not prevent, rotation of a truly stalled peer.
-	if sm.localReadBackpressured() {
-		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check skipped: read-loop backpressured by local block processing", sp.String())
+	//
+	// The skip is bounded by chain progress (stallCheckSuppressed): it holds only while a block
+	// has joined the chain within blockProcessingStallTimeout. During IBD other peers keep every
+	// admission slot full almost all the time, so an unbounded skip turned sync-peer stall
+	// rotation off for the whole sync, and a sync peer that stopped sending the block the chain
+	// waits on was never rotated (review of 76be891d6). Base had the same bound on its
+	// block backlog; this branch removed it with the decoded block queue.
+	if sm.stallCheckSuppressed(time.Now()) {
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check skipped: read-loop backpressured by local block processing while the chain still advances", sp.String())
 		return
 	}
 
@@ -1851,6 +1902,7 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 	timeStart := time.Now()
 	// passing in block height 0, which will default to utxo store block height in validator
 	txMeta, err = sm.validationClient.Validate(ctx, btTx, 0)
+	txMeta, err = sm.acceptedMetaOnUnlockFailure(ctx, btTx, txMeta, err)
 
 	prometheusLegacyNetsyncHandleTxMsgValidate.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
@@ -1919,6 +1971,31 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 	}
 }
 
+// acceptedMetaOnUnlockFailure turns the validator's ErrTxUnlockFailed into a success. The transaction was
+// accepted, spent and created, and only its unlock failed, so it must not be rejected or dropped. The
+// response metadata does not survive a gRPC error, so it is read back from the UTXO store. If that read
+// fails the transaction is still accepted: it is returned with empty metadata, whose zero size passes
+// every peer fee filter, so it is announced rather than rejected or dropped. Any other result is
+// returned unchanged.
+func (sm *SyncManager) acceptedMetaOnUnlockFailure(ctx context.Context, tx *bt.Tx, txMeta *meta.Data, err error) (*meta.Data, error) {
+	if err == nil || !errors.Is(err, errors.ErrTxUnlockFailed) {
+		return txMeta, err
+	}
+
+	if txMeta != nil {
+		return txMeta, nil
+	}
+
+	stored := &meta.Data{}
+	if getErr := sm.utxoStore.GetMeta(ctx, tx.TxIDChainHash(), stored); getErr != nil {
+		sm.logger.Warnf("[acceptedMetaOnUnlockFailure][%s] accepted transaction, failed to read its meta, announcing without fee: %v", tx.TxID(), getErr)
+
+		return &meta.Data{}, nil
+	}
+
+	return stored, nil
+}
+
 // processOrphanTransactions recursively processes orphan transactions that were waiting for a transaction to be accepted
 func (sm *SyncManager) processOrphanTransactions(ctx context.Context, txHash *chainhash.Hash, acceptedTxs *[]*TxHashAndFee) {
 	// check whether any transaction in the orphan pool has this transaction as a parent
@@ -1942,6 +2019,7 @@ func (sm *SyncManager) processOrphanTransactions(ctx context.Context, txHash *ch
 		// validate the orphan transaction
 		// passing in block height 0, which will default to utxo store block height in validator
 		txMeta, err := sm.validationClient.Validate(ctx, orphanTx.tx, 0)
+		txMeta, err = sm.acceptedMetaOnUnlockFailure(ctx, orphanTx.tx, txMeta, err)
 		if err != nil {
 			if errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxLocked) || errors.Is(err, errors.ErrTxCreating) {
 				// silently exit, we will accept this transaction when the other parent(s) comes in
@@ -3642,9 +3720,19 @@ func (sm *SyncManager) blockHandler() {
 	// that have nothing to do with the park. The sweep decides, looks parents up,
 	// evicts and deletes on its own; the one thing it may not do is commit, and
 	// it posts those back to the consumer through parkCommits.
-	go sm.runParkSweep()
+	sm.handlerLoops.Add(2)
 
-	go sm.runFrontierRace()
+	go func() {
+		defer sm.handlerLoops.Done()
+
+		sm.runParkSweep()
+	}()
+
+	go func() {
+		defer sm.handlerLoops.Done()
+
+		sm.runFrontierRace()
+	}()
 
 out:
 	for {
@@ -3730,6 +3818,10 @@ out:
 			break out
 		}
 	}
+
+	// Both loops return on quit. Waiting for them here, not in Stop, is what makes every
+	// waiter on handlerDone (Stop, and the tests that run the handler) see them finished.
+	sm.handlerLoops.Wait()
 
 	close(sm.handlerDone)
 	sm.logger.Infof("Block handler done")
@@ -3860,7 +3952,9 @@ func (sm *SyncManager) conversionInFlight(blockHash chainhash.Hash) bool {
 // streamRegistry.arriving) or reads a nil map under a zero mutex
 // (conversionInFlight), so a struct-literal manager in a test may call it.
 func (sm *SyncManager) blockHeldLocally(h chainhash.Hash) bool {
-	return sm.blockPark.Has(h) || sm.blockCommitting(h) || sm.streams.arriving(h) || sm.conversionInFlight(h)
+	// Holds reads the park's index and its handed-out set under one lock, so a block given back
+	// between two separate reads is not missed (pipelineBlockDelete has the same need).
+	return sm.blockPark.Holds(h) || sm.dispatcher.inFlight(h) || sm.streams.arriving(h) || sm.conversionInFlight(h)
 }
 
 // blockCommitting reports whether this block is out of the park and in use: taken by
@@ -3945,9 +4039,50 @@ func (sm *SyncManager) committedTip() (height int32, hash chainhash.Hash, ok boo
 	return h, *header.Hash(), true
 }
 
-// noteChainProgress records that a block joined the chain, for the commit rate.
+// noteChainProgress records that a block joined the chain, for the commit rate and for the
+// bound on the stall check's backpressure skip (stallCheckSuppressed).
 func (sm *SyncManager) noteChainProgress() {
-	sm.commitRate.note(time.Now())
+	now := time.Now()
+
+	sm.lastChainProgress.Store(now.UnixNano())
+	sm.commitRate.note(now)
+}
+
+// defaultBlockProcessingStallTimeout is blockProcessingStallTimeout when no settings are wired
+// (managers built as struct literals in tests) or the setting is unset. Equal to the
+// setting's own default.
+const defaultBlockProcessingStallTimeout = 3 * time.Minute
+
+// blockProcessingStallTimeout is how long the chain may go without a block joining it before a
+// backpressured node stops excusing its sync peer: legacy_peerProcessingTimeout, the setting
+// base bounded the same skip with.
+func (sm *SyncManager) blockProcessingStallTimeout() time.Duration {
+	if sm.settings != nil && sm.settings.Legacy.PeerProcessingTimeout > 0 {
+		return sm.settings.Legacy.PeerProcessingTimeout
+	}
+
+	return defaultBlockProcessingStallTimeout
+}
+
+// stallCheckSuppressed reports whether handleCheckSyncPeer skips its checks at now: while the
+// node is backpressured (localReadBackpressured) and a block joined the chain within
+// blockProcessingStallTimeout. Backpressure with the chain advancing is our own processing
+// speed, not the peer's health. Backpressure with the chain standing still for that long is a
+// stalled pipeline or a block nobody is sending, and the check runs: a sync peer that is not
+// sending is rotated, one that is keeps its role through the throughput rule below the skip.
+// No commit since start counts as standing still, so the check is never off before the first
+// block joins.
+func (sm *SyncManager) stallCheckSuppressed(now time.Time) bool {
+	if !sm.localReadBackpressured() {
+		return false
+	}
+
+	last := sm.lastChainProgress.Load()
+	if last == 0 {
+		return false
+	}
+
+	return now.Sub(time.Unix(0, last)) < sm.blockProcessingStallTimeout()
 }
 
 // localReadBackpressured reports whether the node is currently throttling its
@@ -4436,6 +4571,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// neither, so every block took the decoding path. See streaming_install.go
 	// for why that mattered beyond the allocation.
 	sm.installStreamingBlockPath(peerpkg.SetBlockBodyStreaming)
+	peerpkg.SetBlockPolicyDeclinedHook(func(hash chainhash.Hash, from *peerpkg.Peer) {
+		sm.notePolicyDecline(hash, from, time.Now())
+	})
 
 	// Bounded async block prefetch: admitPipelineSink admits a block against
 	// this global weighted semaphore and returns, so the read-loop reads the
@@ -4470,7 +4608,35 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// try to process one last time
 		// passing in block height 0, which will default to utxo store block height in validator
 		if _, err := sm.validationClient.Validate(sm.ctx, orphanTx.tx, 0); err != nil {
-			sm.logger.Debugf("failed to validate orphan transaction when evicting %v: %v", txHash, err)
+			// ErrTxUnlockFailed means the orphan was ACCEPTED - spent, created and delivered to
+			// block assembly - and only an unlock is outstanding, so it is not a validation
+			// failure. Every other Validate call site branches on this code; leaving it out here
+			// costs a misleading "failed to validate" line for a transaction the node took.
+			if errors.Is(err, errors.ErrTxUnlockFailed) {
+				sm.logger.Debugf("evicted orphan transaction %v, it was accepted with its unlock pending", txHash)
+			} else {
+				// The tx is now dropped for good: it never validated and nothing will
+				// retry it. This is the event that hid the #1214 ghost-spender incident
+				// for ~40 hours, so every abandonment is counted — the metric is the
+				// dashboard signal.
+				//
+				// Only ErrTxMissingParent is demoted to Debugf: the orphan outlived its
+				// wait for a parent that never arrived, which is the normal outcome for a
+				// chunk of orphans during initial sync and carries no operator signal.
+				// ErrTxLocked stays at WARN even though the parking path treats it as an
+				// orphan class alongside ErrTxMissingParent — it means the parent's record
+				// is still two-phase-commit locked pending block-assembly ack, a window
+				// measured in milliseconds, so a lock that outlived the whole orphan TTL
+				// is anomalous rather than routine. Everything else (policy rejection,
+				// storage failure) stays at WARN for the obvious reason.
+				prometheusLegacyNetsyncOrphansAbandoned.Inc()
+
+				if errors.Is(err, errors.ErrTxMissingParent) {
+					sm.logger.Debugf("orphan transaction %v abandoned after eviction, never validated: %v", txHash, err)
+				} else {
+					sm.logger.Warnf("orphan transaction %v abandoned after eviction, never validated: %v", txHash, err)
+				}
+			}
 		} else {
 			sm.logger.Debugf("evicted orphan transaction %v", txHash)
 		}

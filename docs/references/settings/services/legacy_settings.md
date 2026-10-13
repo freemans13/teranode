@@ -142,17 +142,22 @@ context), and `${LEGACY_GRPC_PORT}` is `8099`.
   known before the download, so the schedule uses none, and no block waits while
   a peer has room. A peer holds the per-peer depth scaled by its rate against
   the fastest peer's. A peer with no rate gets one block from the top of the
-  window. Measured rates are kept by address in `legacy-peer-rates.json` in the
-  working directory. Below the
+  window. Measured rates of outbound peers are kept by address, with the time
+  each was measured, in `legacy-peer-rates.json` in the working directory. A
+  remembered rate loses half its weight per hour of age, an entry older than
+  24 hours is dropped, and the file keeps at most the 1,000 newest. Below the
   last checkpoint the range comes from the header cache, which runs to the next
   checkpoint; above it, blocks are asked for from invs and the pass re-asks from
   the download ledger. There is no download cursor, so nothing carries a
   position between passes.
 - A block whose owners have sent nothing for the 60-second retry window is
-  offered to another peer on the next pass. Above the last checkpoint this
-  applies to every block, one block per quiet owner. Below it, it applies only to a
-  block with two or more active owners: a block with one active owner stays
-  with it, and the watcher judges it.
+  offered to another peer on the next pass. An owner that has delivered a block
+  asked after this one has passed this one over, and its bytes do not count for
+  it. Above the last checkpoint this applies to every block, one block per quiet
+  owner. Below it, a block with one active owner that is still sending other
+  block bytes, and has not passed this one over, stays with it, and the watcher
+  judges it; the watcher also treats a passed-over block as one its owner will
+  not deliver.
 - During headers-first sync, a block above the committed tip that has been
   arriving for 30 seconds at under 100 KB/s, and will not finish before the
   chain needs it, is asked of one other peer, and the slow peer is disconnected.
@@ -171,8 +176,9 @@ context), and `${LEGACY_GRPC_PORT}` is `8099`.
   the block, at the recent mean size, in half the owner's time. A copy with more
   than half its bytes gets no extra request unless it will take more than 5
   minutes, and a block whose every copy arrives under 100 KB/s is left to the
-  race, with no block above it counted as late. A block gets one such extra
-  request. There is no setting for it; the metric is
+  race, with no block above it counted as late. A block is judged while it has
+  one live copy, and the watcher and the race together ask for at most two extra
+  copies of a block in 10 minutes. There is no setting for it; the metric is
   `teranode_legacy_netsync_frontier_races_total`.
 - `MultiPeerBlockDownload` set to false keeps the pass but gives every block to
   the sync peer, bounded by the block-size ladder alone.

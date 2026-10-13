@@ -106,3 +106,40 @@ func TestTheRaceDropsNobodyWhileThisNodeIsBackpressured(t *testing.T) {
 	sm.maybeRaceSlowBlock(now.Add(35 * time.Second))
 	require.True(t, WaitUntil(func() bool { return !a.Connected() }, 5*time.Second), "dropped when the backpressure is gone")
 }
+
+// The exemption for backpressure is bounded. During sync with every admission slot full the
+// signal holds almost all the time, and a staller at the copy cap was never dropped, while the
+// peer stall detector skipped on the same signal (review of 2026-10-12). Past
+// raceBackpressureGrace from the first time the block's staller was spared, it is dropped.
+func TestTheRaceDropsAStallerOnceBackpressureHasSparedItForTheGrace(t *testing.T) {
+	sm := assignManager(t, 1, 120)
+	sm.streams = newStreamRegistry()
+	mockCommittedTip(t, sm, 10, 0)
+
+	a, _ := schedulerPeer(t, sm, 1, 2000)
+	schedulerPeer(t, sm, 2, 2000)
+	schedulerPeer(t, sm, 3, 2000)
+
+	next := heightHash(t, sm, 11)
+	require.True(t, sm.blockDownloads.Add(a, next))
+
+	now := time.Now()
+	slowCopy(sm, next, a, now.Add(-40*time.Second))
+
+	sm.blockPrefetchWaiters.Add(1)
+	defer sm.blockPrefetchWaiters.Add(-1)
+
+	sm.maybeRaceSlowBlock(now)
+	require.False(t, WaitUntil(func() bool { return !a.Connected() }, 300*time.Millisecond), "spared at first")
+
+	// The second extra copy is asked 35 s on, so the cap is reached and a staller can only be
+	// dropped, not raced again.
+	sm.maybeRaceSlowBlock(now.Add(35 * time.Second))
+	require.False(t, WaitUntil(func() bool { return !a.Connected() }, 300*time.Millisecond), "still within the grace")
+
+	sm.maybeRaceSlowBlock(now.Add(raceBackpressureGrace - time.Second))
+	require.False(t, WaitUntil(func() bool { return !a.Connected() }, 300*time.Millisecond), "still within the grace at the cap")
+
+	sm.maybeRaceSlowBlock(now.Add(raceBackpressureGrace))
+	require.True(t, WaitUntil(func() bool { return !a.Connected() }, 5*time.Second), "dropped once backpressure has spared it for the grace")
+}

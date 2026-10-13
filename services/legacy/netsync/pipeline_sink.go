@@ -157,6 +157,22 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		writer = newSubtreeWriterUnresolvedHeight(sm.logger, sm.settings, sm.subtreeStore, sm.fallbackSubtreeDAH())
 	}
 
+	// One registry for every conversion, so no block's cleanup removes a file another adopted.
+	// A copy that fails closes its writer's window as a creator here. One that converts keeps
+	// it open until the wire layer settles the copy (holdUntilSettled), because a refusal after
+	// the sink still runs this copy's cleanup in pipelineBlockDelete.
+	writer.adoptions = sm.subtreeAdoptionsFor()
+
+	sinkConverted := false
+
+	defer func() {
+		if sinkConverted {
+			sm.holdUntilSettled(hash, writer)
+		} else {
+			writer.finish()
+		}
+	}()
+
 	var (
 		root          *chainhash.Hash
 		subtreeHashes []chainhash.Hash
@@ -201,6 +217,17 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 
 		// A faster copy of this block may complete first and take over (conversion_race.go).
 		ctl := sm.startConversion(hash, r)
+		if ctl == nil {
+			// Another conversion of this block is live: one that took over converts outside the
+			// admission slot, so this copy was admitted beside it. Nothing of this copy has been
+			// written yet; it is read off the wire and the block is left to the other.
+			sm.deleteWrittenOnFailure(hash, writer)
+			sm.streams.setStreamPath(r, admitRawDuplicate)
+			sm.logger.Infof("[pipelineBlockSink][%s] another copy is converting this block; draining this one", hash)
+
+			return sm.drainDuplicate(hash, r)
+		}
+
 		yr.ctl = ctl
 
 		defer sm.endConversion(hash, ctl)
@@ -348,6 +375,8 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 		return false, errors.NewStorageError("[pipelineBlockSink][%s] failed to write the converted record", hash, err)
 	}
 
+	sinkConverted = true
+
 	return true, nil
 }
 
@@ -374,14 +403,23 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // when THIS call is known, from its own return value, to have written a
 // record does this function go looking for what it wrote.
 //
-// This task also retired the in-memory pipelineVerified map that used to tell
-// this function which subtree files to remove. It is not replaced with a
-// second map — a second map keyed by hash would have exactly the same
-// cross-delivery problem converted exists to avoid. Instead, when converted is
-// true, the record ReadConverted hands back names every subtree THIS call's
-// own sink wrote (record.Subtrees) — true only because converted being true
-// guarantees this call was the one that just wrote whatever sits under hash
-// right now, with nothing else able to have raced in between.
+// The converting copy's writer, which holdUntilSettled keeps open until this
+// verdict or the copy's acceptance, says exactly which subtree files this copy
+// created, and DeleteAll removes those that no other block holds. The writers
+// wait in a queue keyed by hash, which is not a delivery identity: a second
+// copy of the block can convert after this copy's sink returned and before
+// this verdict arrived. When two wait, this function cannot tell which copy it
+// was called for, and it deletes nothing at all, the record included, rather
+// than risk the copy about to be accepted. If both copies are then refused,
+// the record stays on disk, and a restart's park recovery picks it up; its
+// subtree files may have reached their delete-at-height by then, and the
+// commit's completeness check drops the record so the block is downloaded
+// again (FilesGone). A copy accepted and not yet parked counts as parked
+// (settleAccepted), so a refusal of the other copy in that gap keeps the
+// accepted copy's record too. Without a waiting writer (a record
+// not written by this process's sink just now) it falls back to the record:
+// ReadConverted hands back the subtrees the record names, and a file a writer
+// is writing or holds is skipped.
 //
 // The delete probes all four file types under each root rather than
 // recomputing which structure type the sink chose. subtreeWriter always writes
@@ -394,18 +432,21 @@ func (sm *SyncManager) pipelineBlockSink(hash chainhash.Hash, header *wire.Block
 // HTTP each treat a missing key as deleted), and ErrNotFound is tolerated for
 // any that does not.
 //
-// That guarantee has one hole, and pipelineBlockSink closes it rather than this
-// function. The record is written with overwrite allowed, so a redelivery of a
-// block already parked converts, overwrites the parked record with an identical
-// one, and reports converted. If the wire layer then refused it, this function
-// would delete the parked block's record and every subtree file it names. The
-// refusals left after a successful sink are both about length: declared bytes
-// after the last transaction, and a body that stops short of its declared length
-// and then hits EOF (the peer declares more than it sends and closes). The sink
-// now refuses both itself, before writing the record, by holding the stream to
-// exactly the declared body length (blockTxStream.RequireEnd). The wire layer's
+// That guarantee has one hole, and two things close it. The record is written
+// with overwrite allowed, so a redelivery of a block already parked converts,
+// overwrites the parked record with an identical one, and reports converted. If
+// the wire layer then refused it, deleting under the hash would take the parked
+// block's record and every subtree file it names. The refusals left after a
+// successful sink are both about length: declared bytes after the last
+// transaction, and a body that stops short of its declared length and then hits
+// EOF (the peer declares more than it sends and closes). The sink refuses both
+// itself, before writing the record, by holding the stream to exactly the
+// declared body length (blockTxStream.RequireEnd). The wire layer's
 // transaction-count read cannot fail after a successful sink, because the sink
-// has already read the same count.
+// has already read the same count. As a backstop for any refusal that still
+// gets through, this function returns early, deleting nothing, while the park
+// holds the block or has handed it out, so a refused copy cannot remove the
+// parked copy's files.
 //
 // The converted record itself is deleted by blockPark.Delete, which every path
 // that retires a park entry goes through, not only this discard path.
@@ -422,12 +463,54 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 	// names are the parked copy's, and deleting them left a record whose files were gone: the
 	// parent's commit then dropped it (970,503 on 2026-10-10). A file this copy did create is
 	// left to its delete-at-height.
-	if sm.blockPark.Has(hash) || sm.blockPark.HandedOut(hash) {
-		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked block; keeping the parked copy's subtree files", hash)
+	// The copy's writer, kept open by the sink until now (holdUntilSettled).
+	writer, ambiguous := sm.takeSettling(hash)
+
+	// Two converted copies of the block are waiting for their verdicts, and nothing says which
+	// one this refusal is about. Both wrote the same record under the hash, so deleting it, or
+	// either copy's files, could remove the copy that is about to be accepted. Leave all of it:
+	// the files keep their delete-at-height, and the other verdict or the park sweep settles
+	// both writers.
+	if ambiguous {
+		sm.logger.Warnf("[pipelineBlockDelete][%s] two converted copies are waiting and this refusal cannot say which; deleting nothing", hash)
 
 		return nil
 	}
 
+	// A copy accepted but not yet parked (settleAccepted) counts as parked: the record under the
+	// hash is the accepted copy's.
+	//
+	// The acceptance mark is read first. The consumer parks an accepted copy and only then clears
+	// its mark, so a mark found clear means the park already holds the block, or has handed it
+	// out, or is done with it. Read the other way round, the park could take the block and clear
+	// the mark between the two reads, and the refusal deleted the accepted copy's record (review
+	// of 76be891d6). The park's two states are read under one lock (Holds) for the same reason.
+	if sm.acceptancePending(hash) || sm.blockPark.Holds(hash) {
+		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked or accepted block; keeping the other copy's subtree files", hash)
+
+		if writer != nil {
+			writer.finish()
+		}
+
+		return nil
+	}
+
+	// The writer knows exactly which files this copy created, and its window as a creator is
+	// still open, so holds other blocks took on them still stand: DeleteAll removes the files
+	// this copy created that nobody holds, and nothing this copy merely adopted.
+	if writer != nil {
+		firstErr := writer.DeleteAll(sm.ctx)
+		if firstErr != nil {
+			firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting the subtree files this copy wrote", hash, firstErr)
+		}
+
+		sm.blockPark.Delete(sm.ctx, parkedBlock{hash: hash})
+
+		return firstErr
+	}
+
+	// No writer is waiting: the record was not written by a sink of this process just now.
+	// Fall back to what the record names, skipping any file a writer is writing or holds.
 	var firstErr error
 
 	record, err := sm.blockPark.ReadConverted(sm.ctx, hash)
@@ -436,7 +519,7 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 	case err == nil && record != nil:
 		for _, root := range record.Subtrees {
 			for _, ft := range []fileformat.FileType{fileformat.FileTypeSubtreeData, fileformat.FileTypeSubtreeMeta, fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtree} {
-				delErr := sm.subtreeStore.Del(sm.ctx, root[:], ft)
+				delErr := sm.deleteSubtreeFileUnlessAdopted(*root, ft)
 				if delErr != nil && !errors.Is(delErr, errors.ErrNotFound) && firstErr == nil {
 					firstErr = errors.NewStorageError("[pipelineBlockDelete][%s] failed deleting %s for subtree %s", hash, ft, root, delErr)
 				}
@@ -588,7 +671,8 @@ func newPipelineDedupMap(declared uint64) txmap.TxMap {
 // fails, logs a single-line warning naming the block hash rather than
 // discarding the error silently. subtreeWriter's own doc comment explains why
 // an orphaned subtree file is dangerous (it is content-addressed and shared
-// with any other block carrying the same run of transactions); a cleanup
+// with any other block carrying the same run of transactions, which is also
+// why DeleteAll leaves a file another block adopted); a cleanup
 // failure that goes unlogged defeats the point of calling DeleteAll at all,
 // since nothing else will ever tell an operator those files are still there.
 func (sm *SyncManager) deleteWrittenOnFailure(hash chainhash.Hash, writer *subtreeWriter) {

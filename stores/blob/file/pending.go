@@ -132,14 +132,14 @@ func (p *PendingFile) Commit(ctx context.Context, key []byte, opts ...options.Fi
 		return errors.NewStorageError("[File][PendingFile] failed to flush %s", p.tmp, err)
 	}
 
-	filename, err := p.s.constructFilename(key, p.fileType, opts)
+	merged := options.MergeOptions(p.s.options, opts)
+
+	filename, err := p.s.publishFilename(key, p.fileType, merged, opts)
 	if err != nil {
 		p.Abort()
 
 		return errors.NewStorageError("[File][PendingFile] failed to get file name", err)
 	}
-
-	merged := options.MergeOptions(p.s.options, opts)
 
 	if err = p.s.errorOnOverwrite(filename, merged); err != nil {
 		p.Abort()
@@ -156,12 +156,13 @@ func (p *PendingFile) Commit(ctx context.Context, key []byte, opts ...options.Fi
 		return err
 	}
 
-	if err = p.s.publishTempFile(p.tmp, filename, merged, p.hasher); err != nil {
+	if err = p.s.publish(ctx, key, p.fileType, p.tmp, filename, merged, p.hasher); err != nil {
 		p.Abort()
 
 		return err
 	}
 
+	// The temporary name is given up now, so there is nothing left for Abort to discard.
 	p.done = true
 
 	return nil

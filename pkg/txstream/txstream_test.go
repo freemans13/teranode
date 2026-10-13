@@ -132,3 +132,29 @@ func TestDataScriptsAreKeptWithoutAWriter(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, tx.Outputs[1].LockingScript, got.Outputs[1].LockingScript)
 }
+
+// With StandardOnly, a transaction in the extended form is refused with ErrExtendedForm before
+// any output is read, and a standard one is read as before. A block on the wire carries the
+// standard form only (review of 2026-10-12).
+func TestStandardOnlyRefusesTheExtendedForm(t *testing.T) {
+	var stream bytes.Buffer
+
+	standard := sampleTx(t, 1, 10)
+	stream.Write(standard.Bytes())
+	stream.Write(sampleTx(t, 2, 10).ExtendedBytes())
+
+	r := NewReader(&stream)
+
+	got, _, _, err := r.Next(Options{StandardOnly: true})
+	require.NoError(t, err)
+	require.Equal(t, standard.Bytes(), got.Bytes())
+
+	called := false
+
+	_, _, _, err = r.Next(Options{StandardOnly: true, BeforeOutputs: func(*bt.Tx) (io.Writer, error) {
+		called = true
+		return nil, nil
+	}})
+	require.ErrorAs(t, err, new(ExtendedFormError))
+	require.False(t, called, "refused before any output is read")
+}

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -1778,4 +1780,62 @@ func TestPrepareTxsPerLevel_CircularDependency(t *testing.T) {
 		t.Logf("Successfully processed %d transactions with max level %d using iterative algorithm",
 			totalProcessed, maxLevel)
 	})
+}
+
+// warnCaptureLogger records Warnf messages so a test can assert what was logged,
+// delegating every other method to an embedded test logger.
+type warnCaptureLogger struct {
+	ulogger.Logger
+
+	mu       sync.Mutex
+	warnings []string
+}
+
+func (l *warnCaptureLogger) Warnf(format string, args ...interface{}) {
+	l.mu.Lock()
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+	l.mu.Unlock()
+	l.Logger.Warnf(format, args...)
+}
+
+func (l *warnCaptureLogger) warned() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	out := make([]string, len(l.warnings))
+	copy(out, l.warnings)
+
+	return out
+}
+
+// minedValidator accepts every transaction and reports it mined in blockIDs.
+type minedValidator struct {
+	validator.Interface
+	blockIDs []uint32
+}
+
+func (v minedValidator) ValidateWithOptions(context.Context, *bt.Tx, uint32, *validator.Options) (*meta.Data, error) {
+	return &meta.Data{BlockIDs: v.blockIDs}, nil
+}
+
+// TestBlessMissing_AlreadyMinedNamesNoStoreID: a transaction already mined on this
+// chain is a TX_INVALID verdict, a class on the shared allowlist, so any boundary
+// that sees it shows its message (reconsiderblock's revalidation reaches RPC with
+// it). The block it was mined in is named by this node's store id, which is no
+// block's public identifier, so it goes to the log and the verdict names the
+// transaction.
+func TestBlessMissing_AlreadyMinedNamesNoStoreID(t *testing.T) {
+	logger := &warnCaptureLogger{Logger: ulogger.TestLogger{}}
+
+	server, _, txs, _ := newUnlockFailureServer(t, false, alwaysFail)
+	server.logger = logger
+	server.validatorClient = minedValidator{Interface: server.validatorClient, blockIDs: []uint32{77123}}
+
+	_, _, err := server.blessMissing(context.Background(), chainhash.Hash{}, chainhash.Hash{}, txs[1], 2,
+		map[uint32]bool{77123: true}, validator.ProcessOptions())
+	require.ErrorIs(t, err, errors.ErrTxInvalid)
+	require.Contains(t, err.Error(), "transaction is already mined on our chain")
+	require.NotContains(t, err.Error(), "77123")
+
+	require.Contains(t, fmt.Sprint(logger.warned()), "77123", "the id is still recorded")
 }

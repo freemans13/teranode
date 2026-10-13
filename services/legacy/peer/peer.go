@@ -1259,6 +1259,29 @@ func (p *Peer) PushRejectMsg(command string, code wire.RejectCode, reason string
 	<-doneChan
 }
 
+// rejectWriteBound is how long a reject is waited for before the peer is dropped without it, as
+// netsync's parkRejectWriteBound bounds the park's reject.
+const rejectWriteBound = 2 * time.Second
+
+// pushRejectWithin queues a reject and waits at most bound for it to be written. It reports
+// whether the write finished, or will never happen, within the bound. The connection has no
+// write deadline, so a remote that has stopped reading holds an unbounded wait until the socket
+// closes; the caller disconnects next, which ends the hung write either way.
+func (p *Peer) pushRejectWithin(command string, code wire.RejectCode, reason string, hash *chainhash.Hash, bound time.Duration) bool {
+	done := make(chan struct{}, 1)
+	p.QueueRejectMsg(command, code, reason, hash, done)
+
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 // QueueRejectMsg queues the reject message PushRejectMsg sends and returns at
 // once. doneChan, when not nil, receives one value when the message has been
 // written, or when it will never be: the peer disconnected first, the write
@@ -1927,8 +1950,84 @@ func responseStallBudget(cmd string) time.Duration {
 // rather than stalled. A getdata can ask for several blocks, and the first to arrive clears the
 // whole block-reply group, so the other deadlines count down again while the peer sends the rest.
 // A connection still receiving at a healthy rate is delivering; its reply is behind those bytes.
-func shouldDeferQueuedResponse(command string, healthyDownload bool) bool {
-	return healthyDownload && !isBlockResponseCommand(command)
+//
+// The rate is the whole association's, so transaction relay alone can keep it healthy with no
+// block in flight, and a reply the peer never sends would be deferred for good. deferredFor is
+// how long this reply has already been deferred, and past maxDeferral it is judged a stall: a
+// reply queued behind blocks waits at most for those blocks, whose download is bounded by the
+// same budget (blockDownloadBudget).
+func shouldDeferQueuedResponse(command string, healthyDownload bool, deferredFor, maxDeferral time.Duration) bool {
+	return healthyDownload && !isBlockResponseCommand(command) && deferredFor < maxDeferral
+}
+
+// stallTickVerdict is what one stall tick decided about the peer's pending responses.
+type stallTickVerdict int
+
+const (
+	// stallTickNone: no pending response is past its deadline.
+	stallTickNone stallTickVerdict = iota
+	// stallTickExtendBlock: a block is still arriving at a healthy rate within its wall-clock
+	// cap, and the block-response group's deadlines were extended.
+	stallTickExtendBlock
+	// stallTickDefer: a non-block reply is late while bytes still arrive at a healthy rate, so it
+	// is queued behind blocks; its deadline was pushed out, within its deferral bound.
+	stallTickDefer
+	// stallTickDisconnect: the peer is stalled.
+	stallTickDisconnect
+)
+
+// judgeStallTick is the decision of one stallHandler tick, on the handler's own state: the
+// pending response deadlines and, for each non-block reply deferred as queued behind blocks, when
+// it was first deferred. It updates both maps as the tick does and returns the late command and
+// the verdict. A reply's first deferral is stamped once and never moved, so its deferral is
+// bounded by budget however many ticks defer it; stallHandler clears the stamp when the reply
+// arrives. budgetFor is asked for the block download budget only when a response is late, and
+// the budget it gave is returned for the log.
+func judgeStallTick(pending, deferredSince map[string]time.Time, now time.Time, offset time.Duration, healthyDownload bool, blockFetchStart time.Time, budgetFor func() time.Duration) (string, stallTickVerdict, time.Duration) {
+	command, stalled := expiredStallResponse(pending, now, offset)
+	if !stalled {
+		return "", stallTickNone, 0
+	}
+
+	budget := budgetFor()
+
+	if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, budget) {
+		// The block is still actively arriving at a healthy rate and within the wall-clock
+		// cap; extend the whole block-response group (armed together) rather than disconnect a
+		// peer making real progress on a large (multi-GB) block.
+		refreshed := now.Add(stallResponseTimeoutBlocks)
+		for cmd := range pending {
+			if isBlockResponseCommand(cmd) {
+				pending[cmd] = refreshed
+			}
+		}
+
+		return command, stallTickExtendBlock, budget
+	}
+
+	if since, deferred := deferredSince[command]; shouldDeferQueuedResponse(command, healthyDownload, deferredDuration(since, deferred, now), budget) {
+		// Bytes are still arriving at a healthy rate, so the reply is queued behind blocks the
+		// peer is sending, not stalled.
+		if !deferred {
+			deferredSince[command] = now
+		}
+
+		pending[command] = now.Add(stallResponseTimeout)
+
+		return command, stallTickDefer, budget
+	}
+
+	return command, stallTickDisconnect, budget
+}
+
+// deferredDuration is how long a reply first deferred at since has been deferred by now, or zero
+// when it has not been deferred.
+func deferredDuration(since time.Time, deferred bool, now time.Time) time.Duration {
+	if !deferred {
+		return 0
+	}
+
+	return now.Sub(since)
 }
 
 func expiredStallResponse(pending map[string]time.Time, now time.Time, offset time.Duration) (string, bool) {
@@ -2004,6 +2103,11 @@ func (p *Peer) stallHandler() {
 	// pendingResponses tracks the expected response deadline times.
 	pendingResponses := make(map[string]time.Time)
 
+	// deferredSince is when each pending non-block reply was first deferred as queued behind
+	// blocks (shouldDeferQueuedResponse), so the deferral is bounded. Cleared when the reply
+	// arrives.
+	deferredSince := make(map[string]time.Time)
+
 	// stallTicker is used to periodically check pending responses that have
 	// exceeded the expected deadline and disconnect the peer due to
 	// stalling.
@@ -2058,6 +2162,7 @@ out:
 					}
 				default:
 					delete(pendingResponses, msgCmd)
+					delete(deferredSince, msgCmd)
 				}
 
 			case sccHandlerStart:
@@ -2125,32 +2230,16 @@ out:
 			// Disconnect the peer if a pending response has not arrived by
 			// its adjusted deadline. While a block fetch is in flight,
 			// non-block deadlines are suppressed (see expiredStallResponse).
-			if command, stalled := expiredStallResponse(pendingResponses, now, offset); stalled {
-				budget := p.blockDownloadBudget()
-				if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, budget) {
-					// The block is still actively arriving at a healthy rate and
-					// within the wall-clock cap; extend the whole block-response
-					// group (armed together) rather than disconnect a peer
-					// making real progress on a large (multi-GB) block.
-					refreshed := now.Add(stallResponseTimeoutBlocks)
-					for cmd := range pendingResponses {
-						if isBlockResponseCommand(cmd) {
-							pendingResponses[cmd] = refreshed
-						}
-					}
-
-					p.logger.Debugf("Extending block deadline for %s: downloading at %d B/s (%.0fs into fetch, cap %s)",
-						p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), budget)
-				} else if shouldDeferQueuedResponse(command, healthyDownload) {
-					// Bytes are still arriving at a healthy rate, so the reply is queued
-					// behind blocks the peer is sending, not stalled.
-					pendingResponses[command] = now.Add(stallResponseTimeout)
-
-					p.logger.Debugf("Deferring %s deadline for %s: still receiving at %d B/s", command, p, recvDelta/uint64(stallTickInterval.Seconds()))
-				} else {
-					reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout", command)
-					p.DisconnectWithInfo(reason)
-				}
+			switch command, verdict, budget := judgeStallTick(pendingResponses, deferredSince, now, offset, healthyDownload, blockFetchStart, p.blockDownloadBudget); verdict {
+			case stallTickExtendBlock:
+				p.logger.Debugf("Extending block deadline for %s: downloading at %d B/s (%.0fs into fetch, cap %s)",
+					p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), budget)
+			case stallTickDefer:
+				p.logger.Debugf("Deferring %s deadline for %s: still receiving at %d B/s", command, p, recvDelta/uint64(stallTickInterval.Seconds()))
+			case stallTickDisconnect:
+				reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout", command)
+				p.DisconnectWithInfo(reason)
+			case stallTickNone:
 			}
 
 			// Reset the deadline offset for the next tick.
@@ -2307,7 +2396,13 @@ out:
 						p.cfg.Listeners.OnBlockBodyRejected(p, rejected)
 					}
 
-					p.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block body rejected", &rejected.Hash, true)
+					// Bounded: the connection has no write deadline, so a remote that has
+					// stopped reading our socket held this wait, and with it the disconnect,
+					// for as long as it kept the socket open.
+					if !p.pushRejectWithin(wire.CmdBlock, wire.RejectInvalid, "block body rejected", &rejected.Hash, rejectWriteBound) {
+						p.logger.Warnf("[%s] the reject for block %s was not written within %s; dropping the association without it", p, rejected.Hash, rejectWriteBound)
+					}
+
 					p.DisconnectAssociation("block body rejected")
 
 					break out

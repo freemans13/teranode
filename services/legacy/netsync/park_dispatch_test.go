@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -402,7 +403,11 @@ func TestDrain_AChainOfParkedBlocksDrainsOneAfterAnother(t *testing.T) {
 
 	require.NoError(t, h.deliver(t, 0))
 
-	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 0 }, 10*time.Second),
+	// Len() is zero from the moment the drain step takes the last block out of the index, before
+	// the commit goroutine has committed it and unlinked its blob, so the park is empty well
+	// before the assertions below hold. Wait for each block to be settled: no longer handed out,
+	// and its blob gone.
+	require.True(t, WaitUntil(func() bool { return parkSettled(t, h, secondHash) && parkSettled(t, h, thirdHash) }, 10*time.Second),
 		"both parked blocks must drain, so a committed drained block has to schedule the one behind it")
 
 	// All three are in the real chain, each committed once, in order.
@@ -471,7 +476,9 @@ func TestDrain_TheSweepsPostIsRestoredAndThenDispatched(t *testing.T) {
 
 	h.sm.parkCommits <- parkCommit{entry: entry, parentHeight: 1}
 
-	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 0 }, 10*time.Second),
+	// Settled, not merely out of the index: Len() is zero from the moment the drain step takes the
+	// entry, before the commit and the blob's unlink (see parkSettled).
+	require.True(t, WaitUntil(func() bool { return parkSettled(t, h, child) }, 10*time.Second),
 		"the consumer must restore the posted entry and then dispatch it through the drain step")
 
 	h.requireCommitted(t, child)
@@ -523,4 +530,24 @@ func TestParkDispatch_ARecordWhoseDataFileIsGoneIsDroppedBeforeValidation(t *tes
 
 	_, failed := h.sm.recentlyFailedBlocks.Get(entry.hash)
 	require.False(t, failed, "a block nobody judged must not be written off")
+}
+
+// parkSettled reports whether the park is done with hash: not in the index, not handed out, and
+// its blob gone from the park's directory. An empty index alone is true at hand-out, before the
+// commit goroutine has committed the block and unlinked the blob, which is what made the drain
+// tests fail about 4 runs in 60 under -race when they waited on Len() == 0.
+func parkSettled(t *testing.T, h *parkWiringHarness, hash chainhash.Hash) bool {
+	t.Helper()
+
+	if h.sm.blockPark.Has(hash) || h.sm.blockPark.HandedOut(hash) {
+		return false
+	}
+
+	for _, name := range parkDirEntries(t, h.parkDir) {
+		if strings.Contains(name, hash.String()) {
+			return false
+		}
+	}
+
+	return true
 }

@@ -213,7 +213,7 @@ type streamRegistry struct {
 	decay map[*peerpkg.Peer]float64
 	// remembered is the last rate of each peer address this process has not measured since it
 	// started, from the rates file (peerRatesFile) or from a peer that disconnected.
-	remembered map[string]float64
+	remembered map[string]peerRateRecord
 }
 
 // raceHistory is what the race and the watcher did for one block in the last raceExpiry. It is
@@ -226,6 +226,9 @@ type raceHistory struct {
 	dropped time.Time
 	// reasked is each owner asked for this block again after it was forgiven, and when.
 	reasked map[*peerpkg.Peer]time.Time
+	// spared is when the race first left this block's stalling copies connected because this
+	// node was backpressured, or zero (backpressureSpares).
+	spared time.Time
 }
 
 // newest is when the newest extra copy was asked for, or zero.
@@ -251,7 +254,7 @@ func newStreamRegistry() *streamRegistry {
 		active:     make(map[*blockStream]struct{}),
 		rates:      make(map[*peerpkg.Peer]float64),
 		raced:      make(map[chainhash.Hash]*raceHistory),
-		remembered: make(map[string]float64),
+		remembered: make(map[string]peerRateRecord),
 	}
 }
 
@@ -598,6 +601,26 @@ func (r *streamRegistry) arrivingFrom(h chainhash.Hash, p *peerpkg.Peer) (read, 
 	return 0, 0, time.Time{}, false
 }
 
+// judgedArrivalFrom is arrivingFrom with the rate the copy is judged on at now (judgedRateLocked):
+// once the copy is liveRateWindow old, the lower of its average and its rate over the last
+// window. The average alone kept a copy that was fast early and slow later looking healthy.
+func (r *streamRegistry) judgedArrivalFrom(h chainhash.Hash, p *peerpkg.Peer, now time.Time) (read, total int64, start time.Time, rate float64, ok bool) {
+	if r == nil || p == nil {
+		return 0, 0, time.Time{}, 0, false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for s := range r.active {
+		if s.hash == h && s.owner == p {
+			return s.read.Load(), s.total, s.start, r.judgedRateLocked(s, now), true
+		}
+	}
+
+	return 0, 0, time.Time{}, 0, false
+}
+
 // arrivingBytes is the declared size of every block arriving now from a peer that owes it, and how
 // many there are. A copy from a peer that does not owe the block is drained, not held, so its
 // declared size is not counted against the disk.
@@ -672,11 +695,16 @@ func (r *streamRegistry) peerRate(p *peerpkg.Peer) float64 {
 	// A remembered rate becomes the peer's rate the first time it is read, so it decays while the
 	// peer owes blocks and sends none (decayQuiet), as a measured rate does. A rate read only from
 	// the file did not, and a silent remembered peer kept its rate until the getdata deadline.
-	if bps, ok := r.remembered[p.Addr()]; ok && bps > 0 {
-		r.rates[p] = bps
+	// It is weighed down by its age (peerRateHalfLife), so a peer that was fast before a long
+	// stop does not take the near blocks at its old speed.
+	if rec, ok := r.remembered[p.Addr()]; ok {
 		delete(r.remembered, p.Addr())
 
-		return r.rateLocked(p)
+		if bps := rec.discountedRate(time.Now()); bps > 0 {
+			r.rates[p] = bps
+
+			return r.rateLocked(p)
+		}
 	}
 
 	return 0
@@ -713,31 +741,46 @@ func (r *streamRegistry) liveRateLocked(p *peerpkg.Peer) (float64, bool) {
 }
 
 // remember loads rates by peer address, for peers this process has not measured yet.
-func (r *streamRegistry) remember(rates map[string]float64) {
+func (r *streamRegistry) remember(rates map[string]peerRateRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for addr, bps := range rates {
-		if bps > 0 {
-			r.remembered[addr] = bps
+	for addr, rec := range rates {
+		if rec.BPS > 0 {
+			r.remembered[addr] = rec
 		}
 	}
 }
 
-// rememberedRates is each measured peer's rate by address, plus the remembered rates of peers not
-// connected now, for the rates file.
-func (r *streamRegistry) rememberedRates() map[string]float64 {
+// rememberedRates is each measured outbound peer's rate by address, stamped now, plus the
+// remembered rates of peers not connected now, for the rates file. An inbound peer connects from
+// a different port each time, so its address never matches again and is left out. Old entries are
+// dropped and the rest bounded (prunePeerRates), in memory as well as in the result, so neither
+// grows across restarts.
+func (r *streamRegistry) rememberedRates(now time.Time) map[string]peerRateRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	out := make(map[string]float64, len(r.remembered)+len(r.rates))
-	for addr, bps := range r.remembered {
-		out[addr] = bps
+	out := make(map[string]peerRateRecord, len(r.remembered)+len(r.rates))
+	for addr, rec := range r.remembered {
+		out[addr] = rec
 	}
 
 	for p := range r.rates {
+		if p.Inbound() {
+			continue
+		}
+
 		if bps := r.rateLocked(p); bps > 0 {
-			out[p.Addr()] = bps
+			out[p.Addr()] = peerRateRecord{BPS: bps, At: now}
+		}
+	}
+
+	out = prunePeerRates(out, now)
+
+	for addr := range r.remembered {
+		if _, kept := out[addr]; !kept {
+			delete(r.remembered, addr)
 		}
 	}
 
@@ -851,7 +894,7 @@ func (r *streamRegistry) forgetPeer(p *peerpkg.Peer) {
 	// An inbound peer connects from a different port each time, so its address never comes
 	// back, and its entry stayed in the rates file for good.
 	if bps := r.rateLocked(p); bps > 0 && !p.Inbound() {
-		r.remembered[p.Addr()] = bps
+		r.remembered[p.Addr()] = peerRateRecord{BPS: bps, At: time.Now()}
 	}
 
 	delete(r.rates, p)
@@ -884,6 +927,13 @@ func (r *streamRegistry) lastBlockBytesLocked(p *peerpkg.Peer) time.Time {
 			continue
 		}
 
+		// A complete copy still active is being converted: the wait is this node's, not the
+		// peer's, so the peer counts as sending now. From its last byte it looked silent while a
+		// 2 GB takeover converted for 90 s (review of 2026-10-12).
+		if s.complete() {
+			return time.Now()
+		}
+
 		if at := s.lastRead.Load(); at > 0 {
 			if t := time.Unix(0, at); t.After(latest) {
 				latest = t
@@ -905,7 +955,13 @@ func (r *streamRegistry) lastLiveBytesLocked(p *peerpkg.Peer, now time.Time) tim
 			continue
 		}
 
-		if !s.complete() && now.Sub(s.start) >= liveRateWindow && r.judgedRateLocked(s, now) < raceStallRate {
+		// A complete copy still active is being converted, which is this node's time, not the
+		// peer's: the peer is active now (lastBlockBytesLocked).
+		if s.complete() {
+			return now
+		}
+
+		if now.Sub(s.start) >= liveRateWindow && r.judgedRateLocked(s, now) < raceStallRate {
 			continue
 		}
 
@@ -942,7 +998,11 @@ func (r *streamRegistry) expireRacesLocked(now time.Time) {
 			}
 		}
 
-		if len(hist.asked) == 0 && hist.dropped.IsZero() && len(hist.reasked) == 0 {
+		if !hist.spared.IsZero() && now.Sub(hist.spared) > raceExpiry {
+			hist.spared = time.Time{}
+		}
+
+		if len(hist.asked) == 0 && hist.dropped.IsZero() && len(hist.reasked) == 0 && hist.spared.IsZero() {
 			delete(r.raced, h)
 		}
 	}
@@ -1198,6 +1258,37 @@ func (sm *SyncManager) decayQuietRates(now time.Time) {
 	sm.streams.decayQuiet(now, owedSince)
 }
 
+// raceBackpressureGrace is how long the race leaves a block's stalling copies connected because
+// this node is backpressured, from the first time it does.
+const raceBackpressureGrace = 5 * time.Minute
+
+// backpressureSpares reports whether h's stalling copies are left connected because this node is
+// backpressured: while localReadBackpressured holds, for at most raceBackpressureGrace from the
+// first time they were spared, within raceExpiry.
+func (sm *SyncManager) backpressureSpares(h chainhash.Hash, now time.Time) bool {
+	if !sm.localReadBackpressured() {
+		return false
+	}
+
+	return sm.streams.spare(h, now)
+}
+
+// spare records that h's stalling copies were spared at now, unless they already were, and
+// reports whether that was less than raceBackpressureGrace ago.
+func (r *streamRegistry) spare(h chainhash.Hash, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.expireRacesLocked(now)
+
+	hist := r.historyLocked(h)
+	if hist.spared.IsZero() {
+		hist.spared = now
+	}
+
+	return now.Sub(hist.spared) < raceBackpressureGrace
+}
+
 // maybeRaceSlowBlock asks a second peer for the block the chain is about to wait on, if one is
 // arriving from a slow peer. The committed tip is read here, outside any lock.
 func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
@@ -1224,9 +1315,12 @@ func (sm *SyncManager) maybeRaceSlowBlock(now time.Time) {
 	// Nobody is dropped while this node is backpressured: a read loop waits for an admission slot
 	// (localReadBackpressured, the signal the peer stall detector reads), so the slow bytes are
 	// this node's. Only that signal is measured today. A slow disk with admission slots still
-	// free does not raise it; the history bound above is what limits the cost then.
+	// free does not raise it; the history bound above is what limits the cost then. The
+	// exemption lasts raceBackpressureGrace for each block: during sync with every slot full
+	// the signal holds almost all the time, and a staller at the copy cap was never dropped
+	// (backpressureSpares).
 	asked, droppedRecently := sm.streams.raceCost(s.hash, now)
-	mayDrop := !droppedRecently && !sm.localReadBackpressured()
+	mayDrop := !droppedRecently && !sm.backpressureSpares(s.hash, now)
 
 	// At the cap no extra copy is asked for, but each stalling copy is still dropped, as SV Node's
 	// DetectStalling drops a staller whatever its parallel fetch count (net_processing.cpp:5446-5466).

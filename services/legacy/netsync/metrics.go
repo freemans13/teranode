@@ -17,6 +17,7 @@ var (
 	prometheusLegacyNetsyncOrphans                   prometheus.Gauge
 	prometheusLegacyNetsyncParkedBlocks              prometheus.Gauge
 	prometheusLegacyNetsyncParkedBytes               prometheus.Gauge
+	prometheusLegacyNetsyncOrphansAbandoned          prometheus.Counter
 	prometheusLegacyNetsyncOrphanTime                prometheus.Histogram
 
 	// prometheusLegacyNetsyncFrontierRaces counts blocks asked of a second peer because the
@@ -138,6 +139,14 @@ func _initPrometheusMetrics() {
 		Help:      "Bytes the park bills for the blocks it holds: a block parked off the wire at its wire size, a block recovered from disk after a restart at its converted record's size; bytes_ahead is what the backstop reads",
 	})
 	prometheus.MustRegister(prometheusLegacyNetsyncParkedBytes)
+
+	prometheusLegacyNetsyncOrphansAbandoned = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "legacy_netsync",
+		Name:      "orphans_abandoned_total",
+		Help:      "Orphan transactions dropped for good: evicted from the orphan pool and still invalid on the final validation attempt",
+	})
+	prometheus.MustRegister(prometheusLegacyNetsyncOrphansAbandoned)
 
 	prometheusLegacyNetsyncOrphanTime = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "teranode",

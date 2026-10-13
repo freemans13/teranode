@@ -236,19 +236,9 @@ func (sm *SyncManager) parkedRecordIncomplete(entry parkedBlock, checkErr error)
 		return false
 	}
 
-	sm.logger.Warnf("[commitParkedBlock][%s] %s; dropping the record so the next wanted-range pass downloads the block again", entry.hash, parkDispositionFilesGone.reason)
+	// The row's reAsk asks a peer for the block again above the last checkpoint.
+	sm.logger.Warnf("[commitParkedBlock][%s] %s; dropping the record so the block is downloaded again", entry.hash, parkDispositionFilesGone.reason)
 	sm.applyParkDisposition(entry, parkDispositionFilesGone)
-
-	// Above the last checkpoint no wanted-range pass names a block: announcements and the
-	// download ledger do, and a dropped record is in neither. Ask again now, with the getblocks
-	// a missing parent gets, so the peer re-announces the block. On 2026-10-10 the chain
-	// waited 13 minutes at 970,502 for the next announcement instead.
-	if !sm.headersFirstMode.Load() {
-		if peer := sm.livePeer(entry.peer); peer != nil {
-			sm.logger.Infof("[commitParkedBlock][%s] asking %s again for the block above the last checkpoint", entry.hash, peer)
-			sm.requestMissingBlocks(peer, entry.hash)
-		}
-	}
 
 	return false
 }
@@ -372,8 +362,9 @@ func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 		sm.logger.Errorf("[commitParkedBlock][%s] giving the block up (%s): %v", entry.hash, d.reason, err)
 
 	default:
-		// A drop that is not a judgement: the record is this node's own and
-		// the block is downloaded again on the next wanted-range pass.
+		// A drop that is not a judgement: the record is this node's own. Below
+		// the last checkpoint the next wanted-range pass downloads the block
+		// again; above it the row's reAsk asks a peer for it.
 		sm.logger.Warnf("[commitParkedBlock][%s] dropping the record (%s); it will be downloaded again: %v", entry.hash, d.reason, err)
 	}
 
@@ -461,6 +452,13 @@ func (sm *SyncManager) runParkSweep() {
 
 		case <-ticker.C:
 			sm.sweepParkedBlocks(time.Now())
+
+			// A converted copy whose verdict never reached QueueBlockOnDisk or
+			// pipelineBlockDelete still holds its writer open; close it.
+			sm.settleStale(time.Now())
+
+			// A dropped block's paced re-ask whose wait has passed (reAskDroppedBlock).
+			sm.sendDueReAsks(time.Now())
 
 			// A block given up on since the last tick has nothing put back for
 			// it: the wanted-range pass recomputes what it wants and who owes

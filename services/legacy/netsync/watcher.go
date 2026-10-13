@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"context"
 	"sort"
 	"time"
 
@@ -16,7 +17,8 @@ import (
 //   - Arriving: the declared size is known from the first bytes, so the time is its remaining
 //     bytes at the copy's rate. Under raceStallRate the block is the race's.
 //   - Queued: the bytes its owner sends first and the block, a recent mean block for each block of
-//     unknown size, at the owner's rate.
+//     unknown size, at the owner's rate. A block the owner passed over, delivering a block asked
+//     after it, never lands from that owner.
 // The chain applies a block only after each block below it, so a block that lands after each
 // block below it adds to the chain's wait. When it adds watchMinETA or more, its request is
 // watchMinAge old, and it has one owner, one more peer is asked:
@@ -28,11 +30,67 @@ import (
 // A block whose every copy is stalled is the race's; no block above it counts as late until it is
 // resolved, since the chain waits on it whatever lands above.
 // The owner keeps its request and its connection; the first complete copy converts and the other
-// drains at the sink. One block gets one more getdata at the maximum. Headers-first mode only: the
+// drains at the sink. A block is judged only while it has one live copy, and gets no more than the
+// race's cap of extra getdatas (maxBlockCopies-1) in raceExpiry, counted with the race's. It runs
+// under assignMu, so no download pass asks for a block beside it. Headers-first mode only: the
 // heights come from the header cache, which is empty above the last checkpoint.
 //
 // It replaces the rescue rule, which examined only the lowest owed block, 30 s after its getdata,
 // against a deadline from the chain's pace.
+
+// watchReseedEvery is the least time between two of the watcher's attempts to seed an empty block
+// size tracker from the chain.
+const watchReseedEvery = time.Minute
+
+// reseedBlockSizes seeds the block size tracker from the chain again, unless it was tried within
+// watchReseedEvery of now, and reports whether it tried. Only the watcher calls it, on the race
+// ticker, and only while the tracker is empty, so the seed never adds to sizes already recorded.
+func (sm *SyncManager) reseedBlockSizes(now time.Time) bool {
+	last := sm.watchLastReseed.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < watchReseedEvery {
+		return false
+	}
+
+	sm.watchLastReseed.Store(now.UnixNano())
+
+	ctx := sm.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	sm.seedBlockSizes(ctx)
+
+	return true
+}
+
+// watchMaxSkips is how many race ticks in a row the watcher skips because a download pass holds
+// assignMu before it waits for the lock: 30 s at raceCheckInterval.
+const watchMaxSkips = 6
+
+// lockForWatch takes assignMu for the watcher and reports whether it did. It tries without
+// waiting, and waits only after watchMaxSkips ticks in a row found the lock taken (see
+// watchOwedBlocks).
+func (sm *SyncManager) lockForWatch() bool {
+	if sm.assignMu.TryLock() {
+		sm.watchSkips.Store(0)
+
+		return true
+	}
+
+	skipped := sm.watchSkips.Add(1)
+	if skipped < watchMaxSkips {
+		sm.logger.Debugf("[watch] a download pass holds the assignment lock; skipping this tick (%d in a row)", skipped)
+
+		return false
+	}
+
+	sm.logger.Warnf("[watch] a download pass held the assignment lock for %d ticks in a row; waiting for it", skipped)
+
+	sm.assignMu.Lock()
+	sm.watchSkips.Store(0)
+
+	return true
+}
 
 const (
 	// rescueFasterBy is how many times sooner, or faster, a helper must be.
@@ -98,15 +156,48 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 		return
 	}
 
+	// With no block size the watcher cannot estimate a queued block. The tracker is seeded from
+	// the chain at start (seedBlockSizes), so it is empty only when that read failed or found no
+	// sizes (a chain at genesis); the watcher tries the seed again, at most once a minute, rather
+	// than wait for the first block to convert, which it may be the one to rescue (review of
+	// 76be891d6). No default size is
+	// assumed: one too large asks helpers for blocks that are not late, one too small hides
+	// late ones. While the tracker stays empty that is said once, not left silent (review of
+	// 2026-10-12).
 	typical := sm.blockSizeTracker.meanRecentSize()
+	if typical <= 0 && sm.reseedBlockSizes(now) {
+		typical = sm.blockSizeTracker.meanRecentSize()
+	}
+
 	if typical <= 0 {
+		if sm.watchNoSizeLogged.CompareAndSwap(false, true) {
+			sm.logger.Warnf("[watch] no recent block size to judge late blocks by; the watcher waits for the first block to convert")
+		}
+
 		return
 	}
+
+	sm.watchNoSizeLogged.Store(false)
 
 	tip, _, ok := sm.committedTip()
 	if !ok {
 		return
 	}
+
+	// One asker at a time: a download pass that ran beside the watcher could find the same late
+	// block and ask a peer for it too, as two passes once did (assignWantedBlocks). TryLock first:
+	// this runs on the frontier-race ticker, and a pass can take minutes (assignWantedBlocks
+	// records ten), during which waiting here would also stop stream sampling, rate decay, the
+	// stall drops and the rates-file save. A tick that finds a pass running is skipped and
+	// counted, and after watchMaxSkips skips in a row the watcher waits for the lock: passes run
+	// back to back could otherwise starve it for as long as the chain is busy (review of
+	// 76be891d6). That wait holds up the race's ticker for the rest of one pass, once per
+	// watchMaxSkips skipped ticks; sync.Mutex hands the lock to a waiter of more than 1 ms, so
+	// the next pass does not overtake it.
+	if !sm.lockForWatch() {
+		return
+	}
+	defer sm.assignMu.Unlock()
 
 	queues := sm.blockDownloads.Queues()
 	used := make(map[*peerpkg.Peer]bool)
@@ -166,11 +257,26 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 		adds := eta - latest
 		latest = max(latest, eta)
 
-		if adds < watchMinETA || len(owners) != 1 || sm.streams.wasRaced(b.rec.hash, now) {
+		if adds < watchMinETA || sm.streams.wasRaced(b.rec.hash, now) {
 			continue
 		}
 
-		owner := owners[0]
+		// One live copy: an owner not let off the block, or one let off that still sends it. A
+		// forgiven owner sending nothing used to count, and once a block had one the watcher never
+		// judged it again (review of 2026-10-12).
+		live := sm.liveCopies(b.rec.hash, owners)
+		if len(live) != 1 {
+			continue
+		}
+
+		// The race's cap on extra copies, by the block's history over raceExpiry rather than by
+		// who owes it now: a helper that disconnects leaves the ledger, and the watcher then asked
+		// a new one every 30 s (review of 2026-10-12).
+		if asked, _ := sm.streams.raceCost(b.rec.hash, now); asked >= maxBlockCopies-1 {
+			continue
+		}
+
+		owner := live[0]
 
 		// A copy with more than half its bytes gets no helper while it lands within
 		// watchPastHalfWait: the helper must send the full block, and the owner's nearly complete
@@ -314,8 +420,8 @@ const farOff = maxEstimate
 // admission slot), and arrivalStalled when its bytes arrive under raceStallRate, so it is the
 // race's.
 //
-// A copy arriving from o is judged on its own rate: its remaining bytes at that rate, and a fresh
-// copy must fetch the whole block. A copy not yet started is judged by o's queue: the bytes o is
+// A copy arriving from o is judged on its own rate, the lower of its average and its live rate:
+// its remaining bytes at that rate, and a fresh copy must fetch the whole block. A copy not yet started is judged by o's queue: the bytes o is
 // still sending, a typical block for each block ahead of it and its own typical size, at o's rate.
 // An owner let off the block (forgiven, so not in its queue) and sending no copy will not deliver.
 func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []queuedBlock, typical int64, now time.Time) (eta time.Duration, ownSize int64, state string, verdict arrivalVerdict) {
@@ -324,17 +430,17 @@ func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []q
 		return 0, 0, "", arrivalTooEarly
 	}
 
-	if read, total, start, arriving := sm.streams.arrivingFrom(h, o); arriving {
-		elapsed := now.Sub(start)
-		if elapsed < watchMinAge {
+	// The copy's rate is the one the race judges it on (judgedRateLocked): the lower of its
+	// average and its live rate. On the average alone a copy that was fast early and slow past
+	// half kept a short estimate and got no helper (review of 2026-10-12).
+	if read, total, start, rate, arriving := sm.streams.judgedArrivalFrom(h, o, now); arriving {
+		if now.Sub(start) < watchMinAge {
 			return 0, 0, "", arrivalTooEarly
 		}
 
-		if read <= 0 || float64(read)/elapsed.Seconds() < raceStallRate {
+		if read <= 0 || rate < raceStallRate {
 			return 0, 0, "", arrivalStalled
 		}
-
-		rate := float64(read) / elapsed.Seconds()
 
 		return estimate(float64(total-read), rate), total, "arrives slowly from", arrivalJudged
 	}
@@ -358,6 +464,14 @@ func (sm *SyncManager) ownerArrival(o *peerpkg.Peer, h chainhash.Hash, queue []q
 
 	if now.Sub(rec.at) < watchMinAge {
 		return 0, 0, "", arrivalTooEarly
+	}
+
+	// The owner delivered a block asked after this one and has not started this one: it passed
+	// it over, and will not deliver it from its queue. A fast owner that ignored one getdata
+	// entry kept the estimate here at a typical block at its rate, under watchMinETA, while any
+	// block it delivered cleared its deadline and kept its rate up (review of 2026-10-12).
+	if sm.blockDownloads.PassedOver(o, h) {
+		return farOff, 0, "was passed over by", arrivalJudged
 	}
 
 	// An owner with no rate has sent no block bytes: it lands the block very late. The median rate

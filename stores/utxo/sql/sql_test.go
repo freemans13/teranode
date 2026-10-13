@@ -1023,6 +1023,15 @@ func Test_SmokeTests(t *testing.T) {
 		tests.SpendErrorTypes(t, db)
 	})
 
+	t.Run("partial spend rollback", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.PartialSpendRollback(t, db)
+	})
+
 	t.Run("get spend not found", func(t *testing.T) {
 		db, _ := setup(ctx, t)
 
@@ -3769,4 +3778,31 @@ func TestGetBlockPlacementFieldsIndependently(t *testing.T) {
 		require.Equal(t, []uint32{99}, data.BlockHeights)
 		require.Equal(t, []int{3}, data.SubtreeIdxs)
 	})
+}
+
+// TestPreviousOutputsDecorate_MissingParentIsTxNotFound pins the class a missing
+// parent output is reported as. Aerospike reports it as TX_NOT_FOUND, and the
+// JSON-RPC boundary turns that into sendrawtransaction's "Missing inputs"; this
+// store reported PROCESSING, which the boundary can only answer as "internal
+// error". TX_NOT_FOUND also keeps legacy sync's per-transaction fallback
+// (services/legacy/netsync, extendPerTxFallback) taking the same branch, since it
+// keys on ErrProcessing or ErrTxNotFound.
+func TestPreviousOutputsDecorate_MissingParentIsTxNotFound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, tx := setup(ctx, t)
+
+	// setup's transaction arrives extended, and the decorator only fills what is
+	// missing. Clear the supplied previous outputs, as sendrawtransaction does, so
+	// the store has to resolve a parent that was never created.
+	for _, input := range tx.Inputs {
+		input.PreviousTxScript = nil
+		input.PreviousTxSatoshis = 0
+	}
+
+	err := store.PreviousOutputsDecorate(ctx, tx)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, errors.ErrTxNotFound)
 }

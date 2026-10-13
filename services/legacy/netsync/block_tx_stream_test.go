@@ -7,6 +7,8 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
@@ -290,4 +292,40 @@ func TestBlockTxStream_RefusesAnEmptyBlock(t *testing.T) {
 	_, err := newBlockTxStream(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no transactions")
+}
+
+// A block on the wire whose transaction comes in the extended form is a corrupt delivery. Its id,
+// and so the header, still match, because an id is defined over the standard form, but SV Node
+// rejects the encoding, and the previous outputs it carries would land in the .subtreeData file.
+// Nothing reaches the subtree writer (review of 2026-10-12).
+func TestBlockTxStream_RefusesATransactionInTheExtendedForm(t *testing.T) {
+	tx, _ := streamTx(t, 1)
+
+	for _, in := range tx.Inputs {
+		in.PreviousTxSatoshis = 1000
+		in.PreviousTxScript = bscript.NewFromBytes([]byte{bscript.OpTRUE})
+	}
+
+	raw := tx.ExtendedBytes()
+	require.NotEqual(t, tx.Bytes(), raw)
+
+	var buf bytes.Buffer
+
+	require.NoError(t, wire.WriteVarInt(&buf, wire.ProtocolVersion, 1))
+
+	_, err := buf.Write(raw)
+	require.NoError(t, err)
+
+	s, err := newBlockTxStream(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	var written bytes.Buffer
+
+	_, _, _, err = s.NextStreamed(func(*bt.Tx) (io.Writer, error) {
+		return &written, nil
+	})
+	require.Error(t, err)
+	require.True(t, errors.IsBlockCorrupt(err), "a delivery fault, the peer's: %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "and says nothing about the block itself")
+	require.Zero(t, written.Len(), "nothing reaches the subtree file")
 }

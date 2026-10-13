@@ -422,6 +422,26 @@ func (p *blockPark) HandedOut(hash chainhash.Hash) bool {
 	return ok
 }
 
+// Holds reports whether the park has this block in its index or handed out, read under one
+// lock. Has then HandedOut, as two calls, missed a block given back between them (Restore moves
+// it from out to the index), and HandedOut then Has missed one taken between them.
+func (p *blockPark) Holds(hash chainhash.Hash) bool {
+	if p == nil {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, ok := p.entries[hash]; ok {
+		return true
+	}
+
+	_, ok := p.out[hash]
+
+	return ok
+}
+
 // handOutLocked removes entry from the index, records it as handed out under a
 // fresh claim and returns the copy the taker holds. The caller holds mu and
 // removes the parent edge itself, since the three takes keep their edges
@@ -1239,7 +1259,7 @@ const strandedRecordAge = time.Minute
 // reports whether it adopted the record; a record that is unreadable or missing a subtree file
 // is left to holdsBlock, which then answers false so the block is downloaded again.
 func (p *blockPark) adoptStranded(ctx context.Context, hash chainhash.Hash, subtreeStore blob.Store) bool {
-	if p == nil || p.Has(hash) || p.HandedOut(hash) {
+	if p == nil || p.Holds(hash) {
 		return false
 	}
 

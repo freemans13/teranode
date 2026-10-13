@@ -351,9 +351,15 @@ func (sm *SyncManager) pipelineAdmissionAcquireTimeout() time.Duration {
 // read instead of after the whole download. After the asked-for check on
 // purpose, so an unrequested oversize body is still only discarded. This is a
 // decline, not a verdict: the error carries ErrBlockPolicyDeclined, which the
-// wire layer turns into a discard with the connection kept, and the hash is
-// marked in recentlyFailedBlocks so the wanted-range pass does not ask for it
-// again and drain it in a loop. At shipped defaults this arm never fires:
+// wire layer turns into a discard with the connection kept. The hash is not
+// marked in recentlyFailedBlocks: the length is the sender's claim, not the
+// block's, and the gate does not know whether the sender owes the block, so a
+// mark let any peer that knew a requested hash stop this node asking anyone for
+// it for the mark's lifetime, at no cost to itself. The wire layer reports the
+// declining peer to notePolicyDecline instead, which marks the hash once
+// policyDeclinePeers different hosts this node asked for the block have
+// declared it above policy, so an honest oversize block is not drained again on
+// every pass while one host's claim still stops nothing. At shipped defaults this arm never fires:
 // go-wire refuses a payload above maxWireBlockPayload (4,000,000,000,
 // services/legacy/config.go) before this handler runs, and the default
 // excessiveblocksize is 4,294,967,296; it exists for an operator who lowers
@@ -381,16 +387,10 @@ func (sm *SyncManager) streamingBlockGate(hash chainhash.Hash, header *wire.Bloc
 		return &peerpkg.BlockNotRequestedError{Hash: hash}
 	}
 
-	// sm.settings is nil on struct-literal managers in tests; recentlyFailedBlocks
-	// likewise. Policy.ExcessiveBlockSize is 0 when the operator disabled the
-	// limit. The map is guarded by its own lock (util/expiringmap), so writing it
-	// from the read loop is safe.
+	// sm.settings is nil on struct-literal managers in tests. Policy.ExcessiveBlockSize
+	// is 0 when the operator disabled the limit.
 	if sm.settings != nil && sm.settings.Policy.ExcessiveBlockSize > 0 {
 		if limit, err := safeconversion.IntToUint64(sm.settings.Policy.ExcessiveBlockSize); err == nil && length > limit {
-			if sm.recentlyFailedBlocks != nil {
-				sm.recentlyFailedBlocks.Set(hash, struct{}{})
-			}
-
 			sm.logger.Warnf("[streamingBlockGate][%s] declared %d-byte body exceeds excessiveblocksize %d (local policy); not read", hash, length, limit)
 
 			return errors.NewBlockPolicyDeclinedError("[streamingBlockGate][%s] declared %d-byte body exceeds excessiveblocksize %d (local policy)", hash, length, limit)
@@ -478,7 +478,17 @@ type blockOnDiskMsg struct {
 // read loop is already free by the time this is called, because the bytes went
 // to disk as they arrived rather than into a buffer somebody has to release.
 func (sm *SyncManager) QueueBlockOnDisk(body peerpkg.BlockBody, peer *peerpkg.Peer) {
-	if atomic.LoadInt32(&sm.shutdown) != 0 {
+	shuttingDown := atomic.LoadInt32(&sm.shutdown) != 0
+
+	// The wire layer accepted the copy, so its cleanup will not run: the converting writer's
+	// window as a creator closes here (holdUntilSettled). Unless the manager is stopping, the
+	// copy is also marked as accepting until the consumer has parked it, so a refusal of another
+	// copy keeps its record (pipelineBlockDelete); handleBlockOnDiskMsg clears the mark.
+	if body.Converted {
+		sm.settleAccepted(body.Hash, !shuttingDown)
+	}
+
+	if shuttingDown {
 		return
 	}
 
@@ -499,6 +509,12 @@ func (sm *SyncManager) QueueBlockOnDisk(body peerpkg.BlockBody, peer *peerpkg.Pe
 func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	if msg == nil {
 		return
+	}
+
+	// QueueBlockOnDisk's mark: by the time this returns the park holds the block or this
+	// handler chose to drop it.
+	if msg.body.Converted {
+		defer sm.acceptanceHandled(msg.body.Hash)
 	}
 
 	// Every block arrives on this on-disk route, so this is where the download
@@ -548,7 +564,9 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		_, primary, _ = sm.peerStateResolvingPrimary(msg.peer)
 	}
 
-	sm.blockDownloads.RemoveOwner(primary, msg.body.Hash)
+	// Delivered, not RemoveOwner: the ledger remembers where in the peer's queue this request
+	// was, so a block asked of the peer earlier and not sent reads as passed over.
+	sm.blockDownloads.Delivered(primary, msg.body.Hash)
 
 	// The delivering peer has room again, so ask it for more now. Only a commit
 	// used to, and while download is the limit blocks arrive out of order and

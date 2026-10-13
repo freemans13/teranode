@@ -164,7 +164,10 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 		sink     *errRecordingWriter
 	)
 
-	opts := txstream.Options{SkipDataScripts: true}
+	// StandardOnly: an id is defined over the standard form, so an extended copy of a valid block
+	// still matches its header, but SV Node rejects the encoding, and the previous outputs it
+	// carries would land in the .subtreeData file.
+	opts := txstream.Options{SkipDataScripts: true, StandardOnly: true}
 	if beforeOutputs != nil {
 		opts.BeforeOutputs = func(tx *bt.Tx) (io.Writer, error) {
 			w, err := beforeOutputs(tx)
@@ -188,6 +191,12 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 	if err != nil {
 		if localErr != nil {
 			return nil, nil, 0, localErr
+		}
+
+		// Corrupt, not invalid: the transaction ids, and so the header, match the block whatever
+		// the encoding, so the refusal is about this delivery, not the block.
+		if stderrors.As(err, new(txstream.ExtendedFormError)) {
+			return nil, nil, 0, errors.NewBlockCorruptError("[blockTxStream] transaction %d of the %d declared is in the extended form, which a block on the wire never carries", s.read, s.txCount)
 		}
 
 		if sink != nil && sink.err != nil {
@@ -225,8 +234,9 @@ func (s *blockTxStream) NextStreamed(beforeOutputs txstream.BeforeOutputs) (*bt.
 //
 // The wire layer refuses both too, but only after the sink has reported success (readBlockMessage,
 // services/legacy/peer/wire_streaming.go). By then the converted record is written, possibly over
-// a parked copy of the same block, and the refusal's cleanup, pipelineBlockDelete, takes that
-// parked copy's subtree files with it, because they are keyed by root and shared by every copy.
+// a parked copy of the same block, whose subtree files are keyed by root and shared by every copy.
+// The refusal's cleanup, pipelineBlockDelete, now leaves those files alone while the park holds or
+// has handed out the block, but refusing here first keeps the record from being written at all.
 func (s *blockTxStream) RequireEnd() error {
 	// Corrupt, not invalid, here and below: the transactions matched the header, so a length
 	// that disagrees says nothing about the block, only about this delivery of it.

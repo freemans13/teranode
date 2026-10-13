@@ -39,6 +39,7 @@ var (
 	ErrServiceNotStarted          = New(ERR_SERVICE_NOT_STARTED, "service not started")
 	ErrServiceUnavailable         = New(ERR_SERVICE_UNAVAILABLE, "service unavailable")
 	ErrServiceRateLimited         = New(ERR_SERVICE_RATE_LIMITED, "service rate limited")
+	ErrServiceNotReady            = New(ERR_SERVICE_NOT_READY, "service not ready")
 	ErrFrozen                     = New(ERR_UTXO_FROZEN, "tx is frozen")
 	ErrNonFinal                   = New(ERR_UTXO_NON_FINAL, "tx is non-final")
 	ErrSpent                      = New(ERR_UTXO_SPENT, "utxo already spent")
@@ -70,6 +71,7 @@ var (
 	ErrTxPolicy                   = New(ERR_TX_POLICY, "tx policy error")
 	ErrTxLocked                   = New(ERR_TX_LOCKED, "tx locked")
 	ErrTxCreating                 = New(ERR_TX_CREATING, "tx creating")
+	ErrTxUnlockFailed             = New(ERR_TX_UNLOCK_FAILED, "tx unlock failed")
 	ErrUnknown                    = New(ERR_UNKNOWN, "unknown error")
 	ErrNetworkError               = New(ERR_NETWORK_ERROR, "network error")
 	ErrNetworkTimeout             = New(ERR_NETWORK_TIMEOUT, "network timeout")
@@ -397,6 +399,13 @@ func NewTxCreatingError(message string, params ...interface{}) *Error {
 	return New(ERR_TX_CREATING, message, params...)
 }
 
+// NewTxUnlockFailedError creates a new error with the transaction unlock failed error code.
+// It marks a transaction that was accepted, spent and created, but whose two-phase-commit
+// unlock did not complete, so the record stays locked until it is mined.
+func NewTxUnlockFailedError(message string, params ...interface{}) *Error {
+	return New(ERR_TX_UNLOCK_FAILED, message, params...)
+}
+
 // NewTxCoinbaseImmatureError creates a new error with the transaction coinbase immature error code.
 func NewTxCoinbaseImmatureError(message string, params ...interface{}) *Error {
 	return New(ERR_TX_COINBASE_IMMATURE, message, params...)
@@ -421,6 +430,17 @@ func NewServiceUnavailableError(message string, params ...interface{}) *Error {
 // not the peer's fault; retry with backoff.
 func NewServiceRateLimitedError(message string, params ...interface{}) *Error {
 	return New(ERR_SERVICE_RATE_LIMITED, message, params...)
+}
+
+// NewServiceNotReadyError creates a new error with the service not ready error code.
+//
+// The service is up but still loading state it needs, and refuses work it will
+// accept shortly; nothing is broken. It is distinct from ERR_SERVICE_NOT_STARTED,
+// whose producers report a service that failed to start, and from
+// ERR_SERVICE_UNAVAILABLE, which callers treat as a fault. It carries no gRPC
+// status of its own (codes.Internal), so it does not wake the client retry gate.
+func NewServiceNotReadyError(message string, params ...interface{}) *Error {
+	return New(ERR_SERVICE_NOT_READY, message, params...)
 }
 
 // NewServiceNotStartedError creates a new error with the service not started error code.

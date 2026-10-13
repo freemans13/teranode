@@ -15,7 +15,7 @@ import (
 // up on a peer averaging under 100 KB/s of block data, or after tens of minutes.
 func TestABlockAtAPeerStillSendingBlocksIsNotAskedOfAnother(t *testing.T) {
 	sm := assignManager(t, 1, 120)
-	// Above the last checkpoint: below it a quiet owner keeps its blocks (TestAQuietOwnerIsNotReAskedBelowTheCheckpoint).
+	// Above the last checkpoint: below it a busy single owner keeps its blocks (TestABusyOwnerKeepsItsBlockBelowTheCheckpoint).
 	sm.headersFirstMode.Store(false)
 	sm.streams = newStreamRegistry()
 	mockCommittedTip(t, sm, 10, 0)

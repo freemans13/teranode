@@ -562,3 +562,48 @@ func TestStreamingBlockHandlerDiscardsABodyTheGateDeclinesOnPolicy(t *testing.T)
 	require.NoError(t, readErr)
 	require.Equal(t, tail, got, "the declined body must be drained exactly, leaving the next message intact")
 }
+
+// The decline is reported to the sync manager with the peer that declared the body, before the
+// body is drained, so it can tell a block every peer declares too large from one peer's claim
+// (review of 76be891d6). The gate's own signature carries no peer.
+func TestStreamingBlockHandlerReportsAPolicyDeclineWithItsPeer(t *testing.T) {
+	payload, hash := serialisedBlock(t, 4)
+
+	blockBodySink = func(chainhash.Hash, *wire.BlockHeader, io.Reader, int64) (bool, error) {
+		t.Fatal("a body the policy declines must never reach the sink")
+
+		return false, nil
+	}
+	t.Cleanup(func() { blockBodySink = nil })
+
+	blockBodyDelete = func(chainhash.Hash, bool) error { return nil }
+	t.Cleanup(func() { blockBodyDelete = nil })
+
+	installGate(t, func(_ chainhash.Hash, _ *wire.BlockHeader, length uint64) error {
+		return errors.NewBlockPolicyDeclinedError("declared %d-byte body exceeds excessiveblocksize (local policy)", length)
+	})
+
+	var (
+		gotHash chainhash.Hash
+		gotFrom *Peer
+		calls   int
+	)
+
+	SetBlockPolicyDeclinedHook(func(h chainhash.Hash, from *Peer) {
+		gotHash, gotFrom = h, from
+		calls++
+	})
+	t.Cleanup(func() { SetBlockPolicyDeclinedHook(nil) })
+
+	sender := &Peer{}
+
+	_, msg, _, err := streamingBlockHandler(&deliveryReader{r: bytes.NewReader(payload), from: sender}, uint64(len(payload)), 24)
+	require.NoError(t, err)
+
+	_, ok := msg.(*MsgBlockDiscarded)
+	require.True(t, ok, "still discarded and drained")
+
+	require.Equal(t, 1, calls, "the decline is reported once")
+	require.Equal(t, hash, gotHash)
+	require.Same(t, sender, gotFrom, "with the peer that declared the body")
+}
