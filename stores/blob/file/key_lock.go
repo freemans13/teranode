@@ -1,6 +1,10 @@
 package file
 
-import "sync"
+import (
+	"context"
+	"sync"
+	"time"
+)
 
 // blobKeyLocks serialises, per blob, the steps that decide its delete-at-height: an exclusive
 // publish (its schedule and the publish itself) and SetDAH. It is per process and keyed by the
@@ -21,8 +25,16 @@ import "sync"
 // not covered: it schedules before it publishes and takes no lock, as it always has, and a
 // plain write over an existing blob still replaces that blob's delete-at-height.
 //
-// One mutex per name in use, created on demand and dropped when its last holder leaves, so a
-// slow scheduler call on one blob never holds up another.
+// keyLockedSchedulerTimeout bounds each blob-deletion scheduler call made while a blob's key lock
+// is held. The scheduler is a call to the blockchain service; one that hangs would otherwise hold
+// the key, and every writer waiting on it, for as long as it hangs. 30 s is far above a healthy
+// call.
+var keyLockedSchedulerTimeout = 30 * time.Second
+
+// One lock per name in use, created on demand and dropped when its last holder or waiter leaves,
+// so a slow scheduler call on one blob never holds up another. A waiter gives up when its context
+// ends: every caller holds a file-store write permit while it waits, and a wait with no way out
+// let one hung holder pin, through its waiters, the whole permit pool (review of 76be891d6).
 var blobKeyLocks = keyLocks{locks: make(map[string]*keyLock)}
 
 type keyLocks struct {
@@ -30,36 +42,47 @@ type keyLocks struct {
 	locks map[string]*keyLock
 }
 
+// keyLock is a one-slot channel: holding the lock is having sent into it.
 type keyLock struct {
-	mu   sync.Mutex
+	slot chan struct{}
 	refs int
 }
 
-// lock takes name's lock and returns the function that gives it back.
-func (k *keyLocks) lock(name string) func() {
+// lock takes name's lock and returns the function that gives it back, or ctx's error if ctx ends
+// first.
+func (k *keyLocks) lock(ctx context.Context, name string) (func(), error) {
 	k.mu.Lock()
 
 	l, ok := k.locks[name]
 	if !ok {
-		l = &keyLock{}
+		l = &keyLock{slot: make(chan struct{}, 1)}
 		k.locks[name] = l
 	}
 
 	l.refs++
 	k.mu.Unlock()
 
-	l.mu.Lock()
+	select {
+	case l.slot <- struct{}{}:
+	case <-ctx.Done():
+		k.release(name, l)
+
+		return nil, ctx.Err()
+	}
 
 	return func() {
-		l.mu.Unlock()
+		<-l.slot
+		k.release(name, l)
+	}, nil
+}
 
-		k.mu.Lock()
+// release drops one reference to name's lock, and the lock itself with the last.
+func (k *keyLocks) release(name string, l *keyLock) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
 
-		l.refs--
-		if l.refs == 0 {
-			delete(k.locks, name)
-		}
-
-		k.mu.Unlock()
+	l.refs--
+	if l.refs == 0 {
+		delete(k.locks, name)
 	}
 }

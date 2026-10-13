@@ -944,7 +944,7 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 	}
 	file = nil
 
-	if err = s.publish(key, fileType, tmpFilename, filename, merged, hasher); err != nil {
+	if err = s.publish(ctx, key, fileType, tmpFilename, filename, merged, hasher); err != nil {
 		return err
 	}
 	cleanupTmpFile = false
@@ -1102,7 +1102,9 @@ func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts 
 		return "", err
 	}
 
-	if err := s.scheduleDAH(key, fileType, merged); err != nil {
+	// Use background context since SetFromReader might be cancelled but we still want the
+	// deletion to be scheduled. No lock is held here.
+	if err := s.scheduleDAH(context.Background(), key, fileType, merged); err != nil {
 		return "", err
 	}
 
@@ -1121,8 +1123,9 @@ func (s *File) filenameFor(key []byte, fileType fileformat.FileType, merged *opt
 	return merged.ConstructFilename(s.path, key, fileType)
 }
 
-// scheduleDAH schedules the blob's deletion at its delete-at-height, when merged gives one.
-func (s *File) scheduleDAH(key []byte, fileType fileformat.FileType, merged *options.Options) error {
+// scheduleDAH schedules the blob's deletion at its delete-at-height, when merged gives one, with
+// ctx on the scheduler call.
+func (s *File) scheduleDAH(ctx context.Context, key []byte, fileType fileformat.FileType, merged *options.Options) error {
 	// Skip DAH functionality entirely if disabled for this store
 	// Lifecycle is managed externally (e.g., by Aerospike pruner)
 	if merged.DisableDAH {
@@ -1143,10 +1146,7 @@ func (s *File) scheduleDAH(key []byte, fileType fileformat.FileType, merged *opt
 			return errors.NewConfigurationError("cannot schedule blob deletion: blob deletion scheduler not configured")
 		}
 
-		// Use background context since SetFromReader might be cancelled
-		// but we still want the deletion to be scheduled
-		bgCtx := context.Background()
-		if _, _, err := s.blobDeletionScheduler.ScheduleBlobDeletion(bgCtx, key, string(fileType), s.storeType, dah); err != nil {
+		if _, _, err := s.blobDeletionScheduler.ScheduleBlobDeletion(ctx, key, string(fileType), s.storeType, dah); err != nil {
 			return errors.NewStorageError("failed to schedule blob deletion", err)
 		}
 	}
@@ -1185,12 +1185,19 @@ func (s *File) publishFilename(key []byte, fileType fileformat.FileType, merged 
 // has replaced the plain write's. A publish that fails after its schedule (a link error other
 // than the name being taken, or a checksum sidecar that cannot be written) leaves a
 // delete-at-height for a blob that is not there; the next writer of the name schedules its own.
-func (s *File) publish(key []byte, fileType fileformat.FileType, tmpFilename, filename string, merged *options.Options, hasher hash.Hash) error {
+//
+// The wait for the lock ends with ctx, and the schedule under the lock is bounded by
+// keyLockedSchedulerTimeout, so a scheduler call that hangs holds the key, and the write permits
+// of the callers waiting on it, for that long and no longer.
+func (s *File) publish(ctx context.Context, key []byte, fileType fileformat.FileType, tmpFilename, filename string, merged *options.Options, hasher hash.Hash) error {
 	if !merged.ExclusivePublish {
 		return s.publishTempFile(tmpFilename, filename, merged, hasher)
 	}
 
-	unlock := blobKeyLocks.lock(filename)
+	unlock, err := blobKeyLocks.lock(ctx, filename)
+	if err != nil {
+		return errors.NewStorageError("[File][publish] [%s] gave up waiting for the blob's key lock", filename, err)
+	}
 	defer unlock()
 
 	// Under the lock this check decides between exclusive publishers, so a writer that loses
@@ -1200,7 +1207,12 @@ func (s *File) publish(key []byte, fileType fileformat.FileType, tmpFilename, fi
 		return err
 	}
 
-	if err := s.scheduleDAH(key, fileType, merged); err != nil {
+	// Detached from ctx as the plain path's schedule is, so a cancelled write that got this far
+	// still schedules before it publishes, but bounded, because the key lock is held.
+	scheduleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), keyLockedSchedulerTimeout)
+	defer cancel()
+
+	if err := s.scheduleDAH(scheduleCtx, key, fileType, merged); err != nil {
 		return err
 	}
 
@@ -1253,8 +1265,16 @@ func (s *File) SetDAH(ctx context.Context, key []byte, fileType fileformat.FileT
 
 	// After any exclusive publish of this blob in flight has scheduled and published, so this
 	// change is the later one (see publish).
-	unlock := blobKeyLocks.lock(fileName)
+	// The wait ends with ctx: this caller holds a write permit while it waits.
+	unlock, err := blobKeyLocks.lock(ctx, fileName)
+	if err != nil {
+		return errors.NewStorageError("[File][SetDAH] [%s] gave up waiting for the blob's key lock", fileName, err)
+	}
 	defer unlock()
+
+	// Bounded while the key lock is held, so one hung scheduler call cannot pin the key.
+	ctx, cancel := context.WithTimeout(ctx, keyLockedSchedulerTimeout)
+	defer cancel()
 
 	if newDAH == 0 {
 		// Cancel scheduled deletion

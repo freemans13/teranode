@@ -156,7 +156,7 @@ func (p *PendingFile) Commit(ctx context.Context, key []byte, opts ...options.Fi
 		return err
 	}
 
-	if err = p.s.publish(key, p.fileType, p.tmp, filename, merged, p.hasher); err != nil {
+	if err = p.s.publish(ctx, key, p.fileType, p.tmp, filename, merged, p.hasher); err != nil {
 		p.Abort()
 
 		return err
