@@ -521,13 +521,9 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 	}
 
 	// In headers-first mode the wanted-range pass names the dropped block, so only
-	// above the last checkpoint is the re-ask needed. livePeer may fall back to the
-	// sync peer: a re-ask is a sync action, not a misbehaviour signal.
+	// above the last checkpoint is the re-ask needed.
 	if d.reAsk && !sm.headersFirstMode.Load() {
-		if peer := sm.livePeer(entry.peer); peer != nil {
-			sm.logger.Infof("[applyParkDisposition][%s] asking %s again for the dropped block above the last checkpoint", entry.hash, peer)
-			sm.requestMissingBlocks(peer, entry.hash)
-		}
+		sm.reAskDroppedBlock(entry)
 	}
 
 	if !d.blamePeer && !d.dropPeer {
@@ -567,6 +563,51 @@ func (sm *SyncManager) applyParkDisposition(entry parkedBlock, d parkDisposition
 		// waited on.
 		entry.peer.DisconnectAssociation(dropReason)
 	}
+}
+
+// reAskDroppedBlock asks a peer again for a block whose parked record a reAsk row has just
+// dropped, above the last checkpoint, where nothing else will.
+//
+// A request for a block passes several suppression layers, and a re-ask has to get through
+// every one that would swallow it while a real duplicate is still stopped:
+//
+//   - PushGetBlocksMsg drops a getblocks that repeats the last (locator[0], stop hash) pair
+//     sent to that peer. The re-ask used to be a getblocks from the best block with a zero stop
+//     hash, which is exactly the request that fetched the block whenever the tip has not moved
+//     since, so it never left the node (external review of e4698b219). It is a getdata for the
+//     one block now, which no filter on the peer touches.
+//   - handleInvMsg ignores invs from anyone but the sync peer while the node is not current,
+//     and drainRequestQueue skips a block held locally or requested within the retry window.
+//     A getdata needs no inv, so none of that is in the way.
+//   - The streaming gate takes a body only if the download ledger says it was requested.
+//     reAskBlockFromPeer records the request first, against the primary peer, because the
+//     ledger is keyed by primary: entry.peer is the DATA1 sub-peer when the body streamed, and
+//     Delivered(primary, hash) would never discharge a record kept on the sub-peer.
+//   - recentlyFailedBlocks: no reAsk row marks the block failed (pinned by
+//     TestParkDispositions_ReAskIsSetOnTheDropRowsThatWantTheBlockBack).
+//
+// What still stops it is a request that would really be a duplicate: the block parked again,
+// arriving, being converted, or asked of any peer within the retry window. The dispatcher's
+// own in-flight entry for this block is not asked, because this disposition is how that entry
+// ends. livePeer may fall back to the sync peer: a re-ask is a sync action, not a misbehaviour
+// signal.
+func (sm *SyncManager) reAskDroppedBlock(entry parkedBlock) {
+	peer := sm.livePeer(entry.peer)
+	if peer == nil {
+		return
+	}
+
+	_, peer, _ = sm.peerStateResolvingPrimary(peer)
+
+	if sm.blockPark.Has(entry.hash) || sm.streams.arriving(entry.hash) || sm.conversionInFlight(entry.hash) ||
+		sm.blockDownloads.RequestedWithin(entry.hash, blockRequestRetryInterval) {
+		sm.logger.Infof("[applyParkDisposition][%s] not asking again for the dropped block: it is already parked, arriving, converting or requested", entry.hash)
+
+		return
+	}
+
+	sm.logger.Infof("[applyParkDisposition][%s] asking %s again for the dropped block above the last checkpoint", entry.hash, peer)
+	sm.reAskBlockFromPeer(peer, entry.hash)
 }
 
 // rejectThenDropPeer queues the reject for entry to the peer that delivered it,

@@ -47,13 +47,13 @@ func TestSyncManager_EveryDroppedRecordIsAskedForAgainAboveTheCheckpoint(t *test
 
 			h.sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
 
-			before := h.rec.getBlocksCount()
+			before := h.rec.getDataCount()
 
 			require.NoError(t, h.deliver(t, 0))
 			h.drainOneParkCommit(t)
 
 			require.Zero(t, h.sm.blockPark.Len(), "the record is dropped")
-			require.True(t, WaitUntil(func() bool { return h.rec.getBlocksCount() > before }, 5*time.Second),
+			require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
 				"above the checkpoint a dropped record must be asked for again at once")
 		})
 	}
