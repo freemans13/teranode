@@ -49,12 +49,14 @@ import (
 // The NOT EXISTS guard is belt-and-braces: with a non-unique key a concurrent re-create
 // could otherwise produce a duplicate live row for one outpoint, which is counterfeit.
 //
-// It does not cover two journal rows for the same spend, and that case is real: the pruner's
-// copy-forward commits a carried copy before it detaches the original partition, so for that
-// interval both rows match all three predicates. Both are consumed, which is right, since a
-// copy left behind would be a second authorisation. But the guard reads the pre-statement
-// snapshot, in which the UTXO is absent for both, so both used to insert and one spent output
-// came back as two live ones. The `one` CTE collapses them to one row per UTXO first.
+// It does not cover two journal rows for the same spend. The pruner's carry no longer makes
+// them, because it moves the row rather than copying it (copyForwardSQL), but a database
+// upgraded from a build whose carry was a copy can hold the original and its copy until the
+// next pass over the leaf heals it, and both match all three predicates. Both are consumed,
+// which is right, since a copy left behind would be a second authorisation. But the guard reads
+// the pre-statement snapshot, in which the UTXO is absent for both, so both used to insert and
+// one spent output came back as two live ones. The `one` CTE collapses them to one row per UTXO
+// first.
 //
 // $4 carries the flags to OR in, so a caller asking for flagAsLocked gets the UTXO back
 // already locked rather than briefly spendable. IT REACHES BOTH OUTCOMES, the UTXO this call
@@ -123,9 +125,9 @@ taken AS (
               j.spendable_from, j.flags, j.hash_override, j.mined_height, j.block_id
 ),
 one AS (
-    -- One row per UTXO, whatever the journal held. Two rows for one spend is the pruner's
-    -- copy-forward window: the carried copy has committed and the original partition is not
-    -- yet detached, so both match and both are consumed above. The NOT EXISTS below cannot
+    -- One row per UTXO, whatever the journal held. Two rows for one spend is what a build
+    -- whose carry was a copy left between its copy and its drop, until the next pass heals
+    -- it, so both match and both are consumed above. The NOT EXISTS below cannot
     -- collapse them, because it reads the same pre-statement snapshot for both. A filled-in
     -- pair beats an unfilled one, which is the only way the two can differ.
     SELECT DISTINCT ON (t.ukey, t.txid) t.*

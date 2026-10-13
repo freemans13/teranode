@@ -527,35 +527,62 @@ SELECT m.txid, m.tx_inpoints
  WHERE m.mined_height >= $1::int
    AND m.created_height < $2::int`
 
-// copyForwardSQL copies the named spends out of one retiring partition into the live journal,
+// copyForwardSQL moves the named spends out of one retiring partition into the live journal,
 // re-stamped to $4 so they land in a partition that is not about to drop.
+//
+// A MOVE, not a copy: the original is deleted in the same statement that inserts the carried
+// row. The detach and drop of the retiring partition come later and cannot share a transaction
+// with anything (DETACH CONCURRENTLY refuses a transaction block), so a copy left the spend with
+// two attached rows until the detach, both matching every reader's predicates. Every journal
+// reader then answered twice for one input. SpendsMadeBy and SetConflicting, the two reads
+// conflict reversal builds its restore from, each named the input twice, Unspend restored it
+// once and failed its accounting ("restored 1 ... of 2 requested") after the commit, and the
+// reorganisation aborted. Tolerating the duplicate would mean every reader of the journal
+// collapsing it, and the next reader added would miss it; moving the row means no reader ever
+// sees two. Deleting from a partition about to be dropped costs nothing that the drop does not
+// reclaim at once.
 //
 // The retiring partition is addressed by name (%s) and probed on its packed-key index, one
 // descent per waiting input, so the cost follows the waiting population and not the size of
-// the partition, which reached 39 GB at mainnet heights near 876,000.
+// the partition, which reached 39 GB at mainnet heights near 876,000. Named directly, the
+// delete works whether the partition is attached, detach-pending or already standalone.
 //
-// A copied row whose parent coin carried no block, (0,0), gets the parent's block filled in from
+// A carried row whose parent coin carried no block, (0,0), gets the parent's block filled in from
 // its stamped containment window. Such a row can only exist because the spend came before the
 // parent's window was stamped, so the original sits below the window's stamped_at and the drop
 // rule has kept the window attached until now; stamped, the window names only the winner, and a
-// stamped pair is final. Without the fill the copy would land above stamped_at, where the drop
-// rule does not look, the window would drop, and Unspend would rebuild the coin with no block.
-// A parent whose window is not stamped yet keeps (0,0): its window cannot drop before its stamp,
-// and the stamp's stamped_at lies above the copy, so the drop rule holds it for the copy too.
+// stamped pair is final. Without the fill the carried row would land above stamped_at, where the
+// drop rule does not look, the window would drop, and Unspend would rebuild the coin with no
+// block. A parent whose window is not stamped yet keeps (0,0): its window cannot drop before its
+// stamp, and the stamp's stamped_at lies above the carried row, so the drop rule holds it too.
 //
-// The NOT EXISTS makes it idempotent. The copy commits on its own and the drop comes after, so
-// a crash between them copies the same partition again on the next pass; a second copy would
-// hand Unspend two rows for one spend. It looks only at partitions from $5 up, the ones the
-// copies land in.
+// The NOT EXISTS keeps it idempotent, and it does not gate the delete. Every original matched
+// is deleted; one is inserted only if no carried row exists yet, in the partitions from $5 up,
+// the ones the carried rows land in. A journal a build before the move left with both rows
+// (original and copy) is healed by the next pass over the leaf: the original goes and the copy
+// stays. The originals sit below $5, so the NOT EXISTS, which reads the pre-statement snapshot
+// in which they still exist, never mistakes one for a carried row.
+//
+// A concurrent Unspend that takes the original's row lock first consumes it, and the move then
+// finds nothing to carry, which is right. One whose snapshot predates the move's commit but
+// reaches the row after it finds the original gone and the carried row invisible to its
+// snapshot, so it restores nothing, consumes nothing and reports the shortfall; the carried row
+// survives for the retry.
 const copyForwardSQL = `
+WITH moved AS (
+    DELETE FROM %s j
+     USING unnest($1::uuid[], $2::bytea[], $3::bytea[]) AS k(ukey, txid, spender)
+     WHERE j.ukey = k.ukey AND j.txid = k.txid AND j.spending_txid = k.spender
+    RETURNING j.spending_vin, j.satoshis, j.created_height, j.spendable_from, j.flags,
+              j.mined_height, j.block_id, j.ukey, j.txid, j.spending_txid, j.script, j.hash_override
+)
 INSERT INTO spend_journal (spent_height, spending_vin, satoshis, created_height, spendable_from, flags,
                            mined_height, block_id, ukey, txid, spending_txid, script, hash_override)
 SELECT $4::int, j.spending_vin, j.satoshis, j.created_height, j.spendable_from, j.flags,
        CASE WHEN j.mined_height = 0 THEN coalesce(w.h, 0) ELSE j.mined_height END,
        CASE WHEN j.mined_height = 0 THEN coalesce(w.b, 0) ELSE j.block_id END,
        j.ukey, j.txid, j.spending_txid, j.script, j.hash_override
-  FROM unnest($1::uuid[], $2::bytea[], $3::bytea[]) AS k(ukey, txid, spender)
-  JOIN %s j ON j.ukey = k.ukey AND j.txid = k.txid AND j.spending_txid = k.spender
+  FROM moved j
   LEFT JOIN LATERAL (
        SELECT m.mined_height AS h, m.block_id AS b
          FROM tx_mined m
