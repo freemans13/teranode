@@ -31,9 +31,9 @@ import (
 // writer of the file could still delete it. Three counts per file say so, all under mu:
 //
 //   - pending: writers trying to write the file right now. Each writer counts itself before it
-//     tries, so a delete and an attempt are always ordered under mu: either the delete runs
-//     first and the writer finds no file and creates its own, or the attempt is counted first
-//     and the delete is skipped.
+//     tries, so a delete and an attempt are always ordered: either the delete is decided first,
+//     the attempt waits for it to end (deleting), and the writer finds no file and creates its
+//     own, or the attempt is counted first and the delete is skipped.
 //   - live: creators whose conversion has not finished.
 //   - held: writers that adopted the file while another writer of it was pending or live.
 //
@@ -83,6 +83,11 @@ type subtreeFileCounts struct {
 	pending int
 	live    int
 	held    int
+
+	// deleting is closed when a delete of the file in flight outside mu ends; nil when none
+	// is. An attempt waits for it, so a writer never finds the file in the unlink window and
+	// adopts a file that is about to go (deleteUnlessAdopted).
+	deleting chan struct{}
 }
 
 // subtreeHold is one hold a writer took as an adopter: the file, and the entry the hold is
@@ -110,16 +115,31 @@ func (a *subtreeAdoptions) countsLocked(key writtenSubtree) *subtreeFileCounts {
 // tidyLocked drops key's entry, and with it every hold on it, once no writer of the file is
 // pending or live: nobody is left who could delete it. The caller holds mu.
 func (a *subtreeAdoptions) tidyLocked(key writtenSubtree, c *subtreeFileCounts) {
-	if c.pending == 0 && c.live == 0 {
+	if c.pending == 0 && c.live == 0 && c.deleting == nil {
 		delete(a.files, key)
 	}
 }
 
-// attempt records that a writer is about to try to write key.
+// attempt records that a writer is about to try to write key. While a delete of key is in
+// flight it waits for the delete to end first, so the write and the delete stay ordered as they
+// were when the delete ran under mu.
 func (a *subtreeAdoptions) attempt(key writtenSubtree) {
-	a.mu.Lock()
-	a.countsLocked(key).pending++
-	a.mu.Unlock()
+	for {
+		a.mu.Lock()
+
+		c := a.countsLocked(key)
+		if c.deleting == nil {
+			c.pending++
+			a.mu.Unlock()
+
+			return
+		}
+
+		done := c.deleting
+		a.mu.Unlock()
+
+		<-done
+	}
 }
 
 // abandoned ends an attempt that neither created nor adopted key: the write failed.
@@ -193,20 +213,48 @@ func (a *subtreeAdoptions) finished(key writtenSubtree) {
 }
 
 // deleteUnlessAdopted deletes key from store unless a writer is trying to write it or holds it,
-// and reports whether it was left. The check and the delete happen under one lock.
+// and reports whether it was left.
+//
+// The check is made under mu and the delete runs outside it. store.Del can wait up to 25 s for a
+// file-store write permit, and holding mu across that stalled every writer of every file, and
+// through finish every read loop's settle (review of 76be891d6). The file is marked deleting
+// under mu instead: attempt waits for the mark, so no writer can start on the file, find it
+// still there and adopt it, until the delete has ended. A writer counted before the check keeps
+// the file, as before. A second delete of the same file waits for the first and reports it
+// deleted.
 func (a *subtreeAdoptions) deleteUnlessAdopted(ctx context.Context, store blob.Store, key writtenSubtree) (bool, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 
-	if c, ok := a.files[key]; ok && (c.pending > 0 || c.held > 0) {
+	c := a.countsLocked(key)
+
+	if c.pending > 0 || c.held > 0 {
+		a.mu.Unlock()
+
 		return true, nil
 	}
 
-	if err := store.Del(ctx, key.Hash[:], key.FileType); err != nil {
-		return false, err
+	if c.deleting != nil {
+		done := c.deleting
+		a.mu.Unlock()
+
+		<-done
+
+		return false, nil
 	}
 
-	return false, nil
+	done := make(chan struct{})
+	c.deleting = done
+	a.mu.Unlock()
+
+	err := store.Del(ctx, key.Hash[:], key.FileType)
+
+	a.mu.Lock()
+	c.deleting = nil
+	close(done)
+	a.tidyLocked(key, c)
+	a.mu.Unlock()
+
+	return false, err
 }
 
 // size is the number of files the registry is tracking, for tests.
@@ -338,16 +386,21 @@ func (sm *SyncManager) acceptancePending(hash chainhash.Hash) bool {
 }
 
 // settleStale finishes every writer that has waited longer than settleBackstop.
+//
+// The writers are taken out under settlingMu and finished after it is released, as
+// settleAccepted does: finish takes the adoption registry's lock, and holding settlingMu across
+// it made every read loop's settle wait on whatever held the registry (review of 76be891d6).
 func (sm *SyncManager) settleStale(now time.Time) {
+	var stale []*subtreeWriter
+
 	sm.settlingMu.Lock()
-	defer sm.settlingMu.Unlock()
 
 	for hash, waiting := range sm.settling {
 		kept := waiting[:0]
 
 		for _, s := range waiting {
 			if now.Sub(s.since) >= settleBackstop {
-				s.writer.finish()
+				stale = append(stale, s.writer)
 			} else {
 				kept = append(kept, s)
 			}
@@ -358,6 +411,12 @@ func (sm *SyncManager) settleStale(now time.Time) {
 		} else {
 			sm.settling[hash] = kept
 		}
+	}
+
+	sm.settlingMu.Unlock()
+
+	for _, w := range stale {
+		w.finish()
 	}
 }
 
