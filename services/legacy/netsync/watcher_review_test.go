@@ -1,12 +1,17 @@
 package netsync
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,13 +48,25 @@ func TestWatchSaysOnceThatItHasNoBlockSize(t *testing.T) {
 	sm.blockSizeTracker = newBlockSizeTracker(10)
 	now := time.Now()
 
+	// The chain read the watcher retries the seed with fails too.
+	client, ok := sm.blockchainClient.(*blockchain2.Mock)
+	require.True(t, ok)
+	client.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, errors.NewServiceError("blockchain unavailable"))
+
 	askAt(t, sm, owner, heightHash(t, sm, 11), now.Add(-2*time.Minute))
 
 	sm.watchOwedBlocks(now)
 	sm.watchOwedBlocks(now.Add(5 * time.Second))
 
-	require.Len(t, logs.warnings, 1, "said once, not on every tick")
-	require.Contains(t, logs.warnings[0], "no recent block size")
+	var noSize []string
+
+	for _, w := range logs.warnings {
+		if strings.Contains(w, "no recent block size") {
+			noSize = append(noSize, w)
+		}
+	}
+
+	require.Len(t, noSize, 1, "said once, not on every tick")
 
 	sm.blockSizeTracker.addBlockSize(reaskTypicalBlock)
 	sm.watchOwedBlocks(now.Add(10 * time.Second))
@@ -263,4 +280,40 @@ func TestWatchWaitsForTheLockAfterTooManySkippedTicks(t *testing.T) {
 
 	require.True(t, sm.blockDownloads.HasOwner(fast, next), "the waiting tick asks for the late block")
 	require.Zero(t, sm.watchSkips.Load(), "a tick that ran starts the count again")
+}
+
+// The tracker is empty only when the seed from the chain failed at start, and the watcher used to
+// do nothing until the first block converted, which might be the very block it should have
+// rescued (review of 76be891d6). It now tries the seed again, at most once a minute, and judges
+// with the sizes it gets.
+func TestWatchSeedsAnEmptyBlockSizeTrackerAgain(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	sm.blockSizeTracker = newBlockSizeTracker(10)
+	now := time.Now()
+
+	for _, h := range []int32{13, 14, 15, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
+	}
+
+	next := heightHash(t, sm, 11)
+
+	tip := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+	metas := make([]*model.BlockHeaderMeta, 0, largestSizeSamples)
+	headers := make([]*model.BlockHeader, 0, largestSizeSamples)
+
+	for i := range largestSizeSamples {
+		metas = append(metas, &model.BlockHeaderMeta{Height: uint32(10 - min(i, 10)), SizeInBytes: uint64(reaskTypicalBlock)})
+		headers = append(headers, tip)
+	}
+
+	client, ok := sm.blockchainClient.(*blockchain2.Mock)
+	require.True(t, ok)
+	client.On("GetBlockHeaders", mock.Anything, mock.Anything, uint64(largestSizeSamples)).Return(headers, metas, nil)
+
+	sm.watchOwedBlocks(now)
+
+	require.Equal(t, int64(reaskTypicalBlock), sm.blockSizeTracker.meanRecentSize(), "the tracker is seeded from the chain")
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "and the watcher judges on the same tick")
+
+	client.AssertNumberOfCalls(t, "GetBlockHeaders", 1)
 }

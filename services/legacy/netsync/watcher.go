@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"context"
 	"sort"
 	"time"
 
@@ -36,6 +37,31 @@ import (
 //
 // It replaces the rescue rule, which examined only the lowest owed block, 30 s after its getdata,
 // against a deadline from the chain's pace.
+
+// watchReseedEvery is the least time between two of the watcher's attempts to seed an empty block
+// size tracker from the chain.
+const watchReseedEvery = time.Minute
+
+// reseedBlockSizes seeds the block size tracker from the chain again, unless it was tried within
+// watchReseedEvery of now, and reports whether it tried. Only the watcher calls it, on the race
+// ticker, and only while the tracker is empty, so the seed never adds to sizes already recorded.
+func (sm *SyncManager) reseedBlockSizes(now time.Time) bool {
+	last := sm.watchLastReseed.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < watchReseedEvery {
+		return false
+	}
+
+	sm.watchLastReseed.Store(now.UnixNano())
+
+	ctx := sm.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	sm.seedBlockSizes(ctx)
+
+	return true
+}
 
 // watchMaxSkips is how many race ticks in a row the watcher skips because a download pass holds
 // assignMu before it waits for the lock: 30 s at raceCheckInterval.
@@ -130,10 +156,19 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 		return
 	}
 
-	// With no block size the watcher cannot estimate a queued block, and does nothing until the
-	// first block converts: seeding the tracker failed, or the chain starts at genesis. That is
-	// said once, not left silent (review of 2026-10-12).
+	// With no block size the watcher cannot estimate a queued block. The tracker is seeded from
+	// the chain at start (seedBlockSizes), so it is empty only when that read failed or found no
+	// sizes (a chain at genesis); the watcher tries the seed again, at most once a minute, rather
+	// than wait for the first block to convert, which it may be the one to rescue (review of
+	// 76be891d6). No default size is
+	// assumed: one too large asks helpers for blocks that are not late, one too small hides
+	// late ones. While the tracker stays empty that is said once, not left silent (review of
+	// 2026-10-12).
 	typical := sm.blockSizeTracker.meanRecentSize()
+	if typical <= 0 && sm.reseedBlockSizes(now) {
+		typical = sm.blockSizeTracker.meanRecentSize()
+	}
+
 	if typical <= 0 {
 		if sm.watchNoSizeLogged.CompareAndSwap(false, true) {
 			sm.logger.Warnf("[watch] no recent block size to judge late blocks by; the watcher waits for the first block to convert")

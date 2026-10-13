@@ -911,6 +911,9 @@ type SyncManager struct {
 	// watchSkips counts the race ticks in a row on which the watcher found assignMu taken
 	// (lockForWatch).
 	watchSkips atomic.Int32
+	// watchLastReseed is the UnixNano time the watcher last tried to seed an empty block size
+	// tracker (reseedBlockSizes), zero before the first try.
+	watchLastReseed atomic.Int64
 
 	// dispatcher runs each parked block's work on a worker, one block at a time,
 	// and every chain-order step in dispatch order. Built in New(); nil when
