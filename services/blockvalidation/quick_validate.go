@@ -2019,13 +2019,14 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	// The batch goes to the store as ONE list, in block order, through SpendAndCreateMulti. A
 	// batch spans several subtrees, so each transaction carries its own subtree index. The list
-	// is ordered parents first because a block is. What the store does with the list is up to
-	// the store: the SQL and Aerospike stores apply it through DefaultSpendAndCreateMulti, one
-	// SpendAndCreate per transaction, a dependency level at a time, so a parent's outputs are
-	// created as UTXOs and its child in the list spends them a level later. Each level waits for
-	// the one before it, so a chain of N dependent transactions in the batch costs N rounds of
-	// store calls there. A store with its own SpendAndCreateMulti may instead net the list and
-	// never write an output the list also spends.
+	// is ordered parents first because a block is. Quick validation only runs on a block at or
+	// below a checkpoint, so the list carries WithBelowCheckpoint: the block is known valid, and
+	// the store may write the list in any order. What the store does with that is up to the
+	// store: the SQL and Aerospike stores apply it through DefaultSpendAndCreateMulti in two
+	// waves, every create and then every spend, as the separate create and spend phases did, so
+	// a chain of dependent transactions costs two rounds of store calls however deep it goes. A
+	// store with its own SpendAndCreateMulti may instead net the list and never write an output
+	// the list also spends.
 	//
 	// A transaction whose create is skipped as unspendable stays out of the list and has its
 	// inputs spent afterwards, as before: it has no output anything can spend, so it is nobody's
@@ -2284,6 +2285,7 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: block.ID, BlockHeight: block.Height}),
 		utxo.WithSubtreeIdxs(subtreeIdxs),
 		utxo.WithTXIDs(txids),
+		utxo.WithBelowCheckpoint(),
 		utxo.WithLocked(lockUTXOs),
 		utxo.WithIgnoreLocked(true),
 		utxo.WithSkipExtendedInputs(outpointOnly),

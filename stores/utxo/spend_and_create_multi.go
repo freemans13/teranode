@@ -24,13 +24,15 @@ const (
 	MultiTxCreated
 	// MultiTxExisted means a record for the transaction already existed. Nothing
 	// was written to it, and its children in the list spend it as an outside
-	// parent.
+	// parent. For a WithBelowCheckpoint list its inputs were spent again; see
+	// writeCreateThenSpend.
 	MultiTxExisted
 	// MultiTxFailed means the transaction's SpendAndCreate failed; Err says why,
 	// and Spends is what SpendAndCreate returned alongside the error.
 	MultiTxFailed
 	// MultiTxParentFailed means the transaction was not written, because a parent
-	// earlier in the list failed.
+	// earlier in the list failed. For a WithBelowCheckpoint list its record may
+	// exist, though its inputs were not spent; see writeCreateThenSpend.
 	MultiTxParentFailed
 )
 
@@ -78,16 +80,39 @@ func IsSpendAndCreateMultiRefused(err error) bool {
 	return false
 }
 
-// SpendAndCreateMultiConcurrency is the per-level concurrency Aerospike and SQL
-// pass to DefaultSpendAndCreateMulti: twice the subtree-validation spend batcher
-// size, the same bound subtree validation applies to a level today, so a level
-// reaches the store exactly as wide as it does now.
-func SpendAndCreateMultiConcurrency(tSettings *settings.Settings) int {
-	if tSettings == nil || tSettings.SubtreeValidation.SpendBatcherSize <= 0 {
-		return 1
+// SpendAndCreateMultiWidths bounds how many SpendAndCreate calls
+// DefaultSpendAndCreateMulti keeps in flight. Level bounds one dependency level
+// of the default order. Create and Spend bound the create wave and the spend
+// wave of a WithBelowCheckpoint list. A width below 1 is taken as 1.
+type SpendAndCreateMultiWidths struct {
+	Level  int
+	Create int
+	Spend  int
+}
+
+// UniformSpendAndCreateMultiWidths returns widths that bound every level and
+// every wave to n calls.
+func UniformSpendAndCreateMultiWidths(n int) SpendAndCreateMultiWidths {
+	return SpendAndCreateMultiWidths{Level: n, Create: n, Spend: n}
+}
+
+// SpendAndCreateMultiWidthsFor returns the widths Aerospike and SQL pass to
+// DefaultSpendAndCreateMulti. A level is twice the subtree-validation spend
+// batcher size, the bound subtree validation applies to a level, so a level
+// reaches the store exactly as wide as it does there. The two waves of a
+// WithBelowCheckpoint list are as wide as quick validation's create and spend
+// phases were before it wrote a list: eight store batches of creates, and two
+// rounds of every spend batcher.
+func SpendAndCreateMultiWidthsFor(tSettings *settings.Settings) SpendAndCreateMultiWidths {
+	if tSettings == nil {
+		return UniformSpendAndCreateMultiWidths(1)
 	}
 
-	return tSettings.SubtreeValidation.SpendBatcherSize * 2
+	return SpendAndCreateMultiWidths{
+		Level:  tSettings.SubtreeValidation.SpendBatcherSize * 2,
+		Create: tSettings.UtxoStore.StoreBatcherSize * 8,
+		Spend:  tSettings.UtxoStore.SpendBatcherSize * tSettings.UtxoStore.SpendBatcherConcurrency * 2,
+	}
 }
 
 // SpendAndCreateMultiStore is the subset of a store's methods that
@@ -98,7 +123,7 @@ type SpendAndCreateMultiStore interface {
 
 // DefaultSpendAndCreateMulti implements the Store.SpendAndCreateMulti contract by
 // writing one record per transaction through s.SpendAndCreate. It writes each
-// dependency level's transactions in parallel, at most concurrency at once, and
+// dependency level's transactions in parallel, at most widths.Level at once, and
 // starts a level only after every earlier level has finished, so a parent in the
 // list is created before its child spends it. It is never a plain loop: a store's
 // batchers group a level's concurrent calls into one spend and one create round
@@ -126,7 +151,10 @@ type SpendAndCreateMultiStore interface {
 // The returned error is non-nil when nothing was written (a refusal), or when
 // ctx was cancelled between levels; in that case the results are returned too
 // and transactions never reached are MultiTxNotAttempted.
-func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore, concurrency int, txs []*bt.Tx,
+//
+// With WithBelowCheckpoint it writes in two waves instead; see
+// writeCreateThenSpend.
+func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore, widths SpendAndCreateMultiWidths, txs []*bt.Tx,
 	blockHeight uint32, opts ...CreateOption) ([]SpendAndCreateMultiResult, error) {
 	list, err := PrepareSpendAndCreateMulti(txs, opts...)
 	if err != nil {
@@ -135,6 +163,10 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 
 	if len(txs) == 0 {
 		return []SpendAndCreateMultiResult{}, nil
+	}
+
+	if list.Options.BelowCheckpoint {
+		return writeCreateThenSpend(ctx, s, widths, txs, list, blockHeight, opts)
 	}
 
 	txids, parentsInList := list.TxIDs, list.ParentsInList
@@ -159,17 +191,13 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 		byLevel[level[i]] = append(byLevel[level[i]], i)
 	}
 
-	if concurrency < 1 {
-		concurrency = 1
-	}
-
 	for _, members := range byLevel {
 		if err := ctx.Err(); err != nil {
 			return results, err
 		}
 
 		g := errgroup.Group{}
-		g.SetLimit(concurrency)
+		g.SetLimit(max(widths.Level, 1))
 
 		for _, i := range members {
 			if failedParent(results, parentsInList[i]) {
@@ -207,6 +235,131 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 	}
 
 	return results, nil
+}
+
+// writeCreateThenSpend writes a WithBelowCheckpoint list in two waves: it
+// creates every record, then spends every input. Every parent in the list
+// exists before any child spends it, so the list costs two rounds of store
+// calls however deep its chains go. It is only correct for a block the caller
+// already knows is valid: a transaction whose spends fail has its record
+// written anyway.
+//
+// The results keep their meaning, with three differences that follow from the
+// order:
+//   - a transaction whose create fails is MultiTxFailed, and its descendants in
+//     the list are MultiTxParentFailed and not spent, but their records may
+//     have been created;
+//   - a transaction whose spend fails is MultiTxFailed with its record
+//     created; its children in the list were spent in the same wave and keep
+//     their own result;
+//   - a MultiTxExisted transaction has its inputs spent again in the spend
+//     wave, because a record found here may have been created by a call that
+//     never reached its spends. A spend repeated by the same spender is
+//     accepted as the same spend.
+//
+// The spend wave sets IgnoreFlags.RequireParentOutputs, so a missing parent
+// output fails the spend. Without it the store would read the spender's own
+// record, created moments earlier by the create wave, as proof that the spend
+// happened in an earlier attempt and the parent has been pruned since, and a
+// list spending an output that exists nowhere would pass. Turning the fallback
+// off cannot fail a legitimate repeat: a parent is pruned only after its
+// retention has passed since it was fully spent, and the chain does not advance
+// past the block being applied, so a repeat of that block's list runs before
+// any parent its spends emptied can be pruned.
+//
+// A caller treats anything but MultiTxCreated and MultiTxExisted as a failed
+// list and repeats it whole, as quick validation does. If ctx is cancelled
+// between the waves, every transaction that was waiting for its spends is
+// MultiTxNotAttempted and the error is returned.
+func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, widths SpendAndCreateMultiWidths, txs []*bt.Tx,
+	list *SpendAndCreateMultiList, blockHeight uint32, opts []CreateOption) ([]SpendAndCreateMultiResult, error) {
+	txids, parentsInList := list.TxIDs, list.ParentsInList
+	results := make([]SpendAndCreateMultiResult, len(txs))
+
+	itemOpts := func(i int, half CreateOption) []CreateOption {
+		callOpts := make([]CreateOption, 0, len(opts)+3)
+		callOpts = append(callOpts, opts...)
+
+		return append(callOpts, withListItem(i), WithTXID(&txids[i]), half)
+	}
+
+	all := make([]int, len(txs))
+	for i := range all {
+		all[i] = i
+	}
+
+	runSpendAndCreateWave(widths.Create, all, func(i int) {
+		md, _, err := s.SpendAndCreate(ctx, txs[i], blockHeight, itemOpts(i, WithCreateOnly())...)
+
+		switch {
+		case err == nil:
+			results[i] = SpendAndCreateMultiResult{Status: MultiTxCreated, Meta: md}
+		case errors.Is(err, errors.ErrTxExists):
+			results[i] = SpendAndCreateMultiResult{Status: MultiTxExisted}
+		default:
+			results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Err: err}
+		}
+	})
+
+	// A failed create leaves its outputs missing, so its descendants' spends
+	// would fail too. Mark them in list order, which reaches a grandchild after
+	// its parent.
+	toSpend := make([]int, 0, len(txs))
+
+	for i := range txs {
+		if results[i].Status == MultiTxFailed {
+			continue
+		}
+
+		if failedParent(results, parentsInList[i]) {
+			results[i] = SpendAndCreateMultiResult{
+				Status: MultiTxParentFailed,
+				Err:    errors.NewProcessingError("SpendAndCreateMulti: the create of a parent of %s earlier in the list failed", txids[i]),
+			}
+
+			continue
+		}
+
+		toSpend = append(toSpend, i)
+	}
+
+	if err := ctx.Err(); err != nil {
+		for _, i := range toSpend {
+			results[i] = SpendAndCreateMultiResult{}
+		}
+
+		return results, err
+	}
+
+	runSpendAndCreateWave(widths.Spend, toSpend, func(i int) {
+		_, spends, err := s.SpendAndCreate(ctx, txs[i], blockHeight, append(itemOpts(i, WithSpendOnly()), withRequireParentOutputs())...)
+		if err != nil {
+			results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Meta: results[i].Meta, Spends: spends, Err: err}
+
+			return
+		}
+
+		results[i].Spends = spends
+	})
+
+	return results, nil
+}
+
+// runSpendAndCreateWave runs call for every member, at most width at once, and
+// waits for all of them.
+func runSpendAndCreateWave(width int, members []int, call func(i int)) {
+	g := errgroup.Group{}
+	g.SetLimit(max(width, 1))
+
+	for _, i := range members {
+		g.Go(func() error {
+			call(i)
+
+			return nil
+		})
+	}
+
+	_ = g.Wait()
 }
 
 // SpendAndCreateMultiList is a list SpendAndCreateMulti has accepted: its
