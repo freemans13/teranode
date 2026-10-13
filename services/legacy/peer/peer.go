@@ -1960,6 +1960,66 @@ func shouldDeferQueuedResponse(command string, healthyDownload bool, deferredFor
 	return healthyDownload && !isBlockResponseCommand(command) && deferredFor < maxDeferral
 }
 
+// stallTickVerdict is what one stall tick decided about the peer's pending responses.
+type stallTickVerdict int
+
+const (
+	// stallTickNone: no pending response is past its deadline.
+	stallTickNone stallTickVerdict = iota
+	// stallTickExtendBlock: a block is still arriving at a healthy rate within its wall-clock
+	// cap, and the block-response group's deadlines were extended.
+	stallTickExtendBlock
+	// stallTickDefer: a non-block reply is late while bytes still arrive at a healthy rate, so it
+	// is queued behind blocks; its deadline was pushed out, within its deferral bound.
+	stallTickDefer
+	// stallTickDisconnect: the peer is stalled.
+	stallTickDisconnect
+)
+
+// judgeStallTick is the decision of one stallHandler tick, on the handler's own state: the
+// pending response deadlines and, for each non-block reply deferred as queued behind blocks, when
+// it was first deferred. It updates both maps as the tick does and returns the late command and
+// the verdict. A reply's first deferral is stamped once and never moved, so its deferral is
+// bounded by budget however many ticks defer it; stallHandler clears the stamp when the reply
+// arrives. budgetFor is asked for the block download budget only when a response is late, and
+// the budget it gave is returned for the log.
+func judgeStallTick(pending, deferredSince map[string]time.Time, now time.Time, offset time.Duration, healthyDownload bool, blockFetchStart time.Time, budgetFor func() time.Duration) (string, stallTickVerdict, time.Duration) {
+	command, stalled := expiredStallResponse(pending, now, offset)
+	if !stalled {
+		return "", stallTickNone, 0
+	}
+
+	budget := budgetFor()
+
+	if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, budget) {
+		// The block is still actively arriving at a healthy rate and within the wall-clock
+		// cap; extend the whole block-response group (armed together) rather than disconnect a
+		// peer making real progress on a large (multi-GB) block.
+		refreshed := now.Add(stallResponseTimeoutBlocks)
+		for cmd := range pending {
+			if isBlockResponseCommand(cmd) {
+				pending[cmd] = refreshed
+			}
+		}
+
+		return command, stallTickExtendBlock, budget
+	}
+
+	if since, deferred := deferredSince[command]; shouldDeferQueuedResponse(command, healthyDownload, deferredDuration(since, deferred, now), budget) {
+		// Bytes are still arriving at a healthy rate, so the reply is queued behind blocks the
+		// peer is sending, not stalled.
+		if !deferred {
+			deferredSince[command] = now
+		}
+
+		pending[command] = now.Add(stallResponseTimeout)
+
+		return command, stallTickDefer, budget
+	}
+
+	return command, stallTickDisconnect, budget
+}
+
 // deferredDuration is how long a reply first deferred at since has been deferred by now, or zero
 // when it has not been deferred.
 func deferredDuration(since time.Time, deferred bool, now time.Time) time.Duration {
@@ -2170,36 +2230,16 @@ out:
 			// Disconnect the peer if a pending response has not arrived by
 			// its adjusted deadline. While a block fetch is in flight,
 			// non-block deadlines are suppressed (see expiredStallResponse).
-			if command, stalled := expiredStallResponse(pendingResponses, now, offset); stalled {
-				budget := p.blockDownloadBudget()
-				if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, budget) {
-					// The block is still actively arriving at a healthy rate and
-					// within the wall-clock cap; extend the whole block-response
-					// group (armed together) rather than disconnect a peer
-					// making real progress on a large (multi-GB) block.
-					refreshed := now.Add(stallResponseTimeoutBlocks)
-					for cmd := range pendingResponses {
-						if isBlockResponseCommand(cmd) {
-							pendingResponses[cmd] = refreshed
-						}
-					}
-
-					p.logger.Debugf("Extending block deadline for %s: downloading at %d B/s (%.0fs into fetch, cap %s)",
-						p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), budget)
-				} else if since, deferred := deferredSince[command]; shouldDeferQueuedResponse(command, healthyDownload, deferredDuration(since, deferred, now), budget) {
-					// Bytes are still arriving at a healthy rate, so the reply is queued
-					// behind blocks the peer is sending, not stalled.
-					if !deferred {
-						deferredSince[command] = now
-					}
-
-					pendingResponses[command] = now.Add(stallResponseTimeout)
-
-					p.logger.Debugf("Deferring %s deadline for %s: still receiving at %d B/s", command, p, recvDelta/uint64(stallTickInterval.Seconds()))
-				} else {
-					reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout", command)
-					p.DisconnectWithInfo(reason)
-				}
+			switch command, verdict, budget := judgeStallTick(pendingResponses, deferredSince, now, offset, healthyDownload, blockFetchStart, p.blockDownloadBudget); verdict {
+			case stallTickExtendBlock:
+				p.logger.Debugf("Extending block deadline for %s: downloading at %d B/s (%.0fs into fetch, cap %s)",
+					p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), budget)
+			case stallTickDefer:
+				p.logger.Debugf("Deferring %s deadline for %s: still receiving at %d B/s", command, p, recvDelta/uint64(stallTickInterval.Seconds()))
+			case stallTickDisconnect:
+				reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout", command)
+				p.DisconnectWithInfo(reason)
+			case stallTickNone:
 			}
 
 			// Reset the deadline offset for the next tick.
