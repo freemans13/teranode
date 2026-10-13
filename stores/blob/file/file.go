@@ -944,22 +944,18 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 	}
 	file = nil
 
-	if err = s.publishTempFile(tmpFilename, filename, merged, hasher); err != nil {
+	if err = s.publish(key, fileType, tmpFilename, filename, merged, hasher); err != nil {
 		return err
 	}
 	cleanupTmpFile = false
-
-	if err = s.scheduleAfterExclusivePublish(key, fileType, filename, merged); err != nil {
-		return err
-	}
 
 	s.debugf("[File] SetFromReader completed key=%s type=%s filename=%s", keyHex, fileType, filename)
 	return nil
 }
 
 // publishTempFile gives a finished, synced and closed temporary file its final name and
-// publishes or clears its checksum sidecar. It is the last step of every streamed write, shared by
-// SetFromReader and a pending file's Commit so the two publish a blob identically. After a nil
+// publishes or clears its checksum sidecar. It is the last step of every streamed write, reached
+// through publish from SetFromReader and a pending file's Commit. After a nil
 // return the temporary name has been given up (renamed, or unlinked after the link), so a caller
 // must not remove it; after an error the caller still owns it.
 func (s *File) publishTempFile(tmpFilename, filename string, merged *options.Options, hasher hash.Hash) error {
@@ -1160,10 +1156,9 @@ func (s *File) scheduleDAH(key []byte, fileType fileformat.FileType, merged *opt
 
 // publishFilename is the name a streamed write publishes under. A plain write schedules its
 // delete-at-height here, before the publish, as constructFilename always has. An exclusive
-// publish (options.WithExclusivePublish) does not: the scheduler's upsert is last-writer-wins,
-// so a writer that then loses the publish would replace the winner's delete-at-height with its
-// own, undoing a later SetDAH(0) that keeps the blob. scheduleAfterExclusivePublish schedules it
-// once the publish has succeeded.
+// publish (options.WithExclusivePublish) does not: publish schedules it under the blob's key
+// lock, once it has found the name free, so a writer that loses the publish never replaces the
+// winner's delete-at-height with its own.
 func (s *File) publishFilename(key []byte, fileType fileformat.FileType, merged *options.Options, opts []options.FileOption) (string, error) {
 	if merged.ExclusivePublish {
 		return s.filenameFor(key, fileType, merged)
@@ -1172,29 +1167,44 @@ func (s *File) publishFilename(key []byte, fileType fileformat.FileType, merged 
 	return s.constructFilename(key, fileType, opts)
 }
 
-// scheduleAfterExclusivePublish schedules the delete-at-height of a blob that an exclusive
-// publish has just created, and does nothing for any other write. If scheduling fails the blob
-// is removed, as a plain write that fails to schedule never publishes: the exclusive publish
-// proves this writer created the file, so removing it touches no one else's blob.
-func (s *File) scheduleAfterExclusivePublish(key []byte, fileType fileformat.FileType, filename string, merged *options.Options) error {
+// publish gives a finished temporary file its final name, the last step of SetFromReader and of
+// a pending file's Commit, so the two publish a blob identically. A plain write's
+// delete-at-height was scheduled in publishFilename, and this only publishes.
+//
+// An exclusive publish holds the blob's key lock (blobKeyLocks) across three steps: it checks
+// the name is free, schedules the blob's delete-at-height, and publishes. SetDAH takes the same
+// lock, so a promotion (SetDAH 0) cannot land between the publish and its schedule: the blob is
+// never visible without its delete-at-height, and a promotion that overlaps the publish runs
+// after it and wins. Scheduling after the publish, as this used to, let a promotion in that gap
+// find nothing to cancel and then be overwritten (external review of e4698b219). It also meant
+// a failed schedule had to remove a blob that was already visible, which another writer could
+// have adopted; a failed schedule now leaves nothing published.
+//
+// What the lock does not cover: a plain write of the same name takes no lock, so if one
+// publishes between the check and the link, the link is refused and this writer's schedule
+// has replaced the plain write's. A publish that fails after its schedule (a link error other
+// than the name being taken, or a checksum sidecar that cannot be written) leaves a
+// delete-at-height for a blob that is not there; the next writer of the name schedules its own.
+func (s *File) publish(key []byte, fileType fileformat.FileType, tmpFilename, filename string, merged *options.Options, hasher hash.Hash) error {
 	if !merged.ExclusivePublish {
-		return nil
+		return s.publishTempFile(tmpFilename, filename, merged, hasher)
 	}
 
-	err := s.scheduleDAH(key, fileType, merged)
-	if err == nil {
-		return nil
+	unlock := blobKeyLocks.lock(filename)
+	defer unlock()
+
+	// Under the lock this check decides between exclusive publishers, so a writer that loses
+	// schedules nothing. The link in publishTempFile stays the authority against anything
+	// else that writes the name.
+	if err := s.errorOnOverwrite(filename, merged); err != nil {
+		return err
 	}
 
-	if removeErr := s.removeStorePath(filename); removeErr != nil && !os.IsNotExist(removeErr) {
-		s.logger.Warnf("[File] failed to remove blob file %s after its deletion could not be scheduled: %v", filename, removeErr)
+	if err := s.scheduleDAH(key, fileType, merged); err != nil {
+		return err
 	}
 
-	if removeErr := os.Remove(filename + checksumExtension); removeErr != nil && !os.IsNotExist(removeErr) {
-		s.logger.Warnf("[File] failed to remove checksum file for %s after its deletion could not be scheduled: %v", filename, removeErr)
-	}
-
-	return err
+	return s.publishTempFile(tmpFilename, filename, merged, hasher)
 }
 
 // SetDAH sets the Delete-At-Height (DAH) value for a blob in the file store.
@@ -1240,6 +1250,11 @@ func (s *File) SetDAH(ctx context.Context, key []byte, fileType fileformat.FileT
 	if s.blobDeletionScheduler == nil {
 		return errors.NewConfigurationError("cannot modify DAH: blob deletion scheduler not configured")
 	}
+
+	// After any exclusive publish of this blob in flight has scheduled and published, so this
+	// change is the later one (see publish).
+	unlock := blobKeyLocks.lock(fileName)
+	defer unlock()
 
 	if newDAH == 0 {
 		// Cancel scheduled deletion
@@ -1721,8 +1736,8 @@ func (s *File) syncParentDirBestEffort(filename string) {
 //     that both passed errorOnOverwrite's Stat, exactly one is told it created the blob,
 //     which is what the legacy subtree writer's DeleteAll relies on (services/legacy/netsync/
 //     subtree_writer.go), the only caller that asks for it. The blob's delete-at-height is
-//     scheduled only after this succeeds (scheduleAfterExclusivePublish), so the writer
-//     that is refused never schedules one over the winner's.
+//     scheduled just before this, under the blob's key lock and only once the name was found
+//     free (publish), so the writer that is refused never schedules one over the winner's.
 //   - otherwise: rename(2). On POSIX (Linux, macOS, *BSD) rename atomically replaces an
 //     existing regular file, so the "destination exists" branch below is unreachable there
 //     and the no-overwrite contract rests on SetFromReader's earlier call to

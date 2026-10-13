@@ -156,7 +156,7 @@ func (p *PendingFile) Commit(ctx context.Context, key []byte, opts ...options.Fi
 		return err
 	}
 
-	if err = p.s.publishTempFile(p.tmp, filename, merged, p.hasher); err != nil {
+	if err = p.s.publish(key, p.fileType, p.tmp, filename, merged, p.hasher); err != nil {
 		p.Abort()
 
 		return err
@@ -165,7 +165,7 @@ func (p *PendingFile) Commit(ctx context.Context, key []byte, opts ...options.Fi
 	// The temporary name is given up now, so there is nothing left for Abort to discard.
 	p.done = true
 
-	return p.s.scheduleAfterExclusivePublish(key, p.fileType, filename, merged)
+	return nil
 }
 
 // Abort discards the pending file. It is safe to call more than once, and after Commit.
