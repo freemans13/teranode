@@ -454,10 +454,18 @@ func TestSyncManager_AnAcceptanceMarkLastsUntilTheConsumerHandlesIt(t *testing.T
 // blockedIn reports whether some goroutine's stack is currently inside fn, which is how the test
 // below holds pipelineBlockDelete between two of its reads without a hook in production code.
 func blockedIn(fn string) bool {
+	// The whole dump: with -count, goroutines other tests left behind can fill a fixed buffer
+	// and push the one asked about out of it.
 	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
 
-	return strings.Contains(string(buf[:n]), fn)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Contains(string(buf[:n]), fn)
+		}
+
+		buf = make([]byte, 2*len(buf))
+	}
 }
 
 // The refusal read the park before the acceptance mark (review of 76be891d6). The consumer parks
