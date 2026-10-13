@@ -833,6 +833,11 @@ type SyncManager struct {
 	// analogue of the blockBacklog guard. Read by handleCheckSyncPeer.
 	blockPrefetchWaiters atomic.Int64
 
+	// lastChainProgress is the UnixNano time a block last joined the chain (noteChainProgress),
+	// zero before the first. It bounds the stall check's backpressure skip
+	// (stallCheckSuppressed).
+	lastChainProgress atomic.Int64
+
 	// blockPrefetchReserved shadows how many slots of blockPrefetchBudget are
 	// currently reserved, purely so the figure can be reported.
 	//
@@ -1551,8 +1556,15 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// validation speed, not the peer. A genuinely stalled peer stops feeding the
 	// queue, the backlog drains, and the check resumes — so this delays, but does
 	// not prevent, rotation of a truly stalled peer.
-	if sm.localReadBackpressured() {
-		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check skipped: read-loop backpressured by local block processing", sp.String())
+	//
+	// The skip is bounded by chain progress (stallCheckSuppressed): it holds only while a block
+	// has joined the chain within blockProcessingStallTimeout. During IBD other peers keep every
+	// admission slot full almost all the time, so an unbounded skip turned sync-peer stall
+	// rotation off for the whole sync, and a sync peer that stopped sending the block the chain
+	// waits on was never rotated (review of 76be891d6). Base had the same bound on its
+	// block backlog; this branch removed it with the decoded block queue.
+	if sm.stallCheckSuppressed(time.Now()) {
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check skipped: read-loop backpressured by local block processing while the chain still advances", sp.String())
 		return
 	}
 
@@ -4011,9 +4023,50 @@ func (sm *SyncManager) committedTip() (height int32, hash chainhash.Hash, ok boo
 	return h, *header.Hash(), true
 }
 
-// noteChainProgress records that a block joined the chain, for the commit rate.
+// noteChainProgress records that a block joined the chain, for the commit rate and for the
+// bound on the stall check's backpressure skip (stallCheckSuppressed).
 func (sm *SyncManager) noteChainProgress() {
-	sm.commitRate.note(time.Now())
+	now := time.Now()
+
+	sm.lastChainProgress.Store(now.UnixNano())
+	sm.commitRate.note(now)
+}
+
+// defaultBlockProcessingStallTimeout is blockProcessingStallTimeout when no settings are wired
+// (managers built as struct literals in tests) or the setting is unset. Equal to the
+// setting's own default.
+const defaultBlockProcessingStallTimeout = 3 * time.Minute
+
+// blockProcessingStallTimeout is how long the chain may go without a block joining it before a
+// backpressured node stops excusing its sync peer: legacy_peerProcessingTimeout, the setting
+// base bounded the same skip with.
+func (sm *SyncManager) blockProcessingStallTimeout() time.Duration {
+	if sm.settings != nil && sm.settings.Legacy.PeerProcessingTimeout > 0 {
+		return sm.settings.Legacy.PeerProcessingTimeout
+	}
+
+	return defaultBlockProcessingStallTimeout
+}
+
+// stallCheckSuppressed reports whether handleCheckSyncPeer skips its checks at now: while the
+// node is backpressured (localReadBackpressured) and a block joined the chain within
+// blockProcessingStallTimeout. Backpressure with the chain advancing is our own processing
+// speed, not the peer's health. Backpressure with the chain standing still for that long is a
+// stalled pipeline or a block nobody is sending, and the check runs: a sync peer that is not
+// sending is rotated, one that is keeps its role through the throughput rule below the skip.
+// No commit since start counts as standing still, so the check is never off before the first
+// block joins.
+func (sm *SyncManager) stallCheckSuppressed(now time.Time) bool {
+	if !sm.localReadBackpressured() {
+		return false
+	}
+
+	last := sm.lastChainProgress.Load()
+	if last == 0 {
+		return false
+	}
+
+	return now.Sub(time.Unix(0, last)) < sm.blockProcessingStallTimeout()
 }
 
 // localReadBackpressured reports whether the node is currently throttling its

@@ -390,3 +390,33 @@ func TestDemotion_OffPathDisconnectsButKeepsTheHeaderCache(t *testing.T) {
 	require.Same(t, cacheBefore, sm.headerCache, "even the off-path disconnect must not rebuild the header cache")
 	require.Equal(t, successor, sm.loadSyncPeer())
 }
+
+// TestStalledSyncPeer_IsDemotedUnderBackpressureOnceTheChainStandsStill is the end-to-end form of
+// the bound on the stall check's backpressure skip. A read loop waits for an admission slot, as it
+// does for most of IBD with the other peers keeping every slot full, and the sync peer has sent
+// nothing for longer than the stall window. While blocks still join the chain the peer is excused;
+// once the chain has stood still for blockProcessingStallTimeout it is demoted. Unbounded, the
+// skip excused it for as long as anybody else kept the slots full (review of 76be891d6).
+func TestStalledSyncPeer_IsDemotedUnderBackpressureOnceTheChainStandsStill(t *testing.T) {
+	sm := newDemotionManager(t)
+
+	stalled, _, _ := demotionPeer(t, sm, 100, 1000)
+	successor, _, _ := demotionPeer(t, sm, 101, 1000)
+
+	sm.storeSyncPeer(stalled, stalledSyncPeerState())
+	stalled.SetSyncPeer(true)
+
+	sm.blockPrefetchWaiters.Add(1)
+
+	sm.noteChainProgress()
+	sm.handleCheckSyncPeer()
+	require.Same(t, stalled, sm.loadSyncPeer(), "a backpressured node whose chain advances excuses its sync peer")
+
+	// A fresh stalled state: the skipped tick still sampled the peer's throughput
+	// (updateNetwork runs deferred), and a test peer's handshake bytes over a few
+	// microseconds read as a healthy rate.
+	sm.storeSyncPeer(stalled, stalledSyncPeerState())
+	sm.lastChainProgress.Store(time.Now().Add(-sm.blockProcessingStallTimeout() - time.Second).UnixNano())
+	sm.handleCheckSyncPeer()
+	require.Same(t, successor, sm.loadSyncPeer(), "once the chain has stood still past the bound, backpressure no longer excuses a silent sync peer")
+}

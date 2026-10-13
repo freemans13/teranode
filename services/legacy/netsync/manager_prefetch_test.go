@@ -236,10 +236,8 @@ func TestLocalReadBackpressured(t *testing.T) {
 // not rotated merely because a block is slow to validate. It still rotates a
 // genuinely idle stalled peer once that self-backpressure clears.
 //
-// This used to also cover a queued / mid-validation backlog suppressing
-// rotation on its own, gated on a lastChainProgress staleness check; both are
-// gone with the decoded block queue (blockBacklog, lastChainProgress), so the
-// only self-backpressure signal left is the prefetch waiter count.
+// The only self-backpressure signal left is the prefetch waiter count, and the
+// skip it buys is bounded by chain progress (stallCheckSuppressed).
 func TestHandleCheckSyncPeer_PrefetchBackpressure(t *testing.T) {
 	newStalledState := func() *syncPeerState {
 		return &syncPeerState{
@@ -269,9 +267,33 @@ func TestHandleCheckSyncPeer_PrefetchBackpressure(t *testing.T) {
 		sm := newSyncManager(sp, newStalledState())
 
 		sm.blockPrefetchWaiters.Add(1) // read-loop parked in AcquireBlockPrefetch
+		sm.noteChainProgress()         // and the chain is still advancing
 
 		require.NotPanics(t, func() { sm.handleCheckSyncPeer() })
 		require.Equal(t, sp, sm.loadSyncPeer())
+	})
+
+	// The skip is bounded by chain progress. During IBD the other peers keep every admission
+	// slot full, so backpressure holds almost all the time; unbounded, it turned rotation off for
+	// the whole sync. Once no block has joined the chain for blockProcessingStallTimeout, the
+	// check runs again (and panics in this minimal SyncManager, which proves it ran).
+	t.Run("rotates a stalled peer once the chain has stood still past the bound, backpressure or not", func(t *testing.T) {
+		sp := &peerpkg.Peer{}
+		sm := newSyncManager(sp, newStalledState())
+
+		sm.blockPrefetchWaiters.Add(1)
+		sm.lastChainProgress.Store(time.Now().Add(-defaultBlockProcessingStallTimeout - time.Second).UnixNano())
+
+		require.Panics(t, func() { sm.handleCheckSyncPeer() })
+	})
+
+	t.Run("rotates a stalled peer under backpressure when no block has joined the chain yet", func(t *testing.T) {
+		sp := &peerpkg.Peer{}
+		sm := newSyncManager(sp, newStalledState())
+
+		sm.blockPrefetchWaiters.Add(1)
+
+		require.Panics(t, func() { sm.handleCheckSyncPeer() })
 	})
 
 	t.Run("rotates a genuinely idle stalled peer (no waiters)", func(t *testing.T) {
