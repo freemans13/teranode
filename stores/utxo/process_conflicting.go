@@ -633,7 +633,7 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 			// Re-spending its inputs needs the body -- SpendAndCreate takes a
 			// *bt.Tx and there is no body-free route in the interface -- but a
 			// body-less record is not exotic: on the utxoset store the tx_body
-			// window ages out, so an unmined counter older than the window has no
+			// partition ages out, so an unmined counter older than the partition has no
 			// body at all, and below the checkpoint with
 			// utxostore_skipTxBodyBelowCheckpoint on neither the body nor the
 			// stored inpoints exist. When that happens the promoted counter's

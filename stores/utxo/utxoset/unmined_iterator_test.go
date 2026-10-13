@@ -135,7 +135,7 @@ func TestUnminedIteratorSkipsConflictingTransactions(t *testing.T) {
 // TestUnminedIteratorCarriesWhatBlockAssemblyNeedsToRebuildACandidate.
 //
 // Block assembly reassembles a mining candidate from the fee, the size and the inputs, not
-// from the serialized transaction. That is what lets the body age out of its window while
+// from the serialized transaction. That is what lets the body age out of its partition while
 // the transaction stays mineable.
 func TestUnminedIteratorCarriesWhatBlockAssemblyNeedsToRebuildACandidate(t *testing.T) {
 	s, ctx := newTestStore(t)

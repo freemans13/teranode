@@ -10,8 +10,8 @@ import (
 )
 
 // TestOnlyTheSchemaAndTheStampNameTheStampedTable is the design's SC-2, a source scan. The
-// tx_mined_stamped table records, per stamped window, the tip at which the deep stamp
-// completed. It is NOT the per-window marker table that was rejected on 15 September, and the
+// tx_mined_stamped table records, per stamped partition, the tip at which the deep stamp
+// completed. It is NOT the per-partition marker table that was rejected on 15 September, and the
 // difference is exactly who touches it: only the stamp writes it and only the drop reads and
 // deletes it. No reorg, un-mine, invalidation or unspend path may name it, because a table that
 // every chain switch had to keep consistent would be the rejected design under a new name.
@@ -42,6 +42,6 @@ func TestOnlyTheSchemaAndTheStampNameTheStampedTable(t *testing.T) {
 		}
 
 		require.True(t, allowed[name],
-			"%s names tx_mined_stamped: only the schema, the stamp and the drop may, or the completion record becomes the per-window marker table the design rejected", name)
+			"%s names tx_mined_stamped: only the schema, the stamp and the drop may, or the completion record becomes the per-partition marker table the design rejected", name)
 	}
 }

@@ -139,7 +139,7 @@ func (s *Server) Init(ctx context.Context) error {
 	// The stamp worker, for a store whose UTXOs get their block from a deep pass.
 	s.stamper = s.findStamper()
 	if s.stamper != nil && s.settings.Pruner.SkipDuringCatchup {
-		s.logger.Errorf("[pruner] pruner_skipDuringCatchup is true on a store that stamps: the stamp, and with it every containment window drop, will stall for the whole catch-up")
+		s.logger.Errorf("[pruner] pruner_skipDuringCatchup is true on a store that stamps: the stamp, and with it every tx_mined partition drop, will stall for the whole catch-up")
 	}
 
 	// Validate block trigger mode

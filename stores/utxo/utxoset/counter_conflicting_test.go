@@ -11,7 +11,7 @@ import (
 // through the one store that can actually produce the state.
 //
 // This store bounds serialized transaction bytes by a retention horizon and drops them by
-// window, so a metadata read returns a record whose transaction is nil for anything older.
+// partition, so a metadata read returns a record whose transaction is nil for anything older.
 // That is the ordinary steady state rather than an error, and a transaction that lost a
 // double-spend race is kept indefinitely while its bytes age out, so the combination is not
 // exotic.
@@ -40,7 +40,7 @@ func TestCounterConflictingSurvivesABodyThatHasAgedOut(t *testing.T) {
 	// Age the bytes out, exactly as the pruner does once the horizon passes.
 	dropped, err := s.dropTxBodyWindowsBelow(ctx, 100_000)
 	require.NoError(t, err)
-	require.Positive(t, dropped, "the body windows must actually have been dropped")
+	require.Positive(t, dropped, "the tx_body partitions must actually have been dropped")
 	forgetCarriedBodies(t, s, ctx)
 
 	ch := child.TxIDChainHash()

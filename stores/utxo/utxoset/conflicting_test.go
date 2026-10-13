@@ -313,11 +313,11 @@ func TestSetConflictingOnAnEmptyListIsANoOp(t *testing.T) {
 // matched straddling its neighbours, so that whole class of defect is gone rather than
 // defended against.
 //
-// What is left to pin is the dedupe, which now has two halves. Inside one window the unique
-// index and ON CONFLICT DO NOTHING make a repeat write nothing; across windows the same pair
+// What is left to pin is the dedupe, which now has two halves. Inside one partition the unique
+// index and ON CONFLICT DO NOTHING make a repeat write nothing; across partitions the same pair
 // is two legal rows, because a unique index on a partitioned table must include the partition
 // key, so the READER has to say DISTINCT. Both are exercised: the store's height is moved past
-// a window boundary between the two notes.
+// a partition boundary between the two notes.
 func TestNotingTheSameContestTwiceRecordsItOnce(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(100))
@@ -330,11 +330,11 @@ func TestNotingTheSameContestTwiceRecordsItOnce(t *testing.T) {
 	_, err = s.Create(ctx, loser, 100, utxo.WithConflicting(true))
 	require.NoError(t, err)
 
-	// Same window: the insert's ON CONFLICT is what absorbs this.
+	// Same partition: the insert's ON CONFLICT is what absorbs this.
 	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*loser.TxIDChainHash()}, true)
 	require.NoError(t, err)
 
-	// A different window: two rows now exist, and only the reader's DISTINCT hides them.
+	// A different partition: two rows now exist, and only the reader's DISTINCT hides them.
 	require.NoError(t, s.SetBlockHeight(100+SpendJournalPartitionBlocks))
 
 	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*loser.TxIDChainHash()}, true)
@@ -419,7 +419,7 @@ func TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp(t *testing.T) 
 
 // TestConflictingChildrenAnswerForAParentKnownOnlyFromItsUTXO is the third read step.
 //
-// A transaction whose membership window has been dropped is known to this store only through
+// A transaction whose tx_mined partition has been dropped is known to this store only through
 // one of its own live UTXOs -- which is exactly what a pruned SV Node can say about a parent
 // whose block it no longer holds. The contest is keyed on the txid rather than on whichever
 // row answered, so it must attach to that answer too. Folding it into the identity read, or
@@ -436,7 +436,7 @@ func TestConflictingChildrenAnswerForAParentKnownOnlyFromItsUTXO(t *testing.T) {
 	require.NoError(t, err)
 
 	dropped := retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 7})
-	require.Equal(t, 1, dropped, "the membership window has to be gone for this test to mean anything")
+	require.Equal(t, 1, dropped, "the tx_mined partition has to be gone for this test to mean anything")
 
 	loser := spendOneOutput(t, s, ctx, parent, 0, 700_101)
 

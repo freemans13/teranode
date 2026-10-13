@@ -242,7 +242,7 @@ func _initPrometheusMetrics() {
 	stampResidualLag = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "pruner_stamp_residual_lag_windows",
-			Help: "Windows stampable at the live tip with no completion record, read as the last drain exited",
+			Help: "Partitions stampable at the live tip with no completion record, read as the last drain exited",
 		},
 	)
 
@@ -256,7 +256,7 @@ func _initPrometheusMetrics() {
 	stampWindowsPerDrain = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "pruner_stamp_windows_per_drain",
-			Help:    "Windows completed by one drain",
+			Help:    "Partitions completed by one drain",
 			Buckets: prometheus.ExponentialBuckets(1, 2, 8), // 1 to 128
 		},
 	)

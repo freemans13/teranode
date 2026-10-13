@@ -12,7 +12,7 @@ import (
 // default-value assertion cannot tell a wired false from a disconnected one.
 func TestUtxoStoreRetainWindowsIndefinitelyIsWired(t *testing.T) {
 	gocore.Config().Set("utxostore_retainWindowsIndefinitely", "")
-	require.False(t, NewSettings().UtxoStore.RetainWindowsIndefinitely, "off by default: windows and undo partitions drop on their rules")
+	require.False(t, NewSettings().UtxoStore.RetainWindowsIndefinitely, "off by default: partitions and undo partitions drop on their rules")
 
 	gocore.Config().Set("utxostore_retainWindowsIndefinitely", "true")
 	t.Cleanup(func() { gocore.Config().Set("utxostore_retainWindowsIndefinitely", "") })

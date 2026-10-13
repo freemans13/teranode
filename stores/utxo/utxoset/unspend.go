@@ -49,12 +49,14 @@ import (
 // The NOT EXISTS guard is belt-and-braces: with a non-unique key a concurrent re-create
 // could otherwise produce a duplicate live row for one outpoint, which is counterfeit.
 //
-// It does not cover two journal rows for the same spend, and that case is real: the pruner's
-// copy-forward commits a carried copy before it detaches the original partition, so for that
-// interval both rows match all three predicates. Both are consumed, which is right, since a
-// copy left behind would be a second authorisation. But the guard reads the pre-statement
-// snapshot, in which the UTXO is absent for both, so both used to insert and one spent output
-// came back as two live ones. The `one` CTE collapses them to one row per UTXO first.
+// It does not cover two journal rows for the same spend. The pruner's carry no longer makes
+// them, because it moves the row rather than copying it (copyForwardSQL), but a database
+// upgraded from a build whose carry was a copy can hold the original and its copy until the
+// next pass over the leaf heals it, and both match all three predicates. Both are consumed,
+// which is right, since a copy left behind would be a second authorisation. But the guard reads
+// the pre-statement snapshot, in which the UTXO is absent for both, so both used to insert and
+// one spent output came back as two live ones. The `one` CTE collapses them to one row per UTXO
+// first.
 //
 // $4 carries the flags to OR in, so a caller asking for flagAsLocked gets the UTXO back
 // already locked rather than briefly spendable. IT REACHES BOTH OUTCOMES, the UTXO this call
@@ -98,17 +100,17 @@ import (
 //
 // The restored UTXO's pair is the copy's own, verbatim, whenever it is non-zero: a non-zero
 // pair was final when it was copied and stays final. A copy at (0,0) is the REPAIR's case. The
-// UTXO was spent while still unstamped, and if its window has since been stamped, the stamp
+// UTXO was spent while still unstamped, and if its partition has since been stamped, the stamp
 // found no live UTXO to write onto and has deleted the identity row, so nothing would ever
 // come back for it. The repair reads the copy's containment rows below the stamp fence ($6),
 // at or above the dropped floor ($5). Below the fence every row left names a winner, because
 // the stamp deleted the losers in the same transaction that raised the fence, so exactly one
 // row means its pair is written onto the restored UTXO here, with no chain access. No row and
-// an identity row means the transaction is unmined, or its window is not yet stamped: (0,0) is
+// an identity row means the transaction is unmined, or its partition is not yet stamped: (0,0) is
 // kept and the stamp will reach it through the identity row. No row and no identity row, or
 // more than one row, are the two failures the wrapper turns into a rolled-back storage error.
 // The fence itself is read after the shared fence lock, in the same transaction, so it cannot
-// move under this statement. Both floors are scalars, so the planner reads only the windows
+// move under this statement. Both floors are scalars, so the planner reads only the partitions
 // between them.
 const unspendSQL = `
 WITH items AS (
@@ -123,9 +125,9 @@ taken AS (
               j.spendable_from, j.flags, j.hash_override, j.mined_height, j.block_id
 ),
 one AS (
-    -- One row per UTXO, whatever the journal held. Two rows for one spend is the pruner's
-    -- copy-forward window: the carried copy has committed and the original partition is not
-    -- yet detached, so both match and both are consumed above. The NOT EXISTS below cannot
+    -- One row per UTXO, whatever the journal held. Two rows for one spend is what a build
+    -- whose carry was a copy left between its copy and its drop, until the next pass heals
+    -- it, so both match and both are consumed above. The NOT EXISTS below cannot
     -- collapse them, because it reads the same pre-statement snapshot for both. A filled-in
     -- pair beats an unfilled one, which is the only way the two can differ.
     SELECT DISTINCT ON (t.ukey, t.txid) t.*

@@ -47,12 +47,12 @@ import (
 // or below the checkpoint has no body to reach, and a DELETE that matches nothing is not an
 // error, so the join is unchanged either way.
 // Joining through ident alone left a mined-only transaction's body behind: no tx_ident row
-// exists to gate it, so nothing found it, and it sat there until its 288-block body window aged
+// exists to gate it, so nothing found it, and it sat there until its 288-block tx_body partition aged
 // out on its own, contradicting Delete's promise to remove every trace immediately.
 //
 // mined removes the transaction's membership rows, tx_mined's replacement for the identity row
 // on a mined transaction. It is keyed by txid alone -- tx_mined has no leaf column, and its
-// primary key leads with txid, so this is an index descent per live window rather than a scan.
+// primary key leads with txid, so this is an index descent per live partition rather than a scan.
 // Left behind, a deleted-but-still-a-member transaction would misreport itself as present to
 // any later lookup that consults tx_mined, exactly the resurrection the identity delete above
 // already guards against for a mempool transaction. It RETURNs created_height and txid for the
@@ -64,7 +64,7 @@ import (
 // behind, it would keep answering lookups for a transaction Delete promised to remove every
 // trace of, which is the same resurrection the identity and membership deletes guard against.
 //
-// A transaction can hold several tx_mined rows -- one per window its UTXOs are still claimed
+// A transaction can hold several tx_mined rows -- one per partition its UTXOs are still claimed
 // through, or a coinbase re-org claiming it at more than one height -- all sharing the same
 // created_height, so gone runs them through UNION rather than a plain concatenation to collapse
 // them to one (created_height, txid) pair before the join.

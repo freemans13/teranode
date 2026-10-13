@@ -7,7 +7,7 @@ import (
 )
 
 // TestUTXORowsCarryTheirParentsBlockFacts pins the two columns the read path relies on once
-// a transaction's containment window has been dropped: the height and block of the
+// a transaction's tx_mined partition has been dropped: the height and block of the
 // transaction that made the UTXO. Both fixed width, placed before the variable-length
 // script so alignment costs nothing.
 func TestUTXORowsCarryTheirParentsBlockFacts(t *testing.T) {
@@ -58,12 +58,12 @@ func TestMembershipTableIsKeyedByTransactionIdFirst(t *testing.T) {
 	var n int
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM pg_inherits WHERE inhparent = 'tx_mined'::regclass`).Scan(&n))
-	require.Equal(t, 1, n, "one 288-block window for height 700,000")
+	require.Equal(t, 1, n, "one 288-block partition for height 700,000")
 }
 
-// TestDroppedMembershipWindowsCannotComeBack pins the floor: once a window is dropped, a
-// create for a height inside it fails instead of recreating the window, because a block
-// re-offered after its window retired would otherwise claim every transaction in it afresh.
+// TestDroppedMembershipWindowsCannotComeBack pins the floor: once a partition is dropped, a
+// create for a height inside it fails instead of recreating the partition, because a block
+// re-offered after its partition retired would otherwise claim every transaction in it afresh.
 func TestDroppedMembershipWindowsCannotComeBack(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -74,16 +74,16 @@ func TestDroppedMembershipWindowsCannotComeBack(t *testing.T) {
 
 	floor, err := s.txMinedFloor(ctx)
 	require.NoError(t, err)
-	require.Equal(t, uint32(1), floor, "window 0 (heights 0-287) was dropped, so the floor is window 1")
+	require.Equal(t, uint32(1), floor, "partition 0 (heights 0-287) was dropped, so the floor is partition 1")
 
 	err = s.ensureTxMinedPartition(ctx, 100)
-	require.Error(t, err, "recreating a dropped window would let a stale block double its UTXOs")
+	require.Error(t, err, "recreating a dropped partition would let a stale block double its UTXOs")
 
-	require.NoError(t, s.ensureTxMinedPartition(ctx, 1_000), "a live window is still fine")
+	require.NoError(t, s.ensureTxMinedPartition(ctx, 1_000), "a live partition is still fine")
 }
 
 // TestDropWritesOnlyTheDroppedFloor: the drop's transaction advances the dropped floor alone.
-// The other two floors are already at or above the window's upper bound, because the drop's
+// The other two floors are already at or above the partition's upper bound, because the drop's
 // first condition is the completion record the stamp wrote when it advanced them.
 func TestDropWritesOnlyTheDroppedFloor(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -92,15 +92,15 @@ func TestDropWritesOnlyTheDroppedFloor(t *testing.T) {
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 400))
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 5_000))
 
-	require.Equal(t, 2, retireWindows(t, s, ctx, 1, nil), "windows 0 and 1 go, window 17 stays")
+	require.Equal(t, 2, retireWindows(t, s, ctx, 1, nil), "partitions 0 and 1 go, partition 17 stays")
 
 	var floor, fence, complete int32
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT floor, stamp_fence, stamp_complete_floor FROM tx_mined_floor WHERE id = 0`).
 		Scan(&floor, &fence, &complete))
 
-	require.Equal(t, int32(2), floor, "a window number: the highest dropped plus one")
-	require.Equal(t, int32(2*TxMinedPartitionBlocks), complete, "a height: the stamped windows' upper bound")
+	require.Equal(t, int32(2), floor, "a partition number: the highest dropped plus one")
+	require.Equal(t, int32(2*TxMinedPartitionBlocks), complete, "a height: the stamped partitions' upper bound")
 	require.Equal(t, int32(2*TxMinedPartitionBlocks), fence)
 }
 
@@ -115,10 +115,10 @@ func TestFloorRowRefusesAFloorAboveTheFence(t *testing.T) {
 }
 
 // TestDroppingAWindowClearsTheEnsureCache pins the interaction between the two halves of
-// window management, which is invisible until they disagree.
+// partition management, which is invisible until they disagree.
 //
-// ensureTxMinedPartition remembers the last window it created and returns early when the next
-// create lands in the same one. That memory can outlive the window itself: a fork stamp at an
+// ensureTxMinedPartition remembers the last partition it created and returns early when the next
+// create lands in the same one. That memory can outlive the partition itself: a fork stamp at an
 // old height caches it, the pruner then drops it, and a later stamp at that height hits the
 // cache, skips the floor read, and the INSERT fails with "no partition of relation" instead of
 // the loud, explained refusal the floor exists to give.
@@ -130,5 +130,5 @@ func TestDroppingAWindowClearsTheEnsureCache(t *testing.T) {
 	require.Equal(t, 1, retireWindows(t, s, ctx, 0, nil))
 
 	require.Error(t, s.ensureTxMinedPartition(ctx, 100),
-		"the cached window is gone, so the floor has to be re-read and the create refused")
+		"the cached partition is gone, so the floor has to be re-read and the create refused")
 }

@@ -7,8 +7,8 @@
 // Once built it holds no client and no method takes a context, so it can do no I/O: a store
 // that receives one reads it like an array and makes no chain call of its own.
 //
-// Two callers share it. The pruner's stamp asks BlockID at each height of a containment
-// window, anchored on the best tip. The validator asks Contains for a parent's candidate
+// Two callers share it. The pruner's stamp asks BlockID at each height of a tx_mined
+// partition, anchored on the best tip. The validator asks Contains for a parent's candidate
 // blocks, anchored on the parent of the block being validated.
 package chainancestry
 
@@ -91,8 +91,8 @@ func (a *Ancestry) Contains(id uint32) bool {
 
 // NotMined returns the lowest height in [lo, hi] whose block had mined_set false when the
 // ancestry was built, and whether there was one. mined_set is the blocks-table flag that says
-// every transaction of the block has had its containment recorded, so a false inside a window
-// means that window's containment may still be incomplete.
+// every transaction of the block has had its containment recorded, so a false inside a partition
+// means that partition's containment may still be incomplete.
 func (a *Ancestry) NotMined(lo, hi uint32) (uint32, bool) {
 	i := sort.Search(len(a.notMined), func(i int) bool { return a.notMined[i] >= lo })
 	if i < len(a.notMined) && a.notMined[i] <= hi {

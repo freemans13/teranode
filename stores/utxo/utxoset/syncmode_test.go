@@ -17,10 +17,10 @@ import (
 // replayed, and writing it is a heap insert plus an index insert per input for nothing.
 //
 // What that missed, at the time, was that the journal was also the prune engine: a retiring
-// partition was the only record of WHICH transactions had an output spent in a window, and
+// partition was the only record of WHICH transactions had an output spent in a partition, and
 // with the journal off nothing at all could be reclaimed below the checkpoint.
 //
-// That is no longer why it stays on. Identity reclaim is a tx_mined window drop and reads
+// That is no longer why it stays on. Identity reclaim is a tx_mined partition drop and reads
 // nothing, so the journal is undo insurance again. It stays on below the checkpoint because
 // switching it off there is a SECOND spend path -- one that writes the undo row and one that
 // does not -- exercised only during a sync, for a measured 354.8 bytes of WAL and 12.9

@@ -15,7 +15,7 @@ import (
 // conflictingInputsSQL reads what each named transaction spends, and proves the store holds it.
 //
 // It reads tx_inpoints rather than the serialized body for two reasons. The body is dropped
-// once its window ages out, which is the ordinary steady state rather than an error, so a
+// once its partition ages out, which is the ordinary steady state rather than an error, so a
 // design resting on it would work for 288 blocks and then stop. And this store writes the body
 // in plain rather than extended form, meaning its inputs carry no value or locking script, so
 // even a body that is still present could not answer this.
@@ -33,8 +33,8 @@ import (
 // the paired `unnest(l[],t[]) JOIN tx_ident` form, whose plan flips with statistics.
 //
 // The containment arm puts the keys on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the
-// shape minedByTxidSQL uses, so it is one primary-key descent per key per live window rather
-// than a hash join against every window read whole. Every containment row of one transaction
+// shape minedByTxidSQL uses, so it is one primary-key descent per key per live partition rather
+// than a hash join against every partition read whole. Every containment row of one transaction
 // carries the same inpoints, copied from the identity row or from an earlier row, so which row
 // answers does not matter; the ORDER BY only makes the choice repeatable.
 //
@@ -86,8 +86,8 @@ SELECT k.txid, m.tx_inpoints
 // RemoveFromConflictingChildren's job.
 //
 // $1 is the height, $2 the parents and $3 the children, one element per (parent, child) pair.
-// ON CONFLICT DO NOTHING against the window's own unique index makes a repeat free; the
-// reader still says DISTINCT, because the index is per window. See the schema comment.
+// ON CONFLICT DO NOTHING against the partition's own unique index makes a repeat free; the
+// reader still says DISTINCT, because the index is per partition. See the schema comment.
 const noteConflictingChildrenSQL = `
 INSERT INTO conflict_children (noted_height, parent_txid, child_txid)
 SELECT DISTINCT $1::int, p.ptxid, p.child
@@ -274,11 +274,11 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
 
 	plan := s.planConflicting(named, inpoints)
 
-	// The height is read ONCE and used for both the window and the row, because a second read
+	// The height is read ONCE and used for both the partition and the row, because a second read
 	// that crossed a leaf boundary would insert into a partition that does not exist.
 	notedHeight := s.GetBlockHeight()
 
-	// The note's window BEFORE the transaction is opened, never inside it: the DDL needs its
+	// The note's partition BEFORE the transaction is opened, never inside it: the DDL needs its
 	// own pool connection, and taking one while holding a transaction from the same pool
 	// deadlocks the pool under concurrency, with no timeout.
 	if len(plan.pChild) > 0 {

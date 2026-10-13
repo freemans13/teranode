@@ -17,7 +17,7 @@ import (
 
 // bodylessUtxoStore is a UTXO store that holds every record but hands back none
 // of their serialized bodies, which is the steady state of a store running with
-// utxostore_skipTxBodyBelowCheckpoint on (and of any store whose body window has
+// utxostore_skipTxBodyBelowCheckpoint on (and of any store whose tx_body partition has
 // aged out). It answers a missing transaction exactly as the wrapped store does,
 // so the two cases stay distinguishable.
 type bodylessUtxoStore struct {

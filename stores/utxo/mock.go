@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -415,6 +416,13 @@ func (m *MockUtxostore) SetBlockState(height, medianTime uint32) error {
 func (m *MockUtxostore) GetBlockState() BlockState {
 	args := m.Called()
 	return args.Get(0).(BlockState)
+}
+
+// Stamper returns pruner.NoStamp without consulting the mock's expectations: the mock stands in
+// for a store with nothing to stamp, and every test that holds one would otherwise have to set up
+// a call it never cares about.
+func (m *MockUtxostore) Stamper() pruner.Stamper {
+	return pruner.NoStamp
 }
 
 // QueryOldUnminedTransactions mocks the querying of old unmined transactions before a cutoff height.

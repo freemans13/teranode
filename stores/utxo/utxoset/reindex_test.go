@@ -50,7 +50,7 @@ func TestRebuildUTXOIndexRunsConcurrentlyAndOnce(t *testing.T) {
 //
 // A refresh that finds a rebuild running is skipped rather than queued. A rebuild of a
 // mainnet partition runs for about fifteen minutes, and the stamp worker must not wait that
-// long; the next stamped window analyzes again. The store has no pool here, so a skip that
+// long; the next stamped partition analyzes again. The store has no pool here, so a skip that
 // reached the database would panic.
 func TestStatisticsRefreshIsSkippedWhileARebuildRuns(t *testing.T) {
 	s := &Store{logger: ulogger.TestLogger{}}

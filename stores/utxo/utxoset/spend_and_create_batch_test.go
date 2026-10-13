@@ -373,7 +373,7 @@ func TestSpendAndCreateBatchAnswersANilTransactionAlone(t *testing.T) {
 }
 
 // TestSpendAndCreateBatchSpansPartitions: items in one flush landing in different journal leaves
-// and body windows. Both partitions must exist before the transaction opens, or the insert fails
+// and tx_body partitions. Both partitions must exist before the transaction opens, or the insert fails
 // with "no partition of relation found for row".
 func TestSpendAndCreateBatchSpansPartitions(t *testing.T) {
 	s, ctx := newTestStore(t)

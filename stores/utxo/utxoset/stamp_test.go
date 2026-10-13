@@ -17,9 +17,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// drainAll drives one drain the way the pruner service will: open, then every stampable window
-// from the completion floor up, lowest first, each begun, paged and completed, until a window is
-// not deep enough. It returns how many windows completed. liveTip is what the service would
+// drainAll drives one drain the way the pruner service will: open, then every stampable partition
+// from the completion floor up, lowest first, each begun, paged and completed, until a partition is
+// not deep enough. It returns how many partitions completed. liveTip is what the service would
 // read uncached before each completion; the tests pass the ancestry's anchor height.
 func drainAll(t *testing.T, s *Store, ctx context.Context, anc *chainancestry.Ancestry, liveTip uint32) int {
 	t.Helper()
@@ -54,7 +54,7 @@ func drainAll(t *testing.T, s *Store, ctx context.Context, anc *chainancestry.An
 	}
 }
 
-// stampThrough stamps every window up to and including window `through`, with the ancestry
+// stampThrough stamps every partition up to and including partition `through`, with the ancestry
 // naming the given block ids at the given heights and a filler id everywhere else. It sets the
 // store's height to the tip that makes `through` stampable and leaves it there. It returns the
 // tip.
@@ -73,10 +73,10 @@ func stampThrough(t *testing.T, s *Store, ctx context.Context, through uint32, i
 	return tip
 }
 
-// retireWindows stamps every window through `through` and then drops them the way the pruner
+// retireWindows stamps every partition through `through` and then drops them the way the pruner
 // pass will: the tip moved to the earliest height the drop rule allows, undo partitions due at
-// that tip dropped first, then the containment windows. It restores the store's height
-// afterwards, so a test that set one keeps it. Returns the number of windows dropped.
+// that tip dropped first, then the tx_mined partitions. It restores the store's height
+// afterwards, so a test that set one keeps it. Returns the number of partitions dropped.
 func retireWindows(t *testing.T, s *Store, ctx context.Context, through uint32, ids map[uint32]uint32) int {
 	t.Helper()
 
@@ -92,9 +92,9 @@ func retireWindows(t *testing.T, s *Store, ctx context.Context, through uint32, 
 	return dropped
 }
 
-// dropStamped drops the windows stamped at tip at the earliest height the rule allows: the tip
+// dropStamped drops the partitions stamped at tip at the earliest height the rule allows: the tip
 // moved to stamped_at + the undo lifetime, undo partitions due at that height dropped first, then the
-// containment windows. The store's height is left at the drop height.
+// tx_mined partitions. The store's height is left at the drop height.
 func dropStamped(t *testing.T, s *Store, ctx context.Context, tip uint32) int {
 	t.Helper()
 
@@ -112,7 +112,7 @@ func dropStamped(t *testing.T, s *Store, ctx context.Context, tip uint32) int {
 	return dropped
 }
 
-// stampedAtOf reads a window's completion record; ok is false when it has none.
+// stampedAtOf reads a partition's completion record; ok is false when it has none.
 func stampedAtOf(t *testing.T, s *Store, ctx context.Context, wLo uint32) (uint32, bool) {
 	t.Helper()
 
@@ -126,7 +126,7 @@ func stampedAtOf(t *testing.T, s *Store, ctx context.Context, wLo uint32) (uint3
 	return uint32(at), true //nolint:gosec // a height is never negative
 }
 
-// windowAttached reports whether a window's partition is attached.
+// windowAttached reports whether the tx_mined partition numbered window is attached.
 func windowAttached(t *testing.T, s *Store, ctx context.Context, window uint32) bool {
 	t.Helper()
 
@@ -139,7 +139,7 @@ func windowAttached(t *testing.T, s *Store, ctx context.Context, window uint32) 
 // TestStampDepthIsDerivedFromCoinbaseMaturity pins the arithmetic the rest of the design rests
 // on, so a change to any one constant is caught beside the others it must move with.
 func TestStampDepthIsDerivedFromCoinbaseMaturity(t *testing.T) {
-	require.Equal(t, uint32(288), StampDepthFor(100), "twice maturity, rounded up to a whole window")
+	require.Equal(t, uint32(288), StampDepthFor(100), "twice maturity, rounded up to a whole partition")
 	require.Equal(t, uint32(288), StampDepthFor(144))
 	require.Equal(t, uint32(576), StampDepthFor(145))
 
@@ -153,7 +153,7 @@ func TestStampDepthIsDerivedFromCoinbaseMaturity(t *testing.T) {
 }
 
 // TestStampWritesTheWinnerAndDeletesTheIdentityRow is the ordinary case at the tip: a
-// transaction seen before its block, mined in one block, stamped 288 deep. The window then
+// transaction seen before its block, mined in one block, stamped 288 deep. The partition then
 // drops on schedule and the UTXO alone still answers.
 func TestStampWritesTheWinnerAndDeletesTheIdentityRow(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
@@ -166,7 +166,7 @@ func TestStampWritesTheWinnerAndDeletesTheIdentityRow(t *testing.T) {
 	require.NoError(t, err)
 
 	h, b := utxoFacts(t, s, ctx, tx)
-	require.Equal(t, int32(0), h, "unstamped until the window is 288 deep")
+	require.Equal(t, int32(0), h, "unstamped until the partition is 288 deep")
 	require.Equal(t, int32(0), b)
 
 	tip := stampThrough(t, s, ctx, 0, map[uint32]uint32{100: 7})
@@ -202,10 +202,10 @@ func TestStampWritesTheWinnerAndDeletesTheIdentityRow(t *testing.T) {
 
 	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
 	require.NoError(t, err)
-	require.Equal(t, []uint32{7}, got.BlockIDs, "the UTXO answers once the window is gone")
+	require.Equal(t, []uint32{7}, got.BlockIDs, "the UTXO answers once the partition is gone")
 
 	// GetMeta is what the validator asks when a resubmitted transaction finds its coins gone
-	// (Validator.knownTxResubmission). The identity row went with the stamp and the window has
+	// (Validator.knownTxResubmission). The identity row went with the stamp and the partition has
 	// dropped, so the answer has to come from the unspent coin, and it must say mined.
 	var md meta.Data
 
@@ -214,7 +214,7 @@ func TestStampWritesTheWinnerAndDeletesTheIdentityRow(t *testing.T) {
 	require.False(t, md.Conflicting)
 }
 
-// TestStampDeletesLosersAndLeavesForkOnlyTransactionsWaiting: a window with a fork block. The
+// TestStampDeletesLosersAndLeavesForkOnlyTransactionsWaiting: a partition with a fork block. The
 // transaction in both blocks is stamped with the winner and the loser's row goes. The
 // transaction only the fork block contained keeps its identity row, its marker and its UTXO at
 // (0,0), and is counted as normal.
@@ -255,7 +255,7 @@ func TestStampDeletesLosersAndLeavesForkOnlyTransactionsWaiting(t *testing.T) {
 }
 
 // TestStampNeverTouchesAnUnminedTransaction: an identity row with no containment at all is
-// neither stamped nor deleted, however many windows pass it.
+// neither stamped nor deleted, however many partitions pass it.
 func TestStampNeverTouchesAnUnminedTransaction(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
@@ -275,19 +275,19 @@ func TestStampNeverTouchesAnUnminedTransaction(t *testing.T) {
 	require.Equal(t, [][2]int32{{0, 0}}, pairsOf(t, s, ctx, unmined))
 }
 
-// TestStampFindsAStragglerByWhereItWasMined is the design's ST-1 and ST-2: window membership
+// TestStampFindsAStragglerByWhereItWasMined is the design's ST-1 and ST-2: partition membership
 // comes from containment and never from the height a transaction was first seen at.
 func TestStampFindsAStragglerByWhereItWasMined(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
-	// Seen in window 0, mined in window 1.
+	// Seen in partition 0, mined in partition 1.
 	late := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, late, 286)
 	require.NoError(t, err)
 	_, err = s.SetMinedMulti(ctx, hashes(late), utxo.MinedBlockInfo{BlockID: 20, BlockHeight: 289, OnLongestChain: true})
 	require.NoError(t, err)
 
-	// Seen in window 1, mined in window 0.
+	// Seen in partition 1, mined in partition 0.
 	early := mkTx(t, 1, 6_000)
 	_, err = s.Create(ctx, early, 289)
 	require.NoError(t, err)
@@ -296,7 +296,7 @@ func TestStampFindsAStragglerByWhereItWasMined(t *testing.T) {
 
 	ids := map[uint32]uint32{286: 19, 289: 20}
 
-	// Window 0 alone: early is stamped, late is left for window 1.
+	// Partition 0 alone: early is stamped, late is left for partition 1.
 	stampThrough(t, s, ctx, 0, ids)
 
 	require.Equal(t, [][2]int32{{286, 19}}, pairsOf(t, s, ctx, early))
@@ -318,8 +318,8 @@ func TestStampFindsAStragglerByWhereItWasMined(t *testing.T) {
 }
 
 // TestStampBelowTheCheckpointHasNoWorkAndStillCompletes is the design's ST-3: with every create
-// carrying its block, tx_ident is empty, the pass stamps nothing, the window still gets its
-// completion record and drops on schedule. A window that never ran the pass never drops.
+// carrying its block, tx_ident is empty, the pass stamps nothing, the partition still gets its
+// completion record and drops on schedule. A partition that never ran the pass never drops.
 func TestStampBelowTheCheckpointHasNoWorkAndStillCompletes(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -342,16 +342,16 @@ func TestStampBelowTheCheckpointHasNoWorkAndStillCompletes(t *testing.T) {
 	require.Equal(t, identBefore, testutil.ToFloat64(stampIdentityDeleted))
 
 	_, ok := stampedAtOf(t, s, ctx, 0)
-	require.True(t, ok, "window 0 completed")
+	require.True(t, ok, "partition 0 completed")
 	_, ok = stampedAtOf(t, s, ctx, 288)
-	require.False(t, ok, "window 1 was not deep enough at tip %d", tip)
+	require.False(t, ok, "partition 1 was not deep enough at tip %d", tip)
 
 	dropAt := tip + stampMarginBlocks + s.undoMaxLife()
 	require.NoError(t, s.SetBlockHeight(dropAt))
 
 	dropped, err := s.dropStampedTxMinedWindows(ctx, dropAt)
 	require.NoError(t, err)
-	require.Equal(t, 1, dropped, "window 0 drops; window 1 has no completion record and stays")
+	require.Equal(t, 1, dropped, "partition 0 drops; partition 1 has no completion record and stays")
 	require.True(t, windowAttached(t, s, ctx, 1))
 }
 
@@ -441,13 +441,13 @@ func TestStampResumesAfterACrashMidWindow(t *testing.T) {
 }
 
 // TestStampTreatsAWindowWithNoTableAsEmpty is decision 8: both stamp floors move past a missing
-// window and the pass carries on to the next. Windows below the lowest window that exists are
+// partition and the pass carries on to the next. Partitions below the lowest partition that exists are
 // what a seed leaves (it writes no containment rows), so they are skipped without being counted
 // as missing.
 func TestStampTreatsAWindowWithNoTableAsEmpty(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
-	// Only window 3 exists.
+	// Only partition 3 exists.
 	tx := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, tx, 999)
 	require.NoError(t, err)
@@ -458,12 +458,12 @@ func TestStampTreatsAWindowWithNoTableAsEmpty(t *testing.T) {
 
 	stampThrough(t, s, ctx, 3, map[uint32]uint32{1000: 30})
 
-	require.Equal(t, before, testutil.ToFloat64(stampMissingWindows), "windows 0, 1 and 2 lie below the lowest window, as after a seed")
+	require.Equal(t, before, testutil.ToFloat64(stampMissingWindows), "partitions 0, 1 and 2 lie below the lowest partition, as after a seed")
 	require.Equal(t, [][2]int32{{1000, 30}}, pairsOf(t, s, ctx, tx))
 
 	for _, w := range []uint32{0, 288, 576} {
 		_, ok := stampedAtOf(t, s, ctx, w)
-		require.False(t, ok, "a missing window gets no completion record; there is nothing to drop")
+		require.False(t, ok, "a missing partition gets no completion record; there is nothing to drop")
 	}
 
 	floors, err := s.Floors(ctx)
@@ -473,7 +473,7 @@ func TestStampTreatsAWindowWithNoTableAsEmpty(t *testing.T) {
 }
 
 // TestWindowDropWaitsForTheUndoPartitionsBelowItsStampedAt is the design's ST-26, the third
-// drop condition in isolation: a window due by the tip is still held while an undo partition
+// drop condition in isolation: a partition due by the tip is still held while an undo partition
 // covering a height below its stamped_at is attached, and drops in the same pass as that
 // partition once the undo drop runs first.
 func TestWindowDropWaitsForTheUndoPartitionsBelowItsStampedAt(t *testing.T) {
@@ -581,7 +581,7 @@ func TestRetainIndefinitelySkipsTheDropsAndNotTheStamp(t *testing.T) {
 	_, err = svc.Prune(ctx, 10_000, "test")
 	require.NoError(t, err)
 
-	require.True(t, windowAttached(t, s, ctx, 0), "the window is kept")
+	require.True(t, windowAttached(t, s, ctx, 0), "the partition is kept")
 	require.Equal(t, 1, journalLeaves(t, s, ctx), "and so is the undo partition")
 	require.Equal(t, float64(1), testutil.ToFloat64(retainIndefinitelyGauge))
 }
@@ -607,7 +607,7 @@ func TestSecondDrainIsSkippedWhileOneIsOpen(t *testing.T) {
 }
 
 // TestStampRefusesAWindowWhoseBlockIsNotMined is the design's ST-22: a main-chain block of the
-// window with mined_set false aborts the window with zero writes and counts it.
+// partition with mined_set false aborts the partition with zero writes and counts it.
 func TestStampRefusesAWindowWhoseBlockIsNotMined(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
@@ -649,12 +649,12 @@ func TestNoIndexOnUTXONamesMinedHeight(t *testing.T) {
 	require.Zero(t, n)
 }
 
-// A window missing above one that exists is not what a seed leaves: it can be a window dropped by
+// A partition missing above one that exists is not what a seed leaves: it can be a partition dropped by
 // mistake, so it is still counted. The floors move past it either way.
 func TestStampCountsAMissingWindowAboveAnExistingOne(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
-	// Windows 3 and 5 exist; 4 does not.
+	// Partitions 3 and 5 exist; 4 does not.
 	early := mkTx(t, 1, 5_000)
 	_, err := s.Create(ctx, early, 999)
 	require.NoError(t, err)
@@ -671,7 +671,7 @@ func TestStampCountsAMissingWindowAboveAnExistingOne(t *testing.T) {
 
 	stampThrough(t, s, ctx, 5, map[uint32]uint32{1000: 30, 1600: 50})
 
-	require.Equal(t, before+1, testutil.ToFloat64(stampMissingWindows), "window 4 only; 0, 1 and 2 lie below the lowest window")
+	require.Equal(t, before+1, testutil.ToFloat64(stampMissingWindows), "partition 4 only; 0, 1 and 2 lie below the lowest partition")
 	require.Equal(t, [][2]int32{{1600, 50}}, pairsOf(t, s, ctx, late))
 
 	floors, err := s.Floors(ctx)
@@ -680,9 +680,9 @@ func TestStampCountsAMissingWindowAboveAnExistingOne(t *testing.T) {
 }
 
 // A page whose slab has no identity row reads nothing from tx_mined. Below the checkpoint every
-// create carries its block and tx_ident is empty, yet each of the 256 pages read the window's
+// create carries its block and tx_ident is empty, yet each of the 256 pages read the partition's
 // tx_mined slab before the identity delete found nothing: on mainnet at height 875,000 on
-// 2026-10-09 that was about 30 GB of reads for each window, to change no row. Rows is the count
+// 2026-10-09 that was about 30 GB of reads for each partition, to change no row. Rows is the count
 // of tx_mined rows the page read, so a skipped page reports 0.
 func TestStampPageWithNoIdentityRowReadsNoContainmentRows(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -713,7 +713,7 @@ func TestStampPageWithNoIdentityRowReadsNoContainmentRows(t *testing.T) {
 	page := int(tx.TxIDChainHash()[0])
 	res, err := drain.StampPage(ctx, 0, anc, page)
 	require.NoError(t, err)
-	require.Zero(t, res.Rows, "the page read the window's tx_mined slab with no identity row to stamp")
+	require.Zero(t, res.Rows, "the page read the partition's tx_mined slab with no identity row to stamp")
 	require.Zero(t, res.UTXOs)
 	require.Zero(t, res.Transactions)
 }

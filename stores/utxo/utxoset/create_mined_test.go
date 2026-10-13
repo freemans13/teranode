@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// minedRows counts the membership rows a transaction holds, across every live window.
+// minedRows counts the membership rows a transaction holds, across every live partition.
 func minedRows(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) int {
 	t.Helper()
 
@@ -114,7 +114,7 @@ func TestBlockPathCreateRefusesATransactionThatStillHasAUTXO(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// Its window is stamped and dropped; the UTXO stays because nobody spent it.
+	// Its partition is stamped and dropped; the UTXO stays because nobody spent it.
 	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 1}))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 
@@ -240,13 +240,13 @@ func TestBlockPathCreateRefusesATransactionContainedElsewhereAndFullySpent(t *te
 
 // TestClaimFloorIsTheLowerOfTheFixedReachAndTheOldestUndoPartition pins the two bounds of the
 // create claims' containment probe. The fixed reach is 2,016 blocks below the store's height,
-// aligned down to a window edge. The oldest attached undo partition lowers it further, because
+// aligned down to a partition edge. The oldest attached undo partition lowers it further, because
 // a fully spent transaction can be re-offered as itself only while the undo copies of its
 // inputs live, and they live in the attached undo partitions, however late the drops run.
 func TestClaimFloorIsTheLowerOfTheFixedReachAndTheOldestUndoPartition(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	require.Equal(t, int32(0), s.claimFloor(), "a fresh store at height zero reads every window")
+	require.Equal(t, int32(0), s.claimFloor(), "a fresh store at height zero reads every partition")
 
 	require.NoError(t, s.SetBlockHeight(10_000))
 	require.Equal(t, int32(7_776), s.claimFloor(), "align_down(10,000 - 2,016, 288) with no undo partition attached")
@@ -337,8 +337,8 @@ func TestMempoolCreateRefusesASettledTransaction(t *testing.T) {
 // membership guard alone leaves open.
 //
 // For a transaction mined more than the membership retention ago, both of the mempool claim's
-// original guards are empty: the identity row never existed, and the membership window has
-// been dropped. Its UTXOs are still live, because window retirement stamped them on the way
+// original guards are empty: the identity row never existed, and the tx_mined partition has
+// been dropped. Its UTXOs are still live, because partition retirement stamped them on the way
 // out. So the claim took, and because the UTXO insert is gated on that same claim, every
 // output was written a SECOND row -- the UTXO key is a non-unique 96-bit prefix by design, so
 // nothing downstream catches it. That is money-supply inflation.
@@ -356,7 +356,7 @@ func TestMempoolCreateRefusesATransactionThatStillHasAUTXO(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	// Its window is stamped and dropped; the UTXO stays because nobody spent it.
+	// Its partition is stamped and dropped; the UTXO stays because nobody spent it.
 	require.Equal(t, 1, retireWindows(t, s, ctx, 0, map[uint32]uint32{100: 1}))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 	require.False(t, identExists(t, s, ctx, tx))

@@ -25,21 +25,21 @@ import (
 // is answered from both.
 //
 // The first containment read carries a height floor, the lookup floor: the stamp depth plus one
-// window below the store's height, aligned down to a window edge. Every unstamped transaction
-// sits inside it when the stamp is on time, with one window of slack, and the floor is what
+// partition below the store's height, aligned down to a partition edge. Every unstamped transaction
+// sits inside it when the stamp is on time, with one partition of slack, and the floor is what
 // keeps the read at the same three or four partitions however far behind the stamp falls. What
 // the floor can miss, the second tier reads: a transaction with an identity row that believes
 // itself mined and no containment in the first tier, a UTXO at (0,0) with no identity row, or an
 // undo copy at (0,0) that nothing else answered for. Each of those means containment exists
 // below the floor, or nothing can ever stamp the transaction, and the tier reads every attached
-// window in ONE snapshot so that a create committing between two of the earlier statements
+// partition in ONE snapshot so that a create committing between two of the earlier statements
 // cannot be mistaken for corruption.
 //
 // A UTXO holds ONE block id, and on the ordinary two-step reorg (a fork block recorded as not
 // on the longest chain, then a later block making it the main chain) nothing rewrites the UTXOs
 // of transactions shared between the two blocks. A UTXO-first read would then hand block
 // validation an id that lost, and the parent check stores a valid block as invalid. The
-// containment table holds every id while the window lives, so the UTXO is consulted only for a
+// containment table holds every id while the partition lives, so the UTXO is consulted only for a
 // transaction with no identity row and no containment in the first tier, and a non-zero pair on
 // it is final: the stamp wrote it 288 blocks deep, or the block path wrote it below the
 // checkpoint.
@@ -51,7 +51,7 @@ import (
 // was available. Ask it last and it is reached only for a transaction with no live UTXO at all,
 // which is the case it exists for: the FULLY-SPENT parent mined more than the lookup reach ago,
 // which model/Block.go's checkParentTransactions asks about on most blocks above the highest
-// checkpoint. Past both the containment window and the journal's retention the transaction is
+// checkpoint. Past both the tx_mined partition and the journal's retention the transaction is
 // genuinely gone and the store reports not-found, which is what aerospike's delete-at-height
 // does and what the shared suite's pruning test requires.
 //
@@ -59,12 +59,12 @@ import (
 // the row was still there, and a copy taken under the interim rule of an earlier build could
 // name the block that lost a reorg. Read last, it can never outrank a UTXO or an undo copy
 // carrying a correct pair, and it answers only for the one population it exists for: a fully
-// spent parent whose window is gone and whose child is still unmined.
+// spent parent whose partition is gone and whose child is still unmined.
 
 // identByTxidSQL reads the identity rows for a set of transactions, joining each body only if
-// it is still inside its window.
+// it is still inside its partition.
 //
-// The join is LEFT, and that is the point rather than caution. The body window is dropped
+// The join is LEFT, and that is the point rather than caution. The tx_body partition is dropped
 // after 288 blocks while the identity row lives for as long as any of the transaction's
 // outputs is unspent, at any age, so a body-less row is the ordinary steady state for an old
 // transaction. An inner join would report every such transaction as missing, and a missing
@@ -98,19 +98,19 @@ SELECT i.txid, i.created_height, i.off_chain_since, i.fee, i.size_in_bytes,
 // floor, $2, in (mined_height, block_id) order. The floor is a scalar bind parameter, never a
 // join variable, so under force_custom_plan the planner leaves out every partition below it
 // before it takes a lock: the read costs the same three or four partitions at any stamp lag. The primary key leads with txid, so this is one
-// descent per window per transaction, and for one transaction id that order is the key's own,
-// so no sort step is needed inside a window.
+// descent per partition per transaction, and for one transaction id that order is the key's own,
+// so no sort step is needed inside a partition.
 //
 // The order replaces the insertion counter the table used to carry. No correctness rule rests
 // on it, because no reader may treat the first row as the winner; it exists so that results
 // are repeatable, and the shared conformance suite's two-entry assertions hold under it.
 //
 // The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, and that is the difference
-// between one descent per key and a read of every live window. Written as the plain
+// between one descent per key and a read of every live partition. Written as the plain
 // `JOIN tx_mined m ON m.txid = k.txid` the planner is free to hash-join the keys against the
 // whole partitioned table, and it does: measured on this schema at 40,000 transactions across
-// six windows, 500 keys took 9.9 ms and the plan carried a Seq Scan on every one of the six
-// windows, against 3.4 ms and none for the lateral. At 400,000 the planner happened to choose
+// six partitions, 500 keys took 9.9 ms and the plan carried a Seq Scan on every one of the six
+// partitions, against 3.4 ms and none for the lateral. At 400,000 the planner happened to choose
 // index scans for both, which is exactly why the fence has to be in the statement rather than
 // left to the estimate: the hash-join cost grows with the size of the live membership set,
 // which at 1440 blocks of mainnet is millions of rows, and this read is on the validator's
@@ -125,8 +125,8 @@ SELECT i.txid, i.created_height, i.off_chain_since, i.fee, i.size_in_bytes,
 // `LEFT JOIN tx_body b ON b.created_height = m.created_height AND b.txid = k.txid` outside
 // the fence, and that left the planner free to join it to the fenced containment rows any way
 // it liked. With good estimates it chose a nested loop of primary-key probes. With bad ones, as
-// on mainnet right after a fresh 288-block containment window opened with no statistics, it
-// hash-joined and seq-scanned every live body window for each 1024-key batch: 30 to 260
+// on mainnet right after a fresh 288-block tx_mined partition opened with no statistics, it
+// hash-joined and seq-scanned every live tx_body partition for each 1024-key batch: 30 to 260
 // seconds per batch, temp spills to the point of ENOSPC, and SetMinedMulti's read-back, which
 // went through this statement, stalled setTxMined long enough for the waiting child block to
 // be given up. A LATERAL reference can only be satisfied by a nested loop, so the body is now
@@ -155,7 +155,7 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes, m.fee
  ORDER BY k.txid, m.mined_height, m.block_id`
 
 // preservedByTxidSQL reads the preserved copies of a set of transactions' membership rows,
-// joining each body only if it is still inside its window.
+// joining each body only if it is still inside its partition.
 //
 // The column list and its order match minedByTxidSQL's exactly, because both feed minedRow: a
 // preserved parent has to answer what its membership row would have answered, and two readers
@@ -201,7 +201,7 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
   LEFT JOIN tx_body b ON b.created_height = hit.created_height AND b.txid = k.txid`
 
 // spentParentFactsSQL reads ONE journal row per transaction, for a fully-spent parent whose
-// membership window has already retired. It is the last thing the store can say about a
+// tx_mined partition has already retired. It is the last thing the store can say about a
 // transaction before not-found.
 //
 // The shape is utxoFactsSQL's, and for the same reasons. The keys sit on the OUTSIDE of a
@@ -232,7 +232,7 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
 //
 // Any output of the transaction will do, so there is no preference between the rows a
 // multi-output transaction left behind: every one of them was stamped with the same block
-// facts, by the block path at create or by window retirement, before any of them was spent.
+// facts, by the block path at create or by partition retirement, before any of them was spent.
 const spentParentFactsSQL = `
 SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
   FROM unnest($1::bytea[], $2::uuid[], $3::uuid[]) AS k(txid, lo, hi)
@@ -286,8 +286,8 @@ func (r *lookupResult) resolved(h chainhash.Hash) bool {
 }
 
 // lookupReach is how far below the store's height the first containment read reaches before
-// the floor is aligned down to a window edge: the stamp depth plus one window, so a stamp up to
-// one window late changes nothing a reader can see.
+// the floor is aligned down to a partition edge: the stamp depth plus one partition, so a stamp up to
+// one partition late changes nothing a reader can see.
 func (s *Store) lookupReach() uint32 { return s.stampDepth + TxMinedPartitionBlocks }
 
 // lookupFloor is the lower bound, a height, of the first containment read. H is the store's own
@@ -416,7 +416,7 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 		}
 	}
 
-	// The carried body, for a transaction whose window has aged out while it waited.
+	// The carried body, for a transaction whose partition has aged out while it waited.
 	if err := s.readCarriedBodies(ctx, uniq, &res); err != nil {
 		return lookupResult{}, err
 	}
@@ -464,17 +464,17 @@ func without(hashes, drop []chainhash.Hash) []chainhash.Hash {
 // knows only from a live UTXO -- the packed column it replaces could only ever answer for the
 // first of the four.
 //
-// DISTINCT because the uniqueness underneath is PER WINDOW: a unique index on a partitioned
-// table must include the partition key, so the same (parent, child) pair noted in two windows
+// DISTINCT because the uniqueness underneath is PER PARTITION: a unique index on a partitioned
+// table must include the partition key, so the same (parent, child) pair noted in two partitions
 // is two legal rows. See the schema comment on conflict_children.
 //
 // The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, which is the same shape and
 // the same reason as minedByTxidSQL. Written as the plain `WHERE c.parent_txid = ANY($1)` the
-// planner has no statistics for an array and guesses a sixth of each window, so it seq-scans
-// every live window: measured at 500 keys against 40,000 rows in six windows, 2.3 ms with a
+// planner has no statistics for an array and guesses a sixth of each partition, so it seq-scans
+// every live partition: measured at 500 keys against 40,000 rows in six partitions, 2.3 ms with a
 // Seq Scan on all six. OFFSET 0 is the fence itself -- it stops the subquery being pulled up
-// into the outer join, which is what re-admits the scan -- and each window's unique index,
-// which parent_txid leads, then gives one descent per key per window: 2.7 ms, flat across
+// into the outer join, which is what re-admits the scan -- and each partition's unique index,
+// which parent_txid leads, then gives one descent per key per partition: 2.7 ms, flat across
 // eight executions.
 const conflictChildrenSQL = `
 SELECT DISTINCT k.parent, hit.child_txid
@@ -579,11 +579,18 @@ SELECT k.txid, c.raw_tx
  ) AS c`
 
 // mayHaveCarriedBody reports whether a record with no body could have one in tx_body_carry. It
-// is the reclaim rule's keep condition widened by one window, so a body the table still holds
-// is always looked for, and it is what keeps the probe off the common read: an old parent whose
-// window aged out in the ordinary way is mined far below the tip, and below the checkpoint,
-// where bodies may never have been written at all, nothing was ever carried.
-func (s *Store) mayHaveCarriedBody(d *meta.Data, tip uint32) bool {
+// is the reclaim rule's keep condition, read against the floor the reclaim itself recorded
+// (carryFloor): a waiting transaction keeps its carried body, and a mined one keeps it while one
+// of its blocks is above the floor. So a body the table still holds is always looked for, and
+// the probe stays off the common read: an old parent whose partition aged out in the ordinary way
+// is mined below the floor, and below the checkpoint, where bodies may never have been written
+// at all, nothing was ever carried.
+//
+// The floor is the pruner's height less the body horizon, and the pruner's height is the block
+// persister's archived height. It used to be the chain tip less the horizon and one partition,
+// which was the same thing only while the persister kept up: with the persister stalled 336
+// blocks behind the tip, the persister asked for a body the store still held and got nil.
+func (s *Store) mayHaveCarriedBody(d *meta.Data, floor uint32) bool {
 	if d.UnminedSince != 0 {
 		return true
 	}
@@ -602,21 +609,38 @@ func (s *Store) mayHaveCarriedBody(d *meta.Data, tip uint32) bool {
 		return false
 	}
 
-	return highest+s.bodyRetention+TxBodyPartitionBlocks > tip
+	return highest > floor
 }
 
 // readCarriedBodies fills in the body of every answered transaction that came back without one
-// and could have been carried past its window (see tx_body_carry in schema.go). The window's
-// own copy always wins: this runs only where the window's join found nothing, so a body that
+// and could have been carried past its partition (see tx_body_carry in schema.go). The partition's
+// own copy always wins: this runs only where the partition's join found nothing, so a body that
 // exists in both places during the interval between the carry and the drop is read once.
 func (s *Store) readCarriedBodies(ctx context.Context, hashes []chainhash.Hash, res *lookupResult) error {
-	tip := s.GetBlockHeight()
-
-	var txids [][]byte
+	var (
+		txids     [][]byte
+		floor     uint32
+		haveFloor bool
+	)
 
 	for i := range hashes {
 		d, ok := res.found[hashes[i]]
-		if !ok || d.Tx != nil || !s.mayHaveCarriedBody(d, tip) {
+		if !ok || d.Tx != nil {
+			continue
+		}
+
+		// The floor is read only for a read that has a body-less record, so a read whose
+		// records all carry their body costs nothing more.
+		if !haveFloor {
+			f, err := s.carryFloor(ctx)
+			if err != nil {
+				return err
+			}
+
+			floor, haveFloor = f, true
+		}
+
+		if !s.mayHaveCarriedBody(d, floor) {
 			continue
 		}
 
@@ -727,7 +751,7 @@ func (s *Store) readIdentGroup(ctx context.Context, g leafBatch, res *lookupResu
 	return nil
 }
 
-// readMinedInto fills in the block lists of every transaction a live containment window names.
+// readMinedInto fills in the block lists of every transaction a live tx_mined partition names.
 //
 // One transaction can hold several rows -- one per block that contains it -- and they arrive
 // grouped and in (mined_height, block_id) order, which is the order every reader returns and
@@ -880,7 +904,7 @@ func (r *minedRow) mergeInto(data *meta.Data, hash *chainhash.Hash) error {
 	data.BlockHeights = append(data.BlockHeights, uint32(r.minedHeight)) //nolint:gosec // a height is never negative
 	data.SubtreeIdxs = append(data.SubtreeIdxs, int(r.subtreeIdx))
 
-	// A body-less row is expected once its window has aged out, so this is a nil transaction
+	// A body-less row is expected once its partition has aged out, so this is a nil transaction
 	// rather than an error, exactly as it is on the identity read.
 	if data.Tx == nil && len(r.rawTx) > 0 {
 		tx, terr := bt.NewTxFromBytes(r.rawTx)
@@ -894,7 +918,7 @@ func (r *minedRow) mergeInto(data *meta.Data, hash *chainhash.Hash) error {
 	return nil
 }
 
-// readPreserved fills in every transaction whose membership window is gone but whose facts the
+// readPreserved fills in every transaction whose tx_mined partition is gone but whose facts the
 // pruner asked to keep, because an unmined child still needs them. See preserved_parent in
 // schema.go for why the table exists and why it is small.
 //
@@ -903,7 +927,7 @@ func (r *minedRow) mergeInto(data *meta.Data, hash *chainhash.Hash) error {
 // probing it. See preservedByTxidSQL for both measurements.
 //
 // The body is joined the same way it is everywhere else, on (created_height, txid), and is
-// absent whenever its own 288-block window has aged out -- which for a preserved parent is the
+// absent whenever its own 288-block partition has aged out -- which for a preserved parent is the
 // ordinary case, since the transaction is by definition old. A caller that needs the bytes has
 // to check, exactly as it does after the identity and membership reads.
 func (s *Store) readPreserved(ctx context.Context, hashes []chainhash.Hash,
@@ -1003,8 +1027,8 @@ SELECT k.txid
  ) AS hit`
 
 // probeZeroUndoCopies is trigger 4 of the second tier: a fully spent transaction whose undo
-// copy was taken while its UTXO was still at (0,0). Its containment window is its only home,
-// and the drop rule keeps that window attached for as long as the copy can live.
+// copy was taken while its UTXO was still at (0,0). Its tx_mined partition is its only home,
+// and the drop rule keeps that partition attached for as long as the copy can live.
 func (s *Store) probeZeroUndoCopies(ctx context.Context, hashes []chainhash.Hash) ([]chainhash.Hash, error) {
 	txids := make([][]byte, 0, len(hashes))
 	for i := range hashes {
@@ -1022,13 +1046,13 @@ func (s *Store) probeZeroUndoCopies(ctx context.Context, hashes []chainhash.Hash
 }
 
 // readSpentParents is the step past the last one: a transaction with no identity row, no
-// membership window, no preserved copy and no live UTXO, answered from the journal row its
+// tx_mined partition, no preserved copy and no live UTXO, answered from the journal row its
 // last spend left behind.
 //
 // It answers exactly what readUTXOFacts answers, and it has to, because the two are the same
 // claim from two sources: this transaction was mined in this block and the store no longer
 // holds the record that would say more. What comes back is thin -- a block, and the body if
-// its window happens to still hold it -- which is all the validator needs to check a child's
+// its partition happens to still hold it -- which is all the validator needs to check a child's
 // inputs, and all a pruned SV Node could say either.
 //
 // The packed-key arguments are built by the same liveUTXOArgs the UTXO step uses, so the two
@@ -1195,7 +1219,7 @@ SELECT k.txid,
 // row's otherwise. No containment and an identity row means unmined or waiting: the identity
 // record stands, with empty block lists. No containment, no identity row, and a UTXO or an undo
 // copy at (0,0) in the same snapshot is corruption: nothing can ever stamp that UTXO, and the
-// drop rule keeps a window attached for longer than any (0,0) undo copy of its UTXOs can live.
+// drop rule keeps a partition attached for longer than any (0,0) undo copy of its UTXOs can live.
 // That transaction fails with a storage error and the I1 counter climbs; the other
 // transactions of the batch are unaffected. Nothing at all means carry on to the preserved
 // parent, which is the Delete race: Delete removes every row of a transaction in one statement,
@@ -1337,8 +1361,8 @@ func (s *Store) settleTier2(h chainhash.Hash, rows []tier2Row, res *lookupResult
 		lookupTier2Empty.Inc()
 
 		if hasIdent {
-			// Unmined, or mined in a window this snapshot cannot see, which cannot happen
-			// while the window is attached. The identity record from step 1 stands; if step 1
+			// Unmined, or mined in a partition this snapshot cannot see, which cannot happen
+			// while the partition is attached. The identity record from step 1 stands; if step 1
 			// did not build it (the create race), build it now.
 			if _, ok := res.found[h]; !ok {
 				data, derr := first.ident.toMeta(&h)

@@ -203,7 +203,7 @@ func TestSeedingModeWritesCoinsOnly(t *testing.T) {
 	}
 
 	require.Zero(t, count(`SELECT count(*) FROM pg_class WHERE relname ~ '^tx_mined_w[0-9]+$'`),
-		"a seed creates no containment windows")
+		"a seed creates no tx_mined partitions")
 
 	// A create without the seeder's shape takes the normal route even in seeding mode.
 	normal := seededTx(map[uint32]uint64{0: 30})

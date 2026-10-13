@@ -40,7 +40,7 @@ SELECT c.relispartition,
 // CREATE TABLE ... PARTITION OF takes ACCESS EXCLUSIVE on the parent. That waits for every
 // reader of the parent to finish, and every new reader then waits behind it. On the block
 // path that is a stall of however long the longest concurrent read of the parent takes:
-// MEASURED on mainnet, 939 to 1,004 ms per window boundary while the pruner's stamp held a
+// MEASURED on mainnet, 939 to 1,004 ms per partition boundary while the pruner's stamp held a
 // multi-second read on tx_mined.
 //
 // ATTACH PARTITION takes SHARE UPDATE EXCLUSIVE instead, which neither readers nor ordinary
@@ -52,11 +52,11 @@ SELECT c.relispartition,
 // All of it is one transaction, so a crash leaves either nothing or an attached partition.
 //
 // A table of the child's name that exists but is not an attached partition is refused. Only
-// the pruner leaves that state, between detaching a window and dropping it, and its rows are
-// a window the pruner has already retired. Adopting them would resurrect a dropped window.
+// the pruner leaves that state, between detaching a partition and dropping it, and its rows are
+// a partition the pruner has already retired. Adopting them would resurrect a dropped partition.
 //
 // Callers hold their own per-table mutex, so within a process two ensures for the same
-// window never run at once. Across processes a race ends in a duplicate-table error from
+// partition never run at once. Across processes a race ends in a duplicate-table error from
 // CREATE, which the caller sees and which the next call clears, because the cache is set
 // only on success.
 func (s *Store) ensureAttachedPartition(ctx context.Context, spec partitionSpec) error {
