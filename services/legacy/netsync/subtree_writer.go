@@ -70,10 +70,11 @@ type subtreeWriter struct {
 	// block adopted is never deleted by its creator's cleanup, nor the reverse. Nil gives the
 	// writer a registry of its own (tests that build one writer alone).
 	adoptions *subtreeAdoptions
-	// adopted is every file this writer found already published while a creator of it was
-	// still converting, so it holds the file against that creator's cleanup. DeleteAll gives
-	// the holds back; otherwise they end when the last such creator finishes.
-	adopted []writtenSubtree
+	// adopted is every file this writer found already published while another writer of it
+	// was still pending or converting, so it holds the file against that writer's cleanup.
+	// DeleteAll gives the holds back; otherwise they end when no writer of the file is left
+	// pending or live.
+	adopted []subtreeHold
 	// live is every file this writer created, until finish closes its window: while it is
 	// open, a writer that adopts one of them holds it.
 	live []writtenSubtree
@@ -274,11 +275,11 @@ func (w *subtreeWriter) created(key writtenSubtree) {
 	w.registry().created(key)
 }
 
-// adopt records that key was already published, keeping the hold the registry gives while a
-// creator of it is still converting.
+// adopt records that key was already published, keeping the hold the registry gives while
+// another writer of it could still delete it.
 func (w *subtreeWriter) adopt(key writtenSubtree) {
-	if w.registry().adopted(key) {
-		w.adopted = append(w.adopted, key)
+	if entry, held := w.registry().adopted(key); held {
+		w.adopted = append(w.adopted, subtreeHold{key: key, entry: entry})
 	}
 }
 
@@ -382,8 +383,8 @@ func (w *subtreeWriter) DeleteAll(ctx context.Context) error {
 	reg := w.registry()
 
 	// This writer's own holds go first, so they never shield a file from itself.
-	for _, entry := range w.adopted {
-		reg.release(entry)
+	for _, hold := range w.adopted {
+		reg.release(hold.key, hold.entry)
 	}
 
 	w.adopted = w.adopted[:0]

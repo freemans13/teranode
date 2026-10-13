@@ -23,23 +23,57 @@ import (
 // regardless, leaving the adopter's record, or a committed block, naming subtree data that was
 // gone.
 //
-// Only a creator ever deletes a subtree file, and only while its own conversion is in flight:
+// Only a creator deletes a subtree file (one exception, the record-read fallback, is set out
+// below), and only while its own conversion is in flight:
 // subtreeWriter.DeleteAll runs inside pipelineBlockSink, and pipelineBlockDelete runs in the
 // same wire read, straight after the sink. So a creator holds its files "live" from the moment
 // it publishes them until its writer finishes, and an adoption needs protecting only while some
-// creator of the file is live. Three counts per file say so:
+// writer of the file could still delete it. Three counts per file say so, all under mu:
 //
 //   - pending: writers trying to write the file right now. Each writer counts itself before it
 //     tries, so a delete and an attempt are always ordered under mu: either the delete runs
 //     first and the writer finds no file and creates its own, or the attempt is counted first
 //     and the delete is skipped.
 //   - live: creators whose conversion has not finished.
-//   - held: writers that adopted the file while a creator of it was live.
+//   - held: writers that adopted the file while another writer of it was pending or live.
 //
-// A delete is skipped while pending or held is above zero. When the last live creator of a file
-// finishes, no one is left who could delete it, so its entry, holds included, is dropped. The
-// registry therefore holds only the files of conversions in flight, however many copies of a
-// block convert and whatever happens to them afterwards. A failed adopter gives its holds back.
+// The invariant, held under mu: a writer that adopts a file takes a hold whenever any other
+// writer of it is unresolved (pending, so possibly about to be told it created the file, or
+// live), and every hold on a file stands until no writer of it is pending or live. A delete is
+// skipped while pending or held is above zero.
+//
+// Per writer and file, the transitions are:
+//
+//	attempt   none -> pending                         (before the write)
+//	created   pending -> live                         (its publish succeeded)
+//	adopted   pending -> holding, if pending or live is still above zero once it leaves
+//	          pending -> none, otherwise
+//	abandoned pending -> none                         (its write failed)
+//	finished  live -> none                            (its conversion is over, no delete follows)
+//	release   holding -> none                         (it failed, its record is never read)
+//
+// The creator's publish makes the file visible before created runs, and an adopter can meet the
+// file in that gap. The creator is still pending then, which is why pending counts as a writer
+// that could delete. A hold that counted only live creators missed that gap, and the creator's
+// failure cleanup deleted a file the adopter's record named (external review of e4698b219).
+//
+// When no writer of a file is pending or live, nobody is left who could delete it, so its
+// entry, holds included, is dropped; tidyLocked is the only place that ends a hold other than
+// release. A later write of the same file starts a new entry, and a hold remembers the entry it
+// was taken on (subtreeHold), so a release that arrives after its entry was dropped is a no-op
+// rather than taking a hold someone else took on the new entry.
+//
+// The registry is in memory and dies with the process. Restart recovery needs nothing from it:
+// after a restart no conversion is in flight, so no creator exists who could delete, and the
+// files are left to their delete-at-height. The one delete that is not a creator's is the
+// record-read fallback in pipelineBlockDelete, taken only when no writer waits for the copy
+// (settleStale finished it after settleBackstop); it skips pending and held files like the
+// rest, but an adopter of a finished creator holds nothing, so it can remove a file another
+// block adopted. The wire layer settles a copy in the same read that converted it, so that path
+// needs a verdict delayed past a minute.
+//
+// The registry therefore holds only the files of conversions in flight, however many copies of
+// a block convert and whatever happens to them afterwards.
 type subtreeAdoptions struct {
 	mu    sync.Mutex
 	files map[writtenSubtree]*subtreeFileCounts
@@ -49,6 +83,13 @@ type subtreeFileCounts struct {
 	pending int
 	live    int
 	held    int
+}
+
+// subtreeHold is one hold a writer took as an adopter: the file, and the entry the hold is
+// counted on.
+type subtreeHold struct {
+	key   writtenSubtree
+	entry *subtreeFileCounts
 }
 
 func newSubtreeAdoptions() *subtreeAdoptions {
@@ -66,12 +107,9 @@ func (a *subtreeAdoptions) countsLocked(key writtenSubtree) *subtreeFileCounts {
 	return c
 }
 
-// tidyLocked drops key's entry once nothing about it is left to protect. The caller holds mu.
+// tidyLocked drops key's entry, and with it every hold on it, once no writer of the file is
+// pending or live: nobody is left who could delete it. The caller holds mu.
 func (a *subtreeAdoptions) tidyLocked(key writtenSubtree, c *subtreeFileCounts) {
-	if c.live == 0 {
-		c.held = 0
-	}
-
 	if c.pending == 0 && c.live == 0 {
 		delete(a.files, key)
 	}
@@ -105,31 +143,34 @@ func (a *subtreeAdoptions) created(key writtenSubtree) {
 }
 
 // adopted ends an attempt that found key already published, and reports whether the writer now
-// holds it: only while a creator of key is live is there anyone the hold protects against.
-func (a *subtreeAdoptions) adopted(key writtenSubtree) bool {
+// holds it and on which entry. It holds whenever another writer of key is still pending or
+// live, because either could yet delete it: a live creator in its cleanup, and a pending writer
+// may be the creator whose publish succeeded and which has not said so yet.
+func (a *subtreeAdoptions) adopted(key writtenSubtree) (*subtreeFileCounts, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	c := a.countsLocked(key)
 	c.pending--
 
-	held := c.live > 0
-	if held {
+	if c.pending > 0 || c.live > 0 {
 		c.held++
+
+		return c, true
 	}
 
 	a.tidyLocked(key, c)
 
-	return held
+	return nil, false
 }
 
-// release gives back a hold a failed adopter took. A hold whose creators have all finished is
-// already gone, and releasing it is a no-op.
-func (a *subtreeAdoptions) release(key writtenSubtree) {
+// release gives back a hold a failed adopter took on entry. A hold whose entry has since been
+// dropped is already gone, and releasing it is a no-op, even if the file has a new entry now.
+func (a *subtreeAdoptions) release(key writtenSubtree, entry *subtreeFileCounts) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if c, ok := a.files[key]; ok && c.held > 0 {
+	if c, ok := a.files[key]; ok && c == entry && c.held > 0 {
 		c.held--
 	}
 }
