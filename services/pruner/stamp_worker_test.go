@@ -485,10 +485,12 @@ func TestStampWorkerRetriesOnItsTimerAfterAnAbandonedDrain(t *testing.T) {
 
 	s.stampNotify <- *notificationAt(chain, 575)
 
+	// The worker closes a drain after its last CompleteWindow, so wait for the close too. Waiting
+	// for the completion alone read the close count in between, and saw 1.
 	require.Eventually(t, func() bool {
-		_, _, completes, _, _ := fake.snapshot()
+		_, _, completes, _, closed := fake.snapshot()
 
-		return len(completes) == 1
+		return len(completes) == 1 && closed == 2
 	}, 5*time.Second, 10*time.Millisecond)
 
 	_, _, completes, opened, closed := fake.snapshot()
