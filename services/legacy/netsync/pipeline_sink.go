@@ -479,7 +479,13 @@ func (sm *SyncManager) pipelineBlockDelete(hash chainhash.Hash, converted bool) 
 
 	// A copy accepted but not yet parked (settleAccepted) counts as parked: the record under the
 	// hash is the accepted copy's.
-	if sm.blockPark.Has(hash) || sm.blockPark.HandedOut(hash) || sm.acceptancePending(hash) {
+	//
+	// The acceptance mark is read first. The consumer parks an accepted copy and only then clears
+	// its mark, so a mark found clear means the park already holds the block, or has handed it
+	// out, or is done with it. Read the other way round, the park could take the block and clear
+	// the mark between the two reads, and the refusal deleted the accepted copy's record (review
+	// of 76be891d6). The park's two states are read under one lock (Holds) for the same reason.
+	if sm.acceptancePending(hash) || sm.blockPark.Holds(hash) {
 		sm.logger.Infof("[pipelineBlockDelete][%s] a refused copy of a parked or accepted block; keeping the other copy's subtree files", hash)
 
 		if writer != nil {

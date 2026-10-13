@@ -3945,7 +3945,9 @@ func (sm *SyncManager) conversionInFlight(blockHash chainhash.Hash) bool {
 // streamRegistry.arriving) or reads a nil map under a zero mutex
 // (conversionInFlight), so a struct-literal manager in a test may call it.
 func (sm *SyncManager) blockHeldLocally(h chainhash.Hash) bool {
-	return sm.blockPark.Has(h) || sm.blockCommitting(h) || sm.streams.arriving(h) || sm.conversionInFlight(h)
+	// Holds reads the park's index and its handed-out set under one lock, so a block given back
+	// between two separate reads is not missed (pipelineBlockDelete has the same need).
+	return sm.blockPark.Holds(h) || sm.dispatcher.inFlight(h) || sm.streams.arriving(h) || sm.conversionInFlight(h)
 }
 
 // blockCommitting reports whether this block is out of the park and in use: taken by
