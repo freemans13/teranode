@@ -37,6 +37,35 @@ import (
 // It replaces the rescue rule, which examined only the lowest owed block, 30 s after its getdata,
 // against a deadline from the chain's pace.
 
+// watchMaxSkips is how many race ticks in a row the watcher skips because a download pass holds
+// assignMu before it waits for the lock: 30 s at raceCheckInterval.
+const watchMaxSkips = 6
+
+// lockForWatch takes assignMu for the watcher and reports whether it did. It tries without
+// waiting, and waits only after watchMaxSkips ticks in a row found the lock taken (see
+// watchOwedBlocks).
+func (sm *SyncManager) lockForWatch() bool {
+	if sm.assignMu.TryLock() {
+		sm.watchSkips.Store(0)
+
+		return true
+	}
+
+	skipped := sm.watchSkips.Add(1)
+	if skipped < watchMaxSkips {
+		sm.logger.Debugf("[watch] a download pass holds the assignment lock; skipping this tick (%d in a row)", skipped)
+
+		return false
+	}
+
+	sm.logger.Warnf("[watch] a download pass held the assignment lock for %d ticks in a row; waiting for it", skipped)
+
+	sm.assignMu.Lock()
+	sm.watchSkips.Store(0)
+
+	return true
+}
+
 const (
 	// rescueFasterBy is how many times sooner, or faster, a helper must be.
 	rescueFasterBy = 2
@@ -121,12 +150,16 @@ func (sm *SyncManager) watchOwedBlocks(now time.Time) {
 	}
 
 	// One asker at a time: a download pass that ran beside the watcher could find the same late
-	// block and ask a peer for it too, as two passes once did (assignWantedBlocks). TryLock, not
-	// Lock: this runs on the frontier-race ticker, and a pass can take minutes (assignWantedBlocks
+	// block and ask a peer for it too, as two passes once did (assignWantedBlocks). TryLock first:
+	// this runs on the frontier-race ticker, and a pass can take minutes (assignWantedBlocks
 	// records ten), during which waiting here would also stop stream sampling, rate decay, the
-	// stall drops and the rates-file save. A tick that finds a pass running is skipped; the next
-	// one, raceCheckInterval later, tries again.
-	if !sm.assignMu.TryLock() {
+	// stall drops and the rates-file save. A tick that finds a pass running is skipped and
+	// counted, and after watchMaxSkips skips in a row the watcher waits for the lock: passes run
+	// back to back could otherwise starve it for as long as the chain is busy (review of
+	// 76be891d6). That wait holds up the race's ticker for the rest of one pass, once per
+	// watchMaxSkips skipped ticks; sync.Mutex hands the lock to a waiter of more than 1 ms, so
+	// the next pass does not overtake it.
+	if !sm.lockForWatch() {
 		return
 	}
 	defer sm.assignMu.Unlock()

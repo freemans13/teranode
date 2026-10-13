@@ -908,6 +908,9 @@ type SyncManager struct {
 	// watchNoSizeLogged is set once the watcher has logged that it has no block size to judge
 	// by, and cleared when it has one again, so the line is written once per episode.
 	watchNoSizeLogged atomic.Bool
+	// watchSkips counts the race ticks in a row on which the watcher found assignMu taken
+	// (lockForWatch).
+	watchSkips atomic.Int32
 
 	// dispatcher runs each parked block's work on a worker, one block at a time,
 	// and every chain-order step in dispatch order. Built in New(); nil when

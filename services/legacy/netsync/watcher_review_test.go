@@ -217,3 +217,50 @@ func TestTheLedgerKnowsABlockAPeerPassedOver(t *testing.T) {
 	ledger.ClearPeer(p)
 	require.False(t, ledger.PassedOver(p, first))
 }
+
+// Passes run back to back must not starve the watcher (review of 76be891d6). A pass holds
+// assignMu across watchMaxSkips-1 ticks, each skipped; on the next tick the watcher waits for the
+// lock instead of skipping again, and asks for the late block as soon as the pass lets go.
+func TestWatchWaitsForTheLockAfterTooManySkippedTicks(t *testing.T) {
+	sm, owner, fast, _ := reaskSetup(t)
+	now := time.Now()
+
+	for _, h := range []int32{13, 14, 15, 11} {
+		askAt(t, sm, owner, heightHash(t, sm, h), now.Add(-2*time.Minute))
+	}
+
+	next := heightHash(t, sm, 11)
+
+	sm.assignMu.Lock()
+
+	for range watchMaxSkips - 1 {
+		sm.watchOwedBlocks(now)
+	}
+
+	require.False(t, sm.blockDownloads.HasOwner(fast, next), "no helper is asked while a pass holds assignMu")
+
+	done := make(chan struct{})
+
+	go func() {
+		sm.watchOwedBlocks(now)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		sm.assignMu.Unlock()
+		t.Fatalf("after %d skipped ticks the watcher must wait for the lock, not skip again", watchMaxSkips-1)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	sm.assignMu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watcher never ran once the pass let go of the lock")
+	}
+
+	require.True(t, sm.blockDownloads.HasOwner(fast, next), "the waiting tick asks for the late block")
+	require.Zero(t, sm.watchSkips.Load(), "a tick that ran starts the count again")
+}
