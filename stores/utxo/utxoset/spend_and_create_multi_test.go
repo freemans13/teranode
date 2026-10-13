@@ -568,7 +568,7 @@ func TestSpendAndCreateMultiMergedGroupWithAnExistingParent(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
 	ref := setup(t, s, 0xd0)
-	refResults, err := utxo.DefaultSpendAndCreateMulti(ctx, s, 1, ref.Txs, height, utxo.WithIgnoreLocked(true))
+	refResults, err := utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.UniformSpendAndCreateMultiWidths(1), ref.Txs, height, utxo.WithIgnoreLocked(true))
 	require.NoError(t, err)
 
 	w := setup(t, s, 0xd1)

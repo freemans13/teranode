@@ -80,7 +80,7 @@ func TestSpendAndCreateMultiFallbackRestoresTheNettedSpendsOfARejectedChild(t *t
 	t.Run("per-transaction", func(t *testing.T) {
 		s, ctx := newUncheckpointedStore(t)
 		checkRejectedChildLeavesNoSpend(t, s, ctx, func(txs []*bt.Tx, height uint32) ([]utxo.SpendAndCreateMultiResult, error) {
-			return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiConcurrency(s.settings), txs, height, utxo.WithIgnoreLocked(true))
+			return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiWidthsFor(s.settings), txs, height, utxo.WithIgnoreLocked(true))
 		})
 	})
 }

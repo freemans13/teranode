@@ -83,7 +83,7 @@ func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeig
 	}
 
 	if !s.canNet(list.Options) {
-		return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiConcurrency(s.settings), txs, blockHeight, opts...)
+		return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiWidthsFor(s.settings), txs, blockHeight, opts...)
 	}
 
 	w := s.newNettedWrite(txs, list, blockHeight, opts)
@@ -993,7 +993,7 @@ func (w *nettedWrite) finishPerTransaction(ctx context.Context) error {
 		opts = append(opts, utxo.WithSubtreeIdxs(idxs))
 	}
 
-	results, err := utxo.DefaultSpendAndCreateMulti(ctx, w.s, utxo.SpendAndCreateMultiConcurrency(w.s.settings), txs, w.blockHeight, opts...)
+	results, err := utxo.DefaultSpendAndCreateMulti(ctx, w.s, utxo.SpendAndCreateMultiWidthsFor(w.s.settings), txs, w.blockHeight, opts...)
 	for k, r := range results {
 		rest[k].result = r
 	}
