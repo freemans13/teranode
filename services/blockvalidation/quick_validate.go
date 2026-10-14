@@ -2413,8 +2413,9 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 }
 
 // spendBatchWithRetry spends txs in parallel with bounded retries, over applyTxsWithRetry. After
-// a batch's list is written it spends the inputs of the transactions the list did not carry:
-// those skipped as unspendable, and those the store reported as already existing.
+// a batch's list is written it spends the inputs of the transactions the list did not carry,
+// those skipped as unspendable. A transaction the store reported as existing is not spent here:
+// under WithBelowCheckpoint the store has already made its spends.
 func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool) error {
 	items := make([]txApply, len(txs))
 	for i, tx := range txs {
@@ -2440,7 +2441,7 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 // applyList writes a batch's list through SpendAndCreateMulti, repeating the whole list on a
 // store fault: a repeat is safe because the store reports a transaction it finds again as
 // existing rather than writing it twice. A transaction that exists is collected for the
-// mined-info stamp and for a second spend of its inputs, as the separate phases did. A transaction the
+// mined-info stamp; the store has already made its spends. A transaction the
 // store fails, or whose parent in the list failed, fails the batch closed unless the failure is
 // retryable, which the per-transaction default reports per transaction rather than as an error.
 func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs []*bt.Tx, txids []chainhash.Hash,
