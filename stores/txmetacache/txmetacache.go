@@ -32,6 +32,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/cespare/xxhash/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -91,11 +92,12 @@ func putTxMetaCacheReadBuffer(buf *[]byte) {
 //
 // Thread-safety: All operations are thread-safe and can be called concurrently from multiple goroutines.
 type TxMetaCache struct {
-	utxoStore                     utxo.Store     // The underlying UTXO store that this cache wraps; provides persistence
-	cache                         cacheBackend   // Storage primitive (ImprovedCache or PointerCache) chosen by BucketType at construction
-	metrics                       metrics        // Performance metrics for monitoring cache efficiency and throughput
-	logger                        ulogger.Logger // Logger for operational logging and diagnostic information
-	noOfBlocksToKeepInTxMetaCache uint32         // Cache retention horizon (blocks); kept for compatibility with the height-based expiration plumbing in ImprovedCache
+	utxoStore                     utxo.Store                    // The underlying UTXO store that this cache wraps; provides persistence
+	cache                         cacheBackend                  // Storage primitive (ImprovedCache or PointerCache) chosen by BucketType at construction
+	metrics                       metrics                       // Performance metrics for monitoring cache efficiency and throughput
+	logger                        ulogger.Logger                // Logger for operational logging and diagnostic information
+	noOfBlocksToKeepInTxMetaCache uint32                        // Cache retention horizon (blocks); kept for compatibility with the height-based expiration plumbing in ImprovedCache
+	lanes                         [writeBackLanes]writeBackLane // BatchDecorate write-back, one writer per bucket range (see writeback_lanes.go)
 }
 
 // CacheStats provides statistical information about the current state of the cache.
@@ -371,8 +373,13 @@ func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values []
 	return nil
 }
 
+// SetCacheMultiValuesRaw stores values as given (no block height is appended)
+// on the calling goroutine. It deliberately avoids SetMultiFromBytes: its
+// per-bucket goroutine fan-out, run from every concurrent BatchDecorate under a
+// miss burst, flooded the scheduler and the bucket locks and starved the Kafka
+// txmeta handler.
 func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) error {
-	if err := t.cache.SetMultiFromBytes(keys, values); err != nil {
+	if err := t.cache.SetMultiSequential(keys, values); err != nil {
 		return err
 	}
 
@@ -406,6 +413,44 @@ func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*me
 	t.metrics.hits.Add(1)
 
 	return d, true
+}
+
+// GetMetaCachedMulti is GetMetaCached for many hashes: out[i] is the cached
+// entry for hashes[i], or nil on a miss. Lookups that share a cache bucket take
+// its read lock once, so pass hashes grouped by ProbeRangeOf to get the
+// benefit. keyHashes, if non-nil, holds KeyHash(&hashes[i]) so the cache does
+// not hash them again. Same read-only contract as GetMetaCached.
+func (t *TxMetaCache) GetMetaCachedMulti(_ context.Context, hashes []chainhash.Hash, keyHashes []uint64, out []*meta.Data) {
+	t.cache.GetMulti(hashes, keyHashes, out)
+
+	hits := 0
+
+	for _, d := range out[:len(hashes)] {
+		if d != nil {
+			hits++
+		}
+	}
+
+	t.metrics.hits.Add(uint64(hits))                 //nolint:gosec // non-negative count
+	t.metrics.misses.Add(uint64(len(hashes) - hits)) //nolint:gosec // non-negative count
+}
+
+// ProbeRanges is the number of disjoint, contiguous cache bucket ranges that
+// batched cache lookups are grouped by (see ProbeRangeOf). With the production
+// bucket count each range spans 32 buckets.
+const ProbeRanges = min(256, BucketsCount)
+
+// KeyHash is the hash the cache places a transaction's entry by.
+func KeyHash(hash *chainhash.Hash) uint64 {
+	return xxhash.Sum64(hash[:])
+}
+
+// ProbeRangeOf returns the bucket range of the entry whose KeyHash is
+// keyHash. Grouping a large lookup by range and handing each group to
+// GetMetaCachedMulti makes every bucket's read lock be taken once per group
+// instead of once per key.
+func ProbeRangeOf(keyHash uint64) int {
+	return int(keyHash % BucketsCount / (BucketsCount / ProbeRanges))
 }
 
 // GetMeta retrieves transaction metadata for a given transaction hash, first checking the cache
@@ -556,13 +601,13 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 
 	t.metrics.getOrigin.Add(uint64(len(hashes)))
 
-	// Batch cache population: build keys/values once and call SetCacheMulti.
+	// Batch cache population: build keys/values once and hand them to writeBack.
 	// Note: values are serialized the same way SetCache() does (via MetaBytes).
 	keys := make([][]byte, 0, len(hashes))
 	values := make([][]byte, 0, len(hashes))
 
 	// The per-tx MetaBytes serialization buffers are recycled through a pool:
-	// SetCacheMultiValuesRaw (SetMulti) copies the value bytes into the cache's
+	// writeBack copies the value bytes into the cache's
 	// own chunk storage before returning, so each buffer is dead afterwards.
 	// They are held in `values` until then, so return them only after the cache
 	// write completes (deferred), not per iteration.
@@ -625,7 +670,7 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 	}
 
 	if len(keys) > 0 {
-		if err := t.SetCacheMultiValuesRaw(keys, values); err != nil {
+		if err := t.writeBack(keys, values); err != nil {
 			// Preserve prior behavior: cache population failures are logged but don't fail BatchDecorate.
 			if errors.Is(err, errors.ErrProcessing) {
 				t.logger.Debugf("error setting cache batch for %d txMeta entries: %v", len(keys), err)

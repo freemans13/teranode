@@ -112,10 +112,10 @@ func UniformSpendAndCreateMultiWidths(n int) SpendAndCreateMultiWidths {
 // SpendAndCreateMultiWidthsFor returns the widths Aerospike and SQL pass to
 // DefaultSpendAndCreateMulti. A level is twice the subtree-validation spend
 // batcher size, the bound subtree validation applies to a level, so a level
-// reaches the store exactly as wide as it does there. The two waves of a
-// WithBelowCheckpoint list are as wide as quick validation's create and spend
-// phases were before it wrote a list: eight store batches of creates, and two
-// rounds of every spend batcher. A call's bound is the spend's own budget plus
+// reaches the store exactly as wide as it does there. The first wave of a
+// WithBelowCheckpoint list is as wide as belowCheckpointCreateWidth says, and
+// its spend wave is two rounds of every spend batcher, as quick validation's
+// spend phase was before it wrote a list. A call's bound is the spend's own budget plus
 // the rollback budget. It does not bound the rollback of a failed create, which
 // SequentialSpendAndCreate runs on a context of its own; a call that reaches the
 // bound mid-create keeps its spends, since its create may yet commit.
@@ -126,11 +126,51 @@ func SpendAndCreateMultiWidthsFor(tSettings *settings.Settings) SpendAndCreateMu
 
 	return SpendAndCreateMultiWidths{
 		Level:     tSettings.SubtreeValidation.SpendBatcherSize * 2,
-		Create:    tSettings.UtxoStore.StoreBatcherSize * 8,
+		Create:    belowCheckpointCreateWidth(&tSettings.BlockValidation, &tSettings.UtxoStore),
 		Spend:     tSettings.UtxoStore.SpendBatcherSize * tSettings.UtxoStore.SpendBatcherConcurrency * 2,
 		CallBound: tSettings.UtxoStore.SpendWaitTimeout + tSettings.UtxoStore.SpendRollbackTimeout,
 	}
 }
+
+// belowCheckpointCreateWidth is how many calls the first wave of a
+// WithBelowCheckpoint list may have in flight at once. That wave creates every
+// record of the list, and for a transaction with no parent in the list it also
+// spends that transaction's inputs in the same call.
+//
+// It bounds callers, not store statements: each caller blocks until the batch
+// it lands in commits, so the statements actually in flight to the store are
+// (callers / batch size).
+//
+// blockvalidation_quick_validate_create_concurrency, when set above 0, is used
+// directly. Otherwise the width is derived from the store's own batcher
+// settings: StoreBatcherSize * BatcherMaxConcurrent, so every batcher worker
+// can have a full batch of callers queued behind it, floored at
+// StoreBatcherSize * 8 for a store whose BatcherMaxConcurrent is 0 (unbounded
+// workers), the flat multiplier the derivation replaced.
+//
+// The derived value is capped at belowCheckpointDerivedCreateCeiling unless the
+// floor is higher. Each caller is a goroutine holding a transaction, and at the
+// default batch size of 2048 and 64 batcher workers the product is 131,072. The
+// cap keeps the gain the derivation was for, more callers on a store with a
+// small batch size, and never goes below the floor.
+func belowCheckpointCreateWidth(bv *settings.BlockValidationSettings, store *settings.UtxoStoreSettings) int {
+	if bv.QuickValidateCreateConcurrency > 0 {
+		return bv.QuickValidateCreateConcurrency
+	}
+
+	derived := min(store.StoreBatcherSize*store.BatcherMaxConcurrent, belowCheckpointDerivedCreateCeiling)
+	floor := store.StoreBatcherSize * 8
+
+	if derived > floor {
+		return derived
+	}
+
+	return floor
+}
+
+// belowCheckpointDerivedCreateCeiling bounds the derived first-wave width: the
+// flat 8x multiplier's value at the default batch size of 2048.
+const belowCheckpointDerivedCreateCeiling = 16384
 
 // SpendAndCreateMultiStore is the subset of a store's methods that
 // DefaultSpendAndCreateMulti needs.

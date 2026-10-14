@@ -269,9 +269,8 @@ func listBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, outp
 }
 
 // listBatchFor builds a batch out of txs, one subtree per transaction, and runs the real
-// extend stage over it so the in-block-parent partition is derived by production code rather
-// than asserted into place.
-
+// extend stage over it, so each transaction is extended, or marked as missing a parent, by
+// production code rather than by hand.
 func listBatchFor(t *testing.T, bv *BlockValidation, block *model.Block, txs []*bt.Tx, outpointOnly bool) *SubtreeProcessingBatch {
 	t.Helper()
 

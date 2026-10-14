@@ -339,6 +339,11 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).
 			Return(nil, []*utxo.Spend{}, nil).Maybe()
 
+		// Mock the spend phase. The mined-info stamp now runs after both waves rather than
+		// between them, so the spend happens before the error under test is reached.
+		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).
+			Return(nil, []*utxo.Spend{}, nil).Maybe()
+
 		// Mock SetMinedMulti to return an error
 		suite.MockUTXOStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(map[chainhash.Hash][]uint32{}, errors.NewProcessingError("database error")).Once()
@@ -677,7 +682,7 @@ func assertCreatedLocked(t *testing.T, m *utxo.MockUtxostore, wantLocked bool) {
 		require.Equal(t, wantLocked, o.Locked, "SpendAndCreate WithLocked flag mismatch")
 		found = true
 	}
-	require.True(t, found, "expected at least one create-phase SpendAndCreate call")
+	require.True(t, found, "expected at least one SpendAndCreate call that creates")
 }
 
 // assertCreatedSkipExtended asserts every Create call carried WithSkipExtendedInputs(want).
@@ -700,7 +705,7 @@ func assertCreatedSkipExtended(t *testing.T, m *utxo.MockUtxostore, want bool) {
 		require.Equal(t, want, o.SkipExtendedInputs, "SpendAndCreate WithSkipExtendedInputs flag mismatch")
 		found = true
 	}
-	require.True(t, found, "expected at least one create-phase SpendAndCreate call")
+	require.True(t, found, "expected at least one SpendAndCreate call that creates")
 }
 
 // assertSpentSkipUTXOHashCheck asserts every Spend call carried IgnoreFlags.SkipUTXOHashCheck(want).
@@ -723,7 +728,7 @@ func assertSpentSkipUTXOHashCheck(t *testing.T, m *utxo.MockUtxostore, want bool
 		require.Equal(t, want, o.IgnoreFlags.SkipUTXOHashCheck, "SpendAndCreate SkipUTXOHashCheck flag mismatch")
 		found = true
 	}
-	require.True(t, found, "expected at least one spend-phase SpendAndCreate call")
+	require.True(t, found, "expected at least one SpendAndCreate call that spends")
 }
 
 // buildOneSubtreeBlock builds a block with one subtree (coinbase + 2 txs) and stores its

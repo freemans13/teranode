@@ -51,6 +51,10 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// errServiceNotReadyUnminedLoading is the refusal every method below answers while
+// unmined transactions are loading. It is SERVICE_NOT_READY in a gRPC status, so a
+// client gets the class back, not just the text: the state clears on its own, and
+// RPC answers it as warm-up.
 const errServiceNotReadyUnminedLoading = "service not ready - unmined transactions are still being loaded"
 
 var (
@@ -861,6 +865,81 @@ func (ba *BlockAssembly) sendSubtreeNotification(ctx context.Context, subtreeHas
 	}
 }
 
+// buildSubtreeMeta returns the serialized subtree meta of the subtree in the
+// request, or false, after logging why, when it cannot be built.
+func (ba *BlockAssembly) buildSubtreeMeta(subtreeRequest subtreeprocessor.NewSubtreeRequest) ([]byte, bool) {
+	subtree := subtreeRequest.Subtree
+
+	// An in-memory tx map keeps the inpoints serialized, so the meta is put
+	// together from those bytes without decoding and encoding every tx's inpoints.
+	if serialized, ok := subtreeRequest.ParentTxMap.(serializedInpointsMap); ok {
+		subtreeMetaBytes, err := buildSubtreeMetaBytes(subtree, serialized, subtreeRequest.DeletedTxs)
+		if err != nil {
+			ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to build subtree meta: %s", subtree.RootHash().String(), err)
+			return nil, false
+		}
+
+		return subtreeMetaBytes, true
+	}
+
+	subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
+
+	// DiskTxMap satisfies this so a read error here is returned to us
+	// instead of being recorded on the map, where it would be
+	// misattributed to whichever subtree processor operation happens to
+	// check the map's pending error next (this runs in a background
+	// goroutine, concurrently with the processor).
+	parentTxMapWithErr, parentTxMapSupportsErr := subtreeRequest.ParentTxMap.(interface {
+		GetWithErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool, error)
+	})
+
+	for idx, node := range subtreeRequest.Subtree.Nodes {
+		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			var (
+				txInpoints *subtreepkg.TxInpoints
+				found      bool
+			)
+
+			if parentTxMapSupportsErr {
+				var getErr error
+
+				txInpoints, found, getErr = parentTxMapWithErr.GetWithErr(node.Hash)
+				if getErr != nil {
+					ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] error reading parent tx hashes for node %s: %s", subtreeRequest.Subtree.RootHash().String(), node.Hash.String(), getErr)
+				}
+			} else {
+				txInpoints, found = subtreeRequest.ParentTxMap.Get(node.Hash)
+			}
+
+			if !found && subtreeRequest.DeletedTxs != nil {
+				// Fallback: check if transaction was deleted during async storage
+				var deletedTxInpoints subtreepkg.TxInpoints
+				deletedTxInpoints, found = subtreeRequest.DeletedTxs.Get(node.Hash)
+				if found {
+					txInpoints = &deletedTxInpoints
+				}
+			}
+			if !found {
+				ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap or DeletedTxs", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+				return nil, false
+			}
+
+			if err := subtreeMeta.SetTxInpoints(idx, *txInpoints); err != nil {
+				ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
+				return nil, false
+			}
+		}
+	}
+
+	subtreeMetaBytes, err := subtreeMeta.Serialize()
+	if err != nil {
+		ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to serialize subtree meta: %s", subtree.RootHash().String(), err)
+		return nil, false
+	}
+
+	return subtreeMetaBytes, true
+}
+
 // storeSubtreeData stores the subtree data and metadata to the blob store.
 // It returns two channels:
 //   - subtreeDone: signals when subtree storage is complete (bool = success)
@@ -915,58 +994,9 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 	if subtreeRequest.ParentTxMap != nil && ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
 		go func() {
 			defer close(metaDoneCh)
-			subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
 
-			// DiskTxMap satisfies this so a read error here is returned to us
-			// instead of being recorded on the map, where it would be
-			// misattributed to whichever subtree processor operation happens to
-			// check the map's pending error next (this runs in a background
-			// goroutine, concurrently with the processor).
-			parentTxMapWithErr, parentTxMapSupportsErr := subtreeRequest.ParentTxMap.(interface {
-				GetWithErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool, error)
-			})
-
-			for idx, node := range subtreeRequest.Subtree.Nodes {
-				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					var (
-						txInpoints *subtreepkg.TxInpoints
-						found      bool
-					)
-
-					if parentTxMapSupportsErr {
-						var getErr error
-
-						txInpoints, found, getErr = parentTxMapWithErr.GetWithErr(node.Hash)
-						if getErr != nil {
-							ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] error reading parent tx hashes for node %s: %s", subtreeRequest.Subtree.RootHash().String(), node.Hash.String(), getErr)
-						}
-					} else {
-						txInpoints, found = subtreeRequest.ParentTxMap.Get(node.Hash)
-					}
-
-					if !found && subtreeRequest.DeletedTxs != nil {
-						// Fallback: check if transaction was deleted during async storage
-						var deletedTxInpoints subtreepkg.TxInpoints
-						deletedTxInpoints, found = subtreeRequest.DeletedTxs.Get(node.Hash)
-						if found {
-							txInpoints = &deletedTxInpoints
-						}
-					}
-					if !found {
-						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap or DeletedTxs", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
-						return
-					}
-
-					if err := subtreeMeta.SetTxInpoints(idx, *txInpoints); err != nil {
-						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
-						return
-					}
-				}
-			}
-
-			subtreeMetaBytes, err := subtreeMeta.Serialize()
-			if err != nil {
-				ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to serialize subtree meta: %s", subtree.RootHash().String(), err)
+			subtreeMetaBytes, ok := ba.buildSubtreeMeta(subtreeRequest)
+			if !ok {
 				return
 			}
 
@@ -1688,7 +1718,7 @@ func (ba *BlockAssembly) SubmitMiningSolution(ctx context.Context, req *blockass
 	// Check if unmined transactions are still being loaded
 	if ba.blockAssembler.unminedTransactionsLoading.Load() {
 		ba.logger.Warnf("[SubmitMiningSolution] service not ready - unmined transactions are still being loaded")
-		return nil, errors.NewServiceError(errServiceNotReadyUnminedLoading)
+		return nil, errors.WrapGRPC(errors.NewServiceNotReadyError(errServiceNotReadyUnminedLoading))
 	}
 
 	var responseChan chan error
@@ -1772,8 +1802,14 @@ func validateCoinbaseForSubmission(jobID string, coinbaseTx *bt.Tx) error {
 	// pool branch: bitcoin-sv's generateBlocks carries the identical guard on the
 	// generate/generatetoaddress path (rpc/mining.cpp:199), so guarding here keeps
 	// GenerateBlocks in parity with upstream rather than making Teranode stricter.
+	//
+	// Classed as a local policy refusal, which is what it is, rather than PROCESSING,
+	// which reads as this node's own fault: the RPC boundary shows a policy refusal's
+	// reason to the submitter at any depth, and on generatetoaddress this arrives
+	// under two of GenerateBlocks' wrappers. Nothing branches on the class of a
+	// submission error, and both classes map to the same gRPC status.
 	if coinbaseHasP2SHOutput(coinbaseTx) {
-		return errors.NewProcessingError("[BlockAssembly][%s] bad-txns-vout-p2sh: coinbase pays to a P2SH output", jobID)
+		return errors.NewBlockPolicyDeclinedError("[BlockAssembly][%s] bad-txns-vout-p2sh: coinbase pays to a P2SH output", jobID)
 	}
 
 	return nil
@@ -2334,7 +2370,7 @@ func (ba *BlockAssembly) ResetBlockAssembly(ctx context.Context, _ *blockassembl
 	// Check if unmined transactions are still being loaded
 	if ba.blockAssembler.unminedTransactionsLoading.Load() {
 		ba.logger.Warnf("[ResetBlockAssembly] service not ready - unmined transactions are still being loaded")
-		return nil, errors.NewServiceError(errServiceNotReadyUnminedLoading)
+		return nil, errors.WrapGRPC(errors.NewServiceNotReadyError(errServiceNotReadyUnminedLoading))
 	}
 
 	ba.blockAssembler.Reset(false)
@@ -2352,7 +2388,7 @@ func (ba *BlockAssembly) ResetBlockAssemblyFully(ctx context.Context, _ *blockas
 	// Check if unmined transactions are still being loaded
 	if ba.blockAssembler.unminedTransactionsLoading.Load() {
 		ba.logger.Warnf("[ResetBlockAssemblyFully] service not ready - unmined transactions are still being loaded")
-		return nil, errors.NewServiceError(errServiceNotReadyUnminedLoading)
+		return nil, errors.WrapGRPC(errors.NewServiceNotReadyError(errServiceNotReadyUnminedLoading))
 	}
 
 	ba.blockAssembler.Reset(true)
@@ -2374,7 +2410,7 @@ func (ba *BlockAssembly) ResetBlockAssemblyValidateInputs(ctx context.Context, _
 
 	if ba.blockAssembler.unminedTransactionsLoading.Load() {
 		ba.logger.Warnf("[ResetBlockAssemblyValidateInputs] service not ready - unmined transactions are still being loaded")
-		return nil, errors.NewServiceError(errServiceNotReadyUnminedLoading)
+		return nil, errors.WrapGRPC(errors.NewServiceNotReadyError(errServiceNotReadyUnminedLoading))
 	}
 
 	ba.blockAssembler.ResetWithInputValidation()
@@ -2395,7 +2431,7 @@ func (ba *BlockAssembly) CheckBlockAssemblyValidateInputs(ctx context.Context, _
 
 	if ba.blockAssembler.unminedTransactionsLoading.Load() {
 		ba.logger.Warnf("[CheckBlockAssemblyValidateInputs] service not ready - unmined transactions are still being loaded")
-		return nil, errors.NewServiceError(errServiceNotReadyUnminedLoading)
+		return nil, errors.WrapGRPC(errors.NewServiceNotReadyError(errServiceNotReadyUnminedLoading))
 	}
 
 	invalidCount, err := ba.blockAssembler.CheckInputValidation(ctx)
@@ -2614,7 +2650,7 @@ func (ba *BlockAssembly) GenerateBlocks(ctx context.Context, req *blockassembly_
 	// Check if unmined transactions are still being loaded
 	if ba.blockAssembler.unminedTransactionsLoading.Load() {
 		ba.logger.Warnf("[GenerateBlocks] service not ready - unmined transactions are still being loaded")
-		return nil, errors.NewServiceError(errServiceNotReadyUnminedLoading)
+		return nil, errors.WrapGRPC(errors.NewServiceNotReadyError(errServiceNotReadyUnminedLoading))
 	}
 
 	if !ba.blockAssembler.settings.ChainCfgParams.GenerateSupported {

@@ -296,9 +296,10 @@ func WithSubtreeIdxs(idxs []int) CreateOption {
 
 // WithBelowCheckpoint tells SpendAndCreateMulti that the list comes from a block at or below a
 // checkpoint the caller trusts, so the block is already known valid and the list may be written in
-// any order. DefaultSpendAndCreateMulti then creates every record first and spends every input
-// after, in two waves, instead of one dependency level at a time, so a chain of N transactions
-// costs two rounds of store calls rather than N. A store that nets the list may ignore it. Never
+// any order. DefaultSpendAndCreateMulti then writes it in two waves instead of one dependency
+// level at a time: a first wave that creates every record, spending in the same call the inputs
+// of each transaction with no parent in the list, and a second that spends the rest. A chain of
+// N transactions costs two rounds of store calls rather than N. A store that nets the list may ignore it. Never
 // set it above the checkpoint: there a transaction's inputs must be spent before its outputs
 // exist, or a transaction that fails its spends leaves outputs behind. It has no effect on
 // SpendAndCreate.
@@ -345,6 +346,44 @@ func withListItem(i int) CreateOption {
 	}
 }
 
+// The boolean CreateOptions below return one of two package-level closures
+// rather than closing over their argument. A closure that captures anything is
+// heap-allocated the moment it escapes, and these escape on every call: they go
+// straight into SpendAndCreate's variadic list, which the quick-validation write
+// path built once per TRANSACTION when this was measured.
+//
+// That is one allocation per option per transaction, and on a node whose heap
+// sits at GOMEMLIMIT an allocation is not cheap. A CPU profile taken on Hetzner
+// mainnet while block 760431 was applied charged 14.77 core-seconds to
+// runtime.newobject underneath WithIgnoreLocked alone, inside a 25-second
+// window, because each allocation first pays off sweep debt through
+// runtime.deductSweepCredit before it is allowed to proceed.
+//
+// A closure that captures nothing is a static function value, so these cost
+// nothing at all. TestCreateOptionsDoNotAllocate holds them to that.
+var (
+	optFrozenTrue  CreateOption = func(o *CreateOptions) { o.Frozen = true }
+	optFrozenFalse CreateOption = func(o *CreateOptions) { o.Frozen = false }
+
+	optConflictingTrue  CreateOption = func(o *CreateOptions) { o.Conflicting = true }
+	optConflictingFalse CreateOption = func(o *CreateOptions) { o.Conflicting = false }
+
+	optLockedTrue  CreateOption = func(o *CreateOptions) { o.Locked = true }
+	optLockedFalse CreateOption = func(o *CreateOptions) { o.Locked = false }
+
+	optSkipExtendedInputsTrue  CreateOption = func(o *CreateOptions) { o.SkipExtendedInputs = true }
+	optSkipExtendedInputsFalse CreateOption = func(o *CreateOptions) { o.SkipExtendedInputs = false }
+
+	optIgnoreConflictingTrue  CreateOption = func(o *CreateOptions) { o.IgnoreFlags.IgnoreConflicting = true }
+	optIgnoreConflictingFalse CreateOption = func(o *CreateOptions) { o.IgnoreFlags.IgnoreConflicting = false }
+
+	optIgnoreLockedTrue  CreateOption = func(o *CreateOptions) { o.IgnoreFlags.IgnoreLocked = true }
+	optIgnoreLockedFalse CreateOption = func(o *CreateOptions) { o.IgnoreFlags.IgnoreLocked = false }
+
+	optSkipUTXOHashCheckTrue  CreateOption = func(o *CreateOptions) { o.IgnoreFlags.SkipUTXOHashCheck = true }
+	optSkipUTXOHashCheckFalse CreateOption = func(o *CreateOptions) { o.IgnoreFlags.SkipUTXOHashCheck = false }
+)
+
 // WithTXIDs supplies the txids of a SpendAndCreateMulti list, in the same order,
 // so the store does not rehash each transaction. It is the list form of WithTXID
 // and has no effect on SpendAndCreate.
@@ -363,48 +402,60 @@ func WithSetCoinbase(b bool) CreateOption {
 
 // WithFrozen returns a CreateOption that marks a UTXO as frozen.
 func WithFrozen(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.Frozen = b
+	if b {
+		return optFrozenTrue
 	}
+
+	return optFrozenFalse
 }
 
 // WithConflicting marks a transaction as conflicting with another transaction.
 func WithConflicting(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.Conflicting = b
+	if b {
+		return optConflictingTrue
 	}
+
+	return optConflictingFalse
 }
 
 // WithLocked sets the transactions as locked and not spendable on creation
 func WithLocked(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.Locked = b
+	if b {
+		return optLockedTrue
 	}
+
+	return optLockedFalse
 }
 
 // WithSkipExtendedInputs marks a create as minimal: compute meta with fee=0 (no GetFees) and
 // persist per-input parent script/satoshis as empty/zero, while ALWAYS retaining the per-input
 // outpoint and every output. Set ONLY on the gated below-checkpoint path (spec §3.2 Seam 3, §3.3).
 func WithSkipExtendedInputs(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.SkipExtendedInputs = b
+	if b {
+		return optSkipExtendedInputsTrue
 	}
+
+	return optSkipExtendedInputsFalse
 }
 
 // WithIgnoreConflicting makes the spend phase of SpendAndCreate ignore the
 // conflicting flag on the UTXOs being spent.
 func WithIgnoreConflicting(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.IgnoreFlags.IgnoreConflicting = b
+	if b {
+		return optIgnoreConflictingTrue
 	}
+
+	return optIgnoreConflictingFalse
 }
 
 // WithIgnoreLocked makes the spend phase of SpendAndCreate ignore the locked
 // flag on the UTXOs being spent.
 func WithIgnoreLocked(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.IgnoreFlags.IgnoreLocked = b
+	if b {
+		return optIgnoreLockedTrue
 	}
+
+	return optIgnoreLockedFalse
 }
 
 // WithSkipUTXOHashCheck disables the per-input utxo-hash integrity comparison in
@@ -413,9 +464,11 @@ func WithIgnoreLocked(b bool) CreateOption {
 // does not implement the outpoint-only fast path and treats this flag as a
 // no-op (see SupportsOutpointOnlySpend).
 func WithSkipUTXOHashCheck(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.IgnoreFlags.SkipUTXOHashCheck = b
+	if b {
+		return optSkipUTXOHashCheckTrue
 	}
+
+	return optSkipUTXOHashCheckFalse
 }
 
 // WithCreateOnly makes SpendAndCreate skip the spend phase: only the
