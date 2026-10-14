@@ -2733,7 +2733,7 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 		}
 
 		if ctx.Err() != nil {
-			return errors.NewProcessingError("[applyList][%s] context cancelled", block.Hash().String())
+			return errors.NewContextCanceledError("[applyList][%s] context cancelled", block.Hash().String(), ctx.Err())
 		}
 
 		results, err := u.utxoStore.SpendAndCreateMulti(ctx, txs, block.Height, opts...)
@@ -2828,7 +2828,7 @@ func (u *BlockValidation) applyOneByOne(ctx context.Context, block *model.Block,
 			}
 
 			if ctx.Err() != nil {
-				return errors.NewProcessingError("[applyOneByOne][%s] context cancelled", block.Hash().String())
+				return errors.NewContextCanceledError("[applyOneByOne][%s] context cancelled", block.Hash().String(), ctx.Err())
 			}
 
 			_, _, err = u.utxoStore.SpendAndCreate(ctx, tx, block.Height,

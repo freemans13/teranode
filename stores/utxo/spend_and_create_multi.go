@@ -2,6 +2,8 @@ package utxo
 
 import (
 	"context"
+	"sync"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -24,7 +26,8 @@ const (
 	MultiTxCreated
 	// MultiTxExisted means a record for the transaction already existed. Nothing
 	// was written to it, and its children in the list spend it as an outside
-	// parent. For a WithBelowCheckpoint list its inputs were spent again; see
+	// parent. For a WithBelowCheckpoint list its inputs were spent again, or,
+	// with no parent in the list, by its own combined call; see
 	// writeCreateThenSpend.
 	MultiTxExisted
 	// MultiTxFailed means the transaction's SpendAndCreate failed; Err says why,
@@ -82,13 +85,23 @@ func IsSpendAndCreateMultiRefused(err error) bool {
 
 // SpendAndCreateMultiWidths bounds how many SpendAndCreate calls
 // DefaultSpendAndCreateMulti keeps in flight. Level bounds one dependency level
-// of the default order. Create and Spend bound the create wave and the spend
+// of the default order. Create and Spend bound the first wave and the spend
 // wave of a WithBelowCheckpoint list. A width below 1 is taken as 1.
+//
+// CallBound is how long one call of a WithBelowCheckpoint list may run once it
+// no longer follows the caller's cancellation; see writeCreateThenSpend. Zero
+// means defaultSpendAndCreateMultiCallBound.
 type SpendAndCreateMultiWidths struct {
-	Level  int
-	Create int
-	Spend  int
+	Level     int
+	Create    int
+	Spend     int
+	CallBound time.Duration
 }
+
+// defaultSpendAndCreateMultiCallBound is CallBound when none is set: the
+// settings defaults of utxostore_spendWaitTimeout (30s) and
+// utxostore_spendRollbackTimeout (120s).
+const defaultSpendAndCreateMultiCallBound = 150 * time.Second
 
 // UniformSpendAndCreateMultiWidths returns widths that bound every level and
 // every wave to n calls.
@@ -102,16 +115,18 @@ func UniformSpendAndCreateMultiWidths(n int) SpendAndCreateMultiWidths {
 // reaches the store exactly as wide as it does there. The two waves of a
 // WithBelowCheckpoint list are as wide as quick validation's create and spend
 // phases were before it wrote a list: eight store batches of creates, and two
-// rounds of every spend batcher.
+// rounds of every spend batcher. A call's bound is the spend's own budget plus
+// the rollback's, the longest a combined SpendAndCreate can take.
 func SpendAndCreateMultiWidthsFor(tSettings *settings.Settings) SpendAndCreateMultiWidths {
 	if tSettings == nil {
 		return UniformSpendAndCreateMultiWidths(1)
 	}
 
 	return SpendAndCreateMultiWidths{
-		Level:  tSettings.SubtreeValidation.SpendBatcherSize * 2,
-		Create: tSettings.UtxoStore.StoreBatcherSize * 8,
-		Spend:  tSettings.UtxoStore.SpendBatcherSize * tSettings.UtxoStore.SpendBatcherConcurrency * 2,
+		Level:     tSettings.SubtreeValidation.SpendBatcherSize * 2,
+		Create:    tSettings.UtxoStore.StoreBatcherSize * 8,
+		Spend:     tSettings.UtxoStore.SpendBatcherSize * tSettings.UtxoStore.SpendBatcherConcurrency * 2,
+		CallBound: tSettings.UtxoStore.SpendWaitTimeout + tSettings.UtxoStore.SpendRollbackTimeout,
 	}
 }
 
@@ -237,50 +252,68 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 	return results, nil
 }
 
-// writeCreateThenSpend writes a WithBelowCheckpoint list in two waves: it
-// creates every record, then spends every input. Every parent in the list
+// writeCreateThenSpend writes a WithBelowCheckpoint list in two waves. The
+// first wave writes every transaction: one with no parent in the list gets one
+// combined SpendAndCreate, which spends its inputs and creates its record, and
+// one with a parent in the list gets a create-only call. The second wave spends
+// the inputs of the transactions that only created. Every parent in the list
 // exists before any child spends it, so the list costs two rounds of store
-// calls however deep its chains go. It is only correct for a block the caller
-// already knows is valid: a transaction whose spends fail has its record
-// written anyway.
+// calls however deep its chains go, and a transaction with no parent in the
+// list costs one call rather than two. It is only correct for a block the
+// caller already knows is valid: a transaction whose spends fail in the second
+// wave has its record written anyway.
 //
 // The results keep their meaning, with three differences that follow from the
 // order:
-//   - a transaction whose create fails is MultiTxFailed, and its descendants in
-//     the list are MultiTxParentFailed and not spent, but their records may
-//     have been created;
-//   - a transaction whose spend fails is MultiTxFailed with its record
-//     created; its children in the list were spent in the same wave and keep
-//     their own result;
-//   - a MultiTxExisted transaction has its inputs spent again in the spend
-//     wave, because a record found here may have been created by a call that
-//     never reached its spends. A spend repeated by the same spender is
-//     accepted as the same spend.
+//   - a transaction whose first-wave call fails is MultiTxFailed, and its
+//     descendants in the list are MultiTxParentFailed and not spent, but their
+//     records may have been created;
+//   - a transaction whose second-wave spend fails is MultiTxFailed with its
+//     record created; its children in the list were spent in the same wave and
+//     keep their own result;
+//   - a MultiTxExisted transaction with a parent in the list has its inputs
+//     spent again in the second wave, because a record found here may have been
+//     created by a call that never reached its spends. A spend repeated by the
+//     same spender is accepted as the same spend. One with no parent in the list
+//     made its spends in its combined call, which spends before it creates and
+//     leaves the spends in place when the record exists.
 //
-// The spend wave sets IgnoreFlags.RequireParentOutputs, so a missing parent
-// output fails the spend. Without it the store would read the spender's own
-// record, created moments earlier by the create wave, as proof that the spend
-// happened in an earlier attempt and the parent has been pruned since, and a
-// list spending an output that exists nowhere would pass. Turning the fallback
-// off cannot fail a legitimate repeat: a parent is pruned only after its
-// retention has passed since it was fully spent, and the chain does not advance
-// past the block being applied, so a repeat of that block's list runs before
-// any parent its spends emptied can be pruned.
+// Every spend sets IgnoreFlags.RequireParentOutputs, so a missing parent output
+// fails the spend. Without it the store would read the spender's own record,
+// created moments earlier by the first wave, as proof that the spend happened
+// in an earlier attempt and the parent has been pruned since, and a list
+// spending an output that exists nowhere would pass. Turning the fallback off
+// cannot fail a legitimate repeat: a parent is pruned only after its retention
+// has passed since it was fully spent, and the chain does not advance past the
+// block being applied, so a repeat of that block's list runs before any parent
+// its spends emptied can be pruned.
+//
+// A call, once started, runs to its end. A combined SpendAndCreate is not
+// atomic on a store that spends and then creates (SequentialSpendAndCreate),
+// and a cancel between the two leaves inputs spent with no record, with the
+// rollback running under the same cancelled context. So each call runs under
+// context.WithoutCancel(ctx), bounded by widths.CallBound, and a call that has
+// not started when ctx is cancelled never starts: it is MultiTxNotAttempted and
+// the error is returned.
 //
 // A caller treats anything but MultiTxCreated and MultiTxExisted as a failed
-// list and repeats it whole, as quick validation does. If ctx is cancelled
-// between the waves, every transaction that was waiting for its spends is
-// MultiTxNotAttempted and the error is returned.
+// list and repeats it whole, as quick validation does.
 func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, widths SpendAndCreateMultiWidths, txs []*bt.Tx,
 	list *SpendAndCreateMultiList, blockHeight uint32, opts []CreateOption) ([]SpendAndCreateMultiResult, error) {
 	txids, parentsInList := list.TxIDs, list.ParentsInList
 	results := make([]SpendAndCreateMultiResult, len(txs))
 
-	itemOpts := func(i int, half CreateOption) []CreateOption {
-		callOpts := make([]CreateOption, 0, len(opts)+3)
-		callOpts = append(callOpts, opts...)
+	bound := widths.CallBound
+	if bound <= 0 {
+		bound = defaultSpendAndCreateMultiCallBound
+	}
 
-		return append(callOpts, withListItem(i), WithTXID(&txids[i]), half)
+	itemOpts := func(i int, extra ...CreateOption) []CreateOption {
+		callOpts := make([]CreateOption, 0, len(opts)+2+len(extra))
+		callOpts = append(callOpts, opts...)
+		callOpts = append(callOpts, withListItem(i), WithTXID(&txids[i]))
+
+		return append(callOpts, extra...)
 	}
 
 	all := make([]int, len(txs))
@@ -288,22 +321,44 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 		all[i] = i
 	}
 
-	runSpendAndCreateWave(widths.Create, all, func(i int) {
-		md, _, err := s.SpendAndCreate(ctx, txs[i], blockHeight, itemOpts(i, WithCreateOnly())...)
+	notStarted := runDetachedWave(ctx, bound, widths.Create, all, func(callCtx context.Context, i int) {
+		var (
+			md     *meta.Data
+			spends []*Spend
+			err    error
+		)
+
+		if len(parentsInList[i]) == 0 {
+			md, spends, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, withRequireParentOutputs())...)
+		} else {
+			md, _, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, WithCreateOnly())...)
+		}
 
 		switch {
 		case err == nil:
-			results[i] = SpendAndCreateMultiResult{Status: MultiTxCreated, Meta: md}
+			results[i] = SpendAndCreateMultiResult{Status: MultiTxCreated, Meta: md, Spends: spends}
 		case errors.Is(err, errors.ErrTxExists):
-			results[i] = SpendAndCreateMultiResult{Status: MultiTxExisted}
+			results[i] = SpendAndCreateMultiResult{Status: MultiTxExisted, Spends: spends}
 		default:
-			results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Err: err}
+			results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Spends: spends, Err: err}
 		}
 	})
 
-	// A failed create leaves its outputs missing, so its descendants' spends
-	// would fail too. Mark them in list order, which reaches a grandchild after
-	// its parent.
+	if notStarted {
+		// A create-only record whose spends never ran is not a written transaction.
+		for i := range txs {
+			if len(parentsInList[i]) > 0 && results[i].Status != MultiTxFailed {
+				results[i] = SpendAndCreateMultiResult{}
+			}
+		}
+
+		return results, ctx.Err()
+	}
+
+	// A failed first-wave call leaves its outputs missing, so its descendants'
+	// spends would fail too. Mark them in list order, which reaches a grandchild
+	// after its parent. A transaction with no parent in the list has made its
+	// spends already.
 	toSpend := make([]int, 0, len(txs))
 
 	for i := range txs {
@@ -314,13 +369,15 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 		if failedParent(results, parentsInList[i]) {
 			results[i] = SpendAndCreateMultiResult{
 				Status: MultiTxParentFailed,
-				Err:    errors.NewProcessingError("SpendAndCreateMulti: the create of a parent of %s earlier in the list failed", txids[i]),
+				Err:    errors.NewProcessingError("SpendAndCreateMulti: the write of a parent of %s earlier in the list failed", txids[i]),
 			}
 
 			continue
 		}
 
-		toSpend = append(toSpend, i)
+		if len(parentsInList[i]) > 0 {
+			toSpend = append(toSpend, i)
+		}
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -331,8 +388,12 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 		return results, err
 	}
 
-	runSpendAndCreateWave(widths.Spend, toSpend, func(i int) {
-		_, spends, err := s.SpendAndCreate(ctx, txs[i], blockHeight, append(itemOpts(i, WithSpendOnly()), withRequireParentOutputs())...)
+	spent := make([]bool, len(txs))
+
+	notStarted = runDetachedWave(ctx, bound, widths.Spend, toSpend, func(callCtx context.Context, i int) {
+		spent[i] = true
+
+		_, spends, err := s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, WithSpendOnly(), withRequireParentOutputs())...)
 		if err != nil {
 			results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Meta: results[i].Meta, Spends: spends, Err: err}
 
@@ -342,24 +403,55 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 		results[i].Spends = spends
 	})
 
+	if notStarted {
+		// A record whose spends never ran is not a written transaction.
+		for _, i := range toSpend {
+			if !spent[i] {
+				results[i] = SpendAndCreateMultiResult{}
+			}
+		}
+
+		return results, ctx.Err()
+	}
+
 	return results, nil
 }
 
-// runSpendAndCreateWave runs call for every member, at most width at once, and
-// waits for all of them.
-func runSpendAndCreateWave(width int, members []int, call func(i int)) {
+// runDetachedWave runs call for every member, at most width at once, and waits
+// for all of them. Each call gets context.WithoutCancel(ctx) bounded by bound,
+// so a cancel of ctx never lands inside a call; a member whose call has not
+// started when ctx is cancelled is skipped. It reports whether any was skipped.
+func runDetachedWave(ctx context.Context, bound time.Duration, width int, members []int, call func(callCtx context.Context, i int)) bool {
 	g := errgroup.Group{}
 	g.SetLimit(max(width, 1))
 
+	var (
+		mu      sync.Mutex
+		skipped bool
+	)
+
 	for _, i := range members {
 		g.Go(func() error {
-			call(i)
+			if ctx.Err() != nil {
+				mu.Lock()
+				skipped = true
+				mu.Unlock()
+
+				return nil
+			}
+
+			callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bound)
+			defer cancel()
+
+			call(callCtx, i)
 
 			return nil
 		})
 	}
 
 	_ = g.Wait()
+
+	return skipped
 }
 
 // SpendAndCreateMultiList is a list SpendAndCreateMulti has accepted: its
