@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 )
@@ -159,6 +160,15 @@ func (h *HTTP) getTransaction(c echo.Context, mode ReadMode) error {
 	b, err := h.repository.GetTransaction(ctx, hash)
 	if err != nil {
 		if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), "not found") {
+			// Marks this 404 as the handler's verdict on the transaction, as opposed
+			// to a route that failed to match; see util.AssetNotFoundHeader. Only the
+			// class marks it: a store fault can say "not found" without being a miss,
+			// and the text alone keeps its 404 for callers that read the status, but
+			// unmarked, so getrawtransaction does not deny a transaction it may hold.
+			if errors.Is(err, errors.ErrNotFound) {
+				c.Response().Header().Set(util.AssetNotFoundHeader, util.AssetNotFoundTx)
+			}
+
 			return echo.NewHTTPError(http.StatusNotFound, err.Error())
 		} else {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())

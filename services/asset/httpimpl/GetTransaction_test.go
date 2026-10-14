@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -251,4 +252,49 @@ func TestGetTransaction(t *testing.T) {
 		// Check response body
 		assert.Equal(t, "INVALID_ARGUMENT (1): bad read mode", echoErr.Message)
 	})
+}
+
+// TestGetTransaction_MarksItsOwnNotFound pins the header that tells a caller this
+// 404 is the handler's verdict on the transaction, not a route that failed to
+// match. getrawtransaction answers -5 only for a marked 404; without the mark a
+// misconfigured asset URL would read as every transaction being unknown.
+func TestGetTransaction_MarksItsOwnNotFound(t *testing.T) {
+	initPrometheusMetrics()
+
+	for name, tc := range map[string]struct {
+		err    error
+		status int
+		marked bool
+	}{
+		"the transaction is not held": {errors.NewNotFoundError("transaction not found"), http.StatusNotFound, true},
+		"the repository failed":       {errors.NewProcessingError("error getting transaction"), http.StatusInternalServerError, false},
+		// A store fault can say "not found" without being a miss: a misconfigured
+		// aerospike namespace does. The text still earns a 404 for callers that read
+		// the status alone, but only the class marks it as a verdict, so
+		// getrawtransaction does not answer -5 for a transaction it may hold.
+		"a store fault whose text says not found": {
+			errors.NewServiceError("aerospike get failed: Namespace not found"), http.StatusNotFound, false,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+			mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(nil, tc.err)
+
+			echoContext.SetPath("/tx/:hash/hex")
+			echoContext.SetParamNames("hash")
+			echoContext.SetParamValues("9d45ad79ad3c6baecae872c0e35022d60c3bbbd024ccce06690321ece15ea995")
+
+			err := httpServer.GetTransaction(HEX)(echoContext)
+			echoErr := &echo.HTTPError{}
+			require.True(t, errors.As(err, &echoErr))
+			require.Equal(t, tc.status, echoErr.Code)
+
+			if tc.marked {
+				require.Equal(t, util.AssetNotFoundTx, responseRecorder.Header().Get(util.AssetNotFoundHeader))
+			} else {
+				require.Empty(t, responseRecorder.Header().Get(util.AssetNotFoundHeader),
+					"only a verdict that the transaction is absent is marked")
+			}
+		})
+	}
 }

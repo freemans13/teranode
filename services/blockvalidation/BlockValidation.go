@@ -2104,11 +2104,13 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// costs nothing, and persisting on it both stores the peer's coinbase and poisons a real
 			// block hash so the honest body is later refused as already-invalid.
 			//
-			// The binding is not computable here either, so this is unconditional rather than gated:
+			// The binding is not computable here either, so this is not gated on a binding check:
 			// CheckBlockSubtrees batches the MISSING subtrees and pipelines the load of batch N+1
 			// against the UTXO-mutating process of batch N, a structure that exists to bound memory,
 			// so an early-batch failure leaves later subtrees unfetched. A binding attempt would
 			// report "not bound" for a genuinely bound consensus-invalid block and misclassify it.
+			// The one route where the binding is already known is the legacy route, handled inside
+			// the branch below.
 			//
 			// Cost of this, stated plainly: a consensus-invalid block whose fault is an invalid
 			// transaction is no longer REMEMBERED as invalid. On the direct peer path the verdict is
@@ -2133,6 +2135,28 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					ctxLogger.Warnf("[ValidateBlock][%s] local failure during subtree transaction validation, will retry: %s", block.Hash().String(), err)
 
 					return err
+				}
+
+				// On the legacy route the premise above does not hold: the subtree list IS bound.
+				// The legacy pipeline sink checked the merkle root against the header before the
+				// record existed and derived every subtree hash from the bytes it wrote
+				// (services/legacy/netsync/pipeline_sink.go), so there is no doctored list for a
+				// corrupt verdict to protect against. A corrupt verdict here would land on the
+				// legacy caller's RecordCorrupt row (block_park_policy.go), which drops the record
+				// with no mark and no blame so the block is downloaded again, and the same block
+				// would then be downloaded, validated in full and dropped on every wanted-range
+				// pass. A judgement goes back as one. The hash is still not persisted as invalid
+				// from here: ErrBlockInvalid lands on the caller's BlockInvalid row
+				// (block_park_policy.go), which remembers the hash for recentlyFailedBlocksTTL,
+				// rejects it to the peer once RUNNING and drops the delivering association, as the
+				// base did for an invalid block. That is the same bound the legacy route's own
+				// unpersisted invalid verdicts (proof of work in commitPreparedBlock, height in
+				// processBlockFound) have today. No strike from here: the serving connection is the
+				// legacy service's to judge, and penalizeCorruptBlockPeer is a no-op for its peer IDs.
+				if baseURL == "legacy" {
+					ctxLogger.Warnf("[ValidateBlock][%s] invalid transaction in a sink-bound subtree list on the legacy route, rejecting without persisting: %s", block.Hash().String(), err)
+
+					return errors.NewBlockInvalidError("[ValidateBlock][%s] block contains invalid transactions", block.Hash().String(), err)
 				}
 
 				ctxLogger.Warnf("[ValidateBlock][%s] invalid transaction in an unbound subtree list, rejecting without persisting: %s", block.Hash().String(), err)
@@ -3827,6 +3851,17 @@ func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 	cache := make(map[string]bool, cacheHint)
 	var builder strings.Builder
 
+	// The parent block ids are this node's store keys, not block hashes or heights.
+	// They go to the log; the verdict, which crosses to RPC and is stored as the
+	// block's invalid reason, names the transaction.
+	notOnCurrentChain := func(txID chainhash.Hash, blockIDs []uint32, how string) error {
+		if u.logger != nil {
+			u.logger.Warnf("[Block Validation][checkOldBlockIDs][%s] transaction %s has parents in blocks %v, which are not on the current chain%s", block.String(), txID, blockIDs, how)
+		}
+
+		return errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks are not from current chain%s", block.String(), txID, how)
+	}
+
 	oldBlockIDsMap.Iterate(func(txID chainhash.Hash, blockIDs []uint32) bool {
 		if len(blockIDs) == 0 {
 			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] blockIDs is empty for txID: %v", block.String(), txID)
@@ -3851,7 +3886,7 @@ func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 		if blocksPartOfCurrentChain, ok := cache[blockIDsString]; ok {
 			cacheHitCount++
 			if !blocksPartOfCurrentChain {
-				iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain using cache", block.String(), txID, blockIDs)
+				iterationError = notOnCurrentChain(txID, blockIDs, " using cache")
 				return false
 			}
 			return true
@@ -3867,7 +3902,7 @@ func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 		cache[blockIDsString] = blocksPartOfCurrentChain
 
 		if !blocksPartOfCurrentChain {
-			iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain", block.String(), txID, blockIDs)
+			iterationError = notOnCurrentChain(txID, blockIDs, "")
 			return false
 		}
 
