@@ -40,13 +40,11 @@ import (
 // that are missing.
 //
 // A transaction of the list can hold coins this write never wrote: one that reached the store
-// unmined (the identity probe, read once before any chunk), or one whose record an earlier
-// write made with every output a coin (the build before version 2, or the per-transaction
-// path). Such a transaction is not written again. Its chunk deletes its own outputs the list
-// spends instead, so only the parent's chunk ever touches the parent's coins, a child never
-// does, and the result is the same whichever commits first or whether the child's record
-// already exists. A newly claimed transaction has no such coin, so its chunk deletes nothing
-// for it.
+// unmined before its block (the identity probe, read once before any chunk), which holds every
+// output as a coin and has made its spends. It is not written again. Its chunk deletes its own
+// outputs the list spends instead, so only the parent's chunk ever touches the parent's coins, a
+// child never does, and the result is the same whichever commits first or whether the child's
+// record already exists, as it can when the parent arrives between two attempts.
 //
 // A coinbase is never in the list. Its create path is the one that refuses the historic
 // duplicate coinbases, and that check is not repeated here.
@@ -194,9 +192,6 @@ type netBelowTx struct {
 	tx    *bt.Tx
 	txid  chainhash.Hash
 	ident bool
-	// mined is set when the transaction already has its mined record for this block. It is
-	// probed only for a transaction that could write nothing; see dropWriteNothing.
-	mined bool
 	// netted[vin] is true when input vin spends an output of an earlier transaction of the
 	// list. nil when none does.
 	netted []bool
@@ -280,10 +275,6 @@ func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndC
 		return nil, err
 	}
 
-	if err := s.probeMinedWriteNothing(ctx, items, mi); err != nil {
-		return nil, err
-	}
-
 	if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 		return nil, err
 	}
@@ -350,62 +341,6 @@ func (s *Store) identityHeld(ctx context.Context, txids []chainhash.Hash) (map[c
 	}
 
 	return held, nil
-}
-
-// minedHeldSQL returns which of the given transactions already have their mined record for the
-// block.
-const minedHeldSQL = `
-SELECT t.txid FROM unnest($1::bytea[]) AS t(txid)
- WHERE EXISTS (SELECT 1 FROM tx_mined m WHERE m.txid = t.txid AND m.mined_height = $2 AND m.block_id = $3)`
-
-// probeMinedWriteNothing sets mined on each transaction that could write nothing (every input
-// netted, no identity row) and already has its mined record for the block. An earlier write gave
-// it that record, possibly with its outputs as coins, so it must not be taken for one that writes
-// nothing. On a first attempt no transaction has a record and the probe finds none.
-func (s *Store) probeMinedWriteNothing(ctx context.Context, items []*netBelowTx, mi utxo.MinedBlockInfo) error {
-	var ids [][]byte
-
-	byID := make(map[chainhash.Hash]*netBelowTx)
-
-	for _, it := range items {
-		if it.ident || !it.allInputsNetted() {
-			continue
-		}
-
-		ids = append(ids, it.txid[:])
-		byID[it.txid] = it
-	}
-
-	if len(ids) == 0 {
-		return nil
-	}
-
-	rows, err := s.pool.Query(ctx, minedHeldSQL, ids, int32(mi.BlockHeight), int32(mi.BlockID)) //nolint:gosec // a height and a block id fit int32
-	if err != nil {
-		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] mined record probe", err)
-	}
-
-	defer rows.Close()
-
-	for rows.Next() {
-		var id []byte
-		if err := rows.Scan(&id); err != nil {
-			return errors.NewStorageError("[utxoset][SpendAndCreateMulti] mined record probe scan", err)
-		}
-
-		var h chainhash.Hash
-		copy(h[:], id)
-
-		if it, ok := byID[h]; ok {
-			it.mined = true
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] mined record probe rows", err)
-	}
-
-	return nil
 }
 
 // nettedOwnSpentSQL deletes coins a transaction of the list holds for outputs the list spends.
@@ -557,7 +492,7 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 		return err
 	}
 
-	if err = s.netBelowOwnSpent(ctx, dbTx, chunk, claimed); err != nil {
+	if err = s.netBelowOwnSpent(ctx, dbTx, chunk); err != nil {
 		return err
 	}
 
@@ -611,8 +546,7 @@ func (s *Store) netBelowFault(chunk []*netBelowTx) error {
 // dropWriteNothing takes out of the plan every transaction the chunk would write only a mined
 // record for, and marks it. Such a transaction W
 //
-//   - has no identity row, so it did not reach the store unmined, and no mined record for the
-//     block, so no earlier write gave it coins (probeMinedWriteNothing);
+//   - has no identity row, so it did not reach the store unmined;
 //   - spends only outputs of earlier transactions of the list, so it deletes no coin;
 //   - has no output left as a coin: each is spent in the list or is not spendable;
 //   - carries no body, which below the checkpoint means utxostore_skipTxBodyBelowCheckpoint.
@@ -647,7 +581,7 @@ func dropWriteNothing(chunk []*netBelowTx, plan *createPlan) *createPlan {
 		it := chunk[owner]
 
 		_, coin := withCoin[string(plan.txids[i])]
-		if it.ident || it.mined || coin || plan.bodies[i] != nil || !it.allInputsNetted() {
+		if it.ident || coin || plan.bodies[i] != nil || !it.allInputsNetted() {
 			keep = append(keep, i)
 			continue
 		}
@@ -743,20 +677,6 @@ func (s *Store) netBelowDeletes(ctx context.Context, dbTx pgx.Tx, chunk []*netBe
 		return nil
 	}
 
-	// A coin can be missing only because this same transaction already spent it through the
-	// build before version 2, which spent every outside input of a list before it created any
-	// transaction, and wrote a journal row naming the spender. A restart onto version 2 between
-	// those two steps leaves exactly that. Version 2 itself writes no journal rows, so a match
-	// here is always such a spend, and it is accepted as already made. Anything else missing
-	// is a store fault.
-	if err := s.acceptOldWriteSpends(ctx, dbTx, plan, done); err != nil {
-		return err
-	}
-
-	if len(done) == len(plan.idx) {
-		return nil
-	}
-
 	for i, k := range plan.idx {
 		if _, ok := done[k]; ok {
 			continue
@@ -772,12 +692,11 @@ func (s *Store) netBelowDeletes(ctx context.Context, dbTx pgx.Tx, chunk []*netBe
 	return nil
 }
 
-// netBelowOwnSpent deletes, for each transaction of the chunk this attempt did not newly claim,
-// its own coins for outputs the list spends. Such a transaction reached the store by a path that
-// writes every output as a coin: unmined (the identity route) or through an earlier write of the
-// block. Only its chunk deletes them, never its child's, so the outcome does not depend on which
-// chunk commits first or on whether the child was written by an earlier attempt.
-func (s *Store) netBelowOwnSpent(ctx context.Context, dbTx pgx.Tx, chunk []*netBelowTx, claimed map[string]bool) error {
+// netBelowOwnSpent deletes, for each transaction of the chunk that reached the store unmined
+// (the identity route), its own coins for outputs the list spends. Only its chunk deletes them,
+// never its child's, so the outcome does not depend on which chunk commits first or on whether
+// the child was written by an earlier attempt.
+func (s *Store) netBelowOwnSpent(ctx context.Context, dbTx pgx.Tx, chunk []*netBelowTx) error {
 	type key struct {
 		leaf int16
 		ukey [16]byte
@@ -787,7 +706,7 @@ func (s *Store) netBelowOwnSpent(ctx context.Context, dbTx pgx.Tx, chunk []*netB
 	var keys []key
 
 	for _, it := range chunk {
-		if it.writesNothing || len(it.listSpent) == 0 || (!it.ident && claimed[string(it.txid[:])]) {
+		if !it.ident || len(it.listSpent) == 0 {
 			continue
 		}
 
@@ -820,57 +739,6 @@ func (s *Store) netBelowOwnSpent(ctx context.Context, dbTx pgx.Tx, chunk []*netB
 
 	if _, err := dbTx.Exec(ctx, nettedOwnSpentSQL, leaves, ukeys, txids); err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] delete list-spent coins of an existing transaction", err)
-	}
-
-	return nil
-}
-
-// acceptOldWriteSpends marks done every missing input whose spend-journal row names the same
-// spender, the replay rule the per-transaction spend path uses (namePlanSpenders).
-func (s *Store) acceptOldWriteSpends(ctx context.Context, dbTx pgx.Tx, plan *spendPlan, done map[int32]struct{}) error {
-	var leaves []int16
-	var ukeys [][16]byte
-	var txids [][]byte
-	var idx []int32
-
-	for i, k := range plan.idx {
-		if _, ok := done[k]; ok {
-			continue
-		}
-
-		leaves = append(leaves, plan.leaves[i])
-		ukeys = append(ukeys, plan.ukeys[i])
-		txids = append(txids, plan.txids[i])
-		idx = append(idx, k)
-	}
-
-	rows, err := dbTx.Query(ctx, spenderSQL, leaves, ukeys, txids, idx)
-	if err != nil {
-		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] find spender of a missing coin", err)
-	}
-
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			k            int32
-			spender      []byte
-			satoshis     int64
-			script       []byte
-			hashOverride []byte
-		)
-
-		if err := rows.Scan(&k, &spender, &satoshis, &script, &hashOverride); err != nil {
-			return errors.NewStorageError("[utxoset][SpendAndCreateMulti] spender scan", err)
-		}
-
-		if bytes.Equal(spender, plan.spenders[k]) {
-			done[k] = struct{}{}
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] spender rows", err)
 	}
 
 	return nil
