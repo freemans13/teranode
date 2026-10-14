@@ -1434,10 +1434,13 @@ func (sm *SyncManager) markStoredSkippedMined(ctx context.Context, txMap *txmap.
 
 	sm.logger.Infof("[markStoredSkippedMined][%s] marking %d skipped transactions mined that were stored anyway", bi.hash.String(), len(stored))
 
+	// SubtreeIdx 0 matches what createUtxos stamps on every transaction it creates, although a
+	// large block spans several subtrees; the legacy path does not carry each transaction's
+	// subtree index this far.
 	return utxo.SetMinedMultiChunked(ctx, sm.logger, sm.utxoStore, stored, utxo.MinedBlockInfo{
 		BlockID:        blockID,
 		BlockHeight:    bi.height,
-		SubtreeIdx:     0, // legacy path produces a single subtree at index 0
+		SubtreeIdx:     0,
 		OnLongestChain: true,
 	}, sm.settings.UtxoStore.MaxMinedBatchSize, sm.settings.UtxoStore.MaxMinedRoutines)
 }

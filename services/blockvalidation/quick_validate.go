@@ -3,6 +3,8 @@ package blockvalidation
 import (
 	"bufio"
 	"context"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -2024,18 +2026,15 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// resource usage, allowing multiple batches to be in flight simultaneously.
 	util.SafeSetLimit(u.logger, createG, u.settings.UtxoStore.StoreBatcherSize*8)
 
-	// Track transactions that already exist so we can update their mined info
+	// Track transactions that already exist so we can update their mined info, keyed by the
+	// subtree each sits in so the update records the right placement.
 	var existingTxsMu sync.Mutex
-	var existingTxHashes []*chainhash.Hash
+	existingBySubtree := make(map[int][]*chainhash.Hash)
 
 	// skippedTxHashes are the transactions with no spendable outputs left out of the create
-	// wave. See the retry handling after the wave.
+	// wave, and skippedSubtreeIdx the subtree each sits in. See the retry handling after the wave.
 	var skippedTxHashes []*chainhash.Hash
-
-	minedBlockInfo := utxo.MinedBlockInfo{
-		BlockID:     block.ID,
-		BlockHeight: block.Height,
-	}
+	skippedSubtreeIdx := make(map[chainhash.Hash]int)
 
 	batchSize := batch.batchEnd - batch.batchStart
 	for i := 0; i < batchSize; i++ {
@@ -2047,6 +2046,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 			if shouldSkipUnspendableCreate(lockUTXOs, u.settings, tx, block.Height) {
 				// Not written to the store; its inputs are still spent in Phase 2.
 				skippedTxHashes = append(skippedTxHashes, tx.TxIDChainHash())
+				skippedSubtreeIdx[*tx.TxIDChainHash()] = globalSubtreeIdx
 
 				continue
 			}
@@ -2064,7 +2064,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 						// Transaction already exists - collect it for mined info update
 						txHash := tx.TxIDChainHash()
 						existingTxsMu.Lock()
-						existingTxHashes = append(existingTxHashes, txHash)
+						existingBySubtree[sIdx] = append(existingBySubtree[sIdx], txHash)
 						existingTxsMu.Unlock()
 						return nil
 					}
@@ -2091,18 +2091,29 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	if len(storedSkipped) > 0 {
 		u.logger.Infof("[createAndSpendUTXOsForBatch][%s] marking %d skipped transactions mined that an earlier attempt had stored", block.Hash().String(), len(storedSkipped))
-		existingTxHashes = append(existingTxHashes, storedSkipped...)
+		for _, txHash := range storedSkipped {
+			sIdx := skippedSubtreeIdx[*txHash]
+			existingBySubtree[sIdx] = append(existingBySubtree[sIdx], txHash)
+		}
 	}
 
 	// Phase 1.5: Update mined info for transactions that already existed
 	// This handles the case where a previous attempt created UTXOs with a different
 	// block ID. Chunked via the shared helper (issue 936): on a fat-batch retry every tx
 	// in the batch already exists, and a single unchunked SetMinedMulti call would
-	// overrun the aerospike client connection pool.
-	if len(existingTxHashes) > 0 {
+	// overrun the aerospike client connection pool. One update per subtree, because the
+	// subtree index is part of the placement and a merkle proof is looked up by it.
+	for _, sIdx := range slices.Sorted(maps.Keys(existingBySubtree)) {
+		existingTxHashes := existingBySubtree[sIdx]
+		minedBlockInfo := utxo.MinedBlockInfo{
+			BlockID:     block.ID,
+			BlockHeight: block.Height,
+			SubtreeIdx:  sIdx,
+		}
+
 		if err := utxo.SetMinedMultiChunked(ctx, u.logger, u.utxoStore, existingTxHashes, minedBlockInfo,
 			u.settings.UtxoStore.MaxMinedBatchSize, u.settings.UtxoStore.MaxMinedRoutines); err != nil {
-			return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to update mined info for %d existing txs", block.Hash().String(), len(existingTxHashes), err)
+			return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to update mined info for %d existing txs in subtree %d", block.Hash().String(), len(existingTxHashes), sIdx, err)
 		}
 	}
 

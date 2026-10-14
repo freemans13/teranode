@@ -284,12 +284,14 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).
 			Return((*meta.Data)(nil), nil, errors.ErrTxExists).Maybe()
 
-		// Mock SetMinedMulti - should be called with both transaction hashes
-		suite.MockUTXOStore.On("SetMinedMulti", mock.Anything, mock.MatchedBy(func(hashes []*chainhash.Hash) bool {
-			return len(hashes) == 2
-		}), mock.MatchedBy(func(info utxo.MinedBlockInfo) bool {
-			return info.BlockID == 50 && info.BlockHeight == 100
-		})).Return(map[chainhash.Hash][]uint32{}, nil).Once()
+		// Mock SetMinedMulti - called once per subtree, each transaction with the subtree it sits in
+		for sIdx, tx := range regularTxs {
+			suite.MockUTXOStore.On("SetMinedMulti", mock.Anything, mock.MatchedBy(func(hashes []*chainhash.Hash) bool {
+				return len(hashes) == 1 && *hashes[0] == *tx.TxIDChainHash()
+			}), mock.MatchedBy(func(info utxo.MinedBlockInfo) bool {
+				return info.BlockID == 50 && info.BlockHeight == 100 && info.SubtreeIdx == sIdx
+			})).Return(map[chainhash.Hash][]uint32{}, nil).Once()
+		}
 
 		// Mock the spend phase
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).
@@ -298,8 +300,8 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 		err := suite.Server.blockValidation.createAndSpendUTXOsForBatch(suite.Ctx, block, batch)
 		require.NoError(t, err)
 
-		// Verify SetMinedMulti was called
-		suite.MockUTXOStore.AssertCalled(t, "SetMinedMulti", mock.Anything, mock.Anything, mock.Anything)
+		// Verify SetMinedMulti was called once for each subtree
+		suite.MockUTXOStore.AssertNumberOfCalls(t, "SetMinedMulti", 2)
 	})
 
 	t.Run("SetMinedMulti error is propagated", func(t *testing.T) {
@@ -1210,7 +1212,7 @@ func TestSkipUnspendableTxStorageDuringCatchup_EndToEnd(t *testing.T) {
 
 		block := &model.Block{Height: blockHeight, ID: 99}
 		batch := &SubtreeProcessingBatch{
-			batchTxs:   []*bt.Tx{opReturnTx, spendableTx},
+			batchTxs:   []*bt.Tx{spendableTx, opReturnTx},
 			txRanges:   [][2]int{{0, 1}, {1, 2}},
 			batchStart: 0,
 			batchEnd:   2,
@@ -1218,9 +1220,12 @@ func TestSkipUnspendableTxStorageDuringCatchup_EndToEnd(t *testing.T) {
 
 		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, batch))
 
-		txMeta, err := store.Get(ctx, opReturnTx.TxIDChainHash(), fields.BlockIDs)
+		// The skipped transaction sits in subtree 1, so its placement has to say 1, not the
+		// zero a shared block-wide update would give it, or its merkle proof cannot be found.
+		txMeta, err := store.Get(ctx, opReturnTx.TxIDChainHash(), fields.BlockIDs, fields.SubtreeIdxs)
 		require.NoError(t, err)
-		require.Contains(t, txMeta.BlockIDs, uint32(99), "the skipped transaction is recorded in the block that mined it")
+		require.Equal(t, []uint32{99}, txMeta.BlockIDs, "the skipped transaction is recorded in the block that mined it")
+		require.Equal(t, []int{1}, txMeta.SubtreeIdxs, "the skipped transaction keeps the subtree it sits in")
 	})
 
 	// Negative case: with QuickValidateSkipUtxoLock=false the skip is gated out;
