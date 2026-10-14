@@ -131,6 +131,21 @@ func TestSpendBatchWithRetry(t *testing.T) {
 		require.Error(t, u.spendBatchWithRetry(context.Background(), block, txs, false))
 	})
 
+	t.Run("a cancelled context surfaces as a context error and spends nothing", func(t *testing.T) {
+		spy := &spendRetrySpyStore{failuresLeft: map[chainhash.Hash]int{}, failErr: map[chainhash.Hash]error{}}
+		u, block, txs := newSpendRetryHarness(t, spy)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := u.spendBatchWithRetry(ctx, block, txs, false)
+		require.Error(t, err)
+		// A context error, not a processing one: the legacy park's commit classifier reads a
+		// processing error as a verdict on the block and drops it.
+		require.True(t, errors.IsContextError(err), "a cancel must surface as a context error, got: %v", err)
+		require.Equal(t, int64(0), spy.spendCalls.Load())
+	})
+
 	t.Run("no progress: permanently-retryable tx gives up with error", func(t *testing.T) {
 		spy := &spendRetrySpyStore{failuresLeft: map[chainhash.Hash]int{}, failErr: map[chainhash.Hash]error{}}
 		u, block, txs := newSpendRetryHarness(t, spy)
