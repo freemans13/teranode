@@ -588,6 +588,9 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 	// input is settled that way no later row may unsettle it.
 	replayed := make(map[int32]struct{})
 
+	// The repeats journaled in an earlier partition than their own height, moved below.
+	var moves repeatMoves
+
 	for rows.Next() {
 		var (
 			k            int32
@@ -595,9 +598,10 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 			satoshis     int64
 			script       []byte
 			hashOverride []byte
+			spentHeight  int32
 		)
 
-		if err := rows.Scan(&k, &spender, &satoshis, &script, &hashOverride); err != nil {
+		if err := rows.Scan(&k, &spender, &satoshis, &script, &hashOverride, &spentHeight); err != nil {
 			return errors.NewStorageError("[utxoset][Spend] spender scan", err)
 		}
 
@@ -621,6 +625,8 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 
 		if bytes.Equal(spender, p.spenders[k]) {
 			replayed[k] = struct{}{}
+
+			moves.add(p, k, spentHeight)
 
 			// The replay decorates from the journal rather than from the UTXO row, which
 			// makes this the SECOND place the store hands a caller's claim back
@@ -656,7 +662,53 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 		return errors.NewStorageError("[utxoset][Spend] spender rows", err)
 	}
 
+	rows.Close()
+
+	if err := moves.run(ctx, q); err != nil {
+		return err
+	}
+
 	return s.nameUnknownParents(ctx, q, p)
+}
+
+// repeatMoves collects the journal rows of repeated spends that sit in an earlier partition than
+// the repeat's own height, for moveRepeatedSpendsSQL.
+type repeatMoves struct {
+	ukeys    [][16]byte
+	txids    [][]byte
+	spenders [][]byte
+	heights  []int32
+	floors   []int32
+}
+
+// add records input k's row when it was journaled below the lowest height of the repeat's
+// partition. A row in the same partition, or above it after a rewind, stays where it is.
+func (m *repeatMoves) add(p *spendPlan, k int32, spentHeight int32) {
+	h := p.heights[k]
+	floor := h - h%SpendJournalPartitionBlocks
+
+	if spentHeight >= floor {
+		return
+	}
+
+	m.ukeys = append(m.ukeys, p.ukeys[k])
+	m.txids = append(m.txids, p.txids[k])
+	m.spenders = append(m.spenders, p.spenders[k])
+	m.heights = append(m.heights, h)
+	m.floors = append(m.floors, floor)
+}
+
+// run moves the collected rows in the spend's own transaction, so the move commits with it.
+func (m *repeatMoves) run(ctx context.Context, q pgx.Tx) error {
+	if len(m.ukeys) == 0 {
+		return nil
+	}
+
+	if _, err := q.Exec(ctx, moveRepeatedSpendsSQL, m.ukeys, m.txids, m.spenders, m.heights, m.floors); err != nil {
+		return errors.NewStorageError("[utxoset][Spend] move repeated spends", err)
+	}
+
+	return nil
 }
 
 // parentKnownSQL asks, for a set of outpoints, whether the store holds the parent transaction

@@ -508,14 +508,15 @@ SELECT txid, tx_inpoints
 // their spends. Their spends sit below $2, in the partition about to drop. The waiting set's
 // copy does not see them, because mining cleared their marker.
 //
-// The created_height test rests on one assumption, stated here because nothing enforces it: a
-// spend is journaled at the height of the call that spends, and the spender's identity row at
-// the height of the call that creates it, and the second is never above the first. SpendAndCreate
-// takes one height for both, which is the validator's path, and a create-only followed by a
-// spend-only spends at the same or a later tip. A spender whose spend was journaled below $2 and
-// whose identity was first written at or above $2 (a spend and its create split across a
-// partition boundary, the create retried a partition later) is not found here, and a reorg of
-// its block within retention could not give its coins back.
+// The created_height test rests on one assumption: a spend is never journaled in an earlier
+// partition than its spender's created_height. SpendAndCreate takes one height for both, which
+// is the validator's path, and a create-only followed by a spend-only spends at the same or a
+// later tip. The one path that splits them is a repeat: SpendAndCreateMulti commits its spends
+// before its creates, so a crash between the two can leave the spends journaled at one height
+// and the transaction accepted later, in a later partition. The spend path enforces the
+// assumption there: a repeat moves its journal rows up to its own height (moveRepeatedSpendsSQL).
+// Without that, such a spender is not found here, and a reorg of its block within retention
+// could not give its coins back.
 //
 // tx_mined is RANGE partitioned on mined_height, so only the partitions at or above $1 are read: the
 // containment rows of the last retention's worth of blocks, once per journal partition drop.
