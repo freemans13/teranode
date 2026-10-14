@@ -39,10 +39,14 @@ import (
 // so a transaction is either fully written or not at all, and a repeat writes exactly the ones
 // that are missing.
 //
-// The one input the netting does take from the store is the identity probe, read once before
-// any chunk: a transaction that reached the store unmined before its block already holds real
-// coins and has made its spends. It is not written again, and its outputs are treated as coins
-// from outside the list, so a child in the list deletes them for real.
+// A transaction of the list can hold coins this write never wrote: one that reached the store
+// unmined (the identity probe, read once before any chunk), or one whose record an earlier
+// write made with every output a coin (the build before version 2, or the per-transaction
+// path). Such a transaction is not written again. Its chunk deletes its own outputs the list
+// spends instead, so only the parent's chunk ever touches the parent's coins, a child never
+// does, and the result is the same whichever commits first or whether the child's record
+// already exists. A newly claimed transaction has no such coin, so its chunk deletes nothing
+// for it.
 //
 // A coinbase is never in the list. Its create path is the one that refuses the historic
 // duplicate coinbases, and that check is not repeated here.
@@ -190,9 +194,14 @@ type netBelowTx struct {
 	tx    *bt.Tx
 	txid  chainhash.Hash
 	ident bool
+	// mined is set when the transaction already has its mined record for this block. It is
+	// probed only for a transaction that could write nothing; see dropWriteNothing.
+	mined bool
 	// netted[vin] is true when input vin spends an output of an earlier transaction of the
-	// list that is not identity-held. nil when none does.
+	// list. nil when none does.
 	netted []bool
+	// listSpent are the transaction's own outputs a later transaction of the list spends.
+	listSpent []uint32
 	// writesNothing is set for a transaction the chunk writes no row for at all; see
 	// dropWriteNothing.
 	writesNothing bool
@@ -243,7 +252,7 @@ func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndC
 
 		for vin, in := range tx.Inputs {
 			p, ok := position[*in.PreviousTxIDChainHash()]
-			if !ok || ident[list.TxIDs[p]] {
+			if !ok {
 				continue
 			}
 
@@ -257,6 +266,7 @@ func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndC
 			}
 
 			it.netted[vin] = true
+			items[p].listSpent = append(items[p].listSpent, in.PreviousTxOutIndex)
 
 			parent := list.TxIDs[p]
 			spender[newNettedKey(parent[:], Pack(parent[:], in.PreviousTxOutIndex))] =
@@ -267,6 +277,10 @@ func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndC
 	}
 
 	if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+		return nil, err
+	}
+
+	if err := s.probeMinedWriteNothing(ctx, items, mi); err != nil {
 		return nil, err
 	}
 
@@ -337,6 +351,70 @@ func (s *Store) identityHeld(ctx context.Context, txids []chainhash.Hash) (map[c
 
 	return held, nil
 }
+
+// minedHeldSQL returns which of the given transactions already have their mined record for the
+// block.
+const minedHeldSQL = `
+SELECT t.txid FROM unnest($1::bytea[]) AS t(txid)
+ WHERE EXISTS (SELECT 1 FROM tx_mined m WHERE m.txid = t.txid AND m.mined_height = $2 AND m.block_id = $3)`
+
+// probeMinedWriteNothing sets mined on each transaction that could write nothing (every input
+// netted, no identity row) and already has its mined record for the block. An earlier write gave
+// it that record, possibly with its outputs as coins, so it must not be taken for one that writes
+// nothing. On a first attempt no transaction has a record and the probe finds none.
+func (s *Store) probeMinedWriteNothing(ctx context.Context, items []*netBelowTx, mi utxo.MinedBlockInfo) error {
+	var ids [][]byte
+
+	byID := make(map[chainhash.Hash]*netBelowTx)
+
+	for _, it := range items {
+		if it.ident || !it.allInputsNetted() {
+			continue
+		}
+
+		ids = append(ids, it.txid[:])
+		byID[it.txid] = it
+	}
+
+	if len(ids) == 0 {
+		return nil
+	}
+
+	rows, err := s.pool.Query(ctx, minedHeldSQL, ids, int32(mi.BlockHeight), int32(mi.BlockID)) //nolint:gosec // a height and a block id fit int32
+	if err != nil {
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] mined record probe", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var id []byte
+		if err := rows.Scan(&id); err != nil {
+			return errors.NewStorageError("[utxoset][SpendAndCreateMulti] mined record probe scan", err)
+		}
+
+		var h chainhash.Hash
+		copy(h[:], id)
+
+		if it, ok := byID[h]; ok {
+			it.mined = true
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] mined record probe rows", err)
+	}
+
+	return nil
+}
+
+// nettedOwnSpentSQL deletes coins a transaction of the list holds for outputs the list spends.
+// A coin that is not there was never written, or is already gone, and is no fault.
+const nettedOwnSpentSQL = `
+DELETE FROM utxo u USING unnest($1::smallint[], $2::uuid[], $3::bytea[]) AS k(leaf, ukey, txid)
+ WHERE u.leaf = k.leaf
+   AND u.ukey = k.ukey
+   AND u.txid = k.txid`
 
 // nettedMinedSQL is the claim: the mined record of each transaction, inserted unless it exists.
 // The returned txids are the transactions this attempt writes.
@@ -479,6 +557,10 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 		return err
 	}
 
+	if err = s.netBelowOwnSpent(ctx, dbTx, chunk, claimed); err != nil {
+		return err
+	}
+
 	if err = s.netBelowCoins(ctx, dbTx, plan.subset(newRows), claimed); err != nil {
 		return err
 	}
@@ -529,7 +611,8 @@ func (s *Store) netBelowFault(chunk []*netBelowTx) error {
 // dropWriteNothing takes out of the plan every transaction the chunk would write only a mined
 // record for, and marks it. Such a transaction W
 //
-//   - has no identity row, so it did not reach the store unmined;
+//   - has no identity row, so it did not reach the store unmined, and no mined record for the
+//     block, so no earlier write gave it coins (probeMinedWriteNothing);
 //   - spends only outputs of earlier transactions of the list, so it deletes no coin;
 //   - has no output left as a coin: each is spent in the list or is not spendable;
 //   - carries no body, which below the checkpoint means utxostore_skipTxBodyBelowCheckpoint.
@@ -543,11 +626,11 @@ func (s *Store) netBelowFault(chunk []*netBelowTx) error {
 // recovery reads on a repeat: that one is at position 0 of the block's first list, and position 0
 // has no earlier transaction of the list to spend.
 //
-// W's classification depends on the list, the setting, and the identity rows of W and its
-// parents in the list. After a crash part-way through a list, a parent whose chunk did not commit
-// still has its inputs as coins, so propagation could store it, and then W, unmined before the
-// repeat. W is then not W on the repeat: it takes a record, or the identity route, and deletes the
-// parent's coin for real, which is the right answer either way. Once a list has fully applied the
+// W's classification depends on the list, the setting, and W's own identity row and mined
+// record, never on its parents': a parent that holds coins deletes its own (netBelowOwnSpent).
+// After a crash part-way through a list, propagation could store W unmined before the repeat. W
+// is then not W on the repeat: it takes the identity route and its chunk deletes its own
+// list-spent coins, which is the right answer either way. Once a list has fully applied the
 // classification cannot change, because every transaction in it has spent its inputs and W's
 // inputs were never coins. That is the only case the fence judge sees: a block can be behind the
 // stamp fence only once it has fully applied, so the rows it counts are the same rows the first
@@ -564,7 +647,7 @@ func dropWriteNothing(chunk []*netBelowTx, plan *createPlan) *createPlan {
 		it := chunk[owner]
 
 		_, coin := withCoin[string(plan.txids[i])]
-		if it.ident || coin || plan.bodies[i] != nil || !it.allInputsNetted() {
+		if it.ident || it.mined || coin || plan.bodies[i] != nil || !it.allInputsNetted() {
 			keep = append(keep, i)
 			continue
 		}
@@ -684,6 +767,59 @@ func (s *Store) netBelowDeletes(ctx context.Context, dbTx pgx.Tx, chunk []*netBe
 
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] below the checkpoint, transaction %s spends %s:%d, which is not a spendable coin in the store; %d of %d spends of the chunk missing",
 			tx.TxIDChainHash().String(), in.PreviousTxIDChainHash().String(), in.PreviousTxOutIndex, len(plan.idx)-len(done), len(plan.idx))
+	}
+
+	return nil
+}
+
+// netBelowOwnSpent deletes, for each transaction of the chunk this attempt did not newly claim,
+// its own coins for outputs the list spends. Such a transaction reached the store by a path that
+// writes every output as a coin: unmined (the identity route) or through an earlier write of the
+// block. Only its chunk deletes them, never its child's, so the outcome does not depend on which
+// chunk commits first or on whether the child was written by an earlier attempt.
+func (s *Store) netBelowOwnSpent(ctx context.Context, dbTx pgx.Tx, chunk []*netBelowTx, claimed map[string]bool) error {
+	type key struct {
+		leaf int16
+		ukey [16]byte
+		txid []byte
+	}
+
+	var keys []key
+
+	for _, it := range chunk {
+		if it.writesNothing || len(it.listSpent) == 0 || (!it.ident && claimed[string(it.txid[:])]) {
+			continue
+		}
+
+		leaf := LeafFor(it.txid[:])
+
+		for _, vout := range it.listSpent {
+			keys = append(keys, key{leaf: leaf, ukey: Pack(it.txid[:], vout), txid: it.txid[:]})
+		}
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	sort.Slice(keys, func(a, b int) bool {
+		if keys[a].leaf != keys[b].leaf {
+			return keys[a].leaf < keys[b].leaf
+		}
+
+		return bytes.Compare(keys[a].ukey[:], keys[b].ukey[:]) < 0
+	})
+
+	leaves := make([]int16, len(keys))
+	ukeys := make([][16]byte, len(keys))
+	txids := make([][]byte, len(keys))
+
+	for i, k := range keys {
+		leaves[i], ukeys[i], txids[i] = k.leaf, k.ukey, k.txid
+	}
+
+	if _, err := dbTx.Exec(ctx, nettedOwnSpentSQL, leaves, ukeys, txids); err != nil {
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] delete list-spent coins of an existing transaction", err)
 	}
 
 	return nil
