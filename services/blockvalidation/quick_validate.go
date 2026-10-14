@@ -2191,16 +2191,16 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		}
 	}
 
-	// Track transactions that already exist so we can update their mined info, and spend
-	// their inputs again below.
-	var (
-		existingTxHashes []*chainhash.Hash
-		existingTxs      []*bt.Tx
-	)
+	// Track transactions that already exist so we can update their mined info. Their spends
+	// are already made: the store makes the spends of a transaction it reports as existing
+	// before reporting it (Store.SpendAndCreateMulti under WithBelowCheckpoint), and the
+	// one-at-a-time fallback's combined call spends before it creates and keeps the spends
+	// when the record is found. Spending them again here would cost a whole extra round of
+	// store calls on every replayed batch for no change.
+	var existingTxHashes []*chainhash.Hash
 
 	collectExisting := func(tx *bt.Tx) {
 		existingTxHashes = append(existingTxHashes, tx.TxIDChainHash())
-		existingTxs = append(existingTxs, tx)
 	}
 
 	start := time.Now()
@@ -2209,14 +2209,11 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	listDuration := time.Since(start)
 
 	// Spend the unspendable transactions' inputs once every create of the batch has committed,
-	// since they may spend an output the list created. A transaction the store reported as
-	// already existing is spent again too, as the separate spend phase always spent every
-	// transaction: an earlier attempt that stored it is not proof it made its spends, and a
-	// repeat spend by the same spender is the store's idempotent success path. Conflicts are NOT
-	// tolerated here: the quick path never writes conflicting subtree nodes and has no resolver
-	// for a loser, so a spend attributed to a non-canonical transaction would stay that way.
+	// since they may spend an output the list created. Conflicts are NOT tolerated here: the
+	// quick path never writes conflicting subtree nodes and has no resolver for a loser, so a
+	// spend attributed to a non-canonical transaction would stay that way.
 	if applyErr == nil {
-		applyErr = u.spendBatchWithRetry(ctx, block, append(unspendableTxs, existingTxs...), outpointOnly)
+		applyErr = u.spendBatchWithRetry(ctx, block, unspendableTxs, outpointOnly)
 	}
 
 	// Logged on the failure path too: how long the list ran for is the first thing anyone

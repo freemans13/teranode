@@ -511,6 +511,49 @@ func TestBatchList_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
 			require.NoError(t, err)
 			require.Contains(t, md.BlockIDs, uint32(43), "%s must carry the replayed block id", tx.TxIDChainHash().String())
 		}
+
+		// The store made the existing transactions' spends inside the list, so block validation
+		// spends nothing again: on a replayed batch that would be a whole extra round of calls.
+		require.Zero(t, recorder.spendOnlyCalls(), "block validation must not spend an existing transaction again")
+	})
+}
+
+// TestBatchList_ReplayAfterCrashMakesTheMissingSpends: a crash can leave a batch's records
+// written with none of their inputs spent, which is what main's create phase left behind when it
+// stopped before its spend phase. Replaying the batch must make every spend, and block
+// validation must not have to: the store spends an existing transaction's inputs itself.
+func TestBatchList_ReplayAfterCrashMakesTheMissingSpends(t *testing.T) {
+	listModes(t, "netted_replay_after_crash", func(t *testing.T, dbName string, outpointOnly bool) {
+		bv, recorder, cleanup := newListHarness(t, dbName, outpointOnly)
+		defer cleanup()
+
+		ctx := context.Background()
+
+		root, key := seedRoot(t, recorder.Store, 2, "NETTED_REPLAY_CRASH_KEY")
+
+		first := spendOf(t, key, root, 0, 90_000)
+		chained := spendOf(t, key, first, 0, 80_000)
+		other := spendOf(t, key, root, 1, 90_000)
+
+		txs := []*bt.Tx{first, chained, other}
+
+		// The crash: every record written, no input spent.
+		for _, tx := range txs {
+			_, _, err := recorder.Store.SpendAndCreate(ctx, tx, 100, utxo.WithCreateOnly(),
+				utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 100}))
+			require.NoError(t, err)
+		}
+
+		block := &model.Block{Height: 100, ID: 42}
+
+		recorder.reset()
+		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, listBatchFor(t, bv, block, txs, outpointOnly)))
+
+		requireSpentBy(t, recorder.Store, root, 0, first)
+		requireSpentBy(t, recorder.Store, first, 0, chained)
+		requireSpentBy(t, recorder.Store, root, 1, other)
+
+		require.Zero(t, recorder.spendOnlyCalls(), "the store makes the missing spends, not block validation")
 	})
 }
 
