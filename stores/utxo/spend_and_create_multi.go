@@ -222,8 +222,10 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 		return []SpendAndCreateMultiResult{}, nil
 	}
 
+	items := listItemOptions(list)
+
 	if list.Options.BelowCheckpoint {
-		return writeCreateThenSpend(ctx, s, widths, txs, list, blockHeight, opts)
+		return writeCreateThenSpend(ctx, s, widths, txs, list, blockHeight, items)
 	}
 
 	txids, parentsInList := list.TxIDs, list.ParentsInList
@@ -267,11 +269,7 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 			}
 
 			g.Go(func() error {
-				callOpts := make([]CreateOption, 0, len(opts)+2)
-				callOpts = append(callOpts, opts...)
-				callOpts = append(callOpts, withListItem(i), WithTXID(&txids[i]))
-
-				md, spends, err := s.SpendAndCreate(ctx, txs[i], blockHeight, callOpts...)
+				md, spends, err := s.SpendAndCreate(ctx, txs[i], blockHeight, items[i:i+1:i+1]...)
 
 				switch {
 				case err == nil:
@@ -342,7 +340,7 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 // A caller treats anything but MultiTxCreated and MultiTxExisted as a failed
 // list and repeats it whole, as quick validation does.
 func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, widths SpendAndCreateMultiWidths, txs []*bt.Tx,
-	list *SpendAndCreateMultiList, blockHeight uint32, opts []CreateOption) ([]SpendAndCreateMultiResult, error) {
+	list *SpendAndCreateMultiList, blockHeight uint32, items []CreateOption) ([]SpendAndCreateMultiResult, error) {
 	txids, parentsInList := list.TxIDs, list.ParentsInList
 	results := make([]SpendAndCreateMultiResult, len(txs))
 
@@ -351,12 +349,17 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 		bound = defaultSpendAndCreateMultiCallBound
 	}
 
-	itemOpts := func(i int, extra ...CreateOption) []CreateOption {
-		callOpts := make([]CreateOption, 0, len(opts)+2+len(extra))
-		callOpts = append(callOpts, opts...)
-		callOpts = append(callOpts, withListItem(i), WithTXID(&txids[i]))
+	// Each call's options are the transaction's own, followed by the wave's: two per
+	// transaction in the first wave and three in the second, cut from one array per wave so
+	// a call allocates nothing for its options.
+	firstWave := make([]CreateOption, 0, 2*len(txs))
 
-		return append(callOpts, extra...)
+	for i := range txs {
+		if len(parentsInList[i]) == 0 {
+			firstWave = append(firstWave, items[i], withRequireParentOutputs())
+		} else {
+			firstWave = append(firstWave, items[i], WithCreateOnly())
+		}
 	}
 
 	all := make([]int, len(txs))
@@ -371,10 +374,12 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 			err    error
 		)
 
+		callOpts := firstWave[2*i : 2*i+2 : 2*i+2]
+
 		if len(parentsInList[i]) == 0 {
-			md, spends, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, withRequireParentOutputs())...)
+			md, spends, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, callOpts...)
 		} else {
-			md, _, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, WithCreateOnly())...)
+			md, _, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, callOpts...)
 		}
 
 		switch {
@@ -433,10 +438,15 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 
 	spent := make([]bool, len(txs))
 
+	secondWave := make([]CreateOption, 0, 3*len(txs))
+	for i := range txs {
+		secondWave = append(secondWave, items[i], WithSpendOnly(), withRequireParentOutputs())
+	}
+
 	notStarted = runDetachedWave(ctx, bound, widths.Spend, toSpend, func(callCtx context.Context, i int) {
 		spent[i] = true
 
-		_, spends, err := s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, WithSpendOnly(), withRequireParentOutputs())...)
+		_, spends, err := s.SpendAndCreate(callCtx, txs[i], blockHeight, secondWave[3*i:3*i+3:3*i+3]...)
 		if err != nil {
 			results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Meta: results[i].Meta, Spends: spends, Err: err}
 
@@ -458,6 +468,55 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 	}
 
 	return results, nil
+}
+
+// listItemOptions returns, for each transaction of list, one CreateOption that sets every option
+// the transaction is written with: ItemOptions(i), with its txid from the list. It works them out
+// once per list. Applying the list's own options again on every call, and then ItemOptions on top,
+// allocated on every parse of a call's options: the list's mined-block info grows a fresh slice,
+// and ItemOptions copies the struct and that slice to set one subtree index. Here every
+// transaction's mined-block info is cut from one array for the whole list, with its capacity
+// capped at its length, so an option appended later copies rather than writing into a neighbour.
+func listItemOptions(list *SpendAndCreateMultiList) []CreateOption {
+	base := list.Options
+	n := len(list.TxIDs)
+	k := len(base.MinedBlockInfos)
+	perItem := base.SubtreeIdxs != nil && k > 0
+
+	var infos []MinedBlockInfo
+	if perItem {
+		infos = make([]MinedBlockInfo, n*k)
+	}
+
+	items := make([]CreateOptions, n)
+	fns := make([]CreateOption, n)
+
+	for i := range items {
+		item := *base
+		item.TxIDs = nil
+		item.SubtreeIdxs = nil
+		item.BelowCheckpoint = false
+		item.MinedBlockInfos = base.MinedBlockInfos[:k:k]
+
+		if perItem && i < len(base.SubtreeIdxs) {
+			own := infos[i*k : (i+1)*k : (i+1)*k]
+			copy(own, base.MinedBlockInfos)
+
+			for j := range own {
+				own[j].SubtreeIdx = base.SubtreeIdxs[i]
+			}
+
+			item.MinedBlockInfos = own
+		}
+
+		item.TxID = &list.TxIDs[i]
+		items[i] = item
+
+		p := &items[i]
+		fns[i] = func(o *CreateOptions) { *o = *p }
+	}
+
+	return fns
 }
 
 // runDetachedWave runs call for every member, at most width at once, and waits

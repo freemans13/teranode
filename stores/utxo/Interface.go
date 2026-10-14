@@ -338,14 +338,6 @@ func withRequireParentOutputs() CreateOption {
 	}
 }
 
-// withListItem applies ItemOptions(i) as an option, for a list written one SpendAndCreate at a
-// time.
-func withListItem(i int) CreateOption {
-	return func(o *CreateOptions) {
-		*o = *o.ItemOptions(i)
-	}
-}
-
 // The boolean CreateOptions below return one of two package-level closures
 // rather than closing over their argument. A closure that captures anything is
 // heap-allocated the moment it escapes, and these escape on every call: they go
