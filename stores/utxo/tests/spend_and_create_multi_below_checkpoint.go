@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
@@ -344,6 +346,130 @@ func SpendAndCreateMultiBelowCheckpointCancelMidCall(t *testing.T, db utxostore.
 	requireSpentBy(t, db, w.Roots[0], 0, inFlight, 0)
 	requireNotStored(t, db, queued)
 	requireUnspent(t, db, w.Roots[1], 0)
+}
+
+// SpendAndCreateMultiBelowCheckpointRollbackOutlivesDeadline: a combined call
+// whose context ends during its create. When the create then definitely fails,
+// the spends already made are rolled back all the same: the rollback runs on a
+// context of its own, so the parent output ends unspent and the child has no
+// record, and no parent names a spender that does not exist. This holds for the
+// call's own bound in a list and for a caller's cancel of a direct
+// SequentialSpendAndCreate. When the create fails with the context's error its
+// outcome is unknown, since a batched create can still commit; the spends stay
+// in place and a repeat of the list finishes the transaction.
+//
+// db must implement utxostore.SequentialStore, as the SQL and Aerospike stores
+// do: the test runs utxostore.SequentialSpendAndCreate over db with a create
+// that does not return until its context is done.
+func SpendAndCreateMultiBelowCheckpointRollbackOutlivesDeadline(t *testing.T, db utxostore.Store) {
+	const height = 860
+
+	seq, ok := db.(utxostore.SequentialStore)
+	require.True(t, ok, "the store must implement utxostore.SequentialStore")
+
+	w := BuildMultiWorkload(t, 0xa7, 0, 3)
+	w.StoreRoots(t, db, height-1)
+
+	rejected := func(error) error { return errors.NewStorageError("create rejected") }
+	unknown := func(ctxErr error) error { return errors.NewContextCanceledError("create did not finish", ctxErr) }
+
+	bounded := utxostore.UniformSpendAndCreateMultiWidths(1)
+	bounded.CallBound = 200 * time.Millisecond
+
+	t.Run("call bound expires during a create that then fails", func(t *testing.T) {
+		child := multiSpend(t, 1, []*bt.Tx{w.Roots[0]}, []uint32{0}, 1)
+		store := &createUntilDone{SequentialStore: seq, fail: rejected}
+
+		results, err := utxostore.DefaultSpendAndCreateMulti(context.Background(), store, bounded,
+			[]*bt.Tx{child}, height, utxostore.WithBelowCheckpoint(), utxostore.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		require.Equal(t, utxostore.MultiTxFailed, results[0].Status)
+		require.True(t, store.created.Load(), "the create must have been reached, after the spend")
+
+		// End state first: these are what a rollback cut short breaks.
+		requireUnspent(t, db, w.Roots[0], 0)
+		requireNotStored(t, db, child)
+
+		require.NotContains(t, results[0].Err.Error(), "reversing", "the rollback must not fail")
+		require.Empty(t, results[0].Spends, "a completed rollback leaves no spends in effect")
+	})
+
+	t.Run("caller cancels during a create that then fails", func(t *testing.T) {
+		child := multiSpend(t, 2, []*bt.Tx{w.Roots[1]}, []uint32{0}, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		store := &createUntilDone{SequentialStore: seq, fail: rejected, onCreate: cancel}
+
+		_, spends, err := store.SpendAndCreate(ctx, child, height, utxostore.WithIgnoreLocked(true))
+		require.True(t, store.created.Load(), "the create must have been reached, after the spend")
+
+		// End state first: these are what a rollback cut short breaks.
+		requireUnspent(t, db, w.Roots[1], 0)
+		requireNotStored(t, db, child)
+
+		require.ErrorIs(t, err, errors.ErrStorageError)
+		require.NotContains(t, err.Error(), "reversing", "the rollback must not fail")
+		require.Nil(t, spends, "a completed rollback leaves no spends in effect")
+	})
+
+	t.Run("call bound expires with the create's outcome unknown", func(t *testing.T) {
+		child := multiSpend(t, 3, []*bt.Tx{w.Roots[2]}, []uint32{0}, 1)
+		store := &createUntilDone{SequentialStore: seq, fail: unknown}
+
+		results, err := utxostore.DefaultSpendAndCreateMulti(context.Background(), store, bounded,
+			[]*bt.Tx{child}, height, utxostore.WithBelowCheckpoint(), utxostore.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		require.Equal(t, utxostore.MultiTxFailed, results[0].Status)
+		require.True(t, errors.IsContextError(results[0].Err), "%v", results[0].Err)
+		require.Len(t, results[0].Spends, 1, "the spends of a create that may commit stay in effect")
+
+		// The create may still commit, so the spend stays; here it never does.
+		requireSpentBy(t, db, w.Roots[2], 0, child, 0)
+		requireNotStored(t, db, child)
+
+		// A repeat of the list finishes the transaction.
+		results, err = db.SpendAndCreateMulti(context.Background(), []*bt.Tx{child}, height,
+			utxostore.WithBelowCheckpoint(), utxostore.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		require.Equal(t, utxostore.MultiTxCreated, results[0].Status, "%v", results[0].Err)
+
+		requireSpentBy(t, db, w.Roots[2], 0, child, 0)
+
+		_, err = db.Get(context.Background(), child.TxIDChainHash(), fields.Fee)
+		require.NoError(t, err)
+	})
+}
+
+// createUntilDone runs utxostore.SequentialSpendAndCreate over a real store
+// whose create does not return until its context is done, and then fails with
+// fail(ctx.Err()): a definite rejection, or the context's own error, as a create
+// still waiting on its store's batch would return. onCreate, when set, runs as
+// the create starts.
+type createUntilDone struct {
+	utxostore.SequentialStore
+	fail     func(ctxErr error) error
+	onCreate func()
+	created  atomic.Bool
+}
+
+func (c *createUntilDone) Create(ctx context.Context, _ *bt.Tx, _ uint32, _ ...utxostore.CreateOption) (*meta.Data, error) {
+	c.created.Store(true)
+
+	if c.onCreate != nil {
+		c.onCreate()
+	}
+
+	<-ctx.Done()
+
+	return nil, c.fail(ctx.Err())
+}
+
+func (c *createUntilDone) SpendAndCreate(ctx context.Context, tx *bt.Tx, h uint32, opts ...utxostore.CreateOption) (*meta.Data, []*utxostore.Spend, error) {
+	return utxostore.SequentialSpendAndCreate(ctx, ulogger.TestLogger{}, c, tx, h, opts...)
 }
 
 // cancelInsideCall cancels the caller's context from inside the call for hold,

@@ -116,7 +116,9 @@ func UniformSpendAndCreateMultiWidths(n int) SpendAndCreateMultiWidths {
 // WithBelowCheckpoint list are as wide as quick validation's create and spend
 // phases were before it wrote a list: eight store batches of creates, and two
 // rounds of every spend batcher. A call's bound is the spend's own budget plus
-// the rollback's, the longest a combined SpendAndCreate can take.
+// the rollback budget. It does not bound the rollback of a failed create, which
+// SequentialSpendAndCreate runs on a context of its own; a call that reaches the
+// bound mid-create keeps its spends, since its create may yet commit.
 func SpendAndCreateMultiWidthsFor(tSettings *settings.Settings) SpendAndCreateMultiWidths {
 	if tSettings == nil {
 		return UniformSpendAndCreateMultiWidths(1)
@@ -289,10 +291,11 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 // its spends emptied can be pruned.
 //
 // A call, once started, runs to its end. A combined SpendAndCreate is not
-// atomic on a store that spends and then creates (SequentialSpendAndCreate),
-// and a cancel between the two leaves inputs spent with no record, with the
-// rollback running under the same cancelled context. So each call runs under
-// context.WithoutCancel(ctx), bounded by widths.CallBound, and a call that has
+// atomic on a store that spends and then creates (SequentialSpendAndCreate): a
+// context that ends between the two leaves the create's outcome unknown, so the
+// spends stay and the transaction is MultiTxFailed until a repeat of the list
+// finishes it. So each call runs under context.WithoutCancel(ctx), bounded by
+// widths.CallBound, and a call that has
 // not started when ctx is cancelled never starts: it is MultiTxNotAttempted and
 // the error is returned.
 //

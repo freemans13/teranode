@@ -29,6 +29,7 @@ func spendAndCreateMultiSuite(t *testing.T, newStore func(t *testing.T) utxostor
 	t.Run("below checkpoint existing respent", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointExistingRespent(t, newStore(t)) })
 	t.Run("below checkpoint missing parent", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointMissingParent(t, newStore(t)) })
 	t.Run("below checkpoint cancel mid-call", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointCancelMidCall(t, newStore(t)) })
+	t.Run("below checkpoint rollback outlives deadline", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointRollbackOutlivesDeadline(t, newStore(t)) })
 }
 
 func TestSpendAndCreateMultiSQLite(t *testing.T) {
