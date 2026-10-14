@@ -126,8 +126,9 @@ func TestIsTransientLocalError(t *testing.T) {
 		// fault in this node's stack. Including it here would let a 429 from a
 		// peer's asset service change netsync's peer-retention decisions.
 		{name: "service rate limited - remote, not local", err: NewServiceRateLimitedError("429 from peer"), expected: false},
-		// Its producers reported this state as ErrServiceError, which is local.
-		{name: "service not ready - local", err: NewServiceNotReadyError("still loading"), expected: true},
+		// Only block assembly produces it, and no caller of this predicate receives a
+		// block-assembly error; IsRetryableError and IsTemporaryError omit it too.
+		{name: "service not ready - not transient-local", err: NewServiceNotReadyError("still loading"), expected: false},
 		{name: "wrapped service rate limited - remote, not local", err: NewProcessingError("outer", NewServiceRateLimitedError("429 from peer")), expected: false},
 	}
 

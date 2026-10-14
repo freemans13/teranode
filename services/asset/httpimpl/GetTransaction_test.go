@@ -1,13 +1,21 @@
 package httpimpl
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/asset/repository"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -275,6 +283,19 @@ func TestGetTransaction_MarksItsOwnNotFound(t *testing.T) {
 		"a store fault whose text says not found": {
 			errors.NewServiceError("aerospike get failed: Namespace not found"), http.StatusNotFound, false,
 		},
+		// The repository counts a tx store's blob not-found as a miss, as it does
+		// ErrNotFound, so it is the same verdict.
+		"the tx store has no blob": {errors.NewBlobNotFoundError("blob not found"), http.StatusNotFound, true},
+		// The class decides the 404, not the wording.
+		"a blob miss whose text does not say so": {errors.NewBlobNotFoundError("no tx blob for this hash"), http.StatusNotFound, true},
+		// A store that calls its not-found a storage failure has failed while it
+		// looked; that is a fault, not an answer about the transaction.
+		"a storage error over a not-found": {
+			errors.NewStorageError("tx store read failed", errors.NewNotFoundError("not found")), http.StatusNotFound, false,
+		},
+		// The repository hands this class back raw even when the UTXO store failed,
+		// so marking it would deny a transaction the node may hold.
+		"a tx not-found the repository does not vet": {errors.NewTxNotFoundError("tx not found"), http.StatusNotFound, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
@@ -297,4 +318,51 @@ func TestGetTransaction_MarksItsOwnNotFound(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGetTransaction_MarksAMissBehindAnHTTPTxStore drives the handler over a real
+// repository: a UTXO store that does not hold the transaction and an http:// tx store
+// that answers 404. That is a miss in both, so the 404 is marked. The tx store's error
+// reaches isTransactionMiss as the repository returns it, so an HTTP store that wrapped
+// its 404 in a storage error left the miss unmarked and getrawtransaction answered it
+// as a node fault.
+func TestGetTransaction_MarksAMissBehindAnHTTPTxStore(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+
+	blobServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer blobServer.Close()
+
+	txStoreURL, err := url.Parse(blobServer.URL)
+	require.NoError(t, err)
+
+	txStore, err := blob.NewStore(logger, txStoreURL)
+	require.NoError(t, err)
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///get_transaction_http_tx_store")
+	require.NoError(t, err)
+
+	utxoStore, err := utxosql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	repo, err := repository.NewRepository(logger, tSettings, utxoStore, txStore, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+
+	httpServer, _, echoContext, responseRecorder := GetMockHTTP(t, nil)
+	httpServer.repository = repo
+
+	echoContext.SetPath("/tx/:hash/hex")
+	echoContext.SetParamNames("hash")
+	echoContext.SetParamValues("9d45ad79ad3c6baecae872c0e35022d60c3bbbd024ccce06690321ece15ea995")
+
+	err = httpServer.GetTransaction(HEX)(echoContext)
+	echoErr := &echo.HTTPError{}
+	require.True(t, errors.As(err, &echoErr))
+	require.Equal(t, http.StatusNotFound, echoErr.Code)
+	require.Equal(t, util.AssetNotFoundTx, responseRecorder.Header().Get(util.AssetNotFoundHeader))
 }

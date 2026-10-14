@@ -676,6 +676,11 @@ type ValidateSubtree struct {
 	// When true, validation stops at the first error for quick failure detection.
 	// When false, validation attempts to process all transactions to collect comprehensive error information.
 	AllowFailFast bool
+
+	// FromBlock marks a subtree validated for a block (CheckBlockSubtrees,
+	// CheckSubtreeFromBlock). Its cache probe uses the block probe pool, so a burst
+	// of peer-announced subtrees cannot delay it.
+	FromBlock bool
 }
 
 type metaSliceItem struct {
@@ -829,7 +834,12 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		// unlike many other lists, this needs to be a pointer list, because a lot of values could be empty = nil
 
 		// 1. First attempt to load the txMeta from the cache...
-		missed, err := u.processTxMetaUsingCache(ctx, txHashes, txMetaSlice, failFast)
+		probePool := &u.peerProbePool
+		if v.FromBlock {
+			probePool = &u.blockProbePool
+		}
+
+		missed, err := u.probeTxMetaCache(ctx, probePool, txHashes, txMetaSlice, failFast)
 		if err != nil {
 			if errors.Is(err, errors.ErrThresholdExceeded) {
 				u.logger.Warnf("[ValidateSubtreeInternal][%s] [attempt #%d] too many missing txmeta entries in cache (fail fast check only, will retry)", v.SubtreeHash.String(), attempt)

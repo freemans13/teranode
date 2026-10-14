@@ -159,13 +159,13 @@ func (h *HTTP) getTransaction(c echo.Context, mode ReadMode) error {
 
 	b, err := h.repository.GetTransaction(ctx, hash)
 	if err != nil {
-		if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, errors.ErrNotFound) || errors.Is(err, errors.ErrBlobNotFound) || strings.Contains(err.Error(), "not found") {
 			// Marks this 404 as the handler's verdict on the transaction, as opposed
-			// to a route that failed to match; see util.AssetNotFoundHeader. Only the
-			// class marks it: a store fault can say "not found" without being a miss,
+			// to a route that failed to match; see util.AssetNotFoundHeader. Only a
+			// miss marks it: a store fault can say "not found" without being one,
 			// and the text alone keeps its 404 for callers that read the status, but
 			// unmarked, so getrawtransaction does not deny a transaction it may hold.
-			if errors.Is(err, errors.ErrNotFound) {
+			if isTransactionMiss(err) {
 				c.Response().Header().Set(util.AssetNotFoundHeader, util.AssetNotFoundTx)
 			}
 
@@ -213,4 +213,21 @@ func (h *HTTP) getTransaction(c echo.Context, mode ReadMode) error {
 	default:
 		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("bad read mode").Error())
 	}
+}
+
+// isTransactionMiss reports whether a repository GetTransaction error says the
+// node does not hold the transaction.
+//
+// It is the tx-store miss set in repository.GetTransaction, {ErrNotFound,
+// ErrBlobNotFound}, minus anything with a storage error in the chain. Only that set
+// is converted to a fault when the UTXO store failed, so a class the repository
+// returns raw, such as ErrTxNotFound, may sit on top of a UTXO fault and cannot be
+// marked. A storage error is the store failing while it looked, not a miss,
+// whatever it wraps.
+func isTransactionMiss(err error) bool {
+	if errors.Is(err, errors.ErrStorageError) {
+		return false
+	}
+
+	return errors.Is(err, errors.ErrNotFound) || errors.Is(err, errors.ErrBlobNotFound)
 }

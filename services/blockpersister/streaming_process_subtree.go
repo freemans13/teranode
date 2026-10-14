@@ -35,7 +35,8 @@ import (
 //  3. Create a SubtreeDataWriter backed by FileStorer
 //  4. Launch parallel batch fetchers that retrieve tx data via BatchDecorate
 //  5. Each fetcher serializes transactions and sends to SubtreeDataWriter
-//  6. SubtreeDataWriter ensures transactions are written in correct order
+//  6. SubtreeDataWriter ensures transactions are written in correct order. A batch that finishes
+//     the errgroup limit or more ahead of the next one to write waits until the window reaches it
 //  7. Close writer to flush buffers and finalize file
 //
 // Parameters:
@@ -82,8 +83,16 @@ func (u *Server) CreateSubtreeDataFileStreaming(ctx context.Context, subtreeHash
 		return errors.NewStorageError("[BlockPersister] error creating file storer for %s", subtreeHash.String(), err)
 	}
 
-	// Create SubtreeDataWriter for ordered writes
-	writer := NewSubtreeDataWriter(storer)
+	// 4. Launch parallel batch fetchers with errgroup
+	batchSize := u.settings.Block.ProcessTxMetaUsingStoreBatchSize
+	concurrency := subtreeDataFetchConcurrency()
+
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(u.logger, g, concurrency)
+
+	// Create SubtreeDataWriter for ordered writes. Its window is the errgroup limit, and gCtx,
+	// which the errgroup cancels when a batch fails, wakes the batches waiting on that window.
+	writer := NewSubtreeDataWriter(gCtx, storer, concurrency)
 
 	// Track whether write succeeded to determine whether to close or abort
 	var writeSucceeded bool
@@ -95,13 +104,6 @@ func (u *Server) CreateSubtreeDataFileStreaming(ctx context.Context, subtreeHash
 		// Error path - abort to prevent incomplete file from being finalized
 		writer.Abort(errors.NewProcessingError("[CreateSubtreeDataFileStreaming] write failed for subtree %s", subtreeHash.String()))
 	}()
-
-	// 4. Launch parallel batch fetchers with errgroup
-	batchSize := u.settings.Block.ProcessTxMetaUsingStoreBatchSize
-	concurrency := subtreepkg.Max(4, runtime.NumCPU()/2)
-
-	g, gCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(u.logger, g, concurrency)
 
 	subtreeLen := subtree.Length()
 
@@ -242,6 +244,12 @@ func (u *Server) CreateSubtreeDataFileStreaming(ctx context.Context, subtreeHash
 	}
 
 	return nil
+}
+
+// subtreeDataFetchConcurrency is how many batches CreateSubtreeDataFileStreaming fetches at
+// once. It is also the window of the SubtreeDataWriter it writes them through.
+func subtreeDataFetchConcurrency() int {
+	return subtreepkg.Max(4, runtime.NumCPU()/2)
 }
 
 // keepExistingSubtreeData judges a subtreeData file this service did not write: a file found
