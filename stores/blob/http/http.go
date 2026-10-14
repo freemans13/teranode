@@ -199,10 +199,17 @@ func (s *HTTPStore) Exists(ctx context.Context, key []byte, fileType fileformat.
 //
 // Returns:
 //   - []byte: The blob data
-//   - error: Any error that occurred during the operation
+//   - error: ErrNotFound if the server has no such blob, a storage error for any other failure
 func (s *HTTPStore) Get(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) ([]byte, error) {
 	rc, err := s.GetIoReader(ctx, key, fileType, opts...)
 	if err != nil {
+		// A miss is returned as it is, as GetIoReader and the other blob stores return
+		// it. Wrapped in a storage error it reads as the store failing to look, and
+		// callers that tell the two apart by ErrStorageError treat it as a fault.
+		if errors.Is(err, errors.ErrNotFound) {
+			return nil, errors.ErrNotFound
+		}
+
 		return nil, errors.NewStorageError("[HTTPStore] Get failed", err)
 	}
 	defer rc.Close()

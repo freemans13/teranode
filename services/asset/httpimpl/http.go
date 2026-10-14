@@ -182,7 +182,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 		e.IPExtractor = echo.ExtractIPFromXFFHeader()
 	}
 
-	e.HTTPErrorHandler = customHTTPErrorHandler(logger)
+	e.HTTPErrorHandler = customHTTPErrorHandler(logger, tSettings)
 
 	e.Use(middleware.Recover())
 
@@ -379,12 +379,20 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	e.GET("/health", func(c echo.Context) error {
 		logger.Debugf("[Asset_http] Health check")
 
-		_, details, err := repo.Health(c.Request().Context(), false)
+		readiness, details, err := repo.Health(c.Request().Context(), false)
 		if err != nil {
-			return c.String(http.StatusInternalServerError, details)
+			// The check itself failed, which is not dependency degradation, so
+			// this keeps its 500 regardless of the strict-status switch.
+			logger.Errorf("[Asset_http] Health check failed: %v", err)
+
+			_, body := healthResponse(tSettings, http.StatusInternalServerError, details)
+
+			return c.String(http.StatusInternalServerError, body)
 		}
 
-		return c.String(http.StatusOK, details)
+		status, body := healthResponse(tSettings, readiness, details)
+
+		return c.String(status, body)
 	})
 
 	apiRestGroup := e.Group("/rest")
@@ -764,6 +772,33 @@ func (h *HTTP) AddHTTPHandler(pattern string, handler http.Handler) error {
 	return nil
 }
 
+// ClientIP returns r's client IP using the same extraction echo.Context.RealIP uses:
+// h.e.IPExtractor when set (honouring asset_trustedProxyCIDRs), falling back to
+// X-Forwarded-For, then X-Real-IP, then RemoteAddr. Handlers mounted via
+// AddHTTPHandler receive a raw http.Handler with no echo.Context, so they call this
+// instead of c.RealIP() to derive the same client IP.
+func (h *HTTP) ClientIP(r *http.Request) string {
+	if h.e != nil && h.e.IPExtractor != nil {
+		return h.e.IPExtractor(r)
+	}
+
+	if ip := r.Header.Get(echo.HeaderXForwardedFor); ip != "" {
+		if i := strings.IndexAny(ip, ","); i > 0 {
+			return strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(ip[:i]), "["), "]")
+		}
+
+		return ip
+	}
+
+	if ip := r.Header.Get(echo.HeaderXRealIP); ip != "" {
+		return strings.TrimSuffix(strings.TrimPrefix(ip, "["), "]")
+	}
+
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+
+	return host
+}
+
 // signatureScopeResourceIdentifier is the value of the X-Signature-Scope
 // header. It states exactly what X-Signature covers so no client mistakes it
 // for response-body integrity.
@@ -969,7 +1004,7 @@ func postAuthMiddleware(apiPrefix string, check echo.MiddlewareFunc) echo.Middle
 }
 
 // customHTTPErrorHandler creates a custom error handler that logs all errors before returning them to the client
-func customHTTPErrorHandler(logger ulogger.Logger) echo.HTTPErrorHandler {
+func customHTTPErrorHandler(logger ulogger.Logger, tSettings *settings.Settings) echo.HTTPErrorHandler {
 	return func(err error, c echo.Context) {
 		var (
 			message = ""
@@ -987,19 +1022,33 @@ func customHTTPErrorHandler(logger ulogger.Logger) echo.HTTPErrorHandler {
 			}
 		}
 
+		// Handlers build this message from err.Error(), which splices in the
+		// whole wrapped backend chain. Project it onto what a caller may see;
+		// the full error still reaches the log line below, keyed by the same
+		// correlation id the caller is handed.
+		correlationID := ""
+		if !tSettings.Asset.PublicErrorDetail {
+			message, correlationID = publicErrorMessage(code, message)
+		}
+
 		// Log the error with the route pattern (c.Path()) rather than the
 		// raw RequestURI. Error paths are precisely where query-string values
 		// (tokens, search terms, etc.) should not leak into logs.
-		logger.Errorf("[Asset HTTP] Error handling request [%s %s]: status=%d, error=%v", c.Request().Method, c.Path(), code, err)
+		logger.Errorf("[Asset HTTP] Error handling request [%s %s]: status=%d, correlation_id=%s, error=%v", c.Request().Method, c.Path(), code, correlationID, err)
 
 		// Send JSON response if not already sent
 		if !c.Response().Committed {
 			if c.Request().Method == http.MethodHead {
 				err = c.NoContent(code)
 			} else {
-				err = c.JSON(code, map[string]interface{}{
+				body := map[string]interface{}{
 					"message": message,
-				})
+				}
+				if correlationID != "" {
+					body["correlation_id"] = correlationID
+				}
+
+				err = c.JSON(code, body)
 			}
 			if err != nil {
 				logger.Errorf("[Asset HTTP] Failed to send error response: %v", err)
@@ -1147,4 +1196,37 @@ func securityHeadersMiddleware() echo.MiddlewareFunc {
 			return next(c)
 		}
 	}
+}
+
+// healthStatusOK and healthStatusUnavailable are the bodies /health returns
+// when the dependency inventory is withheld.
+const (
+	healthStatusOK          = "OK"
+	healthStatusUnavailable = "UNAVAILABLE"
+)
+
+// healthResponse projects the repository readiness result onto what the public
+// /health route returns.
+//
+// The detail switch controls the body: the full inventory names every backing
+// store and, when one is degraded, quotes its raw error, which hands an
+// anonymous caller a map of the deployment exactly when it is weakest. The
+// strict switch controls the status code: /health has always answered 200 and
+// existing monitoring reads only that, so propagating the computed 503 is
+// opt-in.
+func healthResponse(tSettings *settings.Settings, readiness int, details string) (int, string) {
+	status := http.StatusOK
+	if tSettings.Asset.HealthStrictStatus {
+		status = readiness
+	}
+
+	if tSettings.Asset.PublicHealthDetail {
+		return status, details
+	}
+
+	if readiness == http.StatusOK {
+		return status, healthStatusOK
+	}
+
+	return status, healthStatusUnavailable
 }

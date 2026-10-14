@@ -235,41 +235,53 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PeerMinerReputationThreshold: getFloat64("asset_peerMinerReputationThreshold", 50.0, alternativeContext...),
 
 			// Concurrency limits for repository methods (0 = unlimited, -1 = NumCPU(), anything else is the specific limit)
-			ConcurrencyGetTransaction:         getInt("asset_concurrency_get_transaction", 0, alternativeContext...),
-			ConcurrencyGetTransactionMeta:     getInt("asset_concurrency_get_transaction_meta", 0, alternativeContext...),
-			ConcurrencyGetSubtreeData:         getInt("asset_concurrency_get_subtree_data", 2, alternativeContext...),
-			ConcurrencyGetSubtreeDataReader:   getInt("asset_concurrency_get_subtree_data_reader", 4, alternativeContext...),
-			ConcurrencySubtreeDataCreate:      getInt("asset_concurrency_subtree_data_create", 4, alternativeContext...),
-			ConcurrencyGetSubtreeTransactions: getInt("asset_concurrency_get_subtree_transactions", 2, alternativeContext...),
-			ConcurrencyGetSubtreeExists:       getInt("asset_concurrency_get_subtree_exists", 0, alternativeContext...),
-			ConcurrencyGetSubtreeHead:         getInt("asset_concurrency_get_subtree_head", 0, alternativeContext...),
-			ConcurrencyGetUtxo:                getInt("asset_concurrency_get_utxo", 0, alternativeContext...),
-			ConcurrencyGetLegacyBlockReader:   getInt("asset_concurrency_get_legacy_block_reader", -1, alternativeContext...), // -1 = NumCPU()
+			ConcurrencyGetTransaction:           getInt("asset_concurrency_get_transaction", 0, alternativeContext...),
+			ConcurrencyGetTransactionMeta:       getInt("asset_concurrency_get_transaction_meta", 0, alternativeContext...),
+			ConcurrencyGetSubtreeData:           getInt("asset_concurrency_get_subtree_data", 2, alternativeContext...),
+			ConcurrencyGetSubtreeDataReader:     getInt("asset_concurrency_get_subtree_data_reader", 4, alternativeContext...),
+			ConcurrencySubtreeDataCreate:        getInt("asset_concurrency_subtree_data_create", 4, alternativeContext...),
+			ConcurrencyGetSubtreeTransactions:   getInt("asset_concurrency_get_subtree_transactions", 2, alternativeContext...),
+			ConcurrencyGetSubtreeExists:         getInt("asset_concurrency_get_subtree_exists", 0, alternativeContext...),
+			ConcurrencyGetSubtreeHead:           getInt("asset_concurrency_get_subtree_head", 0, alternativeContext...),
+			ConcurrencyGetUtxo:                  getInt("asset_concurrency_get_utxo", 0, alternativeContext...),
+			ConcurrencyGetLegacyBlockReader:     getInt("asset_concurrency_get_legacy_block_reader", 0, alternativeContext...),      // 0 = unlimited (opt-in cap)
+			ConcurrencyGetLegacyBlockReaderPeer: getInt("asset_concurrency_get_legacy_block_reader_peer", 0, alternativeContext...), // 0 = unlimited (opt-in cap)
 
 			// Streaming configuration
+			LegacyPeerPoolToken:             getString("asset_legacyPeerPoolToken", "", alternativeContext...),
 			SubtreeDataStreamingChunkSize:   getInt("asset_subtreeDataStreamingChunkSize", 10000, alternativeContext...),
 			SubtreeDataStreamingConcurrency: getInt("asset_subtreeDataStreamingConcurrency", 2, alternativeContext...),
 
-			// Batch and response admission budgets (warn-only prep; enforcement lands in a later release)
-			MaxBatchRecords:          getInt("asset_maxBatchRecords", 0, alternativeContext...),
-			MaxBatchResponseBytes:    getInt64("asset_maxBatchResponseBytes", 0, alternativeContext...),
-			MaxUTXOsPerTx:            getInt("asset_maxUTXOsPerTx", 0, alternativeContext...),
-			MaxBlockHeaders:          getInt("asset_maxBlockHeaders", 0, alternativeContext...),
-			MaxLastNBlocks:           getInt("asset_maxLastNBlocks", 0, alternativeContext...),
-			MaxNBlocks:               getInt("asset_maxNBlocks", 0, alternativeContext...),
-			RequireAuthCredentials:   getBool("asset_requireAuthCredentials", true, alternativeContext...),
-			SecureCookies:            getBool("asset_secureCookies", false, alternativeContext...),
-			CORSAllowOrigins:         getString("asset_corsAllowOrigins", "", alternativeContext...),
-			EnforcePostAuth:          getBool("asset_enforcePostAuth", false, alternativeContext...),
-			MaxWebsocketConnections:  getInt("asset_maxWebsocketConnections", 0, alternativeContext...),
-			WebsocketReadLimit:       getInt64("asset_websocketReadLimit", 0, alternativeContext...),
-			SubtreeStreamConcurrency: getInt("asset_subtreeStreamConcurrency", 0, alternativeContext...),
-			PublicErrorDetail:        getBool("asset_publicErrorDetail", true, alternativeContext...),
-			PublicHealthDetail:       getBool("asset_publicHealthDetail", true, alternativeContext...),
-			HealthStrictStatus:       getBool("asset_healthStrictStatus", false, alternativeContext...),
-			PublicPeersDetail:        getBool("asset_publicPeersDetail", true, alternativeContext...),
-			TxMetaRawEnabled:         getBool("asset_txMetaRawEnabled", true, alternativeContext...),
-			MaxBlockGraphPoints:      getInt("asset_maxBlockGraphPoints", 0, alternativeContext...),
+			// Batch and response admission budgets and detail switches. Each default preserves today's
+			// behaviour (0, false, empty, or true for the public*Detail/txMetaRawEnabled switches),
+			// except asset_maxBatchRecords, which defaults to 16384. Several keys are already wired
+			// (enforced for any non-default value) while others remain warn-only prep - see each key's
+			// own longdesc for its current status.
+			MaxBatchRecords:       getInt("asset_maxBatchRecords", 16384, alternativeContext...),
+			MaxBatchResponseBytes: getInt64("asset_maxBatchResponseBytes", 0, alternativeContext...),
+			MaxUTXOsPerTx:         getInt("asset_maxUTXOsPerTx", 0, alternativeContext...),
+
+			// Numeric bounds, enforced by their handlers now (see asset_settings.go)
+			MaxBlockHeaders: getInt("asset_maxBlockHeaders", 0, alternativeContext...),
+			MaxLastNBlocks:  getInt("asset_maxLastNBlocks", 0, alternativeContext...),
+			// Floored at 100, the default blockvalidation_fetch_large_batch_size: the
+			// catchup client rejects any batch shorter than it asked for, so a lower cap
+			// breaks every batch of peer catchup from this node.
+			MaxNBlocks:                   getIntFloorUnlessZero("asset_maxNBlocks", 0, 100, "blockvalidation_fetch_large_batch_size", alternativeContext...),
+			RequireAuthCredentials:       getBool("asset_requireAuthCredentials", true, alternativeContext...),
+			SecureCookies:                getBool("asset_secureCookies", false, alternativeContext...),
+			CORSAllowOrigins:             getString("asset_corsAllowOrigins", "", alternativeContext...),
+			EnforcePostAuth:              getBool("asset_enforcePostAuth", false, alternativeContext...),
+			MaxWebsocketConnections:      getInt("asset_maxWebsocketConnections", 0, alternativeContext...),
+			MaxWebsocketConnectionsPerIP: getInt("asset_maxWebsocketConnectionsPerIP", 0, alternativeContext...),
+			WebsocketReadLimit:           getInt64("asset_websocketReadLimit", 0, alternativeContext...),
+			SubtreeStreamConcurrency:     getInt("asset_subtreeStreamConcurrency", 0, alternativeContext...),
+			PublicErrorDetail:            getBool("asset_publicErrorDetail", true, alternativeContext...),
+			PublicHealthDetail:           getBool("asset_publicHealthDetail", true, alternativeContext...),
+			HealthStrictStatus:           getBool("asset_healthStrictStatus", false, alternativeContext...),
+			PublicPeersDetail:            getBool("asset_publicPeersDetail", true, alternativeContext...),
+			TxMetaRawEnabled:             getBool("asset_txMetaRawEnabled", true, alternativeContext...),
+			MaxBlockGraphPoints:          getInt("asset_maxBlockGraphPoints", 0, alternativeContext...),
 		},
 		Block: BlockSettings{
 			MinedCacheMaxMB:                       getInt("blockMinedCacheMaxMB", 256, alternativeContext...),
@@ -432,10 +444,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupCheckpointHeight:               getInt32("blockvalidation_catchup_checkpoint_height", 0, alternativeContext...),
 			QuickValidateSkipUtxoLock:             getBool("blockvalidation_quick_validate_skip_utxo_lock", false, alternativeContext...),
 			SkipUnspendableTxStorageDuringCatchup: getBool("blockvalidation_skipUnspendableTxStorageDuringCatchup", false, alternativeContext...),
+			QuickValidateCreateConcurrency:        getInt("blockvalidation_quick_validate_create_concurrency", 0, alternativeContext...),
 			CatchupAllowQuickValidation:           getBool("blockvalidation_catchup_allow_quick_validation", true, alternativeContext...),
 			OutpointOnlyBelowCheckpoint:           getBool("blockvalidation_outpoint_only_below_checkpoint", false, alternativeContext...),
 			LegacyUnifiedBelowCheckpoint:          getBool("blockvalidation_legacy_unified_below_checkpoint", false, alternativeContext...),
-			LegacyBelowCheckpointFailClosed:       getBool("blockvalidation_legacy_below_checkpoint_fail_closed", false, alternativeContext...),
 			// Catchup circuit breaker configuration
 			CircuitBreakerFailureThreshold: getInt("blockvalidation_circuit_breaker_failure_threshold", 5, alternativeContext...),
 			CircuitBreakerSuccessThreshold: getInt("blockvalidation_circuit_breaker_success_threshold", 2, alternativeContext...),
@@ -691,14 +703,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UTXOPrunedSetMaxEntries:         getInt("pruner_utxoPrunedSetMaxEntries", 10_000_000, alternativeContext...),          // Soft cap on PrunedTxSet entries; 0 = use built-in 2B default (NOT unlimited)
 		},
 		SubtreeValidation: SubtreeValidationSettings{
-			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
-			QuorumPath:                                getString("subtree_quorum_path", "", alternativeContext...),
-			SubtreeStore:                              getURL("subtreestore", "", alternativeContext...),
-			GetMissingTransactions:                    getInt("subtreevalidation_getMissingTransactions", max(4, runtime.NumCPU()/2), alternativeContext...),
-			GRPCAddress:                               getString("subtreevalidation_grpcAddress", "localhost:8089", alternativeContext...),
-			GRPCListenAddress:                         getString("subtreevalidation_grpcListenAddress", ":8089", alternativeContext...),
-			ProcessTxMetaUsingCacheBatchSize:          getInt("subtreevalidation_processTxMetaUsingCache_BatchSize", 1024, alternativeContext...),
-			ProcessTxMetaUsingCacheConcurrency:        getInt("subtreevalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
+			QuorumAbsoluteTimeout:              getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
+			QuorumPath:                         getString("subtree_quorum_path", "", alternativeContext...),
+			SubtreeStore:                       getURL("subtreestore", "", alternativeContext...),
+			GetMissingTransactions:             getInt("subtreevalidation_getMissingTransactions", max(4, runtime.NumCPU()/2), alternativeContext...),
+			GRPCAddress:                        getString("subtreevalidation_grpcAddress", "localhost:8089", alternativeContext...),
+			GRPCListenAddress:                  getString("subtreevalidation_grpcListenAddress", ":8089", alternativeContext...),
+			ProcessTxMetaUsingCacheConcurrency: getInt("subtreevalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
 			ProcessTxMetaUsingCacheMissingTxThreshold: getInt("subtreevalidation_processTxMetaUsingCache_MissingTxThreshold", 1, alternativeContext...),
 			SubtreeDAHConcurrency:                     getInt("subtreevalidation_subtreeDAHConcurrency", 8, alternativeContext...),
 			TxMetaCacheEnabled:                        getBool("subtreevalidation_txMetaCacheEnabled", true, alternativeContext...),
@@ -746,12 +757,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ConnectPeers:                     getMultiString("legacy_connect_peers", "|", []string{}, alternativeContext...),
 			OrphanEvictionDuration:           getDuration("legacy_orphanEvictionDuration", 10*time.Minute, alternativeContext...),
 			MaxOrphanTxs:                     getInt("legacy_maxOrphanTxs", 100, alternativeContext...),
-			StoreBatcherSize:                 getInt("legacy_storeBatcherSize", 1024, alternativeContext...),
-			StoreBatcherConcurrency:          getInt("legacy_storeBatcherConcurrency", 32, alternativeContext...),
-			SpendBatcherSize:                 getInt("legacy_spendBatcherSize", 1024, alternativeContext...),
-			SpendBatcherConcurrency:          getInt("legacy_spendBatcherConcurrency", 4, alternativeContext...),
-			OutpointBatcherSize:              getInt("legacy_outpointBatcherSize", 1024, alternativeContext...),
-			OutpointBatcherConcurrency:       getInt("legacy_outpointBatcherConcurrency", 32, alternativeContext...),
 			PrintInvMessages:                 getBool("legacy_printInvMessages", false, alternativeContext...),
 			GRPCAddress:                      getString("legacy_grpcAddress", "", alternativeContext...),
 			AllowBlockPriority:               getBool("legacy_allowBlockPriority", true, alternativeContext...),
@@ -766,12 +771,19 @@ func NewSettings(alternativeContext ...string) *Settings {
 			FeelerInterval:                   getDuration("legacy_feelerInterval", 120*time.Second, alternativeContext...),
 			FeelerHandshakeTimeout:           getDuration("legacy_feelerHandshakeTimeout", 25*time.Second, alternativeContext...),
 			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
-			BlockFailureBackoffBase:          getDuration("legacy_blockFailureBackoffBase", 5*time.Second, alternativeContext...),
-			BlockFailureBackoffMaxDuration:   getDuration("legacy_blockFailureBackoffMaxDuration", 150*time.Second, alternativeContext...),
-			BlockPrefetchBufferBytes:         getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
-			PeerRegistryEnabled:              getBool("legacy_peerRegistryEnabled", true, alternativeContext...),
-			PeerRegistrySyncInterval:         getDuration("legacy_peerRegistrySyncInterval", 10*time.Second, alternativeContext...),
-			Upnp:                             getBool("legacy_upnp", false, alternativeContext...),
+
+			BlockDownloadTimeoutBasePercent:    getInt64("legacy_blockDownloadTimeoutBasePercent", 100, alternativeContext...),
+			BlockDownloadTimeoutBaseIBDPercent: getInt64("legacy_blockDownloadTimeoutBaseIBDPercent", 600, alternativeContext...),
+			BlockDownloadTimeoutPerPeerPercent: getInt64("legacy_blockDownloadTimeoutPerPeerPercent", 50, alternativeContext...),
+
+			MultiPeerBlockDownload:    getBool("legacy_multiPeerBlockDownload", true, alternativeContext...),
+			MaxBlocksInTransitPerPeer: getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
+			BlockDownloadWindow:       getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
+
+			ParkStoreTimeout:         getDuration("legacy_parkStoreTimeout", 10*time.Second, alternativeContext...),
+			PeerRegistryEnabled:      getBool("legacy_peerRegistryEnabled", true, alternativeContext...),
+			PeerRegistrySyncInterval: getDuration("legacy_peerRegistrySyncInterval", 10*time.Second, alternativeContext...),
+			Upnp:                     getBool("legacy_upnp", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

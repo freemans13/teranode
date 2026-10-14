@@ -146,6 +146,12 @@ type Server struct {
 	// adaptiveFetch tracks whether subtreeData downloads should be skipped
 	// when transactions are expected to already be in the local UTXO store via propagation.
 	adaptiveFetch *adaptivefetch.State
+
+	// peerProbePool and blockProbePool limit txmeta cache-probe workers across
+	// all concurrent peer-subtree and block-validation lookups respectively;
+	// see probeTxMetaCache.
+	peerProbePool  probePool
+	blockProbePool probePool
 }
 
 // New creates a new Server instance with the provided dependencies.
@@ -337,8 +343,15 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 				// Cancel context before retrying to prevent leak
 				subscribeCancel()
 
-				// backoff for 5 seconds and try again
-				time.Sleep(5 * time.Second)
+				// backoff for 5 seconds and try again, but stop immediately if the
+				// caller's context is cancelled rather than blocking the shutdown
+				// path for up to 5 seconds.
+				select {
+				case <-ctx.Done():
+					ctxLogger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] exiting during backoff: %s", ctx.Err())
+					return
+				case <-time.After(5 * time.Second):
+				}
 
 				continue
 			}
@@ -355,7 +368,14 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 						// Channel closed, reconnect
 						ctxLogger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] subscription channel closed, reconnecting")
 						subscribeCancel()
-						time.Sleep(1 * time.Second)
+
+						select {
+						case <-ctx.Done():
+							ctxLogger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] exiting during reconnect delay: %s", ctx.Err())
+							return
+						case <-time.After(1 * time.Second):
+						}
+
 						break subscriptionLoop
 					}
 
@@ -857,6 +877,7 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 			BaseURL:       request.BaseUrl,
 			TxHashes:      txHashes,
 			AllowFailFast: false,
+			FromBlock:     true,
 		}
 
 		// CheckSubtree responds to peer subtree-validation requests. The request
@@ -950,6 +971,7 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		SubtreeHash:   *hash,
 		BaseURL:       request.BaseUrl,
 		AllowFailFast: false,
+		FromBlock:     true,
 	}
 
 	// Call the ValidateSubtreeInternal method
@@ -992,6 +1014,8 @@ func resolveTxMetaCacheBucketType(logger ulogger.Logger, raw string) txmetacache
 		return txmetacache.Native
 	case "pointer":
 		return txmetacache.Pointer
+	case "lockfree":
+		return txmetacache.Lockfree
 	default:
 		logger.Warnf("[SubtreeValidation] unknown txMetaCacheBucketType %q; falling back to unallocated", raw)
 		return txmetacache.Unallocated
