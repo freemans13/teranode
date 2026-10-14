@@ -635,6 +635,9 @@ func TestBatchList_CancelStopsTheBackoff(t *testing.T) {
 			elapsed := time.Since(start)
 
 			require.Error(t, err)
+			// A context error, not a processing one: the legacy park's commit classifier reads a
+			// processing error as a verdict on the block and drops it.
+			require.True(t, errors.IsContextError(err), "a cancel must surface as a context error, got: %v", err)
 			require.Less(t, elapsed, backoff/2, "cancellation must cut the backoff short")
 
 			_, getErr := recorder.Store.Get(context.Background(), tx.TxIDChainHash())
