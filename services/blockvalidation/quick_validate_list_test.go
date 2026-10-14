@@ -440,9 +440,16 @@ func TestBatchList_DeepChainIsBelowCheckpoint(t *testing.T) {
 		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, batch))
 		t.Logf("a chain %d deep applied in %v", depth, time.Since(start))
 
+		// One list for the batch. The SQLite store can fail the first transaction's combined
+		// call with a lock conflict against the creates running beside it, which is retryable, so
+		// the same list may be sent again; it is never a different list.
 		lists := recorder.recordedLists()
-		require.Len(t, lists, 1)
-		require.True(t, lists[0].belowCheckpoint, "quick validation marks its list below-checkpoint")
+		require.NotEmpty(t, lists)
+
+		for _, l := range lists {
+			require.Equal(t, lists[0].txids, l.txids, "a repeat sends the same list")
+			require.True(t, l.belowCheckpoint, "quick validation marks its list below-checkpoint")
+		}
 
 		requireSpentBy(t, recorder.Store, root, 0, txs[0])
 
@@ -538,12 +545,12 @@ func TestBatchList_MissingParentFailsTheBlock(t *testing.T) {
 		require.Contains(t, err.Error(), fmt.Sprintf("%s:0", ghost.TxIDChainHash().String()),
 			"the failure must name the missing outpoint, got: %v", err)
 
-		// The list is written create-then-spend below a checkpoint, so the orphan's record is
-		// created before its spend fails. What matters is that the block fails rather than passes:
-		// the spend wave carries RequireParentOutputs, so the store does not take the record it
-		// just created as proof the missing parent was spent long ago.
+		// The orphan has no parent in the list, so it takes one combined call, which spends before
+		// it creates: the failed spend leaves no record behind. The spend carries
+		// RequireParentOutputs, so the store does not take a record as proof the missing parent
+		// was spent long ago.
 		_, err = recorder.Store.Get(ctx, orphan.TxIDChainHash())
-		require.NoError(t, err, "create-then-spend writes the orphan's record before its spend fails")
+		require.True(t, errors.Is(err, errors.ErrTxNotFound), "a failed combined call writes no record, got: %v", err)
 	}
 }
 

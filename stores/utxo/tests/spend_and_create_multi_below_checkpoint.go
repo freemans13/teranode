@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -16,11 +17,13 @@ import (
 )
 
 // These are the WithBelowCheckpoint contract tests: the list is written in two
-// waves, every create and then every spend, and ends in the same store state
-// as the default order; a create that fails stops its descendants' spends; a
-// record that already exists has its spends made again; and a parent output
-// that exists nowhere fails the spend instead of passing on the strength of
-// the record the create wave just wrote.
+// waves and ends in the same store state as the default order; a transaction
+// with no parent in the list takes one combined call, and one with a parent in
+// the list a create and then a spend; a write that fails stops its
+// descendants' spends; a record that already exists has its spends made again;
+// a parent output that exists nowhere fails the spend instead of passing on
+// the strength of the record the first wave just wrote; and a cancel never
+// lands inside a call.
 
 // waveCall is one SpendAndCreate call DefaultSpendAndCreateMulti made, with the
 // half it asked for.
@@ -32,8 +35,8 @@ type waveCall struct {
 
 // waveRecorder wraps a real store and records every SpendAndCreate call. delay
 // holds each call before it reaches the store, so calls that can overlap
-// visibly do. failCreate, when set, fails that transaction's create-only call
-// before it reaches the store.
+// visibly do. failCreate, when set, fails that transaction's first-wave call
+// (create-only or combined) before it reaches the store.
 type waveRecorder struct {
 	utxostore.Store
 	delay      time.Duration
@@ -60,7 +63,7 @@ func (w *waveRecorder) SpendAndCreate(ctx context.Context, tx *bt.Tx, h uint32, 
 		spends []*utxostore.Spend
 	)
 
-	if w.failCreate != nil && options.CreateOnly && *tx.TxIDChainHash() == *w.failCreate.TxIDChainHash() {
+	if w.failCreate != nil && !options.SpendOnly && *tx.TxIDChainHash() == *w.failCreate.TxIDChainHash() {
 		err = errors.NewStorageError("injected create failure")
 	} else {
 		md, spends, err = w.Store.SpendAndCreate(ctx, tx, h, opts...)
@@ -115,10 +118,12 @@ func SpendAndCreateMultiBelowCheckpointMatchesLoop(t *testing.T, db utxostore.St
 	require.Equal(t, loop.Records(t, db), multi.Records(t, db), "records after the record-mined write")
 }
 
-// SpendAndCreateMultiBelowCheckpointTwoWaves: every transaction gets one
-// create-only call and one spend-only call; every create returns before any
-// spend starts; and the creates of all five levels run together, as do the
-// spends, so the depth of the list does not add rounds.
+// SpendAndCreateMultiBelowCheckpointTwoWaves: the first level, whose parents
+// are outside the list, gets one combined call per transaction; every deeper
+// transaction gets one create-only call and one spend-only call; every
+// first-wave call returns before any spend starts; and the first-wave calls of
+// all five levels run together, as do the spends, so the depth of the list
+// does not add rounds.
 func SpendAndCreateMultiBelowCheckpointTwoWaves(t *testing.T, db utxostore.Store) {
 	const (
 		height = 810
@@ -136,38 +141,53 @@ func SpendAndCreateMultiBelowCheckpointTwoWaves(t *testing.T, db utxostore.Store
 	require.NoError(t, err)
 	requireAllStatus(t, results, utxostore.MultiTxCreated)
 
-	calls := rec.recorded()
-	require.Len(t, calls, 2*len(w.Txs), "one create and one spend per transaction")
+	firstLevel := make(map[chainhash.Hash]bool, width)
+	for _, tx := range w.Txs[:width] {
+		firstLevel[*tx.TxIDChainHash()] = true
+	}
 
-	var creates, spends []waveCall
+	calls := rec.recorded()
+	require.Len(t, calls, width+2*(len(w.Txs)-width), "one combined call per first-level transaction, a create and a spend per deeper one")
+
+	var firstWave, spends []waveCall
 
 	for _, c := range calls {
-		require.True(t, c.createOnly != c.spendOnly, "every call is one half: createOnly=%v spendOnly=%v", c.createOnly, c.spendOnly)
+		if firstLevel[*c.tx.TxIDChainHash()] {
+			require.False(t, c.createOnly || c.spendOnly, "a transaction with no parent in the list takes one combined call")
+
+			firstWave = append(firstWave, c)
+
+			continue
+		}
+
+		require.True(t, c.createOnly != c.spendOnly, "a deeper call is one half: createOnly=%v spendOnly=%v", c.createOnly, c.spendOnly)
 
 		if c.createOnly {
-			creates = append(creates, c)
+			firstWave = append(firstWave, c)
 		} else {
 			spends = append(spends, c)
 		}
 	}
 
-	require.Len(t, creates, len(w.Txs))
-	require.Len(t, spends, len(w.Txs))
+	require.Len(t, firstWave, len(w.Txs))
+	require.Len(t, spends, len(w.Txs)-width)
 
 	for _, s := range spends {
-		for _, c := range creates {
-			require.False(t, s.start.Before(c.end), "a spend started before every create had returned")
+		for _, c := range firstWave {
+			require.False(t, s.start.Before(c.end), "a spend started before every first-wave call had returned")
 		}
 	}
 
-	requireOneRound(t, "create", creates)
+	requireOneRound(t, "first", firstWave)
 	requireOneRound(t, "spend", spends)
 
 	for i, r := range w.Records(t, db) {
 		require.True(t, r.ExistsInStore, "tx %d", i)
 	}
 
-	// The deepest link of the first chain is spent by its child.
+	// A first-level transaction is spent by its child, and the deepest link of
+	// the first chain by its child.
+	requireSpentBy(t, db, w.Txs[0], 0, w.Txs[width], 0)
 	requireSpentBy(t, db, w.Txs[(levels-2)*width], 0, w.Txs[(levels-1)*width], 0)
 }
 
@@ -191,9 +211,9 @@ func requireOneRound(t *testing.T, wave string, calls []waveCall) {
 	require.True(t, latestStart.Before(earliestEnd), "the %s wave did not run as one round", wave)
 }
 
-// SpendAndCreateMultiBelowCheckpointCreateFails: a transaction whose create
-// fails is Failed, its child and grandchild are ParentFailed and never spend,
-// and an unrelated transaction is written and spent.
+// SpendAndCreateMultiBelowCheckpointCreateFails: a transaction whose
+// first-wave call fails is Failed, its child and grandchild are ParentFailed
+// and never spend, and an unrelated transaction is written and spent.
 func SpendAndCreateMultiBelowCheckpointCreateFails(t *testing.T, db utxostore.Store) {
 	const height = 820
 
@@ -221,10 +241,13 @@ func SpendAndCreateMultiBelowCheckpointCreateFails(t *testing.T, db utxostore.St
 	require.Equal(t, utxostore.MultiTxCreated, results[3].Status, "%v", results[3].Err)
 
 	for _, call := range rec.recorded() {
-		if call.spendOnly {
-			require.Equal(t, *d.TxIDChainHash(), *call.tx.TxIDChainHash(), "only the unrelated transaction spends")
+		if *call.tx.TxIDChainHash() == *b.TxIDChainHash() || *call.tx.TxIDChainHash() == *c.TxIDChainHash() {
+			require.True(t, call.createOnly, "a descendant of a failed write only creates")
 		}
 	}
+
+	requireUnspent(t, db, a, 0)
+	requireUnspent(t, db, b, 0)
 
 	requireNotStored(t, db, a)
 	requireUnspent(t, db, w.Roots[0], 0)
@@ -262,9 +285,11 @@ func SpendAndCreateMultiBelowCheckpointExistingRespent(t *testing.T, db utxostor
 }
 
 // SpendAndCreateMultiBelowCheckpointMissingParent: a transaction whose parent
-// is in neither the list nor the store is Failed with ErrTxNotFound. The
-// create wave has already written its record, and the store must not take that
-// record as proof the spend was made in an earlier attempt.
+// is in neither the list nor the store is Failed with ErrTxNotFound, and a
+// child in the list that spends it is ParentFailed. The orphan's combined call
+// spends before it creates, so its record is never written. The child's record
+// is, by the first wave, and the store must not take a record as proof the
+// spend was made in an earlier attempt.
 func SpendAndCreateMultiBelowCheckpointMissingParent(t *testing.T, db utxostore.Store) {
 	ctx := context.Background()
 
@@ -273,15 +298,71 @@ func SpendAndCreateMultiBelowCheckpointMissingParent(t *testing.T, db utxostore.
 	w := BuildMultiWorkload(t, 0xa5, 0, 1) // roots never stored
 
 	orphan := multiSpend(t, 1, []*bt.Tx{w.Roots[0]}, []uint32{0}, 1)
+	child := multiSpend(t, 2, []*bt.Tx{orphan}, []uint32{0}, 1)
 
-	results, err := db.SpendAndCreateMulti(ctx, []*bt.Tx{orphan}, height, utxostore.WithBelowCheckpoint(), utxostore.WithIgnoreLocked(true))
+	results, err := db.SpendAndCreateMulti(ctx, []*bt.Tx{orphan, child}, height, utxostore.WithBelowCheckpoint(), utxostore.WithIgnoreLocked(true))
 	require.NoError(t, err)
-	require.Len(t, results, 1)
+	require.Len(t, results, 2)
 	require.Equal(t, utxostore.MultiTxFailed, results[0].Status, "a spend of an output that exists nowhere must fail")
 	require.ErrorIs(t, results[0].Err, errors.ErrTxNotFound)
+	require.Equal(t, utxostore.MultiTxParentFailed, results[1].Status)
 
 	_, err = db.Get(ctx, orphan.TxIDChainHash(), fields.Fee)
-	require.NoError(t, err, "the create wave wrote the orphan's record before its spend failed")
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the orphan's combined call failed its spend before it created")
+}
+
+// SpendAndCreateMultiBelowCheckpointCancelMidCall: a cancel that arrives while
+// a call is in the store does not reach that call, and a call that has not
+// started never starts. The in-flight transaction is written with its input
+// spent; the queued one is absent with its input unspent; the error is the
+// context's.
+func SpendAndCreateMultiBelowCheckpointCancelMidCall(t *testing.T, db utxostore.Store) {
+	const height = 850
+
+	w := BuildMultiWorkload(t, 0xa6, 0, 2)
+	w.StoreRoots(t, db, height-1)
+
+	inFlight := multiSpend(t, 1, []*bt.Tx{w.Roots[0]}, []uint32{0}, 1)
+	queued := multiSpend(t, 2, []*bt.Tx{w.Roots[1]}, []uint32{0}, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &cancelInsideCall{Store: db, hold: *inFlight.TxIDChainHash(), cancel: cancel, seen: make(chan error, 1)}
+
+	// Width 1: the queued transaction cannot start until the in-flight call
+	// returns, by which time the cancel has landed.
+	results, err := utxostore.DefaultSpendAndCreateMulti(ctx, store, utxostore.UniformSpendAndCreateMultiWidths(1),
+		[]*bt.Tx{inFlight, queued}, height, utxostore.WithBelowCheckpoint(), utxostore.WithIgnoreLocked(true))
+
+	require.NoError(t, <-store.seen, "the in-flight call must not see the caller's cancel")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, results, 2)
+	require.Equal(t, utxostore.MultiTxCreated, results[0].Status, "%v", results[0].Err)
+	require.Equal(t, utxostore.MultiTxNotAttempted, results[1].Status)
+
+	requireSpentBy(t, db, w.Roots[0], 0, inFlight, 0)
+	requireNotStored(t, db, queued)
+	requireUnspent(t, db, w.Roots[1], 0)
+}
+
+// cancelInsideCall cancels the caller's context from inside the call for hold,
+// before that call reaches the store, and reports the context error the call
+// then sees.
+type cancelInsideCall struct {
+	utxostore.Store
+	hold   chainhash.Hash
+	cancel context.CancelFunc
+	seen   chan error
+}
+
+func (c *cancelInsideCall) SpendAndCreate(ctx context.Context, tx *bt.Tx, h uint32, opts ...utxostore.CreateOption) (*meta.Data, []*utxostore.Spend, error) {
+	if *tx.TxIDChainHash() == c.hold {
+		c.cancel()
+		c.seen <- ctx.Err()
+	}
+
+	return c.Store.SpendAndCreate(ctx, tx, h, opts...)
 }
 
 // requireUnspent checks that output vout of parent has no spender.
