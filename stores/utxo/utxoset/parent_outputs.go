@@ -191,52 +191,82 @@ func (s *Store) readParentCoins(ctx context.Context, outpoints []utxo.Outpoint, 
 	}
 }
 
+// missedBodyChunk is how many parent bodies readMissedFromBodies holds at one time.
+const missedBodyChunk = 16
+
+// missedBodyChunkRead is a test hook called with the parent count of each body read
+// readMissedFromBodies makes. nil in production.
+var missedBodyChunkRead func(parents int)
+
 // readMissedFromBodies answers, from the parent's body, an output the coin rows do not hold. That
 // is a spent output whose journal row has dropped, or an output that never was a UTXO. The body
 // still answers the first while the store keeps it, and a mined transaction submitted again
 // after its journal row dropped depends on that: without the output, the validator rejects it
 // before it can recognise its own resubmission. Only these misses read a body, so the read
 // path for an ordinary spend stays body-free. An output in neither place is NoSuchIndex.
+//
+// The sender of a transaction chooses its outpoints, so a hostile one can name outputs that miss
+// on purpose: out-of-range indexes, outputs never stored, outputs spent long ago. The bodies are
+// therefore read missedBodyChunk parents at a time, each chunk answered and let go before the
+// next, so the memory this holds has a fixed bound however many misses a call carries.
 func (s *Store) readMissedFromBodies(ctx context.Context, outpoints []utxo.Outpoint, idx []int, answers []utxo.ParentOutput) {
-	hashes := make([]chainhash.Hash, 0, len(idx))
-	seen := make(map[chainhash.Hash]struct{}, len(idx))
+	byParent := make(map[chainhash.Hash][]int, len(idx))
+	parents := make([]chainhash.Hash, 0, len(idx))
 
 	for _, i := range idx {
 		h := outpoints[i].TxID
-		if _, dup := seen[h]; !dup {
-			seen[h] = struct{}{}
-			hashes = append(hashes, h)
+		if _, seen := byParent[h]; !seen {
+			parents = append(parents, h)
 		}
+
+		byParent[h] = append(byParent[h], i)
 	}
 
-	res, err := s.lookupMany(ctx, hashes, false, false)
-	if err != nil {
-		fault := errors.NewStorageError("[utxoset][ParentOutputsForValidation] read bodies", err)
-		for _, i := range idx {
-			answers[i] = utxo.ParentOutput{Err: fault}
+	for lo := 0; lo < len(parents); lo += missedBodyChunk {
+		chunk := parents[lo:min(lo+missedBodyChunk, len(parents))]
+
+		if missedBodyChunkRead != nil {
+			missedBodyChunkRead(len(chunk))
 		}
 
+		res, err := s.lookupMany(ctx, chunk, false, false)
+		if err != nil {
+			fault := errors.NewStorageError("[utxoset][ParentOutputsForValidation] read bodies", err)
+
+			for _, h := range chunk {
+				for _, i := range byParent[h] {
+					answers[i] = utxo.ParentOutput{Err: fault}
+				}
+			}
+
+			continue
+		}
+
+		for _, h := range chunk {
+			for _, i := range byParent[h] {
+				answerFromBody(res, outpoints[i], &answers[i])
+			}
+		}
+	}
+}
+
+// answerFromBody sets one output's value and script from its parent's body, or NoSuchIndex when
+// the body is gone or has no such output.
+func answerFromBody(res lookupResult, op utxo.Outpoint, answer *utxo.ParentOutput) {
+	if derr, bad := res.failed[op.TxID]; bad {
+		*answer = utxo.ParentOutput{Err: derr}
 		return
 	}
 
-	for _, i := range idx {
-		op := outpoints[i]
-
-		if derr, bad := res.failed[op.TxID]; bad {
-			answers[i] = utxo.ParentOutput{Err: derr}
-			continue
-		}
-
-		data, ok := res.found[op.TxID]
-		if !ok || data.Tx == nil || int(op.Vout) >= len(data.Tx.Outputs) ||
-			data.Tx.Outputs[op.Vout] == nil || data.Tx.Outputs[op.Vout].LockingScript == nil {
-			answers[i] = utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
-			continue
-		}
-
-		out := data.Tx.Outputs[op.Vout]
-		script := bscript.Script(append([]byte(nil), *out.LockingScript...))
-		answers[i].Satoshis = out.Satoshis
-		answers[i].LockingScript = &script
+	data, ok := res.found[op.TxID]
+	if !ok || data.Tx == nil || int(op.Vout) >= len(data.Tx.Outputs) ||
+		data.Tx.Outputs[op.Vout] == nil || data.Tx.Outputs[op.Vout].LockingScript == nil {
+		*answer = utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
+		return
 	}
+
+	out := data.Tx.Outputs[op.Vout]
+	script := bscript.Script(append([]byte(nil), *out.LockingScript...))
+	answer.Satoshis = out.Satoshis
+	answer.LockingScript = &script
 }

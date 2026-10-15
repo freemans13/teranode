@@ -79,3 +79,39 @@ func TestParentOutputsForValidationNeverReadsTheBody(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, utxo.ParentOutputTxNotFound, answers[0].Status)
 }
+
+// TestParentOutputsForValidationBoundsTheBodiesAMissReads is the bot review's point on PR 1663.
+// A sender chooses the outpoints, so a transaction can name outputs that are in no coin row on
+// purpose, here an out-of-range index on each of 40 parents. Each miss reads its parent's body,
+// so the reads go missedBodyChunk parents at a time, and each answer is still NoSuchIndex.
+func TestParentOutputsForValidationBoundsTheBodiesAMissReads(t *testing.T) {
+	s, ctx := newUncheckpointedStore(t)
+
+	const parents = 40
+
+	outpoints := make([]utxo.Outpoint, 0, parents)
+
+	for i := 0; i < parents; i++ {
+		p := mkTx(t, 1, uint64(10_000+i))
+		_, err := s.Create(ctx, p, 1_000)
+		require.NoError(t, err)
+
+		outpoints = append(outpoints, utxo.Outpoint{TxID: *p.TxIDChainHash(), Vout: 50})
+	}
+
+	var chunks []int
+
+	missedBodyChunkRead = func(n int) { chunks = append(chunks, n) }
+
+	t.Cleanup(func() { missedBodyChunkRead = nil })
+
+	answers, err := s.ParentOutputsForValidation(ctx, outpoints)
+	require.NoError(t, err)
+
+	for i, a := range answers {
+		require.NoError(t, a.Err, "outpoint %d", i)
+		require.Equal(t, utxo.ParentOutputNoSuchIndex, a.Status, "outpoint %d", i)
+	}
+
+	require.Equal(t, []int{16, 16, 8}, chunks, "the misses read their bodies in bounded chunks")
+}
