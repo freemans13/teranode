@@ -400,6 +400,13 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	cutoff := height / SpendJournalPartitionBlocks
 	dropped := 0
 
+	// The spenders to carry are read once for the pass, when the first journal leaf retires,
+	// and not again for each leaf: on a backlog the pass retires many leaves, and each read is
+	// every waiting and recently mined transaction with its inputs. Reading once is safe. A
+	// spend made after the read is journaled at its own height, above every retiring leaf, and
+	// a repeated spend moves its row up to that height (moveRepeatedSpendsSQL).
+	var carry *copyForwardSet
+
 	for _, l := range leaves {
 		if l.leaf >= cutoff {
 			continue
@@ -408,7 +415,18 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 		// Before the partition goes, carry forward the spends of transactions still waiting to
 		// be mined. The table exists in every state below until the DROP, attached or not.
 		if l.parent == "spend_journal" {
-			if _, err := s.copyForwardUnminedSpends(ctx, l.leaf, cutoff*SpendJournalPartitionBlocks); err != nil {
+			keepFrom := cutoff * SpendJournalPartitionBlocks
+
+			if carry == nil {
+				c, err := s.collectCopyForward(ctx, keepFrom)
+				if err != nil {
+					return dropped, err
+				}
+
+				carry = c
+			}
+
+			if _, err := s.copyForwardFrom(ctx, l.leaf, keepFrom, carry); err != nil {
 				return dropped, err
 			}
 		}
@@ -689,10 +707,29 @@ func (s *Store) collectSpenders(ctx context.Context, c *copyForwardSet, what, st
 // goes, once its block is below keepFrom. Below the highest checkpoint no block can be un-mined,
 // so nothing mined there is carried.
 func (s *Store) copyForwardUnminedSpends(ctx context.Context, leaf, keepFrom uint32) (int64, error) {
+	c, err := s.collectCopyForward(ctx, keepFrom)
+	if err != nil {
+		return 0, err
+	}
+
+	return s.copyForwardFrom(ctx, leaf, keepFrom, c)
+}
+
+// copyForwardCollected is a test hook called each time collectCopyForward reads. nil in
+// production.
+var copyForwardCollected func()
+
+// collectCopyForward reads the spends the copy-forward carries: those of every waiting
+// transaction, and of every transaction mined at or above keepFrom.
+func (s *Store) collectCopyForward(ctx context.Context, keepFrom uint32) (*copyForwardSet, error) {
+	if copyForwardCollected != nil {
+		copyForwardCollected()
+	}
+
 	c := &copyForwardSet{seen: make(map[string]struct{})}
 
 	if err := s.collectSpenders(ctx, c, "unmined", unminedInpointsSQL); err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	// A block at or below the highest checkpoint is never un-mined (unMine refuses it), so the
@@ -701,9 +738,14 @@ func (s *Store) copyForwardUnminedSpends(ctx context.Context, leaf, keepFrom uin
 
 	if err := s.collectSpenders(ctx, c, "recently mined", recentlyMinedInpointsSQL,
 		int32(minedFrom), int32(keepFrom)); err != nil { //nolint:gosec // heights fit int32
-		return 0, err
+		return nil, err
 	}
 
+	return c, nil
+}
+
+// copyForwardFrom carries the spends in c out of the journal partition for leaf.
+func (s *Store) copyForwardFrom(ctx context.Context, leaf, keepFrom uint32, c *copyForwardSet) (int64, error) {
 	ukeys, parents, spenders := c.ukeys, c.parents, c.spenders
 
 	if len(ukeys) == 0 {
