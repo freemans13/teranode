@@ -15,7 +15,9 @@ import (
 // call. The validator turns a missing parent into a rejection for that transaction alone, so
 // failing the batch would reject every transaction that happened to be resolved beside it.
 //
-// The field list is accepted and ignored with one exception, as it is on the single read:
+// The body is read only when a field held in it is named, or no field at all (see wantsBody).
+// Apart from that, the field list is accepted and ignored with one exception, as it is on the
+// single read:
 // whichever step answers returns every column it holds on one row, so narrowing the projection
 // would save a little on the wire and hand the caller a partly populated record it might
 // dereference. The exception is the contest, which is not on that row at all -- it is keyed on
@@ -34,7 +36,7 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 		hashes = append(hashes, it.Hash)
 	}
 
-	res, err := s.lookupMany(ctx, hashes, wantsConflictingChildren(fieldNames))
+	res, err := s.lookupMany(ctx, hashes, wantsConflictingChildren(fieldNames), !wantsBody(fieldNames))
 	if err != nil {
 		return errors.NewStorageError("[utxoset][BatchDecorate]", err)
 	}

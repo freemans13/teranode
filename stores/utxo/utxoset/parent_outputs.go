@@ -56,7 +56,7 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 		hashes[i] = op.TxID
 	}
 
-	res, err := s.lookupManyWith(ctx, hashes, false, true)
+	res, err := s.lookupMany(ctx, hashes, false, true)
 	if err != nil {
 		fault := errors.NewStorageError("[utxoset][ParentOutputsForValidation] lookup", err)
 		for i := range answers {

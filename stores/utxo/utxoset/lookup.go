@@ -261,7 +261,8 @@ type lookupResult struct {
 	// noBody makes every read leave the body out: each statement's body join is switched off by
 	// its last parameter, and the carried bodies are not read. ParentOutputsForValidation sets it,
 	// because it needs one output of each parent, and that comes from the coin rows. Reading
-	// whole parent bodies there held gigabytes live on mainnet on 2026-10-15.
+	// whole parent bodies there held gigabytes live on mainnet on 2026-10-15. Get, the get
+	// batcher and BatchDecorate set it when the caller names no field held in the body.
 	noBody bool
 }
 
@@ -319,14 +320,10 @@ func (s *Store) lookupFloor() int32 {
 // The returned error is for faults that are NOT per-transaction: a dead connection, a syntax
 // error, a partition that vanished mid-read. Those really do fail every entry, because nothing
 // was answered.
+//
+// With noBody set, every record comes back with a nil Tx, and no statement reads tx_body or
+// tx_body_carry. See lookupResult.noBody.
 func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
-	wantChildren bool) (lookupResult, error) {
-	return s.lookupManyWith(ctx, hashes, wantChildren, false)
-}
-
-// lookupManyWith is lookupMany with the body switched off when noBody is set: every record comes
-// back with a nil Tx, and no statement reads tx_body or tx_body_carry. See lookupResult.noBody.
-func (s *Store) lookupManyWith(ctx context.Context, hashes []chainhash.Hash,
 	wantChildren, noBody bool) (lookupResult, error) {
 	res := newLookupResult(len(hashes))
 	res.noBody = noBody

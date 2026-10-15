@@ -56,6 +56,26 @@ func wantsSpendingData(fieldNames []fields.FieldName) bool {
 	return false
 }
 
+// wantsBody reports whether the caller asked for something only the transaction's body holds.
+// No field list means everything. The sql store reads its transaction bytes on the same rule,
+// so a caller that names only metadata already gets a nil Tx there. Reading and parsing the
+// body for a caller that never looks at it was most of the cost of a metadata read near the
+// tip, where nearly every transaction still has its body.
+func wantsBody(fieldNames []fields.FieldName) bool {
+	if len(fieldNames) == 0 {
+		return true
+	}
+
+	for _, f := range fieldNames {
+		switch f {
+		case fields.Tx, fields.Inputs, fields.Outputs, fields.External, fields.ExtendedSize, fields.Version:
+			return true
+		}
+	}
+
+	return false
+}
+
 // wantsConflictingChildren reports whether the caller asked which losing transactions contest
 // this one's UTXOs.
 //

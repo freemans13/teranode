@@ -25,7 +25,9 @@ type getResult struct {
 type getItem struct {
 	hash         chainhash.Hash
 	wantChildren bool
-	done         chan getResult
+	// wantBody works the same way: the batch reads bodies if ANY item asked for one.
+	wantBody bool
+	done     chan getResult
 }
 
 // newGetBatcher funnels single reads into one BatchDecorate call, which is what the sql
@@ -60,7 +62,7 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 	ctx := context.Background()
 
 	hashes := make([]chainhash.Hash, len(batch))
-	wantChildren := false
+	wantChildren, wantBody := false, false
 
 	for i, it := range batch {
 		hashes[i] = it.hash
@@ -68,9 +70,13 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 		if it.wantChildren {
 			wantChildren = true
 		}
+
+		if it.wantBody {
+			wantBody = true
+		}
 	}
 
-	res, err := s.lookupMany(ctx, hashes, wantChildren)
+	res, err := s.lookupMany(ctx, hashes, wantChildren, !wantBody)
 	if err != nil {
 		for _, it := range batch {
 			it.done <- getResult{err: err}
@@ -183,10 +189,10 @@ func (s *Store) sendLockBatch(batch []*lockItem) {
 
 // getBatched routes one read through the batcher.
 func (s *Store) getBatched(ctx context.Context, hash *chainhash.Hash,
-	wantChildren bool) (*meta.Data, error) {
+	wantChildren, wantBody bool) (*meta.Data, error) {
 	done := make(chan getResult, 1)
 
-	s.getBatcher.PutCtx(ctx, &getItem{hash: *hash, wantChildren: wantChildren, done: done})
+	s.getBatcher.PutCtx(ctx, &getItem{hash: *hash, wantChildren: wantChildren, wantBody: wantBody, done: done})
 
 	select {
 	case res := <-done:
