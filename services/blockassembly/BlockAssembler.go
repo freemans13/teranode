@@ -3529,6 +3529,13 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	lockedCount := atomic.Int64{}
 	invalidInputCount := atomic.Int64{}
 
+	// The first input check the store could not answer. It fails the load after the workers
+	// stop, so a transient read error does not cost a valid transaction its place.
+	var (
+		undecidedOnce sync.Once
+		undecidedErr  error
+	)
+
 	// Worker pool configuration — workers only filter and append to slices,
 	// they are not the bottleneck (Aerospike partition queries are). Keep low.
 	numWorkers := 4
@@ -3606,13 +3613,18 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 						}
 
 						if validateErr != nil {
-							// Undecidable, not decided. The transaction is still
-							// left out of this candidate -- there is nothing else
-							// to do with an input set that cannot be resolved --
-							// but it must be visible, because the silent version
-							// of this dropped every unmined transaction on the
-							// SQL store and said nothing.
-							b.logger.Errorf("[loadUnminedTransactions][%s] could not validate inputs, leaving the transaction out of the candidate: %v", unminedTransaction.Hash.String(), validateErr)
+							// Undecidable, not decided. The store did not answer, so
+							// nothing says the transaction is invalid, and counting it
+							// invalid dropped a valid transaction from the candidate on
+							// one transient read error. The load fails instead, after
+							// the workers stop, and the next load decides it.
+							b.logger.Errorf("[loadUnminedTransactions][%s] could not validate inputs, failing the load: %v", unminedTransaction.Hash.String(), validateErr)
+
+							undecidedOnce.Do(func() {
+								undecidedErr = errors.NewProcessingError("[loadUnminedTransactions][%s] could not validate inputs", unminedTransaction.Hash.String(), validateErr)
+							})
+
+							continue
 						}
 
 						if !valid {
@@ -3680,6 +3692,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	// Close channel and wait for all workers to finish
 	close(workChan)
 	wg.Wait()
+
+	// An input check the store could not answer fails the load, as an iterator error does.
+	// The conflicting marks the workers collected are dropped with it, for the same cause.
+	if undecidedErr != nil {
+		return undecidedErr
+	}
 
 	// The loop above only exits once Next has returned an empty batch, and the
 	// SQL iterator closes its read cursor at that point, so no cursor is open

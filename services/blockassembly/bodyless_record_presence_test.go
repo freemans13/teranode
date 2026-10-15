@@ -331,3 +331,26 @@ func TestValidateUnminedTxInputs_ParentReadErrorIsReturned(t *testing.T) {
 	require.False(t, valid)
 	require.Contains(t, err.Error(), "failed to load parent")
 }
+
+// TestLoadUnminedTransactions_UndecidedInputCheckFailsTheLoad is icellan's review point. When the
+// store could not answer an input check, the reload left the transaction out of the candidate and
+// counted it invalid, so one transient read error dropped a valid transaction. The load now
+// fails, after its workers stop, and the next load decides the transaction.
+func TestLoadUnminedTransactions_UndecidedInputCheckFailsTheLoad(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+
+	_, child := seedParentAndChild(ctx, t, items)
+
+	items.blockAssembler.utxoStore = &erroringParentUtxoStore{
+		Store: items.utxoStore,
+		self:  *child.TxIDChainHash(),
+	}
+
+	err := items.blockAssembler.loadUnminedTransactions(ctx, true, true)
+	require.Error(t, err, "an input check the store could not answer must fail the load, not drop the transaction")
+	require.Contains(t, err.Error(), "could not validate inputs")
+}
