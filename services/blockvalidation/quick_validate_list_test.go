@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -269,9 +271,8 @@ func listBatchForErr(bv *BlockValidation, block *model.Block, txs []*bt.Tx, outp
 }
 
 // listBatchFor builds a batch out of txs, one subtree per transaction, and runs the real
-// extend stage over it so the in-block-parent partition is derived by production code rather
-// than asserted into place.
-
+// extend stage over it, so each transaction is extended, or marked as missing a parent, by
+// production code rather than by hand.
 func listBatchFor(t *testing.T, bv *BlockValidation, block *model.Block, txs []*bt.Tx, outpointOnly bool) *SubtreeProcessingBatch {
 	t.Helper()
 
@@ -510,6 +511,49 @@ func TestBatchList_ReplayStampsAndCreatesNothingTwice(t *testing.T) {
 			require.NoError(t, err)
 			require.Contains(t, md.BlockIDs, uint32(43), "%s must carry the replayed block id", tx.TxIDChainHash().String())
 		}
+
+		// The store made the existing transactions' spends inside the list, so block validation
+		// spends nothing again: on a replayed batch that would be a whole extra round of calls.
+		require.Zero(t, recorder.spendOnlyCalls(), "block validation must not spend an existing transaction again")
+	})
+}
+
+// TestBatchList_ReplayAfterCrashMakesTheMissingSpends: a crash can leave a batch's records
+// written with none of their inputs spent, which is what main's create phase left behind when it
+// stopped before its spend phase. Replaying the batch must make every spend, and block
+// validation must not have to: the store spends an existing transaction's inputs itself.
+func TestBatchList_ReplayAfterCrashMakesTheMissingSpends(t *testing.T) {
+	listModes(t, "netted_replay_after_crash", func(t *testing.T, dbName string, outpointOnly bool) {
+		bv, recorder, cleanup := newListHarness(t, dbName, outpointOnly)
+		defer cleanup()
+
+		ctx := context.Background()
+
+		root, key := seedRoot(t, recorder.Store, 2, "NETTED_REPLAY_CRASH_KEY")
+
+		first := spendOf(t, key, root, 0, 90_000)
+		chained := spendOf(t, key, first, 0, 80_000)
+		other := spendOf(t, key, root, 1, 90_000)
+
+		txs := []*bt.Tx{first, chained, other}
+
+		// The crash: every record written, no input spent.
+		for _, tx := range txs {
+			_, _, err := recorder.Store.SpendAndCreate(ctx, tx, 100, utxo.WithCreateOnly(),
+				utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 100}))
+			require.NoError(t, err)
+		}
+
+		block := &model.Block{Height: 100, ID: 42}
+
+		recorder.reset()
+		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, listBatchFor(t, bv, block, txs, outpointOnly)))
+
+		requireSpentBy(t, recorder.Store, root, 0, first)
+		requireSpentBy(t, recorder.Store, first, 0, chained)
+		requireSpentBy(t, recorder.Store, root, 1, other)
+
+		require.Zero(t, recorder.spendOnlyCalls(), "the store makes the missing spends, not block validation")
 	})
 }
 
@@ -676,4 +720,216 @@ func TestBatchList_RetryableParentFailureRetriesTheList(t *testing.T) {
 	block := &model.Block{Height: 100, ID: 42}
 	require.NoError(t, bv.applyList(context.Background(), block, txs, txids, []int{0, 0}, false, false, func(*bt.Tx) {}))
 	store.AssertNumberOfCalls(t, "SpendAndCreateMulti", 2)
+}
+
+// callBoundStore is a real utxo.Store whose list write runs through the shared
+// DefaultSpendAndCreateMulti with a short CallBound, and whose create of one transaction does
+// not return until its call's context ends, as a create still waiting on its store's batch
+// would. The hold applies once, so a repeat of the list goes through.
+type callBoundStore struct {
+	utxo.Store
+
+	widths utxo.SpendAndCreateMultiWidths
+	hold   chainhash.Hash
+	fail   func(ctxErr error) error
+	held   atomic.Bool
+}
+
+func (s *callBoundStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32,
+	opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	return utxo.DefaultSpendAndCreateMulti(ctx, s, s.widths, txs, blockHeight, opts...)
+}
+
+func (s *callBoundStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
+	opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
+	return utxo.SequentialSpendAndCreate(ctx, ulogger.TestLogger{}, s, tx, blockHeight, opts...)
+}
+
+// Spend and the pass-through half of Create reach the real store's own methods, which utxo.Store
+// does not expose but the SQL store implements as a utxo.SequentialStore.
+func (s *callBoundStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32,
+	ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	return s.Store.(utxo.SequentialStore).Spend(ctx, tx, blockHeight, ignoreFlags...)
+}
+
+func (s *callBoundStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32,
+	opts ...utxo.CreateOption) (*meta.Data, error) {
+	if *tx.TxIDChainHash() == s.hold && s.held.CompareAndSwap(false, true) {
+		<-ctx.Done()
+
+		return nil, s.fail(ctx.Err())
+	}
+
+	return s.Store.(utxo.SequentialStore).Create(ctx, tx, blockHeight, opts...)
+}
+
+// TestBatchList_CallBoundExpiryIsARetryNotAVerdict: a store call in a below-checkpoint list that
+// runs past its CallBound comes back MultiTxFailed with the context's error, and applyList fails
+// the batch without retrying it. The legacy park's parkCommitFailure reads that failure after the
+// gRPC hop from block validation, and must see a context error, which keeps the parked block for
+// a retry, rather than a judgement, which deletes it and writes the hash off. The create's
+// outcome is unknown, so the spend stays, and a repeat of the batch finishes the transaction.
+// Both shapes a held create can return are covered: the bare context error a batcher wait
+// returns, and teranode's ContextCanceledError around it.
+func TestBatchList_CallBoundExpiryIsARetryNotAVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail func(ctxErr error) error
+	}{
+		{name: "bare context error", fail: func(ctxErr error) error { return ctxErr }},
+		{name: "context canceled error", fail: func(ctxErr error) error {
+			return errors.NewContextCanceledError("create did not finish", ctxErr)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bv, recorder, cleanup := newListHarness(t, "list_call_bound_"+strings.ReplaceAll(tc.name, " ", "_"), true)
+			defer cleanup()
+
+			ctx := context.Background()
+
+			root, key := seedRoot(t, recorder.Store, 1, "LIST_CALL_BOUND_KEY")
+			child := spendOf(t, key, root, 0, 90_000)
+
+			widths := utxo.UniformSpendAndCreateMultiWidths(1)
+			widths.CallBound = 200 * time.Millisecond
+
+			store := &callBoundStore{Store: recorder.Store, widths: widths, hold: *child.TxIDChainHash(), fail: tc.fail}
+			bv.utxoStore = store
+
+			block := &model.Block{Height: 100, ID: 42}
+			batch := listBatchFor(t, bv, block, []*bt.Tx{child}, true)
+
+			err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+			require.Error(t, err)
+			require.True(t, store.held.Load(), "the create must have been held past the call bound")
+
+			// End state first: the spend stays, because the create may still commit, and no
+			// record was written.
+			requireSpentBy(t, recorder.Store, root, 0, child)
+
+			_, getErr := recorder.Store.Get(ctx, child.TxIDChainHash())
+			require.True(t, errors.Is(getErr, errors.ErrTxNotFound), "the held create wrote no record: %v", getErr)
+
+			// What the legacy park sees, across the gRPC hop.
+			parked := errors.UnwrapGRPC(errors.WrapGRPC(err))
+			require.True(t, errors.IsContextError(parked), "a call-bound expiry must reach the park as a context error, got: %v", parked)
+			require.False(t, errors.Is(parked, errors.ErrBlockInvalid), "a call-bound expiry is not a verdict on the block: %v", parked)
+			require.False(t, errors.IsBlockCorrupt(parked), "a call-bound expiry is not a corrupt block: %v", parked)
+
+			// A repeat of the batch finishes the transaction.
+			require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, batch))
+			requireSpentBy(t, recorder.Store, root, 0, child)
+
+			_, getErr = recorder.Store.Get(ctx, child.TxIDChainHash())
+			require.NoError(t, getErr, "the repeat must write the record")
+		})
+	}
+}
+
+// flakyTxStore is a real utxo.Store whose list write runs through the shared
+// DefaultSpendAndCreateMulti, and whose SpendAndCreate of one transaction fails with a retryable
+// store error, before reaching the store, for the first failTimes calls.
+type flakyTxStore struct {
+	utxo.Store
+
+	fail      chainhash.Hash
+	failTimes atomic.Int32
+}
+
+func (s *flakyTxStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32,
+	opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.UniformSpendAndCreateMultiWidths(4), txs, blockHeight, opts...)
+}
+
+func (s *flakyTxStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
+	opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
+	if *tx.TxIDChainHash() == s.fail && s.failTimes.Add(-1) >= 0 {
+		return nil, nil, errors.NewStorageError("forced transient fault on %s", tx.TxIDChainHash())
+	}
+
+	return utxo.SequentialSpendAndCreate(ctx, ulogger.TestLogger{}, s, tx, blockHeight, opts...)
+}
+
+func (s *flakyTxStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32,
+	ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	return s.Store.(utxo.SequentialStore).Spend(ctx, tx, blockHeight, ignoreFlags...)
+}
+
+func (s *flakyTxStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32,
+	opts ...utxo.CreateOption) (*meta.Data, error) {
+	return s.Store.(utxo.SequentialStore).Create(ctx, tx, blockHeight, opts...)
+}
+
+// flakyListBatch builds a batch of four transactions, a, b, c and d, where d spends b, over a
+// store that fails b's write with a retryable error failTimes times.
+func flakyListBatch(t *testing.T, dbName string, failTimes int32) (bv *BlockValidation, recorder *applyRecorder,
+	root *bt.Tx, txs []*bt.Tx, cleanup func()) {
+	t.Helper()
+
+	bv, recorder, cleanup = newListHarness(t, dbName, true)
+
+	root, key := seedRoot(t, recorder.Store, 3, "LIST_SUBSET_RETRY_KEY")
+	a := spendOf(t, key, root, 0, 90_000)
+	b := spendOf(t, key, root, 1, 90_000)
+	c := spendOf(t, key, root, 2, 90_000)
+
+	// spendOf pays every output to this key, so it is the one that spends b's output.
+	outKey, _ := bec.PrivateKeyFromBytes([]byte("netted-out"))
+	d := spendOf(t, outKey, b, 0, 80_000)
+
+	flaky := &flakyTxStore{Store: recorder.Store, fail: *b.TxIDChainHash()}
+	flaky.failTimes.Store(failTimes)
+	recorder.Store = flaky
+
+	return bv, recorder, root, []*bt.Tx{a, b, c, d}, cleanup
+}
+
+// TestBatchList_RetryableFailureRetriesOnlyWhatFailed: a transaction that fails with a retryable
+// store error is retried with the child the store failed as ParentFailed beside it, and nothing
+// that went through on the first pass is sent again, as the per-transaction waves retried only
+// what failed. Every transaction ends written with its input spent.
+func TestBatchList_RetryableFailureRetriesOnlyWhatFailed(t *testing.T) {
+	bv, recorder, root, txs, cleanup := flakyListBatch(t, "list_subset_retry", 1)
+	defer cleanup()
+
+	a, b, c, d := txs[0], txs[1], txs[2], txs[3]
+
+	block := &model.Block{Height: 100, ID: 42}
+	batch := listBatchFor(t, bv, block, txs, true)
+
+	recorder.reset()
+	require.NoError(t, bv.createAndSpendUTXOsForBatch(context.Background(), block, batch))
+
+	lists := recorder.recordedLists()
+	require.Len(t, lists, 2, "one failed pass, then one retry")
+	require.Equal(t, []chainhash.Hash{*a.TxIDChainHash(), *b.TxIDChainHash(), *c.TxIDChainHash(), *d.TxIDChainHash()}, lists[0].txids)
+	require.Equal(t, []chainhash.Hash{*b.TxIDChainHash(), *d.TxIDChainHash()}, lists[1].txids,
+		"the retry carries only the failed transaction and its child, in block order")
+	require.Len(t, lists[1].subtreeIdxs, 2, "the retry's subtree indexes are cut to its transactions")
+
+	requireSpentBy(t, recorder.Store, root, 0, a)
+	requireSpentBy(t, recorder.Store, root, 1, b)
+	requireSpentBy(t, recorder.Store, root, 2, c)
+	requireSpentBy(t, recorder.Store, b, 0, d)
+
+	for _, tx := range txs {
+		_, err := recorder.Store.Get(context.Background(), tx.TxIDChainHash())
+		require.NoError(t, err, "%s must be written", tx.TxIDChainHash())
+	}
+}
+
+// TestBatchList_RetryWithNoProgressGivesUp: a retry that fails as many transactions as the pass
+// before it makes no progress, and the batch fails then rather than after every retry.
+func TestBatchList_RetryWithNoProgressGivesUp(t *testing.T) {
+	bv, recorder, _, txs, cleanup := flakyListBatch(t, "list_no_progress", 1_000)
+	defer cleanup()
+
+	block := &model.Block{Height: 100, ID: 42}
+	batch := listBatchFor(t, bv, block, txs, true)
+
+	recorder.reset()
+	err := bv.createAndSpendUTXOsForBatch(context.Background(), block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no progress")
+	require.Len(t, recorder.recordedLists(), 2, "the first pass, then one retry that fails the same two")
 }

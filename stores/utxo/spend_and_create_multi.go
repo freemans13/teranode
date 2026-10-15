@@ -112,11 +112,13 @@ func UniformSpendAndCreateMultiWidths(n int) SpendAndCreateMultiWidths {
 // SpendAndCreateMultiWidthsFor returns the widths Aerospike and SQL pass to
 // DefaultSpendAndCreateMulti. A level is twice the subtree-validation spend
 // batcher size, the bound subtree validation applies to a level, so a level
-// reaches the store exactly as wide as it does there. The two waves of a
-// WithBelowCheckpoint list are as wide as quick validation's create and spend
-// phases were before it wrote a list: eight store batches of creates, and two
-// rounds of every spend batcher. A call's bound is the spend's own budget plus
-// the rollback's, the longest a combined SpendAndCreate can take.
+// reaches the store exactly as wide as it does there. The first wave of a
+// WithBelowCheckpoint list is as wide as belowCheckpointCreateWidth says, and
+// its spend wave is two rounds of every spend batcher, as quick validation's
+// spend phase was before it wrote a list. A call's bound is the spend's own budget plus
+// the rollback budget. It does not bound the rollback of a failed create, which
+// SequentialSpendAndCreate runs on a context of its own; a call that reaches the
+// bound mid-create keeps its spends, since its create may yet commit.
 func SpendAndCreateMultiWidthsFor(tSettings *settings.Settings) SpendAndCreateMultiWidths {
 	if tSettings == nil {
 		return UniformSpendAndCreateMultiWidths(1)
@@ -124,11 +126,51 @@ func SpendAndCreateMultiWidthsFor(tSettings *settings.Settings) SpendAndCreateMu
 
 	return SpendAndCreateMultiWidths{
 		Level:     tSettings.SubtreeValidation.SpendBatcherSize * 2,
-		Create:    tSettings.UtxoStore.StoreBatcherSize * 8,
+		Create:    belowCheckpointCreateWidth(&tSettings.BlockValidation, &tSettings.UtxoStore),
 		Spend:     tSettings.UtxoStore.SpendBatcherSize * tSettings.UtxoStore.SpendBatcherConcurrency * 2,
 		CallBound: tSettings.UtxoStore.SpendWaitTimeout + tSettings.UtxoStore.SpendRollbackTimeout,
 	}
 }
+
+// belowCheckpointCreateWidth is how many calls the first wave of a
+// WithBelowCheckpoint list may have in flight at once. That wave creates every
+// record of the list, and for a transaction with no parent in the list it also
+// spends that transaction's inputs in the same call.
+//
+// It bounds callers, not store statements: each caller blocks until the batch
+// it lands in commits, so the statements actually in flight to the store are
+// (callers / batch size).
+//
+// blockvalidation_quick_validate_create_concurrency, when set above 0, is used
+// directly. Otherwise the width is derived from the store's own batcher
+// settings: StoreBatcherSize * BatcherMaxConcurrent, so every batcher worker
+// can have a full batch of callers queued behind it, floored at
+// StoreBatcherSize * 8 for a store whose BatcherMaxConcurrent is 0 (unbounded
+// workers), the flat multiplier the derivation replaced.
+//
+// The derived value is capped at belowCheckpointDerivedCreateCeiling unless the
+// floor is higher. Each caller is a goroutine holding a transaction, and at the
+// default batch size of 2048 and 64 batcher workers the product is 131,072. The
+// cap keeps the gain the derivation was for, more callers on a store with a
+// small batch size, and never goes below the floor.
+func belowCheckpointCreateWidth(bv *settings.BlockValidationSettings, store *settings.UtxoStoreSettings) int {
+	if bv.QuickValidateCreateConcurrency > 0 {
+		return bv.QuickValidateCreateConcurrency
+	}
+
+	derived := min(store.StoreBatcherSize*store.BatcherMaxConcurrent, belowCheckpointDerivedCreateCeiling)
+	floor := store.StoreBatcherSize * 8
+
+	if derived > floor {
+		return derived
+	}
+
+	return floor
+}
+
+// belowCheckpointDerivedCreateCeiling bounds the derived first-wave width: the
+// flat 8x multiplier's value at the default batch size of 2048.
+const belowCheckpointDerivedCreateCeiling = 16384
 
 // SpendAndCreateMultiStore is the subset of a store's methods that
 // DefaultSpendAndCreateMulti needs.
@@ -180,8 +222,10 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 		return []SpendAndCreateMultiResult{}, nil
 	}
 
+	items := listItemOptions(list)
+
 	if list.Options.BelowCheckpoint {
-		return writeCreateThenSpend(ctx, s, widths, txs, list, blockHeight, opts)
+		return writeCreateThenSpend(ctx, s, widths, txs, list, blockHeight, items)
 	}
 
 	txids, parentsInList := list.TxIDs, list.ParentsInList
@@ -225,11 +269,7 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 			}
 
 			g.Go(func() error {
-				callOpts := make([]CreateOption, 0, len(opts)+2)
-				callOpts = append(callOpts, opts...)
-				callOpts = append(callOpts, withListItem(i), WithTXID(&txids[i]))
-
-				md, spends, err := s.SpendAndCreate(ctx, txs[i], blockHeight, callOpts...)
+				md, spends, err := s.SpendAndCreate(ctx, txs[i], blockHeight, items[i:i+1:i+1]...)
 
 				switch {
 				case err == nil:
@@ -278,28 +318,37 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 //     made its spends in its combined call, which spends before it creates and
 //     leaves the spends in place when the record exists.
 //
-// Every spend sets IgnoreFlags.RequireParentOutputs, so a missing parent output
-// fails the spend. Without it the store would read the spender's own record,
-// created moments earlier by the first wave, as proof that the spend happened
-// in an earlier attempt and the parent has been pruned since, and a list
-// spending an output that exists nowhere would pass. Turning the fallback off
-// cannot fail a legitimate repeat: a parent is pruned only after its retention
-// has passed since it was fully spent, and the chain does not advance past the
-// block being applied, so a repeat of that block's list runs before any parent
-// its spends emptied can be pruned.
+// Every spend of the second wave sets IgnoreFlags.RequireParentOutputs, so a
+// missing parent output fails the spend. Without it the store would read the
+// spender's own record, created moments earlier by the first wave, as proof
+// that the spend happened in an earlier attempt and the parent has been pruned
+// since, and a list spending an output that exists nowhere would pass. Turning
+// the fallback off cannot fail a legitimate repeat: a parent is pruned only
+// after its retention has passed since it was fully spent, and the chain does
+// not advance past the block being applied, so a repeat of that block's list
+// runs before any parent its spends emptied can be pruned. A first-wave
+// combined call keeps the fallback, as the per-transaction path does: it spends
+// before it creates, so a record it finds was written after its spends, and on
+// a store left ahead of the chain by a reset, a transaction whose parent has
+// since been pruned is found as existing rather than failing the block.
 //
 // A call, once started, runs to its end. A combined SpendAndCreate is not
-// atomic on a store that spends and then creates (SequentialSpendAndCreate),
-// and a cancel between the two leaves inputs spent with no record, with the
-// rollback running under the same cancelled context. So each call runs under
-// context.WithoutCancel(ctx), bounded by widths.CallBound, and a call that has
+// atomic on a store that spends and then creates (SequentialSpendAndCreate): a
+// context that ends between the two leaves the create's outcome unknown, so the
+// spends stay and the transaction is MultiTxFailed until a repeat of the list
+// finishes it. So each call runs under context.WithoutCancel(ctx), bounded by
+// widths.CallBound, and a call that has
 // not started when ctx is cancelled never starts: it is MultiTxNotAttempted and
 // the error is returned.
 //
 // A caller treats anything but MultiTxCreated and MultiTxExisted as a failed
-// list and repeats it whole, as quick validation does.
+// transaction. It may repeat the whole list, or only the failed transactions
+// with their descendants, in list order, as quick validation does: a parent
+// that went through is then outside the shorter list, so its children get a
+// combined call, which makes any spends a create-only record from the earlier
+// attempt is missing.
 func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, widths SpendAndCreateMultiWidths, txs []*bt.Tx,
-	list *SpendAndCreateMultiList, blockHeight uint32, opts []CreateOption) ([]SpendAndCreateMultiResult, error) {
+	list *SpendAndCreateMultiList, blockHeight uint32, items []CreateOption) ([]SpendAndCreateMultiResult, error) {
 	txids, parentsInList := list.TxIDs, list.ParentsInList
 	results := make([]SpendAndCreateMultiResult, len(txs))
 
@@ -308,12 +357,14 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 		bound = defaultSpendAndCreateMultiCallBound
 	}
 
-	itemOpts := func(i int, extra ...CreateOption) []CreateOption {
-		callOpts := make([]CreateOption, 0, len(opts)+2+len(extra))
-		callOpts = append(callOpts, opts...)
-		callOpts = append(callOpts, withListItem(i), WithTXID(&txids[i]))
+	// Each call's options are the transaction's own, followed by the wave's: nothing for a
+	// combined call and create-only for the rest in the first wave, spend-only and
+	// RequireParentOutputs in the second. Each wave's are cut from one array, so a call
+	// allocates nothing for its options.
+	firstWave := make([]CreateOption, 0, 2*len(txs))
 
-		return append(callOpts, extra...)
+	for i := range txs {
+		firstWave = append(firstWave, items[i], WithCreateOnly())
 	}
 
 	all := make([]int, len(txs))
@@ -329,9 +380,9 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 		)
 
 		if len(parentsInList[i]) == 0 {
-			md, spends, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, withRequireParentOutputs())...)
+			md, spends, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, firstWave[2*i:2*i+1:2*i+1]...)
 		} else {
-			md, _, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, WithCreateOnly())...)
+			md, _, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, firstWave[2*i:2*i+2:2*i+2]...)
 		}
 
 		switch {
@@ -390,10 +441,15 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 
 	spent := make([]bool, len(txs))
 
+	secondWave := make([]CreateOption, 0, 3*len(txs))
+	for i := range txs {
+		secondWave = append(secondWave, items[i], WithSpendOnly(), withRequireParentOutputs())
+	}
+
 	notStarted = runDetachedWave(ctx, bound, widths.Spend, toSpend, func(callCtx context.Context, i int) {
 		spent[i] = true
 
-		_, spends, err := s.SpendAndCreate(callCtx, txs[i], blockHeight, itemOpts(i, WithSpendOnly(), withRequireParentOutputs())...)
+		_, spends, err := s.SpendAndCreate(callCtx, txs[i], blockHeight, secondWave[3*i:3*i+3:3*i+3]...)
 		if err != nil {
 			results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Meta: results[i].Meta, Spends: spends, Err: err}
 
@@ -415,6 +471,55 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 	}
 
 	return results, nil
+}
+
+// listItemOptions returns, for each transaction of list, one CreateOption that sets every option
+// the transaction is written with: ItemOptions(i), with its txid from the list. It works them out
+// once per list. Applying the list's own options again on every call, and then ItemOptions on top,
+// allocated on every parse of a call's options: the list's mined-block info grows a fresh slice,
+// and ItemOptions copies the struct and that slice to set one subtree index. Here every
+// transaction's mined-block info is cut from one array for the whole list, with its capacity
+// capped at its length, so an option appended later copies rather than writing into a neighbour.
+func listItemOptions(list *SpendAndCreateMultiList) []CreateOption {
+	base := list.Options
+	n := len(list.TxIDs)
+	k := len(base.MinedBlockInfos)
+	perItem := base.SubtreeIdxs != nil && k > 0
+
+	var infos []MinedBlockInfo
+	if perItem {
+		infos = make([]MinedBlockInfo, n*k)
+	}
+
+	items := make([]CreateOptions, n)
+	fns := make([]CreateOption, n)
+
+	for i := range items {
+		item := *base
+		item.TxIDs = nil
+		item.SubtreeIdxs = nil
+		item.BelowCheckpoint = false
+		item.MinedBlockInfos = base.MinedBlockInfos[:k:k]
+
+		if perItem && i < len(base.SubtreeIdxs) {
+			own := infos[i*k : (i+1)*k : (i+1)*k]
+			copy(own, base.MinedBlockInfos)
+
+			for j := range own {
+				own[j].SubtreeIdx = base.SubtreeIdxs[i]
+			}
+
+			item.MinedBlockInfos = own
+		}
+
+		item.TxID = &list.TxIDs[i]
+		items[i] = item
+
+		p := &items[i]
+		fns[i] = func(o *CreateOptions) { *o = *p }
+	}
+
+	return fns
 }
 
 // runDetachedWave runs call for every member, at most width at once, and waits

@@ -184,7 +184,7 @@ func TestServerNew(t *testing.T) {
 		subtreeConsumer := &mockKafkaConsumer{}
 		txmetaConsumer := &mockKafkaConsumer{}
 
-		server, err := New(common.Ctx, common.Logger, tSettings, subtreeStore, txStore, utxoStore,
+		server, err := New(newCancelCtx(t), common.Logger, tSettings, subtreeStore, txStore, utxoStore,
 			validatorClient, blockchainClient, subtreeConsumer, txmetaConsumer, nil, nil)
 
 		require.Error(t, err)
@@ -211,7 +211,7 @@ func TestServerNew(t *testing.T) {
 		subtreeConsumer := setupMemoryKafkaConsumer(t, "subtrees-topic")
 		txmetaConsumer := setupMemoryKafkaConsumer(t, "txmeta-topic")
 
-		server, err := New(common.Ctx, common.Logger, tSettings, subtreeStore, txStore, utxoStore,
+		server, err := New(newCancelCtx(t), common.Logger, tSettings, subtreeStore, txStore, utxoStore,
 			validatorClient, blockchainClient, subtreeConsumer, txmetaConsumer, nil, nil)
 
 		require.NoError(t, err)
@@ -245,7 +245,7 @@ func TestServerNew(t *testing.T) {
 		subtreeConsumer := setupMemoryKafkaConsumer(t, "subtrees-topic-cache")
 		txmetaConsumer := setupMemoryKafkaConsumer(t, "txmeta-topic-cache")
 
-		server, err := New(common.Ctx, common.Logger, tSettings, subtreeStore, txStore, utxoStore,
+		server, err := New(newCancelCtx(t), common.Logger, tSettings, subtreeStore, txStore, utxoStore,
 			validatorClient, blockchainClient, subtreeConsumer, txmetaConsumer, nil, nil)
 
 		require.NoError(t, err)
@@ -273,7 +273,7 @@ func TestServerNew(t *testing.T) {
 		subtreeConsumer := setupMemoryKafkaConsumer(t, "subtrees-topic-invalid")
 		txmetaConsumer := setupMemoryKafkaConsumer(t, "txmeta-topic-invalid")
 
-		server, err := New(common.Ctx, common.Logger, tSettings, subtreeStore, txStore, utxoStore,
+		server, err := New(newCancelCtx(t), common.Logger, tSettings, subtreeStore, txStore, utxoStore,
 			validatorClient, blockchainClient, subtreeConsumer, txmetaConsumer, nil, nil)
 
 		require.NoError(t, err)

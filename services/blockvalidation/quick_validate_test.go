@@ -127,7 +127,6 @@ func TestQuickValidateBlock(t *testing.T) {
 		// Setup UTXO store expectations for creating all transactions (including coinbase)
 		// Use mock.Anything for the transaction since the order may vary
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).Return(&meta.Data{}, nil, nil).Maybe()
-		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCombined()).Return(&meta.Data{}, []*utxo.Spend{}, nil).Maybe()
 
 		// Setup UTXO store expectations for spending transactions
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).Return(nil, []*utxo.Spend{}, nil).Maybe()
@@ -377,10 +376,9 @@ func TestExtendTxFromSameBlockParents(t *testing.T) {
 	t.Run("in-range vout extends the input", func(t *testing.T) {
 		child := childWithVout(t, 1, parentHash)
 
-		needsExternal, hasSameBlockParent, err := extendTxFromSameBlockParents(child, parents)
+		needsExternal, err := extendTxFromSameBlockParents(child, parents)
 		require.NoError(t, err)
 		require.False(t, needsExternal)
-		require.True(t, hasSameBlockParent, "the parent is in this block")
 		require.Equal(t, uint64(2000), child.Inputs[0].PreviousTxSatoshis)
 		require.NotNil(t, child.Inputs[0].PreviousTxScript)
 	})
@@ -388,7 +386,7 @@ func TestExtendTxFromSameBlockParents(t *testing.T) {
 	t.Run("out-of-range vout returns error, no panic", func(t *testing.T) {
 		child := childWithVout(t, 2, parentHash) // parent only has outputs 0 and 1
 
-		_, _, err := extendTxFromSameBlockParents(child, parents)
+		_, err := extendTxFromSameBlockParents(child, parents)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "non-existent output")
 	})
@@ -396,10 +394,9 @@ func TestExtendTxFromSameBlockParents(t *testing.T) {
 	t.Run("parent absent from map needs external lookup", func(t *testing.T) {
 		child := childWithVout(t, 0, parentHash)
 
-		needsExternal, hasSameBlockParent, err := extendTxFromSameBlockParents(child, map[chainhash.Hash]*bt.Tx{})
+		needsExternal, err := extendTxFromSameBlockParents(child, map[chainhash.Hash]*bt.Tx{})
 		require.NoError(t, err)
 		require.True(t, needsExternal)
-		require.False(t, hasSameBlockParent, "no parent of this block was found")
 	})
 
 	t.Run("parent with no outputs returns error", func(t *testing.T) {
@@ -407,7 +404,7 @@ func TestExtendTxFromSameBlockParents(t *testing.T) {
 		emptyHash := *emptyParent.TxIDChainHash()
 		child := childWithVout(t, 0, emptyHash)
 
-		_, _, err := extendTxFromSameBlockParents(child, map[chainhash.Hash]*bt.Tx{emptyHash: emptyParent})
+		_, err := extendTxFromSameBlockParents(child, map[chainhash.Hash]*bt.Tx{emptyHash: emptyParent})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "non-existent output")
 	})

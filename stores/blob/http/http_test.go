@@ -508,6 +508,45 @@ func TestHTTPStore_ConflictIsBlobAlreadyExists(t *testing.T) {
 	require.ErrorIs(t, err, errors.ErrBlobAlreadyExists)
 }
 
+// TestHTTPStore_GetMissIsNotFound pins that Get reports a 404 the way the other blob stores
+// report a miss: as ErrNotFound with no storage error in the chain. Callers that tell a miss
+// from a store fault by ErrStorageError - the asset tx 404 marker, for one - would otherwise
+// read every miss behind an http:// store as a fault. Any other failure is still a storage
+// error.
+func TestHTTPStore_GetMissIsNotFound(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status int
+		miss   bool
+	}{
+		"a 404 is a miss":        {http.StatusNotFound, true},
+		"a 500 is a store fault": {http.StatusInternalServerError, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+			}))
+			defer server.Close()
+
+			storeURL, err := url.Parse(server.URL)
+			require.NoError(t, err)
+
+			store, err := New(ulogger.TestLogger{}, storeURL)
+			require.NoError(t, err)
+
+			_, err = store.Get(context.Background(), []byte("k"), fileformat.FileTypeTx)
+			require.Error(t, err)
+
+			if tc.miss {
+				require.ErrorIs(t, err, errors.ErrNotFound)
+				require.NotErrorIs(t, err, errors.ErrStorageError)
+			} else {
+				require.ErrorIs(t, err, errors.ErrStorageError)
+				require.NotErrorIs(t, err, errors.ErrNotFound)
+			}
+		})
+	}
+}
+
 // TestHTTPStore_StatusErrorHasNoStrayParam pins that a non-2xx write reports its status code
 // without a formatting artefact such as "%!(EXTRA <nil>)".
 func TestHTTPStore_StatusErrorHasNoStrayParam(t *testing.T) {
