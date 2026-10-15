@@ -12,6 +12,7 @@ import (
 	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -353,4 +354,36 @@ func TestLoadUnminedTransactions_UndecidedInputCheckFailsTheLoad(t *testing.T) {
 	err := items.blockAssembler.loadUnminedTransactions(ctx, true, true)
 	require.Error(t, err, "an input check the store could not answer must fail the load, not drop the transaction")
 	require.Contains(t, err.Error(), "could not validate inputs")
+
+	// Undecided again in the next load: the error no longer fails it, or one record the store
+	// can never answer would fail every reset after it. The transaction is left out and counted.
+	excluded := testutil.ToFloat64(prometheusBlockAssemblerUnminedUndecidedExcluded)
+
+	require.NoError(t, items.blockAssembler.loadUnminedTransactions(ctx, true, true),
+		"a transaction undecided in two loads in a row must not fail the second")
+	require.Greater(t, testutil.ToFloat64(prometheusBlockAssemblerUnminedUndecidedExcluded), excluded)
+}
+
+// TestLoadUnminedTransactions_PermanentlyUndecidableRecordIsLeftOut is the bot review's case on
+// PR 1663: a record with neither stored inpoints nor a body can never have its inputs checked.
+// Failing the load on it would fail every reset while the record stays unmined, and block
+// assembly could not rebuild its candidate after a reorg. It is left out, logged and counted,
+// and the load succeeds.
+func TestLoadUnminedTransactions_PermanentlyUndecidableRecordIsLeftOut(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+
+	seedParentAndChild(ctx, t, items)
+
+	items.blockAssembler.utxoStore = &bodylessUtxoStore{Store: items.utxoStore, stripInpoints: true}
+
+	excluded := testutil.ToFloat64(prometheusBlockAssemblerUnminedUndecidedExcluded)
+
+	require.NoError(t, items.blockAssembler.loadUnminedTransactions(ctx, true, true),
+		"a record that can never be checked must not fail the load")
+	require.Greater(t, testutil.ToFloat64(prometheusBlockAssemblerUnminedUndecidedExcluded), excluded,
+		"the left-out record is counted")
 }

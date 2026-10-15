@@ -105,6 +105,12 @@ type BlockAssembler struct {
 	// logger provides logging functionality for the assembler
 	logger ulogger.Logger
 
+	// undecidedMu guards undecidedLastLoad, the unmined transactions whose input check the store
+	// could not answer in the last reload with input validation. A transaction undecided in two
+	// loads in a row is left out instead of failing the load again (see loadUnminedTransactions).
+	undecidedMu       sync.Mutex
+	undecidedLastLoad map[chainhash.Hash]struct{}
+
 	// stats tracks operational statistics for monitoring and debugging
 	stats *gocore.Stat
 
@@ -3530,11 +3536,20 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	invalidInputCount := atomic.Int64{}
 
 	// The first input check the store could not answer. It fails the load after the workers
-	// stop, so a transient read error does not cost a valid transaction its place.
+	// stop, so a transient read error does not cost a valid transaction its place. A check that
+	// can never be answered must not fail every load after it, so two cases are left out of the
+	// candidate instead, logged and counted: a record whose inputs cannot be resolved at all
+	// (permanentInputCheck), and a transaction that was undecided in the last load too.
 	var (
 		undecidedOnce sync.Once
 		undecidedErr  error
+		undecidedMu   sync.Mutex
+		undecidedNow  = map[chainhash.Hash]struct{}{}
 	)
+
+	b.undecidedMu.Lock()
+	undecidedBefore := b.undecidedLastLoad
+	b.undecidedMu.Unlock()
 
 	// Worker pool configuration — workers only filter and append to slices,
 	// they are not the bottleneck (Aerospike partition queries are). Keep low.
@@ -3613,12 +3628,29 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 						}
 
 						if validateErr != nil {
+							_, again := undecidedBefore[unminedTransaction.Hash]
+
+							if isPermanentInputCheck(validateErr) || again {
+								// It cannot be decided, now or by retrying, so it is left
+								// out as before, and the load goes on.
+								b.logger.Errorf("[loadUnminedTransactions][%s] could not validate inputs (permanent %t, undecided in the last load %t), leaving the transaction out of the candidate: %v",
+									unminedTransaction.Hash.String(), isPermanentInputCheck(validateErr), again, validateErr)
+								prometheusBlockAssemblerUnminedUndecidedExcluded.Inc()
+								invalidInputCount.Add(1)
+
+								continue
+							}
+
 							// Undecidable, not decided. The store did not answer, so
 							// nothing says the transaction is invalid, and counting it
 							// invalid dropped a valid transaction from the candidate on
 							// one transient read error. The load fails instead, after
 							// the workers stop, and the next load decides it.
 							b.logger.Errorf("[loadUnminedTransactions][%s] could not validate inputs, failing the load: %v", unminedTransaction.Hash.String(), validateErr)
+
+							undecidedMu.Lock()
+							undecidedNow[unminedTransaction.Hash] = struct{}{}
+							undecidedMu.Unlock()
 
 							undecidedOnce.Do(func() {
 								undecidedErr = errors.NewProcessingError("[loadUnminedTransactions][%s] could not validate inputs", unminedTransaction.Hash.String(), validateErr)
@@ -3692,6 +3724,14 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	// Close channel and wait for all workers to finish
 	close(workChan)
 	wg.Wait()
+
+	// The transactions undecided in this load are the ones the next load leaves out if they are
+	// undecided again. A load that decided every one clears the list.
+	if shouldValidateInputs {
+		b.undecidedMu.Lock()
+		b.undecidedLastLoad = undecidedNow
+		b.undecidedMu.Unlock()
+	}
 
 	// An input check the store could not answer fails the load, as an iterator error does.
 	// The conflicting marks the workers collected are dropped with it, for the same cause.
@@ -3955,6 +3995,22 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 	return valid, err
 }
 
+// permanentInputCheck marks an input check that can never be answered for this record, such as
+// a record with neither stored inpoints nor a body. A reload leaves such a transaction out of
+// the candidate instead of failing, because no retry can decide it. Every other error from the
+// check is a store that did not answer this time.
+type permanentInputCheck struct{ err error }
+
+func (p permanentInputCheck) Error() string { return p.err.Error() }
+
+func (p permanentInputCheck) Unwrap() error { return p.err }
+
+func isPermanentInputCheck(err error) bool {
+	_, ok := err.(permanentInputCheck) //nolint:errorlint // returned unwrapped by checkUnminedTxInputs
+
+	return ok
+}
+
 // checkUnminedTxInputs is validateUnminedTxInputs without the write: it reports
 // whether the transaction must be marked conflicting instead of marking it, and
 // only ever reads the store. loadUnminedTransactions calls it from its workers
@@ -3984,7 +4040,7 @@ func (b *BlockAssembler) checkUnminedTxInputs(ctx context.Context, txHash chainh
 	}
 
 	if txMeta == nil {
-		return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] store returned no record and no error", txHash.String())
+		return false, false, permanentInputCheck{errors.NewProcessingError("[validateUnminedTxInputs][%s] store returned no record and no error", txHash.String())}
 	}
 
 	if txMeta.Conflicting {
@@ -3999,7 +4055,9 @@ func (b *BlockAssembler) checkUnminedTxInputs(ctx context.Context, txHash chainh
 			return false, false, nil
 		}
 
-		return false, false, err
+		// A record with neither stored inpoints nor a body: its parents cannot be resolved,
+		// and asking again will not change that.
+		return false, false, permanentInputCheck{err}
 	}
 
 	for _, inpoint := range inpoints {
