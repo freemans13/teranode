@@ -1178,10 +1178,14 @@ func liveUTXOArgs(txids [][]byte) (leaves []int16, ids [][]byte, los, his [][16]
 // a disagreement INSIDE this one statement counts as corruption. The locked bit of a
 // containment row is masked with $6: a row below the lookup floor never supplies it, because
 // SetLocked's containment arm stops at that floor.
+//
+// The identity arm reads what identByTxidSQL reads, the unmined marker and the body included,
+// because in the create race above this tier builds the record. Without the marker an unmined
+// parent came back as mined in no block, and block assembly dropped its child as corrupt.
 const tier2SQL = `
 SELECT k.txid,
-       i.marker_set, i.created_height, i.fee, i.size_in_bytes, i.tx_inpoints, i.locktime,
-       i.created_at, i.flags,
+       i.ident_found, i.created_height, i.off_chain_since, i.fee, i.size_in_bytes, i.tx_inpoints,
+       i.locktime, i.created_at, i.flags, i.raw_tx,
        uz.hit IS NOT NULL AS utxo_zero,
        jz.hit IS NOT NULL AS undo_zero,
        m.mined_height, m.block_id, m.subtree_idx, m.created_height, m.size_in_bytes,
@@ -1189,9 +1193,10 @@ SELECT k.txid,
        m.flags & ~$6::smallint AS flags
   FROM unnest($2::bytea[], $3::uuid[], $4::uuid[]) AS k(txid, lo, hi)
   LEFT JOIN LATERAL (
-    SELECT i.off_chain_since IS NOT NULL AS marker_set, i.created_height, i.fee,
-           i.size_in_bytes, i.tx_inpoints, i.locktime, i.created_at, i.flags
+    SELECT TRUE AS ident_found, i.created_height, i.off_chain_since, i.fee,
+           i.size_in_bytes, i.tx_inpoints, i.locktime, i.created_at, i.flags, b.raw_tx
       FROM tx_ident i
+      LEFT JOIN tx_body b ON b.created_height = i.created_height AND b.txid = i.txid
      WHERE i.leaf = $1::smallint AND i.txid = k.txid
     OFFSET 0 ) AS i ON TRUE
   LEFT JOIN LATERAL (
@@ -1247,11 +1252,11 @@ func (s *Store) readTier2(ctx context.Context, hashes []chainhash.Hash, res *loo
 // tier2Row is one row of tier2SQL: the per-transaction columns and, when there is one, a
 // containment row.
 type tier2Row struct {
-	markerSet *bool
-	ident     metaRow
-	utxoZero  bool
-	undoZero  bool
-	mined     *minedRow
+	identFound *bool // non-nil when the identity row is there
+	ident      metaRow
+	utxoZero   bool
+	undoZero   bool
+	mined      *minedRow
 }
 
 func (s *Store) readTier2Group(ctx context.Context, g leafBatch, droppedFloor int32, res *lookupResult) error {
@@ -1287,8 +1292,9 @@ func (s *Store) readTier2Group(ctx context.Context, g leafBatch, droppedFloor in
 
 		// Every identity column is NULL when there is no identity row, so the two NOT NULL
 		// columns of that table are scanned through pointers here.
-		if err := rows.Scan(&txid, &r.markerSet, &identCreatedAt, &r.ident.fee, &r.ident.sizeInBytes,
-			&r.ident.txInpoints, &r.ident.locktime, &r.ident.createdAt, &identFlags,
+		if err := rows.Scan(&txid, &r.identFound, &identCreatedAt, &r.ident.offChainSince, &r.ident.fee,
+			&r.ident.sizeInBytes, &r.ident.txInpoints, &r.ident.locktime, &r.ident.createdAt, &identFlags,
+			&r.ident.rawTx,
 			&r.utxoZero, &r.undoZero,
 			&minedHeight, &blockID, &subtreeIdx, &createdHeight, &sizeInBytes, &fee, &txInpoints,
 			&locktime, &createdAt, &flags); err != nil {
@@ -1347,7 +1353,7 @@ func (s *Store) readTier2Group(ctx context.Context, g leafBatch, droppedFloor in
 // settleTier2 turns one transaction's tier-2 rows into its answer.
 func (s *Store) settleTier2(h chainhash.Hash, rows []tier2Row, res *lookupResult) {
 	first := rows[0]
-	hasIdent := first.markerSet != nil
+	hasIdent := first.identFound != nil
 
 	var mined []*minedRow
 
