@@ -20,7 +20,7 @@ func TestGetServesAMinedTransactionFromTheMembershipTable(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, SubtreeIdx: 3, OnLongestChain: true}))
 	require.NoError(t, err)
 
-	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
+	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights, fields.Tx)
 	require.NoError(t, err)
 	require.Equal(t, []uint32{42}, got.BlockIDs)
 	require.Equal(t, []uint32{700_100}, got.BlockHeights)

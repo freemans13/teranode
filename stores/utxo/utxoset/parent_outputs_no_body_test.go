@@ -14,7 +14,9 @@ import (
 // journal once it is spent.
 //
 // Each parent's body is overwritten with bytes that do not decode, and its coin rows are left
-// as they are. A read that touches the body fails the entry; one that does not answers it.
+// as they are. A read that touches the body fails the entry; one that does not answers it. Only
+// an output the coin rows do not hold is looked for in the body, so the no-such-output case uses
+// a parent whose body is intact.
 func TestParentOutputsForValidationNeverReadsTheBody(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
@@ -32,6 +34,11 @@ func TestParentOutputsForValidationNeverReadsTheBody(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 5, BlockHeight: 1_000, OnLongestChain: true}))
 	require.NoError(t, err)
 
+	// A parent whose body stays intact, for the output that is in no coin row.
+	intact := mkTx(t, 1, 8_000)
+	_, err = s.Create(ctx, intact, 1_000)
+	require.NoError(t, err)
+
 	for _, p := range [][]byte{unmined.TxIDChainHash()[:], mined.TxIDChainHash()[:]} {
 		tag, uerr := s.pool.Exec(ctx, `UPDATE tx_body SET raw_tx = '\xff'::bytea WHERE txid = $1`, p)
 		require.NoError(t, uerr)
@@ -42,7 +49,7 @@ func TestParentOutputsForValidationNeverReadsTheBody(t *testing.T) {
 		{TxID: *unmined.TxIDChainHash(), Vout: 0},
 		{TxID: *unmined.TxIDChainHash(), Vout: 1},
 		{TxID: *mined.TxIDChainHash(), Vout: 0},
-		{TxID: *mined.TxIDChainHash(), Vout: 9},
+		{TxID: *intact.TxIDChainHash(), Vout: 9},
 	})
 	require.NoError(t, err)
 

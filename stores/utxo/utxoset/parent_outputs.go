@@ -30,20 +30,21 @@ SELECT k.ref, j.satoshis, j.script, j.hash_override
 // ParentOutputsForValidation implements utxo.Store.
 //
 // The transaction-level answer, whether the parent exists and the lowest height of a block it
-// is recorded in, comes from the same read order Get uses, with the body left out. Every output
-// comes from the UTXO table while it is unspent, and from the spend journal once it is spent. An
-// output of a known parent in neither is reported NoSuchIndex, as the Aerospike and SQL stores
+// is recorded in, comes from the same read order Get uses, with the body left out. Each output
+// comes from the UTXO table while it is unspent, and from the spend journal once it is spent.
+// Only an output in neither is looked for in the parent's body (readMissedFromBodies). An output
+// of a known parent in none of the three is reported NoSuchIndex, as the Aerospike and SQL stores
 // report a parent with no output at that index. It covers an output the seeder never held (spent
 // before the snapshot), one that never existed, one the store never kept because it is provably
 // unspendable, and one spent before the journal's retention; none of them can be spent, so all
 // are a verdict on the spender rather than a missing parent to go and fetch. Only an unknown
 // parent is TxNotFound.
 //
-// The body is never read, even while the store keeps it. Subtree validation asks for about
-// 131,000 parent outputs at once on mainnet, 1,024 to a call with up to 128 calls in flight.
-// Reading and parsing each parent's whole body to keep one output held gigabytes live, none of
-// it garbage, and on 2026-10-15 it took mainnet past its memory limit. The fix is to read less;
-// a cache of parent outputs is ruled out on this path.
+// The body is not the source of an ordinary answer. Subtree validation asks for about 131,000
+// parent outputs at once on mainnet, 1,024 to a call with up to 128 calls in flight. Reading and
+// parsing each parent's whole body to keep one output held gigabytes live, none of it garbage,
+// and on 2026-10-15 it took mainnet past its memory limit. The fix is to read less; a cache of
+// parent outputs is ruled out on this path.
 func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint,
 	_ ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
 	answers := make([]utxo.ParentOutput, len(outpoints))
@@ -177,9 +178,65 @@ func (s *Store) readParentCoins(ctx context.Context, outpoints []utxo.Outpoint, 
 		return
 	}
 
+	var missed []int
+
 	for k, i := range idx {
 		if !found[k] && answers[i].Err == nil {
-			answers[i] = utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
+			missed = append(missed, i)
 		}
+	}
+
+	if len(missed) > 0 {
+		s.readMissedFromBodies(ctx, outpoints, missed, answers)
+	}
+}
+
+// readMissedFromBodies answers, from the parent's body, an output the coin rows do not hold. That
+// is a spent output whose journal row has dropped, or an output that never was a UTXO. The body
+// still answers the first while the store keeps it, and a mined transaction submitted again
+// after its journal row dropped depends on that: without the output, the validator rejects it
+// before it can recognise its own resubmission. Only these misses read a body, so the read
+// path for an ordinary spend stays body-free. An output in neither place is NoSuchIndex.
+func (s *Store) readMissedFromBodies(ctx context.Context, outpoints []utxo.Outpoint, idx []int, answers []utxo.ParentOutput) {
+	hashes := make([]chainhash.Hash, 0, len(idx))
+	seen := make(map[chainhash.Hash]struct{}, len(idx))
+
+	for _, i := range idx {
+		h := outpoints[i].TxID
+		if _, dup := seen[h]; !dup {
+			seen[h] = struct{}{}
+			hashes = append(hashes, h)
+		}
+	}
+
+	res, err := s.lookupMany(ctx, hashes, false, false)
+	if err != nil {
+		fault := errors.NewStorageError("[utxoset][ParentOutputsForValidation] read bodies", err)
+		for _, i := range idx {
+			answers[i] = utxo.ParentOutput{Err: fault}
+		}
+
+		return
+	}
+
+	for _, i := range idx {
+		op := outpoints[i]
+
+		if derr, bad := res.failed[op.TxID]; bad {
+			answers[i] = utxo.ParentOutput{Err: derr}
+			continue
+		}
+
+		data, ok := res.found[op.TxID]
+		if !ok || data.Tx == nil || int(op.Vout) >= len(data.Tx.Outputs) ||
+			data.Tx.Outputs[op.Vout] == nil || data.Tx.Outputs[op.Vout].LockingScript == nil {
+			answers[i] = utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
+			continue
+		}
+
+		out := data.Tx.Outputs[op.Vout]
+		script := bscript.Script(append([]byte(nil), *out.LockingScript...))
+		answers[i].Satoshis = out.Satoshis
+		answers[i].LockingScript = &script
 	}
 }
