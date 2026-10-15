@@ -447,4 +447,12 @@ func TestIsKeyNotFound(t *testing.T) {
 
 	var typedNil *aerospike.AerospikeError
 	require.False(t, isKeyNotFound(typedNil))
+
+	// Any shape other than a bare *AerospikeError skips the ResultCode fast path
+	// and takes the Matches fallback. Embedding is the only way to build such an
+	// aerospike.Error outside the client package.
+	type nonBare struct{ *aerospike.AerospikeError }
+
+	require.True(t, isKeyNotFound(nonBare{&aerospike.AerospikeError{ResultCode: types.KEY_NOT_FOUND_ERROR}}))
+	require.False(t, isKeyNotFound(nonBare{&aerospike.AerospikeError{ResultCode: types.TIMEOUT}}))
 }
