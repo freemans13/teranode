@@ -141,7 +141,7 @@ func TestMinedReadsNeverScanEveryBodyWindow(t *testing.T) {
 	}
 
 	t.Run("minedByTxidSQL", func(t *testing.T) {
-		root := explainUnderNoNestloop(t, s, ctx, minedByTxidSQL, keys, int32(0))
+		root := explainUnderNoNestloop(t, s, ctx, minedByTxidSQL, keys, int32(0), true)
 		require.True(t, assertFenced(t, root), "this read joins the body, so its plan must name tx_body")
 	})
 

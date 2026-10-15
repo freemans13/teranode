@@ -30,14 +30,20 @@ SELECT k.ref, j.satoshis, j.script, j.hash_override
 // ParentOutputsForValidation implements utxo.Store.
 //
 // The transaction-level answer, whether the parent exists and the lowest height of a block it
-// is recorded in, comes from the same read order Get uses. The output itself comes from the
-// parent's body while the store keeps it. Without a body, which is the steady state below the
-// checkpoint and 288 blocks behind the tip, it comes from the UTXO table or the spend journal.
-// An output of a known parent in neither is reported NoSuchIndex, as the Aerospike and SQL
-// stores report a parent with no output at that index. It covers an output the seeder never
-// held (spent before the snapshot), one that never existed, and one spent before the journal's
-// retention; none of them can be spent, so all three are a verdict on the spender rather than
-// a missing parent to go and fetch. Only an unknown parent is TxNotFound.
+// is recorded in, comes from the same read order Get uses, with the body left out. Every output
+// comes from the UTXO table while it is unspent, and from the spend journal once it is spent. An
+// output of a known parent in neither is reported NoSuchIndex, as the Aerospike and SQL stores
+// report a parent with no output at that index. It covers an output the seeder never held (spent
+// before the snapshot), one that never existed, one the store never kept because it is provably
+// unspendable, and one spent before the journal's retention; none of them can be spent, so all
+// are a verdict on the spender rather than a missing parent to go and fetch. Only an unknown
+// parent is TxNotFound.
+//
+// The body is never read, even while the store keeps it. Subtree validation asks for about
+// 131,000 parent outputs at once on mainnet, 1,024 to a call with up to 128 calls in flight.
+// Reading and parsing each parent's whole body to keep one output held gigabytes live, none of
+// it garbage, and on 2026-10-15 it took mainnet past its memory limit. The fix is to read less;
+// a cache of parent outputs is ruled out on this path.
 func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint,
 	_ ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
 	answers := make([]utxo.ParentOutput, len(outpoints))
@@ -50,7 +56,7 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 		hashes[i] = op.TxID
 	}
 
-	res, err := s.lookupMany(ctx, hashes, false)
+	res, err := s.lookupManyWith(ctx, hashes, false, true)
 	if err != nil {
 		fault := errors.NewStorageError("[utxoset][ParentOutputsForValidation] lookup", err)
 		for i := range answers {
@@ -60,7 +66,7 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 		return answers, nil
 	}
 
-	var fromCoins []int
+	fromCoins := make([]int, 0, len(outpoints))
 
 	for i, op := range outpoints {
 		if derr, bad := res.failed[op.TxID]; bad {
@@ -74,23 +80,8 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 			continue
 		}
 
-		status, height := parentStatus(data)
-
-		if data.Tx == nil {
-			answers[i].Status, answers[i].Height = status, height
-			fromCoins = append(fromCoins, i)
-
-			continue
-		}
-
-		if int(op.Vout) >= len(data.Tx.Outputs) || data.Tx.Outputs[op.Vout] == nil || data.Tx.Outputs[op.Vout].LockingScript == nil {
-			answers[i].Status = utxo.ParentOutputNoSuchIndex
-			continue
-		}
-
-		out := data.Tx.Outputs[op.Vout]
-		script := bscript.Script(append([]byte(nil), *out.LockingScript...))
-		answers[i] = utxo.ParentOutput{Status: status, Satoshis: out.Satoshis, LockingScript: &script, Height: height}
+		answers[i].Status, answers[i].Height = parentStatus(data)
+		fromCoins = append(fromCoins, i)
 	}
 
 	if len(fromCoins) > 0 {
@@ -114,7 +105,7 @@ func parentStatus(data *meta.Data) (utxo.ParentOutputStatus, uint32) {
 	return utxo.ParentOutputMined, lowest
 }
 
-// readParentCoins fills the outputs of body-less parents from the UTXO table or the journal.
+// readParentCoins fills the outputs of known parents from the UTXO table or the journal.
 // A fault fails only the entries it was asked about.
 func (s *Store) readParentCoins(ctx context.Context, outpoints []utxo.Outpoint, idx []int, answers []utxo.ParentOutput) {
 	leaves := make([]int16, len(idx))
