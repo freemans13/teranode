@@ -34,6 +34,8 @@ func TestSpendAndCreateMulti(t *testing.T) {
 	t.Run("below checkpoint create fails", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointCreateFails(t, store) })
 	t.Run("below checkpoint existing respent", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointExistingRespent(t, store) })
 	t.Run("below checkpoint missing parent", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointMissingParent(t, store) })
+	t.Run("below checkpoint existing parent pruned", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointExistingParentPruned(t, store) })
+	t.Run("below checkpoint second wave missing parent", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointSecondWaveMissingParent(t, store) })
 	t.Run("below checkpoint cancel mid-call", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointCancelMidCall(t, store) })
 	t.Run("below checkpoint rollback outlives deadline", func(t *testing.T) { tests.SpendAndCreateMultiBelowCheckpointRollbackOutlivesDeadline(t, store) })
 }

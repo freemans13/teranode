@@ -318,15 +318,19 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 //     made its spends in its combined call, which spends before it creates and
 //     leaves the spends in place when the record exists.
 //
-// Every spend sets IgnoreFlags.RequireParentOutputs, so a missing parent output
-// fails the spend. Without it the store would read the spender's own record,
-// created moments earlier by the first wave, as proof that the spend happened
-// in an earlier attempt and the parent has been pruned since, and a list
-// spending an output that exists nowhere would pass. Turning the fallback off
-// cannot fail a legitimate repeat: a parent is pruned only after its retention
-// has passed since it was fully spent, and the chain does not advance past the
-// block being applied, so a repeat of that block's list runs before any parent
-// its spends emptied can be pruned.
+// Every spend of the second wave sets IgnoreFlags.RequireParentOutputs, so a
+// missing parent output fails the spend. Without it the store would read the
+// spender's own record, created moments earlier by the first wave, as proof
+// that the spend happened in an earlier attempt and the parent has been pruned
+// since, and a list spending an output that exists nowhere would pass. Turning
+// the fallback off cannot fail a legitimate repeat: a parent is pruned only
+// after its retention has passed since it was fully spent, and the chain does
+// not advance past the block being applied, so a repeat of that block's list
+// runs before any parent its spends emptied can be pruned. A first-wave
+// combined call keeps the fallback, as the per-transaction path does: it spends
+// before it creates, so a record it finds was written after its spends, and on
+// a store left ahead of the chain by a reset, a transaction whose parent has
+// since been pruned is found as existing rather than failing the block.
 //
 // A call, once started, runs to its end. A combined SpendAndCreate is not
 // atomic on a store that spends and then creates (SequentialSpendAndCreate): a
@@ -338,7 +342,11 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 // the error is returned.
 //
 // A caller treats anything but MultiTxCreated and MultiTxExisted as a failed
-// list and repeats it whole, as quick validation does.
+// transaction. It may repeat the whole list, or only the failed transactions
+// with their descendants, in list order, as quick validation does: a parent
+// that went through is then outside the shorter list, so its children get a
+// combined call, which makes any spends a create-only record from the earlier
+// attempt is missing.
 func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, widths SpendAndCreateMultiWidths, txs []*bt.Tx,
 	list *SpendAndCreateMultiList, blockHeight uint32, items []CreateOption) ([]SpendAndCreateMultiResult, error) {
 	txids, parentsInList := list.TxIDs, list.ParentsInList
@@ -349,17 +357,14 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 		bound = defaultSpendAndCreateMultiCallBound
 	}
 
-	// Each call's options are the transaction's own, followed by the wave's: two per
-	// transaction in the first wave and three in the second, cut from one array per wave so
-	// a call allocates nothing for its options.
+	// Each call's options are the transaction's own, followed by the wave's: nothing for a
+	// combined call and create-only for the rest in the first wave, spend-only and
+	// RequireParentOutputs in the second. Each wave's are cut from one array, so a call
+	// allocates nothing for its options.
 	firstWave := make([]CreateOption, 0, 2*len(txs))
 
 	for i := range txs {
-		if len(parentsInList[i]) == 0 {
-			firstWave = append(firstWave, items[i], withRequireParentOutputs())
-		} else {
-			firstWave = append(firstWave, items[i], WithCreateOnly())
-		}
+		firstWave = append(firstWave, items[i], WithCreateOnly())
 	}
 
 	all := make([]int, len(txs))
@@ -374,12 +379,10 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 			err    error
 		)
 
-		callOpts := firstWave[2*i : 2*i+2 : 2*i+2]
-
 		if len(parentsInList[i]) == 0 {
-			md, spends, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, callOpts...)
+			md, spends, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, firstWave[2*i:2*i+1:2*i+1]...)
 		} else {
-			md, _, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, callOpts...)
+			md, _, err = s.SpendAndCreate(callCtx, txs[i], blockHeight, firstWave[2*i:2*i+2:2*i+2]...)
 		}
 
 		switch {

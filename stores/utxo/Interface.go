@@ -196,8 +196,9 @@ type IgnoreFlags struct {
 	// spending transaction already has a record. Without it the store reads that record as
 	// proof the spends were made in an earlier attempt and the parent has since been pruned
 	// ("already blessed"), which holds only when records are created after their spends. Set
-	// ONLY by DefaultSpendAndCreateMulti's spend wave for a WithBelowCheckpoint list, where
-	// every record is created before any spend, so the record proves nothing.
+	// ONLY by DefaultSpendAndCreateMulti's second-wave spends for a WithBelowCheckpoint list,
+	// whose records the first wave created before any of those spends, so the record proves
+	// nothing. Its first-wave combined calls spend before they create and leave it unset.
 	RequireParentOutputs bool
 }
 

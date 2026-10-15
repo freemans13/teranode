@@ -23,9 +23,10 @@ import (
 // with no parent in the list takes one combined call, and one with a parent in
 // the list a create and then a spend; a write that fails stops its
 // descendants' spends; a record that already exists has its spends made again;
-// a parent output that exists nowhere fails the spend instead of passing on
-// the strength of the record the first wave just wrote; and a cancel never
-// lands inside a call.
+// a parent output that exists nowhere fails a second-wave spend instead of
+// passing on the strength of the record the first wave just wrote, while a
+// record that existed before the list, with its spends made, is Existed even
+// when its parent has been pruned; and a cancel never lands inside a call.
 
 // waveCall is one SpendAndCreate call DefaultSpendAndCreateMulti made, with the
 // half it asked for.
@@ -311,6 +312,59 @@ func SpendAndCreateMultiBelowCheckpointMissingParent(t *testing.T, db utxostore.
 
 	_, err = db.Get(ctx, orphan.TxIDChainHash(), fields.Fee)
 	require.ErrorIs(t, err, errors.ErrTxNotFound, "the orphan's combined call failed its spend before it created")
+}
+
+// SpendAndCreateMultiBelowCheckpointExistingParentPruned: a transaction with
+// no parent in the list whose record already exists, with its spends made, and
+// whose parent is no longer in the store, as on a store left ahead of the chain
+// by a reset, is Existed, not Failed. Its combined call spends before it
+// creates, so the record it finds was written after its spends, and the store
+// may read that record as proof the spend was made, as the per-transaction path
+// does.
+func SpendAndCreateMultiBelowCheckpointExistingParentPruned(t *testing.T, db utxostore.Store) {
+	ctx := context.Background()
+
+	const height = 845
+
+	w := BuildMultiWorkload(t, 0xa8, 0, 1)
+	w.StoreRoots(t, db, height-1)
+
+	a := multiSpend(t, 1, []*bt.Tx{w.Roots[0]}, []uint32{0}, 1)
+
+	_, _, err := db.SpendAndCreate(ctx, a, height)
+	require.NoError(t, err)
+	require.NoError(t, db.Delete(ctx, w.Roots[0].TxIDChainHash()))
+
+	results, err := db.SpendAndCreateMulti(ctx, []*bt.Tx{a}, height, utxostore.WithBelowCheckpoint(), utxostore.WithIgnoreLocked(true))
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, utxostore.MultiTxExisted, results[0].Status, "a record whose spends were made must not fail on a pruned parent: %v", results[0].Err)
+}
+
+// SpendAndCreateMultiBelowCheckpointSecondWaveMissingParent: a transaction
+// with a parent in the list that also spends an output existing nowhere fails
+// that spend with ErrTxNotFound. The first wave has just written its record,
+// and the store must not take that record as proof the spend was made in an
+// earlier attempt.
+func SpendAndCreateMultiBelowCheckpointSecondWaveMissingParent(t *testing.T, db utxostore.Store) {
+	ctx := context.Background()
+
+	const height = 846
+
+	w := BuildMultiWorkload(t, 0xa9, 0, 2)
+
+	_, _, err := db.SpendAndCreate(ctx, w.Roots[0], height-1, utxostore.WithCreateOnly()) // Roots[1] never stored
+	require.NoError(t, err)
+
+	a := multiSpend(t, 1, []*bt.Tx{w.Roots[0]}, []uint32{0}, 1)
+	b := multiSpend(t, 2, []*bt.Tx{a, w.Roots[1]}, []uint32{0, 0}, 1)
+
+	results, err := db.SpendAndCreateMulti(ctx, []*bt.Tx{a, b}, height, utxostore.WithBelowCheckpoint(), utxostore.WithIgnoreLocked(true))
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.Equal(t, utxostore.MultiTxCreated, results[0].Status, "%v", results[0].Err)
+	require.Equal(t, utxostore.MultiTxFailed, results[1].Status, "a spend of an output that exists nowhere must fail")
+	require.ErrorIs(t, results[1].Err, errors.ErrTxNotFound)
 }
 
 // SpendAndCreateMultiBelowCheckpointCancelMidCall: a cancel that arrives while
