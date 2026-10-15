@@ -220,6 +220,11 @@ type Stats struct {
 	// PreviousGenEntries is the count of valid entries from the previous generation
 	// that have not yet been overwritten.
 	PreviousGenEntries uint64
+
+	// LaneWaits counts the times a lockfree-cache writer found every lane
+	// busy and had to wait for one. It stays at 0 unless more writers run at
+	// once than the cache has lanes.
+	LaneWaits uint64
 }
 
 // Reset clears all statistics in the Stats object.
