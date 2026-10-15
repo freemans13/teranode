@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
@@ -58,7 +57,7 @@ func repeatAcrossPartitionThenReorg(t *testing.T, s *Store, ctx context.Context,
 // because it assumes a spend is never journaled below its transaction's created_height. The
 // repeat breaks that, unless the repeat moves the journal row to its own height.
 func TestJournalMovesASpendRepeatedInALaterPartition(t *testing.T) {
-	crash := errors.NewProcessingError("injected crash")
+	crash := errMultiCrash
 
 	t.Run("a spend of an output outside the list", func(t *testing.T) {
 		s, ctx := newUncheckpointedStore(t)
@@ -137,7 +136,7 @@ func TestJournalLeavesASpendRepeatedInTheSamePartition(t *testing.T) {
 	require.NoError(t, err)
 
 	child := spendOutput(t, parent, 0, 1)
-	crash := errors.NewProcessingError("injected crash")
+	crash := errMultiCrash
 
 	multiFault = func(at string) error {
 		if at == "spent" {

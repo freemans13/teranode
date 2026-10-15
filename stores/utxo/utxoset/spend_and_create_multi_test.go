@@ -215,7 +215,7 @@ func TestSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
 				w := tests.BuildMultiWorkload(t, seed, levels, width)
 				w.StoreRoots(t, s, height-1)
 
-				crash := errors.NewProcessingError("injected crash")
+				crash := errMultiCrash
 				multiFault = func(at string) error {
 					if at == stage {
 						return crash
@@ -497,7 +497,7 @@ func TestSpendAndCreateMultiRepeatAfterACrashBetweenMergedGroups(t *testing.T) {
 			w := buildChain(t, 0xc1, n, nil)
 			w.StoreRoots(t, s, height-1)
 
-			crash := errors.NewProcessingError("injected crash")
+			crash := errMultiCrash
 			multiFault = func(at string) error {
 				if at == stage {
 					return crash
@@ -702,7 +702,7 @@ func TestSpendAndCreateMultiFlushesPendingBeforeASplitLevel(t *testing.T) {
 			w := buildNarrowThenWide(t, byte(0xf3+2*gi), narrow, wide) //nolint:gosec // test data
 			w.StoreRoots(t, s, height-1)
 
-			crash := errors.NewProcessingError("injected crash")
+			crash := errMultiCrash
 			multiFault = func(at string) error {
 				if at == stage {
 					return crash
@@ -854,7 +854,7 @@ func TestSpendAndCreateMultiBelowTheCheckpointRepeatsTheWholeList(t *testing.T) 
 			list := outpointOnly(w.Txs)
 			listOptions := append(belowCheckpointOptions(height), utxo.WithSubtreeIdxs(idxs))
 
-			crash := errors.NewProcessingError("injected crash")
+			crash := errMultiCrash
 			multiFault = func(at string) error {
 				if at == stage {
 					return crash
