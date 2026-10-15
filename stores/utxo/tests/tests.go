@@ -2666,3 +2666,61 @@ func AbsentRecordObservables(t *testing.T, db utxostore.Store) {
 	require.NoError(t, err)
 	require.Equal(t, int(utxostore.Status_OK), resp.Status, "an output nobody spent must report spendable")
 }
+
+// counterBodyHidingStore answers Get as the wrapped store does, but without the body of one
+// transaction. That is the record a store gives for a transaction whose body has aged out, or
+// was never kept below the checkpoint.
+type counterBodyHidingStore struct {
+	utxostore.Store
+
+	hide chainhash.Hash
+}
+
+func (s *counterBodyHidingStore) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
+	data, err := s.Store.Get(ctx, hash, f...)
+	if err != nil || data == nil || hash == nil || !hash.IsEqual(&s.hide) {
+		return data, err
+	}
+
+	stripped := *data
+	stripped.Tx = nil
+
+	return &stripped, nil
+}
+
+// ReverseKeepsTheWinnerWhenTheCounterHasNoBody is icellan's review point on PR 1663. When a
+// block that promoted D over the counter C is moved back, ReverseProcessConflicting demotes D and
+// re-spends C. Re-spending C needs C's body. When C has none, D must not be demoted: demoting it
+// marked D conflicting and freed its input while C stayed conflicting, so a valid transaction
+// left the mempool with no winner in its place. D keeps its input and stays the winner.
+func ReverseKeepsTheWinnerWhenTheCounterHasNoBody(t *testing.T, db utxostore.Store) {
+	ctx := context.Background()
+	require.NoError(t, db.SetBlockHeight(20))
+
+	parent := crashParentTx(0x51)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxostore.WithCreateOnly())
+	require.NoError(t, err)
+	require.NoError(t, db.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, true))
+
+	// C: the counter, conflicting and recorded against the parent.
+	txC := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, txC, db.GetBlockHeight(), utxostore.WithConflicting(true), utxostore.WithCreateOnly())
+	require.NoError(t, err)
+
+	// D: the winner the block promoted, spending parent[0].
+	txD := crashSpendTx(t, parent, 90000)
+	_, _, err = db.SpendAndCreate(ctx, txD, db.GetBlockHeight(), utxostore.WithCreateOnly())
+	require.NoError(t, err)
+	_, _, err = db.SpendAndCreate(ctx, txD, db.GetBlockHeight()+1, utxostore.WithSpendOnly(), utxostore.WithIgnoreLocked(true))
+	require.NoError(t, err)
+
+	hiding := &counterBodyHidingStore{Store: db, hide: *txC.TxIDChainHash()}
+
+	_, _, err = utxostore.ReverseProcessConflicting(ctx, hiding, 20, chainhash.Hash{}, []chainhash.Hash{*txD.TxIDChainHash()})
+	require.NoError(t, err)
+
+	require.False(t, crashConflicting(t, ctx, db, txD.TxIDChainHash()), "D was demoted although C could not be promoted")
+	require.NotNil(t, crashSpender(t, ctx, db, parent), "parent[0] was freed and nothing spends it")
+	require.Equal(t, txD.TxIDChainHash().String(), crashSpender(t, ctx, db, parent).String())
+	require.True(t, crashConflicting(t, ctx, db, txC.TxIDChainHash()), "C stays the loser")
+}

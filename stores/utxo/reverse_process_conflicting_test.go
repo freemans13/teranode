@@ -873,12 +873,11 @@ func TestReverseProcessConflicting_UnspendErrorPropagates(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
-// TestReverseProcessConflicting_CounterMetaNilSkipsCounter — when
-// selectCountersForDemotedTx returns a counter hash but a subsequent
-// fields.Tx Get yields nil meta (e.g. counter was pruned between calls),
-// the reverse must continue: demoted stays flagged, Unspend already
-// happened, and we just skip the Spend + Unmark for this counter.
-func TestReverseProcessConflicting_CounterMetaNilSkipsCounter(t *testing.T) {
+// TestReverseProcessConflicting_CounterMetaNilKeepsTheWinner: when a counter to promote has no
+// record or no body, it cannot be re-spent, so D is not demoted. Nothing is marked or unspent,
+// and D stays the winner. Demoting D here used to free its input and leave both transactions
+// conflicting.
+func TestReverseProcessConflicting_CounterMetaNilKeepsTheWinner(t *testing.T) {
 	ctx := context.Background()
 	mockStore := &MockUtxostore{}
 
@@ -896,15 +895,7 @@ func TestReverseProcessConflicting_CounterMetaNilSkipsCounter(t *testing.T) {
 	// First counter Get (from selectCountersForDemotedTx) — returns full meta.
 	mockStore.On("Get", mock.Anything, &counterHash, mock.Anything).
 		Return(&meta.Data{Tx: counterTx, Conflicting: true, CreatedAt: 1}, nil).Once()
-
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{demotedHash}, true).
-		Return([]*Spend{}, []chainhash.Hash{}, nil).Once()
-	mockStore.On("SpendsMadeBy", mock.Anything, demotedHash).
-		Return([]*Spend{{TxID: &parentHash, Vout: 0}}, nil).Once()
-	mockStore.On("Unspend", mock.Anything, mock.AnythingOfType("[]*utxo.Spend"), mock.Anything).
-		Return(nil).Once()
-
-	// Second counter Get (from the post-Unspend Spend prep loop) — nil meta.
+	// Second counter Get (the body read before anything changes) — nil meta.
 	mockStore.On("Get", mock.Anything, &counterHash, mock.Anything).
 		Return((*meta.Data)(nil), nil).Once()
 
@@ -912,9 +903,10 @@ func TestReverseProcessConflicting_CounterMetaNilSkipsCounter(t *testing.T) {
 		[]chainhash.Hash{demotedHash})
 	require.NoError(t, err)
 
-	assert.Contains(t, cascade, demotedHash, "demoted must still flag even if counter promotion skipped")
-	assert.Contains(t, touched, demotedHash)
-	assert.NotContains(t, touched, counterHash, "skipped counter must not appear in touched set")
+	assert.Empty(t, cascade, "D must not be demoted when its counter cannot be promoted")
+	assert.Empty(t, touched)
+	mockStore.AssertNotCalled(t, "SetConflicting", mock.Anything, mock.Anything, mock.Anything)
+	mockStore.AssertNotCalled(t, "Unspend", mock.Anything, mock.Anything, mock.Anything)
 	mockStore.AssertExpectations(t)
 }
 

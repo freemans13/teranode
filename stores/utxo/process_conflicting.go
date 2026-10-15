@@ -69,6 +69,18 @@ var (
 			Buckets:   util.MetricsBucketsMilliSeconds,
 		},
 	)
+
+	// prometheusUtxoReverseSkippedNoCounterBody counts the demotions ReverseProcessConflicting
+	// did not make because a counter it would promote has no stored body. These free functions
+	// have no logger, so the counter is how an operator sees it.
+	prometheusUtxoReverseSkippedNoCounterBody = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "utxo",
+			Name:      "reverse_conflicting_skipped_no_counter_body",
+			Help:      "Demotions not made by ReverseProcessConflicting because a counter to promote has no stored body",
+		},
+	)
 )
 
 // conflictingWalkFanOut caps the per-level width of the conflicting-descendant
@@ -591,6 +603,39 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 			return nil, nil, selErr
 		}
 
+		// Every counter's body is read before anything changes. Re-spending a counter's inputs
+		// needs its body, because SpendAndCreate takes a *bt.Tx and the interface has no
+		// body-free route. A body-less record is ordinary: on the utxoset store the tx_body
+		// partition ages out, and below the checkpoint with utxostore_skipTxBodyBelowCheckpoint
+		// on there is no body at all. When a counter has none, D is not demoted. Demoting it
+		// would mark D and its descendants conflicting and free D's inputs while the counter
+		// stays conflicting, and a valid transaction and its descendants would leave the
+		// mempool with no winner in their place. Left as it is, D keeps its inputs and stays
+		// the winner, which is the state before this block's promotion, and the skip is counted.
+		counterTxs := make([]*bt.Tx, 0, len(countersToPromote))
+		missingBody := false
+
+		for _, counterHash := range countersToPromote {
+			counterMeta, getCounterErr := s.Get(ctx, &counterHash, fields.Tx)
+			if getCounterErr != nil {
+				return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting][%s] error getting counter tx %s", demotedHash.String(), counterHash.String(), getCounterErr)
+			}
+
+			if counterMeta == nil || counterMeta.Tx == nil {
+				missingBody = true
+
+				break
+			}
+
+			counterTxs = append(counterTxs, counterMeta.Tx)
+		}
+
+		if missingBody {
+			prometheusUtxoReverseSkippedNoCounterBody.Inc()
+
+			continue
+		}
+
 		// Step 2: re-mark D + descendants Conflicting=true.
 		_, markedOrder, markErr := MarkConflictingRecursively(ctx, s, []chainhash.Hash{demotedHash})
 		if markErr != nil {
@@ -623,30 +668,8 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 		}
 
 		// Step 4 & 5: per counter, re-spend its inputs and un-cascade.
-		for _, counterHash := range countersToPromote {
-			counterMeta, getCounterErr := s.Get(ctx, &counterHash, fields.Tx)
-			if getCounterErr != nil {
-				return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting][%s] error getting counter tx %s", demotedHash.String(), counterHash.String(), getCounterErr)
-			}
-
-			// TODO: this skips a counter whose record carries no body, in silence.
-			// Re-spending its inputs needs the body -- SpendAndCreate takes a
-			// *bt.Tx and there is no body-free route in the interface -- but a
-			// body-less record is not exotic: on the utxoset store the tx_body
-			// partition ages out, so an unmined counter older than the partition has no
-			// body at all, and below the checkpoint with
-			// utxostore_skipTxBodyBelowCheckpoint on neither the body nor the
-			// stored inpoints exist. When that happens the promoted counter's
-			// inputs are left unspent and this reports success. Making it loud
-			// needs a logger on this path (this is a free function over the store
-			// interface, with none), and turning it into a hard error would fail
-			// any reorg touching a pruned counter -- so it is left as is here and
-			// tracked as a follow-up rather than changed blind.
-			if counterMeta == nil || counterMeta.Tx == nil {
-				continue
-			}
-
-			if _, _, spendErr := s.SpendAndCreate(ctx, counterMeta.Tx, blockHeight, WithSpendOnly(),
+		for k, counterHash := range countersToPromote {
+			if _, _, spendErr := s.SpendAndCreate(ctx, counterTxs[k], blockHeight, WithSpendOnly(),
 				WithIgnoreConflicting(true), WithIgnoreLocked(true)); spendErr != nil {
 				return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting][%s] error spending counter %s", demotedHash.String(), counterHash.String(), spendErr)
 			}

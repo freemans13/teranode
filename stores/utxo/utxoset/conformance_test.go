@@ -174,6 +174,12 @@ func TestConformance(t *testing.T) {
 		tests.ConflictWALCrashRecovery(t, db)
 	})
 
+	// A reverse whose counter has no body keeps the winner, and does not demote it.
+	t.Run("ReverseKeepsTheWinnerWhenTheCounterHasNoBody", func(t *testing.T) {
+		db, _ := newUncheckpointedStore(t)
+		tests.ReverseKeepsTheWinnerWhenTheCounterHasNoBody(t, db)
+	})
+
 	// The conflicting flag from the outside: GetSpend reports CONFLICTING on the UTXO, Get
 	// reports it on the metadata, a spend of that UTXO fails with ErrTxConflicting, and the
 	// contested parent names the child without becoming conflicting itself.
