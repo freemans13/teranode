@@ -30,7 +30,8 @@ var (
 	// Count of items evicted from the cache due to memory constraints; indicates pressure
 	prometheusBlockValidationTxMetaCacheEvictions prometheus.Gauge
 	// Count of trim operations performed on the cache; tracks memory management activity
-	prometheusBlockValidationTxMetaCacheTrims prometheus.Gauge
+	prometheusBlockValidationTxMetaCacheTrims     prometheus.Gauge
+	prometheusBlockValidationTxMetaCacheLaneWaits prometheus.Gauge
 	// Total size of all map buckets in the cache; monitors memory consumption
 	prometheusBlockValidationTxMetaCacheMapSize prometheus.Gauge
 	// Cumulative count of all elements ever added to the cache; tracks total throughput
@@ -132,6 +133,7 @@ func updateTxMetaCachePrometheusMetrics() {
 		validEntriesCount  uint64
 		currentGenEntries  uint64
 		previousGenEntries uint64
+		laneWaits          uint64
 	)
 
 	for _, cache := range caches {
@@ -148,6 +150,7 @@ func updateTxMetaCachePrometheusMetrics() {
 		validEntriesCount += cacheStats.ValidEntriesCount
 		currentGenEntries += cacheStats.CurrentGenEntries
 		previousGenEntries += cacheStats.PreviousGenEntries
+		laneWaits += cacheStats.LaneWaits
 	}
 
 	prometheusBlockValidationTxMetaCacheInsertions.Set(float64(insertions))
@@ -161,6 +164,7 @@ func updateTxMetaCachePrometheusMetrics() {
 	prometheusBlockValidationTxMetaCacheValidEntriesCount.Set(float64(validEntriesCount))
 	prometheusBlockValidationTxMetaCacheCurrentGenEntries.Set(float64(currentGenEntries))
 	prometheusBlockValidationTxMetaCachePreviousGenEntries.Set(float64(previousGenEntries))
+	prometheusBlockValidationTxMetaCacheLaneWaits.Set(float64(laneWaits))
 }
 
 // initPrometheusMetrics initializes all Prometheus metrics for the txmetacache package.
@@ -262,6 +266,18 @@ func _initPrometheusMetrics() {
 			Subsystem: "tx_meta_cache",
 			Name:      "evictions",
 			Help:      "Number of evictions in the tx meta cache",
+		},
+	)
+
+	// LaneWaits counts the times a lockfree-cache writer found every lane busy
+	// and had to wait. It should stay at 0; a rising value means more writers
+	// run at once than the cache has lanes, which costs CPU in the wait loop.
+	prometheusBlockValidationTxMetaCacheLaneWaits = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "tx_meta_cache",
+			Name:      "lane_waits",
+			Help:      "Number of times a lockfree txmeta cache writer found every lane busy",
 		},
 	)
 

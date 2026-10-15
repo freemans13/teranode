@@ -143,6 +143,14 @@ const (
 	txLockedMaxSafeRetries = 10
 )
 
+// DefaultTwoPhaseCommitTimeout is the fallback behind validator_twoPhaseCommitTimeout, the
+// budget that bounds a two-phase-commit unlock. Exported so a caller that performs the unlock
+// on the validator's behalf uses the SAME budget rather than a copy that can drift: subtree
+// validation retries the unlock for transactions the validator accepted but could not unlock
+// (see services/subtreevalidation unlockAcceptedTransactions) and has no setting of its own
+// for it. Read validator_twoPhaseCommitTimeout in preference to this when you have settings.
+const DefaultTwoPhaseCommitTimeout = defaultTwoPhaseCommitTimeout
+
 // childLockBudget returns how long a child spending a still-committing parent keeps
 // retrying before it is lost: the sum of the loop's exponential backoffs, which for
 // maxRetries retries of txLockedBaseBackoff doubling each time is
@@ -284,11 +292,9 @@ type Validator struct {
 	// Memory cost: ~4 MB per million blocks (one uint32 per block), negligible for any
 	// foreseeable chain length.
 	//
-	// mtpMu guards concurrent access to mtpStore.
-	//   - EnsureMTPLoaded acquires the write lock for the duration of the fetch + append +
-	//     in-place overlap patch. Concurrent EnsureMTPLoaded callers serialise; the second
-	//     one fast-paths out after acquiring the lock if the first already populated the
-	//     range it needs.
+	// mtpMu guards concurrent access to mtpStore and mtpLoadWindows.
+	//   - EnsureMTPLoaded serializes fetches with mtpLoadMu, leaving readers free
+	//     during RPCs. It takes mtpMu only to inspect or publish the store.
 	//   - validateTransaction acquires the read lock around its MTP lookups. This protects
 	//     against the cross-block case where block N's per-tx goroutines are still reading
 	//     while block N+1's EnsureMTPLoaded is appending or patching overlap entries (the
@@ -296,8 +302,26 @@ type Validator struct {
 	//     readers may be addressing).
 	// Same-block contention is negligible: EnsureMTPLoaded runs once per block before per-tx
 	// goroutines start, and per-tx readers only contend with each other on the read lock.
-	mtpMu    sync.RWMutex
-	mtpStore []uint32
+	mtpLoadMu sync.Mutex
+	mtpMu     sync.RWMutex
+	mtpStore  []uint32
+	// mtpLoadWindows tracks the height ranges ([from, to)) that in-flight
+	// EnsureMTPLoaded calls are about to patch for reorg repair. Guarded by mtpMu.
+	// EnsureMTPLoaded's fast path (see comment there) must fall through to
+	// mtpLoadMu when the requested height falls inside a published window, even
+	// though the store already covers it, since the in-flight loader may be about
+	// to overwrite that entry. mtpLoadMu today serializes loaders one at a time,
+	// so at most one window is ever published, but this is kept as a collection
+	// so correctness does not depend on that serialization staying single-loader.
+	mtpLoadWindows []mtpLoadWindow
+}
+
+// mtpLoadWindow is a half-open height range [From, To) that an in-flight
+// EnsureMTPLoaded call may rewrite while repairing reorg-invalidated MTP
+// entries. See mtpLoadWindows.
+type mtpLoadWindow struct {
+	From uint32
+	To   uint32
 }
 
 // New creates a new Validator instance with the provided configuration.
@@ -1523,11 +1547,17 @@ func (v *Validator) precheckTransaction(tx *bt.Tx, txID string, blockHeight uint
 // and its spends must stand.
 //
 // On the success path, if the unlock itself fails, err is set to the unlock error.
-// No caller currently acts on that signal specifically - the real recovery path is
-// the same self-healing loadUnminedTransactions route described above (see
-// docs/topics/features/two_phase_commit.md), not caller-side handling of this
-// error. Setting err is mainly for observability of the failure at the point it
-// happened.
+// That error is the typed errors.ErrTxUnlockFailed, and it means ACCEPTED, STILL
+// LOCKED - the spend, the record and the delivery to block assembly all succeeded.
+// Callers do act on it, by code rather than by trusting a nil error: propagation,
+// the RPC submit path, this package's own Kafka intake, legacy sync and subtree
+// validation all branch on it (see ErrTxUnlockFailed in errors/Error_types.go), and
+// subtree validation retries the unlock (unlockAcceptedTransactions in
+// services/subtreevalidation/SubtreeValidation.go). A caller must therefore not
+// reduce a non-nil error here to "rejected" without checking the code first. If
+// every retry fails, the recovery path is the self-healing loadUnminedTransactions
+// route described above (see docs/topics/features/two_phase_commit.md); the signal
+// to watch is the teranode_validator_unlock_failed counter.
 //
 // The unlock decision is gated on delivered, not on *err being nil. delivered only
 // becomes true once sendToBlockAssembler has actually returned successfully, so it
@@ -1611,7 +1641,9 @@ func (v *Validator) twoPhaseCommitTransaction(ctx context.Context, tx *bt.Tx, tx
 	// so we can now mark it as spendable again
 	if err := v.utxoStore.SetLocked(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, false); err != nil {
 		// this is not a fatal error, since the transaction will we marked as spendable on the next block it's mined into
-		err = errors.NewProcessingError("[Validate][%s] error marking tx as spendable", txID, err)
+		prometheusValidatorUnlockFailed.Inc()
+
+		err = errors.NewTxUnlockFailedError("[Validate][%s] error marking tx as spendable", txID, err)
 		span.RecordError(err)
 
 		return err
@@ -2713,13 +2745,34 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 
 	needed := blockHeight
 
-	v.mtpMu.Lock()
-	defer v.mtpMu.Unlock()
+	// Fast path: the store already covers `needed` and no in-flight loader is
+	// about to rewrite that entry. A loader publishes the [From, To) window it is
+	// about to patch (see mtpLoadWindows) before it releases mtpMu to perform the
+	// fetch, so a covered-but-in-flight height falls through to the mtpLoadMu wait
+	// below instead of racing the patch.
+	v.mtpMu.RLock()
+	covered := uint32(len(v.mtpStore)) > needed
+	inFlight := false
+	if covered {
+		for _, w := range v.mtpLoadWindows {
+			if needed >= w.From && needed < w.To {
+				inFlight = true
+				break
+			}
+		}
+	}
+	v.mtpMu.RUnlock()
+	if covered && !inFlight {
+		return nil
+	}
 
-	// Fast path: store already covers the needed height.  A concurrent EnsureMTPLoaded
-	// that won the lock may have already populated the store; re-checking here avoids a
-	// redundant gRPC fetch.
+	// Serialize loaders without blocking readers of already loaded heights.
+	// Recheck after admission so concurrent callers do not duplicate RPCs.
+	v.mtpLoadMu.Lock()
+	defer v.mtpLoadMu.Unlock()
+	v.mtpMu.RLock()
 	currentLen := uint32(len(v.mtpStore))
+	v.mtpMu.RUnlock()
 	if currentLen > needed {
 		return nil
 	}
@@ -2733,6 +2786,25 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 		fromHeight = currentLen - mtpReorgOverlap
 	}
 
+	// Publish the window this load is about to patch so concurrent callers whose
+	// needed height falls inside it wait instead of taking the fast path above.
+	// Always removed on return, including on error, so a failed fetch cannot leave
+	// a stale window blocking future fast-path callers.
+	window := mtpLoadWindow{From: fromHeight, To: currentLen}
+	v.mtpMu.Lock()
+	v.mtpLoadWindows = append(v.mtpLoadWindows, window)
+	v.mtpMu.Unlock()
+	defer func() {
+		v.mtpMu.Lock()
+		for i, w := range v.mtpLoadWindows {
+			if w == window {
+				v.mtpLoadWindows = append(v.mtpLoadWindows[:i], v.mtpLoadWindows[i+1:]...)
+				break
+			}
+		}
+		v.mtpMu.Unlock()
+	}()
+
 	isInitialLoad := currentLen == 0
 	start := time.Now()
 
@@ -2745,6 +2817,9 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 	if uint32(len(fetched)) != expected {
 		return errors.NewProcessingError("[Validator][EnsureMTPLoaded] MTP count mismatch: expected %d, got %d", expected, len(fetched))
 	}
+
+	v.mtpMu.Lock()
+	defer v.mtpMu.Unlock()
 
 	// Patch any overlap values that changed (reorg-invalidated entries).
 	for i := fromHeight; i < currentLen; i++ {
@@ -2777,7 +2852,7 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 // Phase 2 is only executed when phase 1 succeeds and SkipPolicyChecks is true (block context).
 // This avoids the cost of MTP lookups when a transaction fails normal validation.
 // MTP values are read from v.mtpStore, pre-loaded by EnsureMTPLoaded before concurrent
-// goroutines start, so no gRPC calls or locking are needed here.
+// goroutines start; lookups take a read lock and do not issue gRPC calls.
 func (v *Validator) validateTransaction(ctx context.Context, tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, validationOptions *Options) error {
 	ctx, span, deferFn := tracing.Tracer("validator").Start(ctx, "validateTransaction",
 		tracing.WithHistogram(prometheusTransactionValidate),
