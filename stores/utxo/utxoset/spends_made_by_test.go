@@ -1,8 +1,10 @@
 package utxoset
 
 import (
+	"strconv"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/require"
 )
@@ -154,5 +156,63 @@ func TestSpendsMadeByMatchesWhatSetConflictingReturns(t *testing.T) {
 			"UTXO %d must come from the same transaction", i)
 		require.Equal(t, viaConflicting[i].Vout, viaMethod[i].Vout,
 			"and the same output", i)
+	}
+}
+
+// TestSpendsMadeByNamesTheInputThatTookEachUTXO is icellan's review point: the record must name
+// the input of the spender that took the UTXO. The list SpendsMadeBy reads groups the outpoints
+// by parent, so a position in that list is not an input index when inputs from two parents are
+// interleaved.
+func TestSpendsMadeByNamesTheInputThatTookEachUTXO(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	a := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, a, 100)
+	require.NoError(t, err)
+
+	b := mkTx(t, 3, 6_000)
+	_, err = s.Create(ctx, b, 100)
+	require.NoError(t, err)
+
+	// Inputs: a:0, b:0, a:1. Grouped by parent, the list reads a:0, a:1, b:0.
+	child := bt.NewTx()
+	for _, in := range []struct {
+		parent *bt.Tx
+		vout   uint32
+	}{{a, 0}, {b, 0}, {a, 1}} {
+		require.NoError(t, child.FromUTXOs(&bt.UTXO{
+			TxIDHash:      in.parent.TxIDChainHash(),
+			Vout:          in.vout,
+			LockingScript: in.parent.Outputs[in.vout].LockingScript,
+			Satoshis:      in.parent.Outputs[in.vout].Satoshis,
+		}))
+	}
+
+	child.AddOutput(&bt.Output{Satoshis: 1_000, LockingScript: a.Outputs[0].LockingScript})
+
+	_, err = s.Create(ctx, child, 101)
+	require.NoError(t, err)
+
+	spends, err := spendOnly(ctx, s, child, 101)
+	require.NoError(t, err)
+
+	for _, sp := range spends {
+		require.NoError(t, sp.Err)
+	}
+
+	got, err := s.SpendsMadeBy(ctx, *child.TxIDChainHash())
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	want := map[string]int{
+		a.TxIDChainHash().String() + ":0": 0,
+		b.TxIDChainHash().String() + ":0": 1,
+		a.TxIDChainHash().String() + ":1": 2,
+	}
+
+	for _, sp := range got {
+		key := sp.TxID.String() + ":" + strconv.Itoa(int(sp.Vout))
+		require.Contains(t, want, key)
+		require.Equal(t, want[key], sp.SpendingData.Vin, "the record for %s names the wrong input", key)
 	}
 }

@@ -27,9 +27,12 @@ import (
 // journal returns no row either. Both are omitted rather than guessed at. That is deliberate:
 // Unspend fails the entire restore if a single record it is given cannot be restored, so
 // padding the answer would break the undo rather than complete it.
+//
+// k.pos is the outpoint's position in the caller's list, which is grouped by parent, so it is not
+// the input index. The input index is j.spending_vin, which the spend wrote.
 const spendsMadeBySQL = `
-SELECT k.vin, j.satoshis, j.script, j.hash_override
-  FROM unnest($1::uuid[], $2::bytea[], $3::int[]) AS k(ukey, txid, vin)
+SELECT k.pos, j.spending_vin, j.satoshis, j.script, j.hash_override
+  FROM unnest($1::uuid[], $2::bytea[], $3::int[]) AS k(ukey, txid, pos)
   JOIN spend_journal j
     ON j.ukey = k.ukey AND j.txid = k.txid AND j.spending_txid = $4::bytea`
 
@@ -62,7 +65,7 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 
 	ukeys := make([][16]byte, 0, len(flat))
 	ptxids := make([][]byte, 0, len(flat))
-	vins := make([]int32, 0, len(flat))
+	positions := make([]int32, 0, len(flat))
 	parents := make([]chainhash.Hash, 0, len(flat))
 	vouts := make([]uint32, 0, len(flat))
 
@@ -76,7 +79,7 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 
 		ukeys = append(ukeys, Pack(parent[:], in.Index))
 		ptxids = append(ptxids, parent[:])
-		vins = append(vins, int32(len(parents))) //nolint:gosec // bounded by input count
+		positions = append(positions, int32(len(parents))) //nolint:gosec // bounded by input count
 		parents = append(parents, parent)
 		vouts = append(vouts, in.Index)
 	}
@@ -85,7 +88,7 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 		return nil, nil
 	}
 
-	rows, err := s.pool.Query(ctx, spendsMadeBySQL, ukeys, ptxids, vins, txHash[:])
+	rows, err := s.pool.Query(ctx, spendsMadeBySQL, ukeys, ptxids, positions, txHash[:])
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset][SpendsMadeBy] %s", txHash.String(), err)
 	}
@@ -96,22 +99,23 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 
 	for rows.Next() {
 		var (
+			pos          int32
 			vin          int32
 			satoshis     int64
 			script       []byte
 			hashOverride []byte
 		)
 
-		if err := rows.Scan(&vin, &satoshis, &script, &hashOverride); err != nil {
+		if err := rows.Scan(&pos, &vin, &satoshis, &script, &hashOverride); err != nil {
 			return nil, errors.NewStorageError("[utxoset][SpendsMadeBy] scan %s", txHash.String(), err)
 		}
 
-		parent := parents[vin]
+		parent := parents[pos]
 		spender := txHash
 
 		sp := &utxo.Spend{
 			TxID: &parent,
-			Vout: vouts[vin],
+			Vout: vouts[pos],
 			// The spender is the ownership token Unspend restores on, so a record without it
 			// is refused outright.
 			SpendingData: spendpkg.NewSpendingData(&spender, int(vin)),
@@ -130,7 +134,7 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 		// The other two stores put the UTXO's computed identity on these records, so this one
 		// does too. Nothing in this store reads it, since Unspend restores on the outpoint and
 		// the spender, but a record that travels to shared code should not be the odd one out.
-		if h, herr := util.UTXOHash(&parent, vouts[vin], bscript.NewFromBytes(script), uint64(satoshis)); herr == nil { //nolint:gosec // satoshis are never negative
+		if h, herr := util.UTXOHash(&parent, vouts[pos], bscript.NewFromBytes(script), uint64(satoshis)); herr == nil { //nolint:gosec // satoshis are never negative
 			sp.UTXOHash = h
 		}
 
