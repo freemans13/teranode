@@ -333,8 +333,11 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 // reports quiet = true when it wrote no containment row on purpose, below the fence.
 //
 // ensureTxMinedPartition runs BEFORE the transaction opens, because the DDL needs its own pool
-// connection; the same rule the create path follows. It refuses a dropped partition, so a call
-// that names one never reaches the fence.
+// connection; the same rule the create path follows. It refuses a dropped partition. For a block
+// off the longest chain that refusal is the dropped-partition skip below, reached early: the
+// floor is read again and, when the block's partition is dropped, the call returns quiet success.
+// Without that, the refusal went back to update-tx-mined as a critical error, and a deep fork
+// block retried for ever. A block on the longest chain keeps the refusal.
 //
 // The fence lock is the transaction's first statement, and the fence is read as its second.
 // Below the fence the rule is: a block off the longest chain inserts nothing and returns
@@ -352,7 +355,23 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 // repairs it.
 func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.MinedBlockInfo) (quiet bool, err error) {
 	if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
-		return false, err
+		if info.OnLongestChain {
+			return false, err
+		}
+
+		// The dropped floor only rises, so a block below it now stays below it.
+		floors, ferr := s.Floors(ctx)
+		if ferr != nil {
+			return false, err
+		}
+
+		if !(fenceState{droppedFloor: floors.DroppedFloor}).dropped(info.BlockHeight) {
+			return false, err
+		}
+
+		fenceNoops.WithLabelValues("dropped_skip").Inc()
+
+		return true, nil
 	}
 
 	dbTx, err := s.pool.Begin(ctx)
