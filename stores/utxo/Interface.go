@@ -645,6 +645,15 @@ type Store interface {
 	// as the same spend, and SpendAndCreate spends before it creates, so a
 	// record that exists has made its spends.
 	//
+	// A caller may repeat only the transactions that were not Created or
+	// Existed, in list order; quick validation does. So a store that reports
+	// per-transaction failures must leave the store such that the shorter list
+	// finishes the write, with every parent that went through outside it. A
+	// store whose write depends on the whole list, one that leaves out the
+	// coins a later transaction of the list spends for instance, cannot: it
+	// returns an error for the whole call instead, and the caller repeats the
+	// whole list.
+	//
 	// WithBelowCheckpoint lets the store write the list in any order, because
 	// the caller already knows the block is valid. In that order a record can
 	// exist before its spends are made, after a crash for instance, so finding
