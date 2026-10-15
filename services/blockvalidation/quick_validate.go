@@ -2438,12 +2438,17 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 	})
 }
 
-// applyList writes a batch's list through SpendAndCreateMulti, repeating the whole list on a
-// store fault: a repeat is safe because the store reports a transaction it finds again as
-// existing rather than writing it twice. A transaction that exists is collected for the
-// mined-info stamp; the store has already made its spends. A transaction the
-// store fails, or whose parent in the list failed, fails the batch closed unless the failure is
-// retryable, which the per-transaction default reports per transaction rather than as an error.
+// applyList writes a batch's list through SpendAndCreateMulti. A store fault on the whole call
+// repeats the list; a retryable failure of some of its transactions repeats only those, with
+// the children the store failed as ParentFailed beside them, as the per-transaction waves
+// retried only what failed. A repeat is safe because the store reports a transaction it finds
+// again as existing rather than writing it twice, and a sub-list keeps block order, so a parent
+// that went through on an earlier pass is one the store finds outside the list. A pass that fails
+// as many transactions as it was given makes no progress and fails the batch. A transaction that
+// exists is collected for the mined-info stamp; the store has already made its spends. A
+// transaction the store fails, or whose parent in the list failed, fails the batch closed unless
+// the failure is retryable, which the per-transaction default reports per transaction rather than
+// as an error.
 func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs []*bt.Tx, txids []chainhash.Hash,
 	subtreeIdxs []int, lockUTXOs, outpointOnly bool, collectExisting func(*bt.Tx)) error {
 	const maxRetries = 10
@@ -2457,22 +2462,27 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 		backoff = spendRetryBackoffDefault
 	}
 
-	opts := []utxo.CreateOption{
-		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: block.ID, BlockHeight: block.Height}),
-		utxo.WithSubtreeIdxs(subtreeIdxs),
-		utxo.WithTXIDs(txids),
-		utxo.WithBelowCheckpoint(),
-		utxo.WithLocked(lockUTXOs),
-		utxo.WithIgnoreLocked(true),
-		utxo.WithSkipExtendedInputs(outpointOnly),
-		utxo.WithSkipUTXOHashCheck(outpointOnly),
+	opts := func(txids []chainhash.Hash, subtreeIdxs []int) []utxo.CreateOption {
+		return []utxo.CreateOption{
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: block.ID, BlockHeight: block.Height}),
+			utxo.WithSubtreeIdxs(subtreeIdxs),
+			utxo.WithTXIDs(txids),
+			utxo.WithBelowCheckpoint(),
+			utxo.WithLocked(lockUTXOs),
+			utxo.WithIgnoreLocked(true),
+			utxo.WithSkipExtendedInputs(outpointOnly),
+			utxo.WithSkipUTXOHashCheck(outpointOnly),
+		}
 	}
+
+	total := len(txs)
+	failed := total + 1 // no pass has failed anything yet, so the first is progress
 
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			u.logger.Infof("[applyList][%s] retry %d/%d of a list of %d transactions: %v", block.Hash().String(), attempt, maxRetries, len(txs), lastErr)
+			u.logger.Infof("[applyList][%s] retry %d/%d of %d of a list of %d transactions: %v", block.Hash().String(), attempt, maxRetries, len(txs), total, lastErr)
 			sleepUnlessDone(ctx, backoff)
 		}
 
@@ -2480,7 +2490,7 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 			return errors.NewContextCanceledError("[applyList][%s] context cancelled", block.Hash().String(), ctx.Err())
 		}
 
-		results, err := u.utxoStore.SpendAndCreateMulti(ctx, txs, block.Height, opts...)
+		results, err := u.utxoStore.SpendAndCreateMulti(ctx, txs, block.Height, opts(txids, subtreeIdxs)...)
 
 		switch {
 		case utxo.IsSpendAndCreateMultiRefused(err):
@@ -2500,46 +2510,58 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 			return errors.NewProcessingError("[applyList][%s] SpendAndCreateMulti returned %d results for %d transactions", block.Hash().String(), len(results), len(txs))
 		}
 
-		// Any retryable failure repeats the whole list, including the children it failed as
-		// ParentFailed, which are not retryable on their own; a hard failure elsewhere in the
-		// list shows up again on the repeat. With no retryable failure, the first hard one fails
-		// the batch.
-		var retryable, hard error
+		// A retryable failure keeps its transaction for the next pass, and so does every
+		// transaction the store failed or skipped beside it, including the children it failed
+		// as ParentFailed, which are not retryable on their own. With no retryable failure, the
+		// first hard one fails the batch.
+		var (
+			retryable, hard error
+			retry           []int
+		)
 
 		for i, r := range results {
-			if r.Status == utxo.MultiTxCreated || r.Status == utxo.MultiTxExisted {
+			switch {
+			case r.Status == utxo.MultiTxExisted:
+				collectExisting(txs[i])
 				continue
-			}
-
-			if r.Err != nil && errors.IsRetryableError(r.Err) {
+			case r.Status == utxo.MultiTxCreated:
+				continue
+			case r.Err != nil && errors.IsRetryableError(r.Err):
 				retryable = r.Err
-				continue
-			}
-
-			if hard == nil {
+			case hard == nil:
 				hard = errors.NewProcessingError("[applyList][%s] transaction %s could not be applied (status %d)", block.Hash().String(), txids[i].String(), r.Status, r.Err)
 			}
+
+			retry = append(retry, i)
 		}
 
-		if retryable != nil {
-			lastErr = retryable
-			continue
-		}
-
-		if hard != nil {
+		if retryable == nil && hard != nil {
 			return hard
 		}
 
-		for i, r := range results {
-			if r.Status == utxo.MultiTxExisted {
-				collectExisting(txs[i])
-			}
+		if len(retry) == 0 {
+			return nil
 		}
 
-		return nil
+		if len(retry) >= failed {
+			return errors.NewProcessingError("[applyList][%s] %d of %d transactions failed again with no progress, giving up", block.Hash().String(), len(retry), total, retryable)
+		}
+
+		failed = len(retry)
+		lastErr = retryable
+
+		nextTxs := make([]*bt.Tx, len(retry))
+		nextTxIDs := make([]chainhash.Hash, len(retry))
+		nextIdxs := make([]int, len(retry))
+
+		for j, i := range retry {
+			nextTxs[j], nextTxIDs[j], nextIdxs[j] = txs[i], txids[i], subtreeIdxs[i]
+		}
+
+		txs, txids, subtreeIdxs = nextTxs, nextTxIDs, nextIdxs
 	}
 
-	return errors.NewProcessingError("[applyList][%s] a list of %d transactions still failing after %d retries", block.Hash().String(), len(txs), maxRetries, lastErr)
+	return errors.NewProcessingError("[applyList][%s] %d of a list of %d transactions still failing after %d retries", block.Hash().String(), len(txs), total, maxRetries, lastErr)
 }
 
 // applyOneByOne applies txs one SpendAndCreate at a time, in block order: the path for a list the
@@ -2553,6 +2575,8 @@ func (u *BlockValidation) applyOneByOne(ctx context.Context, block *model.Block,
 	if backoff <= 0 {
 		backoff = spendRetryBackoffDefault
 	}
+
+	storeCallBound := u.detachedStoreCallBound()
 
 	for i, tx := range txs {
 		var err error
@@ -2568,12 +2592,18 @@ func (u *BlockValidation) applyOneByOne(ctx context.Context, block *model.Block,
 				return errors.NewContextCanceledError("[applyOneByOne][%s] context cancelled", block.Hash().String(), ctx.Err())
 			}
 
-			_, _, err = u.utxoStore.SpendAndCreate(ctx, tx, block.Height,
+			// A call, once started, runs to its end, as on the list and the spend path: a
+			// combined call cancelled between its spend and its create would leave the
+			// create's outcome unknown.
+			callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeCallBound)
+			_, _, err = u.utxoStore.SpendAndCreate(callCtx, tx, block.Height,
 				utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: block.ID, BlockHeight: block.Height, SubtreeIdx: subtreeIdxs[i]}),
 				utxo.WithLocked(lockUTXOs),
 				utxo.WithIgnoreLocked(true),
 				utxo.WithSkipExtendedInputs(outpointOnly),
 				utxo.WithSkipUTXOHashCheck(outpointOnly))
+
+			cancel()
 
 			if err == nil || !errors.IsRetryableError(err) {
 				break
