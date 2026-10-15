@@ -3632,7 +3632,15 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 
 							if isPermanentInputCheck(validateErr) || again {
 								// It cannot be decided, now or by retrying, so it is left
-								// out as before, and the load goes on.
+								// out as before, and the load goes on. A transaction left
+								// out for being undecided again stays on the list, or the
+								// next load would see it as new and fail once more.
+								if again {
+									undecidedMu.Lock()
+									undecidedNow[unminedTransaction.Hash] = struct{}{}
+									undecidedMu.Unlock()
+								}
+
 								b.logger.Errorf("[loadUnminedTransactions][%s] could not validate inputs (permanent %t, undecided in the last load %t), leaving the transaction out of the candidate: %v",
 									unminedTransaction.Hash.String(), isPermanentInputCheck(validateErr), again, validateErr)
 								prometheusBlockAssemblerUnminedUndecidedExcluded.Inc()

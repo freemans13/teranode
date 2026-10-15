@@ -362,6 +362,11 @@ func TestLoadUnminedTransactions_UndecidedInputCheckFailsTheLoad(t *testing.T) {
 	require.NoError(t, items.blockAssembler.loadUnminedTransactions(ctx, true, true),
 		"a transaction undecided in two loads in a row must not fail the second")
 	require.Greater(t, testutil.ToFloat64(prometheusBlockAssemblerUnminedUndecidedExcluded), excluded)
+
+	// And not the third: while the error lasts, the transaction stays left out, and the loads do
+	// not fail every second time.
+	require.NoError(t, items.blockAssembler.loadUnminedTransactions(ctx, true, true),
+		"a transaction that stays undecided must not fail every other load")
 }
 
 // TestLoadUnminedTransactions_PermanentlyUndecidableRecordIsLeftOut is the bot review's case on
