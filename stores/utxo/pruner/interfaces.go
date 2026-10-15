@@ -3,15 +3,7 @@
 // blocks reach a certain age, coordinating with block persistence to ensure data safety.
 package pruner
 
-import (
-	"context"
-
-	"github.com/bsv-blockchain/teranode/errors"
-)
-
-// ErrNoPrunerService is returned when a UTXO store does not provide a pruner
-// service.
-var ErrNoPrunerService = errors.NewServiceError("UTXO store does not provide pruner service")
+import "context"
 
 // Service defines the interface for a pruner service that manages background cleanup jobs.
 type Service interface {

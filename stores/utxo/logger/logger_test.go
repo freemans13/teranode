@@ -1166,16 +1166,19 @@ func TestParentOutputsForValidation_Forwards(t *testing.T) {
 	require.Equal(t, utxo.ParentOutputTxNotFound, answers[1].Status)
 }
 
-// The pruner service finds a store's pruner by type assertion. Wrapping a sql
-// store in the logger must keep that assertion and the pruner it returns.
-func TestGetPrunerService_ForwardsToWrappedStore(t *testing.T) {
+// The pruner service finds a store's pruner with utxo.As, so a sql store
+// wrapped in the logger must still hand back its own pruner service.
+func TestAs_FindsPrunerBehindLogger(t *testing.T) {
 	sql.ResetPrunerServiceForTests()
 	t.Cleanup(sql.ResetPrunerServiceForTests)
 
 	s, base := newLoggedSQLiteStore(t)
 
-	provider, ok := s.(pruner.PrunerServiceProvider)
-	require.True(t, ok, "logged store must implement pruner.PrunerServiceProvider")
+	_, plain := s.(pruner.PrunerServiceProvider)
+	require.False(t, plain, "the logger does not implement the pruner provider itself")
+
+	provider, ok := utxo.As[pruner.PrunerServiceProvider](s)
+	require.True(t, ok)
 
 	service, err := provider.GetPrunerService()
 	require.NoError(t, err)
@@ -1183,27 +1186,18 @@ func TestGetPrunerService_ForwardsToWrappedStore(t *testing.T) {
 
 	inner, err := base.(pruner.PrunerServiceProvider).GetPrunerService()
 	require.NoError(t, err)
-	require.Same(t, inner, service, "logger must return the wrapped store's pruner service")
+	require.Same(t, inner, service)
 }
 
-// A wrapped store with no pruner returns pruner.ErrNoPrunerService, the same
-// error the pruner service returns for an unwrapped store without one.
-func TestGetPrunerService_WrappedStoreWithoutPruner(t *testing.T) {
+// A logged store whose wrapped store has no pruner reports no pruner provider.
+func TestAs_NoPrunerBehindLogger(t *testing.T) {
 	inner, err := nullstore.NewNullStore()
 	require.NoError(t, err)
 
-	_, hasPruner := utxo.Store(inner).(pruner.PrunerServiceProvider)
-	require.False(t, hasPruner, "test needs a store without a pruner")
-
 	s := New(context.Background(), ulogger.TestLogger{}, inner)
 
-	provider, ok := s.(pruner.PrunerServiceProvider)
-	require.True(t, ok, "logged store must implement pruner.PrunerServiceProvider")
-
-	service, err := provider.GetPrunerService()
-	require.Error(t, err)
-	require.Nil(t, service)
-	require.Same(t, pruner.ErrNoPrunerService, err)
+	_, ok := utxo.As[pruner.PrunerServiceProvider](s)
+	require.False(t, ok)
 }
 
 // indexWaitingStore adds the optional WaitForIndexReady method to a real store,

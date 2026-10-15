@@ -25,7 +25,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
-	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
@@ -36,12 +35,9 @@ type Store struct {
 	store  utxo.Store
 }
 
-// The pruner service finds a store's pruner by type assertion, so the wrapper
-// must expose it or turning logging on would switch pruning off.
-var _ pruner.PrunerServiceProvider = (*Store)(nil)
-
-// Callers that check the store for other optional methods use utxo.As, which
-// looks through the wrapper by way of Unwrap.
+// Callers that check the store for an optional method, such as the pruner
+// service looking for a pruner, use utxo.As, which looks through the wrapper by
+// way of Unwrap. Without it, turning logging on would hide those methods.
 var _ utxo.Unwrapper = (*Store)(nil)
 
 // New creates a new logging wrapper around the provided UTXO store.
@@ -428,18 +424,4 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 // Unwrap returns the wrapped store.
 func (s *Store) Unwrap() utxo.Store {
 	return s.store
-}
-
-// GetPrunerService forwards to the wrapped store's pruner service. A wrapped
-// store without one returns pruner.ErrNoPrunerService.
-func (s *Store) GetPrunerService() (pruner.Service, error) {
-	provider, ok := s.store.(pruner.PrunerServiceProvider)
-	if !ok {
-		return nil, pruner.ErrNoPrunerService
-	}
-
-	service, err := provider.GetPrunerService()
-	s.logger.Debugf("[UTXOStore][logger][GetPrunerService] err %v : %s", err, caller())
-
-	return service, err
 }
