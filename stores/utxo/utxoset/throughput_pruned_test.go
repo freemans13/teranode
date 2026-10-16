@@ -155,12 +155,24 @@ func tpCleanDB(t *testing.T, dsn string) {
 	_, _ = pool.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
 	                       WHERE datname = current_database() AND pid != pg_backend_pid()`)
 
+	// Every table the schema makes, as newTestStoreWith drops them. The harness builds the same
+	// transactions on every run, so a table left behind makes a later run's creates collide with
+	// an earlier run's: a worker whose chain already has containment rows fails its first create
+	// and stops, silently, and the run measures fewer workers than it reports.
 	_, err = pool.Exec(ctx, `DROP TABLE IF EXISTS utxo CASCADE;
 	                         DROP TABLE IF EXISTS spend_journal CASCADE;
+	                         DROP TABLE IF EXISTS applied_block CASCADE;
+	                         DROP TABLE IF EXISTS applied_chunk CASCADE;
 	                         DROP TABLE IF EXISTS tx_ident CASCADE;
 	                         DROP TABLE IF EXISTS tx_body CASCADE;
-	                         DROP TABLE IF EXISTS applied_block CASCADE;
-	                         DROP TABLE IF EXISTS applied_chunk CASCADE;`)
+	                         DROP TABLE IF EXISTS tx_mined CASCADE;
+	                         DROP TABLE IF EXISTS tx_mined_floor CASCADE;
+	                         DROP TABLE IF EXISTS tx_mined_stamped CASCADE;
+	                         DROP TABLE IF EXISTS conflict_children CASCADE;
+	                         DROP TABLE IF EXISTS conflict_intents CASCADE;
+	                         DROP TABLE IF EXISTS preserved_parent CASCADE;
+	                         DROP TABLE IF EXISTS tx_body_carry CASCADE;
+	                         DROP TABLE IF EXISTS tx_body_carry_floor CASCADE;`)
 	require.NoError(t, err)
 }
 
@@ -559,6 +571,21 @@ func tpRunValidator(t *testing.T, s *Store, numWorkers int, cfg tpCfg, statPool 
 		}
 	}
 
+	// A worker stops on any error, so the first one is logged: without it a run whose workers
+	// all stopped at once reported zero, or a run that lost some of them reported a lower
+	// rate, with nothing in the log to say why.
+	// THROUGHPUT_SPEND_AND_CREATE=1 writes with SpendAndCreate, as the validator does, in place
+	// of the separate Spend and Create the ported harness uses. The plain create batcher
+	// dispatches one batch at a time by design, because it serves block application, a single
+	// writer; with it the harness measures that queue rather than the validator's path.
+	useSpendAndCreate := os.Getenv("THROUGHPUT_SPEND_AND_CREATE") != ""
+
+	var firstErr sync.Once
+
+	logErr := func(where string, err error) {
+		firstErr.Do(func() { t.Logf("[worker] first error, at %s; that worker stops: %v", where, err) })
+	}
+
 	runPhase := func(dur time.Duration) int64 {
 		var (
 			ops atomic.Int64
@@ -604,6 +631,8 @@ func tpRunValidator(t *testing.T, s *Store, numWorkers int, cfg tpCfg, statPool 
 					child.Inputs[0].PreviousTxSatoshis = 0
 
 					if _, err := s.Get(ctx, parentHash, fields.BlockIDs, fields.BlockHeights); err != nil {
+						logErr("get", err)
+
 						return
 					}
 
@@ -611,18 +640,36 @@ func tpRunValidator(t *testing.T, s *Store, numWorkers int, cfg tpCfg, statPool 
 					decorateBatcher.Put(&dreq)
 
 					if err := <-dreq.errCh; err != nil {
+						logErr("decorate", err)
+
 						return
 					}
 
-					if _, err := spendOnly(ctx, s, child, h); err != nil {
-						return
-					}
+					if useSpendAndCreate {
+						// The validator's write path: one call, through the store's concurrent
+						// spend-and-create batcher.
+						if _, _, err := s.SpendAndCreate(ctx, child, h, utxo.WithLocked(true)); err != nil {
+							logErr("spend and create", err)
 
-					if _, err := s.Create(ctx, child, h, utxo.WithLocked(true)); err != nil {
-						return
+							return
+						}
+					} else {
+						if _, err := spendOnly(ctx, s, child, h); err != nil {
+							logErr("spend", err)
+
+							return
+						}
+
+						if _, err := s.Create(ctx, child, h, utxo.WithLocked(true)); err != nil {
+							logErr("create", err)
+
+							return
+						}
 					}
 
 					if err := s.SetLocked(ctx, []chainhash.Hash{*child.TxIDChainHash()}, false); err != nil {
+						logErr("unlock", err)
+
 						return
 					}
 
