@@ -958,6 +958,42 @@ func TestBatchList_RetryWithNoProgressGivesUp(t *testing.T) {
 	require.Len(t, recorder.recordedLists(), 2, "the first pass, then one retry that fails the same two")
 }
 
+// TestBatchList_GiveUpKeepsTheHardFailure: while one transaction keeps failing with a retryable
+// error, another that fails for good does not fail the batch at once, because the batch repeats.
+// When the batch gives up, its error must still carry that failure's reason, here a spend of an
+// output that exists nowhere, and not only the retryable one.
+func TestBatchList_GiveUpKeepsTheHardFailure(t *testing.T) {
+	bv, recorder, cleanup := newListHarness(t, "list_give_up_hard", true)
+	defer cleanup()
+
+	root, key := seedRoot(t, recorder.Store, 2, "LIST_GIVE_UP_HARD_KEY")
+	flakyTx := spendOf(t, key, root, 0, 90_000)
+
+	// The ghost pays to the root's key, so one key signs both inputs of its spender.
+	_, outPub := bec.PrivateKeyFromBytes([]byte("netted-out"))
+	ghost := transactions.Create(t, transactions.WithCoinbaseData(9, "/ghost/"), transactions.WithP2PKHOutputs(1, 100_000, key.PubKey()))
+	ghostSpender := transactions.Create(t,
+		transactions.WithPrivateKey(key),
+		transactions.WithInput(root, 1),
+		transactions.WithInput(ghost, 0),
+		transactions.WithP2PKHOutputs(1, 80_000, outPub),
+	)
+
+	flaky := &flakyTxStore{Store: recorder.Store, fail: *flakyTx.TxIDChainHash()}
+	flaky.failTimes.Store(1_000)
+	recorder.Store = flaky
+
+	block := &model.Block{Height: 100, ID: 42}
+	batch := listBatchFor(t, bv, block, []*bt.Tx{flakyTx, ghostSpender}, true)
+
+	recorder.reset()
+	err := bv.createAndSpendUTXOsForBatch(context.Background(), block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no progress")
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "the exit error must carry the hard failure's reason: %v", err)
+	require.Contains(t, err.Error(), "forced transient fault", "the retryable failure is still named")
+}
+
 // TestBatchList_RetryKeepsAFailedChildsParent: a child whose second-wave spend fails with a
 // retryable error after its parent in the list went through is retried with that parent, so it
 // meets the store as it did the first time: its create-only record is found as existing and its

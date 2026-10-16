@@ -2448,7 +2448,8 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 // exists is collected for the mined-info stamp; the store has already made its spends. A
 // transaction the store fails, or whose parent in the list failed, fails the batch closed unless
 // the failure is retryable, which the per-transaction default reports per transaction rather than
-// as an error.
+// as an error. A batch that gives up after repeating names the retryable failure and, when the
+// latest pass also failed a transaction for good, carries that failure as its cause.
 func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs []*bt.Tx, txids []chainhash.Hash,
 	subtreeIdxs []int, lockUTXOs, outpointOnly bool, collectExisting func(*bt.Tx)) error {
 	const maxRetries = 10
@@ -2486,6 +2487,22 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 	// that existed before was collected on the pass that first saw it.
 	var carried []bool
 
+	// lastHard is, from the latest pass the store answered, the first failure that is neither
+	// retryable nor a child failed for its parent. While another transaction keeps failing
+	// retryably the batch repeats, so it is not returned at once; if the batch then gives up, it
+	// is the cause of the error, since a repeat did not fix it, and the retryable failure is
+	// named in the message. Without it the exit error carried only the retryable failure, and a
+	// reason such as ErrTxNotFound was lost.
+	var lastHard error
+
+	giveUp := func(format string, retryable error, params ...interface{}) error {
+		if lastHard == nil {
+			return errors.NewProcessingError(format, append(params, retryable)...)
+		}
+
+		return errors.NewProcessingError(format+" (last retryable failure: %v)", append(params, retryable, lastHard)...)
+	}
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			u.logger.Infof("[applyList][%s] retry %d/%d of %d of a list of %d transactions: %v", block.Hash().String(), attempt, maxRetries, len(txs), total, lastErr)
@@ -2521,8 +2538,8 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 		// as ParentFailed, which are not retryable on their own. With no retryable failure, the
 		// first hard one fails the batch.
 		var (
-			retryable, hard error
-			retry           []int
+			retryable, hard, passHard error
+			retry                     []int
 		)
 
 		for i, r := range results {
@@ -2537,12 +2554,27 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 				continue
 			case r.Err != nil && errors.IsRetryableError(r.Err):
 				retryable = r.Err
-			case hard == nil:
-				hard = errors.NewProcessingError("[applyList][%s] transaction %s could not be applied (status %d)", block.Hash().String(), txids[i].String(), r.Status, r.Err)
+			default:
+				own := passHard == nil && r.Status != utxo.MultiTxParentFailed
+
+				var txErr error
+				if hard == nil || own {
+					txErr = errors.NewProcessingError("[applyList][%s] transaction %s could not be applied (status %d)", block.Hash().String(), txids[i].String(), r.Status, r.Err)
+				}
+
+				if hard == nil {
+					hard = txErr
+				}
+
+				if own {
+					passHard = txErr
+				}
 			}
 
 			retry = append(retry, i)
 		}
+
+		lastHard = passHard
 
 		if retryable == nil && hard != nil {
 			return hard
@@ -2553,7 +2585,7 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 		}
 
 		if len(retry) >= failed {
-			return errors.NewProcessingError("[applyList][%s] %d of %d transactions failed again with no progress, giving up", block.Hash().String(), len(retry), total, retryable)
+			return giveUp("[applyList][%s] %d of %d transactions failed again with no progress, giving up", retryable, block.Hash().String(), len(retry), total)
 		}
 
 		failed = len(retry)
@@ -2579,7 +2611,7 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 		txs, txids, subtreeIdxs, carried = nextTxs, nextTxIDs, nextIdxs, nextCarried
 	}
 
-	return errors.NewProcessingError("[applyList][%s] %d of a list of %d transactions still failing after %d retries", block.Hash().String(), len(txs), total, maxRetries, lastErr)
+	return giveUp("[applyList][%s] %d of a list of %d transactions still failing after %d retries", lastErr, block.Hash().String(), len(txs), total, maxRetries)
 }
 
 // withParentsInList returns the positions in failed, with the position of every parent in the
