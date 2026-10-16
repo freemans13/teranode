@@ -380,6 +380,21 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 		}
 	}
 
+	// The lock of every transaction the batch may create, taken at the top of each spend round,
+	// before the spends: see spendAndCreateOne for why a spend that settles as a repeat needs
+	// it. All of them in one statement, a superset of the creators' locks taken before the
+	// create, so that second statement only re-enters locks this transaction holds and cannot
+	// wait on another batch while holding part of its set. A rollback between rounds releases
+	// them, so each round takes them again.
+	lockIDs := make([][]byte, 0, len(batch))
+
+	for _, item := range batch {
+		if item.tx != nil && !item.options.SpendOnly {
+			id := createTxID(item.tx, item.options)
+			lockIDs = append(lockIDs, id[:])
+		}
+	}
+
 	var (
 		dbTx pgx.Tx
 		err  error
@@ -402,6 +417,11 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 		dbTx, err = s.pool.Begin(ctx)
 		if err != nil {
 			return results, rejected, errors.NewStorageError("[utxoset][SpendAndCreate] begin batch", err)
+		}
+
+		if err = s.lockTxids(ctx, dbTx, lockIDs); err != nil {
+			rollback()
+			return results, rejected, err
 		}
 
 		items := make([]*spendItem, len(active))
@@ -480,6 +500,10 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 	}
 
 	if len(creators) > 0 {
+		if spendAndCreateBeforeCreate != nil {
+			spendAndCreateBeforeCreate()
+		}
+
 		plan := s.planCreates(creators)
 
 		// A create-only batch has no spend phase and so no transaction yet, and it needs one:

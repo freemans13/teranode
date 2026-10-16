@@ -3,8 +3,10 @@ package utxoset
 import (
 	"context"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/jackc/pgx/v5"
 )
 
 // unspendSQL restores UTXOs from the journal and CONSUMES the journal rows doing it.
@@ -248,29 +250,12 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		extraFlags |= FlagLocked
 	}
 
-	ukeys := make([][16]byte, 0, len(spends))
-	ptxids := make([][]byte, 0, len(spends))
-	stxids := make([][]byte, 0, len(spends))
-
-	for _, sp := range spends {
-		if sp == nil || sp.TxID == nil {
-			continue
-		}
-
-		if sp.SpendingData == nil || sp.SpendingData.TxID == nil {
-			// Without the spender there is no ownership token, and restoring on the
-			// outpoint alone could resurrect a UTXO a different transaction now owns.
-			// Refuse rather than guess.
-			return errors.NewProcessingError("[utxoset][Unspend] %s:%d has no SpendingData; the spender is required as the restore ownership token",
-				sp.TxID.String(), sp.Vout)
-		}
-
-		ukeys = append(ukeys, Pack(sp.TxID[:], sp.Vout))
-		ptxids = append(ptxids, sp.TxID[:])
-		stxids = append(stxids, sp.SpendingData.TxID[:])
+	keys, err := unspendKeysOf(spends)
+	if err != nil {
+		return err
 	}
 
-	if len(ukeys) == 0 {
+	if len(keys.ukeys) == 0 {
 		return nil
 	}
 
@@ -289,22 +274,74 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		return err
 	}
 
-	var (
-		restored, requested, alreadyLive int
-		repaired, noSource, ambiguous    int
-		offending                        *string
-	)
-
-	if err := dbTx.QueryRow(ctx, unspendSQL, ukeys, ptxids, stxids, extraFlags,
-		int32(fence.droppedFloor), int32(fence.fence), FlagConflicting). //nolint:gosec // heights fit int32
-		Scan(&restored, &requested, &alreadyLive, &repaired, &noSource, &ambiguous, &offending); err != nil {
-		return errors.NewStorageError("[utxoset][Unspend] restore", err)
+	counts, err := s.unspendIn(ctx, dbTx, fence, keys, extraFlags)
+	if err != nil {
+		return err
 	}
 
-	// One bad UTXO fails the whole call, before the commit, so no UTXO of the call is restored
-	// and no undo copy is consumed. The accounting check below runs after the commit and so
-	// does NOT behave this way: what it reports missing was never restored, and what was
-	// restored stays restored.
+	if err := dbTx.Commit(ctx); err != nil {
+		return errors.NewStorageError("[utxoset][Unspend] commit", err)
+	}
+
+	return counts.settle()
+}
+
+// unspendKeys is the three key arrays unspendSQL takes, one entry per spend.
+type unspendKeys struct {
+	ukeys  [][16]byte
+	ptxids [][]byte
+	stxids [][]byte
+}
+
+// unspendKeysOf builds the keys of a restore. A spend with no spender is refused: without it
+// there is no ownership token, and restoring on the outpoint alone could resurrect a UTXO a
+// different transaction now owns.
+func unspendKeysOf(spends []*utxo.Spend) (unspendKeys, error) {
+	k := unspendKeys{
+		ukeys:  make([][16]byte, 0, len(spends)),
+		ptxids: make([][]byte, 0, len(spends)),
+		stxids: make([][]byte, 0, len(spends)),
+	}
+
+	for _, sp := range spends {
+		if sp == nil || sp.TxID == nil {
+			continue
+		}
+
+		if sp.SpendingData == nil || sp.SpendingData.TxID == nil {
+			return unspendKeys{}, errors.NewProcessingError("[utxoset][Unspend] %s:%d has no SpendingData; the spender is required as the restore ownership token",
+				sp.TxID.String(), sp.Vout)
+		}
+
+		k.ukeys = append(k.ukeys, Pack(sp.TxID[:], sp.Vout))
+		k.ptxids = append(k.ptxids, sp.TxID[:])
+		k.stxids = append(k.stxids, sp.SpendingData.TxID[:])
+	}
+
+	return k, nil
+}
+
+// unspendCounts is what one restore statement reports, for the check made after its commit.
+type unspendCounts struct {
+	restored, requested, alreadyLive, repaired int
+}
+
+// unspendIn runs the restore inside the caller's transaction, after the caller has taken the
+// fence lock shared and read the fence. One bad UTXO fails the whole call, before the commit,
+// so no UTXO of the call is restored and no undo copy is consumed.
+func (s *Store) unspendIn(ctx context.Context, dbTx pgx.Tx, fence fenceState, keys unspendKeys, extraFlags int16) (unspendCounts, error) {
+	var (
+		c                   unspendCounts
+		noSource, ambiguous int
+		offending           *string
+	)
+
+	if err := dbTx.QueryRow(ctx, unspendSQL, keys.ukeys, keys.ptxids, keys.stxids, extraFlags,
+		int32(fence.droppedFloor), int32(fence.fence), FlagConflicting). //nolint:gosec // heights fit int32
+		Scan(&c.restored, &c.requested, &c.alreadyLive, &c.repaired, &noSource, &ambiguous, &offending); err != nil {
+		return c, errors.NewStorageError("[utxoset][Unspend] restore", err)
+	}
+
 	if noSource > 0 || ambiguous > 0 {
 		names := ""
 		if offending != nil {
@@ -314,25 +351,28 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		if noSource > 0 {
 			unspendRepairNoSource.Inc()
 
-			return errors.NewStorageError("[utxoset][Unspend] %d UTXOs restored at (0,0) have no containment row below the stamp fence %d and no identity row, so nothing could ever stamp them; the call is rolled back (%s)",
+			return c, errors.NewStorageError("[utxoset][Unspend] %d UTXOs restored at (0,0) have no containment row below the stamp fence %d and no identity row, so nothing could ever stamp them; the call is rolled back (%s)",
 				noSource, fence.fence, names)
 		}
 
 		unspendRepairAmbiguous.Inc()
 
-		return errors.NewStorageError("[utxoset][Unspend] %d UTXOs restored at (0,0) have more than one containment row below the stamp fence %d, where every row should name a winner; the call is rolled back (%s)",
+		return c, errors.NewStorageError("[utxoset][Unspend] %d UTXOs restored at (0,0) have more than one containment row below the stamp fence %d, where every row should name a winner; the call is rolled back (%s)",
 			ambiguous, fence.fence, names)
 	}
 
-	if err := dbTx.Commit(ctx); err != nil {
-		return errors.NewStorageError("[utxoset][Unspend] commit", err)
+	return c, nil
+}
+
+// settle is the check made after the restore committed. Unlike the checks in unspendIn it
+// does not undo anything: what it reports missing was never restored, and what was restored
+// stays restored.
+func (c unspendCounts) settle() error {
+	if c.repaired > 0 {
+		unspendRepaired.Add(float64(c.repaired))
 	}
 
-	if repaired > 0 {
-		unspendRepaired.Add(float64(repaired))
-	}
-
-	if restored+alreadyLive != requested {
+	if c.restored+c.alreadyLive != c.requested {
 		// Silence here would be the dangerous outcome: a reorg that believes it has
 		// restored UTXOs which are in fact still missing leaves the UTXO set wrong and
 		// consensus-divergent, with nothing to indicate it. Either every requested UTXO
@@ -348,8 +388,132 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		// `held` arm above has just put the hold on them, so the caller gets the UTXO
 		// unspent and held, which is the whole instruction.
 		return errors.NewProcessingError("[utxoset][Unspend] restored %d, already live %d, of %d requested; the rest are beyond journal retention or were re-spent by a different transaction",
-			restored, alreadyLive, requested)
+			c.restored, c.alreadyLive, c.requested)
 	}
 
 	return nil
+}
+
+// writtenSpendersSQL returns the spenders among $1 that have a record: an identity row, or a
+// containment row at or above the dropped floor ($2). These are the two places a create writes
+// a transaction, and the same two the create's claim reads before it writes one.
+const writtenSpendersSQL = `
+SELECT t.txid
+  FROM unnest($1::bytea[]) AS t(txid)
+ WHERE EXISTS (SELECT 1 FROM tx_ident i
+                WHERE i.leaf = (get_byte(t.txid, 0) & 7)::smallint
+                  AND i.txid = t.txid)
+    OR EXISTS (SELECT 1 FROM tx_mined m
+                WHERE m.txid = t.txid
+                  AND m.mined_height >= $2::int
+                LIMIT 1 OFFSET 0)`
+
+// giveBackUnlessWritten restores spends a write made for transactions it did not write, and
+// keeps every spend whose spender has a record by the time the restore runs.
+//
+// The write's own result cannot say whether a spender was written. Another writer of the same
+// transaction can create it at any moment: the validator, or a second block that holds it. A
+// commit that failed on the client can also have committed on the server. A spend of a stored
+// transaction restored here makes its parent coin spendable while the transaction stands, so a
+// second transaction can spend it.
+//
+// So the store is asked, in the same database transaction as the restore, and under the
+// spenders' advisory locks (lockTxids). Every create of a transaction holds its lock from before
+// its claim to its commit, and SpendAndCreate holds it from before its spends, so a writer of
+// one of these spenders has either committed, and its record is seen here, or it starts after
+// this commit and finds its parent coins live. The locks come first and the fence second, the
+// order the block-path create takes them in.
+func (s *Store) giveBackUnlessWritten(ctx context.Context, spends []*utxo.Spend) error {
+	keys, err := unspendKeysOf(spends)
+	if err != nil {
+		return err
+	}
+
+	if len(keys.ukeys) == 0 {
+		return nil
+	}
+
+	seen := make(map[chainhash.Hash]struct{}, len(keys.stxids))
+	spenders := make([][]byte, 0, len(keys.stxids))
+
+	for _, id := range keys.stxids {
+		h := chainhash.Hash(id)
+		if _, ok := seen[h]; !ok {
+			seen[h] = struct{}{}
+			spenders = append(spenders, id)
+		}
+	}
+
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][giveBack] begin", err)
+	}
+
+	defer func() { _ = dbTx.Rollback(ctx) }()
+
+	if err := s.lockTxids(ctx, dbTx, spenders); err != nil {
+		return err
+	}
+
+	fence, err := s.takeFenceShared(ctx, dbTx)
+	if err != nil {
+		return err
+	}
+
+	rows, err := dbTx.Query(ctx, writtenSpendersSQL, spenders, int32(fence.droppedFloor)) //nolint:gosec // a height fits int32
+	if err != nil {
+		return errors.NewStorageError("[utxoset][giveBack] read spenders", err)
+	}
+
+	written := make(map[chainhash.Hash]struct{})
+
+	for rows.Next() {
+		var id []byte
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return errors.NewStorageError("[utxoset][giveBack] scan spender", err)
+		}
+
+		written[chainhash.Hash(id)] = struct{}{}
+	}
+
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][giveBack] spender rows", err)
+	}
+
+	if len(written) > 0 {
+		kept := unspendKeys{}
+
+		for i, id := range keys.stxids {
+			if _, ok := written[chainhash.Hash(id)]; ok {
+				continue
+			}
+
+			kept.ukeys = append(kept.ukeys, keys.ukeys[i])
+			kept.ptxids = append(kept.ptxids, keys.ptxids[i])
+			kept.stxids = append(kept.stxids, id)
+		}
+
+		s.logger.Infof("[utxoset][giveBack] %d of %d spends kept: their spender was written by the time of the give-back",
+			len(keys.ukeys)-len(kept.ukeys), len(keys.ukeys))
+
+		keys = kept
+	}
+
+	if len(keys.ukeys) == 0 {
+		return nil
+	}
+
+	counts, err := s.unspendIn(ctx, dbTx, fence, keys, 0)
+	if err != nil {
+		return err
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return errors.NewStorageError("[utxoset][giveBack] commit", err)
+	}
+
+	return counts.settle()
 }

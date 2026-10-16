@@ -131,6 +131,11 @@ var multiCreateCommitted func(txs int)
 // commits, with the context the commit will run under and the chunk's txids. nil in production.
 var multiCreateBeforeCommit func(ctx context.Context, txids []chainhash.Hash)
 
+// multiCreateAfterCommit is a test hook called after each step-2 chunk transaction commits and
+// before its results are set. An error from it is returned as the commit's, which is the shape
+// of a commit that the server made and the client did not hear about. nil in production.
+var multiCreateAfterCommit func() error
+
 // multiConcurrency is how many chunk transactions run at once. Each holds one pool connection
 // and takes no second one, so at most half the pool, leaving the rest of the node its share,
 // and at most 8, which with multiCreateChunkTxs bounds the advisory locks held at once.
@@ -150,6 +155,11 @@ type multiTx struct {
 	nettedOuts int
 	claims     []inputClaim
 	spends     []*utxo.Spend
+	// replayed[vin] is true when step 1 found input vin's coin already spent by this
+	// transaction: another writer of it took the coin, or an earlier attempt that crashed. This
+	// write took nothing there, so the spend is not its to give back, and it stands only while
+	// that other writer keeps it. nil when no input was a repeat.
+	replayed []bool
 	// spent is true once its step-1 chunk committed.
 	spent bool
 	// journaled is true once its step-2 chunk committed, and with it a spend-journal row for
@@ -178,6 +188,52 @@ func (it *multiTx) outsideSpends() []*utxo.Spend {
 
 	for vin, sp := range it.spends {
 		if sp != nil && (it.netted == nil || !it.netted[vin]) {
+			out = append(out, sp)
+		}
+	}
+
+	return out
+}
+
+// takenOutsideSpends is the outside spends this write took itself: settled without an error and
+// not repeats of a spend someone else made. Only these are the write's to give back. A repeat is
+// the spend of another writer of the same transaction, which may yet write it.
+func (it *multiTx) takenOutsideSpends() []*utxo.Spend {
+	out := make([]*utxo.Spend, 0, len(it.spends))
+
+	for vin, sp := range it.spends {
+		if sp == nil || sp.Err != nil || (it.netted != nil && it.netted[vin]) || (it.replayed != nil && it.replayed[vin]) {
+			continue
+		}
+
+		out = append(out, sp)
+	}
+
+	return out
+}
+
+// nettedSpendsJournaled is the spends of this transaction's netted inputs whose parent a
+// committed step-2 group of this write created, with a journal row naming this transaction for
+// each. This write made those rows, so they are its to give back.
+func (w *nettedWrite) nettedSpendsJournaled(it *multiTx) []*utxo.Spend {
+	var out []*utxo.Spend
+
+	for vin, in := range it.tx.Inputs {
+		if it.netted != nil && it.netted[vin] && it.spends[vin] != nil &&
+			w.items[w.position[*in.PreviousTxIDChainHash()]].journaled {
+			out = append(out, it.spends[vin])
+		}
+	}
+
+	return out
+}
+
+// replayedOutsideSpends is the outside spends step 1 settled as repeats of another writer's.
+func (it *multiTx) replayedOutsideSpends() []*utxo.Spend {
+	var out []*utxo.Spend
+
+	for vin, sp := range it.spends {
+		if sp != nil && sp.Err == nil && it.replayed != nil && it.replayed[vin] && (it.netted == nil || !it.netted[vin]) {
 			out = append(out, sp)
 		}
 	}
@@ -303,10 +359,14 @@ func (w *nettedWrite) run(ctx context.Context) (_ []utxo.SpendAndCreateMultiResu
 // which unspends when the create fails.
 //
 // A transaction that was created, or found to exist, keeps its spends: they are its own. Each
-// other transaction gives back its outside spends, and its spends of outputs of a parent a
-// committed step-2 group journaled for it, as undoSpendsOfFailures does. Unspend restores only a
-// UTXO whose journal row names this transaction as the spender, so an outside spend that did not
-// commit, or one restored already, is a no-op.
+// other transaction gives back the outside spends this write took, and its spends of outputs of
+// a parent a committed step-2 group journaled for it, as undoSpendsOfFailures does. A repeat of a
+// spend another writer of the same transaction made is not given back: it is that writer's, and
+// it may yet write the transaction. Nor is any spend whose transaction has a record by the time
+// the give-back runs, which another writer can have written, or a step-2 commit this write saw
+// fail can have made on the server: giveBackUnlessWritten asks the store under the transactions'
+// locks. The restore matches only a UTXO whose journal row names the transaction as the spender,
+// so an outside spend that did not commit, or one restored already, is a no-op.
 //
 // A crash between the two steps is not covered: nothing runs, and the spends stay until a retry
 // of the block. sql and aerospike have the same gap.
@@ -322,18 +382,8 @@ func (w *nettedWrite) giveBackUnwritten(ctx context.Context, cause error) error 
 			continue
 		}
 
-		for _, sp := range it.outsideSpends() {
-			if sp.Err == nil {
-				undo = append(undo, sp)
-			}
-		}
-
-		for vin, in := range it.tx.Inputs {
-			if it.netted != nil && it.netted[vin] && it.spends[vin] != nil &&
-				w.items[w.position[*in.PreviousTxIDChainHash()]].journaled {
-				undo = append(undo, it.spends[vin])
-			}
-		}
+		undo = append(undo, it.takenOutsideSpends()...)
+		undo = append(undo, w.nettedSpendsJournaled(it)...)
 	}
 
 	if len(undo) == 0 {
@@ -343,7 +393,7 @@ func (w *nettedWrite) giveBackUnwritten(ctx context.Context, cause error) error 
 	giveBackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multiGiveBackTimeout)
 	defer cancel()
 
-	if err := w.s.Unspend(giveBackCtx, undo); err != nil {
+	if err := w.s.giveBackUnlessWritten(giveBackCtx, undo); err != nil {
 		w.s.logger.Errorf("[utxoset][SpendAndCreateMulti] the write at height %d stopped (%v) and %d of its spends could not be given back: %v",
 			w.blockHeight, cause, len(undo), err)
 
@@ -566,6 +616,19 @@ func (w *nettedWrite) spendChunk(ctx context.Context, chunk []*multiTx) error {
 		}
 
 		if len(survivors) == len(active) {
+			for k, replayed := range plan.replayed {
+				if !replayed {
+					continue
+				}
+
+				it := active[plan.owner[k]]
+				if it.replayed == nil {
+					it.replayed = make([]bool, len(it.tx.Inputs))
+				}
+
+				it.replayed[plan.ownerVin[k]] = true
+			}
+
 			if err = dbTx.Commit(ctx); err != nil {
 				_ = dbTx.Rollback(ctx)
 				return errors.NewStorageError("[utxoset][SpendAndCreateMulti] commit spend chunk", err)
@@ -593,7 +656,7 @@ func (w *nettedWrite) undoDescendantsOfFailures(ctx context.Context) error {
 
 	for _, it := range w.failDescendants() {
 		if it.spent {
-			undo = append(undo, it.outsideSpends()...)
+			undo = append(undo, it.takenOutsideSpends()...)
 		}
 	}
 
@@ -601,7 +664,7 @@ func (w *nettedWrite) undoDescendantsOfFailures(ctx context.Context) error {
 		return nil
 	}
 
-	if err := w.s.Unspend(ctx, undo); err != nil {
+	if err := w.s.giveBackUnlessWritten(ctx, undo); err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] restoring the spends of descendants of a failed transaction", err)
 	}
 
@@ -948,6 +1011,10 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 		return err
 	}
 
+	if err = w.requireReplayedSpendsStand(ctx, dbTx, chunk); err != nil {
+		return err
+	}
+
 	t1 := time.Now()
 	w.lockNs.Add(int64(t1.Sub(t0)))
 
@@ -990,7 +1057,16 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 		multiCreateBeforeCommit(ctx, txids)
 	}
 
-	if err = dbTx.Commit(ctx); err != nil {
+	// The commit runs on a context the caller cannot cancel. A cancel that lands while the commit
+	// is in flight can leave it committed on the server and failed on the client, and the
+	// give-back then has to find that out from the store. Detached, the commit gives a true
+	// answer unless the connection itself fails.
+	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multiGiveBackTimeout)
+	err = dbTx.Commit(commitCtx)
+
+	cancel()
+
+	if err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] commit create chunk", err)
 	}
 
@@ -998,6 +1074,12 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 	w.createChunks.Add(1)
 
 	committed = true
+
+	if multiCreateAfterCommit != nil {
+		if err = multiCreateAfterCommit(); err != nil {
+			return err
+		}
+	}
 
 	if multiCreateCommitted != nil {
 		multiCreateCommitted(len(chunk))
@@ -1011,6 +1093,60 @@ func (w *nettedWrite) createChunk(ctx context.Context, chunk []*multiTx, spender
 
 		it.journaled = true
 		it.result = utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxCreated, Meta: plan.perItem[k], Spends: it.spends}
+	}
+
+	return nil
+}
+
+// replayedSpendGoneSQL counts the spends of $1-$3 (parent output, spender) that no longer have
+// a journal row naming the spender.
+const replayedSpendGoneSQL = `
+SELECT count(*)
+  FROM unnest($1::uuid[], $2::bytea[], $3::bytea[]) AS k(ukey, txid, spender)
+ WHERE NOT EXISTS (SELECT 1 FROM spend_journal j
+                    WHERE j.ukey = k.ukey
+                      AND j.txid = k.txid
+                      AND j.spending_txid = k.spender)`
+
+// requireReplayedSpendsStand fails the chunk when a spend step 1 settled as a repeat has been
+// given back since.
+//
+// A repeat is a spend another writer of the same transaction made, and step 1 took nothing for
+// it. That writer can stop before writing the transaction and give the spend back, in which
+// case the coin is live again and this write would create the transaction with an input that is
+// not spent. The check runs under the chunk's advisory locks, which the give-back takes too
+// (giveBackUnlessWritten), so a give-back either finished before it, and the row is gone, or
+// waits until this chunk has committed and then finds the transaction written and keeps the
+// spend. A spend this write took itself needs no check: only the writer that took a spend gives
+// it back. Repeats are rare, so on the common path this is no statement at all.
+//
+// The write fails with a storage error, as for any other failure, and its caller retries the
+// list, which spends the coin for real this time.
+func (w *nettedWrite) requireReplayedSpendsStand(ctx context.Context, dbTx pgx.Tx, chunk []*multiTx) error {
+	var spends []*utxo.Spend
+
+	for _, it := range chunk {
+		spends = append(spends, it.replayedOutsideSpends()...)
+	}
+
+	if len(spends) == 0 {
+		return nil
+	}
+
+	keys, err := unspendKeysOf(spends)
+	if err != nil {
+		return err
+	}
+
+	var gone int
+
+	if err := dbTx.QueryRow(ctx, replayedSpendGoneSQL, keys.ukeys, keys.ptxids, keys.stxids).Scan(&gone); err != nil {
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] check repeated spends", err)
+	}
+
+	if gone > 0 {
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] %d of %d spends this write found already made by another writer of the same transaction were given back before the create; retry the list",
+			gone, len(spends))
 	}
 
 	return nil
@@ -1108,22 +1244,17 @@ func (w *nettedWrite) undoSpendsOfFailures(ctx context.Context, items []*multiTx
 		}
 
 		if it.spent {
-			undo = append(undo, it.outsideSpends()...)
+			undo = append(undo, it.takenOutsideSpends()...)
 		}
 
-		for vin, in := range it.tx.Inputs {
-			if it.netted != nil && it.netted[vin] && it.spends[vin] != nil &&
-				w.items[w.position[*in.PreviousTxIDChainHash()]].journaled {
-				undo = append(undo, it.spends[vin])
-			}
-		}
+		undo = append(undo, w.nettedSpendsJournaled(it)...)
 	}
 
 	if len(undo) == 0 {
 		return nil
 	}
 
-	if err := w.s.Unspend(ctx, undo); err != nil {
+	if err := w.s.giveBackUnlessWritten(ctx, undo); err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] restoring the spends of transactions the per-transaction default rejected", err)
 	}
 

@@ -60,6 +60,11 @@ type spendPlan struct {
 	// because a UTXO whose only stored authentication is a digest cannot also waive the claim
 	// the digest is computed from.
 	skipClaim []bool
+	// replayed[k] is true when row k's UTXO was already gone with a journal row naming this
+	// spender, so the spend was settled as a repeat and this statement took nothing. nil until
+	// the first repeat. SpendAndCreateMulti reads it: a spend it did not take is not its to give
+	// back, and one it relies on without having taken can be given back by the writer that did.
+	replayed []bool
 }
 
 // spendGuardMask is the set of UTXO flags that refuse a spend for one caller's options.
@@ -625,6 +630,12 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 
 		if bytes.Equal(spender, p.spenders[k]) {
 			replayed[k] = struct{}{}
+
+			if p.replayed == nil {
+				p.replayed = make([]bool, len(p.owner))
+			}
+
+			p.replayed[k] = true
 
 			moves.add(p, k, spentHeight)
 
