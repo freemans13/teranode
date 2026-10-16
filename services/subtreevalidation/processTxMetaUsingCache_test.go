@@ -18,6 +18,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testCacheBucket is the backend setupTestCache builds. The probe tests run
+// against the deployed default; TestProcessTxMetaUsingCache_Lockfree reruns
+// them against the lock-free backend.
+var testCacheBucket = txmetacache.Unallocated
+
 func setupTestCache(t testing.TB) *txmetacache.TxMetaCache {
 	t.Helper()
 	ctx := context.Background()
@@ -30,10 +35,63 @@ func setupTestCache(t testing.TB) *txmetacache.TxMetaCache {
 	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 
-	c, err := txmetacache.NewTxMetaCache(ctx, tSettings, logger, utxoStore, txmetacache.Unallocated)
+	c, err := txmetacache.NewTxMetaCache(ctx, tSettings, logger, utxoStore, testCacheBucket)
 	require.NoError(t, err)
 
 	return c.(*txmetacache.TxMetaCache)
+}
+
+func TestProcessTxMetaUsingCache_Lockfree(t *testing.T) {
+	testCacheBucket = txmetacache.Lockfree
+
+	t.Cleanup(func() { testCacheBucket = txmetacache.Unallocated })
+
+	for name, fn := range map[string]func(*testing.T){
+		"PartialEntryTreatedAsMiss":       TestProcessTxMetaUsingCache_PartialEntryTreatedAsMiss,
+		"CoinbaseEntryWithNoParentsIsHit": TestProcessTxMetaUsingCache_CoinbaseEntryWithNoParentsIsHit,
+		"AllFound":                        TestProcessTxMetaUsingCache_AllFound,
+		"AllMissing":                      TestProcessTxMetaUsingCache_AllMissing,
+		"PartialHits":                     TestProcessTxMetaUsingCache_PartialHits,
+		"SkipCoinbasePlaceholder":         TestProcessTxMetaUsingCache_SkipCoinbasePlaceholder,
+		"SkipPrefilledEntries":            TestProcessTxMetaUsingCache_SkipPrefilledEntries,
+		"FailFastThresholdExceeded":       TestProcessTxMetaUsingCache_FailFastThresholdExceeded,
+		"MultipleBatches":                 TestProcessTxMetaUsingCache_MultipleBatches,
+		"FieldsMatchCachedMetaEndToEnd":   testProcessTxMetaUsingCacheFields,
+	} {
+		t.Run(name, fn)
+	}
+}
+
+// testProcessTxMetaUsingCacheFields checks every field the probe copies out of
+// the cache, including the parent hashes and vouts, survive the round trip.
+func testProcessTxMetaUsingCacheFields(t *testing.T) {
+	cache := setupTestCache(t)
+	server := setupCacheTestServer(t, cache, 4, 1000)
+
+	hashes := generateTestHashes(3000)
+	populateCache(t, cache, hashes)
+
+	txMetaSlice := make([]metaSliceItem, len(hashes))
+
+	missed, err := server.processTxMetaUsingCache(context.Background(), hashes, txMetaSlice, false)
+	require.NoError(t, err)
+	require.Zero(t, missed)
+
+	ref, ok := cache.GetMetaCached(context.Background(), hashes[0])
+	require.True(t, ok)
+
+	refInpoints, err := ref.TxInpoints.Serialize()
+	require.NoError(t, err)
+
+	for i := range txMetaSlice {
+		require.True(t, txMetaSlice[i].isSet)
+		require.Equal(t, uint64(100), txMetaSlice[i].fee)
+		require.Equal(t, uint64(250), txMetaSlice[i].sizeInBytes)
+
+		got, err := txMetaSlice[i].txInpoints.Serialize()
+		require.NoError(t, err)
+		require.Equal(t, refInpoints, got)
+	}
 }
 
 func setupCacheTestServer(t testing.TB, cache *txmetacache.TxMetaCache, concurrency, threshold int) *Server {

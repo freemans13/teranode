@@ -160,6 +160,34 @@ func (b *improvedCacheBackend) GetMulti(hashes []chainhash.Hash, keyHashes []uin
 	}
 }
 
+// GetRawMulti copies the found entries out under each bucket's read lock (see
+// ImprovedCache.GetMulti) without decoding them.
+func (b *improvedCacheBackend) GetRawMulti(hashes []chainhash.Hash, keyHashes []uint64, dst *[]byte, spans [][2]int) {
+	kp := rawKeysPool.Get().(*[][]byte)
+
+	keys := (*kp)[:0]
+	for i := range hashes {
+		keys = append(keys, hashes[i][:])
+	}
+
+	b.cache.GetMulti(keys, keyHashes, dst, spans)
+
+	// Drop the references to the caller's hashes before pooling.
+	clear(keys)
+	*kp = keys[:0]
+	rawKeysPool.Put(kp)
+}
+
+// rawKeysPool recycles GetRawMulti's key slices: a probe task covers thousands
+// of keys, and allocating the slice per call would take the heap's global lock
+// for every task.
+var rawKeysPool = sync.Pool{
+	New: func() any {
+		k := make([][]byte, 0, 4096)
+		return &k
+	},
+}
+
 func (b *improvedCacheBackend) Del(key []byte) {
 	b.cache.Del(key)
 }
