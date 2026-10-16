@@ -2275,7 +2275,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// opens a database transaction even for an empty set, so without it a
 		// call that failed with nothing to reverse, such as a transaction none of
 		// whose parents is present, paid a round trip for nothing.
-		if rollback := spendRollbackSet(spends, spentSpends, idempotentSpends, unresolved); len(rollback) > 0 {
+		if rollback := spendRollbackSet(spends, spentSpends, idempotentSpends, unresolved, spenderCreatedByCaller); len(rollback) > 0 {
 			if unspendErr := s.Unspend(context.Background(), rollback); unspendErr != nil {
 				s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
 			}
@@ -2312,8 +2312,8 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 // cancellation or timeout error the wait wrote, neither of which is a replay
 // answer, while its real answer may be the marker; reversing the idempotent
 // matches then would release a confirmed historical spend to anyone.
-func spendRollbackSet(spends, written, idempotent []*utxo.Spend, unresolved int) []*utxo.Spend {
-	if !needsSpendRollback(spends) {
+func spendRollbackSet(spends, written, idempotent []*utxo.Spend, unresolved int, spenderCreatedByCaller bool) []*utxo.Spend {
+	if !needsSpendRollback(spends, spenderCreatedByCaller) {
 		return nil
 	}
 
@@ -2322,7 +2322,7 @@ func spendRollbackSet(spends, written, idempotent []*utxo.Spend, unresolved int)
 
 // needsSpendRollback returns true if any spend failed due to a validation error
 // that indicates the transaction is genuinely invalid. Mirrors aerospike/spend.go.
-func needsSpendRollback(spends []*utxo.Spend) bool {
+func needsSpendRollback(spends []*utxo.Spend, spenderCreatedByCaller bool) bool {
 	for _, spend := range spends {
 		if spend.Err == nil {
 			continue
@@ -2332,10 +2332,11 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 			errors.Is(spend.Err, errors.ErrFrozen) ||
 			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) ||
 			errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) ||
-			// The other pruned-replay answer; see the Aerospike
-			// isSpendRollbackError for why a ghost's fresh sibling spend must be
-			// reversed on it.
-			errors.Is(spend.Err, errors.ErrTxNotFound) {
+			// The other pruned-replay answer, for a spender the caller wrote
+			// in this pass only; see the Aerospike isSpendRollbackError for why
+			// a ghost's fresh sibling spend must be reversed on it, and why
+			// every other caller keeps the earlier behaviour.
+			(spenderCreatedByCaller && errors.Is(spend.Err, errors.ErrTxNotFound)) {
 			return true
 		}
 	}

@@ -654,7 +654,7 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 				spend.ConflictingTxID = errSpent.SpendingData.TxID
 			}
 
-			if isSpendRollbackError(spend.Err) {
+			if isSpendRollbackError(spend.Err, item.spenderCreatedByCaller) {
 				result.rollbackNeeded = true
 			}
 
@@ -689,20 +689,23 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 // transient infrastructure failure). Extracted from needsSpendRollback so
 // resolveSpendCompletions can apply the same predicate to a single error at
 // a time without building a throwaway slice.
-func isSpendRollbackError(err error) bool {
+func isSpendRollbackError(err error, spenderCreatedByCaller bool) bool {
 	return errors.Is(err, errors.ErrSpent) ||
 		errors.Is(err, errors.ErrTxConflicting) ||
 		errors.Is(err, errors.ErrFrozen) ||
 		errors.Is(err, errors.ErrUtxoHashMismatch) ||
 		errors.Is(err, errors.ErrUtxoSpendingTxPruned) ||
 		// A missing parent is the other pruned-replay answer (see
-		// utxo.IsPrunedReplayRejection). Without it here a ghost with one parent
-		// pruned and another surviving kept its fresh spend of the survivor, and
-		// DeleteCreated then removed the ghost with that spend still in place:
-		// an output spent by a transaction the store no longer holds. Reaching
-		// here means the "already blessed" fallback did not clear the error, so
-		// the call genuinely failed.
-		errors.Is(err, errors.ErrTxNotFound)
+		// utxo.IsPrunedReplayRejection), but only for a spender the caller
+		// wrote in this pass, the create-first block paths. Without it there a
+		// ghost with one parent pruned and another surviving kept its fresh
+		// spend of the survivor, and DeleteCreated then removed the ghost with
+		// that spend still in place: an output spent by a transaction the store
+		// no longer holds. Any other caller keeps the behaviour from before
+		// replay protection: a missing parent is not a validation failure, the
+		// fresh sibling spends stay, and a retry once the parent arrives
+		// matches them idempotently.
+		(spenderCreatedByCaller && errors.Is(err, errors.ErrTxNotFound))
 }
 
 // needsSpendRollback returns true if any spend failed due to a validation error
@@ -710,12 +713,12 @@ func isSpendRollbackError(err error) bool {
 // validation failures trigger rollback — infrastructure errors (DEVICE_OVERLOAD,
 // timeout, etc.) do not, because the Lua spend script is idempotent for the
 // same spender and successful spends will be silently skipped on retry.
-func needsSpendRollback(spends []*utxo.Spend) bool {
+func needsSpendRollback(spends []*utxo.Spend, spenderCreatedByCaller bool) bool {
 	for _, spend := range spends {
 		if spend.Err == nil {
 			continue
 		}
-		if isSpendRollbackError(spend.Err) {
+		if isSpendRollbackError(spend.Err, spenderCreatedByCaller) {
 			return true
 		}
 	}

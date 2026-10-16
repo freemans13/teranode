@@ -132,3 +132,48 @@ func TestBlessedInputIsKeptOutOfTheRollback(t *testing.T) {
 		}
 	})
 }
+
+// TestMissingParentKeepsSiblingSpendForOrdinaryCaller pins the other side of
+// TestMissingParentRollsBackFreshSiblingSpend. Reversing a fresh sibling spend
+// on a missing parent is for the create-first block paths only, which say so
+// with SpenderCreatedByCaller. Any other caller, such as a transaction whose
+// parent has simply not arrived yet, keeps the behaviour from before replay
+// protection: the missing parent is not a validation failure, the fresh spend
+// of S:0 stays, and a retry once the parent arrives matches it idempotently.
+func TestMissingParentKeepsSiblingSpendForOrdinaryCaller(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		for i, perRow := range []bool{false, true} {
+			store.settings.UtxoStore.BatchSQLOperations = !perRow
+
+			newParent := func(seed string) *bt.Tx {
+				parent := bt.NewTx()
+				require.NoError(t, parent.From("33333333333333333333333333333333333333333333333333333333333333"+seed, 0, "51", 30000))
+				parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+				require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+
+				return parent
+			}
+
+			suffix := string(rune('0' + i))
+			survivor, notYetArrived := newParent("a"+suffix), newParent("b"+suffix)
+			_, err := store.Create(ctx, survivor, 1000)
+			require.NoError(t, err)
+
+			tx := bt.NewTx()
+			for _, parent := range []*bt.Tx{survivor, notYetArrived} {
+				require.NoError(t, tx.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+			}
+
+			for j := range tx.Inputs {
+				tx.Inputs[j].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+			}
+
+			require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+
+			_, err = store.Spend(ctx, tx, 1200)
+			require.ErrorIs(t, err, errors.ErrTxNotFound, "control: the missing parent answers not found")
+			require.Equal(t, spendpkg.NewSpendingData(tx.TxIDChainHash(), 0).Bytes(), outputSpendingData(t, ctx, store, survivor, 0),
+				"an ordinary caller's fresh sibling spend stays in place (perRow=%v)", perRow)
+		}
+	})
+}
