@@ -273,8 +273,10 @@ type CommittedBlockHashFunc func(ctx context.Context, id uint64) (*chainhash.Has
 // under its id, so adopting the id made them look like this block's own
 // leftovers: dropped from this block's SetMinedMulti and eligible for this
 // block's compensating delete. A committed block naming a different hash under
-// the id settles that the records are its, and filing them as pre-existing is
-// correct.
+// the id settles that the records are its. Both callers then fail the attempt
+// rather than go on under that id: AdoptableBlockID keeps a committed block's
+// id out at adoption, so a mismatch here means the other block committed while
+// this attempt was running, and the retry takes an id of its own.
 //
 // The question is asked read-only on purpose. AssignBlockID is not usable here:
 // the blockchain store sweeps reservations older than an hour, and a block

@@ -667,6 +667,8 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 			// batchTxs[0] is the first non-coinbase tx; its recorded mined-in id is
 			// this block's. The legacy quick path (netsync reuseBlockIDFromUTXO) keys
 			// the same recovery on its first non-coinbase tx — keep them in sync.
+			// Unless the tx is shared with another block: recordedBlockID declines
+			// an id a different committed block holds.
 			if !blockIDSet && len(batch.batchTxs) > 0 {
 				recordedID, reuse, err := u.recordedBlockID(ctx, block, batch.batchTxs[0].TxIDChainHash())
 				if err != nil {
