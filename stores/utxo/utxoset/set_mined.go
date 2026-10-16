@@ -64,11 +64,15 @@ ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
 // clearMarkerSQL clears the unmined marker of every listed identity row, because the caller
 // has said a block on the longest chain contains the transaction. A transaction with no
 // identity row has no marker to clear and is untouched. Same key shape as recordMinedSQL.
+//
+// A row whose marker is already clear is not written, so a second block containing the same
+// transactions, a competing block at the same height, locks none of their identity rows.
 const clearMarkerSQL = `
 UPDATE tx_ident i
    SET off_chain_since = NULL
  WHERE i.leaf = $1::smallint
-   AND i.txid = ANY($2::bytea[])`
+   AND i.txid = ANY($2::bytea[])
+   AND i.off_chain_since IS NOT NULL`
 
 // releaseIdentLockSQL clears the locked bit of every listed identity row that still has it, and
 // returns the transactions it released. Same key shape as clearMarkerSQL. A row already
@@ -265,7 +269,8 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	}
 
 	if info.UnsetMined {
-		if err := s.unMine(ctx, txids, info); err != nil {
+		// A deadlock with a concurrent release or mine is run again; see withDeadlockRetry.
+		if err := withDeadlockRetry(ctx, "un_mine", func() error { return s.unMine(ctx, txids, info) }); err != nil {
 			return nil, err
 		}
 
@@ -277,7 +282,16 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		return s.minedIDsByTxid(ctx, txids, floor)
 	}
 
-	quiet, err := s.recordMined(ctx, txids, info)
+	// A deadlock with a concurrent release or mine is run again; see withDeadlockRetry.
+	var quiet bool
+
+	err := withDeadlockRetry(ctx, "record_mined", func() error {
+		var rerr error
+
+		quiet, rerr = s.recordMined(ctx, txids, info)
+
+		return rerr
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -132,12 +132,11 @@ type lockItem struct {
 //
 // Batches run concurrently, up to maxConcurrent, as the spend-and-create batcher's do. Two
 // batches can name the same transaction, and each update touches that transaction's rows, so
-// two batches could lock the same rows in different orders and deadlock. setLockedDirect stops
-// that by taking each transaction's advisory lock first, in sorted order (lockTxids), so any
-// two transactions that share an id queue on it in the same order. This batcher used to
-// dispatch one batch at a time for the same reason, and that queue was where the validator's
-// write path waited: in the throughput harness at 10,000 workers, 78% of the workers' blocked
-// time was the release.
+// two batches can lock the same rows in different orders. PostgreSQL then stops one of them as
+// a deadlock, and setLockedDirect runs it again (withDeadlockRetry). This batcher used to
+// dispatch one batch at a time to avoid that, and that queue was where the validator's write
+// path waited: in the throughput harness at 10,000 workers, 78% of the workers' blocked time
+// was the release.
 //
 // Drain mode and greedy accumulate come from LockedBatcherDrainMode and
 // LockedBatcherGreedyAccumulate, the same keys the aerospike store's locked batcher reads.

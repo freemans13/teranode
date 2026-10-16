@@ -76,6 +76,11 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 
 // setLockedSQL flips the locked bit on the transaction row AND on every UTXO it created.
 //
+// Each arm writes only a row whose bit differs from the value asked for, as releaseIdentLockSQL
+// does. The end state is the same, and an update locks only the rows it writes: a release of a
+// transaction a block has already unlocked then locks nothing, which removes most of the lock
+// conflicts with a concurrent mine, and writes no dead tuple or WAL for an unchanged row.
+//
 // Both, because they are read by different things. The transaction row is what a caller sees
 // through Get; the UTXO row is what the spend path reads, and the spend path never looks at
 // the transaction row. Setting only one would leave a transaction reporting itself locked
@@ -132,6 +137,7 @@ mined AS (
                                        ELSE m.flags & ~$6::smallint END
       FROM k WHERE m.txid = k.txid
        AND m.mined_height >= $7::int
+       AND ((m.flags & $6::smallint) <> 0) <> $5::boolean
 ),
 hit AS (
     SELECT c.leaf, c.ukey, k.txid
@@ -147,7 +153,8 @@ UPDATE utxo u SET flags = CASE WHEN $5::boolean
                                THEN u.flags | $6::smallint
                                ELSE u.flags & ~$6::smallint END
   FROM hit
- WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey AND u.txid = hit.txid`
+ WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey AND u.txid = hit.txid
+   AND ((u.flags & $6::smallint) <> 0) <> $5::boolean`
 
 // setLockedIdentSQL is the ident arm on its own, in the leaf-scalar shape: LEAF AS A SCALAR
 // and the txids as an array, run once per leaf group (leafGroups, set_mined.go) rather than
@@ -158,7 +165,8 @@ UPDATE tx_ident i SET flags = CASE WHEN $3::boolean
                                    THEN i.flags | $4::smallint
                                    ELSE i.flags & ~$4::smallint END
  WHERE i.leaf = $1::smallint
-   AND i.txid = ANY($2::bytea[])`
+   AND i.txid = ANY($2::bytea[])
+   AND ((i.flags & $4::smallint) <> 0) <> $3::boolean`
 
 // SetLocked marks transactions as locked for spending, or releases them.
 //
@@ -191,15 +199,20 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value 
 
 // setLockedDirect issues the update, and is what both the direct and the batched path end at.
 //
-// It first takes each transaction's advisory lock, in sorted order (lockTxids). Two calls
-// naming the same transactions, from concurrent lock batches or from a direct caller beside
-// one, then queue on the shared ids in one order and cannot deadlock on each other's rows.
+// Two calls naming the same transactions, from concurrent lock batches, a direct caller or a
+// mine, can lock those rows in different orders. PostgreSQL then stops one of them as a
+// deadlock, and withDeadlockRetry runs it again.
 //
 // The ident arm runs first, once per leaf group (leafGroups), and the mined+UTXO statement
 // runs after it -- both inside ONE transaction, so a caller reading either row mid-flight
 // still sees them agree: never a transaction whose identity row is locked and whose UTXO or
 // membership row is not, or the reverse.
 func (s *Store) setLockedDirect(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
+	return withDeadlockRetry(ctx, "set_locked", func() error { return s.setLockedOnce(ctx, txHashes, value) })
+}
+
+// setLockedOnce is one attempt of setLockedDirect, in one database transaction.
+func (s *Store) setLockedOnce(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
 	leaves := make([]int16, 0, len(txHashes))
 	txids := make([][]byte, 0, len(txHashes))
 	los := make([][16]byte, 0, len(txHashes))
@@ -215,12 +228,6 @@ func (s *Store) setLockedDirect(ctx context.Context, txHashes []chainhash.Hash, 
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][SetLocked] begin", err)
-	}
-
-	if err := s.lockTxids(ctx, dbTx, txids); err != nil {
-		_ = dbTx.Rollback(ctx)
-
-		return err
 	}
 
 	for _, g := range leafGroups(txids) {
