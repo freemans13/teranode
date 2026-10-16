@@ -191,6 +191,10 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value 
 
 // setLockedDirect issues the update, and is what both the direct and the batched path end at.
 //
+// It first takes each transaction's advisory lock, in sorted order (lockTxids). Two calls
+// naming the same transactions, from concurrent lock batches or from a direct caller beside
+// one, then queue on the shared ids in one order and cannot deadlock on each other's rows.
+//
 // The ident arm runs first, once per leaf group (leafGroups), and the mined+UTXO statement
 // runs after it -- both inside ONE transaction, so a caller reading either row mid-flight
 // still sees them agree: never a transaction whose identity row is locked and whose UTXO or
@@ -211,6 +215,12 @@ func (s *Store) setLockedDirect(ctx context.Context, txHashes []chainhash.Hash, 
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][SetLocked] begin", err)
+	}
+
+	if err := s.lockTxids(ctx, dbTx, txids); err != nil {
+		_ = dbTx.Rollback(ctx)
+
+		return err
 	}
 
 	for _, g := range leafGroups(txids) {
