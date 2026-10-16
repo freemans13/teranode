@@ -246,3 +246,118 @@ func TestValidateReportsPrunedReplayRatherThanConflict(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, meta.Conflicting, "the recreated record must not be flagged conflicting, which is what the conflicting branch did")
 }
+
+// TestValidateReportsMissingParentReplayRatherThanConflict is the second replay
+// answer's twin of TestValidateReportsPrunedReplayRatherThanConflict. Here the
+// pruner removed C's parent P end to end, marker and all, so C's input on P
+// answers ErrTxNotFound rather than the marker, while its input on Q:0, which X
+// now holds, answers ErrSpent. For a record the caller wrote in this pass, a
+// missing parent identifies the replay just as the marker does
+// (utxo.IsPrunedReplayRejection). The guard that keeps a replay out of the
+// conflicting-create branch used to recognise only the marker, so this case
+// returned ErrTxConflicting, which netsync swallows below the checkpoint, and
+// the block committed with C back in the store.
+func TestValidateReportsMissingParentReplayRatherThanConflict(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
+	tSettings.BatcherDrainMode = true
+	tSettings.Pruner.UTXODefensiveEnabled = false
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///missing_parent_replay_not_conflict")
+	require.NoError(t, err)
+
+	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	require.NoError(t, store.SetBlockHeight(1000))
+	require.NoError(t, store.SetMedianBlockTime(1700000000))
+
+	script, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+
+	newParent := func(seed byte) *bt.Tx {
+		tx := bt.NewTx()
+		input := &bt.Input{PreviousTxOutIndex: 0, SequenceNumber: 0xffffffff, UnlockingScript: bscript.NewFromBytes([]byte{0x00})}
+		funding := chainhash.HashH([]byte{seed})
+		require.NoError(t, input.PreviousTxIDAdd(&funding))
+		tx.Inputs = append(tx.Inputs, input)
+		tx.Outputs = append(tx.Outputs, &bt.Output{Satoshis: 500, LockingScript: script}, &bt.Output{Satoshis: 500, LockingScript: script})
+		_, createErr := store.Create(ctx, tx, 1000, utxostore.WithSkipExtendedInputs(true))
+		require.NoError(t, createErr)
+
+		return tx
+	}
+
+	spending := func(outputs []*bt.Tx, satoshis uint64) *bt.Tx {
+		tx := bt.NewTx()
+		for _, prev := range outputs {
+			input := &bt.Input{PreviousTxOutIndex: 0, PreviousTxSatoshis: prev.Outputs[0].Satoshis, PreviousTxScript: prev.Outputs[0].LockingScript,
+				SequenceNumber: 0xfffffffe, UnlockingScript: bscript.NewFromBytes([]byte{0x00})}
+			require.NoError(t, input.PreviousTxIDAdd(prev.TxIDChainHash()))
+			tx.Inputs = append(tx.Inputs, input)
+		}
+
+		tx.Outputs = append(tx.Outputs, &bt.Output{Satoshis: satoshis, LockingScript: script})
+
+		return tx
+	}
+
+	p := newParent(0x11)
+	q := newParent(0x12)
+
+	c := spending([]*bt.Tx{p, q}, 900)
+	_, _, err = store.SpendAndCreate(ctx, c, 1000)
+	require.NoError(t, err)
+
+	// Q:0 is released and X takes it, so C's input on Q answers ErrSpent.
+	q0Hash, err := util.UTXOHashFromOutput(q.TxIDChainHash(), q.Outputs[0], 0)
+	require.NoError(t, err)
+	require.NoError(t, store.Unspend(ctx, []*utxostore.Spend{{
+		TxID: q.TxIDChainHash(), Vout: 0, UTXOHash: q0Hash, SpendingData: spendpkg.NewSpendingData(c.TxIDChainHash(), 1),
+	}}))
+
+	x := spending([]*bt.Tx{q}, 450)
+	_, _, err = store.SpendAndCreate(ctx, x, 1400)
+	require.NoError(t, err, "fixture: X takes Q:0")
+
+	// The pruner has removed C and its parent P with it: nothing is left to carry
+	// a marker, so C's input on P answers ErrTxNotFound.
+	require.NoError(t, store.DeleteComplete(ctx, c.TxIDChainHash()))
+	require.NoError(t, store.DeleteComplete(ctx, p.TxIDChainHash()))
+
+	// The legacy create phase writes C again, locked and mined, before validating.
+	_, _, err = store.SpendAndCreate(ctx, c, 1400, utxostore.WithCreateOnly(), utxostore.WithLocked(true),
+		utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 1400, BlockHeight: 1400}), utxostore.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+
+	v := &Validator{
+		logger:      logger,
+		utxoStore:   store,
+		settings:    tSettings,
+		txValidator: NewTxValidator(logger, tSettings),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	opts := Options{
+		SkipUtxoCreation:          true,
+		SkipScriptValidation:      true,
+		SkipPolicyChecks:          true,
+		OutpointOnlySpend:         true,
+		IgnoreLocked:              true,
+		CreateConflicting:         true,
+		SpenderCreatedByCaller:    true,
+		CandidateParentMedianTime: 1700000000,
+	}
+
+	_, err = v.ValidateWithOptions(ctx, c, 1400, &opts)
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the replay must be reported by its missing parent")
+	require.NotErrorIs(t, err, errors.ErrTxConflicting, "a replay of a chain the pruner removed end to end is not a conflict to reconcile")
+
+	meta, err := store.Get(ctx, c.TxIDChainHash())
+	require.NoError(t, err)
+	require.False(t, meta.Conflicting, "the recreated record must not be flagged conflicting, which is what the conflicting branch did")
+}

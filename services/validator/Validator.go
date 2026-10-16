@@ -1077,7 +1077,12 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 						saveAsConflicting = true
 					}
 
-					if errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) {
+					// Both replay answers, not only the marker: a missing parent
+					// identifies a replay too when the caller wrote this
+					// transaction's record in this pass (utxo.IsPrunedReplayRejection),
+					// which is how a chain the pruner removed end to end, marker and
+					// all, is rejected.
+					if utxo.IsPrunedReplayRejection(spend.Err, validationOptions.SpenderCreatedByCaller) {
 						prunedReplay = true
 					}
 
