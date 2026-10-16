@@ -48,20 +48,22 @@ import (
 // would stay behind with spendable outputs after the parent is removed. A
 // dependent the store already held is different: a pruned parent says nothing
 // about whether a still-unpruned child is legitimate, so that record belongs to
-// whoever put it there and is left alone. The walk is transitive through ghosts
-// only.
+// whoever put it there and is left alone.
 //
-// The walk starts from every rejected transaction, including one that is not
-// createdHere and so is not itself deleted. Such a root is a record this
-// attempt filed as pre-existing: a live child the pruner is holding behind its
+// The walk passes through every transaction it reaches, deleted or not, and
+// deletes only what createdHere vouches for. It starts from every rejected
+// transaction, including one that is not createdHere: a record this attempt
+// filed as pre-existing, such as a live child the pruner is holding behind its
 // marker, or a leftover of an earlier attempt that could not be recognised
 // (the catch-up lock switched off, or the restart/id-reuse limit described at
-// LeftoversAmong). The root stays, as above, but a dependent THIS attempt wrote
+// LeftoversAmong). And it continues below a pre-existing dependent the same
+// way. Such a record stays, as above, but a transaction THIS attempt wrote
 // spending it is still this attempt's own write in a block that has already
 // failed, and left alone it would sit stored mined with no delete_at_height and
 // spendable outputs. Deleting it is safe for the same reason as every other
 // deletion here: it is this attempt's write, and a retry of the block writes it
-// again.
+// again. Stopping at a pre-existing record, root or intermediate, stranded
+// those writes one level further down.
 //
 // "This attempt created it" includes records an EARLIER attempt at the same
 // block created and never finished with: see LeftoversAmong. Without that, a
@@ -112,8 +114,8 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 		}
 	}
 
-	// tainted holds every transaction the walk has reached: the rejected roots,
-	// deleted or not, and the ghosts found from them.
+	// tainted holds every transaction the walk has reached: the rejected roots
+	// and their dependents, deleted or not.
 	tainted := make(map[chainhash.Hash]struct{}, len(rejected))
 	queue := make([]chainhash.Hash, 0, len(rejected))
 	result := make([]*bt.Tx, 0, len(rejected))
@@ -146,13 +148,13 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 				continue
 			}
 
-			if !createdHere(txHash) {
-				continue
-			}
-
 			tainted[*txHash] = struct{}{}
 			queue = append(queue, *txHash)
-			result = append(result, txs[i])
+
+			// A pre-existing record is walked through but never deleted.
+			if createdHere(txHash) {
+				result = append(result, txs[i])
+			}
 		}
 	}
 

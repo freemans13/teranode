@@ -141,12 +141,16 @@ func TestPrunedReplayGhosts(t *testing.T) {
 		require.Equal(t, f.child.TxIDChainHash(), ghosts[0].TxIDChainHash(), "the rejected transaction comes first")
 	})
 
-	t.Run("a dependent the store already held is left alone, and so is its subtree", func(t *testing.T) {
+	t.Run("a dependent the store already held is left alone, but what this attempt wrote below it is not", func(t *testing.T) {
 		// D pre-existed: a pruned parent says nothing about whether a still
-		// unpruned child is legitimate. E was created here but spends D, not a
-		// ghost, so it is not one either.
+		// unpruned child is legitimate, so D stays. E was written by this
+		// attempt, in a block that has already failed, and spends D. Stopping
+		// the walk at D left E stored mined with no delete_at_height and
+		// spendable outputs; a retry of the block writes it again.
 		ghosts := PrunedReplayGhosts(block, rejected, createdSet(f.child, f.greatGrandchild, f.sibling))
-		require.ElementsMatch(t, hashesOf(f.child), hashesOf(ghosts...))
+		require.ElementsMatch(t, hashesOf(f.child, f.greatGrandchild), hashesOf(ghosts...))
+		require.NotContains(t, hashesOf(ghosts...), f.grandchild.TxIDChainHash(), "the pre-existing intermediate is never deleted")
+		require.NotContains(t, hashesOf(ghosts...), f.sibling.TxIDChainHash(), "a sibling outside the walk is never a ghost")
 	})
 
 	t.Run("an unrelated sibling is never a ghost", func(t *testing.T) {
