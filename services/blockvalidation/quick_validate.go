@@ -2440,10 +2440,10 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 
 // applyList writes a batch's list through SpendAndCreateMulti. A store fault on the whole call
 // repeats the list; a retryable failure of some of its transactions repeats only those, with
-// the children the store failed as ParentFailed beside them, as the per-transaction waves
-// retried only what failed. A repeat is safe because the store reports a transaction it finds
-// again as existing rather than writing it twice, and a sub-list keeps block order, so a parent
-// that went through on an earlier pass is one the store finds outside the list. A pass that fails
+// the children the store failed as ParentFailed beside them and their parents in the list
+// (withParentsInList), as the per-transaction waves retried only what failed. A repeat is safe
+// because the store reports a transaction it finds again as existing rather than writing it
+// twice, and a sub-list keeps block order. A pass that fails
 // as many transactions as it was given makes no progress and fails the batch. A transaction that
 // exists is collected for the mined-info stamp; the store has already made its spends. A
 // transaction the store fails, or whose parent in the list failed, fails the batch closed unless
@@ -2550,11 +2550,13 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 		failed = len(retry)
 		lastErr = retryable
 
-		nextTxs := make([]*bt.Tx, len(retry))
-		nextTxIDs := make([]chainhash.Hash, len(retry))
-		nextIdxs := make([]int, len(retry))
+		next := withParentsInList(txs, txids, retry)
 
-		for j, i := range retry {
+		nextTxs := make([]*bt.Tx, len(next))
+		nextTxIDs := make([]chainhash.Hash, len(next))
+		nextIdxs := make([]int, len(next))
+
+		for j, i := range next {
 			nextTxs[j], nextTxIDs[j], nextIdxs[j] = txs[i], txids[i], subtreeIdxs[i]
 		}
 
@@ -2562,6 +2564,41 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 	}
 
 	return errors.NewProcessingError("[applyList][%s] %d of a list of %d transactions still failing after %d retries", block.Hash().String(), len(txs), total, maxRetries, lastErr)
+}
+
+// withParentsInList returns the positions in failed, with the position of every parent in the
+// list of a transaction at one of them, in list order. A retry carries those parents, although
+// they went through, so that a failed transaction meets the store with the same parents in its
+// list as before, and the store writes it as it did. Alone, it would get a combined call, which
+// leaves IgnoreFlags.RequireParentOutputs unset and reads a create-only record an earlier pass
+// left behind as proof its spends were made. A parent comes back Existed and costs one call.
+func withParentsInList(txs []*bt.Tx, txids []chainhash.Hash, failed []int) []int {
+	position := make(map[chainhash.Hash]int, len(txs))
+	for i := range txids {
+		position[txids[i]] = i
+	}
+
+	include := make([]bool, len(txs))
+
+	for _, i := range failed {
+		include[i] = true
+
+		for _, in := range txs[i].Inputs {
+			if p, ok := position[*in.PreviousTxIDChainHash()]; ok {
+				include[p] = true
+			}
+		}
+	}
+
+	next := make([]int, 0, len(failed))
+
+	for i, ok := range include {
+		if ok {
+			next = append(next, i)
+		}
+	}
+
+	return next
 }
 
 // applyOneByOne applies txs one SpendAndCreate at a time, in block order: the path for a list the

@@ -646,7 +646,10 @@ type Store interface {
 	// record that exists has made its spends.
 	//
 	// A caller may repeat only the transactions that were not Created or
-	// Existed, in list order; quick validation does. So a store that reports
+	// Existed, with their parents in the list, in list order; quick validation
+	// does. The parents keep each transaction written the way it was the first
+	// time, which the store's reading of an existing record relies on. So a
+	// store that reports
 	// per-transaction failures must leave the store such that the shorter list
 	// finishes the write, with every parent that went through outside it. A
 	// store whose write depends on the whole list, one that leaves out the

@@ -326,11 +326,16 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 // the fallback off cannot fail a legitimate repeat: a parent is pruned only
 // after its retention has passed since it was fully spent, and the chain does
 // not advance past the block being applied, so a repeat of that block's list
-// runs before any parent its spends emptied can be pruned. A first-wave
-// combined call keeps the fallback, as the per-transaction path does: it spends
-// before it creates, so a record it finds was written after its spends, and on
-// a store left ahead of the chain by a reset, a transaction whose parent has
-// since been pruned is found as existing rather than failing the block.
+// runs before any parent its spends emptied can be pruned.
+//
+// A first-wave combined call keeps the fallback, as the per-transaction path
+// does. It is made only for a transaction with no parent in the list, which a
+// repeat of the list writes the same way, spending before it creates, so a
+// record it finds was written after its spends. A caller that repeats part of
+// a list keeps that true by keeping each transaction's parents in it (below).
+// On a store left ahead of the chain by a reset, a transaction whose parent
+// has since been pruned is then found as existing rather than failing the
+// block.
 //
 // A call, once started, runs to its end. A combined SpendAndCreate is not
 // atomic on a store that spends and then creates (SequentialSpendAndCreate): a
@@ -343,10 +348,11 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 //
 // A caller treats anything but MultiTxCreated and MultiTxExisted as a failed
 // transaction. It may repeat the whole list, or only the failed transactions
-// with their descendants, in list order, as quick validation does: a parent
-// that went through is then outside the shorter list, so its children get a
-// combined call, which makes any spends a create-only record from the earlier
-// attempt is missing.
+// with their parents in the list, in list order, as quick validation does. The
+// parents keep a failed transaction's shape: one that had a parent in the list
+// still gets a create-only call and a second-wave spend, so a create-only
+// record from the earlier attempt never meets a combined call, which would
+// read it as proof its spends were made.
 func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, widths SpendAndCreateMultiWidths, txs []*bt.Tx,
 	list *SpendAndCreateMultiList, blockHeight uint32, items []CreateOption) ([]SpendAndCreateMultiResult, error) {
 	txids, parentsInList := list.TxIDs, list.ParentsInList
