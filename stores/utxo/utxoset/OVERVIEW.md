@@ -197,7 +197,7 @@ Why so late? Near the tip, the chain can change: a block can lose a reorg, and t
 
 1. **Begin.** Delete the containment rows of blocks that lost. Raise the fence (`stamp_fence`) so that no new write can change the partition.
 2. **Stamp pages.** 256 pages, one for each first byte of the transaction id. Each page writes the winning block onto the UTXOs at "no block yet", and deletes the identity rows, in one statement.
-3. **Complete.** A sampled audit, then the completion record with the tip height.
+3. **Complete.** A sampled audit, then the completion record. The record holds the tip height plus one partition (288 blocks), the highest height at which an undo copy of the partition's UTXOs can still be written while the stamp completes.
 
 Below the checkpoint the identity table is empty, so a partition costs one scan for losers and a probe for each page: about 1.3 seconds for each 288-block partition during sync.
 
@@ -207,9 +207,9 @@ The rewind tool (`cmd/rewindblockchain`) refuses to go below a stamped height, b
 
 The pruner service calls the store's `Prune` once per block. Each step is a `DROP TABLE` of partitions that are old enough. There is no list of rows to work through, so there is no backlog that can grow. The steps do not wait for each other: a failed step is logged and counted, and the others still run.
 
-1. **Bodies.** Drop `tx_body` partitions more than 288 blocks below the pruner height. The pruner height is the block persister's archived height, so a body is never dropped before the persister has used it. Before the drop, the body of each transaction that still waits to be mined is copied to `tx_body_carry`. A carried body leaves when its transaction has been mined for 288 blocks.
+1. **Bodies.** Drop `tx_body` partitions more than 288 blocks below the pruner height. With the default trigger, `pruner_block_trigger = OnBlockPersisted`, the pruner height is the block persister's archived height, so a body is never dropped before the persister has used it. With `OnBlockMined`, which is for a node without a block persister, it is the height of the block just mined, and bodies drop 288 blocks below the tip. Before the drop, the body of each transaction that still waits to be mined is copied to `tx_body_carry`. A carried body leaves when its transaction has been mined for 288 blocks.
 2. **Undo copies.** Drop `spend_journal` and `conflict_children` partitions older than `utxostore_spendJournalRetentionBlocks` (default 288). Before the drop, the undo copies of transactions that wait to be mined, or that were mined recently, are **moved** to a newer partition. A shallow reorg can still take such a transaction's block away, and its coins must then come back.
-3. **Containment.** Drop a `tx_mined` partition when all four hold: the stamp completed it; 1,728 blocks have passed since then (the longest an undo copy can live, plus one partition); no undo partition from before the stamp is still attached; and no identity row still points into it.
+3. **Containment.** Drop a `tx_mined` partition when all four hold: the stamp completed it; the longest an undo copy can live has passed since the height in its completion record, which is the journal retention plus one partition, 576 blocks at the default retention of 288; no undo partition from before the stamp is still attached; and no identity row still points into it.
 4. **Index rebuild.** Rebuild the most bloated UTXO index partition, at most one per block.
 
 The pruner also preserves the parents of old unmined transactions (`preserved_parent`) and expires those copies, through the same two calls the aerospike store uses.
@@ -286,6 +286,6 @@ The store needs a **new database**. A schema check at startup refuses a database
 - **The fence**: the height below which no write may change containment, because the stamp has started there.
 - **Netting**: not writing an output as a UTXO when a later transaction in the same list spends it.
 - **Carry**: keeping the body of a waiting transaction after its body partition drops.
-- **Pruner height**: the block persister's archived height, which the pruner uses to decide what is old.
+- **Pruner height**: the height the pruner uses to decide what is old. With the default `pruner_block_trigger = OnBlockPersisted` it is the block persister's archived height; with `OnBlockMined` it is the height of the block just mined.
 - **Highest checkpoint**: the last hard-coded block that the node trusts. Below it a reorg is impossible by rule.
 - **Two-phase commit, locked**: a new transaction's outputs are locked until block assembly acknowledges it.

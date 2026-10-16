@@ -101,7 +101,7 @@ func TestConformance(t *testing.T) {
 	// make it unfindable. On this store that takes the stamp, which the pruner service drives
 	// on its own worker through the Stamper interface, and which the shared case knows nothing
 	// about. stampingPruner is the harness's stand-in for that worker: on Prune it drains every
-	// stampable partition with a hand-built chain answer, moves the tip past stamped_at + 1,728
+	// stampable partition with a hand-built chain answer, moves the tip past stamped_at + undoMaxLife
 	// and then runs the real Prune, which is how one call comes to satisfy a case whose drop
 	// rule needs two conditions.
 	t.Run("MinedThenSpendAllPrunes", func(t *testing.T) {

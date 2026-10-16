@@ -32,9 +32,10 @@ import (
 //     Stamp the UTXOs, then delete the identity rows, in ONE statement, so a crash can never
 //     leave a UTXO at (0,0) with no identity row behind it.
 //  3. CompleteWindow. A sampled audit, then the completion record and the completion floor in
-//     one transaction. The record carries the tip at which the partition was stamped, and the drop
-//     waits 1,728 blocks past it, which is what keeps a UTXO spent before its stamp answerable
-//     for as long as its undo copy can live.
+//     one transaction. The record carries the tip at which the partition was stamped plus one undo
+//     partition (stampMarginBlocks), and the drop waits undoMaxLife past it, the journal retention
+//     plus one partition (576 blocks at the default retention, 1,728 at the maximum), which is
+//     what keeps a UTXO spent before its stamp answerable for as long as its undo copy can live.
 //
 // The work list is the identity table (decision 2): only a transaction seen before its block can
 // own a UTXO at (0,0). Below the checkpoint every create carries its block, tx_ident is empty,

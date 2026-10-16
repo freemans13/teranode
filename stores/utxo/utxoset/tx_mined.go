@@ -225,7 +225,8 @@ const detachTimeout = 10 * time.Second
 //
 // Partition W drops when all four hold. (a) W has a completion record, written by the stamp when
 // it finished W. (b) height is at least stamped_at(W) plus the longest an undo copy can live,
-// 1,728 blocks: a UTXO of W spent before its stamp left an undo copy at (0,0), and the partition is
+// undoMaxLife, the journal retention plus one partition (576 blocks at the default retention,
+// 1,728 at the maximum): a UTXO of W spent before its stamp left an undo copy at (0,0), and the partition is
 // the only thing that can answer for it while that copy lives. (c) No attached undo partition
 // covers any height below stamped_at(W), read from the catalog rather than inferred from the
 // height, because an undo drop can fail or be skipped; this is what keeps (b) true with a late
