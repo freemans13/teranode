@@ -2,7 +2,6 @@ package utxo
 
 import (
 	"context"
-	stderrors "errors"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -56,10 +55,17 @@ func IsCreateOutcomeUnknown(err error) bool {
 		return true
 	}
 
-	for cur := err; cur != nil; cur = stderrors.Unwrap(cur) {
+	for cur := err; cur != nil; {
 		if te, ok := cur.(*errors.Error); ok && te.GetData(createOutcomeUnknownKey) == true {
 			return true
 		}
+
+		u, ok := cur.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+
+		cur = u.Unwrap()
 	}
 
 	return false
