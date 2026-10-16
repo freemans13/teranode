@@ -71,3 +71,64 @@ func TestMissingParentRollsBackFreshSiblingSpend(t *testing.T) {
 		}
 	})
 }
+
+// TestBlessedInputIsKeptOutOfTheRollback: T spends S:0 (present), G:0 (whose
+// record is gone) and X:0 (which another transaction already holds). T's own
+// record exists, so the store blesses the missing parent and counts G:0 as
+// succeeded. X:0 answers ErrSpent, so the call fails and reverses what it wrote.
+// G:0 wrote nothing and has no row: when it was in the rollback set, Unspend
+// answered NotFound for it, the rollback's database transaction was discarded,
+// and S:0 stayed spent by a transaction that will never be mined.
+func TestBlessedInputIsKeptOutOfTheRollback(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		for i, perRow := range []bool{false, true} {
+			store.settings.UtxoStore.BatchSQLOperations = !perRow
+
+			newParent := func(seed string) *bt.Tx {
+				parent := bt.NewTx()
+				require.NoError(t, parent.From("22222222222222222222222222222222222222222222222222222222222222"+seed, 0, "51", 30000))
+				parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+				require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+
+				return parent
+			}
+
+			spending := func(parents ...*bt.Tx) *bt.Tx {
+				tx := bt.NewTx()
+				for _, parent := range parents {
+					require.NoError(t, tx.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+				}
+
+				for j := range tx.Inputs {
+					tx.Inputs[j].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+				}
+
+				require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+
+				return tx
+			}
+
+			suffix := string(rune('0' + i))
+			survivor, gone, taken := newParent("a"+suffix), newParent("b"+suffix), newParent("c"+suffix)
+
+			for _, parent := range []*bt.Tx{survivor, taken} {
+				_, err := store.Create(ctx, parent, 1000)
+				require.NoError(t, err)
+			}
+
+			other := spending(taken)
+			_, err := store.Spend(ctx, other, 1100)
+			require.NoError(t, err, "fixture: another transaction holds X:0")
+
+			spender := spending(survivor, gone, taken)
+			_, err = store.Create(ctx, spender, 1100, utxo.WithSkipExtendedInputs(true))
+			require.NoError(t, err, "fixture: T's own record exists, so the missing parent is blessed")
+
+			_, err = store.Spend(ctx, spender, 1200)
+			require.ErrorIs(t, err, errors.ErrSpent, "X:0 is held by another transaction")
+			require.NotErrorIs(t, err, errors.ErrTxNotFound, "control: the missing parent was blessed")
+			require.Nil(t, outputSpendingData(t, ctx, store, survivor, 0),
+				"the fresh spend of S:0 must be rolled back despite the blessed input (perRow=%v)", perRow)
+		}
+	})
+}

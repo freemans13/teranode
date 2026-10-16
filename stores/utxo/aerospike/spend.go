@@ -620,6 +620,12 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 
 		spend := item.spend
 
+		// A blessed input wrote nothing: its parent record is gone. It counts as
+		// succeeded but goes into neither rollback list, because Unspend fails on
+		// it and stops there, leaving the sibling spends this call did write in
+		// place.
+		blessed := false
+
 		if spend.Err != nil && errors.Is(spend.Err, errors.ErrTxNotFound) && !item.spenderCreatedByCaller {
 			// the parent transaction was not found, this can happen when the parent tx has been DAH'd and removed from
 			// the utxo store. We can check whether the tx already exists, which means it has been validated and
@@ -630,10 +636,12 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 			if txAlreadyExists {
 				// we've previously validated that this tx already exists, no point doing a lookup again or logging anything
 				spend.Err = nil
+				blessed = true
 			} else if _, getErr := s.Get(ctx, tx.TxIDChainHash()); getErr == nil {
 				s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
 
 				spend.Err = nil
+				blessed = true
 				txAlreadyExists = true
 			}
 		}
@@ -662,10 +670,13 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 
 		// An idempotent match wrote nothing: the output already recorded this
 		// exact spend. Kept apart from the fresh spends because whether it may be
-		// reversed depends on why the call failed; see utxo.RollbackSet.
-		if item.idempotent {
+		// reversed depends on why the call failed; see utxo.RollbackSet. A
+		// blessed input wrote nothing and has no record to reverse.
+		switch {
+		case blessed:
+		case item.idempotent:
 			result.idempotentSpends = append(result.idempotentSpends, spend)
-		} else {
+		default:
 			result.spentSpends = append(result.spentSpends, spend)
 		}
 	}

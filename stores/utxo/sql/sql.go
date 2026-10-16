@@ -2197,6 +2197,13 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			// spender before they spend, so its presence is not prior validation,
 			// and a replay of a transaction whose parent was pruned too would be
 			// blessed by the copy the replay itself just created.
+			//
+			// A blessed input wrote nothing: its parent row is gone. It counts as
+			// succeeded but goes into neither rollback list, because Unspend
+			// answers NotFound for it and that error aborted the whole rollback,
+			// leaving the sibling spends this call did write in place.
+			blessed := false
+
 			if batchErr != nil && errors.Is(batchErr, errors.ErrTxNotFound) && !spenderCreatedByCaller {
 				mu.Lock()
 				exists := txAlreadyExists
@@ -2204,6 +2211,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 				if exists {
 					batchErr = nil
+					blessed = true
 				} else {
 					var spendingTxExists bool
 					if scanErr := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
@@ -2212,6 +2220,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 					if spendingTxExists {
 						s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
 						batchErr = nil
+						blessed = true
 
 						mu.Lock()
 						txAlreadyExists = true
@@ -2238,10 +2247,13 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 			// An idempotent match wrote nothing: the output already recorded this
 			// exact spend. Kept apart from the fresh spends because whether it may
-			// be reversed depends on why the call failed; see rollbackSet.
-			if item.idempotent {
+			// be reversed depends on why the call failed; see rollbackSet. A
+			// blessed input wrote nothing and has no row to reverse.
+			switch {
+			case blessed:
+			case item.idempotent:
 				idempotentSpends = append(idempotentSpends, spend)
-			} else {
+			default:
 				spentSpends = append(spentSpends, spend)
 			}
 			mu.Unlock()
