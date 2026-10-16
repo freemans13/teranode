@@ -3,6 +3,7 @@ package blockassembly
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -355,8 +356,11 @@ func TestLoadUnminedTransactions_UndecidedInputCheckFailsTheLoad(t *testing.T) {
 	require.Error(t, err, "an input check the store could not answer must fail the load, not drop the transaction")
 	require.Contains(t, err.Error(), "could not validate inputs")
 
-	// Undecided again in the next load: the error no longer fails it, or one record the store
+	// Undecided past the bound: the error no longer fails the load, or one record the store
 	// can never answer would fail every reset after it. The transaction is left out and counted.
+	// TestLoadUnminedTransactions_UndecidedIsLeftOutOnlyAfterTheBound pins the bound itself.
+	items.blockAssembler.undecidedExcludeAfter = time.Nanosecond
+
 	excluded := testutil.ToFloat64(prometheusBlockAssemblerUnminedUndecidedExcluded)
 
 	require.NoError(t, items.blockAssembler.loadUnminedTransactions(ctx, true, true),
