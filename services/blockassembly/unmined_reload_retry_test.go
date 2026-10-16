@@ -210,6 +210,36 @@ func TestReset_ASuccessfulResetClearsTheRetry(t *testing.T) {
 	}
 }
 
+// TestReset_ASecondFailureKeepsTheValidatingRetry covers two failed resets in a row, the first
+// validating inputs and the second not. The retry still validates, as the first reset asked.
+func TestReset_ASecondFailureKeepsTheValidatingRetry(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	items.blockAssembler.settings.BlockAssembly.OnRestartValidateParentChain = false
+
+	seedParentAndChild(ctx, t, items)
+
+	flaky := &flakyUtxoStore{Store: items.utxoStore}
+	flaky.iteratorDown.Store(true)
+	items.blockAssembler.utxoStore = flaky
+	items.blockAssembler.unminedReloadRetryInterval = time.Millisecond
+
+	mockGenesisChainForReset(items)
+
+	require.Error(t, items.blockAssembler.reset(ctx, true))
+	require.Error(t, items.blockAssembler.reset(ctx, false))
+
+	time.Sleep(5 * time.Millisecond)
+
+	require.True(t, items.blockAssembler.retryFailedUnminedReload())
+
+	req := <-items.blockAssembler.resetCh
+	require.True(t, req.ValidateInputs, "the retry validates inputs, as the first failed reset did")
+	req.ErrCh <- nil
+}
+
 // TestLoadUnminedTransactions_UndecidedIsLeftOutOnlyAfterTheBound is icellan's second point. A
 // transaction undecided in two loads in a row was left out, however close together the loads
 // were, so two validating loads during a store outage dropped it. It is now left out only once

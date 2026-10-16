@@ -202,8 +202,13 @@ func (b *BlockAssembler) checkUnminedTxInputsRetrying(ctx context.Context, txHas
 }
 
 // noteFailedUnminedReload records that the reload inside a reset failed, for
-// retryFailedUnminedReload.
+// retryFailedUnminedReload. A retry still pending from a reset that validated inputs keeps
+// asking for validation, so a later failed reset that did not validate cannot drop it.
 func (b *BlockAssembler) noteFailedUnminedReload(validateInputs bool) {
+	if b.unminedReloadPending.Load() && b.unminedReloadValidate.Load() {
+		validateInputs = true
+	}
+
 	b.unminedReloadValidate.Store(validateInputs)
 	b.unminedReloadFailedAt.Store(time.Now().UnixNano())
 	b.unminedReloadPending.Store(true)
