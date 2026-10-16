@@ -164,10 +164,12 @@ func TestSequentialSpendAndCreate(t *testing.T) {
 		require.Equal(t, 2, f.unspendCalls)
 	})
 
-	t.Run("a create that fails with a context error keeps the spends", func(t *testing.T) {
+	t.Run("a create whose outcome is unknown keeps the spends", func(t *testing.T) {
 		for _, createErr := range []error{
 			context.DeadlineExceeded,
 			errors.NewContextCanceledError("create did not finish", context.Canceled),
+			MarkCreateOutcomeUnknown(errors.NewServiceUnavailableError("store batch did not complete within 1s")),
+			errors.NewProcessingError("wrapped", MarkCreateOutcomeUnknown(errors.NewServiceUnavailableError("store batch did not complete within 1s"))),
 		} {
 			f := &fakeSequentialStore{
 				spends:    []*Spend{{}},
@@ -175,11 +177,24 @@ func TestSequentialSpendAndCreate(t *testing.T) {
 			}
 
 			md, spends, err := SequentialSpendAndCreate(ctx, logger, f, tx, 100)
-			require.True(t, errors.IsContextError(err), "%v", err)
+			require.True(t, IsCreateOutcomeUnknown(err), "%v", err)
 			require.Nil(t, md)
 			require.Len(t, spends, 1, "the create may still commit, so the spends stay in effect")
 			require.Equal(t, 0, f.unspendCalls)
 		}
+	})
+
+	t.Run("an unmarked service-unavailable create failure rolls back", func(t *testing.T) {
+		f := &fakeSequentialStore{
+			spends:    []*Spend{{}},
+			createErr: errors.NewServiceUnavailableError("store is down"),
+		}
+
+		_, spends, err := SequentialSpendAndCreate(ctx, logger, f, tx, 100)
+		require.ErrorIs(t, err, errors.ErrServiceUnavailable)
+		require.False(t, IsCreateOutcomeUnknown(err))
+		require.Nil(t, spends, "a create that definitely failed is rolled back")
+		require.Equal(t, 1, f.unspendCalls)
 	})
 
 	t.Run("rollback backoff stops at the rollback bound", func(t *testing.T) {
