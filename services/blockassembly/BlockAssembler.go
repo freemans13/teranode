@@ -4114,59 +4114,76 @@ func (b *BlockAssembler) checkUnminedTxInputs(ctx context.Context, txHash chainh
 
 		// Case 2: spending data matches, but check if the counter-conflicting tx
 		// (the one this tx replaced via ProcessConflicting) is on the current chain.
-		// This catches the scenario where ProcessConflicting incorrectly flipped a
-		// confirmed transaction to "loser" status.
-		counterTxMeta, err := b.utxoStore.Get(ctx, parentHash, fields.ConflictingChildren)
+		counterConfirmed, err := b.counterConflictConfirmed(ctx, txHash, parentHash, vout, bestBlockIDsMap)
 		if err != nil {
-			if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
-				// No parent record, so no contest recorded against it.
-				continue
-			}
-
-			// Skipping on a store failure fails OPEN: this check is what drops a
-			// transaction whose counter-conflict is confirmed on chain, so a
-			// transient error would let exactly that transaction into the
-			// candidate. Fail closed by reporting it instead.
-			return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load the contest on parent %s", txHash.String(), parentHash.String(), err)
+			return false, false, err
 		}
 
-		if counterTxMeta == nil {
-			continue
-		}
-
-		for _, counterChild := range counterTxMeta.ConflictingChildren {
-			if counterChild.IsEqual(&txHash) {
-				continue
-			}
-
-			counterMeta, err := b.utxoStore.Get(ctx, &counterChild, fields.BlockIDs)
-			if err != nil {
-				if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
-					// The counter's own record is gone, so it is on no block.
-					continue
-				}
-
-				// Same fail-open hazard as the read above: this is the lookup that
-				// decides whether the counter is confirmed on the current chain.
-				return false, false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load counter-conflicting tx %s", txHash.String(), counterChild.String(), err)
-			}
-
-			if counterMeta == nil {
-				continue
-			}
-
-			for _, blockID := range counterMeta.BlockIDs {
-				if bestBlockIDsMap[blockID] {
-					b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d has counter-conflicting tx %s confirmed on chain (blockID %d) — marking conflicting",
-						txHash.String(), parentHash.String(), vout, counterChild.String(), blockID)
-
-					return false, true, nil
-				}
-			}
+		if counterConfirmed {
+			return false, true, nil
 		}
 	}
 
 	return true, false, nil
+}
+
+// counterConflictConfirmed reports whether a transaction that contests the
+// same parent as txHash (the one txHash replaced via ProcessConflicting) is
+// confirmed on the current chain. This catches the scenario where
+// ProcessConflicting incorrectly flipped a confirmed transaction to "loser"
+// status. It only reads the store, and a store failure is returned rather than
+// read as "not confirmed".
+func (b *BlockAssembler) counterConflictConfirmed(ctx context.Context, txHash chainhash.Hash, parentHash *chainhash.Hash, vout int, bestBlockIDsMap map[uint32]bool) (bool, error) {
+	counterTxMeta, err := b.utxoStore.Get(ctx, parentHash, fields.ConflictingChildren)
+	if err != nil {
+		if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+			// No parent record, so no contest recorded against it.
+			return false, nil
+		}
+
+		// Skipping on a store failure fails OPEN: this check is what drops a
+		// transaction whose counter-conflict is confirmed on chain, so a
+		// transient error would let exactly that transaction into the
+		// candidate. Fail closed by reporting it instead.
+		return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load the contest on parent %s", txHash.String(), parentHash.String(), err)
+	}
+
+	if counterTxMeta == nil {
+		return false, nil
+	}
+
+	for _, counterChild := range counterTxMeta.ConflictingChildren {
+		if counterChild.IsEqual(&txHash) {
+			continue
+		}
+
+		counterMeta, err := b.utxoStore.Get(ctx, &counterChild, fields.BlockIDs)
+		if err != nil {
+			if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+				// The counter's own record is gone, so it is on no block.
+				continue
+			}
+
+			// Same fail-open hazard as the read above: this is the lookup that
+			// decides whether the counter is confirmed on the current chain.
+			return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load counter-conflicting tx %s", txHash.String(), counterChild.String(), err)
+		}
+
+		if counterMeta == nil {
+			continue
+		}
+
+		for _, blockID := range counterMeta.BlockIDs {
+			if bestBlockIDsMap[blockID] {
+				b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d has counter-conflicting tx %s confirmed on chain (blockID %d) — marking conflicting",
+					txHash.String(), parentHash.String(), vout, counterChild.String(), blockID)
+
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }
 
 func (b *BlockAssembler) markAsConflicting(ctx context.Context, txHash chainhash.Hash) {
