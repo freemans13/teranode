@@ -27,6 +27,16 @@ type flakyUtxoStore struct {
 	parentReadFailures atomic.Int64
 	// down fails every Get.
 	down atomic.Bool
+	// iteratorDown fails GetUnminedTxIterator, so a reload fails whether it validates inputs or not.
+	iteratorDown atomic.Bool
+}
+
+func (s *flakyUtxoStore) GetUnminedTxIterator() (utxoStore.UnminedTxIterator, error) {
+	if s.iteratorDown.Load() {
+		return nil, errors.NewStorageError("[flakyUtxoStore] the store is down")
+	}
+
+	return s.Store.GetUnminedTxIterator()
 }
 
 func (s *flakyUtxoStore) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
@@ -143,6 +153,61 @@ func TestReset_FailedReloadIsRetriedByTheHeartbeat(t *testing.T) {
 
 	require.True(t, containsHash(items.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx), *child.TxIDChainHash()),
 		"the unmined transaction is back in the candidate")
+}
+
+// TestReset_ASuccessfulResetClearsTheRetry covers a reset that reloads the mempool before the
+// heartbeat retry is due, for example a reorg right after the failure. The retry is then not
+// needed, and queuing it would clear the subtrees and reload the mempool again for nothing. A
+// reset that did not validate inputs does not stand in for a failed one that did.
+func TestReset_ASuccessfulResetClearsTheRetry(t *testing.T) {
+	cases := []struct {
+		name          string
+		failValidate  bool
+		laterValidate bool
+		wantRetry     bool
+	}{
+		{name: "a validating reset clears a validating retry", failValidate: true, laterValidate: true, wantRetry: false},
+		{name: "any reset clears a retry that did not validate", failValidate: false, laterValidate: false, wantRetry: false},
+		{name: "a reset that did not validate keeps a validating retry", failValidate: true, laterValidate: false, wantRetry: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			initPrometheusMetrics()
+
+			ctx := t.Context()
+			items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+			items.blockAssembler.settings.BlockAssembly.OnRestartValidateParentChain = false
+
+			_, child := seedParentAndChild(ctx, t, items)
+
+			flaky := &flakyUtxoStore{Store: items.utxoStore}
+			flaky.iteratorDown.Store(true)
+			items.blockAssembler.utxoStore = flaky
+			items.blockAssembler.unminedReloadRetryInterval = time.Millisecond
+
+			mockGenesisChainForReset(items)
+
+			require.Error(t, items.blockAssembler.reset(ctx, tc.failValidate))
+			require.True(t, items.blockAssembler.unminedReloadPending.Load(), "the failed reload left a retry")
+
+			flaky.iteratorDown.Store(false)
+
+			require.NoError(t, items.blockAssembler.reset(ctx, tc.laterValidate))
+			require.True(t, containsHash(items.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx), *child.TxIDChainHash()),
+				"the later reset put the mempool back in the candidate")
+
+			time.Sleep(5 * time.Millisecond)
+
+			require.Equal(t, tc.wantRetry, items.blockAssembler.retryFailedUnminedReload())
+
+			if tc.wantRetry {
+				req := <-items.blockAssembler.resetCh
+				require.True(t, req.ValidateInputs, "the kept retry still validates inputs")
+				req.ErrCh <- nil
+			}
+		})
+	}
 }
 
 // TestLoadUnminedTransactions_UndecidedIsLeftOutOnlyAfterTheBound is icellan's second point. A

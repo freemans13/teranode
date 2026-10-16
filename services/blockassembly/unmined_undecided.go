@@ -209,6 +209,15 @@ func (b *BlockAssembler) noteFailedUnminedReload(validateInputs bool) {
 	b.unminedReloadPending.Store(true)
 }
 
+// clearPendingUnminedReload drops the retry a failed reload left, once a later reset has reloaded
+// the mempool. A reload that did not validate inputs leaves a retry that asked for validation in
+// place, so the validation the failed reset meant to do still happens.
+func (b *BlockAssembler) clearPendingUnminedReload(validatedInputs bool) {
+	if validatedInputs || !b.unminedReloadValidate.Load() {
+		b.unminedReloadPending.Store(false)
+	}
+}
+
 // retryFailedUnminedReload queues a reset when the reload of an earlier one failed and the retry
 // interval has passed since. Called from the heartbeat tick. It reports whether it queued one.
 //

@@ -989,6 +989,8 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 			return errors.NewProcessingError("[Reset] error loading unmined transactions", err)
 		}
 
+		b.clearPendingUnminedReload(shouldValidateInputs)
+
 		// Drop any in-flight children of cascaded conflicting parents from
 		// the input queue before the existing post-postProcess drain runs
 		// and before default-case dequeue resumes. Report-only: this runs
