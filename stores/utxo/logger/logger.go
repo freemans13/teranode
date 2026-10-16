@@ -36,6 +36,11 @@ type Store struct {
 	store  utxo.Store
 }
 
+// Callers that check the store for an optional method, such as the pruner
+// service looking for a pruner, use utxo.As, which looks through the wrapper by
+// way of Unwrap. Without it, turning logging on would hide those methods.
+var _ utxo.Unwrapper = (*Store)(nil)
+
 // New creates a new logging wrapper around the provided UTXO store.
 // All operations on the returned store will be logged with detailed information
 // including method names, parameters, return values, and execution times.
@@ -433,4 +438,9 @@ func (s *Store) SpendsMadeBy(ctx context.Context, txHash chainhash.Hash) ([]*utx
 	s.logger.Debugf("[UTXOStore][logger][SpendsMadeBy] %s returned %d spends, err %v", txHash.String(), len(spends), err)
 
 	return spends, err
+}
+
+// Unwrap returns the wrapped store.
+func (s *Store) Unwrap() utxo.Store {
+	return s.store
 }

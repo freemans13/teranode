@@ -75,6 +75,14 @@ SELECT k.txid, p.flags
 // always has, so a repeated repair stays idempotent. Mark-off reports it as ErrTxNotFound in
 // the joined error, as it always has, and counts every non-coinbase one, because reaching it
 // means a reorg has touched something that should be beyond a reorg's reach.
+//
+// A hash with neither row is handled the way the sql and aerospike stores handle it since PR
+// 1934. Mark-on logs and skips it: the transaction is mined, so there is no marker to clear,
+// and its rows can be gone legitimately once the stamp and the partition drop have passed it,
+// which a reorg can reach on a chain at height 1,000 or less, where block assembly takes reorgs
+// deeper than coinbase maturity. Block assembly makes this call after its reorg is committed,
+// so an error there cancels nothing. Mark-off still reports it: block assembly would put that
+// transaction back into its templates with no record behind it.
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash,
 	onLongestChain bool) error {
 	if len(txHashes) == 0 {
@@ -110,8 +118,14 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		return nil
 	}
 
-	// Named but absent. Reported rather than swallowed, because the caller asked for a repair
-	// and a row it could not reach is a repair that did not happen.
+	if onLongestChain {
+		s.logMissingOnLongestChain(txHashes, seen)
+
+		return nil
+	}
+
+	// Named but absent on mark-off. Reported rather than swallowed, because the caller would
+	// put the transaction back into block assembly with no record behind it.
 	missing := make([]error, 0, 4)
 
 	for i := range txHashes {
@@ -127,6 +141,32 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	}
 
 	return errors.Join(missing...)
+}
+
+// logMissingOnLongestChain logs the hashes mark-on skipped: the count, and the first ten.
+func (s *Store) logMissingOnLongestChain(txHashes []chainhash.Hash, seen map[chainhash.Hash]struct{}) {
+	count := 0
+	first := make([]string, 0, 10)
+
+	for i := range txHashes {
+		if _, ok := seen[txHashes[i]]; ok {
+			continue
+		}
+
+		count++
+
+		if len(first) < 10 {
+			first = append(first, txHashes[i].String())
+		}
+	}
+
+	if count == 0 {
+		// Only a hash listed twice made the counts differ.
+		return
+	}
+
+	s.logger.Warnf("[utxoset][MarkTransactionsOnLongestChain] skipped %d of %d transactions the store does not hold, first %d: %v",
+		count, len(txHashes), len(first), first)
 }
 
 // markOn clears the unmined marker of every listed identity row.

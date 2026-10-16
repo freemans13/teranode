@@ -396,7 +396,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	if size := tSettings.UtxoStore.LockedBatcherSize; size > 1 {
 		d := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
-		s.lockBatcher = newLockBatcher(s, size, d,
+		s.lockBatcher = newLockBatcher(s, size, d, tSettings.BatcherBackground, tSettings.UtxoStore.BatcherMaxConcurrent,
 			tSettings.UtxoStore.LockedBatcherDrainMode, tSettings.UtxoStore.LockedBatcherGreedyAccumulate)
 	}
 

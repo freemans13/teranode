@@ -110,9 +110,26 @@ var multiCreateChunkTxs = 256
 
 // multiFault is a test hook called after step 1, as "spent", and after each commit unit of step
 // 2, as "created group N" with N counting from 0: a group of merged levels, or one level split
-// into parallel chunks. An error from it stops the write there, as a crash would. nil in
-// production.
+// into parallel chunks. An error from it stops the write there. errMultiCrash stops it as a crash
+// would, with no cleanup; any other error is an ordinary failure, and the write gives back the
+// spends of the transactions it did not write. nil in production.
 var multiFault func(stage string) error
+
+// multiCrash is the error a multiFault hook returns to stop the write as a crash would: the
+// process is gone, so nothing gives the step-1 spends back. It is its own type, matched by
+// identity, for the reason nettedParentExists gives.
+type multiCrash struct{}
+
+func (multiCrash) Error() string {
+	return "[utxoset][SpendAndCreateMulti] simulated crash"
+}
+
+var errMultiCrash error = multiCrash{}
+
+// multiGiveBackTimeout bounds the Unspend that gives back the spends of a write that stopped.
+// That Unspend runs on a context detached from the caller's, because the commonest stop is the
+// caller's context being cancelled, and an Unspend on it would fail at once.
+const multiGiveBackTimeout = time.Minute
 
 // multiCreateCommitted is a test hook called with the transaction count of each step-2 chunk
 // transaction that commits. nil in production.
@@ -232,8 +249,14 @@ func (s *Store) newNettedWrite(txs []*bt.Tx, list *utxo.SpendAndCreateMultiList,
 	return w
 }
 
-func (w *nettedWrite) run(ctx context.Context) ([]utxo.SpendAndCreateMultiResult, error) {
+func (w *nettedWrite) run(ctx context.Context) (_ []utxo.SpendAndCreateMultiResult, err error) {
 	start := time.Now()
+
+	defer func() {
+		if err != nil {
+			err = w.giveBackUnwritten(ctx, err)
+		}
+	}()
 
 	var spent time.Time
 
@@ -275,6 +298,67 @@ func (w *nettedWrite) run(ctx context.Context) ([]utxo.SpendAndCreateMultiResult
 	}
 
 	return w.results(), nil
+}
+
+// giveBackUnwritten restores the spends of every transaction the write did not write, when the
+// write stops with an error: a step-1 chunk or a step-2 group that failed, a cancelled context,
+// or the per-transaction default giving up. Step 1 committed its spends before step 2 began, so
+// without this the inputs of a transaction with no record stay spent by it. A retry of the same
+// block repeats them as the same spends and completes the write, but a retry does not always
+// come: the block can lose to a fork, or nobody asks for it again. A valid spend of those coins
+// then gets ErrSpent naming a spender that does not exist, and SpendsMadeBy has no record to give
+// them back from. The sql and aerospike stores do the same through SequentialSpendAndCreate,
+// which unspends when the create fails.
+//
+// A transaction that was created, or found to exist, keeps its spends: they are its own. Each
+// other transaction gives back its outside spends, and its spends of outputs of a parent a
+// committed step-2 group journaled for it, as undoSpendsOfFailures does. Unspend restores only a
+// UTXO whose journal row names this transaction as the spender, so an outside spend that did not
+// commit, or one restored already, is a no-op.
+//
+// A crash between the two steps is not covered: nothing runs, and the spends stay until a retry
+// of the block. sql and aerospike have the same gap.
+func (w *nettedWrite) giveBackUnwritten(ctx context.Context, cause error) error {
+	if _, crashed := cause.(multiCrash); crashed { //nolint:errorlint // matched by identity; see multiCrash
+		return cause
+	}
+
+	var undo []*utxo.Spend
+
+	for _, it := range w.items {
+		if st := it.result.Status; st == utxo.MultiTxCreated || st == utxo.MultiTxExisted {
+			continue
+		}
+
+		for _, sp := range it.outsideSpends() {
+			if sp.Err == nil {
+				undo = append(undo, sp)
+			}
+		}
+
+		for vin, in := range it.tx.Inputs {
+			if it.netted != nil && it.netted[vin] && it.spends[vin] != nil &&
+				w.items[w.position[*in.PreviousTxIDChainHash()]].journaled {
+				undo = append(undo, it.spends[vin])
+			}
+		}
+	}
+
+	if len(undo) == 0 {
+		return cause
+	}
+
+	giveBackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multiGiveBackTimeout)
+	defer cancel()
+
+	if err := w.s.Unspend(giveBackCtx, undo); err != nil {
+		w.s.logger.Errorf("[utxoset][SpendAndCreateMulti] the write at height %d stopped (%v) and %d of its spends could not be given back: %v",
+			w.blockHeight, cause, len(undo), err)
+
+		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] the write stopped (%v) and its spends could not be given back", cause, err)
+	}
+
+	return cause
 }
 
 func (w *nettedWrite) results() []utxo.SpendAndCreateMultiResult {

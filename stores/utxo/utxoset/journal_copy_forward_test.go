@@ -318,3 +318,34 @@ func TestConflictReversalBetweenCopyForwardAndDrop(t *testing.T) {
 		requireRestoredOnce(t, s, ctx, parent)
 	})
 }
+
+// TestJournalCopyForwardReadsItsSpendersOncePerPass is icellan's review point: a pass that
+// retires several journal partitions read every waiting and recently mined transaction again
+// for each one. On a backlog that is many reads of the same set. The pass now reads the set once
+// and carries from each partition with it. Both waiting spends, one in each retiring partition,
+// must still be carried.
+func TestJournalCopyForwardReadsItsSpendersOncePerPass(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 1_000, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 1_000, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	spendOneOutput(t, s, ctx, parent, 0, 1_010) // partition 3, heights 864-1151
+	spendOneOutput(t, s, ctx, parent, 1, 1_200) // partition 4, heights 1152-1439
+
+	require.NoError(t, s.SetBlockHeight(1_440))
+
+	reads := 0
+	copyForwardCollected = func() { reads++ }
+
+	t.Cleanup(func() { copyForwardCollected = nil })
+
+	_, err = s.dropSpendJournalPartitionsBelow(ctx, 1_440)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, reads, "the pass read the spenders again for each retiring partition")
+	require.Equal(t, 1, journalRowsFor(t, s, ctx, parent, 0), "the spend in partition 3 was carried")
+	require.Equal(t, 1, journalRowsFor(t, s, ctx, parent, 1), "the spend in partition 4 was carried")
+}

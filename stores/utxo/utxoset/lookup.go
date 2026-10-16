@@ -90,7 +90,7 @@ const identByTxidSQL = `
 SELECT i.txid, i.created_height, i.off_chain_since, i.fee, i.size_in_bytes,
        i.tx_inpoints, i.locktime, i.created_at, i.flags, b.raw_tx
   FROM tx_ident i
-  LEFT JOIN tx_body b ON b.created_height = i.created_height AND b.txid = i.txid
+  LEFT JOIN tx_body b ON $3::boolean AND b.created_height = i.created_height AND b.txid = i.txid
  WHERE i.leaf = $1::smallint
    AND i.txid = ANY($2::bytea[])`
 
@@ -148,7 +148,8 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes, m.fee
   LEFT JOIN LATERAL (
    SELECT b.raw_tx
      FROM tx_body b
-    WHERE b.created_height = m.created_height
+    WHERE $3::boolean
+      AND b.created_height = m.created_height
       AND b.txid = k.txid
    OFFSET 0
  ) AS b ON true
@@ -181,7 +182,7 @@ SELECT k.txid, p.mined_height, p.block_id, p.subtree_idx, p.size_in_bytes, p.fee
     WHERE p.txid = k.txid
    OFFSET 0
  ) AS p
-  LEFT JOIN tx_body b ON b.created_height = p.created_height AND b.txid = k.txid`
+  LEFT JOIN tx_body b ON $2::boolean AND b.created_height = p.created_height AND b.txid = k.txid`
 
 // utxoFactsSQL reads one live UTXO per transaction, for the transactions nothing else knows.
 // The LATERAL with ORDER BY and LIMIT 1 OFFSET 0 is the fence the planner needs to walk the
@@ -198,7 +199,7 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
     WHERE u.leaf = k.leaf AND u.ukey >= k.lo AND u.ukey <= k.hi AND u.txid = k.txid
     ORDER BY u.ukey LIMIT 1 OFFSET 0
  ) AS hit
-  LEFT JOIN tx_body b ON b.created_height = hit.created_height AND b.txid = k.txid`
+  LEFT JOIN tx_body b ON $5::boolean AND b.created_height = hit.created_height AND b.txid = k.txid`
 
 // spentParentFactsSQL reads ONE journal row per transaction, for a fully-spent parent whose
 // tx_mined partition has already retired. It is the last thing the store can say about a
@@ -242,7 +243,7 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
     WHERE j.ukey >= k.lo AND j.ukey <= k.hi AND j.txid = k.txid AND j.mined_height > 0
     ORDER BY j.ukey LIMIT 1 OFFSET 0
  ) AS hit
-  LEFT JOIN tx_body b ON b.created_height = hit.created_height AND b.txid = k.txid`
+  LEFT JOIN tx_body b ON $4::boolean AND b.created_height = hit.created_height AND b.txid = k.txid`
 
 // lookupResult is one read of the store: what it found, and what it could not make sense of.
 //
@@ -256,6 +257,13 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
 type lookupResult struct {
 	found  map[chainhash.Hash]*meta.Data
 	failed map[chainhash.Hash]error
+
+	// noBody makes every read leave the body out: each statement's body join is switched off by
+	// its last parameter, and the carried bodies are not read. ParentOutputsForValidation sets it,
+	// because it needs one output of each parent, and that comes from the coin rows. Reading
+	// whole parent bodies there held gigabytes live on mainnet on 2026-10-15. Get, the get
+	// batcher and BatchDecorate set it when the caller names no field held in the body.
+	noBody bool
 }
 
 func newLookupResult(n int) lookupResult {
@@ -312,9 +320,13 @@ func (s *Store) lookupFloor() int32 {
 // The returned error is for faults that are NOT per-transaction: a dead connection, a syntax
 // error, a partition that vanished mid-read. Those really do fail every entry, because nothing
 // was answered.
+//
+// With noBody set, every record comes back with a nil Tx, and no statement reads tx_body or
+// tx_body_carry. See lookupResult.noBody.
 func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
-	wantChildren bool) (lookupResult, error) {
+	wantChildren, noBody bool) (lookupResult, error) {
 	res := newLookupResult(len(hashes))
+	res.noBody = noBody
 	if len(hashes) == 0 {
 		return res, nil
 	}
@@ -617,6 +629,10 @@ func (s *Store) mayHaveCarriedBody(d *meta.Data, floor uint32) bool {
 // own copy always wins: this runs only where the partition's join found nothing, so a body that
 // exists in both places during the interval between the carry and the drop is read once.
 func (s *Store) readCarriedBodies(ctx context.Context, hashes []chainhash.Hash, res *lookupResult) error {
+	if res.noBody {
+		return nil
+	}
+
 	var (
 		txids     [][]byte
 		floor     uint32
@@ -710,7 +726,7 @@ func (s *Store) readIdentRows(ctx context.Context, txids [][]byte, res *lookupRe
 
 // readIdentGroup is one leaf's worth of readIdentRows.
 func (s *Store) readIdentGroup(ctx context.Context, g leafBatch, res *lookupResult) error {
-	rows, err := s.pool.Query(ctx, identByTxidSQL, g.leaf, g.txids)
+	rows, err := s.pool.Query(ctx, identByTxidSQL, g.leaf, g.txids, !res.noBody)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][lookup] identity rows", err)
 	}
@@ -767,7 +783,7 @@ func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 		txids = append(txids, hashes[i][:])
 	}
 
-	rows, err := s.pool.Query(ctx, minedByTxidSQL, txids, floor)
+	rows, err := s.pool.Query(ctx, minedByTxidSQL, txids, floor, !res.noBody)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][lookup] membership rows", err)
 	}
@@ -937,7 +953,7 @@ func (s *Store) readPreserved(ctx context.Context, hashes []chainhash.Hash,
 		txids = append(txids, hashes[i][:])
 	}
 
-	rows, err := s.pool.Query(ctx, preservedByTxidSQL, txids)
+	rows, err := s.pool.Query(ctx, preservedByTxidSQL, txids, !res.noBody)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][lookup] preserved parents", err)
 	}
@@ -999,7 +1015,7 @@ func (s *Store) readUTXOFacts(ctx context.Context, hashes []chainhash.Hash,
 
 	leaves, ids, los, his := liveUTXOArgs(txids)
 
-	rows, err := s.pool.Query(ctx, utxoFactsSQL, leaves, ids, los, his)
+	rows, err := s.pool.Query(ctx, utxoFactsSQL, leaves, ids, los, his, !res.noBody)
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset][lookup] UTXO facts", err)
 	}
@@ -1068,7 +1084,7 @@ func (s *Store) readSpentParents(ctx context.Context, hashes []chainhash.Hash,
 
 	_, ids, los, his := liveUTXOArgs(txids)
 
-	rows, err := s.pool.Query(ctx, spentParentFactsSQL, ids, los, his)
+	rows, err := s.pool.Query(ctx, spentParentFactsSQL, ids, los, his, !res.noBody)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][lookup] spent parents", err)
 	}
@@ -1178,10 +1194,14 @@ func liveUTXOArgs(txids [][]byte) (leaves []int16, ids [][]byte, los, his [][16]
 // a disagreement INSIDE this one statement counts as corruption. The locked bit of a
 // containment row is masked with $6: a row below the lookup floor never supplies it, because
 // SetLocked's containment arm stops at that floor.
+//
+// The identity arm reads what identByTxidSQL reads, the unmined marker and the body included,
+// because in the create race above this tier builds the record. Without the marker an unmined
+// parent came back as mined in no block, and block assembly dropped its child as corrupt.
 const tier2SQL = `
 SELECT k.txid,
-       i.marker_set, i.created_height, i.fee, i.size_in_bytes, i.tx_inpoints, i.locktime,
-       i.created_at, i.flags,
+       i.ident_found, i.created_height, i.off_chain_since, i.fee, i.size_in_bytes, i.tx_inpoints,
+       i.locktime, i.created_at, i.flags, i.raw_tx,
        uz.hit IS NOT NULL AS utxo_zero,
        jz.hit IS NOT NULL AS undo_zero,
        m.mined_height, m.block_id, m.subtree_idx, m.created_height, m.size_in_bytes,
@@ -1189,9 +1209,10 @@ SELECT k.txid,
        m.flags & ~$6::smallint AS flags
   FROM unnest($2::bytea[], $3::uuid[], $4::uuid[]) AS k(txid, lo, hi)
   LEFT JOIN LATERAL (
-    SELECT i.off_chain_since IS NOT NULL AS marker_set, i.created_height, i.fee,
-           i.size_in_bytes, i.tx_inpoints, i.locktime, i.created_at, i.flags
+    SELECT TRUE AS ident_found, i.created_height, i.off_chain_since, i.fee,
+           i.size_in_bytes, i.tx_inpoints, i.locktime, i.created_at, i.flags, b.raw_tx
       FROM tx_ident i
+      LEFT JOIN tx_body b ON $7::boolean AND b.created_height = i.created_height AND b.txid = i.txid
      WHERE i.leaf = $1::smallint AND i.txid = k.txid
     OFFSET 0 ) AS i ON TRUE
   LEFT JOIN LATERAL (
@@ -1247,17 +1268,17 @@ func (s *Store) readTier2(ctx context.Context, hashes []chainhash.Hash, res *loo
 // tier2Row is one row of tier2SQL: the per-transaction columns and, when there is one, a
 // containment row.
 type tier2Row struct {
-	markerSet *bool
-	ident     metaRow
-	utxoZero  bool
-	undoZero  bool
-	mined     *minedRow
+	identFound *bool // non-nil when the identity row is there
+	ident      metaRow
+	utxoZero   bool
+	undoZero   bool
+	mined      *minedRow
 }
 
 func (s *Store) readTier2Group(ctx context.Context, g leafBatch, droppedFloor int32, res *lookupResult) error {
 	_, ids, los, his := liveUTXOArgs(g.txids)
 
-	rows, err := s.pool.Query(ctx, tier2SQL, g.leaf, ids, los, his, droppedFloor, FlagLocked)
+	rows, err := s.pool.Query(ctx, tier2SQL, g.leaf, ids, los, his, droppedFloor, FlagLocked, !res.noBody)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][lookup] second tier", err)
 	}
@@ -1287,8 +1308,9 @@ func (s *Store) readTier2Group(ctx context.Context, g leafBatch, droppedFloor in
 
 		// Every identity column is NULL when there is no identity row, so the two NOT NULL
 		// columns of that table are scanned through pointers here.
-		if err := rows.Scan(&txid, &r.markerSet, &identCreatedAt, &r.ident.fee, &r.ident.sizeInBytes,
-			&r.ident.txInpoints, &r.ident.locktime, &r.ident.createdAt, &identFlags,
+		if err := rows.Scan(&txid, &r.identFound, &identCreatedAt, &r.ident.offChainSince, &r.ident.fee,
+			&r.ident.sizeInBytes, &r.ident.txInpoints, &r.ident.locktime, &r.ident.createdAt, &identFlags,
+			&r.ident.rawTx,
 			&r.utxoZero, &r.undoZero,
 			&minedHeight, &blockID, &subtreeIdx, &createdHeight, &sizeInBytes, &fee, &txInpoints,
 			&locktime, &createdAt, &flags); err != nil {
@@ -1347,7 +1369,7 @@ func (s *Store) readTier2Group(ctx context.Context, g leafBatch, droppedFloor in
 // settleTier2 turns one transaction's tier-2 rows into its answer.
 func (s *Store) settleTier2(h chainhash.Hash, rows []tier2Row, res *lookupResult) {
 	first := rows[0]
-	hasIdent := first.markerSet != nil
+	hasIdent := first.identFound != nil
 
 	var mined []*minedRow
 

@@ -30,14 +30,21 @@ SELECT k.ref, j.satoshis, j.script, j.hash_override
 // ParentOutputsForValidation implements utxo.Store.
 //
 // The transaction-level answer, whether the parent exists and the lowest height of a block it
-// is recorded in, comes from the same read order Get uses. The output itself comes from the
-// parent's body while the store keeps it. Without a body, which is the steady state below the
-// checkpoint and 288 blocks behind the tip, it comes from the UTXO table or the spend journal.
-// An output of a known parent in neither is reported NoSuchIndex, as the Aerospike and SQL
-// stores report a parent with no output at that index. It covers an output the seeder never
-// held (spent before the snapshot), one that never existed, and one spent before the journal's
-// retention; none of them can be spent, so all three are a verdict on the spender rather than
-// a missing parent to go and fetch. Only an unknown parent is TxNotFound.
+// is recorded in, comes from the same read order Get uses, with the body left out. Each output
+// comes from the UTXO table while it is unspent, and from the spend journal once it is spent.
+// Only an output in neither is looked for in the parent's body (readMissedFromBodies). An output
+// of a known parent in none of the three is reported NoSuchIndex, as the Aerospike and SQL stores
+// report a parent with no output at that index. It covers an output the seeder never held (spent
+// before the snapshot), one that never existed, one the store never kept because it is provably
+// unspendable, and one spent before the journal's retention; none of them can be spent, so all
+// are a verdict on the spender rather than a missing parent to go and fetch. Only an unknown
+// parent is TxNotFound.
+//
+// The body is not the source of an ordinary answer. Subtree validation asks for about 131,000
+// parent outputs at once on mainnet, 1,024 to a call with up to 128 calls in flight. Reading and
+// parsing each parent's whole body to keep one output held gigabytes live, none of it garbage,
+// and on 2026-10-15 it took mainnet past its memory limit. The fix is to read less; a cache of
+// parent outputs is ruled out on this path.
 func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint,
 	_ ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
 	answers := make([]utxo.ParentOutput, len(outpoints))
@@ -50,7 +57,7 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 		hashes[i] = op.TxID
 	}
 
-	res, err := s.lookupMany(ctx, hashes, false)
+	res, err := s.lookupMany(ctx, hashes, false, true)
 	if err != nil {
 		fault := errors.NewStorageError("[utxoset][ParentOutputsForValidation] lookup", err)
 		for i := range answers {
@@ -60,7 +67,7 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 		return answers, nil
 	}
 
-	var fromCoins []int
+	fromCoins := make([]int, 0, len(outpoints))
 
 	for i, op := range outpoints {
 		if derr, bad := res.failed[op.TxID]; bad {
@@ -74,23 +81,8 @@ func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo
 			continue
 		}
 
-		status, height := parentStatus(data)
-
-		if data.Tx == nil {
-			answers[i].Status, answers[i].Height = status, height
-			fromCoins = append(fromCoins, i)
-
-			continue
-		}
-
-		if int(op.Vout) >= len(data.Tx.Outputs) || data.Tx.Outputs[op.Vout] == nil || data.Tx.Outputs[op.Vout].LockingScript == nil {
-			answers[i].Status = utxo.ParentOutputNoSuchIndex
-			continue
-		}
-
-		out := data.Tx.Outputs[op.Vout]
-		script := bscript.Script(append([]byte(nil), *out.LockingScript...))
-		answers[i] = utxo.ParentOutput{Status: status, Satoshis: out.Satoshis, LockingScript: &script, Height: height}
+		answers[i].Status, answers[i].Height = parentStatus(data)
+		fromCoins = append(fromCoins, i)
 	}
 
 	if len(fromCoins) > 0 {
@@ -114,7 +106,7 @@ func parentStatus(data *meta.Data) (utxo.ParentOutputStatus, uint32) {
 	return utxo.ParentOutputMined, lowest
 }
 
-// readParentCoins fills the outputs of body-less parents from the UTXO table or the journal.
+// readParentCoins fills the outputs of known parents from the UTXO table or the journal.
 // A fault fails only the entries it was asked about.
 func (s *Store) readParentCoins(ctx context.Context, outpoints []utxo.Outpoint, idx []int, answers []utxo.ParentOutput) {
 	leaves := make([]int16, len(idx))
@@ -186,9 +178,95 @@ func (s *Store) readParentCoins(ctx context.Context, outpoints []utxo.Outpoint, 
 		return
 	}
 
+	var missed []int
+
 	for k, i := range idx {
 		if !found[k] && answers[i].Err == nil {
-			answers[i] = utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
+			missed = append(missed, i)
 		}
 	}
+
+	if len(missed) > 0 {
+		s.readMissedFromBodies(ctx, outpoints, missed, answers)
+	}
+}
+
+// missedBodyChunk is how many parent bodies readMissedFromBodies holds at one time.
+const missedBodyChunk = 16
+
+// missedBodyChunkRead is a test hook called with the parent count of each body read
+// readMissedFromBodies makes. nil in production.
+var missedBodyChunkRead func(parents int)
+
+// readMissedFromBodies answers, from the parent's body, an output the coin rows do not hold. That
+// is a spent output whose journal row has dropped, or an output that never was a UTXO. The body
+// still answers the first while the store keeps it, and a mined transaction submitted again
+// after its journal row dropped depends on that: without the output, the validator rejects it
+// before it can recognise its own resubmission. Only these misses read a body, so the read
+// path for an ordinary spend stays body-free. An output in neither place is NoSuchIndex.
+//
+// The sender of a transaction chooses its outpoints, so a hostile one can name outputs that miss
+// on purpose: out-of-range indexes, outputs never stored, outputs spent long ago. The bodies are
+// therefore read missedBodyChunk parents at a time, each chunk answered and let go before the
+// next, so the memory this holds has a fixed bound however many misses a call carries.
+func (s *Store) readMissedFromBodies(ctx context.Context, outpoints []utxo.Outpoint, idx []int, answers []utxo.ParentOutput) {
+	byParent := make(map[chainhash.Hash][]int, len(idx))
+	parents := make([]chainhash.Hash, 0, len(idx))
+
+	for _, i := range idx {
+		h := outpoints[i].TxID
+		if _, seen := byParent[h]; !seen {
+			parents = append(parents, h)
+		}
+
+		byParent[h] = append(byParent[h], i)
+	}
+
+	for lo := 0; lo < len(parents); lo += missedBodyChunk {
+		chunk := parents[lo:min(lo+missedBodyChunk, len(parents))]
+
+		if missedBodyChunkRead != nil {
+			missedBodyChunkRead(len(chunk))
+		}
+
+		res, err := s.lookupMany(ctx, chunk, false, false)
+		if err != nil {
+			fault := errors.NewStorageError("[utxoset][ParentOutputsForValidation] read bodies", err)
+
+			for _, h := range chunk {
+				for _, i := range byParent[h] {
+					answers[i] = utxo.ParentOutput{Err: fault}
+				}
+			}
+
+			continue
+		}
+
+		for _, h := range chunk {
+			for _, i := range byParent[h] {
+				answerFromBody(res, outpoints[i], &answers[i])
+			}
+		}
+	}
+}
+
+// answerFromBody sets one output's value and script from its parent's body, or NoSuchIndex when
+// the body is gone or has no such output.
+func answerFromBody(res lookupResult, op utxo.Outpoint, answer *utxo.ParentOutput) {
+	if derr, bad := res.failed[op.TxID]; bad {
+		*answer = utxo.ParentOutput{Err: derr}
+		return
+	}
+
+	data, ok := res.found[op.TxID]
+	if !ok || data.Tx == nil || int(op.Vout) >= len(data.Tx.Outputs) ||
+		data.Tx.Outputs[op.Vout] == nil || data.Tx.Outputs[op.Vout].LockingScript == nil {
+		*answer = utxo.ParentOutput{Status: utxo.ParentOutputNoSuchIndex}
+		return
+	}
+
+	out := data.Tx.Outputs[op.Vout]
+	script := bscript.Script(append([]byte(nil), *out.LockingScript...))
+	answer.Satoshis = out.Satoshis
+	answer.LockingScript = &script
 }

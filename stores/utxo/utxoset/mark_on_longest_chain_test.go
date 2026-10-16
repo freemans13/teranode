@@ -68,25 +68,32 @@ func TestMarkOffLongestChainGivesAFreshClock(t *testing.T) {
 	}
 }
 
-// TestMarkOnLongestChainReportsATransactionItDoesNotHold. The sql store returns an error
-// rather than a silent no-op, because the caller is repairing an inconsistency and a
-// silently skipped row leaves the inconsistency in place.
-func TestMarkOnLongestChainReportsATransactionItDoesNotHold(t *testing.T) {
+// TestMarkOnLongestChainSkipsATransactionItDoesNotHold. Marking on the longest chain skips a
+// hash the store does not hold, as the sql and aerospike stores do since PR 1934: a mined
+// transaction has no marker to clear, and block assembly makes this call after its reorg is
+// committed, so an error cancels nothing. Marking off still reports it, because block assembly
+// would put that transaction back with no record behind it.
+func TestMarkOnLongestChainSkipsATransactionItDoesNotHold(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	known := mkStoredTxs(t, s, 700_000, 1_000, 1)[0]
 	missing := mkTx(t, 1, 9_999)
+	kh := known.TxIDChainHash()
+
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*kh}, false))
+	require.NotNil(t, readIdent(t, s, ctx, kh[:]).offChainSince, "off the longest chain first")
+
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
+		[]chainhash.Hash{*missing.TxIDChainHash(), *kh}, true),
+		"a hash the store does not hold is skipped on mark-on")
+
+	// The transactions it DOES hold are still marked.
+	require.Nil(t, readIdent(t, s, ctx, kh[:]).offChainSince)
 
 	err := s.MarkTransactionsOnLongestChain(ctx,
-		[]chainhash.Hash{*known.TxIDChainHash(), *missing.TxIDChainHash()}, true)
-
-	require.Error(t, err, "a hash the store does not hold must fail loudly")
+		[]chainhash.Hash{*missing.TxIDChainHash(), *kh}, false)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "mark-off still reports it: %v", err)
 	require.Contains(t, err.Error(), missing.TxIDChainHash().String())
-
-	// The transactions it DOES hold are still repaired, so a partial input does not
-	// strand the rest.
-	kh := known.TxIDChainHash()
-	require.Nil(t, readIdent(t, s, ctx, kh[:]).offChainSince)
 }
 
 // TestMarkOnLongestChainOnAnEmptyListIsANoOp, which is how block assembly calls it on the

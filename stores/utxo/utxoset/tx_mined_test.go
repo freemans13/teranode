@@ -3,6 +3,8 @@ package utxoset
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -131,4 +133,34 @@ func TestDroppingAWindowClearsTheEnsureCache(t *testing.T) {
 
 	require.Error(t, s.ensureTxMinedPartition(ctx, 100),
 		"the cached partition is gone, so the floor has to be re-read and the create refused")
+}
+
+// TestADeepForkBlockInADroppedPartitionSettles is icellan's review point. A valid fork block
+// deeper than the dropped floor is still recorded by block validation, and its mined status must
+// settle: update-tx-mined treats an error as critical and retries for ever. The partition refusal
+// came before the fence's skip and returned that error. A block on the longest chain in a dropped
+// partition keeps the refusal, because that state means a refusal above was bypassed.
+func TestADeepForkBlockInADroppedPartitionSettles(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.NoError(t, s.ensureTxMinedPartition(ctx, 100))
+	require.NoError(t, s.ensureTxMinedPartition(ctx, 1_000))
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 1_000)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, retireWindows(t, s, ctx, 0, nil))
+
+	skips := testutil.ToFloat64(fenceNoops.WithLabelValues("dropped_skip"))
+
+	fork := utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 100, OnLongestChain: false}
+	got, err := s.SetMinedMulti(ctx, hashes(tx), fork)
+	require.NoError(t, err, "a fork block in a dropped partition must settle, or update-tx-mined retries it for ever")
+	require.Contains(t, got[*tx.TxIDChainHash()], uint32(9), "the quiet outcome reports the block, so the caller's coverage check passes")
+	require.Equal(t, skips+1, testutil.ToFloat64(fenceNoops.WithLabelValues("dropped_skip")))
+
+	main := utxo.MinedBlockInfo{BlockID: 10, BlockHeight: 100, OnLongestChain: true}
+	_, err = s.SetMinedMulti(ctx, hashes(tx), main)
+	require.Error(t, err, "a block on the longest chain in a dropped partition is still refused")
 }

@@ -13,7 +13,10 @@ import (
 
 // Get returns everything the store holds about one transaction.
 //
-// The field list is ignored with TWO exceptions. Whichever step answers (see lookup.go)
+// The field list decides one more thing: the body is read only for a caller that names a field
+// held in it, or no field at all (see wantsBody). Otherwise Tx is nil.
+//
+// Apart from the body, the field list is ignored with TWO exceptions. Whichever step answers (see lookup.go)
 // returns everything that step holds on one row, so narrowing the projection would
 // save a few bytes on the wire and nothing else, while handing a caller a partly populated
 // record it might dereference. Answering the whole question is cheaper than answering half of
@@ -46,11 +49,12 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fie
 	// Batched when configured. The validator resolves parents one at a time from many
 	// goroutines, and each of those is otherwise its own round trip.
 	wantChildren := wantsConflictingChildren(fieldNames)
+	wantBody := wantsBody(fieldNames)
 
 	if s.getBatcher != nil {
-		data, err = s.getBatched(ctx, hash, wantChildren)
+		data, err = s.getBatched(ctx, hash, wantChildren, wantBody)
 	} else {
-		data, err = s.getDirect(ctx, hash, wantChildren)
+		data, err = s.getDirect(ctx, hash, wantChildren, wantBody)
 	}
 
 	if err != nil {
@@ -73,8 +77,8 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fie
 // and a second copy of it here is a defect waiting for one copy to be fixed and the other
 // forgotten.
 func (s *Store) getDirect(ctx context.Context, hash *chainhash.Hash,
-	wantChildren bool) (*meta.Data, error) {
-	res, err := s.lookupMany(ctx, []chainhash.Hash{*hash}, wantChildren)
+	wantChildren, wantBody bool) (*meta.Data, error) {
+	res, err := s.lookupMany(ctx, []chainhash.Hash{*hash}, wantChildren, !wantBody)
 	if err != nil {
 		return nil, err
 	}

@@ -89,34 +89,15 @@ func Build(ctx context.Context, f Fetcher, anchor chainhash.Hash, anchorHeight, 
 			return nil, err
 		}
 
-		// Check 1, length. A short list with a nil error is how a stream that failed part way
-		// arrives, because the header fetches do not check the stream's own error. The one
-		// legitimate short answer ends at height 0.
-		if uint32(len(rows)) != n && (len(rows) == 0 || rows[len(rows)-1].Height != 0) { //nolint:gosec // len fits
-			return nil, &RejectedError{CheckLength, fmt.Sprintf("asked for %d rows from %s, got %d", n, from, len(rows))}
+		if err := checkChunkLength(rows, n, from); err != nil {
+			return nil, err
 		}
 
-		if len(rows) == 0 {
-			return nil, &RejectedError{CheckLength, fmt.Sprintf("no rows from %s", from)}
+		if err := checkChunkTop(rows, first, anchor, anchorHeight, prevBottomPrev, wantHeight); err != nil {
+			return nil, err
 		}
 
-		// Check 2, anchor: the first row of the first chunk is the anchor at its height.
-		if first {
-			if rows[0].Hash != anchor || rows[0].Height != anchorHeight {
-				return nil, &RejectedError{CheckAnchor, fmt.Sprintf("first row is %s at %d, anchor is %s at %d", rows[0].Hash, rows[0].Height, anchor, anchorHeight)}
-			}
-
-			first = false
-		} else {
-			// Check 5, chunk join: this chunk's top continues the previous chunk's bottom.
-			if rows[0].Hash != prevBottomPrev {
-				return nil, &RejectedError{CheckChunkJoin, fmt.Sprintf("chunk top %s does not continue the previous chunk's parent %s", rows[0].Hash, prevBottomPrev)}
-			}
-
-			if rows[0].Height != wantHeight {
-				return nil, &RejectedError{CheckDescent, fmt.Sprintf("chunk top at %d, wanted %d", rows[0].Height, wantHeight)}
-			}
-		}
+		first = false
 
 		for i := range rows {
 			r := rows[i]
@@ -171,4 +152,42 @@ func Build(ctx context.Context, f Fetcher, anchor chainhash.Hash, anchorHeight, 
 	}
 
 	return New(lo, anchor, ids, notMined)
+}
+
+// checkChunkTop proves the first row of a fetched chunk. For the first chunk that is check 2,
+// anchor: the row is the anchor at its height. For every later chunk it is check 5, chunk join:
+// the row continues the previous chunk's bottom, at the height the descent expects.
+func checkChunkTop(rows []Row, first bool, anchor chainhash.Hash, anchorHeight uint32, prevBottomPrev chainhash.Hash, wantHeight uint32) error {
+	if first {
+		if rows[0].Hash != anchor || rows[0].Height != anchorHeight {
+			return &RejectedError{CheckAnchor, fmt.Sprintf("first row is %s at %d, anchor is %s at %d", rows[0].Hash, rows[0].Height, anchor, anchorHeight)}
+		}
+
+		return nil
+	}
+
+	if rows[0].Hash != prevBottomPrev {
+		return &RejectedError{CheckChunkJoin, fmt.Sprintf("chunk top %s does not continue the previous chunk's parent %s", rows[0].Hash, prevBottomPrev)}
+	}
+
+	if rows[0].Height != wantHeight {
+		return &RejectedError{CheckDescent, fmt.Sprintf("chunk top at %d, wanted %d", rows[0].Height, wantHeight)}
+	}
+
+	return nil
+}
+
+// checkChunkLength is check 1, length. A short list with a nil error is how a stream that failed
+// part way arrives, because the header fetches do not check the stream's own error. The one
+// legitimate short answer ends at height 0.
+func checkChunkLength(rows []Row, n uint32, from chainhash.Hash) error {
+	if uint32(len(rows)) != n && (len(rows) == 0 || rows[len(rows)-1].Height != 0) { //nolint:gosec // len fits
+		return &RejectedError{CheckLength, fmt.Sprintf("asked for %d rows from %s, got %d", n, from, len(rows))}
+	}
+
+	if len(rows) == 0 {
+		return &RejectedError{CheckLength, fmt.Sprintf("no rows from %s", from)}
+	}
+
+	return nil
 }

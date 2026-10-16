@@ -64,11 +64,15 @@ ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
 // clearMarkerSQL clears the unmined marker of every listed identity row, because the caller
 // has said a block on the longest chain contains the transaction. A transaction with no
 // identity row has no marker to clear and is untouched. Same key shape as recordMinedSQL.
+//
+// A row whose marker is already clear is not written, so a second block containing the same
+// transactions, a competing block at the same height, locks none of their identity rows.
 const clearMarkerSQL = `
 UPDATE tx_ident i
    SET off_chain_since = NULL
  WHERE i.leaf = $1::smallint
-   AND i.txid = ANY($2::bytea[])`
+   AND i.txid = ANY($2::bytea[])
+   AND i.off_chain_since IS NOT NULL`
 
 // releaseIdentLockSQL clears the locked bit of every listed identity row that still has it, and
 // returns the transactions it released. Same key shape as clearMarkerSQL. A row already
@@ -265,7 +269,8 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	}
 
 	if info.UnsetMined {
-		if err := s.unMine(ctx, txids, info); err != nil {
+		// A deadlock with a concurrent release or mine is run again; see withDeadlockRetry.
+		if err := withDeadlockRetry(ctx, "un_mine", func() error { return s.unMine(ctx, txids, info) }); err != nil {
 			return nil, err
 		}
 
@@ -277,7 +282,16 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		return s.minedIDsByTxid(ctx, txids, floor)
 	}
 
-	quiet, err := s.recordMined(ctx, txids, info)
+	// A deadlock with a concurrent release or mine is run again; see withDeadlockRetry.
+	var quiet bool
+
+	err := withDeadlockRetry(ctx, "record_mined", func() error {
+		var rerr error
+
+		quiet, rerr = s.recordMined(ctx, txids, info)
+
+		return rerr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -333,8 +347,11 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 // reports quiet = true when it wrote no containment row on purpose, below the fence.
 //
 // ensureTxMinedPartition runs BEFORE the transaction opens, because the DDL needs its own pool
-// connection; the same rule the create path follows. It refuses a dropped partition, so a call
-// that names one never reaches the fence.
+// connection; the same rule the create path follows. It refuses a dropped partition. For a block
+// off the longest chain that refusal is the dropped-partition skip below, reached early: the
+// floor is read again and, when the block's partition is dropped, the call returns quiet success.
+// Without that, the refusal went back to update-tx-mined as a critical error, and a deep fork
+// block retried for ever. A block on the longest chain keeps the refusal.
 //
 // The fence lock is the transaction's first statement, and the fence is read as its second.
 // Below the fence the rule is: a block off the longest chain inserts nothing and returns
@@ -352,7 +369,23 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 // repairs it.
 func (s *Store) recordMined(ctx context.Context, txids [][]byte, info utxo.MinedBlockInfo) (quiet bool, err error) {
 	if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
-		return false, err
+		if info.OnLongestChain {
+			return false, err
+		}
+
+		// The dropped floor only rises, so a block below it now stays below it.
+		floors, ferr := s.Floors(ctx)
+		if ferr != nil {
+			return false, err
+		}
+
+		if !(fenceState{droppedFloor: floors.DroppedFloor}).dropped(info.BlockHeight) {
+			return false, err
+		}
+
+		fenceNoops.WithLabelValues("dropped_skip").Inc()
+
+		return true, nil
 	}
 
 	dbTx, err := s.pool.Begin(ctx)

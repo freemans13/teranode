@@ -25,7 +25,9 @@ type getResult struct {
 type getItem struct {
 	hash         chainhash.Hash
 	wantChildren bool
-	done         chan getResult
+	// wantBody works the same way: the batch reads bodies if ANY item asked for one.
+	wantBody bool
+	done     chan getResult
 }
 
 // newGetBatcher funnels single reads into one BatchDecorate call, which is what the sql
@@ -60,7 +62,7 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 	ctx := context.Background()
 
 	hashes := make([]chainhash.Hash, len(batch))
-	wantChildren := false
+	wantChildren, wantBody := false, false
 
 	for i, it := range batch {
 		hashes[i] = it.hash
@@ -68,9 +70,13 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 		if it.wantChildren {
 			wantChildren = true
 		}
+
+		if it.wantBody {
+			wantBody = true
+		}
 	}
 
-	res, err := s.lookupMany(ctx, hashes, wantChildren)
+	res, err := s.lookupMany(ctx, hashes, wantChildren, !wantBody)
 	if err != nil {
 		for _, it := range batch {
 			it.done <- getResult{err: err}
@@ -124,15 +130,24 @@ type lockItem struct {
 // The release is the two-phase commit path: every mempool transaction is created locked and
 // unlocked when it commits, one call per transaction. The sql store batches exactly this.
 //
-// background is false. The update touches the UTXO rows of whichever transactions are in the
-// batch, and two batches can name the same transaction, so concurrent batches could lock the
-// same rows in different orders.
+// Batches run concurrently, up to maxConcurrent, as the spend-and-create batcher's do. Two
+// batches can name the same transaction, and each update touches that transaction's rows, so
+// two batches can lock the same rows in different orders. PostgreSQL then stops one of them as
+// a deadlock, and setLockedDirect runs it again (withDeadlockRetry). This batcher used to
+// dispatch one batch at a time to avoid that, and that queue was where the validator's write
+// path waited: in the throughput harness at 10,000 workers, 78% of the workers' blocked time
+// was the release.
 //
 // Drain mode and greedy accumulate come from LockedBatcherDrainMode and
 // LockedBatcherGreedyAccumulate, the same keys the aerospike store's locked batcher reads.
-func newLockBatcher(s *Store, size int, duration time.Duration, drainMode, greedyAccumulate bool) *batcher.Batcher[lockItem] {
-	b := batcher.NewWithPool(size, duration, s.sendLockBatch, false,
+func newLockBatcher(s *Store, size int, duration time.Duration, background bool, maxConcurrent int,
+	drainMode, greedyAccumulate bool) *batcher.Batcher[lockItem] {
+	b := batcher.NewWithPool(size, duration, s.sendLockBatch, background,
 		batcher.WithGreedyAccumulate(greedyAccumulate))
+
+	if background && maxConcurrent > 0 {
+		b.SetMaxConcurrent(maxConcurrent)
+	}
 
 	if drainMode {
 		b.SetDrainMode(true)
@@ -183,10 +198,10 @@ func (s *Store) sendLockBatch(batch []*lockItem) {
 
 // getBatched routes one read through the batcher.
 func (s *Store) getBatched(ctx context.Context, hash *chainhash.Hash,
-	wantChildren bool) (*meta.Data, error) {
+	wantChildren, wantBody bool) (*meta.Data, error) {
 	done := make(chan getResult, 1)
 
-	s.getBatcher.PutCtx(ctx, &getItem{hash: *hash, wantChildren: wantChildren, done: done})
+	s.getBatcher.PutCtx(ctx, &getItem{hash: *hash, wantChildren: wantChildren, wantBody: wantBody, done: done})
 
 	select {
 	case res := <-done:

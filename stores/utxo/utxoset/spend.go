@@ -44,9 +44,58 @@ import (
 // Bounded by the journal's retention. Beyond it the store genuinely cannot say who took a
 // UTXO, and that is a stated limit of delete-on-spend rather than a gap to paper over.
 const spenderSQL = `
-SELECT k.vin, j.spending_txid, j.satoshis, j.script, j.hash_override
+SELECT k.vin, j.spending_txid, j.satoshis, j.script, j.hash_override, j.spent_height
   FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, vin)
   JOIN spend_journal j ON j.ukey = k.ukey AND j.txid = k.txid`
+
+// moveRepeatedSpendsSQL moves the journal rows of repeated spends up to the height of the
+// repeat: $1-$3 name each row (parent output and spender), $4 is the repeat's height and $5 the
+// lowest height of the repeat's partition. Only rows below $5 move, so a repeat in the same
+// partition, which is the ordinary crash retry of one block at one height, writes nothing.
+//
+// The pruner's copy-forward keeps a mined transaction's spends by one rule: a spend is never
+// journaled below its transaction's created_height (recentlyMinedInpointsSQL). A repeat breaks
+// that. SpendAndCreateMulti commits its spends before its creates, so a crash between the two
+// leaves the spends journaled at the block's height with the transaction not written. If the
+// block is never written again, the same transaction can be accepted later, in a later
+// partition, and its identity row then carries the later height. Once a block mines it, the
+// copy-forward skips it, the partition holding its spends drops, and a shallow reorg of that
+// block cannot give its coins back. Moving the rows to the repeat's height makes the rule hold
+// again, and the repeat is a rare path, so the move costs the ordinary spend nothing.
+//
+// A MOVE, for the same reason as copyForwardSQL: a copy would leave one spend with two rows,
+// and every journal reader would answer twice for it. The NOT EXISTS keeps it from adding a
+// row next to one already at or above $5. A row whose parent coin carried no block, (0,0), gets
+// the parent's block filled in from its stamped tx_mined partition, as copyForwardSQL does and
+// for the same reason: the moved row lands above stamped_at, where the drop rule does not look.
+const moveRepeatedSpendsSQL = `
+WITH moved AS (
+    DELETE FROM spend_journal j
+     USING unnest($1::uuid[], $2::bytea[], $3::bytea[], $4::int[], $5::int[]) AS k(ukey, txid, spender, h, floor)
+     WHERE j.ukey = k.ukey AND j.txid = k.txid AND j.spending_txid = k.spender
+       AND j.spent_height < k.floor
+    RETURNING k.h, k.floor, j.spending_vin, j.satoshis, j.created_height, j.spendable_from, j.flags,
+              j.mined_height, j.block_id, j.ukey, j.txid, j.spending_txid, j.script, j.hash_override
+)
+INSERT INTO spend_journal (spent_height, spending_vin, satoshis, created_height, spendable_from, flags,
+                           mined_height, block_id, ukey, txid, spending_txid, script, hash_override)
+SELECT j.h, j.spending_vin, j.satoshis, j.created_height, j.spendable_from, j.flags,
+       CASE WHEN j.mined_height = 0 THEN coalesce(w.h, 0) ELSE j.mined_height END,
+       CASE WHEN j.mined_height = 0 THEN coalesce(w.b, 0) ELSE j.block_id END,
+       j.ukey, j.txid, j.spending_txid, j.script, j.hash_override
+  FROM moved j
+  LEFT JOIN LATERAL (
+       SELECT m.mined_height AS h, m.block_id AS b
+         FROM tx_mined m
+        WHERE j.mined_height = 0
+          AND m.txid = j.txid
+          AND m.mined_height < (SELECT stamp_complete_floor FROM tx_mined_floor WHERE id = 0)
+        ORDER BY m.mined_height, m.block_id
+        LIMIT 1) w ON true
+ WHERE NOT EXISTS (
+       SELECT 1 FROM spend_journal x
+        WHERE x.spent_height >= j.floor
+          AND x.ukey = j.ukey AND x.txid = j.txid AND x.spending_txid = j.spending_txid)`
 
 // hash_override travels with the flags because the classifier needs it to tell one hold from
 // another. spendable_from carries both coinbase maturity and the alert system's reassignment
