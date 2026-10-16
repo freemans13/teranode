@@ -414,19 +414,14 @@ func (u *Server) getSubtreeToCheck(ctx context.Context, request *subtreevalidati
 func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidation_api.CheckBlockSubtreesRequest) (*subtreevalidation_api.CheckBlockSubtreesResponse, error) {
 	block, err := model.NewBlockFromBytes(request.Block)
 	if err != nil {
-		// Names what actually failed: deserialising the block bytes carried on the
-		// request. Nothing here talks to the blockchain client, and the wrap now puts
-		// this message on the status line the caller logs, so a wrong dependency in it
-		// sends whoever reads that log at the wrong service.
+		// This message is the status line the caller logs, so it names the real failure.
 		return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtrees] failed to deserialise block from request bytes", err))
 	}
 
 	if request.BaseUrl != "" {
 		if err := util.ValidateURL(request.BaseUrl); err != nil {
-			// No %v verb: errors.New* consumes a trailing error argument as the
-			// wrapped link before formatting, so the verb would survive literally.
-			// That was cosmetic while this site returned bare, but the wrap puts
-			// the outermost message on the status line the caller logs.
+			// No %v verb: errors.New* takes a trailing error as the wrapped cause,
+			// so the verb would reach the caller's status line unformatted.
 			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[CheckBlockSubtrees] invalid BaseUrl", err))
 		}
 	}
