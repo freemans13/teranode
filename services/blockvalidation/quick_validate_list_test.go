@@ -61,6 +61,7 @@ type applyRecorder struct {
 	mu    sync.Mutex
 	calls []recordedApply
 	lists []recordedList
+	mined []chainhash.Hash
 }
 
 // recordedList is one SpendAndCreateMulti the batch made.
@@ -109,6 +110,26 @@ func (a *applyRecorder) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, b
 	a.mu.Unlock()
 
 	return results, err
+}
+
+// SetMinedMulti remembers every hash stamped with mined info, then forwards to the store.
+func (a *applyRecorder) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
+	minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	a.mu.Lock()
+	for _, h := range hashes {
+		a.mined = append(a.mined, *h)
+	}
+	a.mu.Unlock()
+
+	return a.Store.SetMinedMulti(ctx, hashes, minedBlockInfo)
+}
+
+// recordedMined returns every hash stamped through SetMinedMulti so far.
+func (a *applyRecorder) recordedMined() []chainhash.Hash {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return append([]chainhash.Hash(nil), a.mined...)
 }
 
 // recordedLists returns every SpendAndCreateMulti recorded so far.
@@ -194,6 +215,7 @@ func (a *applyRecorder) reset() {
 	a.mu.Lock()
 	a.calls = nil
 	a.lists = nil
+	a.mined = nil
 	a.mu.Unlock()
 }
 
@@ -998,6 +1020,12 @@ func TestBatchList_RetryKeepsAFailedChildsParent(t *testing.T) {
 			require.NoError(t, err)
 			requireSpentBy(t, recorder.Store, root, 0, parent)
 			requireSpentBy(t, recorder.Store, parent, 0, child)
+
+			// The parent was created on the first pass and comes back Existed only because the
+			// retry carried it. It must not be collected again: only the child, which the
+			// retry found existing, is stamped, and only once.
+			require.Equal(t, []chainhash.Hash{*child.TxIDChainHash()}, recorder.recordedMined(),
+				"a carried parent is not stamped with mined info again")
 		})
 	}
 }

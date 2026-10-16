@@ -2480,6 +2480,12 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 
 	var lastErr error
 
+	// carried marks, on a retry, the parents withParentsInList put back beside a failed child.
+	// They went through on an earlier pass of this call, so when they come back Existed they
+	// are not collected again: a parent this call created needs no mined-info stamp, and one
+	// that existed before was collected on the pass that first saw it.
+	var carried []bool
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			u.logger.Infof("[applyList][%s] retry %d/%d of %d of a list of %d transactions: %v", block.Hash().String(), attempt, maxRetries, len(txs), total, lastErr)
@@ -2522,7 +2528,10 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 		for i, r := range results {
 			switch {
 			case r.Status == utxo.MultiTxExisted:
-				collectExisting(txs[i])
+				if carried == nil || !carried[i] {
+					collectExisting(txs[i])
+				}
+
 				continue
 			case r.Status == utxo.MultiTxCreated:
 				continue
@@ -2552,15 +2561,22 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 
 		next := withParentsInList(txs, txids, retry)
 
+		failedHere := make([]bool, len(txs))
+		for _, i := range retry {
+			failedHere[i] = true
+		}
+
 		nextTxs := make([]*bt.Tx, len(next))
 		nextTxIDs := make([]chainhash.Hash, len(next))
 		nextIdxs := make([]int, len(next))
+		nextCarried := make([]bool, len(next))
 
 		for j, i := range next {
 			nextTxs[j], nextTxIDs[j], nextIdxs[j] = txs[i], txids[i], subtreeIdxs[i]
+			nextCarried[j] = !failedHere[i]
 		}
 
-		txs, txids, subtreeIdxs = nextTxs, nextTxIDs, nextIdxs
+		txs, txids, subtreeIdxs, carried = nextTxs, nextTxIDs, nextIdxs, nextCarried
 	}
 
 	return errors.NewProcessingError("[applyList][%s] %d of a list of %d transactions still failing after %d retries", block.Hash().String(), len(txs), total, maxRetries, lastErr)
