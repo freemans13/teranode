@@ -1983,7 +1983,9 @@ func TestQuickValidateLeftoverDependentIsRemovedOnRetry(t *testing.T) {
 // the id-reuse lookup does when it reads the mined-in ids of a shared first
 // transaction. The record looked like Y's own leftover (locked and carrying
 // "this block's" id), so Y's compensation deleted a record X wrote. A committed
-// block other than Y holds N, so the record is X's and stays.
+// block other than Y holds N, so the record is X's and stays, and Y's attempt
+// fails before it writes anything more under N: AddBlock would refuse N anyway,
+// and the retry checks the id before adopting it (recordedBlockID).
 func TestQuickValidateSiblingBlockIDIsNotAdoptedAsLeftover(t *testing.T) {
 	bv, store, cleanup := newBlockValidationWithRealStore(t)
 	defer cleanup()
@@ -2013,10 +2015,49 @@ func TestQuickValidateSiblingBlockIDIsNotAdoptedAsLeftover(t *testing.T) {
 
 	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "spending transaction was pruned")
+	require.Contains(t, err.Error(), "held by another committed block")
 
 	_, err = store.Get(ctx, f.child.TxIDChainHash())
 	require.NoError(t, err, "the record X wrote must not be deleted by Y's compensation")
+}
+
+// TestQuickValidateDeclinesARecordedIDACommittedBlockHolds: on a retry the
+// quick path reuses the id recorded on the block's first non-coinbase
+// transaction. When that transaction is shared with block X, already
+// committed, the id is X's. Adopting it made every retry of Y fail at AddBlock,
+// because each retry read the same id back, and treated X's locked records as
+// Y's leftovers. The id is declined and Y reserves its own. X itself, retried,
+// still reuses its id.
+func TestQuickValidateDeclinesARecordedIDACommittedBlockHolds(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	tip, _, err := bv.blockchainClient.GetBestBlockHeader(ctx)
+	require.NoError(t, err)
+
+	x := testhelpers.CreateTestBlocksWithPrev(t, 1, tip.Hash())[0]
+	require.NoError(t, bv.blockchainClient.AddBlock(ctx, x, "test-peer"))
+
+	_, xMeta, err := bv.blockchainClient.GetBlockHeader(ctx, x.Hash())
+	require.NoError(t, err)
+
+	_, _, err = store.SpendAndCreate(ctx, f.child, 1400, utxo.WithCreateOnly(),
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: xMeta.ID, BlockHeight: 1400}))
+	require.NoError(t, err)
+
+	y, _ := replayBatch(f.child, f.sibling)
+
+	_, reuse, err := bv.recordedBlockID(ctx, y, f.child.TxIDChainHash())
+	require.NoError(t, err)
+	require.False(t, reuse, "Y must not adopt the id committed block X holds")
+
+	id, reuse, err := bv.recordedBlockID(ctx, x, f.child.TxIDChainHash())
+	require.NoError(t, err)
+	require.True(t, reuse, "control: X retried keeps its own id")
+	require.Equal(t, xMeta.ID, id)
 }
 
 // failingDeleteStore fails DeleteComplete while failing is set. Everything else

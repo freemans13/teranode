@@ -615,7 +615,12 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 			// the existing UTXO mined-info. Otherwise fall back to the idempotent per-hash
 			// AssignBlockID. Both paths converging on one id is what prevents orphaned
 			// (phantom) block ids that wedge sync in checkOldBlockIDs.
-			if reused, ok := sm.reuseBlockIDFromUTXO(ctx, bi, txOrder); ok {
+			reused, ok, reuseErr := sm.reuseBlockIDFromUTXO(ctx, bi, txOrder)
+			if reuseErr != nil {
+				return nil, nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to check the block id recorded on the block's first transaction", reuseErr)
+			}
+
+			if ok {
 				blockID = reused
 			} else {
 				id, idErr := sm.blockchainClient.AssignBlockID(ctx, &bi.hash)
@@ -1529,8 +1534,12 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 		return nil, errors.NewProcessingError("failed to confirm the leftovers' block id", err)
 	}
 
+	// reuseBlockIDFromUTXO declines an id a committed block holds, so reaching
+	// here means the other block committed during this attempt. Going on would
+	// stamp this block's mined info under that block's id, and AddBlock refuses
+	// the id anyway. The retry checks again and reserves an id of its own.
 	if idMismatch {
-		sm.logger.Warnf("[createUtxos][%s] block id %d is held by another committed block; its locked existing transactions belong to that block and are filed as pre-existing", bi.hash, blockID)
+		return nil, errors.NewProcessingError("[createUtxos][%s] block id %d is held by another committed block; failing the attempt so the retry takes an id of its own", bi.hash, blockID)
 	}
 
 	if len(leftovers) > 0 {
@@ -1597,9 +1606,9 @@ func blockTransactions(txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) []
 // in-memory reservation is gone) or when another ingestion path created the
 // UTXOs first, keeping the committed block id consistent with the UTXO
 // mined-info. Returns ok=false when nothing is recorded yet.
-func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, txOrder []chainhash.Hash) (uint32, bool) {
+func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, txOrder []chainhash.Hash) (uint32, bool, error) {
 	if len(txOrder) < 2 { // index 0 is the coinbase; need a real tx
-		return 0, false
+		return 0, false, nil
 	}
 	// Use the same tx-hash key shape the UTXO store is keyed by. createUtxos
 	// creates entries from bt.Tx via its TxIDChainHash; the txOrder hashes and
@@ -1612,7 +1621,7 @@ func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, 
 	// its first non-coinbase tx — keep the two in sync if this assumption changes.)
 	meta, err := sm.utxoStore.Get(ctx, &txOrder[1], fields.BlockIDs)
 	if err != nil || meta == nil || len(meta.BlockIDs) == 0 {
-		return 0, false
+		return 0, false, nil
 	}
 	if len(meta.BlockIDs) > 1 {
 		// Normal sync records exactly one mined-in block per fresh tx. More than
@@ -1622,7 +1631,24 @@ func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, 
 		sm.logger.Warnf("[reuseBlockIDFromUTXO] tx %s has %d mined-in block ids %v; reusing [0] for block %s — verify if sync stalls",
 			txOrder[1].String(), len(meta.BlockIDs), meta.BlockIDs, bi.hash.String())
 	}
-	return meta.BlockIDs[0], true
+
+	// The tx may be shared with another block, and then BlockIDs[0] is that
+	// block's id. Adopting the id of a block already committed under it made
+	// every retry of this block fail at AddBlock (utxo.AdoptableBlockID), so it
+	// is declined and the caller reserves an id of its own.
+	adoptable, err := utxo.AdoptableBlockID(ctx, blockchain.CommittedBlockHashLookup(sm.blockchainClient), &bi.hash, meta.BlockIDs[0])
+	if err != nil {
+		return 0, false, err
+	}
+
+	if !adoptable {
+		sm.logger.Warnf("[reuseBlockIDFromUTXO] block id %d recorded on tx %s is held by another committed block; not reusing it for block %s",
+			meta.BlockIDs[0], txOrder[1].String(), bi.hash.String())
+
+		return 0, false, nil
+	}
+
+	return meta.BlockIDs[0], true, nil
 }
 
 // PreValidateTransactions pre-validates all the transactions in the block before

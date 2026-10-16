@@ -313,6 +313,34 @@ func ConfirmLeftovers(ctx context.Context, committedHash CommittedBlockHashFunc,
 	return leftovers, false, nil
 }
 
+// AdoptableBlockID reports whether a block may take id as its own, where id was
+// read back from the mined-in ids recorded on one of its transactions.
+//
+// Both below-checkpoint block paths do that on a retry, so that the block keeps
+// the id its earlier attempt stamped on its records. The record may instead be
+// a transaction the block shares with another block, and then the id is that
+// other block's. When a different block is committed under the id, adopting
+// it stamps this block's new records with a foreign id, makes the other
+// block's locked records look like this block's leftovers (ConfirmLeftovers),
+// and ends at AddBlock refusing the id, on every retry, because each retry
+// reads the same foreign id back. Declining the id here lets the caller
+// reserve one of its own, and the retry after that reads its own id back.
+//
+// The same limit as ConfirmLeftovers: a sibling still in flight holds the id
+// only as a reservation, which this read-only lookup does not see.
+func AdoptableBlockID(ctx context.Context, committedHash CommittedBlockHashFunc, blockHash *chainhash.Hash, id uint32) (bool, error) {
+	if committedHash == nil {
+		return false, errors.NewProcessingError("[AdoptableBlockID] no block lookup to check id %d for block %s", id, blockHash.String())
+	}
+
+	holder, err := committedHash(ctx, uint64(id))
+	if err != nil {
+		return false, errors.NewProcessingError("[AdoptableBlockID] could not look up which block holds id %d (block %s)", id, blockHash.String(), err)
+	}
+
+	return holder == nil || holder.IsEqual(blockHash), nil
+}
+
 // carriesBlockID reports whether blockIDs contains blockID.
 func carriesBlockID(blockIDs []uint32, blockID uint32) bool {
 	for _, id := range blockIDs {

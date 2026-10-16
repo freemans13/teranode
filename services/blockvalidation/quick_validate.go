@@ -668,10 +668,13 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 			// this block's. The legacy quick path (netsync reuseBlockIDFromUTXO) keys
 			// the same recovery on its first non-coinbase tx — keep them in sync.
 			if !blockIDSet && len(batch.batchTxs) > 0 {
-				existingMeta, err := u.utxoStore.Get(ctx, batch.batchTxs[0].TxIDChainHash(), fields.BlockIDs)
-				if err == nil && existingMeta != nil && len(existingMeta.BlockIDs) > 0 {
-					existingBlockID = uint64(existingMeta.BlockIDs[0])
-					block.ID = existingMeta.BlockIDs[0]
+				recordedID, reuse, err := u.recordedBlockID(ctx, block, batch.batchTxs[0].TxIDChainHash())
+				if err != nil {
+					return errors.NewProcessingError("[processBlockSubtreesSequential][%s] failed to check the block id recorded on its first transaction", block.Hash().String(), err)
+				}
+				if reuse {
+					existingBlockID = uint64(recordedID)
+					block.ID = recordedID
 					u.logger.Debugf("[processBlockSubtreesSequential][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 				} else if block.ID == 0 {
 					id, err := u.blockchainClient.AssignBlockID(ctx, block.Hash())
@@ -875,10 +878,13 @@ func (u *BlockValidation) processBlockSubtreesPipeline(ctx context.Context, bloc
 
 				// Block ID check (first batch only)
 				if !blockIDSet && len(batch.batchTxs) > 0 {
-					existingMeta, err := u.utxoStore.Get(gCtx, batch.batchTxs[0].TxIDChainHash(), fields.BlockIDs)
-					if err == nil && existingMeta != nil && len(existingMeta.BlockIDs) > 0 {
-						existingBlockID = uint64(existingMeta.BlockIDs[0])
-						block.ID = existingMeta.BlockIDs[0]
+					recordedID, reuse, err := u.recordedBlockID(gCtx, block, batch.batchTxs[0].TxIDChainHash())
+					if err != nil {
+						return errors.NewProcessingError("[processBlockSubtreesPipeline][%s] failed to check the block id recorded on its first transaction", block.Hash().String(), err)
+					}
+					if reuse {
+						existingBlockID = uint64(recordedID)
+						block.ID = recordedID
 						u.logger.Debugf("[processBlockSubtreesPipeline][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 					} else if block.ID == 0 {
 						id, err := u.blockchainClient.AssignBlockID(gCtx, block.Hash())
@@ -1009,10 +1015,13 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 
 				// Block ID check (first batch only)
 				if !blockIDSet && len(batch.batchTxs) > 0 {
-					existingMeta, err := u.utxoStore.Get(gCtx, batch.batchTxs[0].TxIDChainHash(), fields.BlockIDs)
-					if err == nil && existingMeta != nil && len(existingMeta.BlockIDs) > 0 {
-						existingBlockID = uint64(existingMeta.BlockIDs[0])
-						block.ID = existingMeta.BlockIDs[0]
+					recordedID, reuse, err := u.recordedBlockID(gCtx, block, batch.batchTxs[0].TxIDChainHash())
+					if err != nil {
+						return errors.NewProcessingError("[processBlockSubtreesPipelineAsync][%s] failed to check the block id recorded on its first transaction", block.Hash().String(), err)
+					}
+					if reuse {
+						existingBlockID = uint64(recordedID)
+						block.ID = recordedID
 						u.logger.Debugf("[processBlockSubtreesPipelineAsync][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 					} else if block.ID == 0 {
 						id, err := u.blockchainClient.AssignBlockID(gCtx, block.Hash())
@@ -1065,6 +1074,35 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 	resultID, err := u.validateSubtrees(ctx, block, existingBlockID)
 
 	return resultID, wg, freshness.snapshot(), err
+}
+
+// recordedBlockID returns the block id recorded on firstTx, the block's first
+// non-coinbase transaction, and whether this block may reuse it: a retry keeps
+// the id its earlier attempt stamped. reuse is false when nothing is recorded,
+// and also when a different block is committed under the recorded id, which
+// happens when firstTx is shared with that block (utxo.AdoptableBlockID).
+// Adopting that id made every retry of this block fail at AddBlock and treated
+// the other block's locked records as this block's leftovers.
+func (u *BlockValidation) recordedBlockID(ctx context.Context, block *model.Block, firstTx *chainhash.Hash) (uint32, bool, error) {
+	existingMeta, err := u.utxoStore.Get(ctx, firstTx, fields.BlockIDs)
+	if err != nil || existingMeta == nil || len(existingMeta.BlockIDs) == 0 {
+		return 0, false, nil
+	}
+
+	recordedID := existingMeta.BlockIDs[0]
+
+	adoptable, err := utxo.AdoptableBlockID(ctx, blockchain.CommittedBlockHashLookup(u.blockchainClient), block.Hash(), recordedID)
+	if err != nil {
+		return 0, false, err
+	}
+
+	if !adoptable {
+		u.logger.Warnf("[recordedBlockID][%s] block id %d recorded on transaction %s is held by another committed block; not reusing it", block.Hash().String(), recordedID, firstTx.String())
+
+		return 0, false, nil
+	}
+
+	return recordedID, true, nil
 }
 
 // validateSubtrees validates subtree sizes and merkle root after processing.
@@ -2152,8 +2190,13 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to confirm the leftovers' block id", block.Hash().String(), err)
 	}
 
+	// The id check at adoption (recordedBlockID) keeps a committed block's id
+	// out, so reaching here means the other block committed during this
+	// attempt. Going on would stamp this block's mined info under that block's
+	// id, and AddBlock refuses the id anyway. The retry checks again before it
+	// adopts and reserves an id of its own.
 	if idMismatch {
-		u.logger.Warnf("[createAndSpendUTXOsForBatch][%s] block id %d is held by another committed block; its locked existing transactions belong to that block and are filed as pre-existing", block.Hash().String(), block.ID)
+		return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] block id %d is held by another committed block; failing the attempt so the retry takes an id of its own", block.Hash().String(), block.ID)
 	}
 
 	if len(leftovers) > 0 {
