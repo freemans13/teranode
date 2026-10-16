@@ -327,6 +327,40 @@ func has(m map[uint32]struct{}, k uint32) bool {
 	return ok
 }
 
+// batchCreateLockIDs is the advisory lock key of every transaction the batch may create.
+func batchCreateLockIDs(batch []*spendAndCreateItem) [][]byte {
+	lockIDs := make([][]byte, 0, len(batch))
+
+	for _, item := range batch {
+		if item.tx != nil && !item.options.SpendOnly {
+			id := createTxID(item.tx, item.options)
+			lockIDs = append(lockIDs, id[:])
+		}
+	}
+
+	return lockIDs
+}
+
+// countSpendFailures is how many of an item's spends failed, and the first failure's error.
+func countSpendFailures(spends []*utxo.Spend) (int, error) {
+	var (
+		failures int
+		first    error
+	)
+
+	for _, sp := range spends {
+		if sp != nil && sp.Err != nil {
+			failures++
+
+			if first == nil {
+				first = sp.Err
+			}
+		}
+	}
+
+	return failures, first
+}
+
 // runSpendAndCreateBatch applies the batch in one transaction.
 //
 // It returns one result per item and, alongside, which of those results are final. After a
@@ -386,14 +420,7 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 	// create, so that second statement only re-enters locks this transaction holds and cannot
 	// wait on another batch while holding part of its set. A rollback between rounds releases
 	// them, so each round takes them again.
-	lockIDs := make([][]byte, 0, len(batch))
-
-	for _, item := range batch {
-		if item.tx != nil && !item.options.SpendOnly {
-			id := createTxID(item.tx, item.options)
-			lockIDs = append(lockIDs, id[:])
-		}
-	}
+	lockIDs := batchCreateLockIDs(batch)
 
 	var (
 		dbTx pgx.Tx
@@ -442,20 +469,7 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 		for k, i := range active {
 			spends := plan.perItem[k]
 
-			var (
-				failures int
-				first    error
-			)
-
-			for _, sp := range spends {
-				if sp != nil && sp.Err != nil {
-					failures++
-
-					if first == nil {
-						first = sp.Err
-					}
-				}
-			}
+			failures, first := countSpendFailures(spends)
 
 			if failures == 0 {
 				survivors = append(survivors, i)
