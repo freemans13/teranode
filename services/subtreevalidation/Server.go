@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/pkg/urlutil"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
@@ -145,6 +146,12 @@ type Server struct {
 	// adaptiveFetch tracks whether subtreeData downloads should be skipped
 	// when transactions are expected to already be in the local UTXO store via propagation.
 	adaptiveFetch *adaptivefetch.State
+
+	// peerProbePool and blockProbePool limit txmeta cache-probe workers across
+	// all concurrent peer-subtree and block-validation lookups respectively;
+	// see probeTxMetaCache.
+	peerProbePool  probePool
+	blockProbePool probePool
 }
 
 // New creates a new Server instance with the provided dependencies.
@@ -336,8 +343,15 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 				// Cancel context before retrying to prevent leak
 				subscribeCancel()
 
-				// backoff for 5 seconds and try again
-				time.Sleep(5 * time.Second)
+				// backoff for 5 seconds and try again, but stop immediately if the
+				// caller's context is cancelled rather than blocking the shutdown
+				// path for up to 5 seconds.
+				select {
+				case <-ctx.Done():
+					ctxLogger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] exiting during backoff: %s", ctx.Err())
+					return
+				case <-time.After(5 * time.Second):
+				}
 
 				continue
 			}
@@ -354,7 +368,14 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 						// Channel closed, reconnect
 						ctxLogger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] subscription channel closed, reconnecting")
 						subscribeCancel()
-						time.Sleep(1 * time.Second)
+
+						select {
+						case <-ctx.Done():
+							ctxLogger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] exiting during reconnect delay: %s", ctx.Err())
+							return
+						case <-time.After(1 * time.Second):
+						}
+
 						break subscriptionLoop
 					}
 
@@ -718,6 +739,11 @@ func (u *Server) CheckSubtreeFromBlock(ctx context.Context, request *subtreevali
 // This method is called internally by CheckSubtreeFromBlock after acquiring the
 // appropriate locks to prevent duplicate processing.
 func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevalidation_api.CheckSubtreeFromBlockRequest) (ok bool, err error) {
+	// INFO, not DEBUG: this span passes its error to deferFn, and an INFO span
+	// with a non-nil error logs at ERROR (util/tracing, logTraceMessage). The
+	// only production caller is cross-process over gRPC, so demoting this to
+	// DEBUG would leave a failing subtreevalidation replica logging nothing at
+	// all about its own failure.
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "checkSubtree",
 		tracing.WithParentStat(u.stats),
 		tracing.WithHistogram(prometheusSubtreeValidationCheckSubtree),
@@ -851,6 +877,7 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 			BaseURL:       request.BaseUrl,
 			TxHashes:      txHashes,
 			AllowFailFast: false,
+			FromBlock:     true,
 		}
 
 		// CheckSubtree responds to peer subtree-validation requests. The request
@@ -917,7 +944,8 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		// assembly: bulk-history txs do not belong in our template. In
 		// RUNNING, assembly stays enabled so txs from a legacy-bridge tip
 		// block survive in the mempool if the block loses a reorg.
-		if *currentState == blockchain.FSMStateCATCHINGBLOCKS {
+		// IDLE is included: an operator STOP can land while catchup is running.
+		if *currentState != blockchain.FSMStateRUNNING {
 			validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
 		}
 
@@ -943,6 +971,7 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		SubtreeHash:   *hash,
 		BaseURL:       request.BaseUrl,
 		AllowFailFast: false,
+		FromBlock:     true,
 	}
 
 	// Call the ValidateSubtreeInternal method
@@ -985,6 +1014,8 @@ func resolveTxMetaCacheBucketType(logger ulogger.Logger, raw string) txmetacache
 		return txmetacache.Native
 	case "pointer":
 		return txmetacache.Pointer
+	case "lockfree":
+		return txmetacache.Lockfree
 	default:
 		logger.Warnf("[SubtreeValidation] unknown txMetaCacheBucketType %q; falling back to unallocated", raw)
 		return txmetacache.Unallocated
@@ -994,8 +1025,8 @@ func resolveTxMetaCacheBucketType(logger ulogger.Logger, raw string) txmetacache
 // initialiseInvalidSubtreeKafkaProducer creates a Kafka producer for invalid subtree events
 func initialiseInvalidSubtreeKafkaProducer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings) (*kafka.KafkaAsyncProducer, error) {
 	logger.Infof("Initializing Kafka producer for invalid subtrees topic: %s", tSettings.Kafka.InvalidSubtrees)
-	logger.Infof("InvalidBlocksConfig: %s", tSettings.Kafka.InvalidBlocksConfig)
-	logger.Infof("InvalidSubtreesConfig: %s", tSettings.Kafka.InvalidSubtreesConfig)
+	logger.Infof("InvalidBlocksConfig: %s", urlutil.Redact(tSettings.Kafka.InvalidBlocksConfig))
+	logger.Infof("InvalidSubtreesConfig: %s", urlutil.Redact(tSettings.Kafka.InvalidSubtreesConfig))
 
 	invalidSubtreeKafkaProducer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, tSettings.Kafka.InvalidSubtreesConfig, &tSettings.Kafka)
 	if err != nil {
@@ -1026,8 +1057,8 @@ func (u *Server) publishInvalidSubtree(ctx context.Context, subtreeHash, peerURL
 			return
 		}
 
-		if *state == blockchain_api.FSMStateType_CATCHINGBLOCKS {
-			// ignore notifications while syncing or catching up
+		if *state != blockchain_api.FSMStateType_RUNNING {
+			// ignore notifications unless caught up (IDLE can follow a STOP mid-catchup)
 			return
 		}
 	}

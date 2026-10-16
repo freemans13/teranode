@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util"
 	"golang.org/x/sync/errgroup"
@@ -22,7 +23,19 @@ import (
 //
 // Behavior:
 //   - onLongestChain=true: Clears unmined_since (transaction is mined on main chain)
-//   - onLongestChain=false: Sets unmined_since to current height (transaction is unmined)
+//   - onLongestChain=false: Leaves an existing unmined_since untouched. Only when the bin is
+//     absent (the transaction was mined and a reorg/reset moved its block off the longest
+//     chain) is it stamped, with utxo.BackdatedUnminedSince: current height minus
+//     unminedTxRetention, floored at 1.
+//
+// Both rules protect the same invariant: a parent must not be pruned while an unmined child
+// still references it. The pruner's parent-preservation scan keys off unmined_since, while
+// the parent's deleteAtHeight was stamped when this transaction spent it and keeps counting.
+// Overwriting an existing unmined_since re-armed the child's protection clock against a
+// parent delete clock that did not restart, and a late enough re-stamp let the parent be
+// pruned while the child still needed it; stamping the current height on a mined->unmined
+// transition started the protection clock unminedTxRetention blocks late for the same
+// reason (issue 1768).
 //
 // CRITICAL - Resilient Error Handling (Must Not Fail Fast):
 // This function attempts to update ALL transactions even if some fail.
@@ -32,15 +45,27 @@ import (
 //   - Collects up to 10 errors for logging/debugging (prevents log spam)
 //   - Logs summary: attempted, succeeded, failed counts
 //   - Returns aggregated errors after attempting all transactions
-//   - Missing transactions trigger FATAL error (data corruption - unrecoverable)
+//   - onLongestChain=true: transactions the store does not hold are logged and skipped
+//   - onLongestChain=false: a transaction the store does not hold is FATAL
+//
+// Missing on the longest chain: the transaction is mined and has no unminedSince
+// to clear, and its record can be gone legitimately. A side-chain transaction whose
+// outputs were all spent is pruned once its deleteAtHeight passes, and a reorg can
+// still bring its block forward on a chain at height <= 1000 (reorgBlocks takes
+// reorgs deeper than CoinbaseMaturity there) or with a short
+// utxostore_blockHeightRetention. reorgBlocks calls this after its commit point,
+// and exiting the process repaired nothing.
+//
+// Missing off the longest chain stays fatal: the transaction goes back into block
+// assembly, and without a record its parents lose the pruner's protection.
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	if len(txHashes) == 0 {
 		return nil
 	}
 
 	allErrors := make([]error, 0, 10)
-	missingTxErrors := make([]error, 0, 10)
-	var errorCount int64
+	firstMissing := make([]chainhash.Hash, 0, 10)
+	var errorCount, missingCount int64
 	var mu sync.Mutex
 
 	currentBlockHeight := s.GetBlockHeight()
@@ -55,11 +80,23 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	// Pre-create the shared operation — identical for every transaction (same bin name, same value).
 	// The aerospike *Operation struct is immutable after creation and only read during serialization,
 	// so sharing one instance across all batch writes is safe and eliminates 2 allocs per tx.
-	var binValue any
-	if !onLongestChain {
-		binValue = currentBlockHeight
+	var op *aerospike.Operation
+	if onLongestChain {
+		op = aerospike.PutOp(aerospike.NewBin(fields.UnminedSince.String(), nil))
+	} else {
+		// Only stamp unminedSince when the bin is absent. ExpUnknown with EvalNoFail makes the
+		// existing-value branch a no-op, so an earlier unminedSince is never overwritten.
+		unminedSince := utxo.BackdatedUnminedSince(currentBlockHeight, s.settings.UtxoStore.UnminedTxRetention)
+
+		op = aerospike.ExpWriteOp(
+			fields.UnminedSince.String(),
+			aerospike.ExpCond(
+				aerospike.ExpBinExists(fields.UnminedSince.String()), aerospike.ExpUnknown(),
+				aerospike.ExpIntVal(int64(unminedSince)),
+			),
+			aerospike.ExpWriteFlagEvalNoFail,
+		)
 	}
-	op := aerospike.PutOp(aerospike.NewBin(fields.UnminedSince.String(), binValue))
 
 	// Divide work evenly across workers (fewer goroutines, sequential batches within each)
 	rangeSize := (len(txHashes) + numWorkers - 1) / numWorkers
@@ -84,8 +121,10 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 				batchEnd := min(i+batchSize, len(workerHashes))
 				chunk := workerHashes[i:batchEnd]
 
-				// Reuse pooled slice, sized to this chunk
+				// Reuse pooled slice, sized to this chunk; batchHashes[j] is the
+				// hash of batchRecords[j] (a key that failed to build is left out)
 				batchRecords := (*batchRecordsPtr)[:0]
+				batchHashes := make([]chainhash.Hash, 0, len(chunk))
 
 				for _, txHash := range chunk {
 					key, err := aerospike.NewKey(s.namespace, s.setName, txHash[:])
@@ -104,6 +143,7 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 						key,
 						op,
 					))
+					batchHashes = append(batchHashes, txHash)
 				}
 
 				if len(batchRecords) == 0 {
@@ -123,20 +163,30 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 				// Check individual record results
 				for j, batchRecord := range batchRecords {
-					if recErr := batchRecord.BatchRec().Err; recErr != nil {
-						atomic.AddInt64(&errorCount, 1)
-						mu.Lock()
-						if len(allErrors) < 10 {
-							s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v",
-								atomic.LoadInt64(&errorCount), chunk[j], recErr)
-							allErrors = append(allErrors, recErr)
+					recErr := batchRecord.BatchRec().Err
+					if recErr == nil {
+						continue
+					}
 
-							if errors.Is(recErr, aerospike.ErrKeyNotFound) {
-								missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", chunk[j], recErr))
-							}
+					if errors.Is(recErr, aerospike.ErrKeyNotFound) {
+						atomic.AddInt64(&missingCount, 1)
+						mu.Lock()
+						if len(firstMissing) < 10 {
+							firstMissing = append(firstMissing, batchHashes[j])
 						}
 						mu.Unlock()
+
+						continue
 					}
+
+					atomic.AddInt64(&errorCount, 1)
+					mu.Lock()
+					if len(allErrors) < 10 {
+						s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v",
+							atomic.LoadInt64(&errorCount), batchHashes[j], recErr)
+						allErrors = append(allErrors, recErr)
+					}
+					mu.Unlock()
 				}
 			}
 
@@ -150,14 +200,20 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 	attempted := len(txHashes)
 	finalErrorCount := int(atomic.LoadInt64(&errorCount))
-	succeeded := attempted - finalErrorCount
+	finalMissingCount := int(atomic.LoadInt64(&missingCount))
+	succeeded := attempted - finalErrorCount - finalMissingCount
 
-	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, succeeded=%d, failed=%d, onLongestChain=%t",
-		attempted, succeeded, finalErrorCount, onLongestChain)
+	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, succeeded=%d, failed=%d, missing=%d, onLongestChain=%t",
+		attempted, succeeded, finalErrorCount, finalMissingCount, onLongestChain)
 
-	if len(missingTxErrors) > 0 {
-		s.logger.Fatalf("CRITICAL: %d missing transactions during MarkTransactionsOnLongestChain - data integrity compromised. First errors: %v",
-			len(missingTxErrors), errors.Join(missingTxErrors...))
+	if finalMissingCount > 0 {
+		if !onLongestChain {
+			s.logger.Fatalf("CRITICAL: %d missing transactions during MarkTransactionsOnLongestChain(false) - data integrity compromised, first: %v",
+				finalMissingCount, firstMissing)
+		} else {
+			s.logger.Errorf("[MarkTransactionsOnLongestChain] skipped %d transactions the store does not hold, first: %v",
+				finalMissingCount, firstMissing)
+		}
 	}
 
 	if len(allErrors) > 0 {

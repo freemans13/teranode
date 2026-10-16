@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/status"
 )
 
 func Test_storeSubtreeData(t *testing.T) {
@@ -244,11 +245,11 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 		genesisHash := chainhash.HashH([]byte("genesis"))
 		for i := uint64(0); i < 10; i++ {
 			// Different output index for each tx
-			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
+			require.True(t, server.blockAssembler.AddTxBatchIfRoom([]subtreepkg.Node{{
 				Hash:        chainhash.HashH([]byte(fmt.Sprintf("%d", i))),
 				Fee:         i,
 				SizeInBytes: i,
-			}}, []*subtreepkg.TxInpoints{singleParentInpointsPtr(genesisHash, uint32(i))})
+			}}, []*subtreepkg.TxInpoints{singleParentInpointsPtr(genesisHash, uint32(i))}))
 		}
 
 		require.Eventually(t, func() bool {
@@ -554,11 +555,11 @@ func TestTxCount(t *testing.T) {
 		// to avoid TxInpoints serialization issues
 		for i := 0; i < 3; i++ {
 			txHash := chainhash.HashH([]byte(fmt.Sprintf("tx-%d", i)))
-			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
+			require.True(t, server.blockAssembler.AddTxBatchIfRoom([]subtreepkg.Node{{
 				Hash:        txHash,
 				Fee:         uint64(100),
 				SizeInBytes: uint64(250),
-			}}, []*subtreepkg.TxInpoints{{}})
+			}}, []*subtreepkg.TxInpoints{{}}))
 		}
 
 		// Wait for processing - expect initial count + 3 added transactions
@@ -577,11 +578,11 @@ func TestSubmitMiningSolution_InvalidBlock_HandlesReset(t *testing.T) {
 		// Add some transactions to create a mining candidate
 		for i := 0; i < 5; i++ {
 			txHash := chainhash.HashH([]byte(fmt.Sprintf("tx%d", i)))
-			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
+			require.True(t, server.blockAssembler.AddTxBatchIfRoom([]subtreepkg.Node{{
 				Hash:        txHash,
 				Fee:         uint64(100),
 				SizeInBytes: uint64(250),
-			}}, []*subtreepkg.TxInpoints{{}})
+			}}, []*subtreepkg.TxInpoints{{}}))
 		}
 
 		// Wait for transactions to be processed
@@ -1400,11 +1401,11 @@ func TestRemoveTxIntensive(t *testing.T) {
 
 		// First add a transaction
 		txHash := chainhash.HashH([]byte("test-tx-to-remove"))
-		server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
+		require.True(t, server.blockAssembler.AddTxBatchIfRoom([]subtreepkg.Node{{
 			Hash:        txHash,
 			Fee:         100,
 			SizeInBytes: 250,
-		}}, []*subtreepkg.TxInpoints{{}})
+		}}, []*subtreepkg.TxInpoints{{}}))
 
 		// Wait for it to be added
 		time.Sleep(10 * time.Millisecond)
@@ -1548,11 +1549,11 @@ func TestGetMiningCandidateIntensive(t *testing.T) {
 		// Add some transactions to create subtrees
 		for i := 0; i < 5; i++ {
 			txHash := chainhash.HashH([]byte(fmt.Sprintf("mining-tx-%d", i)))
-			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
+			require.True(t, server.blockAssembler.AddTxBatchIfRoom([]subtreepkg.Node{{
 				Hash:        txHash,
 				Fee:         uint64(100),
 				SizeInBytes: uint64(250),
-			}}, []*subtreepkg.TxInpoints{{}})
+			}}, []*subtreepkg.TxInpoints{{}}))
 		}
 
 		time.Sleep(50 * time.Millisecond) // Allow processing
@@ -1586,6 +1587,53 @@ func TestGetMiningCandidateIntensive(t *testing.T) {
 		_ = server.jobStore.Get(*id)
 		// Job may or may not exist depending on implementation, but getting candidate should work
 	})
+}
+
+// TestUnminedLoading_RefusesAsNotReady: while unmined transactions are loading,
+// every method that refuses work answers SERVICE_NOT_READY inside a gRPC status,
+// so a client gets the class back through UnwrapGRPC rather than a bare status
+// whose only content is the text.
+func TestUnminedLoading_RefusesAsNotReady(t *testing.T) {
+	server, _ := setupServer(t)
+	server.blockAssembler.unminedTransactionsLoading.Store(true)
+
+	ctx := context.Background()
+
+	for name, call := range map[string]func() error{
+		"SubmitMiningSolution": func() error {
+			_, err := server.SubmitMiningSolution(ctx, &blockassembly_api.SubmitMiningSolutionRequest{Id: make([]byte, 32)})
+			return err
+		},
+		"ResetBlockAssembly": func() error {
+			_, err := server.ResetBlockAssembly(ctx, &blockassembly_api.EmptyMessage{})
+			return err
+		},
+		"ResetBlockAssemblyFully": func() error {
+			_, err := server.ResetBlockAssemblyFully(ctx, &blockassembly_api.EmptyMessage{})
+			return err
+		},
+		"ResetBlockAssemblyValidateInputs": func() error {
+			_, err := server.ResetBlockAssemblyValidateInputs(ctx, &blockassembly_api.EmptyMessage{})
+			return err
+		},
+		"CheckBlockAssemblyValidateInputs": func() error {
+			_, err := server.CheckBlockAssemblyValidateInputs(ctx, &blockassembly_api.EmptyMessage{})
+			return err
+		},
+		"GenerateBlocks": func() error {
+			_, err := server.GenerateBlocks(ctx, &blockassembly_api.GenerateBlocksRequest{Count: 1})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+
+			_, isStatus := status.FromError(err)
+			require.True(t, isStatus, "a gRPC status, so the class crosses: %v", err)
+			require.ErrorIs(t, errors.UnwrapGRPC(err), errors.ErrServiceNotReady)
+			require.Contains(t, err.Error(), "service not ready - unmined transactions are still being loaded")
+		})
+	}
 }
 
 // TestSubmitMiningSolutionIntensive tests SubmitMiningSolution comprehensively
@@ -2057,11 +2105,11 @@ func TestRemoveTxEdgeCases(t *testing.T) {
 
 		// Add a transaction first
 		txHash := chainhash.HashH([]byte("test-tx-remove"))
-		server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
+		require.True(t, server.blockAssembler.AddTxBatchIfRoom([]subtreepkg.Node{{
 			Hash:        txHash,
 			Fee:         100,
 			SizeInBytes: 250,
-		}}, []*subtreepkg.TxInpoints{{}})
+		}}, []*subtreepkg.TxInpoints{{}}))
 
 		// Now remove it to cover the success path
 		req := &blockassembly_api.RemoveTxRequest{

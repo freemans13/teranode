@@ -131,6 +131,13 @@ type Daemon struct {
 	server             *http.Server
 	serverMu           sync.Mutex
 	stopCh             chan struct{}
+	// startErr and startErrMu record the error (if any) returned by
+	// startServices on the most recent Start call. Start() itself only logs
+	// this error; startErr lets callers within the package (e.g. the test
+	// harness) distinguish a transient failure worth retrying from one that
+	// must fail fast, without reaching into logger internals.
+	startErr   error
+	startErrMu sync.Mutex
 }
 
 // New creates a new Daemon instance with the provided options.
@@ -231,6 +238,15 @@ func (d *Daemon) Stop(skipTracerShutdown ...bool) error {
 	}
 }
 
+// startError returns the error (if any) that startServices returned during
+// the most recent Start call. It is nil until Start has run at least once.
+func (d *Daemon) startError() error {
+	d.startErrMu.Lock()
+	defer d.startErrMu.Unlock()
+
+	return d.startErr
+}
+
 // updateServiceStatuses logs the statuses of all services managed by the ServiceManager.
 func (d *Daemon) updateServiceStatuses(logger ulogger.Logger) {
 	// Get detailed information about all services
@@ -272,6 +288,23 @@ func (d *Daemon) updateServiceStatuses(logger ulogger.Logger) {
 	}
 }
 
+// applyPeerURLPolicy configures the process-wide client for peer-supplied URLs. Hostnames
+// in those URLs may resolve to private-network addresses only on a node that already
+// accepts private peers, matching the static check p2p applies to announced DataHub URLs.
+//
+// The refusing case is announced at start-up because it is the one setting here that can
+// stop a working node syncing: a deployment whose peers are reachable only over a private
+// network refuses every fetch, and the probe failure that drops those peers from selection
+// is logged per peer, not once. One line in the first screen of the log names the setting
+// before the first fetch fails.
+func applyPeerURLPolicy(logger ulogger.Logger, appSettings *settings.Settings) {
+	util.SetSSRFAllowPrivateNetworks(appSettings.P2P.AllowPrivateIPs)
+
+	if !appSettings.P2P.AllowPrivateIPs {
+		logger.Warnf("[Daemon] p2p_allow_private_ips=false: peer URLs resolving to a private-network address (RFC1918, fc00::/7, 100.64.0.0/10) are refused, so peers reachable only over a private network cannot be probed or fetched from. Set p2p_allow_private_ips=true on a node that peers over private addresses.")
+	}
+}
+
 // Start initializes and starts the Daemon and its services.
 func (d *Daemon) Start(logger ulogger.Logger, args []string, appSettings *settings.Settings, readyChannel ...chan struct{}) {
 	if d.loggerFactory == nil {
@@ -279,6 +312,8 @@ func (d *Daemon) Start(logger ulogger.Logger, args []string, appSettings *settin
 			return ulogger.New(serviceName, ulogger.WithLevel(appSettings.LogLevel))
 		}
 	}
+
+	applyPeerURLPolicy(logger, appSettings)
 
 	// Before continuing, if the command line contains "-wait_for_postgres=1", wait for postgres to be ready
 	if d.shouldStart("wait_for_postgres", args) {
@@ -303,6 +338,11 @@ func (d *Daemon) Start(logger ulogger.Logger, args []string, appSettings *settin
 	}
 
 	err := d.startServices(sm.Ctx, logger, appSettings, sm, args, readyChInternal)
+
+	d.startErrMu.Lock()
+	d.startErr = err
+	d.startErrMu.Unlock()
+
 	if err != nil {
 		logger.Errorf("error starting services: %v", err)
 		sm.ForceShutdown()
@@ -680,7 +720,7 @@ func waitForPostgresToStart(logger ulogger.Logger, address string) error {
 }
 
 func getBlockHeightTrackerCh(ctx context.Context, logger ulogger.Logger, blockchainClient blockchain.ClientI) (chan uint32, error) {
-	blockchainSubscriptionCh, err := blockchainClient.Subscribe(ctx, "File BlockHeight")
+	blockchainSubscriptionCh, err := blockchainClient.Subscribe(ctx, blockchain.SubscriberFileBlockHeight)
 	if err != nil {
 		return nil, errors.NewServiceError("error subscribing to blockchain", err)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	p2pconstants "github.com/bsv-blockchain/teranode/interfaces/p2p"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -81,6 +82,7 @@ type PeerInfo struct {
 	TransportTypeSet          bool // When true, TransportType was explicitly set by the caller
 	ClientName                string
 	Height                    uint32
+	AdvertisedHeight          uint32
 	DataHubURL                string
 	NetworkAddress            string
 	IsBanned                  bool
@@ -191,7 +193,12 @@ func DefaultBanConfig() BanConfig {
 			"protocol_violation": 20,
 			"spam":               50,
 			"invalid_block":      10,
-			"catchup_failure":    30,
+			// Corrupt block body (bitcoin-sv/teranode#4692): scored like invalid_block (a DoS-scoring
+			// event) but without the block-index poison — the block is re-downloaded. Keyed off the
+			// shared constant so a rename cannot silently zero the score.
+			p2pconstants.ReasonCorruptBlockBody.String(): 10,
+			"catchup_failure":   30,
+			"catchup_malicious": 50,
 		},
 	}
 }
@@ -341,6 +348,16 @@ func (r *CentralizedPeerRegistry) Register(info *PeerInfo) {
 	if info.Height > 0 {
 		existing.Height = info.Height
 	}
+	// Carried separately from Height: Height is capped against local progress
+	// for sync decisions, AdvertisedHeight is what the peer actually claimed
+	// and is reported to operators unchanged. Newest-wins, like Height: the
+	// p2p batcher keeps the highest claim within one flush window, but across
+	// windows a lower claim may replace a higher one. That is intended — a
+	// peer that reorgs to a lower tip must not keep showing its old height —
+	// and a display that dips heals on the peer's next announcement.
+	if info.AdvertisedHeight > 0 {
+		existing.AdvertisedHeight = info.AdvertisedHeight
+	}
 	if info.DataHubURL != "" {
 		existing.DataHubURL = info.DataHubURL
 	}
@@ -438,6 +455,13 @@ func (r *CentralizedPeerRegistry) UpdateMetrics(
 	info.LastSeen = now
 
 	if recordMalicious {
+		// Setting LastInteractionFailure here and the 5.0 reputation pin in
+		// calculateAndUpdateReputation are both load-bearing for recovery:
+		// ReconsiderBadPeers only clears MaliciousCount for peers with
+		// ReputationScore < 20 and a non-zero last failure, and that sweep is
+		// the sole automatic path that stops IsPeerMalicious excluding the
+		// peer. Removing either turns a malicious record into a permanent
+		// exclusion.
 		info.MaliciousCount++
 		info.InteractionAttempts++
 		info.InteractionFailures++
