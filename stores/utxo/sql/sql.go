@@ -3176,9 +3176,16 @@ func (s *Store) recheckIdempotentMarkers(txn *sql.Tx, batch []*batchSpend, resul
 		              WHERE d.parent_id = v.transaction_id
 		                AND d.child_hash = substring(v.spending_data from 1 for 32))`)
 
+	// An item already answered keeps its answer, as on the batch's commit and
+	// DAH failure paths: overwriting a pruned-replay or spent refusal with a
+	// storage error turned a final rejection into one the caller retries.
 	failAll := func(err error) {
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] failed: idempotent marker re-check", err)
+		for i, item := range batch {
+			if valErr, ok := validationErrors[i]; ok {
+				item.errCh <- valErr
+			} else {
+				item.errCh <- errors.NewStorageError("[Spend] failed: idempotent marker re-check", err)
+			}
 		}
 	}
 
