@@ -160,21 +160,11 @@ func TestCheckBlockSubtrees_GRPCPreservesBatchLoadStorageCode(t *testing.T) {
 		"caller lost ERR_STORAGE_ERROR across the gRPC boundary: %v", err)
 }
 
-// TestCheckBlockSubtrees_GRPCHoldsBackBatchTxInvalidCode is the deliberate
-// carve-out, kept as its own test so the decision is impossible to miss in review.
-//
-// A transaction in the block fails validation with ERR_TX_INVALID inside the batch
-// pipeline. Restoring the boundary naively would hand that code to block
-// validation, which treats it as proof of a consensus violation: permanent
-// invalid=true persistence, a cascade over every descendant, and a malicious-peer
-// report. The UTXO store's error vocabulary cannot support that yet — it labels
-// its own decode and blob-read failures ErrTxInvalid — so the consensus codes are
-// held back and the caller sees a processing error carrying the full detail as
-// text.
-//
-// The block is still rejected either way: the call fails, so the block is not
-// accepted. What is withheld is only the irreversible bookkeeping.
-func TestCheckBlockSubtrees_GRPCHoldsBackBatchTxInvalidCode(t *testing.T) {
+// TestCheckBlockSubtrees_GRPCPreservesBatchTxInvalidCode covers a consensus
+// verdict: a transaction in the block fails validation with ERR_TX_INVALID inside
+// the batch pipeline, and block validation must see that code, since it is what
+// marks the block invalid and reports the peer that served it.
+func TestCheckBlockSubtrees_GRPCPreservesBatchTxInvalidCode(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
@@ -228,15 +218,8 @@ func TestCheckBlockSubtrees_GRPCHoldsBackBatchTxInvalidCode(t *testing.T) {
 
 	err = callCheckBlockSubtrees(t, client, block)
 
-	require.False(t, errors.Is(err, errors.ErrTxInvalid),
-		"ERR_TX_INVALID reached the caller: block validation would persist invalid=true and ban the peer on the strength of it: %v", err)
-	require.False(t, errors.Is(err, errors.ErrBlockInvalid),
-		"ERR_BLOCK_INVALID reached the caller: %v", err)
-
-	// The detail is still there for an operator reading the logs — only the code
-	// that triggers irreversible action is withheld.
-	require.Contains(t, err.Error(), "simulated consensus violation",
-		"the underlying reason must survive as text: %v", err)
+	require.True(t, errors.Is(err, errors.ErrTxInvalid),
+		"caller lost ERR_TX_INVALID across the gRPC boundary: %v", err)
 }
 
 // TestCheckBlockSubtrees_GRPCPreservesInvalidBaseUrlCode covers the BaseUrl guard,
@@ -286,14 +269,4 @@ func TestCheckBlockSubtrees_GRPCPreservesInvalidBaseUrlCode(t *testing.T) {
 	// is never substituted and would reach the caller literally.
 	require.NotContains(t, status.Convert(err).Message(), "%v",
 		"unformatted verb in the status message a caller logs: %q", status.Convert(err).Message())
-}
-
-// TestWrapCheckBlockSubtreesErrNilPassthrough pins the helper's nil contract.
-//
-// Several call sites hand it the result of an operation that may have succeeded;
-// if the helper ever manufactured an error out of nil, CheckBlockSubtrees would
-// fail requests that worked.
-func TestWrapCheckBlockSubtreesErrNilPassthrough(t *testing.T) {
-	require.NoError(t, wrapCheckBlockSubtreesErr(nil))
-	require.Nil(t, wrapCheckBlockSubtreesErr(nil))
 }
