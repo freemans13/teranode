@@ -828,11 +828,13 @@ func TestBatchList_CallBoundExpiryIsARetryNotAVerdict(t *testing.T) {
 
 // flakyTxStore is a real utxo.Store whose list write runs through the shared
 // DefaultSpendAndCreateMulti, and whose SpendAndCreate of one transaction fails with a retryable
-// store error, before reaching the store, for the first failTimes calls.
+// store error, before reaching the store, for the first failTimes calls. With spendOnly, only
+// that transaction's second-wave spend calls fail, so its create-only record is written first.
 type flakyTxStore struct {
 	utxo.Store
 
 	fail      chainhash.Hash
+	spendOnly bool
 	failTimes atomic.Int32
 }
 
@@ -843,7 +845,7 @@ func (s *flakyTxStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, bl
 
 func (s *flakyTxStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
-	if *tx.TxIDChainHash() == s.fail && s.failTimes.Add(-1) >= 0 {
+	if *tx.TxIDChainHash() == s.fail && (!s.spendOnly || parseCreateOptions(opts).SpendOnly) && s.failTimes.Add(-1) >= 0 {
 		return nil, nil, errors.NewStorageError("forced transient fault on %s", tx.TxIDChainHash())
 	}
 
@@ -932,4 +934,70 @@ func TestBatchList_RetryWithNoProgressGivesUp(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no progress")
 	require.Len(t, recorder.recordedLists(), 2, "the first pass, then one retry that fails the same two")
+}
+
+// TestBatchList_RetryKeepsAFailedChildsParent: a child whose second-wave spend fails with a
+// retryable error after its parent in the list went through is retried with that parent, so it
+// meets the store as it did the first time: its create-only record is found as existing and its
+// spends are made with RequireParentOutputs. Retried alone it would get a combined call, which
+// reads its own record as proof the spends were made, so a spend of an output that exists
+// nowhere would pass. The child here also spends such an output, and the block must fail.
+func TestBatchList_RetryKeepsAFailedChildsParent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ghost bool
+	}{
+		{name: "the retry finishes the child's spends", ghost: false},
+		{name: "a spend of an output that exists nowhere still fails", ghost: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bv, recorder, cleanup := newListHarness(t, fmt.Sprintf("list_retry_parent_%v", tc.ghost), true)
+			defer cleanup()
+
+			root, key := seedRoot(t, recorder.Store, 1, "LIST_RETRY_PARENT_KEY")
+			parent := spendOf(t, key, root, 0, 90_000)
+
+			// spendOf pays every output to this key, so it signs the child's inputs.
+			outKey, outPub := bec.PrivateKeyFromBytes([]byte("netted-out"))
+
+			opts := []transactions.TxOption{
+				transactions.WithPrivateKey(outKey),
+				transactions.WithInput(parent, 0),
+				transactions.WithP2PKHOutputs(1, 80_000, outPub),
+			}
+
+			if tc.ghost {
+				ghost := transactions.Create(t, transactions.WithCoinbaseData(9, "/ghost/"), transactions.WithP2PKHOutputs(1, 100_000, outPub))
+				opts = append(opts, transactions.WithInput(ghost, 0))
+			}
+
+			child := transactions.Create(t, opts...)
+
+			flaky := &flakyTxStore{Store: recorder.Store, fail: *child.TxIDChainHash(), spendOnly: true}
+			flaky.failTimes.Store(1)
+			recorder.Store = flaky
+
+			block := &model.Block{Height: 100, ID: 42}
+			batch := listBatchFor(t, bv, block, []*bt.Tx{parent, child}, true)
+
+			recorder.reset()
+			err := bv.createAndSpendUTXOsForBatch(context.Background(), block, batch)
+
+			lists := recorder.recordedLists()
+			require.Len(t, lists, 2, "one failed pass, then one retry")
+			require.Equal(t, []chainhash.Hash{*parent.TxIDChainHash(), *child.TxIDChainHash()}, lists[1].txids,
+				"the retry carries the failed child with its parent in the list")
+
+			if tc.ghost {
+				require.Error(t, err, "a spend of an output that exists nowhere must fail the batch")
+				require.True(t, errors.Is(err, errors.ErrTxNotFound), "the missing output must fail as not found: %v", err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			requireSpentBy(t, recorder.Store, root, 0, parent)
+			requireSpentBy(t, recorder.Store, parent, 0, child)
+		})
+	}
 }
