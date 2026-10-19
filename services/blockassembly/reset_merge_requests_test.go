@@ -79,8 +79,8 @@ func setupConflictedReset(ctx context.Context, t *testing.T) (*baTestItems, *cha
 	return items, txAHash
 }
 
-// TestHandleResetRequests_QueuedValidatingRequestIsHonoured is icellan's point 4 on PR 1663. A
-// plain reset received first used to run alone and then drain a queued validating request,
+// TestHandleResetRequests_QueuedValidatingRequestIsHonoured checks the merged input validation.
+// A plain reset received first used to run alone and then drain a queued validating request,
 // answering it nil. The end state shows which reset ran: only a validating one keeps the
 // transaction whose input is spent elsewhere out of the template.
 func TestHandleResetRequests_QueuedValidatingRequestIsHonoured(t *testing.T) {
