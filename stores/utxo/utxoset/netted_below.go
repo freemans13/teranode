@@ -46,6 +46,15 @@ import (
 // child never does, and the result is the same whichever commits first or whether the child's
 // record already exists, as it can when the parent arrives between two attempts.
 //
+// The identity probe runs once, before any chunk, and this write takes no transaction locks.
+// That is safe only because no other writer stores a transaction while the node syncs below the
+// checkpoint: the FSM is CATCHINGBLOCKS or LEGACYSYNCING, and no transaction is processed outside
+// the sync itself (legacy peers: handleInvMsg in services/legacy/netsync/manager.go requests a
+// transaction only in RUNNING). If a writer stored a list transaction P between the probe and
+// P's chunk commit, and all P's inputs came from the list, P's chunk would treat P as new and
+// leave the outputs the list spends as live coins. A change that lets transactions in during the
+// sync must therefore also change this write.
+//
 // A list that asks for locked creates writes its coins locked, exactly as the ordinary create
 // does, because the plan takes the flag from the list's options. Netted outputs are never
 // written, so they have nothing to lock, and a transaction that writes nothing has no coin for
