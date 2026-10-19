@@ -67,6 +67,32 @@ type chunkPlan struct {
 	cutEdges int
 }
 
+// ranks returns, for every chunk, the length of the longest chain of chunks that starts at it,
+// itself included, and the chunks that depend on each chunk. Dependants have higher indexes, so
+// one pass from the end sees each chunk's dependants ranked already. The largest rank is the
+// critical path of the write: the number of chunks that must commit one after another.
+func (p *chunkPlan) ranks() (rank []int, dependants [][]int) {
+	n := len(p.chunks)
+	rank = make([]int, n)
+	dependants = make([][]int, n)
+
+	for _, ch := range p.chunks {
+		for _, d := range ch.deps {
+			dependants[d] = append(dependants[d], ch.idx)
+		}
+	}
+
+	for i := n - 1; i >= 0; i-- {
+		rank[i] = 1
+
+		for _, c := range dependants[i] {
+			rank[i] = max(rank[i], rank[c]+1)
+		}
+	}
+
+	return rank, dependants
+}
+
 // planFamilyChunks groups the list into families and packs them into chunks of at most maxTxs
 // transactions and maxBytes bytes. parents[i] is the list positions of i's parents, all earlier.
 // A single transaction over maxBytes still gets a chunk to itself.
@@ -429,27 +455,12 @@ func (w *nettedWrite) runChunks(ctx context.Context, plan *chunkPlan, stats *fam
 	}
 
 	pending := make([]int, n)
-	dependants := make([][]int, n)
 
 	for _, ch := range plan.chunks {
 		pending[ch.idx] = len(ch.deps)
-
-		for _, d := range ch.deps {
-			dependants[d] = append(dependants[d], ch.idx)
-		}
 	}
 
-	// rank[i] is the length of the longest chain of chunks that starts at i. Dependants have
-	// higher indexes, so one pass from the end sees each chunk's dependants ranked already.
-	rank := make([]int, n)
-
-	for i := n - 1; i >= 0; i-- {
-		rank[i] = 1
-
-		for _, c := range dependants[i] {
-			rank[i] = max(rank[i], rank[c]+1)
-		}
-	}
+	rank, dependants := plan.ranks()
 
 	var (
 		mu        sync.Mutex

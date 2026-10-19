@@ -107,8 +107,8 @@ func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
 
 		blk := parseBenchBlock(t, raw, uint32(h)) //nolint:gosec // a height fits
 
-		t.Logf("block %d: %d transactions, %d outside coins, %d families (largest %d), %d dependency levels (widest %d), %d chunks, %d cut edges",
-			h, len(blk.txs), len(blk.seed.txids), blk.families, blk.largest, blk.levels, blk.widest, blk.chunks, blk.cutEdges)
+		t.Logf("block %d: %d transactions, %d outside coins, %d families (largest %d), %d dependency levels (widest %d), %d chunks, %d cut edges, %d chunks on the longest dependency chain",
+			h, len(blk.txs), len(blk.seed.txids), blk.families, blk.largest, blk.levels, blk.widest, blk.chunks, blk.cutEdges, blk.critical)
 
 		type sample struct {
 			wall time.Duration
@@ -241,7 +241,7 @@ type benchBlock struct {
 	claims [][]benchClaim
 	seed   benchSeed
 
-	families, largest, chunks, cutEdges int
+	families, largest, chunks, cutEdges, critical int
 	// levels is the depth of the dependency graph, widest the most transactions on one level.
 	levels, widest int
 }
@@ -372,6 +372,10 @@ func parseBenchBlock(t *testing.T, raw []byte, height uint32) *benchBlock {
 	plan := planFamilyChunks(parents, sizes, multiCreateChunkTxs, spendAndCreateBatchByteBudget)
 	blk.families, blk.largest, blk.chunks, blk.cutEdges = plan.families, plan.largest, len(plan.chunks), plan.cutEdges
 
+	if ranks, _ := plan.ranks(); len(ranks) > 0 {
+		blk.critical = slices.Max(ranks)
+	}
+
 	return blk
 }
 
@@ -427,6 +431,13 @@ SELECT o.satoshis, o.created_height, o.created_height, o.mined_height, o.block_i
 
 	_, err := s.pool.Exec(ctx, `ANALYZE utxo`)
 	require.NoError(t, err)
+
+	// Seeding writes tens of megabytes. Without a checkpoint here, the one it provokes lands
+	// inside whichever write follows, and the medians of the big blocks swing by a factor of two.
+	// A superuser is needed; without one the swing stays and the run says so.
+	if _, err := s.pool.Exec(ctx, `CHECKPOINT`); err != nil {
+		t.Logf("no CHECKPOINT before the timed write, expect noise: %v", err)
+	}
 }
 
 // precheck drops the transactions the store already holds, the way the caller's pre-check does.

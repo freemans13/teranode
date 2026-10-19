@@ -51,6 +51,10 @@ func eachProbeOrder(t *testing.T, fn func(t *testing.T)) {
 // spends it, every other in-chunk edge is netted, and both halves end up stored, with the records
 // a per-transaction write leaves.
 func TestSpendAndCreateMultiACutEdgeWritesTheParentsOutputAsACoin(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiACutEdgeWritesTheParentsOutputAsACoin)
+}
+
+func testSpendAndCreateMultiACutEdgeWritesTheParentsOutputAsACoin(t *testing.T) {
 	const (
 		height = 1600
 		n      = 6
@@ -128,6 +132,10 @@ func requireAllCreated(t *testing.T, results []utxo.SpendAndCreateMultiResult) {
 // in the chunks that depend on it, and the chunks that committed before it stay committed. The
 // dependent chunk opens no database transaction.
 func TestSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants)
+}
+
+func testSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants(t *testing.T) {
 	const height = 1700
 
 	setChunkTxs(t, 2)
@@ -187,6 +195,10 @@ func TestSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants(t *test
 // An output a child in the chunk would have netted is a real coin when the child fails: the
 // parent is written, the child is not, and the output is spendable by anyone.
 func TestSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin)
+}
+
+func testSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin(t *testing.T) {
 	const height = 1800
 
 	s, ctx := newUncheckpointedStore(t)
@@ -219,6 +231,10 @@ func TestSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin(t *testing.T
 
 // A chunk waits for the commit of the chunk that holds the parent of one of its cut edges.
 func TestSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents)
+}
+
+func testSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t *testing.T) {
 	const height = 1900
 
 	setChunkTxs(t, 1)
@@ -270,6 +286,10 @@ func TestSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t *testing.T) {
 
 // Chunks with no edge between them run in parallel, up to the concurrency bound.
 func TestSpendAndCreateMultiIndependentChunksRunInParallel(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiIndependentChunksRunInParallel)
+}
+
+func testSpendAndCreateMultiIndependentChunksRunInParallel(t *testing.T) {
 	const (
 		height = 2000
 		chains = 4
@@ -328,6 +348,10 @@ func TestSpendAndCreateMultiIndependentChunksRunInParallel(t *testing.T) {
 // netting is intact. Three chains of 90 make two chunks with no edge cut, so the only coin rows
 // are the last output of each chain, and every other output is a journal row naming its child.
 func TestSpendAndCreateMultiFamiliesInOneChunkAreNetted(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiFamiliesInOneChunkAreNetted)
+}
+
+func testSpendAndCreateMultiFamiliesInOneChunkAreNetted(t *testing.T) {
 	const (
 		height = 2100
 		chains = 3
@@ -376,6 +400,10 @@ func TestSpendAndCreateMultiFamiliesInOneChunkAreNetted(t *testing.T) {
 // of the two to wait, with SQLSTATE 40P01. The chunk is run again, finds the coin free once the
 // rival lets go, and the list is written whole.
 func TestSpendAndCreateMultiAChunkDeadlockIsRetried(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiAChunkDeadlockIsRetried)
+}
+
+func testSpendAndCreateMultiAChunkDeadlockIsRetried(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
 	parent := storedParent(t, s, ctx)
@@ -518,6 +546,26 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 		require.Zero(t, steps, "the two-step write did not")
 		require.Equal(t, reference.Records(t, s), w.Records(t, s), "a block above the checkpoint is carried like a per-transaction write carries it")
 		require.Equal(t, reference.RootSpends(t, s), w.RootSpends(t, s))
+	})
+
+	t.Run("a block below the checkpoint with ordinary spends takes family chunks", func(t *testing.T) {
+		s, ctx := newTestStore(t)
+
+		w := tests.BuildMultiWorkload(t, 0x65, 2, 3)
+		w.StoreRoots(t, s, 799)
+
+		chunks, steps = 0, 0
+		hook()
+
+		// The block is below the checkpoint but the spends are not outpoint-only, the shape
+		// PR 1919's gate also refuses, so the list is not quick validation's.
+		results, err := s.SpendAndCreateMulti(ctx, w.Txs, 800,
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 800}), utxo.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		requireAllCreated(t, results)
+
+		require.Positive(t, chunks)
+		require.Zero(t, steps)
 	})
 
 	t.Run("a list with no block takes family chunks", func(t *testing.T) {

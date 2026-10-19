@@ -83,10 +83,11 @@ var forceTwoStep bool
 // routesToTwoStep reports whether a list is written by the two-step write instead of family
 // chunks. It is the one seam between the two writers.
 //
-// The list is a below-checkpoint list when the block it carries is at or below the highest
-// checkpoint, the test create.go applies to a block-carrying create. Quick validation hands the
-// store exactly those. When the list option that marks a below-checkpoint list arrives (PR 1909,
-// WithBelowCheckpoint), it joins the test here, and nothing else in the routing changes.
+// A list is a below-checkpoint list under the same condition PR 1919's nettedBelowGate uses, so
+// the two writers agree where they meet: it carries a block at or below the highest checkpoint,
+// and its spends are outpoint-only (IgnoreFlags.SkipUTXOHashCheck and SkipExtendedInputs), which
+// is quick validation's fast path. PR 1909's list option does not exist on this branch; both
+// fields the gate reads do.
 func (s *Store) routesToTwoStep(o *utxo.CreateOptions) bool {
 	if forceTwoStep {
 		return true
@@ -94,7 +95,8 @@ func (s *Store) routesToTwoStep(o *utxo.CreateOptions) bool {
 
 	mi, mined := minedBlock(o.MinedBlockInfos)
 
-	return mined && model.BelowCheckpoint(s.checkpoints, mi.BlockHeight)
+	return mined && model.BelowCheckpoint(s.checkpoints, mi.BlockHeight) &&
+		o.IgnoreFlags.SkipUTXOHashCheck && o.SkipExtendedInputs
 }
 
 // canNet reports whether the netted write models every option of the list.
