@@ -589,7 +589,7 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 	}
 
 	if txMeta.Conflicting {
-		if err = s.updateParentConflictingChildren(ctx, transactionID, tx, txn); err != nil {
+		if err = s.updateParentConflictingChildren(ctx, transactionID, parentHashesOf(tx), txn); err != nil {
 			return nil, err
 		}
 	}
@@ -1399,7 +1399,32 @@ func asPgUniqueViolation(err error) error {
 	return nil
 }
 
-func (s *Store) updateParentConflictingChildren(ctx context.Context, transactionID int, tx *bt.Tx, txn *sql.Tx) error {
+// parentHashesOf returns the txid of every input's previous transaction, in input
+// order and including duplicates, which is what the conflicting_children insert
+// iterates. Keeps callers from pinning a whole *bt.Tx when only these are needed.
+func parentHashesOf(tx *bt.Tx) []chainhash.Hash {
+	if tx == nil {
+		return nil
+	}
+
+	hashes := make([]chainhash.Hash, 0, len(tx.Inputs))
+	for _, input := range tx.Inputs {
+		hashes = append(hashes, *input.PreviousTxIDChainHash())
+	}
+
+	return hashes
+}
+
+// updateParentConflictingChildren records transactionID as a conflicting child of
+// each parent named in parentHashes.
+//
+// Takes the parent hashes rather than the *bt.Tx it used to take: SetConflicting
+// resolves every transaction up front, before opening its write transaction, and
+// pinning a whole batch of full transaction bodies until the write pass finished
+// was a memory regression on a path that handles unbounded cascades
+// (MarkConflictingRecursively calls SetConflicting with an entire BFS level).
+// The parent txids are all the write pass ever needed.
+func (s *Store) updateParentConflictingChildren(ctx context.Context, transactionID int, parentHashes []chainhash.Hash, txn *sql.Tx) error {
 	// update all the parents to have this transaction as a conflicting child
 	// do not fail if already exists
 	q := `
@@ -1412,8 +1437,10 @@ func (s *Store) updateParentConflictingChildren(ctx context.Context, transaction
 			ON CONFLICT DO NOTHING
 		`
 
-	for _, input := range tx.Inputs {
-		if _, err := txn.ExecContext(ctx, q, input.PreviousTxIDChainHash()[:], transactionID); err != nil {
+	for _, parentHash := range parentHashes {
+		parentHash := parentHash
+
+		if _, err := txn.ExecContext(ctx, q, parentHash[:], transactionID); err != nil {
 			return errors.NewStorageError("Failed to insert conflicting_children", err)
 		}
 	}
@@ -4788,53 +4815,38 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	affectedParentSpends := make([]*utxo.Spend, 0, len(txHashes))
 	spendingTxHashes := make([]chainhash.Hash, 0, len(txHashes))
 
-	var (
-		transactionID int
-		utxoHash      *chainhash.Hash
-	)
+	var utxoHash *chainhash.Hash
 
-	// Every read this function needs is taken BEFORE the write transaction opens,
-	// and none of them is taken through it.
+	// Read pass — resolve every conflicting tx's metadata and current spend state
+	// BEFORE opening the write transaction below.
 	//
-	// s.Get and s.GetSpend go to the POOL, i.e. to a different connection from the
-	// one the transaction holds. Once the UPDATE below has run, that connection is
-	// a writer, and on SQLite -- where the shared-cache write lock blocks every
-	// other connection's reads -- a read issued from inside the transaction waits
-	// for a writer that is waiting for it. That is a permanent deadlock, not a slow
-	// query: it wedged block assembly's unmined reload for the full test timeout.
-	// It was reachable only once validateUnminedTxInputs started resolving parents
-	// from the stored inpoints, because until then it never reached this path on a
-	// SQL store at all. Postgres did not deadlock, but it did spend two pool
-	// connections per call for the duration of the transaction.
+	// s.Get and s.GetSpend both query the connection pool directly; they do not
+	// run on the txn opened further down. Calling them from inside that txn's
+	// loop (as this used to do) self-deadlocks on SQLite: the txn holds SQLite's
+	// single writer lock, s.Get/s.GetSpend block waiting for a connection that is
+	// waiting on that same lock, and the txn — stuck inside this same call
+	// stack — never reaches Commit() to release it. Latent only because the sole
+	// shared-suite caller of SetConflicting(..., true) runs against
+	// Aerospike/Postgres, not SQLite. Doing every read up front, before Begin(),
+	// removes the cross-connection wait entirely rather than papering over it
+	// with a timeout or a second connection.
+	// Retain only what the write pass consumes — each tx's parent txids — rather
+	// than the full transaction bodies s.Get returns. MarkConflictingRecursively
+	// calls SetConflicting with a whole BFS level, so keeping every body alive
+	// until the write loop finished would materialise that level's transactions
+	// simultaneously on a path that already handles unbounded cascades.
 	//
-	// What hoisting does NOT rest on is the reads being independent of the UPDATE.
-	// They are not: GetSpend selects t.conflicting and t.locked and maps
-	// conflicting to Status_CONFLICTING, which is exactly the column the UPDATE
-	// writes. What makes the move safe is that those reads never saw the UPDATE in
-	// either version. They run on a pool connection, outside the transaction's
-	// snapshot, so they read the last COMMITTED value -- and this transaction has
-	// not committed while the loop runs. Before the hoist and after it, GetSpend
-	// answers from the pre-call state.
-	//
-	// The delete-at-height decision is not read back here either; it is made in SQL
-	// inside the UPDATE itself, by the preserve_until guard in qUpdate above.
-	//
-	// What the hoist does change is the width of an already non-atomic window: the
-	// gap between reading a spend status and committing the flag now also spans the
-	// UPDATE loop. A concurrent writer could spend one of these outputs inside that
-	// wider gap and its txid would be missing from spendingTxHashes. That race
-	// existed before at loop-iteration width; this widens it to loop width, which is
-	// the price of removing a read-inside-write-transaction shape that deadlocks
-	// outright on SQLite.
-	type conflictingRead struct {
-		hash             chainhash.Hash
-		txMeta           *meta.Data
-		spendingTxHashes []chainhash.Hash
-	}
+	// Note on staleness: hoisting the reads widens an existing scan-to-commit
+	// window rather than introducing one. affectedParentSpends is built purely
+	// from each tx's own inputs and cannot go stale, but spendingTxHashes — the
+	// cascade set read from each tx's outputs below — is now resolved further
+	// ahead of the commit for a multi-hash call. A child that commits its spend
+	// in between is absent from that set, and MarkConflictingRecursively drives
+	// its BFS off it, so the miss propagates to the whole descendant walk. That
+	// is the race tracked in #1228; this only makes its window wider.
+	parentHashes := make([][]chainhash.Hash, len(txHashes))
 
-	reads := make([]conflictingRead, 0, len(txHashes))
-
-	for _, conflictingTxHash := range txHashes {
+	for idx, conflictingTxHash := range txHashes {
 		// get the extended tx
 		txMeta, err := s.Get(ctx, &conflictingTxHash)
 		if err != nil {
@@ -4845,7 +4857,23 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			return nil, nil, errors.NewProcessingError("[SetConflicting][%s] record carries no transaction body, so its inputs and outputs cannot be resolved", conflictingTxHash.String())
 		}
 
-		read := conflictingRead{hash: conflictingTxHash, txMeta: txMeta}
+		parentHashes[idx] = parentHashesOf(txMeta.Tx)
+
+		for i, input := range txMeta.Tx.Inputs {
+			utxoHash, err = util.UTXOHashFromInput(input)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			spend := &utxo.Spend{
+				TxID:         input.PreviousTxIDChainHash(),
+				Vout:         input.PreviousTxOutIndex,
+				UTXOHash:     utxoHash,
+				SpendingData: spendpkg.NewSpendingData(&conflictingTxHash, i),
+			}
+
+			affectedParentSpends = append(affectedParentSpends, spend)
+		}
 
 		for vOut, output := range txMeta.Tx.Outputs {
 			if output == nil {
@@ -4879,14 +4907,16 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			}
 
 			if spendResponse.Status == int(utxo.Status_SPENT) && spendResponse.SpendingData != nil && spendResponse.SpendingData.TxID != nil {
-				read.spendingTxHashes = append(read.spendingTxHashes, *spendResponse.SpendingData.TxID)
+				spendingTxHashes = append(spendingTxHashes, *spendResponse.SpendingData.TxID)
 			}
 		}
-
-		reads = append(reads, read)
 	}
 
-	// Create a database transaction
+	// Write pass — only the UPDATE and its dependent conflicting_children insert
+	// run inside the transaction; both are pure writes plus the id RETURNING from
+	// the UPDATE that updateParentConflictingChildren needs.
+	var transactionID int
+
 	txn, err := s.db.Begin()
 	if err != nil {
 		return nil, nil, err
@@ -4896,34 +4926,14 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		_ = txn.Rollback()
 	}()
 
-	for _, read := range reads {
-		conflictingTxHash := read.hash
-
+	for idx, conflictingTxHash := range txHashes {
 		if err = txn.QueryRowContext(ctx, qUpdate, conflictingTxHash[:], setValue, deleteAtHeight).Scan(&transactionID); err != nil {
 			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", conflictingTxHash, err)
 		}
 
-		if err = s.updateParentConflictingChildren(ctx, transactionID, read.txMeta.Tx, txn); err != nil {
+		if err = s.updateParentConflictingChildren(ctx, transactionID, parentHashes[idx], txn); err != nil {
 			return nil, nil, err
 		}
-
-		for i, input := range read.txMeta.Tx.Inputs {
-			utxoHash, err = util.UTXOHashFromInput(input)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			spend := &utxo.Spend{
-				TxID:         input.PreviousTxIDChainHash(),
-				Vout:         input.PreviousTxOutIndex,
-				UTXOHash:     utxoHash,
-				SpendingData: spendpkg.NewSpendingData(&conflictingTxHash, i),
-			}
-
-			affectedParentSpends = append(affectedParentSpends, spend)
-		}
-
-		spendingTxHashes = append(spendingTxHashes, read.spendingTxHashes...)
 	}
 
 	if err = txn.Commit(); err != nil {
