@@ -47,6 +47,31 @@ func requireSingleRecordOf(t *testing.T, s *Store, ctx context.Context, child *b
 	require.Equal(t, len(child.Outputs), utxoCount(t, s, ctx, child), "exactly one set of UTXO rows")
 }
 
+// requireBackendWaitingOnATransaction fails unless some other backend of the test database is
+// blocked behind an open transaction within five seconds. It is what makes "the rival waited on
+// the identity key" a fact the test observed, not a delay it hoped was long enough.
+func requireBackendWaitingOnATransaction(t *testing.T, s *Store) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for time.Now().Before(deadline) {
+		var n int
+		require.NoError(t, s.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM pg_stat_activity
+			  WHERE datname = current_database() AND pid <> pg_backend_pid()
+			    AND wait_event_type = 'Lock' AND wait_event = 'transactionid'`).Scan(&n))
+
+		if n > 0 {
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("no backend waited on the chunk's open transaction: the rival never met the identity key")
+}
+
 func rivalOptions(block int, extra ...utxo.CreateOption) []utxo.CreateOption {
 	return append([]utxo.CreateOption{
 		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: uint32(block), BlockHeight: rivalHeight, OnLongestChain: true}), //nolint:gosec // a test block id
@@ -100,17 +125,18 @@ func TestSpendAndCreateMultiARivalCreateAfterTheClaimWaitsOnTheIdentityKey(t *te
 				fired = true
 
 				go func() {
-					_, _, err := s.SpendAndCreate(context.Background(), spendOutput(t, parent, 0, 1), rivalHeight,
-						rivalOptions(tc.rivalBlock, utxo.WithCreateOnly())...)
+					_, err := s.Create(context.Background(), spendOutput(t, parent, 0, 1), rivalHeight, rivalOptions(tc.rivalBlock)...)
 					rivalErr <- err
 
 					close(finished)
 				}()
 
+				requireBackendWaitingOnATransaction(t, s)
+
 				select {
 				case <-finished:
 					t.Error("a create of T finished while the chunk held T's identity row uncommitted")
-				case <-time.After(400 * time.Millisecond):
+				default:
 				}
 			}
 
@@ -163,8 +189,7 @@ func TestSpendAndCreateMultiARivalCreateBetweenTheSpendAndTheClaimStoresTOnce(t 
 
 				fired = true
 
-				_, _, err := s.SpendAndCreate(context.Background(), spendOutput(t, parent, 0, 1), rivalHeight,
-					rivalOptions(tc.rivalBlock, utxo.WithCreateOnly())...)
+				_, err := s.Create(context.Background(), spendOutput(t, parent, 0, 1), rivalHeight, rivalOptions(tc.rivalBlock)...)
 				require.NoError(t, err, "the rival is not held up by the chunk")
 
 				return nil
@@ -195,7 +220,7 @@ func TestSpendAndCreateMultiARivalCreateBeforeTheChunkStoresTOnce(t *testing.T) 
 	parent := storedParent(t, s, ctx)
 	child := spendOutput(t, parent, 0, 1)
 
-	_, _, err := s.SpendAndCreate(ctx, spendOutput(t, parent, 0, 1), rivalHeight, rivalOptions(7, utxo.WithCreateOnly())...)
+	_, err := s.Create(ctx, spendOutput(t, parent, 0, 1), rivalHeight, rivalOptions(7)...)
 	require.NoError(t, err)
 
 	results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, rivalHeight, rivalOptions(7)...)
