@@ -570,42 +570,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 
 			case resetReq := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
-
-				// If FullReset requested, run lightweight consistency scan first
-				if resetReq.FullReset {
-					if fixErr := b.fixUnminedSinceInconsistencies(ctx); fixErr != nil {
-						b.logger.Errorf("[BlockAssembler] error fixing unmined_since inconsistencies: %v", fixErr)
-					}
-				}
-
-				resp, err := b.resetWithResponse(ctx, resetReq.ValidateInputs)
-
-				// The Reset path replays moveForward blocks through the same
-				// conflict resolution, so it can queue refusals too. Unlike the
-				// reorg path this does not run inside processNewBlockAnnouncement,
-				// so nothing else would drain them until the next block arrives.
-				b.drainPendingInvalidations(ctx)
-
-				// empty out the reset channel. The reset that ran stands in for
-				// every drained request, so it counts as storage-triggered if
-				// any of them was.
-				storageTriggered := resetReq.StorageTriggered
-
-				for len(b.resetCh) > 0 {
-					bufferedCh := <-b.resetCh
-					storageTriggered = storageTriggered || bufferedCh.StorageTriggered
-
-					if bufferedCh.ErrCh != nil {
-						bufferedCh.ErrCh <- nil
-					}
-				}
-
-				b.onResetDone(storageTriggered, resp, err)
-
-				if resetReq.ErrCh != nil {
-					resetReq.ErrCh <- err
-				}
-
+				b.handleResetRequests(ctx, resetReq)
 				b.setCurrentRunningState(StateRunning)
 
 			case notification := <-b.blockchainSubscriptionCh:
@@ -626,6 +591,60 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 	}()
 
 	return nil
+}
+
+// handleResetRequests runs one reset on behalf of first and of every request
+// already queued in resetCh, and answers each of them with that reset's result.
+//
+// The queue is drained before the reset runs, and the flags are merged: the reset
+// scans for unmined_since inconsistencies if any request asked for a full reset,
+// validates inputs if any asked for it, and counts as storage-triggered if any
+// was. Draining after the run instead would answer a queued validating or full
+// request with nil although the reset that ran did neither, and the heartbeat
+// retry (retryFailedUnminedReload clears unminedReloadPending before it queues)
+// would lose its retry for good. A request that arrives while the reset runs stays
+// queued and gets its own reset on the next pass of the loop.
+//
+// Each ErrCh is buffered (cap 1) by its sender, which only logs a non-nil error.
+func (b *BlockAssembler) handleResetRequests(ctx context.Context, first resetRequest) {
+	batch := []resetRequest{first}
+
+	// len is only read by this goroutine, the single consumer of resetCh, so
+	// every request counted here can be received without blocking.
+	for n := len(b.resetCh); n > 0; n-- {
+		batch = append(batch, <-b.resetCh)
+	}
+
+	var fullReset, validateInputs, storageTriggered bool
+
+	for _, req := range batch {
+		fullReset = fullReset || req.FullReset
+		validateInputs = validateInputs || req.ValidateInputs
+		storageTriggered = storageTriggered || req.StorageTriggered
+	}
+
+	// If FullReset requested, run lightweight consistency scan first
+	if fullReset {
+		if fixErr := b.fixUnminedSinceInconsistencies(ctx); fixErr != nil {
+			b.logger.Errorf("[BlockAssembler] error fixing unmined_since inconsistencies: %v", fixErr)
+		}
+	}
+
+	resp, err := b.resetWithResponse(ctx, validateInputs)
+
+	// The Reset path replays moveForward blocks through the same
+	// conflict resolution, so it can queue refusals too. Unlike the
+	// reorg path this does not run inside processNewBlockAnnouncement,
+	// so nothing else would drain them until the next block arrives.
+	b.drainPendingInvalidations(ctx)
+
+	b.onResetDone(storageTriggered, resp, err)
+
+	for _, req := range batch {
+		if req.ErrCh != nil {
+			req.ErrCh <- err
+		}
+	}
 }
 
 // triggerReconcile asks the channel listener to run processNewBlockAnnouncement.
