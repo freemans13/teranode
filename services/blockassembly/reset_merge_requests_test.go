@@ -9,11 +9,8 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/model"
-	"github.com/bsv-blockchain/teranode/services/blockchain"
 	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
 	utxostoresql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -77,7 +74,7 @@ func setupConflictedReset(ctx context.Context, t *testing.T) (*baTestItems, *cha
 	items.blockAssembler.settings.BlockAssembly.OnRestartValidateParentChain = false
 
 	txAHash := seedConflictedUnminedTx(ctx, t, items)
-	genesisChainForMergedReset(items)
+	genesisChainForMergedReset(t, items)
 
 	return items, txAHash
 }
@@ -229,35 +226,14 @@ func TestHandleResetRequests_RequestDuringTheResetIsNotAnswered(t *testing.T) {
 		"the next pass ran the validating reset and left the conflicted transaction out")
 }
 
-// genesisChainForMergedReset lets reset run with both the chain and block assembly at genesis, so
-// it moves no blocks and only clears the subtrees and reloads the unmined transactions. The same
-// set of calls TestReset_ConflictDetectionViaValidateInputs mocks.
-func genesisChainForMergedReset(items *baTestItems) {
-	genesisHeader := &model.BlockHeader{
-		Version:        1,
-		HashPrevBlock:  &chainhash.Hash{},
-		HashMerkleRoot: &chainhash.Hash{},
-		Bits:           model.NBit{},
-		Nonce:          0,
-	}
-	genesisMeta := &model.BlockHeaderMeta{Height: 0, ID: 1}
-	genesisHashSlice := []*chainhash.Hash{genesisHeader.Hash()}
+// genesisChainForMergedReset uses the SQLite blockchain client at genesis.
+// The reset reloads the unmined transactions without block movement.
+func genesisChainForMergedReset(t *testing.T, items *baTestItems) {
+	t.Helper()
 
-	mockBC := &blockchain.Mock{}
-	mockBC.On("GetBestBlockHeader", mock.Anything).Return(genesisHeader, genesisMeta, nil)
-	mockBC.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(false, nil)
-	mockBC.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(genesisHashSlice, nil)
-	mockBC.On("GetBlockHeader", mock.Anything, mock.Anything).Return(genesisHeader, genesisMeta, nil)
-	mockBC.On("GetBlockHeaders", mock.Anything, mock.Anything, uint64(1)).
-		Return([]*model.BlockHeader{genesisHeader}, []*model.BlockHeaderMeta{genesisMeta}, nil)
-	mockBC.On("GetBlockHeaders", mock.Anything, mock.Anything, uint64(0)).
-		Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil)
-	mockBC.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{}, nil)
-	mockBC.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
-
-	items.blockAssembler.blockchainClient = mockBC
-	items.blockAssembler.setBestBlockHeader(genesisHeader, 0)
-	items.blockAssembler.subtreeProcessor.InitCurrentBlockHeader(genesisHeader)
+	header := genesisHeader(t, items)
+	items.blockAssembler.setBestBlockHeader(header, 0)
+	items.blockAssembler.subtreeProcessor.InitCurrentBlockHeader(header)
 }
 
 // iteratorDownStore wraps the real store and can fail GetUnminedTxIterator, so a reload fails
