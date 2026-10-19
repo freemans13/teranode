@@ -173,9 +173,11 @@ func testAgainstASecondMultiWrite(t *testing.T) {
 		t.Cleanup(func() { multiChunkFault = nil })
 
 		first, errFirst = s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
-		multiChunkFault = nil
 
+		// The second write reads the hook until it ends, so the hook stays until then.
 		<-secondDone
+
+		multiChunkFault = nil
 
 		return first, secondResults, errFirst, secondErr
 	}

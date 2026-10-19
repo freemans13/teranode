@@ -107,8 +107,8 @@ func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
 
 		blk := parseBenchBlock(t, raw, uint32(h)) //nolint:gosec // a height fits
 
-		t.Logf("block %d: %d transactions, %d outside coins, %d families (largest %d), %d chunks, %d cut edges",
-			h, len(blk.txs), len(blk.seed.txids), blk.families, blk.largest, blk.chunks, blk.cutEdges)
+		t.Logf("block %d: %d transactions, %d outside coins, %d families (largest %d), %d dependency levels (widest %d), %d chunks, %d cut edges",
+			h, len(blk.txs), len(blk.seed.txids), blk.families, blk.largest, blk.levels, blk.widest, blk.chunks, blk.cutEdges)
 
 		type sample struct {
 			wall time.Duration
@@ -242,6 +242,8 @@ type benchBlock struct {
 	seed   benchSeed
 
 	families, largest, chunks, cutEdges int
+	// levels is the depth of the dependency graph, widest the most transactions on one level.
+	levels, widest int
 }
 
 type benchClaim struct {
@@ -352,6 +354,19 @@ func parseBenchBlock(t *testing.T, raw []byte, height uint32) *benchBlock {
 			blk.seed.vouts = append(blk.seed.vouts, in.PreviousTxOutIndex)
 			blk.seed.sats = append(blk.seed.sats, int64(sats)) //nolint:gosec // satoshis fit int64
 		}
+	}
+
+	level := make([]int, len(parents))
+	width := map[int]int{}
+
+	for i, ps := range parents {
+		for _, p := range ps {
+			level[i] = max(level[i], level[p]+1)
+		}
+
+		width[level[i]]++
+		blk.levels = max(blk.levels, level[i]+1)
+		blk.widest = max(blk.widest, width[level[i]])
 	}
 
 	plan := planFamilyChunks(parents, sizes, multiCreateChunkTxs, spendAndCreateBatchByteBudget)

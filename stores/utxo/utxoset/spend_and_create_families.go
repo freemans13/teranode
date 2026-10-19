@@ -3,6 +3,7 @@ package utxoset
 import (
 	"context"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -11,7 +12,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/jackc/pgx/v5"
-	"golang.org/x/sync/errgroup"
 )
 
 // Family chunks: how SpendAndCreateMulti writes a list above the checkpoint.
@@ -401,71 +401,154 @@ func (w *nettedWrite) writeFamilies(ctx context.Context) ([]utxo.SpendAndCreateM
 		}
 	}
 
-	// Chunks are submitted in index order and a chunk only ever waits on lower indexes, which
-	// already hold a slot or have finished, so waiting for a slot cannot deadlock. The chunks
-	// share the caller's context, not one the group cancels: a sibling cancelled mid-commit is
-	// the case multiCommitTimeout exists for, and the chunks are independent, each safe to
-	// commit on its own.
-	var (
-		g       errgroup.Group
-		stop    atomic.Bool
-		done    = make([]chan struct{}, len(plan.chunks))
-		errored = make([]bool, len(plan.chunks))
-	)
-
-	for k := range done {
-		done[k] = make(chan struct{})
-	}
-
-	g.SetLimit(w.s.multiConcurrency())
-
-	for _, ch := range plan.chunks {
-		g.Go(func() error {
-			defer close(done[ch.idx])
-
-			waited := time.Now()
-
-			for _, d := range ch.deps {
-				select {
-				case <-done[d]:
-				case <-ctx.Done():
-					errored[ch.idx] = true
-					return ctx.Err()
-				}
-			}
-
-			stats.waitingNs.Add(int64(time.Since(waited)))
-
-			for _, d := range ch.deps {
-				if errored[d] {
-					// The write is already returning its error; this chunk is not attempted.
-					errored[ch.idx] = true
-					return nil
-				}
-			}
-
-			if stop.Load() {
-				errored[ch.idx] = true
-				return nil
-			}
-
-			if err := w.runFamilyChunk(ctx, ch, plan, stats); err != nil {
-				errored[ch.idx] = true
-
-				stop.Store(true)
-
-				return err
-			}
-
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
+	if err := w.runChunks(ctx, plan, stats); err != nil {
 		return nil, err
 	}
 
 	return w.results(), nil
+}
+
+// runChunks runs the chunks of a plan, a chunk only once every chunk it depends on has committed,
+// on up to multiConcurrency workers.
+//
+// A chunk is handed to a worker only when it is ready. A worker is never parked waiting for a
+// parent: parked, it would hold one of the few workers while a runnable chunk further down the
+// list waited for a slot, and a family whose chunks are mostly independent would run nearly one
+// chunk at a time. Of the chunks that are ready, the one with the longest chain of chunks still
+// waiting behind it goes first, so a long dependency chain is never held up by independent chunks
+// that could have run beside it.
+//
+// The chunks share the caller's context, not one a failure cancels: a sibling cancelled
+// mid-commit is the case multiCommitTimeout exists for, and the chunks are independent, each safe
+// to commit on its own. After a failure no chunk is started, and the chunks that depended on the
+// failed one are skipped, so the write returns that first error.
+func (w *nettedWrite) runChunks(ctx context.Context, plan *chunkPlan, stats *familyStats) error {
+	n := len(plan.chunks)
+	if n == 0 {
+		return nil
+	}
+
+	pending := make([]int, n)
+	dependants := make([][]int, n)
+
+	for _, ch := range plan.chunks {
+		pending[ch.idx] = len(ch.deps)
+
+		for _, d := range ch.deps {
+			dependants[d] = append(dependants[d], ch.idx)
+		}
+	}
+
+	// rank[i] is the length of the longest chain of chunks that starts at i. Dependants have
+	// higher indexes, so one pass from the end sees each chunk's dependants ranked already.
+	rank := make([]int, n)
+
+	for i := n - 1; i >= 0; i-- {
+		rank[i] = 1
+
+		for _, c := range dependants[i] {
+			rank[i] = max(rank[i], rank[c]+1)
+		}
+	}
+
+	var (
+		mu        sync.Mutex
+		cond      = sync.NewCond(&mu)
+		wg        sync.WaitGroup
+		remaining = n
+		skipped   = make([]bool, n)
+		readyAt   = make([]time.Time, n)
+		ready     []int
+		firstErr  error
+	)
+
+	push := func(idx int) {
+		readyAt[idx] = time.Now()
+		ready = append(ready, idx)
+	}
+
+	// pop takes the ready chunk with the longest chain behind it, the lower index on a tie.
+	pop := func() int {
+		best := 0
+
+		for i, idx := range ready {
+			if r, b := rank[idx], rank[ready[best]]; r > b || (r == b && idx < ready[best]) {
+				best = i
+			}
+		}
+
+		idx := ready[best]
+		ready[best] = ready[len(ready)-1]
+		ready = ready[:len(ready)-1]
+
+		return idx
+	}
+
+	for idx, p := range pending {
+		if p == 0 {
+			push(idx)
+		}
+	}
+
+	// finish settles one chunk and releases the chunks that were waiting for it. The caller
+	// holds mu.
+	finish := func(idx int, failed bool) {
+		remaining--
+
+		for _, c := range dependants[idx] {
+			skipped[c] = skipped[c] || failed
+
+			if pending[c]--; pending[c] == 0 {
+				push(c)
+			}
+		}
+
+		cond.Broadcast()
+	}
+
+	for i := 0; i < w.s.multiConcurrency(); i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			for {
+				for len(ready) == 0 && remaining > 0 {
+					cond.Wait()
+				}
+
+				if remaining == 0 {
+					return
+				}
+
+				idx := pop()
+
+				if skipped[idx] || firstErr != nil {
+					finish(idx, true)
+					continue
+				}
+
+				stats.waitingNs.Add(int64(time.Since(readyAt[idx])))
+
+				mu.Unlock()
+				err := w.runFamilyChunk(ctx, plan.chunks[idx], plan, stats)
+				mu.Lock()
+
+				if err != nil && firstErr == nil {
+					firstErr = err
+				}
+
+				finish(idx, err != nil)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	return firstErr
 }
 
 // runFamilyChunk writes one chunk, running its database transaction again when PostgreSQL stops
@@ -1125,7 +1208,7 @@ func (w *nettedWrite) logFamiliesIfSlow(start time.Time, st *familyStats) {
 		return
 	}
 
-	w.s.logger.Infof("[utxoset][SpendAndCreateMulti] slow list at height %d: %d txs in %d families (largest %d), %d chunks, %d cut edges, %d rounds, %d deadlock retries, %.1f MB of bodies; wall %s (plan %s, lock %s, probe %s, spend %s, create %s, commit %s, waiting on parents %s)",
+	w.s.logger.Infof("[utxoset][SpendAndCreateMulti] slow list at height %d: %d txs in %d families (largest %d), %d chunks, %d cut edges, %d rounds, %d deadlock retries, %.1f MB of bodies; wall %s (plan %s, lock %s, probe %s, spend %s, create %s, commit %s, queued for a worker %s)",
 		w.blockHeight, len(w.items), st.families, st.largest, st.chunks, st.cutEdges, st.rounds.Load(), st.deadlocks.Load(),
 		float64(st.bodyBytes.Load())/1e6, time.Since(start).Round(time.Millisecond),
 		time.Duration(st.planNs.Load()).Round(time.Millisecond),
