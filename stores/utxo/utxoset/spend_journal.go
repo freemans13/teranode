@@ -529,8 +529,8 @@ SELECT txid, tx_inpoints
 // The created_height test rests on one assumption: a spend is never journaled in an earlier
 // partition than its spender's created_height. SpendAndCreate takes one height for both, which
 // is the validator's path, and a create-only followed by a spend-only spends at the same or a
-// later tip. The one path that splits them is a repeat: SpendAndCreateMulti commits its spends
-// before its creates, so a crash between the two can leave the spends journaled at one height
+// later tip. The one path that splits them is a repeat: the two-step SpendAndCreateMulti write, used at or
+// below the checkpoint, commits its spends before its creates, so a crash between the two can leave the spends journaled at one height
 // and the transaction accepted later, in a later partition. The spend path enforces the
 // assumption there: a repeat moves its journal rows up to its own height (moveRepeatedSpendsSQL).
 // Without that, such a spender is not found here, and a reorg of its block within retention

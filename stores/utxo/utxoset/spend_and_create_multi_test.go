@@ -2,6 +2,8 @@ package utxoset
 
 import (
 	"context"
+	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +30,10 @@ func TestParentOutputsForValidationUtxoset(t *testing.T) {
 }
 
 func TestSpendAndCreateMultiUtxoset(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiUtxoset)
+}
+
+func testSpendAndCreateMultiUtxoset(t *testing.T) {
 	suite := func(t *testing.T) {
 		t.Run("matches a loop of SpendAndCreate", func(t *testing.T) {
 			s, _ := newUncheckpointedStore(t)
@@ -69,12 +75,12 @@ func TestSpendAndCreateMultiUtxoset(t *testing.T) {
 		})
 	}
 
-	t.Run("one spend chunk", suite)
+	t.Run("whole families in one chunk", suite)
 
-	// One transaction per create chunk lets one chunk of a level commit while another finds its
-	// parent already exists, so the rest of the list finishes per transaction and has to spend
-	// outputs this write netted, by finding their journal rows.
-	t.Run("a create chunk per transaction", func(t *testing.T) {
+	// One transaction per chunk makes every in-list edge a cut edge: each parent's outputs are
+	// written as coins and each child's chunk waits for its parent's commit and spends them for
+	// real. The same contract must hold when nothing is netted.
+	t.Run("a chunk per transaction", func(t *testing.T) {
 		old := multiCreateChunkTxs
 		multiCreateChunkTxs = 1
 
@@ -83,14 +89,13 @@ func TestSpendAndCreateMultiUtxoset(t *testing.T) {
 		suite(t)
 	})
 
-	// One input per spend chunk puts every transaction in its own chunk, run in parallel, so a
-	// failed transaction's descendants have their spends committed before the failure is known
-	// and must be restored.
-	t.Run("a spend chunk per input", func(t *testing.T) {
-		old := multiSpendChunkInputs
-		multiSpendChunkInputs = 1
+	// Two transactions per chunk cuts families in the middle, so some edges are netted and some
+	// are cut within one list.
+	t.Run("two transactions per chunk", func(t *testing.T) {
+		old := multiCreateChunkTxs
+		multiCreateChunkTxs = 2
 
-		t.Cleanup(func() { multiSpendChunkInputs = old })
+		t.Cleanup(func() { multiCreateChunkTxs = old })
 
 		suite(t)
 	})
@@ -168,11 +173,15 @@ func TestSpendAndCreateMultiNetsOutputsSpentInTheList(t *testing.T) {
 	require.Equal(t, spentBy[*parent.TxIDChainHash()][0], *spends[0].ConflictingTxID)
 }
 
-// A crash after step 1, or after any group of step 2, repeats the way the caller repeats: the
-// pre-check drops every transaction that exists and the rest are sent again, as one list or
-// two. The records must match a clean run. The chunk bound is one level wide, so no two levels
-// share a group and every level is its own commit to crash after.
+// A crash inside a chunk, or between chunks, repeats the way the caller repeats: the pre-check
+// drops every transaction that exists and the rest are sent again, as one list or two. The open
+// chunk is rolled back whole and the committed ones stay, so the records must match a clean run.
+// The chunk bound is one level wide, so the list is cut into chunks to crash in and between.
 func TestSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiNettedRepeatAfterACrash)
+}
+
+func testSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
 	const (
 		height = 800
 		levels = 4
@@ -184,11 +193,17 @@ func TestSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
 
 	t.Cleanup(func() { multiCreateChunkTxs = old })
 
-	stages := []string{"spent", "created group 0", "created group 1", "created group 2"}
+	crashes := []struct {
+		chunk int
+		stage string
+	}{
+		{0, "locked"}, {0, "spent"}, {0, "created"}, {0, "committed"},
+		{1, "spent"}, {1, "created"}, {1, "committed"}, {2, "committed"},
+	}
 
-	for si, stage := range stages {
+	for si, c := range crashes {
 		for _, split := range []bool{false, true} {
-			name := stage
+			name := "chunk " + strconv.Itoa(c.chunk) + " " + c.stage
 			if split {
 				name += ", repeated as two lists"
 			}
@@ -215,28 +230,24 @@ func TestSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
 				w := tests.BuildMultiWorkload(t, seed, levels, width)
 				w.StoreRoots(t, s, height-1)
 
-				crash := errors.NewProcessingError("injected crash")
-				multiFault = func(at string) error {
-					if at == stage {
+				crash := errMultiCrash
+				multiChunkFault = func(chunk int, at string) error {
+					if chunk == c.chunk && at == c.stage {
 						return crash
 					}
 
 					return nil
 				}
 
+				t.Cleanup(func() { multiChunkFault = nil })
+
 				_, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
-				multiFault = nil
+				multiChunkFault = nil
 				require.ErrorIs(t, err, crash)
 
-				var remaining []*bt.Tx
-
-				for _, tx := range w.Txs {
-					if _, err := s.Get(ctx, tx.TxIDChainHash(), fields.Fee); errors.Is(err, errors.ErrTxNotFound) {
-						remaining = append(remaining, tx)
-					} else {
-						require.NoError(t, err)
-					}
-				}
+				// Chunks that did not depend on the crashed one may have committed too, so the
+				// list left may be shorter, or empty.
+				remaining := missingTxs(t, s, w.Txs)
 
 				lists := [][]*bt.Tx{remaining}
 				if split && len(remaining) > 1 {
@@ -320,38 +331,55 @@ func payFrom(t *testing.T, lockTime uint32, parents []*bt.Tx, vouts []uint32) *b
 	return tx
 }
 
-// A transaction whose parent in the list fails has its own outside spends undone, even when a
-// parallel chunk committed them before the parent's failure was known.
-func TestSpendAndCreateMultiRestoresTheOutsideSpendsOfAFailedParentsChild(t *testing.T) {
-	old := multiSpendChunkInputs
-	multiSpendChunkInputs = 1
+// A transaction whose parent in the list fails leaves no spend of its own behind, whether the two
+// share a chunk or sit in different ones. In one chunk the failed parent rolls the round back and
+// the child is dropped before any spend is kept. In two chunks the child's chunk is never
+// started, because its parent's chunk finished with the parent failed. Neither needs anything
+// restored, because no spend was ever committed for the child.
+func TestSpendAndCreateMultiAFailedParentsChildLeavesNoSpend(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiAFailedParentsChildLeavesNoSpend)
+}
 
-	t.Cleanup(func() { multiSpendChunkInputs = old })
+func testSpendAndCreateMultiAFailedParentsChildLeavesNoSpend(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		chunk int
+	}{
+		{"one chunk", 256},
+		{"a chunk per transaction", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := multiCreateChunkTxs
+			multiCreateChunkTxs = tc.chunk
 
-	s, ctx := newUncheckpointedStore(t)
+			t.Cleanup(func() { multiCreateChunkTxs = old })
 
-	const height = 1000
+			s, ctx := newUncheckpointedStore(t)
 
-	w := tests.BuildMultiWorkload(t, 0xa0, 1, 2) // two roots to spend from
-	w.StoreRoots(t, s, height-1)
-	rootA, rootB := w.Roots[0], w.Roots[1]
+			const height = 1000
 
-	thief := payFrom(t, 1, []*bt.Tx{rootA}, []uint32{0})
-	_, _, err := s.SpendAndCreate(ctx, thief, height)
-	require.NoError(t, err)
+			w := tests.BuildMultiWorkload(t, 0xa0, 1, 2) // two roots to spend from
+			w.StoreRoots(t, s, height-1)
+			rootA, rootB := w.Roots[0], w.Roots[1]
 
-	parent := payFrom(t, 2, []*bt.Tx{rootA}, []uint32{0})           // fails: rootA:0 is taken
-	child := payFrom(t, 3, []*bt.Tx{parent, rootB}, []uint32{0, 0}) // rootB:0 is an outside spend
+			thief := payFrom(t, 1, []*bt.Tx{rootA}, []uint32{0})
+			_, _, err := s.SpendAndCreate(ctx, thief, height)
+			require.NoError(t, err)
 
-	results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{parent, child}, height, utxo.WithIgnoreLocked(true))
-	require.NoError(t, err)
-	require.Equal(t, utxo.MultiTxFailed, results[0].Status)
-	require.Equal(t, utxo.MultiTxParentFailed, results[1].Status)
+			parent := payFrom(t, 2, []*bt.Tx{rootA}, []uint32{0})           // fails: rootA:0 is taken
+			child := payFrom(t, 3, []*bt.Tx{parent, rootB}, []uint32{0, 0}) // rootB:0 is an outside spend
 
-	// rootB:0 is spendable again: another transaction can take it.
-	other := payFrom(t, 4, []*bt.Tx{rootB}, []uint32{0})
-	_, _, err = s.SpendAndCreate(ctx, other, height)
-	require.NoError(t, err, "the child's spend of rootB:0 was left in place")
+			results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{parent, child}, height, utxo.WithIgnoreLocked(true))
+			require.NoError(t, err)
+			require.Equal(t, utxo.MultiTxFailed, results[0].Status)
+			require.Equal(t, utxo.MultiTxParentFailed, results[1].Status)
+
+			// rootB:0 is spendable: another transaction can take it.
+			other := payFrom(t, 4, []*bt.Tx{rootB}, []uint32{0})
+			_, _, err = s.SpendAndCreate(ctx, other, height)
+			require.NoError(t, err, "the child's spend of rootB:0 was left in place")
+		})
+	}
 }
 
 // buildChain builds one root and a single chain of n transactions after it, each spending
@@ -395,7 +423,7 @@ func buildChain(t *testing.T, seed byte, n int, extra map[int]int) *tests.MultiW
 	return w
 }
 
-// countCreateCommits records the size of every step-2 chunk transaction that commits, in order.
+// countCreateCommits records the size of every chunk transaction that commits, in order.
 func countCreateCommits(t *testing.T) func() []int {
 	t.Helper()
 
@@ -447,11 +475,15 @@ func recordsOf(t *testing.T, s *Store, w *tests.MultiWorkload) []any {
 	return out
 }
 
-// A deep chain is the shape that made step 2 slow: one level per transaction, each its own
-// database transaction. Consecutive narrow levels share a chunk transaction up to the chunk
-// bounds, so a 600-level chain commits in ceil(600/256) step-2 transactions, and the records
-// are the ones a per-transaction write leaves.
+// A deep chain is one family. It is cut into slices of up to the chunk bound, each one database
+// transaction, so a 600-deep chain commits in ceil(600/256) transactions. The cut edges write
+// their parent's output as a real coin and the next chunk spends it, and the records are still
+// the ones a per-transaction write leaves.
 func TestSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiMergesNarrowLevels)
+}
+
+func testSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
 	const (
 		height = 1100
 		n      = 600
@@ -479,17 +511,21 @@ func TestSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
 	require.Equal(t, wantRoots, w.RootSpends(t, s))
 }
 
-// A crash between two merged groups at the default bound repeats through the caller's
-// pre-check to the records of a clean run: the first group committed every parent's journal
-// rows with the children that spend them, so nothing it left needs the second.
-func TestSpendAndCreateMultiRepeatAfterACrashBetweenMergedGroups(t *testing.T) {
+// A crash between two chunks of a deep chain at the default bound, or inside one, repeats through
+// the caller's pre-check to the records of a clean run. A chunk that committed holds its
+// transactions with their spends, and its last output is a real coin the next chunk spends, so
+// nothing the first chunk left needs the second to make it true.
+func TestSpendAndCreateMultiRepeatAfterACrashBetweenChunksOfAChain(t *testing.T) {
 	const (
 		height = 1200
 		n      = 600
 	)
 
-	for _, stage := range []string{"spent", "created group 0", "created group 1"} {
-		t.Run(stage, func(t *testing.T) {
+	for _, c := range []struct {
+		chunk int
+		stage string
+	}{{0, "spent"}, {0, "committed"}, {1, "created"}} {
+		t.Run("chunk "+strconv.Itoa(c.chunk)+" "+c.stage, func(t *testing.T) {
 			s, ctx := newUncheckpointedStore(t)
 
 			wantRecs, wantRoots := perTxReference(t, s, buildChain(t, 0xc0, n, nil), height)
@@ -497,17 +533,19 @@ func TestSpendAndCreateMultiRepeatAfterACrashBetweenMergedGroups(t *testing.T) {
 			w := buildChain(t, 0xc1, n, nil)
 			w.StoreRoots(t, s, height-1)
 
-			crash := errors.NewProcessingError("injected crash")
-			multiFault = func(at string) error {
-				if at == stage {
+			crash := errMultiCrash
+			multiChunkFault = func(chunk int, at string) error {
+				if chunk == c.chunk && at == c.stage {
 					return crash
 				}
 
 				return nil
 			}
 
+			t.Cleanup(func() { multiChunkFault = nil })
+
 			_, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
-			multiFault = nil
+			multiChunkFault = nil
 			require.ErrorIs(t, err, crash)
 
 			remaining := missingTxs(t, s, w.Txs)
@@ -544,47 +582,60 @@ func missingTxs(t *testing.T, s *Store, txs []*bt.Tx) []*bt.Tx {
 	return remaining
 }
 
-// A chain whose middle transaction already exists, with an output its child in the list spends,
-// stops the merged group holding it. The whole group rolls back, so nothing of it is half
-// written, and the rest of the list goes through the per-transaction default. The records are
-// the ones the per-transaction default leaves from the same start.
-func TestSpendAndCreateMultiMergedGroupWithAnExistingParent(t *testing.T) {
+// A chain that begins with transactions the store already holds, with an output their child in
+// the list spends, is written in one chunk. The chunk finds the stored ones under their locks
+// before it nets anything, so they are Existed and not written, and the first new transaction
+// spends the last stored one's coin for real. The records are the ones the per-transaction
+// default leaves from the same start, with no hand-off to it.
+func TestSpendAndCreateMultiAChunkWithAnExistingParent(t *testing.T) {
+	eachProbeOrder(t, testAChunkWithAnExistingParent)
+}
+
+func testAChunkWithAnExistingParent(t *testing.T) {
 	const (
 		height = 1300
 		n      = 10
-		middle = 5
 	)
 
-	setup := func(t *testing.T, s *Store, seed byte) *tests.MultiWorkload {
-		w := buildChain(t, seed, n, nil)
-		w.StoreRoots(t, s, height-1)
+	for _, stored := range []int{1, 6} {
+		t.Run(strconv.Itoa(stored)+" stored", func(t *testing.T) {
+			// The stored ones are written the way the validator writes them, spends and create
+			// together, so each holds the spends of its own inputs.
+			setup := func(t *testing.T, s *Store, seed byte) *tests.MultiWorkload {
+				w := buildChain(t, seed, n, nil)
+				w.StoreRoots(t, s, height-1)
 
-		_, _, err := s.SpendAndCreate(context.Background(), w.Txs[middle], height-1, utxo.WithCreateOnly())
-		require.NoError(t, err)
+				for _, tx := range w.Txs[:stored] {
+					_, _, err := s.SpendAndCreate(context.Background(), tx, height-1)
+					require.NoError(t, err)
+				}
 
-		return w
+				return w
+			}
+
+			s, ctx := newUncheckpointedStore(t)
+
+			ref := setup(t, s, 0xd0)
+			refResults, err := utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.UniformSpendAndCreateMultiWidths(1), ref.Txs, height, utxo.WithIgnoreLocked(true))
+			require.NoError(t, err)
+
+			w := setup(t, s, 0xd1)
+			commits := countCreateCommits(t)
+
+			results, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
+			require.NoError(t, err)
+			require.Equal(t, []int{n - stored}, commits(), "one chunk, holding every transaction that was not stored")
+
+			for i := range results {
+				require.Equal(t, refResults[i].Status, results[i].Status, "tx %d: %v", i, results[i].Err)
+			}
+
+			require.Equal(t, utxo.MultiTxExisted, results[stored-1].Status)
+			require.Equal(t, utxo.MultiTxCreated, results[stored].Status)
+			require.Equal(t, recordsOf(t, s, ref), recordsOf(t, s, w))
+			require.Equal(t, ref.RootSpends(t, s), w.RootSpends(t, s))
+		})
 	}
-
-	s, ctx := newUncheckpointedStore(t)
-
-	ref := setup(t, s, 0xd0)
-	refResults, err := utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.UniformSpendAndCreateMultiWidths(1), ref.Txs, height, utxo.WithIgnoreLocked(true))
-	require.NoError(t, err)
-
-	w := setup(t, s, 0xd1)
-	commits := countCreateCommits(t)
-
-	results, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
-	require.NoError(t, err)
-	require.Empty(t, commits(), "the group holding the existing parent committed something")
-
-	for i := range results {
-		require.Equal(t, refResults[i].Status, results[i].Status, "tx %d: %v", i, results[i].Err)
-	}
-
-	require.Equal(t, utxo.MultiTxExisted, results[middle].Status)
-	require.Equal(t, recordsOf(t, s, ref), recordsOf(t, s, w))
-	require.Equal(t, ref.RootSpends(t, s), w.RootSpends(t, s))
 }
 
 // A transaction too big for what is left of the byte budget closes the group before it and
@@ -649,13 +700,15 @@ func buildNarrowThenWide(t *testing.T, seed byte, narrow, wide int) *tests.Multi
 	return w
 }
 
-// Narrow levels gathered into a pending group are flushed before a level wider than the chunk
-// bound is split, so the parents commit before the children that spend them. With a chunk bound
-// of 2, three narrow levels, a level of five and one narrow level after it, the commits are the
-// group of the first two levels, the group of the third, the three chunks of the wide level in
-// any order, and the tail. A crash after any of those commit units repeats through the caller's
-// pre-check to the records of a clean run.
-func TestSpendAndCreateMultiFlushesPendingBeforeASplitLevel(t *testing.T) {
+// The shape of a mainnet block, a chain of narrow levels, then a wide level, then a tail, is one
+// family. With a chunk bound of 2 it is cut into chunks, and a chunk commits only after every
+// chunk holding the parent of one of its cut edges. A crash after any chunk, or inside one,
+// repeats through the caller's pre-check to the records of a clean run.
+func TestSpendAndCreateMultiACutFamilyCommitsInDependencyOrder(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiACutFamilyCommitsInDependencyOrder)
+}
+
+func testSpendAndCreateMultiACutFamilyCommitsInDependencyOrder(t *testing.T) {
 	const (
 		height = 1500
 		narrow = 3
@@ -675,26 +728,73 @@ func TestSpendAndCreateMultiFlushesPendingBeforeASplitLevel(t *testing.T) {
 		w := buildNarrowThenWide(t, 0xf1, narrow, wide)
 		w.StoreRoots(t, s, height-1)
 
-		commits := countCreateCommits(t)
+		var (
+			mu        sync.Mutex
+			committed []int
+		)
+
+		multiChunkFault = func(chunk int, at string) error {
+			if at == "committed" {
+				mu.Lock()
+				committed = append(committed, chunk)
+				mu.Unlock()
+			}
+
+			return nil
+		}
+
+		t.Cleanup(func() { multiChunkFault = nil })
 
 		results, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
+		multiChunkFault = nil
 		require.NoError(t, err)
 
 		for i, r := range results {
 			require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
 		}
 
-		got := commits()
-		require.Len(t, got, 6)
-		require.Equal(t, []int{2, 1}, got[:2], "the pending narrow levels commit before the split level")
-		require.ElementsMatch(t, []int{2, 2, 1}, got[2:5])
-		require.Equal(t, 1, got[5])
+		sizes := make([]int, len(w.Txs))
+		for i, tx := range w.Txs {
+			sizes[i] = tx.Size()
+		}
+
+		parents := make([][]int, len(w.Txs))
+		position := map[chainhash.Hash]int{}
+
+		for i, tx := range w.Txs {
+			position[*tx.TxIDChainHash()] = i
+
+			for _, in := range tx.Inputs {
+				if p, ok := position[*in.PreviousTxIDChainHash()]; ok && !slices.Contains(parents[i], p) {
+					parents[i] = append(parents[i], p)
+				}
+			}
+		}
+
+		plan := planFamilyChunks(parents, sizes, multiCreateChunkTxs, spendAndCreateBatchByteBudget)
+		require.Greater(t, plan.cutEdges, 0, "the shape must cut edges for this test to mean anything")
+		require.Len(t, committed, len(plan.chunks))
+
+		at := map[int]int{}
+		for order, chunk := range committed {
+			at[chunk] = order
+		}
+
+		for _, ch := range plan.chunks {
+			for _, d := range ch.deps {
+				require.Less(t, at[d], at[ch.idx], "chunk %d committed before chunk %d, which holds a parent of one of its transactions", ch.idx, d)
+			}
+		}
+
 		require.Equal(t, wantRecs, recordsOf(t, s, w))
 		require.Equal(t, wantRoots, w.RootSpends(t, s))
 	})
 
-	for gi, stage := range []string{"spent", "created group 0", "created group 1", "created group 2", "created group 3"} {
-		t.Run("crash after "+stage, func(t *testing.T) {
+	for gi, c := range []struct {
+		chunk int
+		stage string
+	}{{0, "spent"}, {0, "committed"}, {1, "created"}, {1, "committed"}, {2, "locked"}, {3, "committed"}} {
+		t.Run("crash at chunk "+strconv.Itoa(c.chunk)+" "+c.stage, func(t *testing.T) {
 			s, ctx := newUncheckpointedStore(t)
 
 			wantRecs, wantRoots := perTxReference(t, s, buildNarrowThenWide(t, byte(0xf2+2*gi), narrow, wide), height) //nolint:gosec // test data
@@ -702,17 +802,19 @@ func TestSpendAndCreateMultiFlushesPendingBeforeASplitLevel(t *testing.T) {
 			w := buildNarrowThenWide(t, byte(0xf3+2*gi), narrow, wide) //nolint:gosec // test data
 			w.StoreRoots(t, s, height-1)
 
-			crash := errors.NewProcessingError("injected crash")
-			multiFault = func(at string) error {
-				if at == stage {
+			crash := errMultiCrash
+			multiChunkFault = func(chunk int, at string) error {
+				if chunk == c.chunk && at == c.stage {
 					return crash
 				}
 
 				return nil
 			}
 
+			t.Cleanup(func() { multiChunkFault = nil })
+
 			_, err := s.SpendAndCreateMulti(ctx, w.Txs, height, utxo.WithIgnoreLocked(true))
-			multiFault = nil
+			multiChunkFault = nil
 			require.ErrorIs(t, err, crash)
 
 			remaining := missingTxs(t, s, w.Txs)
