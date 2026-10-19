@@ -48,8 +48,20 @@ func repeatAcrossPartitionThenReorg(t *testing.T, s *Store, ctx context.Context,
 	require.Equal(t, wantUTXOs, utxoCount(t, s, ctx, parent), "the reorg could not restore the parent's output")
 }
 
+// forceTwoStepWrite makes the multi write these tests crash use the two-step write. Family chunks
+// leave no spend without its transaction, so they cannot make the state these tests start from.
+// The two-step write, which lists at or below the checkpoint still use, can, and so can the
+// spends of any earlier version of the store, which a node upgraded in place still holds.
+func forceTwoStepWrite(t *testing.T) {
+	t.Helper()
+
+	forceTwoStep = true
+
+	t.Cleanup(func() { forceTwoStep = false })
+}
+
 // TestJournalMovesASpendRepeatedInALaterPartition is the review's reproduction of a spend and
-// its create split across a partition boundary. SpendAndCreateMulti commits its spends before
+// its create split across a partition boundary. The two-step write commits its spends before
 // its creates, so a crash between the two leaves the spends journaled at the block's height with
 // the transaction not written. If the block is never written again, the same transaction can
 // arrive later and be accepted, its spends recognised as its own. The copy-forward keeps the
@@ -58,6 +70,8 @@ func repeatAcrossPartitionThenReorg(t *testing.T, s *Store, ctx context.Context,
 // repeat breaks that, unless the repeat moves the journal row to its own height.
 func TestJournalMovesASpendRepeatedInALaterPartition(t *testing.T) {
 	crash := errMultiCrash
+
+	forceTwoStepWrite(t)
 
 	t.Run("a spend of an output outside the list", func(t *testing.T) {
 		s, ctx := newUncheckpointedStore(t)
@@ -128,6 +142,8 @@ func TestJournalMovesASpendRepeatedInALaterPartition(t *testing.T) {
 // the same block, at the same height. Its journal row is already where it belongs, so the repeat
 // writes nothing to the journal.
 func TestJournalLeavesASpendRepeatedInTheSamePartition(t *testing.T) {
+	forceTwoStepWrite(t)
+
 	s, ctx := newUncheckpointedStore(t)
 
 	parent := mkTx(t, 2, 5_000)

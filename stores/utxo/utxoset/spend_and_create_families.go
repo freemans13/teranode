@@ -582,6 +582,13 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 		items = append(items, &createItem{tx: it.tx, blockHeight: w.blockHeight, options: w.list.Options.ItemOptions(it.pos)})
 	}
 
+	// A chunk with nothing live, every transaction of it parent-failed, opens no transaction.
+	if len(items) == 0 {
+		w.settleChunk(run, nil, &createPlan{})
+
+		return false, nil
+	}
+
 	plan := w.s.planCreates(items)
 
 	for i := range items {
