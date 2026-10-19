@@ -276,3 +276,53 @@ func TestSpendAndCreateWaitsOnAMultiWriteOfTheSameTransaction(t *testing.T) {
 		})
 	}
 }
+
+// A chunk holds the advisory lock of every transaction it writes from before its spends to its
+// commit. A rival that only creates the transaction, with no spend whose row lock would make it
+// wait anyway, must wait for the chunk, and then find the transaction stored.
+func TestSpendAndCreateMultiHoldsTheLockOfEachTransactionItWrites(t *testing.T) {
+	eachProbeOrder(t, func(t *testing.T) {
+		s, ctx := newUncheckpointedStore(t)
+
+		parent := storedParent(t, s, ctx)
+		child := spendOutput(t, parent, 0, 1)
+
+		done := make(chan error, 1)
+		finished := make(chan struct{})
+		fired := false
+
+		multiChunkFault = func(_ int, stage string) error {
+			if stage != "spent" || fired {
+				return nil
+			}
+
+			fired = true
+
+			go func() {
+				_, _, err := s.SpendAndCreate(context.Background(), spendOutput(t, parent, 0, 1), 1_100, utxo.WithCreateOnly())
+				done <- err
+
+				close(finished)
+			}()
+
+			select {
+			case <-finished:
+				t.Error("a create of T finished while the chunk held T's lock")
+			case <-time.After(400 * time.Millisecond):
+			}
+
+			return nil
+		}
+
+		t.Cleanup(func() { multiChunkFault = nil })
+
+		results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		require.Equal(t, utxo.MultiTxCreated, results[0].Status)
+
+		require.ErrorIs(t, <-done, errors.ErrTxExists, "the rival found T stored")
+		multiChunkFault = nil
+
+		requireCoinStaysSpentByChild(t, s, ctx, parent, child)
+	})
+}
