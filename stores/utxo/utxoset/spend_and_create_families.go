@@ -51,9 +51,13 @@ import (
 //
 // The claim's three guards, an identity row, a containment row at or above the claim floor and a
 // live UTXO of its own, are not what excludes a concurrent writer. They exclude a transaction
-// stored EARLIER, whose rows any statement's snapshot already sees. Two chunks that meet over
-// the same pair of transactions in opposite orders can deadlock on those identity keys, which
-// PostgreSQL detects and runFamilyChunk's retry runs again.
+// stored EARLIER, whose rows any statement's snapshot already sees.
+//
+// Every claim inserts its identity rows in one global order, by leaf and txid (createPlan.sortRows),
+// so two chunks claiming overlapping transactions cannot wait on each other's identity keys in a
+// cycle. The cycle that remains is a claim waiting on a rival's identity key while the rival waits
+// on a coin this chunk deleted; PostgreSQL detects it and runFamilyChunk's retry runs the chunk
+// again.
 
 // chunkStatus is what one chunk round has decided about a transaction.
 type chunkStatus uint8
