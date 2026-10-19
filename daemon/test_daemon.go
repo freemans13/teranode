@@ -879,21 +879,40 @@ func GetFreePort() (int, error) {
 	return getFreePort()
 }
 
-// getFreePort asks the kernel for a free open port that is ready to use.
+// freePortMin and freePortMax bound the ports getFreePort draws from. The range
+// sits below the kernel's ephemeral range (Linux 32768+, macOS 49152+), so an
+// outbound connection's source port can never take a port between the draw and
+// the service binding it, as happened to BlockValidation in TestDaemon_Start_AllServices.
+const (
+	freePortMin = 20000
+	freePortMax = 32000
+)
+
+// getFreePort returns a random port in [freePortMin, freePortMax) that is free
+// to bind on the wildcard address the services listen on.
 func getFreePort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
+	var lastErr error
+
+	for range 100 {
+		n, err := rand.Int(rand.Reader, big.NewInt(freePortMax-freePortMin))
+		if err != nil {
+			return 0, err
+		}
+
+		port := freePortMin + int(n.Int64())
+
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		_ = l.Close()
+
+		return port, nil
 	}
 
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
-	}
-
-	defer func() { _ = l.Close() }()
-
-	return l.Addr().(*net.TCPAddr).Port, nil
+	return 0, errors.NewProcessingError("no free port in [%d, %d)", freePortMin, freePortMax, lastErr)
 }
 
 // maxP2PPortAttempts bounds how many times attemptP2PPort will redraw the

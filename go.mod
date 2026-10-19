@@ -14,7 +14,7 @@ require (
 	github.com/bsv-blockchain/go-bt/v2 v2.7.4
 	github.com/bsv-blockchain/go-chaincfg v1.6.2
 	github.com/bsv-blockchain/go-sdk v1.7.2
-	github.com/bsv-blockchain/go-subtree v1.6.2
+	github.com/bsv-blockchain/go-subtree v1.6.3
 	github.com/bsv-blockchain/testcontainers-aerospike-go v0.4.0
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
@@ -244,7 +244,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.13 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.17 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.9 // indirect
-	github.com/aws/smithy-go v1.25.1 // indirect
+	github.com/aws/smithy-go v1.25.1
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bitcoinschema/go-bitcoin v0.3.20 // indirect
