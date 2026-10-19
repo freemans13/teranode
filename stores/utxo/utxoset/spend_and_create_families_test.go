@@ -51,10 +51,10 @@ func testSpendAndCreateMultiACutEdgeWritesTheParentsOutputAsACoin(t *testing.T) 
 		observed bool
 	)
 
-	// Chunk 1 holds the second half and has not opened its transaction yet at "locked" of its own
+	// Chunk 1 holds the second half and has not opened its transaction yet at "begun" of its own
 	// round, so what chunk 0 committed is exactly what is visible.
 	multiChunkFault = func(chunk int, stage string) error {
-		if chunk != 1 || stage != "locked" {
+		if chunk != 1 || stage != "begun" {
 			return nil
 		}
 
@@ -238,7 +238,7 @@ func testSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t *testing.T) {
 			time.Sleep(300 * time.Millisecond)
 		}
 
-		if chunk >= 0 && (stage == "locked" || stage == "committed") {
+		if chunk >= 0 && (stage == "begun" || stage == "committed") {
 			note("chunk " + string(rune('0'+chunk)) + " " + stage)
 		}
 
@@ -257,8 +257,8 @@ func testSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t *testing.T) {
 		index[e] = i
 	}
 
-	require.Less(t, index["chunk 0 committed"], index["chunk 1 locked"], "chunk 1 began before its parent's chunk committed")
-	require.Less(t, index["chunk 1 committed"], index["chunk 2 locked"], "chunk 2 began before its parent's chunk committed")
+	require.Less(t, index["chunk 0 committed"], index["chunk 1 begun"], "chunk 1 began before its parent's chunk committed")
+	require.Less(t, index["chunk 1 committed"], index["chunk 2 begun"], "chunk 2 began before its parent's chunk committed")
 }
 
 // Chunks with no edge between them run in parallel, up to the concurrency bound.
@@ -293,7 +293,7 @@ func testSpendAndCreateMultiIndependentChunksRunInParallel(t *testing.T) {
 
 	multiChunkFault = func(_ int, stage string) error {
 		switch stage {
-		case "locked":
+		case "begun":
 			mu.Lock()
 			running++
 			peak = max(peak, running)
@@ -372,10 +372,11 @@ func testSpendAndCreateMultiFamiliesInOneChunkAreNetted(t *testing.T) {
 	require.Equal(t, chains*(length-1), journaled, "every output spent inside the list is one journal row")
 }
 
-// A real deadlock, not an injected one: a rival holds the coin the chunk needs and then asks for
-// the advisory lock the chunk holds on its own transaction. PostgreSQL stops the chunk, the first
-// of the two to wait, with SQLSTATE 40P01. The chunk is run again, finds the coin free once the
-// rival lets go, and the list is written whole.
+// A real deadlock, not an injected one: a rival holds an uncommitted identity row for T, so the
+// chunk's claim waits on it with the chunk's coin deleted, and the rival then asks for that coin.
+// PostgreSQL stops the chunk, the first of the two to wait, with SQLSTATE 40P01. The chunk is run
+// again, finds the coin free and T unclaimed once the rival lets go, and the list is written
+// whole.
 func TestSpendAndCreateMultiAChunkDeadlockIsRetried(t *testing.T) {
 	testSpendAndCreateMultiAChunkDeadlockIsRetried(t)
 }
@@ -394,12 +395,11 @@ func testSpendAndCreateMultiAChunkDeadlockIsRetried(t *testing.T) {
 
 	t.Cleanup(func() { _ = rival.Rollback(context.Background()) })
 
-	// The rival takes the coin the chunk will spend.
-	var n int
-	require.NoError(t, rival.QueryRow(ctx,
-		`SELECT count(*) FROM (SELECT 1 FROM utxo WHERE leaf = $1 AND ukey = $2 AND txid = $3 FOR UPDATE) c`,
-		LeafFor(parentID[:]), Pack(parentID[:], 0), parentID[:]).Scan(&n))
-	require.Equal(t, 1, n)
+	// The rival claims T's identity key and does not commit.
+	_, err = rival.Exec(ctx,
+		`INSERT INTO tx_ident (leaf, txid, created_height, flags) VALUES ($1, $2, 1100, 0)`,
+		LeafFor(childID[:]), childID[:])
+	require.NoError(t, err)
 
 	before := testutil.ToFloat64(deadlockRetried.WithLabelValues("multi_chunk"))
 
@@ -407,19 +407,22 @@ func testSpendAndCreateMultiAChunkDeadlockIsRetried(t *testing.T) {
 	fired := false
 
 	multiChunkFault = func(_ int, stage string) error {
-		if stage != "locked" || fired {
+		if stage != "spent" || fired {
 			return nil
 		}
 
 		fired = true
 
 		go func() {
-			// The chunk's spend has been waiting on the coin for a while by now. Ask for the lock
-			// it holds, which closes the cycle, then let go of everything.
+			// The chunk's claim has been waiting on the identity key for a while by now. Ask for
+			// the coin it holds, which closes the cycle, then let go of everything.
 			time.Sleep(300 * time.Millisecond)
 
-			_, err := rival.Exec(context.Background(),
-				`SELECT pg_advisory_xact_lock($1)`, int64(binaryBigEndian(childID[:8]))) //nolint:gosec // a hash prefix as a lock key
+			var n int
+
+			err := rival.QueryRow(context.Background(),
+				`SELECT count(*) FROM (SELECT 1 FROM utxo WHERE leaf = $1 AND ukey = $2 AND txid = $3 FOR UPDATE) c`,
+				LeafFor(parentID[:]), Pack(parentID[:], 0), parentID[:]).Scan(&n)
 			if err == nil {
 				err = rival.Rollback(context.Background())
 			}
@@ -442,16 +445,6 @@ func testSpendAndCreateMultiAChunkDeadlockIsRetried(t *testing.T) {
 		"the chunk was not stopped as a deadlock, so the retry was not exercised")
 
 	requireCoinStaysSpentByChild(t, s, ctx, parent, child)
-}
-
-// binaryBigEndian is the advisory lock key lockTxids derives from a transaction id.
-func binaryBigEndian(b []byte) uint64 {
-	var v uint64
-	for _, c := range b[:8] {
-		v = v<<8 | uint64(c)
-	}
-
-	return v
 }
 
 // The two writers meet at the checkpoint: a quick-validation-shaped list carrying a block at or

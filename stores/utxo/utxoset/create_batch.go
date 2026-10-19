@@ -818,6 +818,12 @@ func (p *createPlan) settle(rows pgx.Rows) error {
 // tx_mined, tx_ident and utxo, and none of those reads takes a row lock, so two creates of the
 // same transaction could each find nothing and each write a full set of UTXOs. The containment
 // key catches that only when both name the same block.
+//
+// The family-chunk writer (spend_and_create_families.go) does NOT take it. It claims through
+// createIdentPlanSQL, whose claim is the tx_ident insert ON CONFLICT (leaf, txid) DO NOTHING:
+// that key is unique across every partition (tx_ident_ck), so two concurrent claims of one
+// transaction cannot both take, whatever their snapshots saw. The block-path claim above has no
+// such key, because below the checkpoint tx_ident is empty, and it keeps the lock.
 func (s *Store) lockTxids(ctx context.Context, q pgx.Tx, txids [][]byte) error {
 	if len(txids) == 0 {
 		return nil

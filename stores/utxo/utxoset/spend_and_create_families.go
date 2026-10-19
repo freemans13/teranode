@@ -29,13 +29,31 @@ import (
 // parent of a cut edge; chunks with no edge between them run in parallel.
 //
 // The rule that makes a stopped write safe: every commit leaves a true state.
-// A chunk locks its transactions, spends the outside coins of them, stores them, and commits, all
-// in one database transaction. It does not ask first which already exist: it spends and stores,
-// and when the create claim finds one stored, or a spend is refused because that same transaction
-// already spent the coin, it rolls the chunk back and redoes it without that transaction. A transaction
-// is stored if and only if its spends are made, so a failed or crashed chunk leaves nothing, and
-// a writer never has to know whether another writer of the same transaction exists or is alive.
-// Two writers of one transaction take its advisory lock in turn, and the second finds it stored.
+// A chunk spends the outside coins of its transactions, stores them, and commits, all in one
+// database transaction. It does not ask first which already exist: it spends and stores, and
+// when the create claim finds one stored, or a spend is refused because that same transaction
+// already spent the coin, it rolls the chunk back and redoes it without that transaction. A
+// transaction is stored if and only if its spends are made, so a failed or crashed chunk leaves
+// nothing, and a writer never has to know whether another writer of the same transaction exists
+// or is alive.
+//
+// The chunk takes NO advisory lock, and the database does the coordinating through two things
+// the writers already share. The first is the identity key: the claim inserts the transaction's
+// tx_ident row ON CONFLICT (leaf, txid) DO NOTHING, and PostgreSQL makes a second inserter of
+// that key wait for the first to commit or abort before it decides, so of any number of
+// concurrent claims of one transaction exactly one takes and the rest report it stored. The
+// second is the row lock on each coin: every writer of a transaction that has an input outside
+// the list deletes that coin, and the second deleter waits for the first's outcome, then either
+// finds the coin gone and recognises its own transaction in the spend journal as a replay, or
+// finds it free because the first rolled back. A transaction whose inputs are all netted in its
+// chunk has a chain of parents in the chunk that ends in one with an outside input, so it is
+// serialised through that root.
+//
+// The claim's three guards, an identity row, a containment row at or above the claim floor and a
+// live UTXO of its own, are not what excludes a concurrent writer. They exclude a transaction
+// stored EARLIER, whose rows any statement's snapshot already sees. Two chunks that meet over
+// the same pair of transactions in opposite orders can deadlock on those identity keys, which
+// PostgreSQL detects and runFamilyChunk's retry runs again.
 
 // chunkStatus is what one chunk round has decided about a transaction.
 type chunkStatus uint8
@@ -335,8 +353,8 @@ func chainOrder(fam []int, parents [][]int) []int {
 	return out
 }
 
-// multiChunkFault is a test hook called inside a chunk's database transaction at "locked", after
-// its transactions' locks are held and the existing ones found; "spent", after its outside
+// multiChunkFault is a test hook called inside a chunk's database transaction at "begun", after
+// it is opened and the transactions an earlier round found stored are marked; "spent", after its outside
 // coins are deleted; and "created", after its records are written and before the commit; and
 // after the commit as "committed". An error from it stops the chunk. errMultiCrash stops it as a
 // crash would. The open transaction is rolled back either way, which is what the server does
@@ -353,9 +371,9 @@ func chunkFault(chunk int, stage string) error {
 
 // existingTxidsSQL returns the txids among $1-$4 that the store already holds, by the three
 // guards the create claim carries (createIdentPlanSQL): an identity row, a containment row at or
-// above the claim floor $5, and a live UTXO of the transaction's own. It is read under the
-// transactions' advisory locks, which every create of a transaction takes before its claim, so
-// the answer stays true until this transaction ends.
+// above the claim floor $5, and a live UTXO of the transaction's own. It is read after a refused
+// spend, that is after the coin's row lock has resolved, so a writer that deleted the coin has
+// committed and its rows are in this statement's snapshot.
 const existingTxidsSQL = `
 SELECT t.txid
   FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS t(leaf, txid, lo, hi)
@@ -377,7 +395,6 @@ type familyStats struct {
 	rounds      atomic.Int64
 	deadlocks   atomic.Int64
 	planNs      atomic.Int64
-	lockNs      atomic.Int64
 	probeNs     atomic.Int64
 	spendNs     atomic.Int64
 	createNs    atomic.Int64
@@ -698,20 +715,11 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 		}
 	}()
 
-	t0 := time.Now()
-
-	if err = w.s.lockTxids(ctx, dbTx, run.lockIDs(run.liveSet())); err != nil {
-		return false, err
-	}
-
-	t1 := time.Now()
-	stats.lockNs.Add(int64(t1.Sub(t0)))
-
 	// A transaction an earlier round found stored is marked existing before anything is netted:
 	// an output of one that exists is a real coin and its child must spend it for real.
 	w.markExisting(run)
 
-	if err = chunkFault(run.ch.idx, "locked"); err != nil {
+	if err = chunkFault(run.ch.idx, "begun"); err != nil {
 		return false, err
 	}
 
@@ -813,16 +821,6 @@ func (r *chunkRun) liveSet() []int {
 	return out
 }
 
-// lockIDs is the lock keys, the txids as bytes, of the given transactions of the chunk.
-func (r *chunkRun) lockIDs(ks []int) [][]byte {
-	out := make([][]byte, len(ks))
-	for i, k := range ks {
-		out[i] = r.its[k].txid[:]
-	}
-
-	return out
-}
-
 // txidsOf is the txids of the given transactions of the chunk.
 func (r *chunkRun) txidsOf(ks []int) []chainhash.Hash {
 	out := make([]chainhash.Hash, len(ks))
@@ -839,8 +837,8 @@ func (w *nettedWrite) parentFailedResult(it *multiTx) utxo.SpendAndCreateMultiRe
 		Err: errors.NewProcessingError("SpendAndCreateMulti: a parent of %s earlier in the list failed", it.txid.String())}
 }
 
-// probeExisting reads which of the given transactions of the chunk the store already holds,
-// under their advisory locks.
+// probeExisting reads which of the given transactions of the chunk the store already holds. It
+// runs only after a spend was refused, which is after the coin's row lock has resolved.
 func (w *nettedWrite) probeExisting(ctx context.Context, dbTx pgx.Tx, run *chunkRun, ks []int) (map[chainhash.Hash]struct{}, error) {
 	leaves := make([]int16, len(ks))
 	txids := make([][]byte, len(ks))
@@ -1193,11 +1191,11 @@ func (w *nettedWrite) logFamiliesIfSlow(start time.Time, st *familyStats) {
 		return
 	}
 
-	w.s.logger.Infof("[utxoset][SpendAndCreateMulti] slow list at height %d: %d txs in %d families (largest %d), %d chunks, %d cut edges, %d rounds, %d deadlock retries, %.1f MB of bodies; wall %s (plan %s, lock %s, probe %s, spend %s, create %s, commit %s, queued for a worker %s)",
+	w.s.logger.Infof("[utxoset][SpendAndCreateMulti] slow list at height %d: %d txs in %d families (largest %d), %d chunks, %d cut edges, %d rounds, %d deadlock retries, %.1f MB of bodies; wall %s (plan %s, probe %s, spend %s, create %s, commit %s, queued for a worker %s)",
 		w.blockHeight, len(w.items), st.families, st.largest, st.chunks, st.cutEdges, st.rounds.Load(), st.deadlocks.Load(),
 		float64(st.bodyBytes.Load())/1e6, time.Since(start).Round(time.Millisecond),
 		time.Duration(st.planNs.Load()).Round(time.Millisecond),
-		time.Duration(st.lockNs.Load()).Round(time.Millisecond), time.Duration(st.probeNs.Load()).Round(time.Millisecond),
+		time.Duration(st.probeNs.Load()).Round(time.Millisecond),
 		time.Duration(st.spendNs.Load()).Round(time.Millisecond), time.Duration(st.createNs.Load()).Round(time.Millisecond),
 		time.Duration(st.commitNs.Load()).Round(time.Millisecond), time.Duration(st.waitingNs.Load()).Round(time.Millisecond))
 }

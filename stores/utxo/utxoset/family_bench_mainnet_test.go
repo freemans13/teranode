@@ -130,9 +130,9 @@ func TestFamilyChunksOnMainnetBlocks(t *testing.T) {
 				}
 
 				multiFamilyDone = func(st *familyStats) {
-					t.Logf("family write: %d chunks, %d rounds, plan %s, lock %s, probe %s, spend %s, create %s, commit %s, waiting on parents %s (summed over chunks)",
+					t.Logf("family write: %d chunks, %d rounds, plan %s, probe %s, spend %s, create %s, commit %s, waiting on parents %s (summed over chunks)",
 						st.chunks, st.rounds.Load(), time.Duration(st.planNs.Load()).Round(time.Millisecond),
-						time.Duration(st.lockNs.Load()).Round(time.Millisecond), time.Duration(st.probeNs.Load()).Round(time.Millisecond),
+						time.Duration(st.probeNs.Load()).Round(time.Millisecond),
 						time.Duration(st.spendNs.Load()).Round(time.Millisecond), time.Duration(st.createNs.Load()).Round(time.Millisecond),
 						time.Duration(st.commitNs.Load()).Round(time.Millisecond), time.Duration(st.waitingNs.Load()).Round(time.Millisecond))
 				}

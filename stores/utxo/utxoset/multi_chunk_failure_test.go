@@ -135,7 +135,7 @@ func TestSpendAndCreateMultiACrashRollsBackTheOpenChunk(t *testing.T) {
 }
 
 func testSpendAndCreateMultiACrashRollsBackTheOpenChunk(t *testing.T) {
-	for _, stage := range []string{"locked", "spent", "created"} {
+	for _, stage := range []string{"begun", "spent", "created"} {
 		t.Run("crash at "+stage, func(t *testing.T) {
 			s, ctx := newUncheckpointedStore(t)
 			parent := storedParent(t, s, ctx)

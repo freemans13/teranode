@@ -126,8 +126,8 @@ func testKeepsTheSpendsOfAStoredTransaction(t *testing.T) {
 }
 
 // TestSpendAndCreateMultiAgainstASecondMultiWrite covers two multi-writes of the same T that
-// overlap in time. The first holds T's lock from before its spend to its commit, so the second
-// waits, and then finds whatever the first left: T stored, or nothing.
+// overlap in time. The first holds the row lock of T's coin from its spend to its commit, so the
+// second waits on it, and then finds whatever the first left: T stored, or nothing.
 func TestSpendAndCreateMultiAgainstASecondMultiWrite(t *testing.T) {
 	testAgainstASecondMultiWrite(t)
 }
@@ -163,7 +163,7 @@ func testAgainstASecondMultiWrite(t *testing.T) {
 
 			select {
 			case <-secondDone:
-				t.Error("the second write finished while the first held T's lock with its coin deleted")
+				t.Error("the second write finished while the first held T's coin deleted and uncommitted")
 			case <-time.After(400 * time.Millisecond):
 			}
 
@@ -211,8 +211,8 @@ func testAgainstASecondMultiWrite(t *testing.T) {
 }
 
 // TestSpendAndCreateWaitsOnAMultiWriteOfTheSameTransaction is the same overlap with the second
-// writer on the single and the batched SpendAndCreate path: it takes T's lock before its spends,
-// so it waits for the chunk and then finds T stored.
+// writer on the single and the batched SpendAndCreate path: its spend waits on the row lock of the
+// coin the chunk deleted, and then finds the coin gone with T named in the journal, and T stored.
 func TestSpendAndCreateWaitsOnAMultiWriteOfTheSameTransaction(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -251,7 +251,7 @@ func TestSpendAndCreateWaitsOnAMultiWriteOfTheSameTransaction(t *testing.T) {
 
 				select {
 				case <-finished:
-					t.Error("SpendAndCreate finished while the chunk held T's lock with its coin deleted")
+					t.Error("SpendAndCreate finished while the chunk held T's coin deleted and uncommitted")
 				case <-time.After(400 * time.Millisecond):
 				}
 
@@ -275,52 +275,4 @@ func TestSpendAndCreateWaitsOnAMultiWriteOfTheSameTransaction(t *testing.T) {
 			requireCoinStaysSpentByChild(t, s, ctx, parent, child)
 		})
 	}
-}
-
-// A chunk holds the advisory lock of every transaction it writes from before its spends to its
-// commit. A rival that only creates the transaction, with no spend whose row lock would make it
-// wait anyway, must wait for the chunk, and then find the transaction stored.
-func TestSpendAndCreateMultiHoldsTheLockOfEachTransactionItWrites(t *testing.T) {
-	s, ctx := newUncheckpointedStore(t)
-
-	parent := storedParent(t, s, ctx)
-	child := spendOutput(t, parent, 0, 1)
-
-	done := make(chan error, 1)
-	finished := make(chan struct{})
-	fired := false
-
-	multiChunkFault = func(_ int, stage string) error {
-		if stage != "spent" || fired {
-			return nil
-		}
-
-		fired = true
-
-		go func() {
-			_, _, err := s.SpendAndCreate(context.Background(), spendOutput(t, parent, 0, 1), 1_100, utxo.WithCreateOnly())
-			done <- err
-
-			close(finished)
-		}()
-
-		select {
-		case <-finished:
-			t.Error("a create of T finished while the chunk held T's lock")
-		case <-time.After(400 * time.Millisecond):
-		}
-
-		return nil
-	}
-
-	t.Cleanup(func() { multiChunkFault = nil })
-
-	results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
-	require.NoError(t, err)
-	require.Equal(t, utxo.MultiTxCreated, results[0].Status)
-
-	require.ErrorIs(t, <-done, errors.ErrTxExists, "the rival found T stored")
-	multiChunkFault = nil
-
-	requireCoinStaysSpentByChild(t, s, ctx, parent, child)
 }

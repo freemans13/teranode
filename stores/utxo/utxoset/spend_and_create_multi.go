@@ -72,12 +72,11 @@ func (s *Store) canNet(o *utxo.CreateOptions) bool {
 	return !o.SpendOnly && !o.CreateOnly && !o.Frozen && !o.Conflicting && !o.Locked
 }
 
-// multiCreateChunkTxs bounds the transactions one chunk transaction writes. The create takes
-// one advisory lock per transaction (lockTxids), held to commit, and Postgres keeps those in a
-// shared table sized max_locks_per_transaction x max_connections, 6,400 slots at the defaults
-// mainnet runs. A chunk cut by bytes alone put 30,000 locks in one transaction and failed with
-// "out of shared memory". At this bound and multiConcurrency chunks in flight the list holds at
-// most about 2,000. A variable so a test can force one transaction per chunk.
+// multiCreateChunkTxs bounds the transactions one chunk transaction writes. The chunk writer
+// takes no advisory lock, so the bound is no longer set by the shared lock table: it limits the
+// size of one chunk's statements and the work a rollback throws away when a rival stored one of
+// its transactions. 256 is the size it was chosen at, when each stored transaction held a lock
+// to commit. A variable so a test can force one transaction per chunk.
 var multiCreateChunkTxs = 256
 
 // multiCrash is the error a chunk fault hook returns to stop the write as a crash would: the
@@ -112,7 +111,7 @@ var multiCreateAfterCommit func() error
 
 // multiConcurrency is how many chunk transactions run at once. Each holds one pool connection
 // and takes no second one, so at most half the pool, leaving the rest of the node its share,
-// and at most 8, which with multiCreateChunkTxs bounds the advisory locks held at once.
+// and at most 8.
 func (s *Store) multiConcurrency() int {
 	return min(max(int(s.pool.Config().MaxConns)/2, 1), 8)
 }

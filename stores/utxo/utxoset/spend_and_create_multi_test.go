@@ -197,7 +197,7 @@ func testSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
 		chunk int
 		stage string
 	}{
-		{0, "locked"}, {0, "spent"}, {0, "created"}, {0, "committed"},
+		{0, "begun"}, {0, "spent"}, {0, "created"}, {0, "committed"},
 		{1, "spent"}, {1, "created"}, {1, "committed"}, {2, "committed"},
 	}
 
@@ -793,7 +793,7 @@ func testSpendAndCreateMultiACutFamilyCommitsInDependencyOrder(t *testing.T) {
 	for gi, c := range []struct {
 		chunk int
 		stage string
-	}{{0, "spent"}, {0, "committed"}, {1, "created"}, {1, "committed"}, {2, "locked"}, {3, "committed"}} {
+	}{{0, "spent"}, {0, "committed"}, {1, "created"}, {1, "committed"}, {2, "begun"}, {3, "committed"}} {
 		t.Run("crash at chunk "+strconv.Itoa(c.chunk)+" "+c.stage, func(t *testing.T) {
 			s, ctx := newUncheckpointedStore(t)
 
