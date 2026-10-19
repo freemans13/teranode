@@ -600,12 +600,12 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 // scans for unmined_since inconsistencies if any request asked for a full reset,
 // validates inputs if any asked for it, and counts as storage-triggered if any
 // was. Draining after the run instead would answer a queued validating or full
-// request with nil although the reset that ran did neither, and the heartbeat
-// retry (retryFailedUnminedReload clears unminedReloadPending before it queues)
-// would lose its retry for good. A request that arrives while the reset runs stays
-// queued and gets its own reset on the next pass of the loop.
+// request with nil although the reset that ran did neither. A request that arrives
+// while the reset runs stays queued and gets its own reset on the next pass of the
+// loop.
 //
-// Each ErrCh is buffered (cap 1) by its sender, which only logs a non-nil error.
+// Each ErrCh is buffered (cap 1) by its sender (resetWithOptions,
+// resetStorageTriggered, resetAfterDrainFailure), which only logs a non-nil error.
 func (b *BlockAssembler) handleResetRequests(ctx context.Context, first resetRequest) {
 	batch := []resetRequest{first}
 
