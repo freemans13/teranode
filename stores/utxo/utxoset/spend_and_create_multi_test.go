@@ -868,9 +868,9 @@ func outpointOnly(txs []*bt.Tx) []*bt.Tx {
 	return out
 }
 
-// When a parent in the list already exists, as on a repeat after a crash, the netted write hands
-// the rest of the list to the per-transaction default. That hand-off must carry each remaining
-// transaction's own subtree index, not refuse the shorter list or shift the indexes.
+// When a transaction of the list already exists, as on a repeat after a crash, the write skips it
+// and writes the rest. Each transaction must keep its own subtree index: the skipped one must not
+// refuse the list or shift the indexes of the others.
 func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
 	old := multiCreateChunkTxs
 	multiCreateChunkTxs = 1
@@ -896,7 +896,7 @@ func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
 	require.NoError(t, err)
 
 	results, err := s.SpendAndCreateMulti(ctx, list, height, append(belowCheckpointOptions(height), utxo.WithSubtreeIdxs(idxs))...)
-	require.NoError(t, err, "the hand-off must not be refused")
+	require.NoError(t, err, "the existing transaction must not refuse the list")
 
 	for i, r := range results {
 		if i == 1 {
@@ -914,12 +914,12 @@ func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
 	}
 }
 
-// When a level is split into parallel chunks and one chunk finds a parent that already exists,
-// the other chunks of that level must still commit. They used to share a context the failing
-// chunk cancelled, and a sibling caught at its commit was either abandoned or, when the server had
-// already committed it, left without a result, so the hand-off found the record this call had
-// just written and reported it MultiTxExisted. This holds transaction 0's chunk at its commit
-// until either its context is cancelled or a second passes, which makes the old race certain.
+// When a list is cut into parallel chunks and another chunk finds a transaction that already
+// exists, a chunk caught at its commit must still commit. A context the other chunk's outcome
+// cancelled would abandon it or, when the server had already committed it, leave it without a
+// result, and a later look would find the record this call had just written and report it
+// MultiTxExisted. This holds transaction 0's chunk at its commit until either its context is
+// cancelled or a second passes, which makes such a race certain.
 func TestSpendAndCreateMultiSplitLevelSiblingIsNotCancelled(t *testing.T) {
 	old := multiCreateChunkTxs
 	multiCreateChunkTxs = 1
@@ -929,8 +929,8 @@ func TestSpendAndCreateMultiSplitLevelSiblingIsNotCancelled(t *testing.T) {
 		multiCreateBeforeCommit = nil
 	})
 
-	// The level path: a store with checkpoints sends a list below the checkpoint to the netted
-	// write instead (netBelow), which has no step-2 chunk commit for the hook to hold.
+	// A store with checkpoints sends a list below the checkpoint to the below-checkpoint writer
+	// (netBelow), which has no chunk commit for the hook to hold, so this store has none.
 	s, ctx := newUncheckpointedStore(t)
 
 	const height = 950
@@ -945,8 +945,7 @@ func TestSpendAndCreateMultiSplitLevelSiblingIsNotCancelled(t *testing.T) {
 		idxs[i] = 10 + i
 	}
 
-	// Transaction 1 already exists, and a child in the list spends it, so its chunk stops the
-	// netted write with errNettedParentExists.
+	// Transaction 1 already exists, and a child in the list spends it.
 	_, _, err := s.SpendAndCreate(ctx, list[1], height, belowCheckpointOptionsAt(height, idxs[1])...)
 	require.NoError(t, err)
 
@@ -980,7 +979,7 @@ func TestSpendAndCreateMultiSplitLevelSiblingIsNotCancelled(t *testing.T) {
 
 	mu.Lock()
 	require.True(t, reached, "transaction 0's chunk must reach its commit")
-	require.NoError(t, cancelled, "a sibling chunk's errNettedParentExists must not cancel transaction 0's commit")
+	require.NoError(t, cancelled, "a sibling chunk's failure must not cancel transaction 0's commit")
 	mu.Unlock()
 
 	require.Equal(t, utxo.MultiTxCreated, results[0].Status, "transaction 0 was created by this call: %v", results[0].Err)

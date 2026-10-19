@@ -12,11 +12,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A list whose parent already exists falls back to the per-transaction default after step 1
-// has committed every outside spend. A child that the fallback then rejects must not keep the
-// outside spends step 1 made for it: its independent input is unspent afterwards and another
-// transaction can take it.
-func TestSpendAndCreateMultiFallbackRestoresTheOutsideSpendsOfARejectedChild(t *testing.T) {
+// A list whose parent already exists leaves the child to spend that parent's outputs for real. A
+// child that is then rejected must not keep the outside spends made for it: its independent input
+// is unspent afterwards and another transaction can take it.
+func TestSpendAndCreateMultiARejectedChildLeavesNoOutsideSpend(t *testing.T) {
 	s, ctx := newUncheckpointedStore(t)
 
 	const height = 1000
@@ -25,8 +24,8 @@ func TestSpendAndCreateMultiFallbackRestoresTheOutsideSpendsOfARejectedChild(t *
 	w.StoreRoots(t, s, height-1)
 	rootA, rootB := w.Roots[0], w.Roots[1]
 
-	// The parent exists before the list runs, which sends the list to the fallback, and a
-	// thief has taken the output the child spends, which the fallback finds and step 1 cannot.
+	// The parent exists before the list runs, so the child must spend its output for real, and a
+	// thief has taken the output the child spends, which the chunk finds when it spends it.
 	parent := payFrom(t, 1, []*bt.Tx{rootA}, []uint32{0})
 	_, _, err := s.SpendAndCreate(ctx, parent, height-1)
 	require.NoError(t, err)
@@ -58,16 +57,13 @@ func TestSpendAndCreateMultiFallbackRestoresTheOutsideSpendsOfARejectedChild(t *
 	require.NoError(t, err, "rootB:0 is not spendable by another transaction")
 }
 
-// A parent created in an earlier step-2 chunk has its outputs netted: its child's spend of them is
-// a spend-journal row committed with the parent, and no UTXO row is ever written. When a later
-// chunk then meets a parent that already exists, the rest of the list goes to the per-transaction
-// default, and a child the default rejects must not keep the netted spend that earlier chunk
-// committed for it: the parent's output is unspent afterwards and another transaction can take it.
-//
-// Default chunk bounds. Level 0 holds 257 transactions, one more than multiCreateChunkTxs, so it
-// is split: the first chunk holds the netted parent and 255 fillers and commits, the second holds
-// only the parent that already exists and stops the netted write.
-func TestSpendAndCreateMultiFallbackRestoresTheNettedSpendsOfARejectedChild(t *testing.T) {
+// A parent written with its child in the list has the output the child spends netted: a
+// spend-journal row committed with the parent, and no UTXO row. When another parent of the same
+// list already exists and a child spending both is rejected, the child must not leave a spend
+// behind: the netted parent's output and the child's independent input are unspent afterwards
+// and another transaction can take them. The list is wider than one chunk, 255 fillers beside
+// the parents, so the end state is checked across more than one chunk.
+func TestSpendAndCreateMultiARejectedChildLeavesNoNettedSpend(t *testing.T) {
 	t.Run("netted", func(t *testing.T) {
 		s, ctx := newUncheckpointedStore(t)
 		checkRejectedChildLeavesNoSpend(t, s, ctx, func(txs []*bt.Tx, height uint32) ([]utxo.SpendAndCreateMultiResult, error) {
@@ -103,8 +99,8 @@ func checkRejectedChildLeavesNoSpend(t *testing.T, s *Store, ctx context.Context
 
 	parent := payFrom(t, 1, []*bt.Tx{rootP}, []uint32{0})
 
-	// The second parent exists before the list runs, which stops the netted write at its chunk,
-	// and a thief has taken the output the child spends, which the default then finds.
+	// The second parent exists before the list runs, and a thief has taken the output the child
+	// spends, which the write finds when it spends it.
 	existing := payFrom(t, 2, []*bt.Tx{rootQ}, []uint32{0})
 	_, _, err := s.SpendAndCreate(ctx, existing, height-1)
 	require.NoError(t, err)

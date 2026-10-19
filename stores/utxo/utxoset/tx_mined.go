@@ -204,7 +204,7 @@ func (s *Store) txMinedWindowState(ctx context.Context, window uint32) (*windowS
 
 // preDropCheckSQL is the last of the four drop conditions: no identity row may still be joined to
 // a containment row of the partition. After the stamp every row of the partition with a non-zero block
-// id is a winner, so any row is the right test, and a loser that survived step 1 also blocks the
+// id is a winner, so any row is the right test, and a loser that survived the stamp's step 1 also blocks the
 // drop, loudly. The partition is addressed by name so the answer is the same whether it is
 // attached, pending detach or already detached.
 const preDropCheckSQL = `

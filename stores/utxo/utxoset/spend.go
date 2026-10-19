@@ -55,10 +55,9 @@ SELECT k.vin, j.spending_txid, j.satoshis, j.script, j.hash_override, j.spent_he
 //
 // The pruner's copy-forward keeps a mined transaction's spends by one rule: a spend is never
 // journaled below its transaction's created_height (recentlyMinedInpointsSQL). A repeat breaks
-// that. The two-step SpendAndCreateMulti write, used at or below the checkpoint, commits its spends
-// before its creates, so a crash between the two
-// leaves the spends journaled at the block's height with the transaction not written. If the
-// block is never written again, the same transaction can be accepted later, in a later
+// that. An earlier version of the store wrote a multi list with its spends committed before its
+// creates, so a crash between the two left the spends journaled at the block's height with the
+// transaction not written. If the block is never written again, the same transaction can be accepted later, in a later
 // partition, and its identity row then carries the later height. Once a block mines it, the
 // copy-forward skips it, the partition holding its spends drops, and a shallow reorg of that
 // block cannot give its coins back. Moving the rows to the repeat's height makes the rule hold

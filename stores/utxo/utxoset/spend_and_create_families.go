@@ -28,7 +28,7 @@ import (
 // spends it like any outside coin. A chunk waits for the commit of every chunk that holds the
 // parent of a cut edge; chunks with no edge between them run in parallel.
 //
-// The rule that replaces the give-back of the two-step write: every commit leaves a true state.
+// The rule that makes a stopped write safe: every commit leaves a true state.
 // A chunk locks its transactions, spends the outside coins of them, stores them, and commits, all
 // in one database transaction. It does not ask first which already exist: it spends and stores,
 // and when the create claim finds one stored, or a spend is refused because that same transaction

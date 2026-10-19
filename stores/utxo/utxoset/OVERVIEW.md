@@ -163,9 +163,9 @@ An output that a later transaction **in the same chunk** spends is never written
 
 A deadlock between two chunks that spend overlapping coins is retried, never failed: the rolled-back chunk starts again.
 
-**At or below the checkpoint: the two-step write.** A block there is valid by rule and a retry of it always comes, and it can be one chain tens of thousands of transactions deep, which cutting every 256 transactions would make slow. So it keeps two steps: spend every outside coin of the whole list in parallel chunks and commit, then create the transactions in dependency order, a group of levels at a time. Between the steps a parent names a spender that has no record yet. If the process stops there, the retry repeats the spends as the same spends and completes the write. `routesToTwoStep` decides which write a list gets.
+**At or below the checkpoint: the below-checkpoint writer.** A list shaped like quick validation's, with a block at or below the highest checkpoint and outpoint-only spends, never reaches the chunk writer. `nettedBelowGate` sends it to `netBelow`, whose chunks have no order between them and each commit a transaction's record, deletes and coins together. Every other list, including a below-checkpoint list with ordinary spends, is written as family chunks.
 
-**A repeated spend in a later partition.** If a crashed write's spends sit in an older journal partition and the same transaction is later accepted at a higher height, the spend moves its undo row up to the newer partition, so the pruner does not drop it too early.
+**A repeated spend in a later partition.** If spends left by a write that stopped between its spends and its create (an earlier version of the store did this, and a node upgraded in place can still hold them) sit in an older journal partition and the same transaction is later accepted at a higher height, the spend moves its undo row up to the newer partition, so the pruner does not drop it too early.
 
 ## 8. Reading a transaction
 
@@ -251,7 +251,7 @@ The store needs a **new database**. A schema check at startup refuses a database
 - **"Who spent this output" has a shorter memory.** utxoset can name the transaction that spent an output while the journal keeps the spend: 288 blocks, or longer for a spender that waits or was mined recently. aerospike and sql can name it while the parent's record exists, which for a parent with other unspent outputs is much longer. This changes the asset API's spend lookup and the text of the error for an old double spend. Validation and reorgs do not depend on it.
 - **`tx_ident` rows leave one by one.** The stamp deletes each at a different time, so a partition drop cannot reclaim them.
 - **Autovacuum must keep up.** Each block makes about 33,000 dead rows in the UTXO table.
-- **A crash between a spend and its create keeps the spends, in every UTXO store.** This is not specific to utxoset. Each store spends a transaction's inputs before it creates the transaction: the aerospike and sql stores for each transaction, and utxoset in the two steps of the multi write. A crash between the two keeps the spends, with no record of the spender, until the same block is written again. Issue 1976 tracks one correction for all three stores.
+- **A crash between a spend and its create keeps the spends in the aerospike and sql stores, not in utxoset.** Those two stores spend a transaction's inputs before they create the transaction. A crash between the two keeps the spends, with no record of the spender, until the same block is written again. utxoset commits a transaction's spends and its record in one database transaction, so a crash leaves both or neither. The gap remains in those two stores, and issue 1976 tracks it.
 
 ## 15. Where to read the code
 
@@ -261,7 +261,7 @@ The store needs a **new database**. A schema check at startup refuses a database
 | Opening the store, settings, connection pool | `store.go` |
 | Spends, the undo copy, repeated spends | `spend.go`, `spend_batch.go` |
 | One transaction, batched | `spend_and_create.go`, `spend_and_create_batch.go` |
-| A block's list, routing, the two-step write below the checkpoint | `spend_and_create_multi.go` |
+| A block's list, routing between the writers | `spend_and_create_multi.go` |
 | Family chunks, netting, cut edges | `spend_and_create_families.go` |
 | Creates | `create.go`, `create_batch.go` |
 | The read order | `lookup.go`, `get.go`, `get_batch.go`, `decorate_batch.go` |

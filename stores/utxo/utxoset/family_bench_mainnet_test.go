@@ -21,38 +21,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks compares the two writers of
-// SpendAndCreateMulti, blocks per second, on real mainnet blocks above the checkpoint. It is a
-// benchmark and does nothing unless UTXOSET_FAMILY_BENCH_BLOCKS names a directory of raw block
-// files (<height>.bin, wire format). Knobs:
+// TestFamilyChunksOnMainnetBlocks times the family-chunk writer of SpendAndCreateMulti, blocks per
+// second, on real mainnet blocks above the checkpoint. It is a benchmark and does nothing unless
+// UTXOSET_FAMILY_BENCH_BLOCKS names a directory of raw block files (<height>.bin, wire format).
+// Knobs:
 //
 //	UTXOSET_FAMILY_BENCH_BLOCKS  directory of <height>.bin files; the height is the file name
 //	UTXOSET_FAMILY_BENCH_ONLY    comma-separated heights to run, default every file
-//	UTXOSET_FAMILY_BENCH_REPS    measured repetitions per writer and block, default 5
+//	UTXOSET_FAMILY_BENCH_REPS    measured repetitions per block, default 5
 //	UTXOSET_FAMILY_BENCH_OUT     file the result table is also written to
 //
 // Run it against a real PostgreSQL (UTXOSET_TEST_DSN), as `rtk proxy go test -run
-// TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks -v -timeout 2h ./stores/utxo/utxoset`,
-// so the filter does not eat the table.
+// TestFamilyChunksOnMainnetBlocks -v -timeout 2h ./stores/utxo/utxoset`, so the filter does not
+// eat the table.
 //
 // What it does. It parses the block, skips the coinbase, seeds one coin for every outpoint whose
 // parent is not in the block, with an arbitrary value and script, and sets each input's claimed
 // value and script to match: the seeded coin for an outside input, the parent's real output for
 // an in-block one. It then drops the transactions the store already holds, as the caller does,
-// and calls SpendAndCreateMulti exactly as services/subtreevalidation's writeList does. The two
-// writers run the same list on a freshly seeded store each, alternating which goes first.
-//
-// The "current" writer is the two-step write, forced above the checkpoint with forceTwoStep. On
-// a clean run it issues the statements the writer at 82e42f113 issues: what that commit adds on
-// top of it, the give-back and the repeat check, runs only when a write stops or finds a repeat.
+// and calls SpendAndCreateMulti exactly as services/subtreevalidation's writeList does, on a
+// freshly seeded store each repetition.
 //
 // What it measures: statement count, commit count and wall time on a small, freshly seeded
 // store whose coin index sits in memory. What it does NOT measure: cold coin-index reads on a
-// large store, which is where a mainnet node spends its time and where the two writers differ
-// by the extra coin-table work a cut edge costs, which a separate analysis put at 0.6% above
-// the checkpoint. Wall time here is dominated by statement and commit overhead, which is the real
-// risk of losing step 1's 8,192-coin spend statements.
-func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
+// large store, which is where a mainnet node spends its time. Wall time here is dominated by
+// statement and commit overhead.
+func TestFamilyChunksOnMainnetBlocks(t *testing.T) {
 	dir := os.Getenv("UTXOSET_FAMILY_BENCH_BLOCKS")
 	if dir == "" {
 		t.Skip("set UTXOSET_FAMILY_BENCH_BLOCKS to a directory of <height>.bin raw blocks to run this benchmark")
@@ -119,81 +113,65 @@ func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
 		runs := map[string][]sample{}
 
 		for rep := -1; rep < reps; rep++ { // rep -1 is a warm-up and is dropped
-			writers := []benchWriter{
-				{"two-step", true},
-				{"family", false},
-			}
+			name := "family"
 
-			// Rotate which writer goes first, so none always gets the warmer cache.
-			if r := (rep + 1) % len(writers); r > 0 {
-				writers = append(writers[r:], writers[:r]...)
-			}
+			t.Run(fmt.Sprintf("%d/%s/rep%d", h, name, rep), func(t *testing.T) {
+				s, ctx := newTestStoreWith(t, nil)
+				seedBenchCoins(t, s, ctx, blk)
+				blk.applyClaims()
 
-			for _, wr := range writers {
-				name := wr.name
+				// The caller's pre-check: drop what the store already holds. A fresh store
+				// holds nothing, so every transaction stays.
+				txs := blk.precheck(t, s, ctx)
+				txids := make([]chainhash.Hash, len(txs))
 
-				t.Run(fmt.Sprintf("%d/%s/rep%d", h, name, rep), func(t *testing.T) {
-					forceTwoStep = wr.twoStep
+				for i, tx := range txs {
+					txids[i] = *tx.TxIDChainHash()
+				}
 
-					t.Cleanup(func() { forceTwoStep = false })
+				multiFamilyDone = func(st *familyStats) {
+					t.Logf("family write: %d chunks, %d rounds, plan %s, lock %s, probe %s, spend %s, create %s, commit %s, waiting on parents %s (summed over chunks)",
+						st.chunks, st.rounds.Load(), time.Duration(st.planNs.Load()).Round(time.Millisecond),
+						time.Duration(st.lockNs.Load()).Round(time.Millisecond), time.Duration(st.probeNs.Load()).Round(time.Millisecond),
+						time.Duration(st.spendNs.Load()).Round(time.Millisecond), time.Duration(st.createNs.Load()).Round(time.Millisecond),
+						time.Duration(st.commitNs.Load()).Round(time.Millisecond), time.Duration(st.waitingNs.Load()).Round(time.Millisecond))
+				}
 
-					s, ctx := newTestStoreWith(t, nil)
-					seedBenchCoins(t, s, ctx, blk)
-					blk.applyClaims()
+				t.Cleanup(func() { multiFamilyDone = nil })
 
-					// The caller's pre-check: drop what the store already holds. A fresh store
-					// holds nothing, so every transaction stays. Identical for both writers.
-					txs := blk.precheck(t, s, ctx)
-					txids := make([]chainhash.Hash, len(txs))
+				tracer.begin()
+				t0 := time.Now()
 
-					for i, tx := range txs {
-						txids[i] = *tx.TxIDChainHash()
+				results, err := s.SpendAndCreateMulti(ctx, txs, blk.height, utxo.WithTXIDs(txids), utxo.WithIgnoreLocked(true))
+
+				wall := time.Since(t0)
+				snap := tracer.end()
+
+				require.NoError(t, err)
+				require.Len(t, results, len(txs))
+
+				var res [4]int
+
+				for _, r := range results {
+					switch r.Status {
+					case utxo.MultiTxCreated:
+						res[0]++
+					case utxo.MultiTxFailed:
+						res[1]++
+					case utxo.MultiTxParentFailed:
+						res[2]++
+					case utxo.MultiTxExisted:
+						res[3]++
 					}
+				}
 
-					multiFamilyDone = func(st *familyStats) {
-						t.Logf("family write: %d chunks, %d rounds, plan %s, lock %s, probe %s, spend %s, create %s, commit %s, waiting on parents %s (summed over chunks)",
-							st.chunks, st.rounds.Load(), time.Duration(st.planNs.Load()).Round(time.Millisecond),
-							time.Duration(st.lockNs.Load()).Round(time.Millisecond), time.Duration(st.probeNs.Load()).Round(time.Millisecond),
-							time.Duration(st.spendNs.Load()).Round(time.Millisecond), time.Duration(st.createNs.Load()).Round(time.Millisecond),
-							time.Duration(st.commitNs.Load()).Round(time.Millisecond), time.Duration(st.waitingNs.Load()).Round(time.Millisecond))
-					}
-
-					t.Cleanup(func() { multiFamilyDone = nil })
-
-					tracer.begin()
-					t0 := time.Now()
-
-					results, err := s.SpendAndCreateMulti(ctx, txs, blk.height, utxo.WithTXIDs(txids), utxo.WithIgnoreLocked(true))
-
-					wall := time.Since(t0)
-					snap := tracer.end()
-
-					require.NoError(t, err)
-					require.Len(t, results, len(txs))
-
-					var res [4]int
-
-					for _, r := range results {
-						switch r.Status {
-						case utxo.MultiTxCreated:
-							res[0]++
-						case utxo.MultiTxFailed:
-							res[1]++
-						case utxo.MultiTxParentFailed:
-							res[2]++
-						case utxo.MultiTxExisted:
-							res[3]++
-						}
-					}
-
-					if rep >= 0 {
-						runs[name] = append(runs[name], sample{wall: wall, st: snap, res: res})
-					}
-				})
-			}
+				if rep >= 0 {
+					runs[name] = append(runs[name], sample{wall: wall, st: snap, res: res})
+				}
+			})
 		}
 
-		for _, name := range []string{"two-step", "family"} {
+		for _, name := range []string{"family"} {
 			ss := runs[name]
 			if len(ss) == 0 {
 				continue
@@ -221,12 +199,6 @@ func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
 	if path := os.Getenv("UTXOSET_FAMILY_BENCH_OUT"); path != "" {
 		require.NoError(t, os.WriteFile(path, []byte(out.String()), 0o600))
 	}
-}
-
-// benchWriter is one writer under test: the two-step write, or family chunks.
-type benchWriter struct {
-	name    string
-	twoStep bool
 }
 
 // benchBlock is a parsed block and what the benchmark seeds for it.

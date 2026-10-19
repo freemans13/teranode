@@ -14,7 +14,7 @@ import (
 // as mined in no block, and block assembly dropped the child as corrupt.
 //
 // The race is between statements, so the test runs the second tier alone on a fresh result: the
-// state step 1 left behind when it ran before the create.
+// state the spends left behind when they ran before the create.
 func TestTier2BuildsAnUnminedRecordWithItsMarkerAndBody(t *testing.T) {
 	s, ctx := newTestStore(t)
 
