@@ -24,6 +24,29 @@ func setChunkTxs(t *testing.T, n int) {
 	t.Cleanup(func() { multiCreateChunkTxs = old })
 }
 
+// eachProbeOrder runs a test once with the chunk reading which transactions exist before it spends
+// (the order the design states) and once spending first and finding them through the create
+// claim. They must end in the same state.
+func eachProbeOrder(t *testing.T, fn func(t *testing.T)) {
+	t.Helper()
+
+	for _, probeFirst := range []bool{true, false} {
+		name := "existence read first"
+		if !probeFirst {
+			name = "existence found by the claim"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			old := multiProbeFirst
+			multiProbeFirst = probeFirst
+
+			t.Cleanup(func() { multiProbeFirst = old })
+
+			fn(t)
+		})
+	}
+}
+
 // A family cut across chunks: the cut edge's parent output is a real coin until its child's chunk
 // spends it, every other in-chunk edge is netted, and both halves end up stored, with the records
 // a per-transaction write leaves.
@@ -512,5 +535,91 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 
 		require.Positive(t, chunks)
 		require.Zero(t, steps)
+	})
+}
+
+// A transaction the store holds is Existed, whatever the state of the evidence that would let a
+// repeat of its spends pass. Here the journal row that names it as the spender of its parent
+// coin is gone, so a spend of that coin is refused as spent by nobody the store can name. The
+// chunk must find the record rather than report the transaction failed, and must not touch
+// anything.
+func TestSpendAndCreateMultiAnExistingTransactionWithNoJournalRowIsExisted(t *testing.T) {
+	eachProbeOrder(t, func(t *testing.T) {
+		s, ctx := newUncheckpointedStore(t)
+
+		parent := storedParent(t, s, ctx)
+		child := spendOutput(t, parent, 0, 1)
+
+		_, _, err := s.SpendAndCreate(ctx, child, 1_100, utxo.WithIgnoreLocked(true))
+		require.NoError(t, err)
+
+		h := parent.TxIDChainHash()
+		_, err = s.pool.Exec(ctx, `DELETE FROM spend_journal WHERE txid = $1`, h[:])
+		require.NoError(t, err)
+
+		results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		require.Equal(t, utxo.MultiTxExisted, results[0].Status, "%v", results[0].Err)
+
+		require.Equal(t, 1, identityCount(t, s, ctx, child))
+		require.Equal(t, 1, utxoCount(t, s, ctx, parent), "the coin the child spent stays spent")
+	})
+}
+
+// A transaction stored without its spends, as a coinbase or a seed is, is Existed and its inputs
+// are left alone: the write took nothing for it. Spending first and finding the record through
+// the create claim must roll that spend back.
+func TestSpendAndCreateMultiAnExistingTransactionKeepsItsInputsUntouched(t *testing.T) {
+	eachProbeOrder(t, func(t *testing.T) {
+		s, ctx := newUncheckpointedStore(t)
+
+		parent := storedParent(t, s, ctx)
+		child := spendOutput(t, parent, 0, 1)
+
+		_, _, err := s.SpendAndCreate(ctx, child, 1_100, utxo.WithCreateOnly())
+		require.NoError(t, err)
+
+		results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		require.Equal(t, utxo.MultiTxExisted, results[0].Status, "%v", results[0].Err)
+
+		require.Equal(t, 2, utxoCount(t, s, ctx, parent), "no spend was kept for a transaction that already existed")
+		require.Equal(t, 0, journalRowsFor(t, s, ctx, parent, 0))
+	})
+}
+
+// A record is built from the transaction as the spends leave it, with every input carrying the
+// value and script of the coin it took, as the per-transaction write builds it. A list that
+// arrives with no previous-output data on its inputs must therefore leave the record, fee
+// included, that a loop of SpendAndCreate leaves. Building the record before the spends would
+// leave no fee, because a fee needs extended inputs.
+func TestSpendAndCreateMultiBuildsTheRecordFromTheDecoratedInputs(t *testing.T) {
+	eachProbeOrder(t, func(t *testing.T) {
+		const height = 2200
+
+		s, ctx := newUncheckpointedStore(t)
+
+		reference := tests.BuildMultiWorkload(t, 0x71, 3, 4)
+		reference.StoreRoots(t, s, height-1)
+
+		for _, tx := range outpointOnly(reference.Txs) {
+			_, _, err := s.SpendAndCreate(ctx, tx, height, utxo.WithIgnoreLocked(true))
+			require.NoError(t, err)
+		}
+
+		w := tests.BuildMultiWorkload(t, 0x72, 3, 4)
+		w.StoreRoots(t, s, height-1)
+
+		results, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, utxo.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		requireAllCreated(t, results)
+
+		want := reference.Records(t, s)
+		for i, r := range want {
+			require.NotZero(t, r.Fee, "tx %d: the reference has a fee, so the comparison means something", i)
+		}
+
+		require.Equal(t, want, w.Records(t, s))
+		require.Equal(t, reference.RootSpends(t, s), w.RootSpends(t, s))
 	})
 }

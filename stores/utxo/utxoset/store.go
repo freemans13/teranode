@@ -225,6 +225,10 @@ type Store struct {
 // cleanly: it folds the entire URL into a config parameter and falls back to a unix socket,
 // which surfaces as a baffling "unrecognized configuration parameter" against the wrong
 // host. So normalise it here, at the one place that owns the connection.
+// poolTracer, when set, is installed on the connection pool of every store New opens. A test and
+// benchmark seam; nil in production.
+var poolTracer pgx.QueryTracer
+
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, storeURL *url.URL) (*Store, error) {
 	dsn := *storeURL
 	if dsn.Scheme == "utxoset" {
@@ -291,6 +295,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// USERSET, travels in the startup packet, and does not touch the blockchain store sharing
 	// the instance.
 	cfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_custom_plan"
+
+	// A test seam: a benchmark counts the statements and commits a write issues. nil in production.
+	if poolTracer != nil {
+		cfg.ConnConfig.Tracer = poolTracer
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

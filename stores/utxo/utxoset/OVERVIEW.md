@@ -153,17 +153,17 @@ If the same transaction is validated again, its inputs are already gone. The sto
 
 ### Many transactions from a block: `SpendAndCreateMulti`
 
-Block and subtree validation write a whole list of transactions, many of which spend each other's outputs. Writing them one at a time costs one commit each. The multi write uses two steps instead:
+Block and subtree validation write a whole list of transactions, many of which spend each other's outputs. Writing them one at a time costs one commit each. What the multi write does depends on the height, as the block path does.
 
-1. **Spend.** It deletes every input whose parent is **outside** the list, in parallel chunks, and commits.
-2. **Create.** It creates the transactions in dependency order, a group of levels at a time.
+**Above the checkpoint: whole families in self-contained chunks.** A *family* is the transactions of the list joined by edges where one spends another's output, directly or through a chain. Most families are one transaction. The list is cut into *chunks* of up to 256 transactions (the cap exists because each transaction takes an advisory lock held to commit, and Postgres keeps those in a table of about 6,400 slots), packing whole families in list order. A family bigger than a chunk is cut into slices in dependency order, following chains so that a chain stays together. An edge whose two ends land in different chunks is a *cut edge*.
 
-An output that a later transaction **in the same list** spends is never written as a UTXO at all. Its undo copy is written directly, naming the child. This is called **netting**, and it saves an insert, a delete and an index entry for each such output.
+Each chunk is **one database transaction**. It locks its transactions, finds which already exist, spends the outside coins of the rest (outside means the parent is not in the same chunk), stores them, and commits. A transaction is therefore stored if and only if its spends are made. A chunk that fails or crashes rolls back whole, so there is nothing to give back and nothing to recover, and no writer needs to know whether another writer of the same transaction exists or is alive: two writers of one transaction take its lock in turn, and the second finds it stored.
 
-Each transaction's inputs are still spent all together or not at all. But between the two steps, a parent names a spender that has no record yet. Two cases follow:
+An output that a later transaction **in the same chunk** spends is never written as a UTXO at all. Its undo copy is written directly, naming the child. This is called **netting**, and it saves an insert, a delete and an index entry for each such output. A cut edge is the one place netting does not apply: the parent's output is written as a real coin because nothing in its chunk spends it, and the child's chunk, which waits for the parent's chunk to commit, spends it like any outside coin. Chunks with no edge between them run in parallel, up to the concurrency bound. A chunk whose parent failed gives its transactions `ParentFailed` without opening a database transaction.
 
-- **Step 2 stops with an error, or the caller cancels.** The store unspends the step 1 spends of every transaction it did not write, so the coins can be spent again.
-- **The process crashes between the steps.** No undo runs. A retry of the same block repeats the spends as the same spends and completes the write. If no retry comes, the spends stay. This gap is the same in every UTXO store: the aerospike and sql stores also spend a transaction's inputs before they create it, and a crash between the two keeps the spends. Issue 1976 tracks one correction for all three.
+A deadlock between two chunks that spend overlapping coins is retried, never failed: the rolled-back chunk starts again.
+
+**At or below the checkpoint: the two-step write.** A block there is valid by rule and a retry of it always comes, and it can be one chain tens of thousands of transactions deep, which cutting every 256 transactions would make slow. So it keeps two steps: spend every outside coin of the whole list in parallel chunks and commit, then create the transactions in dependency order, a group of levels at a time. Between the steps a parent names a spender that has no record yet. If the process stops there, the retry repeats the spends as the same spends and completes the write. `routesToTwoStep` decides which write a list gets.
 
 **A repeated spend in a later partition.** If a crashed write's spends sit in an older journal partition and the same transaction is later accepted at a higher height, the spend moves its undo row up to the newer partition, so the pruner does not drop it too early.
 
@@ -261,7 +261,8 @@ The store needs a **new database**. A schema check at startup refuses a database
 | Opening the store, settings, connection pool | `store.go` |
 | Spends, the undo copy, repeated spends | `spend.go`, `spend_batch.go` |
 | One transaction, batched | `spend_and_create.go`, `spend_and_create_batch.go` |
-| A block's list, netting, the give-back | `spend_and_create_multi.go` |
+| A block's list, routing, the two-step write below the checkpoint | `spend_and_create_multi.go` |
+| Family chunks, netting, cut edges | `spend_and_create_families.go` |
 | Creates | `create.go`, `create_batch.go` |
 | The read order | `lookup.go`, `get.go`, `get_batch.go`, `decorate_batch.go` |
 | Parent outputs for validation | `parent_outputs.go` |

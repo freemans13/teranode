@@ -155,12 +155,11 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 
 	if !options.CreateOnly && !options.SpendOnly {
 		// The transaction's lock is taken BEFORE its spends, not only before the create's claim.
-		// A spend that finds the coin already gone with a journal row naming this transaction
-		// is settled as a repeat and takes nothing, so it leans on whoever took the coin. If that
-		// was a SpendAndCreateMulti write that then stops, its give-back restores the coin unless
-		// the transaction is written by then. The give-back takes this lock, so it either runs
-		// before these spends, which then find the coin live and take it, or after this commit,
-		// when it finds the transaction written and keeps the spend.
+		// A SpendAndCreateMulti chunk holds the lock of every transaction it writes from before
+		// its spends to its commit, so a writer of the same transaction that arrives here waits
+		// for the chunk and then finds the transaction stored, or finds the coins free if the
+		// chunk rolled back. Taken after the spends, the lock would let this writer meet a
+		// spend the chunk had made but not yet committed.
 		id := createTxID(tx, options)
 		if err = s.lockTxids(ctx, dbTx, [][]byte{id[:]}); err != nil {
 			return nil, nil, err

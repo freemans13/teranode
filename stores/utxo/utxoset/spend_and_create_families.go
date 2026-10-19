@@ -348,6 +348,7 @@ type familyStats struct {
 	cutEdges    int
 	rounds      atomic.Int64
 	deadlocks   atomic.Int64
+	planNs      atomic.Int64
 	lockNs      atomic.Int64
 	probeNs     atomic.Int64
 	spendNs     atomic.Int64
@@ -358,6 +359,10 @@ type familyStats struct {
 	waitingNs   atomic.Int64
 	nettedEdges atomic.Int64
 }
+
+// multiFamilyDone is a test hook called with the statistics of each family write when it ends. nil
+// in production.
+var multiFamilyDone func(*familyStats)
 
 // writeFamilies is the write above the checkpoint. See the comment at the top of this file.
 func (w *nettedWrite) writeFamilies(ctx context.Context) ([]utxo.SpendAndCreateMultiResult, error) {
@@ -372,7 +377,13 @@ func (w *nettedWrite) writeFamilies(ctx context.Context) ([]utxo.SpendAndCreateM
 
 	stats := &familyStats{chunks: len(plan.chunks), families: plan.families, largest: plan.largest, cutEdges: plan.cutEdges}
 
-	defer func() { w.logFamiliesIfSlow(start, stats) }()
+	defer func() {
+		w.logFamiliesIfSlow(start, stats)
+
+		if multiFamilyDone != nil {
+			multiFamilyDone(stats)
+		}
+	}()
 
 	// The partitions come before any transaction is opened: the DDL needs its own pool
 	// connection, and taking one while holding a transaction from the same pool can deadlock it.
@@ -545,6 +556,10 @@ func (w *nettedWrite) familyAttempt(ctx context.Context, ch *familyChunk, its []
 
 // familyRound is one database transaction of a chunk. It returns true when it rolled back to run
 // again with a smaller or better-informed set, and false once the chunk is settled.
+//
+// The plan of the records to write is built after the spends, not before: a spend decorates its
+// input with the coin's value and script, and the record's fee and body are built from the
+// decorated transaction, as the per-transaction write builds them.
 func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *familyStats) (again bool, err error) {
 	its := run.its
 
@@ -567,38 +582,11 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 		run.netted[k] = nil
 	}
 
-	// What the round writes, in one plan: every transaction not already out of it.
-	var (
-		planned []int
-		items   []*createItem
-	)
-
-	for k, it := range its {
-		if run.st[k] != chunkLive {
-			continue
-		}
-
-		planned = append(planned, k)
-		items = append(items, &createItem{tx: it.tx, blockHeight: w.blockHeight, options: w.list.Options.ItemOptions(it.pos)})
-	}
-
 	// A chunk with nothing live, every transaction of it parent-failed, opens no transaction.
-	if len(items) == 0 {
-		w.settleChunk(run, nil, &createPlan{})
+	if len(run.liveSet()) == 0 {
+		w.settleChunk(run, nil, nil)
 
 		return false, nil
-	}
-
-	plan := w.s.planCreates(items)
-
-	for i := range items {
-		if plan.errs[i] != nil {
-			return false, plan.errs[i]
-		}
-	}
-
-	for _, b := range plan.bodies {
-		stats.bodyBytes.Add(int64(len(b)))
 	}
 
 	dbTx, err := w.s.pool.Begin(ctx)
@@ -616,7 +604,7 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 
 	t0 := time.Now()
 
-	if err = w.s.lockTxids(ctx, dbTx, plan.txids); err != nil {
+	if err = w.s.lockTxids(ctx, dbTx, run.lockIDs(run.liveSet())); err != nil {
 		return false, err
 	}
 
@@ -625,7 +613,7 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 
 	// Which transactions already exist, under their locks, before anything is netted: an
 	// output of one that exists is a real coin and its child must spend it for real.
-	if err = w.markExisting(ctx, dbTx, run, planned, plan); err != nil {
+	if err = w.markExisting(ctx, dbTx, run); err != nil {
 		return false, err
 	}
 
@@ -648,7 +636,14 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 	stats.spendNs.Add(int64(time.Since(t2)))
 
 	if failed {
-		// Nothing of this round is kept. The next one leaves out what failed.
+		// Nothing of this round is kept. The next one leaves out what failed, and treats as
+		// existing what the store turns out to hold.
+		if !multiProbeFirst {
+			if err = w.reprobeRefused(ctx, dbTx, run); err != nil {
+				return false, err
+			}
+		}
+
 		return true, nil
 	}
 
@@ -658,7 +653,7 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 
 	t3 := time.Now()
 
-	retry, err := w.createInChunk(ctx, dbTx, run, planned, plan, stats)
+	plan, planned, retry, err := w.createInChunk(ctx, dbTx, run, stats)
 	if err != nil {
 		return false, err
 	}
@@ -673,24 +668,9 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 		return false, err
 	}
 
-	live := 0
-	for k := range its {
-		if run.st[k] == chunkLive {
-			live++
-		}
-	}
-
-	if live > 0 {
+	if live := run.liveSet(); len(live) > 0 {
 		if multiCreateBeforeCommit != nil {
-			txids := make([]chainhash.Hash, 0, live)
-
-			for k, it := range its {
-				if run.st[k] == chunkLive {
-					txids = append(txids, it.txid)
-				}
-			}
-
-			multiCreateBeforeCommit(ctx, txids)
+			multiCreateBeforeCommit(ctx, run.txidsOf(live))
 		}
 
 		t4 := time.Now()
@@ -717,7 +697,7 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 		}
 
 		if multiCreateCommitted != nil {
-			multiCreateCommitted(live)
+			multiCreateCommitted(len(live))
 		}
 	}
 
@@ -726,49 +706,147 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 	return false, chunkFault(run.ch.idx, "committed")
 }
 
+// liveSet is the indexes of the chunk's transactions still to be written.
+func (r *chunkRun) liveSet() []int {
+	var out []int
+
+	for k := range r.its {
+		if r.st[k] == chunkLive {
+			out = append(out, k)
+		}
+	}
+
+	return out
+}
+
+// lockIDs is the lock keys, the txids as bytes, of the given transactions of the chunk.
+func (r *chunkRun) lockIDs(ks []int) [][]byte {
+	out := make([][]byte, len(ks))
+	for i, k := range ks {
+		out[i] = r.its[k].txid[:]
+	}
+
+	return out
+}
+
+// txidsOf is the txids of the given transactions of the chunk.
+func (r *chunkRun) txidsOf(ks []int) []chainhash.Hash {
+	out := make([]chainhash.Hash, len(ks))
+	for i, k := range ks {
+		out[i] = r.its[k].txid
+	}
+
+	return out
+}
+
 // parentFailedResult is the result of a transaction whose parent in the list failed.
 func (w *nettedWrite) parentFailedResult(it *multiTx) utxo.SpendAndCreateMultiResult {
 	return utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxParentFailed, Spends: it.spends,
 		Err: errors.NewProcessingError("SpendAndCreateMulti: a parent of %s earlier in the list failed", it.txid.String())}
 }
 
-// markExisting reads which of the planned transactions the store already holds and marks them
-// existed, and does the same for those a create claim reported as stored in an earlier round.
-func (w *nettedWrite) markExisting(ctx context.Context, dbTx pgx.Tx, run *chunkRun, planned []int, plan *createPlan) error {
-	if len(plan.txids) > 0 {
-		rows, err := dbTx.Query(ctx, existingTxidsSQL, plan.leaves, plan.txids, plan.lo, plan.hi, w.s.claimFloor())
+// multiProbeFirst makes a chunk read which of its transactions already exist before it spends
+// anything, which is the order the design states. When false, the chunk spends first on the
+// assumption that none exists, lets the create claim find the ones that do, and runs the round
+// again with them marked existing; a spend that is refused is first checked against the store,
+// so a transaction that exists is never reported as failed. The two end in the same state. The
+// second saves the existence read, a statement that costs a probe of the identity,
+// containment and UTXO tables per transaction, on every chunk that has no existing transaction,
+// which is nearly all of them.
+var multiProbeFirst = true
+
+// probeExisting reads which of the given transactions of the chunk the store already holds,
+// under their advisory locks.
+func (w *nettedWrite) probeExisting(ctx context.Context, dbTx pgx.Tx, run *chunkRun, ks []int) (map[chainhash.Hash]struct{}, error) {
+	leaves := make([]int16, len(ks))
+	txids := make([][]byte, len(ks))
+	lo := make([][16]byte, len(ks))
+	hi := make([][16]byte, len(ks))
+
+	for i, k := range ks {
+		id := &run.its[k].txid
+		leaves[i], txids[i] = LeafFor(id[:]), id[:]
+		lo[i], hi[i] = Pack(id[:], 0), Pack(id[:], ^uint32(0))
+	}
+
+	out, err := dbTx.Query(ctx, existingTxidsSQL, leaves, txids, lo, hi, w.s.claimFloor())
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][SpendAndCreateMulti] read existing", err)
+	}
+
+	held := make(map[chainhash.Hash]struct{})
+
+	for out.Next() {
+		var id []byte
+		if err := out.Scan(&id); err != nil {
+			out.Close()
+			return nil, errors.NewStorageError("[utxoset][SpendAndCreateMulti] scan existing", err)
+		}
+
+		held[chainhash.Hash(id)] = struct{}{}
+	}
+
+	out.Close()
+
+	if err := out.Err(); err != nil {
+		return nil, errors.NewStorageError("[utxoset][SpendAndCreateMulti] existing rows", err)
+	}
+
+	return held, nil
+}
+
+// markExisting marks the live transactions of the chunk the store already holds as existed, and
+// those a create claim reported as stored in an earlier round.
+func (w *nettedWrite) markExisting(ctx context.Context, dbTx pgx.Tx, run *chunkRun) error {
+	live := run.liveSet()
+
+	if multiProbeFirst && len(live) > 0 {
+		held, err := w.probeExisting(ctx, dbTx, run, live)
 		if err != nil {
-			return errors.NewStorageError("[utxoset][SpendAndCreateMulti] read existing", err)
+			return err
 		}
 
-		held := make(map[chainhash.Hash]struct{})
-
-		for rows.Next() {
-			var id []byte
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return errors.NewStorageError("[utxoset][SpendAndCreateMulti] scan existing", err)
-			}
-
-			held[chainhash.Hash(id)] = struct{}{}
-		}
-
-		rows.Close()
-
-		if err := rows.Err(); err != nil {
-			return errors.NewStorageError("[utxoset][SpendAndCreateMulti] existing rows", err)
-		}
-
-		for _, k := range planned {
+		for _, k := range live {
 			if _, ok := held[run.its[k].txid]; ok {
 				run.st[k] = chunkExisted
 			}
 		}
 	}
 
-	for _, k := range planned {
+	for _, k := range live {
 		if run.forcedExisted[k] {
 			run.st[k] = chunkExisted
+		}
+	}
+
+	return nil
+}
+
+// reprobeRefused is the lazy form's check on a refused spend: a transaction whose spend was
+// refused because it already exists, its coins long since spent by itself, is marked existing
+// and no longer failed, for the next round.
+func (w *nettedWrite) reprobeRefused(ctx context.Context, dbTx pgx.Tx, run *chunkRun) error {
+	var refused []int
+
+	for k := range run.its {
+		if run.spendFailed[k] {
+			refused = append(refused, k)
+		}
+	}
+
+	if len(refused) == 0 {
+		return nil
+	}
+
+	held, err := w.probeExisting(ctx, dbTx, run, refused)
+	if err != nil {
+		return err
+	}
+
+	for _, k := range refused {
+		if _, ok := held[run.its[k].txid]; ok {
+			run.spendFailed[k] = false
+			run.forcedExisted[k] = true
 		}
 	}
 
@@ -933,30 +1011,46 @@ func (w *nettedWrite) spendOutsideInChunk(ctx context.Context, dbTx pgx.Tx, run 
 }
 
 // createInChunk writes the live transactions: their records, bodies and every output not spent
-// inside the chunk as a UTXO, and the spend-journal row of every output that is. It returns true
-// when the create claim found a transaction the existence read had missed, which makes the
-// caller roll back and run the round again with that transaction treated as existing.
-func (w *nettedWrite) createInChunk(ctx context.Context, dbTx pgx.Tx, run *chunkRun, planned []int, plan *createPlan,
-	stats *familyStats) (bool, error) {
-	// The plan's rows are sorted, and an item's index in the plan is its place in planned.
-	var rows []int
+// inside the chunk as a UTXO, and the spend-journal row of every output that is. It returns the
+// plan it wrote and which chunk transactions its items are, and true when the create claim found
+// a transaction the existence read had missed, which makes the caller roll back and run the round
+// again with that transaction treated as existing.
+func (w *nettedWrite) createInChunk(ctx context.Context, dbTx pgx.Tx, run *chunkRun, stats *familyStats) (*createPlan, []int, bool, error) {
+	planned := run.liveSet()
+	if len(planned) == 0 {
+		return nil, nil, false, nil
+	}
 
-	for r, i := range plan.owner {
-		if run.st[planned[i]] == chunkLive {
-			rows = append(rows, r)
+	tPlan := time.Now()
+
+	items := make([]*createItem, len(planned))
+	for i, k := range planned {
+		it := run.its[k]
+		items[i] = &createItem{tx: it.tx, blockHeight: w.blockHeight, options: w.list.Options.ItemOptions(it.pos)}
+	}
+
+	plan := w.s.planCreates(items)
+
+	for i := range items {
+		if plan.errs[i] != nil {
+			return nil, nil, false, plan.errs[i]
 		}
 	}
 
-	if len(rows) == 0 {
-		return false, nil
+	for _, b := range plan.bodies {
+		stats.bodyBytes.Add(int64(len(b)))
 	}
+
+	stats.planNs.Add(int64(time.Since(tPlan)))
 
 	spender := make(map[nettedKey]nettedSpender)
 
-	for k, it := range run.its {
-		if run.st[k] != chunkLive || run.netted[k] == nil {
+	for _, k := range planned {
+		if run.netted[k] == nil {
 			continue
 		}
+
+		it := run.its[k]
 
 		for vin, in := range it.tx.Inputs {
 			if !run.netted[k][vin] {
@@ -969,43 +1063,38 @@ func (w *nettedWrite) createInChunk(ctx context.Context, dbTx pgx.Tx, run *chunk
 		}
 	}
 
-	q := plan.subset(rows)
-	journal := q.takeNetted(spender)
+	journal := plan.takeNetted(spender)
 
 	// Every netted spend must have found the output it spends among the plan's UTXOs. A
 	// shortfall would be a netted input with no journal row, a spend that left no trace.
 	if len(journal.ukeys) != len(spender) {
-		return false, errors.NewProcessingError("[utxoset][SpendAndCreateMulti] %d netted spends of a chunk found %d outputs to journal", len(spender), len(journal.ukeys))
+		return nil, nil, false, errors.NewProcessingError("[utxoset][SpendAndCreateMulti] %d netted spends of a chunk found %d outputs to journal", len(spender), len(journal.ukeys))
 	}
 
 	stats.nettedEdges.Add(int64(len(spender)))
 
-	if err := w.s.runCreatePlan(ctx, dbTx, q); err != nil {
-		return false, err
+	if err := w.s.runCreatePlan(ctx, dbTx, plan); err != nil {
+		return nil, nil, false, err
 	}
 
 	retry := false
 
 	for i, k := range planned {
-		if run.st[k] != chunkLive {
-			continue
-		}
-
 		switch err := plan.errs[i]; {
 		case err == nil:
 		case errors.Is(err, errors.ErrTxExists):
 			run.forcedExisted[k] = true
 			retry = true
 		default:
-			return false, err
+			return nil, nil, false, err
 		}
 	}
 
 	if retry {
-		return true, nil
+		return nil, nil, true, nil
 	}
 
-	return false, w.writeNettedJournal(ctx, dbTx, journal)
+	return plan, planned, false, w.writeNettedJournal(ctx, dbTx, journal)
 }
 
 // settleChunk gives every transaction of a settled chunk its result. It runs after the commit,
@@ -1036,9 +1125,10 @@ func (w *nettedWrite) logFamiliesIfSlow(start time.Time, st *familyStats) {
 		return
 	}
 
-	w.s.logger.Infof("[utxoset][SpendAndCreateMulti] slow list at height %d: %d txs in %d families (largest %d), %d chunks, %d cut edges, %d rounds, %d deadlock retries, %.1f MB of bodies; wall %s (lock %s, probe %s, spend %s, create %s, commit %s, waiting on parents %s)",
+	w.s.logger.Infof("[utxoset][SpendAndCreateMulti] slow list at height %d: %d txs in %d families (largest %d), %d chunks, %d cut edges, %d rounds, %d deadlock retries, %.1f MB of bodies; wall %s (plan %s, lock %s, probe %s, spend %s, create %s, commit %s, waiting on parents %s)",
 		w.blockHeight, len(w.items), st.families, st.largest, st.chunks, st.cutEdges, st.rounds.Load(), st.deadlocks.Load(),
 		float64(st.bodyBytes.Load())/1e6, time.Since(start).Round(time.Millisecond),
+		time.Duration(st.planNs.Load()).Round(time.Millisecond),
 		time.Duration(st.lockNs.Load()).Round(time.Millisecond), time.Duration(st.probeNs.Load()).Round(time.Millisecond),
 		time.Duration(st.spendNs.Load()).Round(time.Millisecond), time.Duration(st.createNs.Load()).Round(time.Millisecond),
 		time.Duration(st.commitNs.Load()).Round(time.Millisecond), time.Duration(st.waitingNs.Load()).Round(time.Millisecond))

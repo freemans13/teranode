@@ -30,6 +30,10 @@ func TestParentOutputsForValidationUtxoset(t *testing.T) {
 }
 
 func TestSpendAndCreateMultiUtxoset(t *testing.T) {
+	eachProbeOrder(t, testSpendAndCreateMultiUtxoset)
+}
+
+func testSpendAndCreateMultiUtxoset(t *testing.T) {
 	suite := func(t *testing.T) {
 		t.Run("matches a loop of SpendAndCreate", func(t *testing.T) {
 			s, _ := newUncheckpointedStore(t)
@@ -572,6 +576,10 @@ func missingTxs(t *testing.T, s *Store, txs []*bt.Tx) []*bt.Tx {
 // spends the last stored one's coin for real. The records are the ones the per-transaction
 // default leaves from the same start, with no hand-off to it.
 func TestSpendAndCreateMultiAChunkWithAnExistingParent(t *testing.T) {
+	eachProbeOrder(t, testAChunkWithAnExistingParent)
+}
+
+func testAChunkWithAnExistingParent(t *testing.T) {
 	const (
 		height = 1300
 		n      = 10
