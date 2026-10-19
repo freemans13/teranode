@@ -55,7 +55,7 @@ func TestSpendAndCreateMultiAStoppedWriteLeavesEveryCommittedChunkWhole(t *testi
 		require.Equal(t, 1, utxoCount(t, s, ctx, root), "root's output 0 stays spent by parent, which is stored")
 
 		// The cut edge wrote parent's output 0 as a real coin, and child's chunk rolled back.
-		requireCoinGivenBack(t, s, ctx, parent, child)
+		requireCoinStillSpendable(t, s, ctx, parent, child)
 	})
 
 	t.Run("the caller cancels between chunks", func(t *testing.T) {
@@ -84,7 +84,7 @@ func TestSpendAndCreateMultiAStoppedWriteLeavesEveryCommittedChunkWhole(t *testi
 		require.ErrorIs(t, err, context.Canceled)
 
 		require.Equal(t, 1, identityCount(t, s, ctx, parent), "parent's chunk committed before the cancel")
-		requireCoinGivenBack(t, s, ctx, parent, child)
+		requireCoinStillSpendable(t, s, ctx, parent, child)
 	})
 
 	t.Run("an independent chunk fails; every transaction is whole or absent", func(t *testing.T) {
@@ -118,7 +118,7 @@ func TestSpendAndCreateMultiAStoppedWriteLeavesEveryCommittedChunkWhole(t *testi
 		// Chunk 1 is absent. Chunk 0 is either whole or, if it was never started, absent.
 		requireNoHalfWrite(t, s, ctx, a, pa)
 		require.Equal(t, 0, identityCount(t, s, ctx, po))
-		requireCoinGivenBack(t, s, ctx, other, po)
+		requireCoinStillSpendable(t, s, ctx, other, po)
 	})
 }
 
@@ -147,7 +147,7 @@ func TestSpendAndCreateMultiACrashRollsBackTheOpenChunk(t *testing.T) {
 			multiChunkFault = nil
 			require.ErrorIs(t, err, errMultiCrash)
 
-			requireCoinGivenBack(t, s, ctx, parent, child)
+			requireCoinStillSpendable(t, s, ctx, parent, child)
 		})
 	}
 }
@@ -164,9 +164,9 @@ func storedParent(t *testing.T, s *Store, ctx context.Context) *bt.Tx {
 	return parent
 }
 
-// requireCoinGivenBack asserts that child, which the stopped write did not write, holds no spend
+// requireCoinStillSpendable asserts that child, which the stopped write did not write, holds no spend
 // of parent's output 0, and that a different transaction can spend it.
-func requireCoinGivenBack(t *testing.T, s *Store, ctx context.Context, parent, child *bt.Tx) {
+func requireCoinStillSpendable(t *testing.T, s *Store, ctx context.Context, parent, child *bt.Tx) {
 	t.Helper()
 
 	require.Equal(t, 0, identityCount(t, s, ctx, child), "child was not written")

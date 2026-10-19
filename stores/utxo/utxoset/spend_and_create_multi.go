@@ -34,8 +34,9 @@ import (
 // which has its own write.
 //
 // It does NOT net, and hands the list to the per-transaction default instead, for a list whose
-// options the netted write does not model: create-only or spend-only, and frozen or conflicting
-// creates. Locked creates are modelled: the coins are written locked.
+// options the chunk writer does not model: create-only or spend-only, and frozen, conflicting or
+// locked creates. Below the checkpoint, netBelow does model locked creates and writes the coins
+// locked; above it, canNet sends a locked list to DefaultSpendAndCreateMulti.
 //
 // A transaction in the list that turns out to exist already, which the caller's pre-check makes
 // a race with another writer, is reported MultiTxExisted. The chunk finds it under the

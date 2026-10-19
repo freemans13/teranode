@@ -415,11 +415,12 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 	}
 
 	// The lock of every transaction the batch may create, taken at the top of each spend round,
-	// before the spends: see spendAndCreateOne for why a spend that settles as a repeat needs
-	// it. All of them in one statement, a superset of the creators' locks taken before the
-	// create, so that second statement only re-enters locks this transaction holds and cannot
-	// wait on another batch while holding part of its set. A rollback between rounds releases
-	// them, so each round takes them again.
+	// before the spends. A family chunk takes a transaction's lock before its spends, so taking it
+	// first here puts the batched path, the single path and a family chunk in one lock sequence,
+	// advisory lock and then row, and they cannot deadlock. All of them in one statement, a
+	// superset of the creators' locks taken before the create, so that second statement only
+	// re-enters locks this transaction holds and cannot wait on another batch while holding part
+	// of its set. A rollback between rounds releases them, so each round takes them again.
 	lockIDs := batchCreateLockIDs(batch)
 
 	var (
