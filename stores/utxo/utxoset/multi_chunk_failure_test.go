@@ -14,10 +14,10 @@ import (
 func forceChunkOfOne(t *testing.T) {
 	t.Helper()
 
-	old := multiCreateChunkTxs
-	multiCreateChunkTxs = 1
+	old := multiCreateChunkTxsOverride
+	multiCreateChunkTxsOverride = 1
 
-	t.Cleanup(func() { multiCreateChunkTxs = old })
+	t.Cleanup(func() { multiCreateChunkTxsOverride = old })
 }
 
 // TestSpendAndCreateMultiAStoppedWriteLeavesEveryCommittedChunkWhole is the review's request in

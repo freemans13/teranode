@@ -72,12 +72,31 @@ func (s *Store) canNet(o *utxo.CreateOptions) bool {
 	return !o.SpendOnly && !o.CreateOnly && !o.Frozen && !o.Conflicting && !o.Locked
 }
 
-// multiCreateChunkTxs bounds the transactions one chunk transaction writes. The chunk writer
-// takes no advisory lock, so the bound is no longer set by the shared lock table: it limits the
-// size of one chunk's statements and the work a rollback throws away when a rival stored one of
-// its transactions. 256 is the size it was chosen at, when each stored transaction held a lock
-// to commit. A variable so a test can force one transaction per chunk.
-var multiCreateChunkTxs = 256
+// defaultMultiCreateChunkTxs is the transactions per chunk when the setting
+// utxostore_multiCreateChunkTxs is unset.
+const defaultMultiCreateChunkTxs = 256
+
+// multiCreateChunkTxsOverride, when positive, fixes the transactions per chunk whatever the
+// setting says. Zero in production. A variable so a test can force one transaction per chunk, or
+// run the whole suite at a chosen size.
+var multiCreateChunkTxsOverride = 0
+
+// multiChunkTxs bounds the transactions one chunk transaction writes. The chunk writer takes no
+// advisory lock, so the bound is not set by the shared lock table, which was why it was 256: it
+// limits the size of one chunk's statements and the work a rollback throws away when a rival
+// stored one of its transactions. The byte budget cuts a chunk as well, whichever is reached
+// first.
+func (s *Store) multiChunkTxs() int {
+	if multiCreateChunkTxsOverride > 0 {
+		return multiCreateChunkTxsOverride
+	}
+
+	if s.settings != nil && s.settings.UtxoStore.MultiCreateChunkTxs > 0 {
+		return s.settings.UtxoStore.MultiCreateChunkTxs
+	}
+
+	return defaultMultiCreateChunkTxs
+}
 
 // multiCrash is the error a chunk fault hook returns to stop the write as a crash would: the
 // process is gone, so no cleanup runs and the open chunk's database transaction is never

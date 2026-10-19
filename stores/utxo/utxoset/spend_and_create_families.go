@@ -418,7 +418,7 @@ func (w *nettedWrite) writeFamilies(ctx context.Context) ([]utxo.SpendAndCreateM
 		sizes[i] = it.tx.Size()
 	}
 
-	plan := planFamilyChunks(w.list.ParentsInList, sizes, multiCreateChunkTxs, spendAndCreateBatchByteBudget)
+	plan := planFamilyChunks(w.list.ParentsInList, sizes, w.s.multiChunkTxs(), spendAndCreateBatchByteBudget)
 
 	stats := &familyStats{chunks: len(plan.chunks), families: plan.families, largest: plan.largest, cutEdges: plan.cutEdges}
 

@@ -81,10 +81,10 @@ func testSpendAndCreateMultiUtxoset(t *testing.T) {
 	// written as coins and each child's chunk waits for its parent's commit and spends them for
 	// real. The same contract must hold when nothing is netted.
 	t.Run("a chunk per transaction", func(t *testing.T) {
-		old := multiCreateChunkTxs
-		multiCreateChunkTxs = 1
+		old := multiCreateChunkTxsOverride
+		multiCreateChunkTxsOverride = 1
 
-		t.Cleanup(func() { multiCreateChunkTxs = old })
+		t.Cleanup(func() { multiCreateChunkTxsOverride = old })
 
 		suite(t)
 	})
@@ -92,10 +92,10 @@ func testSpendAndCreateMultiUtxoset(t *testing.T) {
 	// Two transactions per chunk cuts families in the middle, so some edges are netted and some
 	// are cut within one list.
 	t.Run("two transactions per chunk", func(t *testing.T) {
-		old := multiCreateChunkTxs
-		multiCreateChunkTxs = 2
+		old := multiCreateChunkTxsOverride
+		multiCreateChunkTxsOverride = 2
 
-		t.Cleanup(func() { multiCreateChunkTxs = old })
+		t.Cleanup(func() { multiCreateChunkTxsOverride = old })
 
 		suite(t)
 	})
@@ -188,10 +188,10 @@ func testSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
 		width  = 5
 	)
 
-	old := multiCreateChunkTxs
-	multiCreateChunkTxs = width
+	old := multiCreateChunkTxsOverride
+	multiCreateChunkTxsOverride = width
 
-	t.Cleanup(func() { multiCreateChunkTxs = old })
+	t.Cleanup(func() { multiCreateChunkTxsOverride = old })
 
 	crashes := []struct {
 		chunk int
@@ -349,10 +349,10 @@ func testSpendAndCreateMultiAFailedParentsChildLeavesNoSpend(t *testing.T) {
 		{"a chunk per transaction", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			old := multiCreateChunkTxs
-			multiCreateChunkTxs = tc.chunk
+			old := multiCreateChunkTxsOverride
+			multiCreateChunkTxsOverride = tc.chunk
 
-			t.Cleanup(func() { multiCreateChunkTxs = old })
+			t.Cleanup(func() { multiCreateChunkTxsOverride = old })
 
 			s, ctx := newUncheckpointedStore(t)
 
@@ -489,6 +489,8 @@ func testSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
 		n      = 600
 	)
 
+	setChunkTxs(t, 256)
+
 	s, ctx := newUncheckpointedStore(t)
 
 	wantRecs, wantRoots := perTxReference(t, s, buildChain(t, 0xb0, n, nil), height)
@@ -505,7 +507,7 @@ func testSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
 		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
 	}
 
-	require.Len(t, commits(), (n+multiCreateChunkTxs-1)/multiCreateChunkTxs)
+	require.Len(t, commits(), (n+256-1)/256)
 	require.Equal(t, []int{256, 256, 88}, commits())
 	require.Equal(t, wantRecs, recordsOf(t, s, w))
 	require.Equal(t, wantRoots, w.RootSpends(t, s))
@@ -516,10 +518,11 @@ func testSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
 // transactions with their spends, and its last output is a real coin the next chunk spends, so
 // nothing the first chunk left needs the second to make it true.
 func TestSpendAndCreateMultiRepeatAfterACrashBetweenChunksOfAChain(t *testing.T) {
-	const (
-		height = 1200
-		n      = 600
-	)
+	const height = 1200
+
+	// The chain is longer than one chunk at whatever size the suite runs at: 600 transactions at
+	// the default 256, and a full chunk and 88 more above that.
+	n := max(600, multiChunkTxsForTest()+88)
 
 	for _, c := range []struct {
 		chunk int
@@ -715,10 +718,10 @@ func testSpendAndCreateMultiACutFamilyCommitsInDependencyOrder(t *testing.T) {
 		wide   = 5
 	)
 
-	old := multiCreateChunkTxs
-	multiCreateChunkTxs = 2
+	old := multiCreateChunkTxsOverride
+	multiCreateChunkTxsOverride = 2
 
-	t.Cleanup(func() { multiCreateChunkTxs = old })
+	t.Cleanup(func() { multiCreateChunkTxsOverride = old })
 
 	t.Run("commit order", func(t *testing.T) {
 		s, ctx := newUncheckpointedStore(t)
@@ -771,7 +774,7 @@ func testSpendAndCreateMultiACutFamilyCommitsInDependencyOrder(t *testing.T) {
 			}
 		}
 
-		plan := planFamilyChunks(parents, sizes, multiCreateChunkTxs, spendAndCreateBatchByteBudget)
+		plan := planFamilyChunks(parents, sizes, multiCreateChunkTxsOverride, spendAndCreateBatchByteBudget)
 		require.Greater(t, plan.cutEdges, 0, "the shape must cut edges for this test to mean anything")
 		require.Len(t, committed, len(plan.chunks))
 
@@ -872,10 +875,10 @@ func outpointOnly(txs []*bt.Tx) []*bt.Tx {
 // and writes the rest. Each transaction must keep its own subtree index: the skipped one must not
 // refuse the list or shift the indexes of the others.
 func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
-	old := multiCreateChunkTxs
-	multiCreateChunkTxs = 1
+	old := multiCreateChunkTxsOverride
+	multiCreateChunkTxsOverride = 1
 
-	t.Cleanup(func() { multiCreateChunkTxs = old })
+	t.Cleanup(func() { multiCreateChunkTxsOverride = old })
 
 	s, ctx := newTestStore(t)
 
@@ -921,11 +924,11 @@ func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
 // MultiTxExisted. This holds transaction 0's chunk at its commit until either its context is
 // cancelled or a second passes, which makes such a race certain.
 func TestSpendAndCreateMultiSplitLevelSiblingIsNotCancelled(t *testing.T) {
-	old := multiCreateChunkTxs
-	multiCreateChunkTxs = 1
+	old := multiCreateChunkTxsOverride
+	multiCreateChunkTxsOverride = 1
 
 	t.Cleanup(func() {
-		multiCreateChunkTxs = old
+		multiCreateChunkTxsOverride = old
 		multiCreateBeforeCommit = nil
 	})
 
@@ -988,4 +991,13 @@ func TestSpendAndCreateMultiSplitLevelSiblingIsNotCancelled(t *testing.T) {
 	for i, r := range results[2:] {
 		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i+2, r.Err)
 	}
+}
+
+// multiChunkTxsForTest is the transactions per chunk a test store with default settings uses.
+func multiChunkTxsForTest() int {
+	if multiCreateChunkTxsOverride > 0 {
+		return multiCreateChunkTxsOverride
+	}
+
+	return defaultMultiCreateChunkTxs
 }

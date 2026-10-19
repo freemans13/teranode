@@ -568,6 +568,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DisableDAHCleaner:                       getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 			SkipTxBodyBelowCheckpoint:               getBool("utxostore_skipTxBodyBelowCheckpoint", false, alternativeContext...),
 			NettedBelowWorkers:                      getInt("utxostore_nettedBelowWorkers", 16, alternativeContext...),
+			MultiCreateChunkTxs:                     getInt("utxostore_multiCreateChunkTxs", 256, alternativeContext...),
 			RetainWindowsIndefinitely:               getBool("utxostore_retainWindowsIndefinitely", false, alternativeContext...),
 			SpendJournalRetentionBlocks:             getUint32("utxostore_spendJournalRetentionBlocks", 288, alternativeContext...),
 			ReAssignedUtxoSpendableAfterBlocks:      getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),

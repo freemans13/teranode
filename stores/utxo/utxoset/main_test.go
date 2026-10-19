@@ -1,7 +1,9 @@
 package utxoset
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -71,7 +73,21 @@ func testDSN(t testing.TB) string {
 
 // TestMain drops the per-binary database once the suite is done. The container
 // behind it is reaped by testcontainers when this process exits.
+//
+// UTXOSET_TEST_CHUNK_TXS, when set, runs the whole suite with that many transactions per family
+// chunk instead of the setting's default, which is how the chunk writer is tested at 1,024 and
+// 4,096. Tests that set the size themselves, or that pin the shape of a chunk, still do.
 func TestMain(m *testing.M) {
+	if v := os.Getenv("UTXOSET_TEST_CHUNK_TXS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			fmt.Fprintf(os.Stderr, "UTXOSET_TEST_CHUNK_TXS=%q is not a positive integer\n", v)
+			os.Exit(2)
+		}
+
+		multiCreateChunkTxsOverride = n
+	}
+
 	code := m.Run()
 
 	if containerCleanup != nil {

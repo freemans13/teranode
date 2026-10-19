@@ -46,6 +46,7 @@
 | BlockHeightRetentionAdjustment | int32 | 0 | utxostore_blockHeightRetentionAdjustment | **CRITICAL** - Retention adjustment |
 | DisableDAHCleaner | bool | false | utxostore_disableDAHCleaner | **CRITICAL** - DAH cleaner process control |
 | SkipTxBodyBelowCheckpoint | bool | false | utxostore_skipTxBodyBelowCheckpoint | utxoset only - skip the tx_body write at or below the hardcoded checkpoint |
+| MultiCreateChunkTxs | int | 256 | utxostore_multiCreateChunkTxs | utxoset only - most transactions one family chunk writes in one database transaction above the checkpoint |
 
 ### PostgreSQL Connection Pool (PostgresPool)
 

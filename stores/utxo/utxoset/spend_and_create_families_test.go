@@ -18,10 +18,10 @@ import (
 func setChunkTxs(t *testing.T, n int) {
 	t.Helper()
 
-	old := multiCreateChunkTxs
-	multiCreateChunkTxs = n
+	old := multiCreateChunkTxsOverride
+	multiCreateChunkTxsOverride = n
 
-	t.Cleanup(func() { multiCreateChunkTxs = old })
+	t.Cleanup(func() { multiCreateChunkTxsOverride = old })
 }
 
 // A family cut across chunks: the cut edge's parent output is a real coin until its child's chunk
@@ -350,7 +350,11 @@ func testSpendAndCreateMultiFamiliesInOneChunkAreNetted(t *testing.T) {
 	results, err := s.SpendAndCreateMulti(ctx, txs, height, utxo.WithIgnoreLocked(true))
 	require.NoError(t, err)
 	requireAllCreated(t, results)
-	require.ElementsMatch(t, []int{2 * length, length}, commits(), "two chunks of whole chains, no edge cut")
+	if s.multiChunkTxs() >= chains*length {
+		require.Equal(t, []int{chains * length}, commits(), "one chunk holds every chain whole")
+	} else {
+		require.ElementsMatch(t, []int{2 * length, length}, commits(), "two chunks of whole chains, no edge cut")
+	}
 
 	coinRows := 0
 	for _, tx := range txs {

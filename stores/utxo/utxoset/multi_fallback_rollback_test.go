@@ -90,7 +90,8 @@ func checkRejectedChildLeavesNoSpend(t *testing.T, s *Store, ctx context.Context
 		fillers = 255
 	)
 
-	require.Equal(t, 256, multiCreateChunkTxs, "the test relies on the default create chunk bound")
+	setChunkTxs(t, 256)
+	require.Equal(t, 256, s.multiChunkTxs(), "the test relies on a chunk of 256 transactions")
 
 	w := tests.BuildMultiWorkload(t, 0xb1, 1, fillers+3)
 	w.StoreRoots(t, s, height-1)

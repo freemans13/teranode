@@ -30,6 +30,7 @@ import (
 //	UTXOSET_FAMILY_BENCH_ONLY    comma-separated heights to run, default every file
 //	UTXOSET_FAMILY_BENCH_REPS    measured repetitions per block, default 5
 //	UTXOSET_FAMILY_BENCH_OUT     file the result table is also written to
+//	UTXOSET_FAMILY_BENCH_CHUNK   transactions per chunk, default 256
 //
 // Run it against a real PostgreSQL (UTXOSET_TEST_DSN), as `rtk proxy go test -run
 // TestFamilyChunksOnMainnetBlocks -v -timeout 2h ./stores/utxo/utxoset`, so the filter does not
@@ -76,6 +77,17 @@ func TestFamilyChunksOnMainnetBlocks(t *testing.T) {
 		}
 	}
 
+	chunkTxs := defaultMultiCreateChunkTxs
+
+	if v := os.Getenv("UTXOSET_FAMILY_BENCH_CHUNK"); v != "" {
+		n, err := strconv.Atoi(v)
+		require.NoError(t, err)
+
+		chunkTxs = n
+	}
+
+	setChunkTxs(t, chunkTxs)
+
 	tracer := &stmtTracer{}
 
 	poolTracer = tracer
@@ -99,7 +111,7 @@ func TestFamilyChunksOnMainnetBlocks(t *testing.T) {
 		raw, err := os.ReadFile(f)
 		require.NoError(t, err)
 
-		blk := parseBenchBlock(t, raw, uint32(h)) //nolint:gosec // a height fits
+		blk := parseBenchBlock(t, raw, uint32(h), chunkTxs) //nolint:gosec // a height fits
 
 		t.Logf("block %d: %d transactions, %d outside coins, %d families (largest %d), %d dependency levels (widest %d), %d chunks, %d cut edges, %d chunks on the longest dependency chain",
 			h, len(blk.txs), len(blk.seed.txids), blk.families, blk.largest, blk.levels, blk.widest, blk.chunks, blk.cutEdges, blk.critical)
@@ -256,7 +268,7 @@ func readVarInt(b []byte) (uint64, int) {
 
 // parseBenchBlock parses a raw wire-format block, skips the coinbase, and works out the seed and
 // the claims. In-block parents must be earlier in the block, as in every valid block.
-func parseBenchBlock(t *testing.T, raw []byte, height uint32) *benchBlock {
+func parseBenchBlock(t *testing.T, raw []byte, height uint32, chunkTxs int) *benchBlock {
 	t.Helper()
 
 	require.Greater(t, len(raw), 81)
@@ -337,7 +349,7 @@ func parseBenchBlock(t *testing.T, raw []byte, height uint32) *benchBlock {
 		blk.widest = max(blk.widest, width[level[i]])
 	}
 
-	plan := planFamilyChunks(parents, sizes, multiCreateChunkTxs, spendAndCreateBatchByteBudget)
+	plan := planFamilyChunks(parents, sizes, chunkTxs, spendAndCreateBatchByteBudget)
 	blk.families, blk.largest, blk.chunks, blk.cutEdges = plan.families, plan.largest, len(plan.chunks), plan.cutEdges
 
 	if ranks, _ := plan.ranks(); len(ranks) > 0 {
