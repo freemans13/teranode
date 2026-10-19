@@ -1025,6 +1025,15 @@ func Test_SmokeTests(t *testing.T) {
 		tests.SpendErrorTypes(t, db)
 	})
 
+	t.Run("set conflicting after create", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.SetConflictingAfterCreate(t, db)
+	})
+
 	t.Run("partial spend rollback", func(t *testing.T) {
 		db, _ := setup(ctx, t)
 

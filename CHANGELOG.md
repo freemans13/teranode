@@ -83,6 +83,16 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **Peer-announced subtrees are validated at most 32 at a time.** The new
+  `subtreevalidation_peerSubtreeConcurrency` (default 32) bounds how many peer
+  subtrees a subtree validator works on at once; until now the bound was NumCPU. After a
+  block, a backlog of peer subtrees used to be admitted all at once, each allocating
+  about 1 GiB for 1M transactions. The rest now wait, holding no lock, and
+  `teranode_subtreevalidation_peer_subtree_admission_wait` / `_waiting` show the queue.
+  Raise the setting if subtrees queue while CPU is idle; `0` restores the old
+  behaviour. On the `lockfree` txmeta cache, `teranode_tx_meta_cache_evictions` now
+  also counts an estimate of entries lost to ring wraps, so it is no longer 0 there. (#1967)
+
 - **P2P HTTP endpoints are now rate limited.** (shipped in v0.16.0) `/health` and the websocket upgrade
   path are limited per source address, defaulting to 100 requests per second
   (`p2p_httpRateLimit`); requests over the limit receive HTTP 429. These endpoints
@@ -367,6 +377,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   matching `ErrServiceError` on a 429, or log alerts on `SERVICE_ERROR (59)`, will miss it; an older
   service receiving it over gRPC sees an unknown enum value. Upgrade services together. (#1802)
 
+- **A peer's 429 on an announced block is free only 3 times per 10 minutes.** When a peer announces
+  a block and its `/block/:hash` answers 429, that 429 is not charged to its reputation up to 3 times
+  per peer in a fixed 10-minute window; past that it is charged like any other failed fetch. Within
+  the allowance, the block is fetched instead from up to 2 other peers whose advertised tip is that
+  block, so those peers can see `/block/:hash` requests for blocks they did not announce to us.
+  (#1942)
+
 - **Catchup fetches retry a peer's 429.** `POST /subtree/:hash/txs` and `GET /subtree_data` retry 429
   and 503 up to 6 times with backoff (honouring `Retry-After` up to 5s) instead of reporting the
   peer at once, so a serving peer can see up to 6 requests per batch. These requests are now signed
@@ -416,6 +433,15 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   too; no shipped configuration uses that store. (#1963)
 
 ### Not breaking, but worth knowing
+
+- **Mining candidates no longer build on the old tip during a reorg.** While block
+  assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
+  hold the tip from before the reorg. `GetMiningCandidate` built candidates on that
+  old tip, so a miner could mine on the losing side of a reorg. In these states it
+  now returns an empty candidate on the Blockchain service tip, as it already did in
+  `blockchainSubscription` and `movingUp`. Mining pools can see more empty candidates
+  while a reorg or a block assembly reset runs, including a reset at an unchanged
+  tip after a storage error. No action is required. (#1983)
 
 - **Two Blockchain RPCs start working.** `GetLatestBlockHeaderFromBlockLocator` and
   `GetBlockHeadersFromOldest` were implemented under names that did not satisfy the

@@ -587,6 +587,7 @@ func (r *recordingPruner) Prune(_ context.Context, height uint32, _ string) (int
 // skipped, and lastProcessedHeight is not advanced so the height is retried on the next trigger.
 func TestPhase1FailureSkipsPhase2(t *testing.T) {
 	initPrometheusMetrics()
+	prunerPreserveParentsFailing.Set(0) // process-global gauge: reset so state does not leak between tests or -count runs
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -660,6 +661,7 @@ func newPhase1TestServer(ctx context.Context, store *utxo.MockUtxostore, pruneSv
 // runs Phase 1 again and, once it succeeds, Phase 2 and the height advance.
 func TestPhase1FailureThenSuccessPrunes(t *testing.T) {
 	initPrometheusMetrics()
+	prunerPreserveParentsFailing.Set(0) // process-global gauge: reset so state does not leak between tests or -count runs
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -691,6 +693,48 @@ func TestPhase1FailureThenSuccessPrunes(t *testing.T) {
 	require.Eventually(t, func() bool { return server.lastProcessedHeight.Load() == 102 },
 		2*time.Second, 10*time.Millisecond)
 	require.Equal(t, float64(0), testutil.ToFloat64(prunerPreserveParentsFailing), "a success resets the failure streak")
+}
+
+// A Phase 1 error caused by shutdown is not a Phase 1 failure: the streak gauge and
+// the preserve_parents error counter must not move, and the processor must return.
+func TestPhase1ErrorOnContextCancelIsNotAFailure(t *testing.T) {
+	initPrometheusMetrics()
+	prunerPreserveParentsFailing.Set(0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockStore := &utxo.MockUtxostore{}
+	mockStore.On("GetPrunableUnminedTxIterator", mock.Anything).
+		Run(func(mock.Arguments) { cancel() }).
+		Return((*failingIterator)(nil), errors.NewStorageError("boom"))
+	// Stubbed so that if the shutdown guard regresses, the flow reaches Phase 1b
+	// and the assertions below fail cleanly instead of the mock panicking.
+	mockStore.On("ProcessExpiredPreservations", mock.Anything, mock.Anything).Return(nil)
+
+	pruneSvc := &recordingPruner{calls: make(chan uint32, 2)}
+	server := newPhase1TestServer(ctx, mockStore, pruneSvc, false)
+
+	errsBefore := getCounterValue(t, prunerErrors, "preserve_parents")
+	skippedBefore := getCounterValue(t, prunerSkipped, "preserve_parents_failed")
+
+	done := make(chan struct{})
+	go func() {
+		server.prunerProcessor(ctx)
+		close(done)
+	}()
+	server.pruneNotify <- pruneSignal{blockHeight: 101, blockHash: chainhash.Hash{}}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processor did not return after the context was cancelled")
+	}
+
+	require.Equal(t, float64(0), testutil.ToFloat64(prunerPreserveParentsFailing), "shutdown must not count as a Phase 1 failure")
+	require.Equal(t, errsBefore, getCounterValue(t, prunerErrors, "preserve_parents"))
+	require.Equal(t, skippedBefore, getCounterValue(t, prunerSkipped, "preserve_parents_failed"))
+	require.Empty(t, pruneSvc.calls, "Phase 2 must not run")
 }
 
 // With pruner_skipPreserveParents set, Phase 1 is skipped on purpose, not failed:
