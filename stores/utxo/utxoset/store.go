@@ -217,6 +217,10 @@ type Store struct {
 	lockInFlight sync.WaitGroup
 }
 
+// poolTracer, when set, is installed on the connection pool of every store New opens. A test and
+// benchmark seam; nil in production.
+var poolTracer pgx.QueryTracer
+
 // New opens the store and installs the schema.
 //
 // The store is reached by its own URL scheme, utxoset://, so that an operator selecting it
@@ -225,10 +229,6 @@ type Store struct {
 // cleanly: it folds the entire URL into a config parameter and falls back to a unix socket,
 // which surfaces as a baffling "unrecognized configuration parameter" against the wrong
 // host. So normalise it here, at the one place that owns the connection.
-// poolTracer, when set, is installed on the connection pool of every store New opens. A test and
-// benchmark seam; nil in production.
-var poolTracer pgx.QueryTracer
-
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, storeURL *url.URL) (*Store, error) {
 	dsn := *storeURL
 	if dsn.Scheme == "utxoset" {
