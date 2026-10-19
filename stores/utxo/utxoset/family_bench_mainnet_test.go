@@ -113,8 +113,8 @@ func TestFamilyChunksOnMainnetBlocks(t *testing.T) {
 
 		blk := parseBenchBlock(t, raw, uint32(h), chunkTxs) //nolint:gosec // a height fits
 
-		t.Logf("block %d: %d transactions, %d outside coins, %d families (largest %d), %d dependency levels (widest %d), %d chunks, %d cut edges, %d chunks on the longest dependency chain",
-			h, len(blk.txs), len(blk.seed.txids), blk.families, blk.largest, blk.levels, blk.widest, blk.chunks, blk.cutEdges, blk.critical)
+		t.Logf("block %d: %d transactions, %d outside coins, %d families (largest %d), %d dependency levels (widest %d), %d chunks, %d cut edges, %d chunks on the longest dependency chain, %d transactions on it",
+			h, len(blk.txs), len(blk.seed.txids), blk.families, blk.largest, blk.levels, blk.widest, blk.chunks, blk.cutEdges, blk.critical, blk.criticalTxs)
 
 		type sample struct {
 			wall time.Duration
@@ -221,7 +221,7 @@ type benchBlock struct {
 	claims [][]benchClaim
 	seed   benchSeed
 
-	families, largest, chunks, cutEdges, critical int
+	families, largest, chunks, cutEdges, critical, criticalTxs int
 	// levels is the depth of the dependency graph, widest the most transactions on one level.
 	levels, widest int
 }
@@ -354,6 +354,25 @@ func parseBenchBlock(t *testing.T, raw []byte, height uint32, chunkTxs int) *ben
 
 	if ranks, _ := plan.ranks(); len(ranks) > 0 {
 		blk.critical = slices.Max(ranks)
+	}
+
+	// The longest chain of chunks by TRANSACTIONS rather than by chunk count. A chunk's time grows
+	// with its size, so this, not the chain's length, is what the wall time of a one-family block
+	// follows when the chunks are cut bigger.
+	{
+		_, dependants := plan.ranks()
+		weight := make([]int, len(plan.chunks))
+
+		for i := len(plan.chunks) - 1; i >= 0; i-- {
+			best := 0
+
+			for _, c := range dependants[i] {
+				best = max(best, weight[c])
+			}
+
+			weight[i] = plan.chunks[i].count + best
+			blk.criticalTxs = max(blk.criticalTxs, weight[i])
+		}
 	}
 
 	return blk
