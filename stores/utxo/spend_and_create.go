@@ -27,6 +27,50 @@ type spendRollbackBounded interface {
 	SpendRollbackTimeout() time.Duration
 }
 
+// createOutcomeUnknownKey is the error-data key MarkCreateOutcomeUnknown sets.
+const createOutcomeUnknownKey = "createOutcomeUnknown"
+
+// MarkCreateOutcomeUnknown marks err as returned by a Create that stopped
+// waiting for its write while the write could still commit: the store's own
+// wait for its batch ran out, not the batch failing. SequentialSpendAndCreate
+// keeps the spends for such an error, as it does for a context error. It
+// returns err.
+func MarkCreateOutcomeUnknown(err *errors.Error) *errors.Error {
+	if err != nil {
+		err.SetData(createOutcomeUnknownKey, true)
+	}
+
+	return err
+}
+
+// IsCreateOutcomeUnknown reports whether an error from Create leaves the
+// create's outcome unknown: a context error, or an error the store marked with
+// MarkCreateOutcomeUnknown anywhere in its chain.
+func IsCreateOutcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.IsContextError(err) {
+		return true
+	}
+
+	for cur := err; cur != nil; {
+		if te, ok := cur.(*errors.Error); ok && te.GetData(createOutcomeUnknownKey) == true {
+			return true
+		}
+
+		u, ok := cur.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+
+		cur = u.Unwrap()
+	}
+
+	return false
+}
+
 // ParseCreateOptions applies opts to a fresh CreateOptions and validates the
 // combination. Every Store implementation of SpendAndCreate should use this so
 // option validation stays identical across backends.
@@ -63,11 +107,13 @@ type SequentialStore interface {
 // delegate to it until they implement SpendAndCreate atomically (Postgres
 // transactions, Aerospike-specific logic).
 //
-// A create that fails with ErrTxExists, or with a context error, keeps the
-// spends. ErrTxExists means the record is there. A context error means the
-// outcome is not known: the SQL and Aerospike creates go through a batcher, and
-// a caller whose context ends while its item waits returns at once, while the
-// batch can still commit the record. Unspending then would leave a record whose
+// A create that fails with ErrTxExists, or with an error that leaves its
+// outcome unknown (IsCreateOutcomeUnknown), keeps the spends. ErrTxExists means
+// the record is there. The SQL and Aerospike creates go through a batcher, and
+// a caller that stops waiting for its item returns at once, while the batch can
+// still commit the record. That happens when the caller's context ends, and on
+// Aerospike also when the store's own batcher wait runs out, which returns a
+// ServiceUnavailable error marked with MarkCreateOutcomeUnknown. Unspending then would leave a record whose
 // inputs are unspent, which a repeat never heals, since a repeat drops a
 // transaction whose record exists. Keeping the spends leaves either a written
 // transaction or a parent naming a spender with no record yet, and a repeat of
@@ -76,7 +122,7 @@ type SequentialStore interface {
 //
 // Returned spends: nil when the create failed and the rollback succeeded (the
 // spends are no longer in effect); the live spends when the create failed with
-// ErrTxExists or a context error, or the rollback itself failed.
+// ErrTxExists or an unknown outcome, or the rollback itself failed.
 //
 // The rollback does not run under ctx, so a ctx that ends during it cannot
 // leave it half done. It runs under context.WithoutCancel(ctx), bounded by the
@@ -110,7 +156,7 @@ func SequentialSpendAndCreate(ctx context.Context, logger ulogger.Logger, s Sequ
 			return nil, spends, err
 		}
 
-		if errors.IsContextError(err) {
+		if IsCreateOutcomeUnknown(err) {
 			// the create may still commit; leave the spends in place, as for ErrTxExists
 			return nil, spends, err
 		}

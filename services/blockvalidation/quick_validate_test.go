@@ -339,6 +339,10 @@ func TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions(t *testing.T) {
 		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).
 			Return(nil, []*utxo.Spend{}, nil).Maybe()
 
+		// The existing transaction's inputs are spent again, as the spend phase always did
+		suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).
+			Return(nil, []*utxo.Spend{}, nil).Maybe()
+
 		// Mock SetMinedMulti to return an error
 		suite.MockUTXOStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(map[chainhash.Hash][]uint32{}, errors.NewProcessingError("database error")).Once()
