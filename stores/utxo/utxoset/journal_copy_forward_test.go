@@ -349,3 +349,37 @@ func TestJournalCopyForwardReadsItsSpendersOncePerPass(t *testing.T) {
 	require.Equal(t, 1, journalRowsFor(t, s, ctx, parent, 0), "the spend in partition 3 was carried")
 	require.Equal(t, 1, journalRowsFor(t, s, ctx, parent, 1), "the spend in partition 4 was carried")
 }
+
+// copyForwardUnminedSpends is collectCopyForward then copyForwardFrom, for a test that wants one
+// pass. It carries forward, from the journal partition for leaf, every spend
+// whose spending transaction is still waiting to be mined, and returns how many rows it copied.
+// keepFrom is the lowest height the pass keeps; copies are stamped at the store's height, or
+// keepFrom if the store's height is below it, so they never land in a partition the same pass
+// drops.
+//
+// This is the settled design's pruner step 4 (2026-08-26-utxoset-settled-design.md, "Copy
+// forward any journal row whose spending transaction is still unmined"). A waiting
+// transaction's journal rows are the only record of the coins it took, and Unspend rebuilds
+// them from those rows when the transaction loses a double spend to a block. Carried forward,
+// they live as long as the transaction waits, which is what lets journal retention be as short
+// as reorgs need rather than 1440 blocks.
+//
+// Recognising a resubmitted transaction does not need these rows: the validator answers that
+// from the transaction's own txid (Validator.knownTxResubmission).
+//
+// The spends of a transaction mined at or above keepFrom are carried too (see
+// recentlyMinedInpointsSQL). Retention is kept by the height the spender was mined at, not the
+// height it spent at: a spender that waited across the partition's top and was then mined has
+// its block inside the journal's retention, and a shallow reorg that takes the block back and
+// then gives its coins back needs these rows exactly as a waiting spender's loss does. The copy
+// lands at the store's height, so it is kept for another retention's worth of blocks and then
+// goes, once its block is below keepFrom. Below the highest checkpoint no block can be un-mined,
+// so nothing mined there is carried.
+func (s *Store) copyForwardUnminedSpends(ctx context.Context, leaf, keepFrom uint32) (int64, error) {
+	c, err := s.collectCopyForward(ctx, keepFrom)
+	if err != nil {
+		return 0, err
+	}
+
+	return s.copyForwardFrom(ctx, leaf, keepFrom, c)
+}

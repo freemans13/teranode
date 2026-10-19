@@ -467,7 +467,7 @@ func recordsOf(t *testing.T, s *Store, w *tests.MultiWorkload) []any {
 // transaction, so a 600-deep chain commits in ceil(600/256) transactions. The cut edges write
 // their parent's output as a real coin and the next chunk spends it, and the records are still
 // the ones a per-transaction write leaves.
-func TestSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
+func TestSpendAndCreateMultiDeepChainIsCutIntoChunks(t *testing.T) {
 	const (
 		height = 1100
 		n      = 600
@@ -896,7 +896,7 @@ func TestSpendAndCreateMultiParentExistsKeepsEachSubtreeIdx(t *testing.T) {
 // result, and a later look would find the record this call had just written and report it
 // MultiTxExisted. This holds transaction 0's chunk at its commit until either its context is
 // cancelled or a second passes, which makes such a race certain.
-func TestSpendAndCreateMultiSplitLevelSiblingIsNotCancelled(t *testing.T) {
+func TestSpendAndCreateMultiCommittingChunkIsNotCancelledByAnExistedSibling(t *testing.T) {
 	old := multiCreateChunkTxs
 	multiCreateChunkTxs = 1
 

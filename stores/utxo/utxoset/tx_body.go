@@ -280,9 +280,10 @@ func (s *Store) carryBodiesAhead(ctx context.Context, height uint32, force bool)
 // carryUnminedBodySQL copies, into tx_body_carry, the body of every transaction still waiting
 // to be mined whose body lives below $1, a height.
 //
-// "Waiting" is the identity row's unmined marker, the predicate copyForwardUnminedSpends uses
-// (unminedInpointsSQL), and the scan is driven by the marker's partial index for the same
-// reason: it reads the waiting population and nothing else, whatever the size of the partitions.
+// "Waiting" is the identity row's unmined marker, the predicate the copy-forward's
+// collectCopyForward uses (unminedInpointsSQL), and the scan is driven by the marker's partial
+// index for the same reason: it reads the waiting population and nothing else, whatever the size
+// of the partitions.
 //
 // Crash safety. The copy commits on its own and the drop comes later, so a crash between them
 // carries the same partition again on the next pass. The NOT EXISTS skips a transaction already
