@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -83,11 +84,21 @@ func txidsOf(txs []*bt.Tx) []chainhash.Hash {
 // size the block arrived with: a repeat through another route, with another subtree size, hands
 // the store exactly the same lists.
 func TestNetRange_ListsAreTheSameForAnySubtreeSize(t *testing.T) {
+	for _, skipLock := range []bool{true, false} {
+		t.Run(fmt.Sprintf("skip utxo lock %v", skipLock), func(t *testing.T) {
+			netRangeListsAreTheSameForAnySubtreeSize(t, skipLock)
+		})
+	}
+}
+
+func netRangeListsAreTheSameForAnySubtreeSize(t *testing.T, skipLock bool) {
 	const netRange = 4
 
 	run := func(t *testing.T, dbName string, layoutOf func(txs []*bt.Tx) [][]*bt.Tx) [][]chainhash.Hash {
 		bv, recorder, cleanup := newNetRangeHarness(t, dbName, netRange)
 		defer cleanup()
+
+		bv.settings.BlockValidation.QuickValidateSkipUtxoLock = skipLock
 
 		root, key := seedRoot(t, recorder.Store, 6, "NET_RANGE_KEY")
 

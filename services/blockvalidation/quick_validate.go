@@ -3167,11 +3167,14 @@ func (u *BlockValidation) extendBatch(
 }
 
 // netsBelowCheckpoint reports whether this block's UTXO writes go to a store that nets a
-// below-checkpoint list itself and writes no spend-journal rows there (utxoset). It holds only
-// on the outpoint-only fast path with the UTXO lock skipped, which together mean the block is at
-// or below the highest hardcoded checkpoint.
-func (u *BlockValidation) netsBelowCheckpoint(block *model.Block, outpointOnly bool) bool {
-	return outpointOnly && u.quickValidateSkipsUtxoLock(block) && utxo.NetsBelowCheckpoint(u.utxoStore)
+// below-checkpoint list itself and writes no spend-journal rows there (utxoset). It holds on the
+// outpoint-only fast path, which is already limited to blocks at or below the highest hardcoded
+// checkpoint. It does not depend on the UTXO lock: with blockvalidation_quick_validate_skip_utxo_lock
+// off the store still nets the list, writing its coins locked, and quick validation unlocks them
+// after the block commits. The lists must then be the same fixed ranges on every attempt, and a
+// block must stay on quick validation, exactly as with the lock skipped.
+func (u *BlockValidation) netsBelowCheckpoint(_ *model.Block, outpointOnly bool) bool {
+	return outpointOnly && utxo.NetsBelowCheckpoint(u.utxoStore)
 }
 
 // defaultNetRange is the default of blockvalidation_quick_validate_net_range.

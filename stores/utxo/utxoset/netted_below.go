@@ -46,6 +46,12 @@ import (
 // child never does, and the result is the same whichever commits first or whether the child's
 // record already exists, as it can when the parent arrives between two attempts.
 //
+// A list that asks for locked creates writes its coins locked, exactly as the ordinary create
+// does, because the plan takes the flag from the list's options. Netted outputs are never
+// written, so they have nothing to lock, and a transaction that writes nothing has no coin for
+// SetLocked to find, which it treats as nothing to do. SetLocked reaches a coin by its txid and
+// key range alone, so the unlock needs no mined record, and finds the coins this write made.
+//
 // A coinbase is never in the list. Its create path is the one that refuses the historic
 // duplicate coinbases, and that check is not repeated here.
 
@@ -121,6 +127,11 @@ const (
 // outpoint-only, which is quick validation's fast path. A list that qualifies but asks for
 // something this write does not model is refused with an error rather than written another,
 // slower way.
+//
+// A list that asks for locked creates is not refused: quick validation sends one below the
+// checkpoint whenever blockvalidation_quick_validate_skip_utxo_lock is off, which is its default,
+// and unlocks the block's transactions with SetLocked once the block commits. The write gives
+// each coin it writes the locked flag, as the ordinary locked create does (see netBelowCoins).
 func (s *Store) nettedBelowGate(o *utxo.CreateOptions) (bool, error) {
 	mi, mined := minedBlock(o.MinedBlockInfos)
 	if !mined || !model.BelowCheckpoint(s.checkpoints, mi.BlockHeight) {
@@ -131,8 +142,8 @@ func (s *Store) nettedBelowGate(o *utxo.CreateOptions) (bool, error) {
 		return false, nil
 	}
 
-	if o.Locked || o.Frozen || o.Conflicting || o.SpendOnly || o.CreateOnly {
-		return true, errors.NewProcessingError("[utxoset][SpendAndCreateMulti] a list below the checkpoint is netted, and the netted write does not model locked, frozen, conflicting, create-only or spend-only creates; quick validation needs blockvalidation_quick_validate_skip_utxo_lock on")
+	if o.Frozen || o.Conflicting || o.SpendOnly || o.CreateOnly {
+		return true, errors.NewProcessingError("[utxoset][SpendAndCreateMulti] a list below the checkpoint is netted, and the netted write does not model frozen, conflicting, create-only or spend-only creates")
 	}
 
 	return true, nil
@@ -745,7 +756,8 @@ func (s *Store) netBelowOwnSpent(ctx context.Context, dbTx pgx.Tx, chunk []*netB
 }
 
 // netBelowCoins writes the surviving outputs and bodies of the newly claimed transactions,
-// sorted by leaf and packed key.
+// sorted by leaf and packed key. Each coin carries the flags the plan gave it, which include the
+// locked flag when the list asks for locked creates.
 func (s *Store) netBelowCoins(ctx context.Context, dbTx pgx.Tx, p *createPlan, claimed map[string]bool) error {
 	var rows []int
 

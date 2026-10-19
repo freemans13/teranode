@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
 	"github.com/stretchr/testify/require"
 )
@@ -259,19 +260,151 @@ func TestNettedBelowMissingOutsideCoinFails(t *testing.T) {
 	require.Zero(t, readNetState(t, s, ctx, nil, list, height).mined, "the failing chunk wrote nothing")
 }
 
-// Below the checkpoint a list whose creates would be locked cannot be netted, and the store says
-// so rather than silently writing it another, slower way.
-func TestNettedBelowRefusesLockedCreates(t *testing.T) {
+// lockedCoins counts the coin rows of the transactions that carry the locked flag, and all coin
+// rows of them.
+func lockedCoins(t *testing.T, s *Store, ctx context.Context, txs []*bt.Tx) (locked, all int) {
+	t.Helper()
+
+	for _, tx := range txs {
+		id := tx.TxIDChainHash()
+
+		var l, n int
+		require.NoError(t, s.pool.QueryRow(ctx,
+			`SELECT count(*) FILTER (WHERE (flags & $2::smallint) <> 0), count(*) FROM utxo WHERE txid = $1`,
+			id[:], FlagLocked).Scan(&l, &n))
+
+		locked += l
+		all += n
+	}
+
+	return locked, all
+}
+
+// survivors are the coins of the list that nothing in it spends: the last level's outputs.
+func nettedSurvivors(w *tests.MultiWorkload, width int) []*bt.Tx {
+	return w.Txs[len(w.Txs)-width:]
+}
+
+// Below the checkpoint quick validation sends a list that asks for locked creates whenever
+// blockvalidation_quick_validate_skip_utxo_lock is off, its default. The write applies it: the
+// coins it writes are locked and a spend of one is refused as locked, and an output the list
+// spends left no coin to lock.
+func TestNettedBelowLockedCreatesWriteLockedCoins(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	const height = 840
+	const (
+		height = 840
+		levels = 3
+		width  = 4
+	)
 
-	w := tests.BuildMultiWorkload(t, 0x76, 1, 2)
+	w := tests.BuildMultiWorkload(t, 0x76, levels, width)
+	w.StoreRoots(t, s, height-1)
+
+	list := outpointOnly(w.Txs)
+
+	results, err := s.SpendAndCreateMulti(ctx, list, height, append(belowCheckpointOptions(height), utxo.WithLocked(true))...)
+	require.NoError(t, err)
+
+	for i, r := range results {
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+	}
+
+	require.Equal(t, expectedNetState(w.Roots, list), readNetState(t, s, ctx, w.Roots, list, height),
+		"netting is unchanged: a netted output left no coin")
+
+	locked, all := lockedCoins(t, s, ctx, w.Txs)
+	require.Positive(t, all)
+	require.Equal(t, all, locked, "every coin the write made is locked")
+
+	spender := payFrom(t, 9, []*bt.Tx{nettedSurvivors(w, width)[0]}, []uint32{0})
+	_, _, err = s.SpendAndCreate(ctx, spender, height+1)
+	require.ErrorIs(t, err, errors.ErrTxLocked, "a spend of a locked coin is refused")
+}
+
+// Quick validation unlocks a block's transactions, every one of them, with SetLocked once the
+// block has committed. That clears the coins the netted write made, and the transactions that
+// wrote no coin are no fault.
+func TestNettedBelowLockedCreatesUnlockWithSetLocked(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	const (
+		height = 841
+		levels = 3
+		width  = 4
+	)
+
+	w := tests.BuildMultiWorkload(t, 0x77, levels, width)
 	w.StoreRoots(t, s, height-1)
 
 	_, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, append(belowCheckpointOptions(height), utxo.WithLocked(true))...)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "below the checkpoint")
+	require.NoError(t, err)
+
+	hashes := make([]chainhash.Hash, len(w.Txs))
+	for i, tx := range w.Txs {
+		hashes[i] = *tx.TxIDChainHash()
+	}
+
+	require.NoError(t, s.SetLocked(ctx, hashes, false))
+
+	locked, all := lockedCoins(t, s, ctx, w.Txs)
+	require.Positive(t, all)
+	require.Zero(t, locked, "the unlock cleared every coin")
+
+	got, err := s.Get(ctx, w.Txs[len(w.Txs)-1].TxIDChainHash(), fields.Locked)
+	require.NoError(t, err)
+	require.False(t, got.Locked, "and the transaction's record reports it unlocked")
+
+	spender := payFrom(t, 9, []*bt.Tx{nettedSurvivors(w, width)[0]}, []uint32{0})
+	_, _, err = s.SpendAndCreate(ctx, spender, height+1)
+	require.NoError(t, err, "the coin is spendable after the unlock")
+}
+
+// Without the locked option the coins are written unlocked, as before.
+func TestNettedBelowUnlockedCreatesWriteUnlockedCoins(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	const (
+		height = 842
+		levels = 3
+		width  = 4
+	)
+
+	w := tests.BuildMultiWorkload(t, 0x78, levels, width)
+	w.StoreRoots(t, s, height-1)
+
+	_, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, belowCheckpointOptions(height)...)
+	require.NoError(t, err)
+
+	locked, all := lockedCoins(t, s, ctx, w.Txs)
+	require.Positive(t, all)
+	require.Zero(t, locked)
+
+	spender := payFrom(t, 9, []*bt.Tx{nettedSurvivors(w, width)[0]}, []uint32{0})
+	_, _, err = s.SpendAndCreate(ctx, spender, height+1)
+	require.NoError(t, err)
+}
+
+// Frozen and conflicting creates below the checkpoint are not modelled by
+// the netted write (create-only and spend-only never reach it), and the store says so rather than writing the list another, slower way.
+func TestNettedBelowRefusesWhatItDoesNotModel(t *testing.T) {
+	for name, opt := range map[string]utxo.CreateOption{
+		"frozen":      utxo.WithFrozen(true),
+		"conflicting": utxo.WithConflicting(true),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, ctx := newTestStore(t)
+
+			const height = 843
+
+			w := tests.BuildMultiWorkload(t, 0x79, 1, 2)
+			w.StoreRoots(t, s, height-1)
+
+			_, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, append(belowCheckpointOptions(height), opt)...)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "below the checkpoint")
+		})
+	}
 }
 
 // A coinbase never goes through the list: it keeps the create path that refuses the historic

@@ -34,8 +34,8 @@ import (
 // which has its own write.
 //
 // It does NOT net, and hands the list to the per-transaction default instead, for a list whose
-// options the netted write does not model: create-only or spend-only, and frozen, conflicting or
-// locked creates.
+// options the netted write does not model: create-only or spend-only, and frozen or conflicting
+// creates. Locked creates are modelled: the coins are written locked.
 //
 // A transaction in the list that turns out to exist already, which the caller's pre-check makes
 // a race with another writer, is reported MultiTxExisted. The chunk finds it under the
