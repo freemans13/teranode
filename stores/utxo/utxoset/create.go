@@ -272,16 +272,9 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		flags |= FlagLocked
 	}
 
-	// The inputs, stored rather than re-derived. Block assembly rebuilds a mining candidate
-	// from the fee, the size and these, never from the serialized transaction, which is what
-	// lets the body age out of its partition while the transaction stays mineable.
-	//
-	// The parsed form is kept as well, for the metadata returned to the caller. See the return
-	// below for who reads it.
-	var (
-		inpoints   []byte
-		txInpoints subtree.TxInpoints
-	)
+	// The inputs, parsed for the metadata returned to the caller. See the return below for who
+	// reads it. The serialized form is built further down, only for the claim that stores it.
+	var txInpoints subtree.TxInpoints
 
 	if !isCoinbase {
 		ip, ierr := subtree.NewTxInpointsFromTx(tx)
@@ -290,10 +283,6 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		}
 
 		txInpoints = ip
-
-		if inpoints, ierr = ip.Serialize(); ierr != nil {
-			return nil, errors.NewProcessingError("[utxoset][Create] serialise inpoints %s", txHash.String(), ierr)
-		}
 	}
 
 	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
@@ -326,6 +315,21 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		blockID = int32(mi.BlockID)         //nolint:gosec // a block id fits int32
 		subtreeIdx = int32(mi.SubtreeIdx)   //nolint:gosec // a subtree index fits int32
 		atBirth = model.BelowCheckpoint(s.checkpoints, mi.BlockHeight) || s.seedingCreate(options)
+	}
+
+	// The inputs, stored rather than re-derived. Block assembly rebuilds a mining candidate
+	// from the fee, the size and these, never from the serialized transaction, which is what
+	// lets the body age out of its window while the transaction stays mineable. Only the
+	// identity claim stores them: the block-path and seed claims write none (see
+	// createMinedPlanSQL), so a create that takes either is not made to serialize them. Below
+	// the checkpoint that is every transaction of every block.
+	var inpoints []byte
+
+	if !isCoinbase && !atBirth {
+		var ierr error
+		if inpoints, ierr = txInpoints.Serialize(); ierr != nil {
+			return nil, errors.NewProcessingError("[utxoset][Create] serialise inpoints %s", txHash.String(), ierr)
+		}
 	}
 
 	// What the UTXOs carry from birth: the block's pair when the store lets the create write

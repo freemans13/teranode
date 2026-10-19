@@ -275,7 +275,7 @@ func newBenchNode(b *testing.B, storeName string) *benchNode {
 
 		store = s
 		if storeName == "utxoset-pertx" {
-			store = &perTxMulti{Store: s, concurrency: utxo.SpendAndCreateMultiConcurrency(tSettings)}
+			store = &perTxMulti{Store: s, concurrency: utxo.SpendAndCreateMultiWidthsFor(tSettings)}
 		}
 	}
 
@@ -310,7 +310,7 @@ func newBenchNode(b *testing.B, storeName string) *benchNode {
 // default, which is what the netted write replaces. Everything else is the same store.
 type perTxMulti struct {
 	*utxoset.Store
-	concurrency int
+	concurrency utxo.SpendAndCreateMultiWidths
 }
 
 func (p *perTxMulti) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
