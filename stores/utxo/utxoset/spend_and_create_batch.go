@@ -514,10 +514,6 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 	}
 
 	if len(creators) > 0 {
-		if spendAndCreateBeforeCreate != nil {
-			spendAndCreateBeforeCreate()
-		}
-
 		plan := s.planCreates(creators)
 
 		// A create-only batch has no spend phase and so no transaction yet, and it needs one:

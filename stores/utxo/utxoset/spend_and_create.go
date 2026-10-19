@@ -92,11 +92,6 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	return s.spendAndCreateOne(ctx, tx, blockHeight, options, opts...)
 }
 
-// spendAndCreateBeforeCreate is a test hook called between SpendAndCreate's spends and its
-// create, inside the database transaction, on both the single and the batched path. nil in
-// production.
-var spendAndCreateBeforeCreate func()
-
 // spendAndCreateOne is SpendAndCreate for one transaction in its own database transaction.
 //
 // It is the reference semantics: the batched path's contract is to give every caller the
@@ -201,10 +196,6 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 
 			return nil, spends, nil
 		}
-	}
-
-	if spendAndCreateBeforeCreate != nil {
-		spendAndCreateBeforeCreate()
 	}
 
 	data, err := s.createIn(ctx, dbTx, tx, blockHeight, notedHeight, opts...)

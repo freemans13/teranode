@@ -5,24 +5,9 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-// emptyUnminedIterator is an iterator over nothing.
-//
-// It is a real value rather than a nil interface on purpose: the block assembly caller
-// checks only the error and then uses the iterator (BlockAssembler.go:2629-2636), so
-// handing back a nil would move a startup error into a nil dereference, which is a worse
-// failure in a worse place.
-type emptyUnminedIterator struct{}
-
-func (emptyUnminedIterator) Next(_ context.Context) ([]*utxo.UnminedTransaction, error) {
-	return nil, nil
-}
-func (emptyUnminedIterator) Err() error   { return nil }
-func (emptyUnminedIterator) Close() error { return nil }
-
-// QueryOldUnminedTransactions finds none, same reason.
+// QueryOldUnminedTransactions always finds none.
 func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chainhash.Hash, error) {
 	return nil, nil
 }
