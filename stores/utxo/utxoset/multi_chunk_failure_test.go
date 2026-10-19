@@ -26,10 +26,6 @@ func forceChunkOfOne(t *testing.T) {
 // coins are spent, so a different transaction can spend the coin of any transaction that was not
 // stored, with no give-back to run.
 func TestSpendAndCreateMultiAStoppedWriteLeavesEveryCommittedChunkWhole(t *testing.T) {
-	testSpendAndCreateMultiAStoppedWriteLeavesEveryCommittedChunkWhole(t)
-}
-
-func testSpendAndCreateMultiAStoppedWriteLeavesEveryCommittedChunkWhole(t *testing.T) {
 	failure := errors.NewProcessingError("injected failure")
 
 	t.Run("a chunk fails with its spend made; an earlier chunk stays committed", func(t *testing.T) {
@@ -131,10 +127,6 @@ func testSpendAndCreateMultiAStoppedWriteLeavesEveryCommittedChunkWhole(t *testi
 // server, and whatever earlier chunks committed stays. Nothing runs to clean up, and nothing
 // needs to, so a retry of the list writes records identical to a clean run.
 func TestSpendAndCreateMultiACrashRollsBackTheOpenChunk(t *testing.T) {
-	testSpendAndCreateMultiACrashRollsBackTheOpenChunk(t)
-}
-
-func testSpendAndCreateMultiACrashRollsBackTheOpenChunk(t *testing.T) {
 	for _, stage := range []string{"locked", "spent", "created"} {
 		t.Run("crash at "+stage, func(t *testing.T) {
 			s, ctx := newUncheckpointedStore(t)

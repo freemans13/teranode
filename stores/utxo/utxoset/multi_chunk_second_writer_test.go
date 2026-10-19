@@ -50,10 +50,6 @@ func requireNoHalfWrite(t *testing.T, s *Store, ctx context.Context, parent, chi
 // TestSpendAndCreateMultiKeepsTheSpendsOfAStoredTransaction is the review's two orders of a
 // second writer of T, and the commit the client did not hear about.
 func TestSpendAndCreateMultiKeepsTheSpendsOfAStoredTransaction(t *testing.T) {
-	testKeepsTheSpendsOfAStoredTransaction(t)
-}
-
-func testKeepsTheSpendsOfAStoredTransaction(t *testing.T) {
 	failure := errors.NewProcessingError("injected failure")
 
 	t.Run("T stored before the multi-write, which finds it stored", func(t *testing.T) {
@@ -129,10 +125,6 @@ func testKeepsTheSpendsOfAStoredTransaction(t *testing.T) {
 // overlap in time. The first holds T's lock from before its spend to its commit, so the second
 // waits, and then finds whatever the first left: T stored, or nothing.
 func TestSpendAndCreateMultiAgainstASecondMultiWrite(t *testing.T) {
-	testAgainstASecondMultiWrite(t)
-}
-
-func testAgainstASecondMultiWrite(t *testing.T) {
 	failure := errors.NewProcessingError("injected failure")
 
 	// overlap runs the first write with its chunk paused after the coin is deleted, starts the
