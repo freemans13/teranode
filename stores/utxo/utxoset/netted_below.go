@@ -40,20 +40,28 @@ import (
 // that are missing.
 //
 // A transaction of the list can hold coins this write never wrote: one that reached the store
-// unmined before its block (the identity probe, read once before any chunk), which holds every
-// output as a coin and has made its spends. It is not written again. Its chunk deletes its own
-// outputs the list spends instead, so only the parent's chunk ever touches the parent's coins, a
-// child never does, and the result is the same whichever commits first or whether the child's
-// record already exists, as it can when the parent arrives between two attempts.
+// unmined before its chunk (the identity route), which holds every output as a coin and has made
+// its spends. It is not written again. Its chunk deletes its own outputs the list spends instead,
+// so only the parent's chunk ever touches the parent's coins, a child never does, and the result
+// is the same whichever commits first or whether the child's record already exists, as it can
+// when the parent arrives between two attempts.
 //
-// The identity probe runs once, before any chunk, and this write takes no transaction locks.
-// That is safe only because no other writer stores a transaction while the node syncs below the
-// checkpoint: the FSM is CATCHINGBLOCKS or LEGACYSYNCING, and no transaction is processed outside
-// the sync itself (legacy peers: handleInvMsg in services/legacy/netsync/manager.go requests a
-// transaction only in RUNNING). If a writer stored a list transaction P between the probe and
-// P's chunk commit, and all P's inputs came from the list, P's chunk would treat P as new and
-// leave the outputs the list spends as live coins. A change that lets transactions in during the
-// sync must therefore also change this write.
+// Other writers can store a transaction of the list while this write runs. The node does not
+// stop them during the sync: unsolicited legacy tx messages, propagation and the validator's
+// Kafka consumer all store transactions in CATCHINGBLOCKS and LEGACYSYNCING. Two rules keep
+// such a writer from leaving an output the list spends as a live coin.
+//
+//   - Each chunk takes the transaction lock of every transaction it holds, the lock every create
+//     takes before its claim, and reads the identity rows again under that lock. A transaction
+//     stored unmined before the lock takes the identity route. A writer that comes after it
+//     waits for the chunk to commit.
+//   - Each chunk writes the mined record of every transaction it holds, so a writer that comes
+//     after the commit finds the record and its claim does not take. Without the record, a
+//     transaction with no coin to write would be stored a second time as unmined, with every
+//     output a coin, while its parent's chunk still runs.
+//
+// The first identity probe, before any chunk, only sizes the work. The read under the lock
+// decides.
 //
 // A list that asks for locked creates writes its coins locked, exactly as the ordinary create
 // does, because the plan takes the flag from the list's options. Netted outputs are never
@@ -217,26 +225,7 @@ type netBelowTx struct {
 	netted []bool
 	// listSpent are the transaction's own outputs a later transaction of the list spends.
 	listSpent []uint32
-	// writesNothing is set for a transaction the chunk writes no row for at all; see
-	// dropWriteNothing.
-	writesNothing bool
-	result        utxo.SpendAndCreateMultiResult
-}
-
-// allInputsNetted reports whether every input of the transaction spends an output of an earlier
-// transaction of the list, so it deletes no coin.
-func (it *netBelowTx) allInputsNetted() bool {
-	if len(it.netted) == 0 {
-		return false
-	}
-
-	for _, n := range it.netted {
-		if !n {
-			return false
-		}
-	}
-
-	return true
+	result    utxo.SpendAndCreateMultiResult
 }
 
 func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndCreateMultiList,
@@ -249,7 +238,7 @@ func (s *Store) netBelow(ctx context.Context, txs []*bt.Tx, list *utxo.SpendAndC
 		}
 	}
 
-	ident, err := s.identityHeld(ctx, list.TxIDs)
+	ident, err := s.identityHeld(ctx, s.pool, list.TxIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +316,9 @@ const identityHeldSQL = `
 SELECT t.txid FROM unnest($1::smallint[], $2::bytea[]) AS t(leaf, txid)
  WHERE EXISTS (SELECT 1 FROM tx_ident i WHERE i.leaf = t.leaf AND i.txid = t.txid)`
 
-func (s *Store) identityHeld(ctx context.Context, txids []chainhash.Hash) (map[chainhash.Hash]bool, error) {
+// identityHeld reads the identity rows of txids through q: the pool for the first probe, and a
+// chunk's database transaction for the read under the chunk's locks.
+func (s *Store) identityHeld(ctx context.Context, q querier, txids []chainhash.Hash) (map[chainhash.Hash]bool, error) {
 	leaves := make([]int16, len(txids))
 	ids := make([][]byte, len(txids))
 
@@ -336,7 +327,7 @@ func (s *Store) identityHeld(ctx context.Context, txids []chainhash.Hash) (map[c
 		ids[i] = txids[i][:]
 	}
 
-	rows, err := s.pool.Query(ctx, identityHeldSQL, leaves, ids)
+	rows, err := q.Query(ctx, identityHeldSQL, leaves, ids)
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset][SpendAndCreateMulti] identity probe", err)
 	}
@@ -439,34 +430,6 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 	// Outputs the list spends are never coins.
 	_ = plan.takeNetted(spender)
 
-	// Before the fence judge: it counts the records of the rows it is handed, and a transaction
-	// that writes nothing never has one.
-	plan = dropWriteNothing(chunk, plan)
-
-	var identRows, newRows []int
-
-	for i, owner := range plan.owner {
-		if chunk[owner].ident {
-			identRows = append(identRows, i)
-		} else {
-			newRows = append(newRows, i)
-		}
-	}
-
-	// A chunk of transactions that all write nothing has nothing to commit, and needs neither
-	// a database transaction nor the fence lock.
-	if len(plan.owner) == 0 {
-		if err := s.netBelowFault(chunk); err != nil {
-			return err
-		}
-
-		for _, it := range chunk {
-			it.result = utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxCreated}
-		}
-
-		return nil
-	}
-
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][SpendAndCreateMulti] begin netted chunk", err)
@@ -485,6 +448,20 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 		return err
 	}
 
+	if err = s.netBelowLockAndProbe(ctx, dbTx, chunk); err != nil {
+		return err
+	}
+
+	var identRows, newRows []int
+
+	for i, owner := range plan.owner {
+		if chunk[owner].ident {
+			identRows = append(identRows, i)
+		} else {
+			newRows = append(newRows, i)
+		}
+	}
+
 	if err = s.judgeFencedCreates(ctx, dbTx, plan, fence); err != nil {
 		return err
 	}
@@ -492,13 +469,7 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 	// A transaction stored unmined before its block takes today's block-path create, which
 	// records its containment from the identity row and writes nothing else.
 	if len(identRows) > 0 {
-		sub := plan.subset(identRows)
-
-		if err = s.lockTxids(ctx, dbTx, sub.txids); err != nil {
-			return err
-		}
-
-		if err = s.runMinedPlan(ctx, dbTx, sub); err != nil {
+		if err = s.runMinedPlan(ctx, dbTx, plan.subset(identRows)); err != nil {
 			return err
 		}
 	}
@@ -531,13 +502,6 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 	committed = true
 
 	for k, it := range chunk {
-		if it.writesNothing {
-			// No record, so no metadata to report. The caller needs only the status: a
-			// created transaction is neither stamped nor spent again.
-			it.result = utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxCreated}
-			continue
-		}
-
 		if !it.ident && claimed[string(it.txid[:])] {
 			it.result = utxo.SpendAndCreateMultiResult{Status: utxo.MultiTxCreated, Meta: plan.perItem[k]}
 			continue
@@ -563,53 +527,51 @@ func (s *Store) netBelowFault(chunk []*netBelowTx) error {
 	return nettedBelowFault(positions)
 }
 
-// dropWriteNothing takes out of the plan every transaction the chunk would write only a mined
-// record for, and marks it. Such a transaction W
+// netBelowLockAndProbe takes the transaction lock of every transaction of the chunk and then
+// reads their identity rows again, in the chunk's database transaction. A transaction that
+// another writer stored unmined after the first probe is marked ident here, so the chunk takes
+// the identity route for it and deletes its own outputs that the list spends. The lock is the one
+// every create takes before its claim, so no such writer can commit between this read and the
+// chunk's commit. One call locks all the chunk's transactions in key order, so two chunks cannot
+// wait on each other in a cycle.
 //
-//   - has no identity row, so it did not reach the store unmined;
-//   - spends only outputs of earlier transactions of the list, so it deletes no coin;
-//   - has no output left as a coin: each is spent in the list or is not spendable;
-//   - carries no body, which below the checkpoint means utxostore_skipTxBodyBelowCheckpoint.
-//
-// Its record would be the only row it writes, and nothing below the checkpoint reads it. The
-// record is the repeat detector, but W has nothing to repeat: writing nothing on every attempt is
-// already idempotent, and the netting of its parents and children is computed from the list,
-// never from the store. No later block can spend an output of W, because it has none left. A
-// later block that included W again would spend outputs that were never written as coins and
-// fail. W can never be the block's first non-coinbase transaction, whose record block-ID
-// recovery reads on a repeat: that one is at position 0 of the block's first list, and position 0
-// has no earlier transaction of the list to spend.
-//
-// W's classification depends on the list, the setting, and W's own identity row and mined
-// record, never on its parents': a parent that holds coins deletes its own (netBelowOwnSpent).
-// After a crash part-way through a list, propagation could store W unmined before the repeat. W
-// is then not W on the repeat: it takes the identity route and its chunk deletes its own
-// list-spent coins, which is the right answer either way. Once a list has fully applied the
-// classification cannot change, because every transaction in it has spent its inputs and W's
-// inputs were never coins. That is the only case the fence judge sees: a block can be behind the
-// stamp fence only once it has fully applied, so the rows it counts are the same rows the first
-// complete attempt wrote.
-func dropWriteNothing(chunk []*netBelowTx, plan *createPlan) *createPlan {
-	withCoin := make(map[string]struct{}, len(plan.utxoTxids))
-	for _, id := range plan.utxoTxids {
-		withCoin[string(id)] = struct{}{}
-	}
+// Every transaction of the chunk then writes its mined record, also one with no coin to write and
+// no coin to delete. A writer that comes after the commit finds that record and its claim does
+// not take. Without the record, such a transaction could be stored a second time as unmined, with
+// every output a coin, while the chunk of its parent still runs.
+func (s *Store) netBelowLockAndProbe(ctx context.Context, dbTx pgx.Tx, chunk []*netBelowTx) error {
+	ids := make([][]byte, len(chunk))
 
-	keep := make([]int, 0, len(plan.owner))
+	var unknown []chainhash.Hash
 
-	for i, owner := range plan.owner {
-		it := chunk[owner]
+	for k, it := range chunk {
+		ids[k] = it.txid[:]
 
-		_, coin := withCoin[string(plan.txids[i])]
-		if it.ident || coin || plan.bodies[i] != nil || !it.allInputsNetted() {
-			keep = append(keep, i)
-			continue
+		if !it.ident {
+			unknown = append(unknown, it.txid)
 		}
-
-		it.writesNothing = true
 	}
 
-	return plan.subset(keep)
+	if err := s.lockTxids(ctx, dbTx, ids); err != nil {
+		return err
+	}
+
+	if len(unknown) == 0 {
+		return nil
+	}
+
+	held, err := s.identityHeld(ctx, dbTx, unknown)
+	if err != nil {
+		return err
+	}
+
+	for _, it := range chunk {
+		if held[it.txid] {
+			it.ident = true
+		}
+	}
+
+	return nil
 }
 
 // netBelowClaim inserts the mined records and returns the txids whose record is new.
