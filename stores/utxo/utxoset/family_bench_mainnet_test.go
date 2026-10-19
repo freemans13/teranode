@@ -120,9 +120,8 @@ func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
 
 		for rep := -1; rep < reps; rep++ { // rep -1 is a warm-up and is dropped
 			writers := []benchWriter{
-				{"two-step", true, true},
-				{"family", false, true},
-				{"family-lazy", false, false},
+				{"two-step", true},
+				{"family", false},
 			}
 
 			// Rotate which writer goes first, so none always gets the warmer cache.
@@ -135,9 +134,8 @@ func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
 
 				t.Run(fmt.Sprintf("%d/%s/rep%d", h, name, rep), func(t *testing.T) {
 					forceTwoStep = wr.twoStep
-					multiProbeFirst = wr.probeFirst
 
-					t.Cleanup(func() { forceTwoStep, multiProbeFirst = false, true })
+					t.Cleanup(func() { forceTwoStep = false })
 
 					s, ctx := newTestStoreWith(t, nil)
 					seedBenchCoins(t, s, ctx, blk)
@@ -195,7 +193,7 @@ func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
 			}
 		}
 
-		for _, name := range []string{"two-step", "family", "family-lazy"} {
+		for _, name := range []string{"two-step", "family"} {
 			ss := runs[name]
 			if len(ss) == 0 {
 				continue
@@ -225,12 +223,10 @@ func TestFamilyChunksAgainstTheTwoStepWriteOnMainnetBlocks(t *testing.T) {
 	}
 }
 
-// benchWriter is one writer under test: the two-step write, family chunks reading existence
-// first (multiProbeFirst), or family chunks that let the create claim find what exists.
+// benchWriter is one writer under test: the two-step write, or family chunks.
 type benchWriter struct {
-	name       string
-	twoStep    bool
-	probeFirst bool
+	name    string
+	twoStep bool
 }
 
 // benchBlock is a parsed block and what the benchmark seeds for it.

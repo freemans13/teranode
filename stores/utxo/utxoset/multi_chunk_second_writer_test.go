@@ -50,7 +50,7 @@ func requireNoHalfWrite(t *testing.T, s *Store, ctx context.Context, parent, chi
 // TestSpendAndCreateMultiKeepsTheSpendsOfAStoredTransaction is the review's two orders of a
 // second writer of T, and the commit the client did not hear about.
 func TestSpendAndCreateMultiKeepsTheSpendsOfAStoredTransaction(t *testing.T) {
-	eachProbeOrder(t, testKeepsTheSpendsOfAStoredTransaction)
+	testKeepsTheSpendsOfAStoredTransaction(t)
 }
 
 func testKeepsTheSpendsOfAStoredTransaction(t *testing.T) {
@@ -129,7 +129,7 @@ func testKeepsTheSpendsOfAStoredTransaction(t *testing.T) {
 // overlap in time. The first holds T's lock from before its spend to its commit, so the second
 // waits, and then finds whatever the first left: T stored, or nothing.
 func TestSpendAndCreateMultiAgainstASecondMultiWrite(t *testing.T) {
-	eachProbeOrder(t, testAgainstASecondMultiWrite)
+	testAgainstASecondMultiWrite(t)
 }
 
 func testAgainstASecondMultiWrite(t *testing.T) {
@@ -281,48 +281,46 @@ func TestSpendAndCreateWaitsOnAMultiWriteOfTheSameTransaction(t *testing.T) {
 // commit. A rival that only creates the transaction, with no spend whose row lock would make it
 // wait anyway, must wait for the chunk, and then find the transaction stored.
 func TestSpendAndCreateMultiHoldsTheLockOfEachTransactionItWrites(t *testing.T) {
-	eachProbeOrder(t, func(t *testing.T) {
-		s, ctx := newUncheckpointedStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
-		parent := storedParent(t, s, ctx)
-		child := spendOutput(t, parent, 0, 1)
+	parent := storedParent(t, s, ctx)
+	child := spendOutput(t, parent, 0, 1)
 
-		done := make(chan error, 1)
-		finished := make(chan struct{})
-		fired := false
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	fired := false
 
-		multiChunkFault = func(_ int, stage string) error {
-			if stage != "spent" || fired {
-				return nil
-			}
-
-			fired = true
-
-			go func() {
-				_, _, err := s.SpendAndCreate(context.Background(), spendOutput(t, parent, 0, 1), 1_100, utxo.WithCreateOnly())
-				done <- err
-
-				close(finished)
-			}()
-
-			select {
-			case <-finished:
-				t.Error("a create of T finished while the chunk held T's lock")
-			case <-time.After(400 * time.Millisecond):
-			}
-
+	multiChunkFault = func(_ int, stage string) error {
+		if stage != "spent" || fired {
 			return nil
 		}
 
-		t.Cleanup(func() { multiChunkFault = nil })
+		fired = true
 
-		results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
-		require.NoError(t, err)
-		require.Equal(t, utxo.MultiTxCreated, results[0].Status)
+		go func() {
+			_, _, err := s.SpendAndCreate(context.Background(), spendOutput(t, parent, 0, 1), 1_100, utxo.WithCreateOnly())
+			done <- err
 
-		require.ErrorIs(t, <-done, errors.ErrTxExists, "the rival found T stored")
-		multiChunkFault = nil
+			close(finished)
+		}()
 
-		requireCoinStaysSpentByChild(t, s, ctx, parent, child)
-	})
+		select {
+		case <-finished:
+			t.Error("a create of T finished while the chunk held T's lock")
+		case <-time.After(400 * time.Millisecond):
+		}
+
+		return nil
+	}
+
+	t.Cleanup(func() { multiChunkFault = nil })
+
+	results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
+	require.Equal(t, utxo.MultiTxCreated, results[0].Status)
+
+	require.ErrorIs(t, <-done, errors.ErrTxExists, "the rival found T stored")
+	multiChunkFault = nil
+
+	requireCoinStaysSpentByChild(t, s, ctx, parent, child)
 }

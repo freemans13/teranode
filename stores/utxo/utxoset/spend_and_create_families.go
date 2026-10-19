@@ -29,8 +29,10 @@ import (
 // parent of a cut edge; chunks with no edge between them run in parallel.
 //
 // The rule that replaces the give-back of the two-step write: every commit leaves a true state.
-// A chunk locks its transactions, finds which already exist, spends the outside coins of the
-// survivors, stores the survivors, and commits, all in one database transaction. A transaction
+// A chunk locks its transactions, spends the outside coins of them, stores them, and commits, all
+// in one database transaction. It does not ask first which already exist: it spends and stores,
+// and when the create claim finds one stored, or a spend is refused because that same transaction
+// already spent the coin, it rolls the chunk back and redoes it without that transaction. A transaction
 // is stored if and only if its spends are made, so a failed or crashed chunk leaves nothing, and
 // a writer never has to know whether another writer of the same transaction exists or is alive.
 // Two writers of one transaction take its advisory lock in turn, and the second finds it stored.
@@ -608,8 +610,8 @@ type chunkRun struct {
 	// spendFailed[k] is true once a round found a spend of its transaction refused: it stays
 	// failed for the rest of this attempt, and a later round does not spend for it.
 	spendFailed []bool
-	// forcedExisted[k] is true once the create claim reported the transaction as stored although
-	// the existence read had not.
+	// forcedExisted[k] is true once the create claim reported the transaction as stored, or a
+	// refused spend turned out to be its own earlier spend.
 	forcedExisted []bool
 	parentDead    []bool
 	// netted[k][vin] is true when input vin's parent is a live transaction of this same chunk.
@@ -705,13 +707,9 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 	t1 := time.Now()
 	stats.lockNs.Add(int64(t1.Sub(t0)))
 
-	// Which transactions already exist, under their locks, before anything is netted: an
-	// output of one that exists is a real coin and its child must spend it for real.
-	if err = w.markExisting(ctx, dbTx, run); err != nil {
-		return false, err
-	}
-
-	stats.probeNs.Add(int64(time.Since(t1)))
+	// A transaction an earlier round found stored is marked existing before anything is netted:
+	// an output of one that exists is a real coin and its child must spend it for real.
+	w.markExisting(run)
 
 	if err = chunkFault(run.ch.idx, "locked"); err != nil {
 		return false, err
@@ -732,11 +730,13 @@ func (w *nettedWrite) familyRound(ctx context.Context, run *chunkRun, stats *fam
 	if failed {
 		// Nothing of this round is kept. The next one leaves out what failed, and treats as
 		// existing what the store turns out to hold.
-		if !multiProbeFirst {
-			if err = w.reprobeRefused(ctx, dbTx, run); err != nil {
-				return false, err
-			}
+		tProbe := time.Now()
+
+		if err = w.reprobeRefused(ctx, dbTx, run); err != nil {
+			return false, err
 		}
+
+		stats.probeNs.Add(int64(time.Since(tProbe)))
 
 		return true, nil
 	}
@@ -839,16 +839,6 @@ func (w *nettedWrite) parentFailedResult(it *multiTx) utxo.SpendAndCreateMultiRe
 		Err: errors.NewProcessingError("SpendAndCreateMulti: a parent of %s earlier in the list failed", it.txid.String())}
 }
 
-// multiProbeFirst makes a chunk read which of its transactions already exist before it spends
-// anything, which is the order the design states. When false, the chunk spends first on the
-// assumption that none exists, lets the create claim find the ones that do, and runs the round
-// again with them marked existing; a spend that is refused is first checked against the store,
-// so a transaction that exists is never reported as failed. The two end in the same state. The
-// second saves the existence read, a statement that costs a probe of the identity,
-// containment and UTXO tables per transaction, on every chunk that has no existing transaction,
-// which is nearly all of them.
-var multiProbeFirst = true
-
 // probeExisting reads which of the given transactions of the chunk the store already holds,
 // under their advisory locks.
 func (w *nettedWrite) probeExisting(ctx context.Context, dbTx pgx.Tx, run *chunkRun, ks []int) (map[chainhash.Hash]struct{}, error) {
@@ -889,36 +879,20 @@ func (w *nettedWrite) probeExisting(ctx context.Context, dbTx pgx.Tx, run *chunk
 	return held, nil
 }
 
-// markExisting marks the live transactions of the chunk the store already holds as existed, and
-// those a create claim reported as stored in an earlier round.
-func (w *nettedWrite) markExisting(ctx context.Context, dbTx pgx.Tx, run *chunkRun) error {
-	live := run.liveSet()
-
-	if multiProbeFirst && len(live) > 0 {
-		held, err := w.probeExisting(ctx, dbTx, run, live)
-		if err != nil {
-			return err
-		}
-
-		for _, k := range live {
-			if _, ok := held[run.its[k].txid]; ok {
-				run.st[k] = chunkExisted
-			}
-		}
-	}
-
-	for _, k := range live {
+// markExisting marks the live transactions of the chunk that an earlier round found stored, by
+// the create claim or by reprobeRefused, as existed.
+func (w *nettedWrite) markExisting(run *chunkRun) {
+	for _, k := range run.liveSet() {
 		if run.forcedExisted[k] {
 			run.st[k] = chunkExisted
 		}
 	}
-
-	return nil
 }
 
-// reprobeRefused is the lazy form's check on a refused spend: a transaction whose spend was
-// refused because it already exists, its coins long since spent by itself, is marked existing
-// and no longer failed, for the next round.
+// reprobeRefused is the check on a refused spend: a transaction whose spend was refused because
+// it already exists, its coins long since spent by itself, is marked existing and no longer
+// failed, for the next round. It reads only the refused transactions, so a chunk with none pays
+// no existence read.
 func (w *nettedWrite) reprobeRefused(ctx context.Context, dbTx pgx.Tx, run *chunkRun) error {
 	var refused []int
 
@@ -1107,8 +1081,8 @@ func (w *nettedWrite) spendOutsideInChunk(ctx context.Context, dbTx pgx.Tx, run 
 // createInChunk writes the live transactions: their records, bodies and every output not spent
 // inside the chunk as a UTXO, and the spend-journal row of every output that is. It returns the
 // plan it wrote and which chunk transactions its items are, and true when the create claim found
-// a transaction the existence read had missed, which makes the caller roll back and run the round
-// again with that transaction treated as existing.
+// a transaction already stored, which makes the caller roll back and run the round again with
+// that transaction treated as existing.
 func (w *nettedWrite) createInChunk(ctx context.Context, dbTx pgx.Tx, run *chunkRun, stats *familyStats) (*createPlan, []int, bool, error) {
 	planned := run.liveSet()
 	if len(planned) == 0 {

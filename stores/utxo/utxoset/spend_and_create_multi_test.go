@@ -30,7 +30,7 @@ func TestParentOutputsForValidationUtxoset(t *testing.T) {
 }
 
 func TestSpendAndCreateMultiUtxoset(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiUtxoset)
+	testSpendAndCreateMultiUtxoset(t)
 }
 
 func testSpendAndCreateMultiUtxoset(t *testing.T) {
@@ -178,7 +178,7 @@ func TestSpendAndCreateMultiNetsOutputsSpentInTheList(t *testing.T) {
 // chunk is rolled back whole and the committed ones stay, so the records must match a clean run.
 // The chunk bound is one level wide, so the list is cut into chunks to crash in and between.
 func TestSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiNettedRepeatAfterACrash)
+	testSpendAndCreateMultiNettedRepeatAfterACrash(t)
 }
 
 func testSpendAndCreateMultiNettedRepeatAfterACrash(t *testing.T) {
@@ -337,7 +337,7 @@ func payFrom(t *testing.T, lockTime uint32, parents []*bt.Tx, vouts []uint32) *b
 // started, because its parent's chunk finished with the parent failed. Neither needs anything
 // restored, because no spend was ever committed for the child.
 func TestSpendAndCreateMultiAFailedParentsChildLeavesNoSpend(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiAFailedParentsChildLeavesNoSpend)
+	testSpendAndCreateMultiAFailedParentsChildLeavesNoSpend(t)
 }
 
 func testSpendAndCreateMultiAFailedParentsChildLeavesNoSpend(t *testing.T) {
@@ -480,7 +480,7 @@ func recordsOf(t *testing.T, s *Store, w *tests.MultiWorkload) []any {
 // their parent's output as a real coin and the next chunk spends it, and the records are still
 // the ones a per-transaction write leaves.
 func TestSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiMergesNarrowLevels)
+	testSpendAndCreateMultiMergesNarrowLevels(t)
 }
 
 func testSpendAndCreateMultiMergesNarrowLevels(t *testing.T) {
@@ -588,7 +588,7 @@ func missingTxs(t *testing.T, s *Store, txs []*bt.Tx) []*bt.Tx {
 // spends the last stored one's coin for real. The records are the ones the per-transaction
 // default leaves from the same start, with no hand-off to it.
 func TestSpendAndCreateMultiAChunkWithAnExistingParent(t *testing.T) {
-	eachProbeOrder(t, testAChunkWithAnExistingParent)
+	testAChunkWithAnExistingParent(t)
 }
 
 func testAChunkWithAnExistingParent(t *testing.T) {
@@ -705,7 +705,7 @@ func buildNarrowThenWide(t *testing.T, seed byte, narrow, wide int) *tests.Multi
 // chunk holding the parent of one of its cut edges. A crash after any chunk, or inside one,
 // repeats through the caller's pre-check to the records of a clean run.
 func TestSpendAndCreateMultiACutFamilyCommitsInDependencyOrder(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiACutFamilyCommitsInDependencyOrder)
+	testSpendAndCreateMultiACutFamilyCommitsInDependencyOrder(t)
 }
 
 func testSpendAndCreateMultiACutFamilyCommitsInDependencyOrder(t *testing.T) {

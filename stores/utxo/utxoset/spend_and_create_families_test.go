@@ -24,34 +24,11 @@ func setChunkTxs(t *testing.T, n int) {
 	t.Cleanup(func() { multiCreateChunkTxs = old })
 }
 
-// eachProbeOrder runs a test once with the chunk reading which transactions exist before it spends
-// (the order the design states) and once spending first and finding them through the create
-// claim. They must end in the same state.
-func eachProbeOrder(t *testing.T, fn func(t *testing.T)) {
-	t.Helper()
-
-	for _, probeFirst := range []bool{true, false} {
-		name := "existence read first"
-		if !probeFirst {
-			name = "existence found by the claim"
-		}
-
-		t.Run(name, func(t *testing.T) {
-			old := multiProbeFirst
-			multiProbeFirst = probeFirst
-
-			t.Cleanup(func() { multiProbeFirst = old })
-
-			fn(t)
-		})
-	}
-}
-
 // A family cut across chunks: the cut edge's parent output is a real coin until its child's chunk
 // spends it, every other in-chunk edge is netted, and both halves end up stored, with the records
 // a per-transaction write leaves.
 func TestSpendAndCreateMultiACutEdgeWritesTheParentsOutputAsACoin(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiACutEdgeWritesTheParentsOutputAsACoin)
+	testSpendAndCreateMultiACutEdgeWritesTheParentsOutputAsACoin(t)
 }
 
 func testSpendAndCreateMultiACutEdgeWritesTheParentsOutputAsACoin(t *testing.T) {
@@ -132,7 +109,7 @@ func requireAllCreated(t *testing.T, results []utxo.SpendAndCreateMultiResult) {
 // in the chunks that depend on it, and the chunks that committed before it stay committed. The
 // dependent chunk opens no database transaction.
 func TestSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants)
+	testSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants(t)
 }
 
 func testSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants(t *testing.T) {
@@ -195,7 +172,7 @@ func testSpendAndCreateMultiAFailedChunkGivesParentFailedToItsDependants(t *test
 // An output a child in the chunk would have netted is a real coin when the child fails: the
 // parent is written, the child is not, and the output is spendable by anyone.
 func TestSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin)
+	testSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin(t)
 }
 
 func testSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin(t *testing.T) {
@@ -231,7 +208,7 @@ func testSpendAndCreateMultiAFailedChildLeavesItsParentsOutputACoin(t *testing.T
 
 // A chunk waits for the commit of the chunk that holds the parent of one of its cut edges.
 func TestSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents)
+	testSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t)
 }
 
 func testSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t *testing.T) {
@@ -286,7 +263,7 @@ func testSpendAndCreateMultiAChunkWaitsForItsCutEdgeParents(t *testing.T) {
 
 // Chunks with no edge between them run in parallel, up to the concurrency bound.
 func TestSpendAndCreateMultiIndependentChunksRunInParallel(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiIndependentChunksRunInParallel)
+	testSpendAndCreateMultiIndependentChunksRunInParallel(t)
 }
 
 func testSpendAndCreateMultiIndependentChunksRunInParallel(t *testing.T) {
@@ -348,7 +325,7 @@ func testSpendAndCreateMultiIndependentChunksRunInParallel(t *testing.T) {
 // netting is intact. Three chains of 90 make two chunks with no edge cut, so the only coin rows
 // are the last output of each chain, and every other output is a journal row naming its child.
 func TestSpendAndCreateMultiFamiliesInOneChunkAreNetted(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiFamiliesInOneChunkAreNetted)
+	testSpendAndCreateMultiFamiliesInOneChunkAreNetted(t)
 }
 
 func testSpendAndCreateMultiFamiliesInOneChunkAreNetted(t *testing.T) {
@@ -400,7 +377,7 @@ func testSpendAndCreateMultiFamiliesInOneChunkAreNetted(t *testing.T) {
 // of the two to wait, with SQLSTATE 40P01. The chunk is run again, finds the coin free once the
 // rival lets go, and the list is written whole.
 func TestSpendAndCreateMultiAChunkDeadlockIsRetried(t *testing.T) {
-	eachProbeOrder(t, testSpendAndCreateMultiAChunkDeadlockIsRetried)
+	testSpendAndCreateMultiAChunkDeadlockIsRetried(t)
 }
 
 func testSpendAndCreateMultiAChunkDeadlockIsRetried(t *testing.T) {
@@ -477,38 +454,38 @@ func binaryBigEndian(b []byte) uint64 {
 	return v
 }
 
-// The two writers meet at the checkpoint: a list carrying a block at or below it is written by
-// the two-step write, one above it, or carrying no block, by family chunks.
+// The two writers meet at the checkpoint: a quick-validation-shaped list carrying a block at or
+// below it is written by the below-checkpoint writer, and every other list by family chunks.
 func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
-	var chunks, steps int
+	var chunks, below int
 
 	hook := func() {
 		multiChunkFault = func(int, string) error {
 			chunks++
 			return nil
 		}
-		multiFault = func(string) error {
-			steps++
+		nettedBelowFault = func([]int) error {
+			below++
 			return nil
 		}
 	}
 
-	t.Cleanup(func() { multiChunkFault, multiFault = nil, nil })
+	t.Cleanup(func() { multiChunkFault, nettedBelowFault = nil, nil })
 
-	t.Run("a block at or below the checkpoint takes the two-step write", func(t *testing.T) {
+	t.Run("a block at or below the checkpoint takes the below-checkpoint writer", func(t *testing.T) {
 		s, ctx := newTestStore(t) // mainnet checkpoints: 800 is below them
 
 		w := tests.BuildMultiWorkload(t, 0x61, 2, 3)
 		w.StoreRoots(t, s, 799)
 
-		chunks, steps = 0, 0
+		chunks, below = 0, 0
 		hook()
 
 		results, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), 800, belowCheckpointOptions(800)...)
 		require.NoError(t, err)
 		requireAllCreated(t, results)
 
-		require.Positive(t, steps, "the two-step write ran")
+		require.Positive(t, below, "the below-checkpoint writer ran")
 		require.Zero(t, chunks, "family chunks did not")
 	})
 
@@ -535,7 +512,7 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 		w := tests.BuildMultiWorkload(t, 0x63, 2, 3)
 		w.StoreRoots(t, s, height-1)
 
-		chunks, steps = 0, 0
+		chunks, below = 0, 0
 		hook()
 
 		results, err := s.SpendAndCreateMulti(ctx, w.Txs, height, options()...)
@@ -543,7 +520,7 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 		requireAllCreated(t, results)
 
 		require.Positive(t, chunks, "family chunks ran")
-		require.Zero(t, steps, "the two-step write did not")
+		require.Zero(t, below, "the below-checkpoint writer did not")
 		require.Equal(t, reference.Records(t, s), w.Records(t, s), "a block above the checkpoint is carried like a per-transaction write carries it")
 		require.Equal(t, reference.RootSpends(t, s), w.RootSpends(t, s))
 	})
@@ -554,7 +531,7 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 		w := tests.BuildMultiWorkload(t, 0x65, 2, 3)
 		w.StoreRoots(t, s, 799)
 
-		chunks, steps = 0, 0
+		chunks, below = 0, 0
 		hook()
 
 		// The block is below the checkpoint but the spends are not outpoint-only, the shape
@@ -565,7 +542,7 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 		requireAllCreated(t, results)
 
 		require.Positive(t, chunks)
-		require.Zero(t, steps)
+		require.Zero(t, below)
 	})
 
 	t.Run("a list with no block takes family chunks", func(t *testing.T) {
@@ -574,7 +551,7 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 		w := tests.BuildMultiWorkload(t, 0x64, 2, 3)
 		w.StoreRoots(t, s, 799)
 
-		chunks, steps = 0, 0
+		chunks, below = 0, 0
 		hook()
 
 		results, err := s.SpendAndCreateMulti(ctx, w.Txs, 800, utxo.WithIgnoreLocked(true))
@@ -582,7 +559,7 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 		requireAllCreated(t, results)
 
 		require.Positive(t, chunks)
-		require.Zero(t, steps)
+		require.Zero(t, below)
 	})
 }
 
@@ -592,48 +569,44 @@ func TestSpendAndCreateMultiRoutesByTheCheckpoint(t *testing.T) {
 // chunk must find the record rather than report the transaction failed, and must not touch
 // anything.
 func TestSpendAndCreateMultiAnExistingTransactionWithNoJournalRowIsExisted(t *testing.T) {
-	eachProbeOrder(t, func(t *testing.T) {
-		s, ctx := newUncheckpointedStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
-		parent := storedParent(t, s, ctx)
-		child := spendOutput(t, parent, 0, 1)
+	parent := storedParent(t, s, ctx)
+	child := spendOutput(t, parent, 0, 1)
 
-		_, _, err := s.SpendAndCreate(ctx, child, 1_100, utxo.WithIgnoreLocked(true))
-		require.NoError(t, err)
+	_, _, err := s.SpendAndCreate(ctx, child, 1_100, utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
 
-		h := parent.TxIDChainHash()
-		_, err = s.pool.Exec(ctx, `DELETE FROM spend_journal WHERE txid = $1`, h[:])
-		require.NoError(t, err)
+	h := parent.TxIDChainHash()
+	_, err = s.pool.Exec(ctx, `DELETE FROM spend_journal WHERE txid = $1`, h[:])
+	require.NoError(t, err)
 
-		results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
-		require.NoError(t, err)
-		require.Equal(t, utxo.MultiTxExisted, results[0].Status, "%v", results[0].Err)
+	results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
+	require.Equal(t, utxo.MultiTxExisted, results[0].Status, "%v", results[0].Err)
 
-		require.Equal(t, 1, identityCount(t, s, ctx, child))
-		require.Equal(t, 1, utxoCount(t, s, ctx, parent), "the coin the child spent stays spent")
-	})
+	require.Equal(t, 1, identityCount(t, s, ctx, child))
+	require.Equal(t, 1, utxoCount(t, s, ctx, parent), "the coin the child spent stays spent")
 }
 
 // A transaction stored without its spends, as a coinbase or a seed is, is Existed and its inputs
 // are left alone: the write took nothing for it. Spending first and finding the record through
 // the create claim must roll that spend back.
 func TestSpendAndCreateMultiAnExistingTransactionKeepsItsInputsUntouched(t *testing.T) {
-	eachProbeOrder(t, func(t *testing.T) {
-		s, ctx := newUncheckpointedStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
-		parent := storedParent(t, s, ctx)
-		child := spendOutput(t, parent, 0, 1)
+	parent := storedParent(t, s, ctx)
+	child := spendOutput(t, parent, 0, 1)
 
-		_, _, err := s.SpendAndCreate(ctx, child, 1_100, utxo.WithCreateOnly())
-		require.NoError(t, err)
+	_, _, err := s.SpendAndCreate(ctx, child, 1_100, utxo.WithCreateOnly())
+	require.NoError(t, err)
 
-		results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
-		require.NoError(t, err)
-		require.Equal(t, utxo.MultiTxExisted, results[0].Status, "%v", results[0].Err)
+	results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{child}, 1_100, utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
+	require.Equal(t, utxo.MultiTxExisted, results[0].Status, "%v", results[0].Err)
 
-		require.Equal(t, 2, utxoCount(t, s, ctx, parent), "no spend was kept for a transaction that already existed")
-		require.Equal(t, 0, journalRowsFor(t, s, ctx, parent, 0))
-	})
+	require.Equal(t, 2, utxoCount(t, s, ctx, parent), "no spend was kept for a transaction that already existed")
+	require.Equal(t, 0, journalRowsFor(t, s, ctx, parent, 0))
 }
 
 // A record is built from the transaction as the spends leave it, with every input carrying the
@@ -642,32 +615,30 @@ func TestSpendAndCreateMultiAnExistingTransactionKeepsItsInputsUntouched(t *test
 // included, that a loop of SpendAndCreate leaves. Building the record before the spends would
 // leave no fee, because a fee needs extended inputs.
 func TestSpendAndCreateMultiBuildsTheRecordFromTheDecoratedInputs(t *testing.T) {
-	eachProbeOrder(t, func(t *testing.T) {
-		const height = 2200
+	const height = 2200
 
-		s, ctx := newUncheckpointedStore(t)
+	s, ctx := newUncheckpointedStore(t)
 
-		reference := tests.BuildMultiWorkload(t, 0x71, 3, 4)
-		reference.StoreRoots(t, s, height-1)
+	reference := tests.BuildMultiWorkload(t, 0x71, 3, 4)
+	reference.StoreRoots(t, s, height-1)
 
-		for _, tx := range outpointOnly(reference.Txs) {
-			_, _, err := s.SpendAndCreate(ctx, tx, height, utxo.WithIgnoreLocked(true))
-			require.NoError(t, err)
-		}
-
-		w := tests.BuildMultiWorkload(t, 0x72, 3, 4)
-		w.StoreRoots(t, s, height-1)
-
-		results, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, utxo.WithIgnoreLocked(true))
+	for _, tx := range outpointOnly(reference.Txs) {
+		_, _, err := s.SpendAndCreate(ctx, tx, height, utxo.WithIgnoreLocked(true))
 		require.NoError(t, err)
-		requireAllCreated(t, results)
+	}
 
-		want := reference.Records(t, s)
-		for i, r := range want {
-			require.NotZero(t, r.Fee, "tx %d: the reference has a fee, so the comparison means something", i)
-		}
+	w := tests.BuildMultiWorkload(t, 0x72, 3, 4)
+	w.StoreRoots(t, s, height-1)
 
-		require.Equal(t, want, w.Records(t, s))
-		require.Equal(t, reference.RootSpends(t, s), w.RootSpends(t, s))
-	})
+	results, err := s.SpendAndCreateMulti(ctx, outpointOnly(w.Txs), height, utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
+	requireAllCreated(t, results)
+
+	want := reference.Records(t, s)
+	for i, r := range want {
+		require.NotZero(t, r.Fee, "tx %d: the reference has a fee, so the comparison means something", i)
+	}
+
+	require.Equal(t, want, w.Records(t, s))
+	require.Equal(t, reference.RootSpends(t, s), w.RootSpends(t, s))
 }
