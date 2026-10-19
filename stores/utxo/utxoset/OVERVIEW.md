@@ -165,8 +165,6 @@ A deadlock between two chunks that spend overlapping coins is retried, never fai
 
 **At or below the checkpoint: the below-checkpoint writer.** A list shaped like quick validation's, with a block at or below the highest checkpoint and outpoint-only spends, never reaches the chunk writer. `nettedBelowGate` sends it to `netBelow`, whose chunks have no order between them and each commit a transaction's record, deletes and coins together. A list that asks for locked creates, as quick validation's does when `blockvalidation_quick_validate_skip_utxo_lock` is off, writes its coins locked, and quick validation's unlock pass clears them with `SetLocked`; frozen and conflicting creates are refused. Every other list, including a below-checkpoint list with ordinary spends, is written as family chunks.
 
-**A repeated spend in a later partition.** If spends left by a write that stopped between its spends and its create (an earlier version of the store did this, and a node upgraded in place can still hold them) sit in an older journal partition and the same transaction is later accepted at a higher height, the spend moves its undo row up to the newer partition, so the pruner does not drop it too early.
-
 ## 8. Reading a transaction
 
 `Get`, `BatchDecorate` and the batched get all use one function, `lookupMany` (`lookup.go`), and one **read order**. The order matters for correctness, not only speed:

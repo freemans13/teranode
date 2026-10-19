@@ -403,8 +403,7 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	// The spenders to carry are read once for the pass, when the first journal leaf retires,
 	// and not again for each leaf: on a backlog the pass retires many leaves, and each read is
 	// every waiting and recently mined transaction with its inputs. Reading once is safe. A
-	// spend made after the read is journaled at its own height, above every retiring leaf, and
-	// a repeated spend moves its row up to that height (moveRepeatedSpendsSQL).
+	// spend made after the read is journaled at its own height, above every retiring leaf.
 	var carry *copyForwardSet
 
 	for _, l := range leaves {
@@ -529,13 +528,8 @@ SELECT txid, tx_inpoints
 // The created_height test rests on one assumption: a spend is never journaled in an earlier
 // partition than its spender's created_height. SpendAndCreate takes one height for both, which
 // is the validator's path, and a create-only followed by a spend-only spends at the same or a
-// later tip. The one path that splits them is a repeat: an earlier version of the store wrote a multi list
-// with its spends committed before its creates, so a crash between the two left the spends
-// journaled at one height and the transaction accepted later, in a later partition. A store
-// upgraded in place can still hold such spends. The spend path enforces the
-// assumption there: a repeat moves its journal rows up to its own height (moveRepeatedSpendsSQL).
-// Without that, such a spender is not found here, and a reorg of its block within retention
-// could not give its coins back.
+// later tip. The multi-write commits a family's spends and creates in one transaction, so a
+// crash cannot leave spends journaled without the transaction.
 //
 // tx_mined is RANGE partitioned on mined_height, so only the partitions at or above $1 are read: the
 // containment rows of the last retention's worth of blocks, once per journal partition drop.
