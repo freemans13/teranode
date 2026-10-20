@@ -926,7 +926,7 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 			// failure: a panic is a bug in this node, not evidence against the announcing peer.
 			defer func() {
 				if r := recover(); r != nil {
-					u.logger.Errorf("[consumerMessageHandler] PANIC handling block %s, marking Kafka message as completed: %v\n%s", kafkaMsg.Hash, r, debug.Stack())
+					u.logger.Errorf("[consumerMessageHandler] PANIC handling block %s, marking Kafka message as completed: %v stack=%q", kafkaMsg.Hash, r, debug.Stack())
 					errCh <- nil
 				}
 			}()
@@ -2257,11 +2257,16 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 // ERR_PROCESSING error, so one bad block cannot kill the worker or the process (BV-STARTUP-007).
 // It never answers blockFound.errCh: queueFetchedBlock already answered it when the block was
 // queued, and a WaitToComplete errCh is unbuffered, so a second send would block the worker forever.
+// The panic value goes to the log only, not into the error text: the worker reads its error with
+// IsNetworkError and IsMaliciousResponseError, which match words such as "http" or "timeout" in
+// the text, and a panic value with such a word would requeue the block as a fetch failure.
+// Only this worker's goroutine is covered. A panic in a goroutine that the processing starts
+// (an errgroup worker, for example) is not recovered here.
 func (u *Server) processBlockWithPriorityRecovered(ctx context.Context, blockFound processBlockFound) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			u.logger.Errorf("[BlockProcessing] PANIC processing block %s: %v\n%s", blockFound.hash.String(), r, debug.Stack())
-			err = errors.NewProcessingError("panic processing block %s: %v", blockFound.hash.String(), r)
+			u.logger.Errorf("[BlockProcessing] PANIC processing block %s: %v stack=%q", blockFound.hash.String(), r, debug.Stack())
+			err = errors.NewProcessingError("panic processing block %s, see the PANIC log line", blockFound.hash.String())
 		}
 	}()
 
@@ -2286,21 +2291,31 @@ func (u *Server) logCatchupFSMRefusal(blockHash string, err error) {
 // item. Returns to the caller (the consumer's for-loop) on every path — where the
 // inline version used `continue`.
 func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup) {
-	// BV-STARTUP-007: a panic must not kill the consumer goroutine and with it the process.
-	// catchup() releases its lock and restores the FSM in its own defers, which run during the
-	// unwind. Here we clear the markers so a later announcement can retry the block, and count
-	// the attempt so a block that panics every time stays inside the #1057 cap. No peer is
-	// reported: a panic is a bug in this node, not evidence against the peer.
+	// BV-STARTUP-007: a panic on the consumer goroutine must not kill it and with it the process.
+	// catchup() releases its lock in its own defer, and fetchAndValidateBlocks restores the FSM in
+	// its defer. The two run during the unwind. Here we clear the markers so a later announcement
+	// can retry the block, and count the attempt so a block that panics every time stays inside
+	// the #1057 cap. A branch below that already counted this cycle sets attemptRecorded, so a
+	// panic after that count does not count the cycle twice. No peer is reported: a panic is a
+	// bug in this node, not evidence against the peer. Only this goroutine is covered: a panic in
+	// a goroutine that catchup starts (its errgroup workers) is not recovered here.
+	attemptRecorded := false
+
 	defer func() {
 		if r := recover(); r != nil {
 			if c.block == nil {
-				u.logger.Errorf("[catchup] PANIC processing catchup item with nil block from peer %s: %v\n%s", c.peerID, r, debug.Stack())
+				u.logger.Errorf("[catchup] PANIC processing catchup item with nil block from peer %s: %v stack=%q", c.peerID, r, debug.Stack())
 				return
 			}
 
 			blockHash := c.block.Hash()
-			attempts := u.recordCatchupAttemptUnlessProgress(blockHash)
-			u.logger.Errorf("[catchup] PANIC processing catchup for block %s from peer %s (attempt %d/%d), clearing markers: %v\n%s", blockHash.String(), c.peerID, attempts, u.settings.BlockValidation.CatchupMaxAttemptsPerBlock, r, debug.Stack())
+
+			attempts := 0
+			if !attemptRecorded {
+				attempts = u.recordCatchupAttemptUnlessProgress(blockHash)
+			}
+
+			u.logger.Errorf("[catchup] PANIC processing catchup for block %s from peer %s (attempt %d/%d, counted before the panic: %v), clearing markers: %v stack=%q", blockHash.String(), c.peerID, attempts, u.settings.BlockValidation.CatchupMaxAttemptsPerBlock, attemptRecorded, r, debug.Stack())
 			u.processBlockNotify.Delete(*blockHash)
 			u.catchupAlternatives.Delete(*blockHash)
 		}
@@ -2395,6 +2410,7 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 			// #1057: count this cycle toward the per-block cap (unless it made
 			// progress) so persistently failing peers cannot drive unbounded
 			// re-entry via repeated P2P notifications.
+			attemptRecorded = true
 			attempts := u.recordCatchupAttemptUnlessProgress(c.block.Hash())
 			u.logger.Warnf("[catchup] All peers failed for block %s (attempt %d/%d), clearing markers and reporting peer failure to allow retry from a different peer: %v", c.block.Hash().String(), attempts, u.settings.BlockValidation.CatchupMaxAttemptsPerBlock, err)
 			u.processBlockNotify.Delete(*c.block.Hash())
@@ -2459,6 +2475,7 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 			// #1057: count this cycle toward the per-block cap (unless it made
 			// progress) so a persistent local service or storage error cannot drive
 			// unbounded re-entry.
+			attemptRecorded = true
 			attempts := u.recordCatchupAttemptUnlessProgress(c.block.Hash())
 			u.logger.Warnf("[catchup] Local service/storage error during catchup for block %s (attempt %d/%d), clearing markers to allow retry: %v", c.block.Hash().String(), attempts, u.settings.BlockValidation.CatchupMaxAttemptsPerBlock, err)
 			u.processBlockNotify.Delete(*c.block.Hash())
@@ -2585,6 +2602,7 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 			// so an incomplete block no peer can complete (e.g. ErrBlockIncomplete from
 			// a seeded peer) cannot re-enter catchup forever; re-enqueue is gated by
 			// catchupAttemptsExhausted once the cap is reached.
+			attemptRecorded = true
 			attempts := u.recordCatchupAttemptUnlessProgress(blockHash)
 			if u.settings.BlockValidation.CatchupMaxAttemptsPerBlock > 0 && attempts >= u.settings.BlockValidation.CatchupMaxAttemptsPerBlock {
 				u.logger.Warnf("[catchup] Block %s exhausted catchup attempts (%d/%d); entering cooldown before any further retry", blockHash.String(), attempts, u.settings.BlockValidation.CatchupMaxAttemptsPerBlock)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/blockvalidation_api"
@@ -234,6 +235,7 @@ func TestGapBV054_CatchupConsumerSurvivesPanic_Child(t *testing.T) {
 
 	// queueFetchedBlock sets this marker before sending to catchupCh; the recover must clear it.
 	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
+	s.catchupAlternatives.Set(*block.Hash(), []processBlockCatchup{{block: block, peerID: "altpeer"}}, ttlcache.DefaultTTL)
 
 	s.catchupCh <- item
 
@@ -246,6 +248,11 @@ func TestGapBV054_CatchupConsumerSurvivesPanic_Child(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	require.Nil(t, s.processBlockNotify.Get(*block.Hash()), "the in-progress marker must be cleared after the panic")
+	require.Nil(t, s.catchupAlternatives.Get(*block.Hash()), "the cached alternatives must be cleared after the panic")
+
+	attempts := s.blockCatchupAttempts.Get(*block.Hash())
+	require.NotNil(t, attempts, "the panicked cycle must count toward the per-block catchup cap")
+	require.Equal(t, 1, attempts.Value())
 
 	s.catchupCh <- item
 
@@ -318,4 +325,109 @@ func TestGapBV054_KafkaHandlerSurvivesPanic_Child(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the handler did not return for the message after the panic")
 	}
+}
+
+// gap054ReportPanicChain wraps a blockchain client and panics in ReportPeerFailure.
+type gap054ReportPanicChain struct {
+	blockchain.ClientI
+}
+
+func (c *gap054ReportPanicChain) ReportPeerFailure(context.Context, *chainhash.Hash, string, string, string) error {
+	panic("injected panic in ReportPeerFailure")
+}
+
+// TestGapBV054_CatchupPanicInRealCatchupReleasesLock runs the real catchup() (not an injected
+// catchupFunc) and panics in it after acquireCatchupLock, in the block-existence check that
+// catchupGetBlockHeaders makes on the consumer goroutine. The recover in processCatchupChItem
+// must see catchup's deferred releaseCatchupLock run first: the catchup flag is clear, the
+// active catchup context is gone, the attempt is counted one time and the markers are cleared.
+func TestGapBV054_CatchupPanicInRealCatchupReleasesLock(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	chain := &gap054PanicChain{ClientI: s.blockchainClient, onHeader: false, panicking: make(chan struct{}), panicValue: "injected panic in catchup"}
+	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, chain, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+
+	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
+	s.catchupAlternatives.Set(*block.Hash(), []processBlockCatchup{{block: block, peerID: "altpeer"}}, ttlcache.DefaultTTL)
+
+	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: ""})
+
+	select {
+	case <-chain.panicking:
+	default:
+		t.Fatal("setup: catchup never reached the injected panic")
+	}
+
+	require.False(t, s.isCatchingUp.Load(), "catchup must release its lock during the unwind")
+
+	s.activeCatchupCtxMu.RLock()
+	active := s.activeCatchupCtx
+	s.activeCatchupCtxMu.RUnlock()
+	require.Nil(t, active, "the active catchup context must be cleared during the unwind")
+
+	require.Nil(t, s.processBlockNotify.Get(*block.Hash()))
+	require.Nil(t, s.catchupAlternatives.Get(*block.Hash()))
+
+	attempts := s.blockCatchupAttempts.Get(*block.Hash())
+	require.NotNil(t, attempts)
+	require.Equal(t, 1, attempts.Value())
+}
+
+// TestGapBV054_CatchupPanicAfterCountDoesNotCountTwice makes the cycle fail with ErrExternal, which
+// counts the attempt, and then panics in the ReportPeerFailure call that follows the count. The
+// recover must not count the same cycle a second time.
+func TestGapBV054_CatchupPanicAfterCountDoesNotCountTwice(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	s.blockchainClient = &gap054ReportPanicChain{ClientI: s.blockchainClient}
+	s.catchupFunc = func(context.Context, *model.Block, string, string) error {
+		return errors.NewExternalError("all peers failed to serve subtree data")
+	}
+
+	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
+
+	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: "peerA"})
+
+	attempts := s.blockCatchupAttempts.Get(*block.Hash())
+	require.NotNil(t, attempts)
+	require.Equal(t, 1, attempts.Value(), "a panic after the cycle was counted must not count it again")
+	require.Nil(t, s.processBlockNotify.Get(*block.Hash()))
+}
+
+// TestGapBV054_WorkerPanicErrorIsNotAFetchFailure panics with a value that holds words the
+// substring classifiers look for. The worker reads the recovered error with IsNetworkError and
+// IsMaliciousResponseError, and a match requeues the block as a fetch failure. The recovered
+// error must match neither.
+func TestGapBV054_WorkerPanicErrorIsNotAFetchFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	chain := &gap054PanicChain{ClientI: s.blockchainClient, onHeader: false, panicking: make(chan struct{}), panicValue: "http connection timeout: corrupt malformed response"}
+	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, chain, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+
+	err := s.processBlockWithPriorityRecovered(ctx, processBlockFound{hash: block.Hash(), baseURL: "http://test-peer", peerID: "peerA"})
+
+	select {
+	case <-chain.panicking:
+	default:
+		t.Fatal("setup: processing never reached the injected panic")
+	}
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrProcessing), "a recovered panic must be ERR_PROCESSING, got %v", err)
+	require.False(t, errors.IsBlockCorrupt(err))
+	require.False(t, errors.IsNetworkError(err), "a recovered panic must not read as a network error: %v", err)
+	require.False(t, errors.IsMaliciousResponseError(err), "a recovered panic must not read as a malicious response: %v", err)
 }
