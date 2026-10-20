@@ -2,8 +2,11 @@ package blockassembly
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -224,6 +227,136 @@ func TestHandleResetRequests_RequestDuringTheResetIsNotAnswered(t *testing.T) {
 	require.NoError(t, <-lateCh)
 	require.False(t, containsHash(items.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx), *txAHash),
 		"the next pass ran the validating reset and left the conflicted transaction out")
+}
+
+// TestHandleResetRequests_FlagOnTheFirstRequestSurvivesTheMerge puts each flag on the request
+// the loop received and a plain request behind it. The merge reads the batch in order, so a
+// merge that assigned each flag instead of ORing it would let the plain request clear it.
+func TestHandleResetRequests_FlagOnTheFirstRequestSurvivesTheMerge(t *testing.T) {
+	t.Run("ValidateInputs", func(t *testing.T) {
+		ctx := t.Context()
+		items, txAHash := setupConflictedReset(ctx, t)
+
+		validatingCh := make(chan error, 1)
+		plainCh := make(chan error, 1)
+
+		items.blockAssembler.resetCh <- resetRequest{ErrCh: plainCh}
+		items.blockAssembler.handleResetRequests(ctx, resetRequest{ValidateInputs: true, ErrCh: validatingCh})
+
+		require.NoError(t, <-validatingCh)
+		require.NoError(t, <-plainCh)
+		require.False(t, containsHash(items.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx), *txAHash),
+			"the reset validated, so the conflicted transaction is not in the template")
+	})
+
+	t.Run("FullReset", func(t *testing.T) {
+		ctx := t.Context()
+		items, _ := setupConflictedReset(ctx, t)
+
+		counting := &scanCountingStore{Store: items.utxoStore}
+		items.blockAssembler.utxoStore = counting
+
+		fullCh := make(chan error, 1)
+		plainCh := make(chan error, 1)
+
+		items.blockAssembler.resetCh <- resetRequest{ErrCh: plainCh}
+		items.blockAssembler.handleResetRequests(ctx, resetRequest{FullReset: true, ErrCh: fullCh})
+
+		require.NoError(t, <-fullCh)
+		require.NoError(t, <-plainCh)
+		require.Equal(t, int64(1), counting.scans.Load(), "the full reset's scan ran")
+	})
+
+	t.Run("StorageTriggered", func(t *testing.T) {
+		ctx := t.Context()
+		items, _ := setupConflictedReset(ctx, t)
+
+		storageCh := make(chan error, 1)
+		plainCh := make(chan error, 1)
+
+		items.blockAssembler.resetCh <- resetRequest{ErrCh: plainCh}
+		items.blockAssembler.handleResetRequests(ctx, resetRequest{StorageTriggered: true, ErrCh: storageCh})
+
+		require.NoError(t, <-storageCh)
+		require.NoError(t, <-plainCh)
+		require.False(t, items.blockAssembler.lastStorageResetDone.IsZero(), "the reset counted as storage-triggered")
+	})
+
+	t.Run("StorageTriggered on a queued request", func(t *testing.T) {
+		ctx := t.Context()
+		items, _ := setupConflictedReset(ctx, t)
+
+		plainCh := make(chan error, 1)
+		storageCh := make(chan error, 1)
+
+		items.blockAssembler.resetCh <- resetRequest{StorageTriggered: true, ErrCh: storageCh}
+		items.blockAssembler.handleResetRequests(ctx, resetRequest{ErrCh: plainCh})
+
+		require.NoError(t, <-plainCh)
+		require.NoError(t, <-storageCh)
+		require.False(t, items.blockAssembler.lastStorageResetDone.IsZero(), "the reset counted as storage-triggered")
+	})
+}
+
+// blockedResetSenders counts this test's sender goroutines parked on a send to resetCh. A
+// goroutine's stack header names its state, and the sender closure's frame names the test.
+func blockedResetSenders() int {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+
+	n := 0
+
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "[chan send") && strings.Contains(g, "TestHandleResetRequests_BlockedSendersJoinOneReset.func") {
+			n++
+		}
+	}
+
+	return n
+}
+
+// TestHandleResetRequests_BlockedSendersJoinOneReset queues more requests than resetCh holds, as
+// the production senders do: each is a goroutine, and the ones that find the channel full block
+// on the send. One reset must take all of them. Counting len(resetCh) once would take only the
+// buffered two and leave the blocked senders to run back-to-back resets of their own.
+func TestHandleResetRequests_BlockedSendersJoinOneReset(t *testing.T) {
+	ctx := t.Context()
+	items, _ := setupConflictedReset(ctx, t)
+
+	const senders = 6
+
+	queueCap := cap(items.blockAssembler.resetCh)
+	require.Greater(t, senders, queueCap, "the test needs senders blocked behind a full channel")
+
+	errChs := make([]chan error, senders)
+
+	for i := range errChs {
+		errChs[i] = make(chan error, 1)
+
+		go func(errCh chan error) {
+			items.blockAssembler.resetCh <- resetRequest{ErrCh: errCh}
+		}(errChs[i])
+	}
+
+	require.Eventually(t, func() bool {
+		return len(items.blockAssembler.resetCh) == queueCap && blockedResetSenders() == senders-queueCap
+	}, 10*time.Second, time.Millisecond, "every sender is buffered or blocked on the send")
+
+	firstCh := make(chan error, 1)
+	items.blockAssembler.handleResetRequests(ctx, resetRequest{ErrCh: firstCh})
+
+	require.NoError(t, <-firstCh)
+
+	for i, errCh := range errChs {
+		select {
+		case err := <-errCh:
+			require.NoError(t, err, "sender %d", i)
+		default:
+			require.Failf(t, "sender left unanswered", "sender %d was not taken into the reset", i)
+		}
+	}
+
+	require.Empty(t, items.blockAssembler.resetCh, "no request is left for another reset")
 }
 
 // genesisChainForMergedReset uses the SQLite blockchain client at genesis.

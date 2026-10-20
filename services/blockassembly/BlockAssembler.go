@@ -609,10 +609,18 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 func (b *BlockAssembler) handleResetRequests(ctx context.Context, first resetRequest) {
 	batch := []resetRequest{first}
 
-	// len is only read by this goroutine, the single consumer of resetCh, so
-	// every request counted here can be received without blocking.
-	for n := len(b.resetCh); n > 0; n-- {
-		batch = append(batch, <-b.resetCh)
+	// Every sender is a goroutine blocked on resetCh once its two slots are full,
+	// and each receive lets the next one in, so drain until a receive would block
+	// rather than counting len once: a count takes only the buffered two and
+	// leaves the rest of a burst to run as resets of their own.
+drain:
+	for {
+		select {
+		case req := <-b.resetCh:
+			batch = append(batch, req)
+		default:
+			break drain
+		}
 	}
 
 	var fullReset, validateInputs, storageTriggered bool
