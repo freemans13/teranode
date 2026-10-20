@@ -2071,8 +2071,13 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 		// The block IS committed: AddBlock stored it with subtrees_set and mined_set, and the
 		// post-commit unlock still failed after its retries (bitcoin-sv/teranode#4987). The files
 		// this attempt wrote now belong to a block recorded as having them, so a sweep would corrupt
-		// it, and normal validation would find the block stored and do nothing. Its outputs stay
-		// locked, so the next block that spends them fails loudly rather than silently.
+		// it, and normal validation would find the block stored and do nothing. No write can still be
+		// in flight: awaitSubtreeWrites returned nil before commitBlock ran, so no waitDone join is
+		// needed. Its outputs stay locked and nothing unlocks them later: the setMined worker skips a
+		// block with mined_set, and a stored block is skipped by catch-up and by processBlockFound.
+		// Quick validation spends locked outputs anyway (WithIgnoreLocked), so a later checkpointed
+		// block that spends them still commits. Only a spend through full validation or the
+		// validator fails, with ErrTxLocked.
 		if isSubtreeWritesNotLanded(err) || isBlockCommitted(err) {
 			u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: aborting without removing this attempt's .subtree files: %v",
 				catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)

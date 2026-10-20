@@ -626,7 +626,8 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	//
 	// AddBlock has committed the block with subtrees_set and mined_set, so from here on a failure
 	// is post-commit (bitcoin-sv/teranode#4987). The unlock is retried rather than rolled back, and
-	// a failure that survives the retries is marked so no caller treats it as a local fault: that
+	// a failure that survives the retries, or a ctx that ends during them (retry.Retry then returns
+	// ctx.Err()), is marked so no caller treats it as a local fault: that
 	// would delete the .subtree files of a block now recorded as having them, and fall through to
 	// normal validation, which finds the block stored and does nothing. ServiceError so the legacy
 	// park reads it as retry-later and keeps the block instead of rejecting a committed one.

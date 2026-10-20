@@ -18,6 +18,10 @@ import (
 
 // gap056FailingUnlockStore is the real sqlitememory UTXO store except that the first failUnlocks
 // post-commit unlocks (SetLocked(..., false)) fail. Later unlocks go through to the real store.
+//
+// The failure is a bare driver-style error, not a teranode StorageError, as the SQL store gives
+// from db.Begin and txn.Commit. A StorageError would read as transient through any wrap, so it
+// could not show that commitBlock's own ServiceError wrap is what the legacy park keys on.
 type gap056FailingUnlockStore struct {
 	utxo.Store
 
@@ -27,11 +31,17 @@ type gap056FailingUnlockStore struct {
 
 func (s *gap056FailingUnlockStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
 	if !value && s.unlockCalls.Add(1) <= s.failUnlocks {
-		return errors.NewStorageError("gap056: simulated unlock failure after AddBlock")
+		return gap056DriverError{}
 	}
 
 	return s.Store.SetLocked(ctx, txHashes, value)
 }
+
+// gap056DriverError stands in for a raw database driver error. A local type, since depguard forbids
+// the stdlib errors package and forbidigo forbids fmt.Errorf in this package.
+type gap056DriverError struct{}
+
+func (gap056DriverError) Error() string { return "gap056: simulated unlock failure after AddBlock" }
 
 // shrinkPostCommitUnlockRetryBackoff makes the post-commit unlock retries near-immediate for one test.
 func shrinkPostCommitUnlockRetryBackoff(t *testing.T) {
@@ -99,8 +109,8 @@ func gap056QuickValidate(t *testing.T, failUnlocks int32) (*preBindHarness, *mod
 // so the retry clears the lock and quick validation succeeds.
 //
 // Mutation proof: calling unlockSubtreeTransactionsIfNeeded once instead of
-// unlockSubtreeTransactionsWithRetry in commitBlock leaves the outputs locked and fails the last
-// assertion.
+// unlockSubtreeTransactionsWithRetry in commitBlock fails the first assertion, because the single
+// unlock attempt fails and quick validation returns its error.
 func TestGapBV056_PostCommitUnlockFailureKeepsCommittedBlocksSubtreeFiles(t *testing.T) {
 	h, _, subtreeRoot, childHash, failing, tryNormal, quickErr := gap056QuickValidate(t, 1)
 
@@ -122,10 +132,14 @@ func TestGapBV056_PostCommitUnlockFailureKeepsCommittedBlocksSubtreeFiles(t *tes
 // keep the committed block's .subtree file, and return a transient error class, so the legacy park
 // keeps the block for a retry instead of rejecting one that is already stored.
 //
+// The outputs stay locked: that is the known residual of bitcoin-sv/teranode#4987, and the last
+// assertion records it so a future recovery path has to change this test on purpose.
+//
 // Mutation proof: removing the isBlockCommitted branch in tryQuickValidation sends the error to the
-// local-fault branch, which deletes the .subtree file and returns tryNormal=true.
+// local-fault branch, which deletes the .subtree file and returns tryNormal=true. Wrapping the
+// exhausted unlock in a ProcessingError instead of a ServiceError fails the transient assertion.
 func TestGapBV056_PostCommitUnlockExhaustedAbortsWithoutRemovingFiles(t *testing.T) {
-	h, _, subtreeRoot, _, failing, tryNormal, quickErr := gap056QuickValidate(t, 1_000)
+	h, _, subtreeRoot, childHash, failing, tryNormal, quickErr := gap056QuickValidate(t, 1_000)
 
 	require.Error(t, quickErr)
 	require.True(t, isBlockCommitted(quickErr), "the post-commit failure must carry the block-committed marker: %v", quickErr)
@@ -136,4 +150,8 @@ func TestGapBV056_PostCommitUnlockExhaustedAbortsWithoutRemovingFiles(t *testing
 	exists, err := h.subtreeStore.Exists(h.ctx, subtreeRoot[:], fileformat.FileTypeSubtree)
 	require.NoError(t, err)
 	require.True(t, exists, "committed block has subtrees_set=true but its .subtree file was deleted")
+
+	created, err := h.utxoStore.Get(h.ctx, childHash, fields.Locked)
+	require.NoError(t, err)
+	require.True(t, created.Locked, "no recovery path unlocks a committed block's outputs after the retries are exhausted")
 }
