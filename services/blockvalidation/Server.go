@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -919,6 +920,17 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 
 		errCh := make(chan error, 1)
 		go func() {
+			// BV-STARTUP-007: without the recover a panic kills the process, and without the send
+			// the select below waits until shutdown and stalls the consumer. A nil result commits
+			// the message rather than redelivering it into the same panic, and reports no peer
+			// failure: a panic is a bug in this node, not evidence against the announcing peer.
+			defer func() {
+				if r := recover(); r != nil {
+					u.logger.Errorf("[consumerMessageHandler] PANIC handling block %s, marking Kafka message as completed: %v\n%s", kafkaMsg.Hash, r, debug.Stack())
+					errCh <- nil
+				}
+			}()
+
 			errCh <- u.blockHandler(&kafkaMsg)
 		}()
 
@@ -2164,7 +2176,7 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 
 			u.logger.Debugf("[BlockProcessing] Worker %d processing block %s", workerID, blockFound.hash.String())
 
-			err := u.processBlockWithPriority(ctx, blockFound)
+			err := u.processBlockWithPriorityRecovered(ctx, blockFound)
 
 			u.forkManager.FinishProcessingBlock(blockFound.hash)
 
@@ -2241,6 +2253,21 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 	}
 }
 
+// processBlockWithPriorityRecovered runs processBlockWithPriority and turns a panic into an
+// ERR_PROCESSING error, so one bad block cannot kill the worker or the process (BV-STARTUP-007).
+// It never answers blockFound.errCh: queueFetchedBlock already answered it when the block was
+// queued, and a WaitToComplete errCh is unbuffered, so a second send would block the worker forever.
+func (u *Server) processBlockWithPriorityRecovered(ctx context.Context, blockFound processBlockFound) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			u.logger.Errorf("[BlockProcessing] PANIC processing block %s: %v\n%s", blockFound.hash.String(), r, debug.Stack())
+			err = errors.NewProcessingError("panic processing block %s: %v", blockFound.hash.String(), r)
+		}
+	}()
+
+	return u.processBlockWithPriority(ctx, blockFound)
+}
+
 // logCatchupFSMRefusal selects severity only; the caller uses typed StateError
 // for handling. Do not infer authoritative state from the client's cache.
 func (u *Server) logCatchupFSMRefusal(blockHash string, err error) {
@@ -2259,6 +2286,26 @@ func (u *Server) logCatchupFSMRefusal(blockHash string, err error) {
 // item. Returns to the caller (the consumer's for-loop) on every path — where the
 // inline version used `continue`.
 func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup) {
+	// BV-STARTUP-007: a panic must not kill the consumer goroutine and with it the process.
+	// catchup() releases its lock and restores the FSM in its own defers, which run during the
+	// unwind. Here we clear the markers so a later announcement can retry the block, and count
+	// the attempt so a block that panics every time stays inside the #1057 cap. No peer is
+	// reported: a panic is a bug in this node, not evidence against the peer.
+	defer func() {
+		if r := recover(); r != nil {
+			if c.block == nil {
+				u.logger.Errorf("[catchup] PANIC processing catchup item with nil block from peer %s: %v\n%s", c.peerID, r, debug.Stack())
+				return
+			}
+
+			blockHash := c.block.Hash()
+			attempts := u.recordCatchupAttemptUnlessProgress(blockHash)
+			u.logger.Errorf("[catchup] PANIC processing catchup for block %s from peer %s (attempt %d/%d), clearing markers: %v\n%s", blockHash.String(), c.peerID, attempts, u.settings.BlockValidation.CatchupMaxAttemptsPerBlock, r, debug.Stack())
+			u.processBlockNotify.Delete(*blockHash)
+			u.catchupAlternatives.Delete(*blockHash)
+		}
+	}()
+
 	// #1057: authoritative cap chokepoint. catchup() takes the catchup lock and
 	// re-validates, so a block no peer can complete must not be processed once it
 	// has exhausted its attempt budget — skip it (clear its guard) until the
