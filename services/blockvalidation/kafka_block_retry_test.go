@@ -2,12 +2,14 @@ package blockvalidation
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
@@ -66,7 +68,105 @@ func TestRetryBlockMessage_StopsOnShutdown(t *testing.T) {
 
 	msg := &kafkamessage.KafkaBlockTopicMessage{Hash: "h"}
 	server.scheduleBlockMessageRetry(ctx, msg)
+	server.scheduleBlockMessageRetry(ctx, msg) // already pending: refused, no second goroutine
 	cancel()
 
 	require.Eventually(t, func() bool { return server.blockMessageRetries.claim("h") }, time.Second, 10*time.Millisecond)
+}
+
+// shortenBlockMessageRetryDelays makes the retry loop run in milliseconds for one test.
+func shortenBlockMessageRetryDelays(t *testing.T) {
+	initial, maxDelay := blockMessageRetryInitialDelay, blockMessageRetryMaxDelay
+	blockMessageRetryInitialDelay, blockMessageRetryMaxDelay = time.Millisecond, 2*time.Millisecond
+
+	t.Cleanup(func() {
+		blockMessageRetryInitialDelay, blockMessageRetryMaxDelay = initial, maxDelay
+	})
+}
+
+// alwaysFailingExistsChain fails every GetBlockExists with a recoverable error and counts
+// the calls, so a test can count the handler attempts.
+type alwaysFailingExistsChain struct {
+	blockchain.ClientI
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *alwaysFailingExistsChain) GetBlockExists(context.Context, *chainhash.Hash) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.calls++
+
+	return false, errors.NewServiceError("injected persistent blockchain failure")
+}
+
+func (c *alwaysFailingExistsChain) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.calls
+}
+
+// TestRetryBlockMessage_GivesUpAfterMaxAttempts pins that a fault that never clears is
+// retried exactly blockMessageRetryMaxAttempts times, is not blamed on the peer, and
+// frees its slot afterwards.
+func TestRetryBlockMessage_GivesUpAfterMaxAttempts(t *testing.T) {
+	shortenBlockMessageRetryDelays(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	chain := &alwaysFailingExistsChain{ClientI: s.blockchainClient}
+	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, chain, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+
+	// ReportPeerFailure is not expected: a mock call without an expectation panics, and
+	// the panic guard would then free the slot early with fewer attempts counted.
+	s.blockchainClient = &blockchain.Mock{}
+
+	hash := block.Hash().String()
+	s.scheduleBlockMessageRetry(ctx, &kafkamessage.KafkaBlockTopicMessage{Hash: hash, URL: "http://peer", PeerId: "peerA"})
+
+	require.Eventually(t, func() bool { return s.blockMessageRetries.claim(hash) }, 5*time.Second, 5*time.Millisecond)
+	require.Equal(t, blockMessageRetryMaxAttempts, chain.count())
+}
+
+// TestRetryBlockMessage_UnrecoverableReportsPeer pins that a retry hitting an
+// unrecoverable error blames the announcing peer, as the first attempt would have.
+func TestRetryBlockMessage_UnrecoverableReportsPeer(t *testing.T) {
+	shortenBlockMessageRetryDelays(t)
+
+	hash := chainhash.HashH([]byte("retry-unrecoverable"))
+
+	chain := &blockchain.Mock{}
+	chain.On("ReportPeerFailure", mock.Anything, &hash, "peerA", "block", mock.Anything).Return(nil).Once()
+
+	server := &Server{logger: ulogger.TestLogger{}, blockchainClient: chain}
+
+	// A non-http URL fails blockHandler with an unrecoverable processing error.
+	server.scheduleBlockMessageRetry(context.Background(), &kafkamessage.KafkaBlockTopicMessage{Hash: hash.String(), URL: "ftp://peer", PeerId: "peerA"})
+
+	require.Eventually(t, func() bool { return server.blockMessageRetries.claim(hash.String()) }, time.Second, 5*time.Millisecond)
+	chain.AssertExpectations(t)
+}
+
+// TestRetryBlockMessage_RecoversFromPanic pins that a panic in the retry goroutine is
+// contained and frees the slot. Without the guard the panic kills the test binary.
+func TestRetryBlockMessage_RecoversFromPanic(t *testing.T) {
+	shortenBlockMessageRetryDelays(t)
+
+	hash := chainhash.HashH([]byte("retry-panic"))
+
+	chain := &blockchain.Mock{}
+	chain.On("ReportPeerFailure", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { panic("injected panic") }).Once()
+
+	server := &Server{logger: ulogger.TestLogger{}, blockchainClient: chain}
+	server.scheduleBlockMessageRetry(context.Background(), &kafkamessage.KafkaBlockTopicMessage{Hash: hash.String(), URL: "ftp://peer", PeerId: "peerA"})
+
+	require.Eventually(t, func() bool { return server.blockMessageRetries.claim(hash.String()) }, time.Second, 5*time.Millisecond)
+	chain.AssertExpectations(t)
 }

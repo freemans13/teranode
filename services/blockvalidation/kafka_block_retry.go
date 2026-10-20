@@ -19,10 +19,14 @@ import (
 // elsewhere: the next block that builds on the dropped one has a missing parent and goes
 // to catchup, and the P2P sync coordinator syncs from any peer ahead of us.
 const (
-	blockMessageRetryMaxAttempts  = 8
+	blockMessageRetryMaxAttempts = 8
+	blockMessageRetryMaxPending  = 1000
+)
+
+// The retry delays are variables only so tests can shorten them.
+var (
 	blockMessageRetryInitialDelay = 500 * time.Millisecond
 	blockMessageRetryMaxDelay     = 30 * time.Second
-	blockMessageRetryMaxPending   = 1000
 )
 
 // blockMessageRetries tracks block hashes with a retry in flight. A hash is retried at
