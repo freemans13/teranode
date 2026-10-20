@@ -42,6 +42,14 @@ var (
 	// permanently; admitting it lets the cap be transiently exceeded by one batch. A
 	// non-zero value means a client's batch size is above this pod's normalized cap.
 	prometheusSubtreeProcessorOversizeBatchAdmitted prometheus.Counter
+
+	// prometheusSubtreeProcessorDiskTxMapErrors counts disk tx map storage errors
+	// that surface after an operation's commit point, where the underlying state
+	// change has already been applied and cannot be rolled back. These are logged
+	// rather than returned to the caller (returning would desync callers that
+	// treat an error as "not applied" from state that already reflects it); the
+	// "where" label identifies the reporting site for troubleshooting.
+	prometheusSubtreeProcessorDiskTxMapErrors *prometheus.CounterVec
 )
 
 var (
@@ -236,7 +244,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "subtreeprocessor",
 			Name:      "diskmap_filter_ram_bytes",
-			Help:      "Cuckoo filter memory in bytes for disk-backed transaction map",
+			Help:      "Estimated in-RAM index memory in bytes for disk-backed transaction map",
 		},
 	)
 
@@ -257,12 +265,22 @@ func _initPrometheusMetrics() {
 			Help:      "Number of batches larger than the whole item cap admitted alone onto an empty ingest queue",
 		},
 	)
+
+	prometheusSubtreeProcessorDiskTxMapErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreeprocessor",
+			Name:      "disk_tx_map_errors_total",
+			Help:      "Number of disk tx map storage errors reported after their operation's commit point",
+		},
+		[]string{"where"},
+	)
 }
 
 // reportDiskMapStats sets Prometheus gauges for the disk-backed transaction map.
 func reportDiskMapStats(stats DiskMapStats) {
 	prometheusSubtreeProcessorDiskMapEntries.Set(float64(stats.Entries))
-	prometheusSubtreeProcessorDiskMapFilterRAM.Set(float64(stats.FilterMemBytes))
+	prometheusSubtreeProcessorDiskMapFilterRAM.Set(float64(stats.IndexMemBytes))
 	prometheusSubtreeProcessorDiskMapDiskWritten.Set(float64(stats.DiskBytesWritten))
 }
 

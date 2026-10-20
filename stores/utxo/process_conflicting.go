@@ -132,6 +132,12 @@ var step5RetryDelays = []time.Duration{0, 50 * time.Millisecond, 200 * time.Mill
 //     (notably block assembly) need this superset to populate a conflictingMap
 //     so the queue→subtree dequeue path can reject children of conflicting
 //     parents that arrive after the cascade has run.
+// compensationTimeout bounds the deferred unwind of a failed ProcessConflicting.
+// It runs on its own context rather than the caller's (see the rollback call site),
+// so it needs a budget of its own: long enough to re-spend and unflag a whole
+// cascade, short enough not to pin a goroutine on a wedged store.
+const compensationTimeout = 2 * time.Minute
+
 func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockHash chainhash.Hash, conflictingTxHashes []chainhash.Hash,
 	processedConflictingHashesMap map[chainhash.Hash]struct{}, guard AncestryGuard, opts ...ProcessConflictingOption) (losingTxHashesMap txmap.TxMap, allMarkedConflicting []chainhash.Hash, err error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "ProcessConflicting")
@@ -205,7 +211,17 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			return
 		}
 
-		rollbackErr := rollbackProcessConflicting(ctx, s, conflictingTxHashes,
+		// Detached, bounded context — NOT the caller's. The step-2 Unspend stops
+		// early only on ctx.Done, so a cancelled or expired caller ctx is exactly the
+		// failure that leaves the most mixed state. Handing that dead ctx to the
+		// compensation makes every re-spend fail at its first Get, so the undo does
+		// nothing precisely when it is needed most. The work here is cleanup of
+		// writes already made, so it has to outlive the request that triggered it;
+		// the timeout keeps that bounded.
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), compensationTimeout)
+		defer rollbackCancel()
+
+		rollbackErr := rollbackProcessConflicting(rollbackCtx, s, conflictingTxHashes,
 			allMarkedHashes, markedAsNotSpendable, step3SuccessfulSpends, blockHeight,
 			step2Committed, step4Committed)
 		if rollbackErr != nil {
@@ -353,13 +369,27 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	step1Committed = true
 
 	// - 2: un-spend txa, marking the input txs as not spendable (txp & txq)
-	if err = s.Unspend(ctx, affectedParentSpends, true); err != nil {
-		return nil, nil, errors.NewProcessingError("error unspending affected parent spends", err)
-	}
-
+	//
+	// step2Committed is set BEFORE the error check on purpose. Unspend is
+	// best-effort-over-all: it attempts every spend and returns an aggregate, so a
+	// failure means "some, possibly nearly all, spends were reverted" — not "none
+	// were". Gating the compensating re-spend below on full success would skip the
+	// undo in exactly the case that leaves the most uncompensated state, while the
+	// step-4 undo runs unconditionally. Treat a failed step 2 as partially
+	// committed instead: the compensating re-spend is idempotent for the caller
+	// that owns these spends (the Lua same-spender path is a no-op), so running it
+	// after a partial or even total failure is safe, whereas skipping it is not.
 	step2Committed = true
 
-	// get the unique hashes of the transactions that were marked as not spendable
+	// Build the unlock set BEFORE the Unspend, not after. Unspend takes
+	// flagAsLocked=true, so a partial failure can leave some parents locked — but
+	// built after the error return, markedAsNotSpendable was always empty by the
+	// time the compensation checked `step2Committed && len(markedAsNotSpendable) > 0`,
+	// so that arm could never fire after a failed step 2. The set is derived purely
+	// from affectedParentSpends, which is already known here, so computing it first
+	// costs nothing and makes the undo reachable. Latent today only because
+	// aerospike drops flagAsLocked (#1291) and sql Unspend is one transaction; it
+	// goes live the day #1291 makes flagAsLocked real.
 	markedAsNotSpendableHashesUnique := make(map[chainhash.Hash]struct{})
 	for _, spend := range affectedParentSpends {
 		markedAsNotSpendableHashesUnique[*spend.TxID] = struct{}{}
@@ -368,6 +398,10 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	markedAsNotSpendable = make([]chainhash.Hash, 0, len(markedAsNotSpendableHashesUnique))
 	for hash := range markedAsNotSpendableHashesUnique {
 		markedAsNotSpendable = append(markedAsNotSpendable, hash)
+	}
+
+	if err = s.Unspend(ctx, affectedParentSpends, true); err != nil {
+		return nil, nil, errors.NewProcessingError("error unspending affected parent spends", err)
 	}
 
 	// - 3: spend tx_double_spend as normal (ignoring the not spendable flag)
@@ -728,12 +762,14 @@ func selectCountersForDemotedTx(ctx context.Context, s Store, demotedTx *bt.Tx, 
 				continue
 			}
 
-			candidateMeta, err := s.Get(ctx, &candidate, fields.Tx, fields.Conflicting, fields.CreatedAt)
+			// candidateSpendsOutput only compares outpoints, so the inpoints are
+			// enough; fields.Tx would rebuild the whole candidate transaction.
+			candidateMeta, err := s.Get(ctx, &candidate, fields.TxInpoints, fields.Conflicting, fields.CreatedAt)
 			if err != nil {
 				return nil, errors.NewProcessingError("[selectCountersForDemotedTx][%s] error getting candidate counter", candidate.String(), err)
 			}
 
-			if candidateMeta == nil || candidateMeta.Tx == nil {
+			if candidateMeta == nil {
 				continue
 			}
 
@@ -741,7 +777,7 @@ func selectCountersForDemotedTx(ctx context.Context, s Store, demotedTx *bt.Tx, 
 				continue
 			}
 
-			if !candidateSpendsOutput(candidateMeta.Tx, parentHash, vout) {
+			if !candidateSpendsOutput(&candidateMeta.TxInpoints, parentHash, vout) {
 				continue
 			}
 
@@ -793,9 +829,9 @@ func isOlderCounter(aCreatedAt int64, aHash chainhash.Hash, bCreatedAt int64, bH
 	return false
 }
 
-func candidateSpendsOutput(tx *bt.Tx, parentHash *chainhash.Hash, vout uint32) bool {
-	for _, in := range tx.Inputs {
-		if in.PreviousTxOutIndex == vout && in.PreviousTxIDChainHash().IsEqual(parentHash) {
+func candidateSpendsOutput(inpoints *subtree.TxInpoints, parentHash *chainhash.Hash, vout uint32) bool {
+	for _, inpoint := range inpoints.GetTxInpoints() {
+		if inpoint.Index == vout && inpoint.Hash.IsEqual(parentHash) {
 			return true
 		}
 	}
@@ -1233,9 +1269,17 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 
 	defer deferFn()
 
-	txMeta, err := s.Get(ctx, &txHash, fields.Tx)
+	// Only the parent hashes are read below, so ask for the inpoints rather than
+	// the whole transaction.
+	txMeta, err := s.Get(ctx, &txHash, fields.TxInpoints)
 	if err != nil {
 		return nil, err
+	}
+
+	// A missing record surfaces as (nil, nil) on some backends (aerospike returns
+	// nil for a not-found tx), which previously dereferenced straight to a panic.
+	if txMeta == nil {
+		return nil, errors.NewTxNotFoundError("[GetCounterConflictingTxHashes][%s] tx not found", txHash.String())
 	}
 
 	counterConflictingMap := make(map[chainhash.Hash]struct{})
@@ -1244,9 +1288,9 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 	// get the unique parent txs
 	parentTxs := make(map[chainhash.Hash][]*chainhash.Hash)
 
-	for _, input := range txMeta.Tx.Inputs {
+	for _, parentHash := range txMeta.TxInpoints.GetParentTxHashes() {
 		// get the parent tx
-		parentTxs[*input.PreviousTxIDChainHash()] = nil
+		parentTxs[parentHash] = nil
 	}
 
 	for parentTx := range parentTxs {
@@ -1255,6 +1299,14 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 		parentTxMeta, err := s.Get(ctx, parentTxHash, fields.Utxos)
 		if err != nil {
 			return nil, err
+		}
+
+		// Same (nil, nil) contract as the lookup above. Report it as not found
+		// rather than skipping the parent: a parent the store does not hold says
+		// nothing about who spent its outputs, so skipping would silently shrink
+		// the counter-conflicting set.
+		if parentTxMeta == nil {
+			return nil, errors.NewTxNotFoundError("[GetCounterConflictingTxHashes][%s] parent tx %s not found", txHash.String(), parentTxHash.String())
 		}
 
 		spendingTxIDs := make([]*chainhash.Hash, len(parentTxMeta.SpendingDatas))
@@ -1270,24 +1322,39 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 		parentTxs[*parentTxHash] = spendingTxIDs
 	}
 
-	// validate every input and collect the unique counter-spenders in first-seen
-	// input order; several inputs are typically spent by the same counter tx and
-	// its descendant walk must run only once, not once per input. Dedupe on a
-	// dedicated set: counterConflictingMap is seeded with txHash, and a spender
-	// equal to txHash itself must still be walked.
-	seenSpenders := make(map[chainhash.Hash]struct{}, len(txMeta.Tx.Inputs))
-	uniqueSpendingTxIDs := make([]chainhash.Hash, 0, len(txMeta.Tx.Inputs))
+	// Walk the inpoints, not txMeta.Tx.Inputs. The Get above asks for
+	// fields.TxInpoints only, so txMeta.Tx is nil on the SQL store on both read
+	// paths. getUnbatched and batchDecorateChunk attach meta.Data.Tx only for
+	// fields.Tx or fields.Outputs. settings.conf sets utxostore_getBatcherSize to
+	// 4096, so the batched path is the live one, and sendGetBatch decorates each
+	// field set separately, so a batch-mate asking for fields.Tx does not widen
+	// this read.
+	//
+	// GetTxInpoints returns the outpoints grouped parent-then-vout rather than in
+	// input order. Only the order of the descendant walks below changes with it,
+	// and the result is accumulated into counterConflictingMap, so the returned
+	// set is the same. It does decide which walk spends the maxNodes budget
+	// first, which was already unspecified for a transaction with several
+	// conflicting parents.
+	inpoints := txMeta.TxInpoints.GetTxInpoints()
 
-	for _, input := range txMeta.Tx.Inputs {
-		parenTxIDS, ok := parentTxs[*input.PreviousTxIDChainHash()]
+	// Collect the unique counter-spenders: several inputs are typically spent by
+	// the same counter tx and its descendant walk must run only once, not once
+	// per input. Dedupe on a dedicated set: counterConflictingMap is seeded with
+	// txHash, and a spender equal to txHash itself must still be walked.
+	seenSpenders := make(map[chainhash.Hash]struct{}, len(inpoints))
+	uniqueSpendingTxIDs := make([]chainhash.Hash, 0, len(inpoints))
+
+	for _, inpoint := range inpoints {
+		parenTxIDS, ok := parentTxs[inpoint.Hash]
 		if ok {
 			// check the length of the spending txs, if it's less than the index, then the input is not spent
-			if len(parenTxIDS) <= int(input.PreviousTxOutIndex) {
+			if len(parenTxIDS) <= int(inpoint.Index) {
 				// throw an error
-				return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] cannot process counter conflicting, input %d of %s is out of range (len: %d, %v)", txHash.String(), input.PreviousTxOutIndex, input.PreviousTxIDChainHash().String(), len(parenTxIDS), parenTxIDS)
+				return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] cannot process counter conflicting, input %d of %s is out of range (len: %d, %v)", txHash.String(), inpoint.Index, inpoint.Hash.String(), len(parenTxIDS), parenTxIDS)
 			}
 
-			spendingTxID := parenTxIDS[input.PreviousTxOutIndex]
+			spendingTxID := parenTxIDS[inpoint.Index]
 			if spendingTxID != nil {
 				counterConflictingMap[*spendingTxID] = struct{}{}
 

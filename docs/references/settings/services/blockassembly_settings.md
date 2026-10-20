@@ -12,6 +12,7 @@
 | GRPCListenAddress                    | string        | ":8085"          | blockassembly_grpcListenAddress                    | **CRITICAL** - gRPC server binding (service skipped if empty)                        |
 | GRPCMaxRetries                       | int           | 3                | blockassembly_grpcMaxRetries                       | gRPC client retry attempts                                                           |
 | GRPCRetryBackoff                     | time.Duration | 2s               | blockassembly_grpcRetryBackoff                     | Retry delay timing                                                                   |
+| LivenessStallTimeout                 | time.Duration | 0s               | blockassembly_livenessStallTimeout                 | Liveness reports 503 if the main select stops being serviced for this long; 0 = off  |
 | LocalDAHCache                        | string        | ""               | blockassembly_localDAHCache                        | **UNUSED** - Reserved for future DAH caching                                         |
 | MaxBlockReorgCatchup                 | int           | 100              | blockassembly_maxBlockReorgCatchup                 | Map capacity for current chain tracking                                              |
 | MaxBlockReorgRollback                | int           | 100              | blockassembly_maxBlockReorgRollback                | **UNUSED** - Defined but not referenced in code                                      |
@@ -27,7 +28,7 @@
 | InitialMerkleItemsPerSubtree         | int           | 1048576          | initial_merkle_items_per_subtree                   | Initial subtree size                                                                 |
 | MinimumMerkleItemsPerSubtree         | int           | 1024             | minimum_merkle_items_per_subtree                   | Minimum subtree size                                                                 |
 | MaximumMerkleItemsPerSubtree         | int           | 1048576          | maximum_merkle_items_per_subtree                   | Maximum subtree size                                                                 |
-| DoubleSpendWindow                    | time.Duration | BlockTime * 6    | N/A                                                | Double-spend detection window (calculated)                                           |
+| DoubleSpendWindow                    | time.Duration | 0                | double_spend_window_millis | Double-spend detection window; 0 disables it                                         |
 | MaxGetReorgHashes                    | int           | 10000            | blockassembly_maxGetReorgHashes                    | **CRITICAL** - Reorganization hash limit                                             |
 | MinerWalletPrivateKeys               | []string      | []               | miner_wallet_private_keys                          | Mining wallet keys                                                                   |
 | DifficultyCache                      | bool          | true             | blockassembly_difficultyCache                      | Enables difficulty calculation caching (Blockchain service)                          |
@@ -39,9 +40,10 @@
 | SubtreeStorageWorkers                | int           | 4                | blockassembly_subtreeStorageWorkers                | Workers for subtree storage operations                                               |
 | SubtreeAnnouncementInterval          | time.Duration | 10s              | blockassembly_subtreeAnnouncementInterval          | Subtree announcement frequency                                                       |
 | UseColumnarBatch                     | bool          | false            | blockassembly_useColumnarBatch                     | Use columnar batch format for data layout                                            |
-| UnminedTxDiskSortPath                | string        | ""               | blockassembly_unminedTxDiskSortPath                | Path for unmined transaction disk sorting                                            |
+| UnminedTxDiskSortPaths               | []string      | []               | blockassembly_unminedTxDiskSortPath                | Pipe-separated directories for disk-sorted unmined reload runs (OS temp dir if empty) |
 | UnminedTxDiskSortEnabled             | bool          | false            | blockassembly_unminedTxDiskSortEnabled             | Enable disk-based sorting for large mempools                                         |
 | UnminedLoadingBatchSize              | int           | 10485760         | blockassembly_unminedLoadingBatchSize              | Batch size for loading unmined transactions                                          |
+| UnminedTxSortBufferRecords           | int           | 33554432         | blockassembly_unminedTxSortBufferRecords           | Records buffered before the disk-sorted reload spills a sorted run                   |
 | ParallelSetIfNotExistsThreshold      | int           | 10000            | blockassembly_parallelSetIfNotExistsThreshold      | Threshold for parallelizing conditional writes                                       |
 | StoreTxInpointsForSubtreeMeta        | bool          | true             | blockassembly_storeTxInpointsForSubtreeMeta        | Store transaction input points in subtree metadata (required for checkblocktemplate) |
 | IdleSleepDuration                    | time.Duration | 10ms             | blockassembly_idle_sleep_duration                  | Sleep duration when subtree processor queue is empty                                 |

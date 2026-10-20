@@ -35,6 +35,11 @@ func IsRetryableError(err error) bool {
 		case ERR_NETWORK_TIMEOUT,
 			ERR_NETWORK_ERROR,
 			ERR_SERVICE_UNAVAILABLE,
+			// A remote 429 is the definitional retryable failure: the request was
+			// well formed and the server asked us to come back later. Note it is
+			// deliberately absent from IsTransientLocalError — it is a peer-side
+			// decision, not a fault in this node's stack.
+			ERR_SERVICE_RATE_LIMITED,
 			ERR_STORAGE_UNAVAILABLE,
 			ERR_STORAGE_ERROR:
 			return true
@@ -65,9 +70,11 @@ func IsRetryableError(err error) bool {
 // whether to keep the delivering peer instead of disconnecting it (peer_server).
 //
 // The set is {ErrServiceError, ErrStorageError, ErrServiceUnavailable,
-// ErrStorageUnavailable} and the check walks the wrapped chain. It intentionally
-// differs from IsRetryableError, which omits ErrServiceError (and adds network
-// codes) — these two predicates are not interchangeable.
+// ErrStorageUnavailable} and the check walks the wrapped chain. ErrServiceNotReady
+// is absent: only block assembly produces it, and none of this predicate's callers
+// receives a block-assembly error. It intentionally differs from IsRetryableError,
+// which omits ErrServiceError (and adds network codes) — these two predicates are
+// not interchangeable.
 func IsTransientLocalError(err error) bool {
 	if err == nil {
 		return false

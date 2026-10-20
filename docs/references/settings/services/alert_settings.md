@@ -12,6 +12,10 @@
 | StoreURL | *url.URL | "sqlite:///alert" | alert_store | Database connection URL |
 | TopicName | string | "bitcoin_alert_system" | alert_topic_name | P2P pubsub topic (auto-suffixed for testnet/regtest) |
 | P2PPort | int | 9908 | ALERT_P2P_PORT | P2P listening port (string length >= 2 after PORT_PREFIX applied) |
+| P2PBootstrapPeer | string | "" | alert_p2p_bootstrap_peer | Extra libp2p bootstrap multiaddr for private alert networks (public IPFS peers are still tried) |
+| P2PAllowPrivateIPs | bool | false | alert_p2p_allow_private_ips | Allow dialing/accepting/advertising RFC1918 addresses on the alert network |
+| P2PPeerDiscoveryInterval | time.Duration | 10m | alert_p2p_peer_discovery_interval | Peer discovery and alert sync cadence |
+| P2PDHTMode | string | "client" | alert_p2p_dht_mode | Kademlia DHT mode: `client` or `server` |
 
 ## Network-Specific Behavior
 
@@ -54,7 +58,6 @@ Example: `PORT_PREFIX=1` with `ALERT_P2P_PORT=9908` results in port 19908.
 | AlertProcessingInterval | 5 minutes | Alert processing frequency |
 | RequestLogging | true | HTTP request logging |
 | AutoMigrate | true | Database schema migration on startup |
-| DHTMode | "client" | DHT client mode |
 | P2P.IP | "0.0.0.0" | P2P listening address (all interfaces) |
 | PeerBanDuration | 100 years | Duration for peer bans (effectively permanent) |
 | DisableRPCVerification | false | Validates blockchain client connection at startup |
@@ -78,7 +81,6 @@ Example: `PORT_PREFIX=1` with `ALERT_P2P_PORT=9908` results in port 19908.
 | P2P.Port | String length >= 2 characters | `config.ErrNoP2PPort` | During `Init()` |
 | StoreURL | Supported scheme (sqlite/sqlitememory/postgres/mysql) | `ErrDatastoreUnsupported` | During `Init()` |
 
-
 ## Configuration Examples
 
 ### Production Configuration
@@ -86,7 +88,7 @@ Example: `PORT_PREFIX=1` with `ALERT_P2P_PORT=9908` results in port 19908.
 ```bash
 alert_store=postgres://user:pass@host:5432/alert_db?sslmode=require
 alert_genesis_keys=key1|key2|key3
-alert_p2p_port=4001
+ALERT_P2P_PORT=4001
 alert_protocol_id=/bitcoin/alert-system/1.0.0
 alert_topic_name=bitcoin_alert_system
 ```
@@ -105,4 +107,3 @@ alert_genesis_keys=devkey1
 alert_p2p_private_key=
 # File will be created at: $HOME/.alert-system/private_key.pem
 ```
-

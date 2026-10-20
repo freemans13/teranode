@@ -96,3 +96,38 @@ func TestNullStoreCreateCohort(t *testing.T) {
 		require.Equal(t, uint32(cohort.Unset), data.Cohort)
 	})
 }
+
+func TestNullStoreSpendAndCreateMulti(t *testing.T) {
+	store, err := NewNullStore()
+	require.NoError(t, err)
+
+	w := tests.BuildMultiWorkload(t, 0x70, 3, 4)
+
+	results, err := store.SpendAndCreateMulti(context.Background(), w.Txs, 100)
+	require.NoError(t, err)
+	require.Len(t, results, len(w.Txs))
+
+	for i, r := range results {
+		require.Equal(t, utxo.MultiTxCreated, r.Status, "tx %d: %v", i, r.Err)
+	}
+}
+
+func TestNullStoreParentOutputsForValidation(t *testing.T) {
+	store, err := NewNullStore()
+	require.NoError(t, err)
+
+	answers, err := store.ParentOutputsForValidation(context.Background(), []utxo.Outpoint{{Vout: 0}, {Vout: 255}, {Vout: 256}})
+	require.NoError(t, err)
+	require.Len(t, answers, 3)
+	require.Equal(t, utxo.ParentOutputMined, answers[0].Status)
+	require.Equal(t, uint32(1), answers[0].Height)
+	require.Equal(t, utxo.ParentOutputMined, answers[1].Status)
+	require.Equal(t, utxo.ParentOutputNoSuchIndex, answers[2].Status)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	answers, err = store.ParentOutputsForValidation(cancelled, []utxo.Outpoint{{Vout: 0}})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, answers)
+}

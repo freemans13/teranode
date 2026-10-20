@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -125,6 +126,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 			MaxRetries:   tSettings.GRPCMaxRetries,
 			RetryBackoff: tSettings.GRPCRetryBackoff,
 			CallerName:   "blockchain",
+			APIKey:       tSettings.GRPCAdminAPIKey,
 		}, tSettings)
 		if err != nil {
 			return nil, errors.NewServiceError("failed to init blockchain service connection for '%s'", source, err)
@@ -153,6 +155,13 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 		}
 
 		break
+	}
+
+	// HealthGRPC is public, so it cannot tell a wrong key from a right one.
+	if err = checkAdminAPIKeyAccepted(ctx, baClient); err != nil {
+		_ = baConn.Close()
+
+		return nil, errors.NewConfigurationError("blockchain service at '%s' rejected grpc_admin_api_key for '%s'", address, source, err)
 	}
 
 	running := atomic.Bool{}
@@ -313,7 +322,22 @@ func (c *Client) Health(ctx context.Context, checkLiveness bool) (int, string, e
 		return http.StatusFailedDependency, resp.GetDetails(), nil
 	}
 
+	if err = checkAdminAPIKeyAccepted(ctx, c.client); err != nil {
+		return http.StatusFailedDependency, "blockchain rejected grpc_admin_api_key", err
+	}
+
 	return http.StatusOK, resp.GetDetails(), nil
+}
+
+// checkAdminAPIKeyAccepted makes one cheap protected call and fails only on
+// Unauthenticated, so an uninitialised FSM or an older server without the
+// auth interceptor is not treated as a key mismatch.
+func checkAdminAPIKeyAccepted(ctx context.Context, client blockchain_api.BlockchainAPIClient) error {
+	if _, err := client.GetFSMCurrentState(ctx, &emptypb.Empty{}); status.Code(err) == codes.Unauthenticated {
+		return errors.UnwrapGRPC(err)
+	}
+
+	return nil
 }
 
 // AddBlock sends a request to add a new block to the blockchain.
@@ -2472,11 +2496,20 @@ func (c *Client) CompleteBlobDeletions(ctx context.Context, completedIDs []int64
 }
 
 // AcquireBlobDeletionBatch acquires a batch of deletions with locking.
-func (c *Client) AcquireBlobDeletionBatch(ctx context.Context, height uint32, limit int, lockTimeoutSeconds int) (string, []*blockchain_api.ScheduledDeletion, error) {
+func (c *Client) AcquireBlobDeletionBatch(ctx context.Context, height uint32, limit int, lockTimeoutSeconds int, excludeStoreTypes []storetypes.BlobStoreType) (string, []*blockchain_api.ScheduledDeletion, error) {
+	var excluded []int32
+	if len(excludeStoreTypes) > 0 {
+		excluded = make([]int32, len(excludeStoreTypes))
+		for i, storeType := range excludeStoreTypes {
+			excluded[i] = int32(storeType)
+		}
+	}
+
 	resp, err := c.client.AcquireBlobDeletionBatch(ctx, &blockchain_api.AcquireBlobDeletionBatchRequest{
 		Height:             height,
 		Limit:              int32(limit),
 		LockTimeoutSeconds: int32(lockTimeoutSeconds),
+		ExcludeStoreTypes:  excluded,
 	})
 	if err != nil {
 		return "", nil, errors.UnwrapGRPC(err)
@@ -2515,24 +2548,87 @@ func (c *Client) GetMedianTimePastForHeights(ctx context.Context, heights []uint
 // GetMedianTimePastRange returns the MTP values for all blocks in [fromHeight, toHeight].
 // Returns a dense slice where result[i] = MTP for height (fromHeight + i).
 // Internally builds a full heights array to reuse the existing GetMedianTimePastByHeights RPC,
-// avoiding the need for a new proto endpoint.
+// with up to four concurrent requests.
+//
+// The request is chunked client-side into batches of at most
+// maxMedianTimePastHeightsPerRequest: GetMedianTimePastByHeights rejects any
+// single request above that count (an unauthenticated-RPC DoS bound), but a
+// first-party caller can legitimately need MTP for the entire chain in one
+// logical call - most notably the validator's MTP pre-load, which asks for
+// [0, blockHeight] on its first invocation after startup. Chunking here keeps
+// the server-side cap meaningful without breaking that caller.
 func (c *Client) GetMedianTimePastRange(ctx context.Context, fromHeight, toHeight uint32) ([]uint32, error) {
 	if toHeight < fromHeight {
 		return []uint32{}, nil
 	}
 
-	count := toHeight - fromHeight + 1
-	heights := make([]uint32, count)
+	count := uint64(toHeight) - uint64(fromHeight) + 1
+	result := make([]uint32, count)
+	chunkSize := uint64(maxMedianTimePastHeightsPerRequest(c.settings))
+	group, fetchCtx := errgroup.WithContext(ctx)
+	// Keep startup latency bounded without issuing a whole-chain burst of RPCs.
+	group.SetLimit(4)
+	for offset := uint64(0); offset < count; offset += chunkSize {
+		if fetchCtx.Err() != nil {
+			break
+		}
+		end := offset + chunkSize
+		if end > count {
+			end = count
+		}
+		start := uint32(uint64(fromHeight) + offset)
+		output := result[offset:end]
+		group.Go(func() error { return c.fetchMedianTimePastChunk(fetchCtx, start, output) })
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// A smaller server cap must degrade to extra requests instead of stopping
+// validation. Retry only range-size rejections, down to a single height.
+func (c *Client) fetchMedianTimePastChunk(ctx context.Context, start uint32, output []uint32) error {
+	heights := make([]uint32, len(output))
 	for i := range heights {
-		heights[i] = fromHeight + uint32(i)
+		heights[i] = start + uint32(i)
 	}
-
-	resp, err := c.client.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{
-		Heights: heights,
-	})
+	resp, err := c.client.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{Heights: heights})
 	if err != nil {
-		return nil, errors.UnwrapGRPC(err)
+		if status.Code(err) == codes.InvalidArgument && len(output) > 1 {
+			half := len(output) / 2
+			if err := c.fetchMedianTimePastChunk(ctx, start, output[:half]); err != nil {
+				return err
+			}
+			return c.fetchMedianTimePastChunk(ctx, start+uint32(half), output[half:])
+		}
+		return errors.UnwrapGRPC(err)
+	}
+	if resp == nil || len(resp.MedianTimePast) != len(output) {
+		return errors.NewProcessingError("GetMedianTimePastByHeights returned an unexpected number of values")
+	}
+	copy(output, resp.MedianTimePast)
+	return nil
+}
+
+// maxMedianTimePastHeightsPerRequest returns the per-request chunk size used
+// by GetMedianTimePastRange, mirroring the server-side
+// BlockChain.MaxMedianTimePastHeights bound. If settings differ across processes,
+// fetchMedianTimePastChunk retries with smaller batches. Falls back to the default
+// when settings is nil or unset.
+func maxMedianTimePastHeightsPerRequest(tSettings *settings.Settings) uint32 {
+	const defaultMaxMedianTimePastHeights = 10000
+
+	if tSettings == nil || tSettings.BlockChain.MaxMedianTimePastHeights <= 0 {
+		return defaultMaxMedianTimePastHeights
 	}
 
-	return resp.MedianTimePast, nil
+	configured := uint64(tSettings.BlockChain.MaxMedianTimePastHeights)
+	if configured > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(configured) //nolint:gosec // bounded above before conversion
 }

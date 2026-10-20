@@ -3,7 +3,6 @@ package blockvalidation
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -24,6 +23,19 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
+
+// peerBlockFetchTimeout bounds a single peer HTTP fetch of block data - whether a batch of
+// blocks or one block - so a slow or hostile peer cannot hold a fetch goroutine open
+// indefinitely. util.DoHTTPRequestBodyReader falls back to http_streaming_timeout when the
+// context carries no deadline of its own (600 s as shipped in settings.conf, 300 s compiled-in
+// default, sized for large subtree_data downloads), which is far too generous a budget for a
+// block message; every block fetch call site sets this explicitly instead of relying on that
+// fallback.
+const peerBlockFetchTimeout = 30 * time.Second
+
+// overSendProbeTimeout bounds fetchBlocksBatch's diagnostic read past the last requested block.
+// It is diagnostic only, so it must never spend a meaningful share of peerBlockFetchTimeout.
+const overSendProbeTimeout = 2 * time.Second
 
 // Work item represents a block with its position for ordered delivery
 type workItem struct {
@@ -161,8 +173,13 @@ func (u *Server) batchFetchAndDistribute(ctx context.Context, blockHeaders []*mo
 		u.logger.Debugf("[catchup:batchFetchAndDistribute][%s] fetching batch %d-%d (%d blocks)",
 			blockUpTo.Hash().String(), i, end-1, len(batchHeaders))
 
-		// Fetch entire batch in one HTTP request, from last block, since the data is returned newest-first
-		blocks, err := u.fetchBlocksBatch(ctx, batchHeaders[len(batchHeaders)-1].Hash(), uint32(len(batchHeaders)), peerID, baseURL)
+		// Fetch entire batch in one HTTP request, from last block, since the data is returned newest-first.
+		// Bound the fetch explicitly: when ctx carries no deadline, DoHTTPRequestBodyReader (used since
+		// bitcoin-sv/teranode#4742) falls back to http_streaming_timeout (600 s in settings.conf), where the
+		// old io.ReadAll-based DoHTTPRequest fell back to http_timeout (30 s in settings.conf).
+		fetchCtx, fetchCancel := context.WithTimeout(ctx, peerBlockFetchTimeout)
+		blocks, err := u.fetchBlocksBatch(fetchCtx, batchHeaders[len(batchHeaders)-1].Hash(), uint32(len(batchHeaders)), peerID, baseURL)
+		fetchCancel()
 		if err != nil {
 			return errors.NewProcessingError("[catchup:batchFetchAndDistribute][%s] failed to fetch batch starting at %s", blockUpTo.Hash().String(), batchHeaders[0].Hash().String(), err)
 		}
@@ -650,8 +667,7 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 // minCatchupPrefetchWeight is the floor charged for one block. Without it a run of tiny
 // blocks admits an unbounded number of concurrent prewarms within the byte budget; with it
 // the in-flight count can never exceed budget/floor. FetchNumWorkers already caps that at 16
-// today, so this is insurance against a raised worker count. Same value and reasoning as
-// netsync's minInFlightBlockWeight.
+// today, so this is insurance against a raised worker count.
 const minCatchupPrefetchWeight = 64 * 1024
 
 // acquireCatchupPrefetch reserves capacity for one block's subtree-data prewarm and returns
@@ -979,6 +995,29 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 		return newPoisonedSubtreeDataError(peerID, baseURL, subtreeHash, missing, subtree.Length(), bytesRead)
 	}
 
+	// A complete body can still be the wrong body, and this is the one boundary where
+	// the party responsible is known (bitcoin-sv/teranode#4838). The reader above stores
+	// one slot per subtree without ever comparing it to a node — the coinbase diversion
+	// model.FirstMismatchedSubtreeDataTx documents — so a peer can drop a
+	// header-committed transaction, put a fabricated one in its place, and leave a body
+	// that satisfies every length and nil check. Nothing downstream can attribute it:
+	// once these bytes are on disk the read side sees only a local file, and the catch-up
+	// primary it would otherwise be charged to need not be the peer that served this
+	// subtree. So the tie is established here, against the peer holding it, before the
+	// body is stored.
+	//
+	// The exemption argument matches the MissingSubtreeDataTxs call above and must:
+	// index 0 under a coinbase placeholder holds the coinbase, which no node names.
+	if idx, expected, got, mismatched := model.FirstMismatchedSubtreeDataTx(subtree, subtreeData, true); mismatched {
+		// Struck only on the cache-busted retry, for the reason the wrong-root check in
+		// fetchAndStoreSubtree sets out.
+		if bypassCache && u.blockValidation != nil {
+			u.blockValidation.penalizeCorruptBlockPeer(ctx, peerID, block, "subtree_data transaction mismatch on catchup fetch")
+		}
+
+		return newMismatchedSubtreeDataError(peerID, baseURL, subtreeHash, idx, expected, got)
+	}
+
 	// Stream the transactions straight into the store instead of building a second complete
 	// in-memory copy with Serialize() and handing that to Set: the parsed []*bt.Tx is already
 	// resident, and one more full serialized copy per in-flight subtree_data is exactly the
@@ -1257,7 +1296,10 @@ func (u *Server) fetchSubtreeFromPeer(ctx context.Context, subtreeHash *chainhas
 	defer deferFn()
 
 	// Construct URL for subtree endpoint (for subtreeToCheck)
-	url := u.peerResourceURL(baseURL, "subtree", subtreeHash, bypassCache)
+	url, err := u.peerResourceURL(baseURL, "subtree", subtreeHash, bypassCache)
+	if err != nil {
+		return nil, errors.NewServiceError("[catchup:fetchSubtreeFromPeer] invalid peer base URL for subtree %s", subtreeHash.String(), err)
+	}
 
 	u.logger.Debugf("[catchup:fetchSubtreeFromPeer] fetching subtree from %s", url)
 
@@ -1267,8 +1309,10 @@ func (u *Server) fetchSubtreeFromPeer(ctx context.Context, subtreeHash *chainhas
 	// only controls what *this node* assembles; peers may legitimately produce larger subtrees.
 	maxSubtreeBytes := u.settings.SubtreeValidation.MaxIncomingSubtreeBytes
 
-	// Use the existing HTTP utility to fetch subtree
-	subtreeBytes, err := util.DoHTTPRequestBounded(ctx, url, maxSubtreeBytes)
+	// Retry on 429/503 with backoff: a catch-up fans subtree fetches out concurrently, and
+	// failing on the first rate-limit rejection re-issued the whole fan-out straight back into
+	// the peer's limiter (issue 1174).
+	subtreeBytes, err := util.DoHTTPRequestBoundedWithRetry(ctx, url, maxSubtreeBytes)
 	if err != nil {
 		return nil, errors.NewServiceError("[catchup:fetchSubtreeFromPeer] failed to fetch subtree from %s", url, err)
 	}
@@ -1325,7 +1369,10 @@ func (u *Server) fetchSubtreeDataFromPeer(ctx context.Context, subtreeHash *chai
 
 	// peerResourceURL builds <baseURL>/subtree_data/<hash>, appending the cachebust
 	// query parameter when bypassCache is set.
-	url := u.peerResourceURL(baseURL, "subtree_data", subtreeHash, bypassCache)
+	url, err := u.peerResourceURL(baseURL, "subtree_data", subtreeHash, bypassCache)
+	if err != nil {
+		return nil, errors.NewServiceError("[catchup:fetchSubtreeDataFromPeer] invalid peer base URL for subtree %s", subtreeHash.String(), err)
+	}
 
 	u.logger.Debugf("[catchup:fetchSubtreeDataFromPeer] fetching subtree data from %s", url)
 
@@ -1373,25 +1420,75 @@ func (u *Server) fetchBlocksBatch(ctx context.Context, hash *chainhash.Hash, n u
 	)
 	defer deferFn()
 
-	blockBytes, err := util.DoHTTPRequest(ctx, fmt.Sprintf("%s/blocks/%s?n=%d", baseURL, hash.String(), n))
+	blocksURL, err := util.JoinPeerURL(baseURL, "blocks", hash.String())
+	if err != nil {
+		return nil, errors.NewProcessingError("[catchup:fetchBlocksBatch][%s] invalid peer base URL", hash.String(), err)
+	}
+
+	url := fmt.Sprintf("%s?n=%d", blocksURL, n)
+
+	// Stream and parse incrementally rather than io.ReadAll-ing the whole response: a block
+	// carries no consensus-defined maximum size, so there is no byte cap to apply to the HTTP
+	// body as a whole (unlike fetchSubtreeFromPeer's DoHTTPRequestBoundedWithRetry). Streaming the parse
+	// only halves peak memory versus io.ReadAll, though - it does not by itself bound anything,
+	// since the subtree hash list length is an unvalidated wire varint (model/Block.go) that the
+	// parse loop honours with no ceiling. Each block message is additionally capped below via
+	// io.LimitedReader (bitcoin-sv/teranode#4742); see that comment for what the cap does not
+	// cover.
+	//
+	// reqCtx exists so the over-send probe below can abort the body read on its own short
+	// budget without spending the caller's fetch deadline.
+	reqCtx, reqCancel := context.WithCancel(ctx)
+	defer reqCancel()
+
+	// Retry on 429/503, as fetchSubtreeFromPeer does: /blocks shares the peer's catch-up rate
+	// limit with the subtree endpoints (issue 1174). The retries share the caller's fetch
+	// deadline, and spend at most half of it.
+	bodyReader, err := util.DoHTTPRequestBodyReaderWithRetry(reqCtx, url)
 	if err != nil {
 		return nil, errors.NewProcessingError("[catchup:fetchBlocksBatch][%s] failed to get blocks from peer", hash.String(), err)
 	}
 
-	// Track bytes downloaded from peer
-	if u.p2pClient != nil && peerID != "" {
-		if err := u.p2pClient.RecordBytesDownloaded(ctx, peerID, uint64(len(blockBytes))); err != nil {
-			u.logger.Warnf("[fetchBlocksBatch][%s] failed to record %d bytes downloaded from peer %s: %v", hash.String(), len(blockBytes), peerID, err)
-		}
+	countingReader := &countingReadCloser{
+		reader: bodyReader,
+		onClose: func(bytesRead uint64) {
+			if u.p2pClient != nil && peerID != "" {
+				trackCtx, _, deferFn := tracing.DecoupleTracingSpan(ctx, "blockvalidation", "recordBytesDownloaded")
+				defer deferFn()
+
+				if err := u.p2pClient.RecordBytesDownloaded(trackCtx, peerID, bytesRead); err != nil {
+					u.logger.Warnf("[fetchBlocksBatch][%s] failed to record %d bytes downloaded from peer %s: %v", hash.String(), bytesRead, peerID, err)
+				}
+			}
+		},
 	}
+	defer countingReader.Close()
 
-	blockReader := bytes.NewReader(blockBytes)
+	blocks := make([]*model.Block, 0, n)
+	maxBlockMessageBytes := u.settings.BlockValidation.MaxIncomingBlockMessageBytes
 
-	blocks := make([]*model.Block, 0)
+	// Bounded by n, not read-until-EOF: a peer that keeps streaming well-formed blocks past
+	// what was asked for would otherwise drive an allocation bounded only by how long it kept
+	// sending, in *model.Block values that no byte cap could constrain.
+	for uint32(len(blocks)) < n {
+		// Cap what a single block message may consume off the wire. Without this, a peer could
+		// still drive the subtree hash list (and thus the parsed *model.Block) unboundedly large
+		// even though the response itself is streamed rather than io.ReadAll'd. Use a
+		// LimitedReader (not a byte-counted DoHTTPRequestBounded-style cap on the whole
+		// response) so cap-exhaustion is distinguishable per-block from a genuine short stream.
+		//
+		// The cap bounds bytes delivered, not bytes allocated. It does not bound the coinbase
+		// read: go-bt's readArenaScript allocates a script's declared length (up to its
+		// MaxArenaAlloc, 1 GiB) before reading any of it, so that allocation happens whatever
+		// this cap is (bsv-blockchain/go-bt#187).
+		limited := &io.LimitedReader{R: countingReader, N: maxBlockMessageBytes}
 
-	for {
-		block, err := model.NewBlockFromReader(blockReader)
+		block, err := model.NewBlockFromReader(limited)
 		if err != nil {
+			if limited.N == 0 {
+				return nil, errors.NewExternalError("[catchup:fetchBlocksBatch][%s] block message from peer %s exceeds %d byte limit", hash.String(), peerID, maxBlockMessageBytes)
+			}
+
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
@@ -1400,6 +1497,30 @@ func (u *Server) fetchBlocksBatch(ctx context.Context, hash *chainhash.Hash, n u
 		}
 
 		blocks = append(blocks, block)
+	}
+
+	// Diagnostic only: the n blocks above stand regardless - they are still verified by the
+	// caller's verifyBlockHeaders, and stopping at n (rather than reading to EOF) is deliberate
+	// so a peer that pads correct data with extra bytes no longer aborts the whole catchup
+	// cycle. This probe exists purely so the padding is not completely invisible: it records
+	// the observation for the peer dashboard without charging reputation, since padding on top
+	// of correct data is at least as likely to be a caching proxy or ?n= version skew as it is
+	// to be malicious (see the ErrBlockPolicyDeclined exemption in peer_metrics_helpers.go for
+	// the same reasoning about not punishing ambiguous peer behaviour).
+	//
+	// The probe reads a body the peer still controls, so it gets its own budget: a peer that
+	// sends the n blocks and then never ends the response would otherwise hold this read until
+	// the fetch deadline, and the batch would still return success.
+	probeTimer := time.AfterFunc(overSendProbeTimeout, reqCancel)
+
+	var probe [1]byte
+	_, probeErr := io.ReadFull(countingReader, probe[:])
+
+	probeTimer.Stop()
+
+	if probeErr == nil {
+		u.logger.Warnf("[catchup:fetchBlocksBatch][%s] peer %s streamed more than the %d blocks requested", hash.String(), peerID, n)
+		u.reportCatchupError(ctx, peerID, fmt.Sprintf("peer over-sent on /blocks (requested %d)", n))
 	}
 
 	return blocks, nil
@@ -1422,26 +1543,50 @@ func (u *Server) fetchSingleBlock(ctx context.Context, hash *chainhash.Hash, pee
 	)
 	defer deferFn()
 
-	blockBytes, err := util.DoHTTPRequest(ctx, fmt.Sprintf("%s/block/%s", baseURL, hash.String()))
+	blockURL, err := util.JoinPeerURL(baseURL, "block", hash.String())
+	if err != nil {
+		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] invalid peer base URL", hash.String(), err)
+	}
+
+	// Stream and parse incrementally rather than io.ReadAll-ing the whole response - see the
+	// comment on fetchBlocksBatch's DoHTTPRequestBodyReader call (bitcoin-sv/teranode#4742).
+	bodyReader, err := util.DoHTTPRequestBodyReader(ctx, blockURL)
 	if err != nil {
 		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] failed to get block from peer", hash.String(), err)
 	}
 
-	// Track bytes downloaded from peer
-	if u.p2pClient != nil && peerID != "" {
-		if err := u.p2pClient.RecordBytesDownloaded(ctx, peerID, uint64(len(blockBytes))); err != nil {
-			u.logger.Warnf("[fetchSingleBlock][%s] failed to record %d bytes downloaded from peer %s: %v", hash.String(), len(blockBytes), peerID, err)
-		}
-	}
+	countingReader := &countingReadCloser{
+		reader: bodyReader,
+		onClose: func(bytesRead uint64) {
+			if u.p2pClient != nil && peerID != "" {
+				trackCtx, _, deferFn := tracing.DecoupleTracingSpan(ctx, "blockvalidation", "recordBytesDownloaded")
+				defer deferFn()
 
-	block, err := model.NewBlockFromBytes(blockBytes)
+				if err := u.p2pClient.RecordBytesDownloaded(trackCtx, peerID, bytesRead); err != nil {
+					u.logger.Warnf("[fetchSingleBlock][%s] failed to record %d bytes downloaded from peer %s: %v", hash.String(), bytesRead, peerID, err)
+				}
+			}
+		},
+	}
+	defer countingReader.Close()
+
+	// Cap what the block message may consume off the wire - see fetchBlocksBatch's matching
+	// io.LimitedReader comment, including what the cap does not bound (bitcoin-sv/teranode#4742,
+	// bsv-blockchain/go-bt#187).
+	maxBlockMessageBytes := u.settings.BlockValidation.MaxIncomingBlockMessageBytes
+	limited := &io.LimitedReader{R: countingReader, N: maxBlockMessageBytes}
+
+	block, err := model.NewBlockFromReader(limited)
 	if err != nil {
+		if limited.N == 0 {
+			return nil, errors.NewExternalError("[catchup:fetchSingleBlock][%s] block message from peer %s exceeds %d byte limit", hash.String(), peerID, maxBlockMessageBytes)
+		}
+
 		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] failed to create block from bytes", hash.String(), err)
 	}
 
 	if block == nil {
-		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] block could not be created from %d bytes received from peer",
-			hash.String(), len(blockBytes))
+		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] block could not be created from peer response", hash.String())
 	}
 
 	// The peer chooses the response body, so a well-formed block is not necessarily the
@@ -1458,6 +1603,98 @@ func (u *Server) fetchSingleBlock(ctx context.Context, hash *chainhash.Hash, pee
 	// Reputation is credited post-validation in validateBlocksOnChannel via reportValidBlockForPeers
 
 	return block, nil
+}
+
+// maxAnnouncedBlockAlternatives bounds how many other peers fetchAnnouncedBlock asks after the
+// announcer answers 429. All of them share the caller's fetch budget, so the bound is on load put
+// on other peers, not on time.
+const maxAnnouncedBlockAlternatives = 2
+
+// fetchAnnouncedBlock fetches the block a peer announced from the baseURL it announced, charging
+// the announcer by reportAnnouncedBlockFetchFailure if that fails. On an uncharged 429 it then tries up to
+// maxAnnouncedBlockAlternatives other peers advertising the same hash as their tip, so a rate limit
+// does not drop the block until the next announcement. The returned processBlockFound names the
+// peer that served the block, so later subtree fetches go there too; on error it is the input.
+//
+// ctx is the caller's context, used for reporting; fetchCtx bounds every fetch, alternatives included.
+func (u *Server) fetchAnnouncedBlock(ctx, fetchCtx context.Context, blockFound processBlockFound) (*model.Block, processBlockFound, error) {
+	block, err := u.fetchSingleBlock(fetchCtx, blockFound.hash, blockFound.peerID, blockFound.baseURL)
+	if err == nil {
+		return block, blockFound, nil
+	}
+
+	charged := u.reportAnnouncedBlockFetchFailure(ctx, blockFound.peerID, err)
+
+	// Only a 429 suggests the announcer has the block and is refusing us for now. Any other
+	// failure is the announcer's, and is not retried elsewhere. A charged 429 is not retried
+	// either: the announcer is past its allowance, so its 429s must not cost this node a peer
+	// lookup each. Nor is anything retried once the caller's ctx is done, or for an announcement
+	// with no peer ID: it has no allowance to spend, so its 429s would fall back without bound.
+	if !errors.Is(err, errors.ErrServiceRateLimited) || charged || ctx.Err() != nil || blockFound.peerID == "" {
+		return nil, blockFound, err
+	}
+
+	if altBlock, altSource, ok := u.fetchAnnouncedBlockFromTipPeers(fetchCtx, blockFound); ok {
+		return altBlock, altSource, nil
+	}
+
+	return nil, blockFound, err
+}
+
+// fetchAnnouncedBlockFromTipPeers asks peers whose advertised tip is the announced hash. Requiring
+// a tip match is what keeps a flood of made-up hashes, each answered 429 by its announcer, from
+// being amplified onto honest peers: no honest peer advertises a hash that does not exist.
+//
+// An alternative's failure is not charged. This node chose it, and it never announced the block
+// to us.
+//
+// The registry is read directly rather than through selectBestPeersForCatchup, whose Info log would
+// make every fallback read as a catch-up.
+func (u *Server) fetchAnnouncedBlockFromTipPeers(fetchCtx context.Context, blockFound processBlockFound) (*model.Block, processBlockFound, bool) {
+	if u.p2pClient == nil {
+		return nil, blockFound, false
+	}
+
+	peers, err := u.p2pClient.GetPeersForCatchup(fetchCtx)
+	if err != nil || len(peers) == 0 {
+		return nil, blockFound, false
+	}
+
+	tried := 0
+
+	for _, p := range peers {
+		if tried >= maxAnnouncedBlockAlternatives {
+			break
+		}
+
+		peerID := p.ID.String()
+
+		if peerID == blockFound.peerID || p.DataHubURL == "" || p.BlockHash == nil || !p.BlockHash.IsEqual(blockFound.hash) {
+			continue
+		}
+
+		if u.isPeerMalicious(fetchCtx, peerID) {
+			continue
+		}
+
+		tried++
+
+		block, err := u.fetchSingleBlock(fetchCtx, blockFound.hash, peerID, p.DataHubURL)
+		if err != nil {
+			u.logger.Infof("[fetchAnnouncedBlock][%s] alternative peer %s failed after announcer %s answered 429: %v", blockFound.hash.String(), peerID, blockFound.peerID, err)
+			continue
+		}
+
+		u.logger.Infof("[fetchAnnouncedBlock][%s] fetched from alternative peer %s after announcer %s answered 429", blockFound.hash.String(), peerID, blockFound.peerID)
+
+		source := blockFound
+		source.peerID = peerID
+		source.baseURL = p.DataHubURL
+
+		return block, source, true
+	}
+
+	return nil, blockFound, false
 }
 
 // reverseBlocks reverses a slice of blocks in place.

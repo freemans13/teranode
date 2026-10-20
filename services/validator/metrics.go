@@ -43,6 +43,12 @@ var (
 	// or fails structural validation checks. High values may indicate network attacks or client issues.
 	prometheusInvalidTransactions prometheus.Counter
 
+	// prometheusMissingParentTransactions counts Kafka-sourced transactions rejected only because
+	// their parent UTXO has not been seen yet (ErrTxMissingParent). Kept separate from
+	// prometheusInvalidTransactions because this is an ordering artifact of the validatortxs
+	// topic's concurrent per-partition consumption, not a genuinely invalid or attack transaction.
+	prometheusMissingParentTransactions prometheus.Counter
+
 	// prometheusValidatorParentCommitRetries counts retries spent waiting for a parent
 	// transaction to finish its own commit, labelled by condition (TX_LOCKED or
 	// TX_CREATING). Paired with prometheusValidatorParentCommitExhausted, this gives the
@@ -58,6 +64,11 @@ var (
 	// except legacy p2p relay (which parks it in netsync's orphan pool) nothing is
 	// holding it, so the increment marks a transaction the node lost.
 	prometheusValidatorParentCommitExhausted *prometheus.CounterVec
+
+	// prometheusValidatorUnlockFailed counts accepted transactions whose two-phase-commit
+	// unlock failed or timed out. The transaction was spent and created; it stays locked
+	// until it is mined, so its descendants are answered TX_LOCKED until then.
+	prometheusValidatorUnlockFailed prometheus.Counter
 
 	// prometheusTransactionValidateTotal measures the complete end-to-end validation time for transactions.
 	// This histogram tracks the total time spent validating a transaction from initial receipt through
@@ -270,6 +281,16 @@ func _initPrometheusMetrics() {
 		},
 	)
 
+	// Missing-parent transactions counter (Kafka intake only)
+	prometheusMissingParentTransactions = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "missing_parent_transactions",
+			Help:      "Number of Kafka-sourced transactions rejected because their parent UTXO had not been seen yet (ordering artifact, not necessarily invalid)",
+		},
+	)
+
 	// Total validation time histogram
 	prometheusTransactionValidateTotal = promauto.NewHistogram(
 		prometheus.HistogramOpts{
@@ -398,6 +419,15 @@ func _initPrometheusMetrics() {
 			Help:      "Transactions rejected because the parent-commit retry budget ran out, by condition",
 		},
 		[]string{"condition"},
+	)
+
+	prometheusValidatorUnlockFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "unlock_failed",
+			Help:      "Accepted transactions whose two-phase-commit unlock failed and stay locked until mined",
+		},
 	)
 
 	// Block assembly operations histogram
