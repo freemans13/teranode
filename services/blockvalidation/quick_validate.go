@@ -384,8 +384,12 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 }
 
 // quickValidateBlockAsync performs optimized validation with async file writes.
-// Similar to quickValidateBlock but sends subtree file writes to a background channel,
-// allowing the caller to proceed to the next block's UTXO processing while writes continue.
+// Similar to quickValidateBlock but sends subtree file writes to a background channel, so
+// the writes for one batch overlap the UTXO processing of the block's later batches, and
+// the block-ID assignment and coinbase checks. It does not return before this block's own
+// writes have settled: commitBlock stores the block with subtrees_set, so awaitSubtreeWrites
+// waits for them first (bitcoin-sv/teranode#4978). The next block's processing therefore
+// cannot overlap this block's writes, and catch-up pays the write latency of each block's tail.
 //
 // IMPORTANT: The writeJobsChan must be processed by workers in a shared errgroup.
 // If any write fails, the errgroup context is cancelled, which cancels this function's context.
