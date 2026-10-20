@@ -2058,9 +2058,11 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 		// commit it (bitcoin-sv/teranode#4978). Abort rather than fall through: the failing write
 		// worker has already cancelled the shared catch-up context, so normal validation would only
 		// fail on that and bury the storage fault. The block is not stored, so the next catch-up
-		// run validates it again from scratch. No sweep: the barrier already waited for every write
-		// that will ever be handled, and the next run rewrites the .subtree files with
-		// AllowOverwrite.
+		// run validates it again from scratch. No sweep, on either way the barrier can fail. When a
+		// write failed, the barrier had already waited for every job; when the context ended first,
+		// jobs may still be in flight and a delete could race them, as in the ctx.Done branches
+		// above. Leaving the files is harmless either way: the content is honest, every blob carries
+		// a finite DAH, and the next run rewrites it with AllowOverwrite.
 		if isSubtreeWritesNotLanded(err) {
 			u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: .subtree writes did not land, aborting without committing the block: %v",
 				catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)
