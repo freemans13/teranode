@@ -19,11 +19,14 @@ import (
 // first statement of their transaction. The block-path create, the below-checkpoint netted write
 // included, takes its transaction locks first and the fence after them: a writer that held the
 // fence while it waited on a transaction lock would deadlock with a writer that holds that lock
-// and queues for the fence behind the stamp. Shared holders do not block each other. The stamp's first step takes it EXCLUSIVE for one short transaction, so once granted
-// every earlier containment write has committed and its loser scan is exact. A transaction-level
+// and queues for the fence behind the stamp. Shared holders do not block each other.
+//
+// The stamp's first step takes it EXCLUSIVE for one short transaction, so once granted every
+// earlier containment write has committed and its loser scan is exact. A transaction-level
 // advisory lock is released at commit or rollback, so it cannot leak. The writer then reads the
-// fence as its own second statement: the store runs at read committed, under which a read
-// folded into the lock statement would see the fence as it was before the lock was granted.
+// fence in a separate statement after the lock is granted: the store runs at read committed,
+// under which a read folded into the lock statement would see the fence as it was before the
+// lock was granted.
 //
 // Spends never take it. Neither does the unmined create, mark-on or mark-off: none of them
 // writes containment.
