@@ -3,12 +3,15 @@ package blockvalidation
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/stretchr/testify/require"
 )
@@ -224,4 +227,64 @@ func TestNetRange_BatchIsCutToWholeRanges(t *testing.T) {
 
 	block = &model.Block{Height: 100, Subtrees: make([]*chainhash.Hash, 40), TransactionCount: 40 * 1024}
 	require.Equal(t, 64, bv.quickSubtreeBatchSize(block, true), "64 subtrees of 1,024 make one range")
+}
+
+// A block whose first batch writes and whose second batch fails on every attempt is counted
+// once per attempt. A retry starts again at the first batch, and that batch succeeds, so a count
+// cleared per batch never reached netFailureLimit.
+func TestNetRange_FailureCountSurvivesAnEarlierBatchThatSucceeds(t *testing.T) {
+	bv, recorder, cleanup := newNetRangeHarness(t, "net_range_fail_count", 65536)
+	bv.spendRetryBackoff = time.Millisecond
+	defer cleanup()
+
+	ctx := context.Background()
+
+	root, key := seedRoot(t, recorder.Store, 2, "NET_FAIL_COUNT_KEY")
+	first := [][]*bt.Tx{{spendOf(t, key, root, 0, 90_000)}}
+	second := [][]*bt.Tx{{spendOf(t, key, root, 1, 90_000)}}
+	block := netBlockFor(first)
+
+	for attempt := 1; attempt <= netFailureLimit; attempt++ {
+		require.NoError(t, bv.createAndSpendUTXOsForBatch(ctx, block, netBatchFor(t, bv, block, first)))
+
+		recorder.mu.Lock()
+		recorder.failMulti = errors.NewStorageError("injected fault in the second batch")
+		recorder.failMultiTimes = 1_000 // every retry inside the batch fails too
+		recorder.mu.Unlock()
+
+		require.Error(t, bv.createAndSpendUTXOsForBatch(ctx, block, netBatchFor(t, bv, block, second)))
+
+		recorder.mu.Lock()
+		recorder.failMulti = nil
+		recorder.mu.Unlock()
+		require.Equal(t, int64(attempt), bv.netFailureCount(*block.Hash()), "attempt %d", attempt)
+	}
+
+	bv.clearNetFailures(block)
+	require.Zero(t, bv.netFailureCount(*block.Hash()))
+}
+
+// Batches of one block that fail at the same time each add one to the count.
+func TestNetRange_FailureCountIsAtomic(t *testing.T) {
+	bv, _, cleanup := newNetRangeHarness(t, "net_range_fail_atomic", 65536)
+	defer cleanup()
+
+	block := netBlockFor(nil)
+
+	const n = 200
+
+	var wg sync.WaitGroup
+
+	for range n {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			bv.noteNetFailure(block, errors.NewStorageError("injected"))
+		}()
+	}
+
+	wg.Wait()
+
+	require.Equal(t, int64(n), bv.netFailureCount(*block.Hash()))
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -332,6 +333,8 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 			return errors.NewProcessingError("[quickValidateBlock][%s] failed to process block subtrees", block.Hash().String(), err)
 		}
 
+		u.clearNetFailures(block)
+
 		// Verify block ID was assigned during processing (sanity check)
 		if block.ID == 0 {
 			return errors.NewProcessingError("[quickValidateBlock][%s] block ID was not assigned during subtree processing", block.Hash().String())
@@ -478,6 +481,8 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 
 			return wg, freshlyWritten, errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to process block subtrees", block.Hash().String(), err)
 		}
+
+		u.clearNetFailures(block)
 	}
 
 	// If no block ID was assigned during processing, assign idempotently
@@ -2279,9 +2284,10 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		return applyErr
 	}
 
-	if nets {
-		u.netFailures.Delete(*block.Hash())
-	}
+	// The failure count of the block is NOT cleared here. A later batch of the same block can
+	// still fail, and a retry starts again at the first batch, so a clear per batch would reset
+	// the count on every retry. The count is cleared once the whole block is written: see
+	// clearNetFailures.
 
 	// Update mined info for transactions that already existed. This handles the case where a
 	// previous attempt created UTXOs with a different block ID. Chunked via the shared helper
@@ -3254,17 +3260,31 @@ const netFailureLimit = 10
 // normal validation and a transaction-at-a-time write both need spend-journal rows the store did
 // not write. So a fault that repeats every time is a stop, and it says so.
 func (u *BlockValidation) noteNetFailure(block *model.Block, err error) {
-	n := 1
-
-	if v, loaded := u.netFailures.LoadOrStore(*block.Hash(), 1); loaded {
-		n = v.(int) + 1
-		u.netFailures.Store(*block.Hash(), n)
-	}
+	// One counter per block, made once and then only added to, so two batches of the same
+	// block that fail at the same time both count.
+	v, _ := u.netFailures.LoadOrStore(*block.Hash(), new(atomic.Int64))
+	n := v.(*atomic.Int64).Add(1)
 
 	if n >= netFailureLimit {
 		u.logger.Errorf("[createAndSpendUTXOsForBatch][%s] block %d below the checkpoint has failed its UTXO write %d times; it cannot be applied another way, and an operator must look at it: %v",
 			block.Hash().String(), block.Height, n, err)
 	}
+}
+
+// netFailureCount is how many failed UTXO writes of the block noteNetFailure has counted since
+// the block was last written in full.
+func (u *BlockValidation) netFailureCount(hash chainhash.Hash) int64 {
+	if v, ok := u.netFailures.Load(hash); ok {
+		return v.(*atomic.Int64).Load()
+	}
+
+	return 0
+}
+
+// clearNetFailures forgets the failure count of a block once all its subtrees are written. It
+// runs per block, not per batch: see createAndSpendUTXOsForBatch.
+func (u *BlockValidation) clearNetFailures(block *model.Block) {
+	u.netFailures.Delete(*block.Hash())
 }
 
 // mustStayOnQuickValidation reports whether this block may only be validated through quick
