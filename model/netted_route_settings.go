@@ -69,7 +69,9 @@ func LargestCheckpointGap(checkpoints []chaincfg.Checkpoint) uint32 {
 //
 // The plus one is the common ancestor: the peer serves it as the first header and catch-up drops
 // it, so a window of N headers holds at most N-1 new blocks. A window that starts at checkpoint c
-// must reach c+gap to hold the next checkpoint, so it needs gap+1 headers. Without a checkpoint in
+// must reach c+gap to hold the next checkpoint, so it needs gap+1 headers. That count assumes the
+// locator starts at the tip, so block validation does not cap it at a trailing UTXO store height
+// on this route (blockvalidation's locatorCapApplies). Without a checkpoint in
 // the window no block in it is quick validated, and on the netted route no block may take any
 // other route.
 //

@@ -70,6 +70,24 @@ func TestNettedRoute_WindowFloorIsTheGapPlusOne(t *testing.T) {
 	require.Equal(t, 1, model.NettedRouteCatchupWindow(s, bv.utxoStore))
 }
 
+// On the netted route the locator is not capped at a trailing UTXO height, because each header
+// of lag would come out of a window sized to hold exactly one checkpoint gap.
+func TestNettedRoute_LocatorIsNotCappedAtATrailingUTXOHeight(t *testing.T) {
+	bv, _, cleanup := newNetRangeHarness(t, "netted_route_locator", 65536)
+	defer cleanup()
+
+	bv.settings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 400}, {Height: 1000}}
+	u := &Server{logger: ulogger.TestLogger{}, settings: bv.settings, blockValidation: bv, utxoStore: bv.utxoStore}
+
+	require.False(t, u.locatorCapApplies(700, 695), "the next block is on the netted route")
+	require.False(t, u.locatorCapApplies(999, 10), "the checkpoint block itself is on the netted route")
+	require.True(t, u.locatorCapApplies(1000, 995), "above the hardcoded checkpoint the cap applies")
+	require.False(t, u.locatorCapApplies(700, 700), "no lag, no cap")
+
+	u.utxoStore = bv.utxoStore.(nettingRecorder).applyRecorder
+	require.True(t, u.locatorCapApplies(700, 695), "a store that does not net keeps the cap")
+}
+
 // A block below the checkpoint on a netting store, in a window with no verified checkpoint above
 // it, is a local fault, not a fault of the peer: an honest peer that is still syncing serves such
 // a window.

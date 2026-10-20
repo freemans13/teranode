@@ -1207,8 +1207,9 @@ func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) erro
 // checkpoint holds them, and they are at or below it. Quick validation needs a verified
 // checkpoint at or above each block (tryQuickValidation), so those blocks would be refused in
 // this window, and the refusal would be charged to the peer that served them. The next window
-// starts at the checkpoint and holds the next one, because block validation refuses a window
-// smaller than the largest checkpoint gap at startup (model.CheckNettedRouteCatchupSettings).
+// starts at the checkpoint and holds the next one, because the catch-up window on this store is
+// at least one checkpoint gap plus the common ancestor (model.NettedRouteCatchupWindow), and its
+// locator starts at the tip, not at a trailing UTXO height (locatorCapApplies).
 func (u *Server) trimWindowToVerifiedCheckpoint(catchupCtx *CatchupContext) {
 	verified := catchupCtx.highestCheckpointHeight
 	if verified == 0 || verified <= catchupCtx.commonAncestorMeta.Height {
