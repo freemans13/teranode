@@ -170,3 +170,38 @@ func TestRetryBlockMessage_RecoversFromPanic(t *testing.T) {
 	require.Eventually(t, func() bool { return server.blockMessageRetries.claim(hash.String()) }, time.Second, 5*time.Millisecond)
 	chain.AssertExpectations(t)
 }
+
+// TestRunBlockHandler_PanicBecomesServiceError pins that a panic in blockHandler, which
+// runs in its own goroutine, is returned as a recoverable service error. Without the
+// guard the panic kills the test binary.
+func TestRunBlockHandler_PanicBecomesServiceError(t *testing.T) {
+	// A zero BlockValidation has a nil exists cache, so GetBlockExists panics.
+	server := &Server{logger: ulogger.TestLogger{}, blockValidation: &BlockValidation{}}
+
+	hash := chainhash.HashH([]byte("handler-panic"))
+	err := server.runBlockHandler(context.Background(), &kafkamessage.KafkaBlockTopicMessage{Hash: hash.String(), URL: "http://peer", PeerId: "peerA"})
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrServiceError), "got %v", err)
+	require.True(t, isRecoverableBlockMessageError(err), "a panic is a local fault and must be retried, not blamed on the peer")
+}
+
+// TestConsumerMessageHandler_HandlerPanicIsRetried pins the end state for a panic on
+// the first attempt: the message is committed, a retry is pending, and the peer is not
+// reported.
+func TestConsumerMessageHandler_HandlerPanicIsRetried(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// No ReportPeerFailure expectation: a report would make the mock panic.
+	chain := &blockchain.Mock{}
+	server := &Server{logger: ulogger.TestLogger{}, blockchainClient: chain, blockValidation: &BlockValidation{}}
+
+	hash := chainhash.HashH([]byte("consumer-handler-panic"))
+	value, err := proto.Marshal(&kafkamessage.KafkaBlockTopicMessage{Hash: hash.String(), URL: "http://peer", PeerId: "peerA"})
+	require.NoError(t, err)
+
+	require.NoError(t, server.consumerMessageHandler(ctx)(&kafka.KafkaMessage{Value: value}))
+	require.False(t, server.blockMessageRetries.claim(hash.String()), "a retry must be pending for the block")
+	chain.AssertNotCalled(t, "ReportPeerFailure", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}

@@ -74,10 +74,21 @@ func isRecoverableBlockMessageError(err error) bool {
 }
 
 // runBlockHandler runs blockHandler, returning ctx.Err() if ctx ends first.
+//
+// blockHandler runs in its own goroutine, which no caller's recover can reach, so a
+// panic there is caught here and returned as a service error. That makes it a local
+// fault: it is retried, and the announcing peer is not blamed.
 func (u *Server) runBlockHandler(ctx context.Context, kafkaMsg *kafkamessage.KafkaBlockTopicMessage) error {
 	errCh := make(chan error, 1)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				u.logger.Errorf("[blockHandler][%s] PANIC: %v", kafkaMsg.Hash, r)
+				errCh <- errors.NewServiceError("[blockHandler][%s] panic: %v", kafkaMsg.Hash, r)
+			}
+		}()
+
 		errCh <- u.blockHandler(kafkaMsg)
 	}()
 
@@ -113,7 +124,8 @@ func (u *Server) scheduleBlockMessageRetry(ctx context.Context, kafkaMsg *kafkam
 func (u *Server) retryBlockMessage(ctx context.Context, kafkaMsg *kafkamessage.KafkaBlockTopicMessage) {
 	defer u.blockMessageRetries.release(kafkaMsg.Hash)
 
-	// This runs outside the Kafka consumer's panic barrier, so it needs its own.
+	// This runs outside the Kafka consumer's panic barrier, so it needs its own. It
+	// covers this goroutine only; runBlockHandler guards blockHandler's goroutine.
 	defer func() {
 		if r := recover(); r != nil {
 			u.logger.Errorf("[blockMessageRetry][%s] PANIC during retry: %v", kafkaMsg.Hash, r)
