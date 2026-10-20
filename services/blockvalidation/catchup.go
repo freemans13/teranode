@@ -1896,8 +1896,13 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 
 	// If block is not eligible for quick validation, use normal validation
 	if !canUseQuickValidation {
+		// A ServiceError, not a ProcessingError: the window holds no verified checkpoint above this
+		// block, which an honest peer that is still syncing, or a blockUpTo below the next
+		// checkpoint, also produces. The terminal handler scores a ServiceError as a local fault
+		// (isLocalCatchupFault), so no peer is charged and the per-block attempt cap still bounds
+		// the retries.
 		if u.blockValidation.mustStayOnQuickValidation(block) {
-			return false, errors.NewProcessingError("[tryQuickValidation][%s] block at height %d is below the hardcoded checkpoint on a netting UTXO store and can only be quick validated, but quick validation is not enabled for it in this catch-up", block.Hash().String(), block.Height)
+			return false, errors.NewServiceError("[tryQuickValidation][%s] block at height %d is below the hardcoded checkpoint on a netting UTXO store and can only be quick validated, but this catch-up window holds no verified checkpoint above it", block.Hash().String(), block.Height)
 		}
 
 		return true, nil

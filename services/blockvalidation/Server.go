@@ -779,6 +779,10 @@ func (u *Server) Init(ctx context.Context) (err error) {
 		return err
 	}
 
+	if window := model.NettedRouteCatchupWindow(u.settings, u.utxoStore); window != u.settings.BlockValidation.CatchupMaxAccumulatedHeaders {
+		u.logger.Infof("[Init] the UTXO store nets the blocks below the checkpoint, so each catch-up window holds %d headers, one checkpoint gap plus the common ancestor, instead of blockvalidation_max_accumulated_headers %d", window, u.settings.BlockValidation.CatchupMaxAccumulatedHeaders)
+	}
+
 	// Only create a new BlockValidation if one wasn't already set (for testing).
 	// Pass the P2P client through the variadic opts so block-validation can strike the peer
 	// that served a corrupt block body (bitcoin-sv/teranode#4692) with correct attribution to
@@ -2020,8 +2024,16 @@ func (u *Server) legacyUnifiedRoute(block *model.Block, baseURL string, headerPr
 // legacyUnifiedRoute adds that. The parent-missing guard in processBlockFound
 // reads this one on purpose, so an unproven legacy orphan is refused rather than
 // diverted to catch-up.
+//
+// On a store that nets below the checkpoint (model.NettedRouteAt) this service's own copy of
+// blockvalidation_legacy_unified_below_checkpoint is not read: full validation of such a block
+// is not possible, so a false copy here, with legacy's copy true (per-service overrides or split
+// pods), would leave every below-checkpoint legacy block waiting for a header proof that legacy
+// already sent. The legacy service refuses to start with its own copy false on such a store
+// (model.CheckNettedRouteLegacySettings), so that copy decides.
 func (u *Server) legacyUnifiedEligible(block *model.Block, baseURL string) bool {
-	if !u.settings.BlockValidation.LegacyUnifiedBelowCheckpoint {
+	if !u.settings.BlockValidation.LegacyUnifiedBelowCheckpoint &&
+		!model.NettedRouteAt(u.settings, u.utxoStore, block.Height) {
 		return false
 	}
 

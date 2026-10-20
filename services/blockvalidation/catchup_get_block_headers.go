@@ -196,7 +196,9 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 
 	// iteration variables
 	iteration := 0
-	maxAccumulatedHeaders := u.settings.BlockValidation.CatchupMaxAccumulatedHeaders
+	// On a store that nets below the checkpoint the window is raised to hold one checkpoint gap
+	// (model.NettedRouteCatchupWindow); elsewhere this is the setting.
+	maxAccumulatedHeaders := model.NettedRouteCatchupWindow(u.settings, u.utxoStore)
 	totalHeadersFetched := 0
 	reachedTarget := false
 	stopReason := ""

@@ -11,14 +11,86 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The shipped catch-up window holds a checkpoint wherever it starts on mainnet, so the startup
-// check passes on the defaults.
-func TestNettedRoute_MainnetDefaultWindowCoversTheLargestCheckpointGap(t *testing.T) {
-	gap := model.LargestCheckpointGap(chaincfg.MainNetParams.Checkpoints)
+// On every network with checkpoints, the catch-up window of a netting store holds the largest
+// checkpoint gap plus the common ancestor, starting from the shipped default. Mainnet's default
+// already does; testnet's largest gap (700,000 to 800,010) is above the default, so its window
+// is raised rather than refused.
+func TestNettedRoute_DefaultWindowCoversTheLargestGapOnEveryNetwork(t *testing.T) {
+	bv, _, cleanup := newNetRangeHarness(t, "netted_route_networks", 65536)
+	defer cleanup()
 
-	require.Positive(t, gap)
-	require.LessOrEqual(t, gap, uint32(100_000), "the default blockvalidation_max_accumulated_headers")
-	t.Logf("largest mainnet checkpoint gap: %d blocks", gap)
+	const defaultWindow = 100_000
+
+	networks := []*chaincfg.Params{&chaincfg.MainNetParams, &chaincfg.TestNetParams, &chaincfg.TeraTestNetParams, &chaincfg.TeraScalingTestNetParams}
+
+	for _, params := range networks {
+		if len(params.Checkpoints) == 0 {
+			continue
+		}
+
+		p := *params
+		bv.settings.ChainCfgParams = &p
+		bv.settings.BlockValidation.CatchupMaxAccumulatedHeaders = defaultWindow
+
+		gap := int(model.LargestCheckpointGap(p.Checkpoints))
+		window := model.NettedRouteCatchupWindow(bv.settings, bv.utxoStore)
+
+		require.GreaterOrEqual(t, window, gap+1, "%s: a window of N headers holds N-1 new blocks", p.Name)
+		require.Equal(t, max(defaultWindow, gap+1), window, "%s", p.Name)
+		t.Logf("%s: largest checkpoint gap %d, window %d", p.Name, gap, window)
+	}
+
+	bv.settings.ChainCfgParams = &chaincfg.MainNetParams
+	require.Equal(t, defaultWindow, model.NettedRouteCatchupWindow(bv.settings, bv.utxoStore), "mainnet keeps its default")
+
+	testnet := chaincfg.TestNetParams
+	bv.settings.ChainCfgParams = &testnet
+	require.Equal(t, 100_011, model.NettedRouteCatchupWindow(bv.settings, bv.utxoStore), "testnet's gap of 100,010 plus the common ancestor")
+}
+
+// The window floor is the gap plus one: a window that starts at a checkpoint drops that
+// checkpoint as the common ancestor, so it needs gap+1 headers to reach the next one.
+func TestNettedRoute_WindowFloorIsTheGapPlusOne(t *testing.T) {
+	bv, _, cleanup := newNetRangeHarness(t, "netted_route_floor", 65536)
+	defer cleanup()
+
+	s := bv.settings
+	s.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 400}, {Height: 1000}}
+
+	for _, tc := range []struct{ set, want int }{{1, 601}, {599, 601}, {600, 601}, {601, 601}, {5000, 5000}} {
+		s.BlockValidation.CatchupMaxAccumulatedHeaders = tc.set
+		require.Equal(t, tc.want, model.NettedRouteCatchupWindow(s, bv.utxoStore), "setting %d", tc.set)
+	}
+
+	// A store that does not net, or the setting off, keeps the setting.
+	s.BlockValidation.CatchupMaxAccumulatedHeaders = 1
+	require.Equal(t, 1, model.NettedRouteCatchupWindow(s, bv.utxoStore.(nettingRecorder).applyRecorder))
+
+	s.BlockValidation.OutpointOnlyBelowCheckpoint = false
+	require.Equal(t, 1, model.NettedRouteCatchupWindow(s, bv.utxoStore))
+}
+
+// A block below the checkpoint on a netting store, in a window with no verified checkpoint above
+// it, is a local fault, not a fault of the peer: an honest peer that is still syncing serves such
+// a window.
+func TestNettedRoute_WindowWithoutACheckpointIsNotChargedToThePeer(t *testing.T) {
+	bv, _, cleanup := newNetRangeHarness(t, "netted_route_no_checkpoint", 65536)
+	defer cleanup()
+
+	bv.settings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 400}, {Height: 1000}}
+
+	u := &Server{logger: ulogger.TestLogger{}, settings: bv.settings, blockValidation: bv}
+	block := &model.Block{
+		Header: &model.BlockHeader{Version: 1, HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
+		Height: 500,
+	}
+
+	tryNormal, err := u.tryQuickValidation(t.Context(), block, &CatchupContext{useQuickValidation: false}, "peer", "http://peer", nil, nil)
+	require.False(t, tryNormal)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrServiceError), "got %v", err)
+	require.True(t, isLocalCatchupFault(err), "the terminal handler must not charge the peer")
+	require.False(t, shouldReportConsensusMalicious(err))
 }
 
 func TestNettedRoute_LargestCheckpointGap(t *testing.T) {
@@ -36,15 +108,17 @@ func TestNettedRoute_CatchupSettingsRefusedAtStartup(t *testing.T) {
 	s := bv.settings
 	s.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 400}, {Height: 1000}}
 	s.BlockValidation.CatchupAllowQuickValidation = true
-	s.BlockValidation.CatchupMaxAccumulatedHeaders = 600
+	s.BlockValidation.CatchupMaxAccumulatedHeaders = 1
 
-	require.NoError(t, model.CheckNettedRouteCatchupSettings(s, bv.utxoStore))
+	require.NoError(t, model.CheckNettedRouteCatchupSettings(s, bv.utxoStore), "a small window is raised, not refused")
 
-	s.BlockValidation.CatchupMaxAccumulatedHeaders = 599
+	s.BlockValidation.CatchupCheckpointHash = "000000000000000000000000000000000000000000000000000000000000000a"
+	s.BlockValidation.CatchupCheckpointHeight = 700
 	err := model.CheckNettedRouteCatchupSettings(s, bv.utxoStore)
-	require.True(t, errors.Is(err, errors.ErrConfiguration), "a window smaller than the largest gap, got %v", err)
+	require.True(t, errors.Is(err, errors.ErrConfiguration), "a catch-up checkpoint override, got %v", err)
 
-	s.BlockValidation.CatchupMaxAccumulatedHeaders = 600
+	s.BlockValidation.CatchupCheckpointHash = ""
+	s.BlockValidation.CatchupCheckpointHeight = 0
 	s.BlockValidation.CatchupAllowQuickValidation = false
 	err = model.CheckNettedRouteCatchupSettings(s, bv.utxoStore)
 	require.True(t, errors.Is(err, errors.ErrConfiguration), "quick validation off, got %v", err)

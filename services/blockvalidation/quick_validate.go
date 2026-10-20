@@ -3295,8 +3295,9 @@ func (u *BlockValidation) mustStayOnQuickValidation(block *model.Block) bool {
 	return u.mustStayOnQuickValidationAt(block.Height)
 }
 
-// mustStayOnQuickValidationAt is mustStayOnQuickValidation for a block at height.
+// mustStayOnQuickValidationAt is mustStayOnQuickValidation for a block at height. It reads
+// model.NettedRouteAt, the same definition the startup checks in model/netted_route_settings.go
+// read, so the runtime refusal and the startup refusal cannot drift apart.
 func (u *BlockValidation) mustStayOnQuickValidationAt(height uint32) bool {
-	return utxo.NetsBelowCheckpoint(u.utxoStore) &&
-		model.OutpointOnlyEligible(u.settings, u.utxoStore, u.settings.ChainCfgParams, height)
+	return model.NettedRouteAt(u.settings, u.utxoStore, height)
 }
