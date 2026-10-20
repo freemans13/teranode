@@ -104,11 +104,10 @@ func newQuickPathSuiteWithRealUTXOStore(t *testing.T) *CatchupTestSuite {
 	suite.MockBlockchain.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(1), nil).Maybe()
 
 	// Left on the default prefetch depth, so this runs the pipeline variant. The sequential
-	// variant (blockvalidation_subtree_batch_prefetch_depth=0) cannot be driven end to end
-	// today: processSubtreeBatch never allocates SubtreeProcessingBatch.fullSubtreeExists,
-	// which prefetchSubtreeBatch does, so writeSubtreeFilesForBatch panics indexing a nil
-	// slice. That is pre-existing on main and unrelated to this change. All three variants
-	// call scanBatchForDuplicates before their fan-out, so the floor holds on each.
+	// variant (blockvalidation_subtree_batch_prefetch_depth=0) panics at this merge base:
+	// processSubtreeBatch never allocates SubtreeProcessingBatch.fullSubtreeExists. Upstream
+	// 5457f7bd5 removes that slice and routes processSubtreeBatch through
+	// prefetchSubtreeBatch, so the panic goes away when this branch merges main.
 
 	return suite
 }
@@ -168,25 +167,14 @@ func storeDuplicateBearingBlock(t *testing.T, suite *CatchupTestSuite) (*model.B
 }
 
 // TestQuickValidateBlock_DuplicateIsBlockInvalidNotProcessing pins the two entry-point
-// pass-throughs in quickValidateBlock and quickValidateBlockAsync, which return an
-// ErrBlockInvalid from the subtree pipeline unwrapped instead of re-wrapping it as a
-// ProcessingError.
+// branches in quickValidateBlock and quickValidateBlockAsync that wrap an ErrBlockInvalid
+// from the subtree pipeline as BlockInvalid, not as ProcessingError.
 //
-// A mutation check showed these had zero coverage: deleting BOTH left every test in the
-// package passing. TestScanBatchForDuplicates above does not reach them — it drives the scan
-// directly and so never crosses the site that does the wrapping.
+// The require.False on ErrProcessing carries the test. (*Error).Is walks the chain, so
+// errors.Is(err, ErrBlockInvalid) stays true with the branches deleted.
 //
-// Two assertions carry the test. The negative error assertion: (*Error).Is walks the wrapped
-// chain, so errors.Is(err, ErrBlockInvalid) stays true even when the rejection IS re-wrapped
-// as a ProcessingError, and asserting only that would pass with the pass-throughs deleted.
-// What re-wrapping changes is the error's own code — the rejection would additionally satisfy
-// ErrProcessing, so a consumer classifying on the top-level code reads a consensus rejection
-// as transient. Hence require.False on ErrProcessing.
-//
-// And the store assertion: nothing may have been written for the duplicated transaction. That
-// is the property the scan's placement exists to guarantee. Before the scan moved ahead of
-// createAndSpendUTXOsForBatch, a rejected mutant left the whole block's UTXOs created and
-// locked, with no unlock pass on any rejection path to clear them.
+// The store assertion checks that the rejected batch wrote nothing for the duplicate. Both
+// copies sit in one batch here, so the test does not cover a repeat in a later batch.
 func TestQuickValidateBlock_DuplicateIsBlockInvalidNotProcessing(t *testing.T) {
 	// requireConsensusRejection asserts the shape both entry points must produce.
 	requireConsensusRejection := func(t *testing.T, err error) {
@@ -200,7 +188,7 @@ func TestQuickValidateBlock_DuplicateIsBlockInvalidNotProcessing(t *testing.T) {
 			"it must not carry a top-level ErrProcessing code, which reads as a transient fault")
 	}
 
-	t.Run("quickValidateBlock returns the rejection unwrapped", func(t *testing.T) {
+	t.Run("quickValidateBlock returns a BlockInvalid rejection", func(t *testing.T) {
 		suite := newQuickPathSuiteWithRealUTXOStore(t)
 		defer suite.Cleanup()
 
@@ -211,7 +199,7 @@ func TestQuickValidateBlock_DuplicateIsBlockInvalidNotProcessing(t *testing.T) {
 		requireNothingWritten(t, suite, dupTx)
 	})
 
-	t.Run("quickValidateBlockAsync returns the rejection unwrapped", func(t *testing.T) {
+	t.Run("quickValidateBlockAsync returns a BlockInvalid rejection", func(t *testing.T) {
 		suite := newQuickPathSuiteWithRealUTXOStore(t)
 		defer suite.Cleanup()
 

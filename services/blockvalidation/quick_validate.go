@@ -226,15 +226,9 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		// This function waits for all processing to complete before returning, ensuring block.ID is set
 		_, err = u.processBlockSubtrees(ctx, block, outpointOnly)
 		if err != nil {
-			// A consensus rejection (e.g. the CVE-2012-2459 check in scanBatchForDuplicates)
-			// must keep ErrBlockInvalid as its OWN code, not merely somewhere in its chain.
-			// (*Error).Is walks the chain, so the errors.Is(err, ErrBlockInvalid) consumers
-			// would still match a re-wrapped one; what re-wrapping changes is that the
-			// rejection additionally satisfies ErrProcessing, so any consumer classifying on
-			// the top-level code, or testing ErrProcessing first, reads a consensus rejection
-			// as a transient fault. Re-wrap as BlockInvalid rather than passing through bare,
-			// so the block hash and entry point survive — the callee's message carries only a
-			// txid, which on a stalled sync gives no block, height or peer to act on.
+			// Keep ErrBlockInvalid as the top-level code, so the rejection does not also
+			// match ErrProcessing. The wrap adds the block hash and entry point, because the
+			// callee's message names only a txid.
 			if errors.Is(err, errors.ErrBlockInvalid) {
 				return errors.NewBlockInvalidError("[quickValidateBlock][%s] block rejected", block.Hash().String(), err)
 			}
@@ -314,13 +308,8 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		}
 		_, err = u.processBlockSubtreesPipelineAsync(ctx, block, prefetchDepth, writeJobsChan, outpointOnly)
 		if err != nil {
-			// Same treatment as quickValidateBlock, for the same reason, and likewise
-			// re-wrapped as BlockInvalid so the block hash and entry point reach the log.
-			// On this (catchup) route it has no behavioural effect today — tryQuickValidation
-			// inspects only ErrBlockIncomplete; for every other error it discards the subtree
-			// files, swallows the error and falls back to normal validation, which re-checks
-			// the block properly. It is kept so both quick-path entry points classify the
-			// same rejection identically.
+			// Same treatment as quickValidateBlock. tryQuickValidation inspects only
+			// ErrBlockIncomplete today, so on the catchup route this changes the log only.
 			if errors.Is(err, errors.ErrBlockInvalid) {
 				return errors.NewBlockInvalidError("[quickValidateBlockAsync][%s] block rejected", block.Hash().String(), err)
 			}
@@ -621,9 +610,10 @@ func (u *BlockValidation) processBlockSubtreesPipeline(ctx context.Context, bloc
 				blockIDSet = true
 			}
 
-			// CVE-2012-2459 floor — before the fan-out, so a duplicate is rejected with
-			// neither the UTXO writes nor the subtree files applied.
+			// CVE-2012-2459 floor — before the fan-out, so the rejected batch applies
+			// neither its UTXO writes nor its subtree files.
 			if err := scanBatchForDuplicates(batch, dedup); err != nil {
+				batch.Close()
 				return err
 			}
 
@@ -813,7 +803,10 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 	return u.validateSubtrees(ctx, block, existingBlockID)
 }
 
-// validateSubtrees validates subtree sizes and merkle root after processing.
+// validateSubtrees validates subtree sizes and the merkle root after every batch is
+// applied. It does not run the CVE-2012-2459 duplicate check: a duplicated tail gives
+// the honest merkle root, so that check runs per batch in scanBatchForDuplicates,
+// before each batch is applied.
 func (u *BlockValidation) validateSubtrees(ctx context.Context, block *model.Block, existingBlockID uint64) (uint64, error) {
 	// Validate subtree sizes
 	subtreeSize := 0
@@ -824,11 +817,6 @@ func (u *BlockValidation) validateSubtrees(ctx context.Context, block *model.Blo
 			return 0, errors.NewProcessingError("[validateSubtrees][%s] subtree %d size mismatch", block.Hash().String(), i)
 		}
 	}
-
-	// The CVE-2012-2459 duplicate check does NOT live here. It runs per batch, in
-	// scanBatchForDuplicates, before that batch's UTXO writes and subtree-file writes —
-	// see the comment there for why placing it at this point would be too late and would
-	// scan the wrong transaction list.
 
 	// Verify merkle root
 	if err := block.CheckMerkleRoot(ctx); err != nil {
@@ -1325,15 +1313,14 @@ func (u *BlockValidation) newDuplicateTxScanner(block *model.Block) (*model.Dupl
 // one applied is not a floor. batchTxs excludes the coinbase (readSubtree nils it), so
 // no coinbase-placeholder special case is needed here.
 //
-// Rejecting before anything is applied is what keeps the rejection clean. The only
-// unlock pass on this path is commitBlock's, which a rejection never reaches, and the
-// catchup fallback re-validates through subtreevalidation with WithIgnoreLocked(true),
-// so it spends through the locked flag without ever clearing it — a duplicate caught
-// after the writes would strand those UTXOs locked and unspendable.
+// The rejected batch applies nothing. This does not cover batches EARLIER than the
+// rejected one: they are already applied when a later batch carries the repeat.
+// Their UTXOs stay locked, because the only unlock pass on this path is
+// commitBlock's, and a rejection never reaches it. A full-block scan before the
+// first batch is the complete fix, and it does not live here.
 //
-// The merkle root cannot substitute for this: the duplicate-last-node-when-odd rule
-// lets a doctored, duplicated tail reproduce the honest merkle root, and therefore the
-// same header and the same block hash.
+// model.CheckSubtreeSlicesForDuplicateTxs documents why the merkle root cannot
+// replace this check.
 func scanBatchForDuplicates(batch *SubtreeProcessingBatch, dedup *model.DuplicateTxScanner) error {
 	for _, tx := range batch.batchTxs {
 		if err := dedup.Add(*tx.TxIDChainHash()); err != nil {
