@@ -37,6 +37,11 @@ const subtreeKeyMismatchUnquarantinedKey = "subtree_key_mismatch_unquarantined"
 // succeed and falling through would only bury the cause (bitcoin-sv/teranode#4978).
 const subtreeWritesNotLandedKey = "subtree_writes_not_landed"
 
+// blockCommittedKey marks an error raised after commitBlock's AddBlock stored the block with
+// subtrees_set and mined_set. tryQuickValidation must neither delete the attempt's .subtree files
+// nor fall through to normal validation on it (bitcoin-sv/teranode#4987).
+const blockCommittedKey = "block_committed"
+
 // markerChainDepth bounds the walk over a wrapped error chain, matching
 // isCacheBypassRetryable.
 const markerChainDepth = 32
@@ -138,6 +143,17 @@ func markSubtreeWritesNotLanded(err *errors.Error) error {
 // isSubtreeWritesNotLanded reports whether err carries subtreeWritesNotLandedKey.
 func isSubtreeWritesNotLanded(err error) bool {
 	return hasErrorMarker(err, subtreeWritesNotLandedKey)
+}
+
+// markBlockCommitted tags err with blockCommittedKey. err must be non-nil.
+func markBlockCommitted(err *errors.Error) error {
+	err.SetData(blockCommittedKey, true)
+	return err
+}
+
+// isBlockCommitted reports whether err carries blockCommittedKey.
+func isBlockCommitted(err error) bool {
+	return hasErrorMarker(err, blockCommittedKey)
 }
 
 // hasErrorMarker walks err's wrapped chain, up to markerChainDepth, for a true bool under key.

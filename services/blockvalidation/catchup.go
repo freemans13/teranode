@@ -2054,17 +2054,26 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 			return false, err
 		}
 
-		// This block's .subtree writes did not all land, so quickValidateBlockAsync refused to
-		// commit it (bitcoin-sv/teranode#4978). Abort rather than fall through: the failing write
-		// worker has already cancelled the shared catch-up context, so normal validation would only
-		// fail on that and bury the storage fault. The block is not stored, so the next catch-up
-		// run validates it again from scratch. No sweep, on either way the barrier can fail. When a
-		// write failed, the barrier had already waited for every job; when the context ended first,
-		// jobs may still be in flight and a delete could race them, as in the ctx.Done branches
-		// above. Leaving the files is harmless either way: the content is honest, every blob carries
-		// a finite DAH, and the next run rewrites it with AllowOverwrite.
-		if isSubtreeWritesNotLanded(err) {
-			u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: .subtree writes did not land, aborting without committing the block: %v",
+		// Two outcomes abort here, without a sweep, rather than fall through to the local-fault
+		// branch below. Its sweep and its fall-through are each wrong for both of them.
+		//
+		// The .subtree writes did not all land, so quickValidateBlockAsync refused to commit the
+		// block (bitcoin-sv/teranode#4978). The failing write worker has already cancelled the
+		// shared catch-up context, so normal validation would only fail on that and bury the
+		// storage fault. The block is not stored, so the next catch-up run validates it again from
+		// scratch. No sweep, on either way the barrier can fail. When a write failed, the barrier
+		// had already waited for every job; when the context ended first, jobs may still be in
+		// flight and a delete could race them, as in the ctx.Done branches above. Leaving the files
+		// is harmless either way: the content is honest, every blob carries a finite DAH, and the
+		// next run rewrites it with AllowOverwrite.
+		//
+		// The block IS committed: AddBlock stored it with subtrees_set and mined_set, and the
+		// post-commit unlock still failed after its retries (bitcoin-sv/teranode#4987). The files
+		// this attempt wrote now belong to a block recorded as having them, so a sweep would corrupt
+		// it, and normal validation would find the block stored and do nothing. Its outputs stay
+		// locked, so the next block that spends them fails loudly rather than silently.
+		if isSubtreeWritesNotLanded(err) || isBlockCommitted(err) {
+			u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: aborting without removing this attempt's .subtree files: %v",
 				catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)
 
 			return false, err

@@ -3,6 +3,7 @@ package blockvalidation
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
@@ -621,8 +623,15 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	start = time.Now()
 
 	// Unlock all UTXOs - final commit point (no-op when the lock was never taken; #1103).
-	if err := u.unlockSubtreeTransactionsIfNeeded(ctx, block, caller); err != nil {
-		return err
+	//
+	// AddBlock has committed the block with subtrees_set and mined_set, so from here on a failure
+	// is post-commit (bitcoin-sv/teranode#4987). The unlock is retried rather than rolled back, and
+	// a failure that survives the retries is marked so no caller treats it as a local fault: that
+	// would delete the .subtree files of a block now recorded as having them, and fall through to
+	// normal validation, which finds the block stored and does nothing. ServiceError so the legacy
+	// park reads it as retry-later and keeps the block instead of rejecting a committed one.
+	if err := u.unlockSubtreeTransactionsWithRetry(ctx, block, caller); err != nil {
+		return markBlockCommitted(errors.NewServiceError("[%s][%s] block is committed but its UTXOs are still locked", caller, block.Hash().String(), err))
 	}
 
 	prometheusBlockValidationQuickCommitUnlock.Observe(time.Since(start).Seconds())
@@ -1826,6 +1835,31 @@ func (u *BlockValidation) unlockSubtreeTransactionsIfNeeded(ctx context.Context,
 	}
 
 	return nil
+}
+
+// postCommitUnlockRetries and postCommitUnlockRetryBackoff bound the retries of the unlock
+// commitBlock runs after AddBlock: one attempt plus postCommitUnlockRetries more, with
+// retry.Retry's linear backoff of 1, 3 and 5 times postCommitUnlockRetryBackoff between them.
+//
+// The backoff is a package-level var so tests can shrink it.
+const postCommitUnlockRetries = 3
+
+var postCommitUnlockRetryBackoff = 100 * time.Millisecond
+
+// unlockSubtreeTransactionsWithRetry retries unlockSubtreeTransactionsIfNeeded. Each attempt
+// re-sends the whole pass: SetLocked(false) is idempotent, and retrying inside the errgroup would
+// not work, since the first failing goroutine cancels the context its siblings share.
+func (u *BlockValidation) unlockSubtreeTransactionsWithRetry(ctx context.Context, block *model.Block, callerTag string) error {
+	_, err := retry.Retry(ctx, u.logger,
+		func() (struct{}, error) {
+			return struct{}{}, u.unlockSubtreeTransactionsIfNeeded(ctx, block, callerTag)
+		},
+		retry.WithMessage(fmt.Sprintf("[%s][%s] post-commit unlock failed", callerTag, block.Hash().String())),
+		retry.WithRetryCount(postCommitUnlockRetries),
+		retry.WithBackoffDurationType(postCommitUnlockRetryBackoff),
+	)
+
+	return err
 }
 
 // unlockSubtreeTransactions unlocks all transactions in the given subtrees in parallel.
