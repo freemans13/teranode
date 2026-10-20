@@ -141,7 +141,9 @@ func TestReset_FailedReloadIsRetriedByTheHeartbeat(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 
 	require.True(t, items.blockAssembler.retryFailedUnminedReload(), "the heartbeat queued a reset")
-	require.False(t, items.blockAssembler.retryFailedUnminedReload(), "and only one")
+
+	items.blockAssembler.unminedReloadRetryInterval = time.Hour
+	require.False(t, items.blockAssembler.retryFailedUnminedReload(), "and only one in each interval")
 
 	// What the assembler's loop does with the request.
 	req := <-items.blockAssembler.resetCh
@@ -208,6 +210,56 @@ func TestReset_ASuccessfulResetClearsTheRetry(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReset_ADrainedRetryIsQueuedAgain is icellan's resetCh point on PR 1663. The resetCh
+// handler answers a request it drains behind a running reset with nil and does not run it, also a
+// validating request behind a reset that does not validate. The retry used to clear its flag when
+// it queued the reset, so a drained retry was lost and the validation never ran. The retry now
+// stays pending until a reload succeeds, and a reset that does not validate does not clear a
+// validating retry.
+func TestReset_ADrainedRetryIsQueuedAgain(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	items.blockAssembler.settings.BlockAssembly.OnRestartValidateParentChain = false
+
+	seedParentAndChild(ctx, t, items)
+
+	flaky := &flakyUtxoStore{Store: items.utxoStore}
+	flaky.iteratorDown.Store(true)
+	items.blockAssembler.utxoStore = flaky
+	items.blockAssembler.unminedReloadRetryInterval = time.Millisecond
+
+	mockGenesisChainForReset(items)
+
+	require.Error(t, items.blockAssembler.reset(ctx, true))
+
+	flaky.iteratorDown.Store(false)
+	time.Sleep(5 * time.Millisecond)
+
+	require.True(t, items.blockAssembler.retryFailedUnminedReload())
+
+	// A reset that does not validate runs, and the handler drains the retry's request behind it.
+	require.NoError(t, items.blockAssembler.reset(ctx, false))
+
+	req := <-items.blockAssembler.resetCh
+	require.True(t, req.ValidateInputs)
+	req.ErrCh <- nil
+
+	time.Sleep(5 * time.Millisecond)
+
+	require.True(t, items.blockAssembler.retryFailedUnminedReload(), "the drained retry is queued again")
+
+	req = <-items.blockAssembler.resetCh
+	require.True(t, req.ValidateInputs, "and it still validates inputs")
+
+	_, err := items.blockAssembler.resetWithResponse(ctx, req.ValidateInputs)
+	req.ErrCh <- err
+	require.NoError(t, err)
+
+	require.False(t, items.blockAssembler.unminedReloadPending.Load(), "the validating reload cleared the retry")
 }
 
 // TestReset_ASecondFailureKeepsTheValidatingRetry covers two failed resets in a row, the first

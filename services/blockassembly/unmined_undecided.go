@@ -230,6 +230,12 @@ func (b *BlockAssembler) clearPendingUnminedReload(validatedInputs bool) {
 // is in no template, and nothing else would start one: every caller of reset only logs the error.
 // The reset it queues validates inputs when the failed one did. A reset that fails again sets the
 // flag again, so the retry goes on at the interval for as long as the store keeps failing.
+//
+// The retry stays pending while its reset is queued, and only a reload that succeeds clears it
+// (clearPendingUnminedReload). The resetCh handler answers each request it drains behind a
+// running reset with nil and does not run it, also when the drained request validates inputs and
+// the running one does not. Such a drained retry is queued again one interval later, because
+// queuing restarts the interval.
 func (b *BlockAssembler) retryFailedUnminedReload() bool {
 	if !b.unminedReloadPending.Load() {
 		return false
@@ -244,7 +250,7 @@ func (b *BlockAssembler) retryFailedUnminedReload() bool {
 		return false
 	}
 
-	b.unminedReloadPending.Store(false)
+	b.unminedReloadFailedAt.Store(time.Now().UnixNano())
 
 	validate := b.unminedReloadValidate.Load()
 

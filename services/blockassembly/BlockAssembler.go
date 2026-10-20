@@ -118,7 +118,7 @@ type BlockAssembler struct {
 	// unminedReloadPending is set when the unmined reload inside a reset failed after the reset
 	// had already cleared the subtrees, which leaves the mempool out of every template. The
 	// heartbeat tick queues a fresh reset for it, no sooner than unminedReloadRetryInterval after
-	// the failure (see retryFailedUnminedReload). Atomics, because the reload runs on the subtree
+	// the failure or the last retry, until a reload succeeds (see retryFailedUnminedReload). Atomics, because the reload runs on the subtree
 	// processor's goroutine and the tick on the assembler's.
 	unminedReloadPending  atomic.Bool
 	unminedReloadValidate atomic.Bool
