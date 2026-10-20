@@ -443,12 +443,16 @@ func (s *Store) netBelowChunk(ctx context.Context, chunk []*netBelowTx, list *ut
 		}
 	}()
 
-	fence, err := s.takeFenceShared(ctx, dbTx)
-	if err != nil {
+	// The transaction locks come before the fence, the order runMinedPlan relies on in every
+	// other create. The reverse order deadlocks: this chunk holds the fence shared and waits on a
+	// transaction lock, while the writer that holds that lock waits for the fence behind the
+	// stamp's exclusive request.
+	if err = s.netBelowLockAndProbe(ctx, dbTx, chunk); err != nil {
 		return err
 	}
 
-	if err = s.netBelowLockAndProbe(ctx, dbTx, chunk); err != nil {
+	fence, err := s.takeFenceShared(ctx, dbTx)
+	if err != nil {
 		return err
 	}
 

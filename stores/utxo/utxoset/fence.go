@@ -14,9 +14,12 @@ import (
 // raised fence, a row that exists below it is a winner and a row that does not exist is not
 // (invariant I3). Nothing may add a row on the longest chain there, and nothing may delete one.
 //
-// Four writers take the fence lock SHARED as the first statement of their transaction: the
-// block-path create, record mined, the un-mine and Unspend. Shared holders do not block each
-// other. The stamp's first step takes it EXCLUSIVE for one short transaction, so once granted
+// Four writers take the fence lock SHARED before any containment write: the block-path create,
+// record mined, the un-mine and Unspend. Record mined, the un-mine and Unspend take it as the
+// first statement of their transaction. The block-path create, the below-checkpoint netted write
+// included, takes its transaction locks first and the fence after them: a writer that held the
+// fence while it waited on a transaction lock would deadlock with a writer that holds that lock
+// and queues for the fence behind the stamp. Shared holders do not block each other. The stamp's first step takes it EXCLUSIVE for one short transaction, so once granted
 // every earlier containment write has committed and its loser scan is exact. A transaction-level
 // advisory lock is released at commit or rollback, so it cannot leak. The writer then reads the
 // fence as its own second statement: the store runs at read committed, under which a read
