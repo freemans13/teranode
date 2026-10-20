@@ -18,6 +18,11 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — action required before upgrading
 
+- **`CheckBlockSubtrees` gRPC errors keep Teranode error codes.** Storage and
+  consensus errors include gRPC status metadata. Invalid URLs give `InvalidArgument`
+  status. External clients must use `errors.UnwrapGRPC` to read the error chain
+  and must accept these status codes. Teranode clients can read this format. (#1650)
+
 - **`grpc_admin_api_key` is now mandatory for the Blockchain service.** The service
   validates it at startup and refuses to start when it is empty, is a well-known
   placeholder (`testkey`, `changeme`, …), or is shorter than 16 characters. A value
