@@ -635,14 +635,7 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 
 	// loading the subtree data like this will validate the data as it is read
 	// compared to the transactions in the subtree
-	//
-	// Count what the parser consumes so the payload's canonical encoding can be
-	// checked below (issue 1421). This prewarm runs BEFORE block validation and
-	// stores the re-serialized form, so an unchecked non-minimal payload here is
-	// laundered to disk ahead of every downstream check.
-	countingSubtreeData := util.NewCountingReader(subtreeDataBufferedReader)
-
-	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, countingSubtreeData)
+	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, subtreeDataBufferedReader)
 	if err != nil {
 		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Failed to create subtreeData for %s", subtreeHash.String(), err)
 	}
@@ -696,12 +689,6 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	subtreeDataBytes, err := subtreeData.Serialize()
 	if err != nil {
 		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Peer %s (%s) provided incomplete subtree data for %s", peerID, baseURL, subtreeHash.String(), err)
-	}
-
-	// Peer-supplied bytes: reject a non-minimal CompactSize encoding rather than
-	// storing the canonicalised form (issue 1421).
-	if err = util.CheckCanonicalSubtreeData(countingSubtreeData.BytesConsumed(), subtreeDataBytes, util.OmittedCoinbaseTx(subtree, subtreeData)); err != nil {
-		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Peer %s (%s) provided non-canonical subtree data for %s", peerID, baseURL, subtreeHash.String(), err)
 	}
 
 	// Store subtreeData (raw data) in subtreeStore

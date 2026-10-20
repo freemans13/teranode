@@ -408,9 +408,9 @@ func (s *Store) sendStoreBatch(batch []*BatchStoreItem) {
 				}
 			}
 		} else {
-			// tx.Size() omits the extended per-input data; ExtendedTxSize adds it
+			// tx.Size() omits the extended per-input data; extendedTxSize adds it
 			// (matches len(tx.ExtendedBytes()) without serializing).
-			extendedSize = util.ExtendedTxSize(batch[idx].tx)
+			extendedSize = extendedTxSize(batch[idx].tx)
 		}
 
 		if extendedSize > MaxTxSizeInStoreInBytes {
@@ -765,6 +765,32 @@ func appendInputExtendedInto(arena *bt.Arena, in *bt.Input) []byte {
 	return buf
 }
 
+// extendedTxSize returns len(tx.ExtendedBytes()) without serializing the tx.
+// Mirrors go-bt's extended layout: standard size, plus the 6-byte EF marker,
+// plus per-input PreviousTxSatoshis(8) and the previous-script varint+bytes
+// (a nil PreviousTxScript serializes as a single 0x00 == VarInt(0)).
+//
+// bt.Input.Size() counts 32 bytes for the previous txid unconditionally, but
+// ExtendedBytes() omits them when previousTxIDHash is nil; the correction below
+// keeps this exact for inputs with an unset hash too (production txs always set
+// it — via decode or WireTxToGoBtTx — but we don't rely on that).
+func extendedTxSize(tx *bt.Tx) int {
+	size := tx.Size() + 6
+	for _, in := range tx.Inputs {
+		if in.PreviousTxIDChainHash() == nil {
+			size -= 32
+		}
+		size += 8
+		if in.PreviousTxScript == nil {
+			size += 1
+		} else {
+			l := len(*in.PreviousTxScript)
+			size += bt.VarInt(uint64(l)).Length() + l
+		}
+	}
+	return size
+}
+
 // GetBinsToStore prepares Aerospike bins for storage, handling transaction data
 // and UTXO organization.
 //
@@ -806,7 +832,7 @@ func (s *Store) GetBinsToStore(tx *bt.Tx, blockHeight uint32, blockIDs, blockHei
 		utxoHashes, err = utxo.GetUtxoHashes(tx, txHash)
 	} else {
 		size = tx.Size()
-		extendedSize = util.ExtendedTxSize(tx)
+		extendedSize = extendedTxSize(tx)
 		fee, utxoHashes, err = utxo.GetFeesAndUtxoHashes(context.Background(), tx, blockHeight)
 	}
 
