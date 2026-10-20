@@ -105,7 +105,7 @@ The key, `ukey`, is the first 12 bytes of the transaction id followed by the out
 
 **`spend_journal`.** The undo copy. It holds every field needed to rebuild the UTXO row byte for byte, `hash_override` included, plus the spender's id (`spending_txid`) and input number (`spending_vin`). The spender's id is an **ownership token**: a restore must name the transaction that took the UTXO, so a stale undo record cannot bring back a coin that a different transaction now owns. The journal is also the last record of a fully spent old parent, which block validation asks about.
 
-**`tx_ident`.** The identity row of a transaction above the checkpoint, from the mempool or from a block, until the stamp processes it: fee, size, its inputs (`tx_inpoints`), lock time, flags, and the `off_chain_since` marker. A set marker means the transaction is not on the main chain (it waits, or a reorg took its block away). A clear marker means the last word was "a main-chain block contains it", and the row waits for the stamp. Below the highest checkpoint, transactions arrive in blocks, so this table stays empty.
+**`tx_ident`.** The identity row of a transaction above the checkpoint, from the mempool or from a block, until the stamp processes it: fee, size, its inputs (`tx_inpoints`), lock time, flags, and the `off_chain_since` marker. A set marker means the transaction is not on the main chain (it waits, or a reorg took its block away). A clear marker means the last word was "a main-chain block contains it", and the row waits for the stamp. Below the highest checkpoint, most transactions arrive in blocks, so this table stays almost empty. The node does not stop other writers during sync: unsolicited legacy `tx` messages, propagation and the validator's Kafka consumer can each keep a transaction unmined before its block arrives. Such a transaction gets an identity row, and the stamp removes it.
 
 **`tx_mined`.** One row for each (transaction, block) pair. Competing blocks can each have a row for the same transaction, and no row says which block won. Rows are only inserted (`ON CONFLICT DO NOTHING`) and deleted, never changed, so any number of writers in any order leave the same contents. The stamp decides the winner from the chain.
 
@@ -136,7 +136,7 @@ Two paths bring a transaction into the store.
 
 **The block path.** Block and subtree validation write a block's transactions with `SpendAndCreateMulti`. What it writes depends on the height:
 
-- **At or below the highest checkpoint**, the block is final by rule. Each UTXO is written with its block already set. There is no identity row and nothing to stamp. With `utxostore_skipTxBodyBelowCheckpoint` on, there is no body either, so during sync the store keeps only what consensus needs: the UTXOs and the containment rows.
+- **At or below the highest checkpoint**, the block is final by rule. Each UTXO is written with its block already set. There is no identity row and nothing to stamp. One exception: a transaction that another writer kept unmined before its block keeps its identity row and its UTXOs at "no block yet", and the block writes only its containment row. The stamp gives those UTXOs their block later. With `utxostore_skipTxBodyBelowCheckpoint` on, there is no body either, so during sync the store keeps only what consensus needs: the UTXOs and the containment rows.
 - **Above the checkpoint**, the block can still lose a reorg. So a create from a block is written like a mempool create: UTXOs at "no block yet", an identity row, and a containment row for the block. The stamp gives the UTXOs their block later. Thus no UTXO above the checkpoint can carry a block that a reorg makes wrong.
 
 A transaction can arrive both ways: first in the mempool, then in a block. The identity row's primary key makes the second arrival recognise the first, so its outputs are not created twice. A transaction that arrives only in a block, above the checkpoint, gets its identity row from that block.
@@ -163,7 +163,12 @@ An output that a later transaction **in the same chunk** spends is never written
 
 A deadlock between two chunks that spend overlapping coins is retried, never failed: the rolled-back chunk starts again.
 
-**At or below the checkpoint: the below-checkpoint writer.** A list shaped like quick validation's, with a block at or below the highest checkpoint and outpoint-only spends, never reaches the chunk writer. `nettedBelowGate` sends it to `netBelow`, whose chunks have no order between them and each commit a transaction's record, deletes and coins together. A list that asks for locked creates, as quick validation's does when `blockvalidation_quick_validate_skip_utxo_lock` is off, writes its coins locked, and quick validation's unlock pass clears them with `SetLocked`; frozen and conflicting creates are refused. Every other list, including a below-checkpoint list with ordinary spends, is written as family chunks.
+**At or below the checkpoint: the below-checkpoint writer.** A list shaped like quick validation's, with a block at or below the highest checkpoint and outpoint-only spends, never reaches the chunk writer. `nettedBelowGate` sends it to `netBelow`, whose chunks have no order between them and each commit a transaction's record, deletes and coins together. Other writers can keep a transaction of the list while this write runs, as section 3 says for `tx_ident`. Two rules stop such a writer from leaving an output that the list spends as a live coin:
+
+- Each chunk takes the transaction lock of all its transactions, the same lock that each create takes. Under the lock, it reads their identity rows again. A transaction that a writer kept before the lock takes the identity route: its chunk records its containment and deletes its own outputs that the list spends. A writer that comes after the lock waits for the chunk to commit.
+- Each transaction of a chunk writes its mined record, also a transaction with no coin to write or delete. A writer that comes after the commit finds the record and does not keep the transaction a second time.
+
+A list that asks for locked creates, as quick validation's does when `blockvalidation_quick_validate_skip_utxo_lock` is off, writes its coins locked, and quick validation's unlock pass clears them with `SetLocked`; frozen and conflicting creates are refused. Every other list, including a below-checkpoint list with ordinary spends, is written as family chunks.
 
 ## 8. Reading a transaction
 
@@ -197,7 +202,7 @@ Why so late? Near the tip, the chain can change: a block can lose a reorg, and t
 2. **Stamp pages.** 256 pages, one for each first byte of the transaction id. Each page writes the winning block onto the UTXOs at "no block yet", and deletes the identity rows, in one statement.
 3. **Complete.** A sampled audit, then the completion record. The record holds the tip height plus one partition (288 blocks), the highest height at which an undo copy of the partition's UTXOs can still be written while the stamp completes.
 
-Below the checkpoint the identity table is empty, so a partition costs one scan for losers and a probe for each page: about 1.3 seconds for each 288-block partition during sync.
+Below the checkpoint the identity table is almost empty (section 3), so a partition costs one scan for losers and a probe for each page: about 1.3 seconds for each 288-block partition during sync.
 
 The rewind tool (`cmd/rewindblockchain`) refuses to go below a stamped height, because a stamped block is permanent.
 
@@ -261,6 +266,7 @@ The store needs a **new database**. A schema check at startup refuses a database
 | One transaction, batched | `spend_and_create.go`, `spend_and_create_batch.go` |
 | A block's list, routing between the writers | `spend_and_create_multi.go` |
 | Family chunks, netting, cut edges | `spend_and_create_families.go` |
+| The below-checkpoint writer | `netted_below.go` |
 | Creates | `create.go`, `create_batch.go` |
 | The read order | `lookup.go`, `get.go`, `get_batch.go`, `decorate_batch.go` |
 | Parent outputs for validation | `parent_outputs.go` |
