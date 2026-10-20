@@ -1397,7 +1397,16 @@ func drainWriteJobs(ch <-chan *SubtreeWriteJob) {
 	}
 
 	for job := range ch {
-		if job != nil && job.Done != nil {
+		if job == nil {
+			continue
+		}
+
+		// Never written, so flag it before releasing the waiter (bitcoin-sv/teranode#4978).
+		if job.Unwritten != nil {
+			job.Unwritten.Store(true)
+		}
+
+		if job.Done != nil {
 			job.Done.Done()
 		}
 	}
@@ -2041,6 +2050,20 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 				u.logger.Warnf("[catchup:tryQuickValidation][%s] block %s: catch-up context cancelled while waiting for subtree writes to settle, skipping cleanup",
 					catchupCtx.blockUpTo.Hash().String(), block.Hash().String())
 			}
+
+			return false, err
+		}
+
+		// This block's .subtree writes did not all land, so quickValidateBlockAsync refused to
+		// commit it (bitcoin-sv/teranode#4978). Abort rather than fall through: the failing write
+		// worker has already cancelled the shared catch-up context, so normal validation would only
+		// fail on that and bury the storage fault. The block is not stored, so the next catch-up
+		// run validates it again from scratch. No sweep: the barrier already waited for every write
+		// that will ever be handled, and the next run rewrites the .subtree files with
+		// AllowOverwrite.
+		if isSubtreeWritesNotLanded(err) {
+			u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: .subtree writes did not land, aborting without committing the block: %v",
+				catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)
 
 			return false, err
 		}
