@@ -773,6 +773,12 @@ func (u *Server) Init(ctx context.Context) (err error) {
 		return errors.NewConfigurationError("could not get utxostore URL", err)
 	}
 
+	// A store that nets below the checkpoint takes those blocks only through quick
+	// validation, so settings that keep catch-up from quick validating them stop the sync.
+	if err = model.CheckNettedRouteCatchupSettings(u.settings, u.utxoStore); err != nil {
+		return err
+	}
+
 	// Only create a new BlockValidation if one wasn't already set (for testing).
 	// Pass the P2P client through the variadic opts so block-validation can strike the peer
 	// that served a corrupt block body (bitcoin-sv/teranode#4692) with correct attribution to

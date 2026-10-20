@@ -3292,5 +3292,11 @@ func (u *BlockValidation) clearNetFailures(block *model.Block) {
 // without spend-journal rows, and normal validation or a transaction-at-a-time write would read
 // those rows. Callers return an error instead of falling through.
 func (u *BlockValidation) mustStayOnQuickValidation(block *model.Block) bool {
-	return u.netsBelowCheckpoint(block, u.quickValidateOutpointOnly(block))
+	return u.mustStayOnQuickValidationAt(block.Height)
+}
+
+// mustStayOnQuickValidationAt is mustStayOnQuickValidation for a block at height.
+func (u *BlockValidation) mustStayOnQuickValidationAt(height uint32) bool {
+	return utxo.NetsBelowCheckpoint(u.utxoStore) &&
+		model.OutpointOnlyEligible(u.settings, u.utxoStore, u.settings.ChainCfgParams, height)
 }

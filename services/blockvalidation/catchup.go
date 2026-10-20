@@ -1195,9 +1195,39 @@ func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) erro
 	if checkpointsChecked > 0 {
 		u.logger.Infof("[catchup][%s] Successfully verified %d checkpoint(s) in header chain", catchupCtx.blockUpTo.Hash().String(), checkpointsChecked)
 		catchupCtx.useQuickValidation = true // enabled: BlockAssembly sync check added in tryQuickValidation
+
+		u.trimWindowToVerifiedCheckpoint(catchupCtx)
 	}
 
 	return nil
+}
+
+// trimWindowToVerifiedCheckpoint ends the catch-up window at its highest verified checkpoint
+// when the blocks after it can only be quick validated: a store that nets below the hardcoded
+// checkpoint holds them, and they are at or below it. Quick validation needs a verified
+// checkpoint at or above each block (tryQuickValidation), so those blocks would be refused in
+// this window, and the refusal would be charged to the peer that served them. The next window
+// starts at the checkpoint and holds the next one, because block validation refuses a window
+// smaller than the largest checkpoint gap at startup (model.CheckNettedRouteCatchupSettings).
+func (u *Server) trimWindowToVerifiedCheckpoint(catchupCtx *CatchupContext) {
+	verified := catchupCtx.highestCheckpointHeight
+	if verified == 0 || verified <= catchupCtx.commonAncestorMeta.Height {
+		return
+	}
+
+	if !u.blockValidation.mustStayOnQuickValidationAt(verified + 1) {
+		return
+	}
+
+	keep := int(verified - catchupCtx.commonAncestorMeta.Height)
+	if keep >= len(catchupCtx.blockHeaders) {
+		return
+	}
+
+	u.logger.Infof("[catchup][%s] window ends at verified checkpoint %d: %d headers after it wait for the next window, because the netting UTXO store takes blocks below the hardcoded checkpoint only through quick validation",
+		catchupCtx.blockUpTo.Hash().String(), verified, len(catchupCtx.blockHeaders)-keep)
+
+	catchupCtx.blockHeaders = catchupCtx.blockHeaders[:keep]
 }
 
 // verifyCheckpointsAgainstHeaders verifies checkpoints against the fetched headers
