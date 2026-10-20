@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
@@ -31,11 +33,14 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test/mocklogger"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -402,8 +407,10 @@ func TestHandleGetRawTransactionEdgeCases(t *testing.T) {
 	})
 
 	t.Run("HTTP server returns 404", func(t *testing.T) {
-		// Create test server that returns 404
+		// A 404 the asset handler marks as its verdict on the transaction, as the
+		// real one does; an unmarked 404 is a routing failure and not this case.
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set(util.AssetNotFoundHeader, util.AssetNotFoundTx)
 			w.WriteHeader(http.StatusNotFound)
 		}))
 		defer server.Close()
@@ -417,13 +424,28 @@ func TestHandleGetRawTransactionEdgeCases(t *testing.T) {
 
 		verboseLevel := 0
 		cmd := &bsvjson.GetRawTransactionCmd{
-			Txid:    "nonexistenttx",
+			Txid:    strings.Repeat("ab", 32),
 			Verbose: &verboseLevel,
 		}
 
 		_, err := handleGetRawTransaction(context.Background(), s, cmd, nil)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "404")
+
+		// Assert on what a caller actually receives, not on the handler's bare
+		// error. The previous version checked err.Error() for "404" and passed
+		// while the reply on the wire was -32603 "internal error", because the
+		// handler is called directly here and never reaches createMarshalledReply,
+		// which is where the trimming happens.
+		reply, mErr := s.createMarshalledReply(1, nil, err)
+		require.NoError(t, mErr)
+
+		var parsed bsvjson.Response
+		require.NoError(t, json.Unmarshal(reply, &parsed))
+		require.NotNil(t, parsed.Error)
+
+		require.Equal(t, bsvjson.ErrRPCInvalidAddressOrKey, parsed.Error.Code,
+			"an unknown txid is -5, matching bitcoind, not an internal error")
+		require.Equal(t, txNotFoundMessage, parsed.Error.Message)
 	})
 }
 
@@ -1270,7 +1292,14 @@ func TestHandleGetBlockComprehensive(t *testing.T) {
 
 		_, err := handleGetBlock(context.Background(), s, cmd, nil)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "blockchain error")
+
+		// getblock names a block, so it goes through rpcLookupError. This
+		// failure is not a not-found, so it keeps the internal code - and the
+		// internal text stays in the log rather than on the wire.
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
+		assert.NotContains(t, rpcErr.Message, "blockchain error")
 	})
 
 	t.Run("block not on main chain should return -1 confirmations", func(t *testing.T) {
@@ -1455,7 +1484,11 @@ func TestHandleGetBlockByHeightComprehensive(t *testing.T) {
 
 		_, err := handleGetBlockByHeight(context.Background(), s, cmd, nil)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "block not found at height")
+
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
+		assert.NotContains(t, rpcErr.Message, "block not found at height")
 	})
 }
 
@@ -1578,7 +1611,11 @@ func TestHandleGetBlockHeaderComprehensive(t *testing.T) {
 
 		_, err := handleGetBlockHeader(context.Background(), s, cmd, nil)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "header not found")
+
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
+		assert.NotContains(t, rpcErr.Message, "header not found")
 	})
 
 	t.Run("successful block header retrieval with verbose=false", func(t *testing.T) {
@@ -2485,7 +2522,9 @@ func TestHandleGetRawMempoolComprehensive(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
 		assert.Contains(t, rpcErr.Message, "Error retrieving raw mempool")
-		assert.Contains(t, rpcErr.Message, "failed to get tx hashes")
+		// The site's context stays; the internal cause does not. It could be a
+		// gRPC dial target or the storage layer's own text. See rpc_errors.go.
+		assert.NotContains(t, rpcErr.Message, "failed to get tx hashes")
 	})
 
 	t.Run("verbose mode - get mining candidate error", func(t *testing.T) {
@@ -2520,7 +2559,7 @@ func TestHandleGetRawMempoolComprehensive(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
 		assert.Contains(t, rpcErr.Message, "Error retrieving mining candidate")
-		assert.Contains(t, rpcErr.Message, "failed to get mining candidate")
+		assert.NotContains(t, rpcErr.Message, "failed to get mining candidate")
 	})
 
 	t.Run("requires block assembly client", func(t *testing.T) {
@@ -2716,7 +2755,14 @@ func TestHandleInvalidateBlockComprehensive(t *testing.T) {
 
 		require.Error(t, err)
 		assert.Nil(t, result)
-		assert.Equal(t, expectedError, err)
+
+		// invalidateblock names a block, so it goes through rpcLookupError:
+		// the caller gets a typed RPC error, and an internal failure that is
+		// not a not-found keeps the internal code without the internal text.
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
+		assert.NotContains(t, rpcErr.Message, "blockchain service unavailable")
 	})
 
 	t.Run("nil blockchain client", func(t *testing.T) {
@@ -2765,7 +2811,14 @@ func TestHandleInvalidateBlockComprehensive(t *testing.T) {
 
 		require.Error(t, err)
 		assert.Nil(t, result)
-		assert.Equal(t, context.Canceled, err)
+
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
+		// A plain error fails closed: the boundary cannot tell a context error
+		// from a driver's. The real blockchain client never returns one bare - it
+		// unwraps every gRPC status into a Teranode error first.
+		assert.Equal(t, genericErrorMessage, rpcErr.Message)
 	})
 
 	t.Run("zero block hash", func(t *testing.T) {
@@ -2819,6 +2872,7 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 		expectedHash, _ := chainhash.NewHashFromStr("00000000000000000007878ec04bb2b2e12317804810f4c26033585b3f81ffaa")
 
 		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Invalid: true}, nil)
 		mockClient.On("GetLastNInvalidBlocks", mock.Anything, mock.Anything).Return([]*model.BlockInfo{}, nil)
 
 		mockBlockValidationClient := &mockBlockValidationClient{
@@ -2850,6 +2904,7 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 
 	t.Run("invalid block hash format", func(t *testing.T) {
 		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Invalid: true}, nil)
 		mockClient.On("GetLastNInvalidBlocks", mock.Anything, mock.Anything).Return([]*model.BlockInfo{}, nil)
 
 		s := &RPCServer{
@@ -2879,6 +2934,7 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 		expectedError := errors.New(errors.ERR_ERROR, "validation failed")
 
 		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Invalid: true}, nil)
 		mockClient.On("GetLastNInvalidBlocks", mock.Anything, mock.Anything).Return([]*model.BlockInfo{}, nil)
 
 		mockBlockValidationClient := &mockBlockValidationClient{
@@ -2913,6 +2969,7 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 
 	t.Run("nil validation client", func(t *testing.T) {
 		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Invalid: true}, nil)
 		mockClient.On("GetLastNInvalidBlocks", mock.Anything, mock.Anything).Return([]*model.BlockInfo{}, nil)
 
 		s := &RPCServer{
@@ -2941,6 +2998,7 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 
 	t.Run("context cancellation", func(t *testing.T) {
 		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Invalid: true}, nil)
 		mockClient.On("GetLastNInvalidBlocks", mock.Anything, mock.Anything).Return([]*model.BlockInfo{}, nil)
 
 		mockBlockValidationClient := &mockBlockValidationClient{
@@ -2992,6 +3050,7 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 				HashPrevBlock: &chainhash.Hash{},
 			},
 		}, nil)
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Invalid: true}, nil)
 		mockClient.On("GetLastNInvalidBlocks", mock.Anything, mock.Anything).Return([]*model.BlockInfo{}, nil)
 
 		mockBlockValidationClient := &mockBlockValidationClient{
@@ -3030,6 +3089,7 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 				HashPrevBlock: &chainhash.Hash{},
 			},
 		}, nil)
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Invalid: true}, nil)
 		mockClient.On("GetLastNInvalidBlocks", mock.Anything, mock.Anything).Return([]*model.BlockInfo{}, nil)
 
 		mockBlockValidationClient := &mockBlockValidationClient{
@@ -3060,6 +3120,7 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 
 	t.Run("malformed command type", func(t *testing.T) {
 		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Invalid: true}, nil)
 		mockClient.On("GetLastNInvalidBlocks", mock.Anything, mock.Anything).Return([]*model.BlockInfo{}, nil)
 
 		s := &RPCServer{
@@ -3387,6 +3448,124 @@ func TestHandleIsBannedComprehensive(t *testing.T) {
 func TestHandleListBannedComprehensive(t *testing.T) {
 	logger := mocklogger.NewTestLogger()
 
+	sourceErr := errors.New(errors.ERR_ERROR, "list banned failed")
+
+	// Deduplication regression coverage: the handler concatenated both sources
+	// verbatim, so an address reported by both services, or repeated by one
+	// service, appeared more than once in the response. Expected slices are
+	// hand-derived from the fixtures; exact-string equality only, no sorting,
+	// normalisation or filtering.
+	for _, tc := range []struct {
+		name              string
+		p2pOn, legacyOn   bool
+		p2p, legacy       []string
+		p2pErr, legacyErr error
+		want              []string
+	}{
+		{
+			name:     "overlap",
+			p2pOn:    true,
+			legacyOn: true,
+			p2p:      []string{"192.0.2.2", "192.0.2.1"},
+			legacy:   []string{"192.0.2.1", "198.51.100.1"},
+			want:     []string{"192.0.2.2", "192.0.2.1", "198.51.100.1"},
+		},
+		{
+			name:     "combined duplicates",
+			p2pOn:    true,
+			legacyOn: true,
+			p2p:      []string{"192.0.2.2", "192.0.2.1", "192.0.2.2"},
+			legacy:   []string{"192.0.2.1", "198.51.100.2", "198.51.100.1", "198.51.100.2"},
+			want:     []string{"192.0.2.2", "192.0.2.1", "198.51.100.2", "198.51.100.1"},
+		},
+		{
+			name:  "p2p duplicates",
+			p2pOn: true,
+			p2p:   []string{"192.0.2.2", "192.0.2.1", "192.0.2.2"},
+			want:  []string{"192.0.2.2", "192.0.2.1"},
+		},
+		{
+			name:     "legacy duplicates",
+			legacyOn: true,
+			legacy:   []string{"198.51.100.2", "198.51.100.1", "198.51.100.2"},
+			want:     []string{"198.51.100.2", "198.51.100.1"},
+		},
+		{
+			name:     "exact strings",
+			p2pOn:    true,
+			legacyOn: true,
+			p2p:      []string{"192.0.2.1", "", "2001:db8::1", "192.0.2.1"},
+			legacy:   []string{"192.0.2.1/32", "", "2001:0db8::1", "2001:DB8::1", " 192.0.2.1 "},
+			want:     []string{"192.0.2.1", "", "2001:db8::1", "192.0.2.1/32", "2001:0db8::1", "2001:DB8::1", " 192.0.2.1 "},
+		},
+		{name: "nil p2p", p2pOn: true},
+		{name: "empty p2p", p2pOn: true, p2p: []string{}, want: []string{}},
+		{name: "nil legacy", legacyOn: true},
+		{name: "empty legacy", legacyOn: true, legacy: []string{}},
+		{name: "nil p2p empty legacy", p2pOn: true, legacyOn: true, legacy: []string{}},
+		{name: "empty p2p nil legacy", p2pOn: true, legacyOn: true, p2p: []string{}, want: []string{}},
+		{name: "empty p2p empty legacy", p2pOn: true, legacyOn: true, p2p: []string{}, legacy: []string{}, want: []string{}},
+		{
+			name:     "p2p error ignores data",
+			p2pOn:    true,
+			legacyOn: true,
+			p2p:      []string{"203.0.113.1"},
+			p2pErr:   sourceErr,
+			legacy:   []string{"198.51.100.2", "198.51.100.1", "198.51.100.2"},
+			want:     []string{"198.51.100.2", "198.51.100.1"},
+		},
+		{
+			name:      "legacy error ignores data",
+			p2pOn:     true,
+			legacyOn:  true,
+			p2p:       []string{"192.0.2.2", "192.0.2.1", "192.0.2.2"},
+			legacy:    []string{"203.0.113.1"},
+			legacyErr: sourceErr,
+			want:      []string{"192.0.2.2", "192.0.2.1"},
+		},
+		{
+			name:      "both errors",
+			p2pOn:     true,
+			legacyOn:  true,
+			p2p:       []string{"192.0.2.1"},
+			p2pErr:    sourceErr,
+			legacy:    []string{"198.51.100.1"},
+			legacyErr: sourceErr,
+		},
+		{name: "p2p error alone", p2pOn: true, p2p: []string{"192.0.2.1"}, p2pErr: sourceErr},
+		{name: "legacy error alone", legacyOn: true, legacy: []string{"198.51.100.1"}, legacyErr: sourceErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Client presence keeps an absent client distinct from a present
+			// client returning a nil slice; the handler reads no settings.
+			s := &RPCServer{logger: logger}
+
+			if tc.p2pOn {
+				s.p2pClient = &mockP2PClient{
+					listBannedFunc: func(context.Context) ([]string, error) {
+						return tc.p2p, tc.p2pErr
+					},
+				}
+			}
+
+			if tc.legacyOn {
+				s.legacyP2PClient = &mockLegacyPeerClient{
+					listBannedFunc: func(context.Context, *emptypb.Empty) (*peer_api.ListBannedResponse, error) {
+						return &peer_api.ListBannedResponse{Banned: tc.legacy}, tc.legacyErr
+					},
+				}
+			}
+
+			result, err := handleListBanned(context.Background(), s, nil, nil)
+
+			require.NoError(t, err)
+			bannedList, ok := result.([]string)
+			require.True(t, ok)
+			// require.Equal on typed slices distinguishes nil from empty.
+			require.Equal(t, tc.want, bannedList)
+		})
+	}
+
 	t.Run("p2p client returns banned list", func(t *testing.T) {
 		mockP2P := &mockP2PClient{
 			listBannedFunc: func(ctx context.Context) ([]string, error) {
@@ -3407,9 +3586,7 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		require.NoError(t, err)
 		bannedList, ok := result.([]string)
 		require.True(t, ok)
-		assert.Len(t, bannedList, 2)
-		assert.Contains(t, bannedList, "192.168.1.100")
-		assert.Contains(t, bannedList, "10.0.0.0/24")
+		require.Equal(t, []string{"192.168.1.100", "10.0.0.0/24"}, bannedList)
 	})
 
 	t.Run("legacy peer client returns banned list", func(t *testing.T) {
@@ -3434,9 +3611,7 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		require.NoError(t, err)
 		bannedList, ok := result.([]string)
 		require.True(t, ok)
-		assert.Len(t, bannedList, 2)
-		assert.Contains(t, bannedList, "172.16.0.1")
-		assert.Contains(t, bannedList, "192.168.0.0/16")
+		require.Equal(t, []string{"172.16.0.1", "192.168.0.0/16"}, bannedList)
 	})
 
 	t.Run("both clients return banned lists - combined", func(t *testing.T) {
@@ -3468,13 +3643,9 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		require.NoError(t, err)
 		bannedList, ok := result.([]string)
 		require.True(t, ok)
-		assert.Len(t, bannedList, 4)
-		// P2P results come first
-		assert.Contains(t, bannedList, "192.168.1.100")
-		assert.Contains(t, bannedList, "10.0.0.0/24")
-		// Legacy results appended
-		assert.Contains(t, bannedList, "172.16.0.1")
-		assert.Contains(t, bannedList, "192.168.0.0/16")
+		// P2P results come first, legacy results appended; disjoint entries are
+		// all retained in that exact order.
+		require.Equal(t, []string{"192.168.1.100", "10.0.0.0/24", "172.16.0.1", "192.168.0.0/16"}, bannedList)
 	})
 
 	t.Run("p2p client error - continues with legacy", func(t *testing.T) {
@@ -3506,8 +3677,7 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		require.NoError(t, err)
 		bannedList, ok := result.([]string)
 		require.True(t, ok)
-		assert.Len(t, bannedList, 1)
-		assert.Contains(t, bannedList, "172.16.0.1")
+		require.Equal(t, []string{"172.16.0.1"}, bannedList)
 	})
 
 	t.Run("no clients available - empty list", func(t *testing.T) {
@@ -3523,7 +3693,7 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		require.NoError(t, err)
 		bannedList, ok := result.([]string)
 		require.True(t, ok)
-		assert.Empty(t, bannedList)
+		require.Nil(t, bannedList)
 	})
 
 	t.Run("p2p client timeout", func(t *testing.T) {
@@ -3556,7 +3726,85 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		require.NoError(t, err)
 		bannedList, ok := result.([]string)
 		require.True(t, ok)
-		assert.Empty(t, bannedList) // Timeout results in empty list
+		require.Nil(t, bannedList) // Timeout results in empty list
+	})
+
+	t.Run("source slice unchanged", func(t *testing.T) {
+		source := []string{"192.0.2.2", "192.0.2.1", "192.0.2.2", "198.51.100.1"}
+
+		s := &RPCServer{
+			logger: logger,
+			p2pClient: &mockP2PClient{
+				listBannedFunc: func(context.Context) ([]string, error) {
+					return source, nil
+				},
+			},
+		}
+
+		result, err := handleListBanned(context.Background(), s, nil, nil)
+
+		require.NoError(t, err)
+		bannedList, ok := result.([]string)
+		require.True(t, ok)
+		require.Equal(t, []string{"192.0.2.2", "192.0.2.1", "198.51.100.1"}, bannedList)
+		// Deduplication must not compact the source-owned slice in place.
+		require.Equal(t, []string{"192.0.2.2", "192.0.2.1", "192.0.2.2", "198.51.100.1"}, source)
+	})
+
+	t.Run("legacy cancellation retains deduplicated p2p", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		legacyStarted := make(chan struct{})
+
+		s := &RPCServer{
+			logger: logger,
+			p2pClient: &mockP2PClient{
+				listBannedFunc: func(context.Context) ([]string, error) {
+					return []string{"192.0.2.2", "192.0.2.1", "192.0.2.2"}, nil
+				},
+			},
+			legacyP2PClient: &mockLegacyPeerClient{
+				listBannedFunc: func(ctx context.Context, _ *emptypb.Empty) (*peer_api.ListBannedResponse, error) {
+					close(legacyStarted)
+					<-ctx.Done()
+
+					return nil, ctx.Err()
+				},
+			},
+		}
+
+		type callResult struct {
+			value interface{}
+			err   error
+		}
+
+		done := make(chan callResult, 1)
+
+		go func() {
+			value, err := handleListBanned(ctx, s, nil, nil)
+			done <- callResult{value: value, err: err}
+		}()
+
+		// Cancel only once the legacy call is in flight, so the sequential
+		// handler has already collected the P2P result. Either the context
+		// branch or the canceled stub result may win; both must keep that data.
+		select {
+		case <-legacyStarted:
+			cancel()
+		case <-time.After(time.Second):
+			t.Fatal("legacy call did not start")
+		}
+
+		select {
+		case result := <-done:
+			require.NoError(t, result.err)
+			bannedList, ok := result.value.([]string)
+			require.True(t, ok)
+			require.Equal(t, []string{"192.0.2.2", "192.0.2.1"}, bannedList)
+		case <-time.After(time.Second):
+			t.Fatal("handler did not return after cancellation")
+		}
 	})
 }
 
@@ -3573,7 +3821,7 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 
 		mockPeer := &mockLegacyPeerClient{
 			clearBannedFunc: func(ctx context.Context, req *emptypb.Empty) (*peer_api.ClearBannedResponse, error) {
-				return &peer_api.ClearBannedResponse{}, nil
+				return &peer_api.ClearBannedResponse{Ok: true}, nil
 			},
 		}
 
@@ -3583,6 +3831,7 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
+				RPC:            settings.RPCSettings{ClientCallTimeout: 5 * time.Second},
 			},
 		}
 
@@ -3594,16 +3843,19 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 		assert.True(t, success)
 	})
 
-	t.Run("p2p client error - still returns true", func(t *testing.T) {
+	t.Run("absent leg tolerated while the other clears - reports success", func(t *testing.T) {
+		// p2p clears; the legacy service is configured-but-absent and times out
+		// (#591). An absent leg (DeadlineExceeded/Unavailable) must be tolerated,
+		// so the successful p2p clear stands.
 		mockP2P := &mockP2PClient{
 			clearBannedFunc: func(ctx context.Context) error {
-				return errors.New(errors.ERR_ERROR, "p2p service error")
+				return nil
 			},
 		}
 
 		mockPeer := &mockLegacyPeerClient{
 			clearBannedFunc: func(ctx context.Context, req *emptypb.Empty) (*peer_api.ClearBannedResponse, error) {
-				return &peer_api.ClearBannedResponse{}, nil
+				return nil, status.Error(codes.DeadlineExceeded, "legacy service absent")
 			},
 		}
 
@@ -3613,6 +3865,7 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
+				RPC:            settings.RPCSettings{ClientCallTimeout: 5 * time.Second},
 			},
 		}
 
@@ -3621,7 +3874,74 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 		require.NoError(t, err)
 		success, ok := result.(bool)
 		require.True(t, ok)
-		assert.True(t, success) // Still returns true despite error
+		require.True(t, success)
+	})
+
+	t.Run("shipped default: p2p service off (Unavailable), legacy clears - reports success", func(t *testing.T) {
+		// On the shipped deploy defaults the peer service is disabled but its
+		// client is still wired, so the p2p leg reports Unavailable. That is an
+		// absent leg, not a refusal, and there is no p2p ban list to lose.
+		mockP2P := &mockP2PClient{
+			clearBannedFunc: func(ctx context.Context) error {
+				return status.Error(codes.Unavailable, "peer service disabled")
+			},
+		}
+
+		mockPeer := &mockLegacyPeerClient{
+			clearBannedFunc: func(ctx context.Context, req *emptypb.Empty) (*peer_api.ClearBannedResponse, error) {
+				return &peer_api.ClearBannedResponse{Ok: true}, nil
+			},
+		}
+
+		s := &RPCServer{
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
+			settings: &settings.Settings{
+				ChainCfgParams: &chaincfg.MainNetParams,
+				RPC:            settings.RPCSettings{ClientCallTimeout: 5 * time.Second},
+			},
+		}
+
+		result, err := handleClearBanned(context.Background(), s, nil, nil)
+
+		require.NoError(t, err)
+		success, ok := result.(bool)
+		require.True(t, ok)
+		require.True(t, success)
+	})
+
+	t.Run("p2p refuses (Unauthenticated) while legacy clears - reports failure", func(t *testing.T) {
+		// The ChiR14 case: peer enabled + legacy enabled + admin key unset. The
+		// p2p leg is protected and returns Unauthenticated (a refusal, not an
+		// absence), while the unprotected legacy leg clears. Reporting success
+		// here would tell the operator bans are gone while every p2p ban survives.
+		mockP2P := &mockP2PClient{
+			clearBannedFunc: func(ctx context.Context) error {
+				return status.Error(codes.Unauthenticated, "invalid API key")
+			},
+		}
+
+		mockPeer := &mockLegacyPeerClient{
+			clearBannedFunc: func(ctx context.Context, req *emptypb.Empty) (*peer_api.ClearBannedResponse, error) {
+				return &peer_api.ClearBannedResponse{Ok: true}, nil
+			},
+		}
+
+		s := &RPCServer{
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
+			settings: &settings.Settings{
+				ChainCfgParams: &chaincfg.MainNetParams,
+				RPC:            settings.RPCSettings{ClientCallTimeout: 5 * time.Second},
+			},
+		}
+
+		result, err := handleClearBanned(context.Background(), s, nil, nil)
+
+		require.Error(t, err)
+		require.Nil(t, result)
 	})
 
 	t.Run("only p2p client available", func(t *testing.T) {
@@ -3650,7 +3970,7 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 	t.Run("only legacy client available", func(t *testing.T) {
 		mockPeer := &mockLegacyPeerClient{
 			clearBannedFunc: func(ctx context.Context, req *emptypb.Empty) (*peer_api.ClearBannedResponse, error) {
-				return &peer_api.ClearBannedResponse{}, nil
+				return &peer_api.ClearBannedResponse{Ok: true}, nil
 			},
 		}
 
@@ -3659,6 +3979,7 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
+				RPC:            settings.RPCSettings{ClientCallTimeout: 5 * time.Second},
 			},
 		}
 
@@ -3670,7 +3991,30 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 		assert.True(t, success)
 	})
 
-	t.Run("no clients available - still returns true", func(t *testing.T) {
+	t.Run("legacy reports not-ok - reports failure", func(t *testing.T) {
+		mockPeer := &mockLegacyPeerClient{
+			clearBannedFunc: func(ctx context.Context, req *emptypb.Empty) (*peer_api.ClearBannedResponse, error) {
+				// nil error but Ok=false: the ban list was not cleared.
+				return &peer_api.ClearBannedResponse{Ok: false}, nil
+			},
+		}
+
+		s := &RPCServer{
+			logger:          logger,
+			legacyP2PClient: mockPeer,
+			settings: &settings.Settings{
+				ChainCfgParams: &chaincfg.MainNetParams,
+				RPC:            settings.RPCSettings{ClientCallTimeout: 5 * time.Second},
+			},
+		}
+
+		result, err := handleClearBanned(context.Background(), s, nil, nil)
+
+		require.Error(t, err)
+		require.Nil(t, result)
+	})
+
+	t.Run("no clients available - reports failure", func(t *testing.T) {
 		s := &RPCServer{
 			logger: logger,
 			settings: &settings.Settings{
@@ -3678,15 +4022,15 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 			},
 		}
 
+		// With no ban service available, the clear cannot be honored, so report
+		// failure rather than a misleading success (mirrors handleSetBan).
 		result, err := handleClearBanned(context.Background(), s, nil, nil)
 
-		require.NoError(t, err)
-		success, ok := result.(bool)
-		require.True(t, ok)
-		assert.True(t, success)
+		require.Error(t, err)
+		require.Nil(t, result)
 	})
 
-	t.Run("both clients error - still returns true", func(t *testing.T) {
+	t.Run("both clients error - reports failure", func(t *testing.T) {
 		mockP2P := &mockP2PClient{
 			clearBannedFunc: func(ctx context.Context) error {
 				return errors.New(errors.ERR_ERROR, "p2p service error")
@@ -3705,15 +4049,17 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
+				RPC:            settings.RPCSettings{ClientCallTimeout: 5 * time.Second},
 			},
 		}
 
+		// clearbanned is an administrative control: when every attempted ban leg
+		// fails (e.g. Unauthenticated because the admin key is unset), it must
+		// report failure rather than silently returning success.
 		result, err := handleClearBanned(context.Background(), s, nil, nil)
 
-		require.NoError(t, err)
-		success, ok := result.(bool)
-		require.True(t, ok)
-		assert.True(t, success) // Always returns true
+		require.Error(t, err)
+		require.Nil(t, result)
 	})
 }
 
@@ -4038,7 +4384,7 @@ func TestHandleSetBanComprehensive(t *testing.T) {
 
 		rpcErr, ok := err.(*bsvjson.RPCError)
 		require.True(t, ok)
-		assert.Equal(t, bsvjson.ErrRPCInvalidParameter, rpcErr.Code)
+		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
 		assert.Contains(t, rpcErr.Message, "Failed to apply ban")
 	})
 
@@ -4076,7 +4422,7 @@ func TestHandleSetBanComprehensive(t *testing.T) {
 
 		rpcErr, ok := err.(*bsvjson.RPCError)
 		require.True(t, ok)
-		assert.Equal(t, bsvjson.ErrRPCInvalidParameter, rpcErr.Code)
+		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
 		assert.Contains(t, rpcErr.Message, "Failed to remove ban")
 	})
 
@@ -4768,7 +5114,7 @@ func (m *mockBlockValidationClient) BlockFound(ctx context.Context, blockHash *c
 	return nil
 }
 
-func (m *mockBlockValidationClient) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error {
+func (m *mockBlockValidationClient) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32, headerProven bool) error {
 	if m.processBlockFunc != nil {
 		return m.processBlockFunc(ctx, block, blockHeight)
 	}
@@ -4810,7 +5156,12 @@ func TestHandleFreezeComprehensive(t *testing.T) {
 
 		_, err := handleFreeze(context.Background(), s, cmd, nil)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid byte")
+		// The parser's own text is not the contract; the code and the caller's
+		// input are. A malformed hash answers as getblock does.
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCDecodeHexString, rpcErr.Code)
+		assert.Contains(t, rpcErr.Message, "invalid-")
 	})
 
 	t.Run("requires utxo store", func(t *testing.T) {
@@ -4849,7 +5200,12 @@ func TestHandleUnfreezeComprehensive(t *testing.T) {
 
 		_, err := handleUnfreeze(context.Background(), s, cmd, nil)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid byte")
+		// The parser's own text is not the contract; the code and the caller's
+		// input are. A malformed hash answers as getblock does.
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCDecodeHexString, rpcErr.Code)
+		assert.Contains(t, rpcErr.Message, "invalid-")
 	})
 
 	t.Run("requires utxo store", func(t *testing.T) {
@@ -4890,7 +5246,12 @@ func TestHandleReassignComprehensive(t *testing.T) {
 
 		_, err := handleReassign(context.Background(), s, cmd, nil)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid byte")
+		// The parser's own text is not the contract; the code and the caller's
+		// input are. A malformed hash answers as getblock does.
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCDecodeHexString, rpcErr.Code)
+		assert.Contains(t, rpcErr.Message, "invalid-")
 	})
 
 	t.Run("requires valid old UTXO hash", func(t *testing.T) {
@@ -4908,7 +5269,12 @@ func TestHandleReassignComprehensive(t *testing.T) {
 
 		_, err := handleReassign(context.Background(), s, cmd, nil)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid byte")
+		// The parser's own text is not the contract; the code and the caller's
+		// input are. A malformed hash answers as getblock does.
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCDecodeHexString, rpcErr.Code)
+		assert.Contains(t, rpcErr.Message, "invalid-")
 	})
 
 	t.Run("requires valid new UTXO hash", func(t *testing.T) {
@@ -4926,7 +5292,12 @@ func TestHandleReassignComprehensive(t *testing.T) {
 
 		_, err := handleReassign(context.Background(), s, cmd, nil)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid byte")
+		// The parser's own text is not the contract; the code and the caller's
+		// input are. A malformed hash answers as getblock does.
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCDecodeHexString, rpcErr.Code)
+		assert.Contains(t, rpcErr.Message, "invalid-")
 	})
 
 	t.Run("requires utxo store", func(t *testing.T) {
@@ -5400,8 +5771,8 @@ func (m *mockP2PClient) IsPeerMalicious(ctx context.Context, peerID string) (boo
 	return false, "", nil
 }
 
-func (m *mockP2PClient) IsPeerUnhealthy(ctx context.Context, peerID string) (bool, string, float32, error) {
-	return false, "", 0, nil
+func (m *mockP2PClient) IsPeerUnhealthy(ctx context.Context, peerID string) (bool, string, float32, bool, error) {
+	return false, "", 0, false, nil
 }
 
 func (m *mockP2PClient) BanPeer(ctx context.Context, addr string, until int64) error {
@@ -5471,10 +5842,6 @@ func (m *mockP2PClient) RecordCatchupFailureWithKind(ctx context.Context, peerID
 }
 
 func (m *mockP2PClient) RecordCatchupMalicious(ctx context.Context, peerID string) error {
-	return nil
-}
-
-func (m *mockP2PClient) UpdateCatchupReputation(ctx context.Context, peerID string, score float64) error {
 	return nil
 }
 
@@ -5687,9 +6054,15 @@ func TestHandleSubmitMiningSolutionComprehensive(t *testing.T) {
 			},
 		}
 
+		// The site classifies the failure itself (rpcMiningSubmissionError): a
+		// service error is the node's, so its text stays off the wire.
 		_, err := handleSubmitMiningSolution(context.Background(), s, cmd, nil)
 		require.Error(t, err)
-		assert.Equal(t, expectedError, err)
+
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		require.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
+		require.Equal(t, genericErrorMessage, rpcErr.Message)
 	})
 
 	t.Run("nil block assembly client", func(t *testing.T) {
@@ -5867,6 +6240,9 @@ func (m *mockBlockAssemblyClient) CheckBlockAssemblyValidateInputs(ctx context.C
 func (m *mockBlockAssemblyClient) GetBlockAssemblyState(ctx context.Context) (*blockassembly_api.StateMessage, error) {
 	return nil, nil
 }
+func (m *mockBlockAssemblyClient) GetBlockAssemblyQueueStats(ctx context.Context) (blockassembly.QueueStats, error) {
+	return blockassembly.QueueStats{}, nil
+}
 func (m *mockBlockAssemblyClient) GetBlockAssemblyBlockCandidate(ctx context.Context) (*model.Block, error) {
 	return nil, nil
 }
@@ -5878,6 +6254,9 @@ func (m *mockBlockAssemblyClient) GetTransactionHashes(ctx context.Context) ([]s
 }
 func (m *mockBlockAssemblyClient) GetCandidateBlock(ctx context.Context, candidateID []byte) (*blockassembly_api.GetCandidateBlockResponse, error) {
 	return nil, nil
+}
+func (m *mockBlockAssemblyClient) PrepareBlock(ctx context.Context, block *model.Block) error {
+	return nil
 }
 
 // TestHandleGetMiningInfoComprehensive tests the complete handleGetMiningInfo functionality
@@ -6354,7 +6733,9 @@ func TestHandleGenerateToAddressComprehensive(t *testing.T) {
 		rpcErr, ok := err.(*bsvjson.RPCError)
 		require.True(t, ok)
 		assert.Equal(t, bsvjson.ErrRPCInternal.Code, rpcErr.Code)
-		assert.Contains(t, rpcErr.Message, "block assembly generation failed")
+		// A node fault: its text goes to the log, not the wire.
+		assert.Equal(t, genericErrorMessage, rpcErr.Message)
+		assert.NotContains(t, rpcErr.Message, "block assembly generation failed")
 	})
 
 	t.Run("nil block assembly client", func(t *testing.T) {
@@ -6553,10 +6934,9 @@ func (acceptingValidator) Validate(_ context.Context, _ *bt.Tx, _ uint32, _ ...v
 }
 
 // decoratingUtxoStore stamps a fixed input-satoshis value on every input of
-// every tx passed to PreviousOutputsDecorate. RPC-arriving txs are wire-format
-// only (no PreviousTxSatoshis), so the handler always invokes decoration; this
-// stub stands in for what the real UTXO store would do, giving us a known
-// inputSats value to compute fee against.
+// every tx passed to PreviousOutputsDecorate. These tests submit wire-format
+// transactions and use a fixed input value to check the fee ceiling. Extended
+// submissions are covered with a real store in extended_fee_test.go.
 type decoratingUtxoStore struct {
 	utxo.Store
 	inputSats uint64

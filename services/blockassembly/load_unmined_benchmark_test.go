@@ -63,7 +63,7 @@ func benchmarkLoadUnminedTransactions(b *testing.B, txCount int) {
 	// Initialize Aerospike container
 	b.Logf("Initializing Aerospike container...")
 	aerospikeURL, teardownAerospike, err := testAerospike.InitAerospikeContainer()
-	require.NoError(b, err)
+	test.SkipIfContainerUnavailable(b, err)
 
 	b.Cleanup(func() {
 		_ = teardownAerospike()
@@ -72,7 +72,7 @@ func benchmarkLoadUnminedTransactions(b *testing.B, txCount int) {
 	b.Logf("Aerospike container initialized at: %s", aerospikeURL)
 
 	postgresURL, teardownPostgres, err := postgres.SetupTestPostgresContainer()
-	require.NoError(b, err)
+	test.SkipIfContainerUnavailable(b, err)
 
 	b.Cleanup(func() {
 		_ = teardownPostgres()
@@ -185,7 +185,7 @@ func benchmarkLoadUnminedTransactions(b *testing.B, txCount int) {
 		blockAssembler.subtreeProcessor.Reset(genesisBlock.Header, nil, nil, false, nil)
 
 		// Benchmark the loadUnminedTransactions function
-		err := blockAssembler.loadUnminedTransactions(ctx)
+		err := blockAssembler.loadUnminedTransactions(ctx, false)
 		require.NoError(b, err)
 	}
 
@@ -261,7 +261,7 @@ func BenchmarkLoadUnminedTransactions_MixedStates(b *testing.B) {
 	// Initialize Aerospike container
 	b.Logf("Initializing Aerospike container...")
 	aerospikeURL, teardown, err := testAerospike.InitAerospikeContainer()
-	require.NoError(b, err)
+	test.SkipIfContainerUnavailable(b, err)
 
 	b.Cleanup(func() {
 		_ = teardown()
@@ -372,7 +372,7 @@ func BenchmarkLoadUnminedTransactions_MixedStates(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		blockAssembler.subtreeProcessor.Reset(genesisBlock.Header, nil, nil, false, nil)
-		err := blockAssembler.loadUnminedTransactions(ctx)
+		err := blockAssembler.loadUnminedTransactions(ctx, false)
 		require.NoError(b, err)
 	}
 

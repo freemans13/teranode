@@ -35,6 +35,8 @@ The Block Assembly Service is responsible for assembling new blocks and adding t
 
 **No Mempool Design**: Unlike traditional Bitcoin nodes that maintain a mempool (memory pool) to store unconfirmed transactions, Teranode's Block Assembly service processes transactions directly through a validation and subtree assembly pipeline. Transactions are immediately validated and organized into subtrees for efficient block creation, rather than being held in an intermediate memory pool. This design enables higher throughput and more efficient resource utilization for large-scale transaction processing.
 
+**Deployment Model**: Block Assembly does not scale horizontally. It runs as a single stateful instance per Teranode node, with no leader election or standby — every replica that starts is fully active and will serve mining traffic. Its in-memory mining-candidate and subtree-assembler state, and the outstanding mining jobs handed to miners, live in that one process: a mining job exists only where its candidate was issued, so a solution routed anywhere else is rejected with "job not found". A second replica would also write the same persisted `BlockAssembler` checkpoint, overwriting the first's view of the chain tip. See the [Teranode Microservices Overview](../architecture/teranode-microservices-overview.md#26-block-assembly-service) for how this fits the rest of the architecture, and the [Kubernetes miners installation guide](../../howto/miners/kubernetes/minersHowToInstallation.md#scaling-the-propagation-service) for why every example Cluster CR pins its replica count to 1, the Validator excepted.
+
 The block assembly process involves the following steps:
 
 1. **Receiving Transactions from the TX Validator Service**:
@@ -381,10 +383,10 @@ The Block Assembly service implements real-time fork detection through the follo
 
 3. **Reorganization Size Protection**:
 
-    - Monitors the size of potential chain reorganizations
-    - If a reorganization would require moving more than the coinbase maturity threshold (typically 100 blocks, configured via `Settings.ChainCfgParams.CoinbaseMaturity`) either backwards or forwards
-    - AND the current chain height is greater than 1000 blocks
-    - Triggers a full reset of the block assembler as a safety measure against deep reorganizations
+    - Monitors the size of potential chain reorganizations, by the deeper of the two sides (blocks moved back and blocks moved forward)
+    - Triggers a full reset of the block assembler instead of an in-place reorganization when either rule holds:
+        - the depth is at least the effective UTXO store block height retention (`GetUtxoStoreBlockHeightRetention()`: global retention plus the UTXO store adjustment), at any height. Spent transactions of a side chain are deleted at their height plus that retention, so the blocks being moved forward may already have lost them. A retention of 0 (pruning disabled) turns this rule off.
+        - the depth is at least the coinbase maturity threshold (typically 100 blocks, `Settings.ChainCfgParams.CoinbaseMaturity`) and the current chain height is greater than 1000 blocks
 
 The `BlockAssembler` keeps the node synchronized with the network by identifying and switching to the strongest chain (the one with the most accumulated proof of work), ensuring all nodes in the network converge on the same transaction history.
 
@@ -408,9 +410,7 @@ The service automatically manages chain selection through:
     - Accepts the chain with the most accumulated proof of work
     - Performs a safety check on reorganization depth:
 
-        - If the reorganization involves more than the coinbase maturity threshold (typically 100 blocks, configured via `Settings.ChainCfgParams.CoinbaseMaturity`) in either direction
-        - And the current chain height is greater than 1000
-        - The block assembler will reset rather than attempt the reorganization
+        - The block assembler resets rather than attempt the reorganization when the deeper side reaches the effective UTXO store block height retention at any height, or reaches the coinbase maturity threshold above height 1000 (see Reorganization Size Protection above)
 
     - Block validation and transaction verification are handled by other services, not the Block Assembly
 

@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/url"
 	"runtime"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -57,7 +58,9 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 			return errors.NewProcessingError("[subtreeMessageHandler] failed to get FSM current state", err)
 		}
 
-		if *state == blockchain.FSMStateCATCHINGBLOCKS {
+		// Peer subtrees are only validated when caught up. IDLE can follow an
+		// operator STOP mid-catchup, with a UTXO set far behind the tip.
+		if *state != blockchain.FSMStateRUNNING {
 			return nil
 		}
 
@@ -96,7 +99,8 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 			}
 
 			if errors.Is(err, errors.ErrSubtreeExists) {
-				u.logger.Warnf("[subtreeMessageHandler] Subtree already exists - skipping")
+				prometheusSubtreeAlreadyExistsSkipped.Inc()
+				u.logger.Debugf("[subtreeMessageHandler] Subtree already exists - skipping")
 				return nil
 			}
 
@@ -114,13 +118,44 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 }
 
 func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, baseURL *url.URL, peerID string, validationOptions ...validator.Option) error {
+	// Wait for a validation slot before taking the subtree's quorum lock:
+	// block validation (CheckBlockSubtrees) waits on that lock, so a subtree
+	// queued here while holding it would make a block wait for the queue. A
+	// subtree validated while this one was queued is then skipped by the lock
+	// check below.
+	waitStart := time.Now()
+
+	releaseAdmission, err := u.peerSubtreeAdmission.acquire(ctx, u.settings.SubtreeValidation.PeerSubtreeConcurrency)
+	if err != nil {
+		return err
+	}
+	defer releaseAdmission()
+
+	prometheusPeerSubtreeAdmissionWait.Observe(time.Since(waitStart).Seconds())
+
+	// The FSM was checked when the message arrived; the node may have left
+	// RUNNING while this subtree was queued, and peer subtrees are only
+	// validated when caught up.
+	state, err := u.blockchainClient.GetFSMCurrentState(ctx)
+	if err != nil {
+		return errors.NewProcessingError("[subtreesHandler] failed to get FSM current state", err)
+	}
+
+	if *state != blockchain.FSMStateRUNNING {
+		return nil
+	}
+
+	// The span starts after the wait, so the handler histogram measures
+	// validation only; the wait has its own metric.
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "subtreesHandler",
 		tracing.WithParentStat(u.stats),
 		tracing.WithHistogram(prometheusSubtreeValidationValidateSubtreeHandler),
-		tracing.WithLogMessage(u.logger, "[subtreesHandler] Received subtree message for %s from %s", hash.String(), baseURL.String()),
+		tracing.WithDebugLogMessage(u.logger, "[subtreesHandler] Received subtree message for %s from %s", hash.String(), baseURL.String()),
 	)
 	defer deferFn()
 
+	// Read the chain view after the wait: a block accepted while this subtree
+	// was queued must be in blockIds and the height it is validated for.
 	blockIDsMap := u.currentBlockIDsMap.Load()
 	if blockIDsMap == nil {
 		return errors.NewProcessingError("[subtreesHandler] failed to get block IDs map during subtree validation")

@@ -35,6 +35,11 @@ type Store struct {
 	store  utxo.Store
 }
 
+// Callers that check the store for an optional method, such as the pruner
+// service looking for a pruner, use utxo.As, which looks through the wrapper by
+// way of Unwrap. Without it, turning logging on would hide those methods.
+var _ utxo.Unwrapper = (*Store)(nil)
+
 // New creates a new logging wrapper around the provided UTXO store.
 // All operations on the returned store will be logged with detailed information
 // including method names, parameters, return values, and execution times.
@@ -114,6 +119,13 @@ func (s *Store) GetMedianBlockTime() uint32 {
 	s.logger.Debugf("[UTXOStore][logger][GetMedianBlockTime] %d : %s", res, caller())
 
 	return res
+}
+
+func (s *Store) SetBlockState(height, medianTime uint32) error {
+	err := s.store.SetBlockState(height, medianTime)
+	s.logger.Debugf("[UTXOStore][logger][SetBlockState] height: %d, medianTime: %d err %v : %s", height, medianTime, err, caller())
+
+	return err
 }
 
 func (s *Store) GetBlockState() utxo.BlockState {
@@ -225,6 +237,13 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	return err
 }
 
+func (s *Store) DeleteComplete(ctx context.Context, hash *chainhash.Hash) error {
+	err := s.store.DeleteComplete(ctx, hash)
+	s.logger.Debugf("[UTXOStore][logger][DeleteComplete] hash %s err %v : %s", hash.String(), err, caller())
+
+	return err
+}
+
 func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	blockIDsMap, err := s.store.SetMinedMulti(ctx, hashes, minedBlockInfo)
 	s.logger.Debugf("[UTXOStore][logger][SetMinedMulti] hashes %v blockID %d err %v : %s", hashes, minedBlockInfo.BlockID, err, caller())
@@ -281,6 +300,20 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	s.logger.Debugf("[UTXOStore][logger][PreviousOutputsDecorate] outpoints %v err %v : %s", tx, err, caller())
 
 	return err
+}
+
+func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	results, err := s.store.SpendAndCreateMulti(ctx, txs, blockHeight, opts...)
+	s.logger.Debugf("[UTXOStore][logger][SpendAndCreateMulti] txCount=%d blockHeight=%d err=%v : %s", len(txs), blockHeight, err, caller())
+
+	return results, err
+}
+
+func (s *Store) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, opts ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	answers, err := s.store.ParentOutputsForValidation(ctx, outpoints, opts...)
+	s.logger.Debugf("[UTXOStore][logger][ParentOutputsForValidation] outpoints=%d err=%v : %s", len(outpoints), err, caller())
+
+	return answers, err
 }
 
 func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
@@ -386,4 +419,9 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	s.logger.Debugf("[UTXOStore][logger][ProcessExpiredPreservations] currentHeight %d err %v : %s", currentHeight, err, caller())
 
 	return err
+}
+
+// Unwrap returns the wrapped store.
+func (s *Store) Unwrap() utxo.Store {
+	return s.store
 }

@@ -1177,7 +1177,9 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 		_ = subtreeProcessor.currentSubtree.Load().AddCoinbaseNode()
 
 		// Setup maps
-		transactionMap := NewSplitSwissMap(4, 16)      // Transactions that are in the new block
+		transactionMap := NewSortedHashSet(16) // Transactions that are in the new block
+		require.NoError(t, transactionMap.Freeze(1))
+
 		losingTxHashesMap := txmap.NewSplitSwissMap(4) // Conflicting transactions to remove
 		currentTxMap := subtreeProcessor.GetCurrentTxMap()
 
@@ -1212,10 +1214,12 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 		}
 
 		// Test with some transactions marked as in the new block
-		_ = transactionMap.Put(*hashes[3])  // index 3
-		_ = transactionMap.Put(*hashes[7])  // index 7
-		_ = transactionMap.Put(*hashes[11]) // index 11
-		_ = transactionMap.Put(*hashes[15]) // index 15
+		transactionMap = NewSortedHashSet(16)
+		require.NoError(t, transactionMap.Put(*hashes[3]))  // index 3
+		require.NoError(t, transactionMap.Put(*hashes[7]))  // index 7
+		require.NoError(t, transactionMap.Put(*hashes[11])) // index 11
+		require.NoError(t, transactionMap.Put(*hashes[15])) // index 15
+		require.NoError(t, transactionMap.Freeze(1))
 
 		expectedTxIDs := []string{
 			"4ebd5a35e6b73a5f8e1a3621dba857239538c1b1d26364913f14c85b04e208fc",
@@ -1360,7 +1364,8 @@ func testOrderPreservation(t *testing.T, subtreeProcessor *SubtreeProcessor, num
 	// - losingTxHashesMap: empty (no conflicting tx)
 	// - sourceTxMap: populated with all tx (source for parent lookup)
 	// - stp.currentTxMap: cleared (so SetIfNotExists succeeds)
-	transactionMap := NewSplitSwissMap(uint16(numTx), 16)
+	transactionMap := NewSortedHashSet(16)
+	require.NoError(t, transactionMap.Freeze(1))
 	losingTxHashesMap := txmap.NewSplitSwissMap(10, 4)
 
 	// Clear the processor's internal map so SetIfNotExists succeeds
@@ -4633,4 +4638,65 @@ func TestNewSubtreeChanContextCancellation(t *testing.T) {
 			return stp.parallelBuildRemainderSubtrees(cancelledCtx, kept, true)
 		})
 	})
+}
+
+func TestRemoveCoinbaseUtxos_NilCoinbase_ReturnsErrorNotPanic(t *testing.T) {
+	initPrometheusMetrics()
+	ctx := context.Background()
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, test.CreateBaseTestSettings(t), utxoStoreURL)
+	require.NoError(t, err)
+
+	require.NoError(t, utxoStore.SetBlockHeight(4))
+
+	blobStore := blob_memory.New()
+	settings := test.CreateBaseTestSettings(t)
+
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+	go func() {
+		for req := range newSubtreeChan {
+			if req.ErrChan != nil {
+				req.ErrChan <- nil
+			}
+		}
+	}()
+	defer close(newSubtreeChan)
+
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, nil, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+
+	// The processor is deliberately not started. removeCoinbaseUtxos is called
+	// directly here, so the background worker adds nothing to the test -- and
+	// starting it would leave a goroutine running past the end of the test,
+	// racing the deferred close of newSubtreeChan above.
+
+	// A real block carrying a real header but no coinbase -- the shape the
+	// rollback paths can hand to removeCoinbaseUtxos.
+	nilCoinbaseBlock := &model.Block{Header: blockHeader, CoinbaseTx: nil}
+
+	err = stp.removeCoinbaseUtxos(ctx, nilCoinbaseBlock)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "coinbase")
+
+	// The guard is only worth having if the callers can report what it
+	// rejected. Reset's rollback loop used to format this failure with
+	// block.CoinbaseTx.String(), which dereferences the very nil the guard just
+	// reported -- moving the panic one frame out instead of removing it.
+	// Describing the block instead is nil-safe; this reproduces what that call
+	// site now does.
+	require.Panics(t, func() { _ = nilCoinbaseBlock.CoinbaseTx.String() },
+		"the old formatting really did dereference the nil coinbase")
+
+	require.NotPanics(t, func() {
+		_ = errors.NewProcessingError("[SubtreeProcessor][Reset] error deleting coinbase utxos for %s", nilCoinbaseBlock.String(), err)
+	})
+
+	// The error must stay distinguishable from "the coinbase was not in the
+	// store". A nil coinbase is a corrupt block, not nothing-to-remove, and
+	// mapping it onto ErrTxNotFound would make every caller skip it silently.
+	require.False(t, errors.Is(err, errors.ErrTxNotFound),
+		"a nil coinbase must not be reported as an absent transaction")
 }

@@ -20,15 +20,17 @@ import (
 // constants so that callers of GetSubscribers() can reliably detect which
 // services are currently connected.
 const (
-	SubscriberLegacy            = "legacy/manager"
-	SubscriberP2P               = "p2pServer"
-	SubscriberUTXOStore         = "UTXOStore"
-	SubscriberBlockAssembler    = "BlockAssembler"
-	SubscriberBlockValidation   = "blockvalidation"
-	SubscriberSubtreeValidation = "subtreevalidation"
-	SubscriberPruner            = "Pruner"
-	SubscriberAssetService      = "AssetService"
-	SubscriberUTXOPersister     = "utxo-persister"
+	SubscriberLegacy              = "legacy/manager"
+	SubscriberP2P                 = "p2pServer"
+	SubscriberUTXOStore           = "UTXOStore"
+	SubscriberBlockAssembler      = "BlockAssembler"
+	SubscriberBlockValidation     = "blockvalidation"
+	SubscriberSubtreeValidation   = "subtreevalidation"
+	SubscriberPruner              = "Pruner"
+	SubscriberAssetService        = "AssetService"
+	SubscriberUTXOPersister       = "utxo-persister"
+	SubscriberFileBlockHeight     = "File BlockHeight"
+	SubscriberAssetMainChainCache = "asset-mainchain-cache"
 )
 
 // ClientI defines the interface for blockchain client operations.
@@ -883,7 +885,8 @@ type ClientI interface {
 	// - Error if the service fails to start or encounters a critical issue
 	Run(ctx context.Context, source string) error
 
-	// CatchUpBlocks synchronizes the blockchain with peer nodes.
+	// CatchUpBlocks requests automatic synchronization with peer nodes.
+	// It refuses operator IDLE; explicit resume uses SendFSMEvent(CATCHUPBLOCKS).
 	//
 	// This method initiates a process to catch up with the latest blocks from the network,
 	// downloading and validating any blocks that are missing from the local blockchain.
@@ -1095,12 +1098,13 @@ type ClientI interface {
 	// - height: Current blockchain height
 	// - limit: Maximum number of deletions to acquire
 	// - lockTimeoutSeconds: How long to hold the lock (0 = default 300s)
+	// - excludeStoreTypes: store types to leave out of the batch (nil = none); a service that predates this parameter ignores it, so a caller must still cope with rows of an excluded type
 	//
 	// Returns:
 	// - batchToken: Token to use when completing the batch
 	// - deletions: Array of scheduled deletions to process
 	// - Error if acquisition fails
-	AcquireBlobDeletionBatch(ctx context.Context, height uint32, limit int, lockTimeoutSeconds int) (string, []*blockchain_api.ScheduledDeletion, error)
+	AcquireBlobDeletionBatch(ctx context.Context, height uint32, limit int, lockTimeoutSeconds int, excludeStoreTypes []storetypes.BlobStoreType) (string, []*blockchain_api.ScheduledDeletion, error)
 
 	// CompleteBlobDeletionBatch completes a previously acquired batch.
 	//

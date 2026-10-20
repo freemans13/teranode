@@ -18,6 +18,7 @@ func TestAvailableEventsForState(t *testing.T) {
 			state: blockchain_api.FSMStateType_IDLE.String(),
 			expect: []string{
 				blockchain_api.FSMEventType_RUN.String(),
+				blockchain_api.FSMEventType_CATCHUPBLOCKS.String(),
 			},
 		},
 		{
@@ -33,6 +34,7 @@ func TestAvailableEventsForState(t *testing.T) {
 			state: blockchain_api.FSMStateType_CATCHINGBLOCKS.String(),
 			expect: []string{
 				blockchain_api.FSMEventType_RUN.String(),
+				blockchain_api.FSMEventType_STOP.String(),
 			},
 		},
 		{
@@ -60,6 +62,6 @@ func TestFSMTransitions_NoLegacySyncing(t *testing.T) {
 			require.NotEqual(t, "LEGACYSYNCING", src, "no transition may originate from LEGACYSYNCING")
 		}
 	}
-	// RUN must still be valid from CATCHINGBLOCKS (the surviving catch-up exit).
+	// RUN must still be valid from CATCHINGBLOCKS (catchup completion).
 	require.Contains(t, AvailableEventsForState("CATCHINGBLOCKS"), "RUN")
 }

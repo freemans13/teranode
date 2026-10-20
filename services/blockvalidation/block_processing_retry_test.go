@@ -226,6 +226,64 @@ func TestProcessCatchupChItem(t *testing.T) {
 		require.Nil(t, u.processBlockNotify.Get(*b.Hash()))
 	})
 
+	// Issue 1439: a torn, stale or mis-keyed external transaction blob is now an
+	// ErrStorageError. This handler had a dedicated ErrServiceError case that
+	// short-circuits before peer blaming precisely because a local failure is not
+	// the peer's fault, but no matching case for storage — so the error fell
+	// through to reportCatchupFailureForError AND ReportPeerFailure against an
+	// honest primary, then charged every cached alternative in turn.
+	t.Run("storage error is local: counts toward cap, never blames the peer", func(t *testing.T) {
+		u, _ := newServer(3, errors.NewStorageError("[GetTxFromExternalStore][abc] external tx does not hash to the key it was stored under"))
+		b := testBlock()
+		u.processBlockNotify.Set(*b.Hash(), true, ttlcache.DefaultTTL)
+		u.catchupAlternatives.Set(*b.Hash(), []processBlockCatchup{{block: b, peerID: "altpeer"}}, ttlcache.DefaultTTL)
+
+		u.processCatchupChItem(ctx, item(b))
+
+		it := u.blockCatchupAttempts.Get(*b.Hash())
+		require.NotNil(t, it, "a local storage fault must still count toward the #1057 cap")
+		require.Equal(t, 1, it.Value())
+		require.Nil(t, u.processBlockNotify.Get(*b.Hash()))
+		require.Nil(t, u.catchupAlternatives.Get(*b.Hash()))
+
+		mockBC := u.blockchainClient.(*blockchain.Mock)
+		mockBC.AssertNotCalled(t, "ReportPeerFailure", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	// The predicate here is the union of two helpers because neither covers the
+	// local cases alone: IsLocalError is context plus ErrStorageError and misses
+	// the *Unavailable codes, while IsTransientLocalError covers those and misses
+	// context entirely. Using either alone left one class of purely local failure
+	// still charged to an honest primary.
+	for name, localErr := range map[string]error{
+		"context cancellation (shutdown or catchup deadline)": errors.NewContextCanceledError("catchup context cancelled"),
+		"a local service outage (aerospike batch timeout)":    errors.NewServiceUnavailableError("aerospike get batch did not complete within"),
+		"an unavailable store":                                errors.NewStorageUnavailableError("disk below threshold"),
+		// A /blocks 429 during catchup: the serving peer's per-IP bucket is shared
+		// with this node's own subtree fan-out, so the collision is ours. On main a
+		// 429 mapped to ErrServiceError and was local; the dedicated rate-limited
+		// code must stay local here too, or one 429 charges and rotates the peer.
+		"a peer's rate limit on /blocks (HTTP 429)": errors.NewServiceRateLimitedError("http request [http://peer/blocks/abc] returned status code [429]"),
+	} {
+		t.Run(name+" is local: counts toward cap, never blames the peer", func(t *testing.T) {
+			u, _ := newServer(3, localErr)
+			b := testBlock()
+			u.processBlockNotify.Set(*b.Hash(), true, ttlcache.DefaultTTL)
+			u.catchupAlternatives.Set(*b.Hash(), []processBlockCatchup{{block: b, peerID: "altpeer"}}, ttlcache.DefaultTTL)
+
+			u.processCatchupChItem(ctx, item(b))
+
+			it := u.blockCatchupAttempts.Get(*b.Hash())
+			require.NotNil(t, it, "a local fault must still count toward the #1057 cap")
+			require.Equal(t, 1, it.Value())
+			require.Nil(t, u.processBlockNotify.Get(*b.Hash()))
+			require.Nil(t, u.catchupAlternatives.Get(*b.Hash()))
+
+			mockBC := u.blockchainClient.(*blockchain.Mock)
+			mockBC.AssertNotCalled(t, "ReportPeerFailure", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
+
 	t.Run("failure that advanced the chain resets the counter (does not count)", func(t *testing.T) {
 		u, _ := newServer(3, errors.NewServiceError("dropped mid-batch"))
 		b := testBlock()
@@ -390,6 +448,55 @@ func TestProcessCatchupChItem(t *testing.T) {
 		u.processCatchupChItem(ctx, item(b))
 
 		require.Nil(t, u.blockCatchupAttempts.Get(*b.Hash()), "an invalid block is not a retry-cap candidate")
+		require.Nil(t, u.processBlockNotify.Get(*b.Hash()))
+	})
+
+	// bitcoin-sv/teranode#4844: an invalid transaction in an unbound subtree list is a corrupt
+	// verdict, so isUnvalidatablePeerError does not end the cycle and the alternative sources are
+	// walked. That is deliberate: the list came from the primary unbound, and another peer's copy is
+	// how an honest body recovers from a primary that named its own subtrees.
+	unboundTxInvalid := func() error {
+		return errors.NewBlockCorruptError("[ValidateBlock][%s] block contains invalid transactions", "hash",
+			errors.NewTxInvalidError("transaction in subtree is invalid"))
+	}
+
+	t.Run("unbound invalid-transaction verdict recovers via a cached alternative", func(t *testing.T) {
+		require.True(t, isUnboundTxInvalidVerdict(unboundTxInvalid()), "fixture precondition: the producer's error shape")
+
+		u, _ := newServer(3, nil)
+		b := testBlock()
+
+		call := 0
+		u.catchupFunc = func(_ context.Context, _ *model.Block, _, _ string) error {
+			call++
+			if call == 1 {
+				return unboundTxInvalid() // the primary named its own subtrees
+			}
+			return nil // the alternative serves the honest body
+		}
+		u.catchupAlternatives.Set(*b.Hash(), []processBlockCatchup{{block: b, peerID: "altpeer", baseURL: "http://alt"}}, ttlcache.DefaultTTL)
+		u.processBlockNotify.Set(*b.Hash(), true, ttlcache.DefaultTTL)
+
+		u.processCatchupChItem(ctx, item(b))
+
+		require.Equal(t, 2, call, "the alternative catchupFunc must be called for this verdict")
+		require.Nil(t, u.processBlockNotify.Get(*b.Hash()), "guard cleared on alternative success")
+		require.Nil(t, u.blockCatchupAttempts.Get(*b.Hash()), "counter reset on alternative success")
+		require.Nil(t, u.catchupAlternatives.Get(*b.Hash()), "alternatives cleared on success")
+	})
+
+	t.Run("unbound invalid-transaction verdict failing everywhere counts toward the cap", func(t *testing.T) {
+		u, calls := newServer(3, unboundTxInvalid())
+		b := testBlock()
+		u.catchupAlternatives.Set(*b.Hash(), []processBlockCatchup{{block: b, peerID: "altpeer", baseURL: "http://alt"}}, ttlcache.DefaultTTL)
+		u.processBlockNotify.Set(*b.Hash(), true, ttlcache.DefaultTTL)
+
+		u.processCatchupChItem(ctx, item(b))
+
+		require.Equal(t, 2, *calls, "primary then the cached alternative: the walk runs")
+		it := u.blockCatchupAttempts.Get(*b.Hash())
+		require.NotNil(t, it, "a walked cycle that fails everywhere must count toward CatchupMaxAttemptsPerBlock")
+		require.Equal(t, 1, it.Value())
 		require.Nil(t, u.processBlockNotify.Get(*b.Hash()))
 	})
 
