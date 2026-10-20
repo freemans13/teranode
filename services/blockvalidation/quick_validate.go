@@ -1029,9 +1029,10 @@ func (u *BlockValidation) processBlockSubtreesPipeline(ctx context.Context, bloc
 //
 // Returns:
 //   - uint64: Existing BlockID if retry detected, 0 otherwise
-//   - *sync.WaitGroup: counts every write job THIS call queued to writeJobsChan; the caller must
-//     wait on it (context-aware, never bare — see tryQuickValidation) before trusting that a
-//     failed attempt's writes have all settled, since the shared write-worker pool outlives this
+//   - *subtreeWriteBarrier: counts every write job THIS call queued to writeJobsChan, and records
+//     whether any of them ended without landing (bitcoin-sv/teranode#4978); the caller must wait
+//     on it (context-aware, never bare — see awaitSubtreeWrites and tryQuickValidation) before
+//     trusting that the writes have all settled, since the shared write-worker pool outlives this
 //     one call (bitcoin-sv/teranode#4692)
 //   - map[chainhash.Hash]map[fileformat.FileType]struct{}: exactly which (hash, fileType) pairs
 //     this call itself freshly wrote, for removeCatchupSubtreeFiles to restrict deletion to

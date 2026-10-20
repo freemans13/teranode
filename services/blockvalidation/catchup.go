@@ -1386,11 +1386,12 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 }
 
 // drainWriteJobs receives every subtree write job left in ch and counts it down, so a caller blocked
-// in wg.Wait() for a job no worker will ever receive is released (bitcoin-sv/teranode#4692).
+// in wg.Wait() for a job no worker will ever receive is released (bitcoin-sv/teranode#4692). Each
+// drained job was never written, so its Unwritten flag is raised first (bitcoin-sv/teranode#4978).
 //
 // Only safe to call once the producing errgroup has settled, because it relies on the channel being
-// closed to terminate. Nil-safe on both axes: ch is nil when quick validation is disabled (no worker
-// pool, no channel), and job.Done is nil for a job constructed without a barrier.
+// closed to terminate. Nil-safe on every axis: ch is nil when quick validation is disabled (no worker
+// pool, no channel), and job.Done or job.Unwritten is nil for a job constructed without a barrier.
 func drainWriteJobs(ch <-chan *SubtreeWriteJob) {
 	if ch == nil {
 		return
@@ -2061,11 +2062,11 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 		// block (bitcoin-sv/teranode#4978). The failing write worker has already cancelled the
 		// shared catch-up context, so normal validation would only fail on that and bury the
 		// storage fault. The block is not stored, so the next catch-up run validates it again from
-		// scratch. No sweep, on either way the barrier can fail. When a write failed, the barrier
-		// had already waited for every job; when the context ended first, jobs may still be in
-		// flight and a delete could race them, as in the ctx.Done branches above. Leaving the files
-		// is harmless either way: the content is honest, every blob carries a finite DAH, and the
-		// next run rewrites it with AllowOverwrite.
+		// scratch. Do not sweep, whichever way the barrier failed. When a write failed and the
+		// barrier released, every job had been handled; when the context ended first, jobs may
+		// still be in flight and a delete could race them, as in the ctx.Done branches above.
+		// Leaving the files is harmless either way: the content is honest, every blob carries a
+		// finite DAH, and the next run rewrites it with AllowOverwrite.
 		//
 		// The block IS committed: AddBlock stored it with subtrees_set and mined_set, and the
 		// post-commit unlock still failed after its retries (bitcoin-sv/teranode#4987). The files
