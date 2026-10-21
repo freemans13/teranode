@@ -1811,19 +1811,20 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 		return errors.NewServiceError("[processBlockFound][%s] failed to check if parent block %s exists", hash.String(), block.Header.HashPrevBlock.String(), err)
 	}
 
-	// A legacy block on the unified route must never take the catch-up divert: legacy sync
-	// resolves its own orphans with a getblocks, and the divert returns nil, which legacy
-	// records as an accepted block with nothing stored. Legacy hands a block over only once its
-	// parent is in the chain, so a missing parent here is a local fault, re-delivered later.
-	//
-	// Judged on eligibility, not on the proven route: an UNPROVEN eligible block is still a
-	// legacy block whose parent legacy promised to have committed, so it is refused the same
-	// way rather than diverted to catch-up and reported as nil.
-	if !parentExists && baseURL == "legacy" && u.legacyUnifiedEligible(block, baseURL) {
-		return errors.NewServiceError("[processBlockFound][%s] legacy block on the unified route has no stored parent %s", hash.String(), block.Header.HashPrevBlock.String())
-	}
-
 	if !parentExists {
+		// A legacy block must never take the catch-up divert, on either route: legacy sync
+		// resolves its own orphans with a getblocks, and the divert returns nil, which legacy
+		// records as an accepted block with nothing stored (bitcoin-sv/teranode#4973). Legacy
+		// hands a block over only once its parent is in the chain, so a missing parent here is a
+		// local fault. A ServiceError is what legacy's park reads as retry-later
+		// (parkCommitFailure), so the block is kept and committed again once the parent lands.
+		//
+		// Not gated on legacyUnifiedEligible or the header proof: an above-checkpoint block, or an
+		// unproven one, is still a legacy block whose parent legacy promised to have committed.
+		if baseURL == "legacy" {
+			return errors.NewServiceError("[processBlockFound][%s] legacy block has no stored parent %s", hash.String(), block.Header.HashPrevBlock.String())
+		}
+
 		// add to catchup channel, which will block processing any new blocks until we have caught up
 		go func() {
 			u.logger.Debugf("[processBlockFound][%s] processBlockFound add to catchup channel", hash.String())
@@ -2004,9 +2005,7 @@ func (u *Server) legacyUnifiedRoute(block *model.Block, baseURL string, headerPr
 // unified route, and the shared eligibility gate holds (store capability +
 // hardcoded checkpoint boundary via model.OutpointOnlyEligible, never the
 // operator catchup override). It says nothing about which chain the block is on;
-// legacyUnifiedRoute adds that. The parent-missing guard in processBlockFound
-// reads this one on purpose, so an unproven legacy orphan is refused rather than
-// diverted to catch-up.
+// legacyUnifiedRoute adds that.
 func (u *Server) legacyUnifiedEligible(block *model.Block, baseURL string) bool {
 	if !u.settings.BlockValidation.LegacyUnifiedBelowCheckpoint {
 		return false
