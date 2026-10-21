@@ -22,6 +22,7 @@ import (
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/jarcoal/httpmock"
 	"github.com/jellydator/ttlcache/v3"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -32,10 +33,12 @@ const (
 )
 
 // gap054PanicChain wraps a real blockchain client and panics on the first call to the chosen
-// method (after signalling on `panicking`), then delegates normally.
+// method (after signalling on `panicking`), then delegates normally. With always set, it panics
+// on each call to that method.
 type gap054PanicChain struct {
 	blockchain.ClientI
 	onHeader   bool // true: panic in GetBlockHeader; false: panic in GetBlockExists
+	always     bool
 	calls      atomic.Int32
 	panicking  chan struct{}
 	panicValue string
@@ -46,8 +49,12 @@ func (c *gap054PanicChain) maybePanic(isHeaderCall bool) {
 		return
 	}
 
-	if c.calls.Add(1) == 1 {
+	n := c.calls.Add(1)
+	if n == 1 {
 		close(c.panicking)
+	}
+
+	if n == 1 || c.always {
 		panic(c.panicValue)
 	}
 }
@@ -302,6 +309,9 @@ func TestGapBV054_KafkaHandlerSurvivesPanic_Child(t *testing.T) {
 
 	handler := s.consumerMessageHandler(ctx)
 
+	initPrometheusMetrics()
+	panicsBefore := testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathKafka))
+
 	call := func() chan error {
 		ch := make(chan error, 1)
 		go func() { ch <- handler(&kafka.KafkaMessage{Value: msgBytes}) }()
@@ -313,6 +323,7 @@ func TestGapBV054_KafkaHandlerSurvivesPanic_Child(t *testing.T) {
 	case herr := <-call():
 		require.NoError(t, herr, "a panicking message must be committed, not redelivered")
 		require.Zero(t, reporter.reports.Load(), "a panic in this node must not be reported as a peer failure")
+		require.Equal(t, panicsBefore+1, testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathKafka)), "the recover must count the panic")
 	case <-time.After(10 * time.Second):
 		t.Fatal("the handler did not return for the panicking message")
 	}
@@ -341,6 +352,9 @@ func (c *gap054ReportPanicChain) ReportPeerFailure(context.Context, *chainhash.H
 // catchupGetBlockHeaders makes on the consumer goroutine. The recover in processCatchupChItem
 // must see catchup's deferred releaseCatchupLock run first: the catchup flag is clear, the
 // active catchup context is gone, the attempt is counted one time and the markers are cleared.
+// releaseCatchupLock must also record the cycle as a local failure, not as a success: the health
+// check reads lastCatchupResult false, catchupSuccesses does not change, and the dashboard
+// attempt has the error type local_panic, which no peer is charged for.
 func TestGapBV054_CatchupPanicInRealCatchupReleasesLock(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -355,6 +369,14 @@ func TestGapBV054_CatchupPanicInRealCatchupReleasesLock(t *testing.T) {
 	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
 	s.catchupAlternatives.Set(*block.Hash(), []processBlockCatchup{{block: block, peerID: "altpeer"}}, ttlcache.DefaultTTL)
 
+	// A success from an earlier cycle, so the test sees the value change to false.
+	s.catchupStatsMu.Lock()
+	s.lastCatchupResult = true
+	s.catchupStatsMu.Unlock()
+
+	successesBefore := s.catchupSuccesses.Load()
+	panicsBefore := testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathCatchup))
+
 	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: ""})
 
 	select {
@@ -367,6 +389,7 @@ func TestGapBV054_CatchupPanicInRealCatchupReleasesLock(t *testing.T) {
 
 	s.activeCatchupCtxMu.RLock()
 	active := s.activeCatchupCtx
+	previous := s.previousCatchupAttempt
 	s.activeCatchupCtxMu.RUnlock()
 	require.Nil(t, active, "the active catchup context must be cleared during the unwind")
 
@@ -376,6 +399,225 @@ func TestGapBV054_CatchupPanicInRealCatchupReleasesLock(t *testing.T) {
 	attempts := s.blockCatchupAttempts.Get(*block.Hash())
 	require.NotNil(t, attempts)
 	require.Equal(t, 1, attempts.Value())
+
+	s.catchupStatsMu.RLock()
+	lastResult := s.lastCatchupResult
+	s.catchupStatsMu.RUnlock()
+	require.False(t, lastResult, "a panicked catchup must not read as a success in the health check")
+	require.Equal(t, successesBefore, s.catchupSuccesses.Load(), "a panicked catchup must not count as a success")
+
+	require.NotNil(t, previous, "a panicked catchup must be recorded as a failed attempt")
+	require.Equal(t, "local_panic", previous.ErrorType, "a panic is local and must not be scored against the peer")
+
+	require.Equal(t, panicsBefore+1, testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathCatchup)))
+}
+
+// TestGapBV054_CatchupPanicBeforeLockCountsAttempt panics before any catchup takes the lock, while
+// blocksValidated still holds a positive count from an earlier cycle. The recover must count the
+// attempt, not read the stale count as progress and clear the counter.
+func TestGapBV054_CatchupPanicBeforeLockCountsAttempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	s.blocksValidated.Store(5)
+	s.blockCatchupAttempts.Set(*block.Hash(), 1, ttlcache.DefaultTTL)
+
+	s.catchupFunc = func(context.Context, *model.Block, string, string) error {
+		panic("injected panic before the catchup lock")
+	}
+
+	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: "peerA"})
+
+	attempts := s.blockCatchupAttempts.Get(*block.Hash())
+	require.NotNil(t, attempts, "a panic before the lock must not clear the attempt counter")
+	require.Equal(t, 2, attempts.Value(), "a panic before the lock must count toward the per-block catchup cap")
+}
+
+// gap054RunOnce runs runOncePerBlock in a goroutine and sends its error, or the recovered panic
+// value, on the returned channels.
+func gap054RunOnce(bv *BlockValidation, hash *chainhash.Hash, validate func(*ValidateBlockOptions) error) (chan error, chan any) {
+	errCh := make(chan error, 1)
+	panicCh := make(chan any, 1)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicCh <- r
+			}
+		}()
+
+		errCh <- bv.runOncePerBlock(hash, &ValidateBlockOptions{}, validate)
+	}()
+
+	return errCh, panicCh
+}
+
+// TestGapBV054_PanicInValidateReleasesWaiters panics inside the validate function of
+// runOncePerBlock while a second caller waits for the same hash. The panic must continue to the
+// first caller, the waiter must get an ERR_PROCESSING error, the entry must go after the grace
+// window, and a later validation of the hash must run again.
+func TestGapBV054_PanicInValidateReleasesWaiters(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, s.blockchainClient, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+	hash := block.Hash()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	_, firstPanic := gap054RunOnce(bv, hash, func(*ValidateBlockOptions) error {
+		close(started)
+		<-release
+		panic("injected panic in validate")
+	})
+
+	<-started
+
+	waiterErr, waiterPanic := gap054RunOnce(bv, hash, func(*ValidateBlockOptions) error {
+		return errors.NewProcessingError("the waiter must not run its own validation")
+	})
+
+	// The entry stays until the grace window after the release, so the waiter blocks on it.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	select {
+	case r := <-firstPanic:
+		require.Equal(t, "injected panic in validate", r, "the panic must continue to the first caller")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first caller did not panic")
+	}
+
+	select {
+	case err := <-waiterErr:
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrProcessing), "the waiter must get ERR_PROCESSING, got %v", err)
+		require.NotContains(t, err.Error(), "must not run", "the waiter must get the stored result, not run validate")
+	case r := <-waiterPanic:
+		t.Fatalf("the waiter panicked: %v", r)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiter for the same hash is wedged after the panic")
+	}
+
+	require.Eventually(t, func() bool {
+		_, ok := bv.blocksCurrentlyValidating.Get(*hash)
+		return !ok
+	}, 5*time.Second, 10*time.Millisecond, "the entry must go after the grace window")
+
+	var ran atomic.Bool
+
+	laterErr, _ := gap054RunOnce(bv, hash, func(*ValidateBlockOptions) error {
+		ran.Store(true)
+		return nil
+	})
+
+	select {
+	case err := <-laterErr:
+		require.NoError(t, err)
+		require.True(t, ran.Load(), "a later validation of the hash must run again")
+	case <-time.After(5 * time.Second):
+		t.Fatal("a later validation of the hash is wedged after the panic")
+	}
+}
+
+// TestGapBV054_PanicInValidateBlockDoesNotWedgeHash runs the real ValidateBlockWithOptions and
+// panics in its first blockchain lookup, which is inside the runOncePerBlock closure. After the
+// panic, a new validation of the same hash must complete and must reach the blockchain again.
+func TestGapBV054_PanicInValidateBlockDoesNotWedgeHash(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	chain := &gap054PanicChain{ClientI: s.blockchainClient, onHeader: false, panicking: make(chan struct{}), panicValue: "injected panic in ValidateBlock"}
+	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, chain, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+
+	require.PanicsWithValue(t, "injected panic in ValidateBlock", func() {
+		_ = bv.ValidateBlockWithOptions(ctx, block, "http://test-peer", nil)
+	})
+
+	require.Eventually(t, func() bool {
+		_, ok := bv.blocksCurrentlyValidating.Get(*block.Hash())
+		return !ok
+	}, 5*time.Second, 10*time.Millisecond, "the entry must go after the grace window")
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		_ = bv.ValidateBlockWithOptions(ctx, block, "http://test-peer", nil)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a validation of the hash after the panic is wedged")
+	}
+
+	require.GreaterOrEqual(t, chain.calls.Load(), int32(2), "the second validation must run, not get a stored result")
+}
+
+// TestGapBV054_WorkerPanicCapSuppressesRedelivery panics on each delivery of one block from one
+// peer, at the parent-header lookup that follows the download. After MaxCorruptAttemptsPerBlock
+// panics, processBlockFound must stop that peer's deliveries before the download, with an error
+// that does not requeue the block. A different peer must keep its own budget.
+func TestGapBV054_WorkerPanicCapSuppressesRedelivery(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+	s.settings.BlockValidation.MaxCorruptAttemptsPerBlock = 2
+
+	chain := &gap054PanicChain{ClientI: s.blockchainClient, onHeader: true, always: true, panicking: make(chan struct{}), panicValue: "injected panic on each delivery"}
+	s.blockchainClient = chain
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	httpmock.RegisterResponder("GET", "http://test-peer/block/"+block.Hash().String(),
+		httpmock.NewBytesResponder(200, blockBytes))
+
+	deliver := func(peerID string) error {
+		return s.processBlockWithPriorityRecovered(ctx, processBlockFound{hash: block.Hash(), baseURL: "http://test-peer", peerID: peerID})
+	}
+
+	panicsBefore := testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathWorker))
+
+	for i := 1; i <= 2; i++ {
+		err := deliver("peerA")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "see the PANIC log line", "delivery %d must panic", i)
+		require.Equal(t, int32(i), chain.calls.Load())
+	}
+
+	require.Equal(t, panicsBefore+2, testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathWorker)))
+
+	downloadsBefore := httpmock.GetTotalCallCount()
+
+	err = deliver("peerA")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrProcessing), "a capped delivery must be ERR_PROCESSING, got %v", err)
+	require.Contains(t, err.Error(), "recovered-panic cap reached")
+	require.False(t, errors.IsBlockCorrupt(err))
+	require.False(t, errors.IsNetworkError(err), "a capped delivery must not requeue as a fetch failure: %v", err)
+	require.False(t, errors.IsMaliciousResponseError(err), "a capped delivery must not requeue as a fetch failure: %v", err)
+	require.Equal(t, int32(2), chain.calls.Load(), "a capped delivery must stop before the stage that panics")
+	require.Equal(t, downloadsBefore, httpmock.GetTotalCallCount(), "a capped delivery must stop before the download")
+	require.Equal(t, panicsBefore+2, testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathWorker)))
+
+	err = deliver("peerB")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "see the PANIC log line", "a different peer must keep its own budget")
+	require.Equal(t, int32(3), chain.calls.Load())
 }
 
 // TestGapBV054_CatchupPanicAfterCountDoesNotCountTwice makes the cycle fail with ErrExternal, which
@@ -417,7 +659,12 @@ func TestGapBV054_WorkerPanicErrorIsNotAFetchFailure(t *testing.T) {
 	chain := &gap054PanicChain{ClientI: s.blockchainClient, onHeader: false, panicking: make(chan struct{}), panicValue: "http connection timeout: corrupt malformed response"}
 	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, chain, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
 
+	initPrometheusMetrics()
+	panicsBefore := testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathWorker))
+
 	err := s.processBlockWithPriorityRecovered(ctx, processBlockFound{hash: block.Hash(), baseURL: "http://test-peer", peerID: "peerA"})
+
+	require.Equal(t, panicsBefore+1, testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathWorker)), "the recover must count the panic")
 
 	select {
 	case <-chain.panicking:

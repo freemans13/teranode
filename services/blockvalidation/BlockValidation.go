@@ -1626,7 +1626,7 @@ const revalidateFromScratchDelay = 2 * validationResultGrace
 // unreachable.
 const prepareBlockAssemblyTimeout = 2 * time.Second
 
-func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) error {
+func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) (err error) {
 	result := &validationResult{
 		done: make(chan struct{}),
 	}
@@ -1642,22 +1642,34 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 		return existingResult.err
 	}
 
-	// We're first - run validation
-	err := validate(opts)
+	// Store and broadcast the result, and remove the entry after the grace window. This is a
+	// defer so that it also runs when validate panics (BV-STARTUP-007). Without it the entry has
+	// no TTL and its done channel never closes, so each later validation of this hash waits for
+	// ever above. On a panic the waiters get an ERR_PROCESSING error, and the panic continues to
+	// the caller, which logs it with the stack.
+	defer func() {
+		r := recover()
+		if r != nil {
+			err = errors.NewProcessingError("[ValidateBlock][%s] panic during validation", blockHash.String())
+		}
 
-	// Store and broadcast result
-	result.mu.Lock()
-	result.err = err
-	result.mu.Unlock()
-	close(result.done)
+		result.mu.Lock()
+		result.err = err
+		result.mu.Unlock()
+		close(result.done)
 
-	// Cleanup after delay
-	go func() {
-		time.Sleep(validationResultGrace)
-		u.blocksCurrentlyValidating.Delete(*blockHash)
+		go func() {
+			time.Sleep(validationResultGrace)
+			u.blocksCurrentlyValidating.Delete(*blockHash)
+		}()
+
+		if r != nil {
+			panic(r)
+		}
 	}()
 
-	return err
+	// We're first - run validation
+	return validate(opts)
 }
 
 // ValidateBlock performs comprehensive validation of a Bitcoin block.

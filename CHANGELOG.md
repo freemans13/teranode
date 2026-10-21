@@ -88,6 +88,20 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A panic in block validation no longer stops the node.** The priority-queue block
+  workers, the catchup consumer and the Kafka block message handler now recover a panic.
+  Before, the process stopped and restarted, so an alert on a crash loop found it. That alert
+  will not fire now. Monitor the new counter `teranode_blockvalidation_recovered_panics_total`
+  (label `path`: `worker`, `catchup` or `kafka`) and the `PANIC` log line, which has the block
+  hash and the stack. Three more changes come with it:
+  - A Kafka block message that panics is now committed, not redelivered. A peer must announce
+    the block again before the node tries it again.
+  - A catchup that panics counts as a failed attempt with the error type `local_panic`. It is
+    not charged to the peer, and it counts toward `blockvalidation_catchup_max_attempts_per_block`.
+  - After `blockvalidation_max_corrupt_attempts_per_block` (default 3) worker panics for one
+    block from one peer, the node ignores that peer's deliveries of the block for
+    `blockvalidation_corrupt_attempt_cooldown` (default 10 minutes). (#2012)
+
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
   `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and

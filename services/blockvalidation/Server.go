@@ -210,7 +210,7 @@ type Server struct {
 	// ttlCachesStarted records that Init reached the point where it starts the
 	// ttlcache eviction loops (processBlockNotify, catchupAlternatives,
 	// blockCatchupAttempts, peerMaliciousCache, blockCorruptAttempts,
-	// blockPolicyDeclineAttempts, announcedBlockRateLimits), so Stop only calls
+	// blockPolicyDeclineAttempts, blockPanicAttempts, announcedBlockRateLimits), so Stop only calls
 	// ttlcache.Stop - a blocking send to that loop - when a receiver exists.
 	ttlCachesStarted atomic.Bool
 
@@ -243,6 +243,17 @@ type Server struct {
 	// budgets that happen to be sized the same. Same key type, fixed window and no-touch-on-hit
 	// semantics as the corrupt cap, for the same anti-wedge reason.
 	blockPolicyDeclineAttempts *ttlcache.Cache[blockAttemptKey, int]
+
+	// blockPanicAttempts counts the panics that the priority worker recovered for each (block hash,
+	// serving peerID) (BV-STARTUP-007). After MaxCorruptAttemptsPerBlock panics in one
+	// CorruptAttemptCooldown window, processBlockFound drops that peer's next deliveries of the hash
+	// before the download, so a block that panics every time does not log a full stack on each
+	// announcement. It is a third independent budget that uses the corrupt cap's configured values,
+	// as blockPolicyDeclineAttempts does, so operators get no new knob. It is keyed on the pair for
+	// the reason blockAttemptKey gives: a panic can come from one peer's bytes, and a per-hash
+	// count would let that peer stop an honest delivery of the same hash. An empty peerID is not
+	// capped (fail-open), as for the corrupt cap.
+	blockPanicAttempts *ttlcache.Cache[blockAttemptKey, int]
 
 	// announcedBlockRateLimits counts, per announcing peer, the 429s its /block/:hash answered
 	// within a fixed window, so a 429 is free only up to an allowance. See
@@ -493,6 +504,11 @@ func New(
 			ttlcache.WithCapacity[blockAttemptKey, int](corruptAttemptsMaxTracked),
 		),
 		blockPolicyDeclineAttempts: ttlcache.New[blockAttemptKey, int](
+			ttlcache.WithTTL[blockAttemptKey, int](corruptAttemptCooldown(tSettings)),
+			ttlcache.WithDisableTouchOnHit[blockAttemptKey, int](),
+			ttlcache.WithCapacity[blockAttemptKey, int](corruptAttemptsMaxTracked),
+		),
+		blockPanicAttempts: ttlcache.New[blockAttemptKey, int](
 			ttlcache.WithTTL[blockAttemptKey, int](corruptAttemptCooldown(tSettings)),
 			ttlcache.WithDisableTouchOnHit[blockAttemptKey, int](),
 			ttlcache.WithCapacity[blockAttemptKey, int](corruptAttemptsMaxTracked),
@@ -809,6 +825,10 @@ func (u *Server) Init(ctx context.Context) (err error) {
 		go u.blockPolicyDeclineAttempts.Start()
 	}
 
+	if u.blockPanicAttempts != nil {
+		go u.blockPanicAttempts.Start()
+	}
+
 	if u.announcedBlockRateLimits != nil {
 		go u.announcedBlockRateLimits.Start()
 	}
@@ -926,6 +946,7 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 			// failure: a panic is a bug in this node, not evidence against the announcing peer.
 			defer func() {
 				if r := recover(); r != nil {
+					countRecoveredPanic(recoveredPanicPathKafka)
 					u.logger.Errorf("[consumerMessageHandler] PANIC handling block %s, marking Kafka message as completed: %v stack=%q", kafkaMsg.Hash, r, debug.Stack())
 					errCh <- nil
 				}
@@ -1322,6 +1343,10 @@ func (u *Server) Stop(ctx context.Context) error {
 
 		if u.blockPolicyDeclineAttempts != nil {
 			u.blockPolicyDeclineAttempts.Stop()
+		}
+
+		if u.blockPanicAttempts != nil {
+			u.blockPanicAttempts.Stop()
 		}
 
 		if u.announcedBlockRateLimits != nil {
@@ -1781,6 +1806,17 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	if u.policyDeclineAttemptsExhausted(hash, peerID) {
 		u.logger.Warnf("[processBlockFound][%s] local policy decline cap reached for peer %s; suppressing this re-fetch until the cooldown window expires", hash.String(), peerID)
 		return errors.NewBlockPolicyDeclinedError("[processBlockFound][%s] block declined on local policy (excessiveblocksize); re-fetch suppressed until the cooldown window expires (block not stored, not invalid)", hash.String())
+	}
+
+	// Per-(hash, peerID) recovered-panic cap (BV-STARTUP-007). The priority worker recovers a panic
+	// and records it in blockPanicAttempts. After the cap, this peer's deliveries of the hash stop
+	// here until the window lapses, so a block that panics every time is not downloaded and
+	// re-panicked on each announcement. The error is ERR_PROCESSING. Its text has no word that
+	// IsNetworkError or IsMaliciousResponseError matches, and it has no peerID, so the worker does
+	// not requeue the block, no peer gets a strike, and the hash is not marked invalid.
+	if u.panicAttemptsExhausted(hash, peerID) {
+		u.logger.Warnf("[processBlockFound][%s] recovered-panic cap reached for peer %s; suppressing this delivery until the cooldown window expires", hash.String(), peerID)
+		return errors.NewProcessingError("[processBlockFound][%s] recovered-panic cap reached for this peer; delivery suppressed until the cooldown window expires (block not stored)", hash.String())
 	}
 
 	var block *model.Block
@@ -2262,10 +2298,14 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 // the text, and a panic value with such a word would requeue the block as a fetch failure.
 // Only this worker's goroutine is covered. A panic in a goroutine that the processing starts
 // (an errgroup worker, for example) is not recovered here.
+// Each panic counts toward the per-(hash, peerID) cap in blockPanicAttempts, which processBlockFound
+// enforces, so a block that panics every time stops after MaxCorruptAttemptsPerBlock panics.
 func (u *Server) processBlockWithPriorityRecovered(ctx context.Context, blockFound processBlockFound) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			u.logger.Errorf("[BlockProcessing] PANIC processing block %s: %v stack=%q", blockFound.hash.String(), r, debug.Stack())
+			countRecoveredPanic(recoveredPanicPathWorker)
+			attempts := u.recordPanicAttempt(blockFound.hash, blockFound.peerID)
+			u.logger.Errorf("[BlockProcessing] PANIC processing block %s from peer %s (panic %d for this peer in the cooldown window): %v stack=%q", blockFound.hash.String(), blockFound.peerID, attempts, r, debug.Stack())
 			err = errors.NewProcessingError("panic processing block %s, see the PANIC log line", blockFound.hash.String())
 		}
 	}()
@@ -2301,8 +2341,15 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 	// a goroutine that catchup starts (its errgroup workers) is not recovered here.
 	attemptRecorded := false
 
+	// acquireCatchupLock is the only writer of catchupAttempts and the only place that resets
+	// blocksValidated, and this goroutine runs each catchup. If the counter did not change, no
+	// catchup in this cycle took the lock, and blocksValidated still holds an earlier cycle's count.
+	lockCountBefore := u.catchupAttempts.Load()
+
 	defer func() {
 		if r := recover(); r != nil {
+			countRecoveredPanic(recoveredPanicPathCatchup)
+
 			if c.block == nil {
 				u.logger.Errorf("[catchup] PANIC processing catchup item with nil block from peer %s: %v stack=%q", c.peerID, r, debug.Stack())
 				return
@@ -2311,7 +2358,14 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 			blockHash := c.block.Hash()
 
 			attempts := 0
-			if !attemptRecorded {
+
+			switch {
+			case attemptRecorded:
+			case u.catchupAttempts.Load() == lockCountBefore:
+				// The panic came before a catchup took the lock. blocksValidated is from an
+				// earlier cycle and says nothing about this one, so count the attempt always.
+				attempts = u.recordCatchupAttempt(blockHash)
+			default:
 				attempts = u.recordCatchupAttemptUnlessProgress(blockHash)
 			}
 
@@ -2973,6 +3027,66 @@ func (u *Server) policyDeclineAttemptsExhausted(blockHash *chainhash.Hash, peerI
 	item := u.blockPolicyDeclineAttempts.Get(blockAttemptKey{hash: *blockHash, peerID: peerID})
 
 	return item != nil && item.Value() >= maxAttempts
+}
+
+// recordPanicAttempt increments and returns the recovered-panic count for a (block hash, serving
+// peerID) in its fixed cooldown window (BV-STARTUP-007). Same window rules as recordCorruptAttempt.
+// Nil-safe, and it records nothing for an empty peerID (fail-open).
+func (u *Server) recordPanicAttempt(blockHash *chainhash.Hash, peerID string) int {
+	if u.blockPanicAttempts == nil || blockHash == nil || peerID == "" {
+		return 0
+	}
+
+	key := blockAttemptKey{hash: *blockHash, peerID: peerID}
+
+	if item := u.blockPanicAttempts.Get(key); item != nil {
+		remaining := time.Until(item.ExpiresAt())
+		if remaining <= 0 {
+			remaining = ttlcache.DefaultTTL
+		}
+
+		n := item.Value() + 1
+		u.blockPanicAttempts.Set(key, n, remaining)
+
+		return n
+	}
+
+	u.blockPanicAttempts.Set(key, 1, ttlcache.DefaultTTL)
+
+	return 1
+}
+
+// panicAttemptsExhausted reports whether a (block hash, serving peerID) reached the recovered-panic
+// cap and is in its cooldown window (BV-STARTUP-007). It uses MaxCorruptAttemptsPerBlock as the
+// cap. A cap of 0 or less, a nil settings or cache, or an empty peerID reports false (fail-open).
+func (u *Server) panicAttemptsExhausted(blockHash *chainhash.Hash, peerID string) bool {
+	if u.settings == nil || u.blockPanicAttempts == nil || peerID == "" {
+		return false
+	}
+
+	maxAttempts := u.settings.BlockValidation.MaxCorruptAttemptsPerBlock
+	if maxAttempts <= 0 {
+		return false
+	}
+
+	item := u.blockPanicAttempts.Get(blockAttemptKey{hash: *blockHash, peerID: peerID})
+
+	return item != nil && item.Value() >= maxAttempts
+}
+
+// Path label values for prometheusRecoveredPanics.
+const (
+	recoveredPanicPathWorker  = "worker"
+	recoveredPanicPathCatchup = "catchup"
+	recoveredPanicPathKafka   = "kafka"
+)
+
+// countRecoveredPanic increments prometheusRecoveredPanics for one path. It runs inside the
+// recovers, so it must not panic: a Server built without initPrometheusMetrics has a nil vector.
+func countRecoveredPanic(path string) {
+	if prometheusRecoveredPanics != nil {
+		prometheusRecoveredPanics.WithLabelValues(path).Inc()
+	}
 }
 
 // addBlockToPriorityQueue adds a block to the priority queue with appropriate classification
