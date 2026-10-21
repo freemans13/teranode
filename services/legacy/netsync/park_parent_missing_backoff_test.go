@@ -139,10 +139,10 @@ func TestParkedBlockFailed_StampsAMissingParent(t *testing.T) {
 	})
 
 	// Block validation refuses a legacy block whose parent it does not hold with a
-	// plain ServiceError (processBlockFound, bitcoin-sv/teranode#4973), and
-	// HandleConvertedBlock's own parent lookup does the same. parkCommitFailure reads
-	// both as retryLater, which on its own carries no stamp, so the drain offered the
-	// block again on the very next turn while its parent was still missing.
+	// plain ServiceError (processBlockFound, bitcoin-sv/teranode#4973).
+	// parkCommitFailure reads it as retryLater, which on its own carries no stamp, so
+	// the drain offered the block again on the very next turn while its parent was
+	// still missing.
 	refusal := func() error {
 		server := errors.NewServiceError("[processBlockFound][hash] legacy block has no stored parent parent-hash")
 

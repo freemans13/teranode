@@ -339,15 +339,16 @@ func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 			entry.parentMissingAt = time.Now()
 		}
 
-		// A missing parent also arrives as a plain ServiceError, from two places:
-		// HandleConvertedBlock's own parent lookup, and block validation refusing a
-		// legacy block whose parent it does not hold (processBlockFound,
-		// bitcoin-sv/teranode#4973). Both read as retryLater, which carries no
-		// stamp, so the drain would offer the block again on the very next turn.
-		// errors.Is cannot pick these out of the other ServiceErrors (it matches on
-		// the code), so the condition is re-derived from the chain, as the proof
-		// stamp below does. A lookup that fails stamps nothing: a busy store must
-		// not delay a block whose parent may be perfectly fine.
+		// A missing parent also arrives as a plain ServiceError when block
+		// validation refuses a legacy block whose parent it does not hold
+		// (processBlockFound, bitcoin-sv/teranode#4973). HandleConvertedBlock's own
+		// parent lookup does not need this: it wraps the store's ErrBlockNotFound,
+		// so it reads as parentGone above. The refusal reads as retryLater, which
+		// carries no stamp, so the drain would offer the block again on the very
+		// next turn. errors.Is cannot pick it out of the other ServiceErrors (it
+		// matches on the code), so the condition is re-derived from the chain, as
+		// the proof stamp below does. A lookup that fails stamps nothing: a busy
+		// store must not delay a block whose parent may be perfectly fine.
 		if d.reason == parkDispositionRetryLater.reason && sm.parentAbsentFromChain(entry) {
 			entry.parentMissingAt = time.Now()
 		}
