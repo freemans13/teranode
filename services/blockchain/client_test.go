@@ -4397,8 +4397,8 @@ func TestClientSetBlockMinedSet(t *testing.T) {
 
 		err := c.SetBlockMinedSet(ctx, &blockHash, true)
 		require.Error(t, err)
-		assert.True(t, errors.Is(err, errors.ErrStateError), "expected ErrStateError, got %v", err)
-		assert.True(t, c.client.(*mockBlockClient).lastSetBlockMinedSetReq.ExpectInvalid, "expectInvalid must reach the request")
+		require.True(t, errors.Is(err, errors.ErrStateError), "expected ErrStateError, got %v", err)
+		require.True(t, c.client.(*mockBlockClient).lastSetBlockMinedSetReq.ExpectInvalid, "expectInvalid must reach the request")
 	})
 }
 
