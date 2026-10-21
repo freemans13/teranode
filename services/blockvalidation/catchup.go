@@ -486,11 +486,14 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 
 		// TODO: all of these should be using error types, and not checking the strings (!)
 		switch {
-		case ctx.panicked:
+		case ctx.panicked || isConcurrentValidationPanic(*err):
 			// catchup() recovered a panic and set *err only to stop this function from recording
-			// a success (BV-STARTUP-007). A panic is a bug in this node, not evidence against the
-			// peer, so no case below may score it. It must come first: the ERR_PROCESSING error
-			// would otherwise fall through to unknown_error with isPeerError left true.
+			// a success (BV-STARTUP-007). Or a validation in this catchup waited in
+			// runOncePerBlock on a validation of the same block that panicked on another
+			// goroutine, and got that panic's error. A panic is a bug in this node, not evidence
+			// against the peer, so no case below may score it. It must come first: the
+			// ERR_PROCESSING error would otherwise fall through to unknown_error with isPeerError
+			// left true.
 			errorType = "local_panic"
 			isPeerError = false
 		case errors.Is(*err, errors.ErrStorageError):

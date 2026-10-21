@@ -1645,12 +1645,12 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 	// Store and broadcast the result, and remove the entry after the grace window. This is a
 	// defer so that it also runs when validate panics (BV-STARTUP-007). Without it the entry has
 	// no TTL and its done channel never closes, so each later validation of this hash waits for
-	// ever above. On a panic the waiters get an ERR_PROCESSING error, and the panic continues to
-	// the caller, which logs it with the stack.
+	// ever above. On a panic the waiters get the error from newConcurrentValidationPanicError, and
+	// the panic continues to the caller, which logs it with the stack.
 	defer func() {
 		r := recover()
 		if r != nil {
-			err = errors.NewProcessingError("[ValidateBlock][%s] panic during validation", blockHash.String())
+			err = newConcurrentValidationPanicError(blockHash)
 		}
 
 		result.mu.Lock()
@@ -1670,6 +1670,45 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 
 	// We're first - run validation
 	return validate(opts)
+}
+
+// concurrentValidationPanicked marks the error that runOncePerBlock gives to the waiters of a
+// validation that panicked on another goroutine (BV-STARTUP-007). The waiter has no panic of its
+// own, so the caller cannot tell from its own state that the failure is a bug in this node. A
+// catchup waiter would score it against the primary peer.
+//
+// It is a Go type and not an error code or an errors-package sentinel. teranode's errors.Is
+// matches on the code, so a sentinel made with NewProcessingError matches each ERR_PROCESSING
+// error. NewProcessingError turns a trailing cause that is not an *Error into a plain message, so the
+// marker goes into the chain with SetWrappedErr. isConcurrentValidationPanic finds it by type
+// with errors.As, which does no text matching. Over gRPC the marker is lost, and the error is a
+// plain ERR_PROCESSING error, as before.
+type concurrentValidationPanicked struct{}
+
+func (*concurrentValidationPanicked) Error() string {
+	return "a concurrent validation of this block panicked"
+}
+
+// newConcurrentValidationPanicError returns the ERR_PROCESSING error that runOncePerBlock stores
+// for the waiters when validate panics. Its text has no word that IsNetworkError,
+// IsMaliciousResponseError or IsContextError matches.
+func newConcurrentValidationPanicError(blockHash *chainhash.Hash) error {
+	err := errors.NewProcessingError("[ValidateBlock][%s] panic during a concurrent validation of this block, see the PANIC log line", blockHash.String())
+	err.SetWrappedErr(&concurrentValidationPanicked{})
+
+	return err
+}
+
+// isConcurrentValidationPanic reports whether err came from a waiter in runOncePerBlock whose
+// validation panicked on another goroutine. Such an error is a local fault, never the peer's.
+func isConcurrentValidationPanic(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var marker *concurrentValidationPanicked
+
+	return errors.As(err, &marker)
 }
 
 // ValidateBlock performs comprehensive validation of a Bitcoin block.

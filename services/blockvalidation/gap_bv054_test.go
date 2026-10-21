@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/blockvalidation_api"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -496,6 +497,7 @@ func TestGapBV054_PanicInValidateReleasesWaiters(t *testing.T) {
 	case err := <-waiterErr:
 		require.Error(t, err)
 		require.True(t, errors.Is(err, errors.ErrProcessing), "the waiter must get ERR_PROCESSING, got %v", err)
+		require.True(t, isConcurrentValidationPanic(err), "the waiter's error must carry the concurrent-panic marker, got %v", err)
 		require.NotContains(t, err.Error(), "must not run", "the waiter must get the stored result, not run validate")
 	case r := <-waiterPanic:
 		t.Fatalf("the waiter panicked: %v", r)
@@ -763,4 +765,103 @@ func TestGapBV054_RetryPanicChargesAlternative(t *testing.T) {
 
 	require.Equal(t, int32(2), chain.calls.Load())
 	require.True(t, s.panicAttemptsExhausted(hash, "altPeer"), "the retry's alternative must be capped after the limit")
+}
+
+// TestGapBV054_ConcurrentPanicErrorIsDistinct checks that isConcurrentValidationPanic matches the
+// waiter error from runOncePerBlock, also when another error wraps it, and matches no other
+// ERR_PROCESSING error. teranode's errors.Is matches on the code, so it cannot tell them apart.
+// An error with the same text but no marker must not match either: the check is by type, not text.
+func TestGapBV054_ConcurrentPanicErrorIsDistinct(t *testing.T) {
+	hash := chainhash.Hash{1}
+
+	waiterErr := newConcurrentValidationPanicError(&hash)
+
+	require.True(t, errors.Is(waiterErr, errors.ErrProcessing), "the waiter error must still be ERR_PROCESSING")
+	require.True(t, isConcurrentValidationPanic(waiterErr))
+	require.True(t, isConcurrentValidationPanic(errors.NewServiceError("failed block validation", waiterErr)), "a wrapped waiter error must still match")
+	require.True(t, isLocalCatchupFault(waiterErr), "the waiter error must be a local catchup fault")
+
+	require.False(t, errors.IsNetworkError(waiterErr), "%v", waiterErr)
+	require.False(t, errors.IsMaliciousResponseError(waiterErr), "%v", waiterErr)
+	require.False(t, errors.IsBlockCorrupt(waiterErr), "%v", waiterErr)
+	require.False(t, errors.IsContextError(waiterErr), "%v", waiterErr)
+
+	ordinary := errors.NewProcessingError("terminal generic peer error")
+	require.True(t, errors.Is(ordinary, waiterErr), "setup: teranode errors.Is matches any two ERR_PROCESSING errors")
+	require.False(t, isConcurrentValidationPanic(ordinary), "an ordinary ERR_PROCESSING error must not match")
+	require.False(t, isLocalCatchupFault(ordinary), "an ordinary ERR_PROCESSING error must stay a peer error")
+
+	sameText := errors.NewProcessingError("%s", waiterErr.Error())
+	require.False(t, isConcurrentValidationPanic(sameText), "an error with the same text but no marker must not match")
+
+	require.False(t, isConcurrentValidationPanic(nil))
+}
+
+// TestGapBV054_ConcurrentPanicWaiterIsLocalInReleaseCatchupLock ends a catchup with the waiter
+// error from runOncePerBlock while the catchup itself did not panic. releaseCatchupLock must score
+// it local_panic and charge no peer.
+func TestGapBV054_ConcurrentPanicWaiterIsLocalInReleaseCatchupLock(t *testing.T) {
+	server, _, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	recorder := newPeerFailureRecordingP2PClient()
+	server.p2pClient = recorder
+
+	header := testhelpers.CreateTestHeaders(t, 1)[0]
+	catchupCtx := &CatchupContext{
+		blockUpTo: &model.Block{Header: header, Height: 1000},
+		baseURL:   "http://honest-primary:8000",
+		peerID:    "honest-primary",
+		startTime: time.Now(),
+	}
+	require.NoError(t, server.acquireCatchupLock(catchupCtx))
+
+	relErr := newConcurrentValidationPanicError(header.Hash())
+	server.releaseCatchupLock(catchupCtx, &relErr)
+
+	require.False(t, catchupCtx.panicked, "setup: the catchup itself did not panic")
+
+	require.NotNil(t, server.previousCatchupAttempt)
+	require.Equal(t, "local_panic", server.previousCatchupAttempt.ErrorType)
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+
+	require.Equal(t, 0, recorder.failuresByPeer["honest-primary"], "the primary must not be charged for a panic in this node")
+	require.Equal(t, 0, recorder.maliciousByPeer["honest-primary"])
+	require.NotContains(t, recorder.errorMsgsByPeer, "honest-primary", "no catchup error may be stored against the primary")
+}
+
+// TestGapBV054_ConcurrentPanicWaiterIsNotReportedByCatchupConsumer makes catchup return the waiter
+// error from runOncePerBlock. processCatchupChItem must treat it as local: no ReportPeerFailure,
+// no walk of the alternatives, one counted attempt and cleared markers.
+func TestGapBV054_ConcurrentPanicWaiterIsNotReportedByCatchupConsumer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	reports := &gap054PeerReportCounter{ClientI: s.blockchainClient}
+	s.blockchainClient = reports
+
+	var catchups atomic.Int32
+
+	s.catchupFunc = func(context.Context, *model.Block, string, string) error {
+		catchups.Add(1)
+		return newConcurrentValidationPanicError(block.Hash())
+	}
+
+	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
+	s.catchupAlternatives.Set(*block.Hash(), []processBlockCatchup{{block: block, baseURL: "http://alt-peer", peerID: "altPeer"}}, ttlcache.DefaultTTL)
+
+	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: "peerA"})
+
+	require.Equal(t, int32(0), reports.reports.Load(), "no peer failure may be reported for a panic in this node")
+	require.Equal(t, int32(1), catchups.Load(), "the alternatives must not be walked for a local fault")
+
+	attempts := s.blockCatchupAttempts.Get(*block.Hash())
+	require.NotNil(t, attempts)
+	require.Equal(t, 1, attempts.Value())
+	require.Nil(t, s.processBlockNotify.Get(*block.Hash()))
+	require.Nil(t, s.catchupAlternatives.Get(*block.Hash()))
 }
