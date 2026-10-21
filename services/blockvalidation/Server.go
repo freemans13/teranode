@@ -949,7 +949,9 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 	}
 }
 
-func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) error {
+// blockHandler queues a block announced on Kafka for validation. It stops when ctx
+// ends, so a caller that has returned knows the handler has too.
+func (u *Server) blockHandler(ctx context.Context, kafkaMsg *kafkamessage.KafkaBlockTopicMessage) error {
 	u.logger.Debugf("[blockHandler] Starting to process block %s from peer %s", kafkaMsg.Hash, kafkaMsg.GetPeerId())
 
 	hash, err := chainhash.NewHashFromStr(kafkaMsg.Hash)
@@ -972,7 +974,7 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 		return errors.NewProcessingError("[BlockFound] invalid URL scheme '%s' - expected http or https", baseURL.Scheme)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Don't skip blocks from malicious peers entirely - we still want to add them to the queue
@@ -1008,11 +1010,15 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 
 	u.logger.Debugf("[blockHandler] Adding block %s to blockFoundCh", hash.String())
 
-	u.blockFoundCh <- processBlockFound{
+	select {
+	case u.blockFoundCh <- processBlockFound{
 		hash:    hash,
 		baseURL: baseURL.String(),
 		peerID:  kafkaMsg.GetPeerId(),
 		errCh:   nil, // Don't block Kafka consumer waiting for validation
+	}:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	prometheusBlockValidationBlockFoundCh.Set(float64(len(u.blockFoundCh)))
 
