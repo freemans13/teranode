@@ -274,6 +274,16 @@ func (u *Server) reportCatchupFailureForError(ctx context.Context, peerID string
 		return
 	}
 
+	if isConcurrentValidationPanic(err) {
+		// A validation in this catchup waited in runOncePerBlock on a validation of the same block
+		// that panicked on another goroutine (BV-STARTUP-007). The panic is a bug in this node, so
+		// no peer may be charged for it. releaseCatchupLock already scored the cycle local_panic.
+		// The exemption is here, and not only in processCatchupChItem's isLocalCatchupFault branch,
+		// for the reason the policy-decline exemption above gives: tryAlternativePeersForCatchup and
+		// the cached-alternatives loop charge each alternative through this helper.
+		return
+	}
+
 	if catchupFailureAlreadyReported(err) {
 		// The layer where the failure occurred (e.g. the header-fetch stage)
 		// already recorded it; reporting again would let CatchupFailures exceed

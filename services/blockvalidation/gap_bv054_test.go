@@ -912,3 +912,43 @@ func TestGapBV054_ConcurrentPanicWaiterIsNotReportedByCatchupConsumer(t *testing
 	require.Nil(t, s.processBlockNotify.Get(*block.Hash()))
 	require.Nil(t, s.catchupAlternatives.Get(*block.Hash()))
 }
+
+// TestGapBV054_ConcurrentPanicWaiterIsNotChargedToCachedAlternative fails the primary with an
+// ordinary peer error, so processCatchupChItem walks the cached alternatives. The alternative's
+// catchup returns the waiter error from runOncePerBlock. reportCatchupFailureForError must not
+// charge the alternative for a panic in this node. The primary's charge proves the charging line
+// runs, so a zero for the alternative is the exemption and not a dead path.
+func TestGapBV054_ConcurrentPanicWaiterIsNotChargedToCachedAlternative(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	reputation := &subtreeAttributionP2PClient{}
+	s.p2pClient = reputation
+
+	reports := &gap054PeerReportCounter{ClientI: s.blockchainClient}
+	s.blockchainClient = reports
+
+	var altCatchups atomic.Int32
+
+	s.catchupFunc = func(_ context.Context, _ *model.Block, peerID, _ string) error {
+		if peerID == "altPeer" {
+			altCatchups.Add(1)
+			return newConcurrentValidationPanicError(block.Hash())
+		}
+
+		return errors.NewProcessingError("terminal generic peer error")
+	}
+
+	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
+	s.catchupAlternatives.Set(*block.Hash(), []processBlockCatchup{{block: block, baseURL: "http://alt-peer", peerID: "altPeer"}}, ttlcache.DefaultTTL)
+
+	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: "peerA"})
+
+	require.Equal(t, int32(1), altCatchups.Load(), "setup: the cached alternative must be tried")
+	require.Equal(t, 1, reputation.charged("peerA"), "setup: the primary's ordinary peer error must be charged")
+	require.Equal(t, 0, reputation.charged("altPeer"), "the alternative must not be charged for a panic in this node")
+	require.Equal(t, 0, reputation.totalMaliciousReports())
+	require.Equal(t, int32(1), reports.reports.Load(), "only the primary's failure may be reported")
+}
