@@ -58,23 +58,40 @@ func blockMsg(hash, peerID string) *kafkamessage.KafkaBlockTopicMessage {
 	return &kafkamessage.KafkaBlockTopicMessage{Hash: hash, URL: "http://" + peerID, PeerId: peerID}
 }
 
+// mustClaim claims a retry for msg and fails the test unless a new slot was claimed.
+func mustClaim(t *testing.T, r *blockMessageRetries, msg *kafkamessage.KafkaBlockTopicMessage) *pendingBlockRetry {
+	t.Helper()
+
+	owner, outcome := r.claim(msg)
+	require.Equal(t, retryClaimed, outcome, "claim of %s from %s", msg.Hash, msg.GetPeerId())
+	require.NotNil(t, owner)
+
+	return owner
+}
+
+// claimOutcome claims a retry for msg and returns only the outcome.
+func claimOutcome(r *blockMessageRetries, msg *kafkamessage.KafkaBlockTopicMessage) blockRetryClaim {
+	_, outcome := r.claim(msg)
+	return outcome
+}
+
 // TestBlockMessageRetries_Claim pins the dedupe and the global cap on pending retries.
 func TestBlockMessageRetries_Claim(t *testing.T) {
 	var r blockMessageRetries
 
-	require.True(t, r.claim(blockMsg("a", "p")))
-	require.False(t, r.claim(blockMsg("a", "p")), "a hash already pending must not be queued twice")
+	owner := mustClaim(t, &r, blockMsg("a", "p"))
+	require.Equal(t, retryAlreadyPending, claimOutcome(&r, blockMsg("a", "p")), "a hash already pending must not be queued twice")
 
-	r.release("a")
-	require.True(t, r.claim(blockMsg("a", "p")), "a released hash can be queued again")
+	r.release("a", owner)
+	mustClaim(t, &r, blockMsg("a", "p")) // a released hash can be queued again
 
 	// Spread over peers so the per-peer cap does not trip first.
 	for i := 1; i < blockMessageRetryMaxPending; i++ {
 		h := chainhash.HashH([]byte{byte(i), byte(i >> 8)}).String()
-		require.True(t, r.claim(blockMsg(h, string(rune('A'+i%40)))))
+		mustClaim(t, &r, blockMsg(h, string(rune('A'+i%40))))
 	}
 
-	require.False(t, r.claim(blockMsg("overflow", "fresh-peer")), "the queue must refuse once full")
+	require.Equal(t, retryQueueFull, claimOutcome(&r, blockMsg("overflow", "fresh-peer")), "the queue must refuse once full")
 }
 
 // TestBlockMessageRetries_PerPeerCap pins that one peer cannot hold more than its share
@@ -82,15 +99,16 @@ func TestBlockMessageRetries_Claim(t *testing.T) {
 func TestBlockMessageRetries_PerPeerCap(t *testing.T) {
 	var r blockMessageRetries
 
+	owners := make([]*pendingBlockRetry, 0, blockMessageRetryMaxPendingPerPeer)
 	for i := 0; i < blockMessageRetryMaxPendingPerPeer; i++ {
-		require.True(t, r.claim(blockMsg(chainhash.HashH([]byte{byte(i)}).String(), "greedy")))
+		owners = append(owners, mustClaim(t, &r, blockMsg(chainhash.HashH([]byte{byte(i)}).String(), "greedy")))
 	}
 
-	require.False(t, r.claim(blockMsg("one-more", "greedy")), "a peer at its cap must be refused")
-	require.True(t, r.claim(blockMsg("other", "honest")), "another peer must still get a slot")
+	require.Equal(t, retryPeerFull, claimOutcome(&r, blockMsg("one-more", "greedy")), "a peer at its cap must be refused")
+	mustClaim(t, &r, blockMsg("other", "honest")) // another peer must still get a slot
 
-	r.release(chainhash.HashH([]byte{0}).String())
-	require.True(t, r.claim(blockMsg("one-more", "greedy")), "a release must free the peer's share")
+	r.release(chainhash.HashH([]byte{0}).String(), owners[0])
+	mustClaim(t, &r, blockMsg("one-more", "greedy")) // a release must free the peer's share
 }
 
 // TestBlockMessageRetries_KeepsOtherSources pins that later announcers of a pending
@@ -98,19 +116,21 @@ func TestBlockMessageRetries_PerPeerCap(t *testing.T) {
 func TestBlockMessageRetries_KeepsOtherSources(t *testing.T) {
 	var r blockMessageRetries
 
-	require.True(t, r.claim(blockMsg("h", "first")))
-	require.False(t, r.claim(blockMsg("h", "second")))
-	require.False(t, r.claim(blockMsg("h", "second")), "the same peer is kept once")
-	require.False(t, r.claim(blockMsg("h", "first")), "the claiming peer is not its own source")
+	owner := mustClaim(t, &r, blockMsg("h", "first"))
+	require.Equal(t, retryKeptAsSource, claimOutcome(&r, blockMsg("h", "second")))
+	require.Equal(t, retryAlreadyPending, claimOutcome(&r, blockMsg("h", "second")), "the same peer is kept once")
+	require.Equal(t, retryAlreadyPending, claimOutcome(&r, blockMsg("h", "first")), "the claiming peer is not its own source")
 
 	for i := 0; i < blockMessageRetryMaxSources; i++ {
 		r.claim(blockMsg("h", string(rune('a'+i))))
 	}
 
+	require.Equal(t, retryAlreadyPending, claimOutcome(&r, blockMsg("h", "late")), "the sources are full")
+
 	var got []string
 
 	for {
-		src, ok := r.nextSource("h")
+		src, ok := r.nextSource("h", owner)
 		if !ok {
 			break
 		}
@@ -121,7 +141,52 @@ func TestBlockMessageRetries_KeepsOtherSources(t *testing.T) {
 	require.Len(t, got, blockMessageRetryMaxSources)
 	require.Equal(t, "second", got[0])
 	require.False(t, r.isPending("h"), "handing back the last source must release the slot")
-	require.True(t, r.claim(blockMsg("h", "first")), "the peer's share must be freed too")
+	mustClaim(t, &r, blockMsg("h", "first")) // the peer's share must be freed too
+}
+
+// TestBlockMessageRetries_StaleReleaseKeepsReplacement pins slot ownership. The hand-off
+// of a retry frees the slot when its sources run out. A new announcement can then claim
+// the same hash before the deferred release of the first retry runs. That late release
+// must not remove the replacement entry, its peer share, or its kept sources.
+func TestBlockMessageRetries_StaleReleaseKeepsReplacement(t *testing.T) {
+	var r blockMessageRetries
+
+	first := mustClaim(t, &r, blockMsg("h", "peerA"))
+
+	// The hand-off drains the sources and frees the slot.
+	_, ok := r.nextSource("h", first)
+	require.False(t, ok)
+	require.False(t, r.isPending("h"))
+
+	// A new recoverable announcement claims the same hash and keeps another source.
+	replacement := mustClaim(t, &r, blockMsg("h", "peerB"))
+	require.Equal(t, retryKeptAsSource, claimOutcome(&r, blockMsg("h", "peerC")))
+
+	// The deferred release of the first retry runs late, then the first retry's
+	// hand-off loop asks for a source once more.
+	r.release("h", first)
+	_, ok = r.nextSource("h", first)
+	require.False(t, ok, "the first retry must not take the sources of the replacement")
+
+	require.True(t, r.isPending("h"), "a late release must not remove the replacement")
+	require.Equal(t, retryAlreadyPending, claimOutcome(&r, blockMsg("h", "peerC")), "a second concurrent retry for the hash must be refused")
+
+	r.mu.Lock()
+	peerBShare := r.perPeer["peerB"]
+	r.mu.Unlock()
+	require.Equal(t, 1, peerBShare, "a late release must not clear the share of the replacement's peer")
+
+	src, ok := r.nextSource("h", replacement)
+	require.True(t, ok, "the replacement must keep its sources")
+	require.Equal(t, "peerC", src.GetPeerId())
+
+	_, ok = r.nextSource("h", replacement)
+	require.False(t, ok)
+	require.False(t, r.isPending("h"), "the replacement frees the slot when its sources run out")
+
+	r.mu.Lock()
+	require.Empty(t, r.perPeer, "all peer shares are freed")
+	r.mu.Unlock()
 }
 
 // TestRetryBlockMessage_StopsOnShutdown pins that a pending retry exits and frees its
@@ -227,9 +292,9 @@ func TestRetryBlockMessage_RecoversFromPanic(t *testing.T) {
 	chain.AssertExpectations(t)
 }
 
-// TestRunBlockHandler_PanicBecomesServiceError pins that a panic in blockHandler, which
-// runs in its own goroutine, is returned as a recoverable service error. Without the
-// guard the panic kills the test binary.
+// TestRunBlockHandler_PanicBecomesServiceError pins that a panic in blockHandler is
+// returned as a recoverable service error. Without the guard the panic kills the test
+// binary.
 func TestRunBlockHandler_PanicBecomesServiceError(t *testing.T) {
 	// A zero BlockValidation has a nil exists cache, so GetBlockExists panics.
 	server := &Server{logger: ulogger.TestLogger{}, blockValidation: &BlockValidation{}}

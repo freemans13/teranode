@@ -69,10 +69,28 @@ func (r *blockMessageRetries) delays() (initial, maxDelay time.Duration) {
 	return initial, maxDelay
 }
 
-// claim reserves a retry for msg's block. If one is already pending, msg is kept as
-// another source for it and claim returns false. It also returns false if the queue,
-// or the announcing peer's share of it, is full.
-func (r *blockMessageRetries) claim(msg *kafkamessage.KafkaBlockTopicMessage) bool {
+// blockRetryClaim is the outcome of a claim.
+type blockRetryClaim int
+
+const (
+	// retryClaimed: the caller owns a new retry slot for the block.
+	retryClaimed blockRetryClaim = iota
+	// retryKeptAsSource: a retry is already pending, and the message is kept as another source.
+	retryKeptAsSource
+	// retryAlreadyPending: a retry is already pending, and the message is not kept. Its
+	// peer is already a source or the claimant, or the sources are full.
+	retryAlreadyPending
+	// retryQueueFull: the queue is full, and the message is dropped.
+	retryQueueFull
+	// retryPeerFull: the peer's share of the queue is full, and the message is dropped.
+	retryPeerFull
+)
+
+// claim reserves a retry for msg's block. With retryClaimed it returns the new entry,
+// which the caller then owns: only that entry can be released by it. A slot freed and
+// claimed again for the same hash gets a different entry, so a late release by the
+// first owner does not touch the second.
+func (r *blockMessageRetries) claim(msg *kafkamessage.KafkaBlockTopicMessage) (*pendingBlockRetry, blockRetryClaim) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -86,19 +104,25 @@ func (r *blockMessageRetries) claim(msg *kafkamessage.KafkaBlockTopicMessage) bo
 	if p, ok := r.pending[msg.Hash]; ok {
 		if peerID != p.peerID && len(p.sources) < blockMessageRetryMaxSources && !hasSourcePeer(p.sources, peerID) {
 			p.sources = append(p.sources, msg)
+			return nil, retryKeptAsSource
 		}
 
-		return false
+		return nil, retryAlreadyPending
 	}
 
-	if len(r.pending) >= blockMessageRetryMaxPending || r.perPeer[peerID] >= blockMessageRetryMaxPendingPerPeer {
-		return false
+	if len(r.pending) >= blockMessageRetryMaxPending {
+		return nil, retryQueueFull
 	}
 
-	r.pending[msg.Hash] = &pendingBlockRetry{peerID: peerID}
+	if r.perPeer[peerID] >= blockMessageRetryMaxPendingPerPeer {
+		return nil, retryPeerFull
+	}
+
+	owner := &pendingBlockRetry{peerID: peerID}
+	r.pending[msg.Hash] = owner
 	r.perPeer[peerID]++
 
-	return true
+	return owner, retryClaimed
 }
 
 func hasSourcePeer(sources []*kafkamessage.KafkaBlockTopicMessage, peerID string) bool {
@@ -111,14 +135,15 @@ func hasSourcePeer(sources []*kafkamessage.KafkaBlockTopicMessage, peerID string
 	return false
 }
 
-// nextSource hands back the next kept source for hash. With none left it releases the
-// slot under the same lock, so a source added meanwhile is never lost.
-func (r *blockMessageRetries) nextSource(hash string) (*kafkamessage.KafkaBlockTopicMessage, bool) {
+// nextSource hands back the next kept source of owner's entry for hash. With none left
+// it releases the slot under the same lock, so a source added meanwhile is never lost.
+// If owner no longer holds the slot, it returns false and changes nothing.
+func (r *blockMessageRetries) nextSource(hash string, owner *pendingBlockRetry) (*kafkamessage.KafkaBlockTopicMessage, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	p, ok := r.pending[hash]
-	if !ok {
+	if !ok || p != owner {
 		return nil, false
 	}
 
@@ -133,13 +158,13 @@ func (r *blockMessageRetries) nextSource(hash string) (*kafkamessage.KafkaBlockT
 	return src, true
 }
 
-// release frees the slot for hash and drops any kept sources. It is safe to call
-// more than once.
-func (r *blockMessageRetries) release(hash string) {
+// release frees the slot for hash if owner still holds it, and drops any kept sources.
+// It is safe to call more than once, and after the slot has gone to a new owner.
+func (r *blockMessageRetries) release(hash string, owner *pendingBlockRetry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if p, ok := r.pending[hash]; ok {
+	if p, ok := r.pending[hash]; ok && p == owner {
 		r.releaseLocked(hash, p)
 	}
 }
@@ -189,16 +214,27 @@ func (u *Server) reportBlockMessagePeerFailure(ctx context.Context, kafkaMsg *ka
 // scheduleBlockMessageRetry retries a block message in the background after a
 // recoverable failure.
 func (u *Server) scheduleBlockMessageRetry(ctx context.Context, kafkaMsg *kafkamessage.KafkaBlockTopicMessage) {
-	if !u.blockMessageRetries.claim(kafkaMsg) {
-		u.logger.Warnf("[blockMessageRetry][%s] retry already pending, or retry queue full (%d) or full for peer %s (%d), not queueing", kafkaMsg.Hash, blockMessageRetryMaxPending, kafkaMsg.GetPeerId(), blockMessageRetryMaxPendingPerPeer)
-		return
-	}
+	owner, outcome := u.blockMessageRetries.claim(kafkaMsg)
 
-	go u.retryBlockMessage(ctx, kafkaMsg)
+	switch outcome {
+	case retryClaimed:
+		go u.retryBlockMessage(ctx, kafkaMsg, owner)
+	case retryKeptAsSource:
+		u.logger.Debugf("[blockMessageRetry][%s] retry already pending, keeping peer %s as another source", kafkaMsg.Hash, kafkaMsg.GetPeerId())
+	case retryAlreadyPending:
+		u.logger.Debugf("[blockMessageRetry][%s] retry already pending, peer %s already known or sources full (%d)", kafkaMsg.Hash, kafkaMsg.GetPeerId(), blockMessageRetryMaxSources)
+	case retryQueueFull:
+		u.logger.Warnf("[blockMessageRetry][%s] retry queue full (%d), dropping announcement from peer %s", kafkaMsg.Hash, blockMessageRetryMaxPending, kafkaMsg.GetPeerId())
+	case retryPeerFull:
+		u.logger.Warnf("[blockMessageRetry][%s] retry queue full for peer %s (%d), dropping announcement", kafkaMsg.Hash, kafkaMsg.GetPeerId(), blockMessageRetryMaxPendingPerPeer)
+	}
 }
 
-func (u *Server) retryBlockMessage(ctx context.Context, kafkaMsg *kafkamessage.KafkaBlockTopicMessage) {
-	defer u.blockMessageRetries.release(kafkaMsg.Hash)
+// retryBlockMessage runs the retry that owner holds the slot for. It releases only
+// owner's entry: once the hand-off has freed the slot, a new announcement can claim
+// the same hash, and this retry must not release that one.
+func (u *Server) retryBlockMessage(ctx context.Context, kafkaMsg *kafkamessage.KafkaBlockTopicMessage, owner *pendingBlockRetry) {
+	defer u.blockMessageRetries.release(kafkaMsg.Hash, owner)
 
 	// This runs outside the Kafka consumer's panic barrier, so it needs its own.
 	defer func() {
@@ -226,7 +262,7 @@ func (u *Server) retryBlockMessage(ctx context.Context, kafkaMsg *kafkamessage.K
 
 		if err == nil {
 			u.logger.Infof("[blockMessageRetry][%s] succeeded on retry %d", kafkaMsg.Hash, attempt)
-			u.handOffBlockMessageSources(ctx, kafkaMsg.Hash)
+			u.handOffBlockMessageSources(ctx, kafkaMsg.Hash, owner)
 
 			return
 		}
@@ -235,7 +271,7 @@ func (u *Server) retryBlockMessage(ctx context.Context, kafkaMsg *kafkamessage.K
 			u.logger.Errorf("[blockMessageRetry][%s] unrecoverable error on retry %d: %v", kafkaMsg.Hash, attempt, err)
 			u.reportBlockMessagePeerFailure(ctx, kafkaMsg, err)
 			// The fault was this announcer's, so the others still get their turn.
-			u.handOffBlockMessageSources(ctx, kafkaMsg.Hash)
+			u.handOffBlockMessageSources(ctx, kafkaMsg.Hash, owner)
 
 			return
 		}
@@ -252,9 +288,9 @@ func (u *Server) retryBlockMessage(ctx context.Context, kafkaMsg *kafkamessage.K
 // as the first attempt would have, so they reach the priority queue as alternative
 // sources. A local fault on one is logged and that source dropped: the block itself has
 // already been handled.
-func (u *Server) handOffBlockMessageSources(ctx context.Context, hash string) {
+func (u *Server) handOffBlockMessageSources(ctx context.Context, hash string, owner *pendingBlockRetry) {
 	for ctx.Err() == nil {
-		src, ok := u.blockMessageRetries.nextSource(hash)
+		src, ok := u.blockMessageRetries.nextSource(hash, owner)
 		if !ok {
 			return
 		}
