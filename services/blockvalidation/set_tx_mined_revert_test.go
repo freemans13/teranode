@@ -211,4 +211,23 @@ func TestSetTxMinedStatus_RevertFailureLeavesMinedSetFalse(t *testing.T) {
 	require.False(t, blockMeta.MinedSet,
 		"GAP-BV-057: the revert's SetMinedMulti failed (setTxMinedStatus returned err=%v) yet mined_set was set, so the sweep will never retry and T keeps a stale tag", revertErr)
 	require.Error(t, revertErr, "GAP-BV-057: the revert failure must surface")
+
+	// The retry runs against a healthy UTXO store but a subtree store that cannot
+	// be read. If the reload's failure were dropped, the revert would go ahead
+	// without the subtree, find nothing to unset, and set mined_set with T still
+	// tagged. It must return the error and leave mined_set false instead.
+	readErr := errors.NewStorageError("injected subtree store failure during revert")
+	bv.utxoStore = realUtxoStore
+	bv.subtreeStore = &failingGetStore{Store: subtreeStore, err: readErr}
+
+	reloadErr := bv.setTxMinedStatus(ctx, block.Hash(), true)
+	require.ErrorIs(t, reloadErr, readErr, "GAP-BV-057: a subtree read failure during the revert must surface")
+
+	_, blockMeta, err = blockchainClient.GetBlockHeader(ctx, block.Hash())
+	require.NoError(t, err)
+	require.False(t, blockMeta.MinedSet, "GAP-BV-057: the revert could not read the block's subtree yet mined_set was set")
+
+	stillTagged, err := realUtxoStore.Get(ctx, txT.TxIDChainHash())
+	require.NoError(t, err)
+	require.Contains(t, stillTagged.BlockIDs, blockMeta.ID, "precondition for the next sweep: T still carries the tag the revert owes")
 }
