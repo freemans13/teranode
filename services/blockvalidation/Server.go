@@ -1043,14 +1043,36 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 // The error it sends to a WaitToComplete caller has no panic value in its text: callers read
 // errors with substring classifiers such as IsNetworkError and IsMaliciousResponseError, which
 // match words such as "http" or "timeout". The panic value is in the log line.
+//
+// A WaitToComplete caller gets exactly one answer. Its errCh is unbuffered and BlockFound reads it
+// one time, with no timeout. The processing below can answer it and then panic, so a second send
+// from the recover would block this worker for ever. So the processing answers a relay with room
+// for one answer, and the deferred function below sends the caller one value: the processing's
+// answer if it gave one, or else the panic error. A path that returns with no answer and no panic
+// leaves the caller waiting, as before.
 func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf processBlockFound) {
+	caller := bf.errCh
+	if caller != nil {
+		bf.errCh = make(chan error, 1)
+	}
+
 	defer func() {
-		if r := recover(); r != nil {
+		r := recover()
+		if r != nil {
 			countRecoveredPanic(recoveredPanicPathBlockFound)
 			u.logger.Errorf("[Init] PANIC in processBlockFoundChannel for block %s from peer %s: %v stack=%q", bf.hash.String(), bf.peerID, r, debug.Stack())
+		}
 
-			if bf.errCh != nil {
-				bf.errCh <- errors.NewProcessingError("panic processing block %s, see the PANIC log line", bf.hash.String())
+		if caller == nil {
+			return
+		}
+
+		select {
+		case answer := <-bf.errCh:
+			caller <- answer
+		default:
+			if r != nil {
+				caller <- errors.NewProcessingError("panic processing block %s, see the PANIC log line", bf.hash.String())
 			}
 		}
 	}()
@@ -2310,7 +2332,8 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 // processBlockWithPriorityRecovered runs processBlockWithPriority and turns a panic into an
 // ERR_PROCESSING error, so one bad block cannot kill the worker or the process (BV-STARTUP-007).
 // It never answers blockFound.errCh: queueFetchedBlock already answered it when the block was
-// queued, and a WaitToComplete errCh is unbuffered, so a second send would block the worker forever.
+// queued. That channel is the one-answer relay of processBlockFoundChItem, which passes only the
+// first answer to the caller, so a second answer reaches no one and can block the worker for ever.
 // The panic value goes to the log only, not into the error text: the worker reads its error with
 // IsNetworkError and IsMaliciousResponseError, which match words such as "http" or "timeout" in
 // the text, and a panic value with such a word would requeue the block as a fetch failure.

@@ -788,7 +788,12 @@ func TestGapBV054_BlockFoundChPanicIsCountedAndAnswersCaller(t *testing.T) {
 
 	errCh := make(chan error)
 
-	go s.processBlockFoundChItem(ctx, 0, processBlockFound{hash: block.Hash(), baseURL: "http://test-peer", peerID: "peerA", errCh: errCh})
+	done := make(chan struct{})
+
+	go func() {
+		s.processBlockFoundChItem(ctx, 0, processBlockFound{hash: block.Hash(), baseURL: "http://test-peer", peerID: "peerA", errCh: errCh})
+		close(done)
+	}()
 
 	var err error
 
@@ -797,6 +802,8 @@ func TestGapBV054_BlockFoundChPanicIsCountedAndAnswersCaller(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the WaitToComplete caller got no answer after the panic")
 	}
+
+	gap054RequireAnsweredOnce(t, errCh, done)
 
 	select {
 	case <-chain.panicking:
@@ -812,6 +819,86 @@ func TestGapBV054_BlockFoundChPanicIsCountedAndAnswersCaller(t *testing.T) {
 	require.False(t, errors.IsBlockCorrupt(err))
 	require.False(t, errors.IsNetworkError(err), "%v", err)
 	require.False(t, errors.IsMaliciousResponseError(err), "%v", err)
+}
+
+// gap054RequireAnsweredOnce checks, after the caller took one answer from errCh, that the
+// blockFoundCh worker returned and sent no second answer. A second send on the unbuffered errCh
+// would block the worker, so done would never close.
+func gap054RequireAnsweredOnce(t *testing.T, errCh chan error, done chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blockFoundCh worker did not return after it answered the caller: a second send on the unbuffered errCh blocks it for ever")
+	}
+
+	select {
+	case extra := <-errCh:
+		t.Fatalf("the caller got a second answer: %v", extra)
+	default:
+	}
+}
+
+// gap054ExistsChain wraps a blockchain client and reports each block as already stored.
+type gap054ExistsChain struct {
+	blockchain.ClientI
+}
+
+func (c *gap054ExistsChain) GetBlockExists(context.Context, *chainhash.Hash) (bool, error) {
+	return true, nil
+}
+
+// gap054PanicLogger wraps a logger and panics on a Debugf call whose format holds match.
+type gap054PanicLogger struct {
+	ulogger.Logger
+	match string
+}
+
+func (l *gap054PanicLogger) Debugf(format string, args ...interface{}) {
+	if strings.Contains(format, l.match) {
+		panic("injected panic after the caller was answered")
+	}
+
+	l.Logger.Debugf(format, args...)
+}
+
+// TestGapBV054_BlockFoundChPanicAfterAnswerDoesNotBlockWorker answers a WaitToComplete caller and
+// then panics on the same blockFoundCh worker. processBlockFoundChannel answers nil for a block
+// that is already stored, and the panic comes after it returns. The caller must get that one nil
+// answer and no panic error, and the worker must return, so the pool does not lose a worker.
+func TestGapBV054_BlockFoundChPanicAfterAnswerDoesNotBlockWorker(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, &gap054ExistsChain{ClientI: s.blockchainClient}, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+	s.logger = &gap054PanicLogger{Logger: ulogger.TestLogger{}, match: "processBlockFoundChannel completed successfully"}
+
+	panicsBefore := testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathBlockFound))
+
+	for i := 1; i <= 2; i++ {
+		errCh := make(chan error)
+		done := make(chan struct{})
+
+		go func() {
+			s.processBlockFoundChItem(ctx, 0, processBlockFound{hash: block.Hash(), baseURL: "http://test-peer", peerID: "peerA", errCh: errCh})
+			close(done)
+		}()
+
+		select {
+		case err := <-errCh:
+			require.NoError(t, err, "item %d: the caller must get the answer the processing gave, not the panic error", i)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("item %d: the WaitToComplete caller got no answer", i)
+		}
+
+		gap054RequireAnsweredOnce(t, errCh, done)
+		require.Equal(t, panicsBefore+float64(i), testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathBlockFound)), "item %d: the panic after the answer must be recovered and counted", i)
+	}
 }
 
 // TestGapBV054_ConcurrentPanicErrorIsDistinct checks that isConcurrentValidationPanic matches the
