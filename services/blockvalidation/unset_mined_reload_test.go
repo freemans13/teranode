@@ -89,6 +89,7 @@ func TestReloadSubtreesForInvalidBlock_IsRaceFreeAgainstConcurrentRelease(t *tes
 		defer wg.Done()
 
 		for i := 0; i < 50; i++ {
+			// assert, not require: require's FailNow must run on the test goroutine.
 			assert.NoError(t, u.reloadSubtreesForInvalidBlock(ctx, block))
 		}
 	}()
@@ -106,14 +107,20 @@ func TestReloadSubtreesForInvalidBlock_IsRaceFreeAgainstConcurrentRelease(t *tes
 }
 
 // failingGetStore fails every Get with err, standing in for a blob backend
-// that cannot be reached.
+// that cannot be reached. When onlyType is set, only Gets of that file type
+// fail with err and every other Get falls through to the wrapped store.
 type failingGetStore struct {
 	blob.Store
 
-	err error
+	err      error
+	onlyType fileformat.FileType
 }
 
-func (s *failingGetStore) Get(context.Context, []byte, fileformat.FileType, ...options.FileOption) ([]byte, error) {
+func (s *failingGetStore) Get(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) ([]byte, error) {
+	if s.onlyType != "" && fileType != s.onlyType {
+		return s.Store.Get(ctx, key, fileType, opts...)
+	}
+
 	return nil, s.err
 }
 
@@ -157,6 +164,17 @@ func TestReloadSubtreesForInvalidBlock_FailsOnReadErrorSkipsMissing(t *testing.T
 	t.Run("read failure is returned", func(t *testing.T) {
 		readErr := errors.NewStorageError("subtree store unreachable")
 		u := &BlockValidation{logger: ulogger.TestLogger{}, subtreeStore: &failingGetStore{Store: blobmemory.New(), err: readErr}}
+
+		err := u.reloadSubtreesForInvalidBlock(ctx, block)
+		require.Error(t, err)
+		require.ErrorIs(t, err, readErr)
+	})
+	t.Run("read failure on the subtree-to-check fallback is returned", func(t *testing.T) {
+		// The subtree file is absent, so the reload falls back to the
+		// subtree-to-check file, and that read fails with a non-not-found error.
+		readErr := errors.NewStorageError("subtree-to-check read failed")
+		store := &failingGetStore{Store: blobmemory.New(), err: readErr, onlyType: fileformat.FileTypeSubtreeToCheck}
+		u := &BlockValidation{logger: ulogger.TestLogger{}, subtreeStore: store}
 
 		err := u.reloadSubtreesForInvalidBlock(ctx, block)
 		require.Error(t, err)
