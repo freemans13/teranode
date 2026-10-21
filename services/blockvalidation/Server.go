@@ -2298,19 +2298,42 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 // the text, and a panic value with such a word would requeue the block as a fetch failure.
 // Only this worker's goroutine is covered. A panic in a goroutine that the processing starts
 // (an errgroup worker, for example) is not recovered here.
-// Each panic counts toward the per-(hash, peerID) cap in blockPanicAttempts, which processBlockFound
-// enforces, so a block that panics every time stops after MaxCorruptAttemptsPerBlock panics.
+//
+// A panic inside a processBlockFound call is recovered one level down, in
+// processBlockFoundRecovered, which knows the peer that served that attempt and counts the panic
+// toward its cap. This recover catches only a panic outside those calls. No peer served anything
+// there, so it counts toward no peer's cap.
 func (u *Server) processBlockWithPriorityRecovered(ctx context.Context, blockFound processBlockFound) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			countRecoveredPanic(recoveredPanicPathWorker)
-			attempts := u.recordPanicAttempt(blockFound.hash, blockFound.peerID)
-			u.logger.Errorf("[BlockProcessing] PANIC processing block %s from peer %s (panic %d for this peer in the cooldown window): %v stack=%q", blockFound.hash.String(), blockFound.peerID, attempts, r, debug.Stack())
+			u.logger.Errorf("[BlockProcessing] PANIC processing block %s outside a delivery attempt: %v stack=%q", blockFound.hash.String(), r, debug.Stack())
 			err = errors.NewProcessingError("panic processing block %s, see the PANIC log line", blockFound.hash.String())
 		}
 	}()
 
 	return u.processBlockWithPriority(ctx, blockFound)
+}
+
+// processBlockFoundRecovered runs processBlockFound for one source and turns a panic into an
+// ERR_PROCESSING error (BV-STARTUP-007). It counts the panic for (hash, peerID), the peer that
+// served this attempt. That is the same key that the cap gate in processBlockFound reads, so the
+// peer whose delivery panics is the one that gets capped. processBlockWithPriority changes the
+// source on its retry path and in its alternatives loop, so a recover above it charged the queue
+// entry's peer instead. The error text has no panic value, for the reason that
+// processBlockWithPriorityRecovered gives.
+func (u *Server) processBlockFoundRecovered(ctx context.Context, hash *chainhash.Hash, peerID, baseURL string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			countRecoveredPanic(recoveredPanicPathWorker)
+			attempts := u.recordPanicAttempt(hash, peerID)
+			u.logger.Errorf("[BlockProcessing] PANIC processing block %s from peer %s (panic %d for this peer in the cooldown window): %v stack=%q", hash.String(), peerID, attempts, r, debug.Stack())
+			err = errors.NewProcessingError("panic processing block %s, see the PANIC log line", hash.String())
+		}
+	}()
+
+	// The block-found queue never carries a header proof: only legacy netsync holds one.
+	return u.processBlockFound(ctx, hash, peerID, baseURL, false)
 }
 
 // logCatchupFSMRefusal selects severity only; the caller uses typed StateError
@@ -3272,9 +3295,9 @@ func (u *Server) processBlockWithPriority(ctx context.Context, blockFound proces
 		}
 	}
 
-	// Try to process with the primary source
-	// The block-found queue never carries a header proof: only legacy netsync holds one.
-	err := u.processBlockFound(ctx, blockFound.hash, blockFound.peerID, blockFound.baseURL, false)
+	// Try to process with the primary source. Each attempt recovers its own panic, so a panic
+	// counts toward the cap of the peer that served that attempt (BV-STARTUP-007).
+	err := u.processBlockFoundRecovered(ctx, blockFound.hash, blockFound.peerID, blockFound.baseURL)
 
 	// A corrupt body (bitcoin-sv/teranode#4692) is NOT a fetch failure: the peer served bytes that
 	// failed a body-integrity check. Do not walk alternative sources here (that loop is for
@@ -3300,7 +3323,7 @@ func (u *Server) processBlockWithPriority(ctx context.Context, blockFound proces
 			u.logger.Infof("[processBlockWithPriority] Trying alternative source for block %s from %s (peer: %s)", blockFound.hash.String(), alternative.baseURL, alternative.peerID)
 
 			// Try with alternative source
-			altErr := u.processBlockFound(ctx, alternative.hash, alternative.peerID, alternative.baseURL, false)
+			altErr := u.processBlockFoundRecovered(ctx, alternative.hash, alternative.peerID, alternative.baseURL)
 			if altErr == nil {
 				// Success with alternative source
 				return nil

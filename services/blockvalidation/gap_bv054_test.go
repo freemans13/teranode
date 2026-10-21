@@ -678,3 +678,89 @@ func TestGapBV054_WorkerPanicErrorIsNotAFetchFailure(t *testing.T) {
 	require.False(t, errors.IsNetworkError(err), "a recovered panic must not read as a network error: %v", err)
 	require.False(t, errors.IsMaliciousResponseError(err), "a recovered panic must not read as a malicious response: %v", err)
 }
+
+// gap054AltHarness sets up a block whose parent-header lookup panics on each call, a primary peer
+// whose download fails with a network error, and an alternative peer that serves the block. The
+// cap is 2 panics per (hash, peerID).
+func gap054AltHarness(ctx context.Context, t *testing.T) (*Server, *model.Block, *gap054PanicChain, string) {
+	t.Helper()
+
+	initPrometheusMetrics()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+	s.settings.BlockValidation.MaxCorruptAttemptsPerBlock = 2
+
+	chain := &gap054PanicChain{ClientI: s.blockchainClient, onHeader: true, always: true, panicking: make(chan struct{}), panicValue: "injected panic from the alternative's block"}
+	s.blockchainClient = chain
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	t.Cleanup(httpmock.DeactivateAndReset)
+
+	httpmock.RegisterResponder("GET", "http://primary-peer/block/"+block.Hash().String(),
+		httpmock.NewErrorResponder(errors.NewNetworkError("network error")))
+	httpmock.RegisterResponder("GET", "http://alt-peer/block/"+block.Hash().String(),
+		httpmock.NewBytesResponder(200, blockBytes))
+
+	return s, block, chain, "GET http://primary-peer/block/" + block.Hash().String()
+}
+
+// TestGapBV054_AlternativePanicChargesAlternative has a primary whose download fails with a network
+// error and an alternative whose block panics. processBlockWithPriority walks to the alternative.
+// The panic must count for the alternative, which is capped after the limit. The primary must keep
+// its budget and still reach its download.
+func TestGapBV054_AlternativePanicChargesAlternative(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, block, chain, primaryKey := gap054AltHarness(ctx, t)
+	hash := block.Hash()
+
+	primary := processBlockFound{hash: hash, baseURL: "http://primary-peer", peerID: "primaryPeer"}
+	alternative := processBlockFound{hash: hash, baseURL: "http://alt-peer", peerID: "altPeer"}
+
+	// A newer queue entry for the hash. The alternative sources hang off it.
+	s.blockPriorityQueue.Add(processBlockFound{hash: hash, baseURL: "http://other-peer", peerID: "otherPeer"}, PriorityChainExtending, block.Height)
+
+	for i := 1; i <= 3; i++ {
+		s.blockPriorityQueue.Add(alternative, PriorityChainExtending, block.Height)
+
+		primaryCallsBefore := httpmock.GetCallCountInfo()[primaryKey]
+
+		err := s.processBlockWithPriorityRecovered(ctx, primary)
+		require.Error(t, err)
+		require.True(t, errors.IsNetworkError(err), "round %d: the primary's fetch error must come back, got %v", i, err)
+		require.Equal(t, primaryCallsBefore+1, httpmock.GetCallCountInfo()[primaryKey], "round %d: the primary must not be capped", i)
+	}
+
+	require.Equal(t, int32(2), chain.calls.Load(), "the third alternative delivery must stop at the cap, before the stage that panics")
+	require.True(t, s.panicAttemptsExhausted(hash, "altPeer"), "the alternative whose block panics must be capped")
+	require.False(t, s.panicAttemptsExhausted(hash, "primaryPeer"), "the primary must keep its budget")
+	require.Nil(t, s.blockPanicAttempts.Get(blockAttemptKey{hash: *hash, peerID: "primaryPeer"}), "no panic may count for the primary")
+}
+
+// TestGapBV054_RetryPanicChargesAlternative runs a retry item, which has an empty peerID, while the
+// queue holds an alternative whose block panics. The retry path processes the alternative, and the
+// panic must count for the alternative, not for the empty peerID of the retry item.
+func TestGapBV054_RetryPanicChargesAlternative(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, block, chain, _ := gap054AltHarness(ctx, t)
+	hash := block.Hash()
+
+	s.blockPriorityQueue.Add(processBlockFound{hash: hash, baseURL: "http://other-peer", peerID: "otherPeer"}, PriorityChainExtending, block.Height)
+
+	for i := 1; i <= 2; i++ {
+		s.blockPriorityQueue.Add(processBlockFound{hash: hash, baseURL: "http://alt-peer", peerID: "altPeer"}, PriorityChainExtending, block.Height)
+
+		err := s.processBlockWithPriorityRecovered(ctx, processBlockFound{hash: hash, baseURL: SourceTypeRetry, peerID: ""})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "see the PANIC log line", "round %d: the alternative must panic", i)
+	}
+
+	require.Equal(t, int32(2), chain.calls.Load())
+	require.True(t, s.panicAttemptsExhausted(hash, "altPeer"), "the retry's alternative must be capped after the limit")
+}
