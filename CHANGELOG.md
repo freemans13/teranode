@@ -96,9 +96,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   the next catch-up run. Once the block is stored, unlocking its outputs is retried on a
   context that a cancel does not stop, for up to 5 minutes. When `AddBlock` returns an
   error, a retried existence check, bounded at 15 seconds, decides whether to finish the
-  commit or retry the block later. A pod stopped mid catch-up can therefore take longer
-  to exit than before. Nothing to configure; if the blockchain or UTXO store hangs at
-  shutdown, a grace period under 5 minutes ends the pod with the block's outputs still
+  commit or retry the block later. The check and the unlock run one after the other, so
+  a pod stopped mid catch-up can take up to about 5 minutes 15 seconds to exit. Nothing
+  to configure; if the blockchain or UTXO store hangs at shutdown, a
+  `terminationGracePeriodSeconds` below 315 ends the pod with the block's outputs still
   locked (tracked in #2015). (#2011)
 
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
