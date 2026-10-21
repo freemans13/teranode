@@ -18,6 +18,11 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — action required before upgrading
 
+- **`CheckBlockSubtrees` gRPC errors keep Teranode error codes.** Storage and
+  consensus errors include gRPC status metadata. Invalid URLs give `InvalidArgument`
+  status. External clients must use `errors.UnwrapGRPC` to read the error chain
+  and must accept these status codes. Teranode clients can read this format. (#1650)
+
 - **`grpc_admin_api_key` is now mandatory for the Blockchain service.** The service
   validates it at startup and refuses to start when it is empty, is a well-known
   placeholder (`testkey`, `changeme`, …), or is shorter than 16 characters. A value
@@ -82,6 +87,12 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `blockchain_maxMedianTimePastHeights` for the duration of the rollout. (#1776)
 
 ### Breaking — behaviour changes on upgrade
+
+- **This release removes four Aerospike pruner metrics.** External monitoring systems must
+  remove queries for `utxo_pruner_parents_skipped_pruned_total`,
+  `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
+  `utxo_pruner_pruned_set_rotations`. These metrics reported zero because the pruner
+  no longer skipped parents. After this upgrade, their queries give no data. (#1969)
 
 - **Peer-announced subtrees are validated at most 32 at a time.** The new
   `subtreevalidation_peerSubtreeConcurrency` (default 32) bounds how many peer

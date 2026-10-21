@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.5
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
-	github.com/bitcoin-sv/bdk/module/gobdk v1.3.0
+	github.com/bitcoin-sv/bdk/module/gobdk v1.3.1
 	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv6
 	github.com/bsv-blockchain/go-bt/v2 v2.7.4
 	github.com/bsv-blockchain/go-chaincfg v1.6.2
@@ -90,7 +90,6 @@ require (
 	github.com/containerd/platforms v1.0.0-rc.4 // indirect
 	github.com/containerd/ttrpc v1.2.8 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.2.0 // indirect
-	github.com/dgryski/go-metro v0.0.0-20200812162917-85c65e2d0165 // indirect
 	github.com/docker/compose/v5 v5.1.2 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
@@ -210,7 +209,6 @@ require (
 	github.com/felixge/fgprof v0.9.5
 	github.com/moby/moby/api v1.54.2
 	github.com/ordishs/go-bitcoin v1.0.88
-	github.com/seiflotfy/cuckoofilter v0.0.0-20240715131351-a2f2c23f1771
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
 	github.com/twmb/franz-go v1.20.6
 	github.com/twmb/franz-go/pkg/kadm v1.17.2
