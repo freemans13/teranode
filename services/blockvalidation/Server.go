@@ -244,12 +244,12 @@ type Server struct {
 	// semantics as the corrupt cap, for the same anti-wedge reason.
 	blockPolicyDeclineAttempts *ttlcache.Cache[blockAttemptKey, int]
 
-	// blockPanicAttempts counts the panics that the priority worker recovered for each (block hash,
-	// serving peerID) (BV-STARTUP-007). After MaxCorruptAttemptsPerBlock panics in one
-	// CorruptAttemptCooldown window, processBlockFound drops that peer's next deliveries of the hash
-	// before its own download and the validation, so a block that panics every time does not log a
-	// full stack on each announcement. addBlockToPriorityQueue has still fetched the block one time
-	// to classify it, before the gate. It is a third independent budget that uses the corrupt cap's configured values,
+	// blockPanicAttempts counts the panics that the priority worker and the blockFoundCh workers
+	// recovered for each (block hash, serving peerID) (BV-STARTUP-007). After
+	// MaxCorruptAttemptsPerBlock panics in one CorruptAttemptCooldown window, processBlockFoundChItem
+	// drops that peer's next announcements of the hash before the fetch, and processBlockFound drops
+	// its next deliveries before its own download and the validation, so a block that panics every
+	// time does not log a full stack on each announcement. It is a third independent budget that uses the corrupt cap's configured values,
 	// as blockPolicyDeclineAttempts does, so operators get no new knob. It is keyed on the pair for
 	// the reason blockAttemptKey gives: a panic can come from one peer's bytes, and a per-hash
 	// count would let that peer stop an honest delivery of the same hash. An empty peerID is not
@@ -1050,6 +1050,17 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 // for one answer, and the deferred function below sends the caller one value: the processing's
 // answer if it gave one, or else the panic error. A path that returns with no answer and no panic
 // leaves the caller waiting, as before.
+//
+// The recover also counts the panic toward the recovered-panic cap of (bf.hash, bf.peerID), in
+// blockPanicAttempts, the budget that the priority worker's recover also fills. This path fetches
+// and parses the announcer's bytes before processBlockFound's gate, so after the cap the gate below
+// drops the announcer's next deliveries of the hash before the fetch, until the cooldown window
+// lapses. The gate answers a WaitToComplete caller one time with ERR_PROCESSING, through the relay.
+// Its text has no word that IsNetworkError or IsMaliciousResponseError matches. It reports no peer
+// failure: a panic is a bug in this node. Another peer's announcement of the hash has its own key
+// and is still processed. An empty peerID is not capped (fail-open), as for the other caps. After a
+// 429 fallback in fetchAnnouncedBlock another peer serves the bytes, but the panic still counts for
+// the announcer, because this recover sees only the announcement.
 func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf processBlockFound) {
 	caller := bf.errCh
 	if caller != nil {
@@ -1060,7 +1071,8 @@ func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf p
 		r := recover()
 		if r != nil {
 			countRecoveredPanic(recoveredPanicPathBlockFound)
-			u.logger.Errorf("[Init] PANIC in processBlockFoundChannel for block %s from peer %s: %v stack=%q", bf.hash.String(), bf.peerID, r, debug.Stack())
+			attempts := u.recordPanicAttempt(bf.hash, bf.peerID)
+			u.logger.Errorf("[Init] PANIC in processBlockFoundChannel for block %s from peer %s (panic %d for this peer in the cooldown window): %v stack=%q", bf.hash.String(), bf.peerID, attempts, r, debug.Stack())
 		}
 
 		if caller == nil {
@@ -1082,6 +1094,16 @@ func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf p
 
 		if bf.errCh != nil {
 			bf.errCh <- errors.NewProcessingError("peer %s is marked as malicious", bf.peerID)
+		}
+
+		return
+	}
+
+	if u.panicAttemptsExhausted(bf.hash, bf.peerID) {
+		u.logger.Warnf("[blockFound][%s] recovered-panic cap reached for peer %s; dropping this announcement before the fetch until the cooldown window expires", bf.hash.String(), bf.peerID)
+
+		if bf.errCh != nil {
+			bf.errCh <- errors.NewProcessingError("[blockFound][%s] recovered-panic cap reached for this peer; announcement dropped until the cooldown window expires (block not fetched)", bf.hash.String())
 		}
 
 		return
@@ -1849,9 +1871,9 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	// Per-(hash, peerID) recovered-panic cap (BV-STARTUP-007). The priority worker recovers a panic
 	// and records it in blockPanicAttempts for the peer that served the attempt. After the cap, this
 	// peer's deliveries of the hash stop here until the window lapses. A block that panics every
-	// time then skips the download below and the validation that panics. It is still fetched one
-	// time per announcement: addBlockToPriorityQueue fetches it to classify it before it reaches
-	// the queue, and so before this gate. The error is ERR_PROCESSING. Its text has no word that
+	// time then skips the download below and the validation that panics. The same count also stops
+	// the peer's announcements of the hash in processBlockFoundChItem, before the fetch that
+	// addBlockToPriorityQueue does to classify the block. The error is ERR_PROCESSING. Its text has no word that
 	// IsNetworkError or IsMaliciousResponseError matches, and it has no peerID, so the worker does
 	// not requeue the block, no peer gets a strike, and the hash is not marked invalid.
 	if u.panicAttemptsExhausted(hash, peerID) {

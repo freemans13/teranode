@@ -901,6 +901,118 @@ func TestGapBV054_BlockFoundChPanicAfterAnswerDoesNotBlockWorker(t *testing.T) {
 	}
 }
 
+// gap054ParentPanicChain wraps a blockchain client and panics on each GetBlockExists call for one
+// hash. With the block's parent hash, the panic comes in queueFetchedBlock, after the fetch.
+type gap054ParentPanicChain struct {
+	blockchain.ClientI
+	parent chainhash.Hash
+	calls  atomic.Int32
+}
+
+func (c *gap054ParentPanicChain) GetBlockExists(ctx context.Context, h *chainhash.Hash) (bool, error) {
+	if *h == c.parent {
+		c.calls.Add(1)
+		panic("injected panic after the announced block was fetched")
+	}
+
+	return c.ClientI.GetBlockExists(ctx, h)
+}
+
+// TestGapBV054_BlockFoundChPanicCapStopsFetch panics on each blockFoundCh delivery of one block,
+// after the announced block was fetched. After MaxCorruptAttemptsPerBlock panics, the same peer's
+// next announcement must stop before the fetch, and its WaitToComplete caller must get one
+// ERR_PROCESSING answer that does not requeue the block. Another peer keeps its own budget, an
+// empty peerID is never capped, and no peer is charged or reported.
+func TestGapBV054_BlockFoundChPanicCapStopsFetch(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+	s.settings.BlockValidation.MaxCorruptAttemptsPerBlock = 2
+
+	reputation := &subtreeAttributionP2PClient{}
+	s.p2pClient = reputation
+
+	reports := &gap054PeerReportCounter{ClientI: s.blockchainClient}
+	s.blockchainClient = reports
+
+	chain := &gap054ParentPanicChain{ClientI: reports, parent: *block.Header.HashPrevBlock}
+	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, chain, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	fetchKey := "GET http://test-peer/block/" + block.Hash().String()
+	httpmock.RegisterResponder("GET", "http://test-peer/block/"+block.Hash().String(), httpmock.NewBytesResponder(200, blockBytes))
+
+	deliver := func(peerID string) error {
+		errCh := make(chan error)
+		done := make(chan struct{})
+
+		go func() {
+			s.processBlockFoundChItem(ctx, 0, processBlockFound{hash: block.Hash(), baseURL: "http://test-peer", peerID: peerID, errCh: errCh})
+			close(done)
+		}()
+
+		var answer error
+
+		select {
+		case answer = <-errCh:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("peer %q: the WaitToComplete caller got no answer", peerID)
+		}
+
+		gap054RequireAnsweredOnce(t, errCh, done)
+
+		return answer
+	}
+
+	for i := 1; i <= 2; i++ {
+		fetchesBefore := httpmock.GetCallCountInfo()[fetchKey]
+
+		err := deliver("peerA")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "see the PANIC log line", "delivery %d must panic", i)
+		require.Equal(t, fetchesBefore+1, httpmock.GetCallCountInfo()[fetchKey], "delivery %d must fetch the block", i)
+		require.Equal(t, int32(i), chain.calls.Load())
+	}
+
+	require.True(t, s.panicAttemptsExhausted(block.Hash(), "peerA"), "the block_found recover must count toward the cap")
+
+	fetchesBefore := httpmock.GetCallCountInfo()[fetchKey]
+
+	err = deliver("peerA")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrProcessing), "a capped announcement must be ERR_PROCESSING, got %v", err)
+	require.Contains(t, err.Error(), "recovered-panic cap reached")
+	require.False(t, errors.IsBlockCorrupt(err))
+	require.False(t, errors.IsNetworkError(err), "%v", err)
+	require.False(t, errors.IsMaliciousResponseError(err), "%v", err)
+	require.Equal(t, fetchesBefore, httpmock.GetCallCountInfo()[fetchKey], "a capped announcement must stop before the fetch")
+	require.Equal(t, int32(2), chain.calls.Load(), "a capped announcement must stop before the stage that panics")
+
+	err = deliver("peerB")
+	require.Contains(t, err.Error(), "see the PANIC log line", "another peer must keep its own budget")
+	require.Equal(t, fetchesBefore+1, httpmock.GetCallCountInfo()[fetchKey], "another peer's announcement must be fetched")
+	require.Equal(t, int32(3), chain.calls.Load())
+
+	for i := 1; i <= 3; i++ {
+		err = deliver("")
+		require.Contains(t, err.Error(), "see the PANIC log line", "an empty peerID must never be capped (delivery %d)", i)
+	}
+
+	require.Equal(t, fetchesBefore+4, httpmock.GetCallCountInfo()[fetchKey])
+
+	require.Equal(t, 0, reputation.totalCharges(), "no peer may be charged for a panic in this node")
+	require.Equal(t, 0, reputation.totalMaliciousReports())
+	require.Equal(t, int32(0), reports.reports.Load(), "no peer failure may be reported for a panic in this node")
+}
+
 // TestGapBV054_ConcurrentPanicErrorIsDistinct checks that isConcurrentValidationPanic matches the
 // waiter error from runOncePerBlock, also when another error wraps it, and matches no other
 // ERR_PROCESSING error. teranode's errors.Is matches on the code, so it cannot tell them apart.

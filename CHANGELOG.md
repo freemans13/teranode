@@ -101,15 +101,17 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
       announce the block again before the node tries it again.
     - A catchup that panics counts as a failed attempt with the error type `local_panic`. It
       is not charged to the peer. So is a catchup whose validation waited on a validation of
-      the same block that panicked on another goroutine. It counts toward
+      the same block that panicked on another goroutine, also when an alternative peer served
+      that catchup. It counts toward
       `blockvalidation_catchup_max_attempts_per_block` unless it validated at least one block
       first. In that condition it resets the count, as each other failed catchup that made
       progress does.
-    - After `blockvalidation_max_corrupt_attempts_per_block` (default 3) worker panics for
-      one block from one peer, the node stops that peer's deliveries of the block before its
-      own download and validation, for `blockvalidation_corrupt_attempt_cooldown` (default 10
-      minutes). The announcement path still fetches the block one time to classify it. The
-      panic counts for the peer that served the attempt that panicked.
+    - After `blockvalidation_max_corrupt_attempts_per_block` (default 3) worker or
+      `blockFoundCh` panics for one block from one peer, the node stops that peer's
+      announcements and deliveries of the block before it fetches the block, for
+      `blockvalidation_corrupt_attempt_cooldown` (default 10 minutes). The panic counts for
+      the peer that served the attempt that panicked. On the `blockFoundCh` path it counts for
+      the announcing peer.
     - The error that a `WaitToComplete` caller gets after a `blockFoundCh` worker panic no
       longer has the panic value in its text. The panic value is in the `PANIC` log line.
       (#2012)
