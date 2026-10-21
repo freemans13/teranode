@@ -623,25 +623,26 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 		// An AddBlock error does not prove the block was not stored: a deadline or cancel can reach
 		// the client after the blockchain server committed it. Treating a stored block as a local
 		// fault would let tryQuickValidation delete the .subtree files of a block recorded as
-		// having them, the corruption of bitcoin-sv/teranode#4978. So ask the store.
+		// having them, the corruption of bitcoin-sv/teranode#4978. So ask the store, with retries,
+		// and check a "not stored" answer once more after a short delay.
 		stored, probeErr := u.blockStoredAfterAddBlockError(ctx, block)
 
 		switch {
+		case probeErr != nil:
+			// Every probe attempt failed, so we cannot tell whether the block is stored. Keep the
+			// files and abort. If the block is stored, its outputs stay locked: the residual tracked
+			// in bsv-blockchain/teranode#2015, reached here only once the probe retries run out.
+			return markBlockCommitted(errors.NewServiceError("[%s][%s] AddBlock failed and the block may be stored (probe failed: %v)", caller, block.Hash().String(), probeErr, err))
 		case stored:
 			// Usually this insert committed, with subtrees_set and mined_set. The block can also have
 			// been stored by another route first, so the insert failed as a duplicate: that route then
 			// owns the block's flags. Either way the block is stored, so a sweep is wrong and the
 			// unlock is safe. Finish the commit tail.
 			u.logger.Warnf("[%s][%s] AddBlock returned an error but the block is stored, continuing the commit: %v", caller, block.Hash().String(), err)
-		case probeErr != nil || ctx.Err() != nil:
-			// The block may be stored. With the probe failed we cannot tell, and with ctx ended
-			// the server can still be committing it. Keep the files and abort.
-			probe := "not stored yet, but ctx ended"
-			if probeErr != nil {
-				probe = "probe failed: " + probeErr.Error()
-			}
-
-			return markBlockCommitted(errors.NewServiceError("[%s][%s] AddBlock failed and the block may be stored (%s)", caller, block.Hash().String(), probe, err))
+		case ctx.Err() != nil:
+			// The block is not stored yet, but ctx ended, so the server can still be committing it.
+			// Keep the files and abort.
+			return markBlockCommitted(errors.NewServiceError("[%s][%s] AddBlock failed and the block may be stored (not stored yet, but ctx ended)", caller, block.Hash().String(), err))
 		default:
 			return errors.NewProcessingError("[%s][%s] failed to add block to blockchain", caller, block.Hash().String(), err)
 		}
@@ -1870,17 +1871,34 @@ func (u *BlockValidation) unlockSubtreeTransactionsIfNeeded(ctx context.Context,
 // postCommitUnlockRetries and postCommitUnlockRetryBackoff bound the retries of the unlock
 // commitBlock runs after AddBlock: one attempt plus postCommitUnlockRetries more, with
 // retry.Retry's linear backoff of 1, 3 and 5 times postCommitUnlockRetryBackoff between them.
+// The existence probe after an AddBlock error uses the same backoff.
 //
 // The backoff is a package-level var so tests can shrink it.
 const postCommitUnlockRetries = 3
 
 var postCommitUnlockRetryBackoff = 100 * time.Millisecond
 
-// postCommitTimeout bounds the work commitBlock does on a context detached from the caller's:
-// the full unlock retry sequence, and the existence probe after an AddBlock error. It only stops a
-// hung store. A shutdown waits for this work, up to this bound, because a block that is already
-// committed must not be left half-finished. A package-level var so tests can shrink it.
+// postCommitTimeout bounds the unlock retries commitBlock runs after AddBlock, on a context
+// detached from the caller's. It only stops a hung store. A shutdown waits for this work, up to
+// this bound, because a block that is already committed must not be left half-finished. A
+// package-level var so tests can shrink it.
 var postCommitTimeout = 5 * time.Minute
+
+// The existence probe after an AddBlock error has its own, shorter bounds. It runs before the block
+// is known to be stored, and a hung blockchain service must not hold a shutdown past a normal
+// grace period.
+//
+// postCommitProbeRetries is the number of retries after the first attempt in one probe pass, and
+// postCommitProbeAttemptTimeout cuts off each attempt. A "not stored" answer is checked by a second
+// pass after postCommitProbeRecheckDelay. postCommitProbeTimeout bounds both passes together,
+// backoff and delay included. Package-level vars so tests can shrink them.
+const postCommitProbeRetries = 3
+
+var (
+	postCommitProbeAttemptTimeout = 3 * time.Second
+	postCommitProbeRecheckDelay   = 250 * time.Millisecond
+	postCommitProbeTimeout        = 15 * time.Second
+)
 
 // unlockSubtreeTransactionsWithRetry retries unlockSubtreeTransactionsIfNeeded. Each attempt
 // re-sends the whole pass: SetLocked(false) is idempotent, and retrying inside the errgroup would
@@ -1906,7 +1924,7 @@ func (u *BlockValidation) unlockSubtreeTransactionsWithRetry(ctx context.Context
 		retry.WithBackoffDurationType(postCommitUnlockRetryBackoff),
 	)
 
-	if err != nil && lastErr != nil && err != lastErr { //nolint:errorlint // identity: did retry.Retry return the store error itself
+	if err != nil && lastErr != nil && unlockCtx.Err() != nil {
 		return errors.NewProcessingError("[%s][%s] post-commit unlock stopped: %v", callerTag, block.Hash().String(), err, lastErr)
 	}
 
@@ -1914,13 +1932,64 @@ func (u *BlockValidation) unlockSubtreeTransactionsWithRetry(ctx context.Context
 }
 
 // blockStoredAfterAddBlockError reports whether block is in the blockchain store, after AddBlock
-// returned an error. The probe runs on a context detached from ctx, since the AddBlock error can
-// itself be ctx ending.
+// returned an error. It runs on a context detached from ctx, since the AddBlock error can itself be
+// ctx ending, bounded by postCommitProbeTimeout.
+//
+// A failed probe is retried. A "not stored" answer is checked again after
+// postCommitProbeRecheckDelay, because the blockchain SQL store serves GetBlockExists from its
+// response cache, and StoreBlock commits the row before it clears that cache. A false cached before
+// the commit can answer in the gap between the two. An error means a probe pass ran out of retries
+// or the total bound ended, so the caller cannot tell whether the block is stored.
 func (u *BlockValidation) blockStoredAfterAddBlockError(ctx context.Context, block *model.Block) (bool, error) {
-	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCommitTimeout)
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCommitProbeTimeout)
 	defer cancel()
 
-	return u.blockchainClient.GetBlockExists(probeCtx, block.Hash())
+	stored, err := u.probeBlockExistsWithRetry(probeCtx, block)
+	if err != nil || stored {
+		return stored, err
+	}
+
+	select {
+	case <-probeCtx.Done():
+		return false, errors.NewServiceError("[commitBlock][%s] existence probe timed out before its recheck", block.Hash().String(), probeCtx.Err())
+	case <-time.After(postCommitProbeRecheckDelay):
+	}
+
+	stored, err = u.probeBlockExistsWithRetry(probeCtx, block)
+	if err == nil && stored {
+		u.logger.Warnf("[commitBlock][%s] existence probe first said not stored, the recheck found the block stored", block.Hash().String())
+	}
+
+	return stored, err
+}
+
+// probeBlockExistsWithRetry runs one probe pass: GetBlockExists, retried up to
+// postCommitProbeRetries times, each attempt bounded by postCommitProbeAttemptTimeout. When
+// probeCtx ends between attempts, the returned error wraps the last probe error.
+func (u *BlockValidation) probeBlockExistsWithRetry(probeCtx context.Context, block *model.Block) (bool, error) {
+	var lastErr error
+
+	stored, err := retry.Retry(probeCtx, u.logger,
+		func() (bool, error) {
+			attemptCtx, cancel := context.WithTimeout(probeCtx, postCommitProbeAttemptTimeout)
+			defer cancel()
+
+			var exists bool
+
+			exists, lastErr = u.blockchainClient.GetBlockExists(attemptCtx, block.Hash())
+
+			return exists, lastErr
+		},
+		retry.WithMessage(fmt.Sprintf("[commitBlock][%s] existence probe after an AddBlock error failed", block.Hash().String())),
+		retry.WithRetryCount(postCommitProbeRetries),
+		retry.WithBackoffDurationType(postCommitUnlockRetryBackoff),
+	)
+
+	if err != nil && lastErr != nil && probeCtx.Err() != nil {
+		return false, errors.NewServiceError("[commitBlock][%s] existence probe stopped: %v", block.Hash().String(), err, lastErr)
+	}
+
+	return stored, err
 }
 
 // unlockSubtreeTransactions unlocks all transactions in the given subtrees in parallel.

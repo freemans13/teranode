@@ -53,14 +53,19 @@ type gap056DriverError struct{}
 
 func (gap056DriverError) Error() string { return "gap056: simulated unlock failure after AddBlock" }
 
-// shrinkPostCommitUnlockRetryBackoff makes the post-commit unlock retries near-immediate for one test.
+// shrinkPostCommitUnlockRetryBackoff makes the post-commit unlock retries, and the existence probe's
+// retries and recheck, near-immediate for one test.
 func shrinkPostCommitUnlockRetryBackoff(t *testing.T) {
 	t.Helper()
 
-	saved := postCommitUnlockRetryBackoff
+	savedBackoff, savedRecheck := postCommitUnlockRetryBackoff, postCommitProbeRecheckDelay
 	postCommitUnlockRetryBackoff = time.Millisecond
+	postCommitProbeRecheckDelay = time.Millisecond
 
-	t.Cleanup(func() { postCommitUnlockRetryBackoff = saved })
+	t.Cleanup(func() {
+		postCommitUnlockRetryBackoff = savedBackoff
+		postCommitProbeRecheckDelay = savedRecheck
+	})
 }
 
 // gap056QuickValidate runs one honest single-subtree block through tryQuickValidation with a real
@@ -79,8 +84,10 @@ type gap056Config struct {
 	// cancelOnUnlockFail cancels the context given to tryQuickValidation at each injected unlock
 	// failure, as a sibling failure in the catch-up errgroup does.
 	cancelOnUnlockFail bool
-	// wrapChain, when set, wraps the blockchain client that BlockValidation commits through.
-	wrapChain func(blockchain.ClientI) blockchain.ClientI
+	// wrapChain, when set, wraps the blockchain client that BlockValidation commits through. It
+	// gets the cancel func of the context given to tryQuickValidation, so a wrapper can end that
+	// context mid-commit.
+	wrapChain func(blockchain.ClientI, context.CancelFunc) blockchain.ClientI
 	// notCommitted skips the precondition that AddBlock stored the block.
 	notCommitted bool
 }
@@ -104,7 +111,7 @@ func gap056QuickValidateWith(t *testing.T, cfg gap056Config) (*preBindHarness, *
 	h.bv.utxoStore = failing
 
 	if cfg.wrapChain != nil {
-		h.bv.blockchainClient = cfg.wrapChain(h.chain)
+		h.bv.blockchainClient = cfg.wrapChain(h.chain, cancelQuick)
 	}
 
 	coinbase := preBindCoinbase(t, 0x56)
@@ -246,12 +253,24 @@ func TestGapBV056_PostCommitUnlockTimeoutKeepsStoreError(t *testing.T) {
 
 // gap056AmbiguousAddBlockChain stands in for a blockchain client whose AddBlock reply is lost. When
 // store is true it calls the real AddBlock first, so the block is stored, then returns an error, as
-// a deadline that ends after the server committed does. When probeErr is set, GetBlockExists fails.
+// a deadline that ends after the server committed does.
+//
+// The existence probe (GetBlockExists) can be shaped too. With probeErr set it fails: every call
+// when probeFails is 0, otherwise only the first probeFails calls. The first staleFalse calls that
+// do not fail answer false, as a "not stored" answer cached before the commit does.
 type gap056AmbiguousAddBlockChain struct {
 	blockchain.ClientI
 
-	store    bool
-	probeErr error
+	store      bool
+	probeErr   error
+	probeFails int32
+	staleFalse int32
+
+	// cancelBeforeErr, when set, runs before AddBlock returns its error, so the caller's context
+	// has ended by the time commitBlock sees the error.
+	cancelBeforeErr context.CancelFunc
+
+	probeCalls atomic.Int32
 }
 
 func (c *gap056AmbiguousAddBlockChain) AddBlock(ctx context.Context, block *model.Block, peerID string, opts ...options.StoreBlockOption) error {
@@ -261,12 +280,28 @@ func (c *gap056AmbiguousAddBlockChain) AddBlock(ctx context.Context, block *mode
 		}
 	}
 
+	if c.cancelBeforeErr != nil {
+		c.cancelBeforeErr()
+
+		return context.Canceled
+	}
+
 	return context.DeadlineExceeded
 }
 
 func (c *gap056AmbiguousAddBlockChain) GetBlockExists(ctx context.Context, hash *chainhash.Hash) (bool, error) {
-	if c.probeErr != nil {
+	call := c.probeCalls.Add(1)
+
+	if c.probeErr != nil && (c.probeFails == 0 || call <= c.probeFails) {
 		return false, c.probeErr
+	}
+
+	if c.probeErr != nil {
+		call -= c.probeFails
+	}
+
+	if call <= c.staleFalse {
+		return false, nil
 	}
 
 	return c.ClientI.GetBlockExists(ctx, hash)
@@ -281,7 +316,7 @@ func (c *gap056AmbiguousAddBlockChain) GetBlockExists(ctx context.Context, hash 
 // and returns tryNormal=true.
 func TestGapBV056_AddBlockErrorAfterCommitFinishesTheCommit(t *testing.T) {
 	h, block, subtreeRoot, childHash, _, tryNormal, quickErr := gap056QuickValidateWith(t, gap056Config{
-		wrapChain: func(c blockchain.ClientI) blockchain.ClientI {
+		wrapChain: func(c blockchain.ClientI, _ context.CancelFunc) blockchain.ClientI {
 			return &gap056AmbiguousAddBlockChain{ClientI: c, store: true}
 		},
 	})
@@ -303,12 +338,19 @@ func TestGapBV056_AddBlockErrorAfterCommitFinishesTheCommit(t *testing.T) {
 }
 
 // TestGapBV056_AddBlockErrorWithFailedProbeAbortsWithoutRemovingFiles covers an AddBlock error when
-// the existence probe also fails, so commitBlock cannot tell if the block is stored. It must abort
-// with the block-committed marker and keep the .subtree file.
+// every existence probe attempt fails, so commitBlock cannot tell if the block is stored. It must
+// abort with the block-committed marker and keep the .subtree file.
+//
+// The block is stored here, and its outputs stay locked: the residual tracked in
+// bsv-blockchain/teranode#2015, reached only once the probe retries run out. The last assertion
+// records it so a future recovery path has to change this test on purpose.
 func TestGapBV056_AddBlockErrorWithFailedProbeAbortsWithoutRemovingFiles(t *testing.T) {
-	h, _, subtreeRoot, _, _, tryNormal, quickErr := gap056QuickValidateWith(t, gap056Config{
-		wrapChain: func(c blockchain.ClientI) blockchain.ClientI {
-			return &gap056AmbiguousAddBlockChain{ClientI: c, store: true, probeErr: gap056DriverError{}}
+	var chain *gap056AmbiguousAddBlockChain
+
+	h, _, subtreeRoot, childHash, _, tryNormal, quickErr := gap056QuickValidateWith(t, gap056Config{
+		wrapChain: func(c blockchain.ClientI, _ context.CancelFunc) blockchain.ClientI {
+			chain = &gap056AmbiguousAddBlockChain{ClientI: c, store: true, probeErr: gap056DriverError{}}
+			return chain
 		},
 		notCommitted: true,
 	})
@@ -321,21 +363,31 @@ func TestGapBV056_AddBlockErrorWithFailedProbeAbortsWithoutRemovingFiles(t *test
 	exists, err := h.subtreeStore.Exists(h.ctx, subtreeRoot[:], fileformat.FileTypeSubtree)
 	require.NoError(t, err)
 	require.True(t, exists, "a block that may be stored must keep its .subtree file")
+
+	require.Equal(t, int32(postCommitProbeRetries+1), chain.probeCalls.Load(), "every probe retry must have been attempted")
+
+	created, err := h.utxoStore.Get(h.ctx, childHash, fields.Locked)
+	require.NoError(t, err)
+	require.True(t, created.Locked, "no recovery path unlocks a stored block's outputs once the probe retries are exhausted")
 }
 
 // TestGapBV056_AddBlockErrorNotStoredKeepsLocalFaultRoute pins the unchanged route: AddBlock fails,
-// the probe says the block is not stored and ctx is live, so the error stays a local fault. The
-// attempt's .subtree file is swept and catch-up falls through to normal validation.
+// the probe and its recheck both say the block is not stored and ctx is live, so the error stays a
+// local fault. The attempt's .subtree file is swept and catch-up falls through to normal validation.
 func TestGapBV056_AddBlockErrorNotStoredKeepsLocalFaultRoute(t *testing.T) {
+	var chain *gap056AmbiguousAddBlockChain
+
 	h, block, subtreeRoot, _, _, tryNormal, quickErr := gap056QuickValidateWith(t, gap056Config{
-		wrapChain: func(c blockchain.ClientI) blockchain.ClientI {
-			return &gap056AmbiguousAddBlockChain{ClientI: c}
+		wrapChain: func(c blockchain.ClientI, _ context.CancelFunc) blockchain.ClientI {
+			chain = &gap056AmbiguousAddBlockChain{ClientI: c}
+			return chain
 		},
 		notCommitted: true,
 	})
 
 	require.NoError(t, quickErr)
 	require.True(t, tryNormal, "a block proven not stored takes the local-fault route to normal validation")
+	require.Equal(t, int32(2), chain.probeCalls.Load(), "a not-stored answer must be rechecked once before the sweep")
 
 	stored, err := h.chain.GetBlockExists(h.ctx, block.Hash())
 	require.NoError(t, err)
@@ -344,4 +396,93 @@ func TestGapBV056_AddBlockErrorNotStoredKeepsLocalFaultRoute(t *testing.T) {
 	exists, err := h.subtreeStore.Exists(h.ctx, subtreeRoot[:], fileformat.FileTypeSubtree)
 	require.NoError(t, err)
 	require.False(t, exists, "the local-fault route sweeps the attempt's .subtree file")
+}
+
+// TestGapBV056_AddBlockErrorWithTransientProbeFailureFinishesTheCommit covers an AddBlock that
+// stores the block but loses its reply, followed by one failed existence probe. The probe must be
+// retried, find the block stored and finish the commit: files kept, outputs unlocked. Before the
+// probe was retried, the single failure aborted the commit and left the outputs locked for good.
+//
+// Mutation proof: running the probe once instead of through retry.Retry fails the first assertion,
+// and the child output stays locked.
+func TestGapBV056_AddBlockErrorWithTransientProbeFailureFinishesTheCommit(t *testing.T) {
+	var chain *gap056AmbiguousAddBlockChain
+
+	h, _, subtreeRoot, childHash, _, tryNormal, quickErr := gap056QuickValidateWith(t, gap056Config{
+		wrapChain: func(c blockchain.ClientI, _ context.CancelFunc) blockchain.ClientI {
+			chain = &gap056AmbiguousAddBlockChain{ClientI: c, store: true, probeErr: gap056DriverError{}, probeFails: 1}
+			return chain
+		},
+	})
+
+	require.NoError(t, quickErr, "one failed probe must be retried, and the stored block must finish its commit")
+	require.False(t, tryNormal, "a stored block must not fall through to normal validation")
+	require.GreaterOrEqual(t, chain.probeCalls.Load(), int32(2), "the failed probe must have been retried")
+
+	exists, err := h.subtreeStore.Exists(h.ctx, subtreeRoot[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.True(t, exists, "stored block has subtrees_set=true but its .subtree file was deleted")
+
+	created, err := h.utxoStore.Get(h.ctx, childHash, fields.Locked)
+	require.NoError(t, err)
+	require.False(t, created.Locked, "the commit tail must unlock the stored block's outputs after a retried probe")
+}
+
+// TestGapBV056_AddBlockErrorWithStaleNotStoredProbeFinishesTheCommit covers a first probe that
+// answers "not stored" for a block that is stored, as a false cached in the blockchain store's
+// response cache can between StoreBlock's commit and its cache reset. The recheck after the delay
+// must find the block stored and finish the commit, not sweep the files of a stored block.
+//
+// Mutation proof: returning the first probe's answer without the recheck sends the error to the
+// local-fault route, which deletes the .subtree file and returns tryNormal=true.
+func TestGapBV056_AddBlockErrorWithStaleNotStoredProbeFinishesTheCommit(t *testing.T) {
+	var chain *gap056AmbiguousAddBlockChain
+
+	h, _, subtreeRoot, childHash, _, tryNormal, quickErr := gap056QuickValidateWith(t, gap056Config{
+		wrapChain: func(c blockchain.ClientI, _ context.CancelFunc) blockchain.ClientI {
+			chain = &gap056AmbiguousAddBlockChain{ClientI: c, store: true, staleFalse: 1}
+			return chain
+		},
+	})
+
+	require.NoError(t, quickErr, "a stale not-stored answer must be rechecked, and the stored block must finish its commit")
+	require.False(t, tryNormal, "a stored block must not fall through to normal validation")
+	require.Equal(t, int32(2), chain.probeCalls.Load(), "the not-stored answer must have been rechecked once")
+
+	exists, err := h.subtreeStore.Exists(h.ctx, subtreeRoot[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.True(t, exists, "stored block has subtrees_set=true but its .subtree file was deleted")
+
+	created, err := h.utxoStore.Get(h.ctx, childHash, fields.Locked)
+	require.NoError(t, err)
+	require.False(t, created.Locked, "the commit tail must unlock the stored block's outputs")
+}
+
+// TestGapBV056_AddBlockErrorAfterCtxEndedAbortsWithoutRemovingFiles covers the ctx arm: the caller's
+// context ends before AddBlock returns its error, and the block is not stored yet. The server can
+// still be committing it, so commitBlock must abort with the block-committed marker and keep the
+// .subtree file rather than take the local-fault route.
+//
+// Mutation proof: dropping the ctx.Err() check from the switch in commitBlock sends the error to the
+// local-fault route, which returns tryNormal=true without the block-committed marker.
+func TestGapBV056_AddBlockErrorAfterCtxEndedAbortsWithoutRemovingFiles(t *testing.T) {
+	h, block, subtreeRoot, _, _, tryNormal, quickErr := gap056QuickValidateWith(t, gap056Config{
+		wrapChain: func(c blockchain.ClientI, cancel context.CancelFunc) blockchain.ClientI {
+			return &gap056AmbiguousAddBlockChain{ClientI: c, cancelBeforeErr: cancel}
+		},
+		notCommitted: true,
+	})
+
+	require.Error(t, quickErr)
+	require.True(t, isBlockCommitted(quickErr), "an AddBlock error after ctx ended must carry the block-committed marker: %v", quickErr)
+	require.True(t, errors.IsTransientLocalError(quickErr), "an unknown outcome must read as transient to the legacy park: %v", quickErr)
+	require.False(t, tryNormal, "a block that may still be committing must not fall through to normal validation")
+
+	stored, err := h.chain.GetBlockExists(h.ctx, block.Hash())
+	require.NoError(t, err)
+	require.False(t, stored, "precondition: the block is not stored")
+
+	exists, err := h.subtreeStore.Exists(h.ctx, subtreeRoot[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.True(t, exists, "a block that may still be committing must keep its .subtree file")
 }

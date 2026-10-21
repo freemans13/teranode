@@ -2069,13 +2069,15 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 		// finite DAH, and the next run rewrites it with AllowOverwrite.
 		//
 		// The block IS committed, or may be: AddBlock stored it with subtrees_set and mined_set and
-		// the post-commit unlock still failed after its retries, or AddBlock returned an error that
-		// commitBlock could not prove meant "not stored" (bitcoin-sv/teranode#4987). The files this
+		// the post-commit unlock still failed after its retries, or AddBlock returned an error and
+		// commitBlock could not prove the block not stored, because every existence probe failed or
+		// ctx had ended (bitcoin-sv/teranode#4987). The files this
 		// attempt wrote can belong to a block recorded as having them, so a sweep can corrupt it,
 		// and normal validation would find the block stored and do nothing. No write can still be
 		// in flight: awaitSubtreeWrites returned nil before commitBlock ran, so no waitDone join is
-		// needed. Its outputs stay locked and nothing unlocks them later: the setMined worker skips a
-		// block with mined_set, and a stored block is skipped by catch-up and by processBlockFound.
+		// needed. If the block is stored, its outputs stay locked and nothing unlocks them later
+		// (bsv-blockchain/teranode#2015): the setMined worker skips a block with mined_set, and a
+		// stored block is skipped by catch-up and by processBlockFound.
 		// Quick validation spends locked outputs anyway (WithIgnoreLocked), so a later checkpointed
 		// block that spends them still commits. Only a spend through full validation or the
 		// validator fails, with ErrTxLocked.
