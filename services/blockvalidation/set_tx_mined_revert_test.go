@@ -3,6 +3,7 @@ package blockvalidation
 import (
 	"context"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 
@@ -191,9 +192,18 @@ func TestSetTxMinedStatus_RevertFailureLeavesMinedSetFalse(t *testing.T) {
 	failing := &revertFailingUnsetStore{Store: realUtxoStore}
 	bv.utxoStore = failing
 
+	// mmap-backed reloads make a leaked subtree observable: each one leaves a
+	// backing file in this directory until it is closed.
+	mmapDir := t.TempDir()
+	bv.mmapDir = mmapDir
+
 	revertErr := bv.setTxMinedStatus(ctx, block.Hash(), true)
 
 	require.Positive(t, failing.unsetCalls, "precondition: the revert reached SetMinedMulti(unset)")
+
+	entries, err := os.ReadDir(mmapDir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "the subtrees reloaded for the failed revert must be released, removing their mmap backing files")
 
 	_, blockMeta, err = blockchainClient.GetBlockHeader(ctx, block.Hash())
 	require.NoError(t, err)

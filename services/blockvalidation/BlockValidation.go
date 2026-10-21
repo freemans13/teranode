@@ -1393,8 +1393,24 @@ func (u *BlockValidation) tryClaimBlockForSetMined(blockHash *chainhash.Hash) bo
 // invalid block legitimately may not have all of them and a retry cannot bring
 // one back. Any other read failure is returned: it may be transient, and
 // skipping it would let the revert finish with that subtree's tags in place.
-func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) error {
+//
+// On that error the subtrees already loaded are closed before returning. They
+// never reach the block, and an mmap-backed subtree has no finalizer, so they
+// would otherwise keep their mapping and temp backing file until process exit.
+func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) (err error) {
 	reloaded := make([]*subtreepkg.Subtree, len(block.Subtrees))
+
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		for i, st := range reloaded {
+			if closeErr := st.Close(); closeErr != nil {
+				u.logger.Warnf("[setTxMined][%s] failed closing reloaded subtree %d after read failure: %v", block.Hash().String(), i, closeErr)
+			}
+		}
+	}()
 
 	for subtreeIdx, subtreeHash := range block.Subtrees {
 		subtreeBytes, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
@@ -1522,6 +1538,17 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		if err = u.reloadSubtreesForInvalidBlock(ctx, block); err != nil {
 			return err
 		}
+
+		// The reloaded subtrees belong to this call alone, so release them on
+		// every exit. The revert can now fail, and each retry reloads them; an
+		// early return that skipped the release below would leak one set of
+		// mmap mappings and temp files per attempt. On success the explicit
+		// release below has already run and this one finds only nil entries.
+		defer func() {
+			if releaseErr := block.ReleaseSubtreeNodes(nil); releaseErr != nil {
+				u.logger.Warnf("[setTxMined][%s] failed closing reloaded subtrees after unset-mined revert: %v", block.Hash().String(), releaseErr)
+			}
+		}()
 	} else {
 		// All subtrees should already be available for fully processed blocks
 		_, err = block.GetSubtrees(ctx, u.logger, u.subtreeStore, u.settings.Block.GetAndValidateSubtreesConcurrency)
