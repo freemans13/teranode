@@ -88,6 +88,19 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **Catch-up quick validation waits for each block's `.subtree` writes before it commits
+  the block, and a shutdown can wait for post-commit work.** A block was stored with
+  `subtrees_set` while its `.subtree` files could still be in flight, so a failed write
+  left a block recorded as having files it did not have. Each quick-validated block now
+  waits for its own writes to land; a write that fails leaves the block uncommitted for
+  the next catch-up run. Once the block is stored, unlocking its outputs is retried on a
+  context that a cancel does not stop, for up to 5 minutes. When `AddBlock` returns an
+  error, a retried existence check, bounded at 15 seconds, decides whether to finish the
+  commit or retry the block later. A pod stopped mid catch-up can therefore take longer
+  to exit than before. Nothing to configure; if the blockchain or UTXO store hangs at
+  shutdown, a grace period under 5 minutes ends the pod with the block's outputs still
+  locked (tracked in #2015). (#2011)
+
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
   `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
