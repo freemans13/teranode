@@ -88,6 +88,14 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **`utxostore_updateTxMinedStatus` is removed, and it was live.** Affects only nodes that
+  set it to `false`. Mined-tagging, the step after `AddBlock` that writes a block's ID onto
+  each of its transactions, now always runs. So does the check it carries, which rejects a
+  block that re-includes a transaction an ancestor block already mined. With the key at
+  `false`, neither ran, yet the block was still flagged as mined. The loader does not report
+  unknown keys, so a leftover `false` is ignored without an error and those nodes take on
+  the mined-tagging write load again. Delete the key from your config. (#2019)
+
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
   `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
