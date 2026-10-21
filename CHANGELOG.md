@@ -88,6 +88,12 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **This release removes four Aerospike pruner metrics.** External monitoring systems must
+  remove queries for `utxo_pruner_parents_skipped_pruned_total`,
+  `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
+  `utxo_pruner_pruned_set_rotations`. These metrics reported zero because the pruner
+  no longer skipped parents. After this upgrade, their queries give no data. (#1969)
+
 - **Peer-announced subtrees are validated at most 32 at a time.** The new
   `subtreevalidation_peerSubtreeConcurrency` (default 32) bounds how many peer
   subtrees a subtree validator works on at once; until now the bound was NumCPU. After a
