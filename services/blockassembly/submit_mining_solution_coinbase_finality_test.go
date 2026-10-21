@@ -2,15 +2,19 @@ package blockassembly
 
 import (
 	"context"
+	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -21,19 +25,58 @@ import (
 // past, which is the comparison bitcoin-sv makes from CSV onwards.
 const finalityMTPLag = uint32(600)
 
+// headerLookupCounter is a real blockchain client that counts the header reads the median-time-past
+// lookup makes, so a test can assert that a lookup did or did not happen without mocking the client.
+type headerLookupCounter struct {
+	blockchain.ClientI
+	lookups atomic.Int32
+}
+
+func (c *headerLookupCounter) GetBlockHeader(ctx context.Context, hash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	c.lookups.Add(1)
+
+	return c.ClientI.GetBlockHeader(ctx, hash)
+}
+
+func (c *headerLookupCounter) GetBlockHeaders(ctx context.Context, hash *chainhash.Hash, n uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	c.lookups.Add(1)
+
+	return c.ClientI.GetBlockHeaders(ctx, hash, n)
+}
+
+// coinbaseFinalityHarness is the coinbase-height harness plus the real blockchain client the
+// assembler reads the parent's median time past from.
+type coinbaseFinalityHarness struct {
+	*coinbaseHeightHarness
+	chain *headerLookupCounter
+}
+
 // newCoinbaseFinalityHarness is the coinbase-height harness with CSV active at the candidate height,
 // so a time-based coinbase nLockTime is measured against the parent's median time past, and with the
-// assembler wired to the harness's blockchain mock for the median-time-past lookup.
-func newCoinbaseFinalityHarness(t *testing.T) *coinbaseHeightHarness {
+// assembler reading headers from a sqlitememory blockchain store. That store holds only genesis, so
+// the harness's parent is unknown to it until a test stores a chain and points the candidate at it.
+// AddBlock still goes to the coinbase-height harness's client, which records the mined block.
+func newCoinbaseFinalityHarness(t *testing.T) *coinbaseFinalityHarness {
 	t.Helper()
 
 	params := chaincfg.RegressionNetParams
 	params.CSVHeight = 1
 
 	h := newCoinbaseHeightHarness(t, &params, postGenesisCandidateHeight, 5_000_000)
-	h.server.blockAssembler.blockchainClient = h.blockchai
 
-	return h
+	storeURL, err := url.Parse("sqlitememory://")
+	require.NoError(t, err)
+
+	store, err := blockchainstore.NewStore(ulogger.TestLogger{}, storeURL, h.server.blockAssembler.settings)
+	require.NoError(t, err)
+
+	client, err := blockchain.NewLocalClient(ulogger.TestLogger{}, h.server.blockAssembler.settings, store, nil, nil)
+	require.NoError(t, err)
+
+	chain := &headerLookupCounter{ClientI: client}
+	h.server.blockAssembler.blockchainClient = chain
+
+	return &coinbaseFinalityHarness{coinbaseHeightHarness: h, chain: chain}
 }
 
 // parentMTP is the median time past the tests give the candidate's parent.
@@ -96,56 +139,35 @@ func TestSubmitMiningSolution_CoinbaseMustBeFinal(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, resp.Ok)
 		h.blockchai.AssertCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
-		h.blockchai.AssertNotCalled(t, "GetBlockHeader", mock.Anything, mock.Anything)
+		require.Zero(t, h.chain.lookups.Load(), "no median-time-past lookup was needed")
 	})
 
 	t.Run("a cold memo is filled from the blockchain service", func(t *testing.T) {
 		h := newCoinbaseFinalityHarness(t)
 
-		// A chain of eleven headers from the chain start, the parent last, one block every ten
-		// minutes ending ten minutes before the candidate time. Their median is the sixth, sixty
-		// minutes before the candidate time.
-		headers := make([]*model.BlockHeader, 11)
-		prev := &chainhash.Hash{}
-
-		for i := range headers {
-			headers[i] = &model.BlockHeader{
-				Version:        1,
-				HashPrevBlock:  prev,
-				HashMerkleRoot: &chainhash.Hash{byte(i)},
-				Timestamp:      h.candidate.Time - uint32(len(headers)-i)*600,
-				Bits:           h.nBits,
-			}
-			prev = headers[i].Hash()
-		}
-
-		parent := headers[len(headers)-1]
-		h.candidate.PreviousHash = parent.Hash().CloneBytes()
-
-		// GetBlockHeaders answers newest first.
-		newestFirst := make([]*model.BlockHeader, len(headers))
-		for i, header := range headers {
-			newestFirst[len(headers)-1-i] = header
-		}
-
-		h.blockchai.On("GetBlockHeader", mock.Anything, parent.Hash()).Return(parent, &model.BlockHeaderMeta{}, nil)
-		h.blockchai.On("GetBlockHeaders", mock.Anything, parent.Hash(), mock.Anything).Return(newestFirst, []*model.BlockHeaderMeta{}, nil)
-
+		// Eleven blocks on the real store stamped base..base+10, so the parent's median time past is
+		// base+5: an hour before the candidate time.
 		mtp := h.candidate.Time - 3600
+		parent := buildFutureChain(t, t.Context(), h.chain.ClientI, mtp-5)
+		h.candidate.PreviousHash = parent.Hash().CloneBytes()
 
 		resp, err := h.submit(t, timeLockedCoinbase(t, mtp))
 		require.Error(t, err)
 		require.Nil(t, resp)
 		require.Contains(t, err.Error(), "bad-txns-nonfinal")
+		h.blockchai.AssertNotCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+		require.NotZero(t, h.chain.lookups.Load(), "a cold memo must be filled from the blockchain service")
 
 		resp, err = h.submit(t, timeLockedCoinbase(t, mtp-1))
 		require.NoError(t, err)
 		require.True(t, resp.Ok)
+		h.blockchai.AssertCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	})
 
 	t.Run("an unknown median time past refuses the solution", func(t *testing.T) {
+		// The harness's parent is not in the store, so the lookup fails as it would against an
+		// unreachable or out-of-step blockchain service.
 		h := newCoinbaseFinalityHarness(t)
-		h.blockchai.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, nil, errors.NewServiceUnavailableError("blockchain down"))
 
 		resp, err := h.submit(t, timeLockedCoinbase(t, h.parentMTP()-1))
 		require.Error(t, err)
@@ -158,14 +180,14 @@ func TestSubmitMiningSolution_CoinbaseMustBeFinal(t *testing.T) {
 	t.Run("a coinbase whose verdict does not depend on the median time past needs no lookup", func(t *testing.T) {
 		h := newCoinbaseFinalityHarness(t)
 
-		// Cold memo and no GetBlockHeader expectation: a lookup would fail the mock.
+		// Cold memo and a parent the store does not hold: a lookup would refuse the solution.
 		coinbase := timeLockedCoinbase(t, h.candidate.Time)
 		coinbase.Inputs[0].SequenceNumber = bt.DefaultSequenceNumber
 
 		resp, err := h.submit(t, coinbase)
 		require.NoError(t, err)
 		require.True(t, resp.Ok)
-		h.blockchai.AssertNotCalled(t, "GetBlockHeader", mock.Anything, mock.Anything)
+		require.Zero(t, h.chain.lookups.Load(), "no median-time-past lookup was needed")
 	})
 
 	t.Run("a height lock is refused without a lookup", func(t *testing.T) {
@@ -175,7 +197,7 @@ func TestSubmitMiningSolution_CoinbaseMustBeFinal(t *testing.T) {
 		require.Error(t, err)
 		require.Nil(t, resp)
 		require.Contains(t, err.Error(), "bad-txns-nonfinal")
-		h.blockchai.AssertNotCalled(t, "GetBlockHeader", mock.Anything, mock.Anything)
+		require.Zero(t, h.chain.lookups.Load(), "no median-time-past lookup was needed")
 	})
 }
 

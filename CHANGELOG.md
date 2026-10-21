@@ -443,6 +443,18 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   shape. The same collapse on the HTTP blob store's own client and server is fixed
   too; no shipped configuration uses that store. (#1963)
 
+- **A block whose coinbase is not final is rejected.** Affects every node and every miner.
+  bitcoin-sv applies its `IsFinalTx` rule to the coinbase as to any other transaction, and
+  Teranode now does too: a block whose coinbase has a non-final input sequence and an
+  nLockTime not yet reached is invalid (`bad-txns-nonfinal`). From CSV onwards a time-based
+  nLockTime is measured against the parent's median time past. `submitminingsolution`
+  refuses such a coinbase instead of mining a block peers reject. When a solution carries no
+  coinbase, the one block assembly rebuilds no longer gets the solution's time and nonce
+  copied into its nLockTime and input sequence; they go into the header only, as in
+  bitcoin-sv, so the rebuilt coinbase, and the merkle root built from it, no longer depend
+  on the nonce the miner found. A node on an
+  earlier build accepts blocks this one rejects, so upgrade every node together. (#2017)
+
 ### Not breaking, but worth knowing
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
