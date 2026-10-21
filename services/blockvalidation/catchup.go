@@ -2068,10 +2068,11 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 		// Leaving the files is harmless either way: the content is honest, every blob carries a
 		// finite DAH, and the next run rewrites it with AllowOverwrite.
 		//
-		// The block IS committed: AddBlock stored it with subtrees_set and mined_set, and the
-		// post-commit unlock still failed after its retries (bitcoin-sv/teranode#4987). The files
-		// this attempt wrote now belong to a block recorded as having them, so a sweep would corrupt
-		// it, and normal validation would find the block stored and do nothing. No write can still be
+		// The block IS committed, or may be: AddBlock stored it with subtrees_set and mined_set and
+		// the post-commit unlock still failed after its retries, or AddBlock returned an error that
+		// commitBlock could not prove meant "not stored" (bitcoin-sv/teranode#4987). The files this
+		// attempt wrote can belong to a block recorded as having them, so a sweep can corrupt it,
+		// and normal validation would find the block stored and do nothing. No write can still be
 		// in flight: awaitSubtreeWrites returned nil before commitBlock ran, so no waitDone join is
 		// needed. Its outputs stay locked and nothing unlocks them later: the setMined worker skips a
 		// block with mined_set, and a stored block is skipped by catch-up and by processBlockFound.

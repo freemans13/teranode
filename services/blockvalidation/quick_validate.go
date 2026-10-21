@@ -620,7 +620,28 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 		options.WithMinedSet(true),
 		options.WithID(uint64(block.ID)),
 	); err != nil {
-		return errors.NewProcessingError("[%s][%s] failed to add block to blockchain", caller, block.Hash().String(), err)
+		// An AddBlock error does not prove the block was not stored: a deadline or cancel can reach
+		// the client after the blockchain server committed it. Treating a stored block as a local
+		// fault would let tryQuickValidation delete the .subtree files of a block recorded as
+		// having them, the corruption of bitcoin-sv/teranode#4978. So ask the store.
+		stored, probeErr := u.blockStoredAfterAddBlockError(ctx, block)
+
+		switch {
+		case stored:
+			// The insert committed, with subtrees_set and mined_set. Finish the commit tail.
+			u.logger.Warnf("[%s][%s] AddBlock returned an error but the block is stored, continuing the commit: %v", caller, block.Hash().String(), err)
+		case probeErr != nil || ctx.Err() != nil:
+			// The block may be stored. With the probe failed we cannot tell, and with ctx ended
+			// the server can still be committing it. Keep the files and abort.
+			probe := "not stored yet, but ctx ended"
+			if probeErr != nil {
+				probe = "probe failed: " + probeErr.Error()
+			}
+
+			return markBlockCommitted(errors.NewServiceError("[%s][%s] AddBlock failed and the block may be stored (%s)", caller, block.Hash().String(), probe, err))
+		default:
+			return errors.NewProcessingError("[%s][%s] failed to add block to blockchain", caller, block.Hash().String(), err)
+		}
 	}
 
 	prometheusBlockValidationQuickCommitAddBlock.Observe(time.Since(start).Seconds())
@@ -629,9 +650,9 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	// Unlock all UTXOs - final commit point (no-op when the lock was never taken; #1103).
 	//
 	// AddBlock has committed the block with subtrees_set and mined_set, so from here on a failure
-	// is post-commit (bitcoin-sv/teranode#4987). The unlock is retried rather than rolled back, and
-	// a failure that survives the retries, or a ctx that ends during them (retry.Retry then returns
-	// ctx.Err()), is marked so no caller treats it as a local fault: that
+	// is post-commit (bitcoin-sv/teranode#4987). The unlock is retried rather than rolled back, on
+	// a context detached from ctx, so a cancelled catch-up run does not skip the retries. A failure
+	// that survives the retries is marked so no caller treats it as a local fault: that
 	// would delete the .subtree files of a block now recorded as having them, and fall through to
 	// normal validation, which finds the block stored and does nothing. ServiceError so the legacy
 	// park reads it as retry-later and keeps the block instead of rejecting a committed one.
@@ -1852,20 +1873,51 @@ const postCommitUnlockRetries = 3
 
 var postCommitUnlockRetryBackoff = 100 * time.Millisecond
 
+// postCommitTimeout bounds the work commitBlock does on a context detached from the caller's:
+// the full unlock retry sequence, and the existence probe after an AddBlock error. It only stops a
+// hung store. A shutdown waits for this work, up to this bound, because a block that is already
+// committed must not be left half-finished. A package-level var so tests can shrink it.
+var postCommitTimeout = 5 * time.Minute
+
 // unlockSubtreeTransactionsWithRetry retries unlockSubtreeTransactionsIfNeeded. Each attempt
 // re-sends the whole pass: SetLocked(false) is idempotent, and retrying inside the errgroup would
 // not work, since the first failing goroutine cancels the context its siblings share.
+//
+// The retries run on context.WithoutCancel(ctx). ctx is the catch-up errgroup context, which any
+// failure elsewhere in the run cancels, and retry.Retry stops on a cancelled context before its
+// next attempt. On ctx, the first failed unlock would end the retries. When the retries stop
+// because postCommitTimeout ended, the returned error wraps the last store error.
 func (u *BlockValidation) unlockSubtreeTransactionsWithRetry(ctx context.Context, block *model.Block, callerTag string) error {
-	_, err := retry.Retry(ctx, u.logger,
+	unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCommitTimeout)
+	defer cancel()
+
+	var lastErr error
+
+	_, err := retry.Retry(unlockCtx, u.logger,
 		func() (struct{}, error) {
-			return struct{}{}, u.unlockSubtreeTransactionsIfNeeded(ctx, block, callerTag)
+			lastErr = u.unlockSubtreeTransactionsIfNeeded(unlockCtx, block, callerTag)
+			return struct{}{}, lastErr
 		},
 		retry.WithMessage(fmt.Sprintf("[%s][%s] post-commit unlock failed", callerTag, block.Hash().String())),
 		retry.WithRetryCount(postCommitUnlockRetries),
 		retry.WithBackoffDurationType(postCommitUnlockRetryBackoff),
 	)
 
+	if err != nil && lastErr != nil && err != lastErr { //nolint:errorlint // identity: did retry.Retry return the store error itself
+		return errors.NewProcessingError("[%s][%s] post-commit unlock stopped: %v", callerTag, block.Hash().String(), err, lastErr)
+	}
+
 	return err
+}
+
+// blockStoredAfterAddBlockError reports whether block is in the blockchain store, after AddBlock
+// returned an error. The probe runs on a context detached from ctx, since the AddBlock error can
+// itself be ctx ending.
+func (u *BlockValidation) blockStoredAfterAddBlockError(ctx context.Context, block *model.Block) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCommitTimeout)
+	defer cancel()
+
+	return u.blockchainClient.GetBlockExists(probeCtx, block.Hash())
 }
 
 // unlockSubtreeTransactions unlocks all transactions in the given subtrees in parallel.

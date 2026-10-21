@@ -77,6 +77,9 @@ func TestTryQuickValidation_LocalFaultPath_WaitsForDelayedWriteBeforeCleanup(t *
 	// and the pipeline completes, then the commit fails locally.
 	suite.MockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(errors.NewProcessingError("simulated local commit failure"))
+	// The block was not stored, so commitBlock's probe after the AddBlock error keeps the
+	// local-fault route.
+	suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	setupQuickValidateMocks(suite)
 
 	rec := &banScoreRecorder{}
