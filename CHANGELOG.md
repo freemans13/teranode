@@ -88,6 +88,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **`ProcessBlock` refuses a legacy block whose parent is not stored.** Block validation's
+  `ProcessBlock` gRPC call used to answer success for a block with baseURL `legacy` and no stored
+  parent: it handed the block to catch-up and stored nothing. It now returns `ERR_SERVICE_ERROR`.
+  An empty `BaseUrl` defaults to `legacy`, so any external caller that omits it gets the same
+  refusal and must submit the parent first. Legacy sync keeps the block and retries it once the
+  parent commits. Blocks announced by p2p peers still go to catch-up. (#2021)
+
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
   `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
