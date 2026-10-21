@@ -628,7 +628,10 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 
 		switch {
 		case stored:
-			// The insert committed, with subtrees_set and mined_set. Finish the commit tail.
+			// Usually this insert committed, with subtrees_set and mined_set. The block can also have
+			// been stored by another route first, so the insert failed as a duplicate: that route then
+			// owns the block's flags. Either way the block is stored, so a sweep is wrong and the
+			// unlock is safe. Finish the commit tail.
 			u.logger.Warnf("[%s][%s] AddBlock returned an error but the block is stored, continuing the commit: %v", caller, block.Hash().String(), err)
 		case probeErr != nil || ctx.Err() != nil:
 			// The block may be stored. With the probe failed we cannot tell, and with ctx ended
