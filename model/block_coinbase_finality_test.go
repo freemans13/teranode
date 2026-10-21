@@ -258,8 +258,6 @@ func TestCoinbaseFinalityViolation(t *testing.T) {
 		postCSV    = height
 	)
 
-	header := &BlockHeader{Timestamp: headerTime}
-
 	tests := []struct {
 		name      string
 		lockTime  uint32
@@ -291,7 +289,42 @@ func TestCoinbaseFinalityViolation(t *testing.T) {
 			params.CSVHeight = tt.csvHeight
 
 			cb := finalityCoinbase(t, height, tt.lockTime, tt.sequence)
-			require.Equal(t, tt.want, CoinbaseFinalityViolation(cb, header, height, &params, tt.mtp))
+			require.Equal(t, tt.want, CoinbaseFinalityViolation(cb, headerTime, height, &params, tt.mtp))
+
+			// The promise CoinbaseFinalityNeedsMedianTimePast makes to a caller without headers:
+			// when it says the median time past does not matter, leaving it unknown gives the same
+			// verdict.
+			if !CoinbaseFinalityNeedsMedianTimePast(cb, height, &params) {
+				require.Equal(t, tt.want, CoinbaseFinalityViolation(cb, headerTime, height, &params, 0))
+			}
+		})
+	}
+}
+
+func TestCoinbaseFinalityNeedsMedianTimePast(t *testing.T) {
+	const height = uint32(100)
+
+	tests := []struct {
+		name      string
+		lockTime  uint32
+		sequence  uint32
+		csvHeight uint32
+		want      bool
+	}{
+		{"post-CSV time lock with a non-final sequence needs it", lockTimeThreshold, nonFinalSequence, height, true},
+		{"pre-CSV time lock is measured against the header time", lockTimeThreshold, nonFinalSequence, height + 1, false},
+		{"height lock never needs it", lockTimeThreshold - 1, nonFinalSequence, height, false},
+		{"nLockTime 0 never needs it", 0, nonFinalSequence, height, false},
+		{"final sequence waives the time lock", lockTimeThreshold, 0xFFFFFFFF, height, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := chaincfg.RegressionNetParams
+			params.CSVHeight = tt.csvHeight
+
+			cb := finalityCoinbase(t, height, tt.lockTime, tt.sequence)
+			require.Equal(t, tt.want, CoinbaseFinalityNeedsMedianTimePast(cb, height, &params))
 		})
 	}
 }

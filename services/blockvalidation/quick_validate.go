@@ -534,7 +534,7 @@ func (u *BlockValidation) checkQuickValidationCoinbase(block *model.Block, calle
 		return errors.NewBlockInvalidError("[%s][%s] bad coinbase length", caller, block.Hash().String())
 	}
 
-	if reason := model.CoinbaseFinalityViolation(block.CoinbaseTx, block.Header, block.Height, u.settings.ChainCfgParams, 0); reason != "" {
+	if reason := model.CoinbaseFinalityViolation(block.CoinbaseTx, block.Header.Timestamp, block.Height, u.settings.ChainCfgParams, 0); reason != "" {
 		return errors.NewBlockInvalidError("[%s][%s] coinbase is not final: %s", caller, block.Hash().String(), reason)
 	}
 

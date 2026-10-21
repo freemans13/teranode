@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -171,6 +172,32 @@ func (b *BlockAssembler) MinCandidateTime(parentHash *chainhash.Hash) (int64, bo
 	}
 
 	return 0, false
+}
+
+// ParentMedianTimePast returns the median time past of the 11 headers ending at parentHash, which
+// is what bitcoin-sv measures a time-based coinbase nLockTime against from CSV onwards. The submit
+// path uses it for the coinbase finality check (bitcoin-sv/teranode#4981).
+//
+// Unlike MinCandidateTime it neither stops at a memo miss nor defers to GenerateSupported: finality
+// is a consensus rule on every chain, so a miss goes to the blockchain service, and a failed lookup
+// is an error the caller refuses on rather than a reason to skip the rule. A failed lookup is also
+// logged by computeMtpFloor in candidateTime's wording, which names an unfloored candidate.
+func (b *BlockAssembler) ParentMedianTimePast(ctx context.Context, parentHash *chainhash.Hash) (uint32, error) {
+	entry := b.memoizedMtpFloor(parentHash)
+	if entry == nil {
+		// mtpFloor reads the header only for its hash-keyed fallback walk, which refuses a nil one.
+		parentHeader, _, err := b.blockchainClient.GetBlockHeader(ctx, parentHash)
+		if err != nil {
+			return 0, errors.NewProcessingError("failed to fetch parent header %s", parentHash.String(), err)
+		}
+
+		if entry = b.mtpFloor(ctx, parentHeader, parentHash); entry == nil {
+			return 0, errors.NewProcessingError("median time past of parent %s could not be established", parentHash.String())
+		}
+	}
+
+	// The memo holds the floor, median time past plus one.
+	return safeconversion.Int64ToUint32(entry.minTime - 1)
 }
 
 // mtpFloor returns the memoized median-time-past floor for parentHash,

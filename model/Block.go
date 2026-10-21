@@ -1041,7 +1041,7 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 	// headers (block assembly passes none) the parent's median time past is unknown, so from CSV
 	// onwards a time-based nLockTime is not evaluated, as the median-time-past rule above is
 	// skipped; the block is checked again with headers when block validation receives it.
-	if reason := CoinbaseFinalityViolation(b.CoinbaseTx, b.Header, b.Height, settings.ChainCfgParams, parentMedianTimePast); reason != "" {
+	if reason := CoinbaseFinalityViolation(b.CoinbaseTx, b.Header.Timestamp, b.Height, settings.ChainCfgParams, parentMedianTimePast); reason != "" {
 		return false, merkleRootChecked, bindErr("[BLOCK][%s] coinbase is not final: %s", b.String(), reason)
 	}
 
