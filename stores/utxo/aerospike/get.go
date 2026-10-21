@@ -1185,26 +1185,26 @@ NEXT_BATCH_RECORD:
 				// BatchDecorate that block validation depends on would trade a
 				// cosmetic problem for a real one.
 				if v := bins[key.String()]; v != nil {
-					var raw int64
+					var binValue int64
 
 					switch t := v.(type) {
 					case int:
-						raw = int64(t)
+						binValue = int64(t)
 					case int64:
-						raw = t
+						binValue = t
 					default:
 						s.logger.Warnf("[BatchDecorate][%s] ignoring cohort bin of unexpected type %T", items[idx].Hash, v)
 
 						continue
 					}
 
-					if raw < 0 || raw > math.MaxUint32 {
-						s.logger.Warnf("[BatchDecorate][%s] ignoring cohort %d outside the uint32 range", items[idx].Hash, raw)
+					if binValue < 0 || binValue > math.MaxUint32 {
+						s.logger.Warnf("[BatchDecorate][%s] ignoring cohort %d outside the uint32 range", items[idx].Hash, binValue)
 
 						continue
 					}
 
-					items[idx].Data.Cohort = uint32(raw)
+					items[idx].Data.Cohort = uint32(binValue)
 				}
 			}
 		}

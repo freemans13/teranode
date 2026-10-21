@@ -1696,8 +1696,15 @@ func CohortRoundTrip(t *testing.T, db utxostore.Store) {
 
 	// A create without the option is what every caller does while the feature
 	// flag is off: nothing is stamped and the stored label stays at zero.
-	unstamped := newTestTx(t, 8_000_000)
+	//
+	// The amount sits outside every range the other helpers in this file use,
+	// and the record is deleted on exit: the aerospike suite runs these helpers
+	// against one shared store, so a leftover record with a colliding txid
+	// makes a later subtest's create fail with TX_EXISTS.
+	unstamped := newTestTx(t, 9_500_000)
 	_ = db.Delete(ctx, unstamped.TxIDChainHash())
+
+	t.Cleanup(func() { _ = db.Delete(context.Background(), unstamped.TxIDChainHash()) })
 
 	md, _, err = db.SpendAndCreate(ctx, unstamped, 1000, utxostore.WithCreateOnly())
 	require.NoError(t, err)
