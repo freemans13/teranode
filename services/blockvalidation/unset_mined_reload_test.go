@@ -8,10 +8,14 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -85,7 +89,7 @@ func TestReloadSubtreesForInvalidBlock_IsRaceFreeAgainstConcurrentRelease(t *tes
 		defer wg.Done()
 
 		for i := 0; i < 50; i++ {
-			u.reloadSubtreesForInvalidBlock(ctx, block)
+			assert.NoError(t, u.reloadSubtreesForInvalidBlock(ctx, block))
 		}
 	}()
 
@@ -99,4 +103,63 @@ func TestReloadSubtreesForInvalidBlock_IsRaceFreeAgainstConcurrentRelease(t *tes
 	}()
 
 	wg.Wait()
+}
+
+// failingGetStore fails every Get with err, standing in for a blob backend
+// that cannot be reached.
+type failingGetStore struct {
+	blob.Store
+
+	err error
+}
+
+func (s *failingGetStore) Get(context.Context, []byte, fileformat.FileType, ...options.FileOption) ([]byte, error) {
+	return nil, s.err
+}
+
+// TestReloadSubtreesForInvalidBlock_FailsOnReadErrorSkipsMissing pins how the
+// revert of an invalid block treats a subtree it cannot load (GAP-BV-057).
+//
+// A subtree absent from the store is skipped: no retry can bring it back, and
+// failing on it would keep the block in the mined-not-set sweep forever. Any
+// other read failure may be transient, so it is returned and the revert is
+// retried rather than finished with that subtree's tags still in place.
+func TestReloadSubtreesForInvalidBlock_FailsOnReadErrorSkipsMissing(t *testing.T) {
+	nBits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+
+	coinbase, err := bt.NewTxFromString(model.CoinbaseHex)
+	require.NoError(t, err)
+
+	header := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Timestamp:      1,
+		Bits:           *nBits,
+	}
+
+	subtreeHash := chainhash.HashH([]byte("absent-subtree"))
+
+	block, err := model.NewBlock(header, coinbase, []*chainhash.Hash{&subtreeHash}, 2, 123, 0, 0)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	t.Run("missing subtree is skipped", func(t *testing.T) {
+		u := &BlockValidation{logger: ulogger.TestLogger{}, subtreeStore: blobmemory.New()}
+
+		require.NoError(t, u.reloadSubtreesForInvalidBlock(ctx, block))
+		require.Len(t, block.SubtreeSlices, 1)
+		require.Nil(t, block.SubtreeSlices[0])
+	})
+
+	t.Run("read failure is returned", func(t *testing.T) {
+		readErr := errors.NewStorageError("subtree store unreachable")
+		u := &BlockValidation{logger: ulogger.TestLogger{}, subtreeStore: &failingGetStore{Store: blobmemory.New(), err: readErr}}
+
+		err := u.reloadSubtreesForInvalidBlock(ctx, block)
+		require.Error(t, err)
+		require.ErrorIs(t, err, readErr)
+	})
 }

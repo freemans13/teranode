@@ -1389,17 +1389,27 @@ func (u *BlockValidation) tryClaimBlockForSetMined(blockHash *chainhash.Hash) bo
 }
 
 // reloadSubtreesForInvalidBlock reloads an invalid block's subtrees from the
-// store, best-effort: a subtree that cannot be read or parsed is left nil,
-// because an invalid block legitimately may not have all of them.
-func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) {
+// store. A subtree that is absent or does not parse is left nil, because an
+// invalid block legitimately may not have all of them and a retry cannot bring
+// one back. Any other read failure is returned: it may be transient, and
+// skipping it would let the revert finish with that subtree's tags in place.
+func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) error {
 	reloaded := make([]*subtreepkg.Subtree, len(block.Subtrees))
 
 	for subtreeIdx, subtreeHash := range block.Subtrees {
 		subtreeBytes, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
 		if err != nil {
+			if !errors.Is(err, errors.ErrNotFound) {
+				return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+			}
+
 			subtreeBytes, err = u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 			if err != nil {
-				u.logger.Warnf("[setTxMined][%s] failed to get subtree %d/%s from store: %s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+				if !errors.Is(err, errors.ErrNotFound) {
+					return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+				}
+
+				u.logger.Warnf("[setTxMined][%s] subtree %d/%s not in store: %s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
 				continue
 			}
 		}
@@ -1420,6 +1430,8 @@ func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, blo
 	// store I/O is what makes an eviction of the same block stall the whole
 	// lastValidatedBlocks cache.
 	block.ReplaceSubtreeSlices(reloaded)
+
+	return nil
 }
 
 // setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
@@ -1507,7 +1519,9 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 			u.logger.Warnf("[setTxMined][%s] failed closing subtrees before unset-mined reload: %v", block.Hash().String(), releaseErr)
 		}
 
-		u.reloadSubtreesForInvalidBlock(ctx, block)
+		if err = u.reloadSubtreesForInvalidBlock(ctx, block); err != nil {
+			return err
+		}
 	} else {
 		// All subtrees should already be available for fully processed blocks
 		_, err = block.GetSubtrees(ctx, u.logger, u.subtreeStore, u.settings.Block.GetAndValidateSubtreesConcurrency)
