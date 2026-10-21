@@ -30,25 +30,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// gap057FailingUnsetStore wraps a real UTXO store and fails SetMinedMulti calls that unset mined tags,
+// revertFailingUnsetStore wraps a real UTXO store and fails SetMinedMulti calls that unset mined tags,
 // which is the revert of an invalid block's tags.
-type gap057FailingUnsetStore struct {
+type revertFailingUnsetStore struct {
 	utxostore.Store
 
 	unsetCalls int
 }
 
-func (s *gap057FailingUnsetStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, info utxostore.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+func (s *revertFailingUnsetStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, info utxostore.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	if info.UnsetMined {
 		s.unsetCalls++
 
-		return nil, errors.NewStorageError("gap057: injected SetMinedMulti failure during revert")
+		return nil, errors.NewStorageError("injected SetMinedMulti failure during revert")
 	}
 
 	return s.Store.SetMinedMulti(ctx, hashes, info)
 }
 
-// TestGapBV057_RevertFailureDoesNotSetMinedSet is the regression test for GAP-BV-057 (BV-COMMIT-011).
+// TestSetTxMinedStatus_RevertFailureLeavesMinedSetFalse is the regression test for GAP-BV-057 (BV-COMMIT-011).
 //
 // When reverting an invalid block's mined tags, a failed SetMinedMulti must not be swallowed:
 // setTxMinedStatus must return the error so mined_set stays false and the mined-not-set sweep
@@ -56,7 +56,7 @@ func (s *gap057FailingUnsetStore) SetMinedMulti(ctx context.Context, hashes []*c
 // returned success, and setTxMinedStatus went on to SetBlockMinedSet, so the block was recorded as
 // processed while its transactions kept the stale tag. A UTXO-store decorator fails the unset
 // SetMinedMulti call; this is not a real I/O fault.
-func TestGapBV057_RevertFailureDoesNotSetMinedSet(t *testing.T) {
+func TestSetTxMinedStatus_RevertFailureLeavesMinedSetFalse(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -188,7 +188,7 @@ func TestGapBV057_RevertFailureDoesNotSetMinedSet(t *testing.T) {
 	require.False(t, blockMeta.MinedSet, "precondition: InvalidateBlock cleared mined_set, the revert is owed")
 
 	// Now the revert runs against a UTXO store whose unset SetMinedMulti fails.
-	failing := &gap057FailingUnsetStore{Store: realUtxoStore}
+	failing := &revertFailingUnsetStore{Store: realUtxoStore}
 	bv.utxoStore = failing
 
 	revertErr := bv.setTxMinedStatus(ctx, block.Hash(), true)
