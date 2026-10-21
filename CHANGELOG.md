@@ -445,6 +445,17 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Not breaking, but worth knowing
 
+- **A failed revert of an invalid block's mined tags is now retried.** When block
+  validation reverts the mined tags of an invalid block and `SetMinedMulti` fails,
+  or a subtree read fails with anything other than not-found, the revert now
+  returns an error instead of logging a warning and marking the block done. The
+  block goes through the existing setTxMined retry loop: each failure increments
+  `teranode_blockvalidation_setmined_retry_total`, and a block that still fails
+  after 10 attempts logs `manual_intervention_required` and increments
+  `teranode_blockvalidation_setmined_drops_total`. Alerts on those metrics can now
+  fire for invalid blocks under a store fault. A subtree that is absent from the
+  store is still skipped. No action is required. (#2016)
+
 - **Mining candidates no longer build on the old tip during a reorg.** While block
   assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
   hold the tip from before the reorg. `GetMiningCandidate` built candidates on that

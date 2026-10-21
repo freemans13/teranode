@@ -169,6 +169,7 @@ func TestReloadSubtreesForInvalidBlock_FailsOnReadErrorSkipsMissing(t *testing.T
 		require.Error(t, err)
 		require.ErrorIs(t, err, readErr)
 	})
+
 	t.Run("read failure on the subtree-to-check fallback is returned", func(t *testing.T) {
 		// The subtree file is absent, so the reload falls back to the
 		// subtree-to-check file, and that read fails with a non-not-found error.
