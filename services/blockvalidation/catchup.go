@@ -358,19 +358,17 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return err
 	}
 
-	// Step 9.1: On the netted route, refuse a window with no verified checkpoint above its first
-	// block here, before any block body is fetched.
-	if err = u.refuseNettedRouteWindowWithoutCheckpoint(catchupCtx); err != nil {
-		return err
-	}
-
 	u.reportValidatedHeaderProgress(catchupCtx)
 
 	// Step 9.5: Validate header-chain difficulty (DAA) before fetching full blocks.
 	// Header-fetch validation only checks each header's PoW against its own nBits; this
 	// recomputes the DAA-required nBits from the header chain and rejects a peer that
 	// supplied a self-consistent low-difficulty chain.
-	if err = u.validateCatchupHeaderDifficulty(ctx, catchupCtx); err != nil {
+	//
+	// Step 9.6: On the netted route, refuse a window with no verified checkpoint above its first
+	// block, before any block body is fetched. It runs after the DAA check, so a self-consistent
+	// low-difficulty chain in such a window is still reported as malicious.
+	if err = u.validateHeaderWindow(ctx, catchupCtx); err != nil {
 		return err
 	}
 
@@ -1221,6 +1219,18 @@ func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) erro
 	}
 
 	return nil
+}
+
+// validateHeaderWindow runs the checks on the fetched header window that need no block body, in
+// sequence: the DAA (difficulty adjustment algorithm) check, which reports a peer that serves a
+// low-difficulty chain, and then the netted-route refusal of a window without a verified
+// checkpoint, which is a local fault and reports no peer.
+func (u *Server) validateHeaderWindow(ctx context.Context, catchupCtx *CatchupContext) error {
+	if err := u.validateCatchupHeaderDifficulty(ctx, catchupCtx); err != nil {
+		return err
+	}
+
+	return u.refuseNettedRouteWindowWithoutCheckpoint(catchupCtx)
 }
 
 // nettedRouteFirstBlock reports whether the first block after the common ancestor is on the

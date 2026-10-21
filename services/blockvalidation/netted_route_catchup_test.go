@@ -217,3 +217,51 @@ func TestNettedRoute_HeaderWindowFromATrailingUTXOHeightHoldsTheNextCheckpoint(t
 	require.Equal(t, blocks[10].Header.Hash(), result.Headers[0].Hash(), "the window starts at the tip, the common ancestor")
 	require.Equal(t, blocks[30].Header.Hash(), result.Headers[len(result.Headers)-1].Hash(), "the window holds checkpoint 30")
 }
+
+// On the netted route the DAA check runs before the refusal of a window without a verified
+// checkpoint, so a peer that serves a self-consistent low-difficulty chain in such a window is
+// still reported as malicious, and an honest window without a checkpoint stays a local fault.
+func TestNettedRoute_DifficultyIsCheckedBeforeTheWindowRefusal(t *testing.T) {
+	bv, _, cleanup := newNetRangeHarness(t, "netted_route_daa_first", 65536)
+	defer cleanup()
+
+	params := chaincfg.MainNetParams
+	params.DaaForkHeight = 0
+	params.Checkpoints = []chaincfg.Checkpoint{{Height: 300_000}}
+	bv.settings.ChainCfgParams = &params
+
+	startBits, err := model.NewNBitFromString("180a097a")
+	require.NoError(t, err)
+
+	easyBits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+
+	run := func(t *testing.T, tamper bool) (*catchupReportRecorder, error) {
+		t.Helper()
+
+		anchor, headers := buildConstantChain(300, 600, startBits)
+		if tamper {
+			headers[200].Bits = *easyBits
+		}
+
+		rec := &catchupReportRecorder{}
+		u := &Server{logger: ulogger.TestLogger{}, settings: bv.settings, blockValidation: bv, utxoStore: bv.utxoStore, p2pClient: rec}
+		c := &CatchupContext{blockUpTo: newReleaseCatchupBlock(t), peerID: "peer", commonAncestorMeta: anchor, blockHeaders: headers}
+
+		_, netted := u.nettedRouteFirstBlock(c)
+		require.True(t, netted, "the window starts below checkpoint 300,000 on a netting store")
+
+		return rec, u.validateHeaderWindow(t.Context(), c)
+	}
+
+	rec, err := run(t, true)
+	require.Error(t, err)
+	require.True(t, errors.IsMaliciousResponseError(err), "got %v", err)
+	require.Equal(t, []string{"peer"}, rec.maliciousReported(), "the low-difficulty chain is reported")
+
+	rec, err = run(t, false)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrServiceError), "got %v", err)
+	require.True(t, isLocalCatchupFault(err))
+	require.Empty(t, rec.maliciousReported())
+}
