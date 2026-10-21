@@ -767,6 +767,53 @@ func TestGapBV054_RetryPanicChargesAlternative(t *testing.T) {
 	require.True(t, s.panicAttemptsExhausted(hash, "altPeer"), "the retry's alternative must be capped after the limit")
 }
 
+// TestGapBV054_BlockFoundChPanicIsCountedAndAnswersCaller panics in processBlockFoundChannel on a
+// blockFoundCh worker, with a panic value that holds words the substring classifiers look for.
+// The recover must count the panic on the block_found path, and a WaitToComplete caller, which
+// waits on an unbuffered errCh, must get an ERR_PROCESSING error that is not a network, malicious
+// or corrupt error and does not hold the panic value.
+func TestGapBV054_BlockFoundChPanicIsCountedAndAnswersCaller(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	panicValue := "http connection timeout: corrupt malformed response"
+	chain := &gap054PanicChain{ClientI: s.blockchainClient, onHeader: false, panicking: make(chan struct{}), panicValue: panicValue}
+	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, chain, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+
+	panicsBefore := testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathBlockFound))
+
+	errCh := make(chan error)
+
+	go s.processBlockFoundChItem(ctx, 0, processBlockFound{hash: block.Hash(), baseURL: "http://test-peer", peerID: "peerA", errCh: errCh})
+
+	var err error
+
+	select {
+	case err = <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the WaitToComplete caller got no answer after the panic")
+	}
+
+	select {
+	case <-chain.panicking:
+	default:
+		t.Fatal("setup: processing never reached the injected panic")
+	}
+
+	require.Equal(t, panicsBefore+1, testutil.ToFloat64(prometheusRecoveredPanics.WithLabelValues(recoveredPanicPathBlockFound)), "the recover must count the panic on the block_found path")
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrProcessing), "the caller must get ERR_PROCESSING, got %v", err)
+	require.NotContains(t, err.Error(), panicValue, "the panic value must stay out of the error text")
+	require.False(t, errors.IsBlockCorrupt(err))
+	require.False(t, errors.IsNetworkError(err), "%v", err)
+	require.False(t, errors.IsMaliciousResponseError(err), "%v", err)
+}
+
 // TestGapBV054_ConcurrentPanicErrorIsDistinct checks that isConcurrentValidationPanic matches the
 // waiter error from runOncePerBlock, also when another error wraps it, and matches no other
 // ERR_PROCESSING error. teranode's errors.Is matches on the code, so it cannot tell them apart.

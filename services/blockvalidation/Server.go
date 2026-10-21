@@ -247,8 +247,9 @@ type Server struct {
 	// blockPanicAttempts counts the panics that the priority worker recovered for each (block hash,
 	// serving peerID) (BV-STARTUP-007). After MaxCorruptAttemptsPerBlock panics in one
 	// CorruptAttemptCooldown window, processBlockFound drops that peer's next deliveries of the hash
-	// before the download, so a block that panics every time does not log a full stack on each
-	// announcement. It is a third independent budget that uses the corrupt cap's configured values,
+	// before its own download and the validation, so a block that panics every time does not log a
+	// full stack on each announcement. addBlockToPriorityQueue has still fetched the block one time
+	// to classify it, before the gate. It is a third independent budget that uses the corrupt cap's configured values,
 	// as blockPolicyDeclineAttempts does, so operators get no new knob. It is keyed on the pair for
 	// the reason blockAttemptKey gives: a panic can come from one peer's bytes, and a per-hash
 	// count would let that peer stop an honest delivery of the same hash. An empty peerID is not
@@ -853,29 +854,7 @@ func (u *Server) Init(ctx context.Context) (err error) {
 
 				case blockFound := <-u.blockFoundCh:
 					u.logger.Infof("[Init] Worker %d received block %s from blockFoundCh, processing", workerID, blockFound.hash.String())
-					func(bf processBlockFound) {
-						defer func() {
-							if r := recover(); r != nil {
-								u.logger.Errorf("[Init] PANIC in processBlockFoundChannel for block %s: %v", bf.hash.String(), r)
-								if bf.errCh != nil {
-									bf.errCh <- errors.NewProcessingError("panic in processBlockFoundChannel: %v", r)
-								}
-							}
-						}()
-						if u.isPeerMalicious(ctx, blockFound.peerID) {
-							u.logger.Warnf("[blockFound][%s] peer %s (%s) is marked as malicious, skipping", bf.hash.String(), bf.peerID, bf.baseURL)
-							if bf.errCh != nil {
-								bf.errCh <- errors.NewProcessingError("peer %s is marked as malicious", bf.peerID)
-							}
-							return
-						}
-						u.logger.Debugf("[Init] Worker %d starting processBlockFoundChannel for block %s", workerID, bf.hash.String())
-						if err := u.processBlockFoundChannel(ctx, bf); err != nil {
-							u.logger.Errorf("[Init] processBlockFoundChannel failed for block %s: %v", bf.hash.String(), err)
-						} else {
-							u.logger.Debugf("[Init] processBlockFoundChannel completed successfully for block %s", bf.hash.String())
-						}
-					}(blockFound)
+					u.processBlockFoundChItem(ctx, workerID, blockFound)
 				}
 			}
 		}()
@@ -1056,6 +1035,43 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 
 	u.logger.Debugf("[blockHandler] Block %s queued for processing", hash.String())
 	return nil
+}
+
+// processBlockFoundChItem runs one blockFoundCh item on a blockFoundCh worker and recovers a panic,
+// so one bad block cannot kill the worker or the process (BV-STARTUP-007). The recover counts the
+// panic on the block_found path of the recovered-panics counter and logs the stack on one line.
+// The error it sends to a WaitToComplete caller has no panic value in its text: callers read
+// errors with substring classifiers such as IsNetworkError and IsMaliciousResponseError, which
+// match words such as "http" or "timeout". The panic value is in the log line.
+func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf processBlockFound) {
+	defer func() {
+		if r := recover(); r != nil {
+			countRecoveredPanic(recoveredPanicPathBlockFound)
+			u.logger.Errorf("[Init] PANIC in processBlockFoundChannel for block %s from peer %s: %v stack=%q", bf.hash.String(), bf.peerID, r, debug.Stack())
+
+			if bf.errCh != nil {
+				bf.errCh <- errors.NewProcessingError("panic processing block %s, see the PANIC log line", bf.hash.String())
+			}
+		}
+	}()
+
+	if u.isPeerMalicious(ctx, bf.peerID) {
+		u.logger.Warnf("[blockFound][%s] peer %s (%s) is marked as malicious, skipping", bf.hash.String(), bf.peerID, bf.baseURL)
+
+		if bf.errCh != nil {
+			bf.errCh <- errors.NewProcessingError("peer %s is marked as malicious", bf.peerID)
+		}
+
+		return
+	}
+
+	u.logger.Debugf("[Init] Worker %d starting processBlockFoundChannel for block %s", workerID, bf.hash.String())
+
+	if err := u.processBlockFoundChannel(ctx, bf); err != nil {
+		u.logger.Errorf("[Init] processBlockFoundChannel failed for block %s: %v", bf.hash.String(), err)
+	} else {
+		u.logger.Debugf("[Init] processBlockFoundChannel completed successfully for block %s", bf.hash.String())
+	}
 }
 
 // processBlockFoundChannel processes newly found blocks from the block found channel.
@@ -1809,9 +1825,11 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	}
 
 	// Per-(hash, peerID) recovered-panic cap (BV-STARTUP-007). The priority worker recovers a panic
-	// and records it in blockPanicAttempts. After the cap, this peer's deliveries of the hash stop
-	// here until the window lapses, so a block that panics every time is not downloaded and
-	// re-panicked on each announcement. The error is ERR_PROCESSING. Its text has no word that
+	// and records it in blockPanicAttempts for the peer that served the attempt. After the cap, this
+	// peer's deliveries of the hash stop here until the window lapses. A block that panics every
+	// time then skips the download below and the validation that panics. It is still fetched one
+	// time per announcement: addBlockToPriorityQueue fetches it to classify it before it reaches
+	// the queue, and so before this gate. The error is ERR_PROCESSING. Its text has no word that
 	// IsNetworkError or IsMaliciousResponseError matches, and it has no peerID, so the worker does
 	// not requeue the block, no peer gets a strike, and the hash is not marked invalid.
 	if u.panicAttemptsExhausted(hash, peerID) {
@@ -3099,9 +3117,10 @@ func (u *Server) panicAttemptsExhausted(blockHash *chainhash.Hash, peerID string
 
 // Path label values for prometheusRecoveredPanics.
 const (
-	recoveredPanicPathWorker  = "worker"
-	recoveredPanicPathCatchup = "catchup"
-	recoveredPanicPathKafka   = "kafka"
+	recoveredPanicPathWorker     = "worker"
+	recoveredPanicPathCatchup    = "catchup"
+	recoveredPanicPathKafka      = "kafka"
+	recoveredPanicPathBlockFound = "block_found"
 )
 
 // countRecoveredPanic increments prometheusRecoveredPanics for one path. It runs inside the

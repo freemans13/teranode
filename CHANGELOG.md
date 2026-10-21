@@ -88,21 +88,31 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
-- **A panic in block validation no longer stops the node.** The priority-queue block
-  workers, the catchup consumer and the Kafka block message handler now recover a panic.
-  Before, the process stopped and restarted, so an alert on a crash loop found it. That alert
-  will not fire now. Monitor the new counter `teranode_blockvalidation_recovered_panics_total`
-  (label `path`: `worker`, `catchup` or `kafka`) and the `PANIC` log line, which has the block
-  hash and the stack. Three more changes come with it:
-  - A Kafka block message that panics is now committed, not redelivered. A peer must announce
-    the block again before the node tries it again.
-  - A catchup that panics counts as a failed attempt with the error type `local_panic`. It is
-    not charged to the peer. It counts toward `blockvalidation_catchup_max_attempts_per_block`
-    unless it validated at least one block first. In that condition it resets the count, as
-    each other failed catchup that made progress does.
-  - After `blockvalidation_max_corrupt_attempts_per_block` (default 3) worker panics for one
-    block from one peer, the node ignores that peer's deliveries of the block for
-    `blockvalidation_corrupt_attempt_cooldown` (default 10 minutes). (#2012)
+- **A panic on the main block validation goroutines no longer stops the node.** The
+  priority-queue block workers, the catchup consumer and the Kafka block message handler now
+  recover a panic, as the `blockFoundCh` workers already did. A panic in a goroutine that
+  these start, such as the catchup block fetch and validation workers, still stops the
+  process. Before, the process stopped and restarted, so an alert on a crash loop found it.
+  That alert will not fire now for the covered paths. Monitor the new counter
+  `teranode_blockvalidation_recovered_panics_total` (label `path`: `worker`, `catchup`,
+  `kafka` or `block_found`) and the `PANIC` log line, which has the block hash and the stack.
+  Four more changes come with it:
+    - A Kafka block message that panics is now committed, not redelivered. A peer must
+      announce the block again before the node tries it again.
+    - A catchup that panics counts as a failed attempt with the error type `local_panic`. It
+      is not charged to the peer. So is a catchup whose validation waited on a validation of
+      the same block that panicked on another goroutine. It counts toward
+      `blockvalidation_catchup_max_attempts_per_block` unless it validated at least one block
+      first. In that condition it resets the count, as each other failed catchup that made
+      progress does.
+    - After `blockvalidation_max_corrupt_attempts_per_block` (default 3) worker panics for
+      one block from one peer, the node stops that peer's deliveries of the block before its
+      own download and validation, for `blockvalidation_corrupt_attempt_cooldown` (default 10
+      minutes). The announcement path still fetches the block one time to classify it. The
+      panic counts for the peer that served the attempt that panicked.
+    - The error that a `WaitToComplete` caller gets after a `blockFoundCh` worker panic no
+      longer has the panic value in its text. The panic value is in the `PANIC` log line.
+      (#2012)
 
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,

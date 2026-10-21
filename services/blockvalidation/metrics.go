@@ -48,7 +48,7 @@ var (
 	prometheusCatchupActive         prometheus.Gauge
 	prometheusCatchupPeerHealthGate *prometheus.CounterVec
 
-	// prometheusRecoveredPanics counts the panics that the three BV-STARTUP-007 recovers caught,
+	// prometheusRecoveredPanics counts the panics that the four BV-STARTUP-007 recovers caught,
 	// by path. The block hash and the stack are in the PANIC log line.
 	prometheusRecoveredPanics *prometheus.CounterVec
 
@@ -401,12 +401,12 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "blockvalidation",
 			Name:      "recovered_panics_total",
-			Help:      "Total number of panics recovered in block validation, by path: worker (priority-queue block worker), catchup (catchup consumer) or kafka (Kafka block message handler). Each one is a bug in this node. The node continues to run, and the block hash and stack are in the PANIC log line.",
+			Help:      "Total number of panics recovered in block validation, by path: worker (priority-queue block worker), catchup (catchup consumer), kafka (Kafka block message handler) or block_found (blockFoundCh worker). Each one is a bug in this node. The node continues to run, and the block hash and stack are in the PANIC log line.",
 		},
 		[]string{"path"},
 	)
 
-	for _, path := range []string{recoveredPanicPathWorker, recoveredPanicPathCatchup, recoveredPanicPathKafka} {
+	for _, path := range []string{recoveredPanicPathWorker, recoveredPanicPathCatchup, recoveredPanicPathKafka, recoveredPanicPathBlockFound} {
 		prometheusRecoveredPanics.WithLabelValues(path)
 	}
 
