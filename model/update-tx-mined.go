@@ -205,10 +205,6 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 	)
 	defer endSpan(err)
 
-	if !tSettings.UtxoStore.UpdateTxMinedStatus {
-		return nil
-	}
-
 	maxMinedBatchSize := tSettings.UtxoStore.MaxMinedBatchSize
 
 	g, gCtx := errgroup.WithContext(ctx)

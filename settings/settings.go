@@ -559,7 +559,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ExternalStoreConcurrency:                getInt("utxostore_externalStoreConcurrency", 16, alternativeContext...),
 			PostgresPool:                            getPostgresPoolSettings("utxostore", alternativeContext...),
 			VerboseDebug:                            getBool("utxostore_verbose_debug", false, alternativeContext...),
-			UpdateTxMinedStatus:                     getBool("utxostore_updateTxMinedStatus", true, alternativeContext...),
 			MaxMinedRoutines:                        getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
 			MaxMinedBatchSize:                       getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment:          getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
