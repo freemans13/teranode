@@ -2032,8 +2032,9 @@ func (u *Server) legacyUnifiedRoute(block *model.Block, baseURL string, headerPr
 // already sent. The legacy service refuses to start with its own copy false on such a store
 // (model.CheckNettedRouteLegacySettings), so that copy decides.
 func (u *Server) legacyUnifiedEligible(block *model.Block, baseURL string) bool {
-	if !u.settings.BlockValidation.LegacyUnifiedBelowCheckpoint &&
-		!model.NettedRouteAt(u.settings, u.utxoStore, block.Height) {
+	// The return below requires model.OutpointOnlyEligible, so "the store nets" alone here is
+	// model.NettedRouteAt.
+	if !u.settings.BlockValidation.LegacyUnifiedBelowCheckpoint && !utxo.NetsBelowCheckpoint(u.utxoStore) {
 		return false
 	}
 
