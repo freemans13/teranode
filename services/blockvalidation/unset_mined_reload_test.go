@@ -189,6 +189,17 @@ func TestReloadSubtreesForInvalidBlock_FailsOnReadErrorSkipsMissing(t *testing.T
 		require.Error(t, err)
 		require.ErrorIs(t, err, readErr)
 	})
+
+	t.Run("storage error wrapping a not-found is returned, not skipped", func(t *testing.T) {
+		// errors.Is walks the chain, so this matches ErrNotFound too. It is
+		// still the store failing while it looked, not a missing subtree.
+		readErr := errors.NewStorageError("subtree read failed", errors.ErrNotFound)
+		u := &BlockValidation{logger: ulogger.TestLogger{}, subtreeStore: &failingGetStore{Store: blobmemory.New(), err: readErr}}
+
+		err := u.reloadSubtreesForInvalidBlock(ctx, block)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrStorageError)
+	})
 }
 
 // TestReloadSubtreesForInvalidBlock_ClosesLoadedSubtreesOnReadError pins that a

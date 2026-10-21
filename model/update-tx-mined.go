@@ -426,6 +426,10 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 	// swallowed failure let the caller set mined_set, so the block was never revisited
 	// and its transactions kept the stale tag. Unset is idempotent and a missing tx is a
 	// no-op in the store, so an error here is a real store fault and a retry can clear it.
+	// Until one does, the block stays at mined_set=false and block assembly's
+	// WaitForPendingBlocks holds its Start, Reset and reorg, exactly as it already does for
+	// a valid block whose update fails. That is deliberate: reverting the tag is what marks
+	// a tx unmined again, so block assembly carrying on would reload without those txs.
 	// covGaps is always zero on the unset path: checkBatchResults skips it.
 	ioErrs := setMinedErrorCount.Load()
 	covGaps := coverageGapCount.Load()

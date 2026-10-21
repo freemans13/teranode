@@ -88,6 +88,22 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A failed revert of an invalid block's mined tags now holds block assembly until it
+  succeeds.** When block validation reverts the mined tags of an invalid block and
+  `SetMinedMulti` fails, or a subtree read fails with anything other than not-found, the
+  revert now returns an error instead of logging a warning and marking the block done.
+  The block stays at `mined_set=false`, so block assembly waits for it before it starts,
+  resets or reorgs, exactly as it already does for a valid block whose mined update
+  fails. Reverting the tag is what marks a transaction unmined again, so carrying on
+  would rebuild block assembly without those transactions. The wait lasts as long as the
+  store fault: the setTxMined retry loop increments
+  `teranode_blockvalidation_setmined_retry_total`, a block that still fails after 10
+  attempts logs `manual_intervention_required` and increments
+  `teranode_blockvalidation_setmined_drops_total`, and the mined-not-set sweep then picks
+  it up again. Those alerts can now fire for invalid blocks. Operators who see them should
+  fix the UTXO or subtree store fault; block assembly resumes on the next successful
+  attempt. A subtree that is absent from the store is still skipped. (#2016)
+
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
   `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
@@ -444,17 +460,6 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   too; no shipped configuration uses that store. (#1963)
 
 ### Not breaking, but worth knowing
-
-- **A failed revert of an invalid block's mined tags is now retried.** When block
-  validation reverts the mined tags of an invalid block and `SetMinedMulti` fails,
-  or a subtree read fails with anything other than not-found, the revert now
-  returns an error instead of logging a warning and marking the block done. The
-  block goes through the existing setTxMined retry loop: each failure increments
-  `teranode_blockvalidation_setmined_retry_total`, and a block that still fails
-  after 10 attempts logs `manual_intervention_required` and increments
-  `teranode_blockvalidation_setmined_drops_total`. Alerts on those metrics can now
-  fire for invalid blocks under a store fault. A subtree that is absent from the
-  store is still skipped. No action is required. (#2016)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
   assembly is in the `reorging`, `reconciling` or `resetting` state, it can still

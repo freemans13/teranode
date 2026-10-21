@@ -1388,6 +1388,15 @@ func (u *BlockValidation) tryClaimBlockForSetMined(blockHash *chainhash.Hash) bo
 	return true
 }
 
+// subtreeAbsent reports whether a subtree store read failed because the subtree
+// is not there. A storage error is the store failing while it looked, whatever
+// it wraps, so it never counts as absent: errors.Is walks the chain, and a
+// storage error over a not-found would otherwise be skipped as a missing
+// subtree. Same rule as writeStoreError in stores/blob/server.go.
+func subtreeAbsent(err error) bool {
+	return errors.Is(err, errors.ErrNotFound) && !errors.Is(err, errors.ErrStorageError)
+}
+
 // reloadSubtreesForInvalidBlock reloads an invalid block's subtrees from the
 // store. A subtree that is absent or does not parse is left nil, because an
 // invalid block legitimately may not have all of them and a retry cannot bring
@@ -1415,13 +1424,13 @@ func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, blo
 	for subtreeIdx, subtreeHash := range block.Subtrees {
 		subtreeBytes, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
 		if err != nil {
-			if !errors.Is(err, errors.ErrNotFound) {
+			if !subtreeAbsent(err) {
 				return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
 			}
 
 			subtreeBytes, err = u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 			if err != nil {
-				if !errors.Is(err, errors.ErrNotFound) {
+				if !subtreeAbsent(err) {
 					return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
 				}
 
