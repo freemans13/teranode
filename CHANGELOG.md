@@ -97,7 +97,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   - A Kafka block message that panics is now committed, not redelivered. A peer must announce
     the block again before the node tries it again.
   - A catchup that panics counts as a failed attempt with the error type `local_panic`. It is
-    not charged to the peer, and it counts toward `blockvalidation_catchup_max_attempts_per_block`.
+    not charged to the peer. It counts toward `blockvalidation_catchup_max_attempts_per_block`
+    unless it validated at least one block first. In that condition it resets the count, as
+    each other failed catchup that made progress does.
   - After `blockvalidation_max_corrupt_attempts_per_block` (default 3) worker panics for one
     block from one peer, the node ignores that peer's deliveries of the block for
     `blockvalidation_corrupt_attempt_cooldown` (default 10 minutes). (#2012)
