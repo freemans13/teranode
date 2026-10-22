@@ -179,6 +179,10 @@ type Server struct {
 	// Kafka messages for distributed coordination
 	kafkaConsumerClient kafka.KafkaConsumerGroupI
 
+	// blockMessageRetries tracks Kafka block messages being retried in-process after a
+	// recoverable failure (see kafka_block_retry.go)
+	blockMessageRetries blockMessageRetries
+
 	// processBlockNotify caches subtree processing state to prevent duplicate
 	// processing of the same subtree from multiple miners
 	processBlockNotify *ttlcache.Cache[chainhash.Hash, bool]
@@ -917,44 +921,37 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 
 		u.logger.Infof("[consumerMessageHandler] Processing block %s from peer %s at %s", kafkaMsg.Hash, kafkaMsg.GetPeerId(), kafkaMsg.URL)
 
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- u.blockHandler(&kafkaMsg)
-		}()
+		err := u.runBlockHandler(ctx, &kafkaMsg)
+		if err == nil {
+			return nil
+		}
 
-		select {
-		case err := <-errCh:
-			// if err is nil, it means function is successfully executed, return nil.
-			if err == nil {
-				return nil
-			}
+		// Shutting down: return the error so the message is left uncommitted.
+		if ctx.Err() != nil {
+			return err
+		}
 
-			// if error is not nil, check if the error is a recoverable error.
-			// If the error is a recoverable error, then return the error, so that it kafka message is not marked as committed.
-			// So the message will be consumed again.
-			if errors.Is(err, errors.ErrServiceError) || errors.Is(err, errors.ErrStorageError) || errors.Is(err, errors.ErrThresholdExceeded) || errors.Is(err, errors.ErrContextCanceled) || errors.Is(err, errors.ErrExternal) {
-				u.logger.Errorf("Recoverable error (%v) processing kafka message %v for handling block, returning error, thus not marking Kafka message as complete.\n", msg, err)
-				return err
-			}
-
-			// error is not nil and not recoverable, so it is unrecoverable error, and it should not be tried again
-			// kafka message should be committed, so return nil to mark message.
-			u.logger.Errorf("Unrecoverable error (%v) processing kafka message %v for handling block, marking Kafka message as completed.\n", msg, err)
-
-			// mark peer failure
-			blockHash, _ := chainhash.NewHashFromStr(kafkaMsg.Hash)
-			if err = u.blockchainClient.ReportPeerFailure(ctx, blockHash, kafkaMsg.GetPeerId(), "block", err.Error()); err != nil {
-				u.logger.Errorf("Failed to report peer failure: %v", err)
-			}
+		// A recoverable error is retried in-process rather than returned to Kafka: the
+		// consumer commits the highest marked offset per partition, so a later success
+		// on the same partition would commit past it and it would never be redelivered.
+		if isRecoverableBlockMessageError(err) {
+			u.logger.Errorf("Recoverable error (%v) processing kafka message %v for handling block, queueing in-process retry.\n", err, msg)
+			u.scheduleBlockMessageRetry(ctx, &kafkaMsg)
 
 			return nil
-		case <-ctx.Done():
-			return ctx.Err()
 		}
+
+		// Unrecoverable: commit the message and blame the announcing peer.
+		u.logger.Errorf("Unrecoverable error (%v) processing kafka message %v for handling block, marking Kafka message as completed.\n", err, msg)
+		u.reportBlockMessagePeerFailure(ctx, &kafkaMsg, err)
+
+		return nil
 	}
 }
 
-func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) error {
+// blockHandler queues a block announced on Kafka for validation. It stops when ctx
+// ends, so a caller that has returned knows the handler has too.
+func (u *Server) blockHandler(ctx context.Context, kafkaMsg *kafkamessage.KafkaBlockTopicMessage) error {
 	u.logger.Debugf("[blockHandler] Starting to process block %s from peer %s", kafkaMsg.Hash, kafkaMsg.GetPeerId())
 
 	hash, err := chainhash.NewHashFromStr(kafkaMsg.Hash)
@@ -977,7 +974,7 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 		return errors.NewProcessingError("[BlockFound] invalid URL scheme '%s' - expected http or https", baseURL.Scheme)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Don't skip blocks from malicious peers entirely - we still want to add them to the queue
@@ -1013,11 +1010,15 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 
 	u.logger.Debugf("[blockHandler] Adding block %s to blockFoundCh", hash.String())
 
-	u.blockFoundCh <- processBlockFound{
+	select {
+	case u.blockFoundCh <- processBlockFound{
 		hash:    hash,
 		baseURL: baseURL.String(),
 		peerID:  kafkaMsg.GetPeerId(),
 		errCh:   nil, // Don't block Kafka consumer waiting for validation
+	}:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	prometheusBlockValidationBlockFoundCh.Set(float64(len(u.blockFoundCh)))
 
@@ -1811,19 +1812,20 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 		return errors.NewServiceError("[processBlockFound][%s] failed to check if parent block %s exists", hash.String(), block.Header.HashPrevBlock.String(), err)
 	}
 
-	// A legacy block on the unified route must never take the catch-up divert: legacy sync
-	// resolves its own orphans with a getblocks, and the divert returns nil, which legacy
-	// records as an accepted block with nothing stored. Legacy hands a block over only once its
-	// parent is in the chain, so a missing parent here is a local fault, re-delivered later.
-	//
-	// Judged on eligibility, not on the proven route: an UNPROVEN eligible block is still a
-	// legacy block whose parent legacy promised to have committed, so it is refused the same
-	// way rather than diverted to catch-up and reported as nil.
-	if !parentExists && baseURL == "legacy" && u.legacyUnifiedEligible(block, baseURL) {
-		return errors.NewServiceError("[processBlockFound][%s] legacy block on the unified route has no stored parent %s", hash.String(), block.Header.HashPrevBlock.String())
-	}
-
 	if !parentExists {
+		// A legacy block must never take the catch-up divert, on either route: legacy sync
+		// resolves its own orphans with a getblocks, and the divert returns nil, which legacy
+		// records as an accepted block with nothing stored (bitcoin-sv/teranode#4973). Legacy
+		// hands a block over only once its parent is in the chain, so a missing parent here is a
+		// local fault. A ServiceError is what legacy's park reads as retry-later
+		// (parkCommitFailure), so the block is kept and committed again once the parent lands.
+		//
+		// Not gated on legacyUnifiedEligible or the header proof: an above-checkpoint block, or an
+		// unproven one, is still a legacy block whose parent legacy promised to have committed.
+		if baseURL == "legacy" {
+			return errors.NewServiceError("[processBlockFound][%s] legacy block has no stored parent %s", hash.String(), block.Header.HashPrevBlock.String())
+		}
+
 		// add to catchup channel, which will block processing any new blocks until we have caught up
 		go func() {
 			u.logger.Debugf("[processBlockFound][%s] processBlockFound add to catchup channel", hash.String())
@@ -2004,9 +2006,7 @@ func (u *Server) legacyUnifiedRoute(block *model.Block, baseURL string, headerPr
 // unified route, and the shared eligibility gate holds (store capability +
 // hardcoded checkpoint boundary via model.OutpointOnlyEligible, never the
 // operator catchup override). It says nothing about which chain the block is on;
-// legacyUnifiedRoute adds that. The parent-missing guard in processBlockFound
-// reads this one on purpose, so an unproven legacy orphan is refused rather than
-// diverted to catch-up.
+// legacyUnifiedRoute adds that.
 func (u *Server) legacyUnifiedEligible(block *model.Block, baseURL string) bool {
 	if !u.settings.BlockValidation.LegacyUnifiedBelowCheckpoint {
 		return false
