@@ -1063,7 +1063,8 @@ func (u *Server) blockHandler(ctx context.Context, kafkaMsg *kafkamessage.KafkaB
 // processBlockFoundChannel drops the announcer's next deliveries of the hash before the fetch, and
 // fetchAnnouncedBlockFromTipPeers skips a capped alternative before it fetches from it. Both hold
 // until the cooldown window lapses. The announcer's gate runs after the exists check, so a stored
-// block still answers nil. It answers a WaitToComplete caller one time with ERR_PROCESSING,
+// block still answers nil. The malicious-peer gate sits next to it in processBlockFoundChannel, for
+// the same reason. The panic gate answers a WaitToComplete caller one time with ERR_PROCESSING,
 // through the relay. Its text has no word that IsNetworkError or
 // IsMaliciousResponseError matches. Neither gate reports a peer failure: a panic is a bug in this
 // node. Another peer's announcement of the hash has its own key and is still processed. An empty
@@ -1107,16 +1108,6 @@ func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf p
 			}
 		}
 	}()
-
-	if u.isPeerMalicious(ctx, bf.peerID) {
-		u.logger.Warnf("[blockFound][%s] peer %s (%s) is marked as malicious, skipping", bf.hash.String(), bf.peerID, bf.baseURL)
-
-		if bf.errCh != nil {
-			bf.errCh <- errors.NewProcessingError("peer %s is marked as malicious", bf.peerID)
-		}
-
-		return
-	}
 
 	u.logger.Debugf("[Init] Worker %d starting processBlockFoundChannel for block %s", workerID, bf.hash.String())
 
@@ -1177,10 +1168,25 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 		return nil
 	}
 
-	// The announcer's recovered-panic gate (BV-STARTUP-007), see processBlockFoundChItem. It comes
-	// after the exists check, so a capped peer that re-announces a block this node has stored gets
-	// nil, as any other peer does, and before both fetches below (the backlog branch and
-	// addBlockToPriorityQueue), so a capped announcer's bytes are not fetched again.
+	// The announcer's two gates come after the exists check and before both fetches below (the
+	// backlog branch and addBlockToPriorityQueue). After the exists check, so an announcer that one
+	// of them stops still gets nil for a block this node has stored, as any other peer does. Before
+	// the fetches, so nothing is fetched from that announcer. The 429 fallback in
+	// fetchAnnouncedBlockFromTipPeers checks each alternative peer itself.
+	//
+	// The malicious gate runs first, so a peer that is both malicious and at its panic cap gets
+	// the malicious answer, as it did when this gate ran in processBlockFoundChItem.
+	if u.isPeerMalicious(ctx, blockFound.peerID) {
+		u.logger.Warnf("[blockFound][%s] peer %s (%s) is marked as malicious, skipping", blockFound.hash.String(), blockFound.peerID, blockFound.baseURL)
+
+		if blockFound.errCh != nil {
+			blockFound.errCh <- errors.NewProcessingError("peer %s is marked as malicious", blockFound.peerID)
+		}
+
+		return nil
+	}
+
+	// The announcer's recovered-panic gate (BV-STARTUP-007), see processBlockFoundChItem.
 	if u.panicAttemptsExhausted(blockFound.hash, blockFound.peerID) {
 		u.logger.Warnf("[processBlockFoundChannel][%s] recovered-panic cap reached for peer %s; dropping this announcement before the fetch until the cooldown window expires", blockFound.hash.String(), blockFound.peerID)
 
