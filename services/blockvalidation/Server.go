@@ -2495,7 +2495,15 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 	if u.policyDeclineAttemptsExhausted(c.block.Hash(), c.peerID) {
 		u.logger.Warnf("[catchup] Block %s from peer %s in cooldown after exhausting local-policy declines (cap %d); trying alternative peers", c.block.Hash().String(), c.peerID, u.settings.BlockValidation.MaxCorruptAttemptsPerBlock)
 
-		if !u.tryAlternativePeersForCatchup(ctx, c.block, c.peerID) {
+		succeeded, localPanic := u.tryAlternativePeersForCatchup(ctx, c.block, c.peerID)
+		if localPanic {
+			attemptRecorded = true
+			u.endCatchupCycleOnConcurrentPanic(c.block.Hash())
+
+			return
+		}
+
+		if !succeeded {
 			blockHash := c.block.Hash()
 			u.logger.Warnf("[catchup] All alternative peers failed for block %s, clearing processing marker for retry", blockHash.String())
 			u.processBlockNotify.Delete(*blockHash)
@@ -2513,7 +2521,15 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 		u.logger.Warnf("[catchup][%s] peer %s (%s) refused as catchup source (%s), trying alternative peers", c.block.Hash().String(), c.peerID, c.baseURL, reason)
 
 		// Try alternative peers from P2P service instead of just skipping
-		if !u.tryAlternativePeersForCatchup(ctx, c.block, c.peerID) {
+		succeeded, localPanic := u.tryAlternativePeersForCatchup(ctx, c.block, c.peerID)
+		if localPanic {
+			attemptRecorded = true
+			u.endCatchupCycleOnConcurrentPanic(c.block.Hash())
+
+			return
+		}
+
+		if !succeeded {
 			blockHash := c.block.Hash()
 			u.logger.Warnf("[catchup] All alternative peers failed for block %s, clearing processing marker for retry", blockHash.String())
 			u.processBlockNotify.Delete(*blockHash)
@@ -2702,9 +2718,19 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 		blockHash := c.block.Hash()
 
 		// First, try intelligent peer selection from P2P service
-		if u.tryAlternativePeersForCatchup(ctx, c.block, c.peerID) {
+		succeeded, localPanic := u.tryAlternativePeersForCatchup(ctx, c.block, c.peerID)
+		if succeeded {
 			// Recovered via an alternative peer — reset the attempt counter.
 			u.clearCatchupAttempts(blockHash)
+			return
+		}
+
+		// A concurrent validation panicked in this node. Every cached alternative would wait on
+		// the same bug, so end the cycle here, as the primary path does for that error.
+		if localPanic {
+			attemptRecorded = true
+			u.endCatchupCycleOnConcurrentPanic(blockHash)
+
 			return
 		}
 
@@ -2740,6 +2766,14 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 					u.clearCatchupAttempts(blockHash)
 					catchupSucceeded = true
 					break
+				} else if isConcurrentValidationPanic(altErr) {
+					// A concurrent validation panicked in this node, a bug that is the same for
+					// every peer. Try no further alternative and charge none. The block below
+					// then counts the attempt unless the cycle made progress and clears the
+					// markers, as the primary path does for this error.
+					u.logger.Warnf("[catchup] Alternative peer %s: a concurrent validation of block %s panicked in this node; trying no further alternatives: %v", alt.peerID, blockHash.String(), altErr)
+
+					break
 				} else {
 					u.logger.Warnf("[catchup] Alternative peer %s also failed for block %s: %v", alt.peerID, blockHash.String(), altErr)
 					u.reportCatchupFailureForError(ctx, alt.peerID, altErr)
@@ -2773,6 +2807,18 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 		// Clear the processing marker
 		u.processBlockNotify.Delete(*c.block.Hash())
 	}
+}
+
+// endCatchupCycleOnConcurrentPanic ends a catchup cycle in which an alternative peer's catchup got
+// the waiter error of a validation that panicked on another goroutine (BV-STARTUP-007). It leaves
+// the same state as the primary path's isLocalCatchupFault branch: the attempt counts toward the
+// #1057 cap unless the cycle made progress, both markers are cleared so a later announcement can
+// retry the block, and no peer is charged or reported.
+func (u *Server) endCatchupCycleOnConcurrentPanic(blockHash *chainhash.Hash) {
+	attempts := u.recordCatchupAttemptUnlessProgress(blockHash)
+	u.logger.Warnf("[catchup] A concurrent validation of block %s panicked in this node during an alternative peer's catchup (attempt %d/%d); ending this cycle and clearing markers to allow retry", blockHash.String(), attempts, u.settings.BlockValidation.CatchupMaxAttemptsPerBlock)
+	u.processBlockNotify.Delete(*blockHash)
+	u.catchupAlternatives.Delete(*blockHash)
 }
 
 // recordCatchupAttemptUnlessProgress records a failed catchup cycle toward the

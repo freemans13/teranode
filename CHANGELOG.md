@@ -134,7 +134,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
     - A catchup that panics counts as a failed attempt with the error type `local_panic`. It
       is not charged to the peer. So is a catchup whose validation waited on a validation of
       the same block that panicked on another goroutine, also when an alternative peer served
-      that catchup. It counts toward
+      that catchup. In that case the node tries no further alternative peer in the cycle. It
+      counts toward
       `blockvalidation_catchup_max_attempts_per_block` unless it validated at least one block
       first. In that condition it resets the count, as each other failed catchup that made
       progress does.

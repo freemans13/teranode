@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1153,6 +1154,197 @@ func TestGapBV054_ConcurrentPanicWaiterIsNotChargedToCachedAlternative(t *testin
 	require.Equal(t, 0, reputation.charged("altPeer"), "the alternative must not be charged for a panic in this node")
 	require.Equal(t, 0, reputation.totalMaliciousReports())
 	require.Equal(t, int32(1), reports.reports.Load(), "only the primary's failure may be reported")
+}
+
+// gap054CatchupCalls counts catchupFunc calls per peer.
+type gap054CatchupCalls struct {
+	mu    sync.Mutex
+	calls map[string]int
+}
+
+func (c *gap054CatchupCalls) add(peerID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.calls == nil {
+		c.calls = make(map[string]int)
+	}
+
+	c.calls[peerID]++
+}
+
+func (c *gap054CatchupCalls) get(peerID string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.calls[peerID]
+}
+
+// gap054RequireConcurrentPanicEndState checks the state the primary path leaves after the waiter
+// error: one counted attempt, both markers cleared, only the primary's earlier failure reported.
+func gap054RequireConcurrentPanicEndState(t *testing.T, s *Server, block *model.Block, reports *gap054PeerReportCounter, wantReports int32) {
+	t.Helper()
+
+	attempts := s.blockCatchupAttempts.Get(*block.Hash())
+	require.NotNil(t, attempts, "the cycle must count toward the catchup cap")
+	require.Equal(t, 1, attempts.Value())
+	require.Nil(t, s.processBlockNotify.Get(*block.Hash()), "the processing marker must be cleared")
+	require.Nil(t, s.catchupAlternatives.Get(*block.Hash()), "the cached alternatives must be cleared")
+	require.Equal(t, wantReports, reports.reports.Load(), "only the primary's ordinary failure may be reported")
+}
+
+// TestGapBV054_ConcurrentPanicStopsP2PAlternatives fails the primary with an ordinary peer error,
+// so processCatchupChItem asks the P2P-selected peers. The first one's catchup returns the waiter
+// error of a validation that panicked on another goroutine. That is a bug in this node, so no
+// further P2P peer and no cached alternative may be tried, the peer is not charged, and the cycle
+// ends as the primary path ends it for that error.
+func TestGapBV054_ConcurrentPanicStopsP2PAlternatives(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	alt1 := tipPeer("alt1", "http://alt1-peer", block.Hash())
+	alt2 := tipPeer("alt2", "http://alt2-peer", block.Hash())
+	alt1.Height = block.Height
+	alt2.Height = block.Height
+
+	reputation := &subtreeAttributionP2PClient{peers: []*p2p.PeerInfo{alt1, alt2}}
+	s.p2pClient = reputation
+
+	reports := &gap054PeerReportCounter{ClientI: s.blockchainClient}
+	s.blockchainClient = reports
+
+	alt1ID := peer.ID("alt1").String()
+	calls := &gap054CatchupCalls{}
+
+	s.catchupFunc = func(_ context.Context, _ *model.Block, peerID, _ string) error {
+		calls.add(peerID)
+
+		switch peerID {
+		case "peerA":
+			return errors.NewProcessingError("terminal generic peer error")
+		case alt1ID:
+			return newConcurrentValidationPanicError(block.Hash())
+		default:
+			return nil
+		}
+	}
+
+	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
+	s.catchupAlternatives.Set(*block.Hash(), []processBlockCatchup{{block: block, baseURL: "http://cached-alt", peerID: "cachedAlt"}}, ttlcache.DefaultTTL)
+
+	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: "peerA"})
+
+	require.Equal(t, 1, calls.get("peerA"))
+	require.Equal(t, 1, calls.get(alt1ID), "setup: the first P2P peer must be tried")
+	require.Equal(t, 0, calls.get(peer.ID("alt2").String()), "no further P2P peer may be tried after the waiter error")
+	require.Equal(t, 0, calls.get("cachedAlt"), "no cached alternative may be tried after the waiter error")
+
+	require.Equal(t, 1, reputation.charged("peerA"), "setup: the primary's ordinary peer error is charged")
+	require.Equal(t, 0, reputation.charged(alt1ID), "the P2P peer must not be charged for a panic in this node")
+	require.Equal(t, 0, reputation.totalMaliciousReports())
+
+	gap054RequireConcurrentPanicEndState(t, s, block, reports, 1)
+}
+
+// TestGapBV054_ConcurrentPanicStopsCachedAlternatives is the same check for the cached
+// alternatives loop. No P2P peer is offered, the first cached alternative's catchup returns the
+// waiter error, and the second must not be tried.
+func TestGapBV054_ConcurrentPanicStopsCachedAlternatives(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+
+	reputation := &subtreeAttributionP2PClient{}
+	s.p2pClient = reputation
+
+	reports := &gap054PeerReportCounter{ClientI: s.blockchainClient}
+	s.blockchainClient = reports
+
+	calls := &gap054CatchupCalls{}
+
+	s.catchupFunc = func(_ context.Context, _ *model.Block, peerID, _ string) error {
+		calls.add(peerID)
+
+		switch peerID {
+		case "peerA":
+			return errors.NewProcessingError("terminal generic peer error")
+		case "cachedAlt1":
+			return newConcurrentValidationPanicError(block.Hash())
+		default:
+			return nil
+		}
+	}
+
+	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
+	s.catchupAlternatives.Set(*block.Hash(), []processBlockCatchup{
+		{block: block, baseURL: "http://cached-alt1", peerID: "cachedAlt1"},
+		{block: block, baseURL: "http://cached-alt2", peerID: "cachedAlt2"},
+	}, ttlcache.DefaultTTL)
+
+	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: "peerA"})
+
+	require.Equal(t, 1, calls.get("peerA"))
+	require.Equal(t, 1, calls.get("cachedAlt1"), "setup: the first cached alternative must be tried")
+	require.Equal(t, 0, calls.get("cachedAlt2"), "no further cached alternative may be tried after the waiter error")
+
+	require.Equal(t, 1, reputation.charged("peerA"), "setup: the primary's ordinary peer error is charged")
+	require.Equal(t, 0, reputation.charged("cachedAlt1"), "the cached alternative must not be charged for a panic in this node")
+	require.Equal(t, 0, reputation.totalMaliciousReports())
+
+	gap054RequireConcurrentPanicEndState(t, s, block, reports, 1)
+}
+
+// TestGapBV054_ConcurrentPanicStopsP2PAlternativesOnDeclineSkip covers a caller of
+// tryAlternativePeersForCatchup that skips the primary: the primary is at its local-policy decline
+// cap for the hash. The first P2P peer returns the waiter error, so the second is not tried, no
+// peer is charged or reported, and the cycle counts and clears as on the primary path.
+func TestGapBV054_ConcurrentPanicStopsP2PAlternativesOnDeclineSkip(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+	s.settings.BlockValidation.MaxCorruptAttemptsPerBlock = 1
+	s.recordPolicyDeclineAttempt(block.Hash(), "peerA")
+	require.True(t, s.policyDeclineAttemptsExhausted(block.Hash(), "peerA"), "setup: the primary must be at its decline cap")
+
+	alt1 := tipPeer("alt1", "http://alt1-peer", block.Hash())
+	alt2 := tipPeer("alt2", "http://alt2-peer", block.Hash())
+	alt1.Height = block.Height
+	alt2.Height = block.Height
+
+	reputation := &subtreeAttributionP2PClient{peers: []*p2p.PeerInfo{alt1, alt2}}
+	s.p2pClient = reputation
+
+	reports := &gap054PeerReportCounter{ClientI: s.blockchainClient}
+	s.blockchainClient = reports
+
+	alt1ID := peer.ID("alt1").String()
+	calls := &gap054CatchupCalls{}
+
+	s.catchupFunc = func(_ context.Context, _ *model.Block, peerID, _ string) error {
+		calls.add(peerID)
+
+		if peerID == alt1ID {
+			return newConcurrentValidationPanicError(block.Hash())
+		}
+
+		return nil
+	}
+
+	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
+
+	s.processCatchupChItem(ctx, processBlockCatchup{block: block, baseURL: "http://test-peer", peerID: "peerA"})
+
+	require.Equal(t, 0, calls.get("peerA"), "setup: the primary is skipped")
+	require.Equal(t, 1, calls.get(alt1ID), "setup: the first P2P peer must be tried")
+	require.Equal(t, 0, calls.get(peer.ID("alt2").String()), "no further P2P peer may be tried after the waiter error")
+	require.Equal(t, 0, reputation.totalCharges(), "no peer may be charged for a panic in this node")
+	require.Equal(t, 0, reputation.totalMaliciousReports())
+
+	gap054RequireConcurrentPanicEndState(t, s, block, reports, 0)
 }
 
 // TestGapBV054_BlockFoundChPanicCapAnswersStoredBlock: a peer at its recovered-panic cap for a hash
