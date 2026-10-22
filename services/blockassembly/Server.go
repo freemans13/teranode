@@ -110,6 +110,11 @@ type BlockAssembly struct {
 	// jobStore caches mining jobs with TTL
 	jobStore *ttlcache.Cache[chainhash.Hash, *subtreeprocessor.Job]
 
+	// jobCoinbaseMu makes GetMiningCandidate's read of a job's coinbase and its store of the new
+	// job one step, so two polls that share a candidate id cannot each build a coinbase and leave
+	// one miner holding a coinbase the job no longer has.
+	jobCoinbaseMu sync.Mutex
+
 	// blockSubmissionChan handles block submission requests
 	blockSubmissionChan chan *BlockSubmissionRequest
 
@@ -1668,11 +1673,9 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 
 	id, _ := chainhash.NewHash(miningCandidate.Id)
 
-	ba.jobStore.Set(*id, &subtreeprocessor.Job{
-		ID:              id,
-		Subtrees:        subtrees,
-		MiningCandidate: miningCandidate,
-	}, jobTTL) // create a new job with a TTL, will be cleaned up automatically
+	if err = ba.storeJobWithCoinbase(id, miningCandidate, subtrees); err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
 
 	if includeSubtreeHashes {
 		miningCandidate.SubtreeHashes = make([][]byte, len(subtrees))
@@ -1689,6 +1692,42 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 	)
 
 	return miningCandidate, nil
+}
+
+// storeJobWithCoinbase gives the candidate its coinbase and stores it as a job with a TTL, after
+// which it is cleaned up automatically. The coinbase is the one a solution without its own is mined
+// with, as bitcoin-sv keeps the candidate block's coinbase, so it must not change under a miner who
+// has been handed it. Candidate ids repeat: the main path hashes the subtree root, parent and time,
+// so polls in the same second share one, and the empty-block path derives its id from the parent
+// alone. A poll for an id whose job is still held therefore reuses that job's coinbase rather than
+// building a new one, provided it pays the same value at the same height.
+func (ba *BlockAssembly) storeJobWithCoinbase(id *chainhash.Hash, miningCandidate *model.MiningCandidate, subtrees []*subtreepkg.Subtree) error {
+	ba.jobCoinbaseMu.Lock()
+	defer ba.jobCoinbaseMu.Unlock()
+
+	if held := ba.jobStore.Get(*id); held != nil {
+		prev := held.Value().MiningCandidate
+		if len(prev.CoinbaseTx) > 0 && prev.CoinbaseValue == miningCandidate.CoinbaseValue && prev.Height == miningCandidate.Height {
+			miningCandidate.CoinbaseTx = prev.CoinbaseTx
+		}
+	}
+
+	if len(miningCandidate.CoinbaseTx) == 0 {
+		coinbaseTx, err := miningCandidate.CreateCoinbaseTxCandidate(ba.blockAssembler.settings)
+		if err != nil {
+			return errors.NewProcessingError("[GetMiningCandidate][%s] failed to create coinbase tx", id.String(), err)
+		}
+
+		miningCandidate.CoinbaseTx = coinbaseTx.Bytes()
+	}
+
+	ba.jobStore.Set(*id, &subtreeprocessor.Job{
+		ID:              id,
+		Subtrees:        subtrees,
+		MiningCandidate: miningCandidate,
+	}, jobTTL)
+
+	return nil
 }
 
 // SubmitMiningSolution processes a mining solution submission.
@@ -1934,23 +1973,15 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 			return nil, errors.NewProcessingError("[BlockAssembly][%s] submitted coinbase transaction is not a valid coinbase", jobID)
 		}
 	} else {
-		// recreate coinbase tx here, nothing was passed in
-		coinbaseTx, err = jobItem.Value().MiningCandidate.CreateCoinbaseTxCandidate(ba.blockAssembler.settings)
+		// No coinbase was passed in, so mine the one the job was issued with, which is the one
+		// GetMiningCandidate handed out, as bitcoin-sv falls back to the candidate block's coinbase.
+		// It used to be rebuilt here, with a fresh random extranonce, so its merkle root was never
+		// the one the miner hashed and every such solution failed the proof-of-work check. The
+		// solution's version, time and nonce belong in the header, built from req below, and are not
+		// copied into the coinbase, so it is used exactly as issued.
+		coinbaseTx, err = bt.NewTxFromBytes(job.MiningCandidate.CoinbaseTx)
 		if err != nil {
-			return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to create coinbase tx", jobID, err)
-		}
-
-		// set the new mining parameters on the coinbase (nonce)
-		if req.Version != nil {
-			coinbaseTx.Version = *req.Version
-		}
-
-		if req.Time != nil {
-			coinbaseTx.LockTime = *req.Time
-		}
-
-		if req.Nonce != 0 {
-			coinbaseTx.Inputs[0].SequenceNumber = req.Nonce
+			return nil, errors.NewProcessingError("[BlockAssembly][%s] job holds no usable coinbase tx", jobID, err)
 		}
 	}
 
@@ -2290,10 +2321,11 @@ func (ba *BlockAssembly) GetCandidateBlock(ctx context.Context, req *blockassemb
 
 	job := jobItem.Value()
 
-	// Create default coinbase transaction from the mining candidate
-	coinbaseTx, err := job.MiningCandidate.CreateCoinbaseTxCandidate(ba.blockAssembler.settings)
+	// The coinbase the job was issued with, so this block is the one a coinbase-less solution to the
+	// candidate would mine.
+	coinbaseTx, err := bt.NewTxFromBytes(job.MiningCandidate.CoinbaseTx)
 	if err != nil {
-		return nil, errors.WrapGRPC(errors.NewProcessingError("[GetCandidateBlock][%s] failed to create coinbase tx", candidateID, err))
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[GetCandidateBlock][%s] job holds no usable coinbase tx", candidateID, err))
 	}
 
 	coinbaseTxIDHash := coinbaseTx.TxIDChainHash()

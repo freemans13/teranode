@@ -106,6 +106,22 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A mining candidate keeps its coinbase, and a solution without one is mined with it.**
+  Affects miners and pools that use `getminingcandidate` and `submitminingsolution`. As in
+  bitcoin-sv, block assembly now builds a candidate's coinbase once, keeps it on the job,
+  and returns it in the new `coinbase_tx` field of the `MiningCandidate` message. A
+  `submitminingsolution` call with no `coinbase` is mined with that coinbase. Before, block
+  assembly rebuilt one with a fresh random extranonce, so its merkle root was never the one
+  the miner hashed and every such solution failed the proof-of-work check, deleted the job
+  and reset block assembly. A solution's `version` now goes into the header only, no longer
+  into the coinbase as well. `getminingcandidate` with `coinbase=true` returns the kept
+  coinbase: a version 1 transaction paying the configured miner wallet addresses by P2PKH,
+  where it used to return a separately built version 2 transaction with one pay-to-pubkey
+  output that block assembly never saw. Miners that submit their own coinbase are not
+  affected. Upgrade block assembly no later than the RPC service: an RPC service on this
+  build answers `getminingcandidate` with `coinbase=true` with an error while it is talking
+  to an older block assembly, which sends no coinbase. (#TBD)
+
 - **`utxostore_updateTxMinedStatus` is removed, and it was live.** Affects only nodes that
   set it to `false`. Mined-tagging, the step after `AddBlock` that writes a block's ID onto
   each of its transactions, now always runs. So does the check it carries, which rejects a
