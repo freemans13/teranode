@@ -175,7 +175,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
       toward the per-peer panic cap above. Legacy sync gets `ERR_SERVICE_ERROR`
       for it, so the parked block is kept and retried rather than rejected. A panic in the
       Kafka consumer or gRPC server goroutine of the service start stops the service with an
-      error rather than the process with a crash. (#2012)
+      error rather than the process with a crash. (#2012, #2035)
 
 - **Legacy peers that send BIP152 messages are no longer disconnected.** go-wire
   is now v1.4.0, which decodes `cmpctblock`, `getblocktxn` and `blocktxn`. Until
