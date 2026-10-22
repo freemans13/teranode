@@ -610,7 +610,22 @@ func (u *BlockValidation) checkQuickValidationCoinbase(block *model.Block, calle
 // BlockSubtreesSet notification, because the insert already wrote subtrees_set. Extracted verbatim from quickValidateBlock /
 // quickValidateBlockAsync so both share one commit tail.
 // caller labels logs to preserve each call site's existing text.
+//
+// The whole call is registered with backgroundTasks, so Server.Stop's Wait waits for it. From the
+// moment AddBlock is sent the block is, or may be, stored, and until the unlock finishes its
+// outputs are locked. The existence probe and the unlock retries run on contexts detached from ctx,
+// so a shutdown does not cut them short by cancelling ctx; without the registration the process
+// could exit in the middle of them. Wait is bounded by the stop deadline Server.Stop gets
+// (service_manager_stopTimeout), not by postCommitTimeout: a store that hangs past that deadline
+// at shutdown still leaves the outputs locked (bsv-blockchain/teranode#2015). A commit that starts
+// after Wait has begun is not registered, and runs as before.
 func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, peerID, caller string) error {
+	if done, ok := u.trackBackgroundTask(); ok {
+		defer done()
+	} else {
+		u.logger.Warnf("[%s][%s] shutdown has begun, committing without registering with background tasks", caller, block.Hash().String())
+	}
+
 	start := time.Now()
 
 	if err := u.blockchainClient.AddBlock(ctx,
@@ -1879,14 +1894,15 @@ const postCommitUnlockRetries = 3
 var postCommitUnlockRetryBackoff = 100 * time.Millisecond
 
 // postCommitTimeout bounds the unlock retries commitBlock runs after AddBlock, on a context
-// detached from the caller's. It only stops a hung store. A shutdown waits for this work, up to
-// this bound, because a block that is already committed must not be left half-finished. A
-// package-level var so tests can shrink it.
+// detached from the caller's. It only stops a hung store. commitBlock is registered with
+// backgroundTasks, so a shutdown waits for this work, but only up to Server.Stop's own deadline
+// (service_manager_stopTimeout, 30s by default), not up to this bound. A package-level var so
+// tests can shrink it.
 var postCommitTimeout = 5 * time.Minute
 
 // The existence probe after an AddBlock error has its own, shorter bounds. It runs before the block
-// is known to be stored, and a hung blockchain service must not hold a shutdown past a normal
-// grace period.
+// is known to be stored, and a hung blockchain service must not hold the catch-up run for minutes
+// over a block that may never have been stored.
 //
 // postCommitProbeRetries is the number of retries after the first attempt in one probe pass, and
 // postCommitProbeAttemptTimeout cuts off each attempt. A "not stored" answer is checked by a second

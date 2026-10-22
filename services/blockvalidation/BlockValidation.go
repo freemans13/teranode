@@ -319,6 +319,13 @@ type BlockValidation struct {
 	// backgroundTasks tracks background goroutines to ensure proper shutdown
 	backgroundTasks sync.WaitGroup
 
+	// backgroundTasksMu and backgroundTasksClosed let work that is not already covered by a
+	// registered task join backgroundTasks without racing Wait. A WaitGroup Add from zero must
+	// happen before Wait starts; trackBackgroundTask takes the mutex and refuses once Wait has
+	// set backgroundTasksClosed, so every Add it makes is ordered before the Wait.
+	backgroundTasksMu     sync.Mutex
+	backgroundTasksClosed bool
+
 	// mmapDir, when non-empty, enables mmap-backed subtree loading.
 	mmapDir string
 
@@ -4010,8 +4017,19 @@ func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 //   - the inner backgroundTasks.Wait() goroutine and its done channel leak until the
 //     worker eventually exits. sync.WaitGroup has no cancellable wait, and on these paths
 //     the worker itself is already leaking (its ctx was never cancelled), so this adds
-//     nothing that outlives the worker. The daemon path never hits this.
+//     nothing that outlives the worker.
+//
+// The daemon path can reach ctx first too, since commitBlock registers its commit tail here: a
+// store that hangs past the stop deadline holds the tail for up to postCommitTimeout. Wait then
+// returns on ctx, the commit tail keeps running until the process exits, and the inner goroutine
+// ends with it.
 func (u *BlockValidation) Wait(ctx context.Context) {
+	// Close registration first, so trackBackgroundTask cannot Add from zero while
+	// backgroundTasks.Wait below is running.
+	u.backgroundTasksMu.Lock()
+	u.backgroundTasksClosed = true
+	u.backgroundTasksMu.Unlock()
+
 	done := make(chan struct{})
 
 	go func() {
@@ -4024,6 +4042,23 @@ func (u *BlockValidation) Wait(ctx context.Context) {
 	case <-ctx.Done():
 		u.logger.Warnf("[BlockValidation] Wait aborted before background tasks drained: %s", ctx.Err())
 	}
+}
+
+// trackBackgroundTask registers one unit of work with backgroundTasks, so Wait waits for it, and
+// returns the func that ends it. It returns ok false, and registers nothing, once Wait has started:
+// work begun after that is not waited for. Use it for work on a goroutine that no registered task
+// already covers, where a bare backgroundTasks.Add could start from zero during Wait.
+func (u *BlockValidation) trackBackgroundTask() (done func(), ok bool) {
+	u.backgroundTasksMu.Lock()
+	defer u.backgroundTasksMu.Unlock()
+
+	if u.backgroundTasksClosed {
+		return nil, false
+	}
+
+	u.backgroundTasks.Add(1)
+
+	return u.backgroundTasks.Done, true
 }
 
 // StopCaches stops the background cleanup goroutines for all expiring caches.

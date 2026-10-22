@@ -33,9 +33,17 @@ type gap056FailingUnlockStore struct {
 	// onFail, when set, runs before each injected failure. A test uses it to cancel the catch-up
 	// context, as a sibling failure in the errgroup does.
 	onFail func()
+
+	// beforeUnlock, when set, runs at the start of every unlock, before any injected failure. A
+	// test uses it to hold the post-commit unlock in flight.
+	beforeUnlock func()
 }
 
 func (s *gap056FailingUnlockStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
+	if !value && s.beforeUnlock != nil {
+		s.beforeUnlock()
+	}
+
 	if !value && s.unlockCalls.Add(1) <= s.failUnlocks {
 		if s.onFail != nil {
 			s.onFail()
@@ -90,6 +98,11 @@ type gap056Config struct {
 	wrapChain func(blockchain.ClientI, context.CancelFunc) blockchain.ClientI
 	// notCommitted skips the precondition that AddBlock stored the block.
 	notCommitted bool
+	// beforeUnlock, when set, runs at the start of every post-commit unlock with the
+	// BlockValidation that is committing, while that unlock is in flight.
+	beforeUnlock func(bv *BlockValidation)
+	// beforeRun, when set, gets the spending child's hash before tryQuickValidation runs.
+	beforeRun func(child *chainhash.Hash)
 }
 
 // gap056QuickValidateWith is gap056QuickValidate with the failure shape given by cfg.
@@ -106,6 +119,10 @@ func gap056QuickValidateWith(t *testing.T, cfg gap056Config) (*preBindHarness, *
 	failing := &gap056FailingUnlockStore{Store: h.utxoStore, failUnlocks: cfg.failUnlocks}
 	if cfg.cancelOnUnlockFail {
 		failing.onFail = cancelQuick
+	}
+
+	if cfg.beforeUnlock != nil {
+		failing.beforeUnlock = func() { cfg.beforeUnlock(h.bv) }
 	}
 
 	h.bv.utxoStore = failing
@@ -132,6 +149,10 @@ func gap056QuickValidateWith(t *testing.T, cfg gap056Config) (*preBindHarness, *
 
 	g, gCtx := errgroup.WithContext(h.ctx)
 	g.Go(func() error { return h.bv.subtreeWriteWorker(gCtx, writeJobsChan) })
+
+	if cfg.beforeRun != nil {
+		cfg.beforeRun(child.TxIDChainHash())
+	}
 
 	tryNormal, quickErr := server.tryQuickValidation(quickCtx, block, catchupCtx, "peer", "http://peer", writeJobsChan, nil)
 
