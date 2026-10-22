@@ -296,3 +296,34 @@ func TestStoreJobWithCoinbase_NoMinerKeys(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, own.Bytes(), block.CoinbaseTx.Bytes())
 }
+
+// TestGenerateBlocks_NoMinerKeys pins that generatetoaddress mines with miner_wallet_private_keys
+// empty. It pays the given address and never needed those keys, so a candidate must still be
+// served when block assembly cannot build the job's own coinbase.
+func TestGenerateBlocks_NoMinerKeys(t *testing.T) {
+	server, _ := setupServer(t)
+	require.NoError(t, server.blockAssembler.Start(t.Context()))
+
+	server.blockAssembler.settings.BlockAssembly.MinerWalletPrivateKeys = nil
+
+	_, before, err := server.blockchainClient.GetBestBlockHeader(t.Context())
+	require.NoError(t, err)
+
+	// Testnet P2PKH address, as in TestGenerateBlock_AllowsP2PKHCoinbaseOutput.
+	address := "n2ZNV88uQbede7C5M5jzi6SyG4GVVr5JTt"
+
+	_, err = server.GenerateBlocks(t.Context(), &blockassembly_api.GenerateBlocksRequest{Count: 1, Address: &address})
+	require.NoError(t, err)
+
+	best, after, err := server.blockchainClient.GetBestBlockHeader(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, before.Height+1, after.Height)
+
+	block, err := server.blockchainClient.GetBlock(t.Context(), best.Hash())
+	require.NoError(t, err)
+
+	want, err := model.AddressToScript(address)
+	require.NoError(t, err)
+	require.Len(t, block.CoinbaseTx.Outputs, 1)
+	require.Equal(t, want, block.CoinbaseTx.Outputs[0].LockingScript.Bytes(), "the coinbase must pay the requested address")
+}
