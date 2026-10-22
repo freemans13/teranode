@@ -86,8 +86,33 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   until it is reimaged. No chain state is corrupted. Upgrade Blockchain last, or raise
   `blockchain_maxMedianTimePastHeights` for the duration of the rollout. (#1776)
 
+- **The alert service now picks its network identity by `network`, and validates
+  `alert_genesis_keys`.** `alert_genesis_keys`, `alert_protocol_id` and `alert_topic_name`
+  default to empty, and each empty one takes the go-alert-system default for the
+  configured network: testnet and stn nodes now join their own alert network
+  (`/bitcoin-testnet/alert-system/0.0.1`, testnet genesis keys) instead of the mainnet
+  protocol and keys. Mainnet resolves to the same values as before. Regtest, teratestnet
+  and tstn keep the mainnet keys and protocol on `bitcoin_alert_system_<network>` and log
+  a warning. A non-empty `alert_topic_name` is now honoured on every network.
+
+  Affects testnet/stn nodes and any deployment that sets these keys. Clear values copied
+  from the old mainnet defaults into `settings_local.conf`, helm values or env, or a
+  testnet node stays on the mainnet alert network. An explicit `alert_genesis_keys` must
+  now hold 3 to 10 hex-encoded compressed public keys (blank entries are dropped, repeats
+  kept once), or the alert service fails to start with a configuration error. An alert
+  store that holds only the genesis alert and was seeded with other keys (a testnet or stn
+  store from v0.16.x or earlier) has its active keys reset to the resolved genesis keys on
+  first start, with a warning; there is no need to delete `alert.db`. (#1955)
+
 ### Breaking — behaviour changes on upgrade
 
+- **`utxostore_updateTxMinedStatus` is removed, and it was live.** Affects only nodes that
+  set it to `false`. Mined-tagging, the step after `AddBlock` that writes a block's ID onto
+  each of its transactions, now always runs. So does the check it carries, which rejects a
+  block that re-includes a transaction an ancestor block already mined. With the key at
+  `false`, neither ran, yet the block was still flagged as mined. The loader does not report
+  unknown keys, so a leftover `false` is ignored without an error and those nodes take on
+  the mined-tagging write load again. Delete the key from your config. (#2019)
 - **`ProcessBlock` refuses a legacy block whose parent is not stored.** Block validation's
   `ProcessBlock` gRPC call used to answer success for a block with baseURL `legacy` and no stored
   parent: it handed the block to catch-up and stored nothing. It now returns `ERR_SERVICE_ERROR`.
