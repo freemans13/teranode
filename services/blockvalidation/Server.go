@@ -1840,12 +1840,6 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	)
 	defer deferFn()
 
-	// Check if the peer is malicious before attempting to fetch
-	if u.isPeerMalicious(ctx, peerID) {
-		u.logger.Warnf("[processBlockFound][%s] peer %s is malicious, not fetching from [%s]", hash.String(), peerID, baseURL)
-		return errors.NewProcessingError("[processBlockFound][%s] peer %s is malicious", hash.String(), peerID)
-	}
-
 	// first check if the block exists, it might have already been processed
 	exists, err := u.blockValidation.GetBlockExists(ctx, hash)
 	if err != nil {
@@ -1855,6 +1849,18 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	if exists {
 		u.logger.Warnf("[processBlockFound][%s] not processing block that already was found", hash.String())
 		return nil
+	}
+
+	// The peer gates below all run after the exists check and before the fetch. After it, so a
+	// peer that one of them stops still gets nil for a block this node has stored, as any other
+	// peer does. Before it, so nothing is fetched from a peer they stop. processBlockFoundChannel
+	// orders its announcer gates the same way.
+	//
+	// The malicious gate runs first, so a peer that is both malicious and at one of the caps below
+	// gets the malicious answer, as it did when this gate ran ahead of the exists check.
+	if u.isPeerMalicious(ctx, peerID) {
+		u.logger.Warnf("[processBlockFound][%s] peer %s is malicious, not fetching from [%s]", hash.String(), peerID, baseURL)
+		return errors.NewProcessingError("[processBlockFound][%s] peer %s is malicious", hash.String(), peerID)
 	}
 
 	// Per-(hash, peerID) corrupt re-download cap (bitcoin-sv/teranode#4692): once this serving peer
