@@ -2060,6 +2060,40 @@ func TestQuickValidateDeclinesARecordedIDACommittedBlockHolds(t *testing.T) {
 	require.Equal(t, xMeta.ID, id)
 }
 
+// failingGetStore fails Get with a storage error. Everything else goes to the
+// real store.
+type failingGetStore struct {
+	utxo.Store
+}
+
+func (s *failingGetStore) Get(_ context.Context, hash *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
+	return nil, errors.NewStorageError("[failingGetStore] read of %s failed", hash.String())
+}
+
+// TestRecordedBlockIDFailsOnAFailedRead: a transaction the store does not hold
+// is the expected first-attempt answer, and the block reserves an id of its
+// own. Any other read failure fails the attempt. Treated as "nothing recorded",
+// it reserved a fresh id, so an earlier attempt's records under the old id were
+// not recognised as this block's leftovers and never compensated.
+func TestRecordedBlockIDFailsOnAFailedRead(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+	y, _ := replayBatch(f.child, f.sibling)
+
+	_, reuse, err := bv.recordedBlockID(ctx, y, f.child.TxIDChainHash())
+	require.NoError(t, err, "a transaction the store does not hold is not a failure")
+	require.False(t, reuse)
+
+	bv.utxoStore = &failingGetStore{Store: store}
+
+	_, reuse, err = bv.recordedBlockID(ctx, y, f.child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrStorageError, "a failed read must fail the attempt")
+	require.False(t, reuse)
+}
+
 // failingDeleteStore fails DeleteComplete while failing is set. Everything else
 // goes to the real store.
 // retryableReplayStore wraps a real store and, for a spend the store rejects as a

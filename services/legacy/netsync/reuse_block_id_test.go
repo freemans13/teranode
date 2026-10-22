@@ -9,10 +9,13 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -114,4 +117,54 @@ func TestReuseBlockIDFromUTXODeclinesACommittedBlocksID(t *testing.T) {
 
 	_, err = store.Get(ctx, locked.TxIDChainHash())
 	require.NoError(t, err, "X's record stays")
+}
+
+// failingGetStore fails Get with a storage error. Everything else goes to the
+// real store.
+type failingGetStore struct {
+	utxostore.Store
+}
+
+func (s *failingGetStore) Get(_ context.Context, hash *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
+	return nil, errors.NewStorageError("[failingGetStore] read of %s failed", hash.String())
+}
+
+// TestReuseBlockIDFromUTXOFailsOnAFailedRead: a first transaction the store
+// does not hold is the expected first-attempt answer, and the caller reserves
+// an id. Any other read failure fails the attempt. Treated as "nothing
+// recorded", it reserved a fresh id, so an earlier attempt's records under the
+// old id were not recognised as this block's leftovers.
+func TestReuseBlockIDFromUTXOFailsOnAFailedRead(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings, params := newOutpointOnlySettings(t, true, true, 1000)
+
+	storeURL, err := url.Parse("sqlitememory:///legacy_reuse_block_id_failed_read")
+	require.NoError(t, err)
+
+	store, err := sql.New(ctx, logger, tSettings, storeURL)
+	require.NoError(t, err)
+
+	blockchainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+
+	blockchainClient, err := blockchain.NewLocalClient(logger, tSettings, blockchainStore, nil, nil)
+	require.NoError(t, err)
+
+	sm := &SyncManager{ctx: ctx, settings: tSettings, chainParams: params, logger: logger, utxoStore: store, blockchainClient: blockchainClient}
+
+	y := blockIdent{hash: chainhash.HashH([]byte("block Y"))}
+	txOrder := []chainhash.Hash{{}, chainhash.HashH([]byte("first tx the store does not hold"))}
+
+	_, reused, err := sm.reuseBlockIDFromUTXO(ctx, y, txOrder)
+	require.NoError(t, err, "a transaction the store does not hold is not a failure")
+	require.False(t, reused)
+
+	sm.utxoStore = &failingGetStore{Store: store}
+
+	_, reused, err = sm.reuseBlockIDFromUTXO(ctx, y, txOrder)
+	require.ErrorIs(t, err, errors.ErrStorageError, "a failed read must fail the attempt")
+	require.False(t, reused)
 }

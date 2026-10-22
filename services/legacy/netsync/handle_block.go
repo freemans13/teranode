@@ -1621,6 +1621,13 @@ func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, 
 	// its first non-coinbase tx — keep the two in sync if this assumption changes.)
 	// The exception is a tx shared with another block, checked below.
 	meta, err := sm.utxoStore.Get(ctx, &txOrder[1], fields.BlockIDs)
+	if err != nil && !errors.Is(err, errors.ErrTxNotFound) {
+		// A failed read is not "nothing recorded": reserving a fresh id then
+		// would leave an earlier attempt's records, stamped with the old id,
+		// unrecognised as this block's leftovers. Fail the attempt instead.
+		return 0, false, err
+	}
+
 	if err != nil || meta == nil || len(meta.BlockIDs) == 0 {
 		return 0, false, nil
 	}
