@@ -181,25 +181,27 @@ func TestGapBV054_PriorityWorkerSurvivesPanic_Child(t *testing.T) {
 		t.Fatal("setup: the worker never reached the injected panic")
 	}
 
-	// Give a recovering implementation time to unwind, then announce again: the service must
-	// still be alive and process it.
-	time.Sleep(300 * time.Millisecond)
-	announce()
-
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		exists, existsErr := s.blockValidation.GetBlockExists(ctx, block.Hash())
-		require.NoError(t, existsErr)
-
-		if exists {
-			println(gap054OKMarker)
-			return
+	// The service must still be alive after the panic and process a later announcement. The
+	// worker drops an announcement of a hash it is still processing, and the panic signal above
+	// fires before the worker has unwound, so one announcement now could be dropped. Announce
+	// again on each poll until the block is stored. That waits on the end state, with no fixed
+	// delay. An unrecovered panic kills this child process, so the parent test still fails.
+	require.Eventually(t, func() bool {
+		_, callErr := s.BlockFound(ctx, &blockvalidation_api.BlockFoundRequest{
+			Hash:    block.Hash()[:],
+			BaseUrl: "http://test-peer",
+			PeerId:  "peerA",
+		})
+		if callErr != nil {
+			return false
 		}
 
-		time.Sleep(50 * time.Millisecond)
-	}
+		exists, existsErr := s.blockValidation.GetBlockExists(ctx, block.Hash())
 
-	t.Fatal("BV-STARTUP-007: the block announced after the panic was never processed")
+		return existsErr == nil && exists
+	}, 10*time.Second, 100*time.Millisecond, "BV-STARTUP-007: a block announced after the panic was never processed")
+
+	println(gap054OKMarker)
 }
 
 // TestGapBV054_CatchupConsumerSurvivesPanic proves GAP-BV-054 for the catchup consumer.
@@ -257,10 +259,11 @@ func TestGapBV054_CatchupConsumerSurvivesPanic_Child(t *testing.T) {
 		t.Fatal("setup: the catchup consumer never ran catchupFunc")
 	}
 
-	time.Sleep(300 * time.Millisecond)
-
-	require.Nil(t, s.processBlockNotify.Get(*block.Hash()), "the in-progress marker must be cleared after the panic")
-	require.Nil(t, s.catchupAlternatives.Get(*block.Hash()), "the cached alternatives must be cleared after the panic")
+	// The panic signal fires before the recover runs. The recover counts the attempt and then
+	// clears both markers, the alternatives last, so wait for that end state.
+	require.Eventually(t, func() bool {
+		return s.processBlockNotify.Get(*block.Hash()) == nil && s.catchupAlternatives.Get(*block.Hash()) == nil
+	}, 10*time.Second, 10*time.Millisecond, "the in-progress marker and the cached alternatives must be cleared after the panic")
 
 	attempts := s.blockCatchupAttempts.Get(*block.Hash())
 	require.NotNil(t, attempts, "the panicked cycle must count toward the per-block catchup cap")
@@ -440,6 +443,23 @@ func TestGapBV054_CatchupPanicBeforeLockCountsAttempt(t *testing.T) {
 	require.Equal(t, 2, attempts.Value(), "a panic before the lock must count toward the per-block catchup cap")
 }
 
+// gap054SignalLogger wraps a logger and closes seen on the first Debugf call whose format holds
+// match, so a test can wait for a code path that has no other observable signal.
+type gap054SignalLogger struct {
+	ulogger.Logger
+	match string
+	seen  chan struct{}
+	once  sync.Once
+}
+
+func (l *gap054SignalLogger) Debugf(format string, args ...interface{}) {
+	if strings.Contains(format, l.match) {
+		l.once.Do(func() { close(l.seen) })
+	}
+
+	l.Logger.Debugf(format, args...)
+}
+
 // gap054RunOnce runs runOncePerBlock in a goroutine and sends its error, or the recovered panic
 // value, on the returned channels.
 func gap054RunOnce(bv *BlockValidation, hash *chainhash.Hash, validate func(*ValidateBlockOptions) error) (chan error, chan any) {
@@ -468,7 +488,8 @@ func TestGapBV054_PanicInValidateReleasesWaiters(t *testing.T) {
 	defer cancel()
 
 	s, _, block := newProcessBlockFoundHarness(ctx, t)
-	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, s.blockchainClient, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+	waiting := &gap054SignalLogger{Logger: ulogger.TestLogger{}, match: "waiting for concurrent validation", seen: make(chan struct{})}
+	bv := NewBlockValidation(ctx, waiting, s.settings, s.blockchainClient, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
 	hash := block.Hash()
 
 	started := make(chan struct{})
@@ -486,8 +507,15 @@ func TestGapBV054_PanicInValidateReleasesWaiters(t *testing.T) {
 		return errors.NewProcessingError("the waiter must not run its own validation")
 	})
 
-	// The entry stays until the grace window after the release, so the waiter blocks on it.
-	time.Sleep(200 * time.Millisecond)
+	// Release the first caller only once the waiter has found the entry and waits on it.
+	// runOncePerBlock logs "waiting for concurrent validation" after that lookup, so the waiter
+	// gets the stored result even if it reaches the done channel after the panic closed it.
+	select {
+	case <-waiting.seen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("setup: the second caller never waited on the first caller's entry")
+	}
+
 	close(release)
 
 	select {
