@@ -2301,7 +2301,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 }
 
 // spendRollbackSet is what a failed batched Spend reverses: nothing unless an
-// input failed with a genuine validation error (needsSpendRollback), and then
+// input failed with a genuine validation error (utxo.NeedsSpendRollback), and then
 // the inputs this call wrote plus, when that is safe, its idempotent matches
 // (utxo.RollbackSet).
 //
@@ -2313,34 +2313,11 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 // answer, while its real answer may be the marker; reversing the idempotent
 // matches then would release a confirmed historical spend to anyone.
 func spendRollbackSet(spends, written, idempotent []*utxo.Spend, unresolved int, spenderCreatedByCaller bool) []*utxo.Spend {
-	if !needsSpendRollback(spends, spenderCreatedByCaller) {
+	if !utxo.NeedsSpendRollback(spends, spenderCreatedByCaller) {
 		return nil
 	}
 
 	return utxo.RollbackSet(written, idempotent, utxo.AnyPrunedReplay(spends) || unresolved > 0)
-}
-
-// needsSpendRollback returns true if any spend failed due to a validation error
-// that indicates the transaction is genuinely invalid. Mirrors aerospike/spend.go.
-func needsSpendRollback(spends []*utxo.Spend, spenderCreatedByCaller bool) bool {
-	for _, spend := range spends {
-		if spend.Err == nil {
-			continue
-		}
-		if errors.Is(spend.Err, errors.ErrSpent) ||
-			errors.Is(spend.Err, errors.ErrTxConflicting) ||
-			errors.Is(spend.Err, errors.ErrFrozen) ||
-			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) ||
-			errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) ||
-			// The other pruned-replay answer, for a spender the caller wrote
-			// in this pass only; see the Aerospike isSpendRollbackError for why
-			// a ghost's fresh sibling spend must be reversed on it, and why
-			// every other caller keeps the earlier behaviour.
-			(spenderCreatedByCaller && errors.Is(spend.Err, errors.ErrTxNotFound)) {
-			return true
-		}
-	}
-	return false
 }
 
 // isDeadlock checks if a database error is a PostgreSQL deadlock (SQLSTATE 40P01)

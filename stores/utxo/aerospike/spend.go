@@ -594,7 +594,7 @@ func (r *spendCompletionResult) rollbackSet() []*utxo.Spend {
 // resolveSpendCompletions applies the ErrTxNotFound "already blessed"
 // fallback and conflict-data extraction to each item exactly once, and
 // reports which spends succeeded plus whether any completed spend carries a
-// rollback-triggering error (see needsSpendRollback/isSpendRollbackError).
+// rollback-triggering error (see utxo.IsSpendRollbackError).
 //
 // When onlyCompleted is true (the group.Wait abort path), an item whose
 // published flag is still false is skipped without touching its slot: the
@@ -654,7 +654,7 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 				spend.ConflictingTxID = errSpent.SpendingData.TxID
 			}
 
-			if isSpendRollbackError(spend.Err, item.spenderCreatedByCaller) {
+			if utxo.IsSpendRollbackError(spend.Err, item.spenderCreatedByCaller) {
 				result.rollbackNeeded = true
 			}
 
@@ -682,47 +682,6 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 	}
 
 	return result
-}
-
-// isSpendRollbackError reports whether err is one of the validation-error
-// types that indicates the transaction is genuinely invalid (as opposed to a
-// transient infrastructure failure). Extracted from needsSpendRollback so
-// resolveSpendCompletions can apply the same predicate to a single error at
-// a time without building a throwaway slice.
-func isSpendRollbackError(err error, spenderCreatedByCaller bool) bool {
-	return errors.Is(err, errors.ErrSpent) ||
-		errors.Is(err, errors.ErrTxConflicting) ||
-		errors.Is(err, errors.ErrFrozen) ||
-		errors.Is(err, errors.ErrUtxoHashMismatch) ||
-		errors.Is(err, errors.ErrUtxoSpendingTxPruned) ||
-		// A missing parent is the other pruned-replay answer (see
-		// utxo.IsPrunedReplayRejection), but only for a spender the caller
-		// wrote in this pass, the create-first block paths. Without it there a
-		// ghost with one parent pruned and another surviving kept its fresh
-		// spend of the survivor, and DeleteCreated then removed the ghost with
-		// that spend still in place: an output spent by a transaction the store
-		// no longer holds. Any other caller keeps the behaviour from before
-		// replay protection: a missing parent is not a validation failure, the
-		// fresh sibling spends stay, and a retry once the parent arrives
-		// matches them idempotently.
-		(spenderCreatedByCaller && errors.Is(err, errors.ErrTxNotFound))
-}
-
-// needsSpendRollback returns true if any spend failed due to a validation error
-// that indicates the transaction is genuinely invalid. Only explicit Lua-level
-// validation failures trigger rollback — infrastructure errors (DEVICE_OVERLOAD,
-// timeout, etc.) do not, because the Lua spend script is idempotent for the
-// same spender and successful spends will be silently skipped on retry.
-func needsSpendRollback(spends []*utxo.Spend, spenderCreatedByCaller bool) bool {
-	for _, spend := range spends {
-		if spend.Err == nil {
-			continue
-		}
-		if isSpendRollbackError(spend.Err, spenderCreatedByCaller) {
-			return true
-		}
-	}
-	return false
 }
 
 type keyIgnoreLocked struct {
@@ -1223,7 +1182,7 @@ func (s *Store) createSpendError(errMsg LuaErrorInfo, batchItem *batchSpend, txI
 		// INVALID_SPEND has exactly one producer: the deletedChildren check in
 		// teranode.lua's spend, which rejects a replay of a child the pruner has
 		// already removed. It gets the dedicated pruned-spend code so
-		// isSpendRollbackError can roll the transaction's sibling spends back
+		// utxo.IsSpendRollbackError can roll the transaction's sibling spends back
 		// instead of leaving them recorded against a transaction that will
 		// never exist.
 		return errors.NewUtxoSpendingTxPrunedError("[SPEND_BATCH_LUA][%s] invalid spend for vout %d: spending transaction was pruned: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)

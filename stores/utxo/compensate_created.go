@@ -396,7 +396,7 @@ const (
 //
 //   - A rejected transaction's spend of the markered output never committed,
 //     and the store rolls back whatever fresh sibling spends it made in the
-//     same call (needsSpendRollback), on the marker answer and on the missing
+//     same call (IsSpendRollbackError), on the marker answer and on the missing
 //     parent answer alike. What its inputs still record is the
 //     original, confirmed spend, which the marker protects; clearing it would
 //     hand a confirmed output to any new spender, and the marker would not
@@ -531,6 +531,43 @@ func RollbackSet(written, idempotent []*Spend, historical bool) []*Spend {
 func AnyPrunedReplay(spends []*Spend) bool {
 	for _, spend := range spends {
 		if spend != nil && IsReplayAnswer(spend.Err) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// IsSpendRollbackError reports whether a per-input spend error says the
+// spending transaction is invalid, so the inputs the same Spend call did write
+// must be reversed (RollbackSet decides which). An infrastructure error
+// (DEVICE_OVERLOAD, timeout, cancellation) does not: the spend is idempotent for
+// the same spender, so a retry matches the written inputs instead. Both stores
+// use this one predicate, so their rollback decisions cannot drift apart.
+//
+// A missing parent counts only when spenderCreatedByCaller is set, for the
+// create-first block paths. It is the other pruned-replay answer
+// (IsPrunedReplayRejection). Without it a ghost with one parent pruned and
+// another surviving kept its fresh spend of the survivor, and DeleteCreated then
+// removed the ghost with that spend still in place: an output spent by a
+// transaction the store no longer holds. Any other caller keeps the behaviour
+// from before replay protection: a missing parent is not a validation failure,
+// the fresh sibling spends stay, and a retry once the parent arrives matches
+// them idempotently.
+func IsSpendRollbackError(err error, spenderCreatedByCaller bool) bool {
+	return errors.Is(err, errors.ErrSpent) ||
+		errors.Is(err, errors.ErrTxConflicting) ||
+		errors.Is(err, errors.ErrFrozen) ||
+		errors.Is(err, errors.ErrUtxoHashMismatch) ||
+		errors.Is(err, errors.ErrUtxoSpendingTxPruned) ||
+		(spenderCreatedByCaller && errors.Is(err, errors.ErrTxNotFound))
+}
+
+// NeedsSpendRollback reports whether any spend failed with an error
+// IsSpendRollbackError accepts.
+func NeedsSpendRollback(spends []*Spend, spenderCreatedByCaller bool) bool {
+	for _, spend := range spends {
+		if spend != nil && spend.Err != nil && IsSpendRollbackError(spend.Err, spenderCreatedByCaller) {
 			return true
 		}
 	}
