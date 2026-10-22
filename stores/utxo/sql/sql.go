@@ -2866,13 +2866,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			if isDeadlock(err) {
 				return true
 			}
-			for i, item := range batch {
-				if valErr, ok := validationErrors[i]; ok {
-					item.errCh <- valErr
-				} else {
-					item.errCh <- errors.NewStorageError("[Spend] failed: bulk UPDATE outputs", err)
-				}
-			}
+			failSpendBatch(batch, validationErrors, "[Spend] failed: bulk UPDATE outputs", err)
 			return false
 		}
 
@@ -2887,9 +2881,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true
 				}
-				for _, item := range batch {
-					item.errCh <- errors.NewStorageError("[Spend] failed: scanning bulk UPDATE results", err)
-				}
+				failSpendBatch(batch, validationErrors, "[Spend] failed: scanning bulk UPDATE results", err)
 				return false
 			}
 			updatedSet[bIdx] = true
@@ -2902,9 +2894,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			if isDeadlock(err) {
 				return true
 			}
-			for _, item := range batch {
-				item.errCh <- errors.NewStorageError("[Spend] failed: closing bulk UPDATE results", err)
-			}
+			failSpendBatch(batch, validationErrors, "[Spend] failed: closing bulk UPDATE results", err)
 			return false
 		}
 
@@ -2964,9 +2954,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true
 				}
-				for _, item := range batch {
-					item.errCh <- errors.NewStorageError("[Spend] failed: concurrent-idempotent re-check", err)
-				}
+				failSpendBatch(batch, validationErrors, "[Spend] failed: concurrent-idempotent re-check", err)
 				return false
 			}
 			for iRows.Next() {
@@ -2979,9 +2967,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 					if isDeadlock(err) {
 						return true
 					}
-					for _, item := range batch {
-						item.errCh <- errors.NewStorageError("[Spend] failed: scanning concurrent-idempotent re-check", err)
-					}
+					failSpendBatch(batch, validationErrors, "[Spend] failed: scanning concurrent-idempotent re-check", err)
 					return false
 				}
 				if pruned {
@@ -3001,9 +2987,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true
 				}
-				for _, item := range batch {
-					item.errCh <- errors.NewStorageError("[Spend] failed: closing concurrent-idempotent re-check", err)
-				}
+				failSpendBatch(batch, validationErrors, "[Spend] failed: closing concurrent-idempotent re-check", err)
 				return false
 			}
 		}
@@ -3112,13 +3096,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true
 				}
-				for i, item := range batch {
-					if valErr, ok := validationErrors[i]; ok {
-						item.errCh <- valErr
-					} else {
-						item.errCh <- errors.NewStorageError("[Spend] failed to recompute DAH for bulk spend fallback", err)
-					}
-				}
+				failSpendBatch(batch, validationErrors, "[Spend] failed to recompute DAH for bulk spend fallback", err)
 				return false
 			}
 		}
@@ -3129,13 +3107,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		if isDeadlock(err) {
 			return true
 		}
-		for i, item := range batch {
-			if valErr, ok := validationErrors[i]; ok {
-				item.errCh <- valErr
-			} else {
-				item.errCh <- errors.NewStorageError("[Spend] failed to commit transaction", err)
-			}
-		}
+		failSpendBatch(batch, validationErrors, "[Spend] failed to commit transaction", err)
 		return false
 	}
 
@@ -3177,17 +3149,9 @@ func (s *Store) recheckIdempotentMarkers(txn *sql.Tx, batch []*batchSpend, resul
 		              WHERE d.parent_id = v.transaction_id
 		                AND d.child_hash = substring(v.spending_data from 1 for 32))`)
 
-	// An item already answered keeps its answer, as on the batch's commit and
-	// DAH failure paths: overwriting a pruned-replay or spent refusal with a
-	// storage error turned a final rejection into one the caller retries.
+	// An item already answered keeps its answer (failSpendBatch).
 	failAll := func(err error) {
-		for i, item := range batch {
-			if valErr, ok := validationErrors[i]; ok {
-				item.errCh <- valErr
-			} else {
-				item.errCh <- errors.NewStorageError("[Spend] failed: idempotent marker re-check", err)
-			}
-		}
+		failSpendBatch(batch, validationErrors, "[Spend] failed: idempotent marker re-check", err)
 	}
 
 	rows, err := txn.QueryContext(s.ctx, sb.String(), args...)
@@ -3231,6 +3195,24 @@ func (s *Store) recheckIdempotentMarkers(txn *sql.Tx, batch []*batchSpend, resul
 	}
 
 	return false, false
+}
+
+// failSpendBatch answers every item of a bulk spend batch after a statement of
+// the batch failed. An item the batch has already refused keeps its refusal,
+// and every other item gets a storage error built from msg and err. Every
+// failure arm of the bulk path that runs once validationErrors exists goes
+// through here. Overwriting a refusal with a storage error turned a final
+// rejection into one the caller retries, and it hid a pruned-replay answer from
+// utxo.AnyPrunedReplay, so the rollback reversed idempotent matches that are
+// confirmed historical spends (utxo.RollbackSet).
+func failSpendBatch(batch []*batchSpend, validationErrors map[int]error, msg string, err error) {
+	for i, item := range batch {
+		if valErr, ok := validationErrors[i]; ok {
+			item.errCh <- valErr
+		} else {
+			item.errCh <- errors.NewStorageError(msg, err)
+		}
+	}
 }
 
 // trySendSpendBatchPerRow processes a spend batch with per-row SELECT+UPDATE (original behavior).
