@@ -120,7 +120,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   output that block assembly never saw. Miners that submit their own coinbase are not
   affected. Upgrade block assembly no later than the RPC service: an RPC service on this
   build answers `getminingcandidate` with `coinbase=true` with an error while it is talking
-  to an older block assembly, which sends no coinbase. (#TBD)
+  to an older block assembly, which sends no coinbase. (#2027)
 
 - **`utxostore_updateTxMinedStatus` is removed, and it was live.** Affects only nodes that
   set it to `false`. Mined-tagging, the step after `AddBlock` that writes a block's ID onto
