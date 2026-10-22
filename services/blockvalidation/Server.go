@@ -1104,7 +1104,7 @@ func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf p
 			caller <- answer
 		default:
 			if r != nil {
-				caller <- errors.NewProcessingError("panic processing block %s, see the PANIC log line", bf.hash.String())
+				caller <- errors.NewProcessingError(recoveredPanicErrFormat, bf.hash.String())
 			}
 		}
 	}()
@@ -2405,7 +2405,7 @@ func (u *Server) processBlockWithPriorityRecovered(ctx context.Context, blockFou
 		if r := recover(); r != nil {
 			countRecoveredPanic(recoveredPanicPathWorker)
 			u.logger.Errorf("[BlockProcessing] PANIC processing block %s outside a delivery attempt: %v stack=%q", blockFound.hash.String(), r, debug.Stack())
-			err = errors.NewProcessingError("panic processing block %s, see the PANIC log line", blockFound.hash.String())
+			err = errors.NewProcessingError(recoveredPanicErrFormat, blockFound.hash.String())
 		}
 	}()
 
@@ -2425,7 +2425,7 @@ func (u *Server) processBlockFoundRecovered(ctx context.Context, hash *chainhash
 			countRecoveredPanic(recoveredPanicPathWorker)
 			attempts := u.recordPanicAttempt(hash, peerID)
 			u.logger.Errorf("[BlockProcessing] PANIC processing block %s from peer %s (panic %d for this peer in the cooldown window): %v stack=%q", hash.String(), peerID, attempts, r, debug.Stack())
-			err = errors.NewProcessingError("panic processing block %s, see the PANIC log line", hash.String())
+			err = errors.NewProcessingError(recoveredPanicErrFormat, hash.String())
 		}
 	}()
 
@@ -3247,6 +3247,11 @@ const (
 	recoveredPanicPathKafka      = "kafka"
 	recoveredPanicPathBlockFound = "block_found"
 )
+
+// recoveredPanicErrFormat is the error text a recover on the priority worker or a blockFoundCh
+// worker returns, with the block hash as its one argument. It has no panic value, and no word
+// that IsNetworkError or IsMaliciousResponseError matches, so the error never requeues the block.
+const recoveredPanicErrFormat = "panic processing block %s, see the PANIC log line"
 
 // countRecoveredPanic increments prometheusRecoveredPanics for one path. It runs inside the
 // recovers, so it must not panic: a Server built without initPrometheusMetrics has a nil vector.
