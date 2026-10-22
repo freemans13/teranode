@@ -1673,9 +1673,7 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 
 	id, _ := chainhash.NewHash(miningCandidate.Id)
 
-	if err = ba.storeJobWithCoinbase(id, miningCandidate, subtrees); err != nil {
-		return nil, errors.WrapGRPC(err)
-	}
+	ba.storeJobWithCoinbase(id, miningCandidate, subtrees)
 
 	if includeSubtreeHashes {
 		miningCandidate.SubtreeHashes = make([][]byte, len(subtrees))
@@ -1701,7 +1699,13 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 // so polls in the same second share one, and the empty-block path derives its id from the parent
 // alone. A poll for an id whose job is still held therefore reuses that job's coinbase rather than
 // building a new one, provided it pays the same value at the same height.
-func (ba *BlockAssembly) storeJobWithCoinbase(id *chainhash.Hash, miningCandidate *model.MiningCandidate, subtrees []*subtreepkg.Subtree) error {
+//
+// Building the coinbase needs miner_wallet_private_keys, which a pool that submits its own coinbase
+// and generatetoaddress, which pays an explicit address, have never needed. So a coinbase that
+// cannot be built leaves the job without one rather than failing the candidate: only a solution
+// that omits its coinbase, GetCandidateBlock and getminingcandidate with coinbase=true need it,
+// and each of those refuses a job without one.
+func (ba *BlockAssembly) storeJobWithCoinbase(id *chainhash.Hash, miningCandidate *model.MiningCandidate, subtrees []*subtreepkg.Subtree) {
 	ba.jobCoinbaseMu.Lock()
 	defer ba.jobCoinbaseMu.Unlock()
 
@@ -1715,10 +1719,10 @@ func (ba *BlockAssembly) storeJobWithCoinbase(id *chainhash.Hash, miningCandidat
 	if len(miningCandidate.CoinbaseTx) == 0 {
 		coinbaseTx, err := miningCandidate.CreateCoinbaseTxCandidate(ba.blockAssembler.settings)
 		if err != nil {
-			return errors.NewProcessingError("[GetMiningCandidate][%s] failed to create coinbase tx", id.String(), err)
+			ba.logger.Debugf("[GetMiningCandidate][%s] storing the job without a coinbase, so only a solution with its own coinbase can be mined: %v", id.String(), err)
+		} else {
+			miningCandidate.CoinbaseTx = coinbaseTx.Bytes()
 		}
-
-		miningCandidate.CoinbaseTx = coinbaseTx.Bytes()
 	}
 
 	ba.jobStore.Set(*id, &subtreeprocessor.Job{
@@ -1726,8 +1730,6 @@ func (ba *BlockAssembly) storeJobWithCoinbase(id *chainhash.Hash, miningCandidat
 		Subtrees:        subtrees,
 		MiningCandidate: miningCandidate,
 	}, jobTTL)
-
-	return nil
 }
 
 // SubmitMiningSolution processes a mining solution submission.
@@ -1979,6 +1981,10 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		// the one the miner hashed and every such solution failed the proof-of-work check. The
 		// solution's version, time and nonce belong in the header, built from req below, and are not
 		// copied into the coinbase, so it is used exactly as issued.
+		if len(job.MiningCandidate.CoinbaseTx) == 0 {
+			return nil, errors.NewProcessingError("[BlockAssembly][%s] solution has no coinbase and the job has none to mine with, because block assembly could not build one from miner_wallet_private_keys", jobID)
+		}
+
 		coinbaseTx, err = bt.NewTxFromBytes(job.MiningCandidate.CoinbaseTx)
 		if err != nil {
 			return nil, errors.NewProcessingError("[BlockAssembly][%s] job holds no usable coinbase tx", jobID, err)
@@ -2323,6 +2329,10 @@ func (ba *BlockAssembly) GetCandidateBlock(ctx context.Context, req *blockassemb
 
 	// The coinbase the job was issued with, so this block is the one a coinbase-less solution to the
 	// candidate would mine.
+	if len(job.MiningCandidate.CoinbaseTx) == 0 {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[GetCandidateBlock][%s] job has no coinbase, because block assembly could not build one from miner_wallet_private_keys", candidateID))
+	}
+
 	coinbaseTx, err := bt.NewTxFromBytes(job.MiningCandidate.CoinbaseTx)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewProcessingError("[GetCandidateBlock][%s] job holds no usable coinbase tx", candidateID, err))

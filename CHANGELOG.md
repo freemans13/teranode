@@ -118,7 +118,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   coinbase: a version 1 transaction paying the configured miner wallet addresses by P2PKH,
   where it used to return a separately built version 2 transaction with one pay-to-pubkey
   output that block assembly never saw. Miners that submit their own coinbase are not
-  affected. Upgrade block assembly no later than the RPC service: an RPC service on this
+  affected, and neither is a node without `miner_wallet_private_keys`: it still serves
+  candidates, with no coinbase on the job, and refuses only a coinbase-less solution and
+  `coinbase=true`, as it did before. Upgrade block assembly no later than the RPC service: an RPC service on this
   build answers `getminingcandidate` with `coinbase=true` with an error while it is talking
   to an older block assembly, which sends no coinbase. (#2027)
 

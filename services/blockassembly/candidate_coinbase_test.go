@@ -93,7 +93,7 @@ func newCandidateCoinbaseHarness(t *testing.T) *candidateCoinbaseHarness {
 func (h *candidateCoinbaseHarness) issue(t *testing.T) *model.MiningCandidate {
 	t.Helper()
 
-	require.NoError(t, h.server.storeJobWithCoinbase(h.id, h.candidate, nil))
+	h.server.storeJobWithCoinbase(h.id, h.candidate, nil)
 	require.NotEmpty(t, h.candidate.CoinbaseTx, "a stored job must carry its coinbase")
 
 	issued := proto.Clone(h.candidate).(*model.MiningCandidate)
@@ -188,7 +188,7 @@ func TestStoreJobWithCoinbase_OncePerCandidateID(t *testing.T) {
 		again := proto.Clone(h.candidate).(*model.MiningCandidate)
 		again.CoinbaseTx = nil
 
-		require.NoError(t, h.server.storeJobWithCoinbase(h.id, again, nil))
+		h.server.storeJobWithCoinbase(h.id, again, nil)
 		require.Equal(t, first.CoinbaseTx, again.CoinbaseTx)
 		require.Equal(t, first.CoinbaseTx, h.server.jobStore.Get(*h.id).Value().MiningCandidate.CoinbaseTx)
 	})
@@ -212,7 +212,7 @@ func TestStoreJobWithCoinbase_OncePerCandidateID(t *testing.T) {
 				poll := proto.Clone(h.candidate).(*model.MiningCandidate)
 				poll.CoinbaseTx = nil
 
-				require.NoError(t, h.server.storeJobWithCoinbase(h.id, poll, nil))
+				h.server.storeJobWithCoinbase(h.id, poll, nil)
 				got[i] = poll.CoinbaseTx
 			}()
 		}
@@ -233,11 +233,66 @@ func TestStoreJobWithCoinbase_OncePerCandidateID(t *testing.T) {
 		changed.CoinbaseTx = nil
 		changed.CoinbaseValue--
 
-		require.NoError(t, h.server.storeJobWithCoinbase(h.id, changed, nil))
+		h.server.storeJobWithCoinbase(h.id, changed, nil)
 		require.NotEqual(t, first.CoinbaseTx, changed.CoinbaseTx)
 
 		coinbase, err := bt.NewTxFromBytes(changed.CoinbaseTx)
 		require.NoError(t, err)
 		require.Equal(t, changed.CoinbaseValue, coinbase.TotalOutputSatoshis())
 	})
+}
+
+// TestStoreJobWithCoinbase_NoMinerKeys pins that a node without miner_wallet_private_keys still
+// serves candidates. A pool that submits its own coinbase, and generatetoaddress, never needed those
+// keys, so a coinbase that cannot be built leaves the job without one instead of failing the
+// candidate. Only the paths that need the job's coinbase refuse, and refusing does not drop the job.
+func TestStoreJobWithCoinbase_NoMinerKeys(t *testing.T) {
+	h := newCandidateCoinbaseHarness(t)
+
+	// The miner's own coinbase, built while the keys are still configured.
+	own, err := h.candidate.CreateCoinbaseTxCandidate(h.server.blockAssembler.settings)
+	require.NoError(t, err)
+
+	h.server.blockAssembler.settings.BlockAssembly.MinerWalletPrivateKeys = nil
+
+	h.server.storeJobWithCoinbase(h.id, h.candidate, nil)
+	require.Empty(t, h.candidate.CoinbaseTx)
+
+	held := h.server.jobStore.Get(*h.id)
+	require.NotNil(t, held, "the job must be stored even though it has no coinbase")
+	require.Empty(t, held.Value().MiningCandidate.CoinbaseTx)
+
+	_, err = h.server.GetCandidateBlock(t.Context(), &blockassembly_api.GetCandidateBlockRequest{Id: h.candidate.Id})
+	require.ErrorContains(t, err, "miner_wallet_private_keys")
+
+	_, err = h.server.submitMiningSolution(t.Context(), &BlockSubmissionRequest{
+		SubmitMiningSolutionRequest: &blockassembly_api.SubmitMiningSolutionRequest{Id: h.candidate.Id},
+	})
+	require.ErrorContains(t, err, "miner_wallet_private_keys")
+	require.NotNil(t, h.server.jobStore.Get(*h.id), "a refused coinbase-less solution must not drop the job")
+
+	// A solution carrying its own coinbase is mined.
+	hashed := proto.Clone(h.candidate).(*model.MiningCandidate)
+	hashed.CoinbaseTx = own.Bytes()
+
+	version := h.candidate.Version
+	nonce := mine(t, hashed, version)
+
+	resp, err := h.server.submitMiningSolution(t.Context(), &BlockSubmissionRequest{
+		SubmitMiningSolutionRequest: &blockassembly_api.SubmitMiningSolutionRequest{
+			Id:         h.candidate.Id,
+			Nonce:      nonce,
+			Version:    &version,
+			CoinbaseTx: own.Bytes(),
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+
+	best, _, err := h.store.GetBestBlockHeader(t.Context())
+	require.NoError(t, err)
+
+	block, err := h.store.GetBlock(t.Context(), best.Hash())
+	require.NoError(t, err)
+	require.Equal(t, own.Bytes(), block.CoinbaseTx.Bytes())
 }
