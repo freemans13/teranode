@@ -1155,6 +1155,46 @@ func TestGapBV054_ConcurrentPanicWaiterIsNotChargedToCachedAlternative(t *testin
 	require.Equal(t, int32(1), reports.reports.Load(), "only the primary's failure may be reported")
 }
 
+// TestGapBV054_BlockFoundChPanicCapAnswersStoredBlock: a peer at its recovered-panic cap for a hash
+// re-announces it. If this node has stored the block, the caller must get nil, as for any other
+// peer, and nothing is fetched. If the block is not stored, the caller gets the capped
+// ERR_PROCESSING answer and nothing is fetched.
+func TestGapBV054_BlockFoundChPanicCapAnswersStoredBlock(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+	s.settings.BlockValidation.MaxCorruptAttemptsPerBlock = 2
+
+	for i := 0; i < 2; i++ {
+		s.recordPanicAttempt(block.Hash(), "peerA")
+	}
+
+	require.True(t, s.panicAttemptsExhausted(block.Hash(), "peerA"), "setup: peerA must be at its cap")
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	fetchKey := "GET http://test-peer/block/" + block.Hash().String()
+	httpmock.RegisterResponder("GET", "http://test-peer/block/"+block.Hash().String(), httpmock.NewStringResponder(http.StatusInternalServerError, ""))
+
+	stored := s.blockValidation
+	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, &gap054ExistsChain{ClientI: s.blockchainClient}, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+
+	require.NoError(t, gap054Deliver(ctx, t, s, block.Hash(), "http://test-peer", "peerA"), "a stored block must answer nil, also for a capped peer")
+	require.Equal(t, 0, httpmock.GetCallCountInfo()[fetchKey], "a stored block must not be fetched")
+
+	s.blockValidation = stored
+
+	err := gap054Deliver(ctx, t, s, block.Hash(), "http://test-peer", "peerA")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrProcessing), "got %v", err)
+	require.Contains(t, err.Error(), "recovered-panic cap reached")
+	require.Equal(t, 0, httpmock.GetCallCountInfo()[fetchKey], "a capped announcement of a block that is not stored must stop before the fetch")
+}
+
 // gap054PeerListCounter counts the peer-registry reads of the 429 fallback, so a test can tell an
 // alternative that was considered and skipped from one that was never considered.
 type gap054PeerListCounter struct {

@@ -1059,11 +1059,12 @@ func (u *Server) blockHandler(ctx context.Context, kafkaMsg *kafkamessage.KafkaB
 // blockPanicAttempts, the budget that the priority worker's recover also fills. The serving peer is
 // the announcer, or after a 429 fallback in fetchAnnouncedBlock the alternative peer that served
 // the bytes; bf.servedBy carries it to this recover. This path fetches and parses the bytes before
-// processBlockFound's gate, so it has two gates of its own, each keyed like the record: the gate
-// below drops the announcer's next deliveries of the hash before the fetch, and
+// processBlockFound's gate, so it has two gates of its own, each keyed like the record: the gate in
+// processBlockFoundChannel drops the announcer's next deliveries of the hash before the fetch, and
 // fetchAnnouncedBlockFromTipPeers skips a capped alternative before it fetches from it. Both hold
-// until the cooldown window lapses. The gate below answers a WaitToComplete caller one time with
-// ERR_PROCESSING, through the relay. Its text has no word that IsNetworkError or
+// until the cooldown window lapses. The announcer's gate runs after the exists check, so a stored
+// block still answers nil. It answers a WaitToComplete caller one time with ERR_PROCESSING,
+// through the relay. Its text has no word that IsNetworkError or
 // IsMaliciousResponseError matches. Neither gate reports a peer failure: a panic is a bug in this
 // node. Another peer's announcement of the hash has its own key and is still processed. An empty
 // peerID is not capped (fail-open), as for the other caps.
@@ -1103,16 +1104,6 @@ func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf p
 
 		if bf.errCh != nil {
 			bf.errCh <- errors.NewProcessingError("peer %s is marked as malicious", bf.peerID)
-		}
-
-		return
-	}
-
-	if u.panicAttemptsExhausted(bf.hash, bf.peerID) {
-		u.logger.Warnf("[blockFound][%s] recovered-panic cap reached for peer %s; dropping this announcement before the fetch until the cooldown window expires", bf.hash.String(), bf.peerID)
-
-		if bf.errCh != nil {
-			bf.errCh <- errors.NewProcessingError("[blockFound][%s] recovered-panic cap reached for this peer; announcement dropped until the cooldown window expires (block not fetched)", bf.hash.String())
 		}
 
 		return
@@ -1172,6 +1163,20 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 
 		if blockFound.errCh != nil {
 			blockFound.errCh <- nil
+		}
+
+		return nil
+	}
+
+	// The announcer's recovered-panic gate (BV-STARTUP-007), see processBlockFoundChItem. It comes
+	// after the exists check, so a capped peer that re-announces a block this node has stored gets
+	// nil, as any other peer does, and before both fetches below (the backlog branch and
+	// addBlockToPriorityQueue), so a capped announcer's bytes are not fetched again.
+	if u.panicAttemptsExhausted(blockFound.hash, blockFound.peerID) {
+		u.logger.Warnf("[processBlockFoundChannel][%s] recovered-panic cap reached for peer %s; dropping this announcement before the fetch until the cooldown window expires", blockFound.hash.String(), blockFound.peerID)
+
+		if blockFound.errCh != nil {
+			blockFound.errCh <- errors.NewProcessingError("[blockFound][%s] recovered-panic cap reached for this peer; announcement dropped until the cooldown window expires (block not fetched)", blockFound.hash.String())
 		}
 
 		return nil
