@@ -142,8 +142,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
       `blockFoundCh` panics for one block from one peer, the node stops that peer's
       announcements and deliveries of the block before it fetches the block, for
       `blockvalidation_corrupt_attempt_cooldown` (default 10 minutes). The panic counts for
-      the peer that served the attempt that panicked. On the `blockFoundCh` path it counts for
-      the announcing peer.
+      the peer that served the attempt that panicked. On the `blockFoundCh` path that is the
+      announcing peer, or the peer that served the block after the announcer answered 429.
+      A capped peer is not fetched from as that 429 fallback either.
     - The error that a `WaitToComplete` caller gets after a `blockFoundCh` worker panic no
       longer has the panic value in its text. The panic value is in the `PANIC` log line.
       (#2012)

@@ -89,6 +89,21 @@ type processBlockFound struct {
 	// errCh receives any errors encountered during block validation and allows
 	// synchronous waiting for validation completion
 	errCh chan error
+
+	// servedBy, when not nil, holds the peerID of the peer whose bytes this item is processing.
+	// processBlockFoundChItem sets it to the announcer. After a 429 from the announcer,
+	// fetchAnnouncedBlockFromTipPeers sets it to the alternative peer before it fetches from that
+	// peer. The blockFoundCh recover reads it, so a panic counts for the peer that served the bytes.
+	// Copies of the item share it. Only the blockFoundCh worker that owns the item writes or reads it.
+	servedBy *string
+}
+
+// setServedBy records peerID as the peer that serves this item's bytes. It does nothing when the
+// item has no servedBy, for an item that did not come through processBlockFoundChItem.
+func (bf processBlockFound) setServedBy(peerID string) {
+	if bf.servedBy != nil {
+		*bf.servedBy = peerID
+	}
 }
 
 // processBlockCatchup contains information needed to process a block during chain catchup
@@ -1040,28 +1055,33 @@ func (u *Server) blockHandler(ctx context.Context, kafkaMsg *kafkamessage.KafkaB
 // answer if it gave one, or else the panic error. A path that returns with no answer and no panic
 // leaves the caller waiting, as before.
 //
-// The recover also counts the panic toward the recovered-panic cap of (bf.hash, bf.peerID), in
-// blockPanicAttempts, the budget that the priority worker's recover also fills. This path fetches
-// and parses the announcer's bytes before processBlockFound's gate, so after the cap the gate below
-// drops the announcer's next deliveries of the hash before the fetch, until the cooldown window
-// lapses. The gate answers a WaitToComplete caller one time with ERR_PROCESSING, through the relay.
-// Its text has no word that IsNetworkError or IsMaliciousResponseError matches. It reports no peer
-// failure: a panic is a bug in this node. Another peer's announcement of the hash has its own key
-// and is still processed. An empty peerID is not capped (fail-open), as for the other caps. After a
-// 429 fallback in fetchAnnouncedBlock another peer serves the bytes, but the panic still counts for
-// the announcer, because this recover sees only the announcement.
+// The recover also counts the panic toward the recovered-panic cap of (bf.hash, serving peerID), in
+// blockPanicAttempts, the budget that the priority worker's recover also fills. The serving peer is
+// the announcer, or after a 429 fallback in fetchAnnouncedBlock the alternative peer that served
+// the bytes; bf.servedBy carries it to this recover. This path fetches and parses the bytes before
+// processBlockFound's gate, so it has two gates of its own, each keyed like the record: the gate
+// below drops the announcer's next deliveries of the hash before the fetch, and
+// fetchAnnouncedBlockFromTipPeers skips a capped alternative before it fetches from it. Both hold
+// until the cooldown window lapses. The gate below answers a WaitToComplete caller one time with
+// ERR_PROCESSING, through the relay. Its text has no word that IsNetworkError or
+// IsMaliciousResponseError matches. Neither gate reports a peer failure: a panic is a bug in this
+// node. Another peer's announcement of the hash has its own key and is still processed. An empty
+// peerID is not capped (fail-open), as for the other caps.
 func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf processBlockFound) {
 	caller := bf.errCh
 	if caller != nil {
 		bf.errCh = make(chan error, 1)
 	}
 
+	servedBy := bf.peerID
+	bf.servedBy = &servedBy
+
 	defer func() {
 		r := recover()
 		if r != nil {
 			countRecoveredPanic(recoveredPanicPathBlockFound)
-			attempts := u.recordPanicAttempt(bf.hash, bf.peerID)
-			u.logger.Errorf("[Init] PANIC in processBlockFoundChannel for block %s from peer %s (panic %d for this peer in the cooldown window): %v stack=%q", bf.hash.String(), bf.peerID, attempts, r, debug.Stack())
+			attempts := u.recordPanicAttempt(bf.hash, servedBy)
+			u.logger.Errorf("[Init] PANIC in processBlockFoundChannel for block %s served by peer %s, announced by peer %s (panic %d for the serving peer in the cooldown window): %v stack=%q", bf.hash.String(), servedBy, bf.peerID, attempts, r, debug.Stack())
 		}
 
 		if caller == nil {

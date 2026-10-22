@@ -3,6 +3,7 @@ package blockvalidation
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/blockvalidation_api"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/bsv-blockchain/teranode/services/p2p"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -23,6 +25,7 @@ import (
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/jarcoal/httpmock"
 	"github.com/jellydator/ttlcache/v3"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -1150,4 +1153,117 @@ func TestGapBV054_ConcurrentPanicWaiterIsNotChargedToCachedAlternative(t *testin
 	require.Equal(t, 0, reputation.charged("altPeer"), "the alternative must not be charged for a panic in this node")
 	require.Equal(t, 0, reputation.totalMaliciousReports())
 	require.Equal(t, int32(1), reports.reports.Load(), "only the primary's failure may be reported")
+}
+
+// gap054PeerListCounter counts the peer-registry reads of the 429 fallback, so a test can tell an
+// alternative that was considered and skipped from one that was never considered.
+type gap054PeerListCounter struct {
+	*subtreeAttributionP2PClient
+	lookups atomic.Int32
+}
+
+func (c *gap054PeerListCounter) GetPeersForCatchup(ctx context.Context) ([]*p2p.PeerInfo, error) {
+	c.lookups.Add(1)
+	return c.subtreeAttributionP2PClient.GetPeersForCatchup(ctx)
+}
+
+// gap054Deliver runs one blockFoundCh item for peerID on a worker, as a WaitToComplete caller
+// would, and returns the one answer the caller gets.
+func gap054Deliver(ctx context.Context, t *testing.T, s *Server, hash *chainhash.Hash, baseURL, peerID string) error {
+	t.Helper()
+
+	errCh := make(chan error)
+	done := make(chan struct{})
+
+	go func() {
+		s.processBlockFoundChItem(ctx, 0, processBlockFound{hash: hash, baseURL: baseURL, peerID: peerID, errCh: errCh})
+		close(done)
+	}()
+
+	var answer error
+
+	select {
+	case answer = <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("peer %q: the WaitToComplete caller got no answer", peerID)
+	}
+
+	gap054RequireAnsweredOnce(t, errCh, done)
+
+	return answer
+}
+
+// TestGapBV054_BlockFoundChPanicAfter429FallbackCapsServingPeer: the announcer answers 429, so
+// fetchAnnouncedBlock fetches the block from another peer that has it as its tip, and processing
+// the block that peer served panics. The panic must count for the peer that served the
+// bytes, not for the announcer. After MaxCorruptAttemptsPerBlock panics the serving peer must not be
+// fetched from again on this path: the fallback considers it and skips it before the fetch. No
+// peer is charged.
+func TestGapBV054_BlockFoundChPanicAfter429FallbackCapsServingPeer(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, _, block := newProcessBlockFoundHarness(ctx, t)
+	s.settings.BlockValidation.MaxCorruptAttemptsPerBlock = 2
+	s.announcedBlockRateLimits = newAnnouncedBlockRateLimitCache()
+
+	altID := peer.ID("alt").String()
+
+	registry := &gap054PeerListCounter{subtreeAttributionP2PClient: &subtreeAttributionP2PClient{
+		peers: []*p2p.PeerInfo{tipPeer("alt", "http://alt-peer", block.Hash())},
+	}}
+	s.p2pClient = registry
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	announcerKey := "GET http://announcer-peer/block/" + block.Hash().String()
+	httpmock.RegisterResponder("GET", "http://announcer-peer/block/"+block.Hash().String(), httpmock.NewStringResponder(http.StatusTooManyRequests, ""))
+
+	// The alternative serves the real block, and processing it panics after the fetch, in
+	// queueFetchedBlock's parent check. A panic while the bytes are parsed cannot be used:
+	// NewBlockFromReader recovers its own panics and returns an error.
+	chain := &gap054ParentPanicChain{ClientI: s.blockchainClient, parent: *block.Header.HashPrevBlock}
+	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, s.settings, chain, blobmemory.New(), s.txStore, s.utxoStore, nil, nil)
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	var altFetches atomic.Int32
+
+	httpmock.RegisterResponder("GET", "http://alt-peer/block/"+block.Hash().String(), func(req *http.Request) (*http.Response, error) {
+		altFetches.Add(1)
+
+		return httpmock.NewBytesResponse(http.StatusOK, blockBytes), nil
+	})
+
+	// MaxCorruptAttemptsPerBlock is 2 and the announcer's 429 allowance is 3, so each of the three
+	// 429s below is within the allowance and falls back.
+	require.Greater(t, announcedBlockRateLimitAllowance, 2, "setup: the third 429 must still fall back")
+
+	for i := 1; i <= 2; i++ {
+		err := gap054Deliver(ctx, t, s, block.Hash(), "http://announcer-peer", "announcer")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "see the PANIC log line", "delivery %d must panic in the fallback fetch", i)
+		require.Equal(t, int32(i), altFetches.Load(), "delivery %d must fetch from the alternative", i)
+		require.Equal(t, i, httpmock.GetCallCountInfo()[announcerKey])
+	}
+
+	require.True(t, s.panicAttemptsExhausted(block.Hash(), altID), "the panics must fill the budget of the peer that served the bytes")
+	require.False(t, s.panicAttemptsExhausted(block.Hash(), "announcer"), "the announcer served no bytes, so its budget must stay empty")
+	require.Nil(t, s.blockPanicAttempts.Get(blockAttemptKey{hash: *block.Hash(), peerID: "announcer"}), "no panic may count for the announcer")
+
+	lookupsBefore := registry.lookups.Load()
+
+	err = gap054Deliver(ctx, t, s, block.Hash(), "http://announcer-peer", "announcer")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrServiceRateLimited), "with the alternative skipped the caller gets the announcer's 429, got %v", err)
+	require.Equal(t, 3, httpmock.GetCallCountInfo()[announcerKey], "the announcer is not capped, so it is still asked")
+	require.Equal(t, lookupsBefore+1, registry.lookups.Load(), "setup: the third delivery must reach the fallback")
+	require.Equal(t, int32(2), altFetches.Load(), "a capped alternative must be skipped before the fetch")
+
+	require.Equal(t, 0, registry.totalCharges(), "no peer may be charged for a panic in this node or for a 429 within the allowance")
+	require.Equal(t, 0, registry.totalMaliciousReports())
 }
