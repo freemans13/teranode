@@ -385,7 +385,7 @@ require (
 	github.com/bsv-blockchain/go-sdk v1.7.2
 	github.com/bsv-blockchain/go-subtree v1.6.3
 	github.com/bsv-blockchain/go-tx-map v1.5.1
-	github.com/bsv-blockchain/go-wire v1.2.11
+	github.com/bsv-blockchain/go-wire v1.4.0
 	github.com/bsv-blockchain/testcontainers-aerospike-go v0.4.0
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
