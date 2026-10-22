@@ -1315,7 +1315,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 		mockStore.AssertExpectations(t)
 	})
 
-	t.Run("should not return error for invalid blocks when SetMinedMulti errors occur", func(t *testing.T) {
+	t.Run("should return error for invalid blocks when SetMinedMulti errors occur", func(t *testing.T) {
 		mockStore := &utxo.MockUtxostore{}
 
 		testTx := newTx(100)
@@ -1338,11 +1338,12 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		// Call with unsetMined=true (invalid block) - errors should be logged but not returned
+		// Call with unsetMined=true (invalid block). A swallowed error here let the caller
+		// set mined_set with the revert incomplete, so the block was never revisited (GAP-BV-057).
 		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, nil, true)
 
-		// Should NOT return error for invalid blocks - errors are logged only
-		require.NoError(t, err)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to set mined status for 1 batches")
 
 		mockStore.AssertExpectations(t)
 	})

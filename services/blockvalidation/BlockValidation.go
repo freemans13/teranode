@@ -1388,18 +1388,53 @@ func (u *BlockValidation) tryClaimBlockForSetMined(blockHash *chainhash.Hash) bo
 	return true
 }
 
+// subtreeAbsent reports whether a subtree store read failed because the subtree
+// is not there. A storage error is the store failing while it looked, whatever
+// it wraps, so it never counts as absent: errors.Is walks the chain, and a
+// storage error over a not-found would otherwise be skipped as a missing
+// subtree. Same rule as writeStoreError in stores/blob/server.go.
+func subtreeAbsent(err error) bool {
+	return errors.Is(err, errors.ErrNotFound) && !errors.Is(err, errors.ErrStorageError)
+}
+
 // reloadSubtreesForInvalidBlock reloads an invalid block's subtrees from the
-// store, best-effort: a subtree that cannot be read or parsed is left nil,
-// because an invalid block legitimately may not have all of them.
-func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) {
+// store. A subtree that is absent or does not parse is left nil, because an
+// invalid block legitimately may not have all of them and a retry cannot bring
+// one back. Any other read failure is returned: it may be transient, and
+// skipping it would let the revert finish with that subtree's tags in place.
+//
+// On that error the subtrees already loaded are closed before returning. They
+// never reach the block, and an mmap-backed subtree has no finalizer, so they
+// would otherwise keep their mapping and temp backing file until process exit.
+func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) (err error) {
 	reloaded := make([]*subtreepkg.Subtree, len(block.Subtrees))
+
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		for i, st := range reloaded {
+			if closeErr := st.Close(); closeErr != nil {
+				u.logger.Warnf("[setTxMined][%s] failed closing reloaded subtree %d after read failure: %v", block.Hash().String(), i, closeErr)
+			}
+		}
+	}()
 
 	for subtreeIdx, subtreeHash := range block.Subtrees {
 		subtreeBytes, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
 		if err != nil {
+			if !subtreeAbsent(err) {
+				return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+			}
+
 			subtreeBytes, err = u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 			if err != nil {
-				u.logger.Warnf("[setTxMined][%s] failed to get subtree %d/%s from store: %s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+				if !subtreeAbsent(err) {
+					return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+				}
+
+				u.logger.Warnf("[setTxMined][%s] subtree %d/%s not in store: %s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
 				continue
 			}
 		}
@@ -1420,6 +1455,8 @@ func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, blo
 	// store I/O is what makes an eviction of the same block stall the whole
 	// lastValidatedBlocks cache.
 	block.ReplaceSubtreeSlices(reloaded)
+
+	return nil
 }
 
 // setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
@@ -1507,7 +1544,20 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 			u.logger.Warnf("[setTxMined][%s] failed closing subtrees before unset-mined reload: %v", block.Hash().String(), releaseErr)
 		}
 
-		u.reloadSubtreesForInvalidBlock(ctx, block)
+		if err = u.reloadSubtreesForInvalidBlock(ctx, block); err != nil {
+			return err
+		}
+
+		// The reloaded subtrees belong to this call alone, so release them on
+		// every exit. The revert can now fail, and each retry reloads them; an
+		// early return that skipped the release below would leak one set of
+		// mmap mappings and temp files per attempt. On success the explicit
+		// release below has already run and this one finds only nil entries.
+		defer func() {
+			if releaseErr := block.ReleaseSubtreeNodes(nil); releaseErr != nil {
+				u.logger.Warnf("[setTxMined][%s] failed closing reloaded subtrees after unset-mined revert: %v", block.Hash().String(), releaseErr)
+			}
+		}()
 	} else {
 		// All subtrees should already be available for fully processed blocks
 		_, err = block.GetSubtrees(ctx, u.logger, u.subtreeStore, u.settings.Block.GetAndValidateSubtreesConcurrency)

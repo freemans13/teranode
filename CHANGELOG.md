@@ -124,6 +124,22 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   build answers `getminingcandidate` with `coinbase=true` with an error while it is talking
   to an older block assembly, which sends no coinbase. (#2027)
 
+- **A failed revert of an invalid block's mined tags now holds block assembly until it
+  succeeds.** When block validation reverts the mined tags of an invalid block and
+  `SetMinedMulti` fails, or a subtree read fails with anything other than not-found, the
+  revert now returns an error instead of logging a warning and marking the block done.
+  The block stays at `mined_set=false`, so block assembly waits for it before it starts,
+  resets or reorgs, exactly as it already does for a valid block whose mined update
+  fails. Reverting the tag is what marks a transaction unmined again, so carrying on
+  would rebuild block assembly without those transactions. The wait lasts as long as the
+  store fault: the setTxMined retry loop increments
+  `teranode_blockvalidation_setmined_retry_total`, a block that still fails after 10
+  attempts logs `manual_intervention_required` and increments
+  `teranode_blockvalidation_setmined_drops_total`, and the mined-not-set sweep then picks
+  it up again. Those alerts can now fire for invalid blocks. Operators who see them should
+  fix the UTXO or subtree store fault; block assembly resumes on the next successful
+  attempt. A subtree that is absent from the store is still skipped. (#2016)
+
 - **`utxostore_updateTxMinedStatus` is removed, and it was live.** Affects only nodes that
   set it to `false`. Mined-tagging, the step after `AddBlock` that writes a block's ID onto
   each of its transactions, now always runs. So does the check it carries, which rejects a
