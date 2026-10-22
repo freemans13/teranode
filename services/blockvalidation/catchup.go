@@ -470,6 +470,32 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 
 		// TODO: all of these should be using error types, and not checking the strings (!)
 		switch {
+		case isBlockCommitted(*err) || isSubtreeWritesNotLanded(*err):
+			// tryQuickValidation aborted the run on one of its two markers
+			// (bitcoin-sv/teranode#4978, bitcoin-sv/teranode#4987): a .subtree write for
+			// the block did not land, or commitBlock's AddBlock stored the block, or may
+			// have, and the run could not finish or rule out the commit. Both are this
+			// node's own storage or its own blockchain service, never the peer's, and
+			// isLocalCatchupFault already calls them local, so processCatchupChItem
+			// charges no one for them.
+			//
+			// This case must come first. A block_committed error is a ServiceError,
+			// which no code case below matches, so without it the error fell to the
+			// text cases: a flattened gRPC deadline from our own blockchain service was
+			// labelled local_context_cancelled only because of its wording, and a plain
+			// connection failure to it was labelled network_error and charged to the
+			// primary. It also precedes the storage case, which would otherwise take
+			// subtree_writes_not_landed (a StorageError) under the generic
+			// local_storage_fault label. Putting it first shadows nothing
+			// peer-attributable: both markers are set only around this node's own
+			// .subtree writes, AddBlock, its existence probe and the UTXO unlock, after
+			// the block's subtree processing and coinbase checks have passed.
+			if isBlockCommitted(*err) {
+				errorType = "local_block_maybe_committed"
+			} else {
+				errorType = "local_subtree_writes_not_landed"
+			}
+			isPeerError = false
 		case errors.Is(*err, errors.ErrStorageError):
 			// A failed read or write of our own store — a torn, stale or mis-keyed
 			// external transaction blob (issue 1439), a full disk — is this node's
@@ -477,7 +503,8 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// storage errors, so this makes the terminal-error path agree with the
 			// per-fetch one.
 			//
-			// This case must come FIRST, and specifically ahead of the consensus
+			// This case must come first after the quick-validation marker case above,
+			// and specifically ahead of the consensus
 			// case below, because an error chain can carry both codes and errors.Is
 			// walks the whole chain. The aerospike UTXO store wraps its own bins'
 			// read failures — including a live client.Get on a paginated record —
