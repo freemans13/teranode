@@ -2,6 +2,7 @@ package subtreevalidation
 
 import (
 	"bytes"
+	"io"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -89,7 +90,29 @@ func TestReadTransactionsFromSubtreeDataStream_NonMinimalVarInt(t *testing.T) {
 				require.ErrorIs(t, err, bt.ErrNonMinimalVarInt, "go-bt must be what rejects it")
 				require.True(t, errors.Is(err, errors.ErrProcessing))
 				require.False(t, errors.Is(err, errors.ErrTxInvalid), "a delivery fault must not condemn the transaction")
+				require.False(t, errors.Is(err, errors.ErrBlockInvalid), "a delivery fault must not condemn the block")
+				require.False(t, errors.IsLocalError(err), "a delivery fault must not be charged to this node")
 			}
+		})
+
+		// Peer bytes reach the parser through processSubtreeDataStream, which tees
+		// the stream into the subtree store. The store sees the parser abort the
+		// pipe and fails too; that echo must not turn the peer's fault into a
+		// local storage error, which catch-up would neither charge to the peer
+		// nor retry on another.
+		t.Run(c.name+" via processSubtreeDataStream", func(t *testing.T) {
+			var stream bytes.Buffer
+			stream.Write(tx1.Bytes())
+			stream.Write(c.tx)
+
+			var txs []*bt.Tx
+
+			err := server.processSubtreeDataStream(t.Context(), subtree, io.NopCloser(&stream), &txs, 0, nil)
+			require.Error(t, err)
+			require.ErrorIs(t, err, bt.ErrNonMinimalVarInt, "go-bt must be what rejects it")
+			require.False(t, errors.Is(err, errors.ErrTxInvalid), "a delivery fault must not condemn the transaction")
+			require.False(t, errors.Is(err, errors.ErrBlockInvalid), "a delivery fault must not condemn the block")
+			require.False(t, errors.IsLocalError(err), "a delivery fault must not be charged to this node")
 		})
 	}
 

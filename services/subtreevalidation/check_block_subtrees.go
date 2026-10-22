@@ -1123,8 +1123,11 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 		}
 	}()
 
-	// Use TeeReader to split network stream to storage and parser simultaneously
-	teeReader := io.TeeReader(body, pw)
+	// Use TeeReader to split network stream to storage and parser simultaneously.
+	// storeSide records whether a write into the store failed, which tells a parse
+	// error caused by the store from one caused by the peer's bytes.
+	storeSide := &pipeWriteRecorder{w: pw}
+	teeReader := io.TeeReader(body, storeSide)
 
 	// Use pooled bufio.Reader for parsing
 	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
@@ -1147,6 +1150,17 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 
 	// Wait for storage operation to complete
 	storeErr := <-storeDone
+
+	// The parser failed on the peer's bytes while every write into the store had
+	// succeeded, so the store's error, if any, is only the abort above echoed
+	// back. Reporting it would make the peer's fault look like a local storage
+	// fault, which catch-up neither charges to the peer nor retries elsewhere.
+	// If the store failed on its own in the same instant, before any write saw
+	// it, that failure is not reported here; nothing was stored, and the next
+	// attempt meets it again.
+	if parseErr != nil && !storeSide.failed {
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to parse transactions", parseErr)
+	}
 
 	// Check for errors from both operations
 	if storeErr != nil {
@@ -1180,6 +1194,22 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 		txCount, subtree.RootHash().String())
 
 	return nil
+}
+
+// pipeWriteRecorder forwards writes and records whether any failed. It is written
+// only from the parsing goroutine, through the TeeReader.
+type pipeWriteRecorder struct {
+	w      io.Writer
+	failed bool
+}
+
+func (p *pipeWriteRecorder) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	if err != nil {
+		p.failed = true
+	}
+
+	return n, err
 }
 
 // readTransactionsFromSubtreeDataStream reads transactions directly from subtreeData stream.
