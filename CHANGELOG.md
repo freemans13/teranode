@@ -451,9 +451,11 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   refuses such a coinbase instead of mining a block peers reject. When a solution carries no
   coinbase, the one block assembly rebuilds no longer gets the solution's time and nonce
   copied into its nLockTime and input sequence; they go into the header only, as in
-  bitcoin-sv, so the rebuilt coinbase, and the merkle root built from it, no longer depend
-  on the nonce the miner found. A node on an
-  earlier build accepts blocks this one rejects, so upgrade every node together. (#2017)
+  bitcoin-sv. That does not make a coinbase-less solution minable: the rebuilt coinbase
+  still carries a fresh random extranonce, so its merkle root is not the one the miner
+  hashed, and such a submit still fails the proof-of-work check. Submit the coinbase with
+  the solution, as every in-repo miner already does. A node on an earlier build accepts
+  blocks this one rejects, so upgrade every node together. (#2017)
 
 ### Not breaking, but worth knowing
 

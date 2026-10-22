@@ -316,6 +316,10 @@ func TestSubmitMiningSolution_RecreatedCoinbaseIsFinal(t *testing.T) {
 	// whether a given nonce meets the target, cannot be known in advance. Regtest's target takes
 	// about half of all hashes, so resubmit until one does; a miss is a proof-of-work rejection,
 	// which deletes the job and resets assembly, so put the job back each time.
+	//
+	// This loop exists only because of that random rebuild, which is also why a real miner can
+	// never land a coinbase-less solution. It becomes a single submit once the job keeps the
+	// candidate's coinbase and reuses it, as bitcoin-sv does; that change is a separate PR.
 	var (
 		resp *blockassembly_api.OKResponse
 		err  error
