@@ -1087,7 +1087,7 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 // the other block's locked records as this block's leftovers.
 func (u *BlockValidation) recordedBlockID(ctx context.Context, block *model.Block, firstTx *chainhash.Hash) (uint32, bool, error) {
 	existingMeta, err := u.utxoStore.Get(ctx, firstTx, fields.BlockIDs)
-	if err != nil && !errors.Is(err, errors.ErrTxNotFound) {
+	if err != nil && !errors.Is(err, errors.ErrTxNotFound) && !errors.Is(err, errors.ErrNotFound) {
 		// A failed read is not "nothing recorded": reserving a fresh id then
 		// would leave an earlier attempt's records, stamped with the old id,
 		// unrecognised as this block's leftovers. Fail the attempt instead.
