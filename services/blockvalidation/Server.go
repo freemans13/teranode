@@ -1068,6 +1068,15 @@ func (u *Server) blockHandler(ctx context.Context, kafkaMsg *kafkamessage.KafkaB
 // IsMaliciousResponseError matches. Neither gate reports a peer failure: a panic is a bug in this
 // node. Another peer's announcement of the hash has its own key and is still processed. An empty
 // peerID is not capped (fail-open), as for the other caps.
+//
+// In production the announcer's cap applies only to Kafka-announced blocks, and those have no
+// WaitToComplete caller: the Kafka handler queues the item with a nil errCh, so a capped
+// announcement is logged and dropped. The BlockFound gRPC request has a peer_id field, but
+// Client.BlockFound never sets it, and no code in this repository calls Client.BlockFound. A
+// gRPC announcement therefore has an empty peerID and is never capped. The capped answer above
+// reaches only a gRPC caller that sets peer_id itself, which today means the tests.
+// fetchAnnouncedBlock runs the 429 fallback only for an announcement with a peerID, so a gRPC
+// announcement never reaches the fallback peer's cap either.
 func (u *Server) processBlockFoundChItem(ctx context.Context, workerID int, bf processBlockFound) {
 	caller := bf.errCh
 	if caller != nil {

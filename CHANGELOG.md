@@ -145,7 +145,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
       `blockvalidation_corrupt_attempt_cooldown` (default 10 minutes). The panic counts for
       the peer that served the attempt that panicked. On the `blockFoundCh` path that is the
       announcing peer, or the peer that served the block after the announcer answered 429.
-      A capped peer is not fetched from as that 429 fallback either.
+      A capped peer is not fetched from as that 429 fallback either. A block this node has
+      already stored is still answered without error. On the `blockFoundCh` path the cap
+      applies only to blocks announced over Kafka. The `BlockFound` gRPC client sends no peer
+      ID, and a block announced without one is never capped.
     - The error that a `WaitToComplete` caller gets after a `blockFoundCh` worker panic no
       longer has the panic value in its text. The panic value is in the `PANIC` log line.
       (#2012)
