@@ -1915,8 +1915,20 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	// addBlockToPriorityQueue does to classify the block. The error is ERR_PROCESSING. Its text has no word that
 	// IsNetworkError or IsMaliciousResponseError matches, and it has no peerID, so the worker does
 	// not requeue the block, no peer gets a strike, and the hash is not marked invalid.
+	//
+	// Legacy sync reaches this gate too: the unified route counts a quick-validation goroutine
+	// panic for netsync's peer (issue 4993). netsync's parkCommitFailure reads an ERR_PROCESSING
+	// error it does not know as a judgement on the block, and deletes the parked record, blames
+	// the peer and marks the hash failed. So for baseURL "legacy" the gate answers with a
+	// ServiceError, netsync's retry-later row, which keeps the record and blames no one, as the
+	// panic it caps does.
 	if u.panicAttemptsExhausted(hash, peerID) {
 		u.logger.Warnf("[processBlockFound][%s] recovered-panic cap reached for peer %s; suppressing this delivery until the cooldown window expires", hash.String(), peerID)
+
+		if baseURL == "legacy" {
+			return errors.NewServiceError("[processBlockFound][%s] recovered-panic cap reached for this peer; delivery suppressed until the cooldown window expires, retrying later (block not stored)", hash.String())
+		}
+
 		return errors.NewProcessingError("[processBlockFound][%s] recovered-panic cap reached for this peer; delivery suppressed until the cooldown window expires (block not stored)", hash.String())
 	}
 

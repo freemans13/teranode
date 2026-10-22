@@ -35,6 +35,12 @@ type panickingSubtreeStore struct {
 	onGet    bool
 	onExists bool
 
+	// failKey, when set, makes Exists on failKey (same file type) return failErr at once.
+	// panicAfter delays the panic, so that ordinary failure is recorded first.
+	failKey    *chainhash.Hash
+	failErr    error
+	panicAfter time.Duration
+
 	panics atomic.Int32
 }
 
@@ -52,7 +58,12 @@ func (s *panickingSubtreeStore) Get(ctx context.Context, key []byte, fileType fi
 }
 
 func (s *panickingSubtreeStore) Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...bloboptions.FileOption) (bool, error) {
+	if s.failKey != nil && fileType == s.fileType && string(key) == string(s.failKey[:]) {
+		return false, s.failErr
+	}
+
 	if s.onExists && s.hit(key, fileType) {
+		time.Sleep(s.panicAfter)
 		s.panics.Add(1)
 		panic(childPanicValue)
 	}
@@ -186,6 +197,61 @@ func TestBindSubtreeBodyToHeader_ReadPanicIsALocalPanicNotCorrupt(t *testing.T) 
 	requireChildPanicError(t, err)
 }
 
+// TestSubtreeReadVerdicts_PanicSurvivesAnOrdinaryFailure: several reads fail and one of them
+// panicked. Whichever was recorded first, the error the verdicts fold into must carry the
+// local-panic marker, or the caller scores a bug in this node against the peer. errors.Is
+// matches on the code, and so the panic is identified only by its
+// marker type, never by its code.
+func TestSubtreeReadVerdicts_PanicSurvivesAnOrdinaryFailure(t *testing.T) {
+	ordinary := errors.NewStorageError("ordinary read failure")
+	mismatch := markSubtreeKeyMismatch(errors.NewProcessingError("subtree key mismatch"), subtreeBlobRef{hash: chainhash.Hash{0x71}, fileType: fileformat.FileTypeSubtreeToCheck})
+
+	cases := map[string][]error{
+		"ordinary first":            {ordinary, newChildPanicError()},
+		"panic first":               {newChildPanicError(), ordinary},
+		"mismatch, ordinary, panic": {mismatch, ordinary, newChildPanicError()},
+	}
+
+	for name, recorded := range cases {
+		t.Run(name, func(t *testing.T) {
+			var v subtreeReadVerdicts
+
+			for _, err := range recorded {
+				v.record(err)
+			}
+
+			require.True(t, v.failed())
+			require.True(t, isLocalPanic(v.err()), "the panic marker must survive, got %v", v.err())
+		})
+	}
+}
+
+// TestBindSubtreeBodyToHeader_PanicAfterAnOrdinaryFailureIsALocalPanic drives the binding pass
+// with two failing reads: subtree 1 fails at once with an ordinary storage error, and subtree 2
+// panics after it. The panic must still decide the result.
+func TestBindSubtreeBodyToHeader_PanicAfterAnOrdinaryFailureIsALocalPanic(t *testing.T) {
+	h := newPreBindHarness(t, nil)
+
+	f := h.forgedBodies(0x3d, 0x40)
+
+	store := &panickingSubtreeStore{
+		Store:      h.subtreeStore,
+		key:        *f.roots[2],
+		fileType:   fileformat.FileTypeSubtreeToCheck,
+		onExists:   true,
+		failKey:    f.roots[1],
+		failErr:    errors.NewStorageError("ordinary read failure"),
+		panicAfter: 200 * time.Millisecond,
+	}
+	h.bv.subtreeStore = store
+	h.subtreeStore = store
+
+	err := h.bv.bindSubtreeBodyToHeader(h.ctx, f.block)
+
+	require.Positive(t, store.panics.Load(), "setup: the read of subtree 2 must reach the panic")
+	requireChildPanicError(t, err)
+}
+
 // TestPrefetchSubtreeBatch_ReaderPanicIsALocalPanic pins the batch reader. A reader that panics
 // never sends its result, so the collector used to block until the group closed the channel and
 // then return "channel closed", an error with no marker that catchup scored against the peer.
@@ -285,4 +351,17 @@ func TestProcessBlockFound_UnifiedRouteChildPanicIsRetryLaterAndCounted(t *testi
 
 	us.s.settings.BlockValidation.MaxCorruptAttemptsPerBlock = 1
 	require.True(t, us.s.panicAttemptsExhausted(block.Hash(), "peer-1"), "the child panic must count toward the peer's panic cap")
+
+	// The next delivery from the same peer stops at the cap gate. netsync reads that answer
+	// too, so it must also be the retry-later row: a bare ERR_PROCESSING error would make
+	// parkCommitFailure delete the parked record, blame the peer and mark the hash failed.
+	panicsBefore := store.panics.Load()
+
+	err = us.s.processBlockFound(context.Background(), block.Hash(), "peer-1", "legacy", true, block)
+
+	require.Error(t, err)
+	require.True(t, errors.IsTransientLocalError(err), "the capped legacy delivery must read as retry later, got %v", err)
+	require.Equal(t, panicsBefore, store.panics.Load(), "the cap gate must stop the delivery before validation runs")
+
+	requireNothingApplied(t, us, block, parent, child)
 }

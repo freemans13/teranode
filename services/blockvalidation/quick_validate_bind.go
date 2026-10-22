@@ -503,7 +503,8 @@ func bindDeduperHint(numSubtrees, targetLength int) int {
 // first-error slot, and that is the whole point rather than tidiness. A single slot is
 // order-dependent: whichever class lost the race is recorded nowhere, so a mismatch
 // arriving before an ErrNotFound discards the ErrNotFound. With one slot per class, the
-// join in err() fires whenever both classes occurred, in either order.
+// join in err() fires whenever both classes occurred, in either order. Within the
+// firstOtherErr slot a local panic wins over an ordinary failure; see record.
 type subtreeReadVerdicts struct {
 	mu               sync.Mutex
 	mismatches       []subtreeBlobRef
@@ -538,7 +539,13 @@ func (v *subtreeReadVerdicts) record(err error) {
 		return
 	}
 
-	if v.firstOtherErr == nil {
+	// A local panic (a recovered read goroutine, issue 4993) takes the slot from an
+	// ordinary failure that got there first. Its marker is what tells every caller the
+	// failure is a bug in this node and no peer may be charged, and the marker is found
+	// by type, so it must be in the error err() returns, whichever read finished first.
+	// The ordinary failure it displaces is dropped: a local panic is retried as a local
+	// fault, and the retry reads that subtree again.
+	if v.firstOtherErr == nil || (isLocalPanic(err) && !isLocalPanic(v.firstOtherErr)) {
 		v.firstOtherErr = err
 	}
 }

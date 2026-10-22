@@ -173,7 +173,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
     - A panic in a goroutine that a validation started is scored like the panics above: a
       catchup ends as `local_panic` and no peer is charged. On the legacy route it counts
       toward the per-peer panic cap above. Legacy sync gets `ERR_SERVICE_ERROR`
-      for it, so the parked block is kept and retried rather than rejected. A panic in the
+      for it, and also for a delivery that the cap then stops, so the parked block is kept
+      and retried rather than rejected. A panic in the
       Kafka consumer or gRPC server goroutine of the service start stops the service with an
       error rather than the process with a crash. (#2012, #2035)
 
