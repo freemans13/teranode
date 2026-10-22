@@ -272,11 +272,11 @@ func TestGapBV054_CatchupConsumerSurvivesPanic_Child(t *testing.T) {
 	}
 }
 
-// TestGapBV054_KafkaHandlerSurvivesPanic proves GAP-BV-054 for the goroutine started inside
-// consumerMessageHandler, which runs blockHandler. A panic is injected into the existence check
+// TestGapBV054_KafkaHandlerSurvivesPanic proves GAP-BV-054 for consumerMessageHandler, which
+// runs blockHandler through runBlockHandler. A panic is injected into the existence check
 // blockHandler performs; the handler must return nil so the message is committed rather than
-// redelivered into the same panic, must not report the peer, and a following message must still
-// be handled.
+// redelivered by Kafka (the in-memory retry takes it from there), must not report the peer,
+// must count the panic, and a following message must still be handled.
 // Subprocess-isolated (bitcoin-sv/teranode#4985).
 func TestGapBV054_KafkaHandlerSurvivesPanic(t *testing.T) {
 	if os.Getenv(gap054EnvVar) == "1" {
