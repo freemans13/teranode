@@ -106,6 +106,22 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A failed revert of an invalid block's mined tags now holds block assembly until it
+  succeeds.** When block validation reverts the mined tags of an invalid block and
+  `SetMinedMulti` fails, or a subtree read fails with anything other than not-found, the
+  revert now returns an error instead of logging a warning and marking the block done.
+  The block stays at `mined_set=false`, so block assembly waits for it before it starts,
+  resets or reorgs, exactly as it already does for a valid block whose mined update
+  fails. Reverting the tag is what marks a transaction unmined again, so carrying on
+  would rebuild block assembly without those transactions. The wait lasts as long as the
+  store fault: the setTxMined retry loop increments
+  `teranode_blockvalidation_setmined_retry_total`, a block that still fails after 10
+  attempts logs `manual_intervention_required` and increments
+  `teranode_blockvalidation_setmined_drops_total`, and the mined-not-set sweep then picks
+  it up again. Those alerts can now fire for invalid blocks. Operators who see them should
+  fix the UTXO or subtree store fault; block assembly resumes on the next successful
+  attempt. A subtree that is absent from the store is still skipped. (#2016)
+
 - **`utxostore_updateTxMinedStatus` is removed, and it was live.** Affects only nodes that
   set it to `false`. Mined-tagging, the step after `AddBlock` that writes a block's ID onto
   each of its transactions, now always runs. So does the check it carries, which rejects a
@@ -152,6 +168,14 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
     - The error that a `WaitToComplete` caller gets after a `blockFoundCh` worker panic no
       longer has the panic value in its text. The panic value is in the `PANIC` log line.
       (#2012)
+
+- **Legacy peers that send BIP152 messages are no longer disconnected.** go-wire
+  is now v1.4.0, which decodes `cmpctblock`, `getblocktxn` and `blocktxn`. Until
+  now a legacy peer that sent one got a `malformed` reject and was disconnected.
+  Now the message is logged at debug level and ignored, and the peer stays
+  connected. Teranode never sends `sendcmpct`, so a well-behaved peer should not
+  send these. The bump also bounds how much the wire decoder allocates up front
+  for a declared element count. (#1996)
 
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
