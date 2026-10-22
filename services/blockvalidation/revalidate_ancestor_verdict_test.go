@@ -53,10 +53,54 @@ func ancestorVerdictCoinbaseOnlyBlock(t *testing.T, parent *chainhash.Hash, heig
 // funding transaction is stamped as mined in F only, and the child block C (on A) spends it, so
 // Block.Valid passes but the ancestor check says the parent is not on C's chain.
 func TestReValidateBlock_InvalidAncestorVerdictInvalidatesAndPublishes(t *testing.T) {
-	initPrometheusMetrics()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	bv, blockchainClient, blockC, kafkaProducer := newAncestorVerdictFixture(ctx, t, true)
+
+	err := bv.reValidateBlock(revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
+
+	// The verdict is still returned after acting on it, like every other branch of reValidateBlock.
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected the ancestor check's ErrBlockInvalid verdict, got: %v", err)
+
+	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
+	require.NoError(t, err)
+	require.NotNil(t, cMeta)
+
+	require.True(t, cMeta.Invalid,
+		"reValidateBlock returned the INVALID ancestor verdict without invalidating the optimistically added block")
+	require.True(t, kafkaProducer.IsPublishCalled(),
+		"no invalid-block notification was published for the INVALID ancestor verdict")
+}
+
+// TestReValidateBlock_InvalidAncestorVerdictNeverStoredBlockStillPublishes covers the block that
+// reaches reValidateBlock without ever being stored: the non-optimistic path enqueues it when
+// fetching its parent headers fails. The SQL store's InvalidateBlock treats an unknown hash as a
+// no-op success, so nothing is written, and the invalid-block notification still reaches p2p.
+func TestReValidateBlock_InvalidAncestorVerdictNeverStoredBlockStillPublishes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bv, blockchainClient, blockC, kafkaProducer := newAncestorVerdictFixture(ctx, t, false)
+
+	err := bv.reValidateBlock(revalidateBlockData{block: blockC, baseURL: "test"})
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected the ancestor check's ErrBlockInvalid verdict, got: %v", err)
+
+	exists, err := blockchainClient.GetBlockExists(ctx, blockC.Hash())
+	require.NoError(t, err)
+	require.False(t, exists, "a never-stored block must not be written by the revalidation path")
+
+	require.True(t, kafkaProducer.IsPublishCalled(),
+		"no invalid-block notification was published for a never-stored block with an INVALID ancestor verdict")
+}
+
+// newAncestorVerdictFixture builds the GAP-BV-043 fixture and returns a BlockValidation wired to
+// real sqlitememory stores, the blockchain client, the child block C and the Kafka producer. When
+// storeC is false, C is never added to the blockchain store.
+func newAncestorVerdictFixture(ctx context.Context, t *testing.T, storeC bool) (*BlockValidation, blockchain.ClientI, *model.Block, *SafeMockKafkaProducer) {
+	t.Helper()
+
+	initPrometheusMetrics()
 
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
@@ -151,27 +195,17 @@ func TestReValidateBlock_InvalidAncestorVerdictInvalidatesAndPublishes(t *testin
 		uint64(subtree.Length()), uint64(coinbaseTx.Size()+childTx.Size()), childHeight, 0) //nolint:gosec
 	require.NoError(t, err)
 
-	// The block was added optimistically before validation completed.
-	require.NoError(t, blockchainClient.AddBlock(ctx, blockC, "test"))
+	if storeC {
+		// The block was added optimistically before validation completed.
+		require.NoError(t, blockchainClient.AddBlock(ctx, blockC, "test"))
+	}
 
 	kafkaProducer := &SafeMockKafkaProducer{}
 
 	bv := NewBlockValidation(ctx, logger, tSettings, blockchainClient, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
-	defer bv.StopCaches()
+	t.Cleanup(bv.StopCaches)
 
 	bv.invalidBlockKafkaProducer = kafkaProducer
 
-	err = bv.reValidateBlock(revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
-
-	// The verdict is still returned after acting on it, like every other branch of reValidateBlock.
-	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected the ancestor check's ErrBlockInvalid verdict, got: %v", err)
-
-	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
-	require.NoError(t, err)
-	require.NotNil(t, cMeta)
-
-	require.True(t, cMeta.Invalid,
-		"reValidateBlock returned the INVALID ancestor verdict without invalidating the optimistically added block")
-	require.True(t, kafkaProducer.IsPublishCalled(),
-		"no invalid-block notification was published for the INVALID ancestor verdict")
+	return bv, blockchainClient, blockC, kafkaProducer
 }
