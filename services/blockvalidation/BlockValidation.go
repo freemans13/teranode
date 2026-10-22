@@ -3615,7 +3615,19 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 		return err
 	}
 
-	return u.checkOldBlockIDs(ctx, oldBlockIDsMap, blockData.block)
+	// An INVALID ancestor verdict (a parent tx mined only off this block's chain) is a consensus
+	// verdict on the hash, so like the block.Valid INVALID branch above it is acted on whatever
+	// optimisticallyAdded says. Returning it unacted left an optimistically added block on-chain,
+	// with no invalid-block notification, once the worker's retries ran out (bitcoin-sv/teranode#4980).
+	err = u.checkOldBlockIDs(ctx, oldBlockIDsMap, blockData.block)
+	if err != nil && errors.Is(err, errors.ErrBlockInvalid) {
+		reason := p2pconstants.ReasonInvalidBlock.String()
+		if markErr := u.markBlockAsInvalid(ctx, blockData.block, reason, blockData.peerID, blockData.baseURL); markErr != nil {
+			u.logger.Errorf("[ReValidateBlock][%s][InvalidateBlock] failed to invalidate block: %s", blockData.block.String(), markErr)
+		}
+	}
+
+	return err
 }
 
 // quickValidateSkipsUtxoLock reports whether quick validation should create UTXOs
