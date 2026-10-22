@@ -270,7 +270,14 @@ func (u *BlockValidation) bindSubtreeBodyToHeader(ctx context.Context, block *mo
 			local := i - chunkStart
 			hash := block.Subtrees[i]
 
-			g.Go(func() error {
+			g.Go(func() (err error) {
+				// A panic is recorded as a verdict like any failed read. Without that the
+				// chunk's error would only skip the checks, the roots would be composed with
+				// this slot unset, and the block would be called corrupt: a bug in this node
+				// scored against the peer.
+				defer recoverChildPanic(u.logger, recoveredPanicPathBlockValidation, &err, verdicts.record,
+					"[bindSubtreeBodyToHeader][%s] subtree %d", block.Hash().String(), i)
+
 				// Anchor only: this pass never reads a promoted blob's node list, so
 				// readSubtreeStructure anchors it and releases it rather than handing it
 				// back. The anchor itself must stay — with both file types present
@@ -650,6 +657,14 @@ func (u *BlockValidation) sweepSubtreeDataMismatches(ctx context.Context, block 
 			}
 
 			g.Go(func() error {
+				// This group's error is discarded, so a panic is passed on as a subtree that
+				// could not be audited, the same as a read that prevents a verdict.
+				defer recoverChildPanic(u.logger, recoveredPanicPathBlockValidation, nil, func(error) {
+					unauditedMu.Lock()
+					unaudited = true
+					unauditedMu.Unlock()
+				}, "[sweepSubtreeDataMismatches][%s] subtree %d", block.Hash().String(), idx)
+
 				result := u.readSubtree(ctx, block, idx, hash, subtreeReadAnchorOnly, "sweep")
 				if result.err == nil {
 					releaseSubtreeStructure(result.subtree)
