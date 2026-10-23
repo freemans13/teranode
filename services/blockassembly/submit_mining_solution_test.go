@@ -471,17 +471,6 @@ func TestSubmitMiningSolution_NoCurrentBlock(t *testing.T) {
 	require.Contains(t, err.Error(), "no current best block")
 }
 
-// requirePastFloorGuard asserts that a submission got past the median-time-past
-// guard, and does so durably.
-//
-// The accept direction cannot assert success: these fixtures carry no real
-// subtrees or nBits, so the submission always dies further down. Asserting only
-// "the error does not mention the floor" would pass just as happily if a future
-// fixture change made it die *above* the guard, or stop erroring at all — the
-// assertion would be vacuous and nothing would say so. Pinning the specific
-// downstream failure keeps it honest: if the fixture stops dying exactly there,
-// this fails loudly and whoever changed it re-checks that the guard is still on
-// the path being exercised.
 // withIssuedCoinbase gives a hand-built candidate the coinbase GetMiningCandidate would have stored
 // on its job, which a solution without its own coinbase is mined with.
 func withIssuedCoinbase(t *testing.T, tSettings *settings.Settings, candidate *model.MiningCandidate) *model.MiningCandidate {
@@ -495,6 +484,17 @@ func withIssuedCoinbase(t *testing.T, tSettings *settings.Settings, candidate *m
 	return candidate
 }
 
+// requirePastFloorGuard asserts that a submission got past the median-time-past
+// guard, and does so durably.
+//
+// The accept direction cannot assert success: these fixtures carry no real
+// subtrees or nBits, so the submission always dies further down. Asserting only
+// "the error does not mention the floor" would pass just as happily if a future
+// fixture change made it die *above* the guard, or stop erroring at all — the
+// assertion would be vacuous and nothing would say so. Pinning the specific
+// downstream failure keeps it honest: if the fixture stops dying exactly there,
+// this fails loudly and whoever changed it re-checks that the guard is still on
+// the path being exercised.
 func requirePastFloorGuard(t *testing.T, err error) {
 	t.Helper()
 
