@@ -1361,6 +1361,7 @@ func TestProcessSubtreeDataStream(t *testing.T) {
 		err = server.processSubtreeDataStream(context.Background(), subtree, body, &allTransactions, 100, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to store subtree data")
+		require.True(t, errors.IsLocalError(err), "a store that fails first is this node's fault, not the peer's")
 		// With streaming approach, if storage fails, no transactions are collected
 		assert.Len(t, allTransactions, 0)
 	})
