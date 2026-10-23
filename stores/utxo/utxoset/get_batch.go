@@ -25,7 +25,11 @@ type getResult struct {
 type getItem struct {
 	hash         chainhash.Hash
 	wantChildren bool
-	// wantBody works the same way: the batch reads bodies if ANY item asked for one.
+	// wantBody does NOT work the same way. A batch is split by it and each half is its own
+	// lookup, so an item that did not ask never pays for a body. An unwanted contest is one
+	// small statement; an unwanted body is the whole transaction read, scanned and decoded,
+	// and on Hetzner mainnet on 2026-10-19 fee-only existence checks from the legacy
+	// inventory handler, sharing batches with body reads, held tens of gigabytes of them.
 	wantBody bool
 	done     chan getResult
 }
@@ -59,20 +63,41 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 	s.getInFlight.Add(1)
 	defer s.getInFlight.Done()
 
+	// Split by body: the reads that named a body field and the reads that did not each get
+	// their own lookup. See getItem.wantBody.
+	withBody := make([]*getItem, 0, len(batch))
+	withoutBody := make([]*getItem, 0, len(batch))
+
+	for _, it := range batch {
+		if it.wantBody {
+			withBody = append(withBody, it)
+		} else {
+			withoutBody = append(withoutBody, it)
+		}
+	}
+
+	if len(withoutBody) > 0 {
+		s.resolveGetItems(withoutBody, false)
+	}
+
+	if len(withBody) > 0 {
+		s.resolveGetItems(withBody, true)
+	}
+}
+
+// resolveGetItems resolves one body-alike group of a get batch through the shared read order,
+// then hands each caller its own answer.
+func (s *Store) resolveGetItems(batch []*getItem, wantBody bool) {
 	ctx := context.Background()
 
 	hashes := make([]chainhash.Hash, len(batch))
-	wantChildren, wantBody := false, false
+	wantChildren := false
 
 	for i, it := range batch {
 		hashes[i] = it.hash
 
 		if it.wantChildren {
 			wantChildren = true
-		}
-
-		if it.wantBody {
-			wantBody = true
 		}
 	}
 

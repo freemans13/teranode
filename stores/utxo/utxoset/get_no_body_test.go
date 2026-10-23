@@ -63,3 +63,62 @@ func requireMetadataReadsLeaveTheBodyOut(t *testing.T, s *Store, ctx context.Con
 	require.NoError(t, s.BatchDecorate(ctx, items, fields.Outputs))
 	require.Error(t, items[0].Err, "a decorate that names the outputs still reads the body")
 }
+
+// TestBatchedMetadataReadLeavesTheBodyOutBesideABodyRead pins the get batcher's body rule per
+// caller rather than per batch. The batcher used to read bodies for the whole batch whenever any
+// one item asked for one, so a metadata read that happened to share a batch with a body read paid
+// for its own transaction's body all the same. On Hetzner mainnet the legacy inventory handler's
+// fee-only existence checks ran by the hundred thousand beside the bodies other callers asked for.
+//
+// The metadata read's body is overwritten with bytes that do not decode, so a batch that reads it
+// fails that read. The body read names a different transaction with an intact body.
+func TestBatchedMetadataReadLeavesTheBodyOutBesideABodyRead(t *testing.T) {
+	s, ctx := newTestStoreWith(t, func(ts *settings.Settings) {
+		// Two items fill a batch, and the window is long enough that neither flushes alone.
+		ts.UtxoStore.GetBatcherSize = 2
+		ts.UtxoStore.GetBatcherDurationMillis = 5_000
+	})
+	require.NotNil(t, s.getBatcher)
+
+	meta := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, meta, 100)
+	require.NoError(t, err)
+
+	body := mkTx(t, 2, 6_000)
+	_, err = s.Create(ctx, body, 100)
+	require.NoError(t, err)
+
+	metaHash := meta.TxIDChainHash()
+	bodyHash := body.TxIDChainHash()
+
+	tag, err := s.pool.Exec(ctx, `UPDATE tx_body SET raw_tx = '\xff'::bytea WHERE txid = $1`, metaHash[:])
+	require.NoError(t, err)
+	require.Equal(t, int64(1), tag.RowsAffected())
+
+	type answer struct {
+		hasTx bool
+		err   error
+	}
+
+	metaDone := make(chan answer, 1)
+	bodyDone := make(chan answer, 1)
+
+	go func() {
+		got, err := s.Get(ctx, metaHash, fields.Fee)
+		metaDone <- answer{hasTx: err == nil && got.Tx != nil, err: err}
+	}()
+
+	go func() {
+		got, err := s.Get(ctx, bodyHash, fields.Tx)
+		bodyDone <- answer{hasTx: err == nil && got.Tx != nil, err: err}
+	}()
+
+	m := <-metaDone
+	b := <-bodyDone
+
+	require.NoError(t, b.err)
+	require.True(t, b.hasTx, "the body read must still get its body")
+
+	require.NoError(t, m.err, "a metadata read paid for its body because it shared a batch with a body read")
+	require.False(t, m.hasTx)
+}
