@@ -120,7 +120,12 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   output that block assembly never saw. Miners that submit their own coinbase are not
   affected, and neither is a node without `miner_wallet_private_keys`: it still serves
   candidates, with no coinbase on the job, and refuses only a coinbase-less solution and
-  `coinbase=true`, as it did before. Upgrade block assembly no later than the RPC service: an RPC service on this
+  `coinbase=true`, as it did before. A solution that breaks a consensus rule no longer removes the job, so other
+  miners on the same candidate keep its coinbase and can still submit; the job goes when its
+  TTL lapses or a block is mined. A solution whose hash misses the target is rejected without
+  resetting block assembly, which it used to do. If `miner_wallet_private_keys` is set but
+  cannot build a coinbase, block assembly now logs a warning with the cause, at most once a
+  minute. Upgrade block assembly no later than the RPC service: an RPC service on this
   build answers `getminingcandidate` with `coinbase=true` with an error while it is talking
   to an older block assembly, which sends no coinbase. (#2027)
 

@@ -106,6 +106,20 @@ func (h *candidateCoinbaseHarness) issue(t *testing.T) *model.MiningCandidate {
 func mine(t *testing.T, issued *model.MiningCandidate, version uint32) uint32 {
 	t.Helper()
 
+	return searchNonce(t, issued, version, true)
+}
+
+// missTarget finds a nonce whose header, built as in mine, does not meet the target. The regtest
+// target passes about half of all nonces, so an arbitrary "wrong" nonce would be a coin flip.
+func missTarget(t *testing.T, issued *model.MiningCandidate, version uint32) uint32 {
+	t.Helper()
+
+	return searchNonce(t, issued, version, false)
+}
+
+func searchNonce(t *testing.T, issued *model.MiningCandidate, version uint32, meetsTarget bool) uint32 {
+	t.Helper()
+
 	coinbase, err := bt.NewTxFromBytes(issued.CoinbaseTx)
 	require.NoError(t, err)
 
@@ -124,7 +138,7 @@ func mine(t *testing.T, issued *model.MiningCandidate, version uint32) uint32 {
 	}
 
 	for {
-		if ok, _, _ := header.HasMetTargetDifficulty(); ok {
+		if ok, _, _ := header.HasMetTargetDifficulty(); ok == meetsTarget {
 			return header.Nonce
 		}
 
@@ -164,6 +178,106 @@ func TestSubmitMiningSolution_CoinbaseLessMinesTheIssuedCoinbase(t *testing.T) {
 	require.Equal(t, issued.CoinbaseTx, block.CoinbaseTx.Bytes(), "the block must carry the coinbase the candidate was issued with")
 	require.Equal(t, version, block.Header.Version, "the solution's version belongs in the header")
 	require.Equal(t, nonce, block.Header.Nonce)
+}
+
+// TestSubmitMiningSolution_InvalidSolutionKeepsTheIssuedCoinbase pins that a consensus-invalid
+// solution leaves the job, and so its coinbase, in place, as bitcoin-sv leaves a candidate alone
+// after an invalid submitminingsolution. Deleting the job made the next poll for the same id, which
+// for an empty block is derived from the parent alone, build a coinbase with a new random
+// extranonce, so every other miner still hashing the first one failed the proof-of-work check and
+// deleted the job again. A share that misses the target, the commonest invalid solution, did worse:
+// block.Valid reports a miss as a processing error, so it also reset block assembly. A miner on the
+// original coinbase must still get its block.
+func TestSubmitMiningSolution_InvalidSolutionKeepsTheIssuedCoinbase(t *testing.T) {
+	h := newCandidateCoinbaseHarness(t)
+	issued := h.issue(t)
+
+	version := issued.Version
+
+	// One miner's share that misses the target, coinbase-less like the miners it shares the id with.
+	_, err := h.server.submitMiningSolution(t.Context(), &BlockSubmissionRequest{
+		SubmitMiningSolutionRequest: &blockassembly_api.SubmitMiningSolutionRequest{
+			Id:      issued.Id,
+			Nonce:   missTarget(t, issued, version),
+			Version: &version,
+		},
+	})
+	require.ErrorContains(t, err, "block hash does not meet the target")
+
+	// A share that misses the target is the miner's fault, so block assembly is not reset. Reset
+	// sends from a goroutine, so wait a short while rather than checking once.
+	select {
+	case req := <-h.server.blockAssembler.resetCh:
+		require.FailNow(t, "block assembly was reset", "reset request: %+v", req)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	held := h.server.jobStore.Get(*h.id)
+	require.NotNil(t, held, "a consensus-invalid solution must not drop the job")
+	require.Equal(t, issued.CoinbaseTx, held.Value().MiningCandidate.CoinbaseTx, "the job must keep the coinbase it was issued with")
+
+	// Another poll for the same id is handed the same coinbase.
+	again := proto.Clone(h.candidate).(*model.MiningCandidate)
+	again.CoinbaseTx = nil
+	h.server.storeJobWithCoinbase(h.id, again, nil)
+	require.Equal(t, issued.CoinbaseTx, again.CoinbaseTx)
+
+	// A second miner, hashing the coinbase issued before the bad share, solves the block.
+	nonce := mine(t, issued, version)
+
+	resp, err := h.server.submitMiningSolution(t.Context(), &BlockSubmissionRequest{
+		SubmitMiningSolutionRequest: &blockassembly_api.SubmitMiningSolutionRequest{
+			Id:      issued.Id,
+			Nonce:   nonce,
+			Version: &version,
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+
+	best, _, err := h.store.GetBestBlockHeader(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, h.tip.Hash(), best.HashPrevBlock)
+
+	block, err := h.store.GetBlock(t.Context(), best.Hash())
+	require.NoError(t, err)
+	require.Equal(t, issued.CoinbaseTx, block.CoinbaseTx.Bytes(), "the block must carry the coinbase issued before the invalid share")
+	require.Equal(t, nonce, block.Header.Nonce)
+}
+
+// TestStoreJobWithCoinbase_UnusableMinerKeysWarn pins that a configured miner key that cannot build a
+// coinbase is reported at Warn with its cause, so it is not mistaken for a node with no keys, which
+// stays quiet. A node polled every second warns once per minerKeyWarnInterval, not once a poll.
+func TestStoreJobWithCoinbase_UnusableMinerKeysWarn(t *testing.T) {
+	t.Run("a key that is not a WIF warns once with the cause", func(t *testing.T) {
+		h := newCandidateCoinbaseHarness(t)
+		logger := &warnCapturingLogger{}
+		h.server.logger = logger
+		h.server.blockAssembler.settings.BlockAssembly.MinerWalletPrivateKeys = []string{"not-a-wif"}
+
+		for range 3 {
+			poll := proto.Clone(h.candidate).(*model.MiningCandidate)
+			h.server.storeJobWithCoinbase(h.id, poll, nil)
+			require.Empty(t, poll.CoinbaseTx)
+		}
+
+		require.Len(t, logger.warns, 1, "repeated polls within the interval must warn once")
+		require.Contains(t, logger.warns[0], "miner_wallet_private_keys is set but cannot build a coinbase")
+		require.Contains(t, logger.warns[0], "can't decode coinbase priv key", "the warning must carry the cause")
+	})
+
+	t.Run("no keys, or only blank ones, stays quiet", func(t *testing.T) {
+		for _, keys := range [][]string{nil, {""}, {" "}} {
+			h := newCandidateCoinbaseHarness(t)
+			logger := &warnCapturingLogger{}
+			h.server.logger = logger
+			h.server.blockAssembler.settings.BlockAssembly.MinerWalletPrivateKeys = keys
+
+			h.server.storeJobWithCoinbase(h.id, h.candidate, nil)
+			require.Empty(t, h.candidate.CoinbaseTx)
+			require.Empty(t, logger.warns, "keys %q must not warn", keys)
+		}
+	})
 }
 
 // TestGetCandidateBlock_CarriesTheIssuedCoinbase pins that the candidate block served for a job is
