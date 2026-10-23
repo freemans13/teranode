@@ -115,90 +115,121 @@ func TestHandleInvMsg_BoundsTransactionChecks(t *testing.T) {
 }
 
 // TestHandleInvMsg_BlockItemsDoNotWaitForTransactionSlots pins that a block
-// announcement is handled even while every transaction-check slot is taken,
+// announcement is acted on even while every transaction-check slot is taken,
 // including when it comes after transaction items in the same message. The
 // slots are shared by every peer, so a block that waited for one would wait on
-// store latency across the whole node.
+// store latency across the whole node. Both outcomes of a block item are
+// covered: a block the chain holds ends in a locator lookup for a getblocks,
+// and a block the node lacks ends in a getdata.
 func TestHandleInvMsg_BlockItemsDoNotWaitForTransactionSlots(t *testing.T) {
-	tSettings := test.CreateBaseTestSettings(t)
-
-	storeURL, err := url.Parse("sqlitememory:///relay_bound_block_first")
-	require.NoError(t, err)
-
-	realStore, err := sql.New(t.Context(), ulogger.TestLogger{}, tSettings, storeURL)
-	require.NoError(t, err)
-
-	store := &concurrencyStore{Store: realStore}
-
-	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
-	require.NoError(t, err)
-
 	blockHash := chainhash.Hash{0xb1}
 
-	// The chain holds the announced block and it is the last block in the
-	// message, so handling its item ends in a locator lookup for a getblocks.
-	// That lookup is the sign the block item was handled; it fails so that no
-	// getblocks is pushed to a peer that is not connected.
-	var blockHandled atomic.Bool
+	cases := []struct {
+		name string
+		// arrange sets up the chain's answer for blockHash and returns the
+		// check that the block item has been acted on.
+		arrange func(client *blockchain2.Mock, sm *SyncManager) func() bool
+	}{
+		{
+			name: "a block the chain holds",
+			arrange: func(client *blockchain2.Mock, _ *SyncManager) func() bool {
+				// The lookup fails so that no getblocks is pushed.
+				var asked atomic.Bool
 
-	running := blockchain2.FSMStateRUNNING
-	client := &blockchain2.Mock{}
-	client.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
-	client.On("GetBlockHeader", mock.Anything, &blockHash).
-		Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 1}, nil)
-	client.On("GetBlockLocator", mock.Anything, &blockHash, uint32(0)).
-		Run(func(mock.Arguments) { blockHandled.Store(true) }).
-		Return(nil, errors.NewProcessingError("no locator in this test"))
+				client.On("GetBlockHeader", mock.Anything, &blockHash).
+					Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 1}, nil)
+				client.On("GetBlockLocator", mock.Anything, &blockHash, uint32(0)).
+					Run(func(mock.Arguments) { asked.Store(true) }).
+					Return(nil, errors.NewProcessingError("no locator in this test"))
 
-	slots := semaphore.NewWeighted(maxConcurrentTxInvChecks)
+				return asked.Load
+			},
+		},
+		{
+			name: "a block the node lacks",
+			arrange: func(client *blockchain2.Mock, sm *SyncManager) func() bool {
+				// The ledger records the request as the getdata is built.
+				client.On("GetBlockHeader", mock.Anything, &blockHash).
+					Return(nil, nil, errors.NewNotFoundError("not in the chain"))
 
-	sm := &SyncManager{
-		logger:           ulogger.TestLogger{},
-		settings:         tSettings,
-		ctx:              context.Background(),
-		peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-		blockchainClient: client,
-		utxoStore:        store,
-		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](10),
-		requestedTxns:    expiringmap.New[chainhash.Hash, struct{}](time.Hour),
-		txInvChecks:      slots,
-	}
-	sm.headersFirstMode.Store(false)
-
-	state := &peerSyncState{
-		requestQueue:  txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
-		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](time.Hour),
-	}
-	sm.peerStates.Set(p, state)
-	sm.storeSyncPeer(p, &syncPeerState{})
-
-	// Transaction items first, the block last.
-	inv := wire.NewMsgInv()
-	require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{0x7a})))
-	require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{0x7b})))
-	require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &blockHash)))
-
-	// Every slot is held, as it would be with other peers' checks in flight.
-	require.True(t, slots.TryAcquire(maxConcurrentTxInvChecks))
-
-	done := make(chan struct{})
-	go func() {
-		sm.handleInvMsg(&invMsg{inv: inv, peer: p})
-		close(done)
-	}()
-
-	require.True(t, WaitUntil(blockHandled.Load, 2*time.Second),
-		"the block item waited behind the transaction-check bound")
-
-	slots.Release(maxConcurrentTxInvChecks)
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		require.Fail(t, "handleInvMsg did not finish once the slots were free")
+				return func() bool { return sm.blockDownloads.RequestedWithin(blockHash, time.Hour) }
+			},
+		},
 	}
 
-	require.Equal(t, int64(2), store.calls.Load(), "both transactions must still be checked once the slots are free")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tSettings := test.CreateBaseTestSettings(t)
+
+			storeURL, err := url.Parse("sqlitememory:///relay_bound_block_first")
+			require.NoError(t, err)
+
+			realStore, err := sql.New(t.Context(), ulogger.TestLogger{}, tSettings, storeURL)
+			require.NoError(t, err)
+
+			store := &concurrencyStore{Store: realStore}
+
+			p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
+			require.NoError(t, err)
+
+			running := blockchain2.FSMStateRUNNING
+			client := &blockchain2.Mock{}
+			client.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+
+			slots := semaphore.NewWeighted(maxConcurrentTxInvChecks)
+
+			sm := &SyncManager{
+				logger:           ulogger.TestLogger{},
+				settings:         tSettings,
+				ctx:              context.Background(),
+				peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
+				blockchainClient: client,
+				utxoStore:        store,
+				rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](10),
+				requestedTxns:    expiringmap.New[chainhash.Hash, struct{}](time.Hour),
+				blockDownloads:   newBlockDownloadTracker(blockRequestAssignmentTTL),
+				txInvChecks:      slots,
+			}
+			sm.headersFirstMode.Store(false)
+
+			blockActedOn := tc.arrange(client, sm)
+
+			state := &peerSyncState{
+				requestQueue:  txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
+				requestedTxns: expiringmap.New[chainhash.Hash, struct{}](time.Hour),
+			}
+			sm.peerStates.Set(p, state)
+			sm.storeSyncPeer(p, &syncPeerState{})
+
+			// Transaction items first, the block last.
+			inv := wire.NewMsgInv()
+			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{0x7a})))
+			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{0x7b})))
+			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &blockHash)))
+
+			// Every slot is held, as it would be with other peers' checks in flight.
+			require.True(t, slots.TryAcquire(maxConcurrentTxInvChecks))
+
+			done := make(chan struct{})
+			go func() {
+				sm.handleInvMsg(&invMsg{inv: inv, peer: p})
+				close(done)
+			}()
+
+			require.True(t, WaitUntil(blockActedOn, 2*time.Second),
+				"the block item waited behind the transaction-check bound")
+
+			slots.Release(maxConcurrentTxInvChecks)
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				require.Fail(t, "handleInvMsg did not finish once the slots were free")
+			}
+
+			require.Equal(t, int64(2), store.calls.Load(), "both transactions must still be checked once the slots are free")
+		})
+	}
 }
 
 // TestHandleInvMsg_SkipsTransactionItemsOutsideRunning pins that a transaction

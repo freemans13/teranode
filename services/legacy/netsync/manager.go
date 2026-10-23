@@ -3441,6 +3441,17 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 
 	wg := sync.WaitGroup{}
 
+	// Request as much as possible at once.  Anything that won't fit into
+	// the request will be requested on the next inv message.
+	sendGetData := func() {
+		gdmsg := sm.drainRequestQueue(peer, state)
+
+		if len(gdmsg.InvList) > 0 {
+			sm.logger.Debugf("[handleInvMsg] Requesting %d items from %s", len(gdmsg.InvList), peer)
+			peer.QueueMessage(gdmsg, nil)
+		}
+	}
+
 	// Request the advertised inventory if we don't already have it.  Also,
 	// request parent blocks of orphans if we receive one we already have.
 	// Finally, attempt to detect potential stalls due to long side chains
@@ -3449,11 +3460,17 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 	// Blocks go first, in serial and in message order, in a pass of their own.
 	// The transaction pass below can wait for a slot of a bound every peer
 	// shares, and a block announcement must never wait behind that, whatever
-	// its position in the message.
+	// its position in the message. That includes the getdata for a block this
+	// node does not have: processInvMsg only queues it, so it is sent here,
+	// before the transaction pass, and not left for the send at the end.
 	for i, iv := range invVects {
 		if iv.Type == wire.InvTypeBlock {
 			sm.processInvMsg(i, iv, processInvs, peer, exists, state, lastBlock)
 		}
+	}
+
+	if lastBlock != -1 {
+		sendGetData()
 	}
 
 	for i, iv := range invVects {
@@ -3492,14 +3509,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 	// wait for all inv vectors to be processed
 	wg.Wait()
 
-	// Request as much as possible at once.  Anything that won't fit into
-	// the request will be requested on the next inv message.
-	gdmsg := sm.drainRequestQueue(peer, state)
-
-	if len(gdmsg.InvList) > 0 {
-		sm.logger.Debugf("[handleInvMsg] Requesting %d items from %s", len(gdmsg.InvList), peer)
-		peer.QueueMessage(gdmsg, nil)
-	}
+	sendGetData()
 }
 
 // drainRequestQueue turns as much of a peer's announcement queue as it can into
