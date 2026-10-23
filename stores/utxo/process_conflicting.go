@@ -178,6 +178,11 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	// deferred block; a `return nil, nil, err` in the error paths clobbers the named
 	// return before the deferred runs, so we keep a parallel copy that survives.
 	var (
+		// mutationStarted is set just before step 1 runs. Step 1 commits one
+		// cascade level per SetConflicting call, so a failure inside it can leave
+		// earlier levels committed with step1Committed still false; only this flag
+		// says that nothing was touched.
+		mutationStarted       bool
 		step1Committed        bool
 		step2Committed        bool
 		step4Committed        bool
@@ -190,15 +195,16 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 
 	// Registered before the rollback defer below, so it runs AFTER it (LIFO) and
 	// observes the final err (including a rollback-failure escalation). A
-	// successful operation removes the intent, and so does a failure before the
-	// first mutation: there is nothing for a replay to recover, and an intent left
-	// behind by a step-0 refusal would be replayed with the refusal bypassed, as
-	// happened on mainnet on 2026-10-19 against winners that were already
-	// resolved. Any other failure keeps the intent for replay. Completion is
-	// best-effort: a failed delete just leaves an intent that replays on the
-	// next restart.
+	// successful operation removes the intent, and so does a failure before step 1
+	// starts, while nothing has been touched: there is nothing for a replay to
+	// recover, and an intent left behind by a step-0 refusal would be replayed
+	// with the refusal bypassed, as happened on mainnet on 2026-10-19 against
+	// winners that were already resolved. Any failure after step 1 starts keeps
+	// the intent for replay, including one inside step 1 after some of its
+	// levels committed. Completion is best-effort: a failed delete just leaves an
+	// intent that replays on the next restart.
 	defer func() {
-		if err == nil || !step1Committed {
+		if err == nil || !mutationStarted {
 			_ = s.CompleteConflictIntent(ctx, walIntent.IntentID())
 		}
 	}()
@@ -364,6 +370,8 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	// - 1: mark all losingTxHashesPerConflictingTx as conflicting + all its spending transactions recursively.
 	//   allMarkedConflicting is the BFS expansion: every hash now flagged Conflicting=true. Forwarded to callers so
 	//   the block-assembly conflictingMap can include the cascaded descendants (not just the immediate losers).
+	mutationStarted = true
+
 	affectedParentSpends, allMarkedHashes, err = MarkConflictingRecursively(ctx, s, losingTxHashes)
 	if err != nil {
 		return nil, nil, err
