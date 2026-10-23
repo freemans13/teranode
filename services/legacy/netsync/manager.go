@@ -93,6 +93,26 @@ const (
 	// hashes to store in memory.
 	maxRejectedTxns = 10_000
 
+	// maxConcurrentTxInvChecks bounds the transaction inventory items checked
+	// against the UTXO store at once, across every inv message from every peer.
+	// Each check used to get its own goroutine with no ceiling: one inv message
+	// carries up to 50,000 items and each message is handled on its own
+	// goroutine, and on Hetzner mainnet on 2026-10-19 that reached 223,118
+	// goroutines, 88,563 of them queued on one peer's known-inventory lock,
+	// before the cgroup killed the node. 1024 keeps two of the store's get
+	// batches full at the mainnet batch size of 500. It is a first value for
+	// the soak, not a measured optimum.
+	maxConcurrentTxInvChecks = 1024
+
+	// maxConcurrentRelayedTxs bounds the relayed transactions validated at
+	// once. Each one used to get its own goroutine with no ceiling, because
+	// OnTx queues without waiting for the reply its own comment promises. A
+	// transaction that finds the bound full is dropped rather than queued:
+	// waiting would stall the peer's read loop, which also carries its blocks,
+	// and a mempool transaction is not consensus-critical and arrives again in
+	// the block that mines it. A first value for the soak, not a measured one.
+	maxConcurrentRelayedTxs = 256
+
 	// recentlyFailedBlocksMaxTracked bounds recentlyFailedBlocks. Legacy sync
 	// only has a handful of failing block hashes in flight, but capping the map
 	// guarantees a pathological stream of distinct failing hashes can never grow
@@ -785,6 +805,13 @@ type SyncManager struct {
 	// legacy_maxBlocksInTransitPerPeer (see pipelineBlockSlotPeerAllowance).
 	blockPrefetchBudget      *semaphore.Weighted
 	blockPrefetchBudgetSlots int64
+
+	// txInvChecks bounds the transaction inventory checks in flight; see
+	// maxConcurrentTxInvChecks. relayedTxs bounds the relayed transactions
+	// being validated; see maxConcurrentRelayedTxs. Both are built in New; a
+	// SyncManager built by hand in a test leaves them nil, which means no bound.
+	txInvChecks *semaphore.Weighted
+	relayedTxs  *semaphore.Weighted
 
 	// inFlightBlocks is the dedup half of the same block-admission gate whose
 	// other half is blockPrefetchBudget. It holds the hash of every block that is
@@ -3425,11 +3452,31 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			continue
 		}
 
-		// process all remaining inv vectors in parallel
+		// Outside RUNNING processInvMsg drops every non-block item on entry, so
+		// do not start a goroutine only to have it return.
+		if !processInvs {
+			continue
+		}
+
+		// Process the remaining inv vectors in parallel, but no more than
+		// maxConcurrentTxInvChecks at once across every inv message: the slot is
+		// taken before the goroutine starts, so a 50,000-item message waits here
+		// rather than forking 50,000 goroutines.
+		if sm.txInvChecks != nil {
+			if err := sm.txInvChecks.Acquire(sm.ctx, 1); err != nil {
+				// shutting down
+				break
+			}
+		}
+
 		wg.Add(1)
 
 		go func(i int, iv *wire.InvVect) {
 			defer wg.Done()
+
+			if sm.txInvChecks != nil {
+				defer sm.txInvChecks.Release(1)
+			}
 
 			// Ignore unsupported inventory types.
 			sm.processInvMsg(i, iv, processInvs, peer, exists, state, lastBlock)
@@ -3778,7 +3825,12 @@ out:
 
 			case *txMsg:
 				go func(msg *txMsg) {
-					// process tx messages in parallel
+					// process tx messages in parallel, up to the relay bound
+					// QueueTx took a slot of
+					if sm.relayedTxs != nil {
+						defer sm.relayedTxs.Release(1)
+					}
+
 					sm.handleTxMsg(msg)
 					if msg.reply != nil {
 						msg.reply <- struct{}{}
@@ -3848,6 +3900,19 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 		if done != nil {
 			done <- struct{}{}
 		}
+		return
+	}
+
+	// Bounded: see maxConcurrentRelayedTxs. Over the bound the transaction is
+	// dropped, never waited for, because this runs on the peer's read loop.
+	// The slot is released by the block handler once handleTxMsg returns.
+	if sm.relayedTxs != nil && !sm.relayedTxs.TryAcquire(1) {
+		sm.logger.Debugf("[QueueTx] dropping relayed tx %s from %s: %d relayed transactions already being validated", tx.Hash(), peer, maxConcurrentRelayedTxs)
+
+		if done != nil {
+			done <- struct{}{}
+		}
+
 		return
 	}
 
@@ -4590,6 +4655,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	sm.blockPrefetchBudgetSlots = capacity
 	sm.blockPrefetchBudget = semaphore.NewWeighted(capacity)
+
+	sm.txInvChecks = semaphore.NewWeighted(maxConcurrentTxInvChecks)
+	sm.relayedTxs = semaphore.NewWeighted(maxConcurrentRelayedTxs)
 	logger.Infof("[legacy] streaming pipeline active: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
 		capacity, tSettings.Legacy.MaxBlocksInTransitPerPeer, pipelineBlockSlotPeerAllowance)
 
