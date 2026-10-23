@@ -123,6 +123,15 @@ ON CONFLICT DO NOTHING`
 // carries the id prefix first precisely so this is an index range scan, and the full 32-byte id
 // is still rechecked because the prefix is non-unique by design.
 //
+// The range is FENCED: hit finds each transaction's keys through a LATERAL with OFFSET 0, which
+// can only be planned as a per-key index probe, and the update then matches those exact keys
+// as arrays rather than joining. Written as a plain join against the unnest, with the range as
+// a join filter, the generic plan hash-joined on the transaction id, which no UTXO index
+// covers, over a sequential scan of every partition: on Hetzner mainnet on 2026-10-23, 4.56
+// billion rows to flag 16 transactions, about 40 minutes for every block with conflicts. The
+// identity and membership arms match the parameter arrays directly for the same reason, and
+// TestConflictingStatementsNeverScanTheirTables pins all of it.
+//
 // The flag is flipped on THREE things, not two, for the same reason setLockedSQL flips three.
 // A transaction lives in exactly one of tx_ident and tx_mined and this statement does not know
 // which; a contested parent is very often mined, which is the whole reason the note itself
@@ -140,24 +149,31 @@ ident AS (
     UPDATE tx_ident i
        SET flags = CASE WHEN $5::boolean THEN i.flags |  $6::smallint
                                          ELSE i.flags & ~$6::smallint END
-      FROM k
-     WHERE i.leaf = k.leaf AND i.txid = k.txid
+     WHERE i.leaf = ANY ($1::smallint[]) AND i.txid = ANY ($2::bytea[])
 ),
 mined AS (
     UPDATE tx_mined m
        SET flags = CASE WHEN $5::boolean THEN m.flags |  $6::smallint
                                          ELSE m.flags & ~$6::smallint END
+     WHERE m.txid = ANY ($2::bytea[])
+),
+hit AS (
+    SELECT c.leaf, c.ukey, k.txid
       FROM k
-     WHERE m.txid = k.txid
+     CROSS JOIN LATERAL (
+       SELECT x.leaf, x.ukey
+         FROM utxo x
+        WHERE x.leaf = k.leaf AND x.ukey >= k.lo AND x.ukey <= k.hi AND x.txid = k.txid
+       OFFSET 0
+     ) AS c
 ),
 UTXOs AS (
     UPDATE utxo u
        SET flags = CASE WHEN $5::boolean THEN u.flags |  $6::smallint
                                          ELSE u.flags & ~$6::smallint END
-      FROM k
-     WHERE u.leaf  = k.leaf
-       AND u.ukey BETWEEN k.lo AND k.hi
-       AND u.txid  = k.txid
+     WHERE u.leaf = ANY (ARRAY(SELECT hit.leaf FROM hit))
+       AND u.ukey = ANY (ARRAY(SELECT hit.ukey FROM hit))
+       AND u.txid = ANY (ARRAY(SELECT hit.txid FROM hit))
 )
 SELECT 1`
 
@@ -213,8 +229,12 @@ p AS (
 SELECT 'parent'::text AS kind, p.ref, p.ptxid, p.pvout,
        j.satoshis, j.script, j.hash_override, NULL::bytea AS spender
   FROM p
-  LEFT JOIN spend_journal j
-    ON j.ukey = p.pukey AND j.txid = p.ptxid AND j.spending_txid = p.child
+  LEFT JOIN LATERAL (
+    SELECT sj.ukey, sj.satoshis, sj.script, sj.hash_override
+      FROM spend_journal sj
+     WHERE sj.ukey = p.pukey AND sj.txid = p.ptxid AND sj.spending_txid = p.child
+    OFFSET 0
+  ) AS j ON TRUE
   LEFT JOIN LATERAL (
     SELECT 1 AS live
       FROM utxo u
@@ -226,8 +246,12 @@ UNION ALL
 SELECT 'child'::text, k.ref, NULL::bytea, NULL::int,
        NULL::bigint, NULL::bytea, NULL::bytea, j.spending_txid
   FROM k
-  JOIN spend_journal j
-    ON j.ukey BETWEEN k.lo AND k.hi AND j.txid = k.txid
+ CROSS JOIN LATERAL (
+   SELECT sj.spending_txid
+     FROM spend_journal sj
+    WHERE sj.ukey >= k.lo AND sj.ukey <= k.hi AND sj.txid = k.txid
+   OFFSET 0
+ ) AS j
 ORDER BY 1 DESC, 2`
 
 // SetConflicting marks transactions as having lost a double-spend race, or clears that mark.
