@@ -3445,16 +3445,22 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 	// request parent blocks of orphans if we receive one we already have.
 	// Finally, attempt to detect potential stalls due to long side chains
 	// we already have and request more blocks to prevent them.
+	//
+	// Blocks go first, in serial and in message order, in a pass of their own.
+	// The transaction pass below can wait for a slot of a bound every peer
+	// shares, and a block announcement must never wait behind that, whatever
+	// its position in the message.
 	for i, iv := range invVects {
 		if iv.Type == wire.InvTypeBlock {
-			// process blocks in serial
 			sm.processInvMsg(i, iv, processInvs, peer, exists, state, lastBlock)
-			continue
 		}
+	}
 
-		// Outside RUNNING processInvMsg drops every non-block item on entry, so
-		// do not start a goroutine only to have it return.
-		if !processInvs {
+	for i, iv := range invVects {
+		// Outside RUNNING processInvMsg drops every transaction item on entry,
+		// and it drops every type other than block and transaction in every
+		// state, so do not start a goroutine only to have it return.
+		if iv.Type != wire.InvTypeTx || !processInvs {
 			continue
 		}
 
