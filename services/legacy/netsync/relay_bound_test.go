@@ -199,3 +199,52 @@ func TestQueueTx_DropsWhenRelayBoundIsFull(t *testing.T) {
 	sm.QueueTx(tx, p, nil)
 	require.Equal(t, 1, len(sm.msgChan), "with a slot free the transaction is queued")
 }
+
+// TestBlockHandler_ReleasesTheRelaySlotAfterHandlingATx pins the other half of
+// the relayed-transaction bound: the slot QueueTx takes is handed back once the
+// block handler has handled the transaction. Without that release the bound
+// fills after maxConcurrentRelayedTxs transactions and every relayed
+// transaction after it is dropped for the life of the node.
+func TestBlockHandler_ReleasesTheRelaySlotAfterHandlingATx(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+
+	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
+	require.NoError(t, err)
+
+	running := blockchain2.FSMStateRUNNING
+	client := &blockchain2.Mock{}
+	client.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+
+	sm := &SyncManager{
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		ctx:              context.Background(),
+		blockchainClient: client,
+		peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
+		msgChan:          make(chan interface{}),
+		quit:             make(chan struct{}),
+		handlerDone:      make(chan struct{}),
+		relayedTxs:       semaphore.NewWeighted(1),
+	}
+
+	go sm.blockHandler()
+
+	t.Cleanup(func() {
+		close(sm.quit)
+		<-sm.handlerDone
+	})
+
+	done := make(chan struct{}, 1)
+	sm.QueueTx(bsvutil.NewTx(wire.NewMsgTx(1)), p, done)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "the block handler never handled the relayed transaction")
+	}
+
+	// The release runs after the reply, so poll for the slot rather than read
+	// it once.
+	require.True(t, WaitUntil(func() bool { return sm.relayedTxs.TryAcquire(1) }, 2*time.Second),
+		"the block handler kept the relay slot after handling the transaction")
+}
