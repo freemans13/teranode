@@ -100,6 +100,14 @@ type SQL struct {
 	// per store rather than package-global, so tests cannot leak it into each other.
 	// Always nil in production.
 	reconcileHook func() error
+	// rebuildTxHook, when set by a test, replaces the transaction that each attempt of
+	// rebuildOnMainChainFlag runs, so a test can fail the on_main_chain rebuild without a
+	// database fault. Per store for the same reason as reconcileHook. Always nil in
+	// production.
+	rebuildTxHook func(ctx context.Context, full bool) error
+	// onMainChainRepair records a failed on_main_chain write that the running process
+	// still owes a repair for. See on_main_chain_repair.go.
+	onMainChainRepair onMainChainRepairState
 	// engine identifies which SQL engine is being used (PostgreSQL, SQLite, etc.)
 	engine util.SQLEngine
 	// logger provides structured logging capabilities
@@ -242,6 +250,8 @@ type SQL struct {
 func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings) (*SQL, error) {
 	logger = logger.New("bcsql")
 
+	initPrometheusMetrics()
+
 	db, err := util.InitSQLDB(logger, storeURL, tSettings, tSettings.BlockChain.PostgresPool)
 	if err != nil {
 		return nil, errors.NewStorageError("failed to init sql db", err)
@@ -318,6 +328,12 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	}
 
 	s.backgroundDone = make(chan struct{})
+
+	// The repair record must be able to take a mark before its loop is listening, since
+	// the startup rebuild below can fail before the loop is started at the end of New.
+	s.onMainChainRepair.backoff = onMainChainRepairInitialBackoff
+	s.onMainChainRepair.wake = make(chan struct{}, 1)
+	s.onMainChainRepair.stopped = make(chan struct{})
 
 	s.blockIDReservations = ttlcache.New[chainhash.Hash, uint64](
 		ttlcache.WithTTL[chainhash.Hash, uint64](blockIDReservationTTL),
@@ -404,8 +420,13 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 			rebuildTimeout = migrationFullRebuildTimeout
 		}
 		rebuildCtx, rebuildCancel := s.shutdownAwareContext(rebuildTimeout)
+		// A failed startup rebuild used to leave whatever the previous process wrote, or
+		// an unpopulated column after a migration, trusted by every reader once this
+		// goroutine released the guard. Record it so the guard stays up and the repair
+		// loop retries the same walk until it lands.
 		if rebuildErr := s.rebuildOnMainChainFlag(rebuildCtx, full); rebuildErr != nil {
 			s.logger.Errorf("startup: rebuildOnMainChainFlag: %v", rebuildErr)
+			s.markOnMainChainDirty(full, "startup_rebuild", rebuildErr)
 		}
 		rebuildCancel()
 
@@ -432,6 +453,10 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	// Always reclaim abandoned durable block-id reservations: the table is written
 	// regardless of useInMemoryChainCheck, so its sweep must run regardless too.
 	go s.reservationSweepLoop(reservationSweepInterval)
+
+	// Every node reads on_main_chain, so the repair of a failed write to it runs on
+	// every node too. Started last so the error returns above leak nothing.
+	go s.onMainChainRepairLoop()
 
 	return s, nil
 }
@@ -1438,10 +1463,10 @@ const rebuildGroupKey = "rebuild"
 // the returned cancel function to release resources.
 //
 // One goroutine is spawned per call. This is intentionally unbounded because
-// shutdownAwareContext is only called from startup and Close paths — total
-// lifetime calls are O(1) per store. The spawned goroutine is always bounded
-// by ctx.Done (via timeout or caller cancel) or backgroundDone close, so it
-// cannot leak past Close().
+// shutdownAwareContext is only called from startup and Close paths, and from the
+// on_main_chain repair loop once per attempt, so lifetime calls stay small. The
+// spawned goroutine is always bounded by ctx.Done (via timeout or caller cancel)
+// or backgroundDone close, so it cannot leak past Close().
 func (s *SQL) shutdownAwareContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	go func() {
@@ -1663,9 +1688,14 @@ func (s *SQL) rebuildOnMainChainFlag(ctx context.Context, full bool) error {
 		retryBaseDelay     = 100 * time.Millisecond
 	)
 
+	rebuildTx := s.rebuildOnMainChainFlagTx
+	if s.rebuildTxHook != nil {
+		rebuildTx = s.rebuildTxHook
+	}
+
 	var err error
 	for attempt := 0; attempt < maxRebuildAttempts; attempt++ {
-		err = s.rebuildOnMainChainFlagTx(ctx, full)
+		err = rebuildTx(ctx, full)
 		if err == nil || !s.isSerializationRetry(err) {
 			return err
 		}

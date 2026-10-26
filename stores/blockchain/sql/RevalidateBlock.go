@@ -56,8 +56,14 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 		s.resetChainWalkCache()
 	}
 
+	// The UPDATE above has committed, so a failed rebuild leaves the column describing the
+	// chain before the revalidation. Record it so the background repair retries the full
+	// walk until it lands; a rebuild that lands here satisfies any earlier owed repair.
 	if rebuildErr := s.rebuildOnMainChainFlag(rebuildCtx, true); rebuildErr != nil {
 		s.logger.Errorf("RevalidateBlock: rebuildOnMainChainFlag: %v", rebuildErr)
+		s.markOnMainChainDirty(true, "revalidate_block", rebuildErr)
+	} else {
+		s.onMainChainRepaired(true)
 	}
 
 	if s.useInMemoryChainCheck {
