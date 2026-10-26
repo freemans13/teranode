@@ -236,6 +236,12 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 
 	var missed atomic.Int32
 
+	// Conflicting transactions are collected by whichever batch decorates them
+	// and checked against the chain once, after every batch is done (issue 2037).
+	// settleCollectedConflictingTxs checks them even when a batch failed, and
+	// clears them on any error, so no entry is left set without a verdict.
+	var conflicting conflictingTxCollector
+
 	if batched {
 		for i := 0; i < len(txHashes); i += batchSize {
 			i := i // capture range variable for goroutine
@@ -326,9 +332,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 
 						// if the tx is conflicting, we need to check if it is conflicting on the current chain
 						if txMetaSlice[data.Idx].conflicting {
-							if err = u.checkCounterConflictingOnCurrentChain(ctx, data.Hash, blockIds); err != nil {
-								return errors.NewProcessingError("[processTxMetaUsingStore][%s] failed to check counter conflicting tx on current chain", data.Hash.String(), err)
-							}
+							conflicting.add(data.Hash, data.Idx)
 						}
 					}
 
@@ -337,7 +341,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 			})
 		}
 
-		if err := g.Wait(); err != nil {
+		if err := u.settleCollectedConflictingTxs(ctx, g.Wait(), &conflicting, txMetaSlice, blockIds); err != nil {
 			return int(missed.Load()), errors.NewContextCanceledError("[processTxMetaUsingStore]", err)
 		}
 
@@ -413,7 +417,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 			})
 		}
 
-		if err := g.Wait(); err != nil {
+		if err := u.settleCollectedConflictingTxs(ctx, g.Wait(), &conflicting, txMetaSlice, blockIds); err != nil {
 			return int(missed.Load()), errors.NewContextCanceledError(errProcessTxMetaContextDone, err)
 		}
 
