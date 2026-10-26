@@ -46,6 +46,7 @@
 | DisableDAHCleaner | bool | false | utxostore_disableDAHCleaner | **CRITICAL** - DAH cleaner process control |
 | SkipTxBodyBelowCheckpoint | bool | false | utxostore_skipTxBodyBelowCheckpoint | utxoset only - skip the tx_body write at or below the hardcoded checkpoint |
 | NettedBelowWorkers | int | 16 | utxostore_nettedBelowWorkers | utxoset only - chunks of a list that the below-checkpoint netted write runs at once, each one database transaction; at most half of the pool's connections are used, whatever the value |
+| ConflictingChildrenMaxNodes | int | 100000 | utxostore_conflictingChildrenMaxNodes | Fail-closed node budget per root of a conflicting-descendant walk (<=0 = unlimited). Subtree validation walks a block's conflicting transactions as one batch from N roots (the transactions and their counter-spenders) and allows N × this budget: the old aggregate bound of N separate walks. Worst case, the visited set reaches N × this budget entries, and a single runaway cone fails after N × this budget reads rather than this budget |
 
 ### PostgreSQL Connection Pool (PostgresPool)
 
