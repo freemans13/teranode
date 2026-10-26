@@ -1603,6 +1603,31 @@ func conflictingWalkChildren(txMeta *meta.Data) []chainhash.Hash {
 	return children
 }
 
+// CounterConflictingInpoints reports what txHash spends, from txMeta as read with
+// fields.TxInpoints. A record that stores no inpoints keeps what it spends only in
+// its body, so the body is read for that record alone; a record carrying neither
+// is a processing error (see counterConflictingInpoints). A failed body read is
+// returned as the store returned it.
+func CounterConflictingInpoints(ctx context.Context, s Store, txHash chainhash.Hash, txMeta *meta.Data) ([]subtree.Inpoint, error) {
+	if txMeta != nil && len(txMeta.TxInpoints.ParentTxHashes) == 0 && txMeta.Tx == nil {
+		bodyMeta, err := s.Get(ctx, &txHash, fields.Tx)
+		if err != nil {
+			return nil, err
+		}
+
+		if bodyMeta != nil {
+			txMeta.Tx = bodyMeta.Tx
+		}
+	}
+
+	inpoints, err := counterConflictingInpoints(txMeta)
+	if err != nil {
+		return nil, errors.NewProcessingError("[CounterConflictingInpoints][%s] cannot read what the transaction spends", txHash.String(), err)
+	}
+
+	return inpoints, nil
+}
+
 // GetCounterConflictingTxHashes returns the given transaction plus, for every
 // input, the transaction the store records as spending that same output (the
 // counter-conflicting transaction) and that spender's full descendant set.
@@ -1630,22 +1655,9 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 		return nil, errors.NewTxNotFoundError("[GetCounterConflictingTxHashes][%s] tx not found", txHash.String())
 	}
 
-	// A record that stores no inpoints keeps what it spends only in its body, so
-	// read the body for that record alone.
-	if len(txMeta.TxInpoints.ParentTxHashes) == 0 && txMeta.Tx == nil {
-		bodyMeta, bErr := s.Get(ctx, &txHash, fields.Tx)
-		if bErr != nil {
-			return nil, bErr
-		}
-
-		if bodyMeta != nil {
-			txMeta.Tx = bodyMeta.Tx
-		}
-	}
-
-	inpoints, err := counterConflictingInpoints(txMeta)
+	inpoints, err := CounterConflictingInpoints(ctx, s, txHash, txMeta)
 	if err != nil {
-		return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] cannot read what the transaction spends", txHash.String(), err)
+		return nil, err
 	}
 
 	counterConflictingMap := make(map[chainhash.Hash]struct{})

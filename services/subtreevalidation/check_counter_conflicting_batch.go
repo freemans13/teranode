@@ -209,16 +209,25 @@ func (u *Server) counterSpendersBatch(ctx context.Context, txHashes []chainhash.
 
 	parentIdx := make(map[chainhash.Hash]int)
 	parents := make([]chainhash.Hash, 0, len(unique))
+	inpoints := make([][]subtreepkg.Inpoint, len(unique))
 
-	for _, txMeta := range txMetas {
+	for i, txMeta := range txMetas {
 		if txMeta == nil {
 			continue
 		}
 
-		for _, parentHash := range txMeta.TxInpoints.GetParentTxHashes() {
-			if _, ok := parentIdx[parentHash]; !ok {
-				parentIdx[parentHash] = len(parents)
-				parents = append(parents, parentHash)
+		// A record that stores no inpoints is read from its body, and one carrying
+		// neither fails, as in GetCounterConflictingTxHashes: reading it as
+		// spending nothing would find no counter-spender.
+		inpoints[i], err = utxo.CounterConflictingInpoints(ctx, u.utxoStore, unique[i], txMeta)
+		if err != nil {
+			return nil, nil, nil, nil, errors.NewProcessingError("[checkCounterConflictingOnCurrentChainBatch][%s] failed to read what the transaction spends", unique[i].String(), err)
+		}
+
+		for _, inpoint := range inpoints[i] {
+			if _, ok := parentIdx[inpoint.Hash]; !ok {
+				parentIdx[inpoint.Hash] = len(parents)
+				parents = append(parents, inpoint.Hash)
 			}
 		}
 	}
@@ -241,8 +250,8 @@ func (u *Server) counterSpendersBatch(ctx context.Context, txHashes []chainhash.
 		// outputs, so the transaction's counter-spenders cannot be derived.
 		parentMissing := false
 
-		for _, parentHash := range txMeta.TxInpoints.GetParentTxHashes() {
-			if parentMetas[parentIdx[parentHash]] == nil {
+		for _, inpoint := range inpoints[i] {
+			if parentMetas[parentIdx[inpoint.Hash]] == nil {
 				parentMissing = true
 				break
 			}
@@ -253,7 +262,7 @@ func (u *Server) counterSpendersBatch(ctx context.Context, txHashes []chainhash.
 			continue
 		}
 
-		for _, inpoint := range txMeta.TxInpoints.GetTxInpoints() {
+		for _, inpoint := range inpoints[i] {
 			spendingDatas := parentMetas[parentIdx[inpoint.Hash]].SpendingDatas
 
 			// check the length of the spending txs, if it's less than the index, then the input is not spent

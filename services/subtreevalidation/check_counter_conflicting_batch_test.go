@@ -884,3 +884,65 @@ func Test_checkCounterConflictingOnCurrentChainBatch_namesTheConflict(t *testing
 		require.NotContains(t, err.Error(), chain[0].String())
 	})
 }
+
+// inpointlessRecordStore wraps a real utxo.Store and hands back the records in
+// stripped the way the utxoset store does below the checkpoint: no stored
+// inpoints, and with noBody no transaction body either.
+type inpointlessRecordStore struct {
+	utxo.Store
+	stripped map[chainhash.Hash]struct{}
+	noBody   bool
+}
+
+func (s *inpointlessRecordStore) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
+	txMeta, err := s.Store.Get(ctx, hash, f...)
+	if err != nil || txMeta == nil {
+		return txMeta, err
+	}
+
+	if _, ok := s.stripped[*hash]; ok {
+		txMeta.TxInpoints = subtreepkg.TxInpoints{}
+
+		if s.noBody {
+			txMeta.Tx = nil
+		}
+	}
+
+	return txMeta, nil
+}
+
+// Test_checkCounterConflictingOnCurrentChainBatch_recordWithoutInpoints pins the
+// batch to utxo.GetCounterConflictingTxHashes's reading of a record that stores
+// no inpoints: what it spends comes from its body, and a record carrying neither
+// is a processing error. Reading the empty inpoints as "spends nothing" finds no
+// counter-spender, so a block whose conflicting transaction lost to a mined
+// counter-spender would pass.
+func Test_checkCounterConflictingOnCurrentChainBatch_recordWithoutInpoints(t *testing.T) {
+	ctx := context.Background()
+	tSettings := test.CreateBaseTestSettings(t)
+	mined := utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 77, BlockHeight: 100})
+
+	t.Run("counter-spenders come from the body", func(t *testing.T) {
+		sqlStore := newSQLUtxoStore(t, ctx, tSettings)
+		counter, chain := buildConflictingChain(t, ctx, sqlStore, 1, false, mined)
+
+		store := &inpointlessRecordStore{Store: sqlStore, stripped: map[chainhash.Hash]struct{}{chain[0]: {}}}
+		s := &Server{logger: ulogger.NewErrorTestLogger(t), settings: tSettings, utxoStore: store}
+
+		_, err := s.checkCounterConflictingOnCurrentChainBatch(ctx, chain, map[uint32]bool{77: true}, failOnMissingRecords)
+		require.ErrorIs(t, err, errors.ErrTxInvalid)
+		require.Contains(t, err.Error(), counter.TxIDChainHash().String())
+	})
+
+	t.Run("neither inpoints nor body is a processing error", func(t *testing.T) {
+		sqlStore := newSQLUtxoStore(t, ctx, tSettings)
+		_, chain := buildConflictingChain(t, ctx, sqlStore, 1, false, mined)
+
+		store := &inpointlessRecordStore{Store: sqlStore, stripped: map[chainhash.Hash]struct{}{chain[0]: {}}, noBody: true}
+		s := &Server{logger: ulogger.NewErrorTestLogger(t), settings: tSettings, utxoStore: store}
+
+		_, err := s.checkCounterConflictingOnCurrentChainBatch(ctx, chain, map[uint32]bool{77: true}, failOnMissingRecords)
+		require.ErrorIs(t, err, errors.ErrProcessing)
+		require.NotErrorIs(t, err, errors.ErrTxInvalid)
+	})
+}
