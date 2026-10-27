@@ -2078,6 +2078,36 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 			return false, err
 		}
 
+		// A goroutine of quick validation panicked (issue 4993). recoverChildPanic turned the
+		// panic into an error, so it ends up here and not in catchup's own recover. Falling
+		// through to normal validation would drop the error, and with it the local-panic
+		// marker: the run would carry on as if nothing happened, releaseCatchupLock would never
+		// reach its local_panic case, and the same bug could fire again on the next block.
+		// Stop this catch-up attempt instead and return the error unchanged.
+		//
+		// Settle and sweep exactly as the local-fault branch below does, for the same reason:
+		// the panic is this node's fault, so only quick validation's own build output is
+		// stale, and the fetched blobs stay for the retry. The cleanup error is logged, not
+		// returned, because returning it would replace the error that carries the marker.
+		if isLocalPanic(err) {
+			u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: a goroutine panicked during quick validation, aborting this catch-up attempt, see the PANIC log line: %v",
+				catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)
+
+			select {
+			case <-waitDone:
+				if delErr := u.removeCatchupSubtreeFiles(ctx, catchupCtx, freshlyWritten); delErr != nil {
+					u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: failed to remove this attempt's .subtree files after a local panic: %v",
+						catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), delErr)
+				}
+			case <-ctx.Done():
+				// See the corrupt-branch comment above: skip cleanup rather than risk hanging.
+				u.logger.Warnf("[catchup:tryQuickValidation][%s] block %s: catch-up context cancelled while waiting for subtree writes to settle, skipping cleanup",
+					catchupCtx.blockUpTo.Hash().String(), block.Hash().String())
+			}
+
+			return false, err
+		}
+
 		u.logger.Warnf("[catchup:validateBlocksOnChannel][%s] quick validation failed for block %s, removing .subtree files: %v",
 			catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)
 

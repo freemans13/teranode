@@ -2357,9 +2357,13 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 			applyG.Go(func() error {
 				// Like every outcome here, a panic is recorded in hardFail and the goroutine
 				// returns nil, so it does not cancel applyCtx under calls already in flight.
+				// The panic takes hardFail from any failure recorded before it, and no later
+				// failure takes it back (see the hard-failure assignment below). Its marker is
+				// what makes the legacy route count the panic and retry later, and callers find
+				// it by type in the one error this function returns.
 				defer recoverChildPanic(u.logger, recoveredPanicPathBlockValidation, nil, func(err error) {
 					mu.Lock()
-					if hardFail == nil {
+					if !isLocalPanic(hardFail) {
 						hardFail = err
 					}
 					mu.Unlock()
@@ -2390,8 +2394,11 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 						return nil
 					}
 
+					// An ordinary hard failure never displaces a recorded local panic.
 					mu.Lock()
-					hardFail = err
+					if !isLocalPanic(hardFail) {
+						hardFail = err
+					}
 					mu.Unlock()
 				}
 

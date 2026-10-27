@@ -279,7 +279,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
     - The error that a `WaitToComplete` caller gets after a `blockFoundCh` worker panic no
       longer has the panic value in its text. The panic value is in the `PANIC` log line.
     - A panic in a goroutine that a validation started is scored like the panics above: a
-      catchup ends as `local_panic` and no peer is charged. On the legacy route it counts
+      catchup ends as `local_panic` and no peer is charged. In catchup quick validation
+      it ends that catchup attempt, rather than falling back to normal validation of the
+      block. On the legacy route it counts
       toward the per-peer panic cap above. Legacy sync gets `ERR_SERVICE_ERROR`
       for it, and also for a delivery that the cap then stops, so the parked block is kept
       and retried rather than rejected. A panic in the

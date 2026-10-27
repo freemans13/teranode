@@ -365,3 +365,96 @@ func TestProcessBlockFound_UnifiedRouteChildPanicIsRetryLaterAndCounted(t *testi
 
 	requireNothingApplied(t, us, block, parent, child)
 }
+
+// TestTryQuickValidation_ChildPanicAbortsTheAttempt drives catchup's quick-validation step with a
+// subtree read that panics. The panic comes back from quickValidateBlockAsync as an error, and
+// tryQuickValidation must return that error and stop the attempt. Falling through to normal
+// validation would drop the error and its marker, so releaseCatchupLock would never reach its
+// local_panic case.
+func TestTryQuickValidation_ChildPanicAbortsTheAttempt(t *testing.T) {
+	h := newPreBindHarness(t, nil)
+
+	f := h.forgedBodies(0x3e, 0x50) // no forged index: an honest body
+
+	store := &panickingSubtreeStore{Store: h.subtreeStore, key: *f.roots[2], fileType: fileformat.FileTypeSubtreeToCheck, onExists: true}
+	h.bv.subtreeStore = store
+	h.subtreeStore = store
+
+	server, catchupCtx := h.newAbortServer()
+	catchupCtx.blockUpTo = f.block
+
+	writeJobsChan := make(chan *SubtreeWriteJob, 16)
+
+	g, gCtx := errgroup.WithContext(h.ctx)
+	g.Go(func() error { return h.bv.subtreeWriteWorker(gCtx, writeJobsChan) })
+
+	tryNormal, err := server.tryQuickValidation(h.ctx, f.block, catchupCtx, "peer", "http://peer", writeJobsChan, nil)
+
+	close(writeJobsChan)
+	require.NoError(t, g.Wait())
+
+	require.Positive(t, store.panics.Load(), "setup: quick validation must reach the panic")
+	require.False(t, tryNormal, "a local panic must stop the attempt, not fall through to normal validation")
+	requireChildPanicError(t, err)
+	require.Empty(t, catchupCtx.corruptBlockHash, "a local panic must not be recorded as a corrupt block")
+	require.Empty(t, catchupCtx.incompleteBlockHash)
+
+	// End state of the cycle: releaseCatchupLock, handed the error as validateBlocksOnChannel
+	// returns it, records the attempt as local_panic.
+	catchupCtx.startTime = time.Now()
+	require.NoError(t, server.acquireCatchupLock(catchupCtx))
+	server.releaseCatchupLock(catchupCtx, &err)
+
+	require.NotNil(t, server.previousCatchupAttempt)
+	require.Equal(t, "local_panic", server.previousCatchupAttempt.ErrorType)
+}
+
+// TestApplyTxsWithRetry_PanicWinsOverAnOrdinaryHardFailure: one apply panics and another fails
+// with an ordinary hard error. Whichever finishes first, the error the wave returns must carry
+// the local-panic marker. The legacy route keys on that marker to count the panic and to answer
+// retry later; without it netsync reads the ordinary error as a judgement on the block.
+func TestApplyTxsWithRetry_PanicWinsOverAnOrdinaryHardFailure(t *testing.T) {
+	cases := map[string]struct {
+		panicDelay, failDelay time.Duration
+	}{
+		"panic first":    {panicDelay: 0, failDelay: 200 * time.Millisecond},
+		"ordinary first": {panicDelay: 200 * time.Millisecond, failDelay: 0},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			spy := &spendRetrySpyStore{failuresLeft: map[chainhash.Hash]int{}, failErr: map[chainhash.Hash]error{}}
+			u, block, txs := newSpendRetryHarness(t, spy)
+
+			items := make([]txApply, len(txs))
+			for i, tx := range txs {
+				items[i] = txApply{tx: tx}
+			}
+
+			panicking := *txs[0].TxIDChainHash()
+			failing := *txs[1].TxIDChainHash()
+
+			var panics atomic.Int32
+
+			err := u.applyTxsWithRetry(context.Background(), block, "test", items, len(items),
+				func(_ context.Context, item txApply) error {
+					switch *item.tx.TxIDChainHash() {
+					case panicking:
+						time.Sleep(tc.panicDelay)
+						panics.Add(1)
+						panic(childPanicValue)
+					case failing:
+						time.Sleep(tc.failDelay)
+
+						return errors.NewProcessingError("ordinary hard failure")
+					}
+
+					return nil
+				})
+
+			require.Equal(t, int32(1), panics.Load(), "setup: the apply must reach the panic")
+			requireChildPanicError(t, err)
+			require.NotContains(t, err.Error(), "ordinary hard failure")
+		})
+	}
+}
