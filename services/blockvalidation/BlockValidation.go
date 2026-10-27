@@ -848,7 +848,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 						IsCatchupMode:           blockData.isCatchupMode,
 					})
 				} else {
-					err = u.reValidateBlock(blockData)
+					err = u.reValidateBlock(ctx, blockData)
 				}
 
 				if err != nil {
@@ -3486,11 +3486,13 @@ func (u *BlockValidation) checkpointConfirmedAncestor(ctx context.Context, b *mo
 // This method handles blocks that failed initial validation or need reverification.
 //
 // Parameters:
+//   - ctx: the revalidation worker's context. Cancelling it, at shutdown, cuts short the wait for
+//     the parent to be mined, so the worker is not held for that wait's full budget.
 //   - blockData: Contains the block and context for revalidation
 //
 // Returns an error if revalidation fails.
-func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
-	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(context.Background(), "reValidateBlock",
+func (u *BlockValidation) reValidateBlock(ctx context.Context, blockData revalidateBlockData) error {
+	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "reValidateBlock",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[reValidateBlock][%s] validating block from %s", blockData.block.Hash().String(), blockData.baseURL),
 	)

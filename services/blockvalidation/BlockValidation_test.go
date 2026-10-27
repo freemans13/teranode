@@ -3609,7 +3609,7 @@ func TestBlockValidation_reValidateBlock_Success(t *testing.T) {
 		baseURL: "test",
 	}
 
-	err := bv.reValidateBlock(blockData)
+	err := bv.reValidateBlock(context.Background(), blockData)
 	require.NoError(t, err)
 }
 
@@ -3652,7 +3652,7 @@ func TestBlockValidation_reValidateBlock_InvalidBlock(t *testing.T) {
 		baseURL: "test",
 	}
 
-	err = bv.reValidateBlock(blockData)
+	err = bv.reValidateBlock(context.Background(), blockData)
 	require.Error(t, err)
 
 	invalidateBlockCallCount := 0
