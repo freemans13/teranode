@@ -16,6 +16,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jarcoal/httpmock"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -127,11 +128,33 @@ func TestNettedRoute_ReleaseCatchupLockScoresTheRefusals(t *testing.T) {
 
 	t.Run("a wrapped cause with network text stays local", func(t *testing.T) {
 		cause := errors.NewNetworkError("unexpected EOF from http://peer connection")
-		err := errors.NewServiceError("[tryQuickValidation] quick validation of a block below the checkpoint on a netting UTXO store failed; it is retried, not validated another way", cause)
+		err := newNettedRouteRefusal("[tryQuickValidation] quick validation of a block below the checkpoint on a netting UTXO store failed; it is retried, not validated another way", cause)
 
 		s, rec := release(t, err)
 		require.Equal(t, "local_no_verified_checkpoint", s.previousCatchupAttempt.ErrorType)
 		require.Empty(t, rec.genericErrorReported())
+	})
+
+	t.Run("a refusal wrapped by another local error is still a refusal", func(t *testing.T) {
+		refusal := u.refuseNettedRouteWindowWithoutCheckpoint(&CatchupContext{
+			blockUpTo: target, commonAncestorMeta: &model.BlockHeaderMeta{Height: 400}, blockHeaders: []*model.BlockHeader{target.Header},
+		})
+		require.Error(t, refusal)
+
+		err := errors.NewServiceError("[test] catch-up stopped", refusal)
+		require.True(t, isNettedRouteRefusal(err))
+
+		s, rec := release(t, err)
+		require.Equal(t, "local_no_verified_checkpoint", s.previousCatchupAttempt.ErrorType)
+		require.Empty(t, rec.genericErrorReported())
+	})
+
+	t.Run("a local error with the refusal's wording but no marker is not a refusal", func(t *testing.T) {
+		err := errors.NewServiceError("[test] block below the checkpoint on a netting UTXO store, from some other path")
+		require.False(t, isNettedRouteRefusal(err), "the marker, not the wording, makes a refusal")
+
+		s, _ := release(t, err)
+		require.NotEqual(t, "local_no_verified_checkpoint", s.previousCatchupAttempt.ErrorType)
 	})
 
 	t.Run("a corrupt body that wraps a refusal is scored corrupt", func(t *testing.T) {
@@ -292,4 +315,163 @@ func TestNettedRoute_DifficultyIsCheckedBeforeTheWindowRefusal(t *testing.T) {
 	require.True(t, errors.Is(err, errors.ErrServiceError), "got %v", err)
 	require.True(t, isLocalCatchupFault(err))
 	require.Empty(t, rec.maliciousReported())
+}
+
+// nettedForkCatchup is a full catchup() run on the sqlitememory chain store: a local chain of
+// tip blocks on genesis, every block above the fork point marked mined, and a peer that serves
+// forkLen blocks off block ancestor. The store nets below a checkpoint at height 1,000, so every
+// block in these tests can only be quick validated.
+type nettedForkCatchup struct {
+	server *Server
+	client blockchain.ClientI
+	local  []*model.Block
+	target *model.Block
+}
+
+func newNettedForkCatchup(t *testing.T, ancestor, tip uint32, forkLen int) *nettedForkCatchup {
+	t.Helper()
+
+	server, _, mockUTXOStore, cleanup := setupTestCatchupServer(t)
+	t.Cleanup(cleanup)
+
+	params := chaincfg.RegressionNetParams
+	params.CoinbaseMaturity = 100
+	params.Checkpoints = []chaincfg.Checkpoint{{Height: 1000}}
+	server.settings.ChainCfgParams = &params
+	server.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	server.settings.BlockValidation.SecretMiningThreshold = 1000
+
+	chainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, server.settings)
+	require.NoError(t, err)
+
+	genesis, err := chainStore.GetBlockByHeight(t.Context(), 0)
+	require.NoError(t, err)
+
+	local := append([]*model.Block{genesis}, testhelpers.CreateTestBlocksWithPrev(t, int(tip), genesis.Header.Hash())...)
+	for i, b := range local {
+		b.Height = uint32(i) //nolint:gosec // test heights
+	}
+
+	for _, b := range local[1:] {
+		_, _, err := chainStore.StoreBlock(t.Context(), b, "test")
+		require.NoError(t, err)
+	}
+
+	client, err := blockchain.NewLocalClient(ulogger.TestLogger{}, server.settings, chainStore, nil, nil)
+	require.NoError(t, err)
+
+	// Every block above the fork point is marked mined, so a mined_set clear shows in the store.
+	for _, b := range local[ancestor+1:] {
+		require.NoError(t, client.SetBlockMinedSet(t.Context(), b.Header.Hash()))
+	}
+
+	server.blockchainClient = client
+	server.blockValidation.blockchainClient = client
+
+	mockUTXOStore.On("GetBlockHeight").Return(tip)
+
+	store := nettingMockStore{mockUTXOStore}
+	server.blockValidation.utxoStore = store
+	server.utxoStore = store
+
+	fork := testhelpers.CreateSyntheticChainFromAtHeight(local[ancestor].Header, forkLen, ancestor+1)
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	t.Cleanup(httpmock.DeactivateAndReset)
+
+	body := local[ancestor].Header.Bytes()
+	for _, h := range fork {
+		body = append(body, h.Bytes()...)
+	}
+
+	httpmock.RegisterResponder("GET", `=~^http://peer/headers_from_common_ancestor/.*`, httpmock.NewBytesResponder(http.StatusOK, body))
+	// Every other request the peer gets is counted, so assertNoBodyFetch sees a body fetch.
+	httpmock.RegisterResponder("GET", `=~.*`, httpmock.NewStringResponder(http.StatusInternalServerError, ""))
+
+	return &nettedForkCatchup{
+		server: server,
+		client: client,
+		local:  local,
+		target: &model.Block{Header: fork[len(fork)-1], Height: ancestor + uint32(forkLen)}, //nolint:gosec // test heights
+	}
+}
+
+// assertMinedSetKept requires every local block above ancestor to be still marked mined: the
+// refusal came before Step 5.5's mined_set clear.
+func (n *nettedForkCatchup) assertMinedSetKept(t *testing.T, ancestor uint32) {
+	t.Helper()
+
+	for _, b := range n.local[ancestor+1:] {
+		mined, err := n.client.GetBlockIsMined(t.Context(), b.Header.Hash())
+		require.NoError(t, err)
+		require.True(t, mined, "block %d lost its mined_set for a fork that was refused", b.Height)
+	}
+}
+
+// assertNoBodyFetch requires that only the header request reached the peer: the refusal comes
+// before any block body.
+func assertNoBodyFetch(t *testing.T) {
+	t.Helper()
+
+	for call, n := range httpmock.GetCallCountInfo() {
+		if n > 0 && !strings.Contains(call, "headers_from_common_ancestor") {
+			t.Fatalf("the peer was asked for more than headers: %s (%d)", call, n)
+		}
+	}
+}
+
+// The netted-route refusals, through catchup() on a real chain store: each fork is refused before
+// the mined_set clear and before a block body is fetched, a deep fork is still reported malicious,
+// and a fork is charged to the peer at any depth.
+func TestNettedRoute_CatchupRefusesForksOnTheChainStore(t *testing.T) {
+	initPrometheusMetrics()
+
+	t.Run("a fork is refused before the mined_set clear", func(t *testing.T) {
+		// Depth 5 passes the fork-depth and secret-mining checks, so without the refusal catchup
+		// reaches Step 5.5 and un-stamps this node's own blocks for a fork it cannot take.
+		n := newNettedForkCatchup(t, 100, 105, 10)
+
+		err := n.server.catchup(t.Context(), n.target, "peer-netted", "http://peer")
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "got %v", err)
+		require.False(t, isLocalCatchupFault(err), "processCatchupChItem must charge and rotate the peer")
+		n.assertMinedSetKept(t, 100)
+		assertNoBodyFetch(t)
+	})
+
+	t.Run("a window without a checkpoint is refused before the fetch", func(t *testing.T) {
+		// No fork: the peer extends our tip at 100 with blocks 101-105, and the window holds no
+		// verified checkpoint (the next one is 1,000), so no block in it can be quick validated.
+		n := newNettedForkCatchup(t, 100, 100, 5)
+
+		err := n.server.catchup(t.Context(), n.target, "peer-netted", "http://peer")
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrServiceError), "got %v", err)
+		require.True(t, isNettedRouteRefusal(err), "got %v", err)
+		assertNoBodyFetch(t)
+	})
+
+	t.Run("a deep fork is reported malicious and charged to the peer", func(t *testing.T) {
+		// Depth 150 exceeds coinbase maturity. The fork-depth check must see it first, because it
+		// is what reports the peer malicious (recordMaliciousAttempt, ban score 50). Its own
+		// ServiceError is a local fault to processCatchupChItem, which would keep the same sync
+		// peer and retry the same hash, so on the netted route the refusal is returned in its
+		// place, as for a shallower netted fork.
+		n := newNettedForkCatchup(t, 100, 250, 10)
+
+		violations := prometheusCatchupErrors.WithLabelValues("peer-netted-deep", "coinbase_maturity_violation")
+		before := testutil.ToFloat64(violations)
+
+		err := n.server.catchup(t.Context(), n.target, "peer-netted-deep", "http://peer")
+
+		require.Error(t, err)
+		require.Equal(t, before+1, testutil.ToFloat64(violations),
+			"validateForkDepth records the malicious attempt and its metric together")
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "got %v", err)
+		require.False(t, isLocalCatchupFault(err), "processCatchupChItem must charge and rotate the peer")
+		n.assertMinedSetKept(t, 100)
+		assertNoBodyFetch(t)
+	})
 }

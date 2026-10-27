@@ -72,7 +72,7 @@ func TestConflictingStatementsNeverScanTheirTables(t *testing.T) {
 	}
 
 	t.Run("setConflictingSQL", func(t *testing.T) {
-		groups := p.leafKeys()
+		groups := p.leaves
 		require.NotEmpty(t, groups)
 
 		for _, g := range groups {
@@ -150,4 +150,44 @@ func TestDeleteStatementNeverScansItsTables(t *testing.T) {
 
 		require.NotContains(t, n.NodeType, "Hash Join", "a delete arm joins")
 	})
+}
+
+// TestConflictingPlanLeafGroupsComeFromTheFlatKeys pins that the per-leaf flip takes each
+// transaction's key range from the same kLo and kHi the read uses, in ascending leaf order with
+// every named transaction in exactly one group.
+func TestConflictingPlanLeafGroupsComeFromTheFlatKeys(t *testing.T) {
+	named := make([]chainhash.Hash, 0, 64)
+	for i := 0; i < 64; i++ {
+		named = append(named, chainhash.HashH([]byte{byte(i)}))
+	}
+
+	p := (&Store{}).planConflicting(named, map[chainhash.Hash]subtree.TxInpoints{})
+
+	index := make(map[string]int, len(p.kTxid))
+	for i, txid := range p.kTxid {
+		index[string(txid)] = i
+	}
+
+	seen := 0
+	prev := int16(-1)
+
+	for _, g := range p.leaves {
+		require.Greater(t, g.leaf, prev, "leaf groups run in ascending leaf order")
+		prev = g.leaf
+
+		require.Len(t, g.lo, len(g.txids))
+		require.Len(t, g.hi, len(g.txids))
+
+		for j, txid := range g.txids {
+			i, ok := index[string(txid)]
+			require.True(t, ok)
+			require.Equal(t, g.leaf, LeafFor(txid))
+			require.Equal(t, p.kLo[i], g.lo[j], "the flip's range is the read's range")
+			require.Equal(t, p.kHi[i], g.hi[j], "the flip's range is the read's range")
+
+			seen++
+		}
+	}
+
+	require.Equal(t, len(named), seen, "every named transaction is in exactly one group")
 }

@@ -645,29 +645,32 @@ func TestUnspendClearsAStaleConflictingBit(t *testing.T) {
 	require.NoError(t, spends[0].Err)
 }
 
-// TestSetConflictingIsLinearInOutputs flags 32 transactions in one leaf with 1,000 outputs each
-// and requires every UTXO flagged inside a bound that only a linear statement meets.
+// TestSetConflictingIsLinearInOutputs flags 16 and then 64 transactions in one leaf with 1,000
+// outputs each, and requires the time to grow by less than the square of the size.
 //
 // The previous statement matched the found keys through three ANY (ARRAY(SELECT ...)) filters.
 // Postgres hashes only constant arrays, so every candidate row scanned the arrays element by
 // element, and the time grew with the square of the outputs: measured on the test container,
-// 1.3 s at 16,000 outputs and 25-29 s at 64,000. At 32,000 that form takes several seconds;
-// the per-leaf form takes about 0.1 s, so a 3 s bound separates them with a wide margin on a
-// slow runner.
+// 1.3 s at 16,000 outputs and 25-29 s at 64,000, a ratio of about 20. The per-leaf form took
+// 46-57 ms and 159-227 ms, a ratio of about 4. The test compares the two sizes on the same
+// runner rather than against a wall-clock bound, so a slow or loaded runner slows both alike.
+// Each size takes the faster of a set and a clear, to drop a one-off stall. The bound of 10 sits
+// between linear (4) and quadratic (16).
 func TestSetConflictingIsLinearInOutputs(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	const (
-		nTx   = 32
+		small = 16
+		large = 64
 		perTx = 1_000
 	)
 
-	named := make([]chainhash.Hash, 0, nTx)
+	named := make([]chainhash.Hash, 0, large)
 
 	// All in ONE leaf, so a single statement sees every output. The statement runs per leaf,
 	// and spreading the family over eight leaves would hide a quadratic term behind an
 	// eight-way split.
-	for sats := uint64(5_000); len(named) < nTx; sats++ {
+	for sats := uint64(5_000); len(named) < large; sats++ {
 		tx := mkTx(t, perTx, sats)
 		if LeafFor(tx.TxIDChainHash()[:]) != 0 {
 			continue
@@ -679,22 +682,37 @@ func TestSetConflictingIsLinearInOutputs(t *testing.T) {
 		named = append(named, *tx.TxIDChainHash())
 	}
 
-	start := time.Now()
-	_, _, err := s.SetConflicting(ctx, named, true)
-	elapsed := time.Since(start)
-	require.NoError(t, err)
-	t.Logf("SetConflicting over %d outputs: %v", nTx*perTx, elapsed)
+	countFlagged := func() int {
+		var flagged int
+		require.NoError(t, s.pool.QueryRow(ctx,
+			`SELECT count(*) FROM utxo WHERE flags & $1::smallint <> 0`, FlagConflicting).Scan(&flagged))
 
-	var flagged int
-	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM utxo WHERE flags & $1::smallint <> 0`, FlagConflicting).Scan(&flagged))
-	require.Equal(t, nTx*perTx, flagged, "every UTXO of every named transaction")
-	require.Less(t, elapsed, 3*time.Second, "SetConflicting over %d outputs took %v", nTx*perTx, elapsed)
+		return flagged
+	}
 
-	_, _, err = s.SetConflicting(ctx, named, false)
-	require.NoError(t, err)
+	// timeSetAndClear flags the first n transactions, checks every output took the flag, clears
+	// them, checks every output lost it, and returns the faster of the two calls.
+	timeSetAndClear := func(n int) time.Duration {
+		start := time.Now()
+		_, _, err := s.SetConflicting(ctx, named[:n], true)
+		set := time.Since(start)
+		require.NoError(t, err)
+		require.Equal(t, n*perTx, countFlagged(), "every UTXO of every named transaction")
 
-	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM utxo WHERE flags & $1::smallint <> 0`, FlagConflicting).Scan(&flagged))
-	require.Zero(t, flagged, "clearing reaches every UTXO too")
+		start = time.Now()
+		_, _, err = s.SetConflicting(ctx, named[:n], false)
+		cleared := time.Since(start)
+		require.NoError(t, err)
+		require.Zero(t, countFlagged(), "clearing reaches every UTXO too")
+
+		return min(set, cleared)
+	}
+
+	tSmall := timeSetAndClear(small)
+	tLarge := timeSetAndClear(large)
+	ratio := float64(tLarge) / float64(tSmall)
+
+	t.Logf("SetConflicting over %d outputs: %v, over %d outputs: %v, ratio %.1f",
+		small*perTx, tSmall, large*perTx, tLarge, ratio)
+	require.Less(t, ratio, 10.0, "4x the outputs took %.1fx the time (%v vs %v)", ratio, tLarge, tSmall)
 }

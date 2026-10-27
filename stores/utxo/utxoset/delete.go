@@ -65,10 +65,10 @@ import (
 // trace of, which is the same resurrection the identity and membership deletes guard against.
 //
 // NO ARM JOINS A TABLE, and that is what keeps each one keyed whatever the planner's estimates
-// say. The first form joined k to each table with USING, the shape SetConflicting used before
-// 4f125ca1b, where on Hetzner mainnet on 2026-10-23 the generic plan hash-joined on the
-// transaction id over a sequential scan of all eight UTXO partitions, 4.56 billion rows for 16
-// transactions. Delete passes a single hash, which plans as index probes, but deleteIn is the
+// say. The first form joined k to each table with USING, the shape SetConflicting's flag update
+// first had (see setConflictingSQL). On Hetzner mainnet on 2026-10-23 that shape's generic plan
+// hash-joined on the transaction id over a sequential scan of all eight UTXO partitions, 4.56
+// billion rows for 16 transactions. Delete passes a single hash, which plans as index probes, but deleteIn is the
 // multi-delete entry point, so the shape is fixed here rather than at the first batch caller.
 // The UTXO and journal arms find their keys through a fenced LATERAL, which can only be a per-key
 // index probe, and then delete by those keys as an index condition with the full 32-byte id

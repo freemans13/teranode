@@ -5,10 +5,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -174,4 +176,85 @@ func TestSpendWaitingOnSetConflictingIsRefused(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the spend did not finish after SetConflicting committed")
 	}
+}
+
+// TestSetConflictingRetriesADeadlock. SetConflicting holds row locks across one statement per
+// leaf group, and within each statement it takes the UTXO rows before the identity rows. A
+// caller that takes the same rows in the other order, as setLockedOnce does, can deadlock with
+// it, and PostgreSQL then stops one of the two with SQLSTATE 40P01. Conflict resolution must not
+// fail on that: SetConflicting runs the whole transaction again.
+//
+// The deadlock is built by hand. The holder locks the higher leaf's UTXO rows, SetConflicting
+// flips the lower leaf and then waits on those rows, and the holder then asks for the lower
+// leaf's identity row, which SetConflicting holds. The holder's own deadlock_timeout is raised so
+// SetConflicting, which started waiting first, is the side PostgreSQL stops.
+func TestSetConflictingRetriesADeadlock(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	var low, high *bt.Tx
+
+	for sats := uint64(5_000); low == nil || high == nil; sats++ {
+		tx := mkTx(t, 2, sats)
+
+		switch leaf := LeafFor(tx.TxIDChainHash()[:]); {
+		case leaf == 0 && low == nil:
+			low = tx
+		case leaf == 1 && high == nil:
+			high = tx
+		}
+	}
+
+	for _, tx := range []*bt.Tx{low, high} {
+		_, err := s.Create(ctx, tx, 100)
+		require.NoError(t, err)
+	}
+
+	before := testutil.ToFloat64(deadlockRetried.WithLabelValues("set_conflicting"))
+
+	holder, err := s.pool.Begin(ctx)
+	require.NoError(t, err)
+
+	defer func() { _ = holder.Rollback(context.Background()) }()
+
+	_, err = holder.Exec(ctx, `SET LOCAL deadlock_timeout = '30s'`)
+	require.NoError(t, err)
+
+	_, err = holder.Exec(ctx, `UPDATE utxo SET flags = flags WHERE leaf = 1 AND txid = $1`, high.TxIDChainHash()[:])
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, _, serr := s.SetConflicting(ctx, []chainhash.Hash{*low.TxIDChainHash(), *high.TxIDChainHash()}, true)
+		done <- serr
+	}()
+
+	waitForLockWait(t, s, ctx, "UPDATE utxo u")
+
+	// Blocks on the identity row SetConflicting flipped, closing the cycle. It returns once
+	// PostgreSQL has stopped SetConflicting's first attempt.
+	_, err = holder.Exec(ctx, `UPDATE tx_ident SET flags = flags WHERE leaf = 0 AND txid = $1`, low.TxIDChainHash()[:])
+	require.NoError(t, err)
+	require.NoError(t, holder.Commit(ctx))
+
+	select {
+	case serr := <-done:
+		require.NoError(t, serr, "a deadlock is retried, not returned")
+	case <-time.After(30 * time.Second):
+		t.Fatal("SetConflicting did not finish after the holder committed")
+	}
+
+	require.GreaterOrEqual(t, testutil.ToFloat64(deadlockRetried.WithLabelValues("set_conflicting"))-before, 1.0,
+		"the first attempt must have been stopped as a deadlock and run again")
+
+	for _, tx := range []*bt.Tx{low, high} {
+		got, gerr := s.Get(ctx, tx.TxIDChainHash(), fields.Conflicting)
+		require.NoError(t, gerr)
+		require.True(t, got.Conflicting, "the retry flags every named transaction")
+	}
+
+	var flagged int
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM utxo WHERE flags & $1::smallint <> 0`, FlagConflicting).Scan(&flagged))
+	require.Equal(t, 4, flagged, "both outputs of both transactions")
 }

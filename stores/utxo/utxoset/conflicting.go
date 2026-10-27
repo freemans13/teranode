@@ -97,21 +97,29 @@ ON CONFLICT DO NOTHING`
 // setConflictingSQL flips the flag on every row that carries it. conflictingReadSQL then reports
 // both answers the caller needs.
 //
-// TWO STATEMENTS, NOT ONE, and the split is a correctness requirement. A child whose spend of
-// one of these UTXOs is in flight holds that UTXO's row lock, so the UTXO update below waits for
-// it; when the child commits, the row is gone and the update skips it. The child's journal row
-// committed in the same instant, and the read that names the children has to see it. Inside one
-// statement it cannot: every part of a statement reads the snapshot taken when the statement
-// began, and READ COMMITTED's re-check after a lock wait covers only the row being updated, not
-// the other parts of the statement. Measured with the child's spend held open in a transaction
+// THE FLIP AND THE READ ARE SEPARATE STATEMENTS, and the split is a correctness requirement.
+// runConflictingPlan runs this statement once per leaf group, in ascending leaf order, and then
+// runs the read: N+1 statements in one READ COMMITTED transaction, which keeps every row lock it
+// takes until the commit, across all of those round trips. A child whose spend of one of these
+// UTXOs is in flight holds that UTXO's row lock, so the UTXO update below waits for it; when the
+// child commits, the row is gone and the update skips it. The child's journal row committed in
+// the same instant, and the read that names the children has to see it. Inside one statement it
+// cannot: every part of a statement reads the snapshot taken when the statement began, and READ
+// COMMITTED's re-check after a lock wait covers only the row being updated, not the other parts
+// of the statement. Measured with the child's spend held open in a transaction
 // (TestSetConflictingSeesAChildWhoseSpendCommitsWhileItWaits): the one-statement form marked the
 // parent and returned no children, so the child stayed spendable and unmarked with nothing left
-// to find it. As a second statement in the same READ COMMITTED transaction the read takes a
-// fresh snapshot, taken after the update finished waiting, so every child whose spend committed
-// before the update is seen. A spend that comes later finds the conflicting bit set and is
-// refused by its own flag mask, including one that was waiting on the update's row lock, whose
-// predicate READ COMMITTED re-evaluates against the new row version
-// (TestSpendWaitingOnSetConflictingIsRefused).
+// to find it. As a later statement in the same transaction the read takes a fresh snapshot,
+// taken after the last flip finished waiting, so every child whose spend committed before that
+// flip is seen. A spend that comes later finds the conflicting bit set and is refused by its own
+// flag mask, including one that was waiting on a flip's row lock, whose predicate READ COMMITTED
+// re-evaluates against the new row version (TestSpendWaitingOnSetConflictingIsRefused).
+//
+// Holding locks across round trips widens the window for a deadlock with a caller that takes the
+// same rows in another order. Within each statement the UTXO update runs before the identity and
+// membership arms, while setLockedOnce takes the identity rows first, so a concurrent SetLocked on
+// an overlapping set can deadlock with this. SetConflicting runs the whole transaction under
+// withDeadlockRetry, the cure the store uses for the same race between SetLocked and the mine.
 //
 // BOTH rows, for the reason setLockedSQL gives: the identity row is what a metadata read
 // shows, the UTXO row is what the spend path reads, and the spend path never looks at the
@@ -326,6 +334,33 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
 		}
 	}
 
+	var (
+		affected []*utxo.Spend
+		children []chainhash.Hash
+	)
+
+	// The transaction holds row locks across one statement per leaf group, and a concurrent
+	// SetLocked on an overlapping set takes the same rows in another order (see
+	// setConflictingSQL). PostgreSQL stops one of the two as a deadlock, and this runs the whole
+	// transaction again from the start.
+	err = withDeadlockRetry(ctx, "set_conflicting", func() error {
+		var runErr error
+
+		affected, children, runErr = s.setConflictingOnce(ctx, plan, notedHeight, value)
+
+		return runErr
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return affected, children, nil
+}
+
+// setConflictingOnce is one attempt of SetConflicting's write, in one database transaction: the
+// note, the flag flips and the read-back commit or fail together.
+func (s *Store) setConflictingOnce(ctx context.Context, plan *conflictingPlan, notedHeight uint32,
+	value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] begin", err)
@@ -462,6 +497,9 @@ type conflictingPlan struct {
 	kHi   [][16]byte
 	named []chainhash.Hash
 
+	// The same transactions split by leaf, built once from kTxid, kLo and kHi.
+	leaves []conflictingLeafKeys
+
 	// One element per input, across every named transaction.
 	pRef   []int32
 	pChild [][]byte
@@ -507,6 +545,8 @@ func (s *Store) planConflicting(named []chainhash.Hash,
 		}
 	}
 
+	p.groupByLeaf()
+
 	return p
 }
 
@@ -519,37 +559,38 @@ type conflictingLeafKeys struct {
 	hi    [][16]byte
 }
 
-// leafKeys splits the named transactions by leaf, in ascending leaf order, the lock order
-// leafGroups documents.
-func (p *conflictingPlan) leafKeys() []conflictingLeafKeys {
-	groups := leafGroups(p.kTxid)
-	out := make([]conflictingLeafKeys, 0, len(groups))
+// groupByLeaf splits the named transactions by leaf, in ascending leaf order, the lock order
+// leafGroups documents. It copies kTxid, kLo and kHi rather than packing the ranges again, so
+// the flip and the read take their keys from one source.
+func (p *conflictingPlan) groupByLeaf() {
+	var byLeaf [NumLeaves]conflictingLeafKeys
 
-	for _, g := range groups {
-		k := conflictingLeafKeys{
-			leaf:  g.leaf,
-			txids: g.txids,
-			lo:    make([][16]byte, len(g.txids)),
-			hi:    make([][16]byte, len(g.txids)),
-		}
-
-		for i, txid := range g.txids {
-			k.lo[i] = Pack(txid, 0)
-			k.hi[i] = Pack(txid, ^uint32(0))
-		}
-
-		out = append(out, k)
+	for i, txid := range p.kTxid {
+		g := &byLeaf[LeafFor(txid)]
+		g.txids = append(g.txids, txid)
+		g.lo = append(g.lo, p.kLo[i])
+		g.hi = append(g.hi, p.kHi[i])
 	}
 
-	return out
+	p.leaves = make([]conflictingLeafKeys, 0, NumLeaves)
+
+	for leaf := range byLeaf {
+		if len(byLeaf[leaf].txids) == 0 {
+			continue
+		}
+
+		byLeaf[leaf].leaf = int16(leaf) //nolint:gosec // a leaf index fits
+
+		p.leaves = append(p.leaves, byLeaf[leaf])
+	}
 }
 
-// runConflictingPlan flips the flags and then reads back both answers, as two statements so the
-// read sees every spend that committed while the flip waited on its row locks. q must be a
-// transaction for the pair to be atomic; SetConflicting always passes one.
+// runConflictingPlan flips the flags and then reads back both answers, as separate statements so
+// the read sees every spend that committed while a flip waited on its row locks. q must be a
+// transaction for them to be atomic; SetConflicting always passes one.
 func (s *Store) runConflictingPlan(ctx context.Context, q querier, p *conflictingPlan,
 	value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
-	for _, g := range p.leafKeys() {
+	for _, g := range p.leaves {
 		if _, err := q.Exec(ctx, setConflictingSQL,
 			g.leaf, g.txids, g.lo, g.hi, value, FlagConflicting); err != nil {
 			return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] set", err)
