@@ -552,8 +552,11 @@ func TestValidator_ValidateInternal_CreateConflicting_TxAlreadyExistsEvictsTxMet
 	)
 
 	testHash, _ := chainhash.NewHashFromStr("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	// Spent by a named other transaction, as every store reports a real conflict; see
+	// TestValidator_ValidateInternal_CreateConflicting_TxAlreadyExists.
+	winner := chainhash.Hash{0x0b}
 	spends := []*utxo.Spend{
-		{TxID: testHash, Vout: 0, Err: errors.ErrSpent},
+		{TxID: testHash, Vout: 0, Err: errors.ErrSpent, ConflictingTxID: &winner},
 	}
 
 	// The store knows the real parent: the validator re-extends from the
@@ -623,8 +626,11 @@ func TestValidator_ValidateInternal_CreateConflicting_PartialMarkEvictsTxMeta(t 
 	)
 
 	testHash, _ := chainhash.NewHashFromStr("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	// Spent by a named other transaction, as every store reports a real conflict; see
+	// TestValidator_ValidateInternal_CreateConflicting_TxAlreadyExists.
+	winner := chainhash.Hash{0x0b}
 	spends := []*utxo.Spend{
-		{TxID: testHash, Vout: 0, Err: errors.ErrSpent},
+		{TxID: testHash, Vout: 0, Err: errors.ErrSpent, ConflictingTxID: &winner},
 	}
 
 	// The store knows the real parent: the validator re-extends from the
