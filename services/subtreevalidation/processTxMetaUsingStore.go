@@ -412,9 +412,12 @@ func (u *Server) processTxMetaUsingStoreAllowing(ctx context.Context, txHashes [
 									txInpoints:  txMeta.TxInpoints,
 								}
 
-								// The batched branch above runs this check; without it here,
+								// The batched branch above collects these too; without it here,
 								// whether a block's counter-spends are caught depended on which
 								// branch SubtreeValidation.BatchMissingTransactions selected.
+								// Collected rather than checked per transaction, for the reason
+								// the batched branch collects: these transactions share cones,
+								// and one walk each costs ~N²/2 store reads (issue 2037).
 								if txMetaSlice[i+j].conflicting {
 									conflicting.add(txHash, i+j)
 								}
