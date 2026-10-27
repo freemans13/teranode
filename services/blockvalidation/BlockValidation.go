@@ -1388,18 +1388,53 @@ func (u *BlockValidation) tryClaimBlockForSetMined(blockHash *chainhash.Hash) bo
 	return true
 }
 
+// subtreeAbsent reports whether a subtree store read failed because the subtree
+// is not there. A storage error is the store failing while it looked, whatever
+// it wraps, so it never counts as absent: errors.Is walks the chain, and a
+// storage error over a not-found would otherwise be skipped as a missing
+// subtree. Same rule as writeStoreError in stores/blob/server.go.
+func subtreeAbsent(err error) bool {
+	return errors.Is(err, errors.ErrNotFound) && !errors.Is(err, errors.ErrStorageError)
+}
+
 // reloadSubtreesForInvalidBlock reloads an invalid block's subtrees from the
-// store, best-effort: a subtree that cannot be read or parsed is left nil,
-// because an invalid block legitimately may not have all of them.
-func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) {
+// store. A subtree that is absent or does not parse is left nil, because an
+// invalid block legitimately may not have all of them and a retry cannot bring
+// one back. Any other read failure is returned: it may be transient, and
+// skipping it would let the revert finish with that subtree's tags in place.
+//
+// On that error the subtrees already loaded are closed before returning. They
+// never reach the block, and an mmap-backed subtree has no finalizer, so they
+// would otherwise keep their mapping and temp backing file until process exit.
+func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) (err error) {
 	reloaded := make([]*subtreepkg.Subtree, len(block.Subtrees))
+
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		for i, st := range reloaded {
+			if closeErr := st.Close(); closeErr != nil {
+				u.logger.Warnf("[setTxMined][%s] failed closing reloaded subtree %d after read failure: %v", block.Hash().String(), i, closeErr)
+			}
+		}
+	}()
 
 	for subtreeIdx, subtreeHash := range block.Subtrees {
 		subtreeBytes, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
 		if err != nil {
+			if !subtreeAbsent(err) {
+				return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+			}
+
 			subtreeBytes, err = u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 			if err != nil {
-				u.logger.Warnf("[setTxMined][%s] failed to get subtree %d/%s from store: %s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+				if !subtreeAbsent(err) {
+					return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+				}
+
+				u.logger.Warnf("[setTxMined][%s] subtree %d/%s not in store: %s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
 				continue
 			}
 		}
@@ -1420,6 +1455,8 @@ func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, blo
 	// store I/O is what makes an eviction of the same block stall the whole
 	// lastValidatedBlocks cache.
 	block.ReplaceSubtreeSlices(reloaded)
+
+	return nil
 }
 
 // setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
@@ -1530,7 +1567,20 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 			u.logger.Warnf("[setTxMined][%s] failed closing subtrees before unset-mined reload: %v", block.Hash().String(), releaseErr)
 		}
 
-		u.reloadSubtreesForInvalidBlock(ctx, block)
+		if err = u.reloadSubtreesForInvalidBlock(ctx, block); err != nil {
+			return err
+		}
+
+		// The reloaded subtrees belong to this call alone, so release them on
+		// every exit. The revert can now fail, and each retry reloads them; an
+		// early return that skipped the release below would leak one set of
+		// mmap mappings and temp files per attempt. On success the explicit
+		// release below has already run and this one finds only nil entries.
+		defer func() {
+			if releaseErr := block.ReleaseSubtreeNodes(nil); releaseErr != nil {
+				u.logger.Warnf("[setTxMined][%s] failed closing reloaded subtrees after unset-mined revert: %v", block.Hash().String(), releaseErr)
+			}
+		}()
 	} else {
 		// All subtrees should already be available for fully processed blocks
 		_, err = block.GetSubtrees(ctx, u.logger, u.subtreeStore, u.settings.Block.GetAndValidateSubtreesConcurrency)
@@ -1663,7 +1713,7 @@ const revalidateFromScratchDelay = 2 * validationResultGrace
 // unreachable.
 const prepareBlockAssemblyTimeout = 2 * time.Second
 
-func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) error {
+func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) (err error) {
 	result := &validationResult{
 		done: make(chan struct{}),
 	}
@@ -1679,22 +1729,73 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 		return existingResult.err
 	}
 
-	// We're first - run validation
-	err := validate(opts)
+	// Store and broadcast the result, and remove the entry after the grace window. This is a
+	// defer so that it also runs when validate panics (BV-STARTUP-007). Without it the entry has
+	// no TTL and its done channel never closes, so each later validation of this hash waits for
+	// ever above. On a panic the waiters get the error from newConcurrentValidationPanicError, and
+	// the panic continues to the caller, which logs it with the stack.
+	defer func() {
+		r := recover()
+		if r != nil {
+			err = newConcurrentValidationPanicError(blockHash)
+		}
 
-	// Store and broadcast result
-	result.mu.Lock()
-	result.err = err
-	result.mu.Unlock()
-	close(result.done)
+		result.mu.Lock()
+		result.err = err
+		result.mu.Unlock()
+		close(result.done)
 
-	// Cleanup after delay
-	go func() {
-		time.Sleep(validationResultGrace)
-		u.blocksCurrentlyValidating.Delete(*blockHash)
+		go func() {
+			time.Sleep(validationResultGrace)
+			u.blocksCurrentlyValidating.Delete(*blockHash)
+		}()
+
+		if r != nil {
+			panic(r)
+		}
 	}()
 
+	// We're first - run validation
+	return validate(opts)
+}
+
+// concurrentValidationPanicked marks the error that runOncePerBlock gives to the waiters of a
+// validation that panicked on another goroutine (BV-STARTUP-007). The waiter has no panic of its
+// own, so the caller cannot tell from its own state that the failure is a bug in this node. A
+// catchup waiter would score it against the primary peer.
+//
+// It is a Go type and not an error code or an errors-package sentinel. teranode's errors.Is
+// matches on the code, so a sentinel made with NewProcessingError matches each ERR_PROCESSING
+// error. NewProcessingError turns a trailing cause that is not an *Error into a plain message, so the
+// marker goes into the chain with SetWrappedErr. isConcurrentValidationPanic finds it by type
+// with errors.As, which does no text matching. Over gRPC the marker is lost, and the error is a
+// plain ERR_PROCESSING error, as before.
+type concurrentValidationPanicked struct{}
+
+func (*concurrentValidationPanicked) Error() string {
+	return "a concurrent validation of this block panicked"
+}
+
+// newConcurrentValidationPanicError returns the ERR_PROCESSING error that runOncePerBlock stores
+// for the waiters when validate panics. Its text has no word that IsNetworkError,
+// IsMaliciousResponseError or IsContextError matches.
+func newConcurrentValidationPanicError(blockHash *chainhash.Hash) error {
+	err := errors.NewProcessingError("[ValidateBlock][%s] panic during a concurrent validation of this block, see the PANIC log line", blockHash.String())
+	err.SetWrappedErr(&concurrentValidationPanicked{})
+
 	return err
+}
+
+// isConcurrentValidationPanic reports whether err came from a waiter in runOncePerBlock whose
+// validation panicked on another goroutine. Such an error is a local fault, never the peer's.
+func isConcurrentValidationPanic(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var marker *concurrentValidationPanicked
+
+	return errors.As(err, &marker)
 }
 
 // ValidateBlock performs comprehensive validation of a Bitcoin block.
@@ -2173,9 +2274,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			}
 
 			// An invalid transaction in the received subtrees. This CANNOT condemn the hash
-			// (bitcoin-sv/teranode#4844): subtree validation runs above block.Valid, so nothing has
-			// reconciled block.Subtrees against Header.HashMerkleRoot and the body is still whatever
-			// the serving peer chose. Relaying a genuine fresh header with a doctored subtree list
+			// (bitcoin-sv/teranode#4844): subtree validation runs above block.Valid, and it binds
+			// block.Subtrees to Header.HashMerkleRoot only when it reuses a cached subtree or takes
+			// the batched catch-up path, so in general the body is still whatever the serving peer
+			// chose. Relaying a genuine fresh header with a doctored subtree list
 			// costs nothing, and persisting on it both stores the peer's coinbase and poisons a real
 			// block hash so the honest body is later refused as already-invalid.
 			//
@@ -2331,7 +2433,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// honest multi-transaction block is never rejected here. Nothing has been added yet, so
 			// this matches the non-optimistic corrupt branch: strike the serving peer and return
 			// corrupt for re-download, under the corrupt-attempt cap. The residual under the opt-in
-			// is a body carrying subtrees, which cannot be bound until block.Valid is split.
+			// is a body carrying subtrees that subtree validation did not bind (none of them cached),
+			// which cannot be bound here until block.Valid is split.
 			if err = block.CheckCoinbaseOnlyBodyBound(); err != nil {
 				if !opts.IsRevalidation {
 					u.penalizeCorruptBlockPeer(ctx, opts.PeerID, block, err.Error())
