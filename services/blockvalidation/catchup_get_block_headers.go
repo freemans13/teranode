@@ -413,6 +413,26 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 					headersToAppend = blockHeaders[1:]
 					u.logger.Debugf("[catchup][%s] iteration %d: skipping duplicate header %s", chainTipHash.String(), iteration, blockHeaders[0].Hash().String())
 				}
+
+				// An honest peer that reorged between two requests answers this one from its new
+				// chain, so the batch need not build on the last header we hold. Appending it anyway
+				// would leave a broken link that findCommonAncestor rejects as a peer fault. Splice
+				// instead: keep what we hold up to the batch's parent and drop the stale tail. When
+				// the parent is not among the headers we hold, the reorg reaches below this fetch, so
+				// stop here with the linked prefix and let the next catchup start afresh.
+				if len(headersToAppend) > 0 && !headersToAppend[0].HashPrevBlock.IsEqual(allCatchupHeaders[len(allCatchupHeaders)-1].Hash()) {
+					keep := linkedPrefixLength(allCatchupHeaders, headersToAppend[0].HashPrevBlock)
+					if keep == 0 {
+						u.logger.Warnf("[catchup][%s] iteration %d: peer chain changed below the headers fetched so far (parent %s of %s not held), stopping with %d linked headers", chainTipHash.String(), iteration, headersToAppend[0].HashPrevBlock.String(), headersToAppend[0].Hash().String(), len(allCatchupHeaders))
+						stopReason = "Peer chain changed during header fetch"
+
+						break
+					}
+
+					u.logger.Warnf("[catchup][%s] iteration %d: peer chain changed during header fetch, dropping %d stale headers above %s", chainTipHash.String(), iteration, len(allCatchupHeaders)-keep, headersToAppend[0].HashPrevBlock.String())
+					totalHeadersFetched -= len(allCatchupHeaders) - keep
+					allCatchupHeaders = allCatchupHeaders[:keep]
+				}
 			}
 
 			// Check memory limit after duplicate removal
@@ -591,4 +611,17 @@ func (u *Server) catchupTargetHash(ctx context.Context, blockUpTo *model.Block, 
 		u.logger.Infof("[catchup][%s] Using peer %s's actual chain tip %s instead of announced block %s", announced.String(), peerID, peerChainTip.String(), announced.String())
 		return peerChainTip
 	}
+}
+
+// linkedPrefixLength returns how many of held to keep so that a header whose parent is parent
+// links to the last one kept: the index of parent in held plus one, or 0 when held does not
+// contain parent. The search runs from the newest header, where a reorg's fork point usually is.
+func linkedPrefixLength(held []*model.BlockHeader, parent *chainhash.Hash) int {
+	for i := len(held) - 1; i >= 0; i-- {
+		if held[i].Hash().IsEqual(parent) {
+			return i + 1
+		}
+	}
+
+	return 0
 }

@@ -1491,8 +1491,11 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
-		// Simulate server returning headers in chunks
+		// Simulate server returning headers in chunks. Each chunk continues the chain from the
+		// last header of the one before, as a real peer's does: the header fetch splices or stops
+		// on a chunk that does not build on what it already holds.
 		callCount := 0
+		prevHash := bestBlock.Header.Hash()
 		httpmock.RegisterResponder(
 			"GET",
 			`=~^http://test-peer/headers_from_common_ancestor/.*`,
@@ -1501,7 +1504,6 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 				// Create valid headers for testing
 				numHeaders := 10000
 				headers := make([]*model.BlockHeader, numHeaders)
-				prevHash := bestBlock.Header.Hash()
 
 				// Create a valid difficulty setting
 				nBits, _ := model.NewNBitFromString("207fffff") // minimum difficulty

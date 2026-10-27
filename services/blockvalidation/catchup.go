@@ -300,46 +300,6 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return err
 	}
 
-	// Step 5.5: If fork detected, reset mined_set on old blocks for transaction state consistency.
-	// This must run only AFTER the fork-depth and secret-mining safety checks pass; otherwise a peer
-	// merely announcing a deep or secretly-mined fork would un-stamp this node's own still-canonical
-	// txs for a fork that is then rejected, churning honest tx-mined state for no reorg (issue #1145).
-	if catchupCtx.forkDepth > 0 {
-		u.logger.Infof("[catchup][%s] Fork detected (depth %d), clearing mined_set on old blocks",
-			catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth)
-
-		currentHeight := catchupCtx.currentHeight
-		headers, _, err := u.blockchainClient.GetBlockHeadersByHeight(ctx,
-			catchupCtx.commonAncestorMeta.Height+1, currentHeight)
-		if err != nil {
-			u.logger.Errorf("[catchup][%s] Failed to get fork block headers: %v",
-				catchupCtx.blockUpTo.Hash().String(), err)
-		} else {
-			var clearErrors, notifyErrors int
-			for _, header := range headers {
-				if err := u.blockchainClient.ClearBlockMinedSet(ctx, header.Hash()); err != nil {
-					clearErrors++
-				} else {
-					// Send BlockMinedUnset notification to trigger immediate transaction status update
-					// This ensures BlockValidation processes the block immediately instead of waiting
-					// for the periodic job (which runs every 1 minute). Same pattern as InvalidateBlock RPC.
-					if err := u.blockchainClient.SendNotification(ctx, &blockchain_api.Notification{
-						Type: model.NotificationType_BlockMinedUnset,
-						Hash: header.Hash().CloneBytes(),
-					}); err != nil {
-						notifyErrors++
-					}
-				}
-			}
-			if clearErrors > 0 || notifyErrors > 0 {
-				u.logger.Errorf("[catchup][%s] Fork block cleanup: %d/%d clear failures, %d notification failures",
-					catchupCtx.blockUpTo.Hash().String(), clearErrors, len(headers), notifyErrors)
-			}
-			u.logger.Infof("[catchup][%s] Cleared mined_set on %d fork blocks and sent notifications",
-				catchupCtx.blockUpTo.Hash().String(), len(headers))
-		}
-	}
-
 	// Step 6: Filter headers to only those we need to catchup
 	if err = u.filterHeaders(ctx, catchupCtx); err != nil {
 		return err
@@ -377,6 +337,13 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return err
 	}
 
+	// Step 9.6: If a fork was detected, reset mined_set on the local blocks it replaces, for
+	// transaction state consistency. This runs only once every check on the offered chain has
+	// passed (fork depth, secret mining, linkage, checkpoints, difficulty), immediately before the
+	// blocks are fetched. Run any earlier, and a peer offering a fork that a later check rejects
+	// would un-stamp this node's own still-canonical txs for no reorg (issue #1145).
+	u.clearMinedSetOnForkedBlocks(ctx, catchupCtx)
+
 	// Step 10: Fetch and validate blocks
 	if err = u.fetchAndValidateBlocks(ctx, catchupCtx); err != nil {
 		return err
@@ -389,6 +356,50 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 	u.reportCatchupSuccess(ctx, catchupCtx.peerID, time.Since(catchupCtx.startTime))
 
 	return nil
+}
+
+// clearMinedSetOnForkedBlocks clears mined_set on the local blocks above the common ancestor and
+// sends a BlockMinedUnset notification for each, ahead of the reorg that fetchAndValidateBlocks
+// applies. It does nothing when the offered chain does not fork our own. Failures are logged, not
+// returned, as they were when this ran inline as step 5.5.
+func (u *Server) clearMinedSetOnForkedBlocks(ctx context.Context, catchupCtx *CatchupContext) {
+	if catchupCtx.forkDepth == 0 {
+		return
+	}
+
+	u.logger.Infof("[catchup][%s] Fork detected (depth %d), clearing mined_set on old blocks",
+		catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth)
+
+	currentHeight := catchupCtx.currentHeight
+	headers, _, err := u.blockchainClient.GetBlockHeadersByHeight(ctx,
+		catchupCtx.commonAncestorMeta.Height+1, currentHeight)
+	if err != nil {
+		u.logger.Errorf("[catchup][%s] Failed to get fork block headers: %v",
+			catchupCtx.blockUpTo.Hash().String(), err)
+	} else {
+		var clearErrors, notifyErrors int
+		for _, header := range headers {
+			if err := u.blockchainClient.ClearBlockMinedSet(ctx, header.Hash()); err != nil {
+				clearErrors++
+			} else {
+				// Send BlockMinedUnset notification to trigger immediate transaction status update
+				// This ensures BlockValidation processes the block immediately instead of waiting
+				// for the periodic job (which runs every 1 minute). Same pattern as InvalidateBlock RPC.
+				if err := u.blockchainClient.SendNotification(ctx, &blockchain_api.Notification{
+					Type: model.NotificationType_BlockMinedUnset,
+					Hash: header.Hash().CloneBytes(),
+				}); err != nil {
+					notifyErrors++
+				}
+			}
+		}
+		if clearErrors > 0 || notifyErrors > 0 {
+			u.logger.Errorf("[catchup][%s] Fork block cleanup: %d/%d clear failures, %d notification failures",
+				catchupCtx.blockUpTo.Hash().String(), clearErrors, len(headers), notifyErrors)
+		}
+		u.logger.Infof("[catchup][%s] Cleared mined_set on %d fork blocks and sent notifications",
+			catchupCtx.blockUpTo.Hash().String(), len(headers))
+	}
 }
 
 // handleNoNewHeaders is invoked when filterHeaders leaves zero headers to process.
@@ -1033,18 +1044,15 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 		return errors.NewBlockInvalidError("[catchup][%s] common ancestor %s at height %d is marked invalid, not catching up", catchupCtx.blockUpTo.Hash().String(), commonAncestorHash.String(), commonAncestorMeta.Height)
 	}
 
-	// The first header after the ancestor must name the ancestor as its parent. Every later step
-	// assigns heights as ancestor+1+index, so a first header built on some other stored block would
-	// be validated at the wrong heights (checkpoint matching included). The header cache only checks
-	// links among the new headers, and verifyChainContinuity only that the parent exists somewhere.
-	// This runs here, before step 5.5, so a mis-linked offer cannot un-stamp our own blocks for a
-	// fork that is then rejected (issue #1145). ProcessingError, as for the "chain broken" defect
-	// one link later in HeaderChainCache.validateChain: a generic peer fault, not proof of malice,
-	// since a peer that reorged between header iterations can serve a seam like this honestly.
+	// The headers after the ancestor must form one chain built on it. Every later step assigns
+	// heights as ancestor+1+index, so a first header built on some other stored block would be
+	// validated at the wrong heights (checkpoint matching included), and a break further up would
+	// only surface in the header cache. catchupGetBlockHeaders splices an honest peer's mid-fetch
+	// reorg, so a break here is the peer's fault: NetworkInvalidResponse, charged to the peer.
 	if commonAncestorIndex+1 < len(peerHeaders) {
-		firstNewHeader := peerHeaders[commonAncestorIndex+1]
-		if !firstNewHeader.HashPrevBlock.IsEqual(commonAncestorHash) {
-			return errors.NewProcessingError("[catchup][%s] first header %s after common ancestor %s does not link to common ancestor: its parent is %s", catchupCtx.blockUpTo.Hash().String(), firstNewHeader.Hash().String(), commonAncestorHash.String(), firstNewHeader.HashPrevBlock.String())
+		offered := peerHeaders[commonAncestorIndex+1:]
+		if !(&catchup.CommonAncestorFinder{}).ValidateChainConnection(offered, commonAncestorHash) {
+			return errors.NewNetworkInvalidResponseError("[catchup][%s] headers offered after common ancestor %s do not link to common ancestor as one chain (first header %s has parent %s)", catchupCtx.blockUpTo.Hash().String(), commonAncestorHash.String(), offered[0].Hash().String(), offered[0].HashPrevBlock.String())
 		}
 	}
 
@@ -1178,7 +1186,7 @@ func (u *Server) buildHeaderCache(catchupCtx *CatchupContext) error {
 	if len(catchupCtx.blockHeaders) > 0 {
 		firstHeaderParent := catchupCtx.blockHeaders[0].HashPrevBlock
 		if !firstHeaderParent.IsEqual(catchupCtx.commonAncestorHash) {
-			return errors.NewProcessingError("[catchup][%s] first header parent %s does not link to common ancestor %s", catchupCtx.blockUpTo.Hash().String(), firstHeaderParent.String(), catchupCtx.commonAncestorHash.String())
+			return errors.NewNetworkInvalidResponseError("[catchup][%s] first header parent %s does not link to common ancestor %s", catchupCtx.blockUpTo.Hash().String(), firstHeaderParent.String(), catchupCtx.commonAncestorHash.String())
 		}
 	}
 

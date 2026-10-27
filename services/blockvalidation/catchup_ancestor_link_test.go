@@ -79,9 +79,9 @@ func storeMinedBlock(ctx context.Context, t *testing.T, store blockchain_store.S
 }
 
 // minedSetClearRecorder wraps the real sqlitememory-backed client and counts ClearBlockMinedSet
-// calls, delegating each one. Reading mined_set back after catchup() is racy: step 5.5 sends a
+// calls, delegating each one. Reading mined_set back after catchup() is racy: step 9.6 sends a
 // BlockMinedUnset notification per block, and block validation's background job re-marks those
-// blocks mined on its own schedule. The call count is what step 5.5 actually did.
+// blocks mined on its own schedule. The call count is what step 9.6 actually did.
 type minedSetClearRecorder struct {
 	blockchain.ClientI
 
@@ -95,7 +95,7 @@ func (r *minedSetClearRecorder) ClearBlockMinedSet(ctx context.Context, blockHas
 }
 
 // ancestorLinkRun is what one catchup() run left behind: the error, how many /blocks/ requests
-// reached the peer, how many local blocks step 5.5 un-stamped, and the real client plus the two
+// reached the peer, how many local blocks step 9.6 un-stamped, and the real client plus the two
 // header chains, so the caller can read the end state from the store.
 type ancestorLinkRun struct {
 	err            error
@@ -106,12 +106,24 @@ type ancestorLinkRun struct {
 	offered        []*model.BlockHeader // h1..h5, the headers the peer offers after the ancestor
 }
 
+// offerShape is the header offer the peer serves after the common ancestor b5.
+type offerShape int
+
+const (
+	// offerLinked: h1..h5, h1 built on b5. An honest fork of depth 5.
+	offerLinked offerShape = iota
+	// offerFirstOnOther: h1..h5, h1 built on B, a stored block other than the ancestor.
+	offerFirstOnOther
+	// offerBreakAtSecond: h1 built on b5, then h2..h5 built on B, so the chain breaks after h1.
+	offerBreakAtSecond
+	// offerNothingNew: the peer serves b5 alone, nothing after the ancestor.
+	offerNothingNew
+)
+
 // runAncestorLinkCatchup runs catchup() against a real sqlitememory blockchain store holding the
 // local chain genesis..b10, every block mined, plus B, a second stored block (a side block on
-// genesis at height 1). The peer offers [b5, h1..h5]. When firstParentIsAncestor is true, h1 is
-// built on b5, an honest fork of depth 5. When false, h1 is built on B, so it names a stored block
-// other than the common ancestor as its parent.
-func runAncestorLinkCatchup(t *testing.T, firstParentIsAncestor bool) ancestorLinkRun {
+// genesis at height 1). The peer serves [b5] followed by the headers shape describes.
+func runAncestorLinkCatchup(t *testing.T, shape offerShape) ancestorLinkRun {
 	initPrometheusMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,12 +169,20 @@ func runAncestorLinkCatchup(t *testing.T, firstParentIsAncestor bool) ancestorLi
 
 	ancestor := mainChain[4] // b5
 
-	firstParent := otherBlockB
-	if firstParentIsAncestor {
-		firstParent = ancestor
+	var offered, served []*model.BlockHeader
+
+	switch shape {
+	case offerLinked, offerNothingNew:
+		offered = forkHeadersFrom(t, ancestor, 5, 6, 1000)
+	case offerFirstOnOther:
+		offered = forkHeadersFrom(t, otherBlockB, 5, 6, 1000)
+	case offerBreakAtSecond:
+		offered = append(forkHeadersFrom(t, ancestor, 1, 6, 1000), forkHeadersFrom(t, otherBlockB, 4, 7, 2000)...)
 	}
 
-	offered := forkHeadersFrom(t, firstParent, 5, 6, 1000)
+	if shape != offerNothingNew {
+		served = offered
+	}
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
@@ -191,7 +211,7 @@ func runAncestorLinkCatchup(t *testing.T, firstParentIsAncestor bool) ancestorLi
 	t.Cleanup(httpmock.DeactivateAndReset)
 
 	responseHeaders := append([]byte{}, ancestor.Bytes()...)
-	for _, h := range offered {
+	for _, h := range served {
 		responseHeaders = append(responseHeaders, h.Bytes()...)
 	}
 
@@ -224,8 +244,8 @@ func runAncestorLinkCatchup(t *testing.T, firstParentIsAncestor bool) ancestorLi
 }
 
 // minedAboveAncestor reads mined_set from the real store for b6..b10, the local blocks above the
-// ancestor that step 5.5 un-stamps ahead of a reorg. Only meaningful when nothing was cleared: once
-// step 5.5 runs, background re-marking makes the flags race (see minedSetClearRecorder).
+// ancestor that step 9.6 un-stamps ahead of a reorg. Only meaningful when nothing was cleared: once
+// step 9.6 runs, background re-marking makes the flags race (see minedSetClearRecorder).
 func minedAboveAncestor(t *testing.T, run ancestorLinkRun) []bool {
 	t.Helper()
 
@@ -241,41 +261,71 @@ func minedAboveAncestor(t *testing.T, run ancestorLinkRun) []bool {
 	return mined
 }
 
+// requireRejectedWithoutSideEffects asserts that catchup refused the offer and left the node as
+// it was: no block body fetched, no local block un-stamped, b6..b10 still mined, nothing offered
+// stored.
+func requireRejectedWithoutSideEffects(t *testing.T, run ancestorLinkRun) {
+	t.Helper()
+
+	require.Zero(t, run.blocksRequests, "no block may be fetched for a rejected offer")
+	require.Zero(t, run.minedClears, "a rejected offer must not un-stamp any local block (step 9.6)")
+	require.Equal(t, []bool{true, true, true, true, true}, minedAboveAncestor(t, run),
+		"a rejected offer must leave the local blocks above the ancestor mined")
+
+	for _, h := range run.offered {
+		exists, err := run.client.GetBlockExists(context.Background(), h.Hash())
+		require.NoError(t, err)
+		require.False(t, exists, "no offered block may be stored")
+	}
+}
+
 // TestCatchup_FirstHeaderMustLinkToCommonAncestor covers bitcoin-sv/teranode#4975 against a real
-// sqlitememory blockchain store. The peer offers [b5, h1..h5]: b5 is the stored common ancestor,
-// but h1's previous hash is B, a different stored block. Catchup must abort before step 5.5
-// un-stamps the local blocks above the ancestor, and before it fetches any block body, because
-// every height it would assign (ancestor + 1 + index) is wrong.
+// sqlitememory blockchain store. b5 is the stored common ancestor and b10 the local tip, so every
+// offer here is a fork of depth 5. Catchup must reject an offer whose headers do not form one chain
+// on b5, as a peer fault (NetworkInvalidResponse), before it un-stamps the local blocks above the
+// ancestor and before it fetches any block body, because every height it would assign
+// (ancestor + 1 + index) is wrong.
 //
-// The control subtest runs the same setup with h1 built on b5. It does un-stamp b6..b10 and does
-// reach the block fetch, so the zero clear and fetch counts in the second subtest are not vacuous.
+// The control subtest runs the same setup with a linked offer. It does un-stamp b6..b10 and does
+// reach the block fetch, so the zero clear and fetch counts in the other subtests are not vacuous.
 //
-// Mutation proof: delete the link check in findCommonAncestor and the second subtest fails on the
-// clear count, because step 5.5 un-stamps b6..b10 before buildHeaderCache rejects the offer.
+// Mutation proofs: moving the mined_set clear back to its old place straight after the
+// secret-mining check fails nothing_new_after_ancestor on the clear count. Checking only the first
+// link in findCommonAncestor fails chain_breaks_after_first_header on the error message, because
+// the break then surfaces later, in the header cache.
 func TestCatchup_FirstHeaderMustLinkToCommonAncestor(t *testing.T) {
 	t.Run("control_linked_chain_unstamps_and_reaches_block_fetch", func(t *testing.T) {
-		run := runAncestorLinkCatchup(t, true)
+		run := runAncestorLinkCatchup(t, offerLinked)
 
 		require.Positive(t, run.blocksRequests, "a correctly linked chain must reach the block fetch, else the setup is vacuous")
 		require.Equal(t, int64(5), run.minedClears, "a correctly linked fork of depth 5 must un-stamp b6..b10, else the setup is vacuous")
 	})
 
 	t.Run("first_header_parent_is_other_stored_block", func(t *testing.T) {
-		run := runAncestorLinkCatchup(t, false)
+		run := runAncestorLinkCatchup(t, offerFirstOnOther)
 
 		require.Error(t, run.err, "catchup must abort when the first header does not link to the common ancestor")
-		require.True(t, errors.Is(run.err, errors.ErrProcessing), "a mis-linked offer is a generic peer fault: %v", run.err)
-		require.Contains(t, run.err.Error(), "does not link to common ancestor")
-		require.Zero(t, run.blocksRequests, "no block may be fetched once the link to the ancestor is broken")
-		require.Zero(t, run.minedClears, "a rejected offer must not un-stamp any local block (step 5.5)")
-		require.Equal(t, []bool{true, true, true, true, true}, minedAboveAncestor(t, run),
-			"a rejected offer must leave the local blocks above the ancestor mined")
+		require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "a mis-linked offer is a peer fault: %v", run.err)
+		require.Contains(t, run.err.Error(), "do not link to common ancestor as one chain")
+		requireRejectedWithoutSideEffects(t, run)
+	})
 
-		for _, h := range run.offered {
-			exists, err := run.client.GetBlockExists(context.Background(), h.Hash())
-			require.NoError(t, err)
-			require.False(t, exists, "no offered block may be stored")
-		}
+	t.Run("chain_breaks_after_first_header", func(t *testing.T) {
+		run := runAncestorLinkCatchup(t, offerBreakAtSecond)
+
+		require.Error(t, run.err, "catchup must abort when a later offered header does not link to the one before it")
+		require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "a broken offer is a peer fault: %v", run.err)
+		require.Contains(t, run.err.Error(), "do not link to common ancestor as one chain")
+		requireRejectedWithoutSideEffects(t, run)
+	})
+
+	t.Run("nothing_new_after_ancestor", func(t *testing.T) {
+		// The fork depth is still 5, but there is nothing to reorg to, so there is nothing to
+		// un-stamp. The old placement of the clear un-stamped b6..b10 here and then returned.
+		run := runAncestorLinkCatchup(t, offerNothingNew)
+
+		require.Error(t, run.err, "a peer with nothing after the ancestor and an unknown target is on a dead fork")
+		requireRejectedWithoutSideEffects(t, run)
 	})
 }
 
@@ -323,7 +373,7 @@ func TestBuildHeaderCache_RejectsFirstHeaderNotLinkedToAncestor(t *testing.T) {
 
 		err := newServer().buildHeaderCache(catchupCtx)
 		require.Error(t, err)
-		require.True(t, errors.Is(err, errors.ErrProcessing), "a mis-linked first header is a generic peer fault: %v", err)
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "a mis-linked first header is a peer fault: %v", err)
 		require.Contains(t, err.Error(), "does not link to common ancestor")
 	})
 }
