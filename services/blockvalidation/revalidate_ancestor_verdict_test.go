@@ -139,32 +139,108 @@ func TestReValidateBlock_InvalidAncestorVerdictOnForkChainIsNotActedOn(t *testin
 		"reValidateBlock published an invalid-block notification for an honest block whose parent is off the main chain")
 }
 
-// TestReValidateBlock_InvalidAncestorVerdictParentNotMinedIsNotActedOn covers the false INVALID
+// TestReValidateBlock_InvalidAncestorVerdictParentNeverMinedIsNotActedOn covers the false INVALID
 // that comes from stale tx BlockIDs. A parent tx first mined in a losing fork block F keeps
 // BlockIDs=[F] until setTxMined runs for the main-chain block that re-mines it. The revalidation
-// path can reach the ancestor check before that, because the parentHeaderRun-failure enqueue in
-// ValidateBlockWithOptions runs before waitForPreviousBlocksToBeProcessed. While C's parent is not
-// mined_set, reValidateBlock must hand the verdict back unacted for the worker to retry.
+// path can reach reValidateBlock before that, because the parentHeaderRun-failure enqueue in
+// ValidateBlockWithOptions runs before waitForPreviousBlocksToBeProcessed. So reValidateBlock waits
+// for the parent itself, and when the parent never becomes mined it gives up without reading the
+// BlockIDs, so nothing is invalidated or published.
 //
 // Fixture: the same as TestReValidateBlock_InvalidAncestorVerdictInvalidatesAndPublishes, so C's
 // parent A IS on the main chain, but A's mined_set is never set.
-func TestReValidateBlock_InvalidAncestorVerdictParentNotMinedIsNotActedOn(t *testing.T) {
+func TestReValidateBlock_InvalidAncestorVerdictParentNeverMinedIsNotActedOn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	bv, blockchainClient, blockC, kafkaProducer := newAncestorVerdictFixture(ctx, t, ancestorVerdictFixtureOpts{storeC: true})
 
 	err := bv.reValidateBlock(revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
-	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected the ancestor check's ErrBlockInvalid verdict, got: %v", err)
+	require.Error(t, err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "expected a give-up on the parent wait, not an INVALID verdict, got: %v", err)
+	require.True(t, errors.Is(err, errors.ErrBlockParentNotMined), "expected the parent-not-mined give-up, got: %v", err)
 
 	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
 	require.NoError(t, err)
 	require.NotNil(t, cMeta)
 
 	require.False(t, cMeta.Invalid,
-		"reValidateBlock invalidated a block on an ancestor verdict read before its parent was mined_set")
+		"reValidateBlock invalidated a block before its parent was mined_set")
 	require.False(t, kafkaProducer.IsPublishCalled(),
-		"reValidateBlock published an invalid-block notification on an ancestor verdict read before its parent was mined_set")
+		"reValidateBlock published an invalid-block notification before its parent was mined_set")
+}
+
+// TestReValidateBlock_HonestBlockWaitsForParentSetTxMined is the end-to-end form of the case above.
+// The funding tx is first stamped only in fork block F. While reValidateBlock waits on C's parent
+// A, setTxMined for A runs: it adds A to the funding tx's BlockIDs, then marks A mined_set. C is
+// honest once that has run, so it must not be invalidated or published, and revalidation succeeds.
+func TestReValidateBlock_HonestBlockWaitsForParentSetTxMined(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	extras := &ancestorVerdictExtras{}
+	bv, blockchainClient, blockC, kafkaProducer := newAncestorVerdictFixture(ctx, t, ancestorVerdictFixtureOpts{storeC: true, extras: extras})
+
+	setTxMinedDone := make(chan error, 1)
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+
+		if _, err := extras.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{extras.fundingTxHash},
+			utxostore.MinedBlockInfo{BlockID: extras.parentMeta.ID, BlockHeight: extras.parentMeta.Height, OnLongestChain: true}); err != nil {
+			setTxMinedDone <- err
+			return
+		}
+
+		setTxMinedDone <- blockchainClient.SetBlockMinedSet(ctx, blockC.Header.HashPrevBlock)
+	}()
+
+	err := bv.reValidateBlock(revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
+	require.NoError(t, <-setTxMinedDone)
+	require.NoError(t, err, "an honest block must revalidate once its parent's setTxMined has run")
+
+	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
+	require.NoError(t, err)
+	require.NotNil(t, cMeta)
+
+	require.False(t, cMeta.Invalid, "reValidateBlock invalidated an honest block on BlockIDs read before its parent's setTxMined")
+	require.False(t, kafkaProducer.IsPublishCalled(), "reValidateBlock published an honest block as invalid")
+}
+
+// TestReValidateBlock_InvalidAncestorVerdictActsDespiteStaleHeaderCache pins that the parent wait
+// does not read the mined flag from the parent-header run. With the in-memory chain check on,
+// GetBlockHeaders is served from chainWalkCache, which SetBlockMinedSet does not clear. Here the
+// run is cached while A is not yet mined, as ValidateBlockWithOptions's own parentHeaderRun would
+// cache it, and A is then marked mined. C is genuinely invalid, so it must still be invalidated and
+// published.
+func TestReValidateBlock_InvalidAncestorVerdictActsDespiteStaleHeaderCache(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bv, blockchainClient, blockC, kafkaProducer := newAncestorVerdictFixture(ctx, t, ancestorVerdictFixtureOpts{storeC: true, inMemoryChainCheck: true})
+
+	count := bv.settings.BlockValidation.PreviousBlockHeaderCount
+
+	_, primed, err := bv.parentHeaderRun(ctx, blockC, count)
+	require.NoError(t, err)
+	require.NotEmpty(t, primed)
+	require.False(t, primed[0].MinedSet, "precondition: the cached run has the parent not mined")
+
+	require.NoError(t, blockchainClient.SetBlockMinedSet(ctx, blockC.Header.HashPrevBlock))
+
+	_, cached, err := bv.parentHeaderRun(ctx, blockC, count)
+	require.NoError(t, err)
+	require.False(t, cached[0].MinedSet, "precondition: the header run is still served stale from the cache")
+
+	err = bv.reValidateBlock(revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected the ancestor check's ErrBlockInvalid verdict, got: %v", err)
+
+	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
+	require.NoError(t, err)
+	require.NotNil(t, cMeta)
+
+	require.True(t, cMeta.Invalid, "a stale cached mined flag stopped reValidateBlock invalidating a genuinely invalid block")
+	require.True(t, kafkaProducer.IsPublishCalled(), "a stale cached mined flag stopped the invalid-block notification")
 }
 
 // ancestorVerdictFixtureOpts selects the newAncestorVerdictFixture variant.
@@ -175,6 +251,17 @@ type ancestorVerdictFixtureOpts struct {
 	deepFork bool
 	// parentMinedSet marks C's parent mined_set, as setTxMined does once it has run for it.
 	parentMinedSet bool
+	// inMemoryChainCheck turns on blockchain_use_in_memory_chain_check without the deep fork.
+	inMemoryChainCheck bool
+	// extras, when set, receives the stores and ids a test needs to play setTxMined itself.
+	extras *ancestorVerdictExtras
+}
+
+// ancestorVerdictExtras carries what newAncestorVerdictFixture built beyond its return values.
+type ancestorVerdictExtras struct {
+	utxoStore     utxostore.Store
+	fundingTxHash *chainhash.Hash
+	parentMeta    *model.BlockHeaderMeta
 }
 
 // newAncestorVerdictFixture builds the GAP-BV-043 fixture and returns a BlockValidation wired to
@@ -205,6 +292,15 @@ func newAncestorVerdictFixture(ctx context.Context, t *testing.T, opts ancestorV
 		tSettings.BlockChain.UseInMemoryChainCheck = true
 		tSettings.BlockValidation.PreviousBlockHeaderCount = deepForkHeaderCount
 	}
+
+	if opts.inMemoryChainCheck {
+		tSettings.BlockChain.UseInMemoryChainCheck = true
+	}
+
+	// reValidateBlock waits for the parent to be mined. Keep a give-up short: about 0.2s per wait.
+	tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 10
+	tSettings.BlockValidation.IsParentMinedRetryBackoffDuration = 2 * time.Millisecond
+	tSettings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
 
 	blockChainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
 	require.NoError(t, err)
@@ -340,6 +436,15 @@ func newAncestorVerdictFixture(ctx context.Context, t *testing.T, opts ancestorV
 		require.NoError(t, blockchainClient.SetBlockMinedSet(ctx, childParent.Hash()))
 	}
 
+	if opts.extras != nil {
+		_, parentMeta, err := blockchainClient.GetBlockHeader(ctx, childParent.Hash())
+		require.NoError(t, err)
+
+		opts.extras.utxoStore = utxoStore
+		opts.extras.fundingTxHash = fundingTx.TxIDChainHash()
+		opts.extras.parentMeta = parentMeta
+	}
+
 	if storeC {
 		// The block was added optimistically before validation completed.
 		require.NoError(t, blockchainClient.AddBlock(ctx, blockC, "test"))
@@ -353,7 +458,14 @@ func newAncestorVerdictFixture(ctx context.Context, t *testing.T, opts ancestorV
 
 	kafkaProducer := &SafeMockKafkaProducer{}
 
-	bv := NewBlockValidation(ctx, logger, tSettings, blockchainClient, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
+	// Build bv on an already cancelled context, so its background workers exit at once. Left
+	// running, its startup pass runs setTxMined for every block not yet mined_set, which marks C's
+	// parent mined behind the test's back. The tests here drive the parent's mined state themselves.
+	// reValidateBlock does not use this context.
+	bvCtx, bvCancel := context.WithCancel(ctx)
+	bvCancel()
+
+	bv := NewBlockValidation(bvCtx, logger, tSettings, blockchainClient, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
 	t.Cleanup(bv.StopCaches)
 
 	bv.invalidBlockKafkaProducer = kafkaProducer
@@ -382,8 +494,8 @@ func remineAt(t *testing.T, hdr *model.BlockHeader, timestamp uint32) {
 }
 
 // TestAncestorVerdictIsSound_FailSafe pins the branches of ancestorVerdictIsSound that must read as
-// false, the direction that never invalidates: no parent meta, a nil parent entry, a parent not yet
-// mined_set, and a parent id that is not on the main chain. The last positive case shows the real
+// false, the direction that never invalidates: no parent meta, a nil parent entry, and a parent id
+// that is not on the main chain. The last positive case shows the real
 // parent reads as true, so each false above comes from the branch it names.
 func TestAncestorVerdictIsSound_FailSafe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -393,18 +505,13 @@ func TestAncestorVerdictIsSound_FailSafe(t *testing.T) {
 
 	_, parentMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Header.HashPrevBlock)
 	require.NoError(t, err)
-	require.True(t, parentMeta.MinedSet, "precondition: the fixture marked C's parent mined_set")
 
 	require.False(t, bv.ancestorVerdictIsSound(ctx, blockC, nil), "no parent meta must not license acting on the verdict")
 	require.False(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{nil}), "a nil parent entry must not license acting on the verdict")
-
-	notMined := *parentMeta
-	notMined.MinedSet = false
-	require.False(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{&notMined}), "a parent not yet mined_set must not license acting on the verdict")
 
 	unknown := *parentMeta
 	unknown.ID = 1 << 30
 	require.False(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{&unknown}), "a parent id the store does not know must not license acting on the verdict")
 
-	require.True(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{parentMeta}), "a mined_set parent on the main chain licenses acting on the verdict")
+	require.True(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{parentMeta}), "a parent on the main chain licenses acting on the verdict")
 }
