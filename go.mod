@@ -371,7 +371,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
 	github.com/aws/smithy-go v1.25.1
-	github.com/bitcoin-sv/bdk/module/gobdk v1.3.1
+	github.com/bitcoin-sv/bdk/module/gobdk v1.4.0
 	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv6
 	github.com/bsv-blockchain/go-alert-system v0.3.3
 	github.com/bsv-blockchain/go-batcher/v2 v2.0.6

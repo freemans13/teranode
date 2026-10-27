@@ -44,6 +44,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/bump"
 	"github.com/bsv-blockchain/teranode/util/health"
+	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/jellydator/ttlcache/v3"
@@ -135,6 +136,27 @@ type BlockAssembly struct {
 
 	// stopOnce ensures Stop() is only executed once
 	stopOnce sync.Once
+
+	// txMetaProducer publishes txmeta DELETEs for txs demoted to conflicting, so
+	// subtree validation evicts them from its txmeta cache. Nil when the txmeta
+	// topic is not configured. Started in Start, stopped in Stop.
+	txMetaProducer kafka.KafkaAsyncProducerI
+}
+
+// Option configures optional dependencies of the BlockAssembly service.
+type Option func(*BlockAssembly)
+
+// WithTxMetaProducer sets the Kafka producer for the txmeta topic. The service
+// starts and stops it. A nil producer, including a typed-nil pointer, disables
+// txmeta eviction publishing.
+func WithTxMetaProducer(p kafka.KafkaAsyncProducerI) Option {
+	return func(ba *BlockAssembly) {
+		if typed, ok := p.(*kafka.KafkaAsyncProducer); ok && typed == nil {
+			p = nil
+		}
+
+		ba.txMetaProducer = p
+	}
 }
 
 // subtreeRetrySend encapsulates the data needed for retrying subtree storage operations
@@ -163,11 +185,12 @@ type subtreeRetrySend struct {
 //   - utxoStore: UTXO storage
 //   - subtreeStore: Subtree storage
 //   - blockchainClient: Interface to blockchain operations
+//   - opts: Optional dependencies, e.g. WithTxMetaProducer
 //
 // Returns:
 //   - *BlockAssembly: New block assembly instance
 func New(logger ulogger.Logger, tSettings *settings.Settings, txStore blob.Store, utxoStore utxostore.Store, subtreeStore blob.Store,
-	blockchainClient blockchain.ClientI) *BlockAssembly {
+	blockchainClient blockchain.ClientI, opts ...Option) *BlockAssembly {
 	// initialize Prometheus metrics, singleton, will only happen once
 	initPrometheusMetrics()
 
@@ -188,6 +211,10 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, txStore blob.Store
 		subtreeStore:        subtreeStore,
 		jobStore:            ttlcache.New[chainhash.Hash, *subtreeprocessor.Job](),
 		blockSubmissionChan: make(chan *BlockSubmissionRequest),
+	}
+
+	for _, opt := range opts {
+		opt(ba)
 	}
 
 	go ba.jobStore.Start()
@@ -310,7 +337,11 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 	subtreeRetryChan := make(chan *subtreeRetrySend, ba.settings.BlockAssembly.SubtreeRetryChanBuffer)
 
 	// init the block assembler for this server
-	ba.blockAssembler, err = NewBlockAssembler(ctx, ba.logger, ba.settings, ba.stats, ba.utxoStore, ba.subtreeStore, ba.blockchainClient, newSubtreeChan)
+	// nil when no txmeta producer is configured, which disables eviction publishing
+	txMetaEvictor := subtreeprocessor.NewTxMetaEvictor(ba.logger, ba.txMetaProducer)
+
+	ba.blockAssembler, err = NewBlockAssembler(ctx, ba.logger, ba.settings, ba.stats, ba.utxoStore, ba.subtreeStore, ba.blockchainClient, newSubtreeChan,
+		WithTxMetaEvictor(txMetaEvictor))
 	if err != nil {
 		return errors.NewServiceError("failed to init block assembler", err)
 	}
@@ -1149,6 +1180,12 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 		return ctx.Err()
 	}
 
+	// The producer must be running before the block assembler starts: its startup
+	// replay of pending conflict intents can already demote txs and publish DELETEs.
+	if ba.txMetaProducer != nil {
+		ba.txMetaProducer.Start(ctx, make(chan *kafka.Message, 10_000))
+	}
+
 	// This must succeed for the service to be functional
 	if err = ba.blockAssembler.Start(ctx); err != nil {
 		return errors.NewServiceError("failed to start block assembler", err)
@@ -1186,6 +1223,12 @@ func (ba *BlockAssembly) Stop(ctx context.Context) error {
 		if ba.blockAssembler != nil && ba.blockAssembler.subtreeProcessor != nil {
 			ba.blockAssembler.subtreeProcessor.Stop(ctx)
 		}
+
+		// after the subtree processor, which is the last publisher
+		stopCtx, cancel := context.WithTimeout(context.Background(), util.DefaultBatcherDrainTimeout)
+		defer cancel()
+
+		kafka.StopProducerCtx(stopCtx, ba.logger, "blockassembly txmeta", ba.txMetaProducer)
 	})
 
 	return nil
@@ -2121,7 +2164,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		TransactionCount: transactionCount,
 		SizeInBytes:      blockSize,
 		// The height this candidate was issued for (GetMiningCandidate sets it to best+1).
-		// block.Valid below is height-dependent and reads it: CoinbaseCommonRuleViolation picks the
+		// block.Valid below is height-dependent and reads it: TxCommonRuleViolation picks the
 		// pre- or post-Genesis coinbase limits from it, and the BIP34 and reward checks are guarded
 		// on it being non-zero. Leaving it unset judged every submitted block at height 0, which is
 		// below every network's Genesis activation, so a coinbase over 1MB or over the pre-Genesis
