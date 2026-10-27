@@ -290,13 +290,6 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return err
 	}
 
-	// Step 3.1: Refuse a fork below the checkpoint on the netted route, at any depth, before the
-	// fork-depth check scores a deep one as a local fault and before the mined_set clear below
-	// un-stamps this node's own blocks for a fork this route can never take.
-	if err = u.refuseNettedRouteFork(catchupCtx); err != nil {
-		return err
-	}
-
 	// Step 4: Validate fork depth against coinbase maturity
 	if err = u.validateForkDepth(catchupCtx); err != nil {
 		return err
@@ -304,6 +297,15 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 
 	// Step 5: Check for secret mining attempts
 	if err = u.checkSecretMining(ctx, catchupCtx); err != nil {
+		return err
+	}
+
+	// Step 5.1: Refuse a fork below the checkpoint on the netted route, at any depth, before the
+	// mined_set clear below un-stamps this node's own blocks for a fork this route can never take.
+	// It runs after the fork-depth and secret-mining checks, which read headers only, so a fork
+	// deeper than coinbase maturity, or a secretly mined one, is still reported as malicious
+	// (recordMaliciousAttempt) rather than charged as a generic failure.
+	if err = u.refuseNettedRouteFork(catchupCtx); err != nil {
 		return err
 	}
 
@@ -584,14 +586,6 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// remain attributable through the failedPeers drain below.
 			errorType = "local_fsm_refusal"
 			isPeerError = false
-		case isLocalCatchupFault(*err) && strings.Contains(errorMsg, "checkpoint"):
-			// A local refusal that names the checkpoint: the netted route has no verified
-			// checkpoint in this window, or a quick validation there is retried. Server.go scores
-			// it local through isLocalCatchupFault. Matched by code above every text-matched case,
-			// because the wrapped cause of a retried quick validation can contain "eof", "http"
-			// or "connection", and those cases charge the peer.
-			errorType = "local_no_verified_checkpoint"
-			isPeerError = false
 		case isUnboundTxInvalidVerdict(*err):
 			// An invalid transaction in an unbound subtree list (bitcoin-sv/teranode#4844): corrupt
 			// on the direct peer path, but on catch-up a consensus rejection, scored exactly like
@@ -622,6 +616,16 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			isPeerError = false
 			reportCorruptBlock = true
 			corruptBlockHash = ctx.corruptBlockHash
+		case isNettedRouteRefusal(*err):
+			// A local netted-route refusal: the window has no verified checkpoint, or a quick
+			// validation there is retried. Server.go scores it local through isLocalCatchupFault.
+			// Matched by the tag only these refusals carry (nettedRouteRefusalTag), not by the
+			// word "checkpoint", and below the corrupt-body and unbound-tx cases, so a chain that
+			// also carries one of those codes is scored by the code. It stays above every
+			// text-matched case, because the wrapped cause of a retried quick validation can
+			// contain "eof", "http" or "connection", and those cases charge the peer.
+			errorType = "local_no_verified_checkpoint"
+			isPeerError = false
 		case !isLocalCatchupFault(*err) && (errors.Is(*err, errors.ErrBlockInvalid) || errors.Is(*err, errors.ErrTxInvalid)):
 			// Gated on the same predicate validateBlocksOnChannel and
 			// processCatchupChItem use, rather than on the case ordering above it.
@@ -1276,8 +1280,9 @@ func (u *Server) nettedRouteFirstBlock(catchupCtx *CatchupContext) (uint32, bool
 
 // refuseNettedRouteFork refuses a fork whose first block is on the netted route, as the peer's
 // fault (a NetworkInvalidResponseError, as for a header that contradicts a checkpoint: a bare
-// ProcessingError is a local fault and charges no peer). verifyCheckpointsInHeaderChain does not check a fork, so none of its
-// blocks can be quick validated, and on this route no block can take another route. The fork is
+// ProcessingError is a local fault and charges no peer). verifyCheckpointsInHeaderChain does not
+// check a fork, so none of its blocks can be quick validated, and on this route no block can take
+// another route. The fork is
 // off the checkpointed chain: on this route each block this node holds below the checkpoint was
 // written through quick validation under a verified checkpoint at or above it, or through the
 // legacy route under a header proof that ends at a checkpoint, so a different block at the same
@@ -1294,6 +1299,20 @@ func (u *Server) refuseNettedRouteFork(catchupCtx *CatchupContext) error {
 	}
 
 	return errors.NewNetworkInvalidResponseError("[catchup][%s] peer serves a fork of depth %d from height %d, below the hardcoded checkpoint, and a netting UTXO store takes those blocks only on the checkpointed chain", catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth, first)
+}
+
+// nettedRouteRefusalTag is in the message of each local refusal of the netted route: the window
+// without a verified checkpoint (here and in tryQuickValidation), the retried quick validation,
+// and processBlockFound's block with no header proof yet. releaseCatchupLock scores an error that
+// carries it, and is a local fault, as local_no_verified_checkpoint (isNettedRouteRefusal). No
+// other error message in the node contains it, which a match on the word "checkpoint" did not
+// give.
+const nettedRouteRefusalTag = "on a netting UTXO store"
+
+// isNettedRouteRefusal reports whether err is a local refusal of the netted route. See
+// nettedRouteRefusalTag.
+func isNettedRouteRefusal(err error) bool {
+	return err != nil && isLocalCatchupFault(err) && strings.Contains(err.Error(), nettedRouteRefusalTag)
 }
 
 // refuseNettedRouteWindowWithoutCheckpoint refuses a window on the netted route whose first block
@@ -1315,7 +1334,7 @@ func (u *Server) refuseNettedRouteWindowWithoutCheckpoint(catchupCtx *CatchupCon
 		return nil
 	}
 
-	return errors.NewServiceError("[catchup][%s] block at height %d is below the hardcoded checkpoint on a netting UTXO store and can only be quick validated, but this catch-up window holds no verified checkpoint above it", catchupCtx.blockUpTo.Hash().String(), first)
+	return errors.NewServiceError("[catchup][%s] block at height %d is below the hardcoded checkpoint %s and can only be quick validated, but this catch-up window holds no verified checkpoint above it", catchupCtx.blockUpTo.Hash().String(), first, nettedRouteRefusalTag)
 }
 
 // trimWindowToVerifiedCheckpoint ends the catch-up window at its highest verified checkpoint
@@ -2019,7 +2038,7 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 		// (isLocalCatchupFault), so no peer is charged and the per-block attempt cap still bounds
 		// the retries.
 		if u.blockValidation.mustStayOnQuickValidation(block) {
-			return false, errors.NewServiceError("[tryQuickValidation][%s] block at height %d is below the hardcoded checkpoint on a netting UTXO store and can only be quick validated, but this catch-up window holds no verified checkpoint above it", block.Hash().String(), block.Height)
+			return false, errors.NewServiceError("[tryQuickValidation][%s] block at height %d is below the hardcoded checkpoint %s and can only be quick validated, but this catch-up window holds no verified checkpoint above it", block.Hash().String(), block.Height, nettedRouteRefusalTag)
 		}
 
 		return true, nil
@@ -2232,7 +2251,7 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 		if u.blockValidation.mustStayOnQuickValidation(block) {
 			// Normal validation would read spend-journal rows the netting store did not
 			// write for the part of this block it applied. Retry quick validation instead.
-			return false, errors.NewServiceError("[tryQuickValidation][%s] quick validation of a block below the checkpoint on a netting UTXO store failed; it is retried, not validated another way", block.Hash().String(), err)
+			return false, errors.NewServiceError("[tryQuickValidation][%s] quick validation of a block below the checkpoint %s failed; it is retried, not validated another way", block.Hash().String(), nettedRouteRefusalTag, err)
 		}
 
 		// Quick validation failed, try normal validation

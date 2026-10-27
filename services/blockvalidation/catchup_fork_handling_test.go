@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/assert"
@@ -771,7 +772,100 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
 		mockBlockchainClient.AssertNotCalled(t, "SendNotification", mock.Anything, mock.Anything)
 	})
+
+	// The netted route: a store that nets below a checkpoint at height 1,000, so the fork's first
+	// block (101) can take no route but quick validation, which a fork never reaches.
+	makeNetted := func(server *Server) {
+		params := *server.settings.ChainCfgParams
+		params.Checkpoints = []chaincfg.Checkpoint{{Height: 1000}}
+		server.settings.ChainCfgParams = &params
+		server.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+
+		store := nettingMockStore{server.blockValidation.utxoStore.(*utxo.MockUtxostore)}
+		server.blockValidation.utxoStore = store
+		server.utxoStore = store
+
+		// Every other request the peer gets is counted, so assertNoBodyFetch sees a body fetch.
+		httpmock.RegisterResponder("GET", `=~.*`, httpmock.NewStringResponder(http.StatusInternalServerError, ""))
+	}
+
+	// Only the header request may reach the peer: the refusal comes before any block body.
+	assertNoBodyFetch := func(t *testing.T) {
+		for call, n := range httpmock.GetCallCountInfo() {
+			if n > 0 && !strings.Contains(call, "headers_from_common_ancestor") {
+				t.Fatalf("the peer was asked for more than headers: %s (%d)", call, n)
+			}
+		}
+	}
+
+	t.Run("NettedRouteForkIsRefusedBeforeTheMinedSetClear", func(t *testing.T) {
+		// Depth 5 passes the fork-depth and secret-mining checks, so without the refusal catchup
+		// reaches Step 5.5 and un-stamps this node's own blocks for a fork it cannot take.
+		server, mockBlockchainClient, targetBlock, cleanup := buildForkScenario(t, 100, 105)
+		defer cleanup()
+
+		server.settings.ChainCfgParams.CoinbaseMaturity = 100
+		server.settings.BlockValidation.SecretMiningThreshold = 1000
+		makeNetted(server)
+
+		err := server.catchup(context.Background(), targetBlock, "peer-netted", "http://peer")
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "got %v", err)
+
+		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
+		mockBlockchainClient.AssertNotCalled(t, "SendNotification", mock.Anything, mock.Anything)
+		assertNoBodyFetch(t)
+	})
+
+	t.Run("NettedRouteWindowWithoutACheckpointIsRefusedBeforeTheFetch", func(t *testing.T) {
+		// No fork: the peer extends our tip at 100 with blocks 101-105, and the window holds no
+		// verified checkpoint (the next one is 1,000), so no block in it can be quick validated.
+		server, mockBlockchainClient, targetBlock, cleanup := buildForkScenario(t, 100, 100)
+		defer cleanup()
+
+		makeNetted(server)
+
+		err := server.catchup(context.Background(), targetBlock, "peer-netted", "http://peer")
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrServiceError), "got %v", err)
+		require.True(t, isNettedRouteRefusal(err), "got %v", err)
+
+		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
+		assertNoBodyFetch(t)
+	})
+
+	t.Run("NettedRouteDeepForkIsStillReportedMalicious", func(t *testing.T) {
+		// Depth 150 exceeds coinbase maturity. The fork-depth check must see it first, because it
+		// is what reports the peer malicious (recordMaliciousAttempt, ban score 50); the netted-
+		// route refusal must not pre-empt it as a generic failure, which demotes but never bans.
+		server, mockBlockchainClient, targetBlock, cleanup := buildForkScenario(t, 100, 250)
+		defer cleanup()
+
+		server.settings.ChainCfgParams.CoinbaseMaturity = 100
+		server.settings.BlockValidation.SecretMiningThreshold = 1000
+		makeNetted(server)
+
+		err := server.catchup(context.Background(), targetBlock, "peer-netted", "http://peer")
+
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "exceeds coinbase maturity")
+		require.False(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "the netted-route refusal ran first: %v", err)
+
+		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
+		assertNoBodyFetch(t)
+	})
 }
+
+// nettingMockStore is the catch-up test's mock UTXO store as a store that nets below the
+// checkpoint and takes outpoint-only spends, the two properties model.NettedRouteAt reads.
+type nettingMockStore struct {
+	*utxo.MockUtxostore
+}
+
+func (nettingMockStore) NetsBelowCheckpoint() bool       { return true }
+func (nettingMockStore) SupportsOutpointOnlySpend() bool { return true }
 
 // TestCatchup_CompetingEqualWorkChains tests handling of chains with equal proof of work
 func TestCatchup_CompetingEqualWorkChains(t *testing.T) {

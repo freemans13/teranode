@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -133,6 +134,24 @@ func TestNettedRoute_ReleaseCatchupLockScoresTheRefusals(t *testing.T) {
 		require.Empty(t, rec.genericErrorReported())
 	})
 
+	t.Run("a corrupt body that wraps a refusal is scored corrupt", func(t *testing.T) {
+		refusal := u.refuseNettedRouteWindowWithoutCheckpoint(&CatchupContext{
+			blockUpTo: target, commonAncestorMeta: &model.BlockHeaderMeta{Height: 400}, blockHeaders: []*model.BlockHeader{target.Header},
+		})
+		require.Error(t, refusal)
+
+		s, _ := release(t, errors.NewBlockCorruptError("[test] subtree does not hash to its key", refusal))
+		require.Equal(t, "corrupt_block_body", s.previousCatchupAttempt.ErrorType)
+	})
+
+	t.Run("a local error that only names the checkpoint is not a netted refusal", func(t *testing.T) {
+		err := errors.NewServiceError("[test] checkpoint list unavailable")
+		require.False(t, isNettedRouteRefusal(err))
+
+		s, _ := release(t, err)
+		require.NotEqual(t, "local_no_verified_checkpoint", s.previousCatchupAttempt.ErrorType)
+	})
+
 	t.Run("fork below the checkpoint is the peer's", func(t *testing.T) {
 		err := u.refuseNettedRouteFork(&CatchupContext{blockUpTo: target, forkDepth: 1, commonAncestorMeta: &model.BlockHeaderMeta{Height: 499}})
 		require.Error(t, err)
@@ -153,12 +172,22 @@ func TestNettedRoute_HeaderWindowFromATrailingUTXOHeightHoldsTheNextCheckpoint(t
 	bv, _, cleanup := newNetRangeHarness(t, "netted_route_header_window", 65536)
 	defer cleanup()
 
-	blocks := testhelpers.CreateTestBlockChain(t, 41)
+	s := bv.settings
+
+	// The real sqlite chain store, not a mock: the locator and ancestor queries this test guards
+	// are the ones production runs. It starts with the network's genesis, so the test chain
+	// builds on it, and genesis is block 0.
+	chainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, s)
+	require.NoError(t, err)
+
+	genesis, err := chainStore.GetBlockByHeight(t.Context(), 0)
+	require.NoError(t, err)
+
+	blocks := append([]*model.Block{genesis}, testhelpers.CreateTestBlocksWithPrev(t, 40, genesis.Header.Hash())...)
 	for i, b := range blocks {
 		b.Height = uint32(i) //nolint:gosec // test heights
 	}
 
-	s := bv.settings
 	s.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{
 		{Height: 10, Hash: blocks[10].Header.Hash()},
 		{Height: 30, Hash: blocks[30].Header.Hash()},
@@ -166,8 +195,7 @@ func TestNettedRoute_HeaderWindowFromATrailingUTXOHeightHoldsTheNextCheckpoint(t
 	s.BlockValidation.CatchupMaxAccumulatedHeaders = 1
 	require.Equal(t, 21, model.NettedRouteCatchupWindow(s, bv.utxoStore))
 
-	chainStore := blockchain_store.NewMockStore()
-	for _, b := range blocks[:11] {
+	for _, b := range blocks[1:11] {
 		_, _, err := chainStore.StoreBlock(t.Context(), b, "test")
 		require.NoError(t, err)
 	}
