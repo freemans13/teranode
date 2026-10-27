@@ -43,7 +43,7 @@ func TestNettedRoute_ForkBelowTheCheckpointIsChargedToThePeer(t *testing.T) {
 
 		err := u.refuseNettedRouteFork(c)
 		require.Error(t, err, "depth %d", depth)
-		require.True(t, errors.Is(err, errors.ErrProcessing), "depth %d: got %v", depth, err)
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "depth %d: got %v", depth, err)
 		require.False(t, isLocalCatchupFault(err), "depth %d: the terminal handler must charge the peer", depth)
 	}
 
@@ -138,7 +138,7 @@ func TestNettedRoute_ReleaseCatchupLockScoresTheRefusals(t *testing.T) {
 		require.Error(t, err)
 
 		s, rec := release(t, err)
-		require.Equal(t, "checkpoint_verification_failed", s.previousCatchupAttempt.ErrorType)
+		require.Equal(t, "network_error", s.previousCatchupAttempt.ErrorType)
 		require.Equal(t, []string{"peer"}, rec.genericErrorReported(), "the peer error is reported")
 	})
 }

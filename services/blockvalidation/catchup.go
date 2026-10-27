@@ -1275,7 +1275,8 @@ func (u *Server) nettedRouteFirstBlock(catchupCtx *CatchupContext) (uint32, bool
 }
 
 // refuseNettedRouteFork refuses a fork whose first block is on the netted route, as the peer's
-// fault (a ProcessingError). verifyCheckpointsInHeaderChain does not check a fork, so none of its
+// fault (a NetworkInvalidResponseError, as for a header that contradicts a checkpoint: a bare
+// ProcessingError is a local fault and charges no peer). verifyCheckpointsInHeaderChain does not check a fork, so none of its
 // blocks can be quick validated, and on this route no block can take another route. The fork is
 // off the checkpointed chain: on this route each block this node holds below the checkpoint was
 // written through quick validation under a verified checkpoint at or above it, or through the
@@ -1292,7 +1293,7 @@ func (u *Server) refuseNettedRouteFork(catchupCtx *CatchupContext) error {
 		return nil
 	}
 
-	return errors.NewProcessingError("[catchup][%s] peer serves a fork of depth %d from height %d, below the hardcoded checkpoint, and a netting UTXO store takes those blocks only on the checkpointed chain", catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth, first)
+	return errors.NewNetworkInvalidResponseError("[catchup][%s] peer serves a fork of depth %d from height %d, below the hardcoded checkpoint, and a netting UTXO store takes those blocks only on the checkpointed chain", catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth, first)
 }
 
 // refuseNettedRouteWindowWithoutCheckpoint refuses a window on the netted route whose first block
