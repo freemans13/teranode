@@ -2172,24 +2172,25 @@ func (x *RevalidateBlockRequest) GetBlockHash() []byte {
 
 // GetBlockHeaderResponse contains detailed block header information.
 type GetBlockHeaderResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	BlockHeader    []byte                 `protobuf:"bytes,1,opt,name=blockHeader,proto3" json:"blockHeader,omitempty"`                                 // Serialized block header
-	Id             uint32                 `protobuf:"varint,2,opt,name=id,proto3" json:"id,omitempty"`                                                  // Block identifier
-	Height         uint32                 `protobuf:"varint,3,opt,name=height,proto3" json:"height,omitempty"`                                          // Block height
-	TxCount        uint64                 `protobuf:"varint,4,opt,name=tx_count,json=txCount,proto3" json:"tx_count,omitempty"`                         // Transaction count
-	SizeInBytes    uint64                 `protobuf:"varint,5,opt,name=size_in_bytes,json=sizeInBytes,proto3" json:"size_in_bytes,omitempty"`           // Block size
-	Miner          string                 `protobuf:"bytes,6,opt,name=miner,proto3" json:"miner,omitempty"`                                             // Miner identifier
-	PeerId         string                 `protobuf:"bytes,7,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                             // Peer identifier
-	BlockTime      uint32                 `protobuf:"varint,8,opt,name=block_time,json=blockTime,proto3" json:"block_time,omitempty"`                   // Block timestamp
-	Timestamp      uint32                 `protobuf:"varint,9,opt,name=timestamp,proto3" json:"timestamp,omitempty"`                                    // Processing timestamp
-	ChainWork      []byte                 `protobuf:"bytes,10,opt,name=chain_work,json=chainWork,proto3" json:"chain_work,omitempty"`                   // Accumulated chain work
-	MinedSet       bool                   `protobuf:"varint,11,opt,name=mined_set,json=minedSet,proto3" json:"mined_set,omitempty"`                     // Mined status
-	SubtreesSet    bool                   `protobuf:"varint,12,opt,name=subtrees_set,json=subtreesSet,proto3" json:"subtrees_set,omitempty"`            // Subtrees status
-	Invalid        bool                   `protobuf:"varint,13,opt,name=invalid,proto3" json:"invalid,omitempty"`                                       // Validity status
-	ProcessedAt    *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=processed_at,json=processedAt,proto3" json:"processed_at,omitempty"`             // Timestamp when block was processed
-	MedianTimePast uint32                 `protobuf:"varint,15,opt,name=median_time_past,json=medianTimePast,proto3" json:"median_time_past,omitempty"` // Median Time Past (MTP) - median of last 11 block timestamps (BIP113)
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	BlockHeader        []byte                 `protobuf:"bytes,1,opt,name=blockHeader,proto3" json:"blockHeader,omitempty"`                                             // Serialized block header
+	Id                 uint32                 `protobuf:"varint,2,opt,name=id,proto3" json:"id,omitempty"`                                                              // Block identifier
+	Height             uint32                 `protobuf:"varint,3,opt,name=height,proto3" json:"height,omitempty"`                                                      // Block height
+	TxCount            uint64                 `protobuf:"varint,4,opt,name=tx_count,json=txCount,proto3" json:"tx_count,omitempty"`                                     // Transaction count
+	SizeInBytes        uint64                 `protobuf:"varint,5,opt,name=size_in_bytes,json=sizeInBytes,proto3" json:"size_in_bytes,omitempty"`                       // Block size
+	Miner              string                 `protobuf:"bytes,6,opt,name=miner,proto3" json:"miner,omitempty"`                                                         // Miner identifier
+	PeerId             string                 `protobuf:"bytes,7,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                                         // Peer identifier
+	BlockTime          uint32                 `protobuf:"varint,8,opt,name=block_time,json=blockTime,proto3" json:"block_time,omitempty"`                               // Block timestamp
+	Timestamp          uint32                 `protobuf:"varint,9,opt,name=timestamp,proto3" json:"timestamp,omitempty"`                                                // Processing timestamp
+	ChainWork          []byte                 `protobuf:"bytes,10,opt,name=chain_work,json=chainWork,proto3" json:"chain_work,omitempty"`                               // Accumulated chain work
+	MinedSet           bool                   `protobuf:"varint,11,opt,name=mined_set,json=minedSet,proto3" json:"mined_set,omitempty"`                                 // Mined status
+	SubtreesSet        bool                   `protobuf:"varint,12,opt,name=subtrees_set,json=subtreesSet,proto3" json:"subtrees_set,omitempty"`                        // Subtrees status
+	Invalid            bool                   `protobuf:"varint,13,opt,name=invalid,proto3" json:"invalid,omitempty"`                                                   // Validity status
+	ProcessedAt        *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=processed_at,json=processedAt,proto3" json:"processed_at,omitempty"`                         // Timestamp when block was processed
+	MedianTimePast     uint32                 `protobuf:"varint,15,opt,name=median_time_past,json=medianTimePast,proto3" json:"median_time_past,omitempty"`             // Median Time Past (MTP) - median of last 11 block timestamps (BIP113)
+	MinedSetGeneration uint64                 `protobuf:"varint,16,opt,name=mined_set_generation,json=minedSetGeneration,proto3" json:"mined_set_generation,omitempty"` // Bumped by every write that clears mined_set; SetBlockMinedSet compares against it
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *GetBlockHeaderResponse) Reset() {
@@ -2323,6 +2324,13 @@ func (x *GetBlockHeaderResponse) GetProcessedAt() *timestamppb.Timestamp {
 func (x *GetBlockHeaderResponse) GetMedianTimePast() uint32 {
 	if x != nil {
 		return x.MedianTimePast
+	}
+	return 0
+}
+
+func (x *GetBlockHeaderResponse) GetMinedSetGeneration() uint64 {
+	if x != nil {
+		return x.MinedSetGeneration
 	}
 	return 0
 }
@@ -3507,11 +3515,14 @@ func (x *GetNextWorkRequiredResponse) GetBits() []byte {
 type SetBlockMinedSetRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	BlockHash []byte                 `protobuf:"bytes,1,opt,name=blockHash,proto3" json:"blockHash,omitempty"` // Hash of the mined block
-	// The block's invalid flag when the caller's tagging run started; the write is
-	// refused with ERR_STATE_ERROR if the flag has changed since.
-	ExpectInvalid bool `protobuf:"varint,2,opt,name=expectInvalid,proto3" json:"expectInvalid,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// The block's mined_set generation (GetBlockHeaderResponse.mined_set_generation)
+	// when the caller's tagging run started. Every writer that clears mined_set bumps
+	// it, so the write is refused with ERR_STATE_ERROR if it has changed since.
+	// Absent means a caller that predates the field: the write is unconditional, as
+	// it was before.
+	MinedSetGeneration *uint64 `protobuf:"varint,2,opt,name=mined_set_generation,json=minedSetGeneration,proto3,oneof" json:"mined_set_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SetBlockMinedSetRequest) Reset() {
@@ -3551,11 +3562,11 @@ func (x *SetBlockMinedSetRequest) GetBlockHash() []byte {
 	return nil
 }
 
-func (x *SetBlockMinedSetRequest) GetExpectInvalid() bool {
-	if x != nil {
-		return x.ExpectInvalid
+func (x *SetBlockMinedSetRequest) GetMinedSetGeneration() uint64 {
+	if x != nil && x.MinedSetGeneration != nil {
+		return *x.MinedSetGeneration
 	}
-	return false
+	return 0
 }
 
 type ClearBlockMinedSetRequest struct {
@@ -7531,7 +7542,7 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\x17InvalidateBlockResponse\x12,\n" +
 	"\x11invalidatedBlocks\x18\x01 \x03(\fR\x11invalidatedBlocks\"6\n" +
 	"\x16RevalidateBlockRequest\x12\x1c\n" +
-	"\tblockHash\x18\x01 \x01(\fR\tblockHash\"\xef\x03\n" +
+	"\tblockHash\x18\x01 \x01(\fR\tblockHash\"\xa1\x04\n" +
 	"\x16GetBlockHeaderResponse\x12 \n" +
 	"\vblockHeader\x18\x01 \x01(\fR\vblockHeader\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\rR\x02id\x12\x16\n" +
@@ -7550,7 +7561,8 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\fsubtrees_set\x18\f \x01(\bR\vsubtreesSet\x12\x18\n" +
 	"\ainvalid\x18\r \x01(\bR\ainvalid\x12=\n" +
 	"\fprocessed_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\vprocessedAt\x12(\n" +
-	"\x10median_time_past\x18\x0f \x01(\rR\x0emedianTimePast\"V\n" +
+	"\x10median_time_past\x18\x0f \x01(\rR\x0emedianTimePast\x120\n" +
+	"\x14mined_set_generation\x18\x10 \x01(\x04R\x12minedSetGeneration\"V\n" +
 	" CheckBlockIsCurrentChainResponse\x122\n" +
 	"\x14isPartOfCurrentChain\x18\x01 \x01(\bR\x14isPartOfCurrentChain\"^\n" +
 	"\"CheckBlockIsAncestorOfBlockRequest\x12\x1a\n" +
@@ -7619,10 +7631,11 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\x11previousBlockHash\x18\x01 \x01(\fR\x11previousBlockHash\x12*\n" +
 	"\x10currentBlockTime\x18\x02 \x01(\x03R\x10currentBlockTime\"1\n" +
 	"\x1bGetNextWorkRequiredResponse\x12\x12\n" +
-	"\x04bits\x18\x01 \x01(\fR\x04bits\"]\n" +
+	"\x04bits\x18\x01 \x01(\fR\x04bits\"\x87\x01\n" +
 	"\x17SetBlockMinedSetRequest\x12\x1c\n" +
-	"\tblockHash\x18\x01 \x01(\fR\tblockHash\x12$\n" +
-	"\rexpectInvalid\x18\x02 \x01(\bR\rexpectInvalid\"9\n" +
+	"\tblockHash\x18\x01 \x01(\fR\tblockHash\x125\n" +
+	"\x14mined_set_generation\x18\x02 \x01(\x04H\x00R\x12minedSetGeneration\x88\x01\x01B\x17\n" +
+	"\x15_mined_set_generation\"9\n" +
 	"\x19ClearBlockMinedSetRequest\x12\x1c\n" +
 	"\tblockHash\x18\x01 \x01(\fR\tblockHash\">\n" +
 	"\x1cGetBlocksMinedNotSetResponse\x12\x1e\n" +
@@ -8404,6 +8417,7 @@ func file_services_blockchain_blockchain_api_blockchain_api_proto_init() {
 	if File_services_blockchain_blockchain_api_blockchain_api_proto != nil {
 		return
 	}
+	file_services_blockchain_blockchain_api_blockchain_api_proto_msgTypes[63].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

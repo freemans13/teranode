@@ -523,6 +523,7 @@ var blockchainSchemaExpectedColumns = []string{
 	"median_time_past",
 	"coinbase_bump",
 	"on_main_chain",
+	"mined_set_gen",
 }
 
 // blockchainSchemaExpectedIndexes is the list of indexes on blocks that the
@@ -671,6 +672,7 @@ func createPostgresSchemaUnlocked(db *usql.DB, withIndexes bool) error {
 		,median_time_past BIGINT NOT NULL DEFAULT 0
 		,coinbase_bump  BYTEA NULL
 		,on_main_chain  BOOLEAN NOT NULL DEFAULT FALSE
+		,mined_set_gen  BIGINT NOT NULL DEFAULT 0
 	  );
 	`); err != nil {
 		_ = db.Close()
@@ -764,6 +766,23 @@ func createPostgresSchemaUnlocked(db *usql.DB, withIndexes bool) error {
 		} else {
 			_ = db.Close()
 			return errors.NewStorageError("could not check for on_main_chain column in blocks table", err)
+		}
+	}
+
+	// add the mined_set_gen column to the blocks table if it does not exist. Every write that
+	// clears mined_set bumps it, so SetBlockMinedSet can refuse a tagging run that started
+	// before the clear (see SetBlockMinedSet.go).
+	err = db.QueryRow("SELECT column_name FROM information_schema.columns WHERE table_name='blocks' AND column_name='mined_set_gen'").Scan(new(string))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err := db.Exec(`ALTER TABLE blocks ADD COLUMN mined_set_gen BIGINT NOT NULL DEFAULT 0;`)
+			if err != nil {
+				_ = db.Close()
+				return errors.NewStorageError("could not add mined_set_gen column to blocks table", err)
+			}
+		} else {
+			_ = db.Close()
+			return errors.NewStorageError("could not check for mined_set_gen column in blocks table", err)
 		}
 	}
 
@@ -988,6 +1007,7 @@ func createSqliteSchema(db *usql.DB) error {
 		,median_time_past BIGINT NOT NULL DEFAULT 0
 		,coinbase_bump  BLOB NULL
 		,on_main_chain  BOOLEAN NOT NULL DEFAULT FALSE
+		,mined_set_gen  BIGINT NOT NULL DEFAULT 0
 	  );
 	`); err != nil {
 		_ = db.Close()
@@ -1076,6 +1096,23 @@ func createSqliteSchema(db *usql.DB) error {
 		} else {
 			_ = db.Close()
 			return errors.NewStorageError("could not check for on_main_chain column in blocks table", err)
+		}
+	}
+
+	// add the mined_set_gen column to the blocks table if it does not exist. Every write that
+	// clears mined_set bumps it, so SetBlockMinedSet can refuse a tagging run that started
+	// before the clear (see SetBlockMinedSet.go).
+	err = db.QueryRow("SELECT name FROM pragma_table_info('blocks') WHERE name='mined_set_gen'").Scan(new(string))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err := db.Exec(`ALTER TABLE blocks ADD COLUMN mined_set_gen BIGINT NOT NULL DEFAULT 0;`)
+			if err != nil {
+				_ = db.Close()
+				return errors.NewStorageError("could not add mined_set_gen column to blocks table", err)
+			}
+		} else {
+			_ = db.Close()
+			return errors.NewStorageError("could not check for mined_set_gen column in blocks table", err)
 		}
 	}
 

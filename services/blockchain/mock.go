@@ -379,8 +379,8 @@ func (m *Mock) SetState(ctx context.Context, key string, data []byte) error {
 }
 
 // SetBlockMinedSet mocks the SetBlockMinedSet method
-func (m *Mock) SetBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash, expectInvalid bool) error {
-	args := m.Called(ctx, blockHash, expectInvalid)
+func (m *Mock) SetBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash, minedSetGeneration uint64) error {
+	args := m.Called(ctx, blockHash, minedSetGeneration)
 	return args.Error(0)
 }
 
@@ -770,8 +770,8 @@ func (m *mockStoreGetSetBlockIsMined) GetBlockIsMined(ctx context.Context, hash 
 	return args.Bool(0), nil
 }
 
-func (m *mockStoreGetSetBlockIsMined) SetBlockMinedSet(ctx context.Context, hash *chainhash.Hash, expectInvalid bool) error {
-	args := m.Called(ctx, hash, expectInvalid)
+func (m *mockStoreGetSetBlockIsMined) SetBlockMinedSet(ctx context.Context, hash *chainhash.Hash, expectedGeneration *uint64) error {
+	args := m.Called(ctx, hash, expectedGeneration)
 	return args.Error(0)
 }
 

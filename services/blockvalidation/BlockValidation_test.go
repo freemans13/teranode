@@ -241,13 +241,13 @@ func (t *trackingBlockchainClient) Subscribe(ctx context.Context, tag string) (c
 	return t.ClientI.Subscribe(ctx, tag)
 }
 
-func (t *trackingBlockchainClient) SetBlockMinedSet(ctx context.Context, hash *chainhash.Hash, expectInvalid bool) error {
+func (t *trackingBlockchainClient) SetBlockMinedSet(ctx context.Context, hash *chainhash.Hash, minedSetGeneration uint64) error {
 	if t.setMinedCalled != nil {
 		t.setMinedOnce.Do(func() {
 			close(t.setMinedCalled)
 		})
 	}
-	return t.ClientI.SetBlockMinedSet(ctx, hash, expectInvalid)
+	return t.ClientI.SetBlockMinedSet(ctx, hash, minedSetGeneration)
 }
 
 func (m *MockSubtreeValidationClient) Health(ctx context.Context, checkLiveness bool) (int, string, error) {

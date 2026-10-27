@@ -57,22 +57,24 @@ func (s *gap058BlockingStore) SetMinedMulti(ctx context.Context, hashes []*chain
 	return s.Store.SetMinedMulti(ctx, hashes, info)
 }
 
-// TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation is the regression test for GAP-BV-058
-// (BV-COMMIT-005, BV-COMMIT-011, BV-REVALIDATE-003).
-//
-// A set-mined tagging run that is in flight when the block is invalidated must not leave the block
-// invalid with mined_set=true and its transactions still tagged. InvalidateBlock clears mined_set so
-// the block is processed again; an unconditional SetBlockMinedSet at the end of the run used to
-// overwrite that, after which the setMined worker's MinedSet guard and the mined-not-set sweep both
-// skipped the block for good. SetBlockMinedSet is now conditional on the invalid flag the run started
-// from, and setTxMinedStatus re-queues the block when the write is refused. The race is made
-// deterministic with a UTXO-store decorator that parks the tagging run inside SetMinedMulti while
-// InvalidateBlock runs on the real sqlitememory store.
-func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
+// gap058Fixture is a validated, stored block whose single transaction has not been tagged yet,
+// with a bare BlockValidation over real sqlitememory blockchain and UTXO stores.
+type gap058Fixture struct {
+	ctx              context.Context
+	bv               *BlockValidation
+	blockchainClient blockchain.ClientI
+	utxoStore        utxostore.Store
+	block            *model.Block
+	tx               *bt.Tx
+}
+
+func newGap058Fixture(t *testing.T) *gap058Fixture {
+	t.Helper()
+
 	initPrometheusMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
@@ -153,7 +155,7 @@ func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
 	// A bare BlockValidation (no background setMined worker or subscription) keeps the run
 	// deterministic: the only setTxMinedStatus calls are the ones this test makes. The store writes
 	// genesis unmined, and ValidateBlock waits for the parent to be mined.
-	require.NoError(t, blockchainClient.SetBlockMinedSet(ctx, tSettings.ChainCfgParams.GenesisHash, false))
+	require.NoError(t, blockchainClient.SetBlockMinedSet(ctx, tSettings.ChainCfgParams.GenesisHash, 0))
 
 	bv := &BlockValidation{
 		logger:                        logger,
@@ -172,7 +174,7 @@ func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
 		revalidateBlockChan:           make(chan revalidateBlockData, 1),
 		stats:                         gocore.NewStat("blockvalidation"),
 	}
-	defer bv.StopCaches()
+	t.Cleanup(bv.StopCaches)
 
 	// Validate and store the block (mined_set=false, subtrees_set=true); no tagging has run yet.
 	require.NoError(t, bv.ValidateBlock(ctx, block, "test"))
@@ -182,19 +184,33 @@ func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
 	require.False(t, preMeta.MinedSet, "precondition: tagging has not run yet")
 	require.False(t, preMeta.Invalid, "precondition: block is valid when the run starts")
 
+	return &gap058Fixture{
+		ctx:              ctx,
+		bv:               bv,
+		blockchainClient: blockchainClient,
+		utxoStore:        realUtxoStore,
+		block:            block,
+		tx:               txT,
+	}
+}
+
+// runParkedTagging starts a tagging run, parks it inside SetMinedMulti, calls interfere while it
+// is parked, then releases it and returns the run's error.
+func (f *gap058Fixture) runParkedTagging(t *testing.T, interfere func()) error {
+	t.Helper()
+
 	blocking := &gap058BlockingStore{
-		Store:   realUtxoStore,
+		Store:   f.utxoStore,
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	bv.utxoStore = blocking
+	f.bv.utxoStore = blocking
 	blocking.armed.Store(true)
 
-	// The tagging run starts (it read invalid=false) and parks inside SetMinedMulti.
 	runDone := make(chan error, 1)
 
 	go func() {
-		runDone <- bv.setTxMinedStatus(ctx, block.Hash())
+		runDone <- f.bv.setTxMinedStatus(f.ctx, f.block.Hash())
 	}()
 
 	select {
@@ -203,45 +219,123 @@ func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
 		t.Fatal("precondition: the tagging run never reached SetMinedMulti")
 	}
 
-	// While the run is in flight the block is invalidated.
-	_, err = blockchainClient.InvalidateBlock(ctx, block.Hash())
-	require.NoError(t, err)
+	interfere()
 
-	_, midMeta, err := blockchainClient.GetBlockHeader(ctx, block.Hash())
-	require.NoError(t, err)
-	require.True(t, midMeta.Invalid, "precondition: block is invalid while the run is parked")
-	require.False(t, midMeta.MinedSet, "precondition: InvalidateBlock cleared mined_set")
-
-	// Release the parked run and let it finish.
 	close(blocking.release)
 
 	select {
 	case runErr := <-runDone:
-		// nil, not the state error: a refused write is not a failed run and must not
-		// charge the setMined retry counter
-		require.NoError(t, runErr, "the refused run must return nil")
+		return runErr
 	case <-time.After(20 * time.Second):
 		t.Fatal("the tagging run did not finish after release")
 	}
 
-	_, endMeta, err := blockchainClient.GetBlockHeader(ctx, block.Hash())
+	return nil
+}
+
+// requireRequeued asserts the refused run put the block back on setMinedChan.
+func (f *gap058Fixture) requireRequeued(t *testing.T) {
+	t.Helper()
+
+	select {
+	case requeued := <-f.bv.setMinedChan:
+		require.Equal(t, *f.block.Hash(), *requeued, "the refused run must re-queue the block")
+	default:
+		t.Fatal("the refused run did not re-queue the block on setMinedChan")
+	}
+}
+
+// TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation is the regression test for GAP-BV-058
+// (BV-COMMIT-005, BV-COMMIT-011, BV-REVALIDATE-003).
+//
+// A set-mined tagging run that is in flight when the block is invalidated must not leave the block
+// invalid with mined_set=true and its transactions still tagged. InvalidateBlock clears mined_set so
+// the block is processed again; an unconditional SetBlockMinedSet at the end of the run used to
+// overwrite that, after which the setMined worker's MinedSet guard and the mined-not-set sweep both
+// skipped the block for good. SetBlockMinedSet is now conditional on the mined_set generation the run
+// started from, and setTxMinedStatus re-queues the block when the write is refused. The race is made
+// deterministic with a UTXO-store decorator that parks the tagging run inside SetMinedMulti while
+// InvalidateBlock runs on the real sqlitememory store.
+func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
+	f := newGap058Fixture(t)
+	ctx := f.ctx
+
+	runErr := f.runParkedTagging(t, func() {
+		_, err := f.blockchainClient.InvalidateBlock(ctx, f.block.Hash())
+		require.NoError(t, err)
+
+		_, midMeta, err := f.blockchainClient.GetBlockHeader(ctx, f.block.Hash())
+		require.NoError(t, err)
+		require.True(t, midMeta.Invalid, "precondition: block is invalid while the run is parked")
+		require.False(t, midMeta.MinedSet, "precondition: InvalidateBlock cleared mined_set")
+	})
+
+	// nil, not the state error: a refused write is not a failed run and must not
+	// charge the setMined retry counter
+	require.NoError(t, runErr, "the refused run must return nil")
+
+	_, endMeta, err := f.blockchainClient.GetBlockHeader(ctx, f.block.Hash())
 	require.NoError(t, err)
 	require.True(t, endMeta.Invalid, "the block is still invalid at the end")
 
-	endTags, err := realUtxoStore.Get(ctx, txT.TxIDChainHash())
+	endTags, err := f.utxoStore.Get(ctx, f.tx.TxIDChainHash())
 	require.NoError(t, err)
 
 	tagsPresent := len(endTags.BlockIDs) > 0
 
 	require.False(t, endMeta.MinedSet, "the refused write must leave mined_set=false so the sweep still lists the block")
 
-	select {
-	case requeued := <-bv.setMinedChan:
-		require.Equal(t, *block.Hash(), *requeued, "the refused run must re-queue the block for an unset run")
-	default:
-		t.Fatal("the refused run did not re-queue the block on setMinedChan")
-	}
+	f.requireRequeued(t)
 
 	require.False(t, endMeta.MinedSet && tagsPresent,
 		"GAP-BV-058: block is invalid, yet the in-flight run left mined_set=true with the transaction still tagged (BlockIDs=%v); the unconditional SetBlockMinedSet overwrote the invalidation and the sweep will never revisit it", endTags.BlockIDs)
+}
+
+// TestGapBV058_InFlightTaggingDoesNotOverwriteClearBlockMinedSet covers the reset that does not
+// touch the invalid flag. Catchup calls ClearBlockMinedSet on a block that moved off the main chain.
+// A run that started before, with onLongestChain=true, used to match a guard on invalid and write
+// mined_set=true over the clear, after which the re-queued run skipped on MinedSet=true and the
+// block's transactions stayed tagged as on the longest chain. The generation guard refuses it.
+func TestGapBV058_InFlightTaggingDoesNotOverwriteClearBlockMinedSet(t *testing.T) {
+	f := newGap058Fixture(t)
+	ctx := f.ctx
+
+	runErr := f.runParkedTagging(t, func() {
+		require.NoError(t, f.blockchainClient.ClearBlockMinedSet(ctx, f.block.Hash()))
+	})
+
+	require.NoError(t, runErr, "the refused run must return nil")
+
+	_, endMeta, err := f.blockchainClient.GetBlockHeader(ctx, f.block.Hash())
+	require.NoError(t, err)
+	require.False(t, endMeta.Invalid, "precondition: the clear left invalid untouched")
+	require.False(t, endMeta.MinedSet, "the run must not write mined_set=true over ClearBlockMinedSet")
+
+	f.requireRequeued(t)
+}
+
+// TestGapBV058_InvalidFlagMovedBeforeRunStarts covers the window between the worker's read of
+// the invalid flag and the run's own GetBlockHeader. The generation is captured at the second read,
+// so it already counts an invalidation that landed in between and cannot catch it. The run must
+// notice the caller's flag disagrees with the one it read, and re-queue without tagging.
+func TestGapBV058_InvalidFlagMovedBeforeRunStarts(t *testing.T) {
+	f := newGap058Fixture(t)
+	ctx := f.ctx
+
+	// the worker read invalid=false, then the block was invalidated before the run started
+	_, err := f.blockchainClient.InvalidateBlock(ctx, f.block.Hash())
+	require.NoError(t, err)
+
+	require.NoError(t, f.bv.setTxMinedStatus(ctx, f.block.Hash(), false))
+
+	_, endMeta, err := f.blockchainClient.GetBlockHeader(ctx, f.block.Hash())
+	require.NoError(t, err)
+	require.True(t, endMeta.Invalid)
+	require.False(t, endMeta.MinedSet, "a run started on the stale flag must not set mined_set")
+
+	endTags, err := f.utxoStore.Get(ctx, f.tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Empty(t, endTags.BlockIDs, "a run started on the stale flag must not tag the invalid block's transaction")
+
+	f.requireRequeued(t)
 }

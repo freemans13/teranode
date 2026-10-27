@@ -88,6 +88,22 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **`SetBlockMinedSet` can now refuse a write with `ERR_STATE_ERROR`.** The blockchain
+  store gains a `mined_set_gen` column on `blocks`, added on startup with default 0.
+  `ClearBlockMinedSet`, `InvalidateBlock` and `RevalidateBlock` bump it.
+  `SetBlockMinedSetRequest` gains an optional `mined_set_generation` field, and
+  `GetBlockHeaderResponse` gains `mined_set_generation`. When the request carries the
+  field, the write only lands if the generation has not moved since the caller read it.
+  Otherwise the call returns `ERR_STATE_ERROR`, and block validation re-queues the
+  block. This stops a set-mined run that was in flight during an invalidation or a
+  catchup reset from overwriting that reset. Mixed versions keep working, so there is
+  no required upgrade order. An older block validation service sends no generation, and
+  a new blockchain service writes for it unconditionally, as before. A new block
+  validation service talking to an older blockchain service has its field ignored, and
+  gets the old unconditional write. Either way the race stays open until both services
+  run the new version. A client that calls `SetBlockMinedSet` with the field set must
+  handle `ERR_STATE_ERROR`. (#2018)
+
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
   `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
