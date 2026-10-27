@@ -453,6 +453,22 @@ func TestNettedRoute_CatchupRefusesForksOnTheChainStore(t *testing.T) {
 		assertNoBodyFetch(t)
 	})
 
+	t.Run("a secretly mined netted fork keeps the secret-mining error", func(t *testing.T) {
+		// Depth 80 passes the fork-depth check but exceeds a secret-mining threshold of 50, and the
+		// offered fork is lighter. checkSecretMining's other returns are local faults that must not
+		// charge the peer, so its error is never swapped for the netted refusal.
+		n := newNettedForkCatchup(t, 100, 180, 10)
+		n.server.settings.BlockValidation.SecretMiningThreshold = 50
+
+		err := n.server.catchup(t.Context(), n.target, "peer-netted-secret", "http://peer")
+
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "secretly mined")
+		require.False(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "got %v", err)
+		n.assertMinedSetKept(t, 100)
+		assertNoBodyFetch(t)
+	})
+
 	t.Run("a deep fork is reported malicious and charged to the peer", func(t *testing.T) {
 		// Depth 150 exceeds coinbase maturity. The fork-depth check must see it first, because it
 		// is what reports the peer malicious (recordMaliciousAttempt, ban score 50). Its own

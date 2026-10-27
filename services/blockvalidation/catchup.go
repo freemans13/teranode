@@ -299,17 +299,20 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return u.preferNettedRouteForkRefusal(catchupCtx, err)
 	}
 
-	// Step 5: Check for secret mining attempts
+	// Step 5: Check for secret mining attempts. Its error is returned as it is, not through
+	// preferNettedRouteForkRefusal: only one of its returns is a rejection of the peer, and the
+	// others are local faults documented as not penalising the peer. A secretly mined netted fork
+	// therefore takes the same path as one off the netted route: reported malicious, not rotated.
 	if err = u.checkSecretMining(ctx, catchupCtx); err != nil {
-		return u.preferNettedRouteForkRefusal(catchupCtx, err)
+		return err
 	}
 
 	// Step 5.1: Refuse a fork below the checkpoint on the netted route, at any depth, before the
 	// mined_set clear below un-stamps this node's own blocks for a fork this route can never take.
 	// It runs after the fork-depth and secret-mining checks, which read headers only, so a fork
 	// deeper than coinbase maturity, or a secretly mined one, is still reported as malicious
-	// (recordMaliciousAttempt). When one of those checks rejects a netted fork, it returns this
-	// refusal in place of its own error (preferNettedRouteForkRefusal), so the peer is rotated.
+	// (recordMaliciousAttempt). When the fork-depth check rejects a netted fork, this refusal is
+	// returned in place of its error (preferNettedRouteForkRefusal), so the peer is rotated.
 	if err = u.refuseNettedRouteFork(catchupCtx); err != nil {
 		return err
 	}
@@ -1307,16 +1310,16 @@ func (u *Server) refuseNettedRouteFork(catchupCtx *CatchupContext) error {
 }
 
 // preferNettedRouteForkRefusal returns refuseNettedRouteFork's refusal in place of err when the
-// fork is on the netted route, and err otherwise. err is the fork-depth or secret-mining
-// rejection. Those checks have already reported the peer malicious, but they return a
-// ServiceError, which processCatchupChItem reads as a local fault (isLocalCatchupFault): it
-// reports no peer failure, keeps the same sync peer and retries the same hash. On the netted
+// fork is on the netted route, and err otherwise. err is validateForkDepth's rejection, its only
+// error. That check has already reported the peer malicious, but it returns a ServiceError,
+// which processCatchupChItem reads as a local fault (isLocalCatchupFault): it reports no peer
+// failure, keeps the same sync peer and retries the same hash. On the netted
 // route the fork is the peer's fault at any depth, so the refusal, a NetworkInvalidResponseError,
 // is returned instead, and the peer is rotated as it is for a shallower netted fork. The
 // refusal's message names the fork depth, and the check's own log line names the reason.
 func (u *Server) preferNettedRouteForkRefusal(catchupCtx *CatchupContext, err error) error {
 	if refusal := u.refuseNettedRouteFork(catchupCtx); refusal != nil {
-		u.logger.Warnf("[catchup][%s] fork rejected by a header check is on the netted route, refused as the peer's fault: %v", catchupCtx.blockUpTo.Hash().String(), err)
+		u.logger.Warnf("[catchup][%s] fork deeper than coinbase maturity is on the netted route, refused as the peer's fault: %v", catchupCtx.blockUpTo.Hash().String(), err)
 
 		return refusal
 	}
