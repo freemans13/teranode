@@ -1064,7 +1064,9 @@ func TestGapBV054_ConcurrentPanicErrorIsDistinct(t *testing.T) {
 	require.False(t, errors.IsBlockCorrupt(waiterErr), "%v", waiterErr)
 	require.False(t, errors.IsContextError(waiterErr), "%v", waiterErr)
 
-	ordinary := errors.NewProcessingError("terminal generic peer error")
+	// An uncoded ERR_PROCESSING is a local fault (isLocalProcessingFault), so the ordinary peer
+	// error carries a peer code under its ERR_PROCESSING wrapper.
+	ordinary := errors.NewProcessingError("terminal generic peer error", errors.NewNetworkInvalidResponseError("peer served bad bytes"))
 	require.True(t, errors.Is(ordinary, waiterErr), "setup: teranode errors.Is matches any two ERR_PROCESSING errors")
 	require.False(t, isLocalPanic(ordinary), "an ordinary ERR_PROCESSING error must not match")
 	require.False(t, isLocalCatchupFault(ordinary), "an ordinary ERR_PROCESSING error must stay a peer error")
@@ -1169,7 +1171,7 @@ func TestGapBV054_ConcurrentPanicWaiterIsNotChargedToCachedAlternative(t *testin
 			return newConcurrentValidationPanicError(block.Hash())
 		}
 
-		return errors.NewProcessingError("terminal generic peer error")
+		return errors.NewProcessingError("terminal generic peer error", errors.NewNetworkInvalidResponseError("peer served bad bytes"))
 	}
 
 	s.processBlockNotify.Set(*block.Hash(), true, ttlcache.DefaultTTL)
@@ -1251,7 +1253,7 @@ func TestGapBV054_ConcurrentPanicStopsP2PAlternatives(t *testing.T) {
 
 		switch peerID {
 		case "peerA":
-			return errors.NewProcessingError("terminal generic peer error")
+			return errors.NewProcessingError("terminal generic peer error", errors.NewNetworkInvalidResponseError("peer served bad bytes"))
 		case alt1ID:
 			return newConcurrentValidationPanicError(block.Hash())
 		default:
@@ -1298,7 +1300,7 @@ func TestGapBV054_ConcurrentPanicStopsCachedAlternatives(t *testing.T) {
 
 		switch peerID {
 		case "peerA":
-			return errors.NewProcessingError("terminal generic peer error")
+			return errors.NewProcessingError("terminal generic peer error", errors.NewNetworkInvalidResponseError("peer served bad bytes"))
 		case "cachedAlt1":
 			return newConcurrentValidationPanicError(block.Hash())
 		default:
