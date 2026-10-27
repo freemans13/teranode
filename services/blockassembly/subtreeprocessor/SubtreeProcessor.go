@@ -402,6 +402,10 @@ type SubtreeProcessor struct {
 	// txMapDirs, when non-empty, enables disk-backed DiskTxMap across these directories.
 	txMapDirs []string
 
+	// txMetaEvictor publishes txmeta DELETEs for txs this processor's conflict
+	// processing marks conflicting. Nil when the txmeta topic is not configured.
+	txMetaEvictor *TxMetaEvictor
+
 	// diskTxMap is the ACTIVE disk-backed tx map (non-nil when txMapDirs is set).
 	// It is the half currently installed as currentTxMap, and therefore the one
 	// UpdateSubtreeIndex bookkeeping must address.
@@ -1858,8 +1862,13 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 					// postProcess). Any in-flight tx whose parent gets cascaded here
 					// is dropped by that drain regardless of cascade discovery, so
 					// the per-block transient set is not needed here.
-					losingTxHashesMap, _, err := utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
+					losingTxHashesMap, allMarkedConflicting, err := utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
 						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block))
+
+					// the store now says these are conflicting; subtree validation's txmeta cache must
+					// forget them. On error this is what the failed run may have flipped.
+					stp.txMetaEvictor.Evict(allMarkedConflicting)
+
 					if err != nil {
 						return errors.NewProcessingError("[moveForwardBlock][%s] error processing conflicting transactions in Reset()", block.String(), err)
 					}
@@ -4310,6 +4319,25 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			return errors.NewProcessingError("[reorgBlocks] timeout waiting for block being mined %s", moveForwardBlocks[len(moveForwardBlocks)-1].Hash().String())
 		}
 
+		// Drain the backlog before moving forward, as the reorg branch below
+		// does: the drained txs then sit in the subtrees, which each block's
+		// remainder pass filters against that block. Draining only on the last
+		// block filtered the backlog against the last block alone, and txs
+		// mined in an earlier block of the catch-up were mined again (issue
+		// 2050). Draining before the state capture below means a failed
+		// catch-up rolls back to the drained state instead of losing it.
+		if err = stp.dequeueDuringBlockMovement(nil, nil, nil, true); err != nil {
+			return errors.NewProcessingError("[reorgBlocks] error dequeueing transactions before catch-up", err)
+		}
+
+		// A catch-up of empty blocks never reaches a moveForwardBlock
+		// pre-commit check, so check the drain's own disk tx map writes here.
+		stp.flushDiskTxMapWriters()
+
+		if mapErr := stp.diskTxMapErr(); mapErr != nil {
+			return errors.NewStorageError("[reorgBlocks] disk tx map storage error after draining the queue before catch-up", mapErr)
+		}
+
 		// create empty map for processed conflicting hashes
 		processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
@@ -4497,6 +4525,9 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 
 			cascadedConflicting, touched, reverseErr := utxostore.ReverseProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), reverseInputs)
 			if reverseErr != nil {
+				// what the failed reverse may have flipped to conflicting
+				stp.txMetaEvictor.Evict(cascadedConflicting)
+
 				return errors.NewProcessingError("[reorgBlocks][%s] error reversing conflict resolution from moved-back block", block.String(), reverseErr)
 			}
 
@@ -4511,6 +4542,11 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			for _, hash := range cascadedConflicting {
 				reverseCascadedConflictingSet[hash] = struct{}{}
 			}
+
+			// The reverse flipped these to conflicting in the store: the demoted
+			// winners were non-conflicting while their block was on chain, so subtree
+			// validation's txmeta cache may hold them as non-conflicting.
+			stp.txMetaEvictor.Evict(cascadedConflicting)
 
 			// Evict each newly-conflicting tx from block assembly's in-memory
 			// subtree state. moveBackBlockCreateNewSubtrees has already
@@ -5584,8 +5620,14 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 		}
 
 		var allMarkedConflicting []chainhash.Hash
-		if losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block)); err != nil {
+		losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
+			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block))
+
+		// the store now says these are conflicting; subtree validation's txmeta cache must
+		// forget them. On error this is what the failed run may have flipped.
+		stp.txMetaEvictor.Evict(allMarkedConflicting)
+
+		if err != nil {
 			return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing conflicting transactions", block.String(), err)
 		}
 
@@ -5839,7 +5881,7 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 
 		stp.logger.Debugf("[moveForwardBlock][%s] processRemainderTxHashes with %d subtrees", params.Block.String(), len(params.ChainedSubtrees))
 
-		if err := stp.processRemainderTxHashes(ctx, remainderSubtrees, params.TransactionMap, params.LosingTxHashesMap, params.CurrentTxMap, params.SkipNotification); err != nil {
+		if err := stp.processRemainderTxHashes(ctx, remainderSubtrees, params.TransactionMap, params.LosingTxHashesMap, params.ConflictingHashes, params.CurrentTxMap, params.SkipNotification); err != nil {
 			return errors.NewProcessingError("[moveForwardBlock][%s] error getting remainder tx hashes", params.Block.String(), err)
 		}
 
@@ -6441,23 +6483,8 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SortedHa
 					continue
 				}
 
-				if len(conflictingHashes) > 0 {
-					if _, ok := conflictingHashes[node.Hash]; ok {
-						continue
-					}
-					if txInpoints != nil {
-						matched := false
-						for _, parent := range txInpoints.ParentTxHashes {
-							if _, ok := conflictingHashes[parent]; ok {
-								matched = true
-								break
-							}
-						}
-						if matched {
-							conflictingHashes[node.Hash] = struct{}{}
-							continue
-						}
-					}
+				if len(conflictingHashes) > 0 && rejectConflicting(node.Hash, txInpoints, conflictingHashes) {
+					continue
 				}
 
 				if addErr := stp.addNode(node, txInpoints, skipNotification); addErr != nil {
@@ -6639,6 +6666,88 @@ func remainderWorkers(configured int) int {
 	return workers
 }
 
+// dropConflictingDescendants removes, in place, every remainder node that is
+// in conflictingHashes or spends a tx in it, adding each one dropped by parent
+// to the set. The inpoint lookups run in parallel, since on a disk tx map each
+// one is a read; the walk itself is sequential in subtree order, which puts
+// parents before children, so a dropped child takes its own descendants with it.
+// Both run a window at a time, so the looked-up inpoints held at once stay
+// bounded however large the remainder is.
+func dropConflictingDescendants(ctx context.Context, remainderSubtrees [][]subtreepkg.Node,
+	conflictingHashes map[chainhash.Hash]struct{}, currentTxMap TxInpointsMap, workers int) error {
+	const lookupChunk = 16 << 10
+
+	window := workers * lookupChunk
+	inpoints := make([]*subtreepkg.TxInpoints, window)
+
+	for idx, nodes := range remainderSubtrees {
+		// kept never overtakes the node being read, and each window is
+		// looked up before the walk writes into it.
+		kept := nodes[:0]
+
+		for start := 0; start < len(nodes); start += window {
+			part := nodes[start:min(start+window, len(nodes))]
+
+			g, _ := errgroup.WithContext(ctx)
+			g.SetLimit(workers)
+
+			for c := 0; c < len(part); c += lookupChunk {
+				end := min(c+lookupChunk, len(part))
+
+				g.Go(func() error {
+					for i := c; i < end; i++ {
+						txInpoints, ok := currentTxMap.Get(part[i].Hash)
+						if !ok {
+							return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", part[i].Hash.String())
+						}
+
+						inpoints[i] = txInpoints
+					}
+
+					return nil
+				})
+			}
+
+			if err := g.Wait(); err != nil {
+				return err
+			}
+
+			for i, node := range part {
+				if !rejectConflicting(node.Hash, inpoints[i], conflictingHashes) {
+					kept = append(kept, node)
+				}
+			}
+		}
+
+		remainderSubtrees[idx] = kept
+	}
+
+	return nil
+}
+
+// rejectConflicting reports whether a tx must be kept out of the subtrees
+// because it is in conflictingHashes or spends a tx in it. On a parent match
+// it adds the tx itself to the set, so its own descendants are rejected too.
+// txInpoints may be nil, in which case only the tx's own hash is checked.
+func rejectConflicting(hash chainhash.Hash, txInpoints *subtreepkg.TxInpoints, conflictingHashes map[chainhash.Hash]struct{}) bool {
+	if _, ok := conflictingHashes[hash]; ok {
+		return true
+	}
+
+	if txInpoints == nil {
+		return false
+	}
+
+	for _, parent := range txInpoints.ParentTxHashes {
+		if _, ok := conflictingHashes[parent]; ok {
+			conflictingHashes[hash] = struct{}{}
+			return true
+		}
+	}
+
+	return false
+}
+
 // processRemainderTxHashes processes remaining transaction hashes after reorganization.
 //
 // Parameters:
@@ -6646,12 +6755,18 @@ func remainderWorkers(configured int) int {
 //   - chainedSubtrees: List of subtrees to process
 //   - transactionMap: Map of transactions that were in the block and need to be removed
 //   - losingTxHashesMap: Map of transactions that were conflicting and need to be removed
+//   - conflictingHashes: every tx the block's conflict cascade marked
+//     conflicting (see dequeueDuringBlockMovement). May be nil. A remainder
+//     tx in the set, or spending one, is removed, and on a parent match its
+//     own hash is added, so its descendants go too and the drain that follows
+//     rejects their queued children.
 //   - skipNotification: Whether to skip notification of new subtrees
 //
 // Returns:
 //   - error: Any error encountered during processing
 func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chainedSubtrees []*subtreepkg.Subtree,
-	transactionMap *SortedHashSet, losingTxHashesMap txmap.TxMap, currentTxMap TxInpointsMap, skipNotification bool) error {
+	transactionMap *SortedHashSet, losingTxHashesMap txmap.TxMap, conflictingHashes map[chainhash.Hash]struct{},
+	currentTxMap TxInpointsMap, skipNotification bool) error {
 	// clean out the transactions from the old current subtree that were in the block
 	// and add the remainderSubtreeNodes to the new current subtree, in order.
 	//
@@ -6752,6 +6867,12 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 
 	if err := g.Wait(); err != nil {
 		return errors.NewProcessingError("error collecting remainder txs", err)
+	}
+
+	if len(conflictingHashes) > 0 {
+		if err := dropConflictingDescendants(ctx, remainderSubtrees, conflictingHashes, currentTxMap, workers); err != nil {
+			return err
+		}
 	}
 
 	// Calculate total nodes for threshold check

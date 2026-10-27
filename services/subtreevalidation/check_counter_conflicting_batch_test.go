@@ -182,12 +182,13 @@ func newCachedCheckServer(t *testing.T, store utxo.Store, tSettings *settings.Se
 // recorded spender, so each is its own counter-spender and its cone is walked as
 // a counter-spender cone.
 //
-// The bound is c = 6 reads per conflicting transaction. For these shapes the
+// The bound is c = 8 reads per conflicting transaction. For these shapes the
 // batched check needs four: its own inpoints and its parent's spenders (phase 1),
 // one read as a member of the walk (phase 2), and one GetMeta as a member of the
 // counter-conflicting union (phase 3). One more is for the reads that discover
 // which cached transactions are conflicting, when those come from the store
-// rather than the subtree trailer, and one is headroom.
+// rather than the subtree trailer, two are the check at the block's height
+// (checkStoredTxAtHeight: the tx's body and its parent), and one is headroom.
 func Test_checkCachedSubtreesAgainstCandidateChain_scaling(t *testing.T) {
 	const chainLength = 200
 
@@ -208,7 +209,7 @@ func Test_checkCachedSubtreesAgainstCandidateChain_scaling(t *testing.T) {
 			reads := countingStore.reads.Load()
 			t.Logf("%d store reads for a %d-transaction conflicting chain", reads, chainLength)
 
-			require.LessOrEqualf(t, reads, int64(6*chainLength),
+			require.LessOrEqualf(t, reads, int64(8*chainLength),
 				"the cached-subtree conflict check must read a conflicting chain O(N) times, got %d reads for N=%d (O(N^2) is the per-transaction re-walk of issue 2037)",
 				reads, chainLength)
 		})

@@ -213,6 +213,14 @@ func (u *Server) decorateReadPath(skipCachePopulation bool) (utxo.Store, []field
 // is true and the number of missing transactions exceeds the configured threshold.
 func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem,
 	blockIds map[uint32]bool, batched bool, failFast bool, skipCachePopulation bool) (int, error) {
+	return u.processTxMetaUsingStoreAllowing(ctx, txHashes, txMetaSlice, blockIds, batched, failFast, skipCachePopulation, 0)
+}
+
+// processTxMetaUsingStoreAllowing is processTxMetaUsingStore with the fail-fast miss
+// threshold raised by missAllowance, for misses already explained, such as txs the
+// validator rejected as conflicting, which are not in the store either.
+func (u *Server) processTxMetaUsingStoreAllowing(ctx context.Context, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem,
+	blockIds map[uint32]bool, batched bool, failFast bool, skipCachePopulation bool, missAllowance int) (int, error) {
 	if len(txHashes) != len(txMetaSlice) {
 		return 0, errors.NewInvalidArgumentError("txHashes and txMetaSlice must be the same length")
 	}
@@ -223,6 +231,9 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 	batchSize := u.settings.BlockValidation.ProcessTxMetaUsingStoreBatchSize
 	validateSubtreeInternalConcurrency := u.settings.BlockValidation.ProcessTxMetaUsingStoreConcurrency
 	missingTxThreshold := u.settings.BlockValidation.ProcessTxMetaUsingStoreMissingTxThreshold
+	if missingTxThreshold > 0 {
+		missingTxThreshold += missAllowance
+	}
 
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(u.logger, g, validateSubtreeInternalConcurrency)
@@ -399,6 +410,13 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 									creating:    txMeta.Creating,
 									isSet:       true,
 									txInpoints:  txMeta.TxInpoints,
+								}
+
+								// The batched branch above runs this check; without it here,
+								// whether a block's counter-spends are caught depended on which
+								// branch SubtreeValidation.BatchMissingTransactions selected.
+								if txMetaSlice[i+j].conflicting {
+									conflicting.add(txHash, i+j)
 								}
 
 								continue
