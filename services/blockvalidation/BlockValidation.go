@@ -4123,7 +4123,8 @@ func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 //     nothing that outlives the worker.
 //
 // The daemon path can reach ctx first too, since commitBlock registers its commit tail here: a
-// store that hangs past the stop deadline holds the tail for up to postCommitTimeout. Wait then
+// store that hangs past the stop deadline holds the tail for up to postCommitTimeout. Server.Stop
+// passes a ctx that ends before its own deadline (stopWaitContext), so Close still runs. Wait then
 // returns on ctx, the commit tail keeps running until the process exits, and the inner goroutine
 // ends with it.
 func (u *BlockValidation) Wait(ctx context.Context) {

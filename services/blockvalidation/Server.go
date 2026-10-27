@@ -1445,9 +1445,14 @@ func (u *Server) Stop(ctx context.Context) error {
 
 	// Wait for all background tasks in BlockValidation to complete, bounded by the
 	// caller's stop deadline (ctx) so a worker whose Init ctx was not cancelled first
-	// cannot hang shutdown indefinitely.
+	// cannot hang shutdown indefinitely. Wait gets the deadline less a reserve, because
+	// commitBlock registers its commit tail there and a hung store holds Wait to its
+	// bound: without the reserve, Close below would start with ctx already done and the
+	// invalid-block producer's final flush would be abandoned.
 	if u.blockValidation != nil {
-		u.blockValidation.Wait(ctx)
+		waitCtx, cancelWait := stopWaitContext(ctx)
+		u.blockValidation.Wait(waitCtx)
+		cancelWait()
 		u.blockValidation.StopCaches()
 
 		// DC11: drain the BlockValidation-owned invalid-block kafka producer via
@@ -1480,6 +1485,32 @@ func (u *Server) Stop(ctx context.Context) error {
 	u.closeSubtreeValidationClient()
 
 	return nil
+}
+
+// stopCloseReserveMax caps the part of the stop deadline that Stop holds back from
+// BlockValidation.Wait so that BlockValidation.Close still has time to run.
+const stopCloseReserveMax = 5 * time.Second
+
+// stopWaitContext returns the context Stop gives BlockValidation.Wait: ctx with its
+// deadline moved earlier by a quarter of the time left, capped at stopCloseReserveMax.
+// With the default 30s service_manager_stopTimeout that leaves Close about 5s. A ctx
+// with no deadline is returned unchanged, apart from the cancel func.
+func stopWaitContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+
+	reserve := time.Until(deadline) / 4
+	if reserve > stopCloseReserveMax {
+		reserve = stopCloseReserveMax
+	}
+
+	if reserve <= 0 {
+		return context.WithCancel(ctx)
+	}
+
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
 }
 
 // BlockFound notifies the service about a newly discovered block that needs validation.

@@ -116,7 +116,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   error, a retried existence check, bounded at 15 seconds, decides whether to finish the
   commit or retry the block later. Shutdown now waits for a block's commit that is already
   under way, including that check and the unlock, but only up to `service_manager_stopTimeout`
-  (default 30s), which a stop during catch-up can now use in full. If the blockchain or
+  (default 30s), less up to 5s that shutdown keeps for flushing the invalid-block Kafka
+  producer. A stop during catch-up can now use the rest of that time. If the blockchain or
   UTXO store hangs past the stop timeout at shutdown, the block's outputs stay locked
   (tracked in #2015). To give the commit longer at shutdown, raise
   `service_manager_stopTimeout` and the pod's `terminationGracePeriodSeconds` together.
