@@ -573,7 +573,7 @@ func awaitSubtreeWrites(ctx context.Context, block *model.Block, barrier *subtre
 	return nil
 }
 
-// checkQuickValidationCoinbase enforces model.CoinbaseCommonRuleViolation (bitcoin-sv/teranode#4835)
+// checkQuickValidationCoinbase enforces model.TxCommonRuleViolation (bitcoin-sv/teranode#4835)
 // and model.CoinbaseScriptSigLengthInBounds (bitcoin-sv/teranode#4692) on the quick-validation path,
 // which never calls block.Valid and so would otherwise never run either coinbase check at all. They
 // run in bitcoin-sv's CheckCoinbase order, transaction rules before bad-cb-length. Called once,
@@ -593,7 +593,7 @@ func awaitSubtreeWrites(ctx context.Context, block *model.Block, barrier *subtre
 // or below the highest hash-verified checkpoint for this catchup run (catchup.go,
 // tryQuickValidation).
 func (u *BlockValidation) checkQuickValidationCoinbase(block *model.Block, caller string) error {
-	if reason := model.CoinbaseCommonRuleViolation(block.CoinbaseTx, block.Height, u.settings.ChainCfgParams); reason != "" {
+	if reason := model.TxCommonRuleViolation(block.CoinbaseTx, block.Height, u.settings.ChainCfgParams); reason != "" {
 		return errors.NewBlockInvalidError("[%s][%s] coinbase breaks a transaction rule: %s", caller, block.Hash().String(), reason)
 	}
 
