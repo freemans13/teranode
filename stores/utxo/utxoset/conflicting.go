@@ -127,7 +127,10 @@ ON CONFLICT DO NOTHING`
 // transaction's packed-key range through a LATERAL with OFFSET 0, which can only be planned as a
 // per-key index probe on this leaf's partition, with the full 32-byte id rechecked on the heap.
 // The update then takes those keys as an index condition, one descent per distinct key, and
-// rechecks the full id against the constant txid array, which Postgres hashes. The packed key
+// rechecks the full id against the txid array. The pool runs force_custom_plan (store.go), so that
+// array is a constant in every plan and Postgres hashes it; under a generic plan it would be a
+// parameter and scanned per row, which is still linear in outputs, because the array holds one
+// entry per transaction of the leaf group, not one per output. The packed key
 // carries the id prefix first precisely so a transaction's UTXOs are one index range, and the
 // full id is still rechecked because the prefix is non-unique by design.
 //

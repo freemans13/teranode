@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jarcoal/httpmock"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -847,10 +848,15 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 		server.settings.BlockValidation.SecretMiningThreshold = 1000
 		makeNetted(server)
 
+		violations := prometheusCatchupErrors.WithLabelValues("peer-netted", "coinbase_maturity_violation")
+		before := testutil.ToFloat64(violations)
+
 		err := server.catchup(context.Background(), targetBlock, "peer-netted", "http://peer")
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "exceeds coinbase maturity")
+		require.Equal(t, before+1, testutil.ToFloat64(violations),
+			"validateForkDepth records the malicious attempt and its metric together")
 		require.False(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "the netted-route refusal ran first: %v", err)
 
 		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
