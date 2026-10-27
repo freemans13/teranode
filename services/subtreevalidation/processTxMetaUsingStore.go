@@ -213,6 +213,14 @@ func (u *Server) decorateReadPath(skipCachePopulation bool) (utxo.Store, []field
 // is true and the number of missing transactions exceeds the configured threshold.
 func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem,
 	blockIds map[uint32]bool, batched bool, failFast bool, skipCachePopulation bool) (int, error) {
+	return u.processTxMetaUsingStoreAllowing(ctx, txHashes, txMetaSlice, blockIds, batched, failFast, skipCachePopulation, 0)
+}
+
+// processTxMetaUsingStoreAllowing is processTxMetaUsingStore with the fail-fast miss
+// threshold raised by missAllowance, for misses already explained, such as txs the
+// validator rejected as conflicting, which are not in the store either.
+func (u *Server) processTxMetaUsingStoreAllowing(ctx context.Context, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem,
+	blockIds map[uint32]bool, batched bool, failFast bool, skipCachePopulation bool, missAllowance int) (int, error) {
 	if len(txHashes) != len(txMetaSlice) {
 		return 0, errors.NewInvalidArgumentError("txHashes and txMetaSlice must be the same length")
 	}
@@ -223,6 +231,9 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 	batchSize := u.settings.BlockValidation.ProcessTxMetaUsingStoreBatchSize
 	validateSubtreeInternalConcurrency := u.settings.BlockValidation.ProcessTxMetaUsingStoreConcurrency
 	missingTxThreshold := u.settings.BlockValidation.ProcessTxMetaUsingStoreMissingTxThreshold
+	if missingTxThreshold > 0 {
+		missingTxThreshold += missAllowance
+	}
 
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(u.logger, g, validateSubtreeInternalConcurrency)
@@ -235,6 +246,12 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 	store, decorateFields := u.decorateReadPath(skipCachePopulation)
 
 	var missed atomic.Int32
+
+	// Conflicting transactions are collected by whichever batch decorates them
+	// and checked against the chain once, after every batch is done (issue 2037).
+	// settleCollectedConflictingTxs checks them even when a batch failed, and
+	// clears them on any error, so no entry is left set without a verdict.
+	var conflicting conflictingTxCollector
 
 	if batched {
 		for i := 0; i < len(txHashes); i += batchSize {
@@ -326,9 +343,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 
 						// if the tx is conflicting, we need to check if it is conflicting on the current chain
 						if txMetaSlice[data.Idx].conflicting {
-							if err = u.checkCounterConflictingOnCurrentChain(ctx, data.Hash, blockIds); err != nil {
-								return errors.NewProcessingError("[processTxMetaUsingStore][%s] failed to check counter conflicting tx on current chain", data.Hash.String(), err)
-							}
+							conflicting.add(data.Hash, data.Idx)
 						}
 					}
 
@@ -337,7 +352,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 			})
 		}
 
-		if err := g.Wait(); err != nil {
+		if err := u.settleCollectedConflictingTxs(ctx, g.Wait(), &conflicting, txMetaSlice, blockIds); err != nil {
 			return int(missed.Load()), errors.NewContextCanceledError("[processTxMetaUsingStore]", err)
 		}
 
@@ -397,6 +412,13 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 									txInpoints:  txMeta.TxInpoints,
 								}
 
+								// The batched branch above runs this check; without it here,
+								// whether a block's counter-spends are caught depended on which
+								// branch SubtreeValidation.BatchMissingTransactions selected.
+								if txMetaSlice[i+j].conflicting {
+									conflicting.add(txHash, i+j)
+								}
+
 								continue
 							}
 						}
@@ -413,7 +435,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 			})
 		}
 
-		if err := g.Wait(); err != nil {
+		if err := u.settleCollectedConflictingTxs(ctx, g.Wait(), &conflicting, txMetaSlice, blockIds); err != nil {
 			return int(missed.Load()), errors.NewContextCanceledError(errProcessTxMetaContextDone, err)
 		}
 
