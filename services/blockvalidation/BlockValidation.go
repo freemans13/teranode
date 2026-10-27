@@ -3628,8 +3628,15 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 	// chain reads INVALID for any parent mined deeper than the parent-header window. So act only
 	// when the parent is on the main chain, and otherwise return the verdict unacted for the worker
 	// to retry, as before.
+	//
+	// The verdict also reads parent txs' BlockIDs, which are only complete once setTxMined has run
+	// for this block's parent. Unlike ValidateBlockWithOptions, this path never waits for that
+	// (the parentHeaderRun-failure enqueue runs before waitForPreviousBlocksToBeProcessed). A parent
+	// tx first mined in a losing fork block keeps BlockIDs=[fork] until then, so the verdict is
+	// INVALID for an honest block. So also require the parent's mined_set, as read before
+	// block.Valid read those BlockIDs.
 	err = u.checkOldBlockIDs(ctx, oldBlockIDsMap, blockData.block)
-	if errors.Is(err, errors.ErrBlockInvalid) && u.parentOnMainChain(ctx, blockData.block, blockHeadersMeta) {
+	if errors.Is(err, errors.ErrBlockInvalid) && u.ancestorVerdictIsSound(ctx, blockData.block, blockHeadersMeta) {
 		reason := p2pconstants.ReasonInvalidBlock.String()
 		if markErr := u.markBlockAsInvalid(ctx, blockData.block, reason, blockData.peerID, blockData.baseURL); markErr != nil {
 			u.logger.Errorf("[ReValidateBlock][%s][InvalidateBlock] failed to invalidate block: %s", blockData.block.String(), markErr)
@@ -3639,13 +3646,23 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 	return err
 }
 
-// parentOnMainChain reports whether block's parent, blockHeadersMeta[0] as parentHeaderRun returns
-// it, is on the current main chain. When it is, the main chain below block is block's own ancestor
-// chain, so checkOldBlockIDs's main-chain verdict is also an ancestor verdict. A lookup error or a
-// missing parent reads as false, the direction that never invalidates.
-func (u *BlockValidation) parentOnMainChain(ctx context.Context, block *model.Block, blockHeadersMeta []*model.BlockHeaderMeta) bool {
+// ancestorVerdictIsSound reports whether checkOldBlockIDs's INVALID verdict for block can be acted
+// on. It needs block's parent, blockHeadersMeta[0] as parentHeaderRun returns it, to be:
+//   - mined_set, so the parent txs' BlockIDs that block.Valid read already include this chain's
+//     blocks. The flag is the one parentHeaderRun read, before block.Valid, so it cannot turn true
+//     after a stale read.
+//   - on the current main chain, so the main chain below block is block's own ancestor chain and
+//     the main-chain verdict is also an ancestor verdict.
+//
+// A lookup error or a missing parent reads as false, the direction that never invalidates.
+func (u *BlockValidation) ancestorVerdictIsSound(ctx context.Context, block *model.Block, blockHeadersMeta []*model.BlockHeaderMeta) bool {
 	if len(blockHeadersMeta) == 0 || blockHeadersMeta[0] == nil {
 		u.logger.Warnf("[ReValidateBlock][%s] no parent header meta, not acting on the INVALID ancestor verdict", block.String())
+		return false
+	}
+
+	if !blockHeadersMeta[0].MinedSet {
+		u.logger.Warnf("[ReValidateBlock][%s] parent %s is not mined_set yet, so the INVALID ancestor verdict may come from stale tx BlockIDs; not acting on it", block.String(), block.Header.HashPrevBlock.String())
 		return false
 	}
 
