@@ -64,6 +64,22 @@ import (
 // behind, it would keep answering lookups for a transaction Delete promised to remove every
 // trace of, which is the same resurrection the identity and membership deletes guard against.
 //
+// NO ARM JOINS A TABLE, and that is what keeps each one keyed whatever the planner's estimates
+// say. The first form joined k to each table with USING, the shape SetConflicting used before
+// 4f125ca1b, where on Hetzner mainnet on 2026-10-23 the generic plan hash-joined on the
+// transaction id over a sequential scan of all eight UTXO partitions, 4.56 billion rows for 16
+// transactions. Delete passes a single hash, which plans as index probes, but deleteIn is the
+// multi-delete entry point, so the shape is fixed here rather than at the first batch caller.
+// The UTXO and journal arms find their keys through a fenced LATERAL, which can only be a per-key
+// index probe, and then delete by those keys as an index condition with the full 32-byte id
+// rechecked against the constant txid array. The identity, membership and preservation arms
+// match the constant arrays directly: a row whose txid is in the array is a row of a deleted
+// transaction, and its leaf is that txid's leaf, so matching leaf and txid as two arrays
+// selects exactly the pairs. The body arm matches the heights gone found as an array, so it is
+// an index condition on both primary-key columns; a body of a deleted transaction at another
+// deleted transaction's height is also a trace to remove, so the unpaired match is still
+// exact. TestDeleteStatementNeverScansItsTables pins the plan.
+//
 // A transaction can hold several tx_mined rows -- one per partition its UTXOs are still claimed
 // through, or a coinbase re-org claiming it at more than one height -- all sharing the same
 // created_height, so gone runs them through UNION rather than a plain concatenation to collapse
@@ -74,31 +90,45 @@ WITH k AS (
         AS t(leaf, txid, lo, hi)
 ),
 UTXOs AS (
-    DELETE FROM utxo u USING k
-     WHERE u.leaf  = k.leaf
-       AND u.ukey >= k.lo
-       AND u.ukey <= k.hi
-       AND u.txid  = k.txid
+    DELETE FROM utxo u
+     WHERE u.leaf = ANY ($1::smallint[])
+       AND u.ukey = ANY (ARRAY(
+             SELECT c.ukey
+               FROM k
+              CROSS JOIN LATERAL (
+                SELECT x.ukey
+                  FROM utxo x
+                 WHERE x.leaf = k.leaf AND x.ukey >= k.lo AND x.ukey <= k.hi AND x.txid = k.txid
+                OFFSET 0
+              ) AS c))
+       AND u.txid = ANY ($2::bytea[])
 ),
 undo AS (
-    DELETE FROM spend_journal j USING k
-     WHERE j.ukey >= k.lo
-       AND j.ukey <= k.hi
-       AND j.txid  = k.txid
+    DELETE FROM spend_journal j
+     WHERE j.ukey = ANY (ARRAY(
+             SELECT c.ukey
+               FROM k
+              CROSS JOIN LATERAL (
+                SELECT sj.ukey
+                  FROM spend_journal sj
+                 WHERE sj.ukey >= k.lo AND sj.ukey <= k.hi AND sj.txid = k.txid
+                OFFSET 0
+              ) AS c))
+       AND j.txid = ANY ($2::bytea[])
 ),
 ident AS (
-    DELETE FROM tx_ident i USING k
-     WHERE i.leaf = k.leaf AND i.txid = k.txid
+    DELETE FROM tx_ident i
+     WHERE i.leaf = ANY ($1::smallint[]) AND i.txid = ANY ($2::bytea[])
     RETURNING i.created_height, i.txid
 ),
 mined AS (
-    DELETE FROM tx_mined m USING k
-     WHERE m.txid = k.txid
+    DELETE FROM tx_mined m
+     WHERE m.txid = ANY ($2::bytea[])
     RETURNING m.created_height, m.txid
 ),
 preserved AS (
-    DELETE FROM preserved_parent p USING k
-     WHERE p.txid = k.txid
+    DELETE FROM preserved_parent p
+     WHERE p.txid = ANY ($2::bytea[])
 ),
 gone AS (
     SELECT created_height, txid FROM ident
@@ -106,8 +136,9 @@ gone AS (
     SELECT created_height, txid FROM mined
 ),
 body AS (
-    DELETE FROM tx_body b USING gone g
-     WHERE b.created_height = g.created_height AND b.txid = g.txid
+    DELETE FROM tx_body b
+     WHERE b.created_height = ANY (ARRAY(SELECT DISTINCT g.created_height FROM gone g))
+       AND b.txid = ANY ($2::bytea[])
 )
 SELECT count(DISTINCT txid) FROM gone`
 

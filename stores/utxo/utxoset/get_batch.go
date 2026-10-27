@@ -2,6 +2,7 @@ package utxoset
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-batcher/v2"
@@ -76,11 +77,28 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 		}
 	}
 
-	if len(withoutBody) > 0 {
-		s.resolveGetItems(withoutBody, false)
-	}
+	// The two lookups are independent, so a mixed batch runs them at the same time. Run one
+	// after the other, the body readers, validator parent resolution among them, waited for the
+	// whole no-body lookup first. lookupMany is already called from concurrent batches
+	// (background is true), and each half answers only its own items.
+	switch {
+	case len(withoutBody) > 0 && len(withBody) > 0:
+		var wg sync.WaitGroup
 
-	if len(withBody) > 0 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			s.resolveGetItems(withoutBody, false)
+		}()
+
+		s.resolveGetItems(withBody, true)
+
+		wg.Wait()
+	case len(withoutBody) > 0:
+		s.resolveGetItems(withoutBody, false)
+	case len(withBody) > 0:
 		s.resolveGetItems(withBody, true)
 	}
 }

@@ -16,7 +16,12 @@ import (
 type planNode struct {
 	NodeType     string     `json:"Node Type"`
 	RelationName string     `json:"Relation Name"`
+	Filter       string     `json:"Filter"`
+	JoinFilter   string     `json:"Join Filter"`
 	Plans        []planNode `json:"Plans"`
+
+	// ParentRelationship is "InitPlan" for a CTE or an uncorrelated sub-select.
+	ParentRelationship string `json:"Parent Relationship"`
 }
 
 // walkPlan calls visit on every node of the plan, parents before children.

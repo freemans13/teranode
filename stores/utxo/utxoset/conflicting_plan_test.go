@@ -48,10 +48,52 @@ func TestConflictingStatementsNeverScanTheirTables(t *testing.T) {
 		})
 	}
 
+	// The UTXO update must not be a join, and no filter on a UTXO partition may hold an array
+	// that comes from a sub-select. Postgres hashes only constant arrays, so a filter over a
+	// sub-select's array is scanned element by element for every candidate row, which made the
+	// statement quadratic in outputs (see setConflictingSQL). A constant array prints as a
+	// quoted literal, '{...}', so any other ANY operand is that failure.
+	assertLinear := func(t *testing.T, root planNode) {
+		walkPlan(root, func(n planNode) {
+			require.NotContains(t, n.NodeType, "Join", "the UTXO flag update joins: %s", n.NodeType)
+			require.NotEqual(t, "Nested Loop", n.NodeType, "the UTXO flag update joins")
+
+			if !strings.HasPrefix(n.RelationName, "utxo") {
+				return
+			}
+
+			for _, f := range []string{n.Filter, n.JoinFilter} {
+				for _, operand := range strings.Split(f, "ANY (")[1:] {
+					require.True(t, strings.HasPrefix(operand, "'"),
+						"filter on %s matches a non-constant array: %s", n.RelationName, f)
+				}
+			}
+		})
+	}
+
 	t.Run("setConflictingSQL", func(t *testing.T) {
-		root := explainUnderNoNestloop(t, s, ctx, setConflictingSQL,
-			p.kLeaf, p.kTxid, p.kLo, p.kHi, true, FlagConflicting)
-		assertKeyed(t, root)
+		groups := p.leafKeys()
+		require.NotEmpty(t, groups)
+
+		for _, g := range groups {
+			root := explainUnderNoNestloop(t, s, ctx, setConflictingSQL,
+				g.leaf, g.txids, g.lo, g.hi, true, FlagConflicting)
+			assertKeyed(t, root)
+
+			// The top node is the UTXO update. Its row source, the ARRAY sub-select aside (an
+			// InitPlan, whose fenced LATERAL is a nested loop by construction), must be one
+			// keyed scan of the leaf's partition, with no join.
+			require.Equal(t, "ModifyTable", root.NodeType)
+			require.Equal(t, "utxo", root.RelationName)
+
+			for _, c := range root.Plans {
+				if c.ParentRelationship == "InitPlan" || c.ParentRelationship == "SubPlan" {
+					continue
+				}
+
+				assertLinear(t, c)
+			}
+		}
 	})
 
 	t.Run("conflictingReadSQL", func(t *testing.T) {
@@ -59,5 +101,53 @@ func TestConflictingStatementsNeverScanTheirTables(t *testing.T) {
 			p.kRef, p.kTxid, p.kLo, p.kHi,
 			p.pRef, p.pChild, p.pLeaf, p.pTxid, p.pUkey, p.pVout)
 		assertKeyed(t, root)
+	})
+}
+
+// TestDeleteStatementNeverScansItsTables pins deleteTxSQL's plan at 16 keys with nested loops
+// off. Every arm used to join the keys with USING, the shape that on Hetzner mainnet on
+// 2026-10-23 hash-joined on the transaction id over a sequential scan of every UTXO partition.
+// Delete passes one hash today, but deleteIn takes a batch, so the plan is checked at the size a
+// batch caller would bring.
+func TestDeleteStatementNeverScansItsTables(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 2, 10_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	// A spend, so a journal partition exists for the plan to scan or not.
+	child := mkSpender(t, parent, 0)
+	_, _, err = s.SpendAndCreate(ctx, child, 101)
+	require.NoError(t, err)
+
+	keys := []chainhash.Hash{*parent.TxIDChainHash(), *child.TxIDChainHash()}
+	for i := 0; len(keys) < 16; i++ {
+		keys = append(keys, chainhash.HashH([]byte{byte(i)}))
+	}
+
+	leaves := make([]int16, 0, len(keys))
+	txids := make([][]byte, 0, len(keys))
+	los := make([][16]byte, 0, len(keys))
+	his := make([][16]byte, 0, len(keys))
+
+	for i := range keys {
+		leaves = append(leaves, LeafFor(keys[i][:]))
+		txids = append(txids, keys[i][:])
+		los = append(los, Pack(keys[i][:], 0))
+		his = append(his, Pack(keys[i][:], ^uint32(0)))
+	}
+
+	root := explainUnderNoNestloop(t, s, ctx, deleteTxSQL, leaves, txids, los, his)
+
+	walkPlan(root, func(n planNode) {
+		for _, table := range []string{"utxo", "spend_journal", "tx_ident", "tx_mined", "tx_body", "preserved_parent"} {
+			if strings.HasPrefix(n.RelationName, table) {
+				require.NotEqual(t, "Seq Scan", n.NodeType, "seq scan of %s", n.RelationName)
+				require.NotEqual(t, "Parallel Seq Scan", n.NodeType, "seq scan of %s", n.RelationName)
+			}
+		}
+
+		require.NotContains(t, n.NodeType, "Hash Join", "a delete arm joins")
 	})
 }

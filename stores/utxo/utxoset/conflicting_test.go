@@ -2,6 +2,7 @@ package utxoset
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -642,4 +643,58 @@ func TestUnspendClearsAStaleConflictingBit(t *testing.T) {
 	spends, err = spendOnly(ctx, s, other, 102)
 	require.NoError(t, err, "P is no longer conflicting, so its restored output is spendable")
 	require.NoError(t, spends[0].Err)
+}
+
+// TestSetConflictingIsLinearInOutputs flags 32 transactions in one leaf with 1,000 outputs each
+// and requires every UTXO flagged inside a bound that only a linear statement meets.
+//
+// The previous statement matched the found keys through three ANY (ARRAY(SELECT ...)) filters.
+// Postgres hashes only constant arrays, so every candidate row scanned the arrays element by
+// element, and the time grew with the square of the outputs: measured on the test container,
+// 1.3 s at 16,000 outputs and 25-29 s at 64,000. At 32,000 that form takes several seconds;
+// the per-leaf form takes about 0.1 s, so a 3 s bound separates them with a wide margin on a
+// slow runner.
+func TestSetConflictingIsLinearInOutputs(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	const (
+		nTx   = 32
+		perTx = 1_000
+	)
+
+	named := make([]chainhash.Hash, 0, nTx)
+
+	// All in ONE leaf, so a single statement sees every output. The statement runs per leaf,
+	// and spreading the family over eight leaves would hide a quadratic term behind an
+	// eight-way split.
+	for sats := uint64(5_000); len(named) < nTx; sats++ {
+		tx := mkTx(t, perTx, sats)
+		if LeafFor(tx.TxIDChainHash()[:]) != 0 {
+			continue
+		}
+
+		_, err := s.Create(ctx, tx, 100)
+		require.NoError(t, err)
+
+		named = append(named, *tx.TxIDChainHash())
+	}
+
+	start := time.Now()
+	_, _, err := s.SetConflicting(ctx, named, true)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	t.Logf("SetConflicting over %d outputs: %v", nTx*perTx, elapsed)
+
+	var flagged int
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM utxo WHERE flags & $1::smallint <> 0`, FlagConflicting).Scan(&flagged))
+	require.Equal(t, nTx*perTx, flagged, "every UTXO of every named transaction")
+	require.Less(t, elapsed, 3*time.Second, "SetConflicting over %d outputs took %v", nTx*perTx, elapsed)
+
+	_, _, err = s.SetConflicting(ctx, named, false)
+	require.NoError(t, err)
+
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM utxo WHERE flags & $1::smallint <> 0`, FlagConflicting).Scan(&flagged))
+	require.Zero(t, flagged, "clearing reaches every UTXO too")
 }

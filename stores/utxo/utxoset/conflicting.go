@@ -119,17 +119,38 @@ ON CONFLICT DO NOTHING`
 // UTXOs stay spendable. The UTXO bit is what makes the spend statement's flag mask refuse the
 // delete.
 //
-// The UTXO update is bounded by a key RANGE rather than by transaction id alone. The packed key
-// carries the id prefix first precisely so this is an index range scan, and the full 32-byte id
-// is still rechecked because the prefix is non-unique by design.
+// The statement runs ONCE PER LEAF GROUP, in ascending leaf order, with the leaf as a scalar
+// and every array a bound constant. That is what keeps each arm keyed and linear whatever the
+// planner's estimates say, because no arm joins anything to a table.
 //
-// The range is FENCED: hit finds each transaction's keys through a LATERAL with OFFSET 0, which
-// can only be planned as a per-key index probe, and the update then matches those exact keys
-// as arrays rather than joining. Written as a plain join against the unnest, with the range as
-// a join filter, the generic plan hash-joined on the transaction id, which no UTXO index
-// covers, over a sequential scan of every partition: on Hetzner mainnet on 2026-10-23, 4.56
-// billion rows to flag 16 transactions, about 40 minutes for every block with conflicts. The
-// identity and membership arms match the parameter arrays directly for the same reason, and
+// The UTXO arm finds its rows in two steps inside one statement. The ARRAY sub-select walks each
+// transaction's packed-key range through a LATERAL with OFFSET 0, which can only be planned as a
+// per-key index probe on this leaf's partition, with the full 32-byte id rechecked on the heap.
+// The update then takes those keys as an index condition, one descent per distinct key, and
+// rechecks the full id against the constant txid array, which Postgres hashes. The packed key
+// carries the id prefix first precisely so a transaction's UTXOs are one index range, and the
+// full id is still rechecked because the prefix is non-unique by design.
+//
+// Three earlier shapes were measured and rejected, on the test container's Postgres 16 with 2M
+// UTXO rows over 8 partitions plus the flagged rows, 1,000 outputs per transaction
+// (TestSetConflictingIsLinearInOutputs pins the result):
+//
+//   - A plain join against the unnest, with the range as a join filter. The planner hash-joined
+//     on the transaction id, which no UTXO index covers, over a sequential scan of every
+//     partition: on Hetzner mainnet on 2026-10-23, 4.56 billion rows to flag 16 transactions,
+//     about 40 minutes for every block with conflicts.
+//   - The fenced lookup with the update matching the found keys as three independent
+//     ANY (ARRAY(SELECT ...)) filters over all eight partitions. An array from a sub-select is
+//     never hashed, so each candidate row scanned the arrays element by element: 1.3 s at 16,000
+//     outputs and 25-29 s at 64,000, quadratic in outputs.
+//   - The fenced lookup with the update joined to it on (leaf, ukey, txid), setLockedSQL's
+//     shape. Linear under good estimates (61-70 ms at 16,000 outputs, 246-270 ms at 64,000),
+//     but with enable_nestloop off, which stands in for the estimates that pick a hash join, it
+//     became a hash join over a sequential scan of every partition, 4.9 s at 16,000.
+//
+// This shape measured 46-57 ms at 16,000 outputs and 159-227 ms at 64,000, the same with nested
+// loops on or off. The identity and membership arms match the per-leaf constant arrays
+// directly, in setLockedIdentSQL's leaf-scalar shape, and
 // TestConflictingStatementsNeverScanTheirTables pins all of it.
 //
 // The flag is flipped on THREE things, not two, for the same reason setLockedSQL flips three.
@@ -141,41 +162,32 @@ ON CONFLICT DO NOTHING`
 // image of the failure setLockedSQL's own comment warns about. The membership arm is a plain
 // txid equality because tx_mined's primary key leads with txid.
 const setConflictingSQL = `
-WITH k AS (
-    SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[])
-        AS t(leaf, txid, lo, hi)
-),
-ident AS (
+WITH ident AS (
     UPDATE tx_ident i
        SET flags = CASE WHEN $5::boolean THEN i.flags |  $6::smallint
                                          ELSE i.flags & ~$6::smallint END
-     WHERE i.leaf = ANY ($1::smallint[]) AND i.txid = ANY ($2::bytea[])
+     WHERE i.leaf = $1::smallint AND i.txid = ANY ($2::bytea[])
 ),
 mined AS (
     UPDATE tx_mined m
        SET flags = CASE WHEN $5::boolean THEN m.flags |  $6::smallint
                                          ELSE m.flags & ~$6::smallint END
      WHERE m.txid = ANY ($2::bytea[])
-),
-hit AS (
-    SELECT c.leaf, c.ukey, k.txid
-      FROM k
-     CROSS JOIN LATERAL (
-       SELECT x.leaf, x.ukey
-         FROM utxo x
-        WHERE x.leaf = k.leaf AND x.ukey >= k.lo AND x.ukey <= k.hi AND x.txid = k.txid
-       OFFSET 0
-     ) AS c
-),
-UTXOs AS (
-    UPDATE utxo u
-       SET flags = CASE WHEN $5::boolean THEN u.flags |  $6::smallint
-                                         ELSE u.flags & ~$6::smallint END
-     WHERE u.leaf = ANY (ARRAY(SELECT hit.leaf FROM hit))
-       AND u.ukey = ANY (ARRAY(SELECT hit.ukey FROM hit))
-       AND u.txid = ANY (ARRAY(SELECT hit.txid FROM hit))
 )
-SELECT 1`
+UPDATE utxo u
+   SET flags = CASE WHEN $5::boolean THEN u.flags |  $6::smallint
+                                     ELSE u.flags & ~$6::smallint END
+ WHERE u.leaf = $1::smallint
+   AND u.ukey = ANY (ARRAY(
+         SELECT c.ukey
+           FROM unnest($2::bytea[], $3::uuid[], $4::uuid[]) AS k(txid, lo, hi)
+          CROSS JOIN LATERAL (
+            SELECT x.ukey
+              FROM utxo x
+             WHERE x.leaf = $1::smallint AND x.ukey >= k.lo AND x.ukey <= k.hi AND x.txid = k.txid
+            OFFSET 0
+          ) AS c))
+   AND u.txid = ANY ($2::bytea[])`
 
 // conflictingReadSQL reads back the spends to undo and the next level of the cascade, after
 // setConflictingSQL has run in the same transaction. See setConflictingSQL for why it is a
@@ -442,7 +454,6 @@ func (s *Store) readInputsForLeaf(ctx context.Context, g leafBatch,
 type conflictingPlan struct {
 	// One element per named transaction.
 	kRef  []int32
-	kLeaf []int16
 	kTxid [][]byte
 	kLo   [][16]byte
 	kHi   [][16]byte
@@ -466,7 +477,6 @@ func (s *Store) planConflicting(named []chainhash.Hash,
 
 	for i := range named {
 		p.kRef = append(p.kRef, int32(i)) //nolint:gosec // bounded by batch size
-		p.kLeaf = append(p.kLeaf, LeafFor(named[i][:]))
 		p.kTxid = append(p.kTxid, named[i][:])
 		p.kLo = append(p.kLo, Pack(named[i][:], 0))
 		p.kHi = append(p.kHi, Pack(named[i][:], ^uint32(0)))
@@ -497,14 +507,50 @@ func (s *Store) planConflicting(named []chainhash.Hash,
 	return p
 }
 
+// conflictingLeafKeys is one leaf group of a conflictingPlan's named transactions, with each
+// transaction's packed-key range, the arguments setConflictingSQL takes.
+type conflictingLeafKeys struct {
+	leaf  int16
+	txids [][]byte
+	lo    [][16]byte
+	hi    [][16]byte
+}
+
+// leafKeys splits the named transactions by leaf, in ascending leaf order, the lock order
+// leafGroups documents.
+func (p *conflictingPlan) leafKeys() []conflictingLeafKeys {
+	groups := leafGroups(p.kTxid)
+	out := make([]conflictingLeafKeys, 0, len(groups))
+
+	for _, g := range groups {
+		k := conflictingLeafKeys{
+			leaf:  g.leaf,
+			txids: g.txids,
+			lo:    make([][16]byte, len(g.txids)),
+			hi:    make([][16]byte, len(g.txids)),
+		}
+
+		for i, txid := range g.txids {
+			k.lo[i] = Pack(txid, 0)
+			k.hi[i] = Pack(txid, ^uint32(0))
+		}
+
+		out = append(out, k)
+	}
+
+	return out
+}
+
 // runConflictingPlan flips the flags and then reads back both answers, as two statements so the
 // read sees every spend that committed while the flip waited on its row locks. q must be a
 // transaction for the pair to be atomic; SetConflicting always passes one.
 func (s *Store) runConflictingPlan(ctx context.Context, q querier, p *conflictingPlan,
 	value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
-	if _, err := q.Exec(ctx, setConflictingSQL,
-		p.kLeaf, p.kTxid, p.kLo, p.kHi, value, FlagConflicting); err != nil {
-		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] set", err)
+	for _, g := range p.leafKeys() {
+		if _, err := q.Exec(ctx, setConflictingSQL,
+			g.leaf, g.txids, g.lo, g.hi, value, FlagConflicting); err != nil {
+			return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] set", err)
+		}
 	}
 
 	rows, err := q.Query(ctx, conflictingReadSQL,
