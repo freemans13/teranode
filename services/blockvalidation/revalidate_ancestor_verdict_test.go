@@ -380,3 +380,31 @@ func remineAt(t *testing.T, hdr *model.BlockHeader, timestamp uint32) {
 		hdr.Nonce++
 	}
 }
+
+// TestAncestorVerdictIsSound_FailSafe pins the branches of ancestorVerdictIsSound that must read as
+// false, the direction that never invalidates: no parent meta, a nil parent entry, a parent not yet
+// mined_set, and a parent id that is not on the main chain. The last positive case shows the real
+// parent reads as true, so each false above comes from the branch it names.
+func TestAncestorVerdictIsSound_FailSafe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bv, blockchainClient, blockC, _ := newAncestorVerdictFixture(ctx, t, ancestorVerdictFixtureOpts{storeC: true, parentMinedSet: true})
+
+	_, parentMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Header.HashPrevBlock)
+	require.NoError(t, err)
+	require.True(t, parentMeta.MinedSet, "precondition: the fixture marked C's parent mined_set")
+
+	require.False(t, bv.ancestorVerdictIsSound(ctx, blockC, nil), "no parent meta must not license acting on the verdict")
+	require.False(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{nil}), "a nil parent entry must not license acting on the verdict")
+
+	notMined := *parentMeta
+	notMined.MinedSet = false
+	require.False(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{&notMined}), "a parent not yet mined_set must not license acting on the verdict")
+
+	unknown := *parentMeta
+	unknown.ID = 1 << 30
+	require.False(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{&unknown}), "a parent id the store does not know must not license acting on the verdict")
+
+	require.True(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{parentMeta}), "a mined_set parent on the main chain licenses acting on the verdict")
+}
