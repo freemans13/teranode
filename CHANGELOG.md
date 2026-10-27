@@ -698,6 +698,30 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
   (bsv-blockchain/teranode#2037)
 
+- **A proven conflict now rejects a block even when part of the conflict check
+  failed.** Affects `CheckBlockSubtrees`: cached subtrees, fresh subtrees, and
+  missing transactions it fetches and blesses, alike. When a block's conflicting
+  transactions are checked against the candidate chain, a transaction that is
+  provably invalid used to lose to any retryable failure elsewhere in the same
+  check: a pruned parent record, a store fault, the
+  `utxostore_conflictingChildrenMaxNodes` walk limit, a frozen output, or another
+  input of the same transaction that could not be checked. On the fresh path the
+  verdict was also returned as a context cancellation, so block validation retried
+  it even when nothing else failed. Either way the block was retried, never
+  rejected, and the announcing peer was not scored for it. Now, if any
+  counter-conflicting transaction that was read is mined on the candidate chain,
+  the block is rejected with `TX_INVALID` whatever else failed, and scored as any
+  invalid transaction is; the retryable error is returned only when nothing is
+  proven. A block that used to retry indefinitely may now be rejected on the first
+  attempt. This includes a walk over the `utxostore_conflictingChildrenMaxNodes`
+  budget that already reached a mined member: raising the setting no longer
+  changes that verdict. The fresh-path change also reaches `ValidateSubtreeInternal`,
+  so `CheckSubtreeFromBlock` and live peer subtrees return a proven conflict as
+  `TX_INVALID` too. On the live path, `subtreeMessageHandler` now logs it at error
+  level ("error processing kafka message") where it logged a "Context canceled,
+  skipping" warning, so operators will see new error-level log lines for such
+  subtrees. Nothing to configure. (bsv-blockchain/teranode#2052)
+
 ### Not breaking, but worth knowing
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block

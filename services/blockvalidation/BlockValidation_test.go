@@ -298,8 +298,9 @@ func (m *MockSubtreeValidationClient) CheckBlockSubtrees(ctx context.Context, bl
 // - Subtree validation services
 // - Transaction and block storage systems
 // The function returns initialized components and a cleanup function to ensure
-// proper test isolation.
-func setup(t *testing.T) (utxostore.Store, subtreevalidation.Interface, blockchain.ClientI, blob.Store, blob.Store, func()) {
+// proper test isolation. Each configure func adjusts the settings the stores and
+// the subtree validation server are built with.
+func setup(t *testing.T, configure ...func(*settings.Settings)) (utxostore.Store, subtreevalidation.Interface, blockchain.ClientI, blob.Store, blob.Store, func()) {
 	// we only need the httpClient, utxoStore and validatorClient when blessing a transaction
 	httpmock.ActivateNonDefault(util.HTTPClient())
 	httpmock.RegisterResponder(
@@ -318,6 +319,10 @@ func setup(t *testing.T) (utxostore.Store, subtreevalidation.Interface, blockcha
 	logger := ulogger.TestLogger{}
 
 	tSettings := test.CreateBaseTestSettings(t)
+
+	for _, fn := range configure {
+		fn(tSettings)
+	}
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	if err != nil {

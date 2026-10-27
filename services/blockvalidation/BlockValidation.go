@@ -234,6 +234,11 @@ type BlockValidation struct {
 	// variadic opts like p2pClient.
 	blockAssemblyClient blockassembly.ClientI
 
+	// setMinedDisabled leaves the mined status of blocks to another BlockValidation
+	// on the same stores (see NoSetMined): nothing is queued for this instance's
+	// setMined worker. Set from NewBlockValidation's variadic opts.
+	setMinedDisabled bool
+
 	// lastValidatedBlocks caches recently validated blocks for 2 minutes
 	lastValidatedBlocks *expiringmap.ExpiringMap[chainhash.Hash, *model.Block]
 
@@ -389,6 +394,12 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 		u.settings.BlockValidation.SubtreeMetaPeerFetchTimeout)
 }
 
+// NoSetMined, passed to NewBlockValidation, leaves setting the mined status of
+// blocks' transactions to another BlockValidation on the same stores. Two
+// setMined workers on one block race: one's set can land after the other's
+// unset of an invalidated block and leave its transactions marked mined.
+type NoSetMined struct{}
+
 // NewBlockValidation creates a new block validation instance with the provided dependencies.
 // It initializes all required components and starts background processing goroutines for
 // handling block validation tasks.
@@ -403,12 +414,16 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 //   - utxoStore: Storage for utxos and transaction metadata
 //   - validatorClient: Transaction validation interface
 //   - subtreeValidationClient: Subtree validation interface
-//   - opts: Optional parameters:
+//   - opts: Optional parameters: a P2PClientI, a blockassembly.ClientI, NoSetMined
 //
 // Returns a configured BlockValidation instance ready for use.
 func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, subtreeStore blob.Store,
 	txStore blob.Store, utxoStore utxo.Store, validatorClient validator.Interface, subtreeValidationClient subtreevalidation.Interface, opts ...interface{},
 ) *BlockValidation {
+	// The background goroutines below set package metrics; a BlockValidation built
+	// without the Server, such as the test daemon's, must not find them nil.
+	initPrometheusMetrics()
+
 	logger.Infof("optimisticMining = %v", tSettings.BlockValidation.OptimisticMining)
 	if tSettings.BlockValidation.OptimisticMining && !tSettings.BlockValidation.OptimisticMiningPeerBlocks {
 		logger.Warnf("optimistic mining is enabled but stays off on every validation path until blockvalidation_optimistic_mining_peer_blocks is also set (bitcoin-sv/teranode#4692)")
@@ -471,6 +486,10 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		if c, ok := o.(blockassembly.ClientI); ok {
 			bv.blockAssemblyClient = c
 		}
+
+		if _, ok := o.(NoSetMined); ok {
+			bv.setMinedDisabled = true
+		}
 	}
 
 	go func() {
@@ -495,7 +514,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		subscribeCancel context.CancelFunc
 	)
 
-	if bv.blockchainClient != nil {
+	// The subscription only feeds the setMined worker, so a NoSetMined instance skips it.
+	if bv.blockchainClient != nil && !bv.setMinedDisabled {
 		go func() {
 			for {
 				select {
@@ -924,7 +944,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 // We deliberately do NOT call tryClaimBlockForSetMined here because the claim must be
 // released by the consumer, and the worker owns that lifecycle.
 func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context) {
-	if u.blockchainClient == nil {
+	if u.blockchainClient == nil || u.setMinedDisabled {
 		return
 	}
 
@@ -983,6 +1003,10 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context) {
 // once the channel empties, and dedups via the MinedSet/tryClaim guards, so overflow
 // reordering is harmless.
 func (u *BlockValidation) enqueueSetMined(blockHash *chainhash.Hash) {
+	if u.setMinedDisabled {
+		return
+	}
+
 	select {
 	case u.setMinedChan <- blockHash:
 	default:
@@ -2188,7 +2212,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// Wait for reValidationBlock to do its thing
 		// When waitForPreviousBlocksToBeProcessed is done, all the previous blocks will be processed
 		if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
-			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
+			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block.
+			// A NoSetMined instance queues nothing here and waits on the BlockValidation
+			// that owns setMined to mark the parent mined.
 			u.enqueueSetMined(block.Header.HashPrevBlock)
 
 			if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {

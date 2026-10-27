@@ -777,6 +777,8 @@ func enableOutpointOnlyFastPath(t *testing.T, s *CatchupTestSuite) {
 }
 
 func setupQuickValidateMocks(s *CatchupTestSuite) {
+	// validateBlocksOnChannel checks whether the block was stored meanwhile before quick validation.
+	s.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 	s.MockBlockchain.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(1), nil).Maybe()
 	s.MockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	s.MockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil).Maybe()
@@ -798,6 +800,8 @@ func setupQuickValidateMocks(s *CatchupTestSuite) {
 // mandatory would assert the very calls the fix removes. Tests using this assert the
 // absence positively instead, with AssertNotCalled.
 func setupQuickValidateMocksBodyRejected(s *CatchupTestSuite) {
+	// validateBlocksOnChannel checks whether the block was stored meanwhile before quick validation.
+	s.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 	s.MockBlockchain.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(1), nil).Maybe()
 	s.MockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	s.MockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil).Maybe()

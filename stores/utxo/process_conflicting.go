@@ -1434,7 +1434,13 @@ func counterConflictingInpoints(txMeta *meta.Data) ([]subtree.Inpoint, error) {
 //     included, so the caller can decide whether a gap fails its check. Any other
 //     read error aborts the walk.
 //
-// The walk histograms get one observation per call, for the whole walk.
+// A walk that stops on its budget or a read error still returns what it reached
+// with the error: cones has one entry per pass, the pass it stopped in holds the
+// descendants found so far, and later passes are empty. Every hash returned is a
+// descendant of its pass's roots, so a caller may act on a partial cone.
+//
+// The walk histograms get one observation per call, for the whole walk; a walk
+// that stops gets none.
 func GetConflictingChildrenFromRoots(ctx context.Context, s Store, passes [][]chainhash.Hash, maxNodes int) (cones [][]chainhash.Hash, missing []chainhash.Hash, err error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "GetConflictingChildrenFromRoots",
 		tracing.WithHistogram(prometheusUtxoConflictingWalkDuration),
@@ -1456,11 +1462,12 @@ func GetConflictingChildrenFromRoots(ctx context.Context, s Store, passes [][]ch
 
 	for p, pass := range passes {
 		children, err := w.walkPass(ctx, pass)
-		if err != nil {
-			return nil, nil, err
-		}
 
 		cones[p] = children
+
+		if err != nil {
+			return cones, w.missing, err
+		}
 	}
 
 	prometheusUtxoConflictingWalkNodes.Observe(float64(len(w.visited)))
@@ -1529,7 +1536,7 @@ func (w *multiRootWalk) add(hash chainhash.Hash) (bool, error) {
 }
 
 // walkPass walks one pass of roots breadth first and returns the descendants it
-// newly visited.
+// newly visited. On an error it returns those visited so far with it.
 func (w *multiRootWalk) walkPass(ctx context.Context, pass []chainhash.Hash) ([]chainhash.Hash, error) {
 	var children, level []chainhash.Hash
 
@@ -1540,7 +1547,7 @@ func (w *multiRootWalk) walkPass(ctx context.Context, pass []chainhash.Hash) ([]
 
 		added, err := w.add(root)
 		if err != nil {
-			return nil, err
+			return children, err
 		}
 
 		if added {
@@ -1556,7 +1563,7 @@ func (w *multiRootWalk) walkPass(ctx context.Context, pass []chainhash.Hash) ([]
 
 		levelMetas, err := readConflictingWalkLevel(ctx, w.s, current)
 		if err != nil {
-			return nil, err
+			return children, err
 		}
 
 		for i, txMeta := range levelMetas {
@@ -1568,7 +1575,7 @@ func (w *multiRootWalk) walkPass(ctx context.Context, pass []chainhash.Hash) ([]
 			for _, child := range conflictingWalkChildren(txMeta) {
 				added, err := w.add(child)
 				if err != nil {
-					return nil, err
+					return children, err
 				}
 
 				if !added {

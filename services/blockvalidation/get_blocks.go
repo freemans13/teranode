@@ -55,6 +55,9 @@ type resultItem struct {
 	// verdict (bitcoin-sv/teranode#4692), so a doctored body naming an already-persisted hash never
 	// triggers deletion of that hash's promoted blobs.
 	freshlyWritten map[chainhash.Hash]map[fileformat.FileType]struct{}
+	// alreadyStored marks a block that was stored after the header phase, by another path. Its
+	// subtree data was not fetched.
+	alreadyStored bool
 }
 
 // blockForValidation wraps a block with metadata about which peers contributed data
@@ -62,6 +65,7 @@ type blockForValidation struct {
 	block             *model.Block
 	contributingPeers map[string]struct{}
 	freshlyWritten    map[chainhash.Hash]map[fileformat.FileType]struct{}
+	alreadyStored     bool
 }
 
 // fetchBlocksConcurrently fetches blocks from a peer using a high-performance worker pool architecture.
@@ -138,8 +142,9 @@ func (u *Server) fetchBlocksConcurrently(ctx context.Context, catchupCtx *Catchu
 			return errors.NewProcessingError("[catchup:fetchBlocksConcurrently][%s] commonAncestorMeta must not be nil", blockUpTo.Hash().String())
 		}
 
-		// Calculate starting height from common ancestor
-		startingHeight := catchupCtx.commonAncestorMeta.Height + 1
+		// Calculate starting height from common ancestor, moved past any stored blocks trimmed
+		// from the front of the list
+		startingHeight := catchupFirstBlockHeight(catchupCtx)
 
 		return u.batchFetchAndDistribute(gCtx, blockHeaders, workQueue, peerID, baseURL, blockUpTo, largeBatchSize, startingHeight)
 	})
@@ -256,6 +261,7 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 
 			var contributingPeers map[string]struct{}
 			var freshlyWritten map[chainhash.Hash]map[fileformat.FileType]struct{}
+			var alreadyStored bool
 			var err error
 			if optimistic {
 				contributingPeers, freshlyWritten, err = nil, nil, nil
@@ -275,15 +281,34 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 
 				weight, err = u.acquireCatchupPrefetch(ctx, work.block)
 				if err == nil {
-					fetchFn := u.fetchSubtreeDataForBlockFn
-					if fetchFn == nil {
-						fetchFn = u.fetchSubtreeDataForBlock
-					}
+					// A block stored since the header phase, by the normal path, needs no prewarm:
+					// validation finds it stored and stops there. Checked after the reservation, just
+					// before the fetch, because the wait for the budget can be another block's whole
+					// prewarm, and this fetch can be the whole block's subtree data.
+					alreadyStored, err = u.blockStoredSinceHeaders(ctx, work.block)
+					if err == nil && !alreadyStored {
+						fetchFn := u.fetchSubtreeDataForBlockFn
+						if fetchFn == nil {
+							fetchFn = u.fetchSubtreeDataForBlock
+						}
 
-					contributingPeers, freshlyWritten, err = fetchFn(ctx, work.block, peerID, baseURL)
+						contributingPeers, freshlyWritten, err = fetchFn(ctx, work.block, peerID, baseURL)
+					}
 
 					u.releaseCatchupPrefetch(weight)
 				}
+			}
+
+			if err == nil && alreadyStored {
+				u.logger.Infof("[catchup:blockWorker-%d][%s] block %s was stored since the header phase, not fetching its subtree data", workerID, blockUpTo.Hash().String(), work.block.Hash().String())
+
+				select {
+				case resultQueue <- resultItem{block: work.block, index: work.index, alreadyStored: true}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+
+				continue
 			}
 
 			if err != nil {
@@ -332,6 +357,17 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 	}
 }
 
+// blockStoredSinceHeaders reports whether block is now stored. A store error is returned, never
+// guessed.
+func (u *Server) blockStoredSinceHeaders(ctx context.Context, block *model.Block) (bool, error) {
+	exists, err := u.blockValidation.GetBlockExists(ctx, block.Hash())
+	if err != nil {
+		return false, storedLookupError(ctx, err, "[catchup] failed to check whether block %s is stored", block.Hash().String())
+	}
+
+	return exists, nil
+}
+
 // orderedDelivery ensures blocks are delivered to validateBlocksChan in strict order
 func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan resultItem, validateBlocksChan chan<- blockForValidation, totalBlocks int, blockUpTo *model.Block, size *atomic.Int64) error {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(gCtx, "orderedDelivery",
@@ -370,7 +406,7 @@ func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan result
 					u.logger.Debugf("[catchup:orderedDelivery][%s] delivering block %s at index %d (received %d/%d)", blockUpTo.Hash().String(), orderedResult.block.Hash().String(), nextIndex, receivedCount, totalBlocks)
 
 					select {
-					case validateBlocksChan <- blockForValidation{block: orderedResult.block, contributingPeers: orderedResult.contributingPeers, freshlyWritten: orderedResult.freshlyWritten}:
+					case validateBlocksChan <- blockForValidation{block: orderedResult.block, contributingPeers: orderedResult.contributingPeers, freshlyWritten: orderedResult.freshlyWritten, alreadyStored: orderedResult.alreadyStored}:
 						delete(results, nextIndex)
 						nextIndex++
 						// Note: size counter is decremented by validateBlocksOnChannel after processing
