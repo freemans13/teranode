@@ -175,6 +175,17 @@ func (s *SQL) repairOnMainChainUntilClean() bool {
 		r.mu.Lock()
 
 		if err == nil {
+			if !r.pending {
+				// A rebuild outside the loop landed between this attempt's walk and
+				// now, and onMainChainRepaired already released the count. Releasing
+				// it again would drive mainChainRebuilding below zero. A mark recorded
+				// after that release sets pending again with a newer generation, so it
+				// takes the retry path below instead of this one.
+				r.mu.Unlock()
+
+				return true
+			}
+
 			if r.generation == generation {
 				s.clearOnMainChainRepairLocked("the background repair")
 				r.mu.Unlock()

@@ -70,14 +70,53 @@ func setRepairBackoff(t *testing.T, s *SQL, d time.Duration) {
 func waitForRepair(t *testing.T, s *SQL) {
 	t.Helper()
 
-	deadline := time.Now().Add(10 * time.Second)
-	for s.mainChainRebuilding.Load() > 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the background repair did not land within 10 seconds")
+	require.Eventually(t, func() bool {
+		return s.mainChainRebuilding.Load() == 0
+	}, 10*time.Second, time.Millisecond, "the background repair must release its guard exactly once")
+}
+
+// A successful operator rebuild can acknowledge the repair after the worker has
+// selected its generation but before the worker accounts for its own success.
+// Both acknowledgments must release the pending repair's guard only once.
+func TestOnMainChainRepairDoesNotClearAnAlreadyRepairedGeneration(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+	storeBlocks(t, s, block1, block2)
+
+	_, err := s.db.Exec(`UPDATE blocks SET on_main_chain = false WHERE hash = $1`, block1.Hash().CloneBytes())
+	require.NoError(t, err)
+
+	acknowledged := make(chan struct{})
+	s.rebuildTxHook = func(ctx context.Context, full bool) error {
+		if err := s.rebuildOnMainChainFlagTx(ctx, full); err != nil {
+			return err
 		}
 
-		time.Sleep(time.Millisecond)
+		// Model the external acknowledgment in the worker's accounting window,
+		// after a real full rebuild has repaired the persisted flags.
+		s.onMainChainRepaired(true)
+		close(acknowledged)
+
+		return nil
 	}
+
+	s.markOnMainChainDirty(true, "test", errors.NewStorageError("injected"))
+	select {
+	case <-acknowledged:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the repair did not reach the acknowledgment")
+	}
+
+	// Join the worker before examining its final accounting, including underflow.
+	close(s.backgroundDone)
+	select {
+	case <-s.onMainChainRepair.stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the repair loop did not stop")
+	}
+
+	require.Zero(t, s.mainChainRebuilding.Load(), "the same repair must not release its guard twice")
+	require.True(t, getOnMainChain(t, s, block1.Hash().CloneBytes()), "the persisted flag was repaired")
+	require.Zero(t, repairPending(t))
 }
 
 func repairPending(t *testing.T) float64 {
