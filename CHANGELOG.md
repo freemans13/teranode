@@ -120,7 +120,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   cumulative work than the best tip, at any fork depth; equal work is still fetched. The
   deep-fork secret-mining penalty is unchanged. In a mixed-version deploy, a subtree
   validation older than its block validation ignores the new request field and keeps the
-  hand-off off. (#2067)
+  hand-off off. (#2075, fixes #2067)
 
 - **Catch-up quick validation waits for each block's `.subtree` writes before it commits
   the block, and a shutdown waits for a block's in-flight commit.** A block was stored with
