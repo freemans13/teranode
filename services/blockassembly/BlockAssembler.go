@@ -595,16 +595,6 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// dequeued in no subtree. Not a storage fault, so it resets
 				// even while degraded, as a plain (not storage-triggered)
 				// reset.
-				// Wake a replay of the tip changes if none ran for
-				// blockassembly_reconcileInterval: a dropped subscription
-				// delivers no notification until it reconnects.
-				// The check runs outside StateReconciling, so a mining candidate asked
-				// for meanwhile is not an empty one, and a replay starts only when the
-				// tip moved.
-				if b.reconcileDue(time.Now()) && b.idleReconcileNeeded(ctx) {
-					b.triggerReconcile()
-				}
-
 				if b.subtreeProcessor.TakeDrainResetRequested() {
 					b.logger.Warnf("[BlockAssembler] the queue drain after a block failed; resetting block assembly")
 					b.resetAfterDrainFailure()
@@ -630,6 +620,16 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 						b.lastStorageResetDone = time.Now()
 						b.resetStorageTriggered()
 					}
+				}
+
+				// Wake a replay of the tip changes if none ran for
+				// blockassembly_reconcileInterval: a dropped subscription
+				// delivers no notification until it reconnects. The check
+				// runs outside StateReconciling, so a mining candidate asked
+				// for meanwhile is not an empty one, and a replay starts only
+				// when the tip moved.
+				if b.reconcileDue(time.Now()) && b.idleReconcileNeeded(ctx) {
+					b.triggerReconcile()
 				}
 
 			case resetReq := <-b.resetCh:
