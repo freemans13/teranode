@@ -3611,9 +3611,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	}
 	prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues("false", "success").Observe(duration)
 	b.logger.Infof("[loadUnminedTransactions] successfully created unmined tx iterator, starting to process transactions")
+	iteratorClosed := false
 	defer func() {
-		if closeErr := it.Close(); closeErr != nil {
-			b.logger.Warnf("[loadUnminedTransactions] error closing unmined iterator: %v", closeErr)
+		if !iteratorClosed {
+			if closeErr := it.Close(); closeErr != nil {
+				b.logger.Warnf("[loadUnminedTransactions] error closing unmined iterator: %v", closeErr)
+			}
 		}
 	}()
 
@@ -3767,6 +3770,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	if err = it.Close(); err != nil {
 		return errors.NewProcessingError("error closing unmined iterator before validation", err)
 	}
+
+	iteratorClosed = true
 
 	if shouldValidateInputs {
 		valid := unminedTransactions[:0]

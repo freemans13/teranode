@@ -67,6 +67,7 @@ func TestLoadUnminedTransactions_IsReloadSelectsEntryPoint(t *testing.T) {
 				}}
 
 				mockIterator := new(utxo.MockUnminedTxIterator)
+				mockIterator.On("Close").Return(nil).Maybe()
 				mockIterator.On("Next", mock.Anything).Return(txs, nil).Once()
 				mockIterator.On("Next", mock.Anything).Return(nil, nil).Maybe()
 

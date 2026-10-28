@@ -124,7 +124,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   input-validated reset, and resets undo conflicting-spender swaps before reloading
   the pool. Historical resets visit their recorded target; externally requested
   resets finish pending history before serving a populated mining candidate. No
-  configuration change is required. (#2074)
+  configuration change is required. Setting the reconcile interval to `0` disables
+  ordinary polling; recovery of an unfinished reset still retries. (#2074)
 
 - **Catch-up quick validation waits for each block's `.subtree` writes before it commits
   the block, and a shutdown waits for a block's in-flight commit.** A block was stored with

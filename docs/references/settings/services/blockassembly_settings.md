@@ -18,7 +18,7 @@
 | MaxBlockReorgRollback                | int           | 100              | blockassembly_maxBlockReorgRollback                | **UNUSED** - Defined but not referenced in code                                      |
 | MoveBackBlockConcurrency             | int           | 375              | blockassembly_moveBackBlockConcurrency             | Concurrency limit for reorg processing (SubtreeProcessor)                            |
 | ProcessRemainderTxHashesConcurrency  | int           | 375              | blockassembly_processRemainderTxHashesConcurrency  | Concurrency limit for remainder tx hash processing                                   |
-| ReconcileInterval                    | time.Duration | 30s              | blockassembly_reconcileInterval                    | Idle tick replays the best tip changes if no replay ran for this long; 0 = off       |
+| ReconcileInterval                    | time.Duration | 30s              | blockassembly_reconcileInterval                    | Idle polling interval; 0 disables ordinary polling, while unfinished reset recovery still retries       |
 | SendBatchSize                        | int           | 100              | blockassembly_sendBatchSize                        | Client batch size for sending transactions                                           |
 | SendBatchTimeout                     | int           | 2                | blockassembly_sendBatchTimeout                     | Client batch timeout in seconds                                                      |
 | SubtreeProcessorBatcherSize          | int           | 1000             | blockassembly_subtreeProcessorBatcherSize          | Subtree processing batch size                                                        |
