@@ -18,6 +18,7 @@ var (
 	prometheusLegacyNetsyncParkedBlocks              prometheus.Gauge
 	prometheusLegacyNetsyncParkedBytes               prometheus.Gauge
 	prometheusLegacyNetsyncOrphansAbandoned          prometheus.Counter
+	prometheusLegacyNetsyncRelayedTxDropped          prometheus.Counter
 	prometheusLegacyNetsyncOrphanTime                prometheus.Histogram
 
 	// prometheusLegacyNetsyncFrontierRaces counts blocks asked of a second peer because the
@@ -147,6 +148,14 @@ func _initPrometheusMetrics() {
 		Help:      "Orphan transactions dropped for good: evicted from the orphan pool and still invalid on the final validation attempt",
 	})
 	prometheus.MustRegister(prometheusLegacyNetsyncOrphansAbandoned)
+
+	prometheusLegacyNetsyncRelayedTxDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "legacy_netsync",
+		Name:      "relayed_tx_dropped_total",
+		Help:      "Transactions relayed by legacy peers and dropped unvalidated because the relay queue was full or over its byte budget",
+	})
+	prometheus.MustRegister(prometheusLegacyNetsyncRelayedTxDropped)
 
 	prometheusLegacyNetsyncOrphanTime = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "teranode",

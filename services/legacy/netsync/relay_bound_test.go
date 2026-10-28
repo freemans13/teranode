@@ -15,69 +15,76 @@ import (
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/semaphore"
 )
 
-// concurrencyStore wraps a real store and records how many Gets run at once.
-// Each Get holds for a moment so that an unbounded caller visibly piles up.
-type concurrencyStore struct {
+// lookupStore wraps a real store and counts the two ways inventory can be
+// looked up: one Get per item, or one BatchDecorate per chunk. When gate is
+// set, BatchDecorate waits for it to close.
+type lookupStore struct {
 	utxo.Store
 
-	inFlight atomic.Int64
-	peak     atomic.Int64
-	calls    atomic.Int64
+	gets      atomic.Int64
+	batches   atomic.Int64
+	batchSize atomic.Int64
+	gate      chan struct{}
 }
 
-func (s *concurrencyStore) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fields.FieldName) (*meta.Data, error) {
-	n := s.inFlight.Add(1)
-	defer s.inFlight.Add(-1)
-
-	s.calls.Add(1)
-
-	for {
-		p := s.peak.Load()
-		if n <= p || s.peak.CompareAndSwap(p, n) {
-			break
-		}
-	}
-
-	time.Sleep(2 * time.Millisecond)
+func (s *lookupStore) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fields.FieldName) (*meta.Data, error) {
+	s.gets.Add(1)
 
 	return s.Store.Get(ctx, hash, fieldNames...)
 }
 
-// TestHandleInvMsg_BoundsTransactionChecks reproduces the inventory fan-out
-// that took Hetzner mainnet to 223,118 goroutines on 2026-10-19: one inv
-// message full of transaction announcements, each checked against the UTXO
-// store. Every item used to get its own goroutine at once. The checks must now
-// run no more than maxConcurrentTxInvChecks at a time, and every item must
-// still be checked.
-func TestHandleInvMsg_BoundsTransactionChecks(t *testing.T) {
-	tSettings := test.CreateBaseTestSettings(t)
+func (s *lookupStore) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, fieldNames ...fields.FieldName) error {
+	if s.gate != nil {
+		<-s.gate
+	}
 
-	storeURL, err := url.Parse("sqlitememory:///relay_bound_inv")
+	s.batches.Add(1)
+
+	for {
+		p := s.batchSize.Load()
+		if int64(len(items)) <= p || s.batchSize.CompareAndSwap(p, int64(len(items))) {
+			break
+		}
+	}
+
+	return s.Store.BatchDecorate(ctx, items, fieldNames...)
+}
+
+func newLookupStore(t *testing.T, tSettings *settings.Settings, name string) *lookupStore {
+	t.Helper()
+
+	storeURL, err := url.Parse("sqlitememory:///" + name)
 	require.NoError(t, err)
 
 	realStore, err := sql.New(t.Context(), ulogger.TestLogger{}, tSettings, storeURL)
 	require.NoError(t, err)
 
-	store := &concurrencyStore{Store: realStore}
+	return &lookupStore{Store: realStore}
+}
+
+// newInvHarness builds a SyncManager in the given FSM state with one sync peer
+// whose request queue holds a whole inv message.
+func newInvHarness(t *testing.T, tSettings *settings.Settings, store utxo.Store, fsm blockchain2.FSMStateType) (*SyncManager, *peerpkg.Peer, *peerSyncState, *blockchain2.Mock) {
+	t.Helper()
 
 	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
 	require.NoError(t, err)
 
-	running := blockchain2.FSMStateRUNNING
 	client := &blockchain2.Mock{}
-	client.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	client.On("GetFSMCurrentState", mock.Anything).Return(&fsm, nil)
 
 	sm := &SyncManager{
 		logger:           ulogger.TestLogger{},
@@ -88,7 +95,7 @@ func TestHandleInvMsg_BoundsTransactionChecks(t *testing.T) {
 		utxoStore:        store,
 		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](10),
 		requestedTxns:    expiringmap.New[chainhash.Hash, struct{}](time.Hour),
-		txInvChecks:      semaphore.NewWeighted(maxConcurrentTxInvChecks),
+		blockDownloads:   newBlockDownloadTracker(blockRequestAssignmentTTL),
 	}
 	sm.headersFirstMode.Store(false)
 
@@ -99,29 +106,56 @@ func TestHandleInvMsg_BoundsTransactionChecks(t *testing.T) {
 	sm.peerStates.Set(p, state)
 	sm.storeSyncPeer(p, &syncPeerState{})
 
-	const items = 4 * maxConcurrentTxInvChecks
+	return sm, p, state, client
+}
+
+// TestHandleInvMsg_LooksUpTransactionsInBatches reproduces the inventory
+// fan-out of 2026-10-19: a message full of transaction announcements, each of
+// which used to get its own goroutine and its own store Get. The items must now
+// be looked up in chunks of txInvLookupChunk with no Get at all, and the result
+// must be what the per-item path gave: a transaction the store holds and one
+// already rejected are not asked for, and every other one is.
+func TestHandleInvMsg_LooksUpTransactionsInBatches(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	store := newLookupStore(t, tSettings, "relay_bound_batches")
+	sm, p, state, _ := newInvHarness(t, tSettings, store, blockchain2.FSMStateRUNNING)
+
+	held := transactions.CreateTestTransactionChainWithCount(t, 3)[1]
+	_, err := store.Store.(*sql.Store).Create(t.Context(), held, 1)
+	require.NoError(t, err)
+
+	rejected := chainhash.Hash{0xde, 0xad}
+	sm.rejectedTxns.Set(rejected, struct{}{})
+
+	const unknown = 2*txInvLookupChunk + 1
 
 	inv := wire.NewMsgInv()
-	for i := 0; i < items; i++ {
+	require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, held.TxIDChainHash())))
+	require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &rejected)))
+
+	for i := 0; i < unknown; i++ {
 		h := chainhash.Hash{byte(i), byte(i >> 8), byte(i >> 16), 0x7a}
 		require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &h)))
 	}
 
-	sm.handleInvMsg(&invMsg{inv: inv, peer: p})
+	// checkTxInvs rather than handleInvMsg, whose getdata drains the queue
+	// this test reads.
+	sm.checkTxInvs(p, state, inv.InvList)
 
-	require.Equal(t, int64(items), store.calls.Load(), "every announced transaction must still be checked")
-	require.LessOrEqual(t, store.peak.Load(), int64(maxConcurrentTxInvChecks),
-		"transaction inventory checks ran unbounded")
+	require.Zero(t, store.gets.Load(), "transaction inventory must not be looked up one Get per item")
+	require.Equal(t, int64(3), store.batches.Load(), "items must be looked up in chunks of txInvLookupChunk")
+	require.Equal(t, int64(txInvLookupChunk), store.batchSize.Load())
+	require.Equal(t, unknown, state.requestQueue.Length(),
+		"every unknown transaction must be asked for, and the held and rejected ones must not")
 }
 
-// TestHandleInvMsg_BlockItemsDoNotWaitForTransactionSlots pins that a block
-// announcement is acted on even while every transaction-check slot is taken,
-// including when it comes after transaction items in the same message. The
-// slots are shared by every peer, so a block that waited for one would wait on
-// store latency across the whole node. Both outcomes of a block item are
-// covered: a block the chain holds ends in a locator lookup for a getblocks,
-// and a block the node lacks ends in a getdata.
-func TestHandleInvMsg_BlockItemsDoNotWaitForTransactionSlots(t *testing.T) {
+// TestHandleInvMsg_BlockItemsDoNotWaitForTransactionLookups pins that a block
+// announcement is acted on while the message's transaction lookups are still
+// in the store, including when it comes after transaction items in the same
+// message. Both outcomes of a block item are covered: a block the chain holds
+// ends in a locator lookup for a getblocks, and a block the node lacks ends in
+// a getdata.
+func TestHandleInvMsg_BlockItemsDoNotWaitForTransactionLookups(t *testing.T) {
 	blockHash := chainhash.Hash{0xb1}
 
 	cases := []struct {
@@ -160,55 +194,17 @@ func TestHandleInvMsg_BlockItemsDoNotWaitForTransactionSlots(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tSettings := test.CreateBaseTestSettings(t)
+			store := newLookupStore(t, tSettings, "relay_bound_block_first")
+			store.gate = make(chan struct{})
 
-			storeURL, err := url.Parse("sqlitememory:///relay_bound_block_first")
-			require.NoError(t, err)
-
-			realStore, err := sql.New(t.Context(), ulogger.TestLogger{}, tSettings, storeURL)
-			require.NoError(t, err)
-
-			store := &concurrencyStore{Store: realStore}
-
-			p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
-			require.NoError(t, err)
-
-			running := blockchain2.FSMStateRUNNING
-			client := &blockchain2.Mock{}
-			client.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
-
-			slots := semaphore.NewWeighted(maxConcurrentTxInvChecks)
-
-			sm := &SyncManager{
-				logger:           ulogger.TestLogger{},
-				settings:         tSettings,
-				ctx:              context.Background(),
-				peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-				blockchainClient: client,
-				utxoStore:        store,
-				rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](10),
-				requestedTxns:    expiringmap.New[chainhash.Hash, struct{}](time.Hour),
-				blockDownloads:   newBlockDownloadTracker(blockRequestAssignmentTTL),
-				txInvChecks:      slots,
-			}
-			sm.headersFirstMode.Store(false)
-
+			sm, p, _, client := newInvHarness(t, tSettings, store, blockchain2.FSMStateRUNNING)
 			blockActedOn := tc.arrange(client, sm)
-
-			state := &peerSyncState{
-				requestQueue:  txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
-				requestedTxns: expiringmap.New[chainhash.Hash, struct{}](time.Hour),
-			}
-			sm.peerStates.Set(p, state)
-			sm.storeSyncPeer(p, &syncPeerState{})
 
 			// Transaction items first, the block last.
 			inv := wire.NewMsgInv()
 			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{0x7a})))
 			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{0x7b})))
 			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &blockHash)))
-
-			// Every slot is held, as it would be with other peers' checks in flight.
-			require.True(t, slots.TryAcquire(maxConcurrentTxInvChecks))
 
 			done := make(chan struct{})
 			go func() {
@@ -217,89 +213,60 @@ func TestHandleInvMsg_BlockItemsDoNotWaitForTransactionSlots(t *testing.T) {
 			}()
 
 			require.True(t, WaitUntil(blockActedOn, 2*time.Second),
-				"the block item waited behind the transaction-check bound")
+				"the block item waited behind the transaction lookups")
 
-			slots.Release(maxConcurrentTxInvChecks)
+			close(store.gate)
 
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
-				require.Fail(t, "handleInvMsg did not finish once the slots were free")
+				require.Fail(t, "handleInvMsg did not finish once the store answered")
 			}
 
-			require.Equal(t, int64(2), store.calls.Load(), "both transactions must still be checked once the slots are free")
+			require.Equal(t, int64(1), store.batches.Load(), "both transactions must be looked up in one batch")
 		})
 	}
 }
 
 // TestHandleInvMsg_SkipsTransactionItemsOutsideRunning pins that a transaction
-// inventory item outside RUNNING costs no store read and no goroutine: the
-// item is dropped before the check, as processInvMsg already dropped it after.
+// inventory item outside RUNNING costs no store read: the item is dropped
+// before the lookup, as processInvMsg already dropped it.
 func TestHandleInvMsg_SkipsTransactionItemsOutsideRunning(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
-
-	storeURL, err := url.Parse("sqlitememory:///relay_bound_catching")
-	require.NoError(t, err)
-
-	realStore, err := sql.New(t.Context(), ulogger.TestLogger{}, tSettings, storeURL)
-	require.NoError(t, err)
-
-	store := &concurrencyStore{Store: realStore}
-
-	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
-	require.NoError(t, err)
-
-	catching := blockchain2.FSMStateCATCHINGBLOCKS
-	client := &blockchain2.Mock{}
-	client.On("GetFSMCurrentState", mock.Anything).Return(&catching, nil)
-
-	sm := &SyncManager{
-		logger:           ulogger.TestLogger{},
-		settings:         tSettings,
-		ctx:              context.Background(),
-		peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-		blockchainClient: client,
-		utxoStore:        store,
-		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](10),
-		txInvChecks:      semaphore.NewWeighted(maxConcurrentTxInvChecks),
-	}
-
-	state := &peerSyncState{
-		requestQueue: txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
-	}
-	sm.peerStates.Set(p, state)
-	sm.storeSyncPeer(p, &syncPeerState{})
+	store := newLookupStore(t, tSettings, "relay_bound_catching")
+	sm, p, state, _ := newInvHarness(t, tSettings, store, blockchain2.FSMStateCATCHINGBLOCKS)
 
 	inv := wire.NewMsgInv()
 	require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{0x7a})))
 
 	sm.handleInvMsg(&invMsg{inv: inv, peer: p})
 
-	require.Zero(t, store.calls.Load())
+	require.Zero(t, store.gets.Load()+store.batches.Load())
 	require.Zero(t, state.requestQueue.Length())
 }
 
-// TestQueueTx_DropsWhenRelayBoundIsFull pins the relayed-transaction bound. A
-// transaction that arrives with every slot taken is dropped at once rather
-// than queued, so the peer's read loop is never held; once a slot frees, the
-// next transaction is queued again.
-func TestQueueTx_DropsWhenRelayBoundIsFull(t *testing.T) {
+func newRelayHarness(t *testing.T, queueLen int) (*SyncManager, *peerpkg.Peer) {
+	t.Helper()
+
 	tSettings := test.CreateBaseTestSettings(t)
 
 	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
 	require.NoError(t, err)
 
 	sm := &SyncManager{
-		logger:     ulogger.TestLogger{},
-		settings:   tSettings,
-		ctx:        context.Background(),
-		msgChan:    make(chan interface{}, 4),
-		relayedTxs: semaphore.NewWeighted(1),
+		logger:       ulogger.TestLogger{},
+		settings:     tSettings,
+		ctx:          context.Background(),
+		relayTxQueue: make(chan *txMsg, queueLen),
 	}
 
-	tx := bsvutil.NewTx(wire.NewMsgTx(1))
+	return sm, p
+}
 
-	require.True(t, sm.relayedTxs.TryAcquire(1), "take the only slot")
+// queueTxWithin runs QueueTx and fails the test if it does not return, since
+// it runs on the peer's read loop and must never wait.
+func queueTxWithin(t *testing.T, sm *SyncManager, tx *bsvutil.Tx, p *peerpkg.Peer) {
+	t.Helper()
 
 	done := make(chan struct{})
 	go func() {
@@ -310,42 +277,62 @@ func TestQueueTx_DropsWhenRelayBoundIsFull(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		require.Fail(t, "QueueTx blocked the peer's read loop with the relay bound full")
+		require.Fail(t, "QueueTx blocked the peer's read loop")
 	}
-
-	require.Zero(t, len(sm.msgChan), "a transaction over the bound must be dropped, not queued")
-
-	sm.relayedTxs.Release(1)
-	sm.QueueTx(tx, p, nil)
-	require.Equal(t, 1, len(sm.msgChan), "with a slot free the transaction is queued")
 }
 
-// TestBlockHandler_ReleasesTheRelaySlotAfterHandlingATx pins the other half of
-// the relayed-transaction bound: the slot QueueTx takes is handed back once the
-// block handler has handled the transaction. Without that release the bound
-// fills after maxConcurrentRelayedTxs transactions and every relayed
-// transaction after it is dropped for the life of the node.
-func TestBlockHandler_ReleasesTheRelaySlotAfterHandlingATx(t *testing.T) {
-	tSettings := test.CreateBaseTestSettings(t)
+// TestQueueTx_DropsWhenTheRelayQueueIsFull pins that a relayed transaction
+// arriving with the queue full is dropped at once, not waited for, and that the
+// bytes it would have held are not left charged.
+func TestQueueTx_DropsWhenTheRelayQueueIsFull(t *testing.T) {
+	sm, p := newRelayHarness(t, 1)
+	tx := bsvutil.NewTx(wire.NewMsgTx(1))
+	size := int64(tx.MsgTx().SerializeSize())
 
-	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
-	require.NoError(t, err)
+	queueTxWithin(t, sm, tx, p)
+	require.Len(t, sm.relayTxQueue, 1)
+
+	queueTxWithin(t, sm, tx, p)
+	require.Len(t, sm.relayTxQueue, 1, "a transaction over the queue's capacity must be dropped")
+	require.Equal(t, size, sm.relayTxBytes.Load(), "a dropped transaction must not stay charged to the byte budget")
+}
+
+// TestQueueTx_DropsOverTheByteBudget pins the byte bound: a transaction that
+// would take the held bytes over relayTxBytesBudget is dropped, and one that
+// fits it exactly is queued.
+func TestQueueTx_DropsOverTheByteBudget(t *testing.T) {
+	sm, p := newRelayHarness(t, 4)
+	tx := bsvutil.NewTx(wire.NewMsgTx(1))
+	size := int64(tx.MsgTx().SerializeSize())
+
+	sm.relayTxBytes.Store(relayTxBytesBudget - size + 1)
+	queueTxWithin(t, sm, tx, p)
+	require.Empty(t, sm.relayTxQueue, "a transaction over the byte budget must be dropped")
+	require.Equal(t, int64(relayTxBytesBudget-size+1), sm.relayTxBytes.Load())
+
+	sm.relayTxBytes.Store(relayTxBytesBudget - size)
+	queueTxWithin(t, sm, tx, p)
+	require.Len(t, sm.relayTxQueue, 1, "a transaction that fits the budget exactly must be queued")
+
+}
+
+// TestRelayTxWorker_HandsBackTheBytesAfterHandlingATx runs the real block
+// handler, which starts the workers, and pins that a worker answers the
+// transaction and hands its bytes back. Without that the budget fills and
+// every relayed transaction after it is dropped for the life of the node.
+func TestRelayTxWorker_HandsBackTheBytesAfterHandlingATx(t *testing.T) {
+	sm, p := newRelayHarness(t, 4)
+	sm.relayTxWorkers = 2
 
 	running := blockchain2.FSMStateRUNNING
 	client := &blockchain2.Mock{}
 	client.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
 
-	sm := &SyncManager{
-		logger:           ulogger.TestLogger{},
-		settings:         tSettings,
-		ctx:              context.Background(),
-		blockchainClient: client,
-		peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-		msgChan:          make(chan interface{}),
-		quit:             make(chan struct{}),
-		handlerDone:      make(chan struct{}),
-		relayedTxs:       semaphore.NewWeighted(1),
-	}
+	sm.blockchainClient = client
+	sm.peerStates = txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState]()
+	sm.msgChan = make(chan interface{})
+	sm.quit = make(chan struct{})
+	sm.handlerDone = make(chan struct{})
 
 	go sm.blockHandler()
 
@@ -360,11 +347,28 @@ func TestBlockHandler_ReleasesTheRelaySlotAfterHandlingATx(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		require.Fail(t, "the block handler never handled the relayed transaction")
+		require.Fail(t, "no worker handled the relayed transaction")
 	}
 
-	// The release runs after the reply, so poll for the slot rather than read
-	// it once.
-	require.True(t, WaitUntil(func() bool { return sm.relayedTxs.TryAcquire(1) }, 2*time.Second),
-		"the block handler kept the relay slot after handling the transaction")
+	require.Zero(t, sm.relayTxBytes.Load(), "the worker kept the transaction's bytes charged after handling it")
+}
+
+// TestRelayTxWorkerCount pins that the pool is at least twice the largest
+// per-transaction batch on the validation path, so that pool never stops a
+// batch filling, and never below relayTxMinWorkers.
+func TestRelayTxWorkerCount(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+
+	tSettings.UtxoStore.StoreBatcherSize = 2048
+	tSettings.UtxoStore.SpendBatcherSize = 1024
+	tSettings.Validator.SendBatchSize = 1000
+	require.Equal(t, 4096, relayTxWorkerCount(tSettings))
+
+	tSettings.Validator.SendBatchSize = 3000
+	require.Equal(t, 6000, relayTxWorkerCount(tSettings))
+
+	tSettings.UtxoStore.StoreBatcherSize = 10
+	tSettings.UtxoStore.SpendBatcherSize = 10
+	tSettings.Validator.SendBatchSize = 0
+	require.Equal(t, relayTxMinWorkers, relayTxWorkerCount(tSettings))
 }

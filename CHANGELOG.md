@@ -273,18 +273,24 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   (including a non-positive `subtreevalidation_txMetaTombstoneWindow`). It used to
   log the failure and run with no store, then panic on first use.
 
-- **The legacy service now drops relayed transactions over a fixed bound.** At most 256
-  transactions relayed by legacy peers are validated at once. A transaction that arrives
-  with all 256 in progress is dropped, not queued, and the drop is logged only at debug
-  level (`[QueueTx] dropping relayed tx`). The node relies on getting it again from
-  another peer or in the block that mines it. Transaction announcements (`inv` items) are
-  also checked against the UTXO store no more than 1024 at a time, across every peer, and
-  are no longer checked at all outside the RUNNING state, where they were already
-  discarded. Neither limit is a setting. Before this, each relayed transaction and each
-  announced item got its own goroutine with no ceiling, and on 2026-10-19 that reached
-  223,118 goroutines and got the node killed for exceeding its memory limit. Operators who
-  rely on legacy peers relaying a heavy transaction stream should expect some of it to be
-  dropped under load; there is nothing to configure. (#2045)
+- **The legacy service now drops relayed transactions over a bounded queue.** Transactions
+  relayed by legacy peers are validated by a fixed pool of workers, twice the largest of
+  `utxostore_storeBatcherSize`, `utxostore_spendBatcherSize` and
+  `validator_sendBatchSize`, and never fewer than 1024 (4096 with the defaults in
+  `settings.conf`). They wait in a queue four times that long, and the transactions
+  queued or being validated hold at most 256 MiB. A transaction that finds the queue full
+  or the budget spent is dropped, not waited for; the node relies on getting it again
+  from another peer or in the block that mines it. Drops are counted in the new
+  `teranode_legacy_netsync_relayed_tx_dropped_total`. With the workers busy for the
+  validation latency L, the pool validates at most workers / L transactions a second, so
+  a node whose relayed-transaction validation is slow drops some of a heavy relay
+  stream. Transaction announcements (`inv` items) are now looked up in the UTXO store in
+  batches of 4096, one `BatchDecorate` call each, instead of one goroutine and one `Get`
+  per item, and are no longer looked up outside the RUNNING state, where they were
+  already discarded. Before this, each relayed transaction and each announced item got
+  its own goroutine with no ceiling, and on 2026-10-19 that reached 223,118 goroutines and
+  got the node killed for exceeding its memory limit. None of these limits is a setting.
+  (#2045)
 
 - **A failed revert of an invalid block's mined tags now holds block assembly until it
   succeeds.** When block validation reverts the mined tags of an invalid block and

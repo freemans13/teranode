@@ -93,25 +93,34 @@ const (
 	// hashes to store in memory.
 	maxRejectedTxns = 10_000
 
-	// maxConcurrentTxInvChecks bounds the transaction inventory items checked
-	// against the UTXO store at once, across every inv message from every peer.
-	// Each check used to get its own goroutine with no ceiling: one inv message
-	// carries up to 50,000 items and each message is handled on its own
-	// goroutine, and on Hetzner mainnet on 2026-10-19 that reached 223,118
-	// goroutines, 88,563 of them queued on one peer's known-inventory lock,
-	// before the cgroup killed the node. 1024 keeps two of the store's get
-	// batches full at the mainnet batch size of 500. It is a first value for
-	// the soak, not a measured optimum.
-	maxConcurrentTxInvChecks = 1024
+	// txInvLookupChunk is the most transaction inventory items looked up in
+	// the UTXO store in one BatchDecorate call. Each item used to get its own
+	// goroutine and its own Get: one inv message carries up to 50,000 items and
+	// each message is handled on its own goroutine, and on Hetzner mainnet on
+	// 2026-10-19 that reached 223,118 goroutines, 88,563 of them queued on one
+	// peer's known-inventory lock, before the cgroup killed the node. A message
+	// is now looked up in chunks on the goroutine that handles it, with no
+	// goroutine per item. 4096 matches utxostore_getBatcherSize in
+	// settings.conf, the batch the per-item Gets were being collected into.
+	txInvLookupChunk = 4096
 
-	// maxConcurrentRelayedTxs bounds the relayed transactions validated at
-	// once. Each one used to get its own goroutine with no ceiling, because
-	// OnTx queues without waiting for the reply its own comment promises. A
-	// transaction that finds the bound full is dropped rather than queued:
-	// waiting would stall the peer's read loop, which also carries its blocks,
-	// and a mempool transaction is not consensus-critical and arrives again in
-	// the block that mines it. A first value for the soak, not a measured one.
-	maxConcurrentRelayedTxs = 256
+	// relayTxMinWorkers is the floor on the workers that validate relayed
+	// transactions; relayTxWorkerCount raises it to keep the validation path's
+	// batchers full. Each relayed transaction used to get its own goroutine with
+	// no ceiling, because OnTx queues without waiting for a reply.
+	relayTxMinWorkers = 1024
+
+	// relayTxQueueFactor sizes the relayed-transaction queue as a multiple of
+	// the worker count, so a burst of several batches is absorbed rather than
+	// dropped.
+	relayTxQueueFactor = 4
+
+	// relayTxBytesBudget bounds the serialized bytes of relayed transactions
+	// queued or being validated. The queue bounds the count, and a count alone
+	// would let a peer relaying large transactions hold gigabytes. A transaction
+	// that would take the total over the budget is dropped, unless nothing else
+	// is held, so one transaction larger than the budget is still taken.
+	relayTxBytesBudget = 256 << 20
 
 	// recentlyFailedBlocksMaxTracked bounds recentlyFailedBlocks. Legacy sync
 	// only has a handful of failing block hashes in flight, but capping the map
@@ -206,6 +215,8 @@ type txMsg struct {
 	tx    *bsvutil.Tx
 	peer  *peerpkg.Peer
 	reply chan struct{}
+	// size is the serialized size QueueTx charged to relayTxBytes.
+	size int64
 }
 
 // isCurrentMsg is a message type to be sent across the message channel for
@@ -806,12 +817,14 @@ type SyncManager struct {
 	blockPrefetchBudget      *semaphore.Weighted
 	blockPrefetchBudgetSlots int64
 
-	// txInvChecks bounds the transaction inventory checks in flight; see
-	// maxConcurrentTxInvChecks. relayedTxs bounds the relayed transactions
-	// being validated; see maxConcurrentRelayedTxs. Both are built in New; a
-	// SyncManager built by hand in a test leaves them nil, which means no bound.
-	txInvChecks *semaphore.Weighted
-	relayedTxs  *semaphore.Weighted
+	// relayTxQueue holds relayed transactions for the relayTxWorkers workers
+	// that validate them, and relayTxBytes the serialized bytes of those queued
+	// or being validated; see relayTxBytesBudget. QueueTx never waits on the
+	// queue: a transaction that finds it full, or over the byte budget, is
+	// dropped. Built in New; the workers are started by blockHandler.
+	relayTxQueue   chan *txMsg
+	relayTxWorkers int
+	relayTxBytes   atomic.Int64
 
 	// inFlightBlocks is the dedup half of the same block-admission gate whose
 	// other half is blockPrefetchBudget. It holds the hash of every block that is
@@ -3439,8 +3452,6 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		processInvs = true
 	}
 
-	wg := sync.WaitGroup{}
-
 	// Request as much as possible at once.  Anything that won't fit into
 	// the request will be requested on the next inv message.
 	sendGetData := func() {
@@ -3458,8 +3469,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 	// we already have and request more blocks to prevent them.
 	//
 	// Blocks go first, in serial and in message order, in a pass of their own.
-	// The transaction pass below can wait for a slot of a bound every peer
-	// shares, and a block announcement must never wait behind that, whatever
+	// The transaction pass below waits on UTXO store lookups for up to 50,000
+	// items, and a block announcement must never wait behind that, whatever
 	// its position in the message. That includes the getdata for a block this
 	// node does not have: processInvMsg only queues it, so it is sent here,
 	// before the transaction pass, and not left for the send at the end.
@@ -3473,43 +3484,107 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		sendGetData()
 	}
 
-	for i, iv := range invVects {
-		// Outside RUNNING processInvMsg drops every transaction item on entry,
-		// and it drops every type other than block and transaction in every
-		// state, so do not start a goroutine only to have it return.
-		if iv.Type != wire.InvTypeTx || !processInvs {
+	// Outside RUNNING every transaction item is dropped unchecked, as
+	// processInvMsg does, and every type other than block and transaction is
+	// dropped in every state.
+	if processInvs {
+		sm.checkTxInvs(peer, state, invVects)
+	}
+
+	sendGetData()
+}
+
+// checkTxInvs queues for a getdata every transaction item in invVects that the
+// UTXO store does not hold and that has not been rejected. It does for the
+// transaction items of one inv message what processInvMsg does for one item,
+// in the same order, but looks them up in chunks of txInvLookupChunk with one
+// BatchDecorate call each, rather than with a goroutine and a Get per item.
+func (sm *SyncManager) checkTxInvs(peer *peerpkg.Peer, state *peerSyncState, invVects []*wire.InvVect) {
+	txInvs := make([]*wire.InvVect, 0, len(invVects))
+
+	for _, iv := range invVects {
+		if iv.Type != wire.InvTypeTx {
 			continue
 		}
 
-		// Process the remaining inv vectors in parallel, but no more than
-		// maxConcurrentTxInvChecks at once across every inv message: the slot is
-		// taken before the goroutine starts, so a 50,000-item message waits here
-		// rather than forking 50,000 goroutines.
-		if sm.txInvChecks != nil {
-			if err := sm.txInvChecks.Acquire(sm.ctx, 1); err != nil {
-				// shutting down
-				break
-			}
+		peer.AddKnownInventory(iv)
+		txInvs = append(txInvs, iv)
+	}
+
+	// Ignore inventory when we're in headers-first mode.
+	if len(txInvs) == 0 || sm.headersFirstMode.Load() {
+		return
+	}
+
+	// The chunks of one message are looked up at once, one goroutine each, at
+	// most wire.MaxInvPerMsg/txInvLookupChunk+1 of them, so a single large
+	// message is not held to one store round trip at a time. The results are
+	// then acted on in message order.
+	chunks := make([][]*utxostore.UnresolvedMetaData, 0, len(txInvs)/txInvLookupChunk+1)
+	errs := make([]error, cap(chunks))
+
+	var wg sync.WaitGroup
+
+	for start := 0; start < len(txInvs); start += txInvLookupChunk {
+		chunk := txInvs[start:min(start+txInvLookupChunk, len(txInvs))]
+
+		items := make([]*utxostore.UnresolvedMetaData, len(chunk))
+		for i, iv := range chunk {
+			items[i] = &utxostore.UnresolvedMetaData{Hash: iv.Hash, Idx: start + i}
 		}
+
+		c := len(chunks)
+		chunks = append(chunks, items)
 
 		wg.Add(1)
 
-		go func(i int, iv *wire.InvVect) {
+		go func() {
 			defer wg.Done()
 
-			if sm.txInvChecks != nil {
-				defer sm.txInvChecks.Release(1)
-			}
-
-			// Ignore unsupported inventory types.
-			sm.processInvMsg(i, iv, processInvs, peer, exists, state, lastBlock)
-		}(i, iv)
+			errs[c] = sm.utxoStore.BatchDecorate(sm.ctx, items, fields.Fee)
+		}()
 	}
 
-	// wait for all inv vectors to be processed
 	wg.Wait()
 
-	sendGetData()
+	for c, items := range chunks {
+		if errs[c] != nil {
+			sm.logger.Warnf("[handleInvMsg] Unexpected failure when checking %d transactions from %s for existing inventory: %v", len(items), peer, errs[c])
+			continue
+		}
+
+		failed := 0
+
+		var firstErr error
+
+		for _, item := range items {
+			if item.Err == nil && item.Data != nil {
+				// held: processed completely at our end
+				continue
+			}
+
+			if item.Err != nil && !errors.Is(item.Err, errors.ErrTxNotFound) {
+				failed++
+
+				if firstErr == nil {
+					firstErr = item.Err
+				}
+
+				continue
+			}
+
+			// Skip the transaction if it has already been rejected.
+			if _, rejected := sm.rejectedTxns.Get(item.Hash); rejected {
+				continue
+			}
+
+			state.requestQueue.Append(txInvs[item.Idx])
+		}
+
+		if failed > 0 {
+			sm.logger.Warnf("[handleInvMsg] Unexpected failure when checking %d of %d transactions from %s for existing inventory, first: %v", failed, len(items), peer, firstErr)
+		}
+	}
 }
 
 // drainRequestQueue turns as much of a peer's announcement queue as it can into
@@ -3759,6 +3834,11 @@ func (sm *SyncManager) blockHandler() {
 		sm.dispatcher = newBlockDispatcher(sm)
 	}
 
+	// The relayed-transaction workers stop on quit, as this handler does.
+	for i := 0; i < sm.relayTxWorkers; i++ {
+		go sm.relayTxWorker()
+	}
+
 	// start the block queue handler
 	sm.consumerDone = make(chan struct{})
 
@@ -3839,20 +3919,6 @@ out:
 					msg.reply <- struct{}{}
 				}
 
-			case *txMsg:
-				go func(msg *txMsg) {
-					// process tx messages in parallel, up to the relay bound
-					// QueueTx took a slot of
-					if sm.relayedTxs != nil {
-						defer sm.relayedTxs.Release(1)
-					}
-
-					sm.handleTxMsg(msg)
-					if msg.reply != nil {
-						msg.reply <- struct{}{}
-					}
-				}(msg)
-
 			case *blockOnDiskMsg:
 				// A body already on disk. No budget to release and no reply to
 				// send: the read loop was free the moment the bytes landed.
@@ -3907,9 +3973,10 @@ func (sm *SyncManager) NewPeer(peer *peerpkg.Peer, done chan struct{}) {
 	sm.msgChan <- &newPeerMsg{peer: peer, reply: done}
 }
 
-// QueueTx adds the passed transaction message and peer to the block handling
-// queue. Responds to the done channel argument after the tx message is
-// processed.
+// QueueTx adds the passed transaction message and peer to the relayed
+// transaction queue, or drops it when the queue is full or over its byte
+// budget. Responds to the done channel argument once the tx message is
+// processed, or at once when it is dropped.
 func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan struct{}) {
 	// Don't accept more transactions if we're shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
@@ -3919,20 +3986,68 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 		return
 	}
 
-	// Bounded: see maxConcurrentRelayedTxs. Over the bound the transaction is
-	// dropped, never waited for, because this runs on the peer's read loop.
-	// The slot is released by the block handler once handleTxMsg returns.
-	if sm.relayedTxs != nil && !sm.relayedTxs.TryAcquire(1) {
-		sm.logger.Debugf("[QueueTx] dropping relayed tx %s from %s: %d relayed transactions already being validated", tx.Hash(), peer, maxConcurrentRelayedTxs)
+	// Never waits, because this runs on the peer's read loop, which also
+	// carries its blocks. A transaction over the byte budget or with the queue
+	// full is dropped: an unmined transaction is not consensus-critical, and it
+	// arrives again from another peer or in the block that mines it. The bytes
+	// are given back by relayTxWorker once handleTxMsg returns.
+	size := int64(tx.MsgTx().SerializeSize())
 
-		if done != nil {
-			done <- struct{}{}
-		}
+	if held := sm.relayTxBytes.Add(size); held-size > 0 && held > relayTxBytesBudget {
+		sm.relayTxBytes.Add(-size)
+		sm.dropRelayedTx(tx, peer, done, "relayed transaction bytes over budget")
 
 		return
 	}
 
-	sm.msgChan <- &txMsg{tx: tx, peer: peer, reply: done}
+	select {
+	case sm.relayTxQueue <- &txMsg{tx: tx, peer: peer, reply: done, size: size}:
+	default:
+		sm.relayTxBytes.Add(-size)
+		sm.dropRelayedTx(tx, peer, done, "relayed transaction queue full")
+	}
+}
+
+// dropRelayedTx counts and logs a relayed transaction QueueTx did not queue,
+// and answers its done channel as if it had been handled.
+func (sm *SyncManager) dropRelayedTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan struct{}, reason string) {
+	prometheusLegacyNetsyncRelayedTxDropped.Inc()
+	sm.logger.Debugf("[QueueTx] dropping relayed tx %s from %s: %s", tx.Hash(), peer, reason)
+
+	if done != nil {
+		done <- struct{}{}
+	}
+}
+
+// relayTxWorker validates relayed transactions from relayTxQueue until quit
+// closes. blockHandler starts relayTxWorkers of them.
+func (sm *SyncManager) relayTxWorker() {
+	for {
+		select {
+		case <-sm.quit:
+			return
+		case msg := <-sm.relayTxQueue:
+			sm.handleTxMsg(msg)
+			sm.relayTxBytes.Add(-msg.size)
+
+			if msg.reply != nil {
+				msg.reply <- struct{}{}
+			}
+		}
+	}
+}
+
+// relayTxWorkerCount sizes the relayed-transaction worker pool. Validating a
+// transaction feeds batchers that collect one item per transaction: the UTXO
+// store's create and spend batchers, and the validator client's batch when the
+// validator is remote. A pool smaller than a batch never fills one, so every
+// batch waits out its timer and the pool caps throughput below the unbounded
+// goroutines it replaces. Twice the largest batch keeps one batch filling while
+// the one before it is in flight.
+func relayTxWorkerCount(tSettings *settings.Settings) int {
+	largest := max(tSettings.UtxoStore.StoreBatcherSize, tSettings.UtxoStore.SpendBatcherSize, tSettings.Validator.SendBatchSize)
+
+	return max(relayTxMinWorkers, 2*largest)
 }
 
 // AcquireBlockPrefetch reserves one admission slot for blockHash, which the
@@ -4672,8 +4787,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	sm.blockPrefetchBudgetSlots = capacity
 	sm.blockPrefetchBudget = semaphore.NewWeighted(capacity)
 
-	sm.txInvChecks = semaphore.NewWeighted(maxConcurrentTxInvChecks)
-	sm.relayedTxs = semaphore.NewWeighted(maxConcurrentRelayedTxs)
+	sm.relayTxWorkers = relayTxWorkerCount(tSettings)
+	sm.relayTxQueue = make(chan *txMsg, relayTxQueueFactor*sm.relayTxWorkers)
+	logger.Infof("[legacy] relayed transactions: %d validation workers, queue of %d, %d MiB budget",
+		sm.relayTxWorkers, cap(sm.relayTxQueue), relayTxBytesBudget>>20)
 	logger.Infof("[legacy] streaming pipeline active: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
 		capacity, tSettings.Legacy.MaxBlocksInTransitPerPeer, pipelineBlockSlotPeerAllowance)
 

@@ -1124,8 +1124,8 @@ func (sp *serverPeer) OnTx(_ *peer.Peer, msg *wire.MsgTx) {
 	// wait for the transaction to be processed: no reply channel is passed, and
 	// waiting would hold this peer's read loop, which also carries its blocks.
 	// What stops a peer flooding the node with transactions is the sync
-	// manager's relay bound (maxConcurrentRelayedTxs), which drops a
-	// transaction that arrives with every slot taken.
+	// manager's relay queue, which drops a transaction that arrives with the
+	// queue full or its byte budget (relayTxBytesBudget) spent.
 	sp.server.syncManager.QueueTx(tx, sp.Peer, nil)
 }
 
