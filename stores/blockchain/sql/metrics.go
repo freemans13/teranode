@@ -12,8 +12,9 @@ var (
 	// store swallowed, by the path that swallowed it. Each one leaves the column
 	// inconsistent until the background repair lands.
 	prometheusOnMainChainWriteFailures *prometheus.CounterVec
-	// prometheusOnMainChainRepairPending is 1 while the store owes an on_main_chain
-	// repair and every flag reader is on its flag-free walk, and 0 otherwise.
+	// prometheusOnMainChainRepairPending counts the stores in this process that owe an
+	// on_main_chain repair, so every flag reader of each is on its flag-free walk. Each
+	// store adds one while it owes a repair, so one store cannot hide another's.
 	prometheusOnMainChainRepairPending prometheus.Gauge
 
 	prometheusMetricsInitOnce sync.Once
@@ -39,7 +40,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "blockchain_sql",
 			Name:      "on_main_chain_repair_pending",
-			Help:      "1 while a failed on_main_chain write still owes a repair and flag readers use the flag-free walk, 0 otherwise",
+			Help:      "Number of blockchain stores whose failed on_main_chain write still owes a repair; their flag readers use the flag-free walk until it lands",
 		},
 	)
 }

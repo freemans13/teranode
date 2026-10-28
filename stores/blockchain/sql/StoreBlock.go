@@ -349,10 +349,11 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		// whole call, so rebuildOffChainSet takes its flag-free parent_id CTE branch. A
 		// fork-path insert already reconciled the column inside its own transaction, so
 		// only an extend can leave a stale flag here: its INSERT wrote true, and nothing
-		// has confirmed it. Record that so the background repair's bounded walk settles
-		// the flag, rather than leaving it to the next reconcile, invalidation or startup.
+		// has confirmed it. Record that, with this block's height as the floor, so the
+		// background repair's bounded walk settles the flag, rather than leaving it to the
+		// next reconcile, invalidation or startup.
 		if onMainChain {
-			s.markOnMainChainDirty(false, "store_block_best_lookup", bestErr)
+			s.markOnMainChainDirty(false, int64(height), "store_block_best_lookup", bestErr)
 		}
 
 		s.updateMaxBlockID(newBlockID)
@@ -393,10 +394,11 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 
 			// The row is committed with on_main_chain = true on a fork. If the clear fails,
 			// record it before this bracket drops the guard, so readers keep walking and the
-			// background repair clears it; the row is at the tip, so the bounded walk reaches it.
+			// background repair clears it; the mark records this block's height, so the
+			// bounded walk reaches it however far the tip moves before the repair lands.
 			if _, clearErr := s.db.ExecContext(postBestCtx, `UPDATE blocks SET on_main_chain = false WHERE id = $1`, newBlockID); clearErr != nil {
 				s.logger.Errorf("StoreBlock: clear sibling-fork on_main_chain: %v", clearErr)
-				s.markOnMainChainDirty(false, "store_block_fork_clear", clearErr)
+				s.markOnMainChainDirty(false, int64(height), "store_block_fork_clear", clearErr)
 			}
 
 			if !guardWholeCall {

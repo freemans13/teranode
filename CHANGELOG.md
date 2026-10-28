@@ -106,6 +106,20 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A failed `on_main_chain` write in the SQL blockchain store is now repaired in the
+  background, and block storage can wait for the repair.** `InvalidateBlock`,
+  `RevalidateBlock`, the startup rebuild and two `StoreBlock` paths used to log a
+  failed write to the `on_main_chain` column and carry on, leaving chain membership
+  and the by-height readers wrong until a restart. They now record the failure, every
+  reader of the column takes its slower parent-link walk until the repair lands, and a
+  background loop retries the repair every 1 s to 30 s. A repair that only needs the
+  rows near the tip holds the lock `StoreBlock` takes, so while the database keeps
+  failing, each attempt can delay block storage by up to 30 s. A repair that walks the
+  whole chain does not hold that lock. Operators can watch
+  `teranode_blockchain_sql_on_main_chain_repair_pending` (above 0 while a repair is
+  owed) and `teranode_blockchain_sql_on_main_chain_write_failures{path}`. No action is
+  needed. (#2049)
+
 - **A block's tx is created as conflicting only when it is a double spend and nothing
   else.** Block validation used to create a tx as conflicting as soon as one of its inputs
   was already spent by another tx, dropping every other failed input. A block holding a

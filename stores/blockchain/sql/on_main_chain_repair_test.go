@@ -8,21 +8,24 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
 // rebuildFault stands in for the on_main_chain rebuild transaction. While failing is set,
 // or for the first failFirst calls, it returns an error without touching the database;
-// otherwise it runs the real transaction. It records the full argument of every call so a
-// test can see which walk the repair asked for.
+// otherwise it runs the real transaction. It records the full and floor arguments of every
+// call, and whether slowPathMu was held, so a test can see which walk the repair asked for.
 type rebuildFault struct {
 	failing   atomic.Bool
 	failFirst int32
 	calls     atomic.Int32
 
-	mu    sync.Mutex
-	fulls []bool
+	mu     sync.Mutex
+	fulls  []bool
+	floors []int64
+	locked []bool
 }
 
 // installRebuildFault wires a rebuildFault into the store, failing every call until the
@@ -31,18 +34,26 @@ func installRebuildFault(s *SQL) *rebuildFault {
 	f := &rebuildFault{}
 	f.failing.Store(true)
 
-	s.rebuildTxHook = func(ctx context.Context, full bool) error {
+	s.rebuildTxHook = func(ctx context.Context, full bool, floor int64) error {
 		n := f.calls.Add(1)
+
+		// TryLock fails exactly when someone, in practice the caller, holds slowPathMu.
+		held := !s.slowPathMu.TryLock()
+		if !held {
+			s.slowPathMu.Unlock()
+		}
 
 		f.mu.Lock()
 		f.fulls = append(f.fulls, full)
+		f.floors = append(f.floors, floor)
+		f.locked = append(f.locked, held)
 		f.mu.Unlock()
 
 		if f.failing.Load() || n <= f.failFirst {
 			return errors.NewStorageError("injected rebuild failure")
 		}
 
-		return s.rebuildOnMainChainFlagTx(ctx, full)
+		return s.rebuildOnMainChainFlagTx(ctx, full, floor)
 	}
 
 	return f
@@ -53,6 +64,20 @@ func (f *rebuildFault) walks() []bool {
 	defer f.mu.Unlock()
 
 	return append([]bool(nil), f.fulls...)
+}
+
+func (f *rebuildFault) floorsSeen() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]int64(nil), f.floors...)
+}
+
+func (f *rebuildFault) lockHeld() []bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]bool(nil), f.locked...)
 }
 
 // setRepairBackoff shortens the background repair's first backoff so a test does not
@@ -86,8 +111,8 @@ func TestOnMainChainRepairDoesNotClearAnAlreadyRepairedGeneration(t *testing.T) 
 	require.NoError(t, err)
 
 	acknowledged := make(chan struct{})
-	s.rebuildTxHook = func(ctx context.Context, full bool) error {
-		if err := s.rebuildOnMainChainFlagTx(ctx, full); err != nil {
+	s.rebuildTxHook = func(ctx context.Context, full bool, floor int64) error {
+		if err := s.rebuildOnMainChainFlagTx(ctx, full, floor); err != nil {
 			return err
 		}
 
@@ -99,7 +124,8 @@ func TestOnMainChainRepairDoesNotClearAnAlreadyRepairedGeneration(t *testing.T) 
 		return nil
 	}
 
-	s.markOnMainChainDirty(true, "test", errors.NewStorageError("injected"))
+	gaugeBefore := repairPending(t)
+	s.markOnMainChainDirty(true, noRepairFloor, "test", errors.NewStorageError("injected"))
 	select {
 	case <-acknowledged:
 	case <-time.After(5 * time.Second):
@@ -116,7 +142,7 @@ func TestOnMainChainRepairDoesNotClearAnAlreadyRepairedGeneration(t *testing.T) 
 
 	require.Zero(t, s.mainChainRebuilding.Load(), "the same repair must not release its guard twice")
 	require.True(t, getOnMainChain(t, s, block1.Hash().CloneBytes()), "the persisted flag was repaired")
-	require.Zero(t, repairPending(t))
+	require.Equal(t, gaugeBefore, repairPending(t), "the pending gauge is released once")
 }
 
 func repairPending(t *testing.T) float64 {
@@ -154,6 +180,7 @@ func TestInvalidateBlockFailedRebuildIsRepairedInProcess(t *testing.T) {
 	require.False(t, getOnMainChain(t, s, alt3.Hash().CloneBytes()), "alt3 is a fork")
 
 	failuresBefore := writeFailures(t, "invalidate_block")
+	gaugeBefore := repairPending(t)
 	fault := installRebuildFault(s)
 
 	// Invalidating block3 takes block4 with it, so the best chain is now 1 -> alt2 -> alt3.
@@ -169,7 +196,7 @@ func TestInvalidateBlockFailedRebuildIsRepairedInProcess(t *testing.T) {
 	// The guard must stay up for as long as the repair is owed, so no reader trusts the
 	// column, and the failure must be visible.
 	require.Positive(t, s.mainChainRebuilding.Load(), "the guard stays raised while a repair is owed")
-	require.Equal(t, 1.0, repairPending(t), "the pending gauge is 1 while a repair is owed")
+	require.Equal(t, gaugeBefore+1, repairPending(t), "the pending gauge counts this store's owed repair")
 	require.Equal(t, failuresBefore+1, writeFailures(t, "invalidate_block"), "the failure is counted once")
 
 	// Readers answer from the flag-free walk while the guard is up.
@@ -195,7 +222,7 @@ func TestInvalidateBlockFailedRebuildIsRepairedInProcess(t *testing.T) {
 	require.False(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
 	require.False(t, getOnMainChain(t, s, block4.Hash().CloneBytes()))
 
-	require.Equal(t, 0.0, repairPending(t), "the pending gauge drops once the repair lands")
+	require.Equal(t, gaugeBefore, repairPending(t), "the pending gauge drops once the repair lands")
 	require.GreaterOrEqual(t, fault.calls.Load(), int32(2), "at least one failed attempt and the one that landed")
 
 	// With the guard down the flag fast path now agrees with the walk.
@@ -228,6 +255,7 @@ func TestRevalidateBlockFailedRebuildIsRepairedInProcess(t *testing.T) {
 	require.False(t, getOnMainChain(t, s, alt3.Hash().CloneBytes()))
 
 	failuresBefore := writeFailures(t, "revalidate_block")
+	gaugeBefore := repairPending(t)
 	fault := installRebuildFault(s)
 
 	require.NoError(t, s.RevalidateBlock(ctx, alt4.Hash()), "RevalidateBlock logs a failed rebuild and still returns success")
@@ -237,7 +265,7 @@ func TestRevalidateBlockFailedRebuildIsRepairedInProcess(t *testing.T) {
 	require.False(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()), "alt4 is a stale false")
 
 	require.Positive(t, s.mainChainRebuilding.Load(), "the guard stays raised while a repair is owed")
-	require.Equal(t, 1.0, repairPending(t))
+	require.Equal(t, gaugeBefore+1, repairPending(t))
 	require.Equal(t, failuresBefore+1, writeFailures(t, "revalidate_block"))
 
 	onChain, err := s.CheckBlockIsInCurrentChain(ctx, []uint32{getBlockID(t, s, block3.Hash().CloneBytes())})
@@ -256,35 +284,114 @@ func TestRevalidateBlockFailedRebuildIsRepairedInProcess(t *testing.T) {
 	require.True(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()))
 	require.False(t, getOnMainChain(t, s, block2.Hash().CloneBytes()))
 	require.False(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
-	require.Equal(t, 0.0, repairPending(t))
+	require.Equal(t, gaugeBefore, repairPending(t))
 }
 
-// TestOnMainChainRepairEscalatesToAFullWalkAfterRepeatedFailures pins the escalation rule.
-// A bounded repair walks a window measured from the current tip, and blocks keep arriving
-// while the repair keeps failing, so after onMainChainRepairEscalateAfter failed bounded
-// attempts the next one walks to genesis, where nothing can have sunk out of reach.
-func TestOnMainChainRepairEscalatesToAFullWalkAfterRepeatedFailures(t *testing.T) {
+// TestOnMainChainRepairKeepsTheRecordedFloorAsTheTipMoves pins the floor. A bounded
+// repair's own window is measured from the tip at the time of the attempt, and blocks keep
+// arriving while the repair keeps failing. Without the floor the mark recorded, a retry
+// after the tip moved walks a window that no longer reaches the stale row, succeeds,
+// releases the guard, and leaves the row wrong.
+//
+// CoinbaseMaturity 0 makes the bounded window the tip alone, so a single new block is
+// enough to carry it past the stale row.
+func TestOnMainChainRepairKeepsTheRecordedFloorAsTheTipMoves(t *testing.T) {
+	s := newOnMainChainTestStoreWith(t, func(ts *settings.Settings) {
+		ts.ChainCfgParams.CoinbaseMaturity = 0
+	})
+	setRepairBackoff(t, s, 20*time.Millisecond)
+
+	storeBlocks(t, s, block1, block2)
+
+	// block2, at the tip, is the row a failed StoreBlock write left wrong.
+	_, err := s.db.Exec(`UPDATE blocks SET on_main_chain = false WHERE hash = $1`, block2.Hash().CloneBytes())
+	require.NoError(t, err)
+
+	fault := installRebuildFault(s)
+
+	s.markOnMainChainDirty(false, int64(block2.Height), "test", errors.NewStorageError("injected"))
+
+	require.Eventually(t, func() bool { return fault.calls.Load() >= 1 }, 5*time.Second, time.Millisecond, "the first attempt runs")
+
+	// The tip moves while the repair is failing.
+	storeBlocks(t, s, block3)
+
+	fault.failing.Store(false)
+	waitForRepair(t, s)
+
+	require.True(t, getOnMainChain(t, s, block2.Hash().CloneBytes()), "the repair reaches the stale row below the moved window")
+	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
+
+	for i, full := range fault.walks() {
+		require.False(t, full, "attempt %d stays bounded: the floor covers the stale row", i+1)
+	}
+
+	for i, floor := range fault.floorsSeen() {
+		require.EqualValues(t, block2.Height, floor, "attempt %d keeps the recorded floor", i+1)
+	}
+
+	for i, held := range fault.lockHeld() {
+		require.True(t, held, "bounded attempt %d runs under slowPathMu", i+1)
+	}
+}
+
+// TestOnMainChainRepairWithoutAFloorWalksToGenesis: a bounded mark that cannot name the
+// lowest stale height cannot be covered by any bounded window, so it is owed a full walk.
+func TestOnMainChainRepairWithoutAFloorWalksToGenesis(t *testing.T) {
 	s := newOnMainChainTestStore(t)
 	setRepairBackoff(t, s, time.Millisecond)
 	storeBlocks(t, s, block1, block2)
 
 	fault := installRebuildFault(s)
 	fault.failing.Store(false)
-	fault.failFirst = onMainChainRepairEscalateAfter
 
-	s.markOnMainChainDirty(false, "test", errors.NewStorageError("injected"))
-	require.Positive(t, s.mainChainRebuilding.Load())
-
+	s.markOnMainChainDirty(false, noRepairFloor, "test", errors.NewStorageError("injected"))
 	waitForRepair(t, s)
 
-	want := make([]bool, 0, onMainChainRepairEscalateAfter+1)
-	for i := 0; i < onMainChainRepairEscalateAfter; i++ {
-		want = append(want, false)
-	}
+	require.Equal(t, []bool{true}, fault.walks())
+	require.Equal(t, []bool{false}, fault.lockHeld(), "the full walk does not hold slowPathMu")
+}
 
-	want = append(want, true)
-	require.Equal(t, want, fault.walks(), "bounded walks until the escalation threshold, then one full walk")
-	require.Equal(t, 0.0, repairPending(t))
+// TestOnMainChainMarkDropsCachedAnswers: GetBlockByHeight answers from the response cache
+// before it consults the guard, so a reply cached from the stale column before the mark
+// would keep being served while the repair is owed.
+func TestOnMainChainMarkDropsCachedAnswers(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+	setRepairBackoff(t, s, time.Hour)
+	ctx := context.Background()
+
+	storeBlocks(t, s, block1, block2, blockAlternative2)
+
+	// A failed write leaves the fork flagged and the main-chain block not.
+	_, err := s.db.Exec(`UPDATE blocks SET on_main_chain = (hash = $1) WHERE height = 2`, blockAlternative2.Hash().CloneBytes())
+	require.NoError(t, err)
+
+	cached, err := s.GetBlockByHeight(ctx, 2)
+	require.NoError(t, err)
+	require.Equal(t, blockAlternative2.Hash().String(), cached.Hash().String(), "the stale column answers before the mark")
+
+	installRebuildFault(s)
+	s.markOnMainChainDirty(false, 2, "test", errors.NewStorageError("injected"))
+
+	byHeight, err := s.GetBlockByHeight(ctx, 2)
+	require.NoError(t, err)
+	require.Equal(t, block2.Hash().String(), byHeight.Hash().String(), "after the mark the answer comes from the flag-free walk")
+}
+
+// TestOnMainChainMarkIsSkippedWhileClosing: a write cancelled by Close is not a fault to
+// repair. It must not raise the guard, count a failure or set the pending gauge.
+func TestOnMainChainMarkIsSkippedWhileClosing(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+
+	failuresBefore := writeFailures(t, "test_closing")
+	gaugeBefore := repairPending(t)
+
+	close(s.backgroundDone)
+	s.markOnMainChainDirty(true, noRepairFloor, "test_closing", context.Canceled)
+
+	require.Zero(t, s.mainChainRebuilding.Load())
+	require.Equal(t, failuresBefore, writeFailures(t, "test_closing"))
+	require.Equal(t, gaugeBefore, repairPending(t))
 }
 
 // TestALaterFullRebuildClearsThePendingRepair: a full rebuild that an operator path runs
@@ -302,6 +409,7 @@ func TestALaterFullRebuildClearsThePendingRepair(t *testing.T) {
 	alt3 := createBlock3OnFork(blockAlternative2)
 	storeBlocks(t, s, block1, block2, block3, block4, blockAlternative2, alt3)
 
+	gaugeBefore := repairPending(t)
 	fault := installRebuildFault(s)
 
 	_, err := s.InvalidateBlock(ctx, block4.Hash())
@@ -324,7 +432,7 @@ func TestALaterFullRebuildClearsThePendingRepair(t *testing.T) {
 	require.NoError(t, err)
 
 	require.EqualValues(t, 0, s.mainChainRebuilding.Load(), "the successful full rebuild clears the owed repair at once")
-	require.Equal(t, 0.0, repairPending(t))
+	require.Equal(t, gaugeBefore, repairPending(t))
 	require.True(t, getOnMainChain(t, s, alt3.Hash().CloneBytes()))
 	require.False(t, getOnMainChain(t, s, block2.Hash().CloneBytes()))
 

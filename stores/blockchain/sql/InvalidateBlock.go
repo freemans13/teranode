@@ -155,7 +155,7 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 		// repair an earlier failure left owed.
 		if rebuildErr := s.rebuildOnMainChainFlag(rebuildCtx, true); rebuildErr != nil {
 			s.logger.Errorf("InvalidateBlock: rebuildOnMainChainFlag: %v", rebuildErr)
-			s.markOnMainChainDirty(true, "invalidate_block", rebuildErr)
+			s.markOnMainChainDirty(true, noRepairFloor, "invalidate_block", rebuildErr)
 		} else {
 			s.onMainChainRepaired(true)
 		}

@@ -11,12 +11,8 @@ const (
 	onMainChainRepairInitialBackoff = time.Second
 	// onMainChainRepairMaxBackoff caps the doubling wait between attempts.
 	onMainChainRepairMaxBackoff = 30 * time.Second
-	// onMainChainRepairEscalateAfter is the number of failed bounded attempts after which
-	// the next attempt walks to genesis. A bounded walk covers a window measured from the
-	// current tip, and blocks keep arriving while the repair keeps failing, so a long run
-	// of failures can carry the tip past the rows that need the repair. The full walk
-	// reads every row and cannot miss them.
-	onMainChainRepairEscalateAfter = 3
+	// noRepairFloor marks a record with no known lowest stale height.
+	noRepairFloor int64 = -1
 )
 
 // onMainChainRepairState records a failed on_main_chain write that the running process
@@ -42,6 +38,12 @@ type onMainChainRepairState struct {
 	// full is true when the owed repair must walk to genesis: the failed write was one
 	// whose fork point can lie arbitrarily deep, so the bounded window is not enough.
 	full bool
+	// floor is the lowest height a bounded repair must reach, recorded by the marks and
+	// kept across retries. A bounded walk's own window is measured from the tip at the
+	// time of the attempt, and blocks keep arriving while the repair keeps failing, so
+	// without the floor the tip could carry the window past the rows that need the
+	// repair. noRepairFloor when no bounded mark is owed.
+	floor int64
 	// generation counts marks. The loop compares it before and after an attempt, so a
 	// failure recorded while the attempt ran is not cleared by that attempt's success.
 	generation uint64
@@ -60,11 +62,22 @@ type onMainChainRepairState struct {
 // markOnMainChainDirty records that a write to on_main_chain failed after an earlier
 // write in the same path committed, so the column may no longer describe the best chain.
 //
-// full says whether the owed repair must walk to genesis. path labels the failure
-// counter. The guard is raised on the transition from clean to owed and held until the
-// repair lands, so the caller's own bracketing of mainChainRebuilding, if any, can be
-// released as before.
-func (s *SQL) markOnMainChainDirty(full bool, path string, cause error) {
+// full says whether the owed repair must walk to genesis. floor is the lowest height
+// whose flag the failed write may have left wrong; a bounded mark that cannot name one
+// (noRepairFloor) is owed a full walk, because no bounded window can be shown to cover
+// it. path labels the failure counter. The guard is raised on the transition from clean
+// to owed and held until the repair lands, so the caller's own bracketing of
+// mainChainRebuilding, if any, can be released as before.
+//
+// A failure while the store is shutting down is not recorded: it is almost always the
+// shutdown cancelling the write, and the record would die with the process anyway.
+func (s *SQL) markOnMainChainDirty(full bool, floor int64, path string, cause error) {
+	if s.closing() {
+		s.logger.Infof("on_main_chain: %s did not finish because the store is shutting down: %v", path, cause)
+
+		return
+	}
+
 	initPrometheusMetrics()
 
 	r := &s.onMainChainRepair
@@ -74,15 +87,30 @@ func (s *SQL) markOnMainChainDirty(full bool, path string, cause error) {
 	if !r.pending {
 		r.pending = true
 		r.attempts = 0
+		r.floor = noRepairFloor
 
 		s.mainChainRebuilding.Add(1)
-		prometheusOnMainChainRepairPending.Set(1)
+		prometheusOnMainChainRepairPending.Inc()
+	}
+
+	if !full && floor == noRepairFloor {
+		full = true
 	}
 
 	r.full = r.full || full
+
+	if !full && (r.floor == noRepairFloor || floor < r.floor) {
+		r.floor = floor
+	}
+
 	r.generation++
 
 	r.mu.Unlock()
+
+	// GetBlockByHeight and others answer from the response cache before they consult the
+	// guard, so an answer cached from the stale column between the failed write and now
+	// would otherwise outlive the mark.
+	s.ResetResponseCache()
 
 	prometheusOnMainChainWriteFailures.WithLabelValues(path).Inc()
 	s.logger.Errorf("on_main_chain: %s left the column inconsistent, flag readers take the flag-free walk until the background repair lands: %v", path, cause)
@@ -118,10 +146,11 @@ func (s *SQL) clearOnMainChainRepairLocked(how string) {
 	attempts := r.attempts
 	r.pending = false
 	r.full = false
+	r.floor = noRepairFloor
 	r.attempts = 0
 
 	s.mainChainRebuilding.Add(-1)
-	prometheusOnMainChainRepairPending.Set(0)
+	prometheusOnMainChainRepairPending.Dec()
 
 	s.logger.Infof("on_main_chain repair landed by %s after %d failed background attempt(s), flag readers are back on the column", how, attempts)
 }
@@ -132,6 +161,7 @@ func (s *SQL) onMainChainRepairLoop() {
 	r := &s.onMainChainRepair
 
 	defer close(r.stopped)
+	defer s.releaseOnMainChainRepairGauge()
 
 	for {
 		select {
@@ -165,12 +195,13 @@ func (s *SQL) repairOnMainChainUntilClean() bool {
 		}
 
 		generation := r.generation
-		full := r.full || r.attempts >= onMainChainRepairEscalateAfter
+		full := r.full
+		floor := r.floor
 		attempt := r.attempts + 1
 
 		r.mu.Unlock()
 
-		err := s.runOnMainChainRepair(full)
+		err := s.runOnMainChainRepair(full, floor)
 
 		r.mu.Lock()
 
@@ -203,7 +234,7 @@ func (s *SQL) repairOnMainChainUntilClean() bool {
 
 		r.mu.Unlock()
 
-		s.logger.Warnf("on_main_chain repair attempt %d failed (full walk %v), next attempt in %s: %v", attempt, full, wait, err)
+		s.logger.Warnf("on_main_chain repair attempt %d failed (full walk %v, floor %d), next attempt in %s: %v", attempt, full, floor, wait, err)
 
 		select {
 		case <-s.backgroundDone:
@@ -218,10 +249,21 @@ func (s *SQL) repairOnMainChainUntilClean() bool {
 	}
 }
 
-// runOnMainChainRepair runs one attempt under the same lock the paths that owed the
-// repair held, so no slow-path writer interleaves with the walk. rebuildOnMainChainFlag
-// raises the guard itself for its duration, on top of the count this record holds.
-func (s *SQL) runOnMainChainRepair(full bool) error {
+// runOnMainChainRepair runs one attempt. rebuildOnMainChainFlag raises the guard itself
+// for its duration, on top of the count this record holds.
+//
+// A bounded attempt runs under slowPathMu, the lock the StoreBlock paths that owed it
+// held, so no slow-path writer interleaves with a walk over the rows at the tip. It is
+// short: the window is the tip's plus the recorded floor, under a 30 s budget.
+//
+// A full attempt does not take slowPathMu. It can run for up to 30 min, and while the
+// database stays slow it is retried every 30 s, so holding the lock would stop block
+// storage for as long as the fault lasts. It runs the way the startup rebuild always has:
+// readers are on their flag-free walk because of the guard, rows a concurrent StoreBlock
+// inserts are flagged by that StoreBlock, and on Postgres a write-write conflict with a
+// concurrent slow path aborts the REPEATABLE READ walk, which rebuildOnMainChainFlag
+// retries.
+func (s *SQL) runOnMainChainRepair(full bool, floor int64) error {
 	timeout := rebuildOffChainSetTimeout
 	if full {
 		timeout = migrationFullRebuildTimeout
@@ -230,10 +272,12 @@ func (s *SQL) runOnMainChainRepair(full bool) error {
 	ctx, cancel := s.shutdownAwareContext(timeout)
 	defer cancel()
 
-	s.slowPathMu.Lock()
-	defer s.slowPathMu.Unlock()
+	if !full {
+		s.slowPathMu.Lock()
+		defer s.slowPathMu.Unlock()
+	}
 
-	if err := s.rebuildOnMainChainFlag(ctx, full); err != nil {
+	if err := s.rebuildOnMainChainFlagFrom(ctx, full, floor); err != nil {
 		return err
 	}
 
@@ -242,4 +286,31 @@ func (s *SQL) runOnMainChainRepair(full bool) error {
 	s.ResetResponseCache()
 
 	return nil
+}
+
+// releaseOnMainChainRepairGauge drops this store's contribution to the pending gauge when
+// its repair loop exits with a repair still owed, so a closed store does not hold the
+// process-wide gauge up for the stores that outlive it.
+func (s *SQL) releaseOnMainChainRepairGauge() {
+	r := &s.onMainChainRepair
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.pending {
+		// Nothing can land the repair now, so stop a later acknowledgment from releasing
+		// the gauge a second time. The guard stays up: the store is closed.
+		r.pending = false
+		prometheusOnMainChainRepairPending.Dec()
+	}
+}
+
+// closing reports whether Close has signalled the store's background work to stop.
+func (s *SQL) closing() bool {
+	select {
+	case <-s.backgroundDone:
+		return true
+	default:
+		return false
+	}
 }
