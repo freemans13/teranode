@@ -122,14 +122,15 @@ func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 			return false
 		}
 
-		b.logger.Errorf("[BlockAssembler] replay of best tip changes failed %d times in a row, following the best header instead: %v", failures, err)
 		b.bestTipReplayFailures.Store(0)
 
 		// The best-header path moves straight to the tip, so the changes before it are
 		// given up. A change after this read is replayed on the next pass.
 		if b.bestTipResetReplayPending.Load() {
+			b.logger.Errorf("[BlockAssembler] replay failed %d times; retaining pending reset history for recovery: %v", failures, err)
 			return false
 		}
+		b.logger.Errorf("[BlockAssembler] replay of best tip changes failed %d times in a row, following the best header instead: %v", failures, err)
 
 		if seq, seqErr := b.blockchainClient.GetBestTipSeq(ctx); seqErr == nil {
 			b.advanceBestTipSeq(seq)
@@ -183,6 +184,9 @@ func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) {
 	read := 0
 
+	if b.bestTipResetRetryBlocked.Load() {
+		return read, errors.NewStorageError("pending reset requires disk storage recovery before replay")
+	}
 	defer b.saveBestTipSeq(ctx)
 
 	// A reset can finalize its target before its reload or state write fails.
@@ -333,6 +337,9 @@ func (b *BlockAssembler) startingBestTipSeq(ctx context.Context, latest uint64) 
 // It runs outside StateReconciling, so a mining candidate asked for during the check is
 // built as usual. It stamps lastBestTipReplay, so the next check waits a full interval.
 func (b *BlockAssembler) idleReconcileNeeded(ctx context.Context) bool {
+	if b.bestTipResetRetryBlocked.Load() {
+		return false
+	}
 	b.lastBestTipReplay.Store(time.Now().UnixNano())
 	if b.bestTipResetReplayPending.Load() {
 		return true
@@ -404,6 +411,9 @@ func (b *BlockAssembler) saveBestTipSeq(ctx context.Context) {
 // blockassembly_reconcileInterval. It covers lost notifications, because the blockchain
 // service drops a subscriber whose buffer fills and nothing arrives until it reconnects.
 func (b *BlockAssembler) reconcileDue(now time.Time) bool {
+	if b.bestTipResetRetryBlocked.Load() {
+		return false
+	}
 	// Recovery of a reset that already discarded its pool is mandatory even
 	// when ordinary lost-notification reconciliation is disabled.
 	if b.bestTipResetReplayPending.Load() {

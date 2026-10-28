@@ -182,18 +182,23 @@ func TestBlockAssembler_PreRotationFailureIsRetriedNotDegraded(t *testing.T) {
 	require.Zero(t, degradedGauge(), "a failure before the rotation is not a storage failure")
 }
 
-// A storage-triggered reset that fails after the rotation for a non-storage
-// reason is not retried: the rotation discarded the phantom it was for.
-func TestBlockAssembler_PostRotationFailureIsNotRetried(t *testing.T) {
+// A post-rotation reload failure discarded the pool, so numbered-tip recovery
+// must retry it even though the original storage-triggered request was consumed.
+func TestBlockAssembler_PostRotationFailureRetriesIncompleteReload(t *testing.T) {
+	var calls atomic.Int32
 	m, resets := resetTestMock(func(*subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse {
-		return subtreeprocessor.ResetResponse{Err: errors.NewServiceError("utxo store unavailable"), Rotated: true}
+		if calls.Add(1) == 1 {
+			return subtreeprocessor.ResetResponse{Err: errors.NewServiceError("utxo store unavailable"), Rotated: true}
+		}
+		return subtreeprocessor.ResetResponse{Rotated: true}
 	})
 	m.ResetRequested.Store(true)
-
-	startWithMock(t, m)
-
-	require.Eventually(t, func() bool { return resets.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
-	require.Never(t, func() bool { return resets.Load() > 1 }, 200*time.Millisecond, 10*time.Millisecond)
+	items := startWithMock(t, m, func(items *baTestItems) {
+		m.On("GetCurrentBlockHeader").Unset()
+		m.On("GetCurrentBlockHeader").Return(genesisHeader(t, items))
+	})
+	require.Eventually(t, func() bool { return resets.Load() == 2 && !items.blockAssembler.bestTipResetReplayPending.Load() }, 2*time.Second, 5*time.Millisecond)
+	require.Never(t, func() bool { return resets.Load() > 2 }, 200*time.Millisecond, 10*time.Millisecond)
 	require.Zero(t, degradedGauge())
 }
 
@@ -212,6 +217,9 @@ func TestBlockAssembler_DrainedStorageTriggeredRequestCounts(t *testing.T) {
 
 	require.Eventually(t, func() bool { return degradedGauge() == 1 }, 2*time.Second, 5*time.Millisecond)
 	require.Equal(t, int32(1), resets.Load(), "the queued storage-triggered request is drained, not run")
+	require.Never(t, func() bool { return resets.Load() > 1 }, 200*time.Millisecond, 10*time.Millisecond,
+		"persistent pre-rotation storage failures must not loop mandatory resets")
+
 }
 
 // The reorg paths that fall back to a reset go through the same outcome
@@ -369,4 +377,42 @@ func TestBlockAssembler_StartRequestsBlockMaxSizeCheck(t *testing.T) {
 	startWithMock(t, m)
 
 	m.AssertCalled(t, "RequestBlockMaxSizeCheck")
+}
+
+// A persistent fault before rotation retains the pool but must not turn each
+// mandatory replay tick into another failed disk rotation. Explicit reset is
+// the recovery boundary; pending history remains guarded until it succeeds.
+func TestBlockAssembler_UnrotatedStorageFaultBlocksReplayUntilExplicitReset(t *testing.T) {
+	initDegradedGauge(t)
+	items := setupBlockAssemblyTest(t)
+	var calls atomic.Int32
+	m, resets := resetTestMock(func(*subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse {
+		if calls.Add(1) == 1 {
+			return subtreeprocessor.ResetResponse{Err: errors.NewStorageError("disk unavailable"), StorageFailed: true}
+		}
+		return subtreeprocessor.ResetResponse{Rotated: true}
+	})
+	m.On("GetCurrentBlockHeader").Unset()
+	m.On("GetCurrentBlockHeader").Return(genesisHeader(t, items))
+	injectMockStp(t, items, m)
+	ba := items.blockAssembler
+	ba.setBestBlockHeader(genesisHeader(t, items), 0)
+	ba.bestTipSeqKnown.Store(true)
+	result := make(chan error, 1)
+	ba.handleResetRequests(t.Context(), resetRequest{StorageTriggered: true, ErrCh: result})
+	require.Error(t, <-result)
+	require.True(t, ba.bestTipResetRetryBlocked.Load())
+	require.True(t, ba.bestTipResetReplayPending.Load())
+	require.False(t, ba.reconcileDue(time.Now()))
+	for i := 0; i < 3; i++ {
+		require.False(t, ba.followBestTipChanges(t.Context()))
+	}
+	require.Equal(t, int32(1), resets.Load(), "replay must not bypass persistent storage-fault protection")
+	require.Equal(t, uint64(0), ba.bestTipSeq.Load(), "blocked recovery must not discard pending history")
+	ba.handleResetRequests(t.Context(), resetRequest{ErrCh: result})
+	require.NoError(t, <-result)
+	require.Equal(t, int32(2), resets.Load())
+	require.False(t, ba.bestTipResetRetryBlocked.Load())
+	require.False(t, ba.bestTipResetReplayPending.Load())
+	require.Zero(t, degradedGauge())
 }

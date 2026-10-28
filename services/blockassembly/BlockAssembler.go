@@ -222,6 +222,7 @@ type BlockAssembler struct {
 	bestTipSeqKnown           atomic.Bool
 	bestTipResetReplayPending atomic.Bool // candidates stay empty until reset's pending history succeeds
 	bestTipResetIncomplete    atomic.Bool // reset moved its target but has not finished reloading/persisting
+	bestTipResetRetryBlocked  atomic.Bool // persistent pre-rotation disk fault requires an explicit reset
 
 	// bestTipSeqSaved is the position last persisted under BestTipSeqStateKey.
 	bestTipSeqSaved atomic.Uint64
@@ -710,6 +711,9 @@ drain:
 		b.bestTipResetReplayPending.Store(true)
 	}
 	resp, err := b.resetWithResponse(ctx, validateInputs)
+	// Judge the storage outcome of this reset before replay can return an
+	// unrelated history error. A clean rotation still cured its disk fault.
+	b.onResetDone(storageTriggered, resp, err)
 	if err == nil && b.bestTipSeqKnown.Load() {
 		b.bestTipResetReplayPending.Store(true)
 		_, err = b.replayBestTipChanges(ctx)
@@ -723,8 +727,6 @@ drain:
 	// reorg path this does not run inside processNewBlockAnnouncement,
 	// so nothing else would drain them until the next block arrives.
 	b.drainPendingInvalidations(ctx)
-
-	b.onResetDone(storageTriggered, resp, err)
 
 	for _, req := range batch {
 		if req.ErrCh != nil {
@@ -1104,6 +1106,7 @@ func (b *BlockAssembler) resetToBlockWithResponse(ctx context.Context, bestBlock
 		b.bestTipResetReplayPending.Store(true)
 	}
 
+	b.bestTipResetRetryBlocked.Store(false)
 	resp = b.subtreeProcessor.Reset(baBestBlockHeader, moveBackBlocks, moveForwardBlocks, useFastForwardReset, postProcessFn)
 	if resp.Err != nil {
 		b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", resp.Err)
@@ -2227,6 +2230,13 @@ func (b *BlockAssembler) resetToBlockAndRecord(ctx context.Context, header *mode
 //     discarded the phantom, or a manual/reorg reset whose reload left one,
 //     which raises its own request): unchanged.
 func (b *BlockAssembler) onResetDone(storageTriggered bool, resp subtreeprocessor.ResetResponse, resetErr error) {
+	// Keep pending history guarded, but do not let mandatory recovery bypass
+	// persistent disk-fault protection when the old map was never rotated.
+	if resetErr != nil && resp.StorageFailed && !resp.Rotated {
+		b.bestTipResetRetryBlocked.Store(true)
+	} else if resetErr == nil && !resp.StorageFailed {
+		b.bestTipResetRetryBlocked.Store(false)
+	}
 	if storageTriggered {
 		b.lastStorageResetDone = time.Now()
 	}
@@ -3774,10 +3784,34 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	iteratorClosed = true
 
 	if shouldValidateInputs {
+		// Keep store reads bounded and concurrent as in the original reload.
+		// Apply conflict cascades afterwards: they mutate the processor and the
+		// shared drop set, and must finish before filtering accepted children.
+		type validationResult struct{ valid, markConflicting bool }
+		results := make([]validationResult, len(unminedTransactions))
+		validationWork := make(chan int, numWorkers)
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range validationWork {
+					b.heartbeat.BeatIfStarted()
+					results[idx].valid, results[idx].markConflicting = b.checkUnminedTxInputs(ctx, unminedTransactions[idx].Hash, bestBlockHeaderIDsMap)
+				}
+			}()
+		}
+		for idx := range unminedTransactions {
+			validationWork <- idx
+		}
+		close(validationWork)
+		wg.Wait()
+
 		valid := unminedTransactions[:0]
-		for _, tx := range unminedTransactions {
-			b.heartbeat.BeatIfStarted()
-			if b.validateUnminedTxInputs(ctx, tx.Hash, bestBlockHeaderIDsMap, false) {
+		for idx, tx := range unminedTransactions {
+			if results[idx].markConflicting {
+				b.markAsConflicting(ctx, tx.Hash)
+			}
+			if results[idx].valid {
 				valid = append(valid, tx)
 			} else {
 				invalidInputCount.Add(1)
@@ -3985,84 +4019,97 @@ func clearUnminedTxInpoints(tx *utxo.UnminedTransaction) {
 //
 // Returns true if the transaction is valid for inclusion in block assembly.
 func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash chainhash.Hash, bestBlockIDsMap map[uint32]bool, dryRun bool) bool {
-	// Both SQL and Aerospike populate the full transaction for fields.Tx.
-	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.Tx, fields.Conflicting)
-	if err != nil || txMeta == nil || txMeta.Tx == nil || txMeta.Tx.Inputs == nil {
-		return false
+	valid, mark := b.checkUnminedTxInputs(ctx, txHash, bestBlockIDsMap)
+	if mark && !dryRun {
+		b.markAsConflicting(ctx, txHash)
+	}
+	return valid
+}
+
+// checkUnminedTxInputs performs only reads. Its second result requests a
+// conflict cascade, which reload applies serially after parallel validation.
+func (b *BlockAssembler) checkUnminedTxInputs(ctx context.Context, txHash chainhash.Hash, bestBlockIDsMap map[uint32]bool) (bool, bool) {
+	// Both stores populate TxInpoints; full outputs and scripts are unnecessary.
+	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.TxInpoints, fields.Conflicting)
+	if err != nil || txMeta == nil {
+		return false, false
 	}
 
 	if txMeta.Conflicting {
-		return false
+		return false, false
 	}
 
-	for _, input := range txMeta.Tx.Inputs {
-		parentHash := input.PreviousTxIDChainHash()
-
-		parentMeta, err := b.utxoStore.Get(ctx, parentHash, fields.Utxos)
-		if err != nil || parentMeta == nil {
-			// Log the offending tx and parent so CheckBlockAssemblyValidateInputs is
-			// diagnosable: a pruned parent of a live unmined tx (issue 1768) surfaces here.
-			b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d parent could not be loaded (err=%v, meta nil=%t) — counting as invalid",
-				txHash.String(), parentHash.String(), input.PreviousTxOutIndex, err, parentMeta == nil)
-
-			return false
+	parents := txMeta.TxInpoints.GetParentTxHashes()
+	if len(parents) == 0 {
+		return false, false
+	}
+	for parentIdx, parent := range parents {
+		parentHash := &parent
+		vouts, err := txMeta.TxInpoints.GetParentVoutsAtIndex(parentIdx)
+		if err != nil {
+			return false, false
 		}
+		for _, outputIndex := range vouts {
+			parentMeta, err := b.utxoStore.Get(ctx, parentHash, fields.Utxos)
+			if err != nil || parentMeta == nil {
+				// Log the offending tx and parent so CheckBlockAssemblyValidateInputs is
+				// diagnosable: a pruned parent of a live unmined tx (issue 1768) surfaces here.
+				b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d parent could not be loaded (err=%v, meta nil=%t) — counting as invalid",
+					txHash.String(), parentHash.String(), outputIndex, err, parentMeta == nil)
 
-		vout := int(input.PreviousTxOutIndex)
-		if parentMeta.SpendingDatas == nil || vout >= len(parentMeta.SpendingDatas) {
-			continue
-		}
-
-		spendingData := parentMeta.SpendingDatas[vout]
-		if spendingData == nil || spendingData.TxID == nil {
-			continue
-		}
-
-		if !spendingData.TxID.IsEqual(&txHash) {
-			// Case 1: input spent by a different tx
-			b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d is spent by different tx %s — marking conflicting",
-				txHash.String(), parentHash.String(), vout, spendingData.TxID.String())
-
-			if !dryRun {
-				b.markAsConflicting(ctx, txHash)
+				return false, false
 			}
-			return false
-		}
 
-		// Case 2: spending data matches, but check if the counter-conflicting tx
-		// (the one this tx replaced via ProcessConflicting) is on the current chain.
-		// This catches the scenario where ProcessConflicting incorrectly flipped a
-		// confirmed transaction to "loser" status.
-		counterTxMeta, err := b.utxoStore.Get(ctx, parentHash, fields.ConflictingChildren)
-		if err != nil || counterTxMeta == nil {
-			continue
-		}
-
-		for _, counterChild := range counterTxMeta.ConflictingChildren {
-			if counterChild.IsEqual(&txHash) {
+			vout := int(outputIndex)
+			if parentMeta.SpendingDatas == nil || vout >= len(parentMeta.SpendingDatas) {
 				continue
 			}
 
-			counterMeta, err := b.utxoStore.Get(ctx, &counterChild, fields.BlockIDs)
-			if err != nil || counterMeta == nil {
+			spendingData := parentMeta.SpendingDatas[vout]
+			if spendingData == nil || spendingData.TxID == nil {
 				continue
 			}
 
-			for _, blockID := range counterMeta.BlockIDs {
-				if bestBlockIDsMap[blockID] {
-					b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d has counter-conflicting tx %s confirmed on chain (blockID %d) — marking conflicting",
-						txHash.String(), parentHash.String(), vout, counterChild.String(), blockID)
+			if !spendingData.TxID.IsEqual(&txHash) {
+				// Case 1: input spent by a different tx
+				b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d is spent by different tx %s — marking conflicting",
+					txHash.String(), parentHash.String(), vout, spendingData.TxID.String())
 
-					if !dryRun {
-						b.markAsConflicting(ctx, txHash)
+				return false, true
+			}
+
+			// Case 2: spending data matches, but check if the counter-conflicting tx
+			// (the one this tx replaced via ProcessConflicting) is on the current chain.
+			// This catches the scenario where ProcessConflicting incorrectly flipped a
+			// confirmed transaction to "loser" status.
+			counterTxMeta, err := b.utxoStore.Get(ctx, parentHash, fields.ConflictingChildren)
+			if err != nil || counterTxMeta == nil {
+				continue
+			}
+
+			for _, counterChild := range counterTxMeta.ConflictingChildren {
+				if counterChild.IsEqual(&txHash) {
+					continue
+				}
+
+				counterMeta, err := b.utxoStore.Get(ctx, &counterChild, fields.BlockIDs)
+				if err != nil || counterMeta == nil {
+					continue
+				}
+
+				for _, blockID := range counterMeta.BlockIDs {
+					if bestBlockIDsMap[blockID] {
+						b.logger.Warnf("[validateUnminedTxInputs][%s] input %s:%d has counter-conflicting tx %s confirmed on chain (blockID %d) — marking conflicting",
+							txHash.String(), parentHash.String(), vout, counterChild.String(), blockID)
+
+						return false, true
 					}
-					return false
 				}
 			}
 		}
-	}
 
-	return true
+	}
+	return true, false
 }
 
 func (b *BlockAssembler) markAsConflicting(ctx context.Context, txHash chainhash.Hash) {
