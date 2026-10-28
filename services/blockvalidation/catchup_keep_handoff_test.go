@@ -3,11 +3,19 @@ package blockvalidation
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/mock"
@@ -57,6 +65,75 @@ func TestKeepBlockAssemblyHandoff(t *testing.T) {
 
 			got := srv.keepBlockAssemblyHandoff(context.Background(), &CatchupContext{blockUpTo: blockUpTo}, tc.blocks)
 			require.Equal(t, tc.want, got, fmt.Sprintf("state=%s blocks=%d bound=%d", tc.state, tc.blocks, tc.bound))
+		})
+	}
+}
+
+// handoffRecordingClient records the service-boundary flag while allowing the real
+// subtree validation and sqlitememory-backed block validation to finish.
+type handoffRecordingClient struct {
+	subtreevalidation.Interface
+	handoffs []bool
+}
+
+func (c *handoffRecordingClient) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string, keep bool) error {
+	c.handoffs = append(c.handoffs, keep)
+	return c.Interface.CheckBlockSubtrees(ctx, block, peerID, baseURL, keep)
+}
+
+// TestValidateBlocksOnChannel_ForwardsBlockAssemblyHandoff exercises the options
+// chain from the catch-up consumer through full validation to CheckBlockSubtrees.
+// It also checks the accepted block in the real store, so an early exit cannot
+// satisfy the flag assertion without completing validation.
+func TestValidateBlocksOnChannel_ForwardsBlockAssemblyHandoff(t *testing.T) {
+	initPrometheusMetrics()
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keep=%t", keep), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			utxoStore, subtreeClient, localClient, txStore, subtreeStore, cleanup := setup(t)
+			defer cleanup()
+			tSettings := test.CreateBaseTestSettings(t)
+			tSettings.BlockValidation.OptimisticMining = false
+			recorder := &handoffRecordingClient{Interface: subtreeClient}
+
+			// A coinbase-only subtree still crosses CheckBlockSubtrees, while keeping
+			// the fixture focused on block validation rather than transaction policy.
+			block := testhelpers.CreateTestBlocksWithPrev(t, 1, tSettings.ChainCfgParams.GenesisHash)[0]
+			block.Height = 1
+			block.TransactionCount = 1
+			block.SizeInBytes = uint64(block.CoinbaseTx.Size())
+			subtree, err := subtreepkg.NewTreeByLeafCount(2)
+			require.NoError(t, err)
+			require.NoError(t, subtree.AddCoinbaseNode())
+			block.Subtrees = []*chainhash.Hash{subtree.RootHash()}
+			subtreeBytes, err := subtree.Serialize()
+			require.NoError(t, err)
+			require.NoError(t, subtreeStore.Set(ctx, block.Subtrees[0][:], fileformat.FileTypeSubtree, subtreeBytes))
+			subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
+			metaBytes, err := subtreeMeta.Serialize()
+			require.NoError(t, err)
+			require.NoError(t, subtreeStore.Set(ctx, block.Subtrees[0][:], fileformat.FileTypeSubtreeMeta, metaBytes))
+
+			bv := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, localClient, subtreeStore, txStore, utxoStore, nil, recorder, NoSetMined{})
+			defer bv.StopCaches()
+			srv := &Server{
+				logger: ulogger.TestLogger{}, settings: tSettings, blockchainClient: localClient,
+				blockValidation: bv, headerChainCache: catchup.NewHeaderChainCache(ulogger.TestLogger{}),
+			}
+			catchupCtx := &CatchupContext{blockUpTo: block, baseURL: "http://peer", peerID: "peer", keepBlockAssemblyHandoff: keep}
+			input := make(chan blockForValidation, 1)
+			input <- blockForValidation{block: block}
+			close(input)
+			var size atomic.Int64
+			size.Store(1)
+			require.NoError(t, srv.validateBlocksOnChannel(input, ctx, catchupCtx, &size, nil))
+			require.Equal(t, []bool{keep}, recorder.handoffs)
+			require.Zero(t, size.Load())
+			stored, err := localClient.GetBlock(ctx, block.Hash())
+			require.NoError(t, err)
+			require.Equal(t, block.Hash(), stored.Hash())
+			require.Equal(t, block.Subtrees, stored.Subtrees)
 		})
 	}
 }

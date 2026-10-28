@@ -77,7 +77,7 @@ type CatchupContext struct {
 	// keepBlockAssemblyHandoff is true when this run started from RUNNING and fetches no more
 	// than CatchupKeepBlockAssemblyMaxBlocks blocks. Subtree validation then keeps handing the
 	// run's unseen transactions to block assembly although the FSM is in CATCHINGBLOCKS, so a
-	// transaction that only a fork block carried still reaches the pool (issue 2067).
+	// transaction that only a fork block carried is offered to the pool (issue 2067).
 	keepBlockAssemblyHandoff bool
 
 	// failedPeers records the peers that actually failed to serve data during this
