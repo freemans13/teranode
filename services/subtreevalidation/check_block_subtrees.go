@@ -907,21 +907,26 @@ func (u *Server) checkCachedSubtreesAgainstCandidateChain(ctx context.Context, b
 	//
 	// Asked once for all of them, not once per transaction: the transactions
 	// share cones, and the per-transaction loop re-walked them N^2/2 times
-	// (issue 2037).
+	// (issue 2037). Sourcing the set from the store rather than the trailer
+	// raises that N, so the batch is what keeps this path affordable.
 	//
 	// Wrapped as a processing error
 	// rather than forced to tx-invalid: the underlying call returns
 	// ErrTxInvalid only for a genuine ancestry conflict, and errors.Is finds
 	// it through the chain. A walk-budget or store failure stays retryable
-	// instead of permanently marking the block invalid.
+	// instead of permanently marking the block invalid, unless another
+	// member read is proven mined on the candidate chain.
 	notFound, err := u.checkCounterConflictingOnCurrentChainBatch(ctx, conflictingTxHashes, blockIds, skipMissingRecords)
 	if err != nil {
 		return errors.NewProcessingError("[CheckBlockSubtrees][%s] cached subtree conflicts with the candidate chain", block.Hash().String(), err)
 	}
 
-	// Each transaction was read from the store moments ago, so a record not
-	// found here means a counter-conflicting record is gone, or the
-	// transaction itself was pruned between the probe and this walk.
+	// Each of these hashes was read from the store moments ago, so a record
+	// missing now means a counter-conflicting record is gone, or the
+	// transaction itself was pruned between the probe and this walk. The
+	// pre-existing caller of this predicate never saw either, because it had
+	// just validated the transaction and so knew the record existed; probing
+	// cached subtrees removes that precondition.
 	//
 	// A record we cannot find is not evidence of an ancestor double
 	// spend. Rejecting on it would make one node refuse a block its
