@@ -1880,6 +1880,29 @@ func coinbaseHasP2SHOutput(tx *bt.Tx) bool {
 	return false
 }
 
+// checkCoinbaseTimeLockFinality applies the coinbase finality rule where its verdict depends on the
+// parent's median time past: from CSV onwards, a time-based nLockTime with a non-final sequence. In
+// every other case it does nothing, because submitMiningSolution has already applied the rule
+// without the lookup. A failed lookup is this node's problem and stays a processing error. A
+// non-final coinbase is a consensus verdict on the miner's data, the same class block.Valid gives it.
+func (ba *BlockAssembly) checkCoinbaseTimeLockFinality(ctx context.Context, jobID string, coinbaseTx *bt.Tx, nTime, height uint32, hashPrevBlock *chainhash.Hash) error {
+	params := ba.blockAssembler.settings.ChainCfgParams
+	if !model.CoinbaseFinalityNeedsMedianTimePast(coinbaseTx, height, params) {
+		return nil
+	}
+
+	parentMedianTimePast, err := ba.blockAssembler.ParentMedianTimePast(ctx, hashPrevBlock)
+	if err != nil {
+		return errors.NewProcessingError("[BlockAssembly][%s] cannot check that the coinbase is final: its time-based nLockTime needs the parent's median time past", jobID, err)
+	}
+
+	if reason := model.CoinbaseFinalityViolation(coinbaseTx, nTime, height, params, parentMedianTimePast); reason != "" {
+		return errors.NewBlockInvalidError("[BlockAssembly][%s] coinbase is not final: %s", jobID, reason)
+	}
+
+	return nil
+}
+
 func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSubmissionRequest) (*blockassembly_api.OKResponse, error) {
 	jobID := util.ReverseAndHexEncodeSlice(req.SubmitMiningSolutionRequest.Id)
 
@@ -2153,18 +2176,11 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	}
 
 	// block.Valid has no ancestor headers here, so it cannot decide post-CSV time-based finality.
-	// This block goes straight to AddBlock without passing through block validation. Establish the
-	// parent's median time past only after validating the submitted proof of work, and refuse the
-	// solution if the lookup fails. A rejected coinbase leaves the job available for a corrected one.
-	if model.CoinbaseFinalityNeedsMedianTimePast(coinbaseTx, block.Height, ba.blockAssembler.settings.ChainCfgParams) {
-		parentMedianTimePast, lookupErr := ba.blockAssembler.ParentMedianTimePast(ctx, hashPrevBlock)
-		if lookupErr != nil {
-			return nil, errors.NewProcessingError("[BlockAssembly][%s] cannot check that the coinbase is final: its time-based nLockTime needs the parent's median time past", jobID, lookupErr)
-		}
-
-		if reason := model.CoinbaseFinalityViolation(coinbaseTx, nTime, block.Height, ba.blockAssembler.settings.ChainCfgParams, parentMedianTimePast); reason != "" {
-			return nil, errors.NewBlockInvalidError("[BlockAssembly][%s] coinbase is not final: %s", jobID, reason)
-		}
+	// This block goes straight to AddBlock without passing through block validation, so the time
+	// lock is checked now, after block.Valid has verified the submitted proof of work. A rejected
+	// coinbase leaves the job available for a corrected one.
+	if err = ba.checkCoinbaseTimeLockFinality(ctx, jobID, coinbaseTx, nTime, block.Height, hashPrevBlock); err != nil {
+		return nil, err
 	}
 
 	// decouple the tracing context to not cancel the context when the block is being saved, even if we cancel the request
