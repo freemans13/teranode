@@ -716,6 +716,12 @@ func (m *MockBlockchainClient) GetBlockHeadersFromTill(ctx context.Context, bloc
 func (m *MockBlockchainClient) GetBlockHeadersFromHeight(ctx context.Context, height, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	return nil, nil, nil
 }
+func (m *MockBlockchainClient) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
+	return nil, nil, nil, nil
+}
+func (m *MockBlockchainClient) GetBestTipSeq(ctx context.Context) (uint64, error) {
+	return 0, nil
+}
 func (m *MockBlockchainClient) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	return nil, nil, nil
 }

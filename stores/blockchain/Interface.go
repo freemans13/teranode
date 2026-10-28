@@ -266,6 +266,19 @@ type Store interface {
 	// Returns: Slice of BlockHeaders, slice of BlockHeaderMetas, and any error encountered
 	GetBlockHeadersFromHeight(ctx context.Context, height, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
+	// GetBestTipChanges returns, in order, the blocks that became the best tip after sequence
+	// number afterSeq, at or above minHeight, at most limit of them.
+	// Parameters:
+	//   - ctx: Context for the operation
+	//   - afterSeq: Return only changes numbered above this
+	//   - minHeight: Skip blocks below this height
+	//   - limit: Maximum number of changes to return
+	// Returns: BlockHeaders, BlockHeaderMetas and sequence numbers of the same length, and any error encountered
+	GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error)
+
+	// GetBestTipSeq returns the sequence number of the latest change of the best tip, 0 if none.
+	GetBestTipSeq(ctx context.Context) (uint64, error)
+
 	// GetBlockHeadersByHeight retrieves block headers between two heights.
 	// Parameters:
 	//   - ctx: Context for the operation

@@ -523,6 +523,7 @@ var blockchainSchemaExpectedColumns = []string{
 	"median_time_past",
 	"coinbase_bump",
 	"on_main_chain",
+	"best_tip_seq",
 }
 
 // blockchainSchemaExpectedIndexes is the list of indexes on blocks that the
@@ -531,6 +532,7 @@ var blockchainSchemaExpectedColumns = []string{
 var (
 	blockchainSchemaExpectedBaseIndexes = []string{
 		"ux_blocks_hash",
+		"idx_best_tip_seq",
 	}
 	blockchainSchemaExpectedFullIndexes = []string{
 		"idx_chain_work_peer_id",
@@ -671,6 +673,7 @@ func createPostgresSchemaUnlocked(db *usql.DB, withIndexes bool) error {
 		,median_time_past BIGINT NOT NULL DEFAULT 0
 		,coinbase_bump  BYTEA NULL
 		,on_main_chain  BOOLEAN NOT NULL DEFAULT FALSE
+		,best_tip_seq   BIGINT NULL
 	  );
 	`); err != nil {
 		_ = db.Close()
@@ -767,9 +770,34 @@ func createPostgresSchemaUnlocked(db *usql.DB, withIndexes bool) error {
 		}
 	}
 
+	// add the best_tip_seq column to the blocks table if it does not exist. It numbers the
+	// changes of the best tip: the value is the sequence number at which the block last
+	// became the best tip, NULL for a block that never was. Block assembly replays the
+	// changes in that order, so it never skips a branch that was briefly the best chain.
+	err = db.QueryRow("SELECT column_name FROM information_schema.columns WHERE table_name='blocks' AND column_name='best_tip_seq'").Scan(new(string))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err := db.Exec(`ALTER TABLE blocks ADD COLUMN best_tip_seq BIGINT NULL;`)
+			if err != nil {
+				_ = db.Close()
+				return errors.NewStorageError("could not add best_tip_seq column to blocks table", err)
+			}
+		} else {
+			_ = db.Close()
+			return errors.NewStorageError("could not check for best_tip_seq column in blocks table", err)
+		}
+	}
+
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_blocks_hash ON blocks (hash);`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not create ux_blocks_hash index", err)
+	}
+
+	// Always created, not only withIndexes: every write of a tip change reads
+	// MAX(best_tip_seq), which without this index is a scan of the whole table.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_best_tip_seq ON blocks (best_tip_seq);`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create idx_best_tip_seq index", err)
 	}
 
 	if withIndexes {
@@ -988,6 +1016,7 @@ func createSqliteSchema(db *usql.DB) error {
 		,median_time_past BIGINT NOT NULL DEFAULT 0
 		,coinbase_bump  BLOB NULL
 		,on_main_chain  BOOLEAN NOT NULL DEFAULT FALSE
+		,best_tip_seq   BIGINT NULL
 	  );
 	`); err != nil {
 		_ = db.Close()
@@ -1079,9 +1108,34 @@ func createSqliteSchema(db *usql.DB) error {
 		}
 	}
 
+	// add the best_tip_seq column to the blocks table if it does not exist. It numbers the
+	// changes of the best tip: the value is the sequence number at which the block last
+	// became the best tip, NULL for a block that never was. Block assembly replays the
+	// changes in that order, so it never skips a branch that was briefly the best chain.
+	err = db.QueryRow("SELECT name FROM pragma_table_info('blocks') WHERE name='best_tip_seq'").Scan(new(string))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err := db.Exec(`ALTER TABLE blocks ADD COLUMN best_tip_seq BIGINT NULL;`)
+			if err != nil {
+				_ = db.Close()
+				return errors.NewStorageError("could not add best_tip_seq column to blocks table", err)
+			}
+		} else {
+			_ = db.Close()
+			return errors.NewStorageError("could not check for best_tip_seq column in blocks table", err)
+		}
+	}
+
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_blocks_hash ON blocks (hash);`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not create ux_blocks_hash index", err)
+	}
+
+	// Always created, not only withIndexes: every write of a tip change reads
+	// MAX(best_tip_seq), which without this index is a scan of the whole table.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_best_tip_seq ON blocks (best_tip_seq);`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create idx_best_tip_seq index", err)
 	}
 
 	// Drop legacy indexes that have been superseded or consolidated

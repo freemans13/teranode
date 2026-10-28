@@ -269,6 +269,14 @@ func (c *LocalClient) GetBlockHeadersFromHeight(ctx context.Context, height, lim
 	return c.store.GetBlockHeadersFromHeight(ctx, height, limit)
 }
 
+func (c *LocalClient) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
+	return c.store.GetBestTipChanges(ctx, afterSeq, minHeight, limit)
+}
+
+func (c *LocalClient) GetBestTipSeq(ctx context.Context) (uint64, error) {
+	return c.store.GetBestTipSeq(ctx)
+}
+
 func (c *LocalClient) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	return c.store.GetBlockHeadersByHeight(ctx, startHeight, endHeight)
 }

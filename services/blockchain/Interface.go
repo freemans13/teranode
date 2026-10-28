@@ -447,6 +447,17 @@ type ClientI interface {
 	// - Error if the header retrieval fails
 	GetBlockHeadersFromHeight(ctx context.Context, height, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
+	// GetBestTipChanges returns, in order, the blocks that became the best tip after sequence
+	// number afterSeq, at or above minHeight, at most limit of them. Each change of the best tip
+	// is numbered when it is written, so a reader that keeps the last number it handled sees
+	// every branch that was the best chain, even one that lost again before it looked.
+	//
+	// Returns headers, metadata and sequence numbers as slices of the same length.
+	GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error)
+
+	// GetBestTipSeq returns the sequence number of the latest change of the best tip, 0 if none.
+	GetBestTipSeq(ctx context.Context) (uint64, error)
+
 	// GetBlockHeadersByHeight retrieves block headers between two heights.
 	//
 	// This method fetches a sequence of block headers within a specified height range,

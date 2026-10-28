@@ -90,6 +90,12 @@ service BlockchainAPI {
   // GetBlockHeadersFromHeight retrieves block headers starting from a specific height.
   rpc GetBlockHeadersFromHeight(GetBlockHeadersFromHeightRequest) returns (GetBlockHeadersFromHeightResponse) {}
 
+  // GetBestTipChanges returns, in order, the blocks that became the best tip after a sequence number.
+  rpc GetBestTipChanges(GetBestTipChangesRequest) returns (GetBestTipChangesResponse) {}
+
+  // GetBestTipSeq returns the sequence number of the latest change of the best tip.
+  rpc GetBestTipSeq(google.protobuf.Empty) returns (GetBestTipSeqResponse) {}
+
   // GetBlockHeadersByHeight retrieves block headers between two specified heights.
   rpc GetBlockHeadersByHeight(GetBlockHeadersByHeightRequest) returns (GetBlockHeadersByHeightResponse) {}
 
@@ -383,6 +389,25 @@ message GetBlockHeadersFromHeightRequest {
 message GetBlockHeadersFromHeightResponse {
   repeated bytes blockHeaders = 1;  // List of serialized block headers
   repeated bytes metas = 2;         // List of serialized metadata
+}
+
+// GetBestTipChangesRequest requests the changes of the best tip after a sequence number.
+message GetBestTipChangesRequest {
+  uint64 afterSeq = 1;   // Return only changes numbered above this
+  uint32 minHeight = 2;  // Skip blocks below this height
+  uint32 limit = 3;      // Maximum number of changes to return
+}
+
+// GetBestTipChangesResponse contains the changes of the best tip, in order.
+message GetBestTipChangesResponse {
+  repeated bytes blockHeaders = 1;  // List of serialized block headers
+  repeated bytes metas = 2;         // List of serialized metadata
+  repeated uint64 seqs = 3;         // Sequence number of each change
+}
+
+// GetBestTipSeqResponse contains the sequence number of the latest change of the best tip.
+message GetBestTipSeqResponse {
+  uint64 seq = 1;  // 0 when no change has been numbered
 }
 
 // GetBlockHeadersByHeightRequest requests headers between two heights.

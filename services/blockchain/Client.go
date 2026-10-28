@@ -1059,6 +1059,56 @@ func (c *Client) GetBlockHeadersFromHeight(ctx context.Context, height, limit ui
 	return headers, metas, nil
 }
 
+// GetBestTipChanges returns, in order, the blocks that became the best tip after afterSeq.
+func (c *Client) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
+	resp, err := c.client.GetBestTipChanges(ctx, &blockchain_api.GetBestTipChangesRequest{
+		AfterSeq:  afterSeq,
+		MinHeight: minHeight,
+		Limit:     limit,
+	})
+	if err != nil {
+		return nil, nil, nil, errors.UnwrapGRPC(err)
+	}
+
+	if len(resp.Metas) != len(resp.BlockHeaders) || len(resp.Seqs) != len(resp.BlockHeaders) {
+		return nil, nil, nil, errors.NewProcessingError("[GetBestTipChanges] response lengths differ: %d headers, %d metas, %d seqs", len(resp.BlockHeaders), len(resp.Metas), len(resp.Seqs))
+	}
+
+	headers := make([]*model.BlockHeader, 0, len(resp.BlockHeaders))
+
+	for _, headerBytes := range resp.BlockHeaders {
+		header, err := model.NewBlockHeaderFromBytes(headerBytes)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		headers = append(headers, header)
+	}
+
+	metas := make([]*model.BlockHeaderMeta, 0, len(resp.Metas))
+
+	for _, metaBytes := range resp.Metas {
+		meta, err := model.NewBlockHeaderMetaFromBytes(metaBytes)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		metas = append(metas, meta)
+	}
+
+	return headers, metas, resp.Seqs, nil
+}
+
+// GetBestTipSeq returns the sequence number of the latest change of the best tip, 0 if none.
+func (c *Client) GetBestTipSeq(ctx context.Context) (uint64, error) {
+	resp, err := c.client.GetBestTipSeq(ctx, &emptypb.Empty{})
+	if err != nil {
+		return 0, errors.UnwrapGRPC(err)
+	}
+
+	return resp.Seq, nil
+}
+
 // GetBlockHeadersByHeight retrieves block headers between two specified heights.
 func (c *Client) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	resp, err := c.client.GetBlockHeadersByHeight(ctx, &blockchain_api.GetBlockHeadersByHeightRequest{

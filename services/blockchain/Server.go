@@ -2172,6 +2172,54 @@ func (b *Blockchain) GetBlockHeadersFromHeight(ctx context.Context, req *blockch
 	}, nil
 }
 
+// GetBestTipChanges returns, in order, the blocks that became the best tip after a sequence number.
+func (b *Blockchain) GetBestTipChanges(ctx context.Context, req *blockchain_api.GetBestTipChangesRequest) (*blockchain_api.GetBestTipChangesResponse, error) {
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBestTipChanges",
+		tracing.WithParentStat(b.stats),
+	)
+	defer deferFn()
+
+	if req.Limit == 0 || uint64(req.Limit) > b.maxBlockHeadersPerRequest() {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBestTipChanges] invalid limit %d, must be 1 to %d", req.Limit, b.maxBlockHeadersPerRequest()))
+	}
+
+	blockHeaders, metas, seqs, err := b.store.GetBestTipChanges(ctx, req.AfterSeq, req.MinHeight, req.Limit)
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	blockHeaderBytes := make([][]byte, len(blockHeaders))
+	for i, blockHeader := range blockHeaders {
+		blockHeaderBytes[i] = blockHeader.Bytes()
+	}
+
+	metasBytes := make([][]byte, len(metas))
+	for i, meta := range metas {
+		metasBytes[i] = meta.Bytes()
+	}
+
+	return &blockchain_api.GetBestTipChangesResponse{
+		BlockHeaders: blockHeaderBytes,
+		Metas:        metasBytes,
+		Seqs:         seqs,
+	}, nil
+}
+
+// GetBestTipSeq returns the sequence number of the latest change of the best tip.
+func (b *Blockchain) GetBestTipSeq(ctx context.Context, _ *emptypb.Empty) (*blockchain_api.GetBestTipSeqResponse, error) {
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBestTipSeq",
+		tracing.WithParentStat(b.stats),
+	)
+	defer deferFn()
+
+	seq, err := b.store.GetBestTipSeq(ctx)
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	return &blockchain_api.GetBestTipSeqResponse{Seq: seq}, nil
+}
+
 // GetBlockHeadersByHeight retrieves block headers between two specified heights.
 func (b *Blockchain) GetBlockHeadersByHeight(ctx context.Context, req *blockchain_api.GetBlockHeadersByHeightRequest) (*blockchain_api.GetBlockHeadersByHeightResponse, error) {
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlockHeadersByHeight",

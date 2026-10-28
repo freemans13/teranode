@@ -124,12 +124,40 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 	s.mainChainRebuilding.Add(1)
 	defer s.mainChainRebuilding.Add(-1)
 
-	if rows, err = s.db.QueryContext(ctx, q, blockHash.CloneBytes()); err != nil {
-		return nil, errors.NewStorageError("error querying blocks to invalidate", err)
+	// The update and the number of the tip change it causes commit together, so the
+	// rebuild in the defer failing cannot lose the change. The stamp derives the new
+	// best from the table, not from the flags the rebuild writes.
+	if err = s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
+		invalidatedHashes = invalidatedHashes[:0]
+
+		if rows, err = tx.QueryContext(ctx, q, blockHash.CloneBytes()); err != nil {
+			return err
+		}
+
+		for rows.Next() {
+			if err = rows.Scan(&hashBytes); err != nil {
+				_ = rows.Close()
+				return err
+			}
+
+			if hash, err = chainhash.NewHash(hashBytes); err != nil {
+				_ = rows.Close()
+				return err
+			}
+
+			invalidatedHashes = append(invalidatedHashes, *hash)
+		}
+
+		if err = errors.Join(rows.Err(), rows.Close()); err != nil {
+			return err
+		}
+
+		return s.stampBestTip(ctx, tx)
+	}); err != nil {
+		return nil, errors.NewStorageError("error invalidating blocks", err)
 	}
 
 	defer func() {
-		err = errors.Join(err, rows.Close())
 
 		// Invalidate caches FIRST so that getBestBlockID does not return a
 		// stale best block that included the now-invalid block.
@@ -161,18 +189,6 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 			}
 		}
 	}()
-
-	for rows.Next() {
-		if err = rows.Scan(&hashBytes); err != nil {
-			return nil, errors.NewStorageError("error scanning invalidated block hash", err)
-		}
-
-		if hash, err = chainhash.NewHash(hashBytes); err != nil {
-			return nil, errors.NewStorageError("error creating hash from bytes", err)
-		}
-
-		invalidatedHashes = append(invalidatedHashes, *hash)
-	}
 
 	if len(invalidatedHashes) == 0 {
 		return nil, errors.NewStorageError("no blocks were invalidated", errors.ErrProcessing)

@@ -281,6 +281,28 @@ func (m *Mock) GetBlockHeadersFromHeight(ctx context.Context, height, limit uint
 	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Error(2)
 }
 
+// GetBestTipChanges mocks the GetBestTipChanges method
+func (m *Mock) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
+	args := m.Called(ctx, afterSeq, minHeight, limit)
+
+	if args.Error(3) != nil {
+		return nil, nil, nil, args.Error(3)
+	}
+
+	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Get(2).([]uint64), args.Error(3)
+}
+
+// GetBestTipSeq mocks the GetBestTipSeq method
+func (m *Mock) GetBestTipSeq(ctx context.Context) (uint64, error) {
+	args := m.Called(ctx)
+
+	if args.Error(1) != nil {
+		return 0, args.Error(1)
+	}
+
+	return args.Get(0).(uint64), args.Error(1)
+}
+
 // GetBlockHeadersByHeight mocks the GetBlockHeadersByHeight method
 func (m *Mock) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	args := m.Called(ctx, startHeight, endHeight)
@@ -1169,6 +1191,22 @@ func (m *mockBlockClient) GetBlockHeadersFromHeight(
 ) (*blockchain_api.GetBlockHeadersFromHeightResponse, error) {
 	m.lastGetBlockHeadersFromHeightReq = in
 	return m.responseGetBlockHeadersFromHeight, m.err
+}
+
+func (m *mockBlockClient) GetBestTipChanges(
+	ctx context.Context,
+	in *blockchain_api.GetBestTipChangesRequest,
+	opts ...grpc.CallOption,
+) (*blockchain_api.GetBestTipChangesResponse, error) {
+	return &blockchain_api.GetBestTipChangesResponse{}, m.err
+}
+
+func (m *mockBlockClient) GetBestTipSeq(
+	ctx context.Context,
+	in *emptypb.Empty,
+	opts ...grpc.CallOption,
+) (*blockchain_api.GetBestTipSeqResponse, error) {
+	return &blockchain_api.GetBestTipSeqResponse{}, m.err
 }
 
 func (m *mockBlockClient) GetBlockHeadersByHeight(

@@ -8,6 +8,7 @@ package sql
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -62,8 +63,33 @@ func (s *SQL) DeleteBlock(ctx context.Context, blockHash *chainhash.Hash) error 
 	s.mainChainRebuilding.Add(1)
 	defer s.mainChainRebuilding.Add(-1)
 
-	res, err := s.db.ExecContext(ctx, `DELETE FROM blocks WHERE hash = $1`, blockHash.CloneBytes())
-	if err != nil {
+	// Deleting the best block moves the best tip, so the delete and the number of that
+	// change commit together, under the lock every writer of the number holds. The
+	// number is taken from the maximum read before the delete: the deleted row may hold
+	// it, and numbering below it would hide the change from a reader already past it.
+	s.slowPathMu.Lock()
+	defer s.slowPathMu.Unlock()
+
+	var res sql.Result
+
+	if err := s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
+		var (
+			maxBefore sql.NullInt64
+			execErr   error
+		)
+
+		if execErr = tx.QueryRowContext(ctx, `SELECT MAX(best_tip_seq) FROM blocks`).Scan(&maxBefore); execErr != nil {
+			return execErr
+		}
+
+		if res, execErr = tx.ExecContext(ctx, `DELETE FROM blocks WHERE hash = $1`, blockHash.CloneBytes()); execErr != nil {
+			return execErr
+		}
+
+		_, execErr = tx.ExecContext(ctx, stampBestTipAfterQuery, maxBefore.Int64)
+
+		return execErr
+	}); err != nil {
 		return errors.NewStorageError("error deleting block", err)
 	}
 
