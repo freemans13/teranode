@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/bsv-blockchain/teranode/services/p2p"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/assert"
@@ -648,7 +649,7 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 	// announces a short fork off that ancestor. mined_set/notification mocks are
 	// registered permissively so the (buggy) early-clear path would execute without
 	// panicking, letting AssertNotCalled catch the regression rather than a panic.
-	buildForkScenario := func(t *testing.T, ancestorHeight, currentHeight uint32) (*Server, *blockchain.Mock, *model.Block, func()) {
+	buildForkScenarioWithHeaders := func(t *testing.T, ancestorHeight, currentHeight uint32) (*Server, *blockchain.Mock, *model.Block, func(), *model.BlockHeader, []*model.BlockHeader) {
 		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
 
 		mockUTXOStore.On("GetBlockHeight").Return(currentHeight)
@@ -728,13 +729,24 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 			`=~^http://peer/headers_from_common_ancestor/.*`,
 			httpmock.NewBytesResponder(200, responseHeaders),
 		)
+		// Counts every block fetch, so a test can tell whether the run got that far.
+		httpmock.RegisterResponder("GET", blockFetchPattern, httpmock.NewStringResponder(404, "not found"))
 
 		combinedCleanup := func() {
 			httpmock.DeactivateAndReset()
 			cleanup()
 		}
 
-		return server, mockBlockchainClient, targetBlock, combinedCleanup
+		return server, mockBlockchainClient, targetBlock, combinedCleanup, ancestorHeader, forkHeaders
+	}
+
+	buildForkScenario := func(t *testing.T, ancestorHeight, currentHeight uint32) (*Server, *blockchain.Mock, *model.Block, func()) {
+		server, mockBlockchainClient, targetBlock, cleanup, _, _ := buildForkScenarioWithHeaders(t, ancestorHeight, currentHeight)
+		return server, mockBlockchainClient, targetBlock, cleanup
+	}
+
+	blockFetches := func() int {
+		return httpmock.GetCallCountInfo()["GET "+blockFetchPattern]
 	}
 
 	t.Run("ForkDepthExceedsCoinbaseMaturity", func(t *testing.T) {
@@ -789,7 +801,51 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 		require.NoError(t, err)
 		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
 		mockBlockchainClient.AssertNotCalled(t, "CatchUpBlocks", mock.Anything)
-		require.Zero(t, httpmock.GetCallCountInfo()["GET =~^http://peer/block/.*"], "no block may be fetched")
+		require.Zero(t, blockFetches(), "no block may be fetched")
+	})
+
+	t.Run("LessWorkForkFetchedPastAnnouncedBlockIsNotFetched", func(t *testing.T) {
+		// The peer announces the third fork block but its registry tip is the fifth, so the
+		// header fetch runs past the announced block. The whole list (ancestor + 5 = 105) is
+		// still lighter than our 110, so nothing is fetched or un-stamped.
+		server, mockBlockchainClient, _, cleanup, _, forkHeaders := buildForkScenarioWithHeaders(t, 100, 110)
+		defer cleanup()
+
+		server.settings.ChainCfgParams.CoinbaseMaturity = 100
+		server.settings.BlockValidation.SecretMiningThreshold = 50
+		server.p2pClient = &registryTipP2PClient{subtreeAttributionP2PClient: &subtreeAttributionP2PClient{}, tip: forkHeaders[4].Hash()}
+		mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(nil).Maybe()
+
+		announced := &model.Block{Header: forkHeaders[2], Height: 103}
+		err := server.catchup(context.Background(), announced, "peer-2067", "http://peer")
+
+		require.NoError(t, err)
+		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
+		mockBlockchainClient.AssertNotCalled(t, "CatchUpBlocks", mock.Anything)
+		require.Zero(t, blockFetches(), "no block may be fetched")
+	})
+
+	t.Run("GappedHeaderListIsAnInvalidResponse", func(t *testing.T) {
+		// The peer leaves out the third fork block. Weighed as it stands the list is lighter
+		// than our tip, but it is not a chain: the run fails as an invalid response, which
+		// charges the peer and tries the other announcers, before mined_set is touched.
+		server, mockBlockchainClient, targetBlock, cleanup, ancestorHeader, forkHeaders := buildForkScenarioWithHeaders(t, 100, 110)
+		defer cleanup()
+
+		server.settings.ChainCfgParams.CoinbaseMaturity = 100
+		server.settings.BlockValidation.SecretMiningThreshold = 50
+
+		var gapped []byte
+		for _, h := range []*model.BlockHeader{ancestorHeader, forkHeaders[0], forkHeaders[1], forkHeaders[3], forkHeaders[4]} {
+			gapped = append(gapped, h.Bytes()...)
+		}
+		httpmock.RegisterResponder("GET", `=~^http://peer/headers_from_common_ancestor/.*`, httpmock.NewBytesResponder(200, gapped))
+
+		err := server.catchup(context.Background(), targetBlock, "peer-2067", "http://peer")
+
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "got %v", err)
+		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
+		require.Zero(t, blockFetches(), "no block may be fetched")
 	})
 
 	t.Run("ShallowEqualWorkForkIsStillFetched", func(t *testing.T) {
@@ -805,7 +861,23 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 		_ = server.catchup(context.Background(), targetBlock, "peer-2067", "http://peer")
 
 		mockBlockchainClient.AssertCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
+		require.NotZero(t, blockFetches(), "an equal-work fork must reach the block fetch")
 	})
+}
+
+// blockFetchPattern matches the single-block and batched block endpoints a catchup fetches from.
+const blockFetchPattern = `=~^http://peer/blocks?/.*`
+
+// registryTipP2PClient serves a fixed registry tip for every peer, so catchupTargetHash fetches
+// headers past the announced block.
+type registryTipP2PClient struct {
+	*subtreeAttributionP2PClient
+
+	tip *chainhash.Hash
+}
+
+func (c *registryTipP2PClient) GetPeer(_ context.Context, _ string) (*p2p.PeerInfo, error) {
+	return &p2p.PeerInfo{BlockHash: c.tip}, nil
 }
 
 // TestCatchup_CompetingEqualWorkChains tests handling of chains with equal proof of work

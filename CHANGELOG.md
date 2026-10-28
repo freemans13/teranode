@@ -116,9 +116,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `blockvalidation_catchup_keep_block_assembly_max_blocks` blocks (new, default 6) now
   keeps the hand-off on; such a run uses the level path, never the batched catch-up path.
   Set the value to 0 to restore the old behaviour. Separately, catch-up now ends as a
-  no-op, charging no peer, when the offered chain ending at the announced block has less
-  cumulative work than the best tip, at any fork depth; equal work is still fetched. The
-  deep-fork secret-mining penalty is unchanged. In a mixed-version deploy, a subtree
+  no-op, charging no peer, when the header fetch reached the announced block and the
+  whole offered chain has less cumulative work than the best tip; equal work is still
+  fetched. The check runs after the existing fork checks, so a fork deeper than coinbase
+  maturity and the deep-fork secret-mining case are still refused with an error and
+  charged as before. Offered headers that do not link from the common ancestor are now
+  refused as an invalid response before any fork block's mined state is cleared. In a
+  mixed-version deploy, a subtree
   validation older than its block validation ignores the new request field and keeps the
   hand-off off. The existing block-context queue-shed policy still accepts and unlocks
   a transaction without a template entry on `ErrThresholdExceeded`; durable recovery

@@ -311,10 +311,17 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return err
 	}
 
-	// Step 5.1: Refuse a chain with less work than ours, at any depth, before anything is
-	// fetched or un-stamped. Both Bitcoin nodes treat such a peer as offering nothing of
-	// interest, so this ends the run as a no-op and charges no one (issue 2067).
-	if u.offeredChainHasLessWork(catchupCtx) {
+	// Step 5.1: Refuse a chain with less work than ours, before anything is fetched or
+	// un-stamped. Both Bitcoin nodes treat such a peer as offering nothing of interest, so
+	// this ends the run as a no-op and charges no one (issue 2067). Offered headers that do
+	// not link up are an invalid response, refused here rather than after step 5.5 has
+	// un-stamped our own blocks for them.
+	lessWork, err := u.offeredChainHasLessWork(catchupCtx)
+	if err != nil {
+		return err
+	}
+
+	if lessWork {
 		return nil
 	}
 
@@ -1164,38 +1171,55 @@ func offeredHeadersAfterAncestor(catchupCtx *CatchupContext) []*model.BlockHeade
 	return nil
 }
 
-// offeredChainHasLessWork reports whether the chain the peer offers, ending at the announced
-// block, carries less cumulative work than our best tip. Such a chain can never become the
+// offeredChainHasLessWork reports whether the chain the peer offers through the announced
+// block carries less cumulative work than our best tip. Such a chain can never become the
 // best tip, so fetching it only writes transactions that no main-chain block holds, and a
 // child of one of them would then be accepted into the pool alone (issue 2067). SV Node and
 // Bitcoin Core both skip such a peer and process an unrequested block only with at least as
 // much work. Equal work is still fetched, matching both.
 //
-// The test applies only when the fetched headers end at the announced block. A header fetch
-// that stopped on a cap holds only a prefix of the peer's chain, whose work says nothing about
-// the tip, and refusing on it would wedge a heavier fork longer than the cap. Without a tip
-// or an ancestor to weigh, it returns false and leaves the run to the existing checks.
-func (u *Server) offeredChainHasLessWork(catchupCtx *CatchupContext) bool {
+// The test applies only when the header fetch reached the announced block. The fetch may run
+// past it, up to the peer's registry tip, and the whole list is weighed: work only grows along
+// a linked chain, so a full list lighter than our tip means the chain through the announced
+// block is lighter too. A fetch that stopped on a cap before the announced block holds only a
+// prefix, whose work says nothing about the tip, and refusing on it would wedge a heavier fork
+// longer than the cap. Without a tip or an ancestor to weigh, it returns false and leaves the
+// run to the existing checks.
+//
+// The headers have passed only their per-header checks at this point. A list that skips a
+// block would weigh less than the chain it claims to be, so the list must link from the common
+// ancestor to its last header, or the response is invalid and the peer is charged for it.
+func (u *Server) offeredChainHasLessWork(catchupCtx *CatchupContext) (bool, error) {
 	bestMeta := catchupCtx.bestBlockMeta
-	if bestMeta == nil || catchupCtx.commonAncestorMeta == nil {
-		return false
+	if bestMeta == nil || catchupCtx.commonAncestorMeta == nil || catchupCtx.commonAncestorHash == nil ||
+		catchupCtx.headersFetchResult == nil || !catchupCtx.headersFetchResult.ReachedTarget {
+		return false, nil
 	}
 
 	offeredHeaders := offeredHeadersAfterAncestor(catchupCtx)
-	if len(offeredHeaders) == 0 || !offeredHeaders[len(offeredHeaders)-1].Hash().IsEqual(catchupCtx.blockUpTo.Hash()) {
-		return false
+	if len(offeredHeaders) == 0 {
+		return false, nil
+	}
+
+	prevHash := catchupCtx.commonAncestorHash
+	for i, header := range offeredHeaders {
+		if header.HashPrevBlock == nil || !header.HashPrevBlock.IsEqual(prevHash) {
+			return false, errors.NewNetworkInvalidResponseError("[catchup][%s] peer %s offered headers that do not link: header %d after the common ancestor (%s) does not follow %s", catchupCtx.blockUpTo.Hash().String(), catchupCtx.peerID, i+1, header.Hash().String(), prevHash.String())
+		}
+
+		prevHash = header.Hash()
 	}
 
 	localWork := new(big.Int).SetBytes(bestMeta.ChainWork)
 	offeredWork := offeredChainWork(catchupCtx.commonAncestorMeta, offeredHeaders)
 
 	if offeredWork.Cmp(localWork) >= 0 {
-		return false
+		return false, nil
 	}
 
-	u.logger.Infof("[catchup][%s] peer %s offers a chain with less work than our best tip at height %d (fork from height %d), not fetching it", catchupCtx.blockUpTo.Hash().String(), catchupCtx.peerID, bestMeta.Height, catchupCtx.commonAncestorMeta.Height)
+	u.logger.Infof("[catchup][%s] peer %s offers a chain with less work than our best tip at height %d (fork from height %d, %d headers), not fetching it", catchupCtx.blockUpTo.Hash().String(), catchupCtx.peerID, bestMeta.Height, catchupCtx.commonAncestorMeta.Height, len(offeredHeaders))
 
-	return true
+	return true, nil
 }
 
 // filterHeaders filters headers to only those after the common ancestor that we don't have.
