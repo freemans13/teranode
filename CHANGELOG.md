@@ -106,6 +106,22 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A short catch-up from `RUNNING` hands its blocks' unseen transactions to block
+  assembly, and catch-up no longer fetches a chain with less work than the best tip.**
+  Every catch-up moves the FSM to `CATCHINGBLOCKS`, and subtree validation used to stop
+  handing transactions to block assembly in that state. A running node that fetched a
+  short competing branch therefore wrote the branch's transactions to the UTXO store but
+  not to the pool, and a child spending one of them could enter the pool without its
+  parent. A catch-up that starts from `RUNNING` and fetches at most
+  `blockvalidation_catchup_keep_block_assembly_max_blocks` blocks (new, default 6) now
+  keeps the hand-off on; such a run uses the level path, never the batched catch-up path.
+  Set the value to 0 to restore the old behaviour. Separately, catch-up now ends as a
+  no-op, charging no peer, when the offered chain ending at the announced block has less
+  cumulative work than the best tip, at any fork depth; equal work is still fetched. The
+  deep-fork secret-mining penalty is unchanged. In a mixed-version deploy, a subtree
+  validation older than its block validation ignores the new request field and keeps the
+  hand-off off. (#2067)
+
 - **Catch-up quick validation waits for each block's `.subtree` writes before it commits
   the block, and a shutdown waits for a block's in-flight commit.** A block was stored with
   `subtrees_set` while its `.subtree` files could still be in flight, so a failed write

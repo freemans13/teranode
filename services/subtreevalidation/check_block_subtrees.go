@@ -588,8 +588,12 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	}
 
 	// Only RUNNING feeds block assembly. IDLE can follow an operator STOP while
-	// a catchup batch is still validating historical blocks.
-	addTXToBlockAssembly := *currentState == blockchain.FSMStateRUNNING
+	// a catchup batch is still validating historical blocks. The exception is a
+	// short catchup that started from RUNNING: block validation asks to keep the
+	// hand-off on, so a transaction only a fork block carried still reaches the
+	// pool and a child of it cannot enter the pool alone (issue 2067).
+	addTXToBlockAssembly := *currentState == blockchain.FSMStateRUNNING ||
+		(*currentState == blockchain.FSMStateCATCHINGBLOCKS && request.GetKeepBlockAssemblyHandoff())
 
 	// BATCHED SUBTREE LOADING: Get blockIds once before batching
 	blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Header.HashPrevBlock, uint64(u.settings.GetUtxoStoreBlockHeightRetention()*2))
@@ -608,8 +612,13 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	// each load batch is checked on all cores and written with
 	// SpendAndCreateMulti (processTransactionsBatched). That path writes before
 	// block.Valid runs, so it first proves the body is the one the header
-	// commits to.
+	// commits to. The batch path never hands transactions to block assembly, so a
+	// short catchup from RUNNING that keeps the hand-off on takes the level path.
 	checker, batched := u.batchChecker(*currentState, block.Height)
+	if addTXToBlockAssembly {
+		checker, batched = nil, false
+	}
+
 	if batched && !bodyBound {
 		if err = u.checkBlockBodyBound(ctx, request, block, peerID, dah); err != nil {
 			return nil, errors.WrapGRPC(err)

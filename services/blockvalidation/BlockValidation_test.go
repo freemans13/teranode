@@ -271,16 +271,17 @@ func (m *MockSubtreeValidationClient) CheckSubtreeFromBlock(ctx context.Context,
 	return nil
 }
 
-func (m *MockSubtreeValidationClient) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) error {
+func (m *MockSubtreeValidationClient) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string, keepBlockAssemblyHandoff bool) error {
 	blockBytes, err := block.Bytes()
 	if err != nil {
 		return errors.NewServiceError("failed to serialize block for subtree validation", err)
 	}
 
 	request := subtreevalidation_api.CheckBlockSubtreesRequest{
-		Block:   blockBytes,
-		BaseUrl: baseURL,
-		PeerId:  peerID,
+		Block:                    blockBytes,
+		BaseUrl:                  baseURL,
+		PeerId:                   peerID,
+		KeepBlockAssemblyHandoff: keepBlockAssemblyHandoff,
 	}
 
 	_, err = m.server.CheckBlockSubtrees(ctx, &request)
@@ -1731,7 +1732,7 @@ func Test_validateBlockSubtrees(t *testing.T) {
 			Subtrees: make([]*chainhash.Hash, 0),
 		}
 
-		err = blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000")
+		err = blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000", false)
 		require.NoError(t, err)
 	})
 
@@ -1756,7 +1757,7 @@ func Test_validateBlockSubtrees(t *testing.T) {
 			},
 		}
 
-		require.NoError(t, blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000"))
+		require.NoError(t, blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000", false))
 	})
 
 	t.Run("fallback to series", func(t *testing.T) {
@@ -1789,7 +1790,7 @@ func Test_validateBlockSubtrees(t *testing.T) {
 			},
 		}
 
-		require.NoError(t, blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000"))
+		require.NoError(t, blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000", false))
 
 		// check that the subtree validation was called 3 times
 		assert.Len(t, subtreeValidationClient.Calls, 1)

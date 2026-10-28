@@ -4677,6 +4677,7 @@ func TestCatchup_ReportsValidatedHeaderChainWorkAfterHeaderValidation(t *testing
 	).Maybe()
 	mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "CatchUpBlocks")
 	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(errors.NewStateError("stop after validated progress report"))
+	expectFSMRunning(mockBlockchainClient)
 
 	httpmock.ActivateNonDefault(util.HTTPClient())
 	defer httpmock.DeactivateAndReset()
@@ -4939,6 +4940,8 @@ func TestFetchAndValidateBlocks_FSMRejectsWhenNotRunning(t *testing.T) {
 	// from an invalid source state (so CATCHUPBLOCKS event is invalid)
 	mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "CatchUpBlocks")
 	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(errors.NewStateError("event CATCHUPBLOCKS inappropriate in current state IDLE"))
+	idle := blockchain.FSMStateIDLE
+	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&idle, nil).Maybe()
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, nil, errors.NewBlockNotFoundError("not stored"))
 
 	blocks := testhelpers.CreateTestBlockChain(t, 3)

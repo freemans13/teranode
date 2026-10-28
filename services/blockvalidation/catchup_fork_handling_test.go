@@ -771,6 +771,41 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
 		mockBlockchainClient.AssertNotCalled(t, "SendNotification", mock.Anything, mock.Anything)
 	})
+
+	t.Run("ShallowLessWorkForkIsNotFetched", func(t *testing.T) {
+		// Issue 2067: fork depth 110 - 100 = 10, well inside SecretMiningThreshold, and the
+		// offered chain (ancestor + 5 blocks = 105 blocks of work) has less work than our 110.
+		// The run ends as a no-op: no error to charge the peer with, no mined_set churn, and
+		// no move to CATCHINGBLOCKS because nothing is fetched.
+		server, mockBlockchainClient, targetBlock, cleanup := buildForkScenario(t, 100, 110)
+		defer cleanup()
+
+		server.settings.ChainCfgParams.CoinbaseMaturity = 100
+		server.settings.BlockValidation.SecretMiningThreshold = 50
+		mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(nil).Maybe()
+
+		err := server.catchup(context.Background(), targetBlock, "peer-2067", "http://peer")
+
+		require.NoError(t, err)
+		mockBlockchainClient.AssertNotCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
+		mockBlockchainClient.AssertNotCalled(t, "CatchUpBlocks", mock.Anything)
+		require.Zero(t, httpmock.GetCallCountInfo()["GET =~^http://peer/block/.*"], "no block may be fetched")
+	})
+
+	t.Run("ShallowEqualWorkForkIsStillFetched", func(t *testing.T) {
+		// Equal work (ancestor + 5 = 105 blocks, our tip at 105) is fetched, as SV Node and
+		// Bitcoin Core do. Passing the gate is visible as the fork's mined_set clearing,
+		// which runs only after every refusal check.
+		server, mockBlockchainClient, targetBlock, cleanup := buildForkScenario(t, 100, 105)
+		defer cleanup()
+
+		server.settings.ChainCfgParams.CoinbaseMaturity = 100
+		server.settings.BlockValidation.SecretMiningThreshold = 50
+
+		_ = server.catchup(context.Background(), targetBlock, "peer-2067", "http://peer")
+
+		mockBlockchainClient.AssertCalled(t, "ClearBlockMinedSet", mock.Anything, mock.Anything)
+	})
 }
 
 // TestCatchup_CompetingEqualWorkChains tests handling of chains with equal proof of work

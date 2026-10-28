@@ -90,6 +90,12 @@ type ValidateBlockOptions struct {
 	// PeerID is the P2P peer identifier used for reputation tracking.
 	// This is used to track peer behavior during subtree validation.
 	PeerID string
+
+	// KeepBlockAssemblyHandoff asks subtree validation to hand the block's unseen transactions
+	// to block assembly even though the FSM is in CATCHINGBLOCKS. Catchup sets it for a short
+	// run that started from RUNNING, so a fork block's transactions reach the pool exactly as
+	// they would had the block arrived on the normal path (issue 2067).
+	KeepBlockAssemblyHandoff bool
 }
 
 // validationResult holds the result of a block validation for sharing between goroutines
@@ -2276,7 +2282,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// that type is never handed to the fetch branch and this attempt writes nothing for it.
 		subtreeToCheckPresentBefore := u.subtreeToCheckPresentBefore(ctx, block)
 
-		if err = u.validateBlockSubtrees(ctx, block, opts.PeerID, baseURL); err != nil {
+		if err = u.validateBlockSubtrees(ctx, block, opts.PeerID, baseURL, opts.KeepBlockAssemblyHandoff); err != nil {
 			// Corrupt subtree body (bitcoin-sv/teranode#4692): a body-derived failure surfaced during subtree
 			// validation (e.g. a CVE-2012-2459 duplicate tx in the received subtree, subtreevalidation
 			// ValidateSubtreeInternal) — not bound to the header, so it cannot condemn the hash.
@@ -3635,7 +3641,7 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 	// validate all the subtrees in the block
 	u.logger.Infof("[ReValidateBlock][%s] validating %d subtrees", blockData.block.Hash().String(), len(blockData.block.Subtrees))
 
-	if err = u.validateBlockSubtrees(ctx, blockData.block, "", blockData.baseURL); err != nil {
+	if err = u.validateBlockSubtrees(ctx, blockData.block, "", blockData.baseURL, false); err != nil {
 		// A corrupt verdict raised INSIDE subtree validation must still reach the invalidate decision
 		// (bitcoin-sv/teranode#4692). This early return previously skipped it, so an optimistically-added
 		// block whose retry failed corrupt here stayed on-chain unvalidated once the bounded retries
@@ -3802,14 +3808,15 @@ func (u *BlockValidation) updateSubtreesDAH(ctx context.Context, block *model.Bl
 //   - block: Block containing subtrees to validate
 //   - peerID: P2P peer identifier for reputation tracking
 //   - baseURL: Source URL for missing subtree retrieval
+//   - keepBlockAssemblyHandoff: hand unseen transactions to block assembly even in CATCHINGBLOCKS
 //
 // Returns an error if subtree validation fails.
-func (u *BlockValidation) validateBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) error {
+func (u *BlockValidation) validateBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string, keepBlockAssemblyHandoff bool) error {
 	if len(block.Subtrees) == 0 {
 		return nil
 	}
 
-	return u.subtreeValidationClient.CheckBlockSubtrees(ctx, block, peerID, baseURL)
+	return u.subtreeValidationClient.CheckBlockSubtrees(ctx, block, peerID, baseURL, keepBlockAssemblyHandoff)
 }
 
 // computeAndSetCoinbaseBUMP computes the coinbase BUMP for a block if it doesn't already have one.

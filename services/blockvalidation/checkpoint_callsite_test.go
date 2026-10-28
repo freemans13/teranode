@@ -24,7 +24,7 @@ import (
 // distinct error rather than being hidden by a later generic invalid-block error.
 type checkpointSubtreeBoundary struct{ subtreevalidation.Interface }
 
-func (*checkpointSubtreeBoundary) CheckBlockSubtrees(context.Context, *model.Block, string, string) error {
+func (*checkpointSubtreeBoundary) CheckBlockSubtrees(context.Context, *model.Block, string, string, bool) error {
 	return errors.NewProcessingError("checkpoint subtree boundary reached")
 }
 
