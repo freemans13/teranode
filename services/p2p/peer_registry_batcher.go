@@ -60,6 +60,7 @@ const (
 type pendingPeerUpdate struct {
 	clientName       string
 	height           uint32
+	advertisedHeight uint32
 	blockHash        *chainhash.Hash
 	dataHubURL       string
 	storage          string
@@ -87,11 +88,22 @@ func (u *pendingPeerUpdate) merge(from *pendingPeerUpdate) {
 	}
 	if from.height > u.height {
 		u.height = from.height
+	}
+
+	// The raw claim orders the observations in both cases: the capped value is
+	// derived from a ceiling that moves during catchup, so it cannot decide
+	// which claim a peer actually made last. A losing observation must not
+	// displace the winner's claim or its hash.
+	switch {
+	case from.advertisedHeight > u.advertisedHeight:
+		u.advertisedHeight = from.advertisedHeight
 		if from.blockHash != nil {
 			u.blockHash = from.blockHash
 		}
-	} else if from.height == u.height && from.blockHash != nil {
-		u.blockHash = from.blockHash
+	case from.advertisedHeight == u.advertisedHeight:
+		if from.blockHash != nil {
+			u.blockHash = from.blockHash
+		}
 	}
 	if from.dataHubURL != "" {
 		u.dataHubURL = from.dataHubURL
@@ -111,7 +123,7 @@ func (u *pendingPeerUpdate) merge(from *pendingPeerUpdate) {
 // hasInfo reports whether the update carries registration data worth pushing
 // even when the peer was registered recently.
 func (u *pendingPeerUpdate) hasInfo() bool {
-	return u.clientName != "" || u.height > 0 || u.blockHash != nil || u.dataHubURL != ""
+	return u.clientName != "" || u.height > 0 || u.advertisedHeight > 0 || u.blockHash != nil || u.dataHubURL != ""
 }
 
 // registryAssertState remembers when RegisterPeer / UpdateConnectionState were
@@ -159,6 +171,13 @@ type peerRegistryBatcher struct {
 	// fresh post-removal data flushes next cycle. Nil when no flush is
 	// running; reset at the end of each cycle.
 	removedDuringFlush map[string]struct{}
+	// assertForgottenDuringFlush records forgetAssertState calls that arrive
+	// while a flush cycle is processing its snapshot, so the cycle's re-record
+	// step does not resurrect the pre-forget assert state it read earlier.
+	// Nil when no flush is running; reset at the end of each cycle. Bounded at
+	// registryBatcherMaxPending; a dropped entry only means the reconciler's
+	// clear can be masked for up to registryReassertTTL before self-healing.
+	assertForgottenDuringFlush map[string]struct{}
 
 	// flushMu serializes flush cycles (ticker, stop, and synchronous mode).
 	flushMu sync.Mutex
@@ -263,13 +282,14 @@ func (b *peerRegistryBatcher) enqueue(peerID string, from *pendingPeerUpdate) bo
 
 // enqueueRegister records the peer's latest registration data, optionally
 // marking it as directly connected. Mirrors addPeer/addConnectedPeer.
-func (b *peerRegistryBatcher) enqueueRegister(peerID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string, connected bool) {
+func (b *peerRegistryBatcher) enqueueRegister(peerID, clientName string, heights peerHeightClaim, blockHash *chainhash.Hash, dataHubURL string, connected bool) {
 	b.enqueue(peerID, &pendingPeerUpdate{
-		clientName:    clientName,
-		height:        height,
-		blockHash:     blockHash,
-		dataHubURL:    dataHubURL,
-		markConnected: connected,
+		clientName:       clientName,
+		height:           heights.Height,
+		advertisedHeight: heights.AdvertisedHeight,
+		blockHash:        blockHash,
+		dataHubURL:       dataHubURL,
+		markConnected:    connected,
 	})
 }
 
@@ -289,6 +309,30 @@ func (b *peerRegistryBatcher) enqueueStorage(peerID, storage string) {
 		return
 	}
 	b.enqueue(peerID, &pendingPeerUpdate{storage: storage})
+}
+
+// forgetAssertState drops only the peer's reassert memory, so the next flush
+// re-registers it and re-asserts its connection state. Used when the registry's
+// IsConnected flag is cleared out-of-band by the connection-state reconciler:
+// without this, the batcher could skip re-asserting connected=true for up to
+// registryReassertTTL after the peer reconnects. Pending updates and tombstones
+// are untouched — the peer is not being removed. The flush-scoped set stops an
+// in-flight flushOnce from resurrecting the pre-forget snapshot it read before
+// this call (it re-records assert state after its RPCs complete).
+//
+// A pending markConnected enqueued before the reconciler's clear may still
+// flush afterwards and re-assert true for a peer that just disconnected. That
+// is deliberate convergence, not a bug: zeroing connectedAt here guarantees
+// the re-assert is actually sent (not skipped as recently asserted), the
+// wrong-way flag lasts at most one batch interval, and the next reconcile
+// pass clears it again — this time with nothing pending.
+func (b *peerRegistryBatcher) forgetAssertState(peerID string) {
+	b.mu.Lock()
+	delete(b.lastAsserted, peerID)
+	if b.assertForgottenDuringFlush != nil && len(b.assertForgottenDuringFlush) < registryBatcherMaxPending {
+		b.assertForgottenDuringFlush[peerID] = struct{}{}
+	}
+	b.mu.Unlock()
 }
 
 // forget clears the peer's batcher state and leaves a removal tombstone.
@@ -343,12 +387,14 @@ func (b *peerRegistryBatcher) flushOnce(ctx context.Context) {
 		// persistent tombstone, but must not let this loop push the peer's
 		// stale pre-removal snapshot.
 		b.removedDuringFlush = make(map[string]struct{})
+		b.assertForgottenDuringFlush = make(map[string]struct{})
 	}
 	b.mu.Unlock()
 
 	defer func() {
 		b.mu.Lock()
 		b.removedDuringFlush = nil
+		b.assertForgottenDuringFlush = nil
 		b.mu.Unlock()
 	}()
 
@@ -397,6 +443,7 @@ func (b *peerRegistryBatcher) flushOnce(ctx context.Context) {
 				TransportTypeSet: true,
 				ClientName:       u.clientName,
 				Height:           u.height,
+				AdvertisedHeight: u.advertisedHeight,
 				BlockHash:        u.blockHash,
 				DataHubURL:       u.dataHubURL,
 			}
@@ -454,6 +501,19 @@ func (b *peerRegistryBatcher) flushOnce(ctx context.Context) {
 			// above, and recording the assertion would suppress the peer's
 			// re-registration for registryReassertTTL after its next message.
 			if !b.isRemovedLocked(peerID) {
+				// A forgetAssertState() may also have raced the RPCs. Zero the
+				// whole snapshot, including the halves this cycle sent: the
+				// reconciler's clear may have landed AFTER this cycle's
+				// UpdateConnectionState(true), in which case the registry holds
+				// false and keeping connectedAt would suppress the re-assert on
+				// the peer's next message for registryReassertTTL. The batcher
+				// cannot tell from inside the cycle which write landed last, so
+				// forgetting everything is the only safe reading; the cost is
+				// one redundant RegisterPeer + UpdateConnectionState on the
+				// peer's next message, bounded by real reconciler clears.
+				if _, forgotten := b.assertForgottenDuringFlush[peerID]; forgotten {
+					st = registryAssertState{}
+				}
 				b.recordAssertStateLocked(peerID, st)
 			}
 			b.mu.Unlock()

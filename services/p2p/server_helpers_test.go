@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	p2pMessageBus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -29,7 +30,7 @@ func newServerWithLocalRegistry(t *testing.T) (*Server, *blockchain.CentralizedP
 	t.Helper()
 
 	reg := blockchain.NewCentralizedPeerRegistry(blockchain.DefaultBanConfig())
-	return &Server{
+	s := &Server{
 		peerRegistry: blockchain.NewLocalPeerRegistryClient(reg),
 		logger:       ulogger.TestLogger{},
 		gCtx:         context.Background(),
@@ -39,7 +40,13 @@ func newServerWithLocalRegistry(t *testing.T) (*Server, *blockchain.CentralizedP
 				MaxUnvalidatedAdvertisedHeightLead: 10_000,
 			},
 		},
-	}, reg
+	}
+
+	// Go through the same peer-map wiring NewServer uses, so the handler tests
+	// exercise the configured bound rather than a fixture-only fallback.
+	s.applyPeerMapLimits(s.settings)
+
+	return s, reg
 }
 
 func setServerLocalHeight(t *testing.T, s *Server, height uint32) {
@@ -63,11 +70,193 @@ func mustNewPeerID(t *testing.T) peer.ID {
 	return pid
 }
 
+func TestServerHelpers_ReconcileConnectionStates_SyncsBothDirections(t *testing.T) {
+	s, reg := newServerWithLocalRegistry(t)
+
+	liveID := mustNewPeerID(t)
+	goneID := mustNewPeerID(t)
+	unknownID := mustNewPeerID(t)
+	missedID := mustNewPeerID(t)
+
+	s.addConnectedPeer(liveID, "", peerHeightClaim{}, nil, "")
+	s.addConnectedPeer(goneID, "", peerHeightClaim{}, nil, "")
+	s.addConnectedPeer(unknownID, "", peerHeightClaim{}, nil, "")
+	// missed is live but its messages arrived before the liveness snapshot
+	// included it, so the hot path only registered it as gossiped.
+	s.addPeer(missedID, "", peerHeightClaim{}, nil, "")
+
+	// live and missed have open connections (Addrs populated from the host's
+	// connections), gone is a known topic peer whose connection closed
+	// (no Addrs), unknown is not reported by the client at all.
+	s.P2PClient = &MockServerP2PClient{peers: []p2pMessageBus.PeerInfo{
+		{ID: liveID.String(), Addrs: []string{"/ip4/10.0.0.1/tcp/9905"}},
+		{ID: missedID.String(), Addrs: []string{"/ip4/10.0.0.2/tcp/9905"}},
+		{ID: goneID.String()},
+	}}
+
+	s.reconcileConnectionStates(context.Background())
+
+	got, ok := reg.Get(liveID.String())
+	require.True(t, ok)
+	require.True(t, got.IsConnected, "peer with a live connection keeps its flag")
+
+	got, ok = reg.Get(goneID.String())
+	require.True(t, ok)
+	require.False(t, got.IsConnected, "disconnected topic peer is cleared")
+
+	got, ok = reg.Get(unknownID.String())
+	require.True(t, ok)
+	require.False(t, got.IsConnected, "peer unknown to the client is cleared")
+
+	got, ok = reg.Get(missedID.String())
+	require.True(t, ok)
+	require.True(t, got.IsConnected, "live peer the hot path missed is flagged")
+}
+
+func TestServerHelpers_StartPeerMapCleanup_RunsReconcile(t *testing.T) {
+	s, reg := newServerWithLocalRegistry(t)
+	s.settings.P2P.PeerMapCleanupInterval = 10 * time.Millisecond
+	s.registryBatcher = newPeerRegistryBatcher(context.Background(), s.logger, s.peerRegistry, 0)
+
+	stale := mustNewPeerID(t)
+	s.addConnectedPeer(stale, "", peerHeightClaim{}, nil, "")
+
+	// Known topic peer with no open connection: the ticker-driven reconcile
+	// must clear its stale connected flag.
+	s.P2PClient = &MockServerP2PClient{peers: []p2pMessageBus.PeerInfo{{ID: stale.String()}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.startPeerMapCleanup(ctx)
+
+	require.Eventually(t, func() bool {
+		got, ok := reg.Get(stale.String())
+		return ok && !got.IsConnected
+	}, 5*time.Second, 10*time.Millisecond, "ticker-driven reconcile must clear the stale flag")
+}
+
+func TestServerHelpers_ReconcileConnectionStates_ErrorAndGuardPaths(t *testing.T) {
+	// Nil client / nil registry: no-ops, no panic.
+	s, _ := newServerWithLocalRegistry(t)
+	s.reconcileConnectionStates(context.Background())
+
+	s2 := &Server{logger: ulogger.TestLogger{}, P2PClient: &MockServerP2PClient{}}
+	s2.reconcileConnectionStates(context.Background())
+
+	// ListPeers failure: the pass is skipped and flags stay untouched.
+	s3, reg3 := newServerWithLocalRegistry(t)
+	stale := mustNewPeerID(t)
+	s3.addConnectedPeer(stale, "", peerHeightClaim{}, nil, "")
+	counting := newCountingRegistryClient(s3.peerRegistry)
+	s3.peerRegistry = counting
+	s3.P2PClient = &MockServerP2PClient{peers: []p2pMessageBus.PeerInfo{{ID: stale.String()}}}
+
+	counting.failListPeers = assert.AnError
+	s3.reconcileConnectionStates(context.Background())
+	got, _ := reg3.Get(stale.String())
+	require.True(t, got.IsConnected, "flags untouched when ListPeers fails")
+	counting.failListPeers = nil
+
+	// UpdateConnectionState failures: the loop logs and continues, covering
+	// both the clear and the flag direction.
+	live := mustNewPeerID(t)
+	s3.addPeer(live, "", peerHeightClaim{}, nil, "")
+	s3.P2PClient = &MockServerP2PClient{peers: []p2pMessageBus.PeerInfo{
+		{ID: stale.String()},
+		{ID: live.String(), Addrs: []string{"/ip4/10.0.0.9/tcp/9905"}},
+	}}
+	counting.failUpdateConnectionState = assert.AnError
+	s3.reconcileConnectionStates(context.Background())
+	got, _ = reg3.Get(stale.String())
+	require.True(t, got.IsConnected, "clear direction skipped on RPC error")
+	got, _ = reg3.Get(live.String())
+	require.False(t, got.IsConnected, "flag direction skipped on RPC error")
+	counting.failUpdateConnectionState = nil
+
+	// Canceled context: the pass is cut short inside the loop, before any
+	// update. Pin the branch: ListPeers must have succeeded (one more call)
+	// and no UpdateConnectionState may have been attempted — otherwise this
+	// case would be indistinguishable from the ListPeers-error path.
+	listCallsBefore := counting.callCount("ListPeers")
+	updateCallsBefore := counting.callCount("UpdateConnectionState")
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	s3.reconcileConnectionStates(canceled)
+	require.Equal(t, listCallsBefore+1, counting.callCount("ListPeers"), "cut-short must happen after a successful ListPeers")
+	require.Equal(t, updateCallsBefore, counting.callCount("UpdateConnectionState"), "cut-short must happen before any update")
+	got, _ = reg3.Get(stale.String())
+	require.True(t, got.IsConnected, "cut-short pass must not clear flags")
+}
+
+func TestServerHelpers_NewNeighbourFlaggedOnFirstMessage(t *testing.T) {
+	s, reg := newServerWithLocalRegistry(t)
+	s.settings.P2P.PeerMapCleanupInterval = time.Minute // production default
+	s.registryBatcher = newPeerRegistryBatcher(context.Background(), s.logger, s.peerRegistry, 0)
+
+	// Service starts with no peers connected yet.
+	client := &MockServerP2PClient{peers: []p2pMessageBus.PeerInfo{}}
+	s.P2PClient = client
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.startPeerMapCleanup(ctx)
+
+	// Now a peer dials in: the host has an open connection to it, and it
+	// authors a gossip message (node_status heartbeat). It must be flagged
+	// connected on that first message — not a reconcile tick later —
+	// because daemon.TestDaemon.ConnectToPeer polls the IsConnected-filtered
+	// GetPeers RPC with a 15s budget.
+	neighbour := mustNewPeerID(t)
+	client.peers = []p2pMessageBus.PeerInfo{
+		{ID: neighbour.String(), Addrs: []string{"/ip4/10.0.0.9/tcp/9905"}},
+	}
+	s.updatePeerLastMessageTime(neighbour.String(), "")
+
+	got, ok := reg.Get(neighbour.String())
+	require.True(t, ok)
+	require.True(t, got.IsConnected, "a connected, gossiping neighbour must be visible immediately, not one cleanup interval later")
+}
+
+func TestServerHelpers_GossipOnlyPublisherNeverFlaggedConnected(t *testing.T) {
+	s, reg := newServerWithLocalRegistry(t)
+	s.registryBatcher = newPeerRegistryBatcher(context.Background(), s.logger, s.peerRegistry, 0)
+
+	neighbourID := mustNewPeerID(t)
+	publisherID := mustNewPeerID(t)
+
+	// Only the neighbour has an open connection; the publisher's messages
+	// arrive relayed through the mesh (FromID is the pubsub author).
+	s.P2PClient = &MockServerP2PClient{peers: []p2pMessageBus.PeerInfo{
+		{ID: neighbourID.String(), Addrs: []string{"/ip4/10.0.0.1/tcp/9905"}},
+		{ID: publisherID.String()},
+	}}
+
+	s.updatePeerLastMessageTime(neighbourID.String(), "")
+	s.updatePeerLastMessageTime(publisherID.String(), "")
+
+	got, ok := reg.Get(neighbourID.String())
+	require.True(t, ok)
+	require.True(t, got.IsConnected, "directly connected sender is flagged")
+
+	got, ok = reg.Get(publisherID.String())
+	require.True(t, ok)
+	require.False(t, got.IsConnected, "gossip-relayed publisher must not be flagged connected")
+
+	// The publisher keeps gossiping across a reconcile pass: the flag must
+	// converge to false (stay false), not flap back, so the entry remains
+	// subject to TTL/LRU cleanup.
+	s.reconcileConnectionStates(context.Background())
+	s.updatePeerLastMessageTime(publisherID.String(), "")
+
+	got, _ = reg.Get(publisherID.String())
+	require.False(t, got.IsConnected, "flag must not flap back for a peer without a live connection")
+}
+
 func TestServerHelpers_AddPeer_Registers(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
 
-	s.addPeer(pid, "client/1.0", 100, nil, "http://peer.example")
+	s.addPeer(pid, "client/1.0", peerHeightClaim{Height: 100, AdvertisedHeight: 100}, nil, "http://peer.example")
 
 	got, ok := reg.Get(pid.String())
 	require.True(t, ok)
@@ -80,7 +269,7 @@ func TestServerHelpers_AddConnectedPeer_FlipsConnected(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
 
-	s.addConnectedPeer(pid, "", 50, nil, "")
+	s.addConnectedPeer(pid, "", peerHeightClaim{Height: 50, AdvertisedHeight: 50}, nil, "")
 
 	got, ok := reg.Get(pid.String())
 	require.True(t, ok)
@@ -90,7 +279,7 @@ func TestServerHelpers_AddConnectedPeer_FlipsConnected(t *testing.T) {
 func TestServerHelpers_RemovePeer_DropsEntry(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
-	s.addConnectedPeer(pid, "", 1, nil, "")
+	s.addConnectedPeer(pid, "", peerHeightClaim{Height: 1, AdvertisedHeight: 1}, nil, "")
 	require.Equal(t, 1, reg.Count())
 
 	s.removePeer(pid)
@@ -105,7 +294,7 @@ func TestServerHelpers_GetPeer_FoundAndNotFound(t *testing.T) {
 	_, found := s.getPeer(pid)
 	require.False(t, found)
 
-	s.addPeer(pid, "", 1, nil, "")
+	s.addPeer(pid, "", peerHeightClaim{Height: 1, AdvertisedHeight: 1}, nil, "")
 	got, found := s.getPeer(pid)
 	require.True(t, found)
 	require.Equal(t, pid.String(), got.ID)
@@ -114,7 +303,7 @@ func TestServerHelpers_GetPeer_FoundAndNotFound(t *testing.T) {
 func TestServerHelpers_UpdateStorage_PersistsMode(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
-	s.addPeer(pid, "", 1, nil, "")
+	s.addPeer(pid, "", peerHeightClaim{Height: 1, AdvertisedHeight: 1}, nil, "")
 
 	s.updateStorage(pid, "pruned")
 	got, _ := reg.Get(pid.String())
@@ -145,9 +334,9 @@ func TestServerHelpers_InjectPeerForTesting_MarksFull(t *testing.T) {
 func TestGetNodeStatusMessage_CountsOnlyConnectedPeers(t *testing.T) {
 	s, _ := newServerWithLocalRegistry(t)
 
-	s.addConnectedPeer(mustNewPeerID(t), "client/1.0", 10, nil, "")
-	s.addConnectedPeer(mustNewPeerID(t), "client/1.0", 20, nil, "")
-	s.addPeer(mustNewPeerID(t), "client/1.0", 30, nil, "") // gossiped, not connected
+	s.addConnectedPeer(mustNewPeerID(t), "client/1.0", peerHeightClaim{Height: 10, AdvertisedHeight: 10}, nil, "")
+	s.addConnectedPeer(mustNewPeerID(t), "client/1.0", peerHeightClaim{Height: 20, AdvertisedHeight: 20}, nil, "")
+	s.addPeer(mustNewPeerID(t), "client/1.0", peerHeightClaim{Height: 30, AdvertisedHeight: 30}, nil, "") // gossiped, not connected
 
 	msg := s.getNodeStatusMessage(context.Background())
 	require.NotNil(t, msg)
@@ -205,7 +394,7 @@ func TestServerHelpers_GetPeerIDFromDataHubURL(t *testing.T) {
 
 	require.Empty(t, s.getPeerIDFromDataHubURL("http://anywhere"))
 
-	s.addPeer(pid, "", 1, nil, "http://datahub.example/api/v1")
+	s.addPeer(pid, "", peerHeightClaim{Height: 1, AdvertisedHeight: 1}, nil, "http://datahub.example/api/v1")
 
 	require.Equal(t, pid.String(), s.getPeerIDFromDataHubURL("http://datahub.example/api/v1"))
 	require.Empty(t, s.getPeerIDFromDataHubURL("http://other.example"))
@@ -242,7 +431,7 @@ func TestServerHelpers_ShouldSkipBannedPeer_LocalBanImmediate(t *testing.T) {
 	// protocol_violation = 20 points; 6 hits cross the default 100 threshold
 	// and trigger onPeerBanned, which overwrites the cached negative entry.
 	for i := 0; i < 6; i++ {
-		s.applyBanScore(pid.String(), ReasonProtocolViolation)
+		_ = s.applyBanScore(pid.String(), ReasonProtocolViolation)
 	}
 
 	require.True(t, s.shouldSkipBannedPeer(pid.String(), "test"), "locally banned peer must be skipped immediately")
@@ -352,16 +541,19 @@ func TestHandleNodeStatusTopic_BoundsInflatedAdvertisedHeight(t *testing.T) {
 
 	s.handleNodeStatusTopic(context.Background(), msgBytes, remote.String())
 
-	expectedHeight := uint32(10_100)
 	got, ok := reg.Get(remote.String())
 	require.True(t, ok)
-	require.Equal(t, expectedHeight, got.Height)
+	require.Equal(t, uint32(10_100), got.Height,
+		"registry height drives sync decisions, so it stays capped at localHeight+maxLead")
+	require.Equal(t, uint32(1_000_000), got.AdvertisedHeight,
+		"the registry also keeps the peer's raw claim, for operator-facing display")
 	require.NotNil(t, got.BlockHash)
 	require.Equal(t, blockHash, got.BlockHash.String())
 
 	select {
 	case notification := <-s.notificationCh:
-		require.Equal(t, expectedHeight, notification.BestHeight)
+		require.Equal(t, uint32(1_000_000), notification.BestHeight,
+			"the notification is telemetry, so it reports what the peer advertised, not the cap")
 		require.Equal(t, blockHash, notification.BestBlockHash)
 	default:
 		t.Fatal("expected node_status notification")
@@ -391,22 +583,27 @@ func TestHandleBlockTopic_BoundsInflatedAdvertisedHeight(t *testing.T) {
 
 	s.handleBlockTopic(context.Background(), msgBytes, remote.String())
 
-	expectedHeight := uint32(10_100)
 	got, ok := reg.Get(remote.String())
 	require.True(t, ok)
-	require.Equal(t, expectedHeight, got.Height)
+	require.Equal(t, uint32(10_100), got.Height,
+		"registry height drives sync decisions, so it stays capped at localHeight+maxLead")
+	require.Equal(t, uint32(1_000_000), got.AdvertisedHeight,
+		"the registry also keeps the peer's raw claim, for operator-facing display")
 	require.NotNil(t, got.BlockHash)
 	require.Equal(t, blockHash, got.BlockHash.String())
 
 	select {
 	case notification := <-s.notificationCh:
-		require.Equal(t, expectedHeight, notification.Height)
+		require.Equal(t, uint32(1_000_000), notification.Height,
+			"the notification is telemetry, so it reports what the peer advertised, not the cap")
 		require.Equal(t, blockHash, notification.Hash)
 	default:
 		t.Fatal("expected block notification")
 	}
 }
 
+// The non-hex hash now trips the per-field charset bound (checkGossipHex)
+// before parseHash; the observable invariants are unchanged.
 func TestHandleBlockTopic_RejectsMalformedAdvertisedHash(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 
@@ -446,9 +643,7 @@ func TestHandleBlockTopic_RejectsMalformedAdvertisedHash(t *testing.T) {
 	default:
 	}
 
-	entries := 0
-	s.blockPeerMap.Range(func(_, _ any) bool { entries++; return true })
-	require.Zero(t, entries, "malformed hash must not create a blockPeerMap entry")
+	require.Zero(t, s.blockPeerMap.Len(), "malformed hash must not create a blockPeerMap entry")
 }
 
 // chainhash.NewHashFromStr accepts non-canonical hex forms (uppercase,
@@ -528,7 +723,8 @@ func TestHandleSubtreeTopic_PeerMapKeyedByCanonicalHash(t *testing.T) {
 }
 
 // A malformed subtree hash must be rejected before any use: no WebSocket
-// notification, no peerMapEntry, and no peer-activity credit.
+// notification, no peerMapEntry, and no peer-activity credit. The non-hex hash
+// now trips the per-field charset bound (checkGossipHex) before parseHash.
 func TestHandleSubtreeTopic_RejectsMalformedHash(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 
@@ -555,9 +751,7 @@ func TestHandleSubtreeTopic_RejectsMalformedHash(t *testing.T) {
 	default:
 	}
 
-	entries := 0
-	s.subtreePeerMap.Range(func(_, _ any) bool { entries++; return true })
-	require.Zero(t, entries, "malformed hash must not create a subtreePeerMap entry")
+	require.Zero(t, s.subtreePeerMap.Len(), "malformed hash must not create a subtreePeerMap entry")
 
 	_, ok := reg.Get(remote.String())
 	require.False(t, ok, "malformed hash must not count as peer activity")
@@ -612,6 +806,9 @@ func TestHandleNodeStatusTopic_RejectsMalformedAdvertisedHash(t *testing.T) {
 	s.notificationCh = make(chan *notificationMsg, 1)
 
 	remote := mustNewPeerID(t)
+	// Pre-register so the ban-score sync onto PeerInfo is observable; the
+	// handler itself must not write anything for this message.
+	reg.Register(&blockchain.PeerInfo{ID: remote.String()})
 	msgBytes, err := json.Marshal(NodeStatusMessage{
 		PeerID:        remote.String(),
 		ClientName:    "client/1.0",
@@ -623,6 +820,10 @@ func TestHandleNodeStatusTopic_RejectsMalformedAdvertisedHash(t *testing.T) {
 
 	s.handleNodeStatusTopic(context.Background(), msgBytes, remote.String())
 
+	// node_status is telemetry: the malformed advertised tip is zeroed by
+	// sanitizeAdvertisedTip (and the raw hash blanked by sanitizePeerHexString)
+	// while the rest of the message keeps flowing, without penalising the
+	// sender. Nothing tip-related may reach the registry.
 	select {
 	case notification := <-s.notificationCh:
 		require.Equal(t, uint32(0), notification.BestHeight)
@@ -637,6 +838,7 @@ func TestHandleNodeStatusTopic_RejectsMalformedAdvertisedHash(t *testing.T) {
 	require.Nil(t, got.BlockHash)
 	require.Empty(t, got.ClientName)
 	require.Empty(t, got.DataHubURL)
+	require.Zero(t, got.BanScore, "a malformed advertised tip is sanitized, not scored")
 }
 
 func TestServerHelpers_AddProtocolViolation_AccumulatesScore(t *testing.T) {
@@ -657,7 +859,7 @@ func TestServerHelpers_AddProtocolViolation_AccumulatesScore(t *testing.T) {
 
 func TestServerHelpers_ApplyBanScore_NilRegistryNoPanic(t *testing.T) {
 	s := &Server{logger: ulogger.TestLogger{}, gCtx: context.Background()}
-	require.NotPanics(t, func() { s.applyBanScore("anything", "spam") })
+	require.NotPanics(t, func() { _ = s.applyBanScore("anything", "spam") })
 }
 
 func TestServerHelpers_OnPeerBanned_InvalidIDReturnsCleanly(t *testing.T) {
@@ -853,6 +1055,12 @@ func TestValidateDataHubURL(t *testing.T) {
 		{"localhost_uppercase", "http://LOCALHOST/api", true, "localhost"},
 		{"localhost_mixed_case_trailing_dot", "http://LocalHost./api", true, "localhost"},
 		{"sub_localhost_uppercase", "http://sub.LOCALHOST/api", true, "localhost"},
+
+		// Not a clean base URL: fetch paths are joined onto it (issue 4843)
+		{"query_suffix", "http://attacker.example:9644/v1/debug/bundle?x=", true, "query"},
+		{"bare_query", "http://attacker.example/api?", true, "query"},
+		{"fragment", "http://attacker.example/api#x", true, "fragment"},
+		{"userinfo", "http://user:pass@example.com/api", true, "userinfo"},
 	}
 
 	for _, tt := range tests {
@@ -868,14 +1076,26 @@ func TestValidateDataHubURL(t *testing.T) {
 	}
 }
 
+// TestValidateDataHubURL_ShapeCheckedWhenPrivateIPsAllowed keeps the base-URL shape check
+// on for nodes with p2p_allow_private_ips set, which skip the address checks.
+func TestValidateDataHubURL_ShapeCheckedWhenPrivateIPsAllowed(t *testing.T) {
+	server := &Server{
+		logger:   ulogger.New("test"),
+		settings: &settings.Settings{P2P: settings.P2PSettings{AllowPrivateIPs: true}},
+	}
+
+	require.NoError(t, server.validateDataHubURL("http://10.0.0.5:8090/api/v1"))
+	require.ErrorContains(t, server.validateDataHubURL("http://10.0.0.5:9644/v1/debug/bundle?x="), "query")
+	require.ErrorContains(t, server.validateDataHubURL("http://10.0.0.5:8090/api/v1#"), "fragment")
+}
+
 // TestCleanupPeerMaps_EvictsExpiredReputationEntries confirms that the
 // reputationCache populated by shouldSkipUnhealthyPeer does not grow without
 // bound — cleanupPeerMaps must sweep entries whose expiresAt has passed.
 func TestCleanupPeerMaps_EvictsExpiredReputationEntries(t *testing.T) {
 	s := &Server{
-		logger:         ulogger.TestLogger{},
-		peerMapTTL:     time.Minute,
-		peerMapMaxSize: 100,
+		logger:     ulogger.TestLogger{},
+		peerMapTTL: time.Minute,
 	}
 
 	now := time.Now()
@@ -903,39 +1123,177 @@ func TestServerHelpers_SanitizeAdvertisedTip_ClampsAndOverflow(t *testing.T) {
 	t.Run("within lead is returned unchanged", func(t *testing.T) {
 		s, _ := newServerWithLocalRegistry(t)
 		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 50
-		height, hash, ok := s.sanitizeAdvertisedTip(pid, 140, validHash, 100)
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, 140, validHash, 100)
 		require.True(t, ok)
 		require.NotNil(t, hash)
-		require.Equal(t, uint32(140), height)
+		require.Equal(t, uint32(140), heights.Height)
+		require.Equal(t, uint32(140), heights.AdvertisedHeight)
 	})
 
 	t.Run("beyond lead is capped to local height plus lead", func(t *testing.T) {
 		s, _ := newServerWithLocalRegistry(t)
 		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 10
-		height, hash, ok := s.sanitizeAdvertisedTip(pid, 1000, validHash, 100)
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, 1000, validHash, 100)
 		require.True(t, ok)
 		require.NotNil(t, hash)
-		require.Equal(t, uint32(110), height, "capped to localHeight+maxLead")
+		require.Equal(t, uint32(110), heights.Height, "capped to localHeight+maxLead")
+		require.Equal(t, uint32(1000), heights.AdvertisedHeight, "the advertised value is not tied to local progress")
 	})
 
 	t.Run("uint32 overflow clamps the ceiling instead of wrapping", func(t *testing.T) {
-		s, _ := newServerWithLocalRegistry(t)
+		s, reg := newServerWithLocalRegistry(t)
 		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 100
 		localHeight := ^uint32(0) - 5 // localHeight+maxLead overflows uint32
-		height, hash, ok := s.sanitizeAdvertisedTip(pid, ^uint32(0), validHash, localHeight)
+		reg.Register(&blockchain.PeerInfo{ID: pid})
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, ^uint32(0), validHash, localHeight)
 		require.True(t, ok)
 		require.NotNil(t, hash)
-		require.Equal(t, ^uint32(0), height,
+		require.Equal(t, ^uint32(0), heights.Height,
 			"ceiling clamps to max uint32 so a near-max advertisement is accepted, not wrapped")
+		require.Equal(t, ^uint32(0), heights.AdvertisedHeight,
+			"a claim inside the local+lead window is not implausible, whatever its absolute value")
+
+		got, ok := reg.Get(pid)
+		require.True(t, ok)
+		require.Zero(t, got.BanScore, "a claim inside the local+lead window must not be scored")
+	})
+
+	t.Run("advertised height at the plausibility ceiling is accepted", func(t *testing.T) {
+		s, reg := newServerWithLocalRegistry(t)
+		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 10_000
+		reg.Register(&blockchain.PeerInfo{ID: pid})
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, maxPlausibleAdvertisedHeight, validHash, 900_000)
+		require.True(t, ok)
+		require.NotNil(t, hash)
+		require.Equal(t, uint32(910_000), heights.Height, "sync cap still applies to the local+lead ceiling")
+		require.Equal(t, uint32(maxPlausibleAdvertisedHeight), heights.AdvertisedHeight)
+
+		got, ok := reg.Get(pid)
+		require.True(t, ok)
+		require.Zero(t, got.BanScore, "a claim at the ceiling is plausible and must not be scored")
+	})
+
+	t.Run("implausible advertised height is rejected and scored as a protocol violation", func(t *testing.T) {
+		s, reg := newServerWithLocalRegistry(t)
+		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 10_000
+		reg.Register(&blockchain.PeerInfo{ID: pid})
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, maxPlausibleAdvertisedHeight+1, validHash, 900_000)
+		require.False(t, ok, "a claim beyond the plausibility ceiling must not be stored or displayed")
+		require.Nil(t, hash)
+		require.Equal(t, uint32(0), heights.Height)
+		require.Equal(t, uint32(0), heights.AdvertisedHeight)
+
+		got, scored := reg.Get(pid)
+		require.True(t, scored, "the peer must be charged for the implausible claim")
+		require.Positive(t, got.BanScore)
+	})
+
+	t.Run("uint32-max claim from a peer far ahead of local progress is rejected", func(t *testing.T) {
+		s, reg := newServerWithLocalRegistry(t)
+		reg.Register(&blockchain.PeerInfo{ID: pid})
+		heights, _, ok := s.sanitizeAdvertisedTip(pid, ^uint32(0), validHash, 900_000)
+		require.False(t, ok)
+		require.Equal(t, uint32(0), heights.AdvertisedHeight)
+
+		got, scored := reg.Get(pid)
+		require.True(t, scored)
+		require.Positive(t, got.BanScore)
 	})
 
 	t.Run("invalid hash is rejected", func(t *testing.T) {
 		s, _ := newServerWithLocalRegistry(t)
-		height, hash, ok := s.sanitizeAdvertisedTip(pid, 100, "not-a-hash", 100)
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, 100, "not-a-hash", 100)
 		require.False(t, ok)
 		require.Nil(t, hash)
-		require.Equal(t, uint32(0), height)
+		require.Equal(t, uint32(0), heights.Height)
+		require.Equal(t, uint32(0), heights.AdvertisedHeight)
 	})
+}
+
+// TestHandleBlockTopic_RejectsImplausibleAdvertisedHeight checks that a block
+// announcement beyond the plausibility ceiling reaches no operator-facing
+// surface and no catchup trigger, and that the announcing peer is scored.
+func TestHandleBlockTopic_RejectsImplausibleAdvertisedHeight(t *testing.T) {
+	s, reg := newServerWithLocalRegistry(t)
+	setServerLocalHeight(t, s, 900_000)
+
+	self := mustNewPeerID(t)
+	mockP2P := new(MockServerP2PClient)
+	mockP2P.peerID = self
+	s.P2PClient = mockP2P
+	s.notificationCh = make(chan *notificationMsg, 1)
+
+	producer := kafka.NewKafkaAsyncProducerMock()
+	s.blocksKafkaProducerClient = producer
+
+	remote := mustNewPeerID(t)
+	reg.Register(&blockchain.PeerInfo{ID: remote.String()})
+
+	msgBytes, err := json.Marshal(BlockMessage{
+		PeerID:     remote.String(),
+		ClientName: "client/1.0",
+		Hash:       chainhash.HashH([]byte("implausible block")).String(),
+		Height:     maxPlausibleAdvertisedHeight + 1,
+	})
+	require.NoError(t, err)
+
+	s.handleBlockTopic(context.Background(), msgBytes, remote.String())
+
+	select {
+	case notification := <-s.notificationCh:
+		t.Fatalf("unexpected block notification for an implausible height: %+v", notification)
+	default:
+	}
+
+	select {
+	case published := <-producer.PublishChannel():
+		t.Fatalf("unexpected Kafka publish for an implausible height: %+v", published)
+	default:
+	}
+
+	got, ok := reg.Get(remote.String())
+	require.True(t, ok)
+	require.Positive(t, got.BanScore, "the announcing peer must be charged a protocol violation")
+	require.Zero(t, got.Height, "the implausible claim must not reach the sync height")
+	require.Zero(t, got.AdvertisedHeight, "the implausible claim must not reach the displayed height")
+}
+
+// TestHandleNodeStatusTopic_RejectsImplausibleAdvertisedHeight checks that a
+// node_status beyond the plausibility ceiling is still relayed for monitoring
+// but without the height, is never stored, and costs the peer ban score.
+func TestHandleNodeStatusTopic_RejectsImplausibleAdvertisedHeight(t *testing.T) {
+	s, reg := newServerWithLocalRegistry(t)
+	setServerLocalHeight(t, s, 900_000)
+
+	self := mustNewPeerID(t)
+	mockP2P := new(MockServerP2PClient)
+	mockP2P.peerID = self
+	s.P2PClient = mockP2P
+	s.notificationCh = make(chan *notificationMsg, 1)
+
+	remote := mustNewPeerID(t)
+	msgBytes, err := json.Marshal(NodeStatusMessage{
+		PeerID:        remote.String(),
+		BestHeight:    maxPlausibleAdvertisedHeight + 1,
+		BestBlockHash: chainhash.HashH([]byte("implausible tip")).String(),
+	})
+	require.NoError(t, err)
+
+	s.handleNodeStatusTopic(context.Background(), msgBytes, remote.String())
+
+	select {
+	case notification := <-s.notificationCh:
+		require.Zero(t, notification.BestHeight, "the implausible height must not reach WebSocket clients")
+		require.Empty(t, notification.BestBlockHash, "the hash paired with a rejected height must not be relayed")
+	default:
+		t.Fatal("expected node_status notification")
+	}
+
+	got, ok := reg.Get(remote.String())
+	require.True(t, ok)
+	require.Positive(t, got.BanScore, "the advertising peer must be charged a protocol violation")
+	require.Zero(t, got.Height, "the implausible claim must not reach the sync height")
+	require.Zero(t, got.AdvertisedHeight, "the implausible claim must not reach the displayed height")
 }
 
 // TestHandleBlockTopic_RejectsBlacklistedDataHubURL guards the fix for block
@@ -1172,12 +1530,13 @@ func TestServerGetPeersReturnsConnectedPeersWithHeight(t *testing.T) {
 	connectedPID := mustNewPeerID(t)
 	disconnectedPID := mustNewPeerID(t)
 
-	s.addConnectedPeer(connectedPID, "client/1.0", 123, nil, "")
-	s.addPeer(disconnectedPID, "client/1.0", 99, nil, "")
+	s.addConnectedPeer(connectedPID, "client/1.0", peerHeightClaim{Height: 123, AdvertisedHeight: 962710}, nil, "")
+	s.addPeer(disconnectedPID, "client/1.0", peerHeightClaim{Height: 99, AdvertisedHeight: 99}, nil, "")
 
 	resp, err := s.GetPeers(context.Background(), &emptypb.Empty{})
 	require.NoError(t, err)
 	require.Len(t, resp.Peers, 1, "disconnected peers must be excluded")
 	require.Equal(t, connectedPID.String(), resp.Peers[0].Id)
-	require.Equal(t, uint32(123), resp.Peers[0].CurrentHeight)
+	require.Equal(t, uint32(123), resp.Peers[0].CurrentHeight, "sync-decision height stays capped")
+	require.Equal(t, uint32(962710), resp.Peers[0].AdvertisedHeight, "raw advertised claim must reach the GetPeers contract too")
 }

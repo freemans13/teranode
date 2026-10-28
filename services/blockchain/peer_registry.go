@@ -11,6 +11,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	p2pconstants "github.com/bsv-blockchain/teranode/interfaces/p2p"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -57,6 +58,22 @@ func sanitizeClientName(name string) string {
 	return strings.TrimSpace(cleaned.String())
 }
 
+// LegacyPeerInfo holds fields that only a Bitcoin wire-protocol (legacy) peer
+// supplies. A nil pointer on PeerInfo means "this update carries no legacy
+// data"; it never means "clear the stored values". The struct is replaced
+// wholesale on update, because Inbound and IsSyncPeer are meaningful when
+// false and a field-by-field merge could not tell false from unset.
+type LegacyPeerInfo struct {
+	Inbound         bool      // The peer dialled us
+	ProtocolVersion uint32    // Wire protocol version, e.g. 70016
+	ServiceFlags    uint64    // wire.ServiceFlag bits
+	PingMicros      int64     // Last ping round trip, microseconds
+	TimeOffsetSecs  int64     // Peer clock offset from ours, seconds
+	StartingHeight  int32     // Peer height at handshake
+	IsSyncPeer      bool      // The legacy sync manager selected this peer
+	TimeConnected   time.Time // When the wire connection opened
+}
+
 // PeerInfo holds transport-agnostic information about a peer known to the node.
 // It is used across all transport types (HTTP DataHub, wire protocol, etc.).
 type PeerInfo struct {
@@ -65,6 +82,7 @@ type PeerInfo struct {
 	TransportTypeSet          bool // When true, TransportType was explicitly set by the caller
 	ClientName                string
 	Height                    uint32
+	AdvertisedHeight          uint32
 	DataHubURL                string
 	NetworkAddress            string
 	IsBanned                  bool
@@ -109,6 +127,9 @@ type PeerInfo struct {
 	ReputationResetCount int32
 	LastCatchupError     string
 	LastCatchupErrorTime time.Time
+
+	// Legacy holds wire-protocol-only fields. It is nil for libp2p peers.
+	Legacy *LegacyPeerInfo
 }
 
 func clonePeerInfo(info *PeerInfo) PeerInfo {
@@ -116,7 +137,21 @@ func clonePeerInfo(info *PeerInfo) PeerInfo {
 	peerCopy.BlockHash = cloneHash(info.BlockHash)
 	peerCopy.ValidatedBlockHash = cloneHash(info.ValidatedBlockHash)
 	peerCopy.ValidatedChainWork = append([]byte(nil), info.ValidatedChainWork...)
+	peerCopy.Legacy = cloneLegacyPeerInfo(info.Legacy)
+
 	return peerCopy
+}
+
+// cloneLegacyPeerInfo copies the legacy block behind a fresh pointer so the
+// registry never aliases a caller's struct. A nil input returns nil.
+func cloneLegacyPeerInfo(legacy *LegacyPeerInfo) *LegacyPeerInfo {
+	if legacy == nil {
+		return nil
+	}
+
+	legacyCopy := *legacy
+
+	return &legacyCopy
 }
 
 func cloneHash(hash *chainhash.Hash) *chainhash.Hash {
@@ -158,7 +193,12 @@ func DefaultBanConfig() BanConfig {
 			"protocol_violation": 20,
 			"spam":               50,
 			"invalid_block":      10,
-			"catchup_failure":    30,
+			// Corrupt block body (bitcoin-sv/teranode#4692): scored like invalid_block (a DoS-scoring
+			// event) but without the block-index poison — the block is re-downloaded. Keyed off the
+			// shared constant so a rename cannot silently zero the score.
+			p2pconstants.ReasonCorruptBlockBody.String(): 10,
+			"catchup_failure":   30,
+			"catchup_malicious": 50,
 		},
 	}
 }
@@ -308,6 +348,16 @@ func (r *CentralizedPeerRegistry) Register(info *PeerInfo) {
 	if info.Height > 0 {
 		existing.Height = info.Height
 	}
+	// Carried separately from Height: Height is capped against local progress
+	// for sync decisions, AdvertisedHeight is what the peer actually claimed
+	// and is reported to operators unchanged. Newest-wins, like Height: the
+	// p2p batcher keeps the highest claim within one flush window, but across
+	// windows a lower claim may replace a higher one. That is intended — a
+	// peer that reorgs to a lower tip must not keep showing its old height —
+	// and a display that dips heals on the peer's next announcement.
+	if info.AdvertisedHeight > 0 {
+		existing.AdvertisedHeight = info.AdvertisedHeight
+	}
 	if info.DataHubURL != "" {
 		existing.DataHubURL = info.DataHubURL
 	}
@@ -357,6 +407,14 @@ func (r *CentralizedPeerRegistry) Register(info *PeerInfo) {
 			existing.ValidatedHeight = 0
 		}
 	}
+	// Replace the legacy block wholesale rather than field-by-field: Inbound
+	// and IsSyncPeer are meaningful when false, so a per-field "is it non-zero"
+	// merge could not distinguish false from unset. A nil Legacy means the
+	// caller has no legacy data and must leave the stored block alone.
+	if info.Legacy != nil {
+		existing.Legacy = cloneLegacyPeerInfo(info.Legacy)
+	}
+
 	// Only update TransportType when the caller explicitly set it.
 	if info.TransportTypeSet {
 		existing.TransportType = info.TransportType
@@ -397,6 +455,13 @@ func (r *CentralizedPeerRegistry) UpdateMetrics(
 	info.LastSeen = now
 
 	if recordMalicious {
+		// Setting LastInteractionFailure here and the 5.0 reputation pin in
+		// calculateAndUpdateReputation are both load-bearing for recovery:
+		// ReconsiderBadPeers only clears MaliciousCount for peers with
+		// ReputationScore < 20 and a non-zero last failure, and that sweep is
+		// the sole automatic path that stops IsPeerMalicious excluding the
+		// peer. Removing either turns a malicious record into a permanent
+		// exclusion.
 		info.MaliciousCount++
 		info.InteractionAttempts++
 		info.InteractionFailures++
@@ -924,9 +989,9 @@ func (r *CentralizedPeerRegistry) StartPeriodicSave(ctx context.Context, interva
 
 // StartCleanup starts a background goroutine that periodically runs
 // Cleanup(maxSize, ttl) so the in-memory registry cannot grow unboundedly
-// under churn. Connected and banned peers are exempt; expired bans are
-// normalised before each pass so a stale IsBanned flag can't keep an idle
-// peer alive forever. The goroutine exits on the first of: ctx cancellation
+// under churn. Banned peers are exempt, connected peers only while active
+// within ttl; expired bans are normalised before each pass so a stale
+// IsBanned flag can't keep an idle peer alive forever. The goroutine exits on the first of: ctx cancellation
 // OR Close().
 //
 // A zero or negative interval disables the loop (caller's choice — useful
@@ -1310,7 +1375,8 @@ func (r *CentralizedPeerRegistry) RecordCatchupError(peerID string, errMsg strin
 // Cleanup evicts stale peers to bound memory and lookup cost. Phase 1 (TTL)
 // drops peers whose recency timestamp is older than ttl. Phase 2 (LRU) then
 // drops oldest-first until the non-exempt portion of the registry fits under
-// maxSize. Connected peers and banned peers are exempt from both phases.
+// maxSize. Banned peers are exempt from both phases; connected peers are
+// exempt only while their activity is within ttl (see isCleanupExempt).
 // A maxSize of 0 disables the LRU phase. Returns (expired, lru) counts.
 //
 // Recency is taken from peerActivity(info), which uses LastSeen as the canonical
@@ -1329,7 +1395,7 @@ func (r *CentralizedPeerRegistry) Cleanup(maxSize int, ttl time.Duration) (int, 
 	expired := 0
 
 	for id, info := range r.peers {
-		if isCleanupExempt(info) {
+		if isCleanupExempt(info, now, ttl) {
 			continue
 		}
 		if last := peerActivity(info); !last.IsZero() && now.Sub(last) <= ttl {
@@ -1350,7 +1416,7 @@ func (r *CentralizedPeerRegistry) Cleanup(maxSize int, ttl time.Duration) (int, 
 	candidates := make([]candidate, 0, len(r.peers))
 	exemptCount := 0
 	for id, info := range r.peers {
-		if isCleanupExempt(info) {
+		if isCleanupExempt(info, now, ttl) {
 			exemptCount++
 			continue
 		}
@@ -1378,9 +1444,20 @@ func (r *CentralizedPeerRegistry) Cleanup(maxSize int, ttl time.Duration) (int, 
 }
 
 // isCleanupExempt reports whether a peer must be retained regardless of TTL or
-// size pressure. Caller must hold the registry lock.
-func isCleanupExempt(info *PeerInfo) bool {
-	return info.IsConnected || info.IsBanned
+// size pressure. Banned peers are always retained. IsConnected only exempts a
+// peer whose activity is still within ttl: the flag is asserted by the p2p
+// service on every gossip message but there is no libp2p disconnect signal to
+// clear it, so a stale flag must not pin an entry in the registry forever.
+// Caller must hold the registry lock.
+func isCleanupExempt(info *PeerInfo, now time.Time, ttl time.Duration) bool {
+	if info.IsBanned {
+		return true
+	}
+	if !info.IsConnected {
+		return false
+	}
+	last := peerActivity(info)
+	return !last.IsZero() && now.Sub(last) <= ttl
 }
 
 // peerActivity returns the canonical freshness timestamp used by Cleanup —

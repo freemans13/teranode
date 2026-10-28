@@ -1,12 +1,8 @@
 package model
 
 import (
-	"io"
-	"strings"
-
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
@@ -37,17 +33,12 @@ import (
 //
 // It scans every node hash across all subtree slices into a plain Go map,
 // skipping the coinbase placeholder at position [0][0], and returns a
-// BlockInvalidError on the first duplicate. It is intentionally lightweight —
+// BlockCorruptError on the first duplicate. It is intentionally lightweight —
 // O(N) in the total transaction count with one map allocation — so it is cheap
 // enough to run unconditionally on every slice-only path. Callers on the full
 // validation path (Block.Valid) instead use the pooled/disk-backed
 // checkDuplicateTransactions; this helper is the independent floor for the
 // paths that skip it.
-//
-// This one-shot form suits a caller that holds the whole block's slices at once
-// and has not yet touched the UTXO store. A caller that applies the block to the
-// store in batches cannot satisfy the "before creating or spending" precondition
-// with it, and should use DuplicateTxScanner instead.
 func CheckSubtreeSlicesForDuplicateTxs(slices []*subtreepkg.Subtree) error {
 	// Estimate total node count for the initial map capacity to avoid rehashing.
 	totalNodes := 0
@@ -57,141 +48,80 @@ func CheckSubtreeSlicesForDuplicateTxs(slices []*subtreepkg.Subtree) error {
 		}
 	}
 
-	seen := make(map[chainhash.Hash]struct{}, totalNodes)
+	deduper := NewSubtreeTxDeduper("CheckSubtreeSlicesForDuplicateTxs", totalNodes)
 
 	for subIdx, subtree := range slices {
-		if subtree == nil {
-			continue
-		}
-		for txIdx, node := range subtree.Nodes {
-			// Skip the coinbase placeholder (all-0xFF hash) that occupies the
-			// first position of the first subtree. It is not a real transaction
-			// hash and must not be deduped against itself.
-			if subIdx == 0 && txIdx == 0 && node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				continue
-			}
-
-			if _, exists := seen[node.Hash]; exists {
-				return errors.NewBlockInvalidError(
-					"[CheckSubtreeSlicesForDuplicateTxs] block contains duplicate transaction %s (CVE-2012-2459)",
-					node.Hash.String(),
-				)
-			}
-			seen[node.Hash] = struct{}{}
+		if err := deduper.Add(subIdx, subtree); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-// DuplicateTxScanner is the incremental form of CheckSubtreeSlicesForDuplicateTxs,
-// for paths that apply a block to the UTXO store in batches.
+// SubtreeTxDeduper is CheckSubtreeSlicesForDuplicateTxs with the slice loop turned
+// inside out, so a caller that cannot hold every subtree at once can still run the
+// whole-block scan.
 //
-// The one-shot helper above is the wrong shape for such a path in two ways.
-// It can only run once every batch has been applied, so a block rejected by it
-// has already created — and, on default settings, locked — its UTXOs, with no
-// unlock pass on the rejection path to clear them. And its plain Go map holds one
-// entry per transaction for the whole block: hundreds of megabytes on a
-// multi-million-transaction block, gigabytes at a hundred million, on precisely
-// the path that exists to make large blocks fast.
+// The scan is inherently whole-block — a duplicate spanning two subtrees is only
+// visible to something that has seen both — but holding the SLICES for the whole block
+// is a different requirement from holding the txid SET, and only the second is
+// unavoidable. The chunked binding pass releases each chunk's structures before reading
+// the next and feeds them through here as it goes, which is what lets it bound its
+// residency without giving up the check (bitcoin-sv/teranode#4838).
 //
-// This type fixes both. Callers feed it each batch's transaction list BEFORE
-// writing that batch, so a duplicate is rejected with nothing yet applied, and it
-// draws its map from the same size-class pool or disk-backed table that
-// Block.checkDuplicateTransactions uses on the full validation path, honouring the
-// same DiskMapDirs setting.
-//
-// Feed it the transactions actually being applied to the store, not the subtree
-// leaf hashes: on a retry the leaf list can be deserialized from a local .subtree
-// file that differs from the peer-supplied body being written, and a check that
-// scans a different list than the one applied is not a floor.
-//
-// It is not safe for concurrent use; scan a batch before fanning out its writes.
-// Release must be called when the block is done, on every exit path.
-type DuplicateTxScanner struct {
-	txMap    txmap.TxMap
-	pooled   *txmap.SplitSwissMapUint64 // non-nil only when txMap came from the size-class pool
-	sizedFor uint64                     // the pool key Release must return the map under
-	next     uint64
+// One implementation, two drivers: CheckSubtreeSlicesForDuplicateTxs above is now a
+// thin loop over this type, so the coinbase-placeholder skip and the corrupt
+// classification cannot drift between the two callers.
+type SubtreeTxDeduper struct {
+	label string
+	seen  map[chainhash.Hash]struct{}
 }
 
-// NewDuplicateTxScanner returns a scanner sized for expectedTxs transactions.
-// expectedTxs is only an allocation hint — a count above the largest pooled size
-// class is clamped by txMapAllocHint rather than allocating unbounded, so it is
-// safe to pass a peer-supplied transaction count. diskMapDirs mirrors
-// settings.Block.DiskMapDirs: non-empty selects the disk-backed table.
-func NewDuplicateTxScanner(expectedTxs uint64, diskMapDirs []string) (*DuplicateTxScanner, error) {
-	s := &DuplicateTxScanner{sizedFor: expectedTxs}
-
-	if len(diskMapDirs) > 0 {
-		// The mmap-backed table rejects a zero capacity; an empty block clamps to 1.
-		filterCapacity := expectedTxs
-		if filterCapacity == 0 {
-			filterCapacity = 1
-		}
-
-		diskMap, err := NewDiskTxMapUint64(DiskTxMapUint64Options{
-			BasePaths:      diskMapDirs,
-			Prefix:         "qv-dedup",
-			FilterCapacity: uint(filterCapacity),
-		})
-		if err != nil {
-			return nil, errors.NewProcessingError("[DuplicateTxScanner] failed to create disk tx map", err)
-		}
-
-		s.txMap = diskMap
-
-		return s, nil
+// NewSubtreeTxDeduper returns a deduper sized for capacityHint total nodes. The hint
+// only avoids rehashing; an understated one costs growth, never correctness. label is
+// the bracketed site prefix of the duplicate error, so the rejection names the caller
+// that ran the scan.
+func NewSubtreeTxDeduper(label string, capacityHint int) *SubtreeTxDeduper {
+	if capacityHint < 0 {
+		capacityHint = 0
 	}
 
-	s.pooled = GetTxMap(expectedTxs)
-	s.txMap = s.pooled
-
-	return s, nil
+	return &SubtreeTxDeduper{label: label, seen: make(map[chainhash.Hash]struct{}, capacityHint)}
 }
 
-// Add records one transaction hash, returning a BlockInvalidError if this block
-// has already presented it. Put is mutually exclusive, so the duplicate is caught
-// by the insert itself rather than a separate lookup.
-func (s *DuplicateTxScanner) Add(hash chainhash.Hash) error {
-	if err := s.txMap.Put(hash, s.next); err != nil {
-		if errors.Is(err, errors.ErrTxExists) || strings.Contains(err.Error(), "hash already exists in map") {
-			return errors.NewBlockInvalidError(
-				"[DuplicateTxScanner] block contains duplicate transaction %s (CVE-2012-2459)",
-				hash.String(),
+// Add folds one subtree's nodes into the running set, returning a BlockCorruptError on
+// the first node already seen. subIdx is the subtree's index in the BLOCK, not in the
+// caller's chunk: the coinbase-placeholder skip is defined at block position [0][0],
+// so a chunked caller must pass the global index or it will dedupe the placeholder
+// against a real txid.
+//
+// A nil subtree contributes nothing, matching the slice driver's behaviour.
+func (d *SubtreeTxDeduper) Add(subIdx int, subtree *subtreepkg.Subtree) error {
+	if subtree == nil {
+		return nil
+	}
+
+	for txIdx, node := range subtree.Nodes {
+		// Skip the coinbase placeholder (all-0xFF hash) that occupies the
+		// first position of the first subtree. It is not a real transaction
+		// hash and must not be deduped against itself.
+		if subIdx == 0 && txIdx == 0 && node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			continue
+		}
+
+		if _, exists := d.seen[node.Hash]; exists {
+			// Body-derived (a duplicate in the received tx set) and reachable on an
+			// unbound body: classify corrupt so it is re-downloaded, not poisoned
+			// (bitcoin-sv/teranode#4692).
+			return errors.NewBlockCorruptError(
+				"[%s] block contains duplicate transaction %s (CVE-2012-2459)",
+				d.label, node.Hash.String(),
 			)
 		}
 
-		return errors.NewStorageError(
-			"[DuplicateTxScanner] failed to record transaction %s",
-			hash.String(), err,
-		)
+		d.seen[node.Hash] = struct{}{}
 	}
-
-	s.next++
 
 	return nil
-}
-
-// Release returns the pooled map to its size class, or closes the disk-backed
-// table. It is nil-safe and idempotent, so callers can defer it immediately after
-// construction and let every exit path run it.
-func (s *DuplicateTxScanner) Release() {
-	if s == nil || s.txMap == nil {
-		return
-	}
-
-	if s.pooled != nil {
-		PutTxMap(s.pooled, s.sizedFor)
-		s.pooled = nil
-		s.txMap = nil
-
-		return
-	}
-
-	if closer, ok := s.txMap.(io.Closer); ok {
-		_ = closer.Close()
-	}
-
-	s.txMap = nil
 }

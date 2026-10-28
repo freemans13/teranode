@@ -44,6 +44,11 @@ func (m *MockUTXOStore) SetMedianBlockTime(time uint32) error {
 	return args.Error(0)
 }
 
+func (m *MockUTXOStore) SetBlockState(height, medianTime uint32) error {
+	args := m.Called(height, medianTime)
+	return args.Error(0)
+}
+
 func (m *MockUTXOStore) GetBlockHeight() uint32 {
 	args := m.Called()
 	return args.Get(0).(uint32)
@@ -73,6 +78,10 @@ func (m *MockUTXOStore) Get(ctx context.Context, hash *chainhash.Hash, fields ..
 }
 
 func (m *MockUTXOStore) Delete(ctx context.Context, hash *chainhash.Hash) error {
+	return nil
+}
+
+func (m *MockUTXOStore) DeleteComplete(ctx context.Context, hash *chainhash.Hash) error {
 	return nil
 }
 
@@ -142,6 +151,14 @@ func (m *MockUTXOStore) BatchDecorate(ctx context.Context, unresolvedMetaDataSli
 
 func (m *MockUTXOStore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	return nil
+}
+
+func (m *MockUTXOStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	return nil, nil
+}
+
+func (m *MockUTXOStore) ParentOutputsForValidation(ctx context.Context, outpoints []utxo.Outpoint, opts ...utxo.ParentOutputOption) ([]utxo.ParentOutput, error) {
+	return nil, nil
 }
 
 func (m *MockUTXOStore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
@@ -345,10 +362,10 @@ func TestNewStore_BlockchainClientError(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
 
-	// Register mock database initializer
+	// Register mock database initializer. No SetBlockState expectation: this
+	// test makes blockchain-client creation fail, so NewStore returns before it
+	// subscribes and the listener never runs.
 	mockStore := &MockUTXOStore{}
-	mockStore.On("SetBlockHeight", mock.Anything).Return(nil).Maybe()
-	mockStore.On("SetMedianBlockTime", mock.Anything).Return(nil).Maybe()
 
 	availableDatabases["memory"] = func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error) {
 		return mockStore, nil

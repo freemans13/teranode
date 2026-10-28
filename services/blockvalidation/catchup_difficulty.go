@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"math/big"
 
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -32,6 +33,8 @@ func (u *Server) validateCatchupHeaderDifficulty(ctx context.Context, catchupCtx
 	default:
 	}
 
+	// The chain is anchored on the common ancestor, so this must run on the untrimmed header list,
+	// before fetchAndValidateBlocks drops the stored front.
 	if err := validateHeaderChainDifficulty(u.settings, catchupCtx.commonAncestorMeta, catchupCtx.blockHeaders); err != nil {
 		if errors.IsMaliciousResponseError(err) {
 			if prometheusCatchupErrors != nil && catchupCtx.peerID != "" {
@@ -63,6 +66,8 @@ func (u *Server) validateCatchupHeaderDifficulty(ctx context.Context, catchupCtx
 // full-block DAA check (BlockValidation.ValidateBlock via GetNextWorkRequired) covers those
 // using the store. This step exists to reject deep, self-consistent low-difficulty chains
 // early — exactly the region an attacker fully controls.
+// Pre-DAA headers are also deferred to full-block validation and its checkpoint checks:
+// this in-memory precheck only implements the modern DAA, not historical retargets/EDA.
 //
 // Parameters:
 //   - tSettings: chain settings (DAA rules, target spacing, pow limit)
@@ -135,6 +140,9 @@ func validateHeaderChainDifficulty(tSettings *settings.Settings, anchor *model.B
 		}
 
 		parentHeight := anchor.Height + 1 + uint32(parentIdx)
+		if parentHeight < tSettings.ChainCfgParams.DaaForkHeight && tSettings.ChainCfgParams.Net != wire.STN {
+			continue
+		}
 
 		var expected *model.NBit
 

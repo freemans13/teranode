@@ -65,7 +65,7 @@ func computeMultiSubtreeMerkleRoot(t *testing.T, coinbase *bt.Tx, subtrees []*su
 // TestCVE20122459_MerkleMutantPair_SameHashDifferentBody is the linchpin regression for
 // issue 1424 (HARDEN-1424). It builds the CVE-2012-2459 mutant pair exactly as worked out
 // in the issue: honest 7 txs split [cb,T1,T2,T3]+[T4,T5,T6] against mutant 8 txs split
-// [cb,T1,T2,T3]+[T4,T5,T6,T6], using the pinned go-subtree v1.4.2, subtree capacity 4, and
+// [cb,T1,T2,T3]+[T4,T5,T6,T6], using the go-subtree version pinned in go.mod, subtree capacity 4, and
 // real bt.Tx transactions (not hand-faked hashes) — so a change to go-subtree's
 // duplicate-last-node-when-odd padding rule would break this test rather than silently
 // stop being caught.
@@ -78,8 +78,10 @@ func computeMultiSubtreeMerkleRoot(t *testing.T, coinbase *bt.Tx, subtrees []*su
 //     different, doctored transaction list at zero mining cost.
 //  2. (b) Block.CheckMerkleRoot PASSES on BOTH blocks, pinning that the merkle root
 //     alone cannot detect the mutation.
-//  3. (c) Block.Valid REJECTS the mutant — via the later, independent
-//     duplicate-transaction check (the CVE-2012-2459 floor), not the merkle check.
+//  3. (c) Block.Valid REJECTS the mutant — via the independent duplicate-transaction
+//     check (the CVE-2012-2459 floor), not the merkle check — and classifies it as a
+//     corrupt body, never as an invalid block, because the hash it would condemn is the
+//     honest block's hash too.
 func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 	ctx := context.Background()
 	tSettings := test.CreateBaseTestSettings(t)
@@ -201,6 +203,10 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 	validMutant, err := mutantBlock.Valid(ctx, ulogger.TestLogger{}, subtreeStore, nil, mutantOldBlockIDs, nil, nil, tSettings, nil)
 	require.False(t, validMutant, "the mutant block must be rejected")
 	require.Error(t, err)
-	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "mutant rejection must be BlockInvalid (so the peer is still punished)")
+	// The mutant shares the honest block's hash, so the verdict must be about the body, not
+	// the hash: BlockCorrupt (re-download from another peer), never BlockInvalid, which would
+	// mark the honest block's hash invalid for good.
+	require.True(t, errors.IsBlockCorrupt(err), "mutant rejection must be BlockCorrupt, got: %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "mutant rejection must not poison the shared block hash as BlockInvalid")
 	require.Contains(t, err.Error(), "duplicate transaction", "the mutant must be caught by the duplicate-transaction check, not the merkle check")
 }

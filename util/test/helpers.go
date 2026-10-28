@@ -1,11 +1,13 @@
 package test
 
 import (
+	"context"
 	"net/url"
 	"os"
 
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/testcontainers/testcontainers-go"
 )
 
 type TestingT interface {
@@ -17,6 +19,8 @@ type TestingT interface {
 func CreateBaseTestSettings(t TestingT) *settings.Settings {
 	tSettings := settings.NewSettings()
 	tSettings.DataFolder = t.TempDir()
+	// Shared only by test servers and their clients; production has no default key.
+	tSettings.GRPCAdminAPIKey = "teranode-unit-test-service-key"
 	t.Logf("using temp data folder: %s", tSettings.DataFolder)
 
 	// Create a copy of RegressionNetParams to avoid race conditions
@@ -53,4 +57,82 @@ func CreateBaseTestSettings(t TestingT) *settings.Settings {
 	}
 
 	return tSettings
+}
+
+// containerRuntimeHealthProbe reports whether the TestContainers-backed
+// container runtime (Docker/OrbStack) is reachable and healthy. It is a
+// package variable so tests can substitute a fake probe; production code
+// always uses dockerRuntimeHealth.
+var containerRuntimeHealthProbe = dockerRuntimeHealth
+
+// dockerRuntimeHealth asks testcontainers-go itself whether the configured
+// Docker provider is reachable, the same check testcontainers-go's own
+// SkipIfProviderIsNotHealthy performs. Reusing it avoids re-implementing
+// fragile matching against Docker's connection-error strings.
+func dockerRuntimeHealth(ctx context.Context) error {
+	provider, err := testcontainers.ProviderDocker.GetProvider()
+	if err != nil {
+		return err
+	}
+
+	return provider.Health(ctx)
+}
+
+// skipT is the subset of *testing.T (and testing.TB) SkipIfContainerUnavailable
+// needs. Declared as an interface, rather than requiring *testing.T directly,
+// so tests can substitute a fake and assert the skip-vs-fail decision without
+// the assertion itself skipping or failing the real test.
+type skipT interface {
+	Helper()
+	Skipf(format string, args ...interface{})
+	Fatalf(format string, args ...interface{})
+}
+
+// SkipIfContainerUnavailable skips the current test only when the container
+// runtime backing TestContainers (Docker/OrbStack) is genuinely unreachable.
+// Pass the error returned directly from the container-start call: if it is
+// nil, this is a no-op. If it is non-nil, the runtime is probed independently
+// of the error's content - a failure unrelated to runtime availability (a
+// missing fixture, an image-pull failure, a readiness-check timeout, etc.)
+// fails the test instead of being silently reported as skipped.
+func SkipIfContainerUnavailable(t skipT, err error) {
+	t.Helper()
+
+	if err == nil {
+		return
+	}
+
+	if probeErr := containerRuntimeHealthProbe(context.Background()); probeErr != nil {
+		t.Skipf("skipping: container runtime unavailable: %v", probeErr)
+		return
+	}
+
+	t.Fatalf("container setup failed for a reason other than runtime unavailability: %v", err)
+}
+
+// MainNetParamsForSyntheticPoW returns a COPY of the mainnet parameters whose
+// proof-of-work limit is relaxed to admit the trivially-easy nBits (0x207fffff)
+// that tests grind to produce a block header quickly.
+//
+// Two reasons this exists rather than tests using &chaincfg.MainNetParams:
+//
+//  1. Mainnet's PowLimit and PowLimitBits both encode a target of about 2^224, so
+//     model.BlockHeader.HasMetPowLimit correctly rejects a 0x207fffff header
+//     (target about 2^255) against them. Tests that mine synthetic PoW are not
+//     asserting anything about the difficulty schedule, so they need params whose
+//     limit admits their shortcut; a test that IS about the limit should use the
+//     real mainnet params.
+//  2. Taking the address of the chaincfg.MainNetParams package global and then
+//     mutating a field through it (CoinbaseMaturity, and so on) leaks that
+//     mutation into every other test in the binary. Returning a copy removes that
+//     latent cross-test coupling.
+func MainNetParamsForSyntheticPoW() *chaincfg.Params {
+	params := chaincfg.MainNetParams
+
+	// Widen both declarations of the limit consistently, so the looser-of-the-two
+	// rule in HasMetPowLimit lands on the same relaxed ceiling either way.
+	params.PowLimit = chaincfg.RegressionNetParams.PowLimit
+	params.PowLimitBits = 0x207fffff
+
+	return &params
 }
