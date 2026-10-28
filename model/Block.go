@@ -1015,9 +1015,9 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 	// (bitcoin-sv/teranode#4835). Regular transactions get these from BDK; the coinbase does not go
 	// through BDK, so they are applied here. Same position as in bitcoin-sv's CheckCoinbase (after
 	// the is-coinbase check, before bad-cb-length) and the same binding-aware classification as the
-	// checks either side of it. Factored into CoinbaseCommonRuleViolation so the quick-validation
+	// checks either side of it. Factored into TxCommonRuleViolation so the quick-validation
 	// path enforces the identical rules.
-	if reason := CoinbaseCommonRuleViolation(b.CoinbaseTx, b.Height, settings.ChainCfgParams); reason != "" {
+	if reason := TxCommonRuleViolation(b.CoinbaseTx, b.Height, settings.ChainCfgParams); reason != "" {
 		return false, merkleRootChecked, bindErr("[BLOCK][%s] coinbase breaks a transaction rule: %s", b.String(), reason)
 	}
 

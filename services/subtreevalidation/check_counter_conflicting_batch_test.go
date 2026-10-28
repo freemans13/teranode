@@ -2,8 +2,11 @@ package subtreevalidation
 
 import (
 	"context"
+	"maps"
 	"math/rand/v2"
 	"net/url"
+	"regexp"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -182,12 +185,13 @@ func newCachedCheckServer(t *testing.T, store utxo.Store, tSettings *settings.Se
 // recorded spender, so each is its own counter-spender and its cone is walked as
 // a counter-spender cone.
 //
-// The bound is c = 6 reads per conflicting transaction. For these shapes the
+// The bound is c = 8 reads per conflicting transaction. For these shapes the
 // batched check needs four: its own inpoints and its parent's spenders (phase 1),
 // one read as a member of the walk (phase 2), and one GetMeta as a member of the
 // counter-conflicting union (phase 3). One more is for the reads that discover
 // which cached transactions are conflicting, when those come from the store
-// rather than the subtree trailer, and one is headroom.
+// rather than the subtree trailer, two are the check at the block's height
+// (checkStoredTxAtHeight: the tx's body and its parent), and one is headroom.
 func Test_checkCachedSubtreesAgainstCandidateChain_scaling(t *testing.T) {
 	const chainLength = 200
 
@@ -208,7 +212,7 @@ func Test_checkCachedSubtreesAgainstCandidateChain_scaling(t *testing.T) {
 			reads := countingStore.reads.Load()
 			t.Logf("%d store reads for a %d-transaction conflicting chain", reads, chainLength)
 
-			require.LessOrEqualf(t, reads, int64(6*chainLength),
+			require.LessOrEqualf(t, reads, int64(8*chainLength),
 				"the cached-subtree conflict check must read a conflicting chain O(N) times, got %d reads for N=%d (O(N^2) is the per-transaction re-walk of issue 2037)",
 				reads, chainLength)
 		})
@@ -361,7 +365,8 @@ func buildRandomConflictGraph(t *testing.T, ctx context.Context, store utxo.Stor
 		stored = append(stored, tx)
 
 		if recordsSpend {
-			for idx := range picked {
+			// in index order, not map order, so a seed always builds the same graph
+			for _, idx := range slices.Sorted(maps.Keys(picked)) {
 				spent = append(spent, pool[idx])
 			}
 
@@ -393,7 +398,7 @@ func buildRandomConflictGraph(t *testing.T, ctx context.Context, store utxo.Stor
 
 // perTxVerdict is the reference: checkCounterConflictingOnCurrentChain run on
 // every conflicting tx, reduced the way the batch defines its verdict: any
-// processing error wins, then any tx-invalid, else pass. Where the
+// tx-invalid wins, then any processing error, else pass. Where the
 // per-transaction results do not mix classes, that is also exactly what a loop
 // returned; where they do mix, a loop's answer depended on its order. It also
 // reports whether any per-tx check failed on a missing record.
@@ -407,16 +412,145 @@ func perTxVerdict(t *testing.T, ctx context.Context, s *Server, conflicting []ch
 		sawNotFound = sawNotFound || errors.Is(err, errors.ErrTxNotFound)
 
 		switch verdictOf(err) {
-		case verdictProcessing:
-			want = verdictProcessing
 		case verdictTxInvalid:
+			want = verdictTxInvalid
+		case verdictProcessing:
 			if want == verdictPass {
-				want = verdictTxInvalid
+				want = verdictProcessing
 			}
 		}
 	}
 
 	return want, sawNotFound
+}
+
+// requireBatchMatchesPerTx compares the batched verdict, got, with the per-tx
+// reference, want, and reports whether they differed in the one way allowed.
+//
+// They must be equal, except where the reference is processing and the batch is
+// tx-invalid. A per-tx check that fails (a frozen output in the tx's own cone, a
+// missing record) gives up before its mined check; the batch carries on and
+// mined-checks what it could read, and a proven tx-invalid wins. Then the batch
+// must name a tx that is mined on the candidate chain and is in the
+// counter-conflicting set of some conflicting tx, as lenientCounterConflicting
+// derives it from the records the store still holds.
+func requireBatchMatchesPerTx(t *testing.T, ctx context.Context, store utxo.Store, conflicting []chainhash.Hash, blockIds map[uint32]bool, seed uint64, want verdict, gotErr error) (got verdict, oneWay bool) {
+	t.Helper()
+
+	got = verdictOf(gotErr)
+	if want == got {
+		return got, false
+	}
+
+	require.Truef(t, want == verdictProcessing && got == verdictTxInvalid,
+		"seed %d: batched verdict %q differs from the per-transaction check's %q (batch: %v)", seed, got, want, gotErr)
+
+	var minedNamed []chainhash.Hash
+
+	for _, named := range regexp.MustCompile(`[0-9a-f]{64}`).FindAllString(gotErr.Error(), -1) {
+		hash, err := chainhash.NewHashFromStr(named)
+		require.NoError(t, err)
+
+		namedMeta := &meta.Data{}
+		if store.GetMeta(ctx, hash, namedMeta) != nil {
+			continue
+		}
+
+		for _, blockID := range namedMeta.BlockIDs {
+			if blockIds[blockID] {
+				minedNamed = append(minedNamed, *hash)
+				break
+			}
+		}
+	}
+
+	require.NotEmptyf(t, minedNamed, "seed %d: a tx-invalid verdict the per-tx checks did not reach must name a tx mined on the candidate chain (batch: %v)", seed, gotErr)
+
+	for _, txHash := range conflicting {
+		members := lenientCounterConflicting(t, ctx, store, txHash)
+
+		for _, mined := range minedNamed {
+			if _, ok := members[mined]; ok {
+				return got, true
+			}
+		}
+	}
+
+	require.Failf(t, "unproven tx-invalid", "seed %d: the mined tx the batch names is in no conflicting tx's counter-conflicting set (batch: %v)", seed, gotErr)
+
+	return got, true
+}
+
+// lenientCounterConflicting is the test's own derivation of txHash's
+// counter-conflicting set: the tx, the recorded spenders of the outputs it
+// spends, and their descendants through recorded spends and conflicting
+// children. Unlike utxo.GetCounterConflictingTxHashes it never fails: a record
+// that cannot be read, an out-of-range input and the frozen sentinel are leaves,
+// so it yields every member reachable from what the store still holds.
+func lenientCounterConflicting(t *testing.T, ctx context.Context, store utxo.Store, txHash chainhash.Hash) map[chainhash.Hash]struct{} {
+	t.Helper()
+
+	members := map[chainhash.Hash]struct{}{}
+
+	txMeta, err := store.Get(ctx, &txHash, fields.TxInpoints)
+	if err != nil || txMeta == nil {
+		return members
+	}
+
+	members[txHash] = struct{}{}
+
+	// walked is separate from members: a tx that is its own counter-spender is a
+	// member from the start, and its cone must still be walked, as
+	// utxo.GetCounterConflictingTxHashes walks it
+	walked := map[chainhash.Hash]struct{}{}
+
+	var queue []chainhash.Hash
+
+	visit := func(hash chainhash.Hash) {
+		if hash.Equal(subtreepkg.FrozenBytesTxHash) {
+			return
+		}
+
+		members[hash] = struct{}{}
+
+		if _, ok := walked[hash]; !ok {
+			walked[hash] = struct{}{}
+			queue = append(queue, hash)
+		}
+	}
+
+	for _, inpoint := range txMeta.TxInpoints.GetTxInpoints() {
+		parentMeta, err := store.Get(ctx, &inpoint.Hash, fields.Utxos)
+		if err != nil || parentMeta == nil || len(parentMeta.SpendingDatas) <= int(inpoint.Index) {
+			continue
+		}
+
+		if spendingData := parentMeta.SpendingDatas[inpoint.Index]; spendingData != nil && spendingData.TxID != nil {
+			visit(*spendingData.TxID)
+		}
+	}
+
+	for len(queue) > 0 {
+		hash := queue[0]
+		queue = queue[1:]
+
+		hashMeta, err := store.Get(ctx, &hash, fields.Utxos, fields.ConflictingChildren)
+		if err != nil || hashMeta == nil {
+			continue
+		}
+
+		for _, child := range hashMeta.ConflictingChildren {
+			visit(child)
+		}
+
+		for _, spendingData := range hashMeta.SpendingDatas {
+			if spendingData != nil && spendingData.TxID != nil {
+				visit(*spendingData.TxID)
+			}
+		}
+	}
+
+	return members
 }
 
 // Test_checkCounterConflictingOnCurrentChainBatch_equivalence pins the batched
@@ -429,6 +563,9 @@ func perTxVerdict(t *testing.T, ctx context.Context, s *Server, conflicting []ch
 //     batched verdict equals the per-tx reference, in which a missing record is a
 //     retryable ErrTxNotFound, so a gap anywhere either path looks yields the same
 //     class.
+//
+// Both allow one difference (see requireBatchMatchesPerTx): the batch proves
+// tx-invalid from evidence a failing per-tx check never reached.
 func Test_checkCounterConflictingOnCurrentChainBatch_equivalence(t *testing.T) {
 	const seeds = 60
 
@@ -444,6 +581,7 @@ func Test_checkCounterConflictingOnCurrentChainBatch_equivalence(t *testing.T) {
 
 	t.Run("cached path, every record present", func(t *testing.T) {
 		seen := map[verdict]int{}
+		oneWay := 0
 
 		for seed := uint64(1); seed <= seeds; seed++ {
 			ctx := context.Background()
@@ -459,13 +597,15 @@ func Test_checkCounterConflictingOnCurrentChainBatch_equivalence(t *testing.T) {
 			want, sawNotFound := perTxVerdict(t, ctx, s, conflicting, blockIds)
 			require.Falsef(t, sawNotFound, "seed %d: every record is present", seed)
 
-			got := verdictOf(s.checkCachedSubtreesAgainstCandidateChain(ctx, block, cachedSubtrees))
-			require.Equalf(t, want, got, "seed %d: batched verdict differs from the per-transaction check", seed)
+			got, differs := requireBatchMatchesPerTx(t, ctx, store, conflicting, blockIds, seed, want, s.checkCachedSubtreesAgainstCandidateChain(ctx, block, cachedSubtrees))
+			if differs {
+				oneWay++
+			}
 
-			seen[want]++
+			seen[got]++
 		}
 
-		t.Logf("verdicts over %d seeds: %v", seeds, seen)
+		t.Logf("batched verdicts over %d seeds: %v, %d proven tx-invalid by the batch only", seeds, seen, oneWay)
 
 		// the generator must exercise every verdict, or the comparison proves little
 		for _, v := range []verdict{verdictPass, verdictTxInvalid, verdictProcessing} {
@@ -476,6 +616,7 @@ func Test_checkCounterConflictingOnCurrentChainBatch_equivalence(t *testing.T) {
 	t.Run("fresh-path policy, some records missing", func(t *testing.T) {
 		seen := map[verdict]int{}
 		notFoundSeeds := 0
+		oneWay := 0
 
 		for seed := uint64(1); seed <= seeds; seed++ {
 			ctx := context.Background()
@@ -502,12 +643,15 @@ func Test_checkCounterConflictingOnCurrentChainBatch_equivalence(t *testing.T) {
 			}
 
 			_, err := s.checkCounterConflictingOnCurrentChainBatch(ctx, conflicting, blockIds, failOnMissingRecords)
-			require.Equalf(t, want, verdictOf(err), "seed %d: batched verdict differs from the per-transaction check (batch: %v)", seed, err)
+			got, differs := requireBatchMatchesPerTx(t, ctx, store, conflicting, blockIds, seed, want, err)
+			if differs {
+				oneWay++
+			}
 
-			seen[want]++
+			seen[got]++
 		}
 
-		t.Logf("verdicts over %d seeds: %v, %d with a per-tx ErrTxNotFound", seeds, seen, notFoundSeeds)
+		t.Logf("batched verdicts over %d seeds: %v, %d with a per-tx ErrTxNotFound, %d proven tx-invalid by the batch only", seeds, seen, notFoundSeeds, oneWay)
 
 		require.Positive(t, notFoundSeeds, "no seed pruned a record the check reads; retune the generator")
 
@@ -518,10 +662,10 @@ func Test_checkCounterConflictingOnCurrentChainBatch_equivalence(t *testing.T) {
 }
 
 // buildIndependentConflicts stores n unrelated double spends. Each has its own
-// parent, the parent's recorded spender (the counter-spender) and a conflicting
-// tx over the same output; no cone has a descendant. It returns the conflicting
-// txs.
-func buildIndependentConflicts(t *testing.T, ctx context.Context, store utxo.Store, n int) []chainhash.Hash {
+// parent, the parent's recorded spender (the counter-spender, stored with
+// counterOpts) and a conflicting tx over the same output; no cone has a
+// descendant. It returns the conflicting txs.
+func buildIndependentConflicts(t *testing.T, ctx context.Context, store utxo.Store, n int, counterOpts ...utxo.CreateOption) []chainhash.Hash {
 	t.Helper()
 
 	conflicting := make([]chainhash.Hash, 0, n)
@@ -537,7 +681,7 @@ func buildIndependentConflicts(t *testing.T, ctx context.Context, store utxo.Sto
 		_, _, err := store.SpendAndCreate(ctx, parent, 122, utxo.WithCreateOnly())
 		require.NoError(t, err)
 
-		spendAndCreate(t, ctx, store, buildTx(t, []outpoint{{tx: parent, vout: 0}}, 1, salt+2))
+		spendAndCreate(t, ctx, store, buildTx(t, []outpoint{{tx: parent, vout: 0}}, 1, salt+2), counterOpts...)
 
 		tx := buildTx(t, []outpoint{{tx: parent, vout: 0}}, 1, salt+3)
 		createConflicting(t, ctx, store, tx)
@@ -699,13 +843,22 @@ func Test_checkCounterConflictingOnCurrentChainBatch_missingMemberMidCone(t *tes
 	require.ErrorIs(t, err, errors.ErrTxInvalid)
 	require.Contains(t, err.Error(), counter.TxIDChainHash().String(), "the verdict names the mined counter-conflicting tx")
 
-	t.Run("a store fault is still a processing error", func(t *testing.T) {
-		faulty := &faultyGetMetaStore{Store: store, fail: *counterChild.TxIDChainHash()}
+	t.Run("a store fault on another member does not hide the mined one", func(t *testing.T) {
+		faulty := &faultyGetMetaStore{Store: store, fail: chain[1]}
+		s, block, cachedSubtrees := newCachedCheckServer(t, faulty, tSettings, chain, []uint32{77})
+
+		err := s.checkCachedSubtreesAgainstCandidateChain(ctx, block, cachedSubtrees)
+		require.ErrorIs(t, err, errors.ErrTxInvalid, "the mined counter-spender was read, so the conflict is proven")
+		require.Contains(t, err.Error(), counter.TxIDChainHash().String())
+	})
+
+	t.Run("a store fault on the mined member is a processing error", func(t *testing.T) {
+		faulty := &faultyGetMetaStore{Store: store, fail: *counter.TxIDChainHash()}
 		s, block, cachedSubtrees := newCachedCheckServer(t, faulty, tSettings, chain, []uint32{77})
 
 		err := s.checkCachedSubtreesAgainstCandidateChain(ctx, block, cachedSubtrees)
 		require.ErrorIs(t, err, errors.ErrStorageError)
-		require.NotErrorIs(t, err, errors.ErrTxInvalid, "a fault anywhere wins over a mined member, so the verdict is retryable")
+		require.NotErrorIs(t, err, errors.ErrTxInvalid, "nothing read proves a conflict, so the verdict is retryable")
 	})
 }
 
