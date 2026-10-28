@@ -172,7 +172,7 @@ func TestReplayBestTipChanges_OwnLineageIsANoOp(t *testing.T) {
 	// The oldest change, two blocks below the tip, goes through the ancestry check.
 	_, meta, err := items.blockchainClient.GetBlockHeader(t.Context(), chain[0].Hash())
 	require.NoError(t, err)
-	require.NoError(t, items.blockAssembler.applyBestTipChange(t.Context(), chain[0], meta))
+	require.NoError(t, items.blockAssembler.applyBestTipChange(t.Context(), chain[0], meta, false))
 	require.Empty(t, *moves)
 
 	items.blockAssembler.processNewBlockAnnouncement(t.Context())
@@ -180,6 +180,41 @@ func TestReplayBestTipChanges_OwnLineageIsANoOp(t *testing.T) {
 	require.Empty(t, *moves)
 	requireBlockAssemblyTip(t, items, chain[2])
 	require.Equal(t, startSeq+3, items.blockAssembler.bestTipSeq.Load())
+}
+
+// TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack checks that when the latest change is
+// an ancestor of block assembly's tip, the best tip moved back to it and block assembly follows.
+// Invalidating block assembly's tip numbers its parent as the latest change.
+func TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack(t *testing.T) {
+	initPrometheusMetrics()
+
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+
+	chain := buildChain(genesis, 3, 5500)
+	addChain(t, items, chain)
+
+	startSeq := startReplayAt(t, items, chain[2], 3)
+	moves := recordMoves(t, items)
+
+	// A reorg off an invalid block is followed by a reset, which the mock lets succeed.
+	mockStp := items.blockAssembler.subtreeProcessor.(*subtreeprocessor.MockSubtreeProcessor)
+	mockStp.On("WaitForPendingBlocks", mock.Anything).Return(nil)
+
+	resets := 0
+
+	mockStp.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(subtreeprocessor.ResetResponse{}).Run(func(mock.Arguments) { resets++ })
+
+	_, err := items.blockchainClient.InvalidateBlock(t.Context(), chain[2].Hash())
+	require.NoError(t, err)
+
+	items.blockAssembler.processNewBlockAnnouncement(t.Context())
+
+	require.Equal(t, []recordedMove{{back: headerHashes(chain[2]), forward: []string{}}}, *moves)
+	require.Equal(t, 1, resets, "moving off an invalid block resets block assembly")
+	requireBlockAssemblyTip(t, items, chain[1])
+	require.Equal(t, startSeq+1, items.blockAssembler.bestTipSeq.Load())
 }
 
 // TestReplayBestTipChanges_NoOpWhenCaughtUp checks a wake-up with no new change moves nothing.
@@ -227,7 +262,7 @@ func TestReplayBestTipChanges_InvalidNeverAppliedResets(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bMeta.Invalid)
 
-	err = items.blockAssembler.applyBestTipChange(t.Context(), b[1], bMeta)
+	err = items.blockAssembler.applyBestTipChange(t.Context(), b[1], bMeta, true)
 	require.ErrorIs(t, err, errors.ErrBlockAssemblyReset)
 	requireBlockAssemblyTip(t, items, a1)
 }
@@ -253,7 +288,7 @@ func TestReplayBestTipChanges_InvalidOnOwnChainIsLeftToTheNextChange(t *testing.
 
 	moves := recordMoves(t, items)
 
-	require.NoError(t, items.blockAssembler.applyBestTipChange(t.Context(), chain[0], meta))
+	require.NoError(t, items.blockAssembler.applyBestTipChange(t.Context(), chain[0], meta, false))
 	require.Empty(t, *moves)
 	requireBlockAssemblyTip(t, items, chain[1])
 }

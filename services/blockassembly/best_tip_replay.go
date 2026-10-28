@@ -180,7 +180,10 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 				continue
 			}
 
-			if err = b.applyBestTipChange(ctx, headers[i], metas[i]); err != nil && !errors.Is(err, errors.ErrBlockAssemblyReset) {
+			// The latest change is the best tip now. A full page may have more after it.
+			last := i == len(headers)-1 && len(headers) < bestTipChangesPageSize
+
+			if err = b.applyBestTipChange(ctx, headers[i], metas[i], last); err != nil && !errors.Is(err, errors.ErrBlockAssemblyReset) {
 				// The position stays before this change, which the next pass retries. The
 				// changes skipped above are on its path, so they are retried with it.
 				return read, err
@@ -197,13 +200,19 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 	}
 }
 
-// applyBestTipChange moves block assembly to one change of the best tip.
+// applyBestTipChange moves block assembly to one change of the best tip. last says the change is
+// the latest one, so the block is the best tip now.
+//
+// A change already on block assembly's chain is skipped unless it is the latest change. Moving
+// back to it and forward again to a later change nets out, but when it is the latest change the
+// best tip moved back to it, for example after an invalidation of block assembly's tip, and block
+// assembly must move back too.
 //
 // A block that is invalid now is never moved to. If block assembly's chain contains it, a later
 // change moves off it, through the reset rule for invalid blocks. If not, block assembly never
 // applied it, and its block-only transactions reach the pool only through a reset, once block
 // validation has stamped them unmined again, which it does when it processes the invalidation.
-func (b *BlockAssembler) applyBestTipChange(ctx context.Context, header *model.BlockHeader, meta *model.BlockHeaderMeta) error {
+func (b *BlockAssembler) applyBestTipChange(ctx context.Context, header *model.BlockHeader, meta *model.BlockHeaderMeta, last bool) error {
 	tip, tipHeight := b.CurrentBlock()
 	if tip == nil {
 		return errors.NewProcessingError("[applyBestTipChange] block assembly has no tip")
@@ -216,14 +225,15 @@ func (b *BlockAssembler) applyBestTipChange(ctx context.Context, header *model.B
 	}
 
 	// A block extending the tip cannot be on its chain, so it needs no ancestry check.
-	if !header.HashPrevBlock.IsEqual(tip.Hash()) && meta.Height <= tipHeight {
+	if !last && !header.HashPrevBlock.IsEqual(tip.Hash()) && meta.Height <= tipHeight {
 		onChain, err := b.blockchainClient.CheckBlockIsAncestorOfBlock(ctx, []uint32{meta.ID}, tip.Hash())
 		if err != nil {
 			return errors.NewProcessingError("[applyBestTipChange] error checking whether %s is on block assembly's chain", hash, err)
 		}
 
 		if onChain {
-			// Already applied, for example by a reset that went straight to a later tip.
+			// Already applied, for example by a reset that went straight to a later tip, and
+			// a later change moves block assembly on from it.
 			return nil
 		}
 	}

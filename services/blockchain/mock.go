@@ -287,14 +287,25 @@ func (m *Mock) GetBlockHeadersFromHeight(ctx context.Context, height, limit uint
 // existed. A test that wants the replay sets an expectation, or uses a real store.
 var errTipChangesNotMocked = errors.NewServiceUnavailableError("best tip changes not mocked")
 
-// GetBestTipChanges mocks the GetBestTipChanges method
-func (m *Mock) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) (headers []*model.BlockHeader, metas []*model.BlockHeaderMeta, seqs []uint64, err error) {
-	defer func() {
-		// testify panics on a call with no expectation; see errTipChangesNotMocked.
-		if r := recover(); r != nil {
-			headers, metas, seqs, err = nil, nil, nil, errTipChangesNotMocked
+// hasExpectation reports whether a test set an expectation for the named method. It reads only
+// the Method field of each expected call. GetBestTipChanges and GetBestTipSeq check it before
+// m.Called, because testify's unexpected-call path formats every argument, including a context
+// another goroutine may be writing, and the race detector reports that read.
+func (m *Mock) hasExpectation(method string) bool {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == method {
+			return true
 		}
-	}()
+	}
+
+	return false
+}
+
+// GetBestTipChanges mocks the GetBestTipChanges method
+func (m *Mock) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
+	if !m.hasExpectation("GetBestTipChanges") {
+		return nil, nil, nil, errTipChangesNotMocked
+	}
 
 	args := m.Called(ctx, afterSeq, minHeight, limit)
 
@@ -306,13 +317,10 @@ func (m *Mock) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight
 }
 
 // GetBestTipSeq mocks the GetBestTipSeq method
-func (m *Mock) GetBestTipSeq(ctx context.Context) (seq uint64, err error) {
-	defer func() {
-		// testify panics on a call with no expectation; see errTipChangesNotMocked.
-		if r := recover(); r != nil {
-			seq, err = 0, errTipChangesNotMocked
-		}
-	}()
+func (m *Mock) GetBestTipSeq(ctx context.Context) (uint64, error) {
+	if !m.hasExpectation("GetBestTipSeq") {
+		return 0, errTipChangesNotMocked
+	}
 
 	args := m.Called(ctx)
 
