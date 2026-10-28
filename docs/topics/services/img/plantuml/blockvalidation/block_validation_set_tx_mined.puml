@@ -128,7 +128,7 @@ alt Generation unchanged
     Blockchain --> BlockValidation: ok
 else Generation moved during the run
     Blockchain --> BlockValidation: ERR_STATE_ERROR
-    BlockValidation -> BVServer: Re-queue on setMinedChan (retry counter not charged)
+    BlockValidation -> BVServer: Re-queue on setMinedChan after a backoff (retry counter unchanged)
 end
 deactivate Blockchain
 

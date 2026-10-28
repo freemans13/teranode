@@ -233,16 +233,15 @@ func (f *gap058Fixture) runParkedTagging(t *testing.T, interfere func()) error {
 	return nil
 }
 
-// requireRequeued asserts the refused run put the block back on setMinedChan.
-func (f *gap058Fixture) requireRequeued(t *testing.T) {
+// requireRequeued asserts the refused run asked the setMined worker to re-queue the block. The
+// run itself must not put the block straight back on setMinedChan: the worker re-queues it
+// through the backoff path, which TestSetMinedChanWorker_RequeueKeepsRetryCounterAndBacksOff covers.
+func (f *gap058Fixture) requireRequeued(t *testing.T, runErr error) {
 	t.Helper()
 
-	select {
-	case requeued := <-f.bv.setMinedChan:
-		require.Equal(t, *f.block.Hash(), *requeued, "the refused run must re-queue the block")
-	default:
-		t.Fatal("the refused run did not re-queue the block on setMinedChan")
-	}
+	var requeue *setMinedRequeueError
+	require.ErrorAs(t, runErr, &requeue, "the refused run must return setMinedRequeueError, not nil and not a plain failure")
+	require.Len(t, f.bv.setMinedChan, 0, "the run must leave the re-queue, and its backoff, to the worker")
 }
 
 // TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation is the regression test for GAP-BV-058
@@ -253,7 +252,8 @@ func (f *gap058Fixture) requireRequeued(t *testing.T) {
 // the block is processed again; an unconditional SetBlockMinedSet at the end of the run used to
 // overwrite that, after which the setMined worker's MinedSet guard and the mined-not-set sweep both
 // skipped the block for good. SetBlockMinedSet is now conditional on the mined_set generation the run
-// started from, and setTxMinedStatus re-queues the block when the write is refused. The race is made
+// started from, and setTxMinedStatus asks the worker to re-queue the block when the write is
+// refused. The race is made
 // deterministic with a UTXO-store decorator that parks the tagging run inside SetMinedMulti while
 // InvalidateBlock runs on the real sqlitememory store.
 func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
@@ -270,10 +270,6 @@ func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
 		require.False(t, midMeta.MinedSet, "precondition: InvalidateBlock cleared mined_set")
 	})
 
-	// nil, not the state error: a refused write is not a failed run and must not
-	// charge the setMined retry counter
-	require.NoError(t, runErr, "the refused run must return nil")
-
 	_, endMeta, err := f.blockchainClient.GetBlockHeader(ctx, f.block.Hash())
 	require.NoError(t, err)
 	require.True(t, endMeta.Invalid, "the block is still invalid at the end")
@@ -285,7 +281,9 @@ func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
 
 	require.False(t, endMeta.MinedSet, "the refused write must leave mined_set=false so the sweep still lists the block")
 
-	f.requireRequeued(t)
+	// a refused write is not a failed run: the run returns the re-queue error, which the
+	// worker handles without charging the retry counter
+	f.requireRequeued(t, runErr)
 
 	require.False(t, endMeta.MinedSet && tagsPresent,
 		"GAP-BV-058: block is invalid, yet the in-flight run left mined_set=true with the transaction still tagged (BlockIDs=%v); the unconditional SetBlockMinedSet overwrote the invalidation and the sweep will never revisit it", endTags.BlockIDs)
@@ -294,8 +292,13 @@ func TestGapBV058_InFlightTaggingDoesNotOverwriteInvalidation(t *testing.T) {
 // TestGapBV058_InFlightTaggingDoesNotOverwriteClearBlockMinedSet covers the reset that does not
 // touch the invalid flag. Catchup calls ClearBlockMinedSet on a block that moved off the main chain.
 // A run that started before, with onLongestChain=true, used to match a guard on invalid and write
-// mined_set=true over the clear, after which the re-queued run skipped on MinedSet=true and the
-// block's transactions stayed tagged as on the longest chain. The generation guard refuses it.
+// mined_set=true over the clear, after which the re-queued run skipped on MinedSet=true. The
+// generation guard refuses that write, which is all this test proves.
+//
+// It does not prove the catchup fork case is closed. Catchup clears mined_set on the old-chain
+// blocks before the reorg (catchup.go, step 5.5), so the re-queued run still finds the block on the
+// main chain, tags it with onLongestChain=true and sets mined_set=true, and nothing clears it again
+// after the real reorg. That ordering predates this change and needs a clear after the reorg.
 func TestGapBV058_InFlightTaggingDoesNotOverwriteClearBlockMinedSet(t *testing.T) {
 	f := newGap058Fixture(t)
 	ctx := f.ctx
@@ -304,14 +307,12 @@ func TestGapBV058_InFlightTaggingDoesNotOverwriteClearBlockMinedSet(t *testing.T
 		require.NoError(t, f.blockchainClient.ClearBlockMinedSet(ctx, f.block.Hash()))
 	})
 
-	require.NoError(t, runErr, "the refused run must return nil")
-
 	_, endMeta, err := f.blockchainClient.GetBlockHeader(ctx, f.block.Hash())
 	require.NoError(t, err)
 	require.False(t, endMeta.Invalid, "precondition: the clear left invalid untouched")
 	require.False(t, endMeta.MinedSet, "the run must not write mined_set=true over ClearBlockMinedSet")
 
-	f.requireRequeued(t)
+	f.requireRequeued(t, runErr)
 }
 
 // TestGapBV058_InvalidFlagMovedBeforeRunStarts covers the window between the worker's read of
@@ -326,7 +327,7 @@ func TestGapBV058_InvalidFlagMovedBeforeRunStarts(t *testing.T) {
 	_, err := f.blockchainClient.InvalidateBlock(ctx, f.block.Hash())
 	require.NoError(t, err)
 
-	require.NoError(t, f.bv.setTxMinedStatus(ctx, f.block.Hash(), false))
+	runErr := f.bv.setTxMinedStatus(ctx, f.block.Hash(), false)
 
 	_, endMeta, err := f.blockchainClient.GetBlockHeader(ctx, f.block.Hash())
 	require.NoError(t, err)
@@ -337,5 +338,5 @@ func TestGapBV058_InvalidFlagMovedBeforeRunStarts(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, endTags.BlockIDs, "a run started on the stale flag must not tag the invalid block's transaction")
 
-	f.requireRequeued(t)
+	f.requireRequeued(t, runErr)
 }
