@@ -768,6 +768,19 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   shape. The same collapse on the HTTP blob store's own client and server is fixed
   too; no shipped configuration uses that store. (#1963)
 
+- **A block whose coinbase is not final is rejected.** Affects every node and every miner.
+  bitcoin-sv applies its `IsFinalTx` rule to the coinbase as to any other transaction, and
+  Teranode now does too: a block whose coinbase has a non-final input sequence and an
+  nLockTime not yet reached is invalid (`bad-txns-nonfinal`). From CSV onwards a time-based
+  nLockTime is measured against the parent's median time past. `submitminingsolution`
+  refuses such a coinbase instead of mining a block peers reject, and keeps the job, so a
+  corrected coinbase can still be submitted against it. The time-based check needs the
+  parent's median time past, which is looked up only after the solution has passed the
+  proof-of-work check. A solution's time and nonce are no longer copied into the coinbase
+  as its nLockTime and input sequence; they go into the header only, as in bitcoin-sv. A
+  node on an earlier build accepts blocks this one rejects, so upgrade every node
+  together. (#2017)
+
 - **A block's conflicting transactions are checked in one walk, and
   `utxostore_conflictingChildrenMaxNodes` becomes a per-root budget for it.** Subtree
   validation used to check a block's conflicting transactions one at a time, re-walking
