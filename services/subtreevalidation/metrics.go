@@ -146,6 +146,13 @@ var (
 	// a metric a spike in the rate would be invisible.
 	prometheusSubtreeAlreadyExistsSkipped prometheus.Counter
 
+	// prometheusSkippedSubtrees counts peer subtrees announced while the node was catching up, by
+	// outcome: recorded (newly kept), evicted (oldest dropped when full), expired (announced more
+	// than skippedSubtreeMaxAge before its replay), requeued (kept again because the node was
+	// catching up again), dropped (the node was IDLE at replay), replayed (validated or already
+	// stored), replay_failed.
+	prometheusSkippedSubtrees *prometheus.CounterVec
+
 	// prometheusPeerSubtreeAdmissionWait tracks how long a peer subtree waited for a
 	// subtreevalidation_peerSubtreeConcurrency slot, and prometheusPeerSubtreeAdmissionWaiting
 	// how many are waiting now. Together they show whether the limit is too low.
@@ -371,6 +378,16 @@ func _initPrometheusMetrics() {
 			Name:      "subtree_already_exists_skipped_total",
 			Help:      "Number of subtree Kafka messages skipped because the subtree already exists",
 		},
+	)
+
+	prometheusSkippedSubtrees = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "skipped_peer_subtrees_total",
+			Help:      "Peer subtrees announced while the node was catching up, by outcome (recorded, evicted, expired, requeued, dropped, replayed, replay_failed)",
+		},
+		[]string{"outcome"},
 	)
 
 	prometheusPeerSubtreeAdmissionWait = promauto.NewHistogram(

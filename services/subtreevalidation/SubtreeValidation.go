@@ -255,8 +255,8 @@ func (u *Server) DelTxMetaCache(ctx context.Context, hash *chainhash.Hash) error
 	return nil
 }
 
-// txMetaDemotionOps is implemented by txmetacache.TxMetaCache.
-type txMetaDemotionOps interface {
+// demotedDeleter is implemented by txmetacache.TxMetaCache.
+type demotedDeleter interface {
 	DeleteDemoted(hashes []chainhash.Hash)
 }
 
@@ -264,7 +264,7 @@ type txMetaDemotionOps interface {
 // txmetacache.TxMetaCache, keeps later writes from caching them again (see
 // TxMetaCache.DeleteDemoted). Other caching stores get a plain delete.
 func (u *Server) DelTxMetaCacheDemoted(ctx context.Context, hashes []chainhash.Hash) error {
-	if cache, ok := u.utxoStore.(txMetaDemotionOps); ok {
+	if cache, ok := u.utxoStore.(demotedDeleter); ok {
 		cache.DeleteDemoted(hashes)
 
 		return nil
@@ -641,93 +641,15 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 		}
 	}
 
+	// The same check, and the same verdict rule, as a block's conflicting txs get on the cached and
+	// fresh paths, asked of one tx. A missing record fails it, as on the fresh path.
 	if txMeta.Conflicting {
-		if err = u.checkCounterConflictingOnCurrentChain(ctx, *tx.TxIDChainHash(), blockIds); err != nil {
+		if _, err = u.checkCounterConflictingOnCurrentChainBatch(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, blockIds, failOnMissingRecords); err != nil {
 			return nil, unlockFailed, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to check counter conflicting tx on current chain", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
 		}
 	}
 
 	return txMeta, unlockFailed, nil
-}
-
-// checkCounterConflictingOnCurrentChain checks if the counter-conflicting transactions of a given transaction have
-// already been mined on the current chain. If they have, it returns an error indicating that the transaction is invalid.
-// Parameters:
-//   - ctx: Context for cancellation and tracing
-//   - subtreeHash: Hash of the subtree containing the transaction
-//   - txHash: Hash of the transaction to check
-//   - blockIds: Map of block IDs to check if transactions in the subtree are already mined
-//
-// Returns:
-//   - error: Any error encountered during the check
-//   - nil: If the counter-conflicting transactions have not been mined on the current chain
-func (u *Server) checkCounterConflictingOnCurrentChain(ctx context.Context, txHash chainhash.Hash, blockIds map[uint32]bool) error {
-	// the tx is conflicting, check whether the counter-conflicting transactions have already been mined on our chain
-	// first get the parent transactions and check if they were spent
-	counterConflictingTxHashes, err := utxo.GetCounterConflictingTxHashes(ctx, u.utxoStore, txHash, u.settings.UtxoStore.ConflictingChildrenMaxNodes)
-	if err != nil {
-		return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get counter conflicting tx hashes", txHash.String(), err)
-	}
-
-	if len(counterConflictingTxHashes) > conflictingConeWarnThreshold {
-		u.logger.Warnf("[checkCounterConflictingOnCurrentChain][%s] counter-conflicting set is %d transactions", txHash.String(), len(counterConflictingTxHashes))
-	}
-
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(128)
-
-	counterConflictingTxMetas := make([]*meta.Data, len(counterConflictingTxHashes))
-
-	for idx, counterConflictingTxHash := range counterConflictingTxHashes {
-		g.Go(func() error {
-			// if a transaction is frozen, the counter-transaction will be the same as the coinbase placeholder
-			if counterConflictingTxHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] counter conflicting tx is frozen", txHash.String())
-			}
-
-			counterConflictingTxMeta := &meta.Data{}
-			if err := u.utxoStore.GetMeta(gCtx, &counterConflictingTxHash, counterConflictingTxMeta); err != nil {
-				return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get counter conflicting tx meta", txHash.String(), err)
-			}
-
-			counterConflictingTxMetas[idx] = counterConflictingTxMeta
-
-			return nil
-		})
-	}
-
-	if err = g.Wait(); err != nil {
-		return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get counter conflicting tx meta", txHash.String(), err)
-	}
-
-	// check whether any child transaction of txHash itself is frozen. This is the
-	// only walk the counter-conflicting set does not already cover: every
-	// counter-spender's descendant cone was walked (and frozen-checked) inside
-	// GetCounterConflictingTxHashes above, and any frozen sentinel there already
-	// failed the call. Re-walking each set member re-derived subsets of the same
-	// cones — O(N^2) store reads that wedged the mainnet fleet at 960,827 (issue
-	// 1391) — so only the single winner-cone walk remains.
-	childTransactionHashes, err := utxo.GetConflictingChildren(ctx, u.utxoStore, txHash, u.settings.UtxoStore.ConflictingChildrenMaxNodes)
-	if err != nil {
-		return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get child transactions", txHash.String(), err)
-	}
-
-	for _, childTransactionHash := range childTransactionHashes {
-		if childTransactionHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] child transaction is frozen", txHash.String())
-		}
-	}
-
-	// check whether the counter-conflicting transactions have already been mined on our chain
-	for _, counterConflictingTxMeta := range counterConflictingTxMetas {
-		for _, blockID := range counterConflictingTxMeta.BlockIDs {
-			if blockIds[blockID] {
-				return errors.NewTxInvalidError("[checkCounterConflictingOnCurrentChain][%s] transaction is already mined on our chain", txHash.String())
-			}
-		}
-	}
-
-	return nil
 }
 
 // ValidateSubtree encapsulates all the necessary information required to validate a transaction subtree.
