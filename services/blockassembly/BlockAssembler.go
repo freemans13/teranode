@@ -3790,6 +3790,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 		type validationResult struct{ valid, markConflicting bool }
 		results := make([]validationResult, len(unminedTransactions))
 		validationWork := make(chan int, numWorkers)
+		var validatedCount atomic.Int64
 		for i := 0; i < numWorkers; i++ {
 			wg.Add(1)
 			go func() {
@@ -3797,6 +3798,9 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 				for idx := range validationWork {
 					b.heartbeat.BeatIfStarted()
 					results[idx].valid, results[idx].markConflicting = b.checkUnminedTxInputs(ctx, unminedTransactions[idx].Hash, bestBlockHeaderIDsMap)
+					if n := validatedCount.Add(1); n%1000 == 0 {
+						b.logger.Infof("[loadUnminedTransactions] validated %d/%d unmined transactions", n, len(unminedTransactions))
+					}
 				}
 			}()
 		}
