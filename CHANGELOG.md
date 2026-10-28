@@ -119,7 +119,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   when no block notification arrived for that long. Upgrade in any order: block
   assembly against an older blockchain service follows the best header as before, and
   an older binary ignores the new column and state key, so a rollback needs no step.
-  (#2063)
+  (#2074)
 
 - **A policy-mode script error is classified by a consensus re-run.** When policy
   validation fails on `SCRIPTNUM_OVERFLOW`, `OP_COUNT`, `SCRIPT_SIZE`, `PUBKEY_COUNT`,
