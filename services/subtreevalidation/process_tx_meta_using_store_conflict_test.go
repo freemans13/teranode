@@ -85,8 +85,8 @@ func Test_processTxMetaUsingStore_prunedCounterSpenderFailsClosed(t *testing.T) 
 	blockIds := map[uint32]bool{77: true}
 	s := &Server{logger: ulogger.NewErrorTestLogger(t), settings: tSettings, utxoStore: store}
 
-	require.ErrorIs(t, s.checkCounterConflictingOnCurrentChain(ctx, chain[0], blockIds), errors.ErrTxNotFound,
-		"the per-transaction check, which blessMissingTransaction runs, fails on the pruned record")
+	require.ErrorIs(t, s.blessConflictCheck(ctx, chain[0], blockIds), errors.ErrTxNotFound,
+		"the check blessMissingTransaction runs fails on the pruned record")
 
 	_, err := s.processTxMetaUsingStore(ctx, chain, make([]metaSliceItem, len(chain)), blockIds, true, false, true)
 	require.ErrorIs(t, err, errors.ErrTxNotFound)

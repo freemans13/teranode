@@ -1075,8 +1075,8 @@ func Test_checkCounterConflictingOnCurrentChain(t *testing.T) {
 		_, _, err = s.utxoStore.SpendAndCreate(ctx, tx1, 123, utxo.WithCreateOnly())
 		require.NoError(t, err)
 
-		// Call the checkCounterConflictingOnCurrentChain method
-		err = s.checkCounterConflictingOnCurrentChain(ctx, *tx1.TxIDChainHash(), map[uint32]bool{})
+		// Run the check blessMissingTransaction runs
+		err = s.blessConflictCheck(ctx, *tx1.TxIDChainHash(), map[uint32]bool{})
 		require.NoError(t, err)
 	})
 
@@ -1115,8 +1115,8 @@ func Test_checkCounterConflictingOnCurrentChain(t *testing.T) {
 		_, _, err = s.utxoStore.SpendAndCreate(ctx, tx1, 123, utxo.WithConflicting(true), utxo.WithCreateOnly())
 		require.NoError(t, err)
 
-		// Call the checkCounterConflictingOnCurrentChain method, should be OK since tx1DoubleSpend has not been mined
-		err = s.checkCounterConflictingOnCurrentChain(ctx, *tx1.TxIDChainHash(), map[uint32]bool{})
+		// Run the check blessMissingTransaction runs, should be OK since tx1DoubleSpend has not been mined
+		err = s.blessConflictCheck(ctx, *tx1.TxIDChainHash(), map[uint32]bool{})
 		require.NoError(t, err)
 
 		// set the tx1DoubleSpend to mined
@@ -1129,8 +1129,8 @@ func Test_checkCounterConflictingOnCurrentChain(t *testing.T) {
 		require.Len(t, blockIDsMap, 1)
 		require.Equal(t, []uint32{122}, blockIDsMap[*tx1DoubleSpend.TxIDChainHash()])
 
-		// Call the checkCounterConflictingOnCurrentChain method, should be OK since tx1DoubleSpend has not been mined
-		err = s.checkCounterConflictingOnCurrentChain(ctx, *tx1.TxIDChainHash(), map[uint32]bool{
+		// Run the check blessMissingTransaction runs, should fail now that tx1DoubleSpend is mined
+		err = s.blessConflictCheck(ctx, *tx1.TxIDChainHash(), map[uint32]bool{
 			122: true,
 		})
 		require.Error(t, err, "should be an error since tx1DoubleSpend has been mined")
