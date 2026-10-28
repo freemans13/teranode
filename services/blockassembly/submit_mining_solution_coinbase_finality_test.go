@@ -5,7 +5,6 @@ import (
 	"net/url"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -210,7 +209,7 @@ func TestSubmitMiningSolution_CoinbaseMustBeFinal(t *testing.T) {
 		})
 		require.Error(t, err)
 		require.Nil(t, resp)
-		require.Contains(t, err.Error(), "target difficulty")
+		require.Contains(t, err.Error(), "does not meet the target")
 		require.Zero(t, h.chain.lookups.Load(), "an invalid nonce must not trigger blockchain reads")
 		h.requireMined(t, false)
 	})
@@ -329,56 +328,51 @@ func TestParentMedianTimePast_ColdLookupLeavesTheFloorAlone(t *testing.T) {
 	require.Nil(t, ba.mtpFloorFailureLoggedTip.Load(), "a submit lookup failure must not spend the floor's log latch")
 }
 
-// TestSubmitMiningSolution_RecreatedCoinbaseIsFinal pins the coinbase block assembly builds when a
-// solution omits one. The solution's time and nonce used to be copied into that coinbase as its
-// nLockTime and input sequence, which made it non-final for any non-zero nonce
-// (bitcoin-sv/teranode#4981). They belong in the header only.
+// TestSubmitMiningSolution_RecreatedCoinbaseIsFinal pins the coinbase block assembly mines when a
+// solution omits one, under CSV and a warm median time past. The solution's time and nonce used to
+// be copied into that coinbase as its nLockTime and input sequence, which made it non-final for any
+// non-zero nonce (bitcoin-sv/teranode#4981). They belong in the header only, and the job's issued
+// coinbase is mined exactly as issued, so one submit of a nonce found in advance must land.
 func TestSubmitMiningSolution_RecreatedCoinbaseIsFinal(t *testing.T) {
 	h := newCoinbaseFinalityHarness(t)
 	h.warmMTP(t)
 
+	h.server.storeJobWithCoinbase(&h.id, h.candidate, nil)
+	require.NotEmpty(t, h.candidate.CoinbaseTx, "the job must carry the coinbase it was issued with")
+
 	nTime := h.candidate.Time
 
-	// The recreated coinbase carries a fresh random extranonce, so the merkle root, and with it
-	// whether a given nonce meets the target, cannot be known in advance. Regtest's target takes
-	// about half of all hashes, so resubmit until one does; a miss is a proof-of-work rejection,
-	// which deletes the job and resets assembly, so put the job back each time.
-	//
-	// This loop exists only because of that random rebuild, which is also why a real miner can
-	// never land a coinbase-less solution. It becomes a single submit once the job keeps the
-	// candidate's coinbase and reuses it, as bitcoin-sv does; that change is a separate PR.
-	var (
-		resp *blockassembly_api.OKResponse
-		err  error
-	)
+	// The header a miner builds from the issued candidate: with no subtrees, the coinbase txid is the
+	// whole merkle root. The search starts at 1 because a zero nonce copied into the coinbase
+	// sequence would look the same as no copy.
+	issuedCoinbase, err := bt.NewTxFromBytes(h.candidate.CoinbaseTx)
+	require.NoError(t, err)
 
-	for attempt := 0; attempt < 64; attempt++ {
-		h.server.jobStore.Set(h.id, h.job, time.Minute)
-
-		resp, err = h.server.submitMiningSolution(context.Background(), &BlockSubmissionRequest{
-			SubmitMiningSolutionRequest: &blockassembly_api.SubmitMiningSolutionRequest{
-				Id:    h.idBytes,
-				Nonce: 7,
-				Time:  &nTime,
-			},
-		})
-		if err == nil {
+	header := &model.BlockHeader{
+		Version: h.candidate.Version, HashPrevBlock: h.tip.Hash(),
+		HashMerkleRoot: issuedCoinbase.TxIDChainHash(), Timestamp: nTime, Bits: h.nBits, Nonce: 1,
+	}
+	for {
+		if met, _, _ := header.HasMetTargetDifficulty(); met {
 			break
 		}
-
-		require.Contains(t, err.Error(), "target difficulty", "the only acceptable failure is a nonce that misses the target")
-
-		select {
-		case <-h.resets:
-		case <-time.After(time.Second):
-		}
+		header.Nonce++
 	}
 
+	nonce := header.Nonce
+
+	resp, err := h.server.submitMiningSolution(t.Context(), &BlockSubmissionRequest{
+		SubmitMiningSolutionRequest: &blockassembly_api.SubmitMiningSolutionRequest{
+			Id:    h.idBytes,
+			Nonce: nonce,
+			Time:  &nTime,
+		},
+	})
 	require.NoError(t, err)
 	require.True(t, resp.Ok)
 
 	block := h.requireMined(t, true)
-	require.Equal(t, uint32(7), block.Header.Nonce, "the nonce belongs in the header")
+	require.Equal(t, nonce, block.Header.Nonce, "the nonce belongs in the header")
 	require.Equal(t, nTime, block.Header.Timestamp, "the time belongs in the header")
 	require.Zero(t, block.CoinbaseTx.LockTime, "the time must not be copied into the coinbase nLockTime")
 	require.Equal(t, bt.DefaultSequenceNumber, block.CoinbaseTx.Inputs[0].SequenceNumber, "the nonce must not be copied into the coinbase sequence")
