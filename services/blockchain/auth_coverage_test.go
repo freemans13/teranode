@@ -34,6 +34,8 @@ func TestBlockchainAuthMethodCoverage(t *testing.T) {
 		"/blockchain_api.BlockchainAPI/GetBlockHeadersFromCommonAncestor":    true,
 		"/blockchain_api.BlockchainAPI/GetBlockHeadersFromTill":              true,
 		"/blockchain_api.BlockchainAPI/GetBlockHeadersFromHeight":            true,
+		"/blockchain_api.BlockchainAPI/GetBestTipChanges":                    true,
+		"/blockchain_api.BlockchainAPI/GetBestTipSeq":                        true,
 		"/blockchain_api.BlockchainAPI/GetBlockHeadersByHeight":              true,
 		"/blockchain_api.BlockchainAPI/GetMedianTimePastByHeights":           true,
 		"/blockchain_api.BlockchainAPI/GetBlocksByHeight":                    true,

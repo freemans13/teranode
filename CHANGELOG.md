@@ -106,6 +106,21 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **The blockchain store numbers every change of the best tip, and block assembly
+  replays them.** On first start the blockchain store adds a nullable `best_tip_seq`
+  column and an `idx_best_tip_seq` index to `blocks`, on PostgreSQL and SQLite; the
+  index is built on the existing rows, so the first start takes longer on a large
+  table. The blockchain service gains the `GetBestTipChanges` and `GetBestTipSeq`
+  RPCs, which require the admin API key like every other. Block assembly applies each
+  change in order instead of jumping to the best header, so a branch that was the best
+  chain only briefly is moved forward and back through the pool. It keeps its position
+  under a new state key, `BlockAssemblerBestTipSeq`, and a new setting,
+  `blockassembly_reconcileInterval` (default `30s`, `0` turns it off), wakes a replay
+  when no block notification arrived for that long. Upgrade in any order: block
+  assembly against an older blockchain service follows the best header as before, and
+  an older binary ignores the new column and state key, so a rollback needs no step.
+  (#2063)
+
 - **A policy-mode script error is classified by a consensus re-run.** When policy
   validation fails on `SCRIPTNUM_OVERFLOW`, `OP_COUNT`, `SCRIPT_SIZE`, `PUBKEY_COUNT`,
   `SCRIPTNUM_MINENCODE` or `STACK_SIZE`, the validator runs the scripts again under

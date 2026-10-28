@@ -281,8 +281,21 @@ func (m *Mock) GetBlockHeadersFromHeight(ctx context.Context, height, limit uint
 	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Error(2)
 }
 
+// errTipChangesNotMocked is what GetBestTipChanges and GetBestTipSeq return when a test set no
+// expectation for them: the answer of a blockchain service that does not number its tip changes,
+// which keeps a caller such as block assembly on its best-header path, as before the numbers
+// existed. A test that wants the replay sets an expectation, or uses a real store.
+var errTipChangesNotMocked = errors.NewServiceUnavailableError("best tip changes not mocked")
+
 // GetBestTipChanges mocks the GetBestTipChanges method
-func (m *Mock) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
+func (m *Mock) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) (headers []*model.BlockHeader, metas []*model.BlockHeaderMeta, seqs []uint64, err error) {
+	defer func() {
+		// testify panics on a call with no expectation; see errTipChangesNotMocked.
+		if r := recover(); r != nil {
+			headers, metas, seqs, err = nil, nil, nil, errTipChangesNotMocked
+		}
+	}()
+
 	args := m.Called(ctx, afterSeq, minHeight, limit)
 
 	if args.Error(3) != nil {
@@ -293,7 +306,14 @@ func (m *Mock) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight
 }
 
 // GetBestTipSeq mocks the GetBestTipSeq method
-func (m *Mock) GetBestTipSeq(ctx context.Context) (uint64, error) {
+func (m *Mock) GetBestTipSeq(ctx context.Context) (seq uint64, err error) {
+	defer func() {
+		// testify panics on a call with no expectation; see errTipChangesNotMocked.
+		if r := recover(); r != nil {
+			seq, err = 0, errTipChangesNotMocked
+		}
+	}()
+
 	args := m.Called(ctx)
 
 	if args.Error(1) != nil {

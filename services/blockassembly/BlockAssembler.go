@@ -214,6 +214,23 @@ type BlockAssembler struct {
 	// so multiple triggers coalesce into a single reconciliation pass.
 	reconcileCh chan struct{}
 
+	// bestTipSeq is the replay position: the number of the last change of the best tip
+	// that block assembly has applied (see replayBestTipChanges). bestTipSeqKnown is false
+	// until the position has been read, and stays false against a blockchain service that
+	// does not number the changes, which leaves block assembly following the best header.
+	bestTipSeq      atomic.Uint64
+	bestTipSeqKnown atomic.Bool
+
+	// bestTipSeqSaved is the position last persisted under BestTipSeqStateKey.
+	bestTipSeqSaved atomic.Uint64
+
+	// lastBestTipReplay is when processNewBlockAnnouncement last ran, in Unix nanoseconds.
+	// The idle tick wakes a replay once it is older than blockassembly_reconcileInterval.
+	lastBestTipReplay atomic.Int64
+
+	// bestTipReplayFailures counts consecutive failed replay passes.
+	bestTipReplayFailures atomic.Int32
+
 	// currentRunningState tracks the current operational state
 	currentRunningState atomic.Value
 
@@ -571,6 +588,13 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// dequeued in no subtree. Not a storage fault, so it resets
 				// even while degraded, as a plain (not storage-triggered)
 				// reset.
+				// Wake a replay of the tip changes if none ran for
+				// blockassembly_reconcileInterval: a dropped subscription
+				// delivers no notification until it reconnects.
+				if b.reconcileDue(time.Now()) {
+					b.triggerReconcile()
+				}
+
 				if b.subtreeProcessor.TakeDrainResetRequested() {
 					b.logger.Warnf("[BlockAssembler] the queue drain after a block failed; resetting block assembly")
 					b.resetAfterDrainFailure()
@@ -668,7 +692,16 @@ drain:
 		}
 	}
 
+	// The reset moves to the best tip as it reads it, which includes every change numbered
+	// up to now, so the replay position can move past them once it has succeeded.
+	seqBefore, seqKnown := b.bestTipSeqBeforeReset(ctx)
+
 	resp, err := b.resetWithResponse(ctx, validateInputs)
+
+	if err == nil && seqKnown {
+		b.advanceBestTipSeq(seqBefore)
+		b.saveBestTipSeq(ctx)
+	}
 
 	// The Reset path replays moveForward blocks through the same
 	// conflict resolution, so it can queue refusals too. Unlike the
@@ -1233,7 +1266,15 @@ func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *ch
 	return err
 }
 
-// processNewBlockAnnouncement updates the best block information.
+// processNewBlockAnnouncement brings block assembly to the chain's best tip. Every block
+// notification and every reconcile wake-up lands here, and the notification's own block is
+// not read: the tip changes are.
+//
+// It replays the changes of the best tip the blockchain store has numbered since the last
+// one block assembly applied (replayBestTipChanges), so a branch that was the best chain only
+// briefly is moved forward and back like any other, even when block assembly was busy while
+// it won and lost. Against a blockchain service without the numbers it follows the best
+// header, as before.
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -1255,6 +1296,12 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 	// acquisition), and it must run AFTER movement, never during it.
 	defer b.drainPendingInvalidations(ctx)
 
+	b.lastBestTipReplay.Store(time.Now().UnixNano())
+
+	if !b.followBestTipChanges(ctx) {
+		return
+	}
+
 	// Use context-aware logger for trace correlation
 	ctxLogger := b.logger.WithTraceContext(ctx)
 
@@ -1263,6 +1310,21 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 		ctxLogger.Errorf("[BlockAssembler] error getting best block header: %v", err)
 		return
 	}
+
+	_ = b.moveToBlock(ctx, bestBlockchainBlockHeader, bestBlockchainBlockHeaderMeta)
+}
+
+// moveToBlock moves block assembly from its tip to the given block by the shortest path
+// through their common ancestor: a single move-forward, a catch-up, an in-memory reorg, or a
+// full reset. The block need not be the best tip: the replay of tip changes passes each
+// block that was the best tip in turn. On success block assembly's tip is the block and its
+// state is persisted.
+//
+// It logs and counts its own failures, and returns the error so the replay can stop at the
+// failed change. An ErrBlockAssemblyReset means a reset ran, which leaves block assembly on
+// the chain's current best tip rather than on this block.
+func (b *BlockAssembler) moveToBlock(ctx context.Context, bestBlockchainBlockHeader *model.BlockHeader, bestBlockchainBlockHeaderMeta *model.BlockHeaderMeta) (err error) {
+	ctxLogger := b.logger.WithTraceContext(ctx)
 
 	ctxLogger.Infof("[BlockAssembler][%s] new best block header: %d", bestBlockchainBlockHeader.Hash(), bestBlockchainBlockHeaderMeta.Height)
 
@@ -1291,14 +1353,14 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 	switch {
 	case bestBlockAccordingToBlockchain.Hash().IsEqual(bestBlockAccordingToBlockAssembly.Hash()):
 		ctxLogger.Infof("[BlockAssembler][%s] best block header is the same as the current best block header: %s", bestBlockchainBlockHeader.Hash(), bestBlockAccordingToBlockAssembly.Hash())
-		return
+		return nil
 
 	case !bestBlockchainBlockHeader.HashPrevBlock.IsEqual(bestBlockAccordingToBlockAssembly.Hash()):
 		moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, bestBlockchainBlockHeaderMeta.Height)
 		if err != nil {
 			ctxLogger.Errorf("[BlockAssembler][%s] error fetching blocks for reorg/catch-up decision: %v", bestBlockchainBlockHeader.Hash(), err)
 			prometheusBlockAssemblyProcessingStuck.WithLabelValues("reorg_blocks_fetch").Inc()
-			return
+			return err
 		}
 
 		if len(moveBackBlocksWithMeta) == 0 {
@@ -1309,7 +1371,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 			if err = b.handleCatchUp(ctx, moveForwardBlocksWithMeta); err != nil {
 				ctxLogger.Errorf("[BlockAssembler][%s] error catching up: %v", bestBlockchainBlockHeader.Hash(), err)
 				prometheusBlockAssemblyProcessingStuck.WithLabelValues("catchup").Inc()
-				return
+				return err
 			}
 		} else {
 			ctxLogger.Infof("[BlockAssembler][%s] best block header is not the same as the previous best block header, reorging: %s", bestBlockchainBlockHeader.Hash(), bestBlockAccordingToBlockAssembly.Hash())
@@ -1324,7 +1386,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 					prometheusBlockAssemblyProcessingStuck.WithLabelValues("reorg").Inc()
 				}
 
-				return
+				return err
 			}
 		}
 	default:
@@ -1335,7 +1397,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 		if block, err = b.blockchainClient.GetBlock(ctx, bestBlockchainBlockHeader.Hash()); err != nil {
 			ctxLogger.Errorf("[BlockAssembler][%s] error getting block from blockchain: %v", bestBlockchainBlockHeader.Hash(), err)
 			prometheusBlockAssemblyProcessingStuck.WithLabelValues("get_block").Inc()
-			return
+			return err
 		}
 
 		b.setCurrentRunningState(StateMovingUp)
@@ -1343,7 +1405,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 		if err = b.subtreeProcessor.MoveForwardBlock(block); err != nil {
 			ctxLogger.Errorf("[BlockAssembler][%s] error moveForwardBlock in subtree processor: %v", bestBlockchainBlockHeader.Hash(), err)
 			prometheusBlockAssemblyProcessingStuck.WithLabelValues("moveforward").Inc()
-			return
+			return err
 		}
 	}
 
@@ -1359,6 +1421,8 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 	if err = b.SetState(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		ctxLogger.Errorf("[BlockAssembler][%s] error setting state: %v", bestBlockchainBlockHeader.Hash(), err)
 	}
+
+	return nil
 }
 
 // setBestBlockHeader updates the internal best block header and height atomically.
@@ -1453,6 +1517,11 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	if err = b.initState(ctx); err != nil {
 		return errors.NewProcessingError("[BlockAssembler] failed to initialize state: %v", err)
 	}
+
+	// Read the replay position before the first wake-up, so the changes of the best tip made
+	// while block assembly was down are replayed from where it stopped.
+	b.loadBestTipSeq(ctx)
+	b.lastBestTipReplay.Store(time.Now().UnixNano())
 
 	// Wait for any pending blocks to be processed before loading unmined transactions
 	if !b.skipWaitForPendingBlocks {
