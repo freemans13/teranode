@@ -231,6 +231,13 @@ type BlockAssembler struct {
 	// bestTipReplayFailures counts consecutive failed replay passes.
 	bestTipReplayFailures atomic.Int32
 
+	// lastBestTipSeqProbe is when loadBestTipSeq last found the blockchain service without
+	// numbered tip changes, in Unix nanoseconds. The next probe waits bestTipSeqProbeInterval.
+	lastBestTipSeqProbe atomic.Int64
+
+	// bestTipSeqUnsupportedLogged is set once that finding has been logged as a warning.
+	bestTipSeqUnsupportedLogged atomic.Bool
+
 	// currentRunningState tracks the current operational state
 	currentRunningState atomic.Value
 
@@ -591,7 +598,10 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// Wake a replay of the tip changes if none ran for
 				// blockassembly_reconcileInterval: a dropped subscription
 				// delivers no notification until it reconnects.
-				if b.reconcileDue(time.Now()) {
+				// The check runs outside StateReconciling, so a mining candidate asked
+				// for meanwhile is not an empty one, and a replay starts only when the
+				// tip moved.
+				if b.reconcileDue(time.Now()) && b.idleReconcileNeeded(ctx) {
 					b.triggerReconcile()
 				}
 

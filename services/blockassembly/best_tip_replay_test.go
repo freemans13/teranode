@@ -363,6 +363,97 @@ func TestReplayBestTipChanges_RepeatedFailureFollowsBestHeader(t *testing.T) {
 	require.Equal(t, uint64(42), ba.bestTipSeq.Load(), "the position jumps to the latest change")
 }
 
+// TestReplayBestTipChanges_ProbeIsRateLimited checks that against a blockchain service without
+// the numbers, block assembly asks again only after bestTipSeqProbeInterval, so a mixed-version
+// deploy does not cost an RPC and a warning on every wake-up.
+func TestReplayBestTipChanges_ProbeIsRateLimited(t *testing.T) {
+	m := &blockchain.Mock{}
+	m.On("GetBestTipSeq", mock.Anything).Return(uint64(0), errors.NewServiceUnavailableError("not implemented"))
+
+	ba := &BlockAssembler{blockchainClient: m, logger: ulogger.TestLogger{}}
+
+	require.True(t, ba.followBestTipChanges(t.Context()))
+	require.True(t, ba.followBestTipChanges(t.Context()))
+	m.AssertNumberOfCalls(t, "GetBestTipSeq", 1)
+	require.True(t, ba.bestTipSeqUnsupportedLogged.Load())
+
+	ba.lastBestTipSeqProbe.Store(time.Now().Add(-bestTipSeqProbeInterval).UnixNano())
+	require.True(t, ba.followBestTipChanges(t.Context()))
+	m.AssertNumberOfCalls(t, "GetBestTipSeq", 2)
+}
+
+// TestLoadBestTipSeq_NoPersistedPosition checks the start without a persisted position: on
+// the best tip, block assembly starts at the latest change, so it is not moved through the
+// stale branches recorded before it; off the best tip, it replays the recent changes from 0.
+func TestLoadBestTipSeq_NoPersistedPosition(t *testing.T) {
+	initPrometheusMetrics()
+
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+
+	a1 := buildChain(genesis, 1, 13000)[0]
+	addChain(t, items, []*model.BlockHeader{a1})
+
+	// A stale branch that was the best chain for a while.
+	b := buildChain(genesis, 2, 14000)
+	addChain(t, items, b)
+	a := buildChain(a1, 2, 15000)
+	addChain(t, items, a)
+
+	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
+	require.NoError(t, err)
+	require.NotZero(t, latest)
+
+	ba := items.blockAssembler
+
+	ba.setBestBlockHeader(a[1], 3)
+	ba.bestTipSeqKnown.Store(false)
+	ba.loadBestTipSeq(t.Context())
+	require.True(t, ba.bestTipSeqKnown.Load())
+	require.Equal(t, latest, ba.bestTipSeq.Load(), "on the best tip there is nothing to replay")
+
+	moves := recordMoves(t, items)
+	ba.processNewBlockAnnouncement(t.Context())
+	require.Empty(t, *moves, "the stale branch is not replayed")
+
+	ba.setBestBlockHeader(a1, 1)
+	ba.bestTipSeqKnown.Store(false)
+	ba.loadBestTipSeq(t.Context())
+	require.True(t, ba.bestTipSeqKnown.Load())
+	require.Equal(t, uint64(0), ba.bestTipSeq.Load(), "off the best tip the recent changes are replayed")
+}
+
+// TestIdleReconcileNeeded checks that the idle tick starts a replay only when the tip moved:
+// a check that finds nothing keeps block assembly out of StateReconciling, where a mining
+// candidate is an empty one.
+func TestIdleReconcileNeeded(t *testing.T) {
+	initPrometheusMetrics()
+
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+
+	chain := buildChain(genesis, 2, 16000)
+	addChain(t, items, chain[:1])
+
+	ba := items.blockAssembler
+	startReplayAt(t, items, chain[0], 1)
+
+	ba.lastBestTipReplay.Store(0)
+	require.False(t, ba.idleReconcileNeeded(t.Context()), "nothing moved")
+	require.NotZero(t, ba.lastBestTipReplay.Load(), "the check waits a full interval before the next one")
+
+	// A block whose notification was lost.
+	addChain(t, items, chain[1:])
+	require.True(t, ba.idleReconcileNeeded(t.Context()), "a new change of the best tip")
+
+	// Against a blockchain service without the numbers, the best header decides.
+	ba.bestTipSeqKnown.Store(false)
+	require.True(t, ba.idleReconcileNeeded(t.Context()), "block assembly is behind the best header")
+
+	ba.setBestBlockHeader(chain[1], 2)
+	require.False(t, ba.idleReconcileNeeded(t.Context()), "block assembly is on the best header")
+}
+
 func TestReconcileDue(t *testing.T) {
 	ba := &BlockAssembler{settings: createTestSettings(t)}
 	ba.settings.BlockAssembly.ReconcileInterval = 30 * time.Second

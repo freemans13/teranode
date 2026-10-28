@@ -24,6 +24,10 @@ const (
 	// assembly follows the best header once instead, so a change it cannot apply does not
 	// hold it off the tip for ever.
 	maxBestTipReplayFailures = 3
+
+	// bestTipSeqProbeInterval is how often block assembly asks a blockchain service that did
+	// not number its tip changes whether it does now, as it will once it is upgraded.
+	bestTipSeqProbeInterval = time.Minute
 )
 
 // errBestTipReset reports that applying a tip change ran a full reset, which leaves block
@@ -48,13 +52,22 @@ func DecodeBestTipSeq(data []byte) (uint64, error) {
 }
 
 // loadBestTipSeq reads the replay position at start-up. A persisted position is used as it
-// is: the changes made while block assembly was down are after it. Without one the position
-// is 0, and the height floor in replayBestTipChanges limits the replay to recent changes, of
-// which every one on block assembly's own chain is a no-op. If the blockchain service does
-// not number its tip changes the position stays unknown, and the next wake-ups retry.
+// is: the changes made while block assembly was down are after it. Without one, block
+// assembly starts at the latest change when it is on the best tip, since there is nothing to
+// replay, and at 0 otherwise, where the height floor in replayBestTipChanges limits the
+// replay to recent changes. If the blockchain service does not number its tip changes the
+// position stays unknown, and a wake-up retries after bestTipSeqProbeInterval.
 func (b *BlockAssembler) loadBestTipSeq(ctx context.Context) {
-	if _, err := b.blockchainClient.GetBestTipSeq(ctx); err != nil {
-		b.logger.Warnf("[BlockAssembler] blockchain service does not number tip changes, following the best header: %v", err)
+	latest, err := b.blockchainClient.GetBestTipSeq(ctx)
+	if err != nil {
+		b.lastBestTipSeqProbe.Store(time.Now().UnixNano())
+
+		if b.bestTipSeqUnsupportedLogged.CompareAndSwap(false, true) {
+			b.logger.Warnf("[BlockAssembler] blockchain service does not number tip changes, following the best header and asking again every %s: %v", bestTipSeqProbeInterval, err)
+		} else {
+			b.logger.Debugf("[BlockAssembler] blockchain service still does not number tip changes: %v", err)
+		}
+
 		return
 	}
 
@@ -69,7 +82,7 @@ func (b *BlockAssembler) loadBestTipSeq(ctx context.Context) {
 			seq = 0
 		}
 	case errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), sql.ErrNoRows.Error()):
-		b.logger.Infof("[BlockAssembler] no persisted best tip position, replaying recent tip changes")
+		seq = b.startingBestTipSeq(ctx, latest)
 	default:
 		b.logger.Warnf("[BlockAssembler] error reading best tip position, following the best header until it can be read: %v", err)
 		return
@@ -88,6 +101,10 @@ func (b *BlockAssembler) loadBestTipSeq(ctx context.Context) {
 // although block assembly is not on the best tip, which no change of the tip should ever leave.
 func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 	if !b.bestTipSeqKnown.Load() {
+		if time.Since(time.Unix(0, b.lastBestTipSeqProbe.Load())) < bestTipSeqProbeInterval {
+			return true
+		}
+
 		b.loadBestTipSeq(ctx)
 
 		if !b.bestTipSeqKnown.Load() {
@@ -259,6 +276,48 @@ func (b *BlockAssembler) applyBestTipChange(ctx context.Context, header *model.B
 	b.logger.Infof("[BlockAssembler] replaying best tip change %d: %s", meta.Height, hash)
 
 	return b.moveToBlock(ctx, header, meta)
+}
+
+// startingBestTipSeq is the replay position without a persisted one. On the best tip, block
+// assembly starts at latest: replaying older changes would move it onto every stale branch
+// recorded within the floor and back again. Off it, it starts at 0, and the replay moves it to
+// the tip through the recent changes.
+func (b *BlockAssembler) startingBestTipSeq(ctx context.Context, latest uint64) uint64 {
+	tip, _ := b.CurrentBlock()
+
+	best, _, err := b.blockchainClient.GetBestBlockHeader(ctx)
+	if err == nil && tip != nil && best.Hash().IsEqual(tip.Hash()) {
+		b.logger.Infof("[BlockAssembler] no persisted best tip position, block assembly is on the best tip, starting at change %d", latest)
+		return latest
+	}
+
+	b.logger.Infof("[BlockAssembler] no persisted best tip position, replaying recent tip changes")
+
+	return 0
+}
+
+// idleReconcileNeeded reports whether the idle tick should start a replay: when a change of
+// the best tip arrived after the replay position, or block assembly is not on the best tip.
+// It runs outside StateReconciling, so a mining candidate asked for during the check is
+// built as usual. It stamps lastBestTipReplay, so the next check waits a full interval.
+func (b *BlockAssembler) idleReconcileNeeded(ctx context.Context) bool {
+	b.lastBestTipReplay.Store(time.Now().UnixNano())
+
+	if b.bestTipSeqKnown.Load() {
+		if seq, err := b.blockchainClient.GetBestTipSeq(ctx); err == nil && seq > b.bestTipSeq.Load() {
+			return true
+		}
+	}
+
+	best, _, err := b.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		// The replay reports the error.
+		return true
+	}
+
+	tip, _ := b.CurrentBlock()
+
+	return tip == nil || !best.Hash().IsEqual(tip.Hash())
 }
 
 // bestTipFloor is the lowest height of a change the replay reads, the tip minus the UTXO
