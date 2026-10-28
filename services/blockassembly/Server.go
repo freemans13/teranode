@@ -1985,6 +1985,8 @@ func (ba *BlockAssembly) checkCoinbaseTimeLockFinality(ctx context.Context, jobI
 	}
 
 	if reason := model.CoinbaseFinalityViolation(coinbaseTx, nTime, height, params, parentMedianTimePast); reason != "" {
+		ba.logger.Warnf("[BlockAssembly][%s] rejected mining solution, coinbase is not final: %s (parent median time past %d, coinbase nLockTime %d)", jobID, reason, parentMedianTimePast, coinbaseTx.LockTime)
+
 		return errors.NewBlockInvalidError("[BlockAssembly][%s] coinbase is not final: %s", jobID, reason)
 	}
 
