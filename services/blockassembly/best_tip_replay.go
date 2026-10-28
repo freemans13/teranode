@@ -334,6 +334,9 @@ func (b *BlockAssembler) startingBestTipSeq(ctx context.Context, latest uint64) 
 // built as usual. It stamps lastBestTipReplay, so the next check waits a full interval.
 func (b *BlockAssembler) idleReconcileNeeded(ctx context.Context) bool {
 	b.lastBestTipReplay.Store(time.Now().UnixNano())
+	if b.bestTipResetReplayPending.Load() {
+		return true
+	}
 
 	if b.bestTipSeqKnown.Load() {
 		if seq, err := b.blockchainClient.GetBestTipSeq(ctx); err == nil && seq > b.bestTipSeq.Load() {
@@ -401,6 +404,12 @@ func (b *BlockAssembler) saveBestTipSeq(ctx context.Context) {
 // blockassembly_reconcileInterval. It covers lost notifications, because the blockchain
 // service drops a subscriber whose buffer fills and nothing arrives until it reconnects.
 func (b *BlockAssembler) reconcileDue(now time.Time) bool {
+	// Recovery of a reset that already discarded its pool is mandatory even
+	// when ordinary lost-notification reconciliation is disabled.
+	if b.bestTipResetReplayPending.Load() {
+		return true
+	}
+
 	interval := b.settings.BlockAssembly.ReconcileInterval
 	if interval <= 0 {
 		return false

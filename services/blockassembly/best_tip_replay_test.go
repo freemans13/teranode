@@ -470,6 +470,9 @@ func TestReconcileDue(t *testing.T) {
 
 	ba.settings.BlockAssembly.ReconcileInterval = 0
 	require.False(t, ba.reconcileDue(now), "0 turns the timer off")
+	ba.bestTipResetReplayPending.Store(true)
+	require.True(t, ba.reconcileDue(now), "failed reset recovery is retried even with the timer off")
+	require.True(t, ba.idleReconcileNeeded(t.Context()), "pending reset recovery must not wait for a new block")
 }
 
 func TestBestTipFloor(t *testing.T) {
