@@ -81,7 +81,8 @@ Test file layout:
   behaviour it covers (`create_arena_test.go`). Never name a file by how it was
   written: no `_additional`, `_coverage`, `_extra`, `_more`, `_new` or numeric
   suffixes.
-- Keep tests next to the code (same package); don't move them to a separate tree.
+- Keep unit tests in the same directory as the code; don't move them to a
+  separate tree. The top-level `test/` tree is for e2e and multi-node tests.
 - Search production code first and open tests only when needed. Most hits for a
   common identifier are in tests: `git grep <name> -- ':!*_test.go'`.
 
