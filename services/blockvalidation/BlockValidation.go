@@ -147,6 +147,11 @@ type revalidateBlockData struct {
 	// retries tracks the number of revalidation attempts
 	retries int
 
+	// parentNotMinedRetries counts the re-queues taken because the parent was not mined yet. It is
+	// a budget separate from retries: a not-ready parent is not a failed attempt, and it needs a
+	// delay between checks, where a failed attempt is retried at once.
+	parentNotMinedRetries int
+
 	// useFullValidation sends the worker back through ValidateBlockWithOptions instead of
 	// reValidateBlock. Needed whenever the retry must reach a step reValidateBlock does not
 	// perform: AddBlock for a block that failed before it was stored, and the invalid-flag
@@ -310,6 +315,12 @@ type BlockValidation struct {
 	// can never observe "not running" for a worker that is about to drain.
 	revalidateWorkerRunning atomic.Bool
 
+	// revalidateParentNotMinedDelay and revalidateParentNotMinedMaxRetries pace the re-queue of a
+	// block whose parent is not mined yet (see processRevalidation). Fields rather than constants so
+	// tests can shorten them.
+	revalidateParentNotMinedDelay      time.Duration
+	revalidateParentNotMinedMaxRetries int
+
 	// stats tracks operational metrics for monitoring
 	stats *gocore.Stat
 
@@ -453,6 +464,9 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		stats:                         gocore.NewStat("blockvalidation"),
 		mmapDir:                       tSettings.BlockValidation.SubtreeMmapDir,
 	}
+
+	bv.revalidateParentNotMinedDelay = revalidateParentNotMinedDelay
+	bv.revalidateParentNotMinedMaxRetries = revalidateParentNotMinedMaxRetries
 
 	// Wire the optional peer-reputation client from the variadic opts BEFORE any goroutine
 	// (stats ticker, blockchain subscription, revalidate worker) launches, so no worker can
@@ -829,76 +843,123 @@ func (u *BlockValidation) start(ctx context.Context) error {
 
 				return
 			case blockData := <-u.revalidateBlockChan:
-				startTime := time.Now()
-
-				u.logger.Infof("[BlockValidation:start][%s] block revalidation Chan", blockData.block.String())
-
-				// A block that never reached AddBlock has to go back through full validation:
-				// reValidateBlock re-checks an already-stored block and has no AddBlock on any
-				// path, so sending a not-yet-added block there would validate it and discard it.
-				// IsRequeuedRetry stops the retried attempt from enqueuing itself again, so the
-				// worker's retry counter below stays the only retry budget.
-				var err error
-				if blockData.useFullValidation {
-					err = u.ValidateBlockWithOptions(ctx, blockData.block, blockData.baseURL, &ValidateBlockOptions{
-						PeerID:                  blockData.peerID,
-						IsRequeuedRetry:         true,
-						IsRevalidation:          blockData.isRevalidation,
-						DisableOptimisticMining: blockData.disableOptimisticMining,
-						IsCatchupMode:           blockData.isCatchupMode,
-					})
-				} else {
-					err = u.reValidateBlock(ctx, blockData)
-				}
-
-				if err != nil {
-					prometheusBlockValidationReValidateBlockErr.Observe(float64(time.Since(startTime).Microseconds() / 1_000_000))
-					// Check if context is done before logging
-					select {
-					case <-ctx.Done():
-						return
-					default:
-					}
-
-					u.logger.Errorf("[BlockValidation:start][%s] failed block revalidation, retrying: %s", blockData.block.String(), err)
-
-					// put the block back in the revalidateBlockChan
-					if blockData.retries < 3 {
-						blockData.retries++
-						go func() {
-							// A not-yet-added retry runs inside its own runOncePerBlock
-							// closure, so re-enqueuing immediately would collide with that
-							// attempt's own gate entry and short-circuit again. Wait out the
-							// grace window here, off the worker.
-							if blockData.useFullValidation {
-								select {
-								case <-time.After(revalidateFromScratchDelay):
-								case <-ctx.Done():
-									return
-								}
-							}
-
-							// Guard the re-enqueue: on shutdown the consumer (this
-							// worker) exits, so an unguarded send would leak this
-							// goroutine forever on the full channel.
-							select {
-							case u.revalidateBlockChan <- blockData:
-							case <-ctx.Done():
-							}
-						}()
-					} else {
-						u.logger.Errorf("[BlockValidation:start][%s] failed block revalidation, retries exhausted: %s", blockData.block.String(), err)
-					}
-				} else {
-					prometheusBlockValidationReValidateBlock.Observe(float64(time.Since(startTime).Microseconds() / 1_000_000))
-				}
-
-				u.logger.Infof("[BlockValidation:start][%s] block revalidation Chan DONE in %s", blockData.block.String(), time.Since(startTime))
+				u.processRevalidation(ctx, blockData)
 			}
 		}
 	}()
 
 	return nil
+}
+
+// revalidateParentNotMinedDelay is how long a block whose parent is not mined yet waits, off the
+// worker, before it is queued for another check. revalidateParentNotMinedMaxRetries bounds those
+// re-queues. Together they give the parent about 160 seconds, the same budget
+// ValidateBlockWithOptions waits at default settings (two waits of about 80 seconds), without
+// holding the revalidation worker for any of it.
+const (
+	revalidateParentNotMinedDelay      = 5 * time.Second
+	revalidateParentNotMinedMaxRetries = 32
+)
+
+// processRevalidation runs one revalidateBlockChan item on the revalidation worker and schedules
+// its re-queue on failure. It must not block on anything slow: the worker is the channel's only
+// consumer, the channel holds 2, and once it is full enqueueRevalidation blocks its callers inside
+// ValidateBlockWithOptions.
+func (u *BlockValidation) processRevalidation(ctx context.Context, blockData revalidateBlockData) {
+	startTime := time.Now()
+
+	u.logger.Infof("[BlockValidation:start][%s] block revalidation Chan", blockData.block.String())
+
+	// A block that never reached AddBlock has to go back through full validation:
+	// reValidateBlock re-checks an already-stored block and has no AddBlock on any
+	// path, so sending a not-yet-added block there would validate it and discard it.
+	// IsRequeuedRetry stops the retried attempt from enqueuing itself again, so the
+	// worker's retry counter below stays the only retry budget.
+	var err error
+	if blockData.useFullValidation {
+		err = u.ValidateBlockWithOptions(ctx, blockData.block, blockData.baseURL, &ValidateBlockOptions{
+			PeerID:                  blockData.peerID,
+			IsRequeuedRetry:         true,
+			IsRevalidation:          blockData.isRevalidation,
+			DisableOptimisticMining: blockData.disableOptimisticMining,
+			IsCatchupMode:           blockData.isCatchupMode,
+		})
+	} else {
+		err = u.reValidateBlock(ctx, blockData)
+	}
+
+	defer func() {
+		u.logger.Infof("[BlockValidation:start][%s] block revalidation Chan DONE in %s", blockData.block.String(), time.Since(startTime))
+	}()
+
+	if err == nil {
+		prometheusBlockValidationReValidateBlock.Observe(float64(time.Since(startTime).Microseconds() / 1_000_000))
+		return
+	}
+
+	prometheusBlockValidationReValidateBlockErr.Observe(float64(time.Since(startTime).Microseconds() / 1_000_000))
+	// Check if context is done before logging
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	// reValidateBlock found the parent not mined yet, so it read nothing and has no verdict. Check
+	// again after a delay, from a goroutine, so the worker goes straight back to the channel. This
+	// does not spend the ordinary retry budget below, which re-queues at once.
+	if !blockData.useFullValidation && errors.Is(err, errors.ErrBlockParentNotMined) {
+		if blockData.parentNotMinedRetries >= u.revalidateParentNotMinedMaxRetries {
+			u.logger.Errorf("[BlockValidation:start][%s] failed block revalidation, parent still not mined after %d checks, giving up: %s", blockData.block.String(), blockData.parentNotMinedRetries+1, err)
+			return
+		}
+
+		blockData.parentNotMinedRetries++
+
+		u.logger.Warnf("[BlockValidation:start][%s] parent not mined yet, checking again in %s (%d/%d)", blockData.block.String(), u.revalidateParentNotMinedDelay, blockData.parentNotMinedRetries, u.revalidateParentNotMinedMaxRetries)
+
+		go u.requeueRevalidationAfter(ctx, blockData, u.revalidateParentNotMinedDelay)
+
+		return
+	}
+
+	u.logger.Errorf("[BlockValidation:start][%s] failed block revalidation, retrying: %s", blockData.block.String(), err)
+
+	if blockData.retries >= 3 {
+		u.logger.Errorf("[BlockValidation:start][%s] failed block revalidation, retries exhausted: %s", blockData.block.String(), err)
+		return
+	}
+
+	blockData.retries++
+
+	// A not-yet-added retry runs inside its own runOncePerBlock closure, so re-enqueuing
+	// immediately would collide with that attempt's own gate entry and short-circuit again.
+	// Wait out the grace window, off the worker.
+	var delay time.Duration
+	if blockData.useFullValidation {
+		delay = revalidateFromScratchDelay
+	}
+
+	go u.requeueRevalidationAfter(ctx, blockData, delay)
+}
+
+// requeueRevalidationAfter puts blockData back on revalidateBlockChan after delay. It runs in its
+// own goroutine, never on the worker. Both the wait and the send stop at shutdown: the worker, the
+// channel's only consumer, exits then, so an unguarded send would leak this goroutine forever on a
+// full channel.
+func (u *BlockValidation) requeueRevalidationAfter(ctx context.Context, blockData revalidateBlockData, delay time.Duration) {
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	select {
+	case u.revalidateBlockChan <- blockData:
+	case <-ctx.Done():
+	}
 }
 
 // processBlockMinedNotSet enqueues every block the blockchain reports as still needing
@@ -3486,8 +3547,7 @@ func (u *BlockValidation) checkpointConfirmedAncestor(ctx context.Context, b *mo
 // This method handles blocks that failed initial validation or need reverification.
 //
 // Parameters:
-//   - ctx: the revalidation worker's context. Cancelling it, at shutdown, cuts short the wait for
-//     the parent to be mined, so the worker is not held for that wait's full budget.
+//   - ctx: the revalidation worker's context, so shutdown cancels the store reads and validation.
 //   - blockData: Contains the block and context for revalidation
 //
 // Returns an error if revalidation fails.
@@ -3559,21 +3619,28 @@ func (u *BlockValidation) reValidateBlock(ctx context.Context, blockData revalid
 		return errors.NewBlockInvalidError("[reValidateBlock][%s] parent block is invalid", blockData.block.Hash().String())
 	}
 
-	// Wait for setTxMined on the parent before block.Valid reads the parent txs' BlockIDs, as
-	// ValidateBlockWithOptions does. Until it has run, a parent tx first mined in a losing fork block
-	// still reads BlockIDs=[fork], and the ancestor check below says INVALID for an honest block. The
-	// parentHeaderRun-failure enqueue in ValidateBlockWithOptions reaches this worker before that
-	// function's own wait, so nothing else guarantees it here. The parent's mined flag cannot be
-	// taken from blockHeadersMeta: with the in-memory chain check on, GetBlockHeaders is served from
-	// a cache that SetBlockMinedSet does not clear. isParentMined reads GetBlockIsMined, whose cache
-	// it does clear.
-	if err = u.waitForPreviousBlocksToBeProcessed(ctx, blockData.block, blockHeaders); err != nil {
-		// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
+	// setTxMined must have run on the parent before block.Valid reads the parent txs' BlockIDs, as
+	// ValidateBlockWithOptions waits for. Until it has run, a parent tx first mined in a losing fork
+	// block still reads BlockIDs=[fork], and the ancestor check below says INVALID for an honest
+	// block. The parentHeaderRun-failure enqueue in ValidateBlockWithOptions reaches this worker
+	// before that function's own wait, so nothing else guarantees it here. The parent's mined flag
+	// cannot be taken from blockHeadersMeta: with the in-memory chain check on, GetBlockHeaders is
+	// served from a cache that SetBlockMinedSet does not clear. isParentMined reads GetBlockIsMined,
+	// whose cache it does clear.
+	//
+	// Check once and do not wait. This runs on the single revalidation worker, and a wait here would
+	// hold it while the channel fills and its producers block. When the parent is not mined, nudge
+	// its setTxMined and return ErrBlockParentNotMined with no verdict read. processRevalidation
+	// checks again after a delay, off the worker.
+	parentMined, err := u.isParentMined(ctx, blockData.block.Header)
+	if err != nil {
+		return err
+	}
+
+	if !parentMined {
 		u.enqueueSetMined(blockData.block.Header.HashPrevBlock)
 
-		if err = u.waitForPreviousBlocksToBeProcessed(ctx, blockData.block, blockHeaders); err != nil {
-			return errors.NewBlockError("[reValidateBlock][%s] given up waiting on previous blocks to be ready %s", blockData.block.Hash().String(), blockData.block.Header.HashPrevBlock.String(), err)
-		}
+		return errors.NewBlockParentNotMinedError("[reValidateBlock][%s] parent block %s not mined yet", blockData.block.Hash().String(), blockData.block.Header.HashPrevBlock.String())
 	}
 
 	// validate all the subtrees in the block
@@ -3647,7 +3714,7 @@ func (u *BlockValidation) reValidateBlock(ctx context.Context, blockData revalid
 	// chain reads INVALID for any parent mined deeper than the parent-header window. So act only
 	// when the parent is on the main chain, and otherwise return the verdict unacted for the worker
 	// to retry, as before. The verdict also relies on the parent txs' BlockIDs being complete, which
-	// the waitForPreviousBlocksToBeProcessed call above guarantees.
+	// the isParentMined check above guarantees.
 	err = u.checkOldBlockIDs(ctx, oldBlockIDsMap, blockData.block)
 	if errors.Is(err, errors.ErrBlockInvalid) && u.ancestorVerdictIsSound(ctx, blockData.block, blockHeadersMeta) {
 		reason := p2pconstants.ReasonInvalidBlock.String()
@@ -3664,8 +3731,8 @@ func (u *BlockValidation) reValidateBlock(ctx context.Context, blockData revalid
 // current main chain. Then the main chain below block is block's own ancestor chain, so the
 // main-chain verdict is also an ancestor verdict.
 //
-// It does not check the parent's mined flag: reValidateBlock has already waited for that through
-// waitForPreviousBlocksToBeProcessed, and blockHeadersMeta[0].MinedSet can be a stale cached value.
+// It does not check the parent's mined flag: reValidateBlock has already checked it through
+// isParentMined, and blockHeadersMeta[0].MinedSet can be a stale cached value.
 //
 // A lookup error or a missing parent reads as false, the direction that never invalidates.
 func (u *BlockValidation) ancestorVerdictIsSound(ctx context.Context, block *model.Block, blockHeadersMeta []*model.BlockHeaderMeta) bool {

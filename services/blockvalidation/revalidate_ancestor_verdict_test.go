@@ -139,17 +139,17 @@ func TestReValidateBlock_InvalidAncestorVerdictOnForkChainIsNotActedOn(t *testin
 		"reValidateBlock published an invalid-block notification for an honest block whose parent is off the main chain")
 }
 
-// TestReValidateBlock_InvalidAncestorVerdictParentNeverMinedIsNotActedOn covers the false INVALID
+// TestReValidateBlock_InvalidAncestorVerdictParentNotMinedIsNotActedOn covers the false INVALID
 // that comes from stale tx BlockIDs. A parent tx first mined in a losing fork block F keeps
 // BlockIDs=[F] until setTxMined runs for the main-chain block that re-mines it. The revalidation
 // path can reach reValidateBlock before that, because the parentHeaderRun-failure enqueue in
-// ValidateBlockWithOptions runs before waitForPreviousBlocksToBeProcessed. So reValidateBlock waits
-// for the parent itself, and when the parent never becomes mined it gives up without reading the
+// ValidateBlockWithOptions runs before waitForPreviousBlocksToBeProcessed. So reValidateBlock checks
+// the parent first, and while it is not mined it returns ErrBlockParentNotMined without reading the
 // BlockIDs, so nothing is invalidated or published.
 //
 // Fixture: the same as TestReValidateBlock_InvalidAncestorVerdictInvalidatesAndPublishes, so C's
-// parent A IS on the main chain, but A's mined_set is never set.
-func TestReValidateBlock_InvalidAncestorVerdictParentNeverMinedIsNotActedOn(t *testing.T) {
+// parent A IS on the main chain, but A's mined_set is not set.
+func TestReValidateBlock_InvalidAncestorVerdictParentNotMinedIsNotActedOn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -157,8 +157,8 @@ func TestReValidateBlock_InvalidAncestorVerdictParentNeverMinedIsNotActedOn(t *t
 
 	err := bv.reValidateBlock(context.Background(), revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
 	require.Error(t, err)
-	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "expected a give-up on the parent wait, not an INVALID verdict, got: %v", err)
-	require.True(t, errors.Is(err, errors.ErrBlockParentNotMined), "expected the parent-not-mined give-up, got: %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid), "expected a not-ready result, not an INVALID verdict, got: %v", err)
+	require.True(t, errors.Is(err, errors.ErrBlockParentNotMined), "expected the parent-not-mined result, got: %v", err)
 
 	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
 	require.NoError(t, err)
@@ -170,34 +170,27 @@ func TestReValidateBlock_InvalidAncestorVerdictParentNeverMinedIsNotActedOn(t *t
 		"reValidateBlock published an invalid-block notification before its parent was mined_set")
 }
 
-// TestReValidateBlock_HonestBlockWaitsForParentSetTxMined is the end-to-end form of the case above.
-// The funding tx is first stamped only in fork block F. While reValidateBlock waits on C's parent
-// A, setTxMined for A runs: it adds A to the funding tx's BlockIDs, then marks A mined_set. C is
-// honest once that has run, so it must not be invalidated or published, and revalidation succeeds.
-func TestReValidateBlock_HonestBlockWaitsForParentSetTxMined(t *testing.T) {
+// TestReValidateBlock_HonestBlockRevalidatesOnceParentSetTxMinedHasRun is the end-to-end form of the
+// case above. The funding tx is first stamped only in fork block F. reValidateBlock first runs
+// before setTxMined for C's parent A and must report the parent not mined. setTxMined for A then
+// runs: it adds A to the funding tx's BlockIDs and marks A mined_set. C is honest once that has
+// run, so the next attempt must succeed, with nothing invalidated or published. The two steps run
+// in order on the test goroutine, so the result does not depend on timing.
+func TestReValidateBlock_HonestBlockRevalidatesOnceParentSetTxMinedHasRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	extras := &ancestorVerdictExtras{}
 	bv, blockchainClient, blockC, kafkaProducer := newAncestorVerdictFixture(ctx, t, ancestorVerdictFixtureOpts{storeC: true, extras: extras})
 
-	setTxMinedDone := make(chan error, 1)
+	blockData := revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true}
 
-	go func() {
-		time.Sleep(20 * time.Millisecond)
+	err := bv.reValidateBlock(context.Background(), blockData)
+	require.True(t, errors.Is(err, errors.ErrBlockParentNotMined), "expected the parent-not-mined result before setTxMined, got: %v", err)
 
-		if _, err := extras.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{extras.fundingTxHash},
-			utxostore.MinedBlockInfo{BlockID: extras.parentMeta.ID, BlockHeight: extras.parentMeta.Height, OnLongestChain: true}); err != nil {
-			setTxMinedDone <- err
-			return
-		}
+	playParentSetTxMined(ctx, t, blockchainClient, blockC, extras)
 
-		setTxMinedDone <- blockchainClient.SetBlockMinedSet(ctx, blockC.Header.HashPrevBlock)
-	}()
-
-	err := bv.reValidateBlock(context.Background(), revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
-	require.NoError(t, <-setTxMinedDone)
-	require.NoError(t, err, "an honest block must revalidate once its parent's setTxMined has run")
+	require.NoError(t, bv.reValidateBlock(context.Background(), blockData), "an honest block must revalidate once its parent's setTxMined has run")
 
 	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
 	require.NoError(t, err)
@@ -205,6 +198,18 @@ func TestReValidateBlock_HonestBlockWaitsForParentSetTxMined(t *testing.T) {
 
 	require.False(t, cMeta.Invalid, "reValidateBlock invalidated an honest block on BlockIDs read before its parent's setTxMined")
 	require.False(t, kafkaProducer.IsPublishCalled(), "reValidateBlock published an honest block as invalid")
+}
+
+// playParentSetTxMined does what setTxMined does for C's parent in the fixture: it stamps the
+// funding tx as mined in the parent, then marks the parent mined_set.
+func playParentSetTxMined(ctx context.Context, t *testing.T, blockchainClient blockchain.ClientI, blockC *model.Block, extras *ancestorVerdictExtras) {
+	t.Helper()
+
+	_, err := extras.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{extras.fundingTxHash},
+		utxostore.MinedBlockInfo{BlockID: extras.parentMeta.ID, BlockHeight: extras.parentMeta.Height, OnLongestChain: true})
+	require.NoError(t, err)
+
+	require.NoError(t, blockchainClient.SetBlockMinedSet(ctx, blockC.Header.HashPrevBlock))
 }
 
 // TestReValidateBlock_InvalidAncestorVerdictActsDespiteStaleHeaderCache pins that the parent wait
@@ -297,7 +302,9 @@ func newAncestorVerdictFixture(ctx context.Context, t *testing.T, opts ancestorV
 		tSettings.BlockChain.UseInMemoryChainCheck = true
 	}
 
-	// reValidateBlock waits for the parent to be mined. Keep a give-up short: about 0.2s per wait.
+	// Keep any parent-mined wait short, about 0.2s, so a regression that brings a wait back onto
+	// reValidateBlock fails fast instead of hanging. TestProcessRevalidation_ParentNotMinedDoesNotHoldWorker
+	// raises these to the defaults to catch exactly that.
 	tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 10
 	tSettings.BlockValidation.IsParentMinedRetryBackoffDuration = 2 * time.Millisecond
 	tSettings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
@@ -516,31 +523,100 @@ func TestAncestorVerdictIsSound_FailSafe(t *testing.T) {
 	require.True(t, bv.ancestorVerdictIsSound(ctx, blockC, []*model.BlockHeaderMeta{parentMeta}), "a parent on the main chain licenses acting on the verdict")
 }
 
-// TestReValidateBlock_ParentWaitStopsOnWorkerCancel pins that the parent wait runs under the
-// revalidation worker's context. At default settings a parent that is never mined holds the single
-// worker for about 160 seconds, so shutdown must be able to cut the wait short.
-func TestReValidateBlock_ParentWaitStopsOnWorkerCancel(t *testing.T) {
+// TestProcessRevalidation_ParentNotMinedDoesNotHoldWorker pins that a block whose parent is not
+// mined yet never parks the revalidation worker. The worker is the only consumer of a two-slot
+// channel, and once that channel is full enqueueRevalidation blocks its callers inside
+// ValidateBlockWithOptions. So the worker must hand the block back at once, re-queue it after a
+// delay from a goroutine, and not spend the ordinary retry budget on it. When the parent's
+// setTxMined has run, the re-queued block revalidates clean, with nothing invalidated or published
+// and nothing queued again.
+//
+// The parent-wait settings are the defaults, so any wait on the worker would take about 80 seconds
+// and fail the 2-second bound.
+func TestProcessRevalidation_ParentNotMinedDoesNotHoldWorker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	extras := &ancestorVerdictExtras{}
+	bv, blockchainClient, blockC, kafkaProducer := newAncestorVerdictFixture(ctx, t, ancestorVerdictFixtureOpts{storeC: true, extras: extras})
+	waitForFixtureRevalidateWorkerToExit(t, bv)
+
+	bv.settings.BlockValidation.IsParentMinedRetryMaxRetry = 45
+	bv.settings.BlockValidation.IsParentMinedRetryBackoffDuration = 20 * time.Millisecond
+	bv.settings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 4
+	bv.revalidateParentNotMinedDelay = 50 * time.Millisecond
+
+	start := time.Now()
+	bv.processRevalidation(ctx, revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
+	require.Less(t, time.Since(start), 2*time.Second, "the worker was held waiting for the parent to be mined")
+
+	var requeued revalidateBlockData
+	select {
+	case requeued = <-bv.revalidateBlockChan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a block whose parent was not mined was never re-queued")
+	}
+
+	require.GreaterOrEqual(t, time.Since(start), bv.revalidateParentNotMinedDelay, "the re-queue did not wait out the delay")
+	require.Equal(t, 1, requeued.parentNotMinedRetries, "a not-mined parent must count against the not-ready budget")
+	require.Equal(t, 0, requeued.retries, "a not-mined parent must not spend the ordinary retry budget")
+	require.True(t, requeued.optimisticallyAdded, "the re-queue must keep the block's flags")
+
+	playParentSetTxMined(ctx, t, blockchainClient, blockC, extras)
+
+	bv.processRevalidation(ctx, requeued)
+
+	select {
+	case again := <-bv.revalidateBlockChan:
+		t.Fatalf("a block that revalidated clean was queued again (retries=%d, parentNotMinedRetries=%d)", again.retries, again.parentNotMinedRetries)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
+	require.NoError(t, err)
+	require.False(t, cMeta.Invalid, "an honest block was invalidated after its parent's setTxMined ran")
+	require.False(t, kafkaProducer.IsPublishCalled(), "an honest block was published as invalid")
+}
+
+// TestProcessRevalidation_ParentNotMinedGivesUpAfterBudget pins the end of the not-ready budget:
+// the block is dropped, not re-queued, and nothing is invalidated or published.
+func TestProcessRevalidation_ParentNotMinedGivesUpAfterBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	bv, blockchainClient, blockC, kafkaProducer := newAncestorVerdictFixture(ctx, t, ancestorVerdictFixtureOpts{storeC: true})
+	waitForFixtureRevalidateWorkerToExit(t, bv)
 
-	// Two waits of 1+2+3+4 seconds each, about 20 seconds if nothing cuts them short.
-	bv.settings.BlockValidation.IsParentMinedRetryMaxRetry = 4
-	bv.settings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Second
+	bv.revalidateParentNotMinedDelay = time.Millisecond
 
-	workerCtx, workerCancel := context.WithCancel(ctx)
-	time.AfterFunc(50*time.Millisecond, workerCancel)
+	bv.processRevalidation(ctx, revalidateBlockData{
+		block:                 blockC,
+		baseURL:               "test",
+		optimisticallyAdded:   true,
+		parentNotMinedRetries: bv.revalidateParentNotMinedMaxRetries,
+	})
 
-	start := time.Now()
-	err := bv.reValidateBlock(workerCtx, revalidateBlockData{block: blockC, baseURL: "test", optimisticallyAdded: true})
-	elapsed := time.Since(start)
-
-	require.Error(t, err)
-	require.Less(t, elapsed, 5*time.Second, "cancelling the worker's context did not cut the parent wait short")
+	select {
+	case again := <-bv.revalidateBlockChan:
+		t.Fatalf("a block past its not-ready budget was queued again (parentNotMinedRetries=%d)", again.parentNotMinedRetries)
+	case <-time.After(200 * time.Millisecond):
+	}
 
 	_, cMeta, err := blockchainClient.GetBlockHeader(ctx, blockC.Hash())
 	require.NoError(t, err)
-	require.False(t, cMeta.Invalid, "a cancelled wait must not invalidate the block")
-	require.False(t, kafkaProducer.IsPublishCalled(), "a cancelled wait must not publish the block as invalid")
+	require.False(t, cMeta.Invalid, "giving up on a not-mined parent must not invalidate the block")
+	require.False(t, kafkaProducer.IsPublishCalled(), "giving up on a not-mined parent must not publish the block as invalid")
+}
+
+// waitForFixtureRevalidateWorkerToExit waits for the fixture's own revalidation worker to exit. The
+// fixture builds bv on a cancelled context, so start launches that worker and it stops at once. A
+// test that drives processRevalidation itself and reads revalidateBlockChan must not race it.
+func waitForFixtureRevalidateWorkerToExit(t *testing.T, bv *BlockValidation) {
+	t.Helper()
+
+	select {
+	case <-bv.revalidateWorkerStopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the fixture's revalidation worker did not exit")
+	}
 }
