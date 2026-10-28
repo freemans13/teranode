@@ -219,6 +219,10 @@ func testLongestChainInvalidateBlockWithOldTx(t *testing.T, utxoStore string) {
 
 	// 0 -> 1 ... 2 -> 3 -> 4a (*)
 
+	// Block assembly reports block4a from inside its reset, before it leaves the reorging
+	// state, and a candidate asked for meanwhile is empty. Wait for tx1 to reach a candidate.
+	require.NoError(t, td.WaitForTransactionInBlockAssembly(tx1, blockWait),
+		"tx1 must return to block assembly after block5a is invalidated")
 	td.VerifyInBlockAssembly(t, tx1)    // re-added to block assembly
 	td.VerifyNotInBlockAssembly(t, tx2) // removed as already mined in block4a
 	td.VerifyNotOnLongestChainInUtxoStore(t, tx1)
