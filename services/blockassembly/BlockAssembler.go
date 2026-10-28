@@ -638,7 +638,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 			case resetReq := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
 				b.handleResetRequests(ctx, resetReq)
-				b.setCurrentRunningState(StateRunning)
+				b.returnToRunning(ctx)
 
 			case notification := <-b.blockchainSubscriptionCh:
 				b.setCurrentRunningState(StateBlockchainSubscription)
@@ -647,12 +647,12 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 					b.processNewBlockAnnouncement(ctx)
 				}
 
-				b.setCurrentRunningState(StateRunning)
+				b.returnToRunning(ctx)
 
 			case <-b.reconcileCh:
 				b.setCurrentRunningState(StateReconciling)
 				b.processNewBlockAnnouncement(ctx)
-				b.setCurrentRunningState(StateRunning)
+				b.returnToRunning(ctx)
 			} // select
 		} // for
 	}()

@@ -123,6 +123,11 @@ func TestReplayBestTipChanges_FlipFlop(t *testing.T) {
 	require.Equal(t, startSeq+2, latest, "B2 and A3 are the two tip changes")
 	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
 
+	_, err = items.blockchainClient.GetState(t.Context(), BestTipSeqStateKey)
+	require.Error(t, err, "the position is not saved while block assembly is still processing")
+
+	items.blockAssembler.returnToRunning(t.Context())
+
 	saved, err := items.blockchainClient.GetState(t.Context(), BestTipSeqStateKey)
 	require.NoError(t, err)
 
@@ -360,10 +365,36 @@ func TestReplayBestTipChanges_RepeatedFailureFollowsBestHeader(t *testing.T) {
 		require.False(t, ba.followBestTipChanges(t.Context()), "pass %d retries", i)
 	}
 
-	m.On("SetState", mock.Anything, BestTipSeqStateKey, mock.Anything).Return(nil)
-
 	require.True(t, ba.followBestTipChanges(t.Context()))
 	require.Equal(t, uint64(42), ba.bestTipSeq.Load(), "the position jumps to the latest change")
+}
+
+// TestReturnToRunning_SavesAfterLeavingProcessingState checks that the replay position is written
+// only once block assembly is running again, so the write does not lengthen the time a mining
+// candidate comes back empty.
+func TestReturnToRunning_SavesAfterLeavingProcessingState(t *testing.T) {
+	m := &blockchain.Mock{}
+	ba := &BlockAssembler{blockchainClient: m, logger: ulogger.TestLogger{}}
+
+	var stateAtSave State
+
+	m.On("SetState", mock.Anything, BestTipSeqStateKey, EncodeBestTipSeq(7)).
+		Run(func(mock.Arguments) { stateAtSave = ba.GetCurrentRunningState() }).
+		Return(nil).Once()
+
+	ba.bestTipSeqKnown.Store(true)
+	ba.advanceBestTipSeq(7)
+	ba.setCurrentRunningState(StateReorging)
+
+	ba.returnToRunning(t.Context())
+
+	m.AssertExpectations(t)
+	require.Equal(t, StateRunning, stateAtSave)
+	require.Equal(t, uint64(7), ba.bestTipSeqSaved.Load())
+
+	// Nothing moved, so the next return writes nothing.
+	ba.returnToRunning(t.Context())
+	m.AssertNumberOfCalls(t, "SetState", 1)
 }
 
 // TestReplayBestTipChanges_ProbeIsRateLimited checks that against a blockchain service without

@@ -134,7 +134,6 @@ func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 
 		if seq, seqErr := b.blockchainClient.GetBestTipSeq(ctx); seqErr == nil {
 			b.advanceBestTipSeq(seq)
-			b.saveBestTipSeq(ctx)
 		}
 
 		return true
@@ -187,8 +186,6 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 	if b.bestTipResetRetryBlocked.Load() {
 		return read, errors.NewStorageError("pending reset requires disk storage recovery before replay")
 	}
-	defer b.saveBestTipSeq(ctx)
-
 	// A reset can finalize its target before its reload or state write fails.
 	// Retry that rebuild before the hash-equality fast path can acknowledge it.
 	if b.bestTipResetIncomplete.Load() {
@@ -383,9 +380,17 @@ func (b *BlockAssembler) advanceBestTipSeq(seq uint64) {
 	}
 }
 
-// saveBestTipSeq persists the replay position when it moved since the last save. A failed save
-// only costs a restart replaying changes block assembly already applied, each of which is then a
-// no-op, so it is logged and not returned.
+// returnToRunning ends a block-processing state and then persists the replay position. The save
+// is one write to the blockchain service, and a mining candidate asked for during a processing
+// state is an empty one, so the save waits until block assembly is running again.
+func (b *BlockAssembler) returnToRunning(ctx context.Context) {
+	b.setCurrentRunningState(StateRunning)
+	b.saveBestTipSeq(ctx)
+}
+
+// saveBestTipSeq persists the replay position when it moved since the last save. A failed or
+// missed save only costs a restart replaying changes block assembly already applied, each of
+// which is then a no-op, so it is logged and not returned.
 func (b *BlockAssembler) saveBestTipSeq(ctx context.Context) {
 	if !b.bestTipSeqKnown.Load() {
 		return

@@ -162,9 +162,13 @@ func testLongestChainInvalidateBlock(t *testing.T, utxoStore string) {
 	require.NoError(t, td.BlockAssemblyClient.ResetBlockAssembly(td.Ctx),
 		"second reset must succeed to pick up tx1 after BlockMinedUnset processing completes")
 
-	require.NoError(t, td.WaitForTransactionInBlockAssembly(tx1, blockWait),
-		"tx1 must return to block assembly after block4a is invalidated")
-	td.VerifyInBlockAssembly(t, tx1) // re-added to block assembly
+	// ResetBlockAssembly only queues the reset. A candidate read before the reset starts can
+	// already show tx1, and one read during it is empty, so poll until a candidate shows tx1
+	// exactly once rather than checking a single read after the first sighting.
+	require.Eventually(t, func() bool {
+		count, err := td.CountInBlockAssembly(tx1)
+		return err == nil && count == 1
+	}, blockWait, 100*time.Millisecond, "tx1 must return to block assembly exactly once after block4a is invalidated")
 	td.VerifyNotOnLongestChainInUtxoStore(t, tx1)
 }
 
