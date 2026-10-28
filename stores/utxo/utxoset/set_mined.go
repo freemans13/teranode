@@ -688,21 +688,49 @@ type leafBatch struct {
 // every path that writes a batch of identity rows takes their row locks in the same sequence,
 // so two concurrent batches sharing transactions cannot deadlock against each other.
 func leafGroups(txids [][]byte) []leafBatch {
-	var byLeaf [NumLeaves][][]byte
+	groups := leafIndexGroups(txids)
+	out := make([]leafBatch, 0, len(groups))
 
-	for _, txid := range txids {
-		leaf := LeafFor(txid)
-		byLeaf[leaf] = append(byLeaf[leaf], txid)
+	for _, g := range groups {
+		batch := leafBatch{leaf: g.leaf, txids: make([][]byte, len(g.idx))}
+
+		for j, i := range g.idx {
+			batch.txids[j] = txids[i]
+		}
+
+		out = append(out, batch)
 	}
 
-	out := make([]leafBatch, 0, NumLeaves)
+	return out
+}
+
+// leafIndexGroup is one leaf of leafIndexGroups: the leaf and the positions in the input of the
+// transactions it holds, in input order.
+type leafIndexGroup struct {
+	leaf int16
+	idx  []int
+}
+
+// leafIndexGroups buckets txids by leaf and returns the groups in ASCENDING LEAF ORDER, the lock
+// order leafGroups documents. It is the one place that order is decided: leafGroups projects the
+// groups onto the txids, and a caller with parallel arrays per transaction (conflictingPlan)
+// projects them onto each array.
+func leafIndexGroups(txids [][]byte) []leafIndexGroup {
+	var byLeaf [NumLeaves][]int
+
+	for i, txid := range txids {
+		leaf := LeafFor(txid)
+		byLeaf[leaf] = append(byLeaf[leaf], i)
+	}
+
+	out := make([]leafIndexGroup, 0, NumLeaves)
 
 	for leaf := range byLeaf {
 		if len(byLeaf[leaf]) == 0 {
 			continue
 		}
 
-		out = append(out, leafBatch{leaf: int16(leaf), txids: byLeaf[leaf]}) //nolint:gosec // a leaf index fits
+		out = append(out, leafIndexGroup{leaf: int16(leaf), idx: byLeaf[leaf]}) //nolint:gosec // a leaf index fits
 	}
 
 	return out

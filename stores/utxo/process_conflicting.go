@@ -1650,7 +1650,7 @@ func conflictingWalkChildren(txMeta *meta.Data) []chainhash.Hash {
 // is a processing error (see counterConflictingInpoints). A failed body read is
 // returned as the store returned it.
 func CounterConflictingInpoints(ctx context.Context, s Store, txHash chainhash.Hash, txMeta *meta.Data) ([]subtree.Inpoint, error) {
-	if txMeta != nil && len(txMeta.TxInpoints.ParentTxHashes) == 0 && txMeta.Tx == nil {
+	if CounterConflictingNeedsBody(txMeta) {
 		bodyMeta, err := s.Get(ctx, &txHash, fields.Tx)
 		if err != nil {
 			return nil, err
@@ -1661,6 +1661,21 @@ func CounterConflictingInpoints(ctx context.Context, s Store, txHash chainhash.H
 		}
 	}
 
+	return CounterConflictingInpointsOf(txHash, txMeta)
+}
+
+// CounterConflictingNeedsBody reports whether txMeta, read with fields.TxInpoints, stores no
+// inpoints and no body, so CounterConflictingInpoints would read the body before it can say what
+// the transaction spends. A caller that holds many records reads those bodies in one batch,
+// sets each Tx, and calls CounterConflictingInpointsOf.
+func CounterConflictingNeedsBody(txMeta *meta.Data) bool {
+	return txMeta != nil && len(txMeta.TxInpoints.ParentTxHashes) == 0 && txMeta.Tx == nil
+}
+
+// CounterConflictingInpointsOf is CounterConflictingInpoints without the body read: it reports
+// what txHash spends from txMeta as it stands, and a record carrying neither inpoints nor a body
+// is the same processing error.
+func CounterConflictingInpointsOf(txHash chainhash.Hash, txMeta *meta.Data) ([]subtree.Inpoint, error) {
 	inpoints, err := counterConflictingInpoints(txMeta)
 	if err != nil {
 		return nil, errors.NewProcessingError("[CounterConflictingInpoints][%s] cannot read what the transaction spends", txHash.String(), err)

@@ -216,8 +216,19 @@ func TestSetConflictingRetriesADeadlock(t *testing.T) {
 
 	defer func() { _ = holder.Rollback(context.Background()) }()
 
-	_, err = holder.Exec(ctx, `SET LOCAL deadlock_timeout = '30s'`)
-	require.NoError(t, err)
+	// Only a superuser may set deadlock_timeout, and the docker-compose roles are not superusers.
+	// Without it the victim is still SetConflicting: PostgreSQL runs the deadlock check in the
+	// backend whose deadlock_timeout runs out first, and SetConflicting started waiting first.
+	// The raised timeout only widens that margin.
+	var superuser string
+	require.NoError(t, holder.QueryRow(ctx, `SELECT current_setting('is_superuser')`).Scan(&superuser))
+
+	if superuser == "on" {
+		_, err = holder.Exec(ctx, `SET LOCAL deadlock_timeout = '30s'`)
+		require.NoError(t, err)
+	} else {
+		t.Log("not a superuser, so the holder keeps the default deadlock_timeout")
+	}
 
 	_, err = holder.Exec(ctx, `UPDATE utxo SET flags = flags WHERE leaf = 1 AND txid = $1`, high.TxIDChainHash()[:])
 	require.NoError(t, err)
@@ -257,4 +268,67 @@ func TestSetConflictingRetriesADeadlock(t *testing.T) {
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM utxo WHERE flags & $1::smallint <> 0`, FlagConflicting).Scan(&flagged))
 	require.Equal(t, 4, flagged, "both outputs of both transactions")
+}
+
+// TestSetConflictingSkipsRowsAlreadyAtTheValue. SetConflicting writes only the rows whose bit
+// changes, so a mark of a transaction already marked, and a clear of one already clear, take no
+// row lock on it. A holder keeps every row of both transactions locked, and both calls must
+// still finish. Without the skip each would wait on the holder until its deadline.
+func TestSetConflictingSkipsRowsAlreadyAtTheValue(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	// marked is mined, so its flag lives on its containment row and the membership arm is
+	// exercised; unmarked is not, so the identity arm is. marked is above the checkpoint, where a
+	// mined create keeps its inpoints.
+	marked := mkTx(t, 2, 7_001)
+	unmarked := mkTx(t, 2, 7_002)
+
+	_, err := s.Create(ctx, marked, 1_000_000, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 1_000_000}))
+	require.NoError(t, err)
+
+	_, err = s.Create(ctx, unmarked, 100)
+	require.NoError(t, err)
+
+	var minedRows int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_mined WHERE txid = $1`,
+		marked.TxIDChainHash()[:]).Scan(&minedRows))
+	require.Positive(t, minedRows, "the mined transaction has a containment row")
+
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*marked.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	holder, err := s.pool.Begin(ctx)
+	require.NoError(t, err)
+
+	defer func() { _ = holder.Rollback(context.Background()) }()
+
+	for _, tx := range []*bt.Tx{marked, unmarked} {
+		txid := tx.TxIDChainHash()[:]
+
+		for _, stmt := range []string{
+			`UPDATE utxo SET flags = flags WHERE txid = $1`,
+			`UPDATE tx_ident SET flags = flags WHERE txid = $1`,
+			`UPDATE tx_mined SET flags = flags WHERE txid = $1`,
+		} {
+			_, err = holder.Exec(ctx, stmt, txid)
+			require.NoError(t, err)
+		}
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, _, err = s.SetConflicting(callCtx, []chainhash.Hash{*marked.TxIDChainHash()}, true)
+	require.NoError(t, err, "marking a transaction already marked must not wait on its rows")
+
+	_, _, err = s.SetConflicting(callCtx, []chainhash.Hash{*unmarked.TxIDChainHash()}, false)
+	require.NoError(t, err, "clearing a transaction already clear must not wait on its rows")
+
+	require.NoError(t, holder.Rollback(ctx))
+
+	for tx, want := range map[*bt.Tx]bool{marked: true, unmarked: false} {
+		got, gerr := s.Get(ctx, tx.TxIDChainHash(), fields.Conflicting)
+		require.NoError(t, gerr)
+		require.Equal(t, want, got.Conflicting)
+	}
 }

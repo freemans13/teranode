@@ -172,18 +172,34 @@ ON CONFLICT DO NOTHING`
 // mined transaction conflicting set the UTXO bit and not the bit Get reports -- the mirror
 // image of the failure setLockedSQL's own comment warns about. The membership arm is a plain
 // txid equality because tx_mined's primary key leads with txid.
+//
+// Every arm writes ONLY ROWS WHOSE BIT CHANGES, as setLockedSQL and clearMarkerSQL do. A cascade
+// revisits shared descendants and a clear runs over rows that are already clear, and rewriting
+// those rows would lock them for nothing and widen the overlap with SetLocked and the mine that
+// withDeadlockRetry has to cure. Skipping them does not weaken the wait described above. A UTXO
+// row whose bit is still clear in the statement's snapshot is a candidate, so the update still
+// waits on a child's in-flight spend of it. A row whose bit is already set was set by a committed
+// flip, which had to take the row's lock first, and a spend that starts after that is refused by
+// its flag mask, so no spend of it can be in flight for the update to wait on. The one spend the
+// mask lets through is conflict resolution's own, with IgnoreConflicting, made for the winner of
+// a contest. The read names it a child only if it committed before the read. It is the winner,
+// so it is not one the cascade should mark. On a clear, a UTXO row that is already clear is not
+// skipped from the read, only from the write: a child that spent it was not marked through it,
+// and a spend of it committed before the read is still named.
 const setConflictingSQL = `
 WITH ident AS (
     UPDATE tx_ident i
        SET flags = CASE WHEN $5::boolean THEN i.flags |  $6::smallint
                                          ELSE i.flags & ~$6::smallint END
      WHERE i.leaf = $1::smallint AND i.txid = ANY ($2::bytea[])
+       AND ((i.flags & $6::smallint) <> 0) <> $5::boolean
 ),
 mined AS (
     UPDATE tx_mined m
        SET flags = CASE WHEN $5::boolean THEN m.flags |  $6::smallint
                                          ELSE m.flags & ~$6::smallint END
      WHERE m.txid = ANY ($2::bytea[])
+       AND ((m.flags & $6::smallint) <> 0) <> $5::boolean
 )
 UPDATE utxo u
    SET flags = CASE WHEN $5::boolean THEN u.flags |  $6::smallint
@@ -198,7 +214,8 @@ UPDATE utxo u
              WHERE x.leaf = $1::smallint AND x.ukey >= k.lo AND x.ukey <= k.hi AND x.txid = k.txid
             OFFSET 0
           ) AS c))
-   AND u.txid = ANY ($2::bytea[])`
+   AND u.txid = ANY ($2::bytea[])
+   AND ((u.flags & $6::smallint) <> 0) <> $5::boolean`
 
 // conflictingReadSQL reads back the spends to undo and the next level of the cascade, after
 // setConflictingSQL has run in the same transaction. See setConflictingSQL for why it is a
@@ -559,29 +576,28 @@ type conflictingLeafKeys struct {
 	hi    [][16]byte
 }
 
-// groupByLeaf splits the named transactions by leaf, in ascending leaf order, the lock order
-// leafGroups documents. It copies kTxid, kLo and kHi rather than packing the ranges again, so
+// groupByLeaf splits the named transactions by leaf, in the lock order leafIndexGroups decides
+// for every batch writer. It copies kTxid, kLo and kHi rather than packing the ranges again, so
 // the flip and the read take their keys from one source.
 func (p *conflictingPlan) groupByLeaf() {
-	var byLeaf [NumLeaves]conflictingLeafKeys
+	groups := leafIndexGroups(p.kTxid)
+	p.leaves = make([]conflictingLeafKeys, 0, len(groups))
 
-	for i, txid := range p.kTxid {
-		g := &byLeaf[LeafFor(txid)]
-		g.txids = append(g.txids, txid)
-		g.lo = append(g.lo, p.kLo[i])
-		g.hi = append(g.hi, p.kHi[i])
-	}
-
-	p.leaves = make([]conflictingLeafKeys, 0, NumLeaves)
-
-	for leaf := range byLeaf {
-		if len(byLeaf[leaf].txids) == 0 {
-			continue
+	for _, g := range groups {
+		keys := conflictingLeafKeys{
+			leaf:  g.leaf,
+			txids: make([][]byte, len(g.idx)),
+			lo:    make([][16]byte, len(g.idx)),
+			hi:    make([][16]byte, len(g.idx)),
 		}
 
-		byLeaf[leaf].leaf = int16(leaf) //nolint:gosec // a leaf index fits
+		for j, i := range g.idx {
+			keys.txids[j] = p.kTxid[i]
+			keys.lo[j] = p.kLo[i]
+			keys.hi[j] = p.kHi[i]
+		}
 
-		p.leaves = append(p.leaves, byLeaf[leaf])
+		p.leaves = append(p.leaves, keys)
 	}
 }
 

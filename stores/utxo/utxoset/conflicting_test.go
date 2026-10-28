@@ -654,7 +654,9 @@ func TestUnspendClearsAStaleConflictingBit(t *testing.T) {
 // 1.3 s at 16,000 outputs and 25-29 s at 64,000, a ratio of about 20. The per-leaf form took
 // 46-57 ms and 159-227 ms, a ratio of about 4. The test compares the two sizes on the same
 // runner rather than against a wall-clock bound, so a slow or loaded runner slows both alike.
-// Each size takes the faster of a set and a clear, to drop a one-off stall. The bound of 10 sits
+// Each size takes the faster of a set and a clear, to drop a one-off stall. A warm-up call on a
+// third set runs first, and each size runs over freshly created transactions of its own, so
+// neither pays for the cold start or for the other's dead tuples. The bound of 10 sits
 // between linear (4) and quadratic (16).
 func TestSetConflictingIsLinearInOutputs(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -665,12 +667,17 @@ func TestSetConflictingIsLinearInOutputs(t *testing.T) {
 		perTx = 1_000
 	)
 
-	named := make([]chainhash.Hash, 0, large)
+	// Three disjoint sets, each created fresh: one for a warm-up call, then one per timed size.
+	// Timing the large size over the small size's rows would carry the dead tuples and HOT
+	// chains the small run left, and timing the small size cold would charge it the warm-up.
+	const warm = small
+
+	named := make([]chainhash.Hash, 0, warm+small+large)
 
 	// All in ONE leaf, so a single statement sees every output. The statement runs per leaf,
 	// and spreading the family over eight leaves would hide a quadratic term behind an
 	// eight-way split.
-	for sats := uint64(5_000); len(named) < large; sats++ {
+	for sats := uint64(5_000); len(named) < warm+small+large; sats++ {
 		tx := mkTx(t, perTx, sats)
 		if LeafFor(tx.TxIDChainHash()[:]) != 0 {
 			continue
@@ -682,6 +689,8 @@ func TestSetConflictingIsLinearInOutputs(t *testing.T) {
 		named = append(named, *tx.TxIDChainHash())
 	}
 
+	warmSet, smallSet, largeSet := named[:warm], named[warm:warm+small], named[warm+small:]
+
 	countFlagged := func() int {
 		var flagged int
 		require.NoError(t, s.pool.QueryRow(ctx,
@@ -690,26 +699,28 @@ func TestSetConflictingIsLinearInOutputs(t *testing.T) {
 		return flagged
 	}
 
-	// timeSetAndClear flags the first n transactions, checks every output took the flag, clears
+	// timeSetAndClear flags the given transactions, checks every output took the flag, clears
 	// them, checks every output lost it, and returns the faster of the two calls.
-	timeSetAndClear := func(n int) time.Duration {
+	timeSetAndClear := func(set []chainhash.Hash) time.Duration {
 		start := time.Now()
-		_, _, err := s.SetConflicting(ctx, named[:n], true)
-		set := time.Since(start)
+		_, _, err := s.SetConflicting(ctx, set, true)
+		marked := time.Since(start)
 		require.NoError(t, err)
-		require.Equal(t, n*perTx, countFlagged(), "every UTXO of every named transaction")
+		require.Equal(t, len(set)*perTx, countFlagged(), "every UTXO of every named transaction")
 
 		start = time.Now()
-		_, _, err = s.SetConflicting(ctx, named[:n], false)
+		_, _, err = s.SetConflicting(ctx, set, false)
 		cleared := time.Since(start)
 		require.NoError(t, err)
 		require.Zero(t, countFlagged(), "clearing reaches every UTXO too")
 
-		return min(set, cleared)
+		return min(marked, cleared)
 	}
 
-	tSmall := timeSetAndClear(small)
-	tLarge := timeSetAndClear(large)
+	timeSetAndClear(warmSet)
+
+	tSmall := timeSetAndClear(smallSet)
+	tLarge := timeSetAndClear(largeSet)
 	ratio := float64(tLarge) / float64(tSmall)
 
 	t.Logf("SetConflicting over %d outputs: %v, over %d outputs: %v, ratio %.1f",

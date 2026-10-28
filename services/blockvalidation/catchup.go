@@ -726,6 +726,11 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// store a processing error carrying a peer URL as the peer's.
 			errorType = "local_processing_fault"
 			isPeerError = false
+		case hasErrorMarker(*err, nettedDeepForkRefusalKey):
+			// A fork deeper than coinbase maturity on the netted route. preferNettedRouteForkRefusal
+			// returns it as a peer fault so the peer is rotated, and that code would otherwise make
+			// the IsNetworkError case below label it network_error. It stays a peer error.
+			errorType = "coinbase_maturity_violation"
 		case errors.IsNetworkError(*err):
 			errorType = "network_error"
 		case strings.Contains(errorMsg, "secret mining") || strings.Contains(errorMsg, "secretly mined"):
@@ -1318,8 +1323,7 @@ func (u *Server) nettedRouteFirstBlock(catchupCtx *CatchupContext) (uint32, bool
 // fault (a NetworkInvalidResponseError, as for a header that contradicts a checkpoint: a bare
 // ProcessingError is a local fault and charges no peer). verifyCheckpointsInHeaderChain does not
 // check a fork, so none of its blocks can be quick validated, and on this route no block can take
-// another route. The fork is
-// off the checkpointed chain: on this route each block this node holds below the checkpoint was
+// another route. The fork is off the checkpointed chain: on this route each block this node holds below the checkpoint was
 // written through quick validation under a verified checkpoint at or above it, or through the
 // legacy route under a header proof that ends at a checkpoint, so a different block at the same
 // height is not an ancestor of that checkpoint. Refused before the mined_set clear and before any
@@ -1344,16 +1348,34 @@ func (u *Server) refuseNettedRouteFork(catchupCtx *CatchupContext) error {
 // failure, keeps the same sync peer and retries the same hash. On the netted
 // route the fork is the peer's fault at any depth, so the refusal, a NetworkInvalidResponseError,
 // is returned instead, and the peer is rotated as it is for a shallower netted fork. The
-// refusal's message names the fork depth, and the check's own log line names the reason.
+// refusal carries nettedDeepForkRefusalKey, so releaseCatchupLock still labels it
+// coinbase_maturity_violation, and its message names the fork depth.
+//
+// The peer is therefore charged more here than for the same fork off the netted route. Both get
+// validateForkDepth's malicious report. This route adds the catch-up failure charge and the
+// rotation signal processCatchupChItem sends for every peer fault. That is intended: the
+// rotation is what this swap is for, and processCatchupChItem gives no rotation without the
+// charge. Off the netted route the ServiceError gets neither, which is upstream behaviour this
+// change leaves alone.
 func (u *Server) preferNettedRouteForkRefusal(catchupCtx *CatchupContext, err error) error {
-	if refusal := u.refuseNettedRouteFork(catchupCtx); refusal != nil {
-		u.logger.Warnf("[catchup][%s] fork deeper than coinbase maturity is on the netted route, refused as the peer's fault: %v", catchupCtx.blockUpTo.Hash().String(), err)
-
-		return refusal
+	refusal := u.refuseNettedRouteFork(catchupCtx)
+	if refusal == nil {
+		return err
 	}
 
-	return err
+	u.logger.Warnf("[catchup][%s] fork deeper than coinbase maturity is on the netted route, refused as the peer's fault: %v", catchupCtx.blockUpTo.Hash().String(), err)
+
+	var marked *errors.Error
+	if errors.As(refusal, &marked) {
+		marked.SetData(nettedDeepForkRefusalKey, true)
+	}
+
+	return refusal
 }
+
+// nettedDeepForkRefusalKey is the error-data key preferNettedRouteForkRefusal sets on the
+// refusal it returns in place of validateForkDepth's rejection.
+const nettedDeepForkRefusalKey = "netted_deep_fork_refusal"
 
 // nettedRouteRefusalKey is the error-data key newNettedRouteRefusal sets on each local refusal of
 // the netted route: the window without a verified checkpoint (here and in tryQuickValidation),
@@ -1374,26 +1396,13 @@ func newNettedRouteRefusal(message string, params ...interface{}) *errors.Error 
 }
 
 // isNettedRouteRefusal reports whether err is a local refusal of the netted route: a local fault
-// with a link in its chain that newNettedRouteRefusal built.
+// with a link in its chain, within hasErrorMarker's depth bound, that newNettedRouteRefusal built.
 func isNettedRouteRefusal(err error) bool {
 	if err == nil || !isLocalCatchupFault(err) {
 		return false
 	}
 
-	for next := err; next != nil; {
-		var link *errors.Error
-		if !errors.As(next, &link) {
-			return false
-		}
-
-		if marked, _ := link.GetData(nettedRouteRefusalKey).(bool); marked {
-			return true
-		}
-
-		next = link.WrappedErr()
-	}
-
-	return false
+	return hasErrorMarker(err, nettedRouteRefusalKey)
 }
 
 // refuseNettedRouteWindowWithoutCheckpoint refuses a window on the netted route whose first block

@@ -149,6 +149,27 @@ func TestNettedRoute_ReleaseCatchupLockScoresTheRefusals(t *testing.T) {
 		require.Empty(t, rec.genericErrorReported())
 	})
 
+	t.Run("the marker walk is bounded", func(t *testing.T) {
+		// releaseCatchupLock runs this on every local catch-up error, under activeCatchupCtxMu,
+		// and a chain can be tens of thousands of links deep. A marker past the bound is not read.
+		refusal := u.refuseNettedRouteWindowWithoutCheckpoint(&CatchupContext{
+			blockUpTo: target, commonAncestorMeta: &model.BlockHeaderMeta{Height: 400}, blockHeaders: []*model.BlockHeader{target.Header},
+		})
+		require.Error(t, refusal)
+
+		within, beyond := refusal, refusal
+		for i := 0; i < markerChainDepth-1; i++ {
+			within = errors.NewServiceError("[test] wrap", within)
+		}
+
+		for i := 0; i < markerChainDepth; i++ {
+			beyond = errors.NewServiceError("[test] wrap", beyond)
+		}
+
+		require.True(t, isNettedRouteRefusal(within), "a marker on the last link inside the bound is read")
+		require.False(t, isNettedRouteRefusal(beyond), "a marker past the bound is not read")
+	})
+
 	t.Run("a local error with the refusal's wording but no marker is not a refusal", func(t *testing.T) {
 		err := errors.NewServiceError("[test] block below the checkpoint on a netting UTXO store, from some other path")
 		require.False(t, isNettedRouteRefusal(err), "the marker, not the wording, makes a refusal")
@@ -487,6 +508,9 @@ func TestNettedRoute_CatchupRefusesForksOnTheChainStore(t *testing.T) {
 			"validateForkDepth records the malicious attempt and its metric together")
 		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "got %v", err)
 		require.False(t, isLocalCatchupFault(err), "processCatchupChItem must charge and rotate the peer")
+		require.NotNil(t, n.server.previousCatchupAttempt)
+		require.Equal(t, "coinbase_maturity_violation", n.server.previousCatchupAttempt.ErrorType,
+			"the dashboard names the real cause, not network_error")
 		n.assertMinedSetKept(t, 100)
 		assertNoBodyFetch(t)
 	})
