@@ -218,8 +218,10 @@ type BlockAssembler struct {
 	// that block assembly has applied (see replayBestTipChanges). bestTipSeqKnown is false
 	// until the position has been read, and stays false against a blockchain service that
 	// does not number the changes, which leaves block assembly following the best header.
-	bestTipSeq      atomic.Uint64
-	bestTipSeqKnown atomic.Bool
+	bestTipSeq                atomic.Uint64
+	bestTipSeqKnown           atomic.Bool
+	bestTipResetReplayPending atomic.Bool // candidates stay empty until reset's pending history succeeds
+	bestTipResetIncomplete    atomic.Bool // reset moved its target but has not finished reloading/persisting
 
 	// bestTipSeqSaved is the position last persisted under BestTipSeqStateKey.
 	bestTipSeqSaved atomic.Uint64
@@ -595,16 +597,6 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// dequeued in no subtree. Not a storage fault, so it resets
 				// even while degraded, as a plain (not storage-triggered)
 				// reset.
-				// Wake a replay of the tip changes if none ran for
-				// blockassembly_reconcileInterval: a dropped subscription
-				// delivers no notification until it reconnects.
-				// The check runs outside StateReconciling, so a mining candidate asked
-				// for meanwhile is not an empty one, and a replay starts only when the
-				// tip moved.
-				if b.reconcileDue(time.Now()) && b.idleReconcileNeeded(ctx) {
-					b.triggerReconcile()
-				}
-
 				if b.subtreeProcessor.TakeDrainResetRequested() {
 					b.logger.Warnf("[BlockAssembler] the queue drain after a block failed; resetting block assembly")
 					b.resetAfterDrainFailure()
@@ -630,6 +622,16 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 						b.lastStorageResetDone = time.Now()
 						b.resetStorageTriggered()
 					}
+				}
+
+				// Wake a replay of the tip changes if none ran for
+				// blockassembly_reconcileInterval: a dropped subscription
+				// delivers no notification until it reconnects. The check
+				// runs outside StateReconciling, so a mining candidate asked
+				// for meanwhile is not an empty one, and a replay starts only
+				// when the tip moved.
+				if b.reconcileDue(time.Now()) && b.idleReconcileNeeded(ctx) {
+					b.triggerReconcile()
 				}
 
 			case resetReq := <-b.resetCh:
@@ -702,15 +704,18 @@ drain:
 		}
 	}
 
-	// The reset moves to the best tip as it reads it, which includes every change numbered
-	// up to now, so the replay position can move past them once it has succeeded.
-	seqBefore, seqKnown := b.bestTipSeqBeforeReset(ctx)
-
+	// A reset traverses only its endpoint lineages. Keep the replay position so any
+	// briefly winning branch outside those lineages is still replayed afterwards.
+	if b.bestTipSeqKnown.Load() {
+		b.bestTipResetReplayPending.Store(true)
+	}
 	resp, err := b.resetWithResponse(ctx, validateInputs)
-
-	if err == nil && seqKnown {
-		b.advanceBestTipSeq(seqBefore)
-		b.saveBestTipSeq(ctx)
+	if err == nil && b.bestTipSeqKnown.Load() {
+		b.bestTipResetReplayPending.Store(true)
+		_, err = b.replayBestTipChanges(ctx)
+		if err != nil {
+			b.logger.Errorf("[BlockAssembler] reset completed but pending tip changes need retrying: %v", err)
+		}
 	}
 
 	// The Reset path replays moveForward blocks through the same
@@ -838,11 +843,19 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 		return resp, errors.NewProcessingError("[Reset] error getting best block header", err)
 	}
 
+	return b.resetToBlockWithResponse(ctx, bestBlockchainBlockHeader, meta.Height, validateInputs...)
+}
+
+// resetToBlockWithResponse rebuilds assembly at the requested block, which may be a
+// historical winner being replayed rather than the blockchain service's current tip.
+func (b *BlockAssembler) resetToBlockWithResponse(ctx context.Context, bestBlockchainBlockHeader *model.BlockHeader, targetHeight uint32, validateInputs ...bool) (subtreeprocessor.ResetResponse, error) {
+	var resp subtreeprocessor.ResetResponse
+
 	// reset the block assembly
 	hash, h := b.CurrentBlock()
-	b.logger.Warnf("[BlockAssembler][Reset] resetting: %d: %s -> %d: %s", h, hash.Hash(), meta.Height, bestBlockchainBlockHeader.String())
+	b.logger.Warnf("[BlockAssembler][Reset] resetting: %d: %s -> %d: %s", h, hash.Hash(), targetHeight, bestBlockchainBlockHeader.String())
 
-	moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
+	moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, targetHeight)
 	if err != nil {
 		return resp, errors.NewProcessingError("[Reset] error getting reorg blocks", err)
 	}
@@ -861,14 +874,14 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 	// forward range entirely. The safety therefore rests on these being the real
 	// historical chain (gated by the checkpoint), not on the height test alone.
 	//
-	// Testing meta.Height (the target tip) alone is sufficient: it is the max
-	// height of the forward range, so meta.Height <= checkpoint implies every
+	// Testing targetHeight (the target tip) alone is sufficient: it is the max
+	// height of the forward range, so targetHeight <= checkpoint implies every
 	// forward block is <= checkpoint. A range that straddles the checkpoint has
-	// meta.Height > checkpoint and takes the full path.
+	// targetHeight > checkpoint and takes the full path.
 	highestCheckpoint := blockchain.HighestCheckpointHeight(b.settings.ChainCfgParams.Checkpoints)
-	useFastForwardReset := meta.Height <= highestCheckpoint
+	useFastForwardReset := targetHeight <= highestCheckpoint
 
-	currentHeight := meta.Height
+	currentHeight := targetHeight
 
 	moveBackBlocks := make([]*model.Block, len(moveBackBlocksWithMeta))
 	for i, withMeta := range moveBackBlocksWithMeta {
@@ -880,7 +893,7 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 		moveForwardBlocks[i] = withMeta.block
 	}
 
-	b.logger.Warnf("[BlockAssembler][Reset] resetting to new best block header: %d", meta.Height)
+	b.logger.Warnf("[BlockAssembler][Reset] resetting to new best block header: %d", targetHeight)
 
 	// make sure we have processed all pending blocks before resetting
 	if err = b.subtreeProcessor.WaitForPendingBlocks(ctx); err != nil {
@@ -1086,6 +1099,11 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 	// does not depend on a lookup that can itself fail. See resetBlockHeights.
 	resetHeights := resetBlockHeights(bestBlockchainBlockHeader, currentHeight, moveBackBlocksWithMeta, moveForwardBlocksWithMeta)
 
+	if b.bestTipSeqKnown.Load() {
+		b.bestTipResetIncomplete.Store(true)
+		b.bestTipResetReplayPending.Store(true)
+	}
+
 	resp = b.subtreeProcessor.Reset(baBestBlockHeader, moveBackBlocks, moveForwardBlocks, useFastForwardReset, postProcessFn)
 	if resp.Err != nil {
 		b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", resp.Err)
@@ -1159,6 +1177,8 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 
 	_, height := b.CurrentBlock()
 	prometheusBlockAssemblyCurrentBlockHeight.Set(float64(height))
+
+	b.bestTipResetIncomplete.Store(false)
 
 	b.logger.Warnf("[BlockAssembler][Reset] resetting block assembler DONE")
 
@@ -1331,8 +1351,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 // state is persisted.
 //
 // It logs and counts its own failures, and returns the error so the replay can stop at the
-// failed change. An ErrBlockAssemblyReset means a reset ran, which leaves block assembly on
-// the chain's current best tip rather than on this block.
+// failed change. An ErrBlockAssemblyReset means a reset successfully rebuilt assembly on this block.
 func (b *BlockAssembler) moveToBlock(ctx context.Context, bestBlockchainBlockHeader *model.BlockHeader, bestBlockchainBlockHeaderMeta *model.BlockHeaderMeta) (err error) {
 	ctxLogger := b.logger.WithTraceContext(ctx)
 
@@ -2188,6 +2207,14 @@ func (b *BlockAssembler) resetAndRecord(ctx context.Context, validateInputs bool
 	return err
 }
 
+// resetToBlockAndRecord preserves the movement target when a reorg needs a reset.
+func (b *BlockAssembler) resetToBlockAndRecord(ctx context.Context, header *model.BlockHeader, height uint32, validateInputs bool) error {
+	resp, err := b.resetToBlockWithResponse(ctx, header, height, validateInputs)
+	b.onResetDone(false, resp, err)
+
+	return err
+}
+
 // onResetDone updates the disk tx map degraded state once a reset has run,
 // from how that reset ended (every reset completion path calls it):
 //   - completed without a storage error: clears degraded;
@@ -2254,7 +2281,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	// block assembly tip would mine on the old side of a reorg.
 	currentState := b.GetCurrentRunningState()
 	if currentState == StateBlockchainSubscription || currentState == StateMovingUp ||
-		currentState == StateReorging || currentState == StateReconciling || currentState == StateResetting {
+		currentState == StateReorging || currentState == StateReconciling || currentState == StateResetting || b.bestTipResetReplayPending.Load() {
 		b.logger.Infof("[GetMiningCandidate] Block processing in progress (state: %s), returning empty block template for new height", StateStrings[currentState])
 
 		bestBlockHeader, bestBlockMeta, err := b.blockchainClient.GetBestBlockHeader(ctx)
@@ -2537,10 +2564,10 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// make sure we wait for the reset to complete
 		// validateInputs=true: getConflictingNodes() may miss conflicts not stored in subtree
 		// files; validateUnminedTxInputs() independently catches them via SpendingData.
-		err = b.resetAndRecord(ctx, true)
+		err = b.resetToBlockAndRecord(ctx, header, height, true)
 
 		if err != nil {
-			b.logger.Errorf("[BlockAssembler] error resetting after large reorg: %v", err)
+			return errors.NewProcessingError("error resetting after large reorg", err)
 		}
 
 		// return an error to indicate we reset due to a large reorg
@@ -2585,7 +2612,7 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// already detected by reorgBlocks; re-running validateInputs here is redundant
 		// and currently broken (fields.Inputs alone does not populate data.Tx in the
 		// SQL store, so validateUnminedTxInputs always returns false).
-		err = b.resetAndRecord(ctx, reorgFailed)
+		err = b.resetToBlockAndRecord(ctx, header, height, reorgFailed)
 
 		if err != nil {
 			return errors.NewProcessingError("error resetting block assembly after reorg with invalid block", err)
@@ -3584,6 +3611,11 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	}
 	prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues("false", "success").Observe(duration)
 	b.logger.Infof("[loadUnminedTransactions] successfully created unmined tx iterator, starting to process transactions")
+	defer func() {
+		if closeErr := it.Close(); closeErr != nil {
+			b.logger.Warnf("[loadUnminedTransactions] error closing unmined iterator: %v", closeErr)
+		}
+	}()
 
 	unminedTransactions := make([]*utxo.UnminedTransaction, 0, 16*1024*1024) // preallocate a large slice to avoid reallocations
 	lockedTransactions := make([]chainhash.Hash, 0, 1024)
@@ -3653,18 +3685,6 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 								localResult.markAsMinedOnLongestTxs = append(localResult.markAsMinedOnLongestTxs, unminedTransaction.Hash)
 							}
 
-							continue
-						}
-					}
-
-					if shouldValidateInputs {
-						validatedCount := invalidInputCount.Load() + int64(len(localResult.unminedTxs))
-						if validatedCount > 0 && validatedCount%1000 == 0 {
-							b.logger.Infof("[loadUnminedTransactions] input validation progress: %d txs checked, %d invalid", validatedCount, invalidInputCount.Load())
-						}
-
-						if !b.validateUnminedTxInputs(ctx, unminedTransaction.Hash, bestBlockHeaderIDsMap, false) {
-							invalidInputCount.Add(1)
 							continue
 						}
 					}
@@ -3740,6 +3760,33 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	}
 
 	workerResults = nil // release memory
+
+	// Validation can mark conflicts and their descendants. Drain and close the
+	// iterator before those writes: SQLite's open read cursor otherwise blocks
+	// the write transaction, while a worker waits for it and prevents the drain.
+	if err = it.Close(); err != nil {
+		return errors.NewProcessingError("error closing unmined iterator before validation", err)
+	}
+
+	if shouldValidateInputs {
+		valid := unminedTransactions[:0]
+		for _, tx := range unminedTransactions {
+			b.heartbeat.BeatIfStarted()
+			if b.validateUnminedTxInputs(ctx, tx.Hash, bestBlockHeaderIDsMap, false) {
+				valid = append(valid, tx)
+			} else {
+				invalidInputCount.Add(1)
+			}
+		}
+		// An invalid parent can cascade to a child that was validated earlier.
+		// Those children must not be re-added after Remove ran against the old pool.
+		unminedTransactions = valid[:0]
+		for _, tx := range valid {
+			if _, dropped := b.unminedDropHashes[tx.Hash]; !dropped {
+				unminedTransactions = append(unminedTransactions, tx)
+			}
+		}
+	}
 
 	iteratorDuration := time.Since(iteratorStart).Seconds()
 	prometheusBlockAssemblerIteratorProcessingTime.WithLabelValues("false").Observe(iteratorDuration)
@@ -3933,30 +3980,8 @@ func clearUnminedTxInpoints(tx *utxo.UnminedTransaction) {
 //
 // Returns true if the transaction is valid for inclusion in block assembly.
 func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash chainhash.Hash, bestBlockIDsMap map[uint32]bool, dryRun bool) bool {
-	// NOTE: fields.Inputs, not fields.TxInpoints, and deliberately so for now.
-	//
-	// The two stores disagree about what fields.Inputs populates. Aerospike sets
-	// Data.Tx from the inputs bin (stores/utxo/aerospike/get.go, case
-	// fields.Inputs); the SQL store assigns Data.Tx only when fields.Tx was asked
-	// for, so this request comes back with a nil Tx and the guard below returns
-	// false for every transaction. This check is therefore live on aerospike and
-	// dead on SQL today, and on SQL every unmined transaction is dropped by the
-	// caller when input validation is enabled.
-	//
-	// That is not confined to a redundant path. Input validation is enabled by
-	// every large reorg (handleReorg calls b.reset(ctx, true) unconditionally), by
-	// the fallback reset when subtreeProcessor.Reorg fails, and by the
-	// ResetBlockAssemblyValidateInputs RPC. So a SQL-backed node discards its
-	// whole unmined set on any of those.
-	//
-	// Switching to fields.TxInpoints makes it live on SQL, which is correct but
-	// not a mechanical change: the first transaction that fails takes the
-	// markAsConflicting branch below, which writes to the store while
-	// loadUnminedTransactions still holds the unmined iterator open, and on
-	// SQLite that deadlocks. Fixing it means restructuring who writes during the
-	// reload, so it is tracked separately, in bsv-blockchain/teranode issue 1657
-	// section 1, rather than smuggled into a field-set trim.
-	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.Inputs, fields.Conflicting)
+	// Both SQL and Aerospike populate the full transaction for fields.Tx.
+	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.Tx, fields.Conflicting)
 	if err != nil || txMeta == nil || txMeta.Tx == nil || txMeta.Tx.Inputs == nil {
 		return false
 	}

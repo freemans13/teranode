@@ -2179,11 +2179,18 @@ func (b *Blockchain) GetBestTipChanges(ctx context.Context, req *blockchain_api.
 	)
 	defer deferFn()
 
-	if req.Limit == 0 || uint64(req.Limit) > b.maxBlockHeadersPerRequest() {
+	if req.Limit == 0 {
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBestTipChanges] invalid limit %d, must be 1 to %d", req.Limit, b.maxBlockHeadersPerRequest()))
 	}
 
-	blockHeaders, metas, seqs, err := b.store.GetBestTipChanges(ctx, req.AfterSeq, req.MinHeight, req.Limit)
+	// Return a bounded page instead of rejecting a first-party caller's larger
+	// preferred page size. The sequence cursor lets it request the remainder.
+	limit := req.Limit
+	if maximum := b.maxBlockHeadersPerRequest(); uint64(limit) > maximum {
+		limit = uint32(maximum) //nolint:gosec // maximum is smaller than the uint32 request
+	}
+
+	blockHeaders, metas, seqs, err := b.store.GetBestTipChanges(ctx, req.AfterSeq, req.MinHeight, limit)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
 	}

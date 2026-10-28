@@ -127,6 +127,10 @@ func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 
 		// The best-header path moves straight to the tip, so the changes before it are
 		// given up. A change after this read is replayed on the next pass.
+		if b.bestTipResetReplayPending.Load() {
+			return false
+		}
+
 		if seq, seqErr := b.blockchainClient.GetBestTipSeq(ctx); seqErr == nil {
 			b.advanceBestTipSeq(seq)
 			b.saveBestTipSeq(ctx)
@@ -181,7 +185,33 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 
 	defer b.saveBestTipSeq(ctx)
 
+	// A reset can finalize its target before its reload or state write fails.
+	// Retry that rebuild before the hash-equality fast path can acknowledge it.
+	if b.bestTipResetIncomplete.Load() {
+		tip, height := b.CurrentBlock()
+		if tip == nil {
+			return read, errors.NewProcessingError("cannot retry incomplete reset without a tip")
+		}
+		_, meta, err := b.blockchainClient.GetBlockHeader(ctx, tip.Hash())
+		if err != nil {
+			return read, err
+		}
+		if meta.Invalid {
+			err = b.resetAndRecord(ctx, true)
+		} else {
+			err = b.resetToBlockAndRecord(ctx, tip, height, true)
+		}
+		if err != nil {
+			return read, err
+		}
+	}
+
 	for {
+		latest, err := b.blockchainClient.GetBestTipSeq(ctx)
+		if err != nil {
+			return read, errors.NewProcessingError("[replayBestTipChanges] error getting latest tip sequence", err)
+		}
+
 		_, tipHeight := b.CurrentBlock()
 
 		headers, metas, seqs, err := b.blockchainClient.GetBestTipChanges(ctx, b.bestTipSeq.Load(), b.bestTipFloor(tipHeight), bestTipChangesPageSize)
@@ -197,8 +227,9 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 				continue
 			}
 
-			// The latest change is the best tip now. A full page may have more after it.
-			last := i == len(headers)-1 && len(headers) < bestTipChangesPageSize
+			// A server may cap a page below our requested size. Only the latest
+			// sequence can represent a rewind to an ancestor of assembly's tip.
+			last := seqs[i] >= latest
 
 			if err = b.applyBestTipChange(ctx, headers[i], metas[i], last); err != nil && !errors.Is(err, errors.ErrBlockAssemblyReset) {
 				// The position stays before this change, which the next pass retries. The
@@ -206,12 +237,13 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 				return read, err
 			}
 
-			// A reset left block assembly on the current best tip, and the changes after
-			// this one are replayed from there.
+			// Valid changes reset to their own target. Invalid changes reset after
+			// validation has made their transactions recoverable.
 			b.advanceBestTipSeq(seqs[i])
 		}
 
-		if len(headers) < bestTipChangesPageSize {
+		if len(headers) == 0 || b.bestTipSeq.Load() >= latest {
+			b.bestTipResetReplayPending.Store(false)
 			return read, nil
 		}
 	}
@@ -363,23 +395,6 @@ func (b *BlockAssembler) saveBestTipSeq(ctx context.Context) {
 	}
 
 	b.bestTipSeqSaved.Store(seq)
-}
-
-// bestTipSeqBeforeReset reads the latest number before a reset that block assembly did not start
-// from a tip change. The reset moves to the best tip as it is when it reads it, which is at least
-// that change, so the position can move up to it afterwards.
-func (b *BlockAssembler) bestTipSeqBeforeReset(ctx context.Context) (uint64, bool) {
-	if !b.bestTipSeqKnown.Load() {
-		return 0, false
-	}
-
-	seq, err := b.blockchainClient.GetBestTipSeq(ctx)
-	if err != nil {
-		b.logger.Warnf("[BlockAssembler] error reading best tip position before reset: %v", err)
-		return 0, false
-	}
-
-	return seq, true
 }
 
 // reconcileDue reports whether the idle tick should wake a replay: none has run for

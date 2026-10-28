@@ -1,6 +1,7 @@
 package blockassembly
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -208,6 +210,7 @@ func TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack(t *testing.T) {
 
 	_, err := items.blockchainClient.InvalidateBlock(t.Context(), chain[2].Hash())
 	require.NoError(t, err)
+	require.NoError(t, items.blockchainClient.SetBlockMinedSet(t.Context(), chain[2].Hash()))
 
 	items.blockAssembler.processNewBlockAnnouncement(t.Context())
 
@@ -485,4 +488,199 @@ func TestBestTipSeqEncoding(t *testing.T) {
 
 	_, err = DecodeBestTipSeq([]byte{1, 2, 3})
 	require.Error(t, err)
+}
+
+// Regression proof: a historical tip that takes reset must still be traversed.
+func TestReplayBestTipChanges_ResetVisitsHistoricalWinner(t *testing.T) {
+	initPrometheusMetrics()
+	items := setupBlockAssemblyTest(t, func(s *settings.Settings) {
+		s.GlobalBlockHeightRetention = 288
+		s.UtxoStore.BlockHeightRetentionAdjustment = 0
+		params := *s.ChainCfgParams
+		params.CoinbaseMaturity = 100
+		s.ChainCfgParams = &params
+	})
+	genesis := genesisHeader(t, items)
+	prefix := buildChain(genesis, 1001, 18000)
+	addChain(t, items, prefix)
+	common := prefix[len(prefix)-1]
+	a1 := buildChain(common, 1, 15000)[0]
+	addChain(t, items, []*model.BlockHeader{a1})
+	startReplayAt(t, items, a1, 1002)
+	moves := recordMoves(t, items)
+	mockStp := items.blockAssembler.subtreeProcessor.(*subtreeprocessor.MockSubtreeProcessor)
+	mockStp.On("WaitForPendingBlocks", mock.Anything).Return(nil)
+	resetMoves := []recordedMove{}
+	mockStp.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(subtreeprocessor.ResetResponse{}).Run(func(args mock.Arguments) {
+		m := recordedMove{}
+		for _, block := range args.Get(1).([]*model.Block) {
+			m.back = append(m.back, block.Hash().String())
+		}
+		for _, block := range args.Get(2).([]*model.Block) {
+			m.forward = append(m.forward, block.Hash().String())
+		}
+		resetMoves = append(resetMoves, m)
+	})
+	b := buildChain(common, 100, 16000)
+	addChain(t, items, b)
+	a := buildChain(a1, 100, 17000)
+	addChain(t, items, a)
+	read, err := items.blockAssembler.replayBestTipChanges(t.Context())
+	require.NoError(t, err)
+	t.Logf("read=%d retention=%d coinbaseMaturity=%d", read, items.blockAssembler.settings.GetUtxoStoreBlockHeightRetention(), items.blockAssembler.settings.ChainCfgParams.CoinbaseMaturity)
+	requireBlockAssemblyTip(t, items, a[len(a)-1])
+	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
+	t.Logf("incremental moves=%d resets=%d first reset back=%d forward=%d", len(*moves), len(resetMoves), len(resetMoves[0].back), len(resetMoves[0].forward))
+	appliedHistorical := false
+	for _, m := range append(*moves, resetMoves...) {
+		for _, hash := range append(m.back, m.forward...) {
+			if hash == b[len(b)-1].Hash().String() {
+				appliedHistorical = true
+			}
+		}
+	}
+	require.True(t, appliedHistorical, "B2 became best within the height floor, but replay checkpointed it without passing either B block to the subtree processor")
+}
+
+// Regression proof: a historical tip that takes reset must still be traversed.
+func TestReplayBestTipChanges_ExternalResetRetainsPendingHistory(t *testing.T) {
+	initPrometheusMetrics()
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+	a1 := buildChain(genesis, 1, 15000)[0]
+	addChain(t, items, []*model.BlockHeader{a1})
+	startReplayAt(t, items, a1, 1)
+	moves := recordMoves(t, items)
+	mockStp := items.blockAssembler.subtreeProcessor.(*subtreeprocessor.MockSubtreeProcessor)
+	mockStp.On("WaitForPendingBlocks", mock.Anything).Return(nil)
+	resetMoves := []recordedMove{}
+	mockStp.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(subtreeprocessor.ResetResponse{}).Run(func(args mock.Arguments) {
+		m := recordedMove{}
+		for _, block := range args.Get(1).([]*model.Block) {
+			m.back = append(m.back, block.Hash().String())
+		}
+		for _, block := range args.Get(2).([]*model.Block) {
+			m.forward = append(m.forward, block.Hash().String())
+		}
+		resetMoves = append(resetMoves, m)
+	})
+	b := buildChain(genesis, 2, 16000)
+	addChain(t, items, b)
+	a := buildChain(a1, 2, 17000)
+	addChain(t, items, a)
+	items.blockAssembler.handleResetRequests(t.Context(), resetRequest{})
+	read, err := items.blockAssembler.replayBestTipChanges(t.Context())
+	require.NoError(t, err)
+	require.Zero(t, read, "reset must synchronously apply its pending history")
+	requireBlockAssemblyTip(t, items, a[len(a)-1])
+	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
+	t.Logf("incremental moves=%d resets=%d first reset back=%d forward=%d", len(*moves), len(resetMoves), len(resetMoves[0].back), len(resetMoves[0].forward))
+	appliedHistorical := false
+	for _, m := range append(*moves, resetMoves...) {
+		for _, hash := range append(m.back, m.forward...) {
+			if hash == b[len(b)-1].Hash().String() {
+				appliedHistorical = true
+			}
+		}
+	}
+	require.True(t, appliedHistorical, "B2 became best within the height floor, but replay checkpointed it without passing either B block to the subtree processor")
+}
+
+// cappedTipClient keeps real blockchain storage while emulating an RPC server's
+// smaller response cap (or a temporary transport failure).
+type cappedTipClient struct {
+	blockchain.ClientI
+	cap  uint32
+	fail bool
+}
+
+func (c *cappedTipClient) GetBestTipChanges(ctx context.Context, after uint64, floor, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
+	if c.fail {
+		return nil, nil, nil, errors.NewStorageError("temporary replay read failure")
+	}
+	return c.ClientI.GetBestTipChanges(ctx, after, floor, min(limit, c.cap))
+}
+
+func TestReplayBestTipChanges_CappedPagesSkipIntermediateAncestors(t *testing.T) {
+	initPrometheusMetrics()
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+	chain := buildChain(genesis, 3, 25000)
+	startReplayAt(t, items, genesis, 0)
+	addChain(t, items, chain)
+	items.blockAssembler.setBestBlockHeader(chain[2], 3)
+	moves := recordMoves(t, items)
+	items.blockAssembler.blockchainClient = &cappedTipClient{ClientI: items.blockchainClient, cap: 1}
+	n, err := items.blockAssembler.replayBestTipChanges(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+	require.Empty(t, *moves, "a short capped page must not turn an intermediate ancestor into a final rewind")
+	requireBlockAssemblyTip(t, items, chain[2])
+}
+
+func TestReplayBestTipChanges_FailedResetRetainsPosition(t *testing.T) {
+	initPrometheusMetrics()
+	items := setupBlockAssemblyTest(t, func(s *settings.Settings) {
+		s.GlobalBlockHeightRetention = 2
+		s.UtxoStore.BlockHeightRetentionAdjustment = 0
+	})
+	genesis := genesisHeader(t, items)
+	a1 := buildChain(genesis, 1, 26000)[0]
+	addChain(t, items, []*model.BlockHeader{a1})
+	seq := startReplayAt(t, items, a1, 1)
+	recordMoves(t, items)
+	stp := items.blockAssembler.subtreeProcessor.(*subtreeprocessor.MockSubtreeProcessor)
+	stp.On("WaitForPendingBlocks", mock.Anything).Return(nil)
+	failure := errors.NewStorageError("reset failed")
+	stp.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(subtreeprocessor.ResetResponse{Err: failure})
+	stp.On("GetCurrentBlockHeader").Return(a1)
+	b := buildChain(genesis, 2, 27000)
+	addChain(t, items, b)
+	a := buildChain(a1, 2, 28000)
+	addChain(t, items, a)
+	_, err := items.blockAssembler.replayBestTipChanges(t.Context())
+	require.ErrorIs(t, err, failure)
+	require.Equal(t, seq, items.blockAssembler.bestTipSeq.Load(), "failed reset must not acknowledge historical winner")
+}
+
+func TestReplayBestTipChanges_ExternalResetFailureGatesCandidates(t *testing.T) {
+	initPrometheusMetrics()
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+	a1 := buildChain(genesis, 1, 29000)[0]
+	addChain(t, items, []*model.BlockHeader{a1})
+	startReplayAt(t, items, a1, 1)
+	recordMoves(t, items)
+	stp := items.blockAssembler.subtreeProcessor.(*subtreeprocessor.MockSubtreeProcessor)
+	stp.On("WaitForPendingBlocks", mock.Anything).Return(nil)
+	stp.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(subtreeprocessor.ResetResponse{})
+	b := buildChain(genesis, 2, 30000)
+	addChain(t, items, b)
+	a := buildChain(a1, 2, 31000)
+	addChain(t, items, a)
+	client := &cappedTipClient{ClientI: items.blockchainClient, cap: 1, fail: true}
+	ba := items.blockAssembler
+	ba.blockchainClient = client
+	answer := make(chan error, 1)
+	ba.handleResetRequests(t.Context(), resetRequest{ErrCh: answer})
+	require.Error(t, <-answer)
+	require.True(t, ba.bestTipResetReplayPending.Load())
+	ba.setCurrentRunningState(StateRunning)
+	candidate, _, err := ba.GetMiningCandidate(t.Context())
+	require.NoError(t, err)
+	require.Zero(t, candidate.NumTxs, "current tip must not expose child-only pool while replay is pending")
+	for range maxBestTipReplayFailures {
+		require.False(t, ba.followBestTipChanges(t.Context()))
+	}
+	require.True(t, ba.bestTipResetReplayPending.Load())
+	client.fail = false
+	ba.processNewBlockAnnouncement(t.Context())
+	require.False(t, ba.bestTipResetReplayPending.Load())
+	requireBlockAssemblyTip(t, items, a[1])
 }

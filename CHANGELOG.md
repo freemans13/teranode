@@ -120,7 +120,11 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   if the tip moved. Upgrade in any order: block assembly against an older blockchain
   service follows the best header as before, asking again once a minute, and
   an older binary ignores the new column and state key, so a rollback needs no step.
-  (#2074)
+  SQL-backed block assembly also retains valid unmined transactions during an
+  input-validated reset, and resets undo conflicting-spender swaps before reloading
+  the pool. Historical resets visit their recorded target; externally requested
+  resets finish pending history before serving a populated mining candidate. No
+  configuration change is required. (#2074)
 
 - **Catch-up quick validation waits for each block's `.subtree` writes before it commits
   the block, and a shutdown waits for a block's in-flight commit.** A block was stored with

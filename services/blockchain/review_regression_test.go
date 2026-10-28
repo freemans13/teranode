@@ -230,3 +230,27 @@ func TestClientGetBlockHeaderIDs_AboveHeaderCap(t *testing.T) {
 		require.Equal(t, codes.InvalidArgument, status.Code(err), "full headers remain capped")
 	}
 }
+
+func TestGetBestTipChanges_ClampsConfiguredPageSize(t *testing.T) {
+	fixture := setup(t)
+	for height := uint32(1); height <= 3; height++ {
+		block := createTestBlockAtHeight(fixture, t, height, 1000000+height*600)
+		_, _, err := fixture.server.store.StoreBlock(t.Context(), block, "")
+		require.NoError(t, err)
+	}
+	fixture.server.settings.BlockChain.MaxBlockHeadersPerRequest = 1
+	var after uint64
+	for range 4 {
+		page, err := fixture.server.GetBestTipChanges(t.Context(), &blockchain_api.GetBestTipChangesRequest{AfterSeq: after, Limit: 1000})
+		require.NoError(t, err)
+		require.Len(t, page.BlockHeaders, 1)
+		require.Len(t, page.Seqs, 1)
+		require.Greater(t, page.Seqs[0], after)
+		after = page.Seqs[0]
+	}
+	end, err := fixture.server.GetBestTipChanges(t.Context(), &blockchain_api.GetBestTipChangesRequest{AfterSeq: after, Limit: 1000})
+	require.NoError(t, err)
+	require.Empty(t, end.BlockHeaders)
+	_, err = fixture.server.GetBestTipChanges(t.Context(), &blockchain_api.GetBestTipChangesRequest{})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}

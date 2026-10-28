@@ -1757,6 +1757,17 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// the map is only used during the reset process and is not stored in the SubtreeProcessor struct
 	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
+	// A reset must undo the same UTXO swaps as an incremental reorg. Its
+	// in-memory pool has already been cleared, so only the store and cache
+	// need updating here; postProcess reloads the surviving transactions.
+	var moveForwardTxSet map[chainhash.Hash]struct{}
+	if len(moveBackBlocks) > 0 {
+		moveForwardTxSet, err = stp.collectMoveForwardTxHashes(ctx, moveForwardBlocks)
+		if err != nil {
+			return errors.NewProcessingError("[Reset] error collecting moveForward tx hashes", err)
+		}
+	}
+
 	// Every per-block step below reports progress, for the same reason Reorg
 	// does: the owner's main loop is blocked on this call for its whole length,
 	// and a reset can move hundreds of blocks (issue 1447). The serial loops beat
@@ -1789,7 +1800,33 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		}
 
 		if len(conflictingHashes) > 0 {
+			reverseInputs := make([]chainhash.Hash, 0, len(conflictingHashes))
 			for _, hash := range conflictingHashes {
+				// A winner present on both branches stays canonical: neither
+				// reverse nor forward needs to apply its already-completed swap.
+				if _, inForward := moveForwardTxSet[hash]; !inForward {
+					reverseInputs = append(reverseInputs, hash)
+				}
+			}
+
+			if block.Height == 0 {
+				_, blockMeta, metaErr := stp.blockchainClient.GetBlockHeader(ctx, block.Hash())
+				if metaErr != nil {
+					return errors.NewProcessingError("[Reset] error getting moveBack block height", metaErr)
+				}
+				block.Height = blockMeta.Height
+			}
+
+			cascaded, touched, reverseErr := utxostore.ReverseProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), reverseInputs)
+			stp.txMetaEvictor.Evict(cascaded)
+			if reverseErr != nil {
+				return errors.NewProcessingError("[Reset] error reversing moved-back block conflicts", reverseErr)
+			}
+
+			for _, hash := range conflictingHashes {
+				processedConflictingHashesMap[hash] = struct{}{}
+			}
+			for _, hash := range touched {
 				processedConflictingHashesMap[hash] = struct{}{}
 			}
 		}
