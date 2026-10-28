@@ -80,6 +80,8 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 		failureCount := 0
 		mu := sync.Mutex{}
 
+		var winner *CatchupContext
+
 		var wg sync.WaitGroup
 		wg.Add(numGoroutines)
 
@@ -100,9 +102,9 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 				mu.Lock()
 				if err == nil {
 					successCount++
-					// Hold lock briefly
-					time.Sleep(10 * time.Millisecond)
-					server.releaseCatchupLock(ctx, &err)
+					// Hold the lock until every goroutine has tried. Releasing it early lets a
+					// goroutine that starts late acquire it legitimately, which made this flaky.
+					winner = ctx
 				} else {
 					failureCount++
 				}
@@ -111,6 +113,11 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 		}
 
 		wg.Wait()
+
+		if winner != nil {
+			var releaseErr error
+			server.releaseCatchupLock(winner, &releaseErr)
+		}
 
 		// Exactly one should succeed
 		assert.Equal(t, 1, successCount,

@@ -126,7 +126,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DataCarrier:         getBool("datacarrier", false, alternativeContext...),
 			PermitBareMultisig:  getBool("permitbaremultisig", true, alternativeContext...),
 			// MaxStdTxValidationDuration:    getInt("maxstdtxvalidationduration", 3, alternativeContext...),       // 3ms
-			// MaxNonStdTxValidationDuration: getInt("maxnonstdtxvalidationduration", 1000, alternativeContext...), // 1000ms
+			MaxNonStdTxValidationDuration: getInt("maxnonstdtxvalidationduration", 1000, alternativeContext...), // 1000ms
 			// MaxTxChainValidationBudget:    getInt("maxtxchainvalidationbudget", 50, alternativeContext...),      // 50ms
 			// ValidationClockCPU:              getBool("validationclockcpu", false, alternativeContext...),
 			MinConsolidationFactor:          getInt("minconsolidationfactor", 20, alternativeContext...),
@@ -494,6 +494,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HTTPRateLimit:                        getInt("validator_httpRateLimit", 1024, alternativeContext...),
 			HTTPBodyLimit:                        getString("validator_httpBodyLimit", "100MB", alternativeContext...),
 			KafkaMaxMessageBytes:                 getInt("validator_kafka_maxMessageBytes", 1024*1024, alternativeContext...), // Default 1MB
+			ConsensusRerunSlots:                  getInt("validator_consensusRerunSlots", 1, alternativeContext...),
 			UseLocalValidator:                    getBool("useLocalValidator", false, alternativeContext...),
 			TxMetaKafkaBatchSize:                 getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
 			TxMetaKafkaBatchTimeoutMs:            getInt("validator_txmeta_kafka_batchTimeoutMs", 5, alternativeContext...),
@@ -716,6 +717,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GRPCListenAddress:                         getString("subtreevalidation_grpcListenAddress", ":8089", alternativeContext...),
 			ProcessTxMetaUsingCacheConcurrency:        getInt("subtreevalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
 			PeerSubtreeConcurrency:                    getInt("subtreevalidation_peerSubtreeConcurrency", 32, alternativeContext...),
+			SkippedSubtreeBackfillMax:                 getInt("subtreevalidation_skippedSubtreeBackfillMax", 4096, alternativeContext...),
 			ProcessTxMetaUsingCacheMissingTxThreshold: getInt("subtreevalidation_processTxMetaUsingCache_MissingTxThreshold", 1, alternativeContext...),
 			SubtreeDAHConcurrency:                     getInt("subtreevalidation_subtreeDAHConcurrency", 8, alternativeContext...),
 			TxMetaCacheEnabled:                        getBool("subtreevalidation_txMetaCacheEnabled", true, alternativeContext...),

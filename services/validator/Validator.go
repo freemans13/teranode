@@ -268,7 +268,10 @@ type Validator struct {
 	rejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI
 
 	// policyRejectedTxKafkaProducerClient publishes consensus-valid transactions that were
-	// rejected by local policy (ErrTxPolicy). This is a separate topic from
+	// rejected by local policy (ErrTxPolicy). A policy script failure whose consensus
+	// re-run timed out, found no free slot or reached the policy stack memory cap is
+	// published unconfirmed (see classifyPolicyScriptError), so consumers must validate
+	// what they take from it, as subtree validation does. This is a separate topic from
 	// rejectedTxKafkaProducerClient for two reasons:
 	//   1. Different message schema: this topic carries the full raw tx bytes
 	//      (KafkaTxPolicyRejectedTopicMessage.RawTx) so that consumers can reconstruct
@@ -784,7 +787,7 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 			}
 		}
 
-		// Publish consensus-valid but policy-rejected transactions so subtree validation
+		// Publish policy-rejected transactions so subtree validation
 		// pods can cache the raw tx bytes and avoid HTTP roundtrips to other miners.
 		if errors.Is(err, errors.ErrTxPolicy) {
 			v.publishPolicyRejectedTx(ctx, ctxLogger, tx, err)
