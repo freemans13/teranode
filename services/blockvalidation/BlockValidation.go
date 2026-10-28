@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -96,6 +97,18 @@ type validationResult struct {
 	done chan struct{} // Closed when validation completes
 	err  error         // The validation result
 	mu   sync.RWMutex  // Protects err
+
+	// settled is closed after done, once the settle hook has run. Until then the block still
+	// counts as validating, so children held behind it are not started before they have their
+	// class. Nil in literals built by tests, which then fall back to done.
+	settled chan struct{}
+}
+
+// validationDoneHooks run after a block's validation result is published: settle with the block
+// and its validation error, then wake once the block no longer counts as validating.
+type validationDoneHooks struct {
+	settle func(*chainhash.Hash, error)
+	wake   func()
 }
 
 const (
@@ -234,6 +247,11 @@ type BlockValidation struct {
 	// variadic opts like p2pClient.
 	blockAssemblyClient blockassembly.ClientI
 
+	// setMinedDisabled leaves the mined status of blocks to another BlockValidation
+	// on the same stores (see NoSetMined): nothing is queued for this instance's
+	// setMined worker. Set from NewBlockValidation's variadic opts.
+	setMinedDisabled bool
+
 	// lastValidatedBlocks caches recently validated blocks for 2 minutes
 	lastValidatedBlocks *expiringmap.ExpiringMap[chainhash.Hash, *model.Block]
 
@@ -254,6 +272,11 @@ type BlockValidation struct {
 
 	// blocksCurrentlyValidating tracks blocks being validated to prevent concurrent validation
 	blocksCurrentlyValidating *txmap.SyncedMap[chainhash.Hash, *validationResult]
+
+	// validationDoneHooks, when set, run once a block's validation result is published. They
+	// classify the children held behind a block validated outside the queue and wake the priority
+	// queue, which otherwise releases those children only on an unrelated queue event.
+	validationDoneHooks atomic.Pointer[validationDoneHooks]
 
 	// setMinedChan receives block hashes that need to be marked as mined
 	setMinedChan chan *chainhash.Hash
@@ -391,6 +414,12 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 		u.settings.BlockValidation.SubtreeMetaPeerFetchTimeout)
 }
 
+// NoSetMined, passed to NewBlockValidation, leaves setting the mined status of
+// blocks' transactions to another BlockValidation on the same stores. Two
+// setMined workers on one block race: one's set can land after the other's
+// unset of an invalidated block and leave its transactions marked mined.
+type NoSetMined struct{}
+
 // NewBlockValidation creates a new block validation instance with the provided dependencies.
 // It initializes all required components and starts background processing goroutines for
 // handling block validation tasks.
@@ -405,12 +434,16 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 //   - utxoStore: Storage for utxos and transaction metadata
 //   - validatorClient: Transaction validation interface
 //   - subtreeValidationClient: Subtree validation interface
-//   - opts: Optional parameters:
+//   - opts: Optional parameters: a P2PClientI, a blockassembly.ClientI, NoSetMined
 //
 // Returns a configured BlockValidation instance ready for use.
 func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, subtreeStore blob.Store,
 	txStore blob.Store, utxoStore utxo.Store, validatorClient validator.Interface, subtreeValidationClient subtreevalidation.Interface, opts ...interface{},
 ) *BlockValidation {
+	// The background goroutines below set package metrics; a BlockValidation built
+	// without the Server, such as the test daemon's, must not find them nil.
+	initPrometheusMetrics()
+
 	logger.Infof("optimisticMining = %v", tSettings.BlockValidation.OptimisticMining)
 	if tSettings.BlockValidation.OptimisticMining && !tSettings.BlockValidation.OptimisticMiningPeerBlocks {
 		logger.Warnf("optimistic mining is enabled but stays off on every validation path until blockvalidation_optimistic_mining_peer_blocks is also set (bitcoin-sv/teranode#4692)")
@@ -473,6 +506,10 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		if c, ok := o.(blockassembly.ClientI); ok {
 			bv.blockAssemblyClient = c
 		}
+
+		if _, ok := o.(NoSetMined); ok {
+			bv.setMinedDisabled = true
+		}
 	}
 
 	go func() {
@@ -497,7 +534,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		subscribeCancel context.CancelFunc
 	)
 
-	if bv.blockchainClient != nil {
+	// The subscription only feeds the setMined worker, so a NoSetMined instance skips it.
+	if bv.blockchainClient != nil && !bv.setMinedDisabled {
 		go func() {
 			for {
 				select {
@@ -926,7 +964,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 // We deliberately do NOT call tryClaimBlockForSetMined here because the claim must be
 // released by the consumer, and the worker owns that lifecycle.
 func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context) {
-	if u.blockchainClient == nil {
+	if u.blockchainClient == nil || u.setMinedDisabled {
 		return
 	}
 
@@ -985,6 +1023,10 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context) {
 // once the channel empties, and dedups via the MinedSet/tryClaim guards, so overflow
 // reordering is harmless.
 func (u *BlockValidation) enqueueSetMined(blockHash *chainhash.Hash) {
+	if u.setMinedDisabled {
+		return
+	}
+
 	select {
 	case u.setMinedChan <- blockHash:
 	default:
@@ -1137,6 +1179,10 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 			block := block
 
 			g.Go(func() error {
+				// A panic is logged and swallowed like every other failure in this sweep, so one
+				// bad block cannot stop the service from starting. Its subtrees_set stays false.
+				defer recoverChildPanic(u.logger, recoveredPanicPathService, nil, nil, "[BlockValidation:start][%s] subtrees_set sweep", block.Hash().String())
+
 				// See subtreeFilesReady for why the sweep, and only the sweep, needs this check.
 				ready, missing, err := u.subtreeFilesReady(ctx, block)
 				if err != nil {
@@ -1664,6 +1710,36 @@ func (u *BlockValidation) isParentMined(ctx context.Context, blockHeader *model.
 	return parentBlockMined, nil
 }
 
+// IsValidating reports whether the block is being validated, on any path, or its settle hook has
+// not finished yet. A settled validation whose entry is still kept for the validationResultGrace
+// window does not count: its outcome is already in the store, and the window serves only
+// duplicate arrivals.
+func (u *BlockValidation) IsValidating(blockHash *chainhash.Hash) bool {
+	result, ok := u.blocksCurrentlyValidating.Get(*blockHash)
+	if !ok {
+		return false
+	}
+
+	finished := result.settled
+	if finished == nil {
+		finished = result.done
+	}
+
+	select {
+	case <-finished:
+		return false
+	default:
+		return true
+	}
+}
+
+// SetValidationDoneHooks sets the hooks run, on their own goroutine, each time a block's
+// validation result is published: settle with the block and the validation error, then wake once
+// the block no longer counts as validating. Either may be nil.
+func (u *BlockValidation) SetValidationDoneHooks(settle func(*chainhash.Hash, error), wake func()) {
+	u.validationDoneHooks.Store(&validationDoneHooks{settle: settle, wake: wake})
+}
+
 // runOncePerBlock ensures validation runs only once per block.
 // If another goroutine is already validating, it waits and returns that result.
 // validationResultGrace is how long a finished validation's result stays published for
@@ -1685,7 +1761,8 @@ const prepareBlockAssemblyTimeout = 2 * time.Second
 
 func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) (err error) {
 	result := &validationResult{
-		done: make(chan struct{}),
+		done:    make(chan struct{}),
+		settled: make(chan struct{}),
 	}
 
 	existingResult, wasFirst := u.blocksCurrentlyValidating.SetIfNotExists(*blockHash, result)
@@ -1715,10 +1792,32 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 		result.mu.Unlock()
 		close(result.done)
 
-		go func() {
-			time.Sleep(validationResultGrace)
-			u.blocksCurrentlyValidating.Delete(*blockHash)
-		}()
+		// The entry is dropped only after settle, however long it takes: without the entry the
+		// block no longer counts as validating, and its children would be released before they
+		// have their class. A panic in settle is logged, not fatal (BV-STARTUP-007), and still
+		// releases the children.
+		go func(err error) {
+			hooks := u.validationDoneHooks.Load()
+
+			defer func() {
+				if r := recover(); r != nil {
+					u.logger.Errorf("[ValidateBlock][%s] PANIC in the validation-done settle hook: %v stack=%q", blockHash.String(), r, debug.Stack())
+				}
+
+				close(result.settled)
+
+				if hooks != nil && hooks.wake != nil {
+					hooks.wake()
+				}
+
+				time.Sleep(validationResultGrace)
+				u.blocksCurrentlyValidating.Delete(*blockHash)
+			}()
+
+			if hooks != nil && hooks.settle != nil {
+				hooks.settle(blockHash, err)
+			}
+		}(err)
 
 		if r != nil {
 			panic(r)
@@ -1727,45 +1826,6 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 
 	// We're first - run validation
 	return validate(opts)
-}
-
-// concurrentValidationPanicked marks the error that runOncePerBlock gives to the waiters of a
-// validation that panicked on another goroutine (BV-STARTUP-007). The waiter has no panic of its
-// own, so the caller cannot tell from its own state that the failure is a bug in this node. A
-// catchup waiter would score it against the primary peer.
-//
-// It is a Go type and not an error code or an errors-package sentinel. teranode's errors.Is
-// matches on the code, so a sentinel made with NewProcessingError matches each ERR_PROCESSING
-// error. NewProcessingError turns a trailing cause that is not an *Error into a plain message, so the
-// marker goes into the chain with SetWrappedErr. isConcurrentValidationPanic finds it by type
-// with errors.As, which does no text matching. Over gRPC the marker is lost, and the error is a
-// plain ERR_PROCESSING error, as before.
-type concurrentValidationPanicked struct{}
-
-func (*concurrentValidationPanicked) Error() string {
-	return "a concurrent validation of this block panicked"
-}
-
-// newConcurrentValidationPanicError returns the ERR_PROCESSING error that runOncePerBlock stores
-// for the waiters when validate panics. Its text has no word that IsNetworkError,
-// IsMaliciousResponseError or IsContextError matches.
-func newConcurrentValidationPanicError(blockHash *chainhash.Hash) error {
-	err := errors.NewProcessingError("[ValidateBlock][%s] panic during a concurrent validation of this block, see the PANIC log line", blockHash.String())
-	err.SetWrappedErr(&concurrentValidationPanicked{})
-
-	return err
-}
-
-// isConcurrentValidationPanic reports whether err came from a waiter in runOncePerBlock whose
-// validation panicked on another goroutine. Such an error is a local fault, never the peer's.
-func isConcurrentValidationPanic(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	var marker *concurrentValidationPanicked
-
-	return errors.As(err, &marker)
 }
 
 // ValidateBlock performs comprehensive validation of a Bitcoin block.
@@ -2190,7 +2250,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// Wait for reValidationBlock to do its thing
 		// When waitForPreviousBlocksToBeProcessed is done, all the previous blocks will be processed
 		if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
-			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
+			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block.
+			// A NoSetMined instance queues nothing here and waits on the BlockValidation
+			// that owns setMined to mark the parent mined.
 			u.enqueueSetMined(block.Header.HashPrevBlock)
 
 			if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
@@ -3068,6 +3130,12 @@ func (u *BlockValidation) subtreeToCheckPresentBefore(ctx context.Context, block
 		idx, hash := i, *subtreeHash
 
 		g.Go(func() error {
+			// Present until the probe says otherwise, so a probe that panics fails safe like one
+			// that errors. The group's error is discarded, so the panic is only logged and counted.
+			present[idx] = true
+
+			defer recoverChildPanic(u.logger, recoveredPanicPathBlockValidation, nil, nil, "[subtreeToCheckPresentBefore][%s] subtree %s", block.Hash().String(), hash.String())
+
 			_, exists, err := findLocalSubtreeFile(ctx, u.subtreeStore, hash)
 			present[idx] = exists || err != nil
 

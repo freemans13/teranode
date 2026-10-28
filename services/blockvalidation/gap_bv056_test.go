@@ -37,6 +37,9 @@ type gap056FailingUnlockStore struct {
 	// beforeUnlock, when set, runs at the start of every unlock, before any injected failure. A
 	// test uses it to hold the post-commit unlock in flight.
 	beforeUnlock func()
+
+	// panicOnFail makes each injected failure a panic instead of an error.
+	panicOnFail bool
 }
 
 func (s *gap056FailingUnlockStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
@@ -47,6 +50,10 @@ func (s *gap056FailingUnlockStore) SetLocked(ctx context.Context, txHashes []cha
 	if !value && s.unlockCalls.Add(1) <= s.failUnlocks {
 		if s.onFail != nil {
 			s.onFail()
+		}
+
+		if s.panicOnFail {
+			panic("gap056: simulated panic in the post-commit unlock")
 		}
 
 		return gap056DriverError{}
@@ -89,6 +96,8 @@ func gap056QuickValidate(t *testing.T, failUnlocks int32) (*preBindHarness, *mod
 type gap056Config struct {
 	// failUnlocks is how many post-commit unlocks the UTXO store fails.
 	failUnlocks int32
+	// panicOnUnlockFail makes each injected unlock failure a panic.
+	panicOnUnlockFail bool
 	// cancelOnUnlockFail cancels the context given to tryQuickValidation at each injected unlock
 	// failure, as a sibling failure in the catch-up errgroup does.
 	cancelOnUnlockFail bool
@@ -116,7 +125,7 @@ func gap056QuickValidateWith(t *testing.T, cfg gap056Config) (*preBindHarness, *
 	quickCtx, cancelQuick := context.WithCancel(h.ctx)
 	t.Cleanup(cancelQuick)
 
-	failing := &gap056FailingUnlockStore{Store: h.utxoStore, failUnlocks: cfg.failUnlocks}
+	failing := &gap056FailingUnlockStore{Store: h.utxoStore, failUnlocks: cfg.failUnlocks, panicOnFail: cfg.panicOnUnlockFail}
 	if cfg.cancelOnUnlockFail {
 		failing.onFail = cancelQuick
 	}
@@ -227,6 +236,27 @@ func TestGapBV056_PostCommitUnlockExhaustedAbortsWithoutRemovingFiles(t *testing
 	created, err := h.utxoStore.Get(h.ctx, childHash, fields.Locked)
 	require.NoError(t, err)
 	require.True(t, created.Locked, "no recovery path unlocks a committed block's outputs after the retries are exhausted")
+}
+
+// TestGapBV056_PostCommitUnlockPanicAbortsWithoutRemovingFiles covers a panic in the post-commit
+// unlock. recoverChildPanic turns it into a local-panic error, and commitBlock wraps that in the
+// block-committed error, so the error tryQuickValidation sees carries both markers. The committed
+// block's .subtree file must stay, and the panic marker must survive for releaseCatchupLock.
+//
+// Mutation proof: letting the isLocalPanic branch in tryQuickValidation take an error that carries
+// both markers (adding && !isLocalPanic(err) to the isBlockCommitted check) sends it to the
+// local-panic sweep, which deletes the committed block's .subtree file.
+func TestGapBV056_PostCommitUnlockPanicAbortsWithoutRemovingFiles(t *testing.T) {
+	h, _, subtreeRoot, _, _, tryNormal, quickErr := gap056QuickValidateWith(t, gap056Config{failUnlocks: 1_000, panicOnUnlockFail: true})
+
+	require.Error(t, quickErr)
+	require.True(t, isBlockCommitted(quickErr), "the post-commit failure must carry the block-committed marker: %v", quickErr)
+	require.True(t, isLocalPanic(quickErr), "the panic marker must survive the block-committed wrap: %v", quickErr)
+	require.False(t, tryNormal, "a committed block must not fall through to normal validation")
+
+	exists, err := h.subtreeStore.Exists(h.ctx, subtreeRoot[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.True(t, exists, "committed block has subtrees_set=true but its .subtree file was deleted")
 }
 
 // TestGapBV056_PostCommitUnlockRetriesSurviveCancelledCatchupContext covers a cancelled catch-up
