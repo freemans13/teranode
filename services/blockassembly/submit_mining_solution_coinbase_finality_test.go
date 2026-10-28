@@ -188,6 +188,33 @@ func timeLockedCoinbase(t *testing.T, lockTime uint32) *bt.Tx {
 // submit path straight to AddBlock. The submit path therefore fetches the parent's median time past
 // itself, but only when the coinbase's verdict depends on it.
 func TestSubmitMiningSolution_CoinbaseMustBeFinal(t *testing.T) {
+	t.Run("invalid proof of work does not fetch median time past", func(t *testing.T) {
+		h := newCoinbaseFinalityHarness(t)
+		coinbase := timeLockedCoinbase(t, h.parentMTP()-1)
+		header := &model.BlockHeader{
+			Version: h.candidate.Version, HashPrevBlock: h.tip.Hash(),
+			HashMerkleRoot: coinbase.TxIDChainHash(), Timestamp: h.candidate.Time, Bits: h.nBits,
+		}
+		for {
+			met, _, _ := header.HasMetTargetDifficulty()
+			if !met {
+				break
+			}
+			header.Nonce++
+		}
+
+		resp, err := h.server.submitMiningSolution(t.Context(), &BlockSubmissionRequest{
+			SubmitMiningSolutionRequest: &blockassembly_api.SubmitMiningSolutionRequest{
+				Id: h.idBytes, CoinbaseTx: coinbase.Bytes(), Nonce: header.Nonce,
+			},
+		})
+		require.Error(t, err)
+		require.Nil(t, resp)
+		require.Contains(t, err.Error(), "target difficulty")
+		require.Zero(t, h.chain.lookups.Load(), "an invalid nonce must not trigger blockchain reads")
+		h.requireMined(t, false)
+	})
+
 	t.Run("a time lock at or after the parent's median time past is refused", func(t *testing.T) {
 		h := newCoinbaseFinalityHarness(t)
 		h.warmMTP(t)
@@ -289,7 +316,7 @@ func TestParentMedianTimePast_ColdLookupLeavesTheFloorAlone(t *testing.T) {
 	mtp, err := ba.ParentMedianTimePast(t.Context(), h.tip.Hash())
 	require.NoError(t, err)
 	require.Equal(t, h.parentMTP(), mtp)
-	require.NotZero(t, h.chain.lookups.Load(), "a cold memo must be read from the blockchain service")
+	require.Equal(t, int32(1), h.chain.lookups.Load(), "a valid batched run needs no separate parent-header read")
 
 	require.Nil(t, ba.memoizedMtpFloor(h.tip.Hash()), "a submit lookup must not fill the floor memo")
 

@@ -190,13 +190,7 @@ func (b *BlockAssembler) ParentMedianTimePast(ctx context.Context, parentHash *c
 		return safeconversion.Int64ToUint32(entry.minTime - 1)
 	}
 
-	// The header is needed only for the hash-keyed fallback walk, which refuses a nil one.
-	parentHeader, _, err := b.blockchainClient.GetBlockHeader(ctx, parentHash)
-	if err != nil {
-		return 0, errors.NewProcessingError("failed to fetch parent header %s", parentHash.String(), err)
-	}
-
-	median, _, err := b.parentChainMedianTimePast(ctx, parentHeader, parentHash)
+	median, _, err := b.parentChainMedianTimePast(ctx, nil, parentHash)
 	if err != nil {
 		return 0, errors.NewProcessingError("median time past of parent %s could not be established", parentHash.String(), err)
 	}
@@ -339,6 +333,15 @@ func (b *BlockAssembler) parentChainMedianTimePast(ctx context.Context, parentHe
 	run := headers
 
 	if verifyErr := verifyParentChainRun(parentHash, headers); verifyErr != nil {
+		// Candidate creation already holds this header; a submit lookup only needs to fetch it
+		// when the batched result is unusable and the hash-keyed walk is necessary.
+		if parentHeader == nil {
+			parentHeader, _, err = b.blockchainClient.GetBlockHeader(ctx, parentHash)
+			if err != nil {
+				return time.Time{}, nil, errors.NewProcessingError("failed to fetch parent header %s for the hash-keyed walk", parentHash.String(), err)
+			}
+		}
+
 		walked, walkErr := b.walkParentChain(ctx, parentHeader, blockchain.MedianTimeBlocks)
 		if walkErr != nil {
 			return time.Time{}, nil, errors.NewProcessingError("the batched header fetch returned an unusable run (%v) and the hash-keyed parent-chain walk also failed", verifyErr, walkErr)
