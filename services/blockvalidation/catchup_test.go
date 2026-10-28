@@ -1492,8 +1492,8 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		defer httpmock.DeactivateAndReset()
 
 		// Simulate server returning headers in chunks. Each chunk continues the chain from the
-		// last header of the one before, as a real peer's does: the header fetch splices or stops
-		// on a chunk that does not build on what it already holds.
+		// last header of the one before, as a real peer's does: the header fetch rejects a chunk
+		// that does not build on the last header it holds.
 		callCount := 0
 		prevHash := bestBlock.Header.Hash()
 		httpmock.RegisterResponder(
@@ -1538,6 +1538,9 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		assert.LessOrEqual(t, len(result.Headers), 100000)
 		assert.Contains(t, result.StopReason, "Memory limit reached")
 		assert.False(t, result.ReachedTarget)
+		// Ten chunks of 10,000 fill the 100,000 cap and the eleventh would overflow it, so the
+		// cap, not the iteration limit, ends the fetch.
+		require.Equal(t, 11, callCount, "the accumulated-header cap must end the fetch")
 	})
 
 	t.Run("Context Cancellation During Catchup", func(t *testing.T) {

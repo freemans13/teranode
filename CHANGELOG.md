@@ -312,10 +312,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   Before, a peer could offer headers whose first entry built on some other stored
   block, and catchup carried on under the wrong heights with only a warning. Now
   catchup stops before it touches local state, and the error is coded
-  `NETWORK_INVALID_RESPONSE`, so it is charged to the peer. A peer whose chain
-  reorgs between two header requests is not charged: the header fetch drops the
-  stale headers and continues on the peer's new branch, or stops at the last linked
-  header when the fork point is below what it has fetched. Catchup also now clears
+  `NETWORK_INVALID_RESPONSE`, so it is charged to the peer. A header batch that
+  does not build on the last header of the batch before it is rejected the same
+  way, as soon as it arrives. Catchup also now clears
   `mined_set` on the blocks a fork replaces only after every header check has
   passed, just before it fetches blocks, so a fork rejected by a later check, or a
   peer with nothing past the ancestor, no longer un-stamps the node's own blocks.

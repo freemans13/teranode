@@ -1047,8 +1047,8 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 	// The headers after the ancestor must form one chain built on it. Every later step assigns
 	// heights as ancestor+1+index, so a first header built on some other stored block would be
 	// validated at the wrong heights (checkpoint matching included), and a break further up would
-	// only surface in the header cache. catchupGetBlockHeaders splices an honest peer's mid-fetch
-	// reorg, so a break here is the peer's fault: NetworkInvalidResponse, charged to the peer.
+	// only surface in the header cache. An honest peer serves every batch on the path back from
+	// one fixed tip, so a break here is the peer's fault: NetworkInvalidResponse, charged to it.
 	if commonAncestorIndex+1 < len(peerHeaders) {
 		offered := peerHeaders[commonAncestorIndex+1:]
 		if !(&catchup.CommonAncestorFinder{}).ValidateChainConnection(offered, commonAncestorHash) {

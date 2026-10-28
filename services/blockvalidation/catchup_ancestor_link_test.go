@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -94,16 +95,17 @@ func (r *minedSetClearRecorder) ClearBlockMinedSet(ctx context.Context, blockHas
 	return r.ClientI.ClearBlockMinedSet(ctx, blockHash)
 }
 
-// ancestorLinkRun is what one catchup() run left behind: the error, how many /blocks/ requests
-// reached the peer, how many local blocks step 9.6 un-stamped, and the real client plus the two
-// header chains, so the caller can read the end state from the store.
+// ancestorLinkRun is what one catchup() run left behind: the error, how many header and /blocks/
+// requests reached the peer, how many local blocks step 9.6 un-stamped, and the real client plus
+// the two header chains, so the caller can read the end state from the store.
 type ancestorLinkRun struct {
-	err            error
-	blocksRequests int
-	minedClears    int64
-	client         blockchain.ClientI
-	mainChain      []*model.BlockHeader // b1..b10, the local chain; b5 is the common ancestor
-	offered        []*model.BlockHeader // h1..h5, the headers the peer offers after the ancestor
+	err             error
+	headersRequests int
+	blocksRequests  int
+	minedClears     int64
+	client          blockchain.ClientI
+	mainChain       []*model.BlockHeader // b1..b10, the local chain; b5 is the common ancestor
+	offered         []*model.BlockHeader // every header the peer offers after the ancestor, all batches
 }
 
 // offerShape is the header offer the peer serves after the common ancestor b5.
@@ -118,11 +120,20 @@ const (
 	offerBreakAtSecond
 	// offerNothingNew: the peer serves b5 alone, nothing after the ancestor.
 	offerNothingNew
+	// offerBreakBetweenBatches: a full first batch b5, h1..h9999, then a second batch built on h1
+	// rather than on h9999, the last header the first batch ended on.
+	offerBreakBetweenBatches
+	// offerReplayBetweenBatches: a full first batch b5, h1..h9999, then every later batch replays
+	// h1..h9999 and adds one fresh header f1 on h9999. Each replayed batch builds on b5, not on the
+	// header the batch before it ended on. The target is f2 on f1, which the peer never serves, so
+	// reaching the target never ends the fetch.
+	offerReplayBetweenBatches
 )
 
 // runAncestorLinkCatchup runs catchup() against a real sqlitememory blockchain store holding the
 // local chain genesis..b10, every block mined, plus B, a second stored block (a side block on
-// genesis at height 1). The peer serves [b5] followed by the headers shape describes.
+// genesis at height 1). The peer serves [b5] followed by the headers shape describes, and for the
+// two between-batches shapes a different answer to every header request after the first.
 func runAncestorLinkCatchup(t *testing.T, shape offerShape) ancestorLinkRun {
 	initPrometheusMetrics()
 
@@ -169,7 +180,9 @@ func runAncestorLinkCatchup(t *testing.T, shape offerShape) ancestorLinkRun {
 
 	ancestor := mainChain[4] // b5
 
-	var offered, served []*model.BlockHeader
+	var offered, served, later []*model.BlockHeader
+
+	var unservedTarget *model.BlockHeader
 
 	switch shape {
 	case offerLinked, offerNothingNew:
@@ -178,10 +191,22 @@ func runAncestorLinkCatchup(t *testing.T, shape offerShape) ancestorLinkRun {
 		offered = forkHeadersFrom(t, otherBlockB, 5, 6, 1000)
 	case offerBreakAtSecond:
 		offered = append(forkHeadersFrom(t, ancestor, 1, 6, 1000), forkHeadersFrom(t, otherBlockB, 4, 7, 2000)...)
+	case offerBreakBetweenBatches, offerReplayBetweenBatches:
+		// With b5 in front this is a full batch, so the fetch asks again from h9999.
+		offered = forkHeadersFrom(t, ancestor, maxBlockHeadersPerRequest-1, 6, 1000)
 	}
 
 	if shape != offerNothingNew {
 		served = offered
+	}
+
+	switch shape {
+	case offerBreakBetweenBatches:
+		later = forkHeadersFrom(t, offered[0], 5, 7, 3000)
+	case offerReplayBetweenBatches:
+		fresh := forkHeadersFrom(t, offered[len(offered)-1], 2, uint32(6+len(offered)), 3000) //nolint:gosec // small test height
+		later = append(append([]*model.BlockHeader{}, offered...), fresh[0])
+		unservedTarget = fresh[1]
 	}
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
@@ -215,9 +240,31 @@ func runAncestorLinkCatchup(t *testing.T, shape offerShape) ancestorLinkRun {
 		responseHeaders = append(responseHeaders, h.Bytes()...)
 	}
 
+	laterHeaders := make([]byte, 0, len(later)*model.BlockHeaderSize)
+	for _, h := range later {
+		laterHeaders = append(laterHeaders, h.Bytes()...)
+	}
+
+	var headersRequests atomic.Int64
+
 	httpmock.RegisterResponder("GET", `=~^http://peer/headers_from_common_ancestor/.*`,
-		httpmock.NewBytesResponder(200, responseHeaders))
+		func(*http.Request) (*http.Response, error) {
+			if headersRequests.Add(1) > 1 && later != nil {
+				return httpmock.NewBytesResponse(200, laterHeaders), nil
+			}
+
+			return httpmock.NewBytesResponse(200, responseHeaders), nil
+		})
 	httpmock.RegisterResponder("GET", `=~^http://peer/blocks/.*`, httpmock.NewBytesResponder(500, nil))
+
+	// Add the headers only the later batches carry, so the target is the newest header offered and
+	// the end-state check covers every offered block.
+	switch shape {
+	case offerBreakBetweenBatches:
+		offered = append(append([]*model.BlockHeader{}, offered...), later...)
+	case offerReplayBetweenBatches:
+		offered = append(append([]*model.BlockHeader{}, later...), unservedTarget)
+	}
 
 	targetBlock := &model.Block{
 		Header: offered[len(offered)-1],
@@ -234,12 +281,13 @@ func runAncestorLinkCatchup(t *testing.T, shape offerShape) ancestorLinkRun {
 	}
 
 	return ancestorLinkRun{
-		err:            err,
-		blocksRequests: blocksRequests,
-		minedClears:    recorder.clears.Load(),
-		client:         client,
-		mainChain:      mainChain,
-		offered:        offered,
+		err:             err,
+		headersRequests: int(headersRequests.Load()),
+		blocksRequests:  blocksRequests,
+		minedClears:     recorder.clears.Load(),
+		client:          client,
+		mainChain:       mainChain,
+		offered:         offered,
 	}
 }
 
@@ -325,6 +373,42 @@ func TestCatchup_FirstHeaderMustLinkToCommonAncestor(t *testing.T) {
 		run := runAncestorLinkCatchup(t, offerNothingNew)
 
 		require.Error(t, run.err, "a peer with nothing after the ancestor and an unknown target is on a dead fork")
+		requireRejectedWithoutSideEffects(t, run)
+	})
+}
+
+// TestCatchup_HeaderBatchMustLinkToPreviousBatch covers a peer whose second header batch does not
+// build on the last header of the first, against a real sqlitememory blockchain store. Every
+// request names one fixed peer tip and the peer serves the path back from it, so an honest peer's
+// batches always link, reorg or not. A break between batches is a protocol violation: catchup must
+// reject it as NetworkInvalidResponse in the header fetch, before it un-stamps b6..b10 and before
+// it fetches any block body.
+//
+// replayed_batches_end_at_second_request also pins the bound. Its peer answers every request after
+// the first with h1..h9999 plus one fresh header, so the fetch never moves forward. Spliced back
+// onto b5, that answer kept the loop below the accumulated-header cap for all 1000 iterations.
+// Rejected, it costs the peer one extra request.
+//
+// Mutation proofs: removing the link check in catchupGetBlockHeaders fails both subtests, and so
+// does restoring the splice it replaced.
+func TestCatchup_HeaderBatchMustLinkToPreviousBatch(t *testing.T) {
+	t.Run("second_batch_builds_on_earlier_header", func(t *testing.T) {
+		run := runAncestorLinkCatchup(t, offerBreakBetweenBatches)
+
+		require.Error(t, run.err, "catchup must abort when a header batch does not build on the previous one")
+		require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "an unlinked batch is a peer fault: %v", run.err)
+		require.Contains(t, run.err.Error(), "header batch does not link to the previous batch")
+		require.Equal(t, 2, run.headersRequests, "the second batch is rejected as it arrives")
+		requireRejectedWithoutSideEffects(t, run)
+	})
+
+	t.Run("replayed_batches_end_at_second_request", func(t *testing.T) {
+		run := runAncestorLinkCatchup(t, offerReplayBetweenBatches)
+
+		require.Equal(t, 2, run.headersRequests, "a replaying peer must not keep the header fetch looping")
+		require.Error(t, run.err, "catchup must abort when a header batch does not build on the previous one")
+		require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "an unlinked batch is a peer fault: %v", run.err)
+		require.Contains(t, run.err.Error(), "header batch does not link to the previous batch")
 		requireRejectedWithoutSideEffects(t, run)
 	})
 }
