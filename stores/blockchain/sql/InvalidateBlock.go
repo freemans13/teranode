@@ -116,8 +116,6 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 		rows      *sql.Rows
 		hashBytes []byte
 		hash      *chainhash.Hash
-		// updated is true once the UPDATE has returned a row, so it ran.
-		updated bool
 	)
 
 	// Guard the entire window: from when invalid/on_main_chain flags change
@@ -131,17 +129,14 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 	}
 
 	defer func() {
-		// Once the UPDATE has returned a row this call moves chain membership. A walk running
-		// without slowPathMu may have read its rows before these commits; noting the write
-		// after the last of them, which is the rebuild below, and before the lock drops makes
-		// that walk run again rather than leave its older view in place. The fork point can
-		// lie arbitrarily deep, so the note names no height. An UPDATE that failed or matched
-		// nothing moved nothing and is not noted.
-		defer func() {
-			if updated {
-				s.noteOnMainChainWrite(noRepairFloor)
-			}
-		}()
+		// The auto-committed UPDATE was accepted, so it may have moved chain membership even
+		// if no RETURNING row reaches us, and the rebuild below writes the column too. A walk
+		// running without slowPathMu may have read its rows before these commits; noting the
+		// write after the last of them and before the lock drops makes that walk run again
+		// rather than leave its older view in place. The fork point can lie arbitrarily deep,
+		// so the note names no height. A missing block or an UPDATE the database rejected
+		// returned above and is not noted.
+		defer s.noteOnMainChainWrite(noRepairFloor)
 
 		err = errors.Join(err, rows.Close())
 
@@ -184,8 +179,6 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 	}()
 
 	for rows.Next() {
-		updated = true
-
 		if err = rows.Scan(&hashBytes); err != nil {
 			return nil, errors.NewStorageError("error scanning invalidated block hash", err)
 		}
