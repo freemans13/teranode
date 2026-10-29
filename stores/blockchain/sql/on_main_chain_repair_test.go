@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/test/utils/postgres"
@@ -460,7 +461,7 @@ func TestStartupBoundedRebuildFailureKeepsItsWindowAsTheFloor(t *testing.T) {
 	_, err := s.db.Exec(`UPDATE blocks SET on_main_chain = false WHERE hash = $1`, block2.Hash().CloneBytes())
 	require.NoError(t, err)
 
-	floor := s.startupRepairFloor(context.Background(), -1)
+	floor := s.startupRepairFloor(context.Background())
 	require.EqualValues(t, block2.Height, floor, "the window bottom with CoinbaseMaturity 0 is the tip")
 
 	fault := installRebuildFault(s)
@@ -784,7 +785,7 @@ func TestStartupBoundedRebuildOutOfTimeStaysBounded(t *testing.T) {
 	_, err := s.db.Exec(`UPDATE blocks SET on_main_chain = false WHERE hash = $1`, block2.Hash().CloneBytes())
 	require.NoError(t, err)
 
-	floor := s.startupRepairFloor(context.Background(), -1)
+	floor := s.startupRepairFloor(context.Background())
 	require.EqualValues(t, block2.Height, floor)
 
 	fault := installRebuildFault(s)
@@ -801,20 +802,386 @@ func TestStartupBoundedRebuildOutOfTimeStaysBounded(t *testing.T) {
 	require.EqualValues(t, block2.Height, fault.floorsSeen()[1], "the repair keeps the startup window's bottom")
 }
 
-// TestStartupRepairFloorFallsBackToTheHeightAlreadyRead: when the best block cannot be
-// read, the floor comes from the highest valid height the startup detection already read,
-// rather than from nothing, which would owe a walk to genesis.
-func TestStartupRepairFloorFallsBackToTheHeightAlreadyRead(t *testing.T) {
+// TestStartupRepairFloorWithoutTheBestBlockOwesAFullWalk: the floor is the bottom of the
+// window under the chain_work best block. When that block cannot be read there is no
+// height known to be at or below it, since MAX(height) can sit above it when a longer fork
+// has less work, so a failed bounded startup rebuild is owed a full walk.
+func TestStartupRepairFloorWithoutTheBestBlockOwesAFullWalk(t *testing.T) {
 	s := newOnMainChainTestStoreWith(t, func(ts *settings.Settings) {
 		ts.ChainCfgParams.CoinbaseMaturity = 1
 	})
 
+	// Best chain genesis -> 1 -> 2 -> 3, so the window under it starts at 3 less 10.
+	storeBlocks(t, s, block1, block2, block3)
+	require.EqualValues(t, 0, s.startupRepairFloor(context.Background()), "clamped at genesis")
+
 	spent, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	require.EqualValues(t, 6, s.startupRepairFloor(spent, 16), "16 less 10 x CoinbaseMaturity")
-	require.EqualValues(t, 0, s.startupRepairFloor(spent, 4), "clamped at genesis")
-	require.Equal(t, noRepairFloor, s.startupRepairFloor(spent, -1), "an empty store has no floor")
+	require.Equal(t, noRepairFloor, s.startupRepairFloor(spent), "no best block read, no floor")
+
+	fault := installRebuildFault(s)
+	setRepairBackoff(t, s, time.Hour)
+
+	s.startupRebuildOnMainChain(context.Background(), false, s.startupRepairFloor(spent))
+
+	pending, full, floor := repairRecord(s)
+	require.True(t, pending, "the failed bounded rebuild is owed a repair")
+	require.True(t, full, "with no floor the owed repair walks to genesis")
+	require.Equal(t, noRepairFloor, floor)
+	require.Equal(t, []bool{false}, fault.walks()[:1], "the startup rebuild itself was bounded")
+}
+
+// repairRecord reads what the store owes.
+func repairRecord(s *SQL) (pending, full bool, floor int64) {
+	r := &s.onMainChainRepair
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.pending, r.full, r.floor
+}
+
+// requireRepairSettled checks the end state once a repair has landed: nothing owed, no
+// guard held, the gauge back where it started and no watch left open.
+func requireRepairSettled(t *testing.T, s *SQL, gaugeBefore float64) {
+	t.Helper()
+
+	pending, full, floor := repairRecord(s)
+	require.False(t, pending, "nothing is owed")
+	require.False(t, full)
+	require.Equal(t, noRepairFloor, floor)
+	require.Zero(t, s.mainChainRebuilding.Load(), "no guard is held")
+	require.Equal(t, gaugeBefore, repairPending(t), "the pending gauge is back")
+
+	s.onMainChainRepair.mu.Lock()
+	open := len(s.onMainChainRepair.watches)
+	s.onMainChainRepair.mu.Unlock()
+
+	require.Zero(t, open, "every watch is closed")
+}
+
+// reorgFixture stores genesis -> 1 -> 2 -> 3 as the best chain and a fork 1 -> alt2, and
+// returns alt3 and alt4, which extend the fork and take the tip once alt4 is stored.
+func reorgFixture(t *testing.T, s *SQL) (alt3, alt4 *model.Block) {
+	t.Helper()
+
+	alt3 = createBlock3OnFork(blockAlternative2)
+	alt4 = createBlock3OnFork(alt3)
+
+	storeBlocks(t, s, block1, block2, block3, blockAlternative2)
+	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
+
+	return alt3, alt4
+}
+
+// reorgDuringWalk is a rebuild hook for the overlap tests. SQLite cannot hold two writers
+// open at once, so on its first call it stands in for a walk overlapped by a reorg: it
+// stores alt3 and alt4, which moves the best chain to the fork through StoreBlock's
+// reconcile, and then writes what a walk from the snapshot before the reorg would write.
+// Later calls run the real transaction.
+func reorgDuringWalk(s *SQL, fault *rebuildFault, alt3, alt4 *model.Block) func(ctx context.Context, full bool, floor int64) error {
+	recorded := s.rebuildTxHook
+	var calls atomic.Int32
+
+	return func(ctx context.Context, full bool, floor int64) error {
+		if calls.Add(1) != 1 {
+			return recorded(ctx, full, floor)
+		}
+
+		// Recorded like every other call, but without running the real transaction.
+		fault.failing.Store(true)
+		_ = recorded(ctx, full, floor)
+		fault.failing.Store(false)
+
+		for _, b := range []*model.Block{alt3, alt4} {
+			if _, _, err := s.StoreBlock(ctx, b, "peer"); err != nil {
+				return err
+			}
+		}
+
+		_, err := s.db.ExecContext(ctx, `UPDATE blocks SET on_main_chain = (hash IN ($1, $2)) WHERE height IN (2, 3, 4)`,
+			block2.Hash().CloneBytes(), block3.Hash().CloneBytes())
+
+		return err
+	}
+}
+
+// requireForkIsTheMainChain checks the flags once the fork 1 -> alt2 -> alt3 -> alt4 has
+// taken the tip from genesis -> 1 -> 2 -> 3.
+func requireForkIsTheMainChain(t *testing.T, s *SQL, alt3, alt4 *model.Block) {
+	t.Helper()
+
+	require.False(t, getOnMainChain(t, s, block2.Hash().CloneBytes()), "the stale walk's write is undone")
+	require.False(t, getOnMainChain(t, s, block3.Hash().CloneBytes()), "the stale walk's write is undone")
+	require.True(t, getOnMainChain(t, s, blockAlternative2.Hash().CloneBytes()))
+	require.True(t, getOnMainChain(t, s, alt3.Hash().CloneBytes()))
+	require.True(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()))
+}
+
+// TestOnMainChainRepairNarrowsAnOverlappedFullWalkToTheWritesFloor: a full repair on
+// PostgreSQL runs without slowPathMu, and a StoreBlock reorg that commits during it can
+// leave the walk's older view in place. The reorg notes the lowest height it can have
+// moved, and the walk left every row below that right, so the repair runs next as a bounded
+// walk down to that height under slowPathMu, which no write can overlap. It must not run
+// the full walk again, and it must never run a full walk under slowPathMu, which would stop
+// block storage for up to 30 min.
+func TestOnMainChainRepairNarrowsAnOverlappedFullWalkToTheWritesFloor(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+	s.unlockedFullRepair = true
+	setRepairBackoff(t, s, time.Hour)
+
+	alt3, alt4 := reorgFixture(t, s)
+
+	fault := installRebuildFault(s)
+	fault.failing.Store(false)
+	s.rebuildTxHook = reorgDuringWalk(s, fault, alt3, alt4)
+
+	gaugeBefore := repairPending(t)
+	s.markOnMainChainDirty(true, noRepairFloor, "test", errors.NewStorageError("injected"))
+	waitForRepair(t, s)
+
+	require.Equal(t, []bool{true, false}, fault.walks(), "the overlapped full walk, then one bounded walk")
+	require.Equal(t, []bool{false, true}, fault.lockHeld(), "the full walk runs unlocked, the bounded one under slowPathMu")
+	require.Equal(t, s.reconcileFloor(alt4.Height), fault.floorsSeen()[1], "the bounded walk reaches the reorg's floor")
+
+	requireForkIsTheMainChain(t, s, alt3, alt4)
+	requireRepairSettled(t, s, gaugeBefore)
+}
+
+// TestOnMainChainRepairRerunsAnOperatorOverlapInFullWithoutTheLock: InvalidateBlock and
+// RevalidateBlock cannot name the height they moved the chain from, so a full repair they
+// overlap runs again in full. It stays unlocked however many times it is overlapped: the
+// repair waits out its backoff between walks rather than taking slowPathMu for a walk to
+// genesis.
+func TestOnMainChainRepairRerunsAnOperatorOverlapInFullWithoutTheLock(t *testing.T) {
+	const overlapped = 4
+
+	s := newOnMainChainTestStore(t)
+	s.unlockedFullRepair = true
+	setRepairBackoff(t, s, time.Millisecond)
+
+	storeBlocks(t, s, block1, block2)
+
+	fault := installRebuildFault(s)
+	fault.failing.Store(false)
+
+	recorded := s.rebuildTxHook
+	s.rebuildTxHook = func(ctx context.Context, full bool, floor int64) error {
+		err := recorded(ctx, full, floor)
+
+		// An operator write commits during each of the first walks.
+		if fault.calls.Load() <= overlapped && s.slowPathMu.TryLock() {
+			s.noteOnMainChainWrite(noRepairFloor)
+			s.slowPathMu.Unlock()
+		}
+
+		return err
+	}
+
+	gaugeBefore := repairPending(t)
+	s.markOnMainChainDirty(true, noRepairFloor, "test", errors.NewStorageError("injected"))
+	waitForRepair(t, s)
+
+	require.Equal(t, []bool{true, true, true, true, true}, fault.walks(), "every walk is full")
+	require.Equal(t, []bool{false, false, false, false, false}, fault.lockHeld(), "no walk to genesis holds slowPathMu")
+	requireRepairSettled(t, s, gaugeBefore)
+}
+
+// TestStoreBlockNotesOnlyChainWritesThatMoveMembership: an unlocked walk reruns when a
+// chain write is noted during it, so a write that cannot have been overwritten must not be
+// noted. A fork block that leaves the tip where it is, and an invalid record, add a row no
+// older snapshot can see and change none it can. A reorg moves rows and is noted, with the
+// bottom of its reconcile's walk as the height.
+func TestStoreBlockNotesOnlyChainWritesThatMoveMembership(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+	ctx := context.Background()
+
+	storeBlocks(t, s, block1, block2, block3)
+
+	watch := s.watchOnMainChainWrites()
+
+	storeBlocks(t, s, blockAlternative2)
+
+	invalid := createBlock3OnFork(block1)
+	_, _, err := s.StoreBlock(ctx, invalid, "peer", options.WithInvalid(true))
+	require.NoError(t, err)
+
+	moved, floor := s.closeOnMainChainWatch(watch)
+	require.False(t, moved, "a fork block below the tip and an invalid record move nothing")
+	require.Equal(t, noRepairFloor, floor)
+
+	watch = s.watchOnMainChainWrites()
+
+	alt3 := createBlock3OnFork(blockAlternative2)
+	alt4 := createBlock3OnFork(alt3)
+	storeBlocks(t, s, alt3, alt4)
+	require.True(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()))
+
+	moved, floor = s.closeOnMainChainWatch(watch)
+	require.True(t, moved, "the reorg to alt4 is noted")
+	require.Equal(t, s.reconcileFloor(alt4.Height), floor, "with the bottom of its reconcile's walk")
+}
+
+// TestChainWritesThatFailBeforeCommitAreNotNoted: a write that failed before it committed
+// moved nothing. Noting it would make an unlocked walk run again for nothing. Each case
+// here fails before its commit: a duplicate fork INSERT, a failed reconcile, and an
+// InvalidateBlock and a RevalidateBlock whose UPDATE fails.
+func TestChainWritesThatFailBeforeCommitAreNotNoted(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+	ctx := context.Background()
+
+	alt3, alt4 := reorgFixture(t, s)
+
+	watch := s.watchOnMainChainWrites()
+
+	// blockAlternative2 is a fork block, so it takes the transaction path, and its INSERT
+	// fails on the duplicate hash.
+	_, _, err := s.StoreBlock(ctx, blockAlternative2, "peer")
+	require.Error(t, err, "a duplicate fork block fails")
+
+	// alt3 would leave the tip alone and alt4 would take it, but the reconcile fails.
+	storeBlocks(t, s, alt3)
+
+	s.reconcileHook = func() error { return errors.NewStorageError("injected reconcile failure") }
+	_, _, err = s.StoreBlock(ctx, alt4, "peer")
+	require.Error(t, err, "the reconcile fails, so the transaction rolls back")
+	s.reconcileHook = nil
+
+	// Both operator UPDATEs abort inside the database.
+	_, err = s.db.Exec(`CREATE TRIGGER fail_invalidate BEFORE UPDATE OF invalid ON blocks WHEN NEW.invalid = 1 AND OLD.invalid = 0 BEGIN SELECT RAISE(ABORT, 'injected'); END`)
+	require.NoError(t, err)
+	_, err = s.db.Exec(`CREATE TRIGGER fail_revalidate BEFORE UPDATE OF invalid ON blocks WHEN NEW.invalid = 0 AND OLD.invalid = 1 BEGIN SELECT RAISE(ABORT, 'injected'); END`)
+	require.NoError(t, err)
+
+	_, err = s.InvalidateBlock(ctx, block3.Hash())
+	require.Error(t, err, "the invalidation's UPDATE fails")
+
+	invalid := createBlock3OnFork(block2)
+	_, _, err = s.StoreBlock(ctx, invalid, "peer", options.WithInvalid(true))
+	require.NoError(t, err)
+
+	require.Error(t, s.RevalidateBlock(ctx, invalid.Hash()), "the revalidation's UPDATE fails")
+
+	moved, floor := s.closeOnMainChainWatch(watch)
+	require.False(t, moved, "no write that failed before its commit is noted")
+	require.Equal(t, noRepairFloor, floor)
+
+	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()), "nothing moved the best chain")
+	require.Zero(t, s.mainChainRebuilding.Load(), "no guard is left held")
+}
+
+// TestFailedChainWriteDuringAnUnlockedWalkDoesNotRerunIt: a fork StoreBlock that fails
+// before its commit while an unlocked full repair runs must not make the repair walk again.
+func TestFailedChainWriteDuringAnUnlockedWalkDoesNotRerunIt(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+	s.unlockedFullRepair = true
+	setRepairBackoff(t, s, time.Hour)
+
+	reorgFixture(t, s)
+
+	fault := installRebuildFault(s)
+	fault.failing.Store(false)
+
+	recorded := s.rebuildTxHook
+	s.rebuildTxHook = func(ctx context.Context, full bool, floor int64) error {
+		if fault.calls.Load() == 0 {
+			// A duplicate fork block: the transaction fails on its INSERT.
+			if _, _, err := s.StoreBlock(ctx, blockAlternative2, "peer"); err == nil {
+				return errors.NewProcessingError("the duplicate fork block was stored")
+			}
+		}
+
+		return recorded(ctx, full, floor)
+	}
+
+	gaugeBefore := repairPending(t)
+	s.markOnMainChainDirty(true, noRepairFloor, "test", errors.NewStorageError("injected"))
+	waitForRepair(t, s)
+
+	require.Equal(t, []bool{true}, fault.walks(), "one walk: the failed write is not an overlap")
+	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
+	requireRepairSettled(t, s, gaugeBefore)
+}
+
+// TestStartupFullRebuildOverlappedByAReorgOwesABoundedWalk: an overlap on the startup
+// rebuild is handled like one on the loop's walk. A StoreBlock reorg names the lowest
+// height it can have moved, the startup walk left every row below that right, and the
+// owed repair is a bounded walk from there under slowPathMu rather than a second walk to
+// genesis.
+func TestStartupFullRebuildOverlappedByAReorgOwesABoundedWalk(t *testing.T) {
+	s := newOnMainChainTestStore(t)
+	setRepairBackoff(t, s, time.Hour)
+
+	alt3, alt4 := reorgFixture(t, s)
+
+	fault := installRebuildFault(s)
+	fault.failing.Store(false)
+	s.rebuildTxHook = reorgDuringWalk(s, fault, alt3, alt4)
+
+	gaugeBefore := repairPending(t)
+	s.startupRebuildOnMainChain(context.Background(), true, noRepairFloor)
+	waitForRepair(t, s)
+
+	require.Equal(t, []bool{true, false}, fault.walks(), "the overlapped startup walk, then one bounded repair")
+	require.Equal(t, []bool{false, true}, fault.lockHeld())
+	require.Equal(t, s.reconcileFloor(alt4.Height), fault.floorsSeen()[1])
+
+	requireForkIsTheMainChain(t, s, alt3, alt4)
+	requireRepairSettled(t, s, gaugeBefore)
+}
+
+// TestStartupRebuildDoesNotWaitOutAHeldSlowPathMu: the startup goroutine holds New's guard
+// count while it checks for an overlap under slowPathMu, and an operator rebuild or a
+// locked repair can hold slowPathMu for up to 30 min. Startup waits only a bounded time,
+// then records the overlap it cannot rule out as an owed repair, which keeps readers on
+// the flag-free walk without the goroutine waiting.
+func TestStartupRebuildDoesNotWaitOutAHeldSlowPathMu(t *testing.T) {
+	s := newOnMainChainTestStoreWith(t, func(ts *settings.Settings) {
+		ts.ChainCfgParams.CoinbaseMaturity = 0
+	})
+	setRepairBackoff(t, s, time.Millisecond)
+
+	s.onMainChainRepair.mu.Lock()
+	s.onMainChainRepair.startupLockWait = 20 * time.Millisecond
+	s.onMainChainRepair.mu.Unlock()
+
+	storeBlocks(t, s, block1, block2)
+
+	fault := installRebuildFault(s)
+	fault.failing.Store(false)
+
+	floor := s.startupRepairFloor(context.Background())
+	gaugeBefore := repairPending(t)
+
+	s.slowPathMu.Lock()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		s.startupRebuildOnMainChain(context.Background(), false, floor)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		s.slowPathMu.Unlock()
+		t.Fatal("the startup rebuild waited for slowPathMu")
+	}
+
+	pending, full, owedFloor := repairRecord(s)
+	require.True(t, pending, "the overlap it could not rule out is owed")
+	require.False(t, full, "as the bounded walk the startup rebuild ran")
+	require.Equal(t, floor, owedFloor)
+
+	s.slowPathMu.Unlock()
+	waitForRepair(t, s)
+
+	require.Equal(t, []bool{false, false}, fault.walks(), "the startup rebuild and one bounded repair")
+	require.True(t, getOnMainChain(t, s, block2.Hash().CloneBytes()))
+	requireRepairSettled(t, s, gaugeBefore)
 }
 
 // TestLockedRepairAttemptIsNotOverlappedByAWriterItQueuedBehind: a bounded attempt holds
@@ -838,76 +1205,10 @@ func TestLockedRepairAttemptIsNotOverlappedByAWriterItQueuedBehind(t *testing.T)
 	time.Sleep(100 * time.Millisecond)
 	require.Zero(t, fault.calls.Load(), "the attempt waits for the writer")
 
-	s.noteOnMainChainWrite()
+	s.noteOnMainChainWrite(int64(block1.Height))
 	s.slowPathMu.Unlock()
 
 	waitForRepair(t, s)
 
 	require.EqualValues(t, 1, fault.calls.Load(), "one walk: the writer finished before the attempt began")
-}
-
-// TestOnMainChainRepairTakesTheLockAfterRepeatedOverlaps: a full repair on PostgreSQL runs
-// without slowPathMu, and a chain write that commits during it forces another walk. If
-// every walk is overlapped the repair would stay owed for as long as the writes keep
-// coming. After onMainChainRepairMaxOverlaps overlaps in a row the next walk holds
-// slowPathMu, which no chain write can overlap, and lands.
-func TestOnMainChainRepairTakesTheLockAfterRepeatedOverlaps(t *testing.T) {
-	s := newOnMainChainTestStore(t)
-	s.unlockedFullRepair = true
-	setRepairBackoff(t, s, time.Millisecond)
-
-	storeBlocks(t, s, block1, block2)
-
-	fault := installRebuildFault(s)
-	fault.failing.Store(false)
-
-	recorded := s.rebuildTxHook
-	s.rebuildTxHook = func(ctx context.Context, full bool, floor int64) error {
-		err := recorded(ctx, full, floor)
-
-		// A chain write commits during every walk that leaves slowPathMu free.
-		if s.slowPathMu.TryLock() {
-			s.noteOnMainChainWrite()
-			s.slowPathMu.Unlock()
-		}
-
-		return err
-	}
-
-	gaugeBefore := repairPending(t)
-	s.markOnMainChainDirty(true, noRepairFloor, "test", errors.NewStorageError("injected"))
-	waitForRepair(t, s)
-
-	want := make([]bool, onMainChainRepairMaxOverlaps+1)
-	want[onMainChainRepairMaxOverlaps] = true
-
-	require.Equal(t, want, fault.lockHeld(), "unlocked walks until the cap, then one under slowPathMu")
-	require.Equal(t, gaugeBefore, repairPending(t))
-}
-
-// TestStoreBlockCountsOnlyChainWritesThatMoveMembership: an unlocked walk reruns when a
-// chain write is counted during it, so a write that cannot have been overwritten must not
-// be counted. A fork block that leaves the tip where it is, and an invalid record, add a
-// row no older snapshot can see and change none it can. A reorg moves rows and is counted.
-func TestStoreBlockCountsOnlyChainWritesThatMoveMembership(t *testing.T) {
-	s := newOnMainChainTestStore(t)
-	ctx := context.Background()
-
-	storeBlocks(t, s, block1, block2, block3)
-
-	before := s.onMainChainWriteCount()
-
-	storeBlocks(t, s, blockAlternative2)
-	require.Equal(t, before, s.onMainChainWriteCount(), "a fork block below the tip moves nothing")
-
-	invalid := createBlock3OnFork(block1)
-	_, _, err := s.StoreBlock(ctx, invalid, "peer", options.WithInvalid(true))
-	require.NoError(t, err)
-	require.Equal(t, before, s.onMainChainWriteCount(), "an invalid record moves nothing")
-
-	alt3 := createBlock3OnFork(blockAlternative2)
-	alt4 := createBlock3OnFork(alt3)
-	storeBlocks(t, s, alt3, alt4)
-	require.True(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()))
-	require.Greater(t, s.onMainChainWriteCount(), before, "the reorg to alt4 is counted")
 }

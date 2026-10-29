@@ -187,18 +187,28 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	}
 
 	// A non-extend runs reconcileOnMainChain, which can move chain membership. A walk
-	// running without slowPathMu may have read its rows before that commits, so count the
+	// running without slowPathMu may have read its rows before that commits, so note the
 	// write, before slowPathMu drops, and let the walk run again. Only a reconcile that
-	// changed a row is counted: a fork block that does not take the tip, and an invalid
-	// record, which skips the reconcile, add a row the walk's snapshot cannot see and
-	// change none it can. An extend's INSERT is the same. A failed transaction is counted,
-	// because a commit error does not prove nothing committed.
-	var membershipMoved bool
+	// changed a row and reached the commit is noted: a fork block that does not take the
+	// tip, and an invalid record, which skips the reconcile, add a row the walk's snapshot
+	// cannot see and change none it can. An extend's INSERT is the same. A transaction that
+	// failed before its commit moved nothing, so a BEGIN failure, a duplicate INSERT, a
+	// SQLITE_BUSY, a failed reconcile or a cancelled context is not noted. A failed commit
+	// is, because a commit error does not prove nothing committed.
+	//
+	// The note carries the lowest height the reconcile can have moved the best chain at:
+	// the bottom of its own walk, maxDepth below this block. A reorg the reconcile can
+	// handle forks within that walk, and a block that does not take the tip moves no
+	// block's membership at all.
+	var (
+		membershipMoved bool
+		movedFloor      int64
+	)
 
 	if !onMainChain {
 		defer func() {
 			if membershipMoved {
-				s.noteOnMainChainWrite()
+				s.noteOnMainChainWrite(movedFloor)
 			}
 		}()
 	}
@@ -237,7 +247,6 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 			var storeErr error
 
 			reconcileErr = nil
-			membershipMoved = false
 
 			newBlockID, height, _, storedInvalid, storeErr = s.storeBlock(ctx, tx, block, peerID, storeBlockOptions, onMainChain)
 			if storeErr != nil {
@@ -263,13 +272,19 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 				reconcile = func() (bool, error) { return true, s.reconcileHook() }
 			}
 
-			membershipMoved, reconcileErr = reconcile()
+			var moved bool
+
+			moved, reconcileErr = reconcile()
+			if reconcileErr == nil && moved {
+				// RetryTx commits next. Kept true if that commit fails, and across a retry
+				// whose earlier commit may have landed before it reported the error.
+				membershipMoved = true
+				movedFloor = s.reconcileFloor(height)
+			}
 
 			return reconcileErr
 		})
 		if err != nil {
-			membershipMoved = true
-
 			// Label the error as the reconciliation's only when it is the very value the
 			// reconciliation returned. RetryTx hands back the closure's error unchanged, but
 			// it can also fail after a failed reconciliation attempt and before the next one
@@ -422,13 +437,15 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 			// record it before this bracket drops the guard, so readers keep walking and the
 			// background repair clears it; the mark records this block's height, so the
 			// bounded walk reaches it however far the tip moves before the repair lands.
+			//
+			// A clear that committed moves a row a walk without slowPathMu may already have
+			// read, so it is noted. A failed one is marked instead, which owes its own repair.
 			if _, clearErr := s.db.ExecContext(postBestCtx, `UPDATE blocks SET on_main_chain = false WHERE id = $1`, newBlockID); clearErr != nil {
 				s.logger.Errorf("StoreBlock: clear sibling-fork on_main_chain: %v", clearErr)
 				s.markOnMainChainDirty(false, int64(height), "store_block_fork_clear", clearErr)
+			} else {
+				s.noteOnMainChainWrite(int64(height))
 			}
-
-			// The clear moves a row a walk without slowPathMu may already have read.
-			s.noteOnMainChainWrite()
 
 			if !guardWholeCall {
 				s.mainChainRebuilding.Add(-1)

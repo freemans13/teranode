@@ -15,10 +15,11 @@ const (
 	onMainChainRepairMaxBackoff = 30 * time.Second
 	// noRepairFloor marks a record with no known lowest stale height.
 	noRepairFloor int64 = -1
-	// onMainChainRepairMaxOverlaps is how many attempts in a row may run without
-	// slowPathMu and be overlapped by a chain write before the loop runs the next one under
-	// slowPathMu, so a steady stream of reorgs cannot keep the repair owed indefinitely.
-	onMainChainRepairMaxOverlaps = 3
+	// startupWatchLockWait bounds how long the startup goroutine waits for slowPathMu to
+	// read whether a chain write overlapped its rebuild. It holds New's guard count while it
+	// waits, and slowPathMu can be held for up to 30 min by an operator rebuild, so it does
+	// not wait for it. Past the bound it records the overlap it cannot rule out instead.
+	startupWatchLockWait = 10 * time.Second
 )
 
 // onMainChainRepairState records a failed on_main_chain write that the running process
@@ -55,20 +56,14 @@ type onMainChainRepairState struct {
 	generation uint64
 	// attempts counts failed loop attempts since the repair became owed.
 	attempts int
-	// overlaps counts consecutive successful attempts that ran without slowPathMu and had a
-	// chain write commit during them. Once it reaches onMainChainRepairMaxOverlaps the next
-	// attempt takes slowPathMu, which no chain write can overlap. A failed attempt resets it.
-	overlaps int
-	// chainWrites counts committed slow-path writes that moved chain membership: a
-	// fork-path StoreBlock whose reconcile changed a row, the sibling-fork clear,
-	// InvalidateBlock and RevalidateBlock. Each of them holds slowPathMu and counts itself
-	// before releasing it. A walk that does not hold slowPathMu reads its rows from a
-	// snapshot taken when it began, so such a write committing during the walk can be
-	// overwritten by the walk's older view without any row conflict to abort either. The
-	// walk's owner reads the count before the walk and again under slowPathMu after it, so
-	// every write that committed in between has been counted, and runs again when the
-	// count moved.
-	chainWrites uint64
+	// fullGeneration is the generation of the latest mark that owed a full walk. An
+	// overlapped full attempt narrows the record to a bounded walk only when no such mark
+	// arrived while it ran.
+	fullGeneration uint64
+	// watches are the open chain-write watches; see watchOnMainChainWrites.
+	watches map[*chainWriteWatch]struct{}
+	// startupLockWait is startupWatchLockWait; tests shorten it.
+	startupLockWait time.Duration
 	// running is true while the loop has an attempt in flight. A rebuild outside the loop
 	// does not release the record then, because the attempt can commit after it from an
 	// older snapshot; the loop decides once the attempt has finished.
@@ -115,7 +110,6 @@ func (s *SQL) markOnMainChainDirty(full bool, floor int64, path string, cause er
 	if !r.pending {
 		r.pending = true
 		r.attempts = 0
-		r.overlaps = 0
 		r.floor = noRepairFloor
 
 		s.mainChainRebuilding.Add(1)
@@ -133,6 +127,10 @@ func (s *SQL) markOnMainChainDirty(full bool, floor int64, path string, cause er
 	}
 
 	r.generation++
+
+	if full {
+		r.fullGeneration = r.generation
+	}
 
 	r.mu.Unlock()
 
@@ -156,7 +154,7 @@ func (s *SQL) markOnMainChainDirty(full bool, floor int64, path string, cause er
 //
 // While a loop attempt is running the record is left alone. That attempt may commit after
 // this rebuild from a snapshot older than it, so only the loop can tell whether the flags
-// are right once it has finished. The callers count themselves with noteOnMainChainWrite,
+// are right once it has finished. The callers note themselves with noteOnMainChainWrite,
 // so the loop sees the overlap and runs again.
 func (s *SQL) onMainChainRepaired(full bool) {
 	r := &s.onMainChainRepair
@@ -171,37 +169,121 @@ func (s *SQL) onMainChainRepaired(full bool) {
 	s.clearOnMainChainRepairLocked("a later rebuild")
 }
 
-// noteOnMainChainWrite records a committed slow-path write that moved chain membership.
-// The caller holds slowPathMu and calls it after its last commit and before it releases
-// the lock, so a walk's owner that reads the count under slowPathMu once the walk has
-// committed sees every such write that could have landed during the walk.
-func (s *SQL) noteOnMainChainWrite() {
-	r := &s.onMainChainRepair
-
-	r.mu.Lock()
-	r.chainWrites++
-	r.mu.Unlock()
+// chainWriteWatch collects the chain writes that commit while a walk without slowPathMu
+// runs. See watchOnMainChainWrites.
+type chainWriteWatch struct {
+	// moved is true once a write has been noted.
+	moved bool
+	// floor is the lowest height any noted write gave, or noRepairFloor when one of them
+	// could not name one.
+	floor int64
 }
 
-// onMainChainWriteCount returns the count noteOnMainChainWrite keeps, for the owner of a
-// walk that runs without slowPathMu to read before the walk starts.
-func (s *SQL) onMainChainWriteCount() uint64 {
+// watchOnMainChainWrites opens a watch for a walk about to run without slowPathMu.
+//
+// Such a walk reads its rows from a snapshot taken when it began. A chain write that
+// commits during the walk can touch only rows the walk does not, so REPEATABLE READ aborts
+// neither, and the walk can then commit its older view over the write. The owner opens a
+// watch before the walk and closes it under slowPathMu after the walk has committed, so
+// every write that committed in between has been noted on it.
+//
+// Each write notes the lowest height at which it can have moved the best chain. Every row
+// below every noted height has the same membership on the chain the walk saw as on the
+// chain after the writes, so the walk left it right; only rows at or above the lowest noted
+// height can be wrong, and a bounded walk down to it repairs them.
+func (s *SQL) watchOnMainChainWrites() *chainWriteWatch {
+	r := &s.onMainChainRepair
+
+	w := &chainWriteWatch{floor: noRepairFloor}
+
+	r.mu.Lock()
+	if r.watches == nil {
+		r.watches = make(map[*chainWriteWatch]struct{})
+	}
+
+	r.watches[w] = struct{}{}
+	r.mu.Unlock()
+
+	return w
+}
+
+// noteOnMainChainWrite records a committed slow-path write that moved chain membership on
+// every open watch. floor is the lowest height at which the write can have changed the
+// best chain, or noRepairFloor when the write cannot bound it.
+//
+// The caller holds slowPathMu and calls it after its last commit and before it releases
+// the lock, so a watch closed under slowPathMu once its walk has committed has seen every
+// write that could have landed during the walk. A write that failed before it committed
+// is not noted: it moved nothing, and noting it would make a walk run again for nothing.
+func (s *SQL) noteOnMainChainWrite(floor int64) {
 	r := &s.onMainChainRepair
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return r.chainWrites
+	for w := range r.watches {
+		if !w.moved {
+			w.moved = true
+			w.floor = floor
+		} else if w.floor != noRepairFloor && (floor == noRepairFloor || floor < w.floor) {
+			w.floor = floor
+		}
+	}
 }
 
-// onMainChainWritesSince reports whether a chain write has been counted since the count
-// was before. It takes slowPathMu for the read, so no write sits between its commit and
-// its count while the count is read.
-func (s *SQL) onMainChainWritesSince(before uint64) bool {
+// closeOnMainChainWatch closes w and reports whether a chain write was noted on it and
+// the lowest height any of them gave. It takes slowPathMu for the read, so no write sits
+// between its commit and its note.
+func (s *SQL) closeOnMainChainWatch(w *chainWriteWatch) (moved bool, floor int64) {
 	s.slowPathMu.Lock()
 	defer s.slowPathMu.Unlock()
 
-	return s.onMainChainWriteCount() != before
+	return s.dropOnMainChainWatch(w)
+}
+
+// closeOnMainChainWatchWithin is closeOnMainChainWatch that waits at most wait for
+// slowPathMu. ok is false when it could not take the lock in time; the watch is closed
+// either way, and the caller must then assume a write it cannot bound overlapped.
+func (s *SQL) closeOnMainChainWatchWithin(w *chainWriteWatch, wait time.Duration) (moved bool, floor int64, ok bool) {
+	deadline := time.Now().Add(wait)
+
+	for !s.slowPathMu.TryLock() {
+		if s.closing() || time.Now().After(deadline) {
+			s.dropOnMainChainWatch(w)
+
+			return true, noRepairFloor, false
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	defer s.slowPathMu.Unlock()
+
+	moved, floor = s.dropOnMainChainWatch(w)
+
+	return moved, floor, true
+}
+
+// dropOnMainChainWatch closes w without taking slowPathMu, for a walk whose result will
+// not be trusted anyway, and returns what was noted on it.
+func (s *SQL) dropOnMainChainWatch(w *chainWriteWatch) (moved bool, floor int64) {
+	r := &s.onMainChainRepair
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.watches, w)
+
+	return w.moved, w.floor
+}
+
+// lowerRepairFloor returns the lower of two floors, where noRepairFloor means none.
+func lowerRepairFloor(a, b int64) int64 {
+	if a == noRepairFloor || (b != noRepairFloor && b < a) {
+		return b
+	}
+
+	return a
 }
 
 // clearOnMainChainRepairLocked releases the record. The caller holds r.mu.
@@ -215,7 +297,6 @@ func (s *SQL) clearOnMainChainRepairLocked(how string) {
 	r.full = false
 	r.floor = noRepairFloor
 	r.attempts = 0
-	r.overlaps = 0
 
 	s.mainChainRebuilding.Add(-1)
 	prometheusOnMainChainRepairPending.Dec()
@@ -245,9 +326,9 @@ func (s *SQL) onMainChainRepairLoop() {
 }
 
 // repairOnMainChainUntilClean runs repair attempts until the record is clear. A failed
-// attempt and an overlapped one both wait before the next, starting at the record's
-// backoff and doubling to onMainChainRepairMaxBackoff. It returns false when the store
-// shut down first.
+// attempt, and a full one overlapped by a write that named no height, wait before the
+// next, starting at the record's backoff and doubling to onMainChainRepairMaxBackoff. It
+// returns false when the store shut down first.
 func (s *SQL) repairOnMainChainUntilClean() bool {
 	r := &s.onMainChainRepair
 
@@ -264,7 +345,7 @@ func (s *SQL) repairOnMainChainUntilClean() bool {
 		case repairRerun:
 			continue
 		case repairOverlapped:
-			s.logger.Infof("on_main_chain repair overlapped a chain write, running it again in %s", wait)
+			s.logger.Infof("on_main_chain repair overlapped an operator chain write, running the full walk again in %s", wait)
 		case repairFailed:
 			s.logger.Warnf("on_main_chain repair failed, next attempt in %s: %v", wait, err)
 		}
@@ -289,10 +370,12 @@ const (
 	// repairLanded: the record is clear, by this attempt or by a rebuild outside the loop.
 	repairLanded repairOutcome = iota
 	// repairRerun: set the attempt up again at once. A mark recorded while it ran, or while
-	// it waited for slowPathMu, changed what it owes.
+	// it waited for slowPathMu, changed what it owes, or an overlapped full walk narrowed
+	// the record to a bounded walk.
 	repairRerun
-	// repairOverlapped: the walk landed without slowPathMu and a chain write committed
-	// during it, so the walk may have written an older view over that write.
+	// repairOverlapped: the walk landed without slowPathMu and a chain write that could not
+	// bound its reach committed during it, so the walk may have written an older view over
+	// that write and must run again in full.
 	repairOverlapped
 	// repairFailed: the walk returned an error.
 	repairFailed
@@ -304,22 +387,25 @@ const (
 // held, so no slow-path writer interleaves with a walk over the rows at the tip. It is
 // short: the window is the tip's plus the recorded floor, under a 30 s budget.
 //
-// On PostgreSQL a full attempt does not take slowPathMu. It can run for up to 30 min, and
+// On PostgreSQL a full attempt never takes slowPathMu. It can run for up to 30 min, and
 // while the database stays slow it is retried every 30 s, so holding the lock would stop
 // block storage for as long as the fault lasts. Readers are on their flag-free walk
 // because of the guard, and rows a concurrent StoreBlock inserts are flagged by that
-// StoreBlock. A membership write that commits during the attempt can touch only rows the
-// attempt does not, so REPEATABLE READ aborts neither, and the attempt can then commit
-// its older view over the write. The attempt therefore reads the chain-write count before
-// it starts and again under slowPathMu once it has committed, and reports an overlap when
-// the count moved. After onMainChainRepairMaxOverlaps overlaps in a row, the next full
-// attempt holds slowPathMu like a bounded one, and no chain write can overlap it. That
-// attempt stops block storage for the length of one walk, which is the price of ending
-// the cycle.
+// StoreBlock. A chain write that commits during the attempt can leave the attempt's older
+// view in place (see watchOnMainChainWrites), so the attempt watches for chain writes and
+// reports an overlap when one was noted. When every noted write named the lowest height it
+// can have moved, and no mark owing a full walk arrived meanwhile, the walk left every row
+// below that height right, and the record is narrowed to a bounded walk down to it, which
+// runs next under slowPathMu like any bounded attempt and which no write can overlap. When
+// one of them could not name a height, which is InvalidateBlock and RevalidateBlock, the
+// full walk runs again, unlocked, after the backoff. A steady stream of such operator
+// writes can keep the repair owed; readers stay on the flag-free walk meanwhile, which
+// costs speed, not correctness.
 //
 // On SQLite a full attempt does take slowPathMu. SQLite lets one writer in at a time, so a
 // long walk would make each StoreBlock that needs to write fail with SQLITE_BUSY after the
-// 5 s busy timeout; waiting on the lock delays block storage without failing it.
+// 5 s busy timeout; waiting on the lock delays block storage without failing it. Every
+// SQLite attempt is therefore locked, and none can be overlapped.
 //
 // A locked attempt reads the record only once it holds the lock. A chain write it queued
 // behind has finished by then and cannot overlap it, and a rebuild outside the loop that
@@ -353,7 +439,7 @@ func (s *SQL) attemptOnMainChainRepair() (repairOutcome, error) {
 		return repairLanded, nil
 	}
 
-	if r.full != full || s.onMainChainRepairNeedsLockLocked() != locked {
+	if r.full != full {
 		// A mark while this attempt waited for the lock changed the walk it owes.
 		r.mu.Unlock()
 
@@ -361,18 +447,28 @@ func (s *SQL) attemptOnMainChainRepair() (repairOutcome, error) {
 	}
 
 	generation := r.generation
-	writesBefore := r.chainWrites
 	floor := r.floor
 	attempt := r.attempts + 1
 	r.running = true
 
 	r.mu.Unlock()
 
+	var watch *chainWriteWatch
+	if !locked {
+		watch = s.watchOnMainChainWrites()
+	}
+
 	err := s.runOnMainChainRepair(full, floor)
 
 	overlapped := false
-	if err == nil && !locked {
-		overlapped = s.onMainChainWritesSince(writesBefore)
+	writeFloor := noRepairFloor
+
+	if watch != nil {
+		if err == nil {
+			overlapped, writeFloor = s.closeOnMainChainWatch(watch)
+		} else {
+			s.dropOnMainChainWatch(watch)
+		}
 	}
 
 	r.mu.Lock()
@@ -382,7 +478,6 @@ func (s *SQL) attemptOnMainChainRepair() (repairOutcome, error) {
 
 	if err != nil {
 		r.attempts++
-		r.overlaps = 0
 
 		return repairFailed, errors.NewProcessingError("attempt %d (full walk %v, floor %d, holding slowPathMu %v)", attempt, full, floor, locked, err)
 	}
@@ -390,7 +485,14 @@ func (s *SQL) attemptOnMainChainRepair() (repairOutcome, error) {
 	// pending is still true here. onMainChainRepaired leaves the record alone while
 	// running is set, and its callers cannot run at all during a locked attempt.
 	if overlapped {
-		r.overlaps++
+		if writeFloor != noRepairFloor && r.fullGeneration <= generation {
+			// The full walk left every row below writeFloor right. Owe only the rows at or
+			// above it, together with any bounded floor a mark recorded meanwhile.
+			r.full = false
+			r.floor = lowerRepairFloor(r.floor, writeFloor)
+
+			return repairRerun, nil
+		}
 
 		return repairOverlapped, nil
 	}
@@ -406,12 +508,11 @@ func (s *SQL) attemptOnMainChainRepair() (repairOutcome, error) {
 	return repairLanded, nil
 }
 
-// onMainChainRepairNeedsLockLocked reports whether the next attempt must hold slowPathMu.
-// The caller holds r.mu.
+// onMainChainRepairNeedsLockLocked reports whether the next attempt must hold slowPathMu:
+// every bounded attempt, and a full one unless the engine is PostgreSQL. The caller holds
+// r.mu.
 func (s *SQL) onMainChainRepairNeedsLockLocked() bool {
-	r := &s.onMainChainRepair
-
-	return !r.full || !s.unlockedFullRepair || r.overlaps >= onMainChainRepairMaxOverlaps
+	return !s.onMainChainRepair.full || !s.unlockedFullRepair
 }
 
 // runOnMainChainRepair runs the walk of one attempt; attemptOnMainChainRepair decides

@@ -122,12 +122,23 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
     - On SQLite a repair that walks the whole chain also holds the lock, for up to 30 min
       per attempt, because SQLite admits one writer at a time and `StoreBlock` would
       otherwise fail after its 5 s busy timeout.
-    - On PostgreSQL the whole-chain repair, and the startup rebuild, run without the lock,
-      but a `StoreBlock` that reorganises the chain and needs a row the walk has already
-      updated waits for the walk to commit, up to 30 min, while it holds the lock. If a
-      chain change commits while one of these walks runs, the walk runs again, after the
-      same backoff, before readers go back to the column. After three such overlaps in a
-      row the next walk holds the lock, so block storage waits for that one walk.
+    - On PostgreSQL the whole-chain repair runs without the lock, and never takes it
+      however often it is overlapped, but a `StoreBlock` that reorganises the chain and
+      needs a row the walk has already updated waits for the walk to commit, up to
+      30 min, while it holds the lock.
+    - The startup rebuild runs without the lock on both engines.
+    - A chain change that commits while an unlocked walk (the startup rebuild or the
+      PostgreSQL whole-chain repair) runs makes the walk's result untrusted. A
+      `StoreBlock` reorg names the lowest height it can have moved, so the repair that
+      follows is a walk from that height under the lock, run at once, bounded like the
+      repair near the tip. An `InvalidateBlock` or `RevalidateBlock` cannot name a
+      height, so the walk runs again in full and unlocked after the backoff. A startup
+      overlap becomes an owed repair handled the same way. Under a steady stream of
+      operator invalidations the repair can stay owed; readers stay on the slow walk
+      meanwhile, which costs speed, not correctness. Only writes that committed, or
+      whose commit failed and so may have landed, count as chain changes.
+    - The startup goroutine waits at most 10 s for the lock to check for an overlap. If
+      something holds it longer, it records an owed repair instead.
 
   Operators can watch
   `teranode_blockchain_sql_on_main_chain_repair_pending` (above 0 while a repair is

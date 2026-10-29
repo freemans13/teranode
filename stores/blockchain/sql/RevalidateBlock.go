@@ -26,9 +26,6 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 	s.slowPathMu.Lock()
 	defer s.slowPathMu.Unlock()
 
-	// See the matching count in InvalidateBlock.
-	defer s.noteOnMainChainWrite()
-
 	// Hold the rebuild guard from the UPDATE through the reconciliation so
 	// concurrent readers fall back to the authoritative CTE path during the
 	// inconsistent window. Mirrors InvalidateBlock's pattern.
@@ -44,6 +41,11 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 	if _, err = s.db.ExecContext(ctx, q, blockHash.CloneBytes()); err != nil {
 		return errors.NewStorageError("error updating block to valid", err)
 	}
+
+	// The UPDATE committed, so this call moves chain membership; see the matching note in
+	// InvalidateBlock. Deferred so it lands after the rebuild below and before slowPathMu
+	// drops. A failed UPDATE returned above and is not noted.
+	defer s.noteOnMainChainWrite(noRepairFloor)
 
 	// RevalidateBlock, like InvalidateBlock, can move the tip across an
 	// arbitrarily deep fork point. Use the full rebuild for correctness —
