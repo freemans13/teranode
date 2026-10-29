@@ -1781,6 +1781,21 @@ func (b *BlockAssembler) reapplyForward(ctx context.Context, intent utxo.Conflic
 		if err := b.unlockConflictParents(ctx, resolved); err != nil {
 			return err
 		}
+
+		// A kill between step 1 and the original run's eviction leaves the
+		// resolved winners' losers cached as non-conflicting in subtree
+		// validation. The intent's own winners are never losers.
+		winners := make(map[chainhash.Hash]struct{}, len(intent.TxHashes))
+		for _, h := range intent.TxHashes {
+			winners[h] = struct{}{}
+		}
+
+		losers, err := utxo.ResolvedForwardLosers(ctx, b.utxoStore, resolved, winners)
+		if err != nil {
+			return err
+		}
+
+		b.txMetaEvictor.Evict(losers)
 	}
 
 	if len(resolved) == len(intent.TxHashes) {

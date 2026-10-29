@@ -156,6 +156,11 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		opt(&options)
 	}
 
+	resolvedSet := make(map[chainhash.Hash]struct{}, len(options.resolvedWinners))
+	for _, h := range options.resolvedWinners {
+		resolvedSet[h] = struct{}{}
+	}
+
 	// Crash-safety write-ahead log (#861): record the intent durably BEFORE any
 	// state mutation, and remove it once the operation completes successfully. A
 	// SIGKILL between steps (which bypasses the in-process rollback below) leaves
@@ -250,7 +255,16 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), compensationTimeout)
 		defer rollbackCancel()
 
-		rollbackErr := rollbackProcessConflicting(rollbackCtx, s, conflictingTxHashes,
+		// A resolved winner was not conflicting when this call began, so the
+		// rollback must not re-mark it.
+		rollbackWinners := make([]chainhash.Hash, 0, len(conflictingTxHashes))
+		for _, h := range conflictingTxHashes {
+			if _, resolved := resolvedSet[h]; !resolved {
+				rollbackWinners = append(rollbackWinners, h)
+			}
+		}
+
+		rollbackErr := rollbackProcessConflicting(rollbackCtx, s, rollbackWinners,
 			allMarkedHashes, markedAsNotSpendable, step3SuccessfulSpends, blockHeight,
 			step2Committed, step4Committed)
 		if rollbackErr != nil {
@@ -268,11 +282,6 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	// with the winning transaction at the same index in the winningTxs slice
 	losingTxHashesPerConflictingTx := make([][]chainhash.Hash, len(conflictingTxHashes))
 	losingTxHashesPerConflictingTxCount := atomic.Int64{}
-
-	resolvedSet := make(map[chainhash.Hash]struct{}, len(options.resolvedWinners))
-	for _, h := range options.resolvedWinners {
-		resolvedSet[h] = struct{}{}
-	}
 
 	g, gCtx := errgroup.WithContext(ctx)
 
@@ -454,16 +463,41 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	// - 3: spend tx_double_spend as normal (ignoring the not spendable flag)
 	var tErr *errors.Error
 
-	for _, tx := range winningTxs {
+	// A resolved winner already holds its spends, and both stores report a spend
+	// the tx already holds as a success. Only an outpoint step 2 unspent is one
+	// this call spends for it, so only those are the rollback's to undo. Undoing
+	// the rest would unspend a confirmed resolution that predates this call.
+	unspentAtStep2 := make(map[spendOutpointKey]struct{}, len(affectedParentSpends))
+	for _, sp := range affectedParentSpends {
+		if sp != nil && sp.TxID != nil {
+			unspentAtStep2[spendOutpointKey{txID: *sp.TxID, vout: sp.Vout}] = struct{}{}
+		}
+	}
+
+	for idx, tx := range winningTxs {
+		_, resolved := resolvedSet[conflictingTxHashes[idx]]
+
 		_, spends, spendErr := s.SpendAndCreate(ctx, tx, blockHeight, WithSpendOnly(),
 			WithIgnoreConflicting(true), WithIgnoreLocked(true))
 		// Capture per-input partial successes regardless of overall outcome so the rollback
 		// can undo them via Unspend(false) (parents at step 3 entry were unlocked-by-us, so
 		// the unspend MUST NOT relock).
 		for _, sp := range spends {
-			if sp != nil && sp.Err == nil {
-				step3SuccessfulSpends = append(step3SuccessfulSpends, sp)
+			if sp == nil || sp.Err != nil {
+				continue
 			}
+
+			if resolved {
+				if sp.TxID == nil {
+					continue
+				}
+
+				if _, ours := unspentAtStep2[spendOutpointKey{txID: *sp.TxID, vout: sp.Vout}]; !ours {
+					continue
+				}
+			}
+
+			step3SuccessfulSpends = append(step3SuccessfulSpends, sp)
 		}
 
 		if spendErr != nil {
@@ -737,6 +771,12 @@ func ForwardResolutionApplied(ctx context.Context, s Store, winner chainhash.Has
 			parentHash := inpoint.Hash
 
 			parentMeta, err = s.Get(ctx, &parentHash, fields.Utxos)
+			if errors.Is(err, errors.ErrTxNotFound) {
+				// A store reports a missing record as ErrTxNotFound or as a nil one;
+				// both mean the parent is unknown.
+				return false, nil
+			}
+
 			if err != nil {
 				return false, errors.NewProcessingError("[ForwardResolutionApplied][%s] error getting parent %s meta", winner.String(), parentHash.String(), err)
 			}
@@ -774,7 +814,8 @@ func ForwardResolutionApplied(ctx context.Context, s Store, winner chainhash.Has
 // The descendant walk is unbounded, like the forward demotion walk it mirrors. A
 // budget here would fail on every re-application of a block whose resolution
 // succeeded on a larger cone, which wedges block assembly the same way (issue
-// 1391). A loser or descendant the store no longer holds is a leaf.
+// 1391). A parent, loser or descendant the store no longer holds is a leaf,
+// whether the store reports it as ErrTxNotFound or as a nil record.
 func ResolvedForwardLosers(ctx context.Context, s Store, winners []chainhash.Hash, exclude map[chainhash.Hash]struct{}) ([]chainhash.Hash, error) {
 	parents := make(map[chainhash.Hash]*meta.Data)
 	candidates := make(map[chainhash.Hash]*meta.Data)
@@ -799,6 +840,10 @@ func ResolvedForwardLosers(ctx context.Context, s Store, winners []chainhash.Has
 			parentMeta, seen := parents[parentHash]
 			if !seen {
 				parentMeta, err = s.Get(ctx, &parentHash, fields.ConflictingChildren)
+				if errors.Is(err, errors.ErrTxNotFound) {
+					parentMeta, err = nil, nil
+				}
+
 				if err != nil {
 					return nil, errors.NewProcessingError("[ResolvedForwardLosers][%s] error reading parent %s", winner.String(), parentHash.String(), err)
 				}
@@ -824,6 +869,14 @@ func ResolvedForwardLosers(ctx context.Context, s Store, winners []chainhash.Has
 					candidateHash := candidate
 
 					candidateMeta, err = s.Get(ctx, &candidateHash, fields.TxInpoints, fields.Conflicting)
+					// ConflictingChildren is append-only and conflicting txs are
+					// pruned after the retention window, so a candidate can be gone.
+					// A store reports that as ErrTxNotFound or as a nil record;
+					// either way it is a leaf, as in the descendant walk.
+					if errors.Is(err, errors.ErrTxNotFound) {
+						candidateMeta, err = nil, nil
+					}
+
 					if err != nil {
 						return nil, errors.NewProcessingError("[ResolvedForwardLosers][%s] error reading candidate loser %s", winner.String(), candidateHash.String(), err)
 					}

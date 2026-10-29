@@ -1917,6 +1917,10 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 						return err
 					}
 
+					// A kill before the original run's eviction can leave these
+					// losers cached as non-conflicting in subtree validation.
+					stp.txMetaEvictor.Evict(resolvedLosers)
+
 					var losingTxHashesMap txmap.TxMap
 
 					if len(resolvedNodes) < len(conflictingNodes) {
@@ -6014,6 +6018,10 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 		if err != nil {
 			return nil, nil, err
 		}
+
+		// A kill before the original run's eviction can leave these losers
+		// cached as non-conflicting in subtree validation.
+		stp.txMetaEvictor.Evict(resolvedLosers)
 
 		if len(resolvedNodes) < len(conflictingNodes) {
 			var allMarkedConflicting []chainhash.Hash
