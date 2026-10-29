@@ -82,7 +82,8 @@ Test file layout:
   written: no `_additional`, `_coverage`, `_extra`, `_more`, `_new` or numeric
   suffixes.
 - Keep unit tests in the same directory as the code; don't move them to a
-  separate tree. The top-level `test/` tree is for e2e and multi-node tests.
+  separate tree. The top-level `test/` tree holds the e2e, multi-node,
+  consensus-vector, long-running, sequential, chaos and soak suites.
 - Search production code first and open tests only when needed. Most hits for a
   common identifier are in tests: `git grep <name> -- ':!*_test.go'`.
 
