@@ -413,13 +413,22 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 					headersToAppend = blockHeaders[1:]
 					u.logger.Debugf("[catchup][%s] iteration %d: skipping duplicate header %s", chainTipHash.String(), iteration, blockHeaders[0].Hash().String())
 				}
+			}
 
-				// The batch must build on the last header we hold. Every request names the same
-				// chainTipHash and a locator taken from the previous batch, and the peer serves the
-				// headers on the path back from that fixed tip, so consecutive batches of an honest
-				// peer always link, reorg or not. A batch that does not is a protocol violation:
-				// reject it here, charged to the peer, before it is accumulated.
-				if len(headersToAppend) > 0 && !headersToAppend[0].HashPrevBlock.IsEqual(allCatchupHeaders[len(allCatchupHeaders)-1].Hash()) {
+			// The batch must be one chain, built on the last header we hold. Every request names the
+			// same chainTipHash and a locator taken from the previous batch, and the peer serves the
+			// headers on the path back from that fixed tip, so an honest peer's headers always link,
+			// within a batch and across batches, reorg or not. A break is a protocol violation:
+			// reject it here, charged to the peer, before it is accumulated or the fetch is counted
+			// as a success. The first batch's first header has no held predecessor; its link to the
+			// common ancestor is checked by findCommonAncestor.
+			var prevHeader *model.BlockHeader
+			if len(allCatchupHeaders) > 0 {
+				prevHeader = allCatchupHeaders[len(allCatchupHeaders)-1]
+			}
+
+			for _, header := range headersToAppend {
+				if prevHeader != nil && !header.HashPrevBlock.IsEqual(prevHeader.Hash()) {
 					if circuitBreaker != nil {
 						circuitBreaker.RecordFailure()
 					}
@@ -427,8 +436,10 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 					return catchup.CreateCatchupResult(
 						allCatchupHeaders, blockUpTo.Hash(), startHash, startHeight, startTime, baseURL,
 						iteration, failedIterations, false, "Header batch does not link",
-					), nil, errors.NewNetworkInvalidResponseError("[catchup][%s] iteration %d: header batch does not link to the previous batch (header %s has parent %s, last header held is %s)", chainTipHash.String(), iteration, headersToAppend[0].Hash().String(), headersToAppend[0].HashPrevBlock.String(), allCatchupHeaders[len(allCatchupHeaders)-1].Hash().String())
+					), nil, errors.NewNetworkInvalidResponseError("[catchup][%s] iteration %d: header batch does not link as one chain (header %s has parent %s, previous header is %s)", chainTipHash.String(), iteration, header.Hash().String(), header.HashPrevBlock.String(), prevHeader.Hash().String())
 				}
+
+				prevHeader = header
 			}
 
 			// Check memory limit after duplicate removal

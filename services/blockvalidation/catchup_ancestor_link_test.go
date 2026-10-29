@@ -103,6 +103,8 @@ type ancestorLinkRun struct {
 	headersRequests int
 	blocksRequests  int
 	minedClears     int64
+	breakerFailures int    // failures counted on the peer's circuit breaker after the catchup
+	errorType       string // previousCatchupAttempt.ErrorType, how releaseCatchupLock classified err
 	client          blockchain.ClientI
 	mainChain       []*model.BlockHeader // b1..b10, the local chain; b5 is the common ancestor
 	offered         []*model.BlockHeader // every header the peer offers after the ancestor, all batches
@@ -280,8 +282,17 @@ func runAncestorLinkCatchup(t *testing.T, shape offerShape) ancestorLinkRun {
 		}
 	}
 
+	_, breakerFailures, _, _ := server.peerCircuitBreakers.GetBreaker("peer-ancestor-link").GetStats()
+
+	errorType := ""
+	if server.previousCatchupAttempt != nil {
+		errorType = server.previousCatchupAttempt.ErrorType
+	}
+
 	return ancestorLinkRun{
 		err:             err,
+		breakerFailures: breakerFailures,
+		errorType:       errorType,
 		headersRequests: int(headersRequests.Load()),
 		blocksRequests:  blocksRequests,
 		minedClears:     recorder.clears.Load(),
@@ -327,6 +338,18 @@ func requireRejectedWithoutSideEffects(t *testing.T, run ancestorLinkRun) {
 	}
 }
 
+// requireChargedToPeer asserts that the rejection is charged to the serving peer, not only coded
+// as a peer fault: the header fetch recorded a failure on the peer's circuit breaker and no success
+// after it (a success in the closed state resets the count), and releaseCatchupLock classified the
+// error as network_error, the generic peer error it reports to the peer registry.
+func requireChargedToPeer(t *testing.T, run ancestorLinkRun) {
+	t.Helper()
+
+	require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "a broken offer is a peer fault: %v", run.err)
+	require.Equal(t, 1, run.breakerFailures, "the header fetch must record the broken offer as one failure on the peer's circuit breaker, and no success")
+	require.Equal(t, "network_error", run.errorType, "releaseCatchupLock must classify the rejection as a peer network error")
+}
+
 // TestCatchup_FirstHeaderMustLinkToCommonAncestor covers bitcoin-sv/teranode#4975 against a real
 // sqlitememory blockchain store. b5 is the stored common ancestor and b10 the local tip, so every
 // offer here is a fork of depth 5. Catchup must reject an offer whose headers do not form one chain
@@ -337,10 +360,14 @@ func requireRejectedWithoutSideEffects(t *testing.T, run ancestorLinkRun) {
 // The control subtest runs the same setup with a linked offer. It does un-stamp b6..b10 and does
 // reach the block fetch, so the zero clear and fetch counts in the other subtests are not vacuous.
 //
+// The peer serves b5 in front of the offer, so the header fetch, which checks every link within a
+// batch, rejects both broken offers before findCommonAncestor sees them, and charges the peer.
+//
 // Mutation proofs: moving the mined_set clear back to its old place straight after the
-// secret-mining check fails nothing_new_after_ancestor on the clear count. Checking only the first
-// link in findCommonAncestor fails chain_breaks_after_first_header on the error message, because
-// the break then surfaces later, in the header cache.
+// secret-mining check fails nothing_new_after_ancestor on the clear count. Removing the link check
+// in catchupGetBlockHeaders fails both broken-offer subtests on the error message and on the
+// circuit-breaker count, because findCommonAncestor then rejects them after the fetch has recorded
+// a success.
 func TestCatchup_FirstHeaderMustLinkToCommonAncestor(t *testing.T) {
 	t.Run("control_linked_chain_unstamps_and_reaches_block_fetch", func(t *testing.T) {
 		run := runAncestorLinkCatchup(t, offerLinked)
@@ -353,8 +380,8 @@ func TestCatchup_FirstHeaderMustLinkToCommonAncestor(t *testing.T) {
 		run := runAncestorLinkCatchup(t, offerFirstOnOther)
 
 		require.Error(t, run.err, "catchup must abort when the first header does not link to the common ancestor")
-		require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "a mis-linked offer is a peer fault: %v", run.err)
-		require.Contains(t, run.err.Error(), "do not link to common ancestor as one chain")
+		requireChargedToPeer(t, run)
+		require.Contains(t, run.err.Error(), "header batch does not link as one chain")
 		requireRejectedWithoutSideEffects(t, run)
 	})
 
@@ -362,8 +389,8 @@ func TestCatchup_FirstHeaderMustLinkToCommonAncestor(t *testing.T) {
 		run := runAncestorLinkCatchup(t, offerBreakAtSecond)
 
 		require.Error(t, run.err, "catchup must abort when a later offered header does not link to the one before it")
-		require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "a broken offer is a peer fault: %v", run.err)
-		require.Contains(t, run.err.Error(), "do not link to common ancestor as one chain")
+		requireChargedToPeer(t, run)
+		require.Contains(t, run.err.Error(), "header batch does not link as one chain")
 		requireRejectedWithoutSideEffects(t, run)
 	})
 
@@ -396,8 +423,8 @@ func TestCatchup_HeaderBatchMustLinkToPreviousBatch(t *testing.T) {
 		run := runAncestorLinkCatchup(t, offerBreakBetweenBatches)
 
 		require.Error(t, run.err, "catchup must abort when a header batch does not build on the previous one")
-		require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "an unlinked batch is a peer fault: %v", run.err)
-		require.Contains(t, run.err.Error(), "header batch does not link to the previous batch")
+		requireChargedToPeer(t, run)
+		require.Contains(t, run.err.Error(), "header batch does not link as one chain")
 		require.Equal(t, 2, run.headersRequests, "the second batch is rejected as it arrives")
 		requireRejectedWithoutSideEffects(t, run)
 	})
@@ -407,8 +434,8 @@ func TestCatchup_HeaderBatchMustLinkToPreviousBatch(t *testing.T) {
 
 		require.Equal(t, 2, run.headersRequests, "a replaying peer must not keep the header fetch looping")
 		require.Error(t, run.err, "catchup must abort when a header batch does not build on the previous one")
-		require.True(t, errors.Is(run.err, errors.ErrNetworkInvalidResponse), "an unlinked batch is a peer fault: %v", run.err)
-		require.Contains(t, run.err.Error(), "header batch does not link to the previous batch")
+		requireChargedToPeer(t, run)
+		require.Contains(t, run.err.Error(), "header batch does not link as one chain")
 		requireRejectedWithoutSideEffects(t, run)
 	})
 }
