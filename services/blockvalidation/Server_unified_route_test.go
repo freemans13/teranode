@@ -79,14 +79,17 @@ func TestServer_legacyUnifiedRoute(t *testing.T) {
 		{name: "store unsupported", unified: true, outpointOnly: true, supports: false, baseURL: "legacy", height: 1000, headerProven: true, want: false, wantEligible: false},
 		{name: "non-legacy source", unified: true, outpointOnly: true, supports: true, baseURL: "http://peer:8090", height: 1000, headerProven: true, want: false, wantEligible: false},
 		{name: "height 0", unified: true, outpointOnly: true, supports: true, baseURL: "legacy", height: 0, headerProven: true, want: false, wantEligible: false},
-		// On a netting store this service's copy of the unified flag is not read: full
-		// validation cannot take such a block, and the legacy service refuses to start with its
-		// own copy off. Every other conjunct still holds the route closed.
+		// On a netting store neither route flag is read: full validation cannot take such a
+		// block, and the route must not depend on this service's copies, which may differ from
+		// the legacy service's. Every other conjunct still holds the route closed.
 		{name: "netting, unified flag off, proven", unified: false, outpointOnly: true, supports: true, nets: true, baseURL: "legacy", height: 1000, headerProven: true, want: true, wantEligible: true},
 		{name: "netting, unified flag off, unproven", unified: false, outpointOnly: true, supports: true, nets: true, baseURL: "legacy", height: 1000, headerProven: false, want: false, wantEligible: true},
 		{name: "netting, unified flag off, above checkpoint", unified: false, outpointOnly: true, supports: true, nets: true, baseURL: "legacy", height: 2001, headerProven: true, want: false, wantEligible: false},
 		{name: "netting, unified flag off, non-legacy source", unified: false, outpointOnly: true, supports: true, nets: true, baseURL: "http://peer:8090", height: 1000, headerProven: true, want: false, wantEligible: false},
-		{name: "netting, both flags off", unified: false, outpointOnly: false, supports: true, nets: true, baseURL: "legacy", height: 1000, headerProven: true, want: false, wantEligible: false},
+		{name: "netting, outpoint-only flag off", unified: true, outpointOnly: false, supports: true, nets: true, baseURL: "legacy", height: 1000, headerProven: true, want: true, wantEligible: true},
+		{name: "netting, both flags off, proven", unified: false, outpointOnly: false, supports: true, nets: true, baseURL: "legacy", height: 1000, headerProven: true, want: true, wantEligible: true},
+		{name: "netting, both flags off, unproven", unified: false, outpointOnly: false, supports: true, nets: true, baseURL: "legacy", height: 1000, headerProven: false, want: false, wantEligible: true},
+		{name: "netting, both flags off, above checkpoint", unified: false, outpointOnly: false, supports: true, nets: true, baseURL: "legacy", height: 2001, headerProven: true, want: false, wantEligible: false},
 	}
 
 	for _, tt := range tests {

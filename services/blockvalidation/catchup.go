@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/util/blockassemblyutil"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
@@ -1256,8 +1257,10 @@ func (u *Server) buildHeaderCache(catchupCtx *CatchupContext) error {
 func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) error {
 	catchupCtx.useQuickValidation = false
 
-	// Quick validation disabled, no need to verify checkpoints
-	if !u.settings.BlockValidation.CatchupAllowQuickValidation {
+	// Quick validation disabled, no need to verify checkpoints. A store that nets below the
+	// checkpoint (utxoset) takes those blocks only through quick validation, so it ignores
+	// the setting.
+	if !u.settings.BlockValidation.CatchupAllowQuickValidation && !utxo.NetsBelowCheckpoint(u.utxoStore) {
 		return nil
 	}
 

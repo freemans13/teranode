@@ -62,12 +62,14 @@ func TestNettedRoute_WindowFloorIsTheGapPlusOne(t *testing.T) {
 		require.Equal(t, tc.want, model.NettedRouteCatchupWindow(s, bv.utxoStore), "setting %d", tc.set)
 	}
 
-	// A store that does not net, or the setting off, keeps the setting.
+	// A store that does not net keeps the setting.
 	s.BlockValidation.CatchupMaxAccumulatedHeaders = 1
 	require.Equal(t, 1, model.NettedRouteCatchupWindow(s, bv.utxoStore.(nettingRecorder).applyRecorder))
 
+	// A netting store nets below the checkpoint whatever the outpoint-only setting says, so the
+	// floor still applies with it off.
 	s.BlockValidation.OutpointOnlyBelowCheckpoint = false
-	require.Equal(t, 1, model.NettedRouteCatchupWindow(s, bv.utxoStore))
+	require.Equal(t, 601, model.NettedRouteCatchupWindow(s, bv.utxoStore))
 }
 
 // On the netted route the locator is not capped at a trailing UTXO height, because each header
@@ -117,8 +119,9 @@ func TestNettedRoute_LargestCheckpointGap(t *testing.T) {
 		"genesis to 400 is 400, 400 to 1,000 is 600, 1,000 to 1,500 is 500, in any list order")
 }
 
-// With the store netting below the checkpoint, block validation refuses at startup the
-// settings that keep catch-up from quick validating those blocks.
+// With the store netting below the checkpoint, block validation refuses at startup the catch-up
+// checkpoint override, which the route cannot honour. The route settings themselves are not
+// refused, because a netting store ignores them.
 func TestNettedRoute_CatchupSettingsRefusedAtStartup(t *testing.T) {
 	bv, _, cleanup := newNetRangeHarness(t, "netted_route_catchup", 65536)
 	defer cleanup()
@@ -135,36 +138,79 @@ func TestNettedRoute_CatchupSettingsRefusedAtStartup(t *testing.T) {
 	err := model.CheckNettedRouteCatchupSettings(s, bv.utxoStore)
 	require.True(t, errors.Is(err, errors.ErrConfiguration), "a catch-up checkpoint override, got %v", err)
 
+	// The override is refused with the outpoint-only setting off too: the store nets anyway.
+	s.BlockValidation.OutpointOnlyBelowCheckpoint = false
+	err = model.CheckNettedRouteCatchupSettings(s, bv.utxoStore)
+	require.True(t, errors.Is(err, errors.ErrConfiguration), "override with outpoint-only off, got %v", err)
+
 	s.BlockValidation.CatchupCheckpointHash = ""
 	s.BlockValidation.CatchupCheckpointHeight = 0
 	s.BlockValidation.CatchupAllowQuickValidation = false
-	err = model.CheckNettedRouteCatchupSettings(s, bv.utxoStore)
-	require.True(t, errors.Is(err, errors.ErrConfiguration), "quick validation off, got %v", err)
+	require.NoError(t, model.CheckNettedRouteCatchupSettings(s, bv.utxoStore), "quick validation off is ignored, not refused")
 
-	// A store that does not net, or the setting off, needs neither.
+	// A store that does not net needs no check.
+	s.BlockValidation.CatchupCheckpointHash = "000000000000000000000000000000000000000000000000000000000000000a"
+	s.BlockValidation.CatchupCheckpointHeight = 700
 	require.NoError(t, model.CheckNettedRouteCatchupSettings(s, bv.utxoStore.(nettingRecorder).applyRecorder))
-
-	s.BlockValidation.OutpointOnlyBelowCheckpoint = false
-	require.NoError(t, model.CheckNettedRouteCatchupSettings(s, bv.utxoStore))
 }
 
-// With the store netting below the checkpoint, the legacy service refuses at startup a legacy
-// route that sends those blocks to full validation.
-func TestNettedRoute_LegacySettingsRefusedAtStartup(t *testing.T) {
-	bv, _, cleanup := newNetRangeHarness(t, "netted_route_legacy", 65536)
+// On a netting store every route setting is ignored, so a service whose copies are all off
+// still puts a block below the checkpoint on the netted route, and catch-up still quick
+// validates it. This is the split icellan found: legacy's copy of the outpoint-only setting off
+// and block validation's on, which used to leave the two services disagreeing on the route.
+func TestNettedRoute_RouteSettingsAreIgnoredOnANettingStore(t *testing.T) {
+	bv, _, cleanup := newNetRangeHarness(t, "netted_route_ignores_settings", 65536)
 	defer cleanup()
 
 	s := bv.settings
-
-	s.BlockValidation.LegacyUnifiedBelowCheckpoint = true
-	require.NoError(t, model.CheckNettedRouteLegacySettings(s, bv.utxoStore))
-
+	s.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 400}, {Height: 1000}}
+	s.BlockValidation.OutpointOnlyBelowCheckpoint = false
 	s.BlockValidation.LegacyUnifiedBelowCheckpoint = false
-	err := model.CheckNettedRouteLegacySettings(s, bv.utxoStore)
-	require.True(t, errors.Is(err, errors.ErrConfiguration), "got %v", err)
 
-	require.NoError(t, model.CheckNettedRouteLegacySettings(s, bv.utxoStore.(nettingRecorder).applyRecorder),
-		"a store that does not net takes legacy blocks through full validation")
+	require.True(t, model.NettedRouteAt(s, bv.utxoStore, 500), "a netting store nets below the checkpoint with the setting off")
+	require.True(t, bv.mustStayOnQuickValidationAt(500))
+	require.True(t, bv.quickValidateOutpointOnly(&model.Block{Height: 500}))
+	require.False(t, model.NettedRouteAt(s, bv.utxoStore, 1001), "above the checkpoint nothing changes")
+
+	// A store that does not net still follows the setting.
+	require.False(t, model.NettedRouteAt(s, bv.utxoStore.(nettingRecorder).applyRecorder, 500))
+	require.False(t, model.OutpointOnlyEligible(s, bv.utxoStore.(nettingRecorder).applyRecorder, s.ChainCfgParams, 500))
+}
+
+// Catch-up quick validates a window on a netting store with
+// blockvalidation_catchup_allow_quick_validation off, because the store takes the blocks below
+// the checkpoint through no other route.
+func TestNettedRoute_CatchupQuickValidatesWithTheSettingOff(t *testing.T) {
+	bv, _, cleanup := newNetRangeHarness(t, "netted_route_allow_quick_off", 65536)
+	defer cleanup()
+
+	headers := make([]*model.BlockHeader, 400)
+	for i := range headers {
+		headers[i] = &model.BlockHeader{Version: 1, HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}, Nonce: uint32(i)} //nolint:gosec // test index
+	}
+
+	checkpoints := []chaincfg.Checkpoint{{Height: 400, Hash: headers[399].Hash()}}
+	bv.settings.ChainCfgParams.Checkpoints = checkpoints
+	bv.settings.BlockValidation.CatchupAllowQuickValidation = false
+
+	newCtx := func() *CatchupContext {
+		return &CatchupContext{
+			blockUpTo:          &model.Block{Header: headers[len(headers)-1], Height: 400},
+			commonAncestorMeta: &model.BlockHeaderMeta{Height: 0},
+			blockHeaders:       headers,
+			checkpoints:        checkpoints,
+		}
+	}
+
+	u := &Server{logger: ulogger.TestLogger{}, settings: bv.settings, blockValidation: bv, utxoStore: bv.utxoStore}
+	c := newCtx()
+	require.NoError(t, u.verifyCheckpointsInHeaderChain(c))
+	require.True(t, c.useQuickValidation, "a netting store quick validates with the setting off")
+
+	u.utxoStore = bv.utxoStore.(nettingRecorder).applyRecorder
+	c = newCtx()
+	require.NoError(t, u.verifyCheckpointsInHeaderChain(c))
+	require.False(t, c.useQuickValidation, "a store that does not net follows the setting")
 }
 
 // runCheckpointStep runs catch-up's checkpoint step on a window from height 1 to height top.

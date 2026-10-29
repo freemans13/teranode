@@ -2286,10 +2286,9 @@ func (u *Server) legacyUnifiedRoute(block *model.Block, baseURL string, headerPr
 //
 // On a store that nets below the checkpoint (model.NettedRouteAt) this service's own copy of
 // blockvalidation_legacy_unified_below_checkpoint is not read: full validation of such a block
-// is not possible, so a false copy here, with legacy's copy true (per-service overrides or split
-// pods), would leave every below-checkpoint legacy block waiting for a header proof that legacy
-// already sent. The legacy service refuses to start with its own copy false on such a store
-// (model.CheckNettedRouteLegacySettings), so that copy decides.
+// is not possible. Netsync's unifiedRoute and model.OutpointOnlyEligible ignore both route
+// settings on such a store too, so legacy and block validation agree on the route whatever
+// either service's copies say (per-service overrides or split pods).
 func (u *Server) legacyUnifiedEligible(block *model.Block, baseURL string) bool {
 	// The return below requires model.OutpointOnlyEligible, so "the store nets" alone here is
 	// model.NettedRouteAt.

@@ -9,12 +9,15 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-// The netted route is the below-checkpoint write of a UTXO store that nets (utxoset), which
-// engages when blockvalidation_outpoint_only_below_checkpoint is on. Such a store writes a block
-// below the highest hardcoded checkpoint without spend-journal rows, so that block can then only
-// be written through quick validation. A setting that keeps a block below the checkpoint away
-// from quick validation therefore stops the sync at that block for good. The checks below refuse
-// such settings at startup instead.
+// The netted route is the below-checkpoint write of a UTXO store that nets (utxoset). Such a store
+// writes a block below the highest hardcoded checkpoint without spend-journal rows, so that block
+// can then only be written through quick validation. The route depends on the store, the
+// checkpoint table and the height alone: blockvalidation_outpoint_only_below_checkpoint,
+// blockvalidation_legacy_unified_below_checkpoint and blockvalidation_catchup_allow_quick_validation
+// are treated as on for such a store (model.OutpointOnlyEligible, netsync's unifiedRoute and
+// catch-up's verifyCheckpointsInHeaderChain). Each service then reaches the same answer, even when
+// its copy of a setting differs from another service's. The one setting that can still keep a
+// block away from quick validation is refused at startup below.
 
 // NettedRouteAt reports whether a block at height may only be written through quick validation:
 // the store nets the blocks below the checkpoint and the outpoint-only gate holds at height. It is
@@ -91,14 +94,13 @@ func NettedRouteCatchupWindow(tSettings *settings.Settings, store utxo.Store) in
 	return window
 }
 
-// CheckNettedRouteCatchupSettings refuses block validation settings under which native catch-up
-// cannot quick validate every block below the checkpoint while the store nets there:
-//
-//   - blockvalidation_catchup_allow_quick_validation off sends every block to normal validation;
-//   - blockvalidation_catchup_checkpoint_hash with blockvalidation_catchup_checkpoint_height
-//     replaces the whole checkpoint list in catch-up with one checkpoint, so a window below that
-//     one holds no checkpoint, and the window floor of NettedRouteCatchupWindow, which measures
-//     the hardcoded list, no longer applies.
+// CheckNettedRouteCatchupSettings refuses the block validation setting under which native
+// catch-up cannot quick validate every block below the checkpoint while the store nets there:
+// blockvalidation_catchup_checkpoint_hash with blockvalidation_catchup_checkpoint_height replaces
+// the whole checkpoint list in catch-up with one checkpoint, so a window below that one holds no
+// checkpoint, and the window floor of NettedRouteCatchupWindow, which measures the hardcoded list,
+// no longer applies. It is an explicit operator choice the route cannot honour, so it is refused
+// rather than ignored.
 //
 // The window size itself is not refused: NettedRouteCatchupWindow raises it.
 func CheckNettedRouteCatchupSettings(tSettings *settings.Settings, store utxo.Store) error {
@@ -108,29 +110,8 @@ func CheckNettedRouteCatchupSettings(tSettings *settings.Settings, store utxo.St
 
 	bv := tSettings.BlockValidation
 
-	if !bv.CatchupAllowQuickValidation {
-		return errors.NewConfigurationError("blockvalidation_outpoint_only_below_checkpoint is on and the UTXO store nets the blocks below the checkpoint, so every such block must be quick validated, but blockvalidation_catchup_allow_quick_validation is off")
-	}
-
 	if bv.CatchupCheckpointHash != "" && bv.CatchupCheckpointHeight != 0 {
-		return errors.NewConfigurationError("blockvalidation_outpoint_only_below_checkpoint is on and the UTXO store nets the blocks below the checkpoint, so each catch-up window must hold a hardcoded checkpoint, but blockvalidation_catchup_checkpoint_hash and blockvalidation_catchup_checkpoint_height replace the hardcoded checkpoints in catch-up")
-	}
-
-	return nil
-}
-
-// CheckNettedRouteLegacySettings refuses legacy settings under which netsync sends blocks below
-// the checkpoint to full validation while the store nets there:
-// blockvalidation_legacy_unified_below_checkpoint off. Block validation does not need its own
-// copy of that setting on such a store (see blockvalidation's legacyUnifiedEligible), so this
-// check on the legacy service's copy is the one that matters.
-func CheckNettedRouteLegacySettings(tSettings *settings.Settings, store utxo.Store) error {
-	if !nettedRouteOn(tSettings, store) {
-		return nil
-	}
-
-	if !tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint {
-		return errors.NewConfigurationError("blockvalidation_outpoint_only_below_checkpoint is on and the UTXO store nets the blocks below the checkpoint, so every such block must be quick validated, but blockvalidation_legacy_unified_below_checkpoint is off, which sends each legacy block to full validation")
+		return errors.NewConfigurationError("the UTXO store nets the blocks below the checkpoint, so each catch-up window must hold a hardcoded checkpoint, but blockvalidation_catchup_checkpoint_hash and blockvalidation_catchup_checkpoint_height replace the hardcoded checkpoints in catch-up")
 	}
 
 	return nil
