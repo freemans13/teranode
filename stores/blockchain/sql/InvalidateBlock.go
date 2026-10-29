@@ -124,11 +124,16 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 	s.mainChainRebuilding.Add(1)
 	defer s.mainChainRebuilding.Add(-1)
 
-	// The update and the number of the tip change it causes commit together, so the
-	// rebuild in the defer failing cannot lose the change. The stamp derives the new
-	// best from the table, not from the flags the rebuild writes.
+	// The update and the low-water mark of the drop it causes commit together, so a
+	// reader of the mark never misses a drop that committed. The mark is derived from
+	// the table, not from the flags the rebuild in the defer writes.
 	if err = s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
 		invalidatedHashes = invalidatedHashes[:0]
+
+		before, hadBefore, beforeErr := bestTipKey(ctx, tx)
+		if beforeErr != nil {
+			return beforeErr
+		}
 
 		if rows, err = tx.QueryContext(ctx, q, blockHash.CloneBytes()); err != nil {
 			return err
@@ -152,13 +157,12 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 			return err
 		}
 
-		return s.stampBestTip(ctx, tx)
+		return s.recordBestTipDrop(ctx, tx, before, hadBefore)
 	}); err != nil {
 		return nil, errors.NewStorageError("error invalidating blocks", err)
 	}
 
 	defer func() {
-
 		// Invalidate caches FIRST so that getBestBlockID does not return a
 		// stale best block that included the now-invalid block.
 		s.blockTimestampCache.Clear()

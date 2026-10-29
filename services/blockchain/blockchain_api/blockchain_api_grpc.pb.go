@@ -53,8 +53,8 @@ const (
 	BlockchainAPI_GetBlockHeadersFromCommonAncestor_FullMethodName    = "/blockchain_api.BlockchainAPI/GetBlockHeadersFromCommonAncestor"
 	BlockchainAPI_GetBlockHeadersFromTill_FullMethodName              = "/blockchain_api.BlockchainAPI/GetBlockHeadersFromTill"
 	BlockchainAPI_GetBlockHeadersFromHeight_FullMethodName            = "/blockchain_api.BlockchainAPI/GetBlockHeadersFromHeight"
-	BlockchainAPI_GetBestTipChanges_FullMethodName                    = "/blockchain_api.BlockchainAPI/GetBestTipChanges"
-	BlockchainAPI_GetBestTipSeq_FullMethodName                        = "/blockchain_api.BlockchainAPI/GetBestTipSeq"
+	BlockchainAPI_BlocksBetterThan_FullMethodName                     = "/blockchain_api.BlockchainAPI/BlocksBetterThan"
+	BlockchainAPI_ClearBestTipLowWater_FullMethodName                 = "/blockchain_api.BlockchainAPI/ClearBestTipLowWater"
 	BlockchainAPI_GetBlockHeadersByHeight_FullMethodName              = "/blockchain_api.BlockchainAPI/GetBlockHeadersByHeight"
 	BlockchainAPI_GetMedianTimePastByHeights_FullMethodName           = "/blockchain_api.BlockchainAPI/GetMedianTimePastByHeights"
 	BlockchainAPI_GetBlocksByHeight_FullMethodName                    = "/blockchain_api.BlockchainAPI/GetBlocksByHeight"
@@ -157,10 +157,10 @@ type BlockchainAPIClient interface {
 	GetBlockHeadersFromTill(ctx context.Context, in *GetBlockHeadersFromTillRequest, opts ...grpc.CallOption) (*GetBlockHeadersResponse, error)
 	// GetBlockHeadersFromHeight retrieves block headers starting from a specific height.
 	GetBlockHeadersFromHeight(ctx context.Context, in *GetBlockHeadersFromHeightRequest, opts ...grpc.CallOption) (*GetBlockHeadersFromHeightResponse, error)
-	// GetBestTipChanges returns, in order, the blocks that became the best tip after a sequence number.
-	GetBestTipChanges(ctx context.Context, in *GetBestTipChangesRequest, opts ...grpc.CallOption) (*GetBestTipChangesResponse, error)
-	// GetBestTipSeq returns the sequence number of the latest change of the best tip.
-	GetBestTipSeq(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetBestTipSeqResponse, error)
+	// BlocksBetterThan returns the valid blocks that sort better than a key in the best-tip order, worst first.
+	BlocksBetterThan(ctx context.Context, in *BlocksBetterThanRequest, opts ...grpc.CallOption) (*BlocksBetterThanResponse, error)
+	// ClearBestTipLowWater deletes the best tip's low-water mark if it still holds the expected bytes.
+	ClearBestTipLowWater(ctx context.Context, in *ClearBestTipLowWaterRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// GetBlockHeadersByHeight retrieves block headers between two specified heights.
 	GetBlockHeadersByHeight(ctx context.Context, in *GetBlockHeadersByHeightRequest, opts ...grpc.CallOption) (*GetBlockHeadersByHeightResponse, error)
 	// GetMedianTimePastByHeights retrieves Median Time Past (MTP) values for specified block heights.
@@ -496,20 +496,20 @@ func (c *blockchainAPIClient) GetBlockHeadersFromHeight(ctx context.Context, in 
 	return out, nil
 }
 
-func (c *blockchainAPIClient) GetBestTipChanges(ctx context.Context, in *GetBestTipChangesRequest, opts ...grpc.CallOption) (*GetBestTipChangesResponse, error) {
+func (c *blockchainAPIClient) BlocksBetterThan(ctx context.Context, in *BlocksBetterThanRequest, opts ...grpc.CallOption) (*BlocksBetterThanResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetBestTipChangesResponse)
-	err := c.cc.Invoke(ctx, BlockchainAPI_GetBestTipChanges_FullMethodName, in, out, cOpts...)
+	out := new(BlocksBetterThanResponse)
+	err := c.cc.Invoke(ctx, BlockchainAPI_BlocksBetterThan_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *blockchainAPIClient) GetBestTipSeq(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetBestTipSeqResponse, error) {
+func (c *blockchainAPIClient) ClearBestTipLowWater(ctx context.Context, in *ClearBestTipLowWaterRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetBestTipSeqResponse)
-	err := c.cc.Invoke(ctx, BlockchainAPI_GetBestTipSeq_FullMethodName, in, out, cOpts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, BlockchainAPI_ClearBestTipLowWater_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1030,10 +1030,10 @@ type BlockchainAPIServer interface {
 	GetBlockHeadersFromTill(context.Context, *GetBlockHeadersFromTillRequest) (*GetBlockHeadersResponse, error)
 	// GetBlockHeadersFromHeight retrieves block headers starting from a specific height.
 	GetBlockHeadersFromHeight(context.Context, *GetBlockHeadersFromHeightRequest) (*GetBlockHeadersFromHeightResponse, error)
-	// GetBestTipChanges returns, in order, the blocks that became the best tip after a sequence number.
-	GetBestTipChanges(context.Context, *GetBestTipChangesRequest) (*GetBestTipChangesResponse, error)
-	// GetBestTipSeq returns the sequence number of the latest change of the best tip.
-	GetBestTipSeq(context.Context, *emptypb.Empty) (*GetBestTipSeqResponse, error)
+	// BlocksBetterThan returns the valid blocks that sort better than a key in the best-tip order, worst first.
+	BlocksBetterThan(context.Context, *BlocksBetterThanRequest) (*BlocksBetterThanResponse, error)
+	// ClearBestTipLowWater deletes the best tip's low-water mark if it still holds the expected bytes.
+	ClearBestTipLowWater(context.Context, *ClearBestTipLowWaterRequest) (*emptypb.Empty, error)
 	// GetBlockHeadersByHeight retrieves block headers between two specified heights.
 	GetBlockHeadersByHeight(context.Context, *GetBlockHeadersByHeightRequest) (*GetBlockHeadersByHeightResponse, error)
 	// GetMedianTimePastByHeights retrieves Median Time Past (MTP) values for specified block heights.
@@ -1208,11 +1208,11 @@ func (UnimplementedBlockchainAPIServer) GetBlockHeadersFromTill(context.Context,
 func (UnimplementedBlockchainAPIServer) GetBlockHeadersFromHeight(context.Context, *GetBlockHeadersFromHeightRequest) (*GetBlockHeadersFromHeightResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetBlockHeadersFromHeight not implemented")
 }
-func (UnimplementedBlockchainAPIServer) GetBestTipChanges(context.Context, *GetBestTipChangesRequest) (*GetBestTipChangesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetBestTipChanges not implemented")
+func (UnimplementedBlockchainAPIServer) BlocksBetterThan(context.Context, *BlocksBetterThanRequest) (*BlocksBetterThanResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BlocksBetterThan not implemented")
 }
-func (UnimplementedBlockchainAPIServer) GetBestTipSeq(context.Context, *emptypb.Empty) (*GetBestTipSeqResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetBestTipSeq not implemented")
+func (UnimplementedBlockchainAPIServer) ClearBestTipLowWater(context.Context, *ClearBestTipLowWaterRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ClearBestTipLowWater not implemented")
 }
 func (UnimplementedBlockchainAPIServer) GetBlockHeadersByHeight(context.Context, *GetBlockHeadersByHeightRequest) (*GetBlockHeadersByHeightResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetBlockHeadersByHeight not implemented")
@@ -1784,38 +1784,38 @@ func _BlockchainAPI_GetBlockHeadersFromHeight_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _BlockchainAPI_GetBestTipChanges_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetBestTipChangesRequest)
+func _BlockchainAPI_BlocksBetterThan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BlocksBetterThanRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(BlockchainAPIServer).GetBestTipChanges(ctx, in)
+		return srv.(BlockchainAPIServer).BlocksBetterThan(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: BlockchainAPI_GetBestTipChanges_FullMethodName,
+		FullMethod: BlockchainAPI_BlocksBetterThan_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(BlockchainAPIServer).GetBestTipChanges(ctx, req.(*GetBestTipChangesRequest))
+		return srv.(BlockchainAPIServer).BlocksBetterThan(ctx, req.(*BlocksBetterThanRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _BlockchainAPI_GetBestTipSeq_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(emptypb.Empty)
+func _BlockchainAPI_ClearBestTipLowWater_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClearBestTipLowWaterRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(BlockchainAPIServer).GetBestTipSeq(ctx, in)
+		return srv.(BlockchainAPIServer).ClearBestTipLowWater(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: BlockchainAPI_GetBestTipSeq_FullMethodName,
+		FullMethod: BlockchainAPI_ClearBestTipLowWater_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(BlockchainAPIServer).GetBestTipSeq(ctx, req.(*emptypb.Empty))
+		return srv.(BlockchainAPIServer).ClearBestTipLowWater(ctx, req.(*ClearBestTipLowWaterRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2723,12 +2723,12 @@ var BlockchainAPI_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _BlockchainAPI_GetBlockHeadersFromHeight_Handler,
 		},
 		{
-			MethodName: "GetBestTipChanges",
-			Handler:    _BlockchainAPI_GetBestTipChanges_Handler,
+			MethodName: "BlocksBetterThan",
+			Handler:    _BlockchainAPI_BlocksBetterThan_Handler,
 		},
 		{
-			MethodName: "GetBestTipSeq",
-			Handler:    _BlockchainAPI_GetBestTipSeq_Handler,
+			MethodName: "ClearBestTipLowWater",
+			Handler:    _BlockchainAPI_ClearBestTipLowWater_Handler,
 		},
 		{
 			MethodName: "GetBlockHeadersByHeight",

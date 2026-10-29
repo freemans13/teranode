@@ -398,8 +398,7 @@ func TestBlockAssembler_UnrotatedStorageFaultLeavesPoolInService(t *testing.T) {
 	m.On("GetCurrentBlockHeader").Return(genesisHeader(t, items))
 	injectMockStp(t, items, m)
 	ba := items.blockAssembler
-	ba.setBestBlockHeader(genesisHeader(t, items), 0)
-	ba.bestTipSeqKnown.Store(true)
+	startReplayAt(t, items, genesisHeader(t, items), 0)
 	result := make(chan error, 1)
 	ba.handleResetRequests(t.Context(), resetRequest{StorageTriggered: true, ErrCh: result})
 	require.Error(t, <-result)

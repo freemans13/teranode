@@ -266,18 +266,22 @@ type Store interface {
 	// Returns: Slice of BlockHeaders, slice of BlockHeaderMetas, and any error encountered
 	GetBlockHeadersFromHeight(ctx context.Context, height, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
-	// GetBestTipChanges returns, in order, the blocks that became the best tip after sequence
-	// number afterSeq, at or above minHeight, at most limit of them.
+	// BlocksBetterThan returns the valid blocks that sort better than after in the order the
+	// best tip is picked by (chain_work DESC, peer_id ASC, id ASC), worst first. When from is not
+	// nil it also returns the valid blocks that sort better than or level with from.
 	// Parameters:
 	//   - ctx: Context for the operation
-	//   - afterSeq: Return only changes numbered above this
+	//   - after: Return blocks that sort better than this
+	//   - from: Optional; also return blocks that sort better than or level with this
 	//   - minHeight: Skip blocks below this height
-	//   - limit: Maximum number of changes to return
-	// Returns: BlockHeaders, BlockHeaderMetas and sequence numbers of the same length, and any error encountered
-	GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error)
+	//   - limit: Maximum number of blocks to return
+	// Returns: BlockHeaders and BlockHeaderMetas of the same length, and any error encountered
+	BlocksBetterThan(ctx context.Context, after model.BestTipKey, from *model.BestTipKey, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
-	// GetBestTipSeq returns the sequence number of the latest change of the best tip, 0 if none.
-	GetBestTipSeq(ctx context.Context) (uint64, error)
+	// ClearBestTipLowWater deletes the best tip's low-water mark (state key
+	// model.BestTipLowWaterStateKey) if it still holds expected. A drop recorded after the
+	// caller read the mark changes it, and the delete is then a no-op.
+	ClearBestTipLowWater(ctx context.Context, expected []byte) error
 
 	// GetBlockHeadersByHeight retrieves block headers between two heights.
 	// Parameters:

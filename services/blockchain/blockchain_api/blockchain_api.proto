@@ -90,11 +90,11 @@ service BlockchainAPI {
   // GetBlockHeadersFromHeight retrieves block headers starting from a specific height.
   rpc GetBlockHeadersFromHeight(GetBlockHeadersFromHeightRequest) returns (GetBlockHeadersFromHeightResponse) {}
 
-  // GetBestTipChanges returns, in order, the blocks that became the best tip after a sequence number.
-  rpc GetBestTipChanges(GetBestTipChangesRequest) returns (GetBestTipChangesResponse) {}
+  // BlocksBetterThan returns the valid blocks that sort better than a key in the best-tip order, worst first.
+  rpc BlocksBetterThan(BlocksBetterThanRequest) returns (BlocksBetterThanResponse) {}
 
-  // GetBestTipSeq returns the sequence number of the latest change of the best tip.
-  rpc GetBestTipSeq(google.protobuf.Empty) returns (GetBestTipSeqResponse) {}
+  // ClearBestTipLowWater deletes the best tip's low-water mark if it still holds the expected bytes.
+  rpc ClearBestTipLowWater(ClearBestTipLowWaterRequest) returns (google.protobuf.Empty) {}
 
   // GetBlockHeadersByHeight retrieves block headers between two specified heights.
   rpc GetBlockHeadersByHeight(GetBlockHeadersByHeightRequest) returns (GetBlockHeadersByHeightResponse) {}
@@ -391,23 +391,23 @@ message GetBlockHeadersFromHeightResponse {
   repeated bytes metas = 2;         // List of serialized metadata
 }
 
-// GetBestTipChangesRequest requests the changes of the best tip after a sequence number.
-message GetBestTipChangesRequest {
-  uint64 afterSeq = 1;   // Return only changes numbered above this
-  uint32 minHeight = 2;  // Skip blocks below this height
-  uint32 limit = 3;      // Maximum number of changes to return
+// BlocksBetterThanRequest requests the valid blocks that sort better than a key in the best-tip order.
+message BlocksBetterThanRequest {
+  bytes after = 1;       // Serialised model.BestTipKey: return blocks that sort better than it
+  bytes from = 2;        // Optional serialised model.BestTipKey: also return blocks at or above it
+  uint32 minHeight = 3;  // Skip blocks below this height
+  uint32 limit = 4;      // Maximum number of blocks to return
 }
 
-// GetBestTipChangesResponse contains the changes of the best tip, in order.
-message GetBestTipChangesResponse {
+// BlocksBetterThanResponse contains the blocks, worst first.
+message BlocksBetterThanResponse {
   repeated bytes blockHeaders = 1;  // List of serialized block headers
   repeated bytes metas = 2;         // List of serialized metadata
-  repeated uint64 seqs = 3;         // Sequence number of each change
 }
 
-// GetBestTipSeqResponse contains the sequence number of the latest change of the best tip.
-message GetBestTipSeqResponse {
-  uint64 seq = 1;  // 0 when no change has been numbered
+// ClearBestTipLowWaterRequest names the low-water mark bytes the caller read.
+message ClearBestTipLowWaterRequest {
+  bytes expected = 1;  // The mark is deleted only if it still holds these bytes
 }
 
 // GetBlockHeadersByHeightRequest requests headers between two heights.

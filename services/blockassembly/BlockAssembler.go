@@ -214,17 +214,17 @@ type BlockAssembler struct {
 	// so multiple triggers coalesce into a single reconciliation pass.
 	reconcileCh chan struct{}
 
-	// bestTipSeq is the replay position: the number of the last change of the best tip
-	// that block assembly has applied (see replayBestTipChanges). bestTipSeqKnown is false
-	// until the position has been read, and stays false against a blockchain service that
-	// does not number the changes, which leaves block assembly following the best header.
-	bestTipSeq                atomic.Uint64
-	bestTipSeqKnown           atomic.Bool
+	// bestTipPos is the replay position: the place in the blockchain store's best-tip order of
+	// the last block block assembly handled (see replayBestTipChanges). bestTipPosKnown is
+	// false until the position has been read, and stays false against a blockchain service
+	// that does not serve that order, which leaves block assembly following the best header.
+	bestTipPos                atomic.Pointer[model.BestTipKey]
+	bestTipPosKnown           atomic.Bool
 	bestTipResetReplayPending atomic.Bool // candidates stay empty until reset's pending history succeeds or is given up
 	bestTipResetIncomplete    atomic.Bool // reset moved its target but has not finished reloading/persisting
 
-	// bestTipSeqSaved is the position last persisted under BestTipSeqStateKey.
-	bestTipSeqSaved atomic.Uint64
+	// bestTipPosSaved is the position last persisted under BestTipPositionStateKey.
+	bestTipPosSaved atomic.Pointer[model.BestTipKey]
 
 	// lastBestTipReplay is when processNewBlockAnnouncement last ran, in Unix nanoseconds.
 	// The idle tick wakes a replay once it is older than blockassembly_reconcileInterval.
@@ -233,12 +233,12 @@ type BlockAssembler struct {
 	// bestTipReplayFailures counts consecutive failed replay passes.
 	bestTipReplayFailures atomic.Int32
 
-	// lastBestTipSeqProbe is when loadBestTipSeq last found the blockchain service without
-	// numbered tip changes, in Unix nanoseconds. The next probe waits bestTipSeqProbeInterval.
-	lastBestTipSeqProbe atomic.Int64
+	// lastBestTipProbe is when loadBestTipPosition last found the blockchain service without
+	// the best-tip order, in Unix nanoseconds. The next probe waits bestTipProbeInterval.
+	lastBestTipProbe atomic.Int64
 
-	// bestTipSeqUnsupportedLogged is set once that finding has been logged as a warning.
-	bestTipSeqUnsupportedLogged atomic.Bool
+	// bestTipUnsupportedLogged is set once that finding has been logged as a warning.
+	bestTipUnsupportedLogged atomic.Bool
 
 	// currentRunningState tracks the current operational state
 	currentRunningState atomic.Value
@@ -707,7 +707,7 @@ drain:
 	// A reset traverses only its endpoint lineages. Keep the replay position so any
 	// briefly winning branch outside those lineages is still replayed afterwards.
 	wasPending := b.bestTipResetReplayPending.Load()
-	if b.bestTipSeqKnown.Load() {
+	if b.bestTipPosKnown.Load() {
 		b.bestTipResetReplayPending.Store(true)
 	}
 	resp, err := b.resetWithResponse(ctx, validateInputs)
@@ -719,7 +719,7 @@ drain:
 	// Judge the storage outcome of this reset before replay can return an
 	// unrelated history error. A clean rotation still cured its disk fault.
 	b.onResetDone(storageTriggered, resp, err)
-	if err == nil && b.bestTipSeqKnown.Load() {
+	if err == nil && b.bestTipPosKnown.Load() {
 		b.bestTipResetReplayPending.Store(true)
 		_, err = b.replayBestTipChanges(ctx)
 		if err != nil {
@@ -1107,7 +1107,7 @@ func (b *BlockAssembler) resetToBlockWithResponse(ctx context.Context, bestBlock
 	resetHeights := resetBlockHeights(bestBlockchainBlockHeader, currentHeight, moveBackBlocksWithMeta, moveForwardBlocksWithMeta)
 
 	wasIncomplete, wasPending := b.bestTipResetIncomplete.Load(), b.bestTipResetReplayPending.Load()
-	if b.bestTipSeqKnown.Load() {
+	if b.bestTipPosKnown.Load() {
 		b.bestTipResetIncomplete.Store(true)
 		b.bestTipResetReplayPending.Store(true)
 	}
@@ -1313,12 +1313,13 @@ func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *ch
 
 // processNewBlockAnnouncement brings block assembly to the chain's best tip. Every block
 // notification and every reconcile wake-up lands here, and the notification's own block is
-// not read: the tip changes are.
+// not read: the blocks that sort better than the replay position are.
 //
-// It replays the changes of the best tip the blockchain store has numbered since the last
-// one block assembly applied (replayBestTipChanges), so a branch that was the best chain only
+// It moves through every valid block that sorts better than the last one block assembly
+// handled, in the blockchain store's best-tip order, and from the low-water mark the store
+// records when the tip drops (replayBestTipChanges), so a branch that was the best chain only
 // briefly is moved forward and back like any other, even when block assembly was busy while
-// it won and lost. Against a blockchain service without the numbers it follows the best
+// it won and lost. Against a blockchain service without that order it follows the best
 // header, as before.
 //
 // Parameters:
@@ -1361,8 +1362,8 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 
 // moveToBlock moves block assembly from its tip to the given block by the shortest path
 // through their common ancestor: a single move-forward, a catch-up, an in-memory reorg, or a
-// full reset. The block need not be the best tip: the replay of tip changes passes each
-// block that was the best tip in turn. On success block assembly's tip is the block and its
+// full reset. The block need not be the best tip: the replay passes each block that may
+// have been the best tip in turn. On success block assembly's tip is the block and its
 // state is persisted.
 //
 // It logs and counts its own failures, and returns the error so the replay can stop at the
@@ -1562,9 +1563,9 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		return errors.NewProcessingError("[BlockAssembler] failed to initialize state: %v", err)
 	}
 
-	// Read the replay position before the first wake-up, so the changes of the best tip made
-	// while block assembly was down are replayed from where it stopped.
-	b.loadBestTipSeq(ctx)
+	// Read the replay position before the first wake-up, so the best tips made while block
+	// assembly was down are replayed from where it stopped.
+	b.loadBestTipPosition(ctx)
 	b.lastBestTipReplay.Store(time.Now().UnixNano())
 
 	// Wait for any pending blocks to be processed before loading unmined transactions

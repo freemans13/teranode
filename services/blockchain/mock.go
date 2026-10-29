@@ -281,16 +281,16 @@ func (m *Mock) GetBlockHeadersFromHeight(ctx context.Context, height, limit uint
 	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Error(2)
 }
 
-// errTipChangesNotMocked is what GetBestTipChanges and GetBestTipSeq return when a test set no
-// expectation for them: the answer of a blockchain service that does not number its tip changes,
-// which keeps a caller such as block assembly on its best-header path, as before the numbers
-// existed. A test that wants the replay sets an expectation, or uses a real store.
-var errTipChangesNotMocked = errors.NewServiceUnavailableError("best tip changes not mocked")
+// errBetterBlocksNotMocked is what BlocksBetterThan returns when a test set no expectation for
+// it: the answer of a blockchain service that does not have the method, which keeps a caller
+// such as block assembly on its best-header path, as before the method existed. A test that
+// wants the replay sets an expectation, or uses a real store.
+var errBetterBlocksNotMocked = errors.NewServiceUnavailableError("blocks better than not mocked")
 
 // hasExpectation reports whether a test set an expectation for the named method. It reads only
-// the Method field of each expected call. GetBestTipChanges and GetBestTipSeq check it before
-// m.Called, because testify's unexpected-call path formats every argument, including a context
-// another goroutine may be writing, and the race detector reports that read.
+// the Method field of each expected call. BlocksBetterThan and ClearBestTipLowWater check it
+// before m.Called, because testify's unexpected-call path formats every argument, including a
+// context another goroutine may be writing, and the race detector reports that read.
 func (m *Mock) hasExpectation(method string) bool {
 	for _, call := range m.ExpectedCalls {
 		if call.Method == method {
@@ -301,34 +301,28 @@ func (m *Mock) hasExpectation(method string) bool {
 	return false
 }
 
-// GetBestTipChanges mocks the GetBestTipChanges method
-func (m *Mock) GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
-	if !m.hasExpectation("GetBestTipChanges") {
-		return nil, nil, nil, errTipChangesNotMocked
+// BlocksBetterThan mocks the BlocksBetterThan method
+func (m *Mock) BlocksBetterThan(ctx context.Context, after model.BestTipKey, from *model.BestTipKey, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	if !m.hasExpectation("BlocksBetterThan") {
+		return nil, nil, errBetterBlocksNotMocked
 	}
 
-	args := m.Called(ctx, afterSeq, minHeight, limit)
+	args := m.Called(ctx, after, from, minHeight, limit)
 
-	if args.Error(3) != nil {
-		return nil, nil, nil, args.Error(3)
+	if args.Error(2) != nil {
+		return nil, nil, args.Error(2)
 	}
 
-	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Get(2).([]uint64), args.Error(3)
+	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Error(2)
 }
 
-// GetBestTipSeq mocks the GetBestTipSeq method
-func (m *Mock) GetBestTipSeq(ctx context.Context) (uint64, error) {
-	if !m.hasExpectation("GetBestTipSeq") {
-		return 0, errTipChangesNotMocked
+// ClearBestTipLowWater mocks the ClearBestTipLowWater method
+func (m *Mock) ClearBestTipLowWater(ctx context.Context, expected []byte) error {
+	if !m.hasExpectation("ClearBestTipLowWater") {
+		return nil
 	}
 
-	args := m.Called(ctx)
-
-	if args.Error(1) != nil {
-		return 0, args.Error(1)
-	}
-
-	return args.Get(0).(uint64), args.Error(1)
+	return m.Called(ctx, expected).Error(0)
 }
 
 // GetBlockHeadersByHeight mocks the GetBlockHeadersByHeight method
@@ -1221,20 +1215,20 @@ func (m *mockBlockClient) GetBlockHeadersFromHeight(
 	return m.responseGetBlockHeadersFromHeight, m.err
 }
 
-func (m *mockBlockClient) GetBestTipChanges(
+func (m *mockBlockClient) BlocksBetterThan(
 	ctx context.Context,
-	in *blockchain_api.GetBestTipChangesRequest,
+	in *blockchain_api.BlocksBetterThanRequest,
 	opts ...grpc.CallOption,
-) (*blockchain_api.GetBestTipChangesResponse, error) {
-	return &blockchain_api.GetBestTipChangesResponse{}, m.err
+) (*blockchain_api.BlocksBetterThanResponse, error) {
+	return &blockchain_api.BlocksBetterThanResponse{}, m.err
 }
 
-func (m *mockBlockClient) GetBestTipSeq(
+func (m *mockBlockClient) ClearBestTipLowWater(
 	ctx context.Context,
-	in *emptypb.Empty,
+	in *blockchain_api.ClearBestTipLowWaterRequest,
 	opts ...grpc.CallOption,
-) (*blockchain_api.GetBestTipSeqResponse, error) {
-	return &blockchain_api.GetBestTipSeqResponse{}, m.err
+) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, m.err
 }
 
 func (m *mockBlockClient) GetBlockHeadersByHeight(

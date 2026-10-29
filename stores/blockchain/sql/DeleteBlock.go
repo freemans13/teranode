@@ -63,22 +63,17 @@ func (s *SQL) DeleteBlock(ctx context.Context, blockHash *chainhash.Hash) error 
 	s.mainChainRebuilding.Add(1)
 	defer s.mainChainRebuilding.Add(-1)
 
-	// Deleting the best block moves the best tip, so the delete and the number of that
-	// change commit together, under the lock every writer of the number holds. The
-	// number is taken from the maximum read before the delete: the deleted row may hold
-	// it, and numbering below it would hide the change from a reader already past it.
+	// Deleting the best block moves the best tip down. The delete and the low-water mark
+	// of that drop commit together, under the lock every writer of the mark holds, so
+	// block assembly replays from the new best instead of from a block that is gone.
 	s.slowPathMu.Lock()
 	defer s.slowPathMu.Unlock()
 
 	var res sql.Result
 
 	if err := s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
-		var (
-			maxBefore sql.NullInt64
-			execErr   error
-		)
-
-		if execErr = tx.QueryRowContext(ctx, `SELECT MAX(best_tip_seq) FROM blocks`).Scan(&maxBefore); execErr != nil {
+		before, hadBefore, execErr := bestTipKey(ctx, tx)
+		if execErr != nil {
 			return execErr
 		}
 
@@ -86,9 +81,7 @@ func (s *SQL) DeleteBlock(ctx context.Context, blockHash *chainhash.Hash) error 
 			return execErr
 		}
 
-		_, execErr = tx.ExecContext(ctx, stampBestTipAfterQuery, maxBefore.Int64)
-
-		return execErr
+		return s.recordBestTipDrop(ctx, tx, before, hadBefore)
 	}); err != nil {
 		return errors.NewStorageError("error deleting block", err)
 	}

@@ -1463,30 +1463,31 @@ func (x *GetBlockHeadersFromHeightResponse) GetMetas() [][]byte {
 	return nil
 }
 
-// GetBestTipChangesRequest requests the changes of the best tip after a sequence number.
-type GetBestTipChangesRequest struct {
+// BlocksBetterThanRequest requests the valid blocks that sort better than a key in the best-tip order.
+type BlocksBetterThanRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	AfterSeq      uint64                 `protobuf:"varint,1,opt,name=afterSeq,proto3" json:"afterSeq,omitempty"`   // Return only changes numbered above this
-	MinHeight     uint32                 `protobuf:"varint,2,opt,name=minHeight,proto3" json:"minHeight,omitempty"` // Skip blocks below this height
-	Limit         uint32                 `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`         // Maximum number of changes to return
+	After         []byte                 `protobuf:"bytes,1,opt,name=after,proto3" json:"after,omitempty"`          // Serialised model.BestTipKey: return blocks that sort better than it
+	From          []byte                 `protobuf:"bytes,2,opt,name=from,proto3" json:"from,omitempty"`            // Optional serialised model.BestTipKey: also return blocks at or above it
+	MinHeight     uint32                 `protobuf:"varint,3,opt,name=minHeight,proto3" json:"minHeight,omitempty"` // Skip blocks below this height
+	Limit         uint32                 `protobuf:"varint,4,opt,name=limit,proto3" json:"limit,omitempty"`         // Maximum number of blocks to return
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *GetBestTipChangesRequest) Reset() {
-	*x = GetBestTipChangesRequest{}
+func (x *BlocksBetterThanRequest) Reset() {
+	*x = BlocksBetterThanRequest{}
 	mi := &file_services_blockchain_blockchain_api_blockchain_api_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *GetBestTipChangesRequest) String() string {
+func (x *BlocksBetterThanRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*GetBestTipChangesRequest) ProtoMessage() {}
+func (*BlocksBetterThanRequest) ProtoMessage() {}
 
-func (x *GetBestTipChangesRequest) ProtoReflect() protoreflect.Message {
+func (x *BlocksBetterThanRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_services_blockchain_blockchain_api_blockchain_api_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1498,56 +1499,62 @@ func (x *GetBestTipChangesRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use GetBestTipChangesRequest.ProtoReflect.Descriptor instead.
-func (*GetBestTipChangesRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use BlocksBetterThanRequest.ProtoReflect.Descriptor instead.
+func (*BlocksBetterThanRequest) Descriptor() ([]byte, []int) {
 	return file_services_blockchain_blockchain_api_blockchain_api_proto_rawDescGZIP(), []int{23}
 }
 
-func (x *GetBestTipChangesRequest) GetAfterSeq() uint64 {
+func (x *BlocksBetterThanRequest) GetAfter() []byte {
 	if x != nil {
-		return x.AfterSeq
+		return x.After
 	}
-	return 0
+	return nil
 }
 
-func (x *GetBestTipChangesRequest) GetMinHeight() uint32 {
+func (x *BlocksBetterThanRequest) GetFrom() []byte {
+	if x != nil {
+		return x.From
+	}
+	return nil
+}
+
+func (x *BlocksBetterThanRequest) GetMinHeight() uint32 {
 	if x != nil {
 		return x.MinHeight
 	}
 	return 0
 }
 
-func (x *GetBestTipChangesRequest) GetLimit() uint32 {
+func (x *BlocksBetterThanRequest) GetLimit() uint32 {
 	if x != nil {
 		return x.Limit
 	}
 	return 0
 }
 
-// GetBestTipChangesResponse contains the changes of the best tip, in order.
-type GetBestTipChangesResponse struct {
+// BlocksBetterThanResponse contains the blocks, worst first.
+type BlocksBetterThanResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	BlockHeaders  [][]byte               `protobuf:"bytes,1,rep,name=blockHeaders,proto3" json:"blockHeaders,omitempty"` // List of serialized block headers
 	Metas         [][]byte               `protobuf:"bytes,2,rep,name=metas,proto3" json:"metas,omitempty"`               // List of serialized metadata
-	Seqs          []uint64               `protobuf:"varint,3,rep,packed,name=seqs,proto3" json:"seqs,omitempty"`         // Sequence number of each change
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *GetBestTipChangesResponse) Reset() {
-	*x = GetBestTipChangesResponse{}
+func (x *BlocksBetterThanResponse) Reset() {
+	*x = BlocksBetterThanResponse{}
 	mi := &file_services_blockchain_blockchain_api_blockchain_api_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *GetBestTipChangesResponse) String() string {
+func (x *BlocksBetterThanResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*GetBestTipChangesResponse) ProtoMessage() {}
+func (*BlocksBetterThanResponse) ProtoMessage() {}
 
-func (x *GetBestTipChangesResponse) ProtoReflect() protoreflect.Message {
+func (x *BlocksBetterThanResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_services_blockchain_blockchain_api_blockchain_api_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1559,54 +1566,47 @@ func (x *GetBestTipChangesResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use GetBestTipChangesResponse.ProtoReflect.Descriptor instead.
-func (*GetBestTipChangesResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use BlocksBetterThanResponse.ProtoReflect.Descriptor instead.
+func (*BlocksBetterThanResponse) Descriptor() ([]byte, []int) {
 	return file_services_blockchain_blockchain_api_blockchain_api_proto_rawDescGZIP(), []int{24}
 }
 
-func (x *GetBestTipChangesResponse) GetBlockHeaders() [][]byte {
+func (x *BlocksBetterThanResponse) GetBlockHeaders() [][]byte {
 	if x != nil {
 		return x.BlockHeaders
 	}
 	return nil
 }
 
-func (x *GetBestTipChangesResponse) GetMetas() [][]byte {
+func (x *BlocksBetterThanResponse) GetMetas() [][]byte {
 	if x != nil {
 		return x.Metas
 	}
 	return nil
 }
 
-func (x *GetBestTipChangesResponse) GetSeqs() []uint64 {
-	if x != nil {
-		return x.Seqs
-	}
-	return nil
-}
-
-// GetBestTipSeqResponse contains the sequence number of the latest change of the best tip.
-type GetBestTipSeqResponse struct {
+// ClearBestTipLowWaterRequest names the low-water mark bytes the caller read.
+type ClearBestTipLowWaterRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Seq           uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"` // 0 when no change has been numbered
+	Expected      []byte                 `protobuf:"bytes,1,opt,name=expected,proto3" json:"expected,omitempty"` // The mark is deleted only if it still holds these bytes
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *GetBestTipSeqResponse) Reset() {
-	*x = GetBestTipSeqResponse{}
+func (x *ClearBestTipLowWaterRequest) Reset() {
+	*x = ClearBestTipLowWaterRequest{}
 	mi := &file_services_blockchain_blockchain_api_blockchain_api_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *GetBestTipSeqResponse) String() string {
+func (x *ClearBestTipLowWaterRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*GetBestTipSeqResponse) ProtoMessage() {}
+func (*ClearBestTipLowWaterRequest) ProtoMessage() {}
 
-func (x *GetBestTipSeqResponse) ProtoReflect() protoreflect.Message {
+func (x *ClearBestTipLowWaterRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_services_blockchain_blockchain_api_blockchain_api_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1618,16 +1618,16 @@ func (x *GetBestTipSeqResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use GetBestTipSeqResponse.ProtoReflect.Descriptor instead.
-func (*GetBestTipSeqResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use ClearBestTipLowWaterRequest.ProtoReflect.Descriptor instead.
+func (*ClearBestTipLowWaterRequest) Descriptor() ([]byte, []int) {
 	return file_services_blockchain_blockchain_api_blockchain_api_proto_rawDescGZIP(), []int{25}
 }
 
-func (x *GetBestTipSeqResponse) GetSeq() uint64 {
+func (x *ClearBestTipLowWaterRequest) GetExpected() []byte {
 	if x != nil {
-		return x.Seq
+		return x.Expected
 	}
-	return 0
+	return nil
 }
 
 // GetBlockHeadersByHeightRequest requests headers between two heights.
@@ -7653,17 +7653,17 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\x05limit\x18\x02 \x01(\rR\x05limit\"]\n" +
 	"!GetBlockHeadersFromHeightResponse\x12\"\n" +
 	"\fblockHeaders\x18\x01 \x03(\fR\fblockHeaders\x12\x14\n" +
-	"\x05metas\x18\x02 \x03(\fR\x05metas\"j\n" +
-	"\x18GetBestTipChangesRequest\x12\x1a\n" +
-	"\bafterSeq\x18\x01 \x01(\x04R\bafterSeq\x12\x1c\n" +
-	"\tminHeight\x18\x02 \x01(\rR\tminHeight\x12\x14\n" +
-	"\x05limit\x18\x03 \x01(\rR\x05limit\"i\n" +
-	"\x19GetBestTipChangesResponse\x12\"\n" +
+	"\x05metas\x18\x02 \x03(\fR\x05metas\"w\n" +
+	"\x17BlocksBetterThanRequest\x12\x14\n" +
+	"\x05after\x18\x01 \x01(\fR\x05after\x12\x12\n" +
+	"\x04from\x18\x02 \x01(\fR\x04from\x12\x1c\n" +
+	"\tminHeight\x18\x03 \x01(\rR\tminHeight\x12\x14\n" +
+	"\x05limit\x18\x04 \x01(\rR\x05limit\"T\n" +
+	"\x18BlocksBetterThanResponse\x12\"\n" +
 	"\fblockHeaders\x18\x01 \x03(\fR\fblockHeaders\x12\x14\n" +
-	"\x05metas\x18\x02 \x03(\fR\x05metas\x12\x12\n" +
-	"\x04seqs\x18\x03 \x03(\x04R\x04seqs\")\n" +
-	"\x15GetBestTipSeqResponse\x12\x10\n" +
-	"\x03seq\x18\x01 \x01(\x04R\x03seq\"`\n" +
+	"\x05metas\x18\x02 \x03(\fR\x05metas\"9\n" +
+	"\x1bClearBestTipLowWaterRequest\x12\x1a\n" +
+	"\bexpected\x18\x01 \x01(\fR\bexpected\"`\n" +
 	"\x1eGetBlockHeadersByHeightRequest\x12 \n" +
 	"\vstartHeight\x18\x01 \x01(\rR\vstartHeight\x12\x1c\n" +
 	"\tendHeight\x18\x02 \x01(\rR\tendHeight\"[\n" +
@@ -8086,7 +8086,7 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\fFSMStateType\x12\b\n" +
 	"\x04IDLE\x10\x00\x12\v\n" +
 	"\aRUNNING\x10\x01\x12\x12\n" +
-	"\x0eCATCHINGBLOCKS\x10\x02\"\x04\b\x03\x10\x03*\rLEGACYSYNCING2\xb07\n" +
+	"\x0eCATCHINGBLOCKS\x10\x02\"\x04\b\x03\x10\x03*\rLEGACYSYNCING2\xba7\n" +
 	"\rBlockchainAPI\x12F\n" +
 	"\n" +
 	"HealthGRPC\x12\x16.google.protobuf.Empty\x1a\x1e.blockchain_api.HealthResponse\"\x00\x12E\n" +
@@ -8111,9 +8111,9 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\x1fGetBlockHeadersToCommonAncestor\x126.blockchain_api.GetBlockHeadersToCommonAncestorRequest\x1a'.blockchain_api.GetBlockHeadersResponse\"\x00\x12\x88\x01\n" +
 	"!GetBlockHeadersFromCommonAncestor\x128.blockchain_api.GetBlockHeadersFromCommonAncestorRequest\x1a'.blockchain_api.GetBlockHeadersResponse\"\x00\x12t\n" +
 	"\x17GetBlockHeadersFromTill\x12..blockchain_api.GetBlockHeadersFromTillRequest\x1a'.blockchain_api.GetBlockHeadersResponse\"\x00\x12\x82\x01\n" +
-	"\x19GetBlockHeadersFromHeight\x120.blockchain_api.GetBlockHeadersFromHeightRequest\x1a1.blockchain_api.GetBlockHeadersFromHeightResponse\"\x00\x12j\n" +
-	"\x11GetBestTipChanges\x12(.blockchain_api.GetBestTipChangesRequest\x1a).blockchain_api.GetBestTipChangesResponse\"\x00\x12P\n" +
-	"\rGetBestTipSeq\x12\x16.google.protobuf.Empty\x1a%.blockchain_api.GetBestTipSeqResponse\"\x00\x12|\n" +
+	"\x19GetBlockHeadersFromHeight\x120.blockchain_api.GetBlockHeadersFromHeightRequest\x1a1.blockchain_api.GetBlockHeadersFromHeightResponse\"\x00\x12g\n" +
+	"\x10BlocksBetterThan\x12'.blockchain_api.BlocksBetterThanRequest\x1a(.blockchain_api.BlocksBetterThanResponse\"\x00\x12]\n" +
+	"\x14ClearBestTipLowWater\x12+.blockchain_api.ClearBestTipLowWaterRequest\x1a\x16.google.protobuf.Empty\"\x00\x12|\n" +
 	"\x17GetBlockHeadersByHeight\x12..blockchain_api.GetBlockHeadersByHeightRequest\x1a/.blockchain_api.GetBlockHeadersByHeightResponse\"\x00\x12\x85\x01\n" +
 	"\x1aGetMedianTimePastByHeights\x121.blockchain_api.GetMedianTimePastByHeightsRequest\x1a2.blockchain_api.GetMedianTimePastByHeightsResponse\"\x00\x12j\n" +
 	"\x11GetBlocksByHeight\x12(.blockchain_api.GetBlocksByHeightRequest\x1a).blockchain_api.GetBlocksByHeightResponse\"\x00\x12\x88\x01\n" +
@@ -8227,9 +8227,9 @@ var file_services_blockchain_blockchain_api_blockchain_api_proto_goTypes = []any
 	(*GetBlockHeadersFromTillRequest)(nil),              // 23: blockchain_api.GetBlockHeadersFromTillRequest
 	(*GetBlockHeadersFromHeightRequest)(nil),            // 24: blockchain_api.GetBlockHeadersFromHeightRequest
 	(*GetBlockHeadersFromHeightResponse)(nil),           // 25: blockchain_api.GetBlockHeadersFromHeightResponse
-	(*GetBestTipChangesRequest)(nil),                    // 26: blockchain_api.GetBestTipChangesRequest
-	(*GetBestTipChangesResponse)(nil),                   // 27: blockchain_api.GetBestTipChangesResponse
-	(*GetBestTipSeqResponse)(nil),                       // 28: blockchain_api.GetBestTipSeqResponse
+	(*BlocksBetterThanRequest)(nil),                     // 26: blockchain_api.BlocksBetterThanRequest
+	(*BlocksBetterThanResponse)(nil),                    // 27: blockchain_api.BlocksBetterThanResponse
+	(*ClearBestTipLowWaterRequest)(nil),                 // 28: blockchain_api.ClearBestTipLowWaterRequest
 	(*GetBlockHeadersByHeightRequest)(nil),              // 29: blockchain_api.GetBlockHeadersByHeightRequest
 	(*GetBlockHeadersByHeightResponse)(nil),             // 30: blockchain_api.GetBlockHeadersByHeightResponse
 	(*GetMedianTimePastByHeightsRequest)(nil),           // 31: blockchain_api.GetMedianTimePastByHeightsRequest
@@ -8402,8 +8402,8 @@ var file_services_blockchain_blockchain_api_blockchain_api_proto_depIdxs = []int
 	21,  // 53: blockchain_api.BlockchainAPI.GetBlockHeadersFromCommonAncestor:input_type -> blockchain_api.GetBlockHeadersFromCommonAncestorRequest
 	23,  // 54: blockchain_api.BlockchainAPI.GetBlockHeadersFromTill:input_type -> blockchain_api.GetBlockHeadersFromTillRequest
 	24,  // 55: blockchain_api.BlockchainAPI.GetBlockHeadersFromHeight:input_type -> blockchain_api.GetBlockHeadersFromHeightRequest
-	26,  // 56: blockchain_api.BlockchainAPI.GetBestTipChanges:input_type -> blockchain_api.GetBestTipChangesRequest
-	140, // 57: blockchain_api.BlockchainAPI.GetBestTipSeq:input_type -> google.protobuf.Empty
+	26,  // 56: blockchain_api.BlockchainAPI.BlocksBetterThan:input_type -> blockchain_api.BlocksBetterThanRequest
+	28,  // 57: blockchain_api.BlockchainAPI.ClearBestTipLowWater:input_type -> blockchain_api.ClearBestTipLowWaterRequest
 	29,  // 58: blockchain_api.BlockchainAPI.GetBlockHeadersByHeight:input_type -> blockchain_api.GetBlockHeadersByHeightRequest
 	31,  // 59: blockchain_api.BlockchainAPI.GetMedianTimePastByHeights:input_type -> blockchain_api.GetMedianTimePastByHeightsRequest
 	33,  // 60: blockchain_api.BlockchainAPI.GetBlocksByHeight:input_type -> blockchain_api.GetBlocksByHeightRequest
@@ -8496,8 +8496,8 @@ var file_services_blockchain_blockchain_api_blockchain_api_proto_depIdxs = []int
 	22,  // 147: blockchain_api.BlockchainAPI.GetBlockHeadersFromCommonAncestor:output_type -> blockchain_api.GetBlockHeadersResponse
 	22,  // 148: blockchain_api.BlockchainAPI.GetBlockHeadersFromTill:output_type -> blockchain_api.GetBlockHeadersResponse
 	25,  // 149: blockchain_api.BlockchainAPI.GetBlockHeadersFromHeight:output_type -> blockchain_api.GetBlockHeadersFromHeightResponse
-	27,  // 150: blockchain_api.BlockchainAPI.GetBestTipChanges:output_type -> blockchain_api.GetBestTipChangesResponse
-	28,  // 151: blockchain_api.BlockchainAPI.GetBestTipSeq:output_type -> blockchain_api.GetBestTipSeqResponse
+	27,  // 150: blockchain_api.BlockchainAPI.BlocksBetterThan:output_type -> blockchain_api.BlocksBetterThanResponse
+	140, // 151: blockchain_api.BlockchainAPI.ClearBestTipLowWater:output_type -> google.protobuf.Empty
 	30,  // 152: blockchain_api.BlockchainAPI.GetBlockHeadersByHeight:output_type -> blockchain_api.GetBlockHeadersByHeightResponse
 	32,  // 153: blockchain_api.BlockchainAPI.GetMedianTimePastByHeights:output_type -> blockchain_api.GetMedianTimePastByHeightsResponse
 	34,  // 154: blockchain_api.BlockchainAPI.GetBlocksByHeight:output_type -> blockchain_api.GetBlocksByHeightResponse

@@ -2,7 +2,6 @@ package sql
 
 import (
 	"context"
-	"database/sql"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -39,16 +38,7 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 		SET invalid = false, mined_set = false
 		WHERE hash = $1
 	`
-	// The update and the number of the tip change it may cause commit together, so the
-	// rebuild below failing cannot lose the change. The stamp derives the new best from
-	// the table, not from the flags the rebuild writes.
-	if err = s.db.RetryTx(ctx, nil, func(tx *sql.Tx) error {
-		if _, execErr := tx.ExecContext(ctx, q, blockHash.CloneBytes()); execErr != nil {
-			return execErr
-		}
-
-		return s.stampBestTip(ctx, tx)
-	}); err != nil {
+	if _, err = s.db.ExecContext(ctx, q, blockHash.CloneBytes()); err != nil {
 		return errors.NewStorageError("error updating block to valid", err)
 	}
 

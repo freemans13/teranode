@@ -62,20 +62,46 @@ func headerHashes(headers ...*model.BlockHeader) []string {
 	return out
 }
 
-// startReplayAt puts block assembly on tip with the replay position at the store's latest
-// number, as if it had applied every change so far.
-func startReplayAt(t *testing.T, items *baTestItems, tip *model.BlockHeader, height uint32) uint64 {
+// startReplayAt puts block assembly on tip with the replay position on tip, as if it had
+// handled every block up to it.
+func startReplayAt(t *testing.T, items *baTestItems, tip *model.BlockHeader, height uint32) model.BestTipKey {
 	t.Helper()
 
 	items.blockAssembler.setBestBlockHeader(tip, height)
 
-	seq, err := items.blockchainClient.GetBestTipSeq(t.Context())
+	pos := bestTipKeyOf(t, items, tip)
+
+	items.blockAssembler.setBestTipPos(pos)
+	items.blockAssembler.bestTipPosKnown.Store(true)
+
+	return pos
+}
+
+// bestTipKeyOf reads the place of a stored block in the best-tip order.
+func bestTipKeyOf(t *testing.T, items *baTestItems, header *model.BlockHeader) model.BestTipKey {
+	t.Helper()
+
+	h, meta, err := items.blockchainClient.GetBlockHeader(t.Context(), header.Hash())
 	require.NoError(t, err)
 
-	items.blockAssembler.bestTipSeq.Store(seq)
-	items.blockAssembler.bestTipSeqKnown.Store(true)
+	return model.NewBestTipKey(h, meta)
+}
 
-	return seq
+// requireReplayPosition asserts the replay position is on want.
+func requireReplayPosition(t *testing.T, items *baTestItems, want *model.BlockHeader) {
+	t.Helper()
+
+	pos := items.blockAssembler.bestTipPos.Load()
+	require.NotNil(t, pos)
+	require.Equal(t, want.Hash().String(), pos.Hash.String(), "replay position")
+}
+
+// requireNoLowWater asserts the blockchain store holds no low-water mark of the best tip.
+func requireNoLowWater(t *testing.T, items *baTestItems) {
+	t.Helper()
+
+	_, err := items.blockchainClient.GetState(t.Context(), model.BestTipLowWaterStateKey)
+	require.Error(t, err, "the low-water mark is cleared once the replay has passed it")
 }
 
 func requireBlockAssemblyTip(t *testing.T, items *baTestItems, want *model.BlockHeader) {
@@ -101,7 +127,7 @@ func TestReplayBestTipChanges_FlipFlop(t *testing.T) {
 	a1 := buildChain(genesis, 1, 1000)[0]
 	addChain(t, items, []*model.BlockHeader{a1})
 
-	startSeq := startReplayAt(t, items, a1, 1)
+	startReplayAt(t, items, a1, 1)
 	moves := recordMoves(t, items)
 
 	// B1 ties A1 and loses the tiebreak; B2 makes B the best chain.
@@ -120,23 +146,19 @@ func TestReplayBestTipChanges_FlipFlop(t *testing.T) {
 	}, *moves)
 
 	requireBlockAssemblyTip(t, items, a[1])
+	requireReplayPosition(t, items, a[1])
 
-	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, startSeq+2, latest, "B2 and A3 are the two tip changes")
-	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
-
-	_, err = items.blockchainClient.GetState(t.Context(), BestTipSeqStateKey)
+	_, err := items.blockchainClient.GetState(t.Context(), BestTipPositionStateKey)
 	require.Error(t, err, "the position is not saved while block assembly is still processing")
 
 	items.blockAssembler.returnToRunning(t.Context())
 
-	saved, err := items.blockchainClient.GetState(t.Context(), BestTipSeqStateKey)
+	saved, err := items.blockchainClient.GetState(t.Context(), BestTipPositionStateKey)
 	require.NoError(t, err)
 
-	savedSeq, err := DecodeBestTipSeq(saved)
+	savedPos, err := model.NewBestTipKeyFromBytes(saved)
 	require.NoError(t, err)
-	require.Equal(t, latest, savedSeq, "the position is persisted for a restart")
+	require.Equal(t, bestTipKeyOf(t, items, a[1]), savedPos, "the position is persisted for a restart")
 }
 
 // TestReplayBestTipChanges_ExtensionsCollapse checks that a run of extensions is one catch-up,
@@ -170,7 +192,7 @@ func TestReplayBestTipChanges_OwnLineageIsANoOp(t *testing.T) {
 	items := setupBlockAssemblyTest(t)
 	genesis := genesisHeader(t, items)
 
-	startSeq := startReplayAt(t, items, genesis, 0)
+	startReplayAt(t, items, genesis, 0)
 
 	chain := buildChain(genesis, 3, 5000)
 	addChain(t, items, chain)
@@ -189,12 +211,12 @@ func TestReplayBestTipChanges_OwnLineageIsANoOp(t *testing.T) {
 
 	require.Empty(t, *moves)
 	requireBlockAssemblyTip(t, items, chain[2])
-	require.Equal(t, startSeq+3, items.blockAssembler.bestTipSeq.Load())
+	requireReplayPosition(t, items, chain[2])
 }
 
-// TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack checks that when the latest change is
-// an ancestor of block assembly's tip, the best tip moved back to it and block assembly follows.
-// Invalidating block assembly's tip numbers its parent as the latest change.
+// TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack checks that when the best tip drops to
+// an ancestor of block assembly's tip, block assembly follows. Invalidating block assembly's tip
+// records its parent in the low-water mark, which sorts below the replay position.
 func TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -204,7 +226,7 @@ func TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack(t *testing.T) {
 	chain := buildChain(genesis, 3, 5500)
 	addChain(t, items, chain)
 
-	startSeq := startReplayAt(t, items, chain[2], 3)
+	startReplayAt(t, items, chain[2], 3)
 	moves := recordMoves(t, items)
 
 	// A reorg off an invalid block is followed by a reset, which the mock lets succeed.
@@ -225,7 +247,12 @@ func TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack(t *testing.T) {
 	require.Equal(t, []recordedMove{{back: headerHashes(chain[2]), forward: []string{}}}, *moves)
 	require.Equal(t, 1, resets, "moving off an invalid block resets block assembly")
 	requireBlockAssemblyTip(t, items, chain[1])
-	require.Equal(t, startSeq+1, items.blockAssembler.bestTipSeq.Load())
+	requireReplayPosition(t, items, chain[1])
+	requireNoLowWater(t, items)
+
+	saved, err := items.blockchainClient.GetState(t.Context(), BestTipPositionStateKey)
+	require.NoError(t, err)
+	require.Equal(t, bestTipKeyOf(t, items, chain[1]).Bytes(), saved, "the position is persisted before the mark is cleared")
 }
 
 // TestReplayBestTipChanges_NoOpWhenCaughtUp checks a wake-up with no new change moves nothing.
@@ -238,13 +265,13 @@ func TestReplayBestTipChanges_NoOpWhenCaughtUp(t *testing.T) {
 	chain := buildChain(genesis, 2, 6000)
 	addChain(t, items, chain)
 
-	seq := startReplayAt(t, items, chain[1], 2)
+	startReplayAt(t, items, chain[1], 2)
 	moves := recordMoves(t, items)
 
 	items.blockAssembler.processNewBlockAnnouncement(t.Context())
 
 	require.Empty(t, *moves)
-	require.Equal(t, seq, items.blockAssembler.bestTipSeq.Load())
+	requireReplayPosition(t, items, chain[1])
 }
 
 // TestReplayBestTipChanges_InvalidNeverAppliedResets covers a branch that became the best tip and
@@ -315,9 +342,9 @@ func TestReplayBestTipChanges_RestartResumesFromPersistedPosition(t *testing.T) 
 	a1 := buildChain(genesis, 1, 10000)[0]
 	addChain(t, items, []*model.BlockHeader{a1})
 
-	seq := startReplayAt(t, items, a1, 1)
-	items.blockAssembler.bestTipSeqSaved.Store(0)
-	items.blockAssembler.saveBestTipSeq(t.Context())
+	pos := startReplayAt(t, items, a1, 1)
+	items.blockAssembler.bestTipPosSaved.Store(nil)
+	items.blockAssembler.saveBestTipPosition(t.Context())
 
 	// The flip happens while block assembly is down.
 	b := buildChain(genesis, 2, 11000)
@@ -326,11 +353,11 @@ func TestReplayBestTipChanges_RestartResumesFromPersistedPosition(t *testing.T) 
 	addChain(t, items, a)
 
 	// A restart reads the position back.
-	items.blockAssembler.bestTipSeq.Store(0)
-	items.blockAssembler.bestTipSeqKnown.Store(false)
-	items.blockAssembler.loadBestTipSeq(t.Context())
-	require.True(t, items.blockAssembler.bestTipSeqKnown.Load())
-	require.Equal(t, seq, items.blockAssembler.bestTipSeq.Load())
+	items.blockAssembler.bestTipPos.Store(nil)
+	items.blockAssembler.bestTipPosKnown.Store(false)
+	items.blockAssembler.loadBestTipPosition(t.Context())
+	require.True(t, items.blockAssembler.bestTipPosKnown.Load())
+	require.Equal(t, pos, *items.blockAssembler.bestTipPos.Load())
 
 	moves := recordMoves(t, items)
 	items.blockAssembler.processNewBlockAnnouncement(t.Context())
@@ -339,15 +366,15 @@ func TestReplayBestTipChanges_RestartResumesFromPersistedPosition(t *testing.T) 
 	requireBlockAssemblyTip(t, items, a[1])
 }
 
-// TestReplayBestTipChanges_MockWithoutNumbersFollowsBestHeader checks block assembly against a
-// blockchain client that does not number its tip changes: it follows the best header as before.
-func TestReplayBestTipChanges_MockWithoutNumbersFollowsBestHeader(t *testing.T) {
+// TestReplayBestTipChanges_MockWithoutOrderFollowsBestHeader checks block assembly against a
+// blockchain client that does not serve the best-tip order: it follows the best header as before.
+func TestReplayBestTipChanges_MockWithoutOrderFollowsBestHeader(t *testing.T) {
 	m := &blockchain.Mock{}
 
 	ba := &BlockAssembler{blockchainClient: m, logger: ulogger.TestLogger{}}
 
 	require.True(t, ba.followBestTipChanges(t.Context()))
-	require.False(t, ba.bestTipSeqKnown.Load())
+	require.False(t, ba.bestTipPosKnown.Load())
 }
 
 // TestReplayBestTipChanges_RepeatedFailureFollowsBestHeader checks that a replay that keeps
@@ -355,13 +382,18 @@ func TestReplayBestTipChanges_MockWithoutNumbersFollowsBestHeader(t *testing.T) 
 func TestReplayBestTipChanges_RepeatedFailureFollowsBestHeader(t *testing.T) {
 	initPrometheusMetrics()
 
+	best := &model.BlockHeader{Version: 2, HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+	bestMeta := &model.BlockHeaderMeta{ID: 42, Height: 11, ChainWork: []byte{1}}
+
 	m := &blockchain.Mock{}
-	m.On("GetBestTipChanges", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]*model.BlockHeader(nil), []*model.BlockHeaderMeta(nil), []uint64(nil), errors.NewServiceError("down"))
-	m.On("GetBestTipSeq", mock.Anything).Return(uint64(42), nil)
+	m.On("BlocksBetterThan", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]*model.BlockHeader(nil), []*model.BlockHeaderMeta(nil), errors.NewServiceError("down"))
+	m.On("GetState", mock.Anything, model.BestTipLowWaterStateKey).Return([]byte(nil), errors.NewNotFoundError("no mark"))
+	m.On("GetBestBlockHeader", mock.Anything).Return(best, bestMeta, nil)
 
 	ba := &BlockAssembler{blockchainClient: m, logger: ulogger.TestLogger{}, settings: createTestSettings(t)}
-	ba.bestTipSeqKnown.Store(true)
+	ba.bestTipPosKnown.Store(true)
+	ba.setBestTipPos(model.BestTipKey{ChainWork: []byte{0}})
 	ba.setBestBlockHeader(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}, 10)
 
 	for i := 1; i < maxBestTipReplayFailures; i++ {
@@ -369,7 +401,7 @@ func TestReplayBestTipChanges_RepeatedFailureFollowsBestHeader(t *testing.T) {
 	}
 
 	require.True(t, ba.followBestTipChanges(t.Context()))
-	require.Equal(t, uint64(42), ba.bestTipSeq.Load(), "the position jumps to the latest change")
+	require.Equal(t, model.NewBestTipKey(best, bestMeta), *ba.bestTipPos.Load(), "the position jumps to the best tip")
 }
 
 // TestReturnToRunning_SavesAfterLeavingProcessingState checks that the replay position is written
@@ -381,19 +413,21 @@ func TestReturnToRunning_SavesAfterLeavingProcessingState(t *testing.T) {
 
 	var stateAtSave State
 
-	m.On("SetState", mock.Anything, BestTipSeqStateKey, EncodeBestTipSeq(7)).
+	pos := model.BestTipKey{ChainWork: []byte{7}, PeerID: "p", ID: 7}
+
+	m.On("SetState", mock.Anything, BestTipPositionStateKey, pos.Bytes()).
 		Run(func(mock.Arguments) { stateAtSave = ba.GetCurrentRunningState() }).
 		Return(nil).Once()
 
-	ba.bestTipSeqKnown.Store(true)
-	ba.advanceBestTipSeq(7)
+	ba.bestTipPosKnown.Store(true)
+	ba.setBestTipPos(pos)
 	ba.setCurrentRunningState(StateReorging)
 
 	ba.returnToRunning(t.Context())
 
 	m.AssertExpectations(t)
 	require.Equal(t, StateRunning, stateAtSave)
-	require.Equal(t, uint64(7), ba.bestTipSeqSaved.Load())
+	require.Equal(t, pos, *ba.bestTipPosSaved.Load())
 
 	// Nothing moved, so the next return writes nothing.
 	ba.returnToRunning(t.Context())
@@ -401,28 +435,29 @@ func TestReturnToRunning_SavesAfterLeavingProcessingState(t *testing.T) {
 }
 
 // TestReplayBestTipChanges_ProbeIsRateLimited checks that against a blockchain service without
-// the numbers, block assembly asks again only after bestTipSeqProbeInterval, so a mixed-version
-// deploy does not cost an RPC and a warning on every wake-up.
+// the best-tip order, block assembly asks again only after bestTipProbeInterval, so a
+// mixed-version deploy does not cost an RPC and a warning on every wake-up.
 func TestReplayBestTipChanges_ProbeIsRateLimited(t *testing.T) {
 	m := &blockchain.Mock{}
-	m.On("GetBestTipSeq", mock.Anything).Return(uint64(0), errors.NewServiceUnavailableError("not implemented"))
+	m.On("BlocksBetterThan", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]*model.BlockHeader(nil), []*model.BlockHeaderMeta(nil), errors.NewServiceUnavailableError("not implemented"))
 
 	ba := &BlockAssembler{blockchainClient: m, logger: ulogger.TestLogger{}}
 
 	require.True(t, ba.followBestTipChanges(t.Context()))
 	require.True(t, ba.followBestTipChanges(t.Context()))
-	m.AssertNumberOfCalls(t, "GetBestTipSeq", 1)
-	require.True(t, ba.bestTipSeqUnsupportedLogged.Load())
+	m.AssertNumberOfCalls(t, "BlocksBetterThan", 1)
+	require.True(t, ba.bestTipUnsupportedLogged.Load())
 
-	ba.lastBestTipSeqProbe.Store(time.Now().Add(-bestTipSeqProbeInterval).UnixNano())
+	ba.lastBestTipProbe.Store(time.Now().Add(-bestTipProbeInterval).UnixNano())
 	require.True(t, ba.followBestTipChanges(t.Context()))
-	m.AssertNumberOfCalls(t, "GetBestTipSeq", 2)
+	m.AssertNumberOfCalls(t, "BlocksBetterThan", 2)
 }
 
-// TestLoadBestTipSeq_NoPersistedPosition checks the start without a persisted position: on
-// the best tip, block assembly starts at the latest change, so it is not moved through the
-// stale branches recorded before it; off the best tip, it replays the recent changes from 0.
-func TestLoadBestTipSeq_NoPersistedPosition(t *testing.T) {
+// TestLoadBestTipPosition_NoPersistedPosition checks the start without a persisted position: on
+// the best tip, block assembly starts there, so it is not moved through the stale branches
+// before it; off the best tip, it starts at its own tip and replays what sorts better.
+func TestLoadBestTipPosition_NoPersistedPosition(t *testing.T) {
 	initPrometheusMetrics()
 
 	items := setupBlockAssemblyTest(t)
@@ -437,27 +472,32 @@ func TestLoadBestTipSeq_NoPersistedPosition(t *testing.T) {
 	a := buildChain(a1, 2, 15000)
 	addChain(t, items, a)
 
-	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
-	require.NoError(t, err)
-	require.NotZero(t, latest)
-
 	ba := items.blockAssembler
 
 	ba.setBestBlockHeader(a[1], 3)
-	ba.bestTipSeqKnown.Store(false)
-	ba.loadBestTipSeq(t.Context())
-	require.True(t, ba.bestTipSeqKnown.Load())
-	require.Equal(t, latest, ba.bestTipSeq.Load(), "on the best tip there is nothing to replay")
+	ba.bestTipPosKnown.Store(false)
+	ba.loadBestTipPosition(t.Context())
+	require.True(t, ba.bestTipPosKnown.Load())
+	requireReplayPosition(t, items, a[1])
 
 	moves := recordMoves(t, items)
 	ba.processNewBlockAnnouncement(t.Context())
 	require.Empty(t, *moves, "the stale branch is not replayed")
 
 	ba.setBestBlockHeader(a1, 1)
-	ba.bestTipSeqKnown.Store(false)
-	ba.loadBestTipSeq(t.Context())
-	require.True(t, ba.bestTipSeqKnown.Load())
-	require.Equal(t, uint64(0), ba.bestTipSeq.Load(), "off the best tip the recent changes are replayed")
+	ba.bestTipPosKnown.Store(false)
+	ba.loadBestTipPosition(t.Context())
+	require.True(t, ba.bestTipPosKnown.Load())
+	requireReplayPosition(t, items, a1)
+
+	// A persisted value from the build that numbered tip changes is under another key, and an
+	// unreadable value under this key is ignored rather than misparsed.
+	require.NoError(t, items.blockchainClient.SetState(t.Context(), "BlockAssemblerBestTipSeq", []byte{1, 0, 0, 0, 0, 0, 0, 0}))
+	require.NoError(t, items.blockchainClient.SetState(t.Context(), BestTipPositionStateKey, []byte{1, 0, 0, 0, 0, 0, 0, 0}))
+	ba.bestTipPosKnown.Store(false)
+	ba.loadBestTipPosition(t.Context())
+	require.True(t, ba.bestTipPosKnown.Load())
+	requireReplayPosition(t, items, a1)
 }
 
 // TestIdleReconcileNeeded checks that the idle tick starts a replay only when the tip moved:
@@ -481,10 +521,10 @@ func TestIdleReconcileNeeded(t *testing.T) {
 
 	// A block whose notification was lost.
 	addChain(t, items, chain[1:])
-	require.True(t, ba.idleReconcileNeeded(t.Context()), "a new change of the best tip")
+	require.True(t, ba.idleReconcileNeeded(t.Context()), "a block sorts better than the position")
 
-	// Against a blockchain service without the numbers, the best header decides.
-	ba.bestTipSeqKnown.Store(false)
+	// Against a blockchain service without the best-tip order, the best header decides.
+	ba.bestTipPosKnown.Store(false)
 	require.True(t, ba.idleReconcileNeeded(t.Context()), "block assembly is behind the best header")
 
 	ba.setBestBlockHeader(chain[1], 2)
@@ -516,15 +556,6 @@ func TestBestTipFloor(t *testing.T) {
 
 	require.Equal(t, uint32(0), ba.bestTipFloor(retention))
 	require.Equal(t, uint32(10), ba.bestTipFloor(retention+10))
-}
-
-func TestBestTipSeqEncoding(t *testing.T) {
-	seq, err := DecodeBestTipSeq(EncodeBestTipSeq(1234567))
-	require.NoError(t, err)
-	require.Equal(t, uint64(1234567), seq)
-
-	_, err = DecodeBestTipSeq([]byte{1, 2, 3})
-	require.Error(t, err)
 }
 
 // historicalWinnerSetup puts block assembly on A1 at height 1002 with its position there, then
@@ -593,9 +624,7 @@ func TestReplayBestTipChanges_ResetVisitsHistoricalWinner(t *testing.T) {
 	_, err := items.blockAssembler.replayBestTipChanges(t.Context())
 	require.NoError(t, err)
 	requireBlockAssemblyTip(t, items, a[len(a)-1])
-	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
+	requireReplayPosition(t, items, a[len(a)-1])
 	require.NotEmpty(t, *resetMoves)
 	_, forward := movesTouch(b[len(b)-1].Hash().String(), *moves, *resetMoves)
 	require.True(t, forward, "B became best within the height floor, but replay checkpointed it without passing B to the subtree processor")
@@ -612,9 +641,7 @@ func TestReplayBestTipChanges_DeepHistoricalWinnerIsRestamped(t *testing.T) {
 	_, err := items.blockAssembler.replayBestTipChanges(t.Context())
 	require.NoError(t, err)
 	requireBlockAssemblyTip(t, items, a[len(a)-1])
-	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
+	requireReplayPosition(t, items, a[len(a)-1])
 
 	back, _ := movesTouch(a1.Hash().String(), *moves, *resetMoves)
 	require.False(t, back, "A1 is on the best chain and its coinbase may be spent there: it must never be moved back")
@@ -655,9 +682,7 @@ func TestReplayBestTipChanges_ExternalResetRetainsPendingHistory(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, read, "reset must synchronously apply its pending history")
 	requireBlockAssemblyTip(t, items, a[len(a)-1])
-	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
+	requireReplayPosition(t, items, a[len(a)-1])
 	t.Logf("incremental moves=%d resets=%d first reset back=%d forward=%d", len(*moves), len(resetMoves), len(resetMoves[0].back), len(resetMoves[0].forward))
 	appliedHistorical := false
 	for _, m := range append(*moves, resetMoves...) {
@@ -678,11 +703,11 @@ type cappedTipClient struct {
 	fail bool
 }
 
-func (c *cappedTipClient) GetBestTipChanges(ctx context.Context, after uint64, floor, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error) {
+func (c *cappedTipClient) BlocksBetterThan(ctx context.Context, after model.BestTipKey, from *model.BestTipKey, floor, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	if c.fail {
-		return nil, nil, nil, errors.NewStorageError("temporary replay read failure")
+		return nil, nil, errors.NewStorageError("temporary replay read failure")
 	}
-	return c.ClientI.GetBestTipChanges(ctx, after, floor, min(limit, c.cap))
+	return c.ClientI.BlocksBetterThan(ctx, after, from, floor, min(limit, c.cap))
 }
 
 func TestReplayBestTipChanges_CappedPagesSkipIntermediateAncestors(t *testing.T) {
@@ -711,7 +736,7 @@ func TestReplayBestTipChanges_FailedResetRetainsPosition(t *testing.T) {
 	genesis := genesisHeader(t, items)
 	a1 := buildChain(genesis, 1, 26000)[0]
 	addChain(t, items, []*model.BlockHeader{a1})
-	seq := startReplayAt(t, items, a1, 1)
+	startReplayAt(t, items, a1, 1)
 	recordMoves(t, items)
 	stp := items.blockAssembler.subtreeProcessor.(*subtreeprocessor.MockSubtreeProcessor)
 	stp.On("WaitForPendingBlocks", mock.Anything).Return(nil)
@@ -724,7 +749,7 @@ func TestReplayBestTipChanges_FailedResetRetainsPosition(t *testing.T) {
 	addChain(t, items, a)
 	_, err := items.blockAssembler.replayBestTipChanges(t.Context())
 	require.ErrorIs(t, err, failure)
-	require.Equal(t, seq, items.blockAssembler.bestTipSeq.Load(), "failed reset must not acknowledge historical winner")
+	requireReplayPosition(t, items, a1)
 }
 
 func TestReplayBestTipChanges_ExternalResetFailureGatesCandidates(t *testing.T) {

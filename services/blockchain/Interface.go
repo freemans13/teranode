@@ -447,16 +447,23 @@ type ClientI interface {
 	// - Error if the header retrieval fails
 	GetBlockHeadersFromHeight(ctx context.Context, height, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
-	// GetBestTipChanges returns, in order, the blocks that became the best tip after sequence
-	// number afterSeq, at or above minHeight, at most limit of them. Each change of the best tip
-	// is numbered when it is written, so a reader that keeps the last number it handled sees
-	// every branch that was the best chain, even one that lost again before it looked.
+	// BlocksBetterThan returns the valid blocks that sort better than after in the order the
+	// store picks its best tip by (most chain work, then lowest peer id, then lowest block id),
+	// worst first, at or above minHeight, at most limit of them. When from is not nil it also
+	// returns the valid blocks that sort better than or level with from.
 	//
-	// Returns headers, metadata and sequence numbers as slices of the same length.
-	GetBestTipChanges(ctx context.Context, afterSeq uint64, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, []uint64, error)
+	// Without an invalidation the best tip only ever moves to a block that sorts better, so a
+	// reader that keeps the key of the last block it handled finds every later best tip here,
+	// even one that lost again before it looked. A drop of the tip is recorded in the low-water
+	// mark under state key model.BestTipLowWaterStateKey, which the reader passes as from.
+	//
+	// Returns headers and metadata as slices of the same length.
+	BlocksBetterThan(ctx context.Context, after model.BestTipKey, from *model.BestTipKey, minHeight, limit uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
-	// GetBestTipSeq returns the sequence number of the latest change of the best tip, 0 if none.
-	GetBestTipSeq(ctx context.Context) (uint64, error)
+	// ClearBestTipLowWater deletes the best tip's low-water mark if it still holds expected, the
+	// bytes the caller read with GetState. A drop recorded since changes the mark, and the delete
+	// is then a no-op.
+	ClearBestTipLowWater(ctx context.Context, expected []byte) error
 
 	// GetBlockHeadersByHeight retrieves block headers between two heights.
 	//

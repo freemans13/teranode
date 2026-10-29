@@ -193,8 +193,7 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	// rows only, never transactions or coins.
 	//
 	// The common extend keeps its single auto-committed INSERT, which already writes
-	// the correct flag and needs no repair. It also writes the block's best_tip_seq in
-	// the same statement: a block that extends the best is the new best.
+	// the correct flag and needs no repair.
 	var (
 		newBlockID    uint64
 		height        uint32
@@ -241,13 +240,8 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 			}
 
 			reconcileErr = reconcile()
-			if reconcileErr != nil {
-				return reconcileErr
-			}
 
-			// Number the tip change in the same transaction, so a block that won the
-			// tiebreak is never committed without it. A no-op when the best did not move.
-			return s.stampBestTip(ctx, tx)
+			return reconcileErr
 		})
 		if err != nil {
 			// Label the error as the reconciliation's only when it is the very value the
@@ -638,8 +632,7 @@ INSERT INTO blocks (
 	,persisted_at
 	,coinbase_bump
 	,on_main_chain
-	,best_tip_seq
-) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, CASE WHEN $24 THEN (SELECT COALESCE(MAX(best_tip_seq), 0) + 1 FROM blocks) END)
+) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 RETURNING id
 			`
 		} else {
@@ -669,8 +662,7 @@ INSERT INTO blocks (
 	,persisted_at
 	,coinbase_bump
 	,on_main_chain
-	,best_tip_seq
-) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, CASE WHEN $23 THEN (SELECT COALESCE(MAX(best_tip_seq), 0) + 1 FROM blocks) END)
+) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 RETURNING id
 			`
 		}
@@ -703,8 +695,7 @@ INSERT INTO blocks (
 	,persisted_at
 	,coinbase_bump
 	,on_main_chain
-	,best_tip_seq
-) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, CASE WHEN $24 THEN (SELECT COALESCE(MAX(best_tip_seq), 0) + 1 FROM blocks) END)
+) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 RETURNING id
 			`
 		} else {
@@ -734,8 +725,7 @@ INSERT INTO blocks (
 	,persisted_at
 	,coinbase_bump
 	,on_main_chain
-	,best_tip_seq
-) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, CASE WHEN $23 THEN (SELECT COALESCE(MAX(best_tip_seq), 0) + 1 FROM blocks) END)
+) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 RETURNING id
 			`
 		}
