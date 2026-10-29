@@ -148,7 +148,10 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 	// (lag - CatchupMaxAccumulatedHeaders) — the same over-measurement this ceiling change
 	// exists to remove, reached by a different route. That needs a lag of 100k blocks by
 	// default, so the cap is kept for now rather than removed alongside the ceiling fix, but
-	// it is a correctness trade and not the free conservatism it looks like. Note it also sets
+	// it is a correctness trade and not the free conservatism it looks like. On the netted
+	// route the caveat does not apply: the window there counts from the locator height to the
+	// next checkpoint (model.NettedRouteCatchupWindow), so lag lengthens the window instead of
+	// truncating it. Note it also sets
 	// startHash/startHeight, which are reported on the catchup Result and not used in any
 	// decision.
 	if u.utxoStore != nil {

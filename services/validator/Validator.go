@@ -1609,7 +1609,10 @@ func (v *Validator) precheckTransaction(tx *bt.Tx, txID string, blockHeight uint
 	// still qualifies. A lagging snapshot is fail-open (more permissive, never a false rejection);
 	// a tip genuinely past the checkpoint while below-checkpoint work is in flight is a genuine
 	// rejection whose remedy is to turn the fast path off
-	// (blockvalidation_outpoint_only_below_checkpoint=false), which is also the default.
+	// (blockvalidation_outpoint_only_below_checkpoint=false), which is also the default. A store
+	// that nets below the checkpoint (utxoset) has no such switch: it takes those blocks only
+	// through the fast path, whatever the setting says (model.OutpointOnlyEligible), so there the
+	// rejection points at a fault to investigate, not a setting to change.
 	// The condition is `>`, mirroring the caller-asserted guard immediately above it, so it also
 	// admits a tip exactly at the highest checkpoint — a case for which the paragraph above claims
 	// no legitimate producer.
