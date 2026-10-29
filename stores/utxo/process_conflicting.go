@@ -181,11 +181,13 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	// deferred block; a `return nil, nil, err` in the error paths clobbers the named
 	// return before the deferred runs, so we keep a parallel copy that survives.
 	var (
-		// mutationStarted is set just before step 1 runs. Step 1 commits one
-		// cascade level per SetConflicting call, so a failure inside it can leave
-		// earlier levels committed with step1Committed still false; only this flag
-		// says that nothing was touched.
-		mutationStarted       bool
+		// refusedAtStep0 is set when step 0 refuses the winner list itself: a
+		// winner that is the frozen placeholder, or one that is not conflicting
+		// and was not processed earlier in this run. Both depend only on the list
+		// and the winners' state, which no earlier run of the same list can have
+		// produced (a winner is cleared at step 4 only after its spends land, and
+		// block movement takes such winners out of the list first).
+		refusedAtStep0        atomic.Bool
 		step1Committed        bool
 		step2Committed        bool
 		step4Committed        bool
@@ -198,16 +200,19 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 
 	// Registered before the rollback defer below, so it runs AFTER it (LIFO) and
 	// observes the final err (including a rollback-failure escalation). A
-	// successful operation removes the intent, and so does a failure before step 1
-	// starts, while nothing has been touched: there is nothing for a replay to
-	// recover, and an intent left behind by a step-0 refusal would be replayed
+	// successful operation removes the intent, and so does a step-0 refusal of
+	// the winner list: an intent left behind by that refusal would be replayed
 	// with the refusal bypassed, as happened on mainnet on 2026-10-19 against
-	// winners that were already resolved. Any failure after step 1 starts keeps
-	// the intent for replay, including one inside step 1 after some of its
-	// levels committed. Completion is best-effort: a failed delete just leaves an
-	// intent that replays on the next restart.
+	// winners that were already resolved.
+	//
+	// Every other failure keeps the intent, a transient step-0 failure included.
+	// The intent id is deterministic and Begin is an upsert, so this call may
+	// have adopted the record of an earlier run of the same list that was killed
+	// after mutating. Deleting it on a failed Get or a cancelled ctx would drop
+	// the only record of that torn state. Completion is best-effort: a failed
+	// delete just leaves an intent that replays on the next restart.
 	defer func() {
-		if err == nil || !mutationStarted {
+		if err == nil || refusedAtStep0.Load() {
 			_ = s.CompleteConflictIntent(ctx, walIntent.IntentID())
 		}
 	}()
@@ -264,14 +269,22 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	losingTxHashesPerConflictingTx := make([][]chainhash.Hash, len(conflictingTxHashes))
 	losingTxHashesPerConflictingTxCount := atomic.Int64{}
 
+	resolvedSet := make(map[chainhash.Hash]struct{}, len(options.resolvedWinners))
+	for _, h := range options.resolvedWinners {
+		resolvedSet[h] = struct{}{}
+	}
+
 	g, gCtx := errgroup.WithContext(ctx)
 
 	for idx, txHash := range conflictingTxHashes {
 		idx := idx
 		txHash := txHash
+		_, resolved := resolvedSet[txHash]
 
 		if txHash.Equal(subtree.CoinbasePlaceholderHashValue) {
 			// the counter-conflicting tx is frozen, we should not process anything further
+			refusedAtStep0.Store(true)
+
 			return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] tx is frozen", txHash.String())
 		}
 
@@ -297,8 +310,18 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			// unless it was already processed in this run, then it will be in the processedConflictingHashesMap.
 			// This can occur when a transaction is in multiple forks, and we are moving back from one fork to another
 			// and the transaction was already processed in the previous fork.
-			if _, alreadyProcessed := processedConflictingHashesMap[txHash]; !txMeta.Conflicting && !alreadyProcessed {
+			if _, alreadyProcessed := processedConflictingHashesMap[txHash]; !txMeta.Conflicting && !alreadyProcessed && !resolved {
+				refusedAtStep0.Store(true)
+
 				return errors.NewProcessingError("[ProcessConflicting][%s] tx is not conflicting", txHash.String())
+			}
+
+			// A winner whose resolution the store already holds has no losers
+			// left to find, and walking from it would find its own descendants.
+			if resolved {
+				winningTxs[idx] = txMeta.Tx
+
+				return nil
 			}
 
 			// get the counter conflicting transactions for the current transaction
@@ -384,8 +407,6 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	// - 1: mark all losingTxHashesPerConflictingTx as conflicting + all its spending transactions recursively.
 	//   allMarkedConflicting is the BFS expansion: every hash now flagged Conflicting=true. Forwarded to callers so
 	//   the block-assembly conflictingMap can include the cascaded descendants (not just the immediate losers).
-	mutationStarted = true
-
 	affectedParentSpends, allMarkedHashes, err = MarkConflictingRecursively(ctx, s, losingTxHashes)
 	if err != nil {
 		return nil, nil, err
@@ -734,6 +755,120 @@ func ForwardResolutionApplied(ctx context.Context, s Store, winner chainhash.Has
 	}
 
 	return true, nil
+}
+
+// ResolvedForwardLosers recovers, without writing anything, the transactions an
+// applied forward resolution of the given winners demoted: the immediate losers
+// and every descendant of them. Callers pass only winners for which
+// ForwardResolutionApplied is true, and exclude holds the block's own winners,
+// which are never losers.
+//
+// An immediate loser is found the way ReverseProcessConflicting picks the
+// counter to restore: a transaction in a winner's parent's ConflictingChildren
+// that is currently Conflicting and spends that same outpoint. Both filters are
+// needed. ConflictingChildren is kept per parent transaction, not per outpoint,
+// and keeps a winner after it is cleared, so without them a winner of an earlier,
+// unrelated conflict on another output of the same parent would be taken for a
+// loser, and its valid descendants with it.
+//
+// The descendant walk is unbounded, like the forward demotion walk it mirrors. A
+// budget here would fail on every re-application of a block whose resolution
+// succeeded on a larger cone, which wedges block assembly the same way (issue
+// 1391). A loser or descendant the store no longer holds is a leaf.
+func ResolvedForwardLosers(ctx context.Context, s Store, winners []chainhash.Hash, exclude map[chainhash.Hash]struct{}) ([]chainhash.Hash, error) {
+	parents := make(map[chainhash.Hash]*meta.Data)
+	candidates := make(map[chainhash.Hash]*meta.Data)
+	immediateSet := make(map[chainhash.Hash]struct{})
+	immediate := make([]chainhash.Hash, 0)
+
+	for i := range winners {
+		winner := winners[i]
+
+		winnerMeta, err := s.Get(ctx, &winner, fields.TxInpoints)
+		if err != nil {
+			return nil, errors.NewProcessingError("[ResolvedForwardLosers][%s] error reading winner", winner.String(), err)
+		}
+
+		if winnerMeta == nil {
+			continue
+		}
+
+		for _, inpoint := range winnerMeta.TxInpoints.GetTxInpoints() {
+			parentHash := inpoint.Hash
+
+			parentMeta, seen := parents[parentHash]
+			if !seen {
+				parentMeta, err = s.Get(ctx, &parentHash, fields.ConflictingChildren)
+				if err != nil {
+					return nil, errors.NewProcessingError("[ResolvedForwardLosers][%s] error reading parent %s", winner.String(), parentHash.String(), err)
+				}
+
+				parents[parentHash] = parentMeta
+			}
+
+			if parentMeta == nil {
+				continue
+			}
+
+			for _, candidate := range parentMeta.ConflictingChildren {
+				if _, isWinner := exclude[candidate]; isWinner {
+					continue
+				}
+
+				if _, already := immediateSet[candidate]; already {
+					continue
+				}
+
+				candidateMeta, seen := candidates[candidate]
+				if !seen {
+					candidateHash := candidate
+
+					candidateMeta, err = s.Get(ctx, &candidateHash, fields.TxInpoints, fields.Conflicting)
+					if err != nil {
+						return nil, errors.NewProcessingError("[ResolvedForwardLosers][%s] error reading candidate loser %s", winner.String(), candidateHash.String(), err)
+					}
+
+					candidates[candidate] = candidateMeta
+				}
+
+				if candidateMeta == nil || !candidateMeta.Conflicting {
+					continue
+				}
+
+				if !candidateSpendsOutput(&candidateMeta.TxInpoints, &parentHash, inpoint.Index) {
+					continue
+				}
+
+				immediateSet[candidate] = struct{}{}
+				immediate = append(immediate, candidate)
+			}
+		}
+	}
+
+	if len(immediate) == 0 {
+		return nil, nil
+	}
+
+	cones, _, err := GetConflictingChildrenFromRoots(ctx, s, [][]chainhash.Hash{immediate}, 0)
+	if err != nil {
+		return nil, errors.NewProcessingError("[ResolvedForwardLosers] error walking the descendants of %d losers", len(immediate), err)
+	}
+
+	losers := immediate
+
+	for _, cone := range cones {
+		for _, h := range cone {
+			// The walk returns the frozen sentinel when it reaches one; it is
+			// not a transaction to evict.
+			if _, isWinner := exclude[h]; isWinner || h.Equal(subtree.FrozenBytesTxHash) {
+				continue
+			}
+
+			losers = append(losers, h)
+		}
+	}
+
+	return losers, nil
 }
 
 // isReverseFullyApplied returns true iff every input of the demoted tx D has

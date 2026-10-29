@@ -1910,20 +1910,21 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 					// is dropped by that drain regardless of cascade discovery, so
 					// the per-block transient set is not needed here.
 					//
-					// Nodes the store already shows resolved for this block are kept
-					// out of ProcessConflicting here too; see alreadyResolvedConflictingNodes.
-					conflictingNodes, resolvedLosers, err := stp.alreadyResolvedConflictingNodes(ctx, block, conflictingNodes)
+					// Nodes the store already shows resolved for this block are not
+					// re-resolved here either; see alreadyResolvedConflictingNodes.
+					resolvedNodes, resolvedLosers, err := stp.alreadyResolvedConflictingNodes(ctx, block, conflictingNodes)
 					if err != nil {
 						return err
 					}
 
 					var losingTxHashesMap txmap.TxMap
 
-					if len(conflictingNodes) > 0 {
+					if len(resolvedNodes) < len(conflictingNodes) {
 						var allMarkedConflicting []chainhash.Hash
 
 						losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-							utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block))
+							utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block),
+							utxostore.WithResolvedWinners(resolvedNodes))
 
 						// the store now says these are conflicting; subtree validation's txmeta cache must
 						// forget them. On error this is what the failed run may have flipped.
@@ -6005,21 +6006,20 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 			block.Height = blockHeaderMeta.Height
 		}
 
-		// Nodes the store already shows resolved for this block are not handed to
-		// ProcessConflicting, whose guard would refuse them; see
-		// alreadyResolvedConflictingNodes for why they exist and why they cannot
-		// be re-run.
-		var resolvedLosers []chainhash.Hash
-
-		conflictingNodes, resolvedLosers, err = stp.alreadyResolvedConflictingNodes(ctx, block, conflictingNodes)
+		// Nodes the store already shows resolved for this block are not
+		// re-resolved: ProcessConflicting is skipped when all of them are, and
+		// otherwise told which ones they are. See alreadyResolvedConflictingNodes
+		// for why they exist and why they cannot be re-run.
+		resolvedNodes, resolvedLosers, err := stp.alreadyResolvedConflictingNodes(ctx, block, conflictingNodes)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if len(conflictingNodes) > 0 {
+		if len(resolvedNodes) < len(conflictingNodes) {
 			var allMarkedConflicting []chainhash.Hash
 			losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-				utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block))
+				utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block),
+				utxostore.WithResolvedWinners(resolvedNodes))
 
 			// the store now says these are conflicting; subtree validation's txmeta cache must
 			// forget them. On error this is what the failed run may have flipped.

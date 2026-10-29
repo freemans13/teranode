@@ -63,3 +63,57 @@ func TestProcessConflicting_PartialStepOneKeepsIntent(t *testing.T) {
 	require.Len(t, spy.begun, 1)
 	require.Empty(t, spy.completed, "a resolution that committed part of step 1 must keep its intent for replay")
 }
+
+// TestProcessConflicting_TransientStepZeroFailureKeepsIntent pins why only a
+// refusal of the winner list may take the intent back out. The intent id is
+// deterministic and Begin is an upsert, so this call may have adopted the record
+// of an earlier run of the same list that was killed after mutating. A transient
+// failure at step 0, here the counter-conflicting lookup, says nothing about that
+// torn state, and deleting the intent would leave the next restart nothing to
+// recover.
+func TestProcessConflicting_TransientStepZeroFailureKeepsIntent(t *testing.T) {
+	ctx := context.Background()
+
+	winner := createTestHash("transient-step-zero-winner")
+
+	spy := &walSpyStore{MockUtxostore: &MockUtxostore{}}
+	spy.On("Get", mock.Anything, &winner, mock.Anything).Return(&meta.Data{Tx: bt.NewTx(), Conflicting: true}, nil)
+	spy.On("GetCounterConflicting", mock.Anything, winner).Return([]chainhash.Hash(nil), errors.NewStorageError("store unavailable"))
+
+	_, _, err := ProcessConflicting(ctx, spy, 100, chainhash.Hash{}, []chainhash.Hash{winner}, nil, NoAncestryGuard)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "store unavailable")
+	require.Len(t, spy.begun, 1)
+	require.Empty(t, spy.completed, "a transient step-0 failure must keep the intent, which may guard an earlier run's torn state")
+}
+
+// TestProcessConflicting_ResolvedWinnerIsNotWalkedOrRefused pins
+// WithResolvedWinners: a winner the store already shows resolved is neither
+// refused for being not conflicting nor walked for losers, and it stays a winner,
+// so it is spent at step 3 and cleared at step 4 with the rest.
+func TestProcessConflicting_ResolvedWinnerIsNotWalkedOrRefused(t *testing.T) {
+	ctx := context.Background()
+
+	pending := createTestHash("resolved-option-pending")
+	resolved := createTestHash("resolved-option-resolved")
+
+	spy := &walSpyStore{MockUtxostore: &MockUtxostore{}}
+	spy.On("Get", mock.Anything, &pending, mock.Anything).Return(&meta.Data{Tx: bt.NewTx(), Conflicting: true}, nil)
+	spy.On("Get", mock.Anything, &resolved, mock.Anything).Return(&meta.Data{Tx: bt.NewTx(), Conflicting: false}, nil)
+	spy.On("GetCounterConflicting", mock.Anything, pending).Return([]chainhash.Hash{}, nil)
+	spy.On("SetConflicting", mock.Anything, mock.Anything, mock.Anything).Return([]*Spend{}, []chainhash.Hash{}, nil)
+	spy.On("Unspend", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	spy.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, []*Spend{}, nil)
+	spy.On("SetLocked", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	winners := []chainhash.Hash{pending, resolved}
+
+	_, _, err := ProcessConflicting(ctx, spy, 100, chainhash.Hash{}, winners, nil, NoAncestryGuard, WithResolvedWinners([]chainhash.Hash{resolved}))
+
+	require.NoError(t, err)
+	spy.AssertNotCalled(t, "GetCounterConflicting", mock.Anything, resolved)
+	spy.AssertNumberOfCalls(t, "SpendAndCreate", 2)
+	spy.AssertCalled(t, "SetConflicting", mock.Anything, winners, false)
+	require.Equal(t, []chainhash.Hash{spy.begun[0].IntentID()}, spy.completed)
+}

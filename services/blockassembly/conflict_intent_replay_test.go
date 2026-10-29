@@ -399,6 +399,84 @@ func TestReplayPendingConflictIntents_RealStoreForwardAlreadyApplied(t *testing.
 	require.NotNil(t, items)
 
 	store := items.utxoStore
+	fx := newAppliedForwardFixture(t, store)
+
+	// A kill between step 4 and step 5 of the original run leaves the parent
+	// locked. The replay must unlock it even though it re-runs nothing.
+	require.NoError(t, store.SetLocked(ctx, []chainhash.Hash{fx.parent}, true))
+
+	intent := utxo.ConflictIntent{
+		Kind:        utxo.ConflictIntentForward,
+		BlockHeight: 10,
+		TxHashes:    []chainhash.Hash{fx.winner},
+		StartedAt:   1,
+	}
+	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+
+	// The intent's block is on the chain, so the forward intent is not stale.
+	items.blockAssembler.blockchainClient = blockchainMembershipMock(true, false)
+
+	items.blockAssembler.replayPendingConflictIntents(ctx)
+
+	pending, err := store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Empty(t, pending, "an already-applied forward intent must be cleared")
+
+	fx.requireUntouched(t, store)
+
+	parentMeta, err := store.Get(ctx, &fx.parent, utxofields.Locked)
+	require.NoError(t, err)
+	require.False(t, parentMeta.Locked, "the step-5 unlock a kill skipped must still happen")
+}
+
+// TestReplayPendingConflictIntents_StaleReverseLeavesResolvedWinnerAlone covers
+// the heal of a reverse intent whose block is back on the longest chain. The
+// heal re-applies the forward. A reverse killed before it reached a winner
+// leaves that winner resolved, and re-running the forward on it would walk from
+// the parents' recorded spender, the winner itself, and demote its mined child.
+// The heal must take the same already-applied filter as the forward replay.
+func TestReplayPendingConflictIntents_StaleReverseLeavesResolvedWinnerAlone(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	require.NotNil(t, items)
+
+	store := items.utxoStore
+	fx := newAppliedForwardFixture(t, store)
+
+	intent := utxo.ConflictIntent{
+		Kind:        utxo.ConflictIntentReverse,
+		BlockHeight: 10,
+		BlockHash:   chainhash.HashH([]byte("reverse-back-on-chain")),
+		TxHashes:    []chainhash.Hash{fx.winner},
+		StartedAt:   1,
+	}
+	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+
+	// The block is on the longest chain again, so the reverse intent is stale.
+	items.blockAssembler.blockchainClient = blockchainMembershipMock(true, false)
+
+	items.blockAssembler.replayPendingConflictIntents(ctx)
+
+	pending, err := store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Empty(t, pending, "the healed reverse intent must be cleared")
+
+	fx.requireUntouched(t, store)
+}
+
+// appliedForwardFixture is the store after a forward resolution ran in full: the
+// loser is demoted, the winner holds parent[0] and is not conflicting, and a
+// child of the winner was mined in a later block.
+type appliedForwardFixture struct {
+	parent, loser, winner, child chainhash.Hash
+}
+
+func newAppliedForwardFixture(t *testing.T, store utxo.Store) appliedForwardFixture {
+	t.Helper()
+
+	ctx := t.Context()
 	require.NoError(t, store.SetBlockHeight(10))
 
 	parent := bt.NewTx()
@@ -438,40 +516,133 @@ func TestReplayPendingConflictIntents_RealStoreForwardAlreadyApplied(t *testing.
 	child.Outputs = []*bt.Output{{Satoshis: 70000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
 	_, _, err = store.SpendAndCreate(ctx, child, 11)
 	require.NoError(t, err)
-	childHash := child.TxIDChainHash()
+	return appliedForwardFixture{
+		parent: *parentHash,
+		loser:  *loser.TxIDChainHash(),
+		winner: *winnerHash,
+		child:  *child.TxIDChainHash(),
+	}
+}
+
+// requireUntouched asserts the store still holds the fixture's resolved state.
+func (fx appliedForwardFixture) requireUntouched(t *testing.T, store utxo.Store) {
+	t.Helper()
+
+	ctx := t.Context()
+
+	childMeta, err := store.Get(ctx, &fx.child, utxofields.Conflicting)
+	require.NoError(t, err)
+	require.False(t, childMeta.Conflicting, "the winner's mined child must not be demoted by the replay")
+
+	winnerMeta, err := store.Get(ctx, &fx.winner, utxofields.Utxos, utxofields.Conflicting)
+	require.NoError(t, err)
+	require.False(t, winnerMeta.Conflicting)
+	require.NotNil(t, winnerMeta.SpendingDatas[0], "the child's spend of the winner must survive the replay")
+	require.Equal(t, fx.child, *winnerMeta.SpendingDatas[0].TxID)
+
+	parentMeta, err := store.Get(ctx, &fx.parent, utxofields.Utxos)
+	require.NoError(t, err)
+	require.Equal(t, fx.winner, *parentMeta.SpendingDatas[0].TxID, "the winner keeps parent[0]")
+
+	loserMeta, err := store.Get(ctx, &fx.loser, utxofields.Conflicting)
+	require.NoError(t, err)
+	require.True(t, loserMeta.Conflicting)
+}
+
+// TestReplayPendingConflictIntents_DependentWinnersOneResolved covers a forward
+// intent with dependent winners A and B, B spending A, where a crash inside step
+// 4 cleared B but not A, with both spends landed. The replay re-runs A. The walk
+// from A starts at the parent's recorded spender, A itself, and reaches B, which
+// is mined in this block. If B were left out of the winner list, the ancestry
+// guard would refuse it as a loser mined on the block's own ancestry, abandon the
+// resolution and queue a valid block for invalidation; and even unguarded, step 2
+// would undo B's spend with no step 3 to restore it. The guard below answers
+// "on the ancestry" for every block, so any loser with block ids is refused.
+func TestReplayPendingConflictIntents_DependentWinnersOneResolved(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	require.NotNil(t, items)
+
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+
+	parent := bt.NewTx()
+	parentIn := &bt.Input{PreviousTxOutIndex: 0, PreviousTxSatoshis: 200000, SequenceNumber: 0xFFFFFFFF, UnlockingScript: bscript.NewFromBytes([]byte{})}
+	_ = parentIn.PreviousTxIDAdd(&chainhash.Hash{5, 5, 5})
+	parent.Inputs = []*bt.Input{parentIn}
+	parent.Outputs = []*bt.Output{{Satoshis: 100000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err := store.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	parentHash := parent.TxIDChainHash()
+	require.NoError(t, store.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*parentHash}, true))
+
+	// A: still flagged, but already the recorded spender of parent[0].
+	txA := bt.NewTx()
+	require.NoError(t, txA.From(parentHash.String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	txA.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+	txA.Outputs = []*bt.Output{{Satoshis: 90000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err = store.SpendAndCreate(ctx, txA, 10, utxo.WithConflicting(true), utxo.WithCreateOnly())
+	require.NoError(t, err)
+	_, _, err = store.SpendAndCreate(ctx, txA, 10, utxo.WithSpendOnly(), utxo.WithIgnoreConflicting(true))
+	require.NoError(t, err)
+	aHash := *txA.TxIDChainHash()
+
+	// B: spends A[0], mined in the intent's block, and already cleared.
+	txB := bt.NewTx()
+	require.NoError(t, txB.From(aHash.String(), 0, txA.Outputs[0].LockingScript.String(), txA.Outputs[0].Satoshis))
+	txB.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+	txB.Outputs = []*bt.Output{{Satoshis: 80000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err = store.SpendAndCreate(ctx, txB, 10, utxo.WithCreateOnly(),
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 10, OnLongestChain: true}))
+	require.NoError(t, err)
+	_, _, err = store.SpendAndCreate(ctx, txB, 10, utxo.WithSpendOnly(), utxo.WithIgnoreConflicting(true))
+	require.NoError(t, err)
+	bHash := *txB.TxIDChainHash()
+	_, _, err = store.SetConflicting(ctx, []chainhash.Hash{bHash}, false)
+	require.NoError(t, err)
+
+	applied, err := utxo.ForwardResolutionApplied(ctx, store, bHash)
+	require.NoError(t, err)
+	require.True(t, applied, "precondition: B is resolved")
+
+	applied, err = utxo.ForwardResolutionApplied(ctx, store, aHash)
+	require.NoError(t, err)
+	require.False(t, applied, "precondition: A is pending")
 
 	intent := utxo.ConflictIntent{
 		Kind:        utxo.ConflictIntentForward,
 		BlockHeight: 10,
-		TxHashes:    []chainhash.Hash{*winnerHash},
+		BlockHash:   chainhash.HashH([]byte("dependent-winners-block")),
+		TxHashes:    []chainhash.Hash{aHash, bHash},
 		StartedAt:   1,
 	}
 	require.NoError(t, store.BeginConflictIntent(ctx, intent))
 
-	// The intent's block is on the chain, so the forward intent is not stale.
-	items.blockAssembler.blockchainClient = blockchainMembershipMock(true, false)
+	bc := blockchainMembershipMock(true, false)
+	bc.On("CheckBlockIsAncestorOfBlock", mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+	items.blockAssembler.blockchainClient = bc
 
 	items.blockAssembler.replayPendingConflictIntents(ctx)
 
+	require.Empty(t, items.blockAssembler.subtreeProcessor.DrainPendingInvalidations(), "a valid block must not be queued for invalidation")
+
 	pending, err := store.PendingConflictIntents(ctx)
 	require.NoError(t, err)
-	require.Empty(t, pending, "an already-applied forward intent must be cleared")
+	require.Empty(t, pending)
 
-	childMeta, err := store.Get(ctx, childHash, utxofields.Conflicting)
+	aMeta, err := store.Get(ctx, &aHash, utxofields.Utxos, utxofields.Conflicting)
 	require.NoError(t, err)
-	require.False(t, childMeta.Conflicting, "the winner's mined child must not be demoted by the replay")
+	require.False(t, aMeta.Conflicting, "the pending winner is resolved")
+	require.NotNil(t, aMeta.SpendingDatas[0], "B's spend of A must be restored")
+	require.Equal(t, bHash, *aMeta.SpendingDatas[0].TxID)
 
-	winnerMeta, err := store.Get(ctx, winnerHash, utxofields.Utxos, utxofields.Conflicting)
+	bMeta, err := store.Get(ctx, &bHash, utxofields.Conflicting)
 	require.NoError(t, err)
-	require.False(t, winnerMeta.Conflicting)
-	require.NotNil(t, winnerMeta.SpendingDatas[0], "the child's spend of the winner must survive the replay")
-	require.Equal(t, childHash, winnerMeta.SpendingDatas[0].TxID)
+	require.False(t, bMeta.Conflicting, "the resolved winner stays resolved")
 
 	parentMeta, err := store.Get(ctx, parentHash, utxofields.Utxos)
 	require.NoError(t, err)
-	require.Equal(t, winnerHash, parentMeta.SpendingDatas[0].TxID, "the winner keeps parent[0]")
-
-	loserMeta, err := store.Get(ctx, loser.TxIDChainHash(), utxofields.Conflicting)
-	require.NoError(t, err)
-	require.True(t, loserMeta.Conflicting)
+	require.Equal(t, aHash, *parentMeta.SpendingDatas[0].TxID)
 }
