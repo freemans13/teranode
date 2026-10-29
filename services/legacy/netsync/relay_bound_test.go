@@ -24,6 +24,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -248,6 +249,10 @@ func TestHandleInvMsg_SkipsTransactionItemsOutsideRunning(t *testing.T) {
 func newRelayHarness(t *testing.T, queueLen int) (*SyncManager, *peerpkg.Peer) {
 	t.Helper()
 
+	// A drop increments prometheusLegacyNetsyncRelayedTxDropped, which is nil
+	// until the metrics are registered; New does this in production.
+	initPrometheusMetrics()
+
 	tSettings := test.CreateBaseTestSettings(t)
 
 	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
@@ -292,9 +297,37 @@ func TestQueueTx_DropsWhenTheRelayQueueIsFull(t *testing.T) {
 	queueTxWithin(t, sm, tx, p)
 	require.Len(t, sm.relayTxQueue, 1)
 
+	dropped := testutil.ToFloat64(prometheusLegacyNetsyncRelayedTxDropped)
+
 	queueTxWithin(t, sm, tx, p)
 	require.Len(t, sm.relayTxQueue, 1, "a transaction over the queue's capacity must be dropped")
 	require.Equal(t, size, sm.relayTxBytes.Load(), "a dropped transaction must not stay charged to the byte budget")
+	require.InDelta(t, dropped+1, testutil.ToFloat64(prometheusLegacyNetsyncRelayedTxDropped), 0, "a drop must be counted")
+}
+
+// TestQueueTx_TakesOneTransactionLargerThanTheBudget pins the exception to the
+// byte bound: a transaction larger than relayTxBytesBudget is queued when
+// nothing else is held, so it is not refused for ever, and a second one is
+// dropped while the first is held.
+func TestQueueTx_TakesOneTransactionLargerThanTheBudget(t *testing.T) {
+	sm, p := newRelayHarness(t, 4)
+
+	big := wire.NewMsgTx(1)
+	big.AddTxOut(wire.NewTxOut(0, make([]byte, relayTxBytesBudget+1)))
+	tx := bsvutil.NewTx(big)
+	size := int64(big.SerializeSize())
+	require.Greater(t, size, int64(relayTxBytesBudget))
+
+	queueTxWithin(t, sm, tx, p)
+	require.Len(t, sm.relayTxQueue, 1, "a transaction larger than the budget must be taken when nothing else is held")
+	require.Equal(t, size, sm.relayTxBytes.Load())
+
+	dropped := testutil.ToFloat64(prometheusLegacyNetsyncRelayedTxDropped)
+
+	queueTxWithin(t, sm, tx, p)
+	require.Len(t, sm.relayTxQueue, 1, "a second transaction over the budget must be dropped while the first is held")
+	require.Equal(t, size, sm.relayTxBytes.Load())
+	require.InDelta(t, dropped+1, testutil.ToFloat64(prometheusLegacyNetsyncRelayedTxDropped), 0, "a drop must be counted")
 }
 
 // TestQueueTx_DropsOverTheByteBudget pins the byte bound: a transaction that

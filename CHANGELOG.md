@@ -297,7 +297,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `utxostore_storeBatcherSize`, `utxostore_spendBatcherSize` and
   `validator_sendBatchSize`, and never fewer than 1024 (4096 with the defaults in
   `settings.conf`). They wait in a queue four times that long, and the transactions
-  queued or being validated hold at most 256 MiB. A transaction that finds the queue full
+  queued or being validated hold at most 256 MiB, except that one transaction larger than
+  that is still taken when nothing else is held. A transaction that finds the queue full
   or the budget spent is dropped, not waited for; the node relies on getting it again
   from another peer or in the block that mines it. Drops are counted in the new
   `teranode_legacy_netsync_relayed_tx_dropped_total`. With the workers busy for the
