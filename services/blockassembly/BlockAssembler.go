@@ -220,9 +220,8 @@ type BlockAssembler struct {
 	// does not number the changes, which leaves block assembly following the best header.
 	bestTipSeq                atomic.Uint64
 	bestTipSeqKnown           atomic.Bool
-	bestTipResetReplayPending atomic.Bool // candidates stay empty until reset's pending history succeeds
+	bestTipResetReplayPending atomic.Bool // candidates stay empty until reset's pending history succeeds or is given up
 	bestTipResetIncomplete    atomic.Bool // reset moved its target but has not finished reloading/persisting
-	bestTipResetRetryBlocked  atomic.Bool // persistent pre-rotation disk fault requires an explicit reset
 
 	// bestTipSeqSaved is the position last persisted under BestTipSeqStateKey.
 	bestTipSeqSaved atomic.Uint64
@@ -707,10 +706,16 @@ drain:
 
 	// A reset traverses only its endpoint lineages. Keep the replay position so any
 	// briefly winning branch outside those lineages is still replayed afterwards.
+	wasPending := b.bestTipResetReplayPending.Load()
 	if b.bestTipSeqKnown.Load() {
 		b.bestTipResetReplayPending.Store(true)
 	}
 	resp, err := b.resetWithResponse(ctx, validateInputs)
+	if err != nil && !resp.Rotated {
+		// Nothing was discarded: block assembly is still on its old tip with its old pool,
+		// and the ordinary replay from the unchanged position carries it forward.
+		b.bestTipResetReplayPending.Store(wasPending)
+	}
 	// Judge the storage outcome of this reset before replay can return an
 	// unrelated history error. A clean rotation still cured its disk fault.
 	b.onResetDone(storageTriggered, resp, err)
@@ -1101,15 +1106,22 @@ func (b *BlockAssembler) resetToBlockWithResponse(ctx context.Context, bestBlock
 	// does not depend on a lookup that can itself fail. See resetBlockHeights.
 	resetHeights := resetBlockHeights(bestBlockchainBlockHeader, currentHeight, moveBackBlocksWithMeta, moveForwardBlocksWithMeta)
 
+	wasIncomplete, wasPending := b.bestTipResetIncomplete.Load(), b.bestTipResetReplayPending.Load()
 	if b.bestTipSeqKnown.Load() {
 		b.bestTipResetIncomplete.Store(true)
 		b.bestTipResetReplayPending.Store(true)
 	}
 
-	b.bestTipResetRetryBlocked.Store(false)
 	resp = b.subtreeProcessor.Reset(baBestBlockHeader, moveBackBlocks, moveForwardBlocks, useFastForwardReset, postProcessFn)
 	if resp.Err != nil {
 		b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", resp.Err)
+
+		if !resp.Rotated {
+			// The subtree processor failed before its tx map rotation, so it still holds its
+			// old tip, subtrees and pool. Nothing was discarded that a replay must rebuild.
+			b.bestTipResetIncomplete.Store(wasIncomplete)
+			b.bestTipResetReplayPending.Store(wasPending)
+		}
 		// something went wrong, we need to set the best block header in the block assembly to be the
 		// same as the subtree processor's best block header
 		stpHeader := b.subtreeProcessor.GetCurrentBlockHeader()
@@ -2230,13 +2242,6 @@ func (b *BlockAssembler) resetToBlockAndRecord(ctx context.Context, header *mode
 //     discarded the phantom, or a manual/reorg reset whose reload left one,
 //     which raises its own request): unchanged.
 func (b *BlockAssembler) onResetDone(storageTriggered bool, resp subtreeprocessor.ResetResponse, resetErr error) {
-	// Keep pending history guarded, but do not let mandatory recovery bypass
-	// persistent disk-fault protection when the old map was never rotated.
-	if resetErr != nil && resp.StorageFailed && !resp.Rotated {
-		b.bestTipResetRetryBlocked.Store(true)
-	} else if resetErr == nil && !resp.StorageFailed {
-		b.bestTipResetRetryBlocked.Store(false)
-	}
 	if storageTriggered {
 		b.lastStorageResetDone = time.Now()
 	}

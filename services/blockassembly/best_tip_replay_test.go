@@ -92,7 +92,10 @@ func requireBlockAssemblyTip(t *testing.T, items *baTestItems, want *model.Block
 func TestReplayBestTipChanges_FlipFlop(t *testing.T) {
 	initPrometheusMetrics()
 
-	items := setupBlockAssemblyTest(t)
+	// A realistic maturity: the test settings use 1, under which moving back over any block
+	// of the best chain could delete a confirmed spend of its coinbase, and the replay
+	// restamps the branch instead of moving over it.
+	items := setupBlockAssemblyTest(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	genesis := genesisHeader(t, items)
 
 	a1 := buildChain(genesis, 1, 1000)[0]
@@ -306,7 +309,7 @@ func TestReplayBestTipChanges_InvalidOnOwnChainIsLeftToTheNextChange(t *testing.
 func TestReplayBestTipChanges_RestartResumesFromPersistedPosition(t *testing.T) {
 	initPrometheusMetrics()
 
-	items := setupBlockAssemblyTest(t)
+	items := setupBlockAssemblyTest(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	genesis := genesisHeader(t, items)
 
 	a1 := buildChain(genesis, 1, 10000)[0]
@@ -524,16 +527,16 @@ func TestBestTipSeqEncoding(t *testing.T) {
 	require.Error(t, err)
 }
 
-// Regression proof: a historical tip that takes reset must still be traversed.
-func TestReplayBestTipChanges_ResetVisitsHistoricalWinner(t *testing.T) {
-	initPrometheusMetrics()
+// historicalWinnerSetup puts block assembly on A1 at height 1002 with its position there, then
+// adds branch B of bLen blocks off A1's parent and branch A of aLen blocks on A1, so B is the
+// best chain for a while and A wins it back. It records every Reorg and Reset.
+func historicalWinnerSetup(t *testing.T, retention uint32, bLen, aLen int) (*baTestItems, *model.BlockHeader, []*model.BlockHeader, []*model.BlockHeader, *[]recordedMove, *[]recordedMove) {
+	t.Helper()
+
 	items := setupBlockAssemblyTest(t, func(s *settings.Settings) {
-		s.GlobalBlockHeightRetention = 288
+		s.GlobalBlockHeightRetention = retention
 		s.UtxoStore.BlockHeightRetentionAdjustment = 0
-		params := *s.ChainCfgParams
-		params.CoinbaseMaturity = 100
-		s.ChainCfgParams = &params
-	})
+	}, withCoinbaseMaturity(testCoinbaseMaturity))
 	genesis := genesisHeader(t, items)
 	prefix := buildChain(genesis, 1001, 18000)
 	addChain(t, items, prefix)
@@ -544,7 +547,7 @@ func TestReplayBestTipChanges_ResetVisitsHistoricalWinner(t *testing.T) {
 	moves := recordMoves(t, items)
 	mockStp := items.blockAssembler.subtreeProcessor.(*subtreeprocessor.MockSubtreeProcessor)
 	mockStp.On("WaitForPendingBlocks", mock.Anything).Return(nil)
-	resetMoves := []recordedMove{}
+	resetMoves := &[]recordedMove{}
 	mockStp.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(subtreeprocessor.ResetResponse{}).Run(func(args mock.Arguments) {
 		m := recordedMove{}
@@ -554,35 +557,76 @@ func TestReplayBestTipChanges_ResetVisitsHistoricalWinner(t *testing.T) {
 		for _, block := range args.Get(2).([]*model.Block) {
 			m.forward = append(m.forward, block.Hash().String())
 		}
-		resetMoves = append(resetMoves, m)
+		*resetMoves = append(*resetMoves, m)
 	})
-	b := buildChain(common, 100, 16000)
+	b := buildChain(common, bLen, 16000)
 	addChain(t, items, b)
-	a := buildChain(a1, 100, 17000)
+	a := buildChain(a1, aLen, 17000)
 	addChain(t, items, a)
-	read, err := items.blockAssembler.replayBestTipChanges(t.Context())
+
+	return items, a1, a, b, moves, resetMoves
+}
+
+// movesTouch reports whether any recorded move takes hash back, and whether any takes it forward.
+func movesTouch(hash string, moves ...[]recordedMove) (back, forward bool) {
+	for _, ms := range moves {
+		for _, m := range ms {
+			for _, h := range m.back {
+				back = back || h == hash
+			}
+			for _, h := range m.forward {
+				forward = forward || h == hash
+			}
+		}
+	}
+
+	return back, forward
+}
+
+// Regression proof: a historical tip that takes reset must still be traversed. B is longer
+// than the UTXO retention, so moving to it is a reset, while the best tip stays less than
+// coinbase maturity above A1, so moving A1 back cannot touch a confirmed coinbase spend.
+func TestReplayBestTipChanges_ResetVisitsHistoricalWinner(t *testing.T) {
+	initPrometheusMetrics()
+	items, _, a, b, moves, resetMoves := historicalWinnerSetup(t, 50, 60, 61)
+
+	_, err := items.blockAssembler.replayBestTipChanges(t.Context())
 	require.NoError(t, err)
-	t.Logf("read=%d retention=%d coinbaseMaturity=%d", read, items.blockAssembler.settings.GetUtxoStoreBlockHeightRetention(), items.blockAssembler.settings.ChainCfgParams.CoinbaseMaturity)
 	requireBlockAssemblyTip(t, items, a[len(a)-1])
 	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
-	t.Logf("incremental moves=%d resets=%d first reset back=%d forward=%d", len(*moves), len(resetMoves), len(resetMoves[0].back), len(resetMoves[0].forward))
-	appliedHistorical := false
-	for _, m := range append(*moves, resetMoves...) {
-		for _, hash := range append(m.back, m.forward...) {
-			if hash == b[len(b)-1].Hash().String() {
-				appliedHistorical = true
-			}
-		}
-	}
-	require.True(t, appliedHistorical, "B2 became best within the height floor, but replay checkpointed it without passing either B block to the subtree processor")
+	require.NotEmpty(t, *resetMoves)
+	_, forward := movesTouch(b[len(b)-1].Hash().String(), *moves, *resetMoves)
+	require.True(t, forward, "B became best within the height floor, but replay checkpointed it without passing B to the subtree processor")
+}
+
+// TestReplayBestTipChanges_DeepHistoricalWinnerIsRestamped is the coinbase case: the best tip is
+// coinbase maturity blocks above A1, so a spend of A1's coinbase can already be confirmed on A.
+// Moving A1 back to visit B would delete that spend for good, so the replay never moves A1 back.
+// It restamps B where it lies and reloads the pool on block assembly's own tip instead.
+func TestReplayBestTipChanges_DeepHistoricalWinnerIsRestamped(t *testing.T) {
+	initPrometheusMetrics()
+	items, a1, a, b, moves, resetMoves := historicalWinnerSetup(t, 288, 100, 100)
+
+	_, err := items.blockAssembler.replayBestTipChanges(t.Context())
+	require.NoError(t, err)
+	requireBlockAssemblyTip(t, items, a[len(a)-1])
+	latest, err := items.blockchainClient.GetBestTipSeq(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, latest, items.blockAssembler.bestTipSeq.Load())
+
+	back, _ := movesTouch(a1.Hash().String(), *moves, *resetMoves)
+	require.False(t, back, "A1 is on the best chain and its coinbase may be spent there: it must never be moved back")
+	_, forward := movesTouch(b[len(b)-1].Hash().String(), *moves, *resetMoves)
+	require.False(t, forward, "B is restamped where it lies, not moved to")
+	require.Contains(t, *resetMoves, recordedMove{}, "the restamp reloads the pool on block assembly's own tip")
 }
 
 // Regression proof: a historical tip that takes reset must still be traversed.
 func TestReplayBestTipChanges_ExternalResetRetainsPendingHistory(t *testing.T) {
 	initPrometheusMetrics()
-	items := setupBlockAssemblyTest(t)
+	items := setupBlockAssemblyTest(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	genesis := genesisHeader(t, items)
 	a1 := buildChain(genesis, 1, 15000)[0]
 	addChain(t, items, []*model.BlockHeader{a1})
@@ -709,10 +753,12 @@ func TestReplayBestTipChanges_ExternalResetFailureGatesCandidates(t *testing.T) 
 	candidate, _, err := ba.GetMiningCandidate(t.Context())
 	require.NoError(t, err)
 	require.Zero(t, candidate.NumTxs, "current tip must not expose child-only pool while replay is pending")
-	for range maxBestTipReplayFailures {
-		require.False(t, ba.followBestTipChanges(t.Context()))
+	for i := 1; i < maxBestTipReplayFailures; i++ {
+		require.False(t, ba.followBestTipChanges(t.Context()), "pass %d retries the pending history", i)
+		require.True(t, ba.bestTipResetReplayPending.Load())
 	}
-	require.True(t, ba.bestTipResetReplayPending.Load())
+	require.True(t, ba.followBestTipChanges(t.Context()), "the last failure gives the history up and follows the best header")
+	require.False(t, ba.bestTipResetReplayPending.Load(), "a replay that keeps failing must not hold candidates empty for ever")
 	client.fail = false
 	ba.processNewBlockAnnouncement(t.Context())
 	require.False(t, ba.bestTipResetReplayPending.Load())

@@ -29,22 +29,21 @@ func replayPoolTx(parent *chainhash.Hash, amount uint64) *bt.Tx {
 }
 
 func TestReplayBestTipChanges_ResetRecoversParentBeforeChild(t *testing.T) {
-	for _, lateFailure := range []bool{false, true} {
-		name := "normal"
-		if lateFailure {
-			name = "retry_after_target_finalized"
-		}
-		t.Run(name, func(t *testing.T) { testReplayResetPool(t, lateFailure) })
-	}
+	t.Run("normal", func(t *testing.T) { testReplayResetPool(t, false, testCoinbaseMaturity) })
+	t.Run("retry_after_target_finalized", func(t *testing.T) { testReplayResetPool(t, true, testCoinbaseMaturity) })
+	// With maturity 1 the move from A1 to B2 would take A1 back although A3 builds on it,
+	// and a spend of A1's coinbase could already be confirmed. The replay restamps B
+	// where it lies instead, and the parent still reaches the pool ahead of its child.
+	t.Run("restamped_below_coinbase_maturity", func(t *testing.T) { testReplayResetPool(t, false, 1) })
 }
 
-func testReplayResetPool(t *testing.T, lateFailure bool) {
+func testReplayResetPool(t *testing.T, lateFailure bool, coinbaseMaturity uint16) {
 	initPrometheusMetrics()
 	items := setupBlockAssemblyTest(t, func(s *settings.Settings) {
 		s.GlobalBlockHeightRetention = 2
 		s.UtxoStore.BlockHeightRetentionAdjustment = 0
 		s.BlockAssembly.StoreTxInpointsForSubtreeMeta = true
-	})
+	}, withCoinbaseMaturity(coinbaseMaturity))
 	ba := items.blockAssembler
 	ba.subtreeProcessor.Stop(context.Background())
 	stp, err := subtreeprocessor.NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, ba.settings, items.blobStore, items.blockchainClient, items.utxoStore, items.newSubtreeChan)
@@ -98,7 +97,8 @@ func testReplayResetPool(t *testing.T, lateFailure bool) {
 		_, err = ba.replayBestTipChanges(t.Context())
 		require.Error(t, err)
 		requireBlockAssemblyTip(t, items, b[1])
-		for range maxBestTipReplayFailures {
+		// One pass short of giving the history up: the retries keep the position.
+		for i := 1; i < maxBestTipReplayFailures; i++ {
 			require.False(t, ba.followBestTipChanges(t.Context()))
 			require.Equal(t, seq, ba.bestTipSeq.Load(), "finalized target is not a successful reload")
 		}
@@ -118,4 +118,40 @@ func testReplayResetPool(t *testing.T, lateFailure bool) {
 	data, err := items.utxoStore.Get(t.Context(), parent.TxIDChainHash())
 	require.NoError(t, err)
 	require.NotZero(t, data.UnminedSince, "orphaned parent must survive restart/pruning")
+}
+
+// TestBranchOnlyTxs checks which transactions of a stale branch a restamp marks: one that a block
+// of the best chain also contains stays mined, one only the stale branch contains is marked, and
+// one the UTXO store has pruned is left out.
+func TestBranchOnlyTxs(t *testing.T) {
+	initPrometheusMetrics()
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+	a := buildChain(genesis, 2, 32000)
+	b := buildChain(genesis, 1, 33000)
+	for _, h := range append(a, b...) {
+		addBlockWithMinedSet(t.Context(), t, items, h)
+	}
+	_, aMeta, err := items.blockchainClient.GetBlockHeader(t.Context(), a[0].Hash())
+	require.NoError(t, err)
+	_, bMeta, err := items.blockchainClient.GetBlockHeader(t.Context(), b[0].Hash())
+	require.NoError(t, err)
+
+	both := replayPoolTx(&chainhash.Hash{}, 100)
+	staleOnly := replayPoolTx(&chainhash.Hash{}, 99)
+	pruned := replayPoolTx(&chainhash.Hash{}, 98)
+	for _, tx := range []*bt.Tx{both, staleOnly} {
+		_, err = items.utxoStore.(*utxosql.Store).Create(t.Context(), tx, 1)
+		require.NoError(t, err)
+	}
+	_, err = items.utxoStore.SetMinedMulti(t.Context(), []*chainhash.Hash{both.TxIDChainHash(), staleOnly.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: bMeta.ID, BlockHeight: 1})
+	require.NoError(t, err)
+	_, err = items.utxoStore.SetMinedMulti(t.Context(), []*chainhash.Hash{both.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: aMeta.ID, BlockHeight: 1})
+	require.NoError(t, err)
+
+	got, err := items.blockAssembler.branchOnlyTxs(t.Context(),
+		[]chainhash.Hash{*both.TxIDChainHash(), *staleOnly.TxIDChainHash(), *pruned.TxIDChainHash()},
+		map[uint32]struct{}{bMeta.ID: {}}, a[1])
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{*staleOnly.TxIDChainHash()}, got)
 }

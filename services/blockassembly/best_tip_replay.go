@@ -7,8 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 )
 
 // BestTipSeqStateKey is the key under which block assembly persists its replay position, the
@@ -126,10 +130,18 @@ func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 
 		// The best-header path moves straight to the tip, so the changes before it are
 		// given up. A change after this read is replayed on the next pass.
-		if b.bestTipResetReplayPending.Load() {
-			b.logger.Errorf("[BlockAssembler] replay failed %d times; retaining pending reset history for recovery: %v", failures, err)
-			return false
+		//
+		// That includes the history a reset left pending. The reset already rebuilt the
+		// pool on its target, so giving the history up leaves the pool as it was before
+		// the replay existed, and candidates are built from it again. Holding on would
+		// keep every candidate empty for as long as the failure lasts.
+		if b.bestTipResetReplayPending.Load() || b.bestTipResetIncomplete.Load() {
+			b.logger.Errorf("[BlockAssembler] replay failed %d times in a row, giving up the history a reset left pending so mining candidates are built again: %v", failures, err)
+			prometheusBlockAssemblyProcessingStuck.WithLabelValues("best_tip_reset_replay_abandoned").Inc()
+			b.bestTipResetReplayPending.Store(false)
+			b.bestTipResetIncomplete.Store(false)
 		}
+
 		b.logger.Errorf("[BlockAssembler] replay of best tip changes failed %d times in a row, following the best header instead: %v", failures, err)
 
 		if seq, seqErr := b.blockchainClient.GetBestTipSeq(ctx); seqErr == nil {
@@ -183,9 +195,6 @@ func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) {
 	read := 0
 
-	if b.bestTipResetRetryBlocked.Load() {
-		return read, errors.NewStorageError("pending reset requires disk storage recovery before replay")
-	}
 	// A reset can finalize its target before its reload or state write fails.
 	// Retry that rebuild before the hash-equality fast path can acknowledge it.
 	if b.bestTipResetIncomplete.Load() {
@@ -306,9 +315,187 @@ func (b *BlockAssembler) applyBestTipChange(ctx context.Context, header *model.B
 		return errBestTipReset
 	}
 
+	if !last && !header.HashPrevBlock.IsEqual(tip.Hash()) {
+		restamped, err := b.restampDeepStaleBranch(ctx, header, meta)
+		if err != nil || restamped {
+			return err
+		}
+	}
+
 	b.logger.Infof("[BlockAssembler] replaying best tip change %d: %s", meta.Height, hash)
 
 	return b.moveToBlock(ctx, header, meta)
+}
+
+// restampDeepStaleBranch handles a past change whose move would take block assembly back over
+// blocks of the current best chain whose coinbases may already be spent. It reports whether it
+// handled the change, in which case block assembly has not moved.
+//
+// Moving back a block deletes every child spend of its coinbase (removeCoinbaseUtxos). On a real
+// reorg those spends are on the losing side. Here the blocks moved back are on the chain that
+// won, and moving forward again recreates only the coinbases, so confirmed transactions would be
+// lost and the coinbases would read as unspent. A coinbase can be spent from coinbase maturity
+// blocks above it, so a move back is safe while the best tip is less than maturity blocks above
+// the lowest block it moves back. That always holds for a change replayed from the change before
+// it, which is the move the chain itself made. It can fail when block assembly is ahead of the
+// change: after a reset straight to the best tip, after a crash late in a long pass, or on a
+// start without a persisted position.
+//
+// Such a change is applied at its own depth instead. Block assembly never applied the stale
+// branch, so it never swapped the branch's conflicts or created its coinbases, and what is left to
+// undo is the mined mark block validation gave the branch's transactions. restampStaleBranch
+// clears that mark and reloads the pool on block assembly's current tip.
+func (b *BlockAssembler) restampDeepStaleBranch(ctx context.Context, header *model.BlockHeader, meta *model.BlockHeaderMeta) (bool, error) {
+	moveBack, moveForward, err := b.getReorgBlockHeaders(ctx, header, meta.Height)
+	if err != nil {
+		return false, errors.NewProcessingError("[restampDeepStaleBranch] error getting the path to %s", header.Hash(), err)
+	}
+
+	if len(moveBack) == 0 {
+		return false, nil
+	}
+
+	best, bestMeta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return false, errors.NewProcessingError("[restampDeepStaleBranch] error getting best block header", err)
+	}
+
+	lowest := moveBack[len(moveBack)-1].meta
+	maturity := uint64(b.settings.ChainCfgParams.CoinbaseMaturity) //nolint:gosec // maturity is a small positive chain parameter
+
+	// Spendable from height lowest+maturity, and the next block is bestHeight+1.
+	if uint64(bestMeta.Height)+1 < uint64(lowest.Height)+maturity {
+		return false, nil
+	}
+
+	onBest, err := b.blockchainClient.CheckBlockIsAncestorOfBlock(ctx, []uint32{lowest.ID}, best.Hash())
+	if err != nil {
+		return false, errors.NewProcessingError("[restampDeepStaleBranch] error checking whether %s is on the best chain", moveBack[len(moveBack)-1].header.Hash(), err)
+	}
+
+	if !onBest {
+		// Every block moved back is on a branch that lost, so its coinbase spends lost too.
+		return false, nil
+	}
+
+	b.logger.Warnf("[BlockAssembler] best tip change %d: %s is %d blocks below the best tip on a stale branch, restamping its %d blocks instead of moving back over the best chain", meta.Height, header.Hash(), bestMeta.Height-lowest.Height+1, len(moveForward))
+
+	return true, b.restampStaleBranch(ctx, moveForward, best)
+}
+
+// restampStaleBranch marks every transaction of the given stale blocks that no block of the best
+// chain contains as not on the longest chain, then reloads the pool on block assembly's tip so
+// those transactions are in it. A transaction the UTXO store has pruned is left out: it has no
+// record to mark. Invalid blocks are left to block validation, which unmarks their transactions
+// when it processes the invalidation.
+func (b *BlockAssembler) restampStaleBranch(ctx context.Context, branch []blockHeaderWithMeta, best *model.BlockHeader) error {
+	staleIDs := make(map[uint32]struct{}, len(branch))
+	hashes := make([]chainhash.Hash, 0, len(branch)*100)
+
+	for _, hm := range branch {
+		if hm.meta.Invalid {
+			continue
+		}
+
+		b.heartbeat.BeatIfStarted()
+
+		staleIDs[hm.meta.ID] = struct{}{}
+
+		block, err := b.blockchainClient.GetBlock(ctx, hm.header.Hash())
+		if err != nil {
+			return errors.NewProcessingError("[restampStaleBranch] error getting block %s", hm.header.Hash(), err)
+		}
+
+		subtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
+		if err != nil {
+			return errors.NewProcessingError("[restampStaleBranch] error getting subtrees of block %s", hm.header.Hash(), err)
+		}
+
+		for _, st := range subtrees {
+			for _, node := range st.Nodes {
+				if !node.Hash.IsEqual(subtree.CoinbasePlaceholderHash) {
+					hashes = append(hashes, node.Hash)
+				}
+			}
+		}
+	}
+
+	branchOnly, err := b.branchOnlyTxs(ctx, hashes, staleIDs, best)
+	if err != nil {
+		return err
+	}
+
+	if len(branchOnly) > 0 {
+		b.heartbeat.BeatIfStarted()
+
+		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, branchOnly, false); err != nil {
+			return errors.NewProcessingError("[restampStaleBranch] error marking %d stale branch transactions as not on the longest chain", len(branchOnly), err)
+		}
+	}
+
+	b.logger.Infof("[BlockAssembler] restamped %d of %d stale branch transactions, reloading the pool", len(branchOnly), len(hashes))
+
+	tip, height := b.CurrentBlock()
+
+	return b.resetToBlockAndRecord(ctx, tip, height, true)
+}
+
+// branchOnlyTxs returns the hashes, in order, whose transaction no block of the best chain
+// contains. A hash the UTXO store has no record of (pruned) is left out.
+func (b *BlockAssembler) branchOnlyTxs(ctx context.Context, hashes []chainhash.Hash, staleIDs map[uint32]struct{}, best *model.BlockHeader) ([]chainhash.Hash, error) {
+	kept := make([]chainhash.Hash, 0, len(hashes))
+	onBest := make(map[uint32]bool)
+
+	for start := 0; start < len(hashes); start += resetExistenceChunkSize {
+		b.heartbeat.BeatIfStarted()
+
+		chunk := hashes[start:min(start+resetExistenceChunkSize, len(hashes))]
+
+		unresolved := make([]*utxo.UnresolvedMetaData, len(chunk))
+		for i := range chunk {
+			unresolved[i] = &utxo.UnresolvedMetaData{Hash: chunk[i], Idx: i}
+		}
+
+		if err := b.utxoStore.BatchDecorate(ctx, unresolved, fields.BlockIDs); err != nil {
+			return nil, errors.NewProcessingError("[branchOnlyTxs] error reading block ids", err)
+		}
+
+	next:
+		for i, u := range unresolved {
+			switch {
+			case errors.Is(u.Err, errors.ErrTxNotFound):
+				continue
+			case u.Err != nil:
+				return nil, errors.NewProcessingError("[branchOnlyTxs] error reading block ids of %s", chunk[i], u.Err)
+			}
+
+			if u.Data != nil {
+				for _, id := range u.Data.BlockIDs {
+					if _, stale := staleIDs[id]; stale {
+						continue
+					}
+
+					on, known := onBest[id]
+					if !known {
+						var err error
+						if on, err = b.blockchainClient.CheckBlockIsAncestorOfBlock(ctx, []uint32{id}, best.Hash()); err != nil {
+							return nil, errors.NewProcessingError("[branchOnlyTxs] error checking whether block %d is on the best chain", id, err)
+						}
+
+						onBest[id] = on
+					}
+
+					if on {
+						continue next
+					}
+				}
+			}
+
+			kept = append(kept, chunk[i])
+		}
+	}
+
+	return kept, nil
 }
 
 // startingBestTipSeq is the replay position without a persisted one. On the best tip, block
@@ -334,9 +521,6 @@ func (b *BlockAssembler) startingBestTipSeq(ctx context.Context, latest uint64) 
 // It runs outside StateReconciling, so a mining candidate asked for during the check is
 // built as usual. It stamps lastBestTipReplay, so the next check waits a full interval.
 func (b *BlockAssembler) idleReconcileNeeded(ctx context.Context) bool {
-	if b.bestTipResetRetryBlocked.Load() {
-		return false
-	}
 	b.lastBestTipReplay.Store(time.Now().UnixNano())
 	if b.bestTipResetReplayPending.Load() {
 		return true
@@ -416,9 +600,6 @@ func (b *BlockAssembler) saveBestTipSeq(ctx context.Context) {
 // blockassembly_reconcileInterval. It covers lost notifications, because the blockchain
 // service drops a subscriber whose buffer fills and nothing arrives until it reconnects.
 func (b *BlockAssembler) reconcileDue(now time.Time) bool {
-	if b.bestTipResetRetryBlocked.Load() {
-		return false
-	}
 	// Recovery of a reset that already discarded its pool is mandatory even
 	// when ordinary lost-notification reconciliation is disabled.
 	if b.bestTipResetReplayPending.Load() {

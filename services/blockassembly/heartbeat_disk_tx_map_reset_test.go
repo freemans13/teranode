@@ -379,10 +379,12 @@ func TestBlockAssembler_StartRequestsBlockMaxSizeCheck(t *testing.T) {
 	m.AssertCalled(t, "RequestBlockMaxSizeCheck")
 }
 
-// A persistent fault before rotation retains the pool but must not turn each
-// mandatory replay tick into another failed disk rotation. Explicit reset is
-// the recovery boundary; pending history remains guarded until it succeeds.
-func TestBlockAssembler_UnrotatedStorageFaultBlocksReplayUntilExplicitReset(t *testing.T) {
+// A storage fault before the tx map rotation leaves the subtree processor on its
+// old tip with its old pool, so nothing was discarded that a replay must rebuild.
+// The reset leaves no pending history behind: candidates are built from the
+// intact pool, the ordinary replay keeps following the chain, and the replay
+// never retries the reset, which stays paced by the storage-triggered path.
+func TestBlockAssembler_UnrotatedStorageFaultLeavesPoolInService(t *testing.T) {
 	initDegradedGauge(t)
 	items := setupBlockAssemblyTest(t)
 	var calls atomic.Int32
@@ -401,18 +403,17 @@ func TestBlockAssembler_UnrotatedStorageFaultBlocksReplayUntilExplicitReset(t *t
 	result := make(chan error, 1)
 	ba.handleResetRequests(t.Context(), resetRequest{StorageTriggered: true, ErrCh: result})
 	require.Error(t, <-result)
-	require.True(t, ba.bestTipResetRetryBlocked.Load())
-	require.True(t, ba.bestTipResetReplayPending.Load())
-	require.False(t, ba.reconcileDue(time.Now()))
+	require.False(t, ba.bestTipResetReplayPending.Load(), "an unrotated reset discarded nothing, so it leaves no history pending")
+	require.False(t, ba.bestTipResetIncomplete.Load())
 	for i := 0; i < 3; i++ {
-		require.False(t, ba.followBestTipChanges(t.Context()))
+		ba.followBestTipChanges(t.Context())
 	}
-	require.Equal(t, int32(1), resets.Load(), "replay must not bypass persistent storage-fault protection")
-	require.Equal(t, uint64(0), ba.bestTipSeq.Load(), "blocked recovery must not discard pending history")
+	require.Equal(t, int32(1), resets.Load(), "the replay must not retry an unrotated reset")
+	ba.setCurrentRunningState(StateRunning)
+	require.False(t, ba.bestTipResetReplayPending.Load(), "mining candidates are not held empty")
 	ba.handleResetRequests(t.Context(), resetRequest{ErrCh: result})
 	require.NoError(t, <-result)
 	require.Equal(t, int32(2), resets.Load())
-	require.False(t, ba.bestTipResetRetryBlocked.Load())
 	require.False(t, ba.bestTipResetReplayPending.Load())
 	require.Zero(t, degradedGauge())
 }

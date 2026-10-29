@@ -1817,6 +1817,15 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 				block.Height = blockMeta.Height
 			}
 
+			// A reset is the path for reorgs as deep as the UTXO retention, so the pruner may
+			// already have deleted a winner here, while the subtree's conflicting list is kept
+			// for ever. A deleted winner has nothing left to reverse, and passing it on would
+			// fail this reset, and every retry of it, on its missing record.
+			reverseInputs, err = stp.dropPrunedHashes(ctx, reverseInputs)
+			if err != nil {
+				return errors.NewProcessingError("[Reset] error checking moved-back block conflicts exist", err)
+			}
+
 			cascaded, touched, reverseErr := utxostore.ReverseProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), reverseInputs)
 			stp.txMetaEvictor.Evict(cascaded)
 			if reverseErr != nil {
@@ -5652,6 +5661,38 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 	}
 
 	return subtreesNodes, conflictingHashes, nil
+}
+
+// dropPrunedHashes returns hashes, in order, without the ones the UTXO store has no record of.
+// Any other per-hash error is returned: it is no evidence the record is gone.
+func (stp *SubtreeProcessor) dropPrunedHashes(ctx context.Context, hashes []chainhash.Hash) ([]chainhash.Hash, error) {
+	if len(hashes) == 0 {
+		return hashes, nil
+	}
+
+	unresolved := make([]*utxostore.UnresolvedMetaData, len(hashes))
+	for i := range hashes {
+		unresolved[i] = &utxostore.UnresolvedMetaData{Hash: hashes[i], Idx: i}
+	}
+
+	if err := stp.utxoStore.BatchDecorate(ctx, unresolved, fields.Conflicting); err != nil {
+		return nil, err
+	}
+
+	kept := make([]chainhash.Hash, 0, len(hashes))
+
+	for i, u := range unresolved {
+		switch {
+		case u.Err == nil:
+			kept = append(kept, hashes[i])
+		case errors.Is(u.Err, errors.ErrTxNotFound):
+			stp.logger.Warnf("[SubtreeProcessor][Reset] conflict winner %s has been pruned, nothing to reverse", hashes[i])
+		default:
+			return nil, errors.NewProcessingError("[SubtreeProcessor][Reset] error reading conflict winner %s", hashes[i], u.Err)
+		}
+	}
+
+	return kept, nil
 }
 
 // removeCoinbaseUtxos removes the coinbase UTXO and its child spends from the UTXO store.

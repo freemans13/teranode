@@ -33,30 +33,40 @@ func TestResetToHistoricalTip_RestoresConflictingSpender(t *testing.T) {
 		if commonWinner {
 			name = "winner_on_both_branches"
 		}
-		t.Run(name, func(t *testing.T) { testResetHistoricalConflict(t, commonWinner) })
+		t.Run(name, func(t *testing.T) { testResetHistoricalConflict(t, commonWinner, false) })
 	}
+	// A reset is the path for reorgs as deep as the UTXO retention, so the pruner may
+	// already have deleted the winner while the subtree still lists it as conflicting.
+	// The reset must skip it rather than fail on its missing record for ever.
+	t.Run("pruned_winner", func(t *testing.T) { testResetHistoricalConflict(t, false, true) })
 }
 
-func testResetHistoricalConflict(t *testing.T, commonWinner bool) {
-	if testing.Short() {
-		t.Skip("requires PostgreSQL testcontainer")
-	}
+func testResetHistoricalConflict(t *testing.T, commonWinner, pruneWinner bool) {
 	initPrometheusMetrics()
-	pg, err := postgres.Run(t.Context(), "postgres:16-alpine", postgres.WithDatabase("replay"), postgres.WithUsername("replay"), postgres.WithPassword("replay"), testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(time.Minute)))
-	test.SkipIfContainerUnavailable(t, err)
-	t.Cleanup(func() { require.NoError(t, pg.Terminate(context.Background())) })
-	conn, err := pg.ConnectionString(t.Context(), "sslmode=disable")
-	require.NoError(t, err)
-	dbURL, err := url.Parse(conn)
-	require.NoError(t, err)
 	items := setupBlockAssemblyTest(t, func(s *settings.Settings) { s.BlockAssembly.OnRestartValidateParentChain = false })
 	ba := items.blockAssembler
 	ba.subtreeProcessor.Stop(context.Background())
-	store, err := utxosql.New(t.Context(), ulogger.TestLogger{}, ba.settings, dbURL)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close(context.Background())) })
-	items.utxoStore = store
-	ba.utxoStore = store
+
+	// The pruned-winner case runs on the SQLite fixture, so it needs no container.
+	store, _ := items.utxoStore.(*utxosql.Store)
+	if !pruneWinner {
+		if testing.Short() {
+			t.Skip("requires PostgreSQL testcontainer")
+		}
+		pg, err := postgres.Run(t.Context(), "postgres:16-alpine", postgres.WithDatabase("replay"), postgres.WithUsername("replay"), postgres.WithPassword("replay"), testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(time.Minute)))
+		test.SkipIfContainerUnavailable(t, err)
+		t.Cleanup(func() { require.NoError(t, pg.Terminate(context.Background())) })
+		conn, err := pg.ConnectionString(t.Context(), "sslmode=disable")
+		require.NoError(t, err)
+		dbURL, err := url.Parse(conn)
+		require.NoError(t, err)
+		store, err = utxosql.New(t.Context(), ulogger.TestLogger{}, ba.settings, dbURL)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close(context.Background())) })
+		items.utxoStore = store
+		ba.utxoStore = store
+	}
+	require.NotNil(t, store)
 	stp, err := subtreeprocessor.NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, ba.settings, items.blobStore, items.blockchainClient, store, items.newSubtreeChan)
 	require.NoError(t, err)
 	ba.subtreeProcessor = stp
@@ -128,6 +138,12 @@ func testResetHistoricalConflict(t *testing.T, commonWinner bool) {
 		require.True(t, c.Conflicting, "detached descendant must remain safely excluded")
 	}
 	assertSpender(winner, false, true)
+	if pruneWinner {
+		require.NoError(t, store.Delete(t.Context(), winner.TxIDChainHash()))
+		require.NoError(t, ba.resetToBlockAndRecord(t.Context(), a[1], 3, true), "a pruned winner has nothing to reverse")
+		requireBlockAssemblyTip(t, items, a[1])
+		return
+	}
 	require.NoError(t, ba.resetToBlockAndRecord(t.Context(), a[1], 3, true))
 	if commonWinner {
 		assertSpender(winner, false, true)
