@@ -78,13 +78,25 @@ func computeMultiSubtreeMerkleRoot(t *testing.T, coinbase *bt.Tx, subtrees []*su
 //     different, doctored transaction list at zero mining cost.
 //  2. (b) Block.CheckMerkleRoot PASSES on BOTH blocks, pinning that the merkle root
 //     alone cannot detect the mutation.
-//  3. (c) Block.Valid REJECTS the mutant — via the independent duplicate-transaction
-//     check (the CVE-2012-2459 floor), not the merkle check — and classifies it as a
-//     corrupt body, never as an invalid block, because the hash it would condemn is the
-//     honest block's hash too.
+//  3. (c) Block.Valid REJECTS the mutant through its duplicate-transaction check, not
+//     the merkle check, and classifies it as a corrupt body, never as an invalid block,
+//     because the hash it would condemn is the honest block's hash too.
+//
+// Which duplicate check fires matters. buildBlock pre-sets b.SubtreeSlices, so
+// getAndValidateSubtrees returns early ("already loaded") and neither the load-time
+// dedup hook nor the CVE-2012-2459 floor in check_duplicate_txs.go runs. The catch here
+// is Valid's later checkDuplicateTransactions pass (putSubtreeInTxMap), whose error has
+// no "(CVE-2012-2459)" suffix. A real peer block loads its subtrees from the store and
+// goes through the load-time hook instead, so a regression in that hook would NOT turn
+// this test red. This test pins the merkle property and the classification, not the
+// load-time path.
 func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 	ctx := context.Background()
 	tSettings := test.CreateBaseTestSettings(t)
+	// Pin the in-memory txMap arm of checkDuplicateTransactions. block_diskMapDirs has no
+	// default row in settings.conf, so a developer's local value would otherwise pick the
+	// disk-backed arm with no log line.
+	tSettings.Block.DiskMapDirs = nil
 
 	coinbase, err := bt.NewTxFromString(CoinbaseHex)
 	require.NoError(t, err)
@@ -151,7 +163,10 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 	}
 
 	for {
-		if ok, _, _ := sharedHeader.HasMetTargetDifficulty(); ok {
+		ok, _, powErr := sharedHeader.HasMetTargetDifficulty()
+		require.NoError(t, powErr)
+
+		if ok {
 			break
 		}
 
@@ -176,11 +191,10 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 		return b
 	}
 
-	// Both bodies hang off the SAME header, so they necessarily share a block hash.
+	// Both bodies hang off the SAME header pointer, so they share a block hash by
+	// construction. There is no assertion for that: it could not fail.
 	honestBlock := buildBlock(sharedHeader, honestSubtrees)
 	mutantBlock := buildBlock(sharedHeader, mutantSubtrees)
-	require.True(t, honestBlock.Hash().IsEqual(mutantBlock.Hash()),
-		"the two blocks must be indistinguishable by hash — that is what makes the mutation free")
 
 	// --- (b) CheckMerkleRoot passes on BOTH -------------------------------------------
 	require.NoError(t, honestBlock.CheckMerkleRoot(ctx))
@@ -195,7 +209,10 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 	honestOldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
 	validHonest, err := honestBlock.Valid(ctx, ulogger.TestLogger{}, subtreeStore, nil, honestOldBlockIDs, nil, nil, tSettings, nil)
-	require.NoError(t, err, "the honest block must validate cleanly")
+	// The block sits at height 0, so Valid skips the fee check, BIP34 and the
+	// order-and-blessed check. This control only shows the honest body clears the checks
+	// that do run, in particular the duplicate-transaction pass the mutant fails.
+	require.NoError(t, err, "the honest block must pass the checks Valid runs at height 0")
 	require.True(t, validHonest)
 
 	mutantOldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
