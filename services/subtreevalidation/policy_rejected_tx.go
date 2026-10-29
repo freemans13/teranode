@@ -12,9 +12,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// txPolicyRejectedCache is a memory-bounded in-memory cache of consensus-valid
-// transactions that were rejected by local mining policy. Keyed by tx hash, storing
-// raw *bt.Tx.
+// txPolicyRejectedCache is a memory-bounded in-memory cache of transactions that
+// were rejected by local mining policy. They are usually, but not always,
+// consensus-valid: the validator can report a policy script failure as policy
+// without confirming it in consensus mode. Keyed by tx hash, storing raw *bt.Tx.
 //
 // The cache is populated from the KAFKA_TX_POLICY_REJECTED topic and consulted by
 // subtree validation before making an HTTP request to another miner for a missing tx.

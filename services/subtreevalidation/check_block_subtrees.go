@@ -914,7 +914,8 @@ func (u *Server) checkCachedSubtreesAgainstCandidateChain(ctx context.Context, b
 	// rather than forced to tx-invalid: the underlying call returns
 	// ErrTxInvalid only for a genuine ancestry conflict, and errors.Is finds
 	// it through the chain. A walk-budget or store failure stays retryable
-	// instead of permanently marking the block invalid.
+	// instead of permanently marking the block invalid, unless another
+	// member read is proven mined on the candidate chain.
 	notFound, err := u.checkCounterConflictingOnCurrentChainBatch(ctx, conflictingTxHashes, blockIds, skipMissingRecords)
 	if err != nil {
 		return errors.NewProcessingError("[CheckBlockSubtrees][%s] cached subtree conflicts with the candidate chain", block.Hash().String(), err)
