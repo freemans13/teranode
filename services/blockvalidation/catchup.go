@@ -1291,8 +1291,6 @@ func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) erro
 	if checkpointsChecked > 0 {
 		u.logger.Infof("[catchup][%s] Successfully verified %d checkpoint(s) in header chain", catchupCtx.blockUpTo.Hash().String(), checkpointsChecked)
 		catchupCtx.useQuickValidation = true // enabled: BlockAssembly sync check added in tryQuickValidation
-
-		u.trimWindowToVerifiedCheckpoint(catchupCtx)
 	}
 
 	return nil
@@ -1428,35 +1426,6 @@ func (u *Server) refuseNettedRouteWindowWithoutCheckpoint(catchupCtx *CatchupCon
 	}
 
 	return newNettedRouteRefusal("[catchup][%s] block at height %d is below the hardcoded checkpoint on a netting UTXO store and can only be quick validated, but this catch-up window holds no verified checkpoint above it", catchupCtx.blockUpTo.Hash().String(), first)
-}
-
-// trimWindowToVerifiedCheckpoint ends the catch-up window at its highest verified checkpoint
-// when the blocks after it can only be quick validated: a store that nets below the hardcoded
-// checkpoint holds them, and they are at or below it. Quick validation needs a verified
-// checkpoint at or above each block (tryQuickValidation), so those blocks would be refused in
-// this window, and the refusal would be charged to the peer that served them. The next window
-// starts at the checkpoint and holds the next one, because the catch-up window on this store is
-// at least one checkpoint gap plus the common ancestor (model.NettedRouteCatchupWindow), and its
-// locator starts at the tip, not at a trailing UTXO height (locatorCapApplies).
-func (u *Server) trimWindowToVerifiedCheckpoint(catchupCtx *CatchupContext) {
-	verified := catchupCtx.highestCheckpointHeight
-	if verified == 0 || verified <= catchupCtx.commonAncestorMeta.Height {
-		return
-	}
-
-	if !u.blockValidation.mustStayOnQuickValidationAt(verified + 1) {
-		return
-	}
-
-	keep := int(verified - catchupCtx.commonAncestorMeta.Height)
-	if keep >= len(catchupCtx.blockHeaders) {
-		return
-	}
-
-	u.logger.Infof("[catchup][%s] window ends at verified checkpoint %d: %d headers after it wait for the next window, because the netting UTXO store takes blocks below the hardcoded checkpoint only through quick validation",
-		catchupCtx.blockUpTo.Hash().String(), verified, len(catchupCtx.blockHeaders)-keep)
-
-	catchupCtx.blockHeaders = catchupCtx.blockHeaders[:keep]
 }
 
 // verifyCheckpointsAgainstHeaders verifies checkpoints against the fetched headers

@@ -206,13 +206,13 @@ func TestNettedRoute_ReleaseCatchupLockScoresTheRefusals(t *testing.T) {
 	})
 }
 
-// On the netted route the header window, built by catchupGetBlockHeaders with a UTXO height that
-// trails the tip, holds the next checkpoint. Checkpoints at heights 10 and 30 make the window
-// floor 21 headers (the gap of 20 plus the common ancestor). The tip is at checkpoint 10 and the
-// UTXO store reports height 5. A locator from the tip gives headers 10 to 30. A locator capped at
-// the UTXO height gives headers 5 to 25, which stop short of checkpoint 30, and then each block
-// in the window is refused.
-func TestNettedRoute_HeaderWindowFromATrailingUTXOHeightHoldsTheNextCheckpoint(t *testing.T) {
+// On the netted route the header window that catchupGetBlockHeaders fetches ends exactly at the
+// next checkpoint above the tip, whatever blockvalidation_max_accumulated_headers says and however
+// far the UTXO store trails the tip. Checkpoints are at heights 10 and 30, and the tip is at
+// checkpoint 10. With the UTXO store at 10 the window is headers 10 to 30. With it at 5 the locator
+// starts at 5, and the window is headers 5 to 30. A setting of 1 used to stop the window short of
+// checkpoint 30, and a setting of 1,000 used to run it past checkpoint 30 to the peer's tip.
+func TestNettedRoute_HeaderWindowEndsAtTheNextCheckpoint(t *testing.T) {
 	bv, _, cleanup := newNetRangeHarness(t, "netted_route_header_window", 65536)
 	defer cleanup()
 
@@ -236,9 +236,6 @@ func TestNettedRoute_HeaderWindowFromATrailingUTXOHeightHoldsTheNextCheckpoint(t
 		{Height: 10, Hash: blocks[10].Header.Hash()},
 		{Height: 30, Hash: blocks[30].Header.Hash()},
 	}
-	s.BlockValidation.CatchupMaxAccumulatedHeaders = 1
-	require.Equal(t, 21, model.NettedRouteCatchupWindow(s, bv.utxoStore))
-
 	for _, b := range blocks[1:11] {
 		_, _, err := chainStore.StoreBlock(t.Context(), b, "test")
 		require.NoError(t, err)
@@ -248,7 +245,6 @@ func TestNettedRoute_HeaderWindowFromATrailingUTXOHeightHoldsTheNextCheckpoint(t
 	require.NoError(t, err)
 
 	bv.blockchainClient = client
-	require.NoError(t, bv.utxoStore.SetBlockHeight(5))
 
 	u := &Server{logger: ulogger.TestLogger{}, settings: s, blockValidation: bv, utxoStore: bv.utxoStore, blockchainClient: client}
 
@@ -281,13 +277,21 @@ func TestNettedRoute_HeaderWindowFromATrailingUTXOHeightHoldsTheNextCheckpoint(t
 			return httpmock.NewBytesResponse(http.StatusOK, body), nil
 		})
 
-	result, _, err := u.catchupGetBlockHeaders(t.Context(), blocks[40], "netted-peer-id", "http://netted-peer")
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	require.Len(t, result.Headers, 21)
+	for _, tc := range []struct {
+		setting    int
+		utxoHeight uint32
+	}{{1, 10}, {1000, 10}, {1, 5}, {1000, 5}} {
+		s.BlockValidation.CatchupMaxAccumulatedHeaders = tc.setting
+		require.NoError(t, bv.utxoStore.SetBlockHeight(tc.utxoHeight))
 
-	require.Equal(t, blocks[10].Header.Hash(), result.Headers[0].Hash(), "the window starts at the tip, the common ancestor")
-	require.Equal(t, blocks[30].Header.Hash(), result.Headers[len(result.Headers)-1].Hash(), "the window holds checkpoint 30")
+		result, _, err := u.catchupGetBlockHeaders(t.Context(), blocks[40], "netted-peer-id", "http://netted-peer")
+		require.NoError(t, err)
+		require.NotNil(t, result)
+
+		require.Equal(t, blocks[tc.utxoHeight].Header.Hash(), result.Headers[0].Hash(), "setting %d, UTXO height %d: the window starts where the locator starts", tc.setting, tc.utxoHeight)
+		require.Equal(t, blocks[30].Header.Hash(), result.Headers[len(result.Headers)-1].Hash(), "setting %d, UTXO height %d: the window ends at checkpoint 30", tc.setting, tc.utxoHeight)
+		require.Len(t, result.Headers, int(30-tc.utxoHeight)+1)
+	}
 }
 
 // On the netted route the DAA check runs before the refusal of a window without a verified

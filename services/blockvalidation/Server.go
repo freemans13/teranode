@@ -850,10 +850,6 @@ func (u *Server) Init(ctx context.Context) (err error) {
 		return err
 	}
 
-	if window := model.NettedRouteCatchupWindow(u.settings, u.utxoStore); window != u.settings.BlockValidation.CatchupMaxAccumulatedHeaders {
-		u.logger.Infof("[Init] the UTXO store nets the blocks below the checkpoint, so each catch-up window holds %d headers, one checkpoint gap plus the common ancestor, instead of blockvalidation_max_accumulated_headers %d", window, u.settings.BlockValidation.CatchupMaxAccumulatedHeaders)
-	}
-
 	// Only create a new BlockValidation if one wasn't already set (for testing).
 	// Pass the P2P client through the variadic opts so block-validation can strike the peer
 	// that served a corrupt block body (bitcoin-sv/teranode#4692) with correct attribution to

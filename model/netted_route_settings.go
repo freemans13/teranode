@@ -1,8 +1,6 @@
 package model
 
 import (
-	"sort"
-
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -40,69 +38,65 @@ func nettedRouteOn(tSettings *settings.Settings, store utxo.Store) bool {
 	return NettedRouteAt(tSettings, store, HighestCheckpointHeight(tSettings.ChainCfgParams.Checkpoints))
 }
 
-// LargestCheckpointGap is the most blocks between two neighbouring checkpoints of the list, from
-// genesis to the highest checkpoint.
-func LargestCheckpointGap(checkpoints []chaincfg.Checkpoint) uint32 {
-	heights := make([]uint32, 0, len(checkpoints))
+// NextCheckpointAbove is the height of the lowest checkpoint of the list above height, and false
+// when no checkpoint is above it.
+func NextCheckpointAbove(checkpoints []chaincfg.Checkpoint, height uint32) (uint32, bool) {
+	var next uint32
+
+	found := false
 
 	for _, cp := range checkpoints {
-		if cp.Height > 0 {
-			heights = append(heights, uint32(cp.Height))
+		if cp.Height <= 0 || uint32(cp.Height) <= height {
+			continue
+		}
+
+		if h := uint32(cp.Height); !found || h < next {
+			next, found = h, true
 		}
 	}
 
-	sort.Slice(heights, func(a, b int) bool { return heights[a] < heights[b] })
-
-	var gap, prev uint32
-
-	for _, h := range heights {
-		if h-prev > gap {
-			gap = h - prev
-		}
-
-		prev = h
-	}
-
-	return gap
+	return next, found
 }
 
-// NettedRouteCatchupWindow is the number of headers a catch-up window accumulates. It is
-// blockvalidation_max_accumulated_headers, raised to the largest checkpoint gap plus one when the
-// store nets the blocks below the checkpoint.
+// NettedRouteCatchupWindow is the number of headers a catch-up window accumulates when the node's
+// tip is at tipHeight and the peer serves its headers from startHeight, the height of the block the
+// locator starts at.
 //
-// The plus one is the common ancestor: the peer serves it as the first header and catch-up drops
-// it, so a window of N headers holds at most N-1 new blocks. A window that starts at checkpoint c
-// must reach c+gap to hold the next checkpoint, so it needs gap+1 headers. That count assumes the
-// locator starts at the tip, so block validation does not cap it at a trailing UTXO store height
-// on this route (blockvalidation's locatorCapApplies). Without a checkpoint in
-// the window no block in it is quick validated, and on the netted route no block may take any
-// other route.
+// When the next block is on the netted route, the window ends at the next hardcoded checkpoint
+// above the tip, whatever blockvalidation_max_accumulated_headers says. Quick validation needs a
+// verified checkpoint at or above each block of the window, and on that route no block may take
+// any other path, so a window must hold that checkpoint, and blocks past it would wait for the
+// next window anyway. The peer serves every header from startHeight to the checkpoint, the block
+// at startHeight included, which is checkpoint - startHeight + 1 headers. Counting from
+// startHeight rather than from the tip makes the window hold the checkpoint however far the
+// locator trails the tip. A window is one checkpoint gap plus any such lag: about 8 MB for
+// testnet's largest gap of 100,010 blocks.
 //
-// The floor is a value, not a refusal, because the default window is smaller than one testnet
-// gap (100,010 blocks, from 700,000 to 800,010). 100,011 headers take about 8 MB.
-func NettedRouteCatchupWindow(tSettings *settings.Settings, store utxo.Store) int {
+// Elsewhere it is the setting.
+func NettedRouteCatchupWindow(tSettings *settings.Settings, store utxo.Store, tipHeight, startHeight uint32) int {
 	window := tSettings.BlockValidation.CatchupMaxAccumulatedHeaders
 
-	if !nettedRouteOn(tSettings, store) {
+	if tSettings.ChainCfgParams == nil || !NettedRouteAt(tSettings, store, tipHeight+1) {
 		return window
 	}
 
-	if floor := int(LargestCheckpointGap(tSettings.ChainCfgParams.Checkpoints)) + 1; window < floor {
-		return floor
+	next, ok := NextCheckpointAbove(tSettings.ChainCfgParams.Checkpoints, tipHeight)
+	if !ok || next < startHeight {
+		return window
 	}
 
-	return window
+	return int(next-startHeight) + 1
 }
 
 // CheckNettedRouteCatchupSettings refuses the block validation setting under which native
 // catch-up cannot quick validate every block below the checkpoint while the store nets there:
 // blockvalidation_catchup_checkpoint_hash with blockvalidation_catchup_checkpoint_height replaces
 // the whole checkpoint list in catch-up with one checkpoint, so a window below that one holds no
-// checkpoint, and the window floor of NettedRouteCatchupWindow, which measures the hardcoded list,
-// no longer applies. It is an explicit operator choice the route cannot honour, so it is refused
-// rather than ignored.
+// checkpoint, and NettedRouteCatchupWindow, which ends each window at a hardcoded checkpoint, no
+// longer matches the list catch-up verifies. It is an explicit operator choice the route cannot
+// honour, so it is refused rather than ignored.
 //
-// The window size itself is not refused: NettedRouteCatchupWindow raises it.
+// The window size itself is not refused: NettedRouteCatchupWindow sets it on this route.
 func CheckNettedRouteCatchupSettings(tSettings *settings.Settings, store utxo.Store) error {
 	if !nettedRouteOn(tSettings, store) {
 		return nil
