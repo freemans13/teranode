@@ -209,9 +209,12 @@ type IgnoreFlags struct {
 	// whose records the first wave created before any of those spends, so the record proves
 	// nothing. Its first-wave combined calls spend before they create and leave it unset.
 	//
-	// It says the same thing as SpenderCreatedByCaller, and both stores treat the two alike:
-	// no bless, and a failed call reverses what it wrote by error class (IsSpendRollbackError)
-	// rather than on a record-existence probe, which would always find the caller's record.
+	// Both stores also decide a failed call's rollback by error class (IsSpendRollbackError)
+	// rather than on a record-existence probe, which would always find the first wave's
+	// record, but without SpenderCreatedByCaller they reverse only what the call wrote. The
+	// record may then belong to a live transaction the list found in place, and an
+	// idempotent match is that transaction's own spend. The second wave sets
+	// SpenderCreatedByCaller as well for a record its first wave created.
 	RequireParentOutputs bool
 }
 
@@ -349,6 +352,15 @@ func (o *CreateOptions) ItemOptions(i int) *CreateOptions {
 func withRequireParentOutputs() CreateOption {
 	return func(o *CreateOptions) {
 		o.IgnoreFlags.RequireParentOutputs = true
+	}
+}
+
+// withRequireParentOutputsCreatedByCaller sets IgnoreFlags.RequireParentOutputs and
+// SpenderCreatedByCaller, for the spend wave's call on a record its first wave created.
+func withRequireParentOutputsCreatedByCaller() CreateOption {
+	return func(o *CreateOptions) {
+		o.IgnoreFlags.RequireParentOutputs = true
+		o.IgnoreFlags.SpenderCreatedByCaller = true
 	}
 }
 

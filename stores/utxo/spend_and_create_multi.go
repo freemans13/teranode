@@ -326,7 +326,8 @@ func DefaultSpendAndCreateMulti(ctx context.Context, s SpendAndCreateMultiStore,
 //     leaves the spends in place when the record exists.
 //
 // Every spend of the second wave sets IgnoreFlags.RequireParentOutputs, so a
-// missing parent output fails the spend. Without it the store would read the
+// missing parent output fails the spend, and SpenderCreatedByCaller as well when
+// the first wave created the record (Created). Without it the store would read the
 // spender's own record, created moments earlier by the first wave, as proof
 // that the spend happened in an earlier attempt and the parent has been pruned
 // since, and a list spending an output that exists nowhere would pass. Turning
@@ -375,6 +376,7 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 	// RequireParentOutputs in the second. They are built per call, so a list holds no options
 	// for its transactions while it runs; the wave's own are built once here.
 	createOnly, spendOnly, requireParentOutputs := WithCreateOnly(), WithSpendOnly(), withRequireParentOutputs()
+	requireParentOutputsCreated := withRequireParentOutputsCreatedByCaller()
 
 	all := make([]int, len(txs))
 	for i := range all {
@@ -454,7 +456,15 @@ func writeCreateThenSpend(ctx context.Context, s SpendAndCreateMultiStore, width
 	notStarted = runDetachedWave(ctx, bound, widths.Spend, toSpend, func(callCtx context.Context, i int) {
 		spent[i] = true
 
-		_, spends, err := s.SpendAndCreate(callCtx, txs[i], blockHeight, items.option(i), spendOnly, requireParentOutputs)
+		// A record the first wave created is the list's own, and a failed spend
+		// may reverse its idempotent matches with the rest. A record found in
+		// place may be a live transaction's, so only what this spend wrote is.
+		waveOption := requireParentOutputs
+		if results[i].Created {
+			waveOption = requireParentOutputsCreated
+		}
+
+		_, spends, err := s.SpendAndCreate(callCtx, txs[i], blockHeight, items.option(i), spendOnly, waveOption)
 		if err != nil {
 			results[i] = SpendAndCreateMultiResult{Status: MultiTxFailed, Meta: results[i].Meta, Spends: spends, Err: err, Created: results[i].Created}
 

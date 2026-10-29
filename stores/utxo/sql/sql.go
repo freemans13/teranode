@@ -2108,9 +2108,12 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
 	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
 	useSkipUTXOHashCheck := len(ignoreFlags) > 0 && ignoreFlags[0].SkipUTXOHashCheck
-	// RequireParentOutputs says the same as SpenderCreatedByCaller: the caller
-	// wrote the spending transaction's record before this spend.
+	// Both flags turn the bless off and decide the rollback by error class. Only
+	// SpenderCreatedByCaller says the caller wrote the record: with
+	// RequireParentOutputs alone the record may be a live transaction's, so a
+	// failed call reverses what it wrote and leaves its idempotent matches.
 	spenderCreatedByCaller := len(ignoreFlags) > 0 && (ignoreFlags[0].SpenderCreatedByCaller || ignoreFlags[0].RequireParentOutputs)
+	spenderRecordFound := spenderCreatedByCaller && !ignoreFlags[0].SpenderCreatedByCaller
 
 	if useSkipUTXOHashCheck {
 		spends, err = utxo.GetSpendsOutpointOnly(tx)
@@ -2354,7 +2357,8 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		//
 		// The create-first block paths (SpenderCreatedByCaller, and
 		// RequireParentOutputs on DefaultSpendAndCreateMulti's second wave) take
-		// spendRollbackSet's rule instead. They wrote the spender's record
+		// spendRollbackSet's rule instead, holding idempotent matches back when
+		// the record was found rather than created by the list. They wrote the spender's record
 		// themselves and delete it again on a failure (utxo.DeleteCreated), so
 		// the existence probe would always find it and never fire, leaving the
 		// spends naming a record-less spender.
@@ -2364,7 +2368,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 		switch {
 		case spenderCreatedByCaller:
-			if rollback = spendRollbackSet(spends, spentSpends, idempotentSpends, unresolved, true); len(rollback) > 0 {
+			if rollback = spendRollbackSet(spends, spentSpends, idempotentSpends, unresolved, true, spenderRecordFound); len(rollback) > 0 {
 				prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeFired).Inc()
 				s.rollbackPartialSpends(tx, rollback)
 			}
@@ -2499,7 +2503,9 @@ func (s *Store) unspendRollback(rbCtx context.Context, tx *bt.Tx, rollback []*ut
 // wrote the spender's record itself (SpenderCreatedByCaller): nothing unless an
 // input failed with a genuine validation error (utxo.NeedsSpendRollback), and then
 // the inputs this call wrote plus, when that is safe, its idempotent matches
-// (utxo.RollbackSet).
+// (utxo.RollbackSet). recordFound (RequireParentOutputs without
+// SpenderCreatedByCaller) holds every idempotent match back: the record was in
+// place before the list, and its matches are that transaction's own spends.
 //
 // Both halves of RollbackSet's historical contract apply, as on Aerospike
 // (spendCompletionResult.rollbackSet): an idempotent match is held back when an
@@ -2508,12 +2514,12 @@ func (s *Store) unspendRollback(rbCtx context.Context, tx *bt.Tx, rollback []*ut
 // cancellation or timeout error the wait wrote, neither of which is a replay
 // answer, while its real answer may be the marker; reversing the idempotent
 // matches then would release a confirmed historical spend to anyone.
-func spendRollbackSet(spends, written, idempotent []*utxo.Spend, unresolved int, spenderCreatedByCaller bool) []*utxo.Spend {
+func spendRollbackSet(spends, written, idempotent []*utxo.Spend, unresolved int, spenderCreatedByCaller, recordFound bool) []*utxo.Spend {
 	if !utxo.NeedsSpendRollback(spends, spenderCreatedByCaller) {
 		return nil
 	}
 
-	return utxo.RollbackSet(written, idempotent, utxo.AnyPrunedReplay(spends) || unresolved > 0)
+	return utxo.RollbackSet(written, idempotent, utxo.AnyPrunedReplay(spends) || unresolved > 0 || recordFound)
 }
 
 // isDeadlock reports whether a database error is a lock the spend batch should

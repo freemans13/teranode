@@ -111,12 +111,16 @@ type batchSpend struct {
 	published         atomic.Bool
 	ignoreConflicting bool
 	ignoreLocked      bool
-	// spenderCreatedByCaller is set when the caller wrote the spending
-	// transaction's record before this spend: utxo.IgnoreFlags.SpenderCreatedByCaller
-	// or utxo.IgnoreFlags.RequireParentOutputs, which say the same thing. It turns
-	// off the "already blessed" fallback and switches the rollback to its
-	// error-class rule (see rollbackPartialSpends).
+	// spenderCreatedByCaller is set for utxo.IgnoreFlags.SpenderCreatedByCaller or
+	// utxo.IgnoreFlags.RequireParentOutputs. It turns off the "already blessed"
+	// fallback and switches the rollback to its error-class rule (see
+	// rollbackPartialSpends).
 	spenderCreatedByCaller bool
+	// spenderRecordFound is set for RequireParentOutputs without
+	// SpenderCreatedByCaller: the record was in place before the list, so a
+	// failed call keeps its idempotent matches, which are that record's own
+	// spends (spendCompletionResult.rollbackSet).
+	spenderRecordFound bool
 	// idempotent is set from the Lua response when the utxo already recorded
 	// exactly this spend, so nothing was written. resolveSpendCompletions keeps
 	// such inputs out of the rollback list: the spend they matched is the
@@ -446,7 +450,12 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
 	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
+	// Both flags turn the bless off and decide the rollback by error class. Only
+	// SpenderCreatedByCaller says the caller wrote the record: with
+	// RequireParentOutputs alone the record may be a live transaction's, so a
+	// failed call reverses what it wrote and leaves its idempotent matches.
 	spenderCreatedByCaller := len(ignoreFlags) > 0 && (ignoreFlags[0].SpenderCreatedByCaller || ignoreFlags[0].RequireParentOutputs)
+	spenderRecordFound := spenderCreatedByCaller && !ignoreFlags[0].SpenderCreatedByCaller
 
 	spends, err = utxo.GetSpends(tx)
 	if err != nil {
@@ -481,6 +490,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			ignoreConflicting:      useIgnoreConflicting,
 			ignoreLocked:           useIgnoreLocked,
 			spenderCreatedByCaller: spenderCreatedByCaller,
+			spenderRecordFound:     spenderRecordFound,
 		}
 		items[idx] = item
 
@@ -615,9 +625,10 @@ type spendCompletionResult struct {
 	// unresolved counts inputs skipped because they were still in flight on the
 	// abort path. Their answers are unknown.
 	unresolved int
-	// spenderCreatedByCaller mirrors utxo.IgnoreFlags.SpenderCreatedByCaller for
-	// the call; see rollbackPartialSpends.
+	// spenderCreatedByCaller and spenderRecordFound mirror the batchSpend fields
+	// for the call; see rollbackPartialSpends and rollbackSet.
 	spenderCreatedByCaller bool
+	spenderRecordFound     bool
 
 	spenderChecked bool
 	spenderExists  bool
@@ -652,7 +663,7 @@ type spendCompletionResult struct {
 // or when any input is still unanswered, since that input may be the marker hit.
 // On the normal path every input is answered, so unresolved is zero there.
 func (r *spendCompletionResult) rollbackSet() []*utxo.Spend {
-	return utxo.RollbackSet(r.spentSpends, r.idempotentSpends, r.prunedRejection || r.unresolved > 0)
+	return utxo.RollbackSet(r.spentSpends, r.idempotentSpends, r.prunedRejection || r.unresolved > 0 || r.spenderRecordFound)
 }
 
 // rollbackDecision is what the spender-existence probe implies for the spends
@@ -951,6 +962,10 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 		// is safe to read on an unpublished item too.
 		if item.spenderCreatedByCaller {
 			result.spenderCreatedByCaller = true
+		}
+
+		if item.spenderRecordFound {
+			result.spenderRecordFound = true
 		}
 
 		if onlyCompleted && !item.published.Load() {

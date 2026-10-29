@@ -873,14 +873,14 @@ func TestSpendRollbackSetHoldsIdempotentWhenAnInputIsUnresolved(t *testing.T) {
 	spends := []*utxo.Spend{written, idempotent, spent, timedOut}
 
 	require.Equal(t, []*utxo.Spend{written},
-		spendRollbackSet(spends, []*utxo.Spend{written}, []*utxo.Spend{idempotent}, 1, false),
+		spendRollbackSet(spends, []*utxo.Spend{written}, []*utxo.Spend{idempotent}, 1, false, false),
 		"an unanswered input may be the marker hit, so the idempotent match is held back")
 
 	require.Equal(t, []*utxo.Spend{written, idempotent},
-		spendRollbackSet(spends, []*utxo.Spend{written}, []*utxo.Spend{idempotent}, 0, false),
+		spendRollbackSet(spends, []*utxo.Spend{written}, []*utxo.Spend{idempotent}, 0, false, false),
 		"control: with every input answered and no replay answer, the idempotent match is reversed (self-healing)")
 
 	require.Nil(t,
-		spendRollbackSet([]*utxo.Spend{written, timedOut}, []*utxo.Spend{written}, nil, 1, true),
+		spendRollbackSet([]*utxo.Spend{written, timedOut}, []*utxo.Spend{written}, nil, 1, true, false),
 		"control: a caller-created spender whose call failed only on a transient error reverses nothing")
 }

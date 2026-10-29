@@ -3,9 +3,11 @@ package aerospike_test
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -225,4 +227,64 @@ func TestRequireParentOutputsRollsBackLikeSpenderCreatedByCaller(t *testing.T) {
 	after, err := store.GetSpend(ctx, &utxo.Spend{TxID: survivor.TxIDChainHash(), Vout: 0, UTXOHash: hash})
 	require.NoError(t, err)
 	require.Nil(t, after.SpendingData, "the fresh spend of the surviving parent must be rolled back")
+}
+
+// TestSecondWaveFailureKeepsALiveSpendersSpend: T spends S:0 and B:0 and was
+// fully applied by an ordinary SpendAndCreate before this list ran, so its
+// record exists and both outputs record T as spender. B is then flagged
+// conflicting. A WithBelowCheckpoint list [S, T] answers T as existing in the
+// first wave and re-spends it in the second with RequireParentOutputs: S:0 is
+// an idempotent match and B:0 fails. The list did not write T's record, so the
+// rollback must leave S:0 alone: a live transaction owns it.
+func TestSecondWaveFailureKeepsALiveSpendersSpend(t *testing.T) {
+	s := test.CreateBaseTestSettings(t)
+
+	client, store, ctx, cleanup := initAerospike(t, s, ulogger.New("second-wave-live-spender"))
+	t.Cleanup(cleanup)
+	require.NoError(t, store.SetBlockHeight(1000))
+
+	newParent := func(seed string) *bt.Tx {
+		parent := bt.NewTx()
+		require.NoError(t, parent.From(seed, 0, "51", 30000))
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+
+		return parent
+	}
+
+	survivor := newParent("aaaa555555555555555555555555555555555555555555555555555555555555")
+	contested := newParent("bbbb555555555555555555555555555555555555555555555555555555555555")
+
+	for _, parent := range []*bt.Tx{survivor, contested} {
+		_, err := store.Create(ctx, parent, 1000)
+		require.NoError(t, err)
+	}
+
+	spender := bt.NewTx()
+	for _, parent := range []*bt.Tx{survivor, contested} {
+		require.NoError(t, spender.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	}
+
+	require.NoError(t, spender.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+
+	_, _, err := store.SpendAndCreate(ctx, spender, 1100)
+	require.NoError(t, err, "fixture: T fully applied by an ordinary writer")
+
+	contestedKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), contested.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+	require.NoError(t, client.Put(nil, contestedKey, aerospike.BinMap{fields.Conflicting.String(): true}))
+
+	results, err := store.SpendAndCreateMulti(ctx, []*bt.Tx{survivor, spender}, 1200,
+		utxo.WithBelowCheckpoint(), utxo.WithIgnoreLocked(true))
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.False(t, results[1].Created, "control: the list did not write T's record")
+	require.ErrorIs(t, results[1].Err, errors.ErrTxConflicting, "control: B:0 fails the second-wave spend")
+
+	hash, err := util.UTXOHashFromOutput(survivor.TxIDChainHash(), survivor.Outputs[0], 0)
+	require.NoError(t, err)
+
+	after, err := store.GetSpend(ctx, &utxo.Spend{TxID: survivor.TxIDChainHash(), Vout: 0, UTXOHash: hash})
+	require.NoError(t, err)
+	require.NotNil(t, after.SpendingData, "S:0 belongs to live T, whose record the list did not write")
+	require.Equal(t, *spender.TxIDChainHash(), *after.SpendingData.TxID)
 }

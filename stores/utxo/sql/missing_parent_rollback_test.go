@@ -187,3 +187,65 @@ func TestRequireParentOutputsRollsBackLikeSpenderCreatedByCaller(t *testing.T) {
 		}
 	})
 }
+
+// TestSecondWaveFailureKeepsALiveSpendersSpend: T spends S:0 and B:0 and was
+// fully applied by an ordinary SpendAndCreate before this list ran, so its
+// record exists and both outputs record T as spender. B is then flagged
+// conflicting. A WithBelowCheckpoint list [S, T] answers T as existing in the
+// first wave and re-spends it in the second with RequireParentOutputs: S:0 is
+// an idempotent match and B:0 fails. The list did not write T's record, so the
+// rollback must leave S:0 alone: a live transaction owns it.
+func TestSecondWaveFailureKeepsALiveSpendersSpend(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		for i, perRow := range []bool{false, true} {
+			store.settings.UtxoStore.BatchSQLOperations = !perRow
+
+			newParent := func(seed string) *bt.Tx {
+				parent := bt.NewTx()
+				require.NoError(t, parent.From("44444444444444444444444444444444444444444444444444444444444444"+seed, 0, "51", 30000))
+				parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+				require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+
+				return parent
+			}
+
+			suffix := string(rune('0' + i))
+			survivor, contested := newParent("a"+suffix), newParent("b"+suffix)
+
+			for _, parent := range []*bt.Tx{survivor, contested} {
+				_, err := store.Create(ctx, parent, 1000)
+				require.NoError(t, err)
+			}
+
+			spender := bt.NewTx()
+			for _, parent := range []*bt.Tx{survivor, contested} {
+				require.NoError(t, spender.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+			}
+
+			for j := range spender.Inputs {
+				spender.Inputs[j].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+			}
+
+			require.NoError(t, spender.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+
+			_, _, err := store.SpendAndCreate(ctx, spender, 1100)
+			require.NoError(t, err, "fixture: T fully applied by an ordinary writer")
+
+			spentByT := spendpkg.NewSpendingData(spender.TxIDChainHash(), 0).Bytes()
+			require.Equal(t, spentByT, outputSpendingData(t, ctx, store, survivor, 0))
+
+			_, err = store.db.ExecContext(ctx, "UPDATE transactions SET conflicting = true WHERE hash = $1", contested.TxIDChainHash()[:])
+			require.NoError(t, err)
+
+			results, err := store.SpendAndCreateMulti(ctx, []*bt.Tx{survivor, spender}, 1200,
+				utxo.WithBelowCheckpoint(), utxo.WithIgnoreLocked(true))
+			require.NoError(t, err)
+			require.Len(t, results, 2)
+			require.False(t, results[1].Created, "control: the list did not write T's record")
+			require.ErrorIs(t, results[1].Err, errors.ErrTxConflicting, "control: B:0 fails the second-wave spend")
+
+			require.Equal(t, spentByT, outputSpendingData(t, ctx, store, survivor, 0),
+				"S:0 belongs to live T, whose record the list did not write (perRow=%v)", perRow)
+		}
+	})
+}
