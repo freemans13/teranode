@@ -218,3 +218,54 @@ func TestGetConflictingChildrenFromRoots_ObservesOnceForTheWholeWalk(t *testing.
 	require.InDelta(t, 4, nodesSumAfter-nodesSumBefore, 0)
 	require.InDelta(t, 4, depthSumAfter-depthSumBefore, 0)
 }
+
+// A walk that stops, on its budget or on a read fault, still returns what it
+// reached: every node in a pass's partial cone is a descendant of that pass's
+// roots, so a caller may act on it (a mined counter-spender descendant is proof
+// of a conflict whether or not the rest of the cone was read). The passes not
+// reached are empty, and cones keeps one entry per pass.
+func TestGetConflictingChildrenFromRoots_StoppedWalkReturnsPartialCones(t *testing.T) {
+	rootA := createTestHash("partial-a")
+	rootB := createTestHash("partial-b")
+	childA := createTestHash("partial-child-a")
+	grandchildA := createTestHash("partial-grandchild-a")
+	greatGrandchildA := createTestHash("partial-great-grandchild-a")
+
+	newStore := func(childAErr error) *MockUtxostore {
+		mockStore := &MockUtxostore{}
+		mockStore.On("Get", mock.Anything, &rootA, mock.Anything).
+			Return(&meta.Data{SpendingDatas: []*spend.SpendingData{{TxID: &childA}}}, nil).Maybe()
+
+		if childAErr != nil {
+			mockStore.On("Get", mock.Anything, &childA, mock.Anything).Return(nil, childAErr).Maybe()
+		} else {
+			mockStore.On("Get", mock.Anything, &childA, mock.Anything).
+				Return(&meta.Data{SpendingDatas: []*spend.SpendingData{{TxID: &grandchildA}}}, nil).Maybe()
+		}
+
+		mockStore.On("Get", mock.Anything, &grandchildA, mock.Anything).
+			Return(&meta.Data{SpendingDatas: []*spend.SpendingData{{TxID: &greatGrandchildA}}}, nil).Maybe()
+		mockStore.On("Get", mock.Anything, &greatGrandchildA, mock.Anything).Return(&meta.Data{}, nil).Maybe()
+		mockStore.On("Get", mock.Anything, &rootB, mock.Anything).Return(&meta.Data{}, nil).Maybe()
+
+		return mockStore
+	}
+
+	t.Run("budget", func(t *testing.T) {
+		// 2 roots x 1 = 2: pass 1 visits rootA and childA, then trips on
+		// grandchildA before pass 2 starts
+		cones, _, err := GetConflictingChildrenFromRoots(context.Background(), newStore(nil), [][]chainhash.Hash{{rootA}, {rootB}}, 1)
+		require.ErrorIs(t, err, errors.ErrUtxoWalkLimitExceeded)
+		require.Len(t, cones, 2)
+		require.Equal(t, []chainhash.Hash{childA}, cones[0])
+		require.Empty(t, cones[1])
+	})
+
+	t.Run("read fault", func(t *testing.T) {
+		cones, _, err := GetConflictingChildrenFromRoots(context.Background(), newStore(errors.NewStorageError("store down")), [][]chainhash.Hash{{rootA}, {rootB}}, 0)
+		require.ErrorIs(t, err, errors.ErrStorageError)
+		require.Len(t, cones, 2)
+		require.Equal(t, []chainhash.Hash{childA}, cones[0])
+		require.Empty(t, cones[1])
+	})
+}
