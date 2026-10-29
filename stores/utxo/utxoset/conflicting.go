@@ -178,14 +178,24 @@ ON CONFLICT DO NOTHING`
 // those rows would lock them for nothing and widen the overlap with SetLocked and the mine that
 // withDeadlockRetry has to cure. Skipping them does not weaken the wait described above. A UTXO
 // row whose bit is still clear in the statement's snapshot is a candidate, so the update still
-// waits on a child's in-flight spend of it. A row whose bit is already set was set by a committed
-// flip, which had to take the row's lock first, and a spend that starts after that is refused by
-// its flag mask, so no spend of it can be in flight for the update to wait on. The one spend the
+// waits on a child's in-flight spend of it. A row whose bit is already set in the snapshot was set
+// by a committed flip, and a spend that starts after that is refused by its flag mask, so no spend
+// of it can be in flight for the update to wait on. The one spend the
 // mask lets through is conflict resolution's own, with IgnoreConflicting, made for the winner of
 // a contest. The read names it a child only if it committed before the read. It is the winner,
 // so it is not one the cascade should mark. On a clear, a UTXO row that is already clear is not
 // skipped from the read, only from the write: a child that spent it was not marked through it,
 // and a spend of it committed before the read is still named.
+//
+// SKIPPING UNCHANGED ROWS MEANS OPPOSITE FLIPS NO LONGER SERIALIZE. The reasoning above covers
+// in-flight spends only, not an in-flight flip in the other direction. Say a clear of a
+// transaction is running and not yet committed when a set of the same transaction starts. The
+// set's snapshot still shows the bit set, so every arm skips the row without waiting on the
+// clear's row lock, and the clear's value is what stands once it commits. When every arm wrote
+// its rows, the set waited on the clear, re-checked the row and applied its own value. Nothing
+// in this store serializes the two calls, so a caller of SetConflicting must not run opposite
+// flips on the same transaction at the same time: the losing call would act on its affected
+// outputs and children as if its flip had landed. No path that overlaps them is known today.
 const setConflictingSQL = `
 WITH ident AS (
     UPDATE tx_ident i
@@ -310,6 +320,11 @@ ORDER BY 1 DESC, 2`
 // Both answers are bounded by the journal's retention. Beyond that this store cannot say who
 // took a UTXO, so a cascade rooted on an older transaction stops early. That is a real limit of
 // delete-on-spend rather than a gap to paper over.
+//
+// The caller must not run a set and a clear on the same transaction at the same time. The store
+// does not serialize them. A call that starts while the other is uncommitted still sees its own
+// target value in its snapshot, writes nothing, and returns as if its flip had landed, and the
+// other call's value stands once it commits (see setConflictingSQL).
 func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
 	value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
 	if len(txHashes) == 0 {
