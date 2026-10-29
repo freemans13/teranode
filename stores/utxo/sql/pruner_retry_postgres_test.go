@@ -9,6 +9,8 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	sqlpruner "github.com/bsv-blockchain/teranode/stores/utxo/sql/pruner"
 	"github.com/stretchr/testify/require"
 )
@@ -62,6 +64,11 @@ func TestPrunerRetriesSerializationFailureOnDelete_Postgres(t *testing.T) {
 	child.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
 	require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
 	_, _, err = store.SpendAndCreate(ctx, child, 1000)
+	require.NoError(t, err)
+
+	// Mined, because the pruner keeps an unmined record that is not conflicting.
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash(), child.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
 	require.NoError(t, err)
 
 	childHash := child.TxIDChainHash()[:]
