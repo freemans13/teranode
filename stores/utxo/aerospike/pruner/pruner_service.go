@@ -274,6 +274,10 @@ type parentUpdateInfo struct {
 	// markerFailed records that this record's marker write did not land, or
 	// that its outcome could not be read. Set by tallyParentUpdateResults.
 	markerFailed bool
+	// released holds the children that are conflicting losers. ProcessConflicting
+	// released every input they spent, the uncontested ones too, so an unspent
+	// output they name does not hold them back: see keepSpendHolders.
+	released map[chainhash.Hash]struct{}
 }
 
 // add appends childHash unless this parent record already has it queued, and
@@ -293,12 +297,25 @@ func (p *parentUpdateInfo) add(childHash *chainhash.Hash, offset uint32) {
 	p.childHashes = append(p.childHashes, childHash)
 }
 
+// markReleased records that childHash is a conflicting loser.
+func (p *parentUpdateInfo) markReleased(childHash *chainhash.Hash) {
+	if p.released == nil {
+		p.released = make(map[chainhash.Hash]struct{}, 1)
+	}
+
+	p.released[*childHash] = struct{}{}
+}
+
 // merge folds another record's queued children for the same parent into p.
 func (p *parentUpdateInfo) merge(other *parentUpdateInfo) {
 	for _, childHash := range other.childHashes {
 		for _, offset := range other.offsets[*childHash] {
 			p.add(childHash, offset)
 		}
+	}
+
+	for childHash := range other.released {
+		p.markReleased(&childHash)
 	}
 }
 
@@ -1232,6 +1249,12 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 			prometheusUtxoInputResolutionErrors.Inc()
 
 			continue
+		}
+
+		if conflicting, _ := rec.Record.Bins[s.fieldConflicting].(bool); conflicting {
+			for _, info := range recordUpdates {
+				info.markReleased(txHash)
+			}
 		}
 
 		for source, info := range recordUpdates {
@@ -2183,6 +2206,12 @@ func (p *markingPlan) block(childHash chainhash.Hash) {
 // spend cleanly. Held-back children are counted, so a record that stays held
 // back is visible rather than silently retained.
 //
+// A conflicting loser is the exception: ProcessConflicting released every
+// input it spent, the uncontested ones too, so it is never held back for an
+// output that does not name it, and a replay of it meets the winner's spend and
+// is stored as conflicting again. The SQL pruner exempts conflicting rows the
+// same way.
+//
 // A parent record that is gone needs no marker and is dropped. Any other read
 // failure, including a record the batch never answered, holds back that record's
 // children. A transport failure fails the call, because nothing is known about
@@ -2253,10 +2282,12 @@ func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*pare
 				verdict = spendHolder(utxos, info.offsets[*childHash], childHash)
 			}
 
-			switch verdict {
-			case holderNamesChild:
+			_, released := info.released[*childHash]
+
+			switch {
+			case verdict == holderNamesChild:
 				holders = append(holders, childHash)
-			case holderNamesOther:
+			case verdict == holderNamesOther:
 				supersededCount++
 
 				if plan.superseded == nil {
@@ -2264,6 +2295,9 @@ func (s *Service) keepSpendHolders(ctx context.Context, updates map[string]*pare
 				}
 
 				plan.superseded[*childHash]++
+			case released:
+				// A conflicting loser: the output was released, not rolled back
+				// from under a confirmed spend, and a replay meets the winner.
 			default:
 				unverified++
 

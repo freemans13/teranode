@@ -413,6 +413,12 @@ func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
 // so a held-back child gets no marker anywhere: the spend path answers a marker
 // ahead of everything else, and a marker on a child that stays would refuse
 // that live child's own re-spend.
+//
+// A conflicting row never matches. ProcessConflicting releases every input of
+// a loser and of each descendant it cascades to, the uncontested ones too, so a
+// loser always has an input that looks like a rolled-back claim, and holding it
+// back would keep it forever. It needs no marker for those inputs: a replay of
+// it meets the winner's spend and is stored as conflicting again.
 const (
 	unverifiedClaimFrom = `SELECT 1
       FROM inputs hi
@@ -422,8 +428,8 @@ const (
 	unverifiedClaimCondition = `.id
         AND (ho.transaction_id IS NULL OR ho.spending_data IS NULL OR length(ho.spending_data) < 36)`
 
-	unverifiedClaimChild        = unverifiedClaimFrom + `child` + unverifiedClaimCondition
-	unverifiedClaimTransactions = unverifiedClaimFrom + `transactions` + unverifiedClaimCondition
+	unverifiedClaimChild        = unverifiedClaimFrom + `child` + unverifiedClaimCondition + ` AND NOT child.conflicting`
+	unverifiedClaimTransactions = unverifiedClaimFrom + `transactions` + unverifiedClaimCondition + ` AND NOT transactions.conflicting`
 )
 
 // pruneWithoutDefensiveCheck marks and deletes every transaction past its

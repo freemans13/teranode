@@ -604,6 +604,96 @@ func TestPrunerMarksOnlyTheChildThatHeldTheSpend(t *testing.T) {
 	require.NoError(t, err, "a transaction that never held the output must be able to spend it once it is free")
 }
 
+// TestPrunerDeletesConflictingLoserWithReleasedUncontestedInput is the
+// Aerospike twin of the SQL test of the same name. X spends P:0 and Q:0, and
+// the block's winner W spends P:0 only. ProcessConflicting marks X conflicting
+// and releases every input it spent, so Q:0 is unspent although nobody
+// contested it. An unspent output a child names normally holds the child back,
+// since that is what a rolled-back spend leaves; for a conflicting loser it
+// would hold it back forever. A replay of X meets W's spend, so X is pruned.
+func TestPrunerDeletesConflictingLoserWithReleasedUncontestedInput(t *testing.T) {
+	logger := ulogger.New("pruner-conflicting-loser-test")
+	s := test.CreateBaseTestSettings(t)
+	s.UtxoStore.DisableDAHCleaner = false
+	s.Pruner.UTXODefensiveEnabled = false
+	s.Aerospike.EnableSpendFilterExpressions = true
+
+	client, store, ctx, cleanup := initAerospike(t, s, logger)
+	t.Cleanup(cleanup)
+	require.NoError(t, store.SetBlockHeight(1000))
+
+	newParent := func(seed string) *bt.Tx {
+		parent := bt.NewTx()
+		require.NoError(t, parent.From(seed, 0, "51", 30000))
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+		_, err := store.Create(ctx, parent, 1000)
+		require.NoError(t, err)
+
+		return parent
+	}
+
+	parentP := newParent("3333333333333333333333333333333333333333333333333333333333333333")
+	parentQ := newParent("4444444444444444444444444444444444444444444444444444444444444444")
+	_, err := store.SetMinedMulti(ctx, []*chainhash.Hash{parentP.TxIDChainHash(), parentQ.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+	require.NoError(t, err)
+
+	loser := bt.NewTx()
+	for _, parent := range []*bt.Tx{parentP, parentQ} {
+		require.NoError(t, loser.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	}
+
+	require.NoError(t, loser.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 7000))
+	_, _, err = store.SpendAndCreate(ctx, loser, 1000)
+	require.NoError(t, err)
+
+	winner := bt.NewTx()
+	require.NoError(t, winner.From(parentP.TxID(), 0, parentP.Outputs[0].LockingScript.String(), parentP.Outputs[0].Satoshis))
+	require.NoError(t, winner.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+	_, _, err = store.SpendAndCreate(ctx, winner, 1000, utxo.WithConflicting(true), utxo.WithCreateOnly())
+	require.NoError(t, err)
+
+	_, _, err = utxo.ProcessConflicting(ctx, store, 1001, chainhash.Hash{}, []chainhash.Hash{*winner.TxIDChainHash()},
+		map[chainhash.Hash]struct{}{}, utxo.NoAncestryGuard)
+	require.NoError(t, err)
+
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{winner.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+	require.NoError(t, err)
+
+	loserKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), loser.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+
+	loserRecord, err := client.Get(nil, loserKey, fields.Conflicting.String(), fields.DeleteAtHeight.String())
+	require.NoError(t, err)
+	require.Equal(t, true, loserRecord.Bins[fields.Conflicting.String()], "fixture: X is a conflicting loser")
+	require.NotNil(t, loserRecord.Bins[fields.DeleteAtHeight.String()], "fixture: SetConflicting gave X a delete-at height")
+
+	qHash, err := util.UTXOHashFromOutput(parentQ.TxIDChainHash(), parentQ.Outputs[0], 0)
+	require.NoError(t, err)
+	qSpend, err := store.GetSpend(ctx, &utxo.Spend{TxID: parentQ.TxIDChainHash(), Vout: 0, UTXOHash: qHash})
+	require.NoError(t, err)
+	require.Nil(t, qSpend.SpendingData, "fixture: ProcessConflicting released the uncontested Q:0")
+
+	astore.ResetPrunerServiceForTests()
+	t.Cleanup(astore.ResetPrunerServiceForTests)
+	require.NoError(t, store.CreateIndexIfNotExists(ctx, apruner.IndexName, fields.DeleteAtHeight.String(), aerospike.NUMERIC))
+	require.NoError(t, store.WaitForIndexReady(ctx, apruner.IndexName))
+
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+
+	for _, height := range []uint32{5000, 6000} {
+		_, err = svc.(*apruner.Service).PruneWithPartitions(ctx, height, "conflicting-loser-released", 1)
+		require.NoError(t, err)
+	}
+
+	exists, err := client.Exists(nil, loserKey)
+	require.NoError(t, err)
+	require.False(t, exists, "a conflicting loser past its delete-at height is pruned although its uncontested input was released")
+}
+
 // TestPrunerSkipDeletionsWritesNoMarkers: with pruner_skipDeletions on, the
 // pruner deletes nothing, so it must mark nothing either. A marker for a child
 // that stays in the store turns that live, mined child's own idempotent re-spend
