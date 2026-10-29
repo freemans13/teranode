@@ -2527,7 +2527,9 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	if applyErr != nil {
 		if cleanupErr := u.removePrunedReplayGhosts(ctx, block, txs, txids, replays); cleanupErr != nil {
-			applyErr = errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] the list failed and the recreated pruned transactions could not be removed", block.Hash().String(), errors.Join(applyErr, cleanupErr))
+			// A ServiceError: the verdict on the block waits on a retry that
+			// starts from a store with the recreated records gone.
+			applyErr = errors.NewServiceError("[createAndSpendUTXOsForBatch][%s] the list failed and the recreated pruned transactions could not be removed", block.Hash().String(), errors.Join(applyErr, cleanupErr))
 		}
 	}
 
@@ -3081,7 +3083,7 @@ func (u *BlockValidation) removePrunedReplayGhosts(ctx context.Context, block *m
 	deleteErr := utxo.DeleteCreated(cleanupCtx, u.logger, u.utxoStore, ghosts, u.settings.UtxoStore.StoreBatcherSize*8)
 
 	if idMismatch {
-		return errors.NewProcessingError("[removePrunedReplayGhosts][%s] block id %d is held by another committed block; failing the attempt so the retry takes an id of its own", block.Hash().String(), block.ID, deleteErr)
+		return errors.NewServiceError("[removePrunedReplayGhosts][%s] block id %d is held by another committed block; failing the attempt so the retry takes an id of its own", block.Hash().String(), block.ID, deleteErr)
 	}
 
 	if readErr != nil && deleteErr != nil {
