@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -96,6 +97,18 @@ type validationResult struct {
 	done chan struct{} // Closed when validation completes
 	err  error         // The validation result
 	mu   sync.RWMutex  // Protects err
+
+	// settled is closed after done, once the settle hook has run. Until then the block still
+	// counts as validating, so children held behind it are not started before they have their
+	// class. Nil in literals built by tests, which then fall back to done.
+	settled chan struct{}
+}
+
+// validationDoneHooks run after a block's validation result is published: settle with the block
+// and its validation error, then wake once the block no longer counts as validating.
+type validationDoneHooks struct {
+	settle func(*chainhash.Hash, error)
+	wake   func()
 }
 
 const (
@@ -234,6 +247,11 @@ type BlockValidation struct {
 	// variadic opts like p2pClient.
 	blockAssemblyClient blockassembly.ClientI
 
+	// setMinedDisabled leaves the mined status of blocks to another BlockValidation
+	// on the same stores (see NoSetMined): nothing is queued for this instance's
+	// setMined worker. Set from NewBlockValidation's variadic opts.
+	setMinedDisabled bool
+
 	// lastValidatedBlocks caches recently validated blocks for 2 minutes
 	lastValidatedBlocks *expiringmap.ExpiringMap[chainhash.Hash, *model.Block]
 
@@ -254,6 +272,11 @@ type BlockValidation struct {
 
 	// blocksCurrentlyValidating tracks blocks being validated to prevent concurrent validation
 	blocksCurrentlyValidating *txmap.SyncedMap[chainhash.Hash, *validationResult]
+
+	// validationDoneHooks, when set, run once a block's validation result is published. They
+	// classify the children held behind a block validated outside the queue and wake the priority
+	// queue, which otherwise releases those children only on an unrelated queue event.
+	validationDoneHooks atomic.Pointer[validationDoneHooks]
 
 	// setMinedChan receives block hashes that need to be marked as mined
 	setMinedChan chan *chainhash.Hash
@@ -318,6 +341,13 @@ type BlockValidation struct {
 
 	// backgroundTasks tracks background goroutines to ensure proper shutdown
 	backgroundTasks sync.WaitGroup
+
+	// backgroundTasksMu and backgroundTasksClosed let work that is not already covered by a
+	// registered task join backgroundTasks without racing Wait. A WaitGroup Add from zero must
+	// happen before Wait starts; trackBackgroundTask takes the mutex and refuses once Wait has
+	// set backgroundTasksClosed, so every Add it makes is ordered before the Wait.
+	backgroundTasksMu     sync.Mutex
+	backgroundTasksClosed bool
 
 	// mmapDir, when non-empty, enables mmap-backed subtree loading.
 	mmapDir string
@@ -384,6 +414,12 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 		u.settings.BlockValidation.SubtreeMetaPeerFetchTimeout)
 }
 
+// NoSetMined, passed to NewBlockValidation, leaves setting the mined status of
+// blocks' transactions to another BlockValidation on the same stores. Two
+// setMined workers on one block race: one's set can land after the other's
+// unset of an invalidated block and leave its transactions marked mined.
+type NoSetMined struct{}
+
 // NewBlockValidation creates a new block validation instance with the provided dependencies.
 // It initializes all required components and starts background processing goroutines for
 // handling block validation tasks.
@@ -398,12 +434,16 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 //   - utxoStore: Storage for utxos and transaction metadata
 //   - validatorClient: Transaction validation interface
 //   - subtreeValidationClient: Subtree validation interface
-//   - opts: Optional parameters:
+//   - opts: Optional parameters: a P2PClientI, a blockassembly.ClientI, NoSetMined
 //
 // Returns a configured BlockValidation instance ready for use.
 func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, subtreeStore blob.Store,
 	txStore blob.Store, utxoStore utxo.Store, validatorClient validator.Interface, subtreeValidationClient subtreevalidation.Interface, opts ...interface{},
 ) *BlockValidation {
+	// The background goroutines below set package metrics; a BlockValidation built
+	// without the Server, such as the test daemon's, must not find them nil.
+	initPrometheusMetrics()
+
 	logger.Infof("optimisticMining = %v", tSettings.BlockValidation.OptimisticMining)
 	if tSettings.BlockValidation.OptimisticMining && !tSettings.BlockValidation.OptimisticMiningPeerBlocks {
 		logger.Warnf("optimistic mining is enabled but stays off on every validation path until blockvalidation_optimistic_mining_peer_blocks is also set (bitcoin-sv/teranode#4692)")
@@ -466,6 +506,10 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		if c, ok := o.(blockassembly.ClientI); ok {
 			bv.blockAssemblyClient = c
 		}
+
+		if _, ok := o.(NoSetMined); ok {
+			bv.setMinedDisabled = true
+		}
 	}
 
 	go func() {
@@ -490,7 +534,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		subscribeCancel context.CancelFunc
 	)
 
-	if bv.blockchainClient != nil {
+	// The subscription only feeds the setMined worker, so a NoSetMined instance skips it.
+	if bv.blockchainClient != nil && !bv.setMinedDisabled {
 		go func() {
 			for {
 				select {
@@ -919,7 +964,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 // We deliberately do NOT call tryClaimBlockForSetMined here because the claim must be
 // released by the consumer, and the worker owns that lifecycle.
 func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context) {
-	if u.blockchainClient == nil {
+	if u.blockchainClient == nil || u.setMinedDisabled {
 		return
 	}
 
@@ -978,6 +1023,10 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context) {
 // once the channel empties, and dedups via the MinedSet/tryClaim guards, so overflow
 // reordering is harmless.
 func (u *BlockValidation) enqueueSetMined(blockHash *chainhash.Hash) {
+	if u.setMinedDisabled {
+		return
+	}
+
 	select {
 	case u.setMinedChan <- blockHash:
 	default:
@@ -1130,6 +1179,10 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 			block := block
 
 			g.Go(func() error {
+				// A panic is logged and swallowed like every other failure in this sweep, so one
+				// bad block cannot stop the service from starting. Its subtrees_set stays false.
+				defer recoverChildPanic(u.logger, recoveredPanicPathService, nil, nil, "[BlockValidation:start][%s] subtrees_set sweep", block.Hash().String())
+
 				// See subtreeFilesReady for why the sweep, and only the sweep, needs this check.
 				ready, missing, err := u.subtreeFilesReady(ctx, block)
 				if err != nil {
@@ -1388,18 +1441,53 @@ func (u *BlockValidation) tryClaimBlockForSetMined(blockHash *chainhash.Hash) bo
 	return true
 }
 
+// subtreeAbsent reports whether a subtree store read failed because the subtree
+// is not there. A storage error is the store failing while it looked, whatever
+// it wraps, so it never counts as absent: errors.Is walks the chain, and a
+// storage error over a not-found would otherwise be skipped as a missing
+// subtree. Same rule as writeStoreError in stores/blob/server.go.
+func subtreeAbsent(err error) bool {
+	return errors.Is(err, errors.ErrNotFound) && !errors.Is(err, errors.ErrStorageError)
+}
+
 // reloadSubtreesForInvalidBlock reloads an invalid block's subtrees from the
-// store, best-effort: a subtree that cannot be read or parsed is left nil,
-// because an invalid block legitimately may not have all of them.
-func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) {
+// store. A subtree that is absent or does not parse is left nil, because an
+// invalid block legitimately may not have all of them and a retry cannot bring
+// one back. Any other read failure is returned: it may be transient, and
+// skipping it would let the revert finish with that subtree's tags in place.
+//
+// On that error the subtrees already loaded are closed before returning. They
+// never reach the block, and an mmap-backed subtree has no finalizer, so they
+// would otherwise keep their mapping and temp backing file until process exit.
+func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, block *model.Block) (err error) {
 	reloaded := make([]*subtreepkg.Subtree, len(block.Subtrees))
+
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		for i, st := range reloaded {
+			if closeErr := st.Close(); closeErr != nil {
+				u.logger.Warnf("[setTxMined][%s] failed closing reloaded subtree %d after read failure: %v", block.Hash().String(), i, closeErr)
+			}
+		}
+	}()
 
 	for subtreeIdx, subtreeHash := range block.Subtrees {
 		subtreeBytes, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
 		if err != nil {
+			if !subtreeAbsent(err) {
+				return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+			}
+
 			subtreeBytes, err = u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 			if err != nil {
-				u.logger.Warnf("[setTxMined][%s] failed to get subtree %d/%s from store: %s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+				if !subtreeAbsent(err) {
+					return errors.NewProcessingError("[setTxMined][%s] failed to read subtree %d/%s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
+				}
+
+				u.logger.Warnf("[setTxMined][%s] subtree %d/%s not in store: %s", block.Hash().String(), subtreeIdx, subtreeHash.String(), err)
 				continue
 			}
 		}
@@ -1420,6 +1508,8 @@ func (u *BlockValidation) reloadSubtreesForInvalidBlock(ctx context.Context, blo
 	// store I/O is what makes an eviction of the same block stall the whole
 	// lastValidatedBlocks cache.
 	block.ReplaceSubtreeSlices(reloaded)
+
+	return nil
 }
 
 // setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
@@ -1507,7 +1597,20 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 			u.logger.Warnf("[setTxMined][%s] failed closing subtrees before unset-mined reload: %v", block.Hash().String(), releaseErr)
 		}
 
-		u.reloadSubtreesForInvalidBlock(ctx, block)
+		if err = u.reloadSubtreesForInvalidBlock(ctx, block); err != nil {
+			return err
+		}
+
+		// The reloaded subtrees belong to this call alone, so release them on
+		// every exit. The revert can now fail, and each retry reloads them; an
+		// early return that skipped the release below would leak one set of
+		// mmap mappings and temp files per attempt. On success the explicit
+		// release below has already run and this one finds only nil entries.
+		defer func() {
+			if releaseErr := block.ReleaseSubtreeNodes(nil); releaseErr != nil {
+				u.logger.Warnf("[setTxMined][%s] failed closing reloaded subtrees after unset-mined revert: %v", block.Hash().String(), releaseErr)
+			}
+		}()
 	} else {
 		// All subtrees should already be available for fully processed blocks
 		_, err = block.GetSubtrees(ctx, u.logger, u.subtreeStore, u.settings.Block.GetAndValidateSubtreesConcurrency)
@@ -1607,6 +1710,36 @@ func (u *BlockValidation) isParentMined(ctx context.Context, blockHeader *model.
 	return parentBlockMined, nil
 }
 
+// IsValidating reports whether the block is being validated, on any path, or its settle hook has
+// not finished yet. A settled validation whose entry is still kept for the validationResultGrace
+// window does not count: its outcome is already in the store, and the window serves only
+// duplicate arrivals.
+func (u *BlockValidation) IsValidating(blockHash *chainhash.Hash) bool {
+	result, ok := u.blocksCurrentlyValidating.Get(*blockHash)
+	if !ok {
+		return false
+	}
+
+	finished := result.settled
+	if finished == nil {
+		finished = result.done
+	}
+
+	select {
+	case <-finished:
+		return false
+	default:
+		return true
+	}
+}
+
+// SetValidationDoneHooks sets the hooks run, on their own goroutine, each time a block's
+// validation result is published: settle with the block and the validation error, then wake once
+// the block no longer counts as validating. Either may be nil.
+func (u *BlockValidation) SetValidationDoneHooks(settle func(*chainhash.Hash, error), wake func()) {
+	u.validationDoneHooks.Store(&validationDoneHooks{settle: settle, wake: wake})
+}
+
 // runOncePerBlock ensures validation runs only once per block.
 // If another goroutine is already validating, it waits and returns that result.
 // validationResultGrace is how long a finished validation's result stays published for
@@ -1626,9 +1759,10 @@ const revalidateFromScratchDelay = 2 * validationResultGrace
 // unreachable.
 const prepareBlockAssemblyTimeout = 2 * time.Second
 
-func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) error {
+func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) (err error) {
 	result := &validationResult{
-		done: make(chan struct{}),
+		done:    make(chan struct{}),
+		settled: make(chan struct{}),
 	}
 
 	existingResult, wasFirst := u.blocksCurrentlyValidating.SetIfNotExists(*blockHash, result)
@@ -1642,22 +1776,56 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 		return existingResult.err
 	}
 
-	// We're first - run validation
-	err := validate(opts)
+	// Store and broadcast the result, and remove the entry after the grace window. This is a
+	// defer so that it also runs when validate panics (BV-STARTUP-007). Without it the entry has
+	// no TTL and its done channel never closes, so each later validation of this hash waits for
+	// ever above. On a panic the waiters get the error from newConcurrentValidationPanicError, and
+	// the panic continues to the caller, which logs it with the stack.
+	defer func() {
+		r := recover()
+		if r != nil {
+			err = newConcurrentValidationPanicError(blockHash)
+		}
 
-	// Store and broadcast result
-	result.mu.Lock()
-	result.err = err
-	result.mu.Unlock()
-	close(result.done)
+		result.mu.Lock()
+		result.err = err
+		result.mu.Unlock()
+		close(result.done)
 
-	// Cleanup after delay
-	go func() {
-		time.Sleep(validationResultGrace)
-		u.blocksCurrentlyValidating.Delete(*blockHash)
+		// The entry is dropped only after settle, however long it takes: without the entry the
+		// block no longer counts as validating, and its children would be released before they
+		// have their class. A panic in settle is logged, not fatal (BV-STARTUP-007), and still
+		// releases the children.
+		go func(err error) {
+			hooks := u.validationDoneHooks.Load()
+
+			defer func() {
+				if r := recover(); r != nil {
+					u.logger.Errorf("[ValidateBlock][%s] PANIC in the validation-done settle hook: %v stack=%q", blockHash.String(), r, debug.Stack())
+				}
+
+				close(result.settled)
+
+				if hooks != nil && hooks.wake != nil {
+					hooks.wake()
+				}
+
+				time.Sleep(validationResultGrace)
+				u.blocksCurrentlyValidating.Delete(*blockHash)
+			}()
+
+			if hooks != nil && hooks.settle != nil {
+				hooks.settle(blockHash, err)
+			}
+		}(err)
+
+		if r != nil {
+			panic(r)
+		}
 	}()
 
-	return err
+	// We're first - run validation
+	return validate(opts)
 }
 
 // ValidateBlock performs comprehensive validation of a Bitcoin block.
@@ -2082,7 +2250,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// Wait for reValidationBlock to do its thing
 		// When waitForPreviousBlocksToBeProcessed is done, all the previous blocks will be processed
 		if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
-			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
+			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block.
+			// A NoSetMined instance queues nothing here and waits on the BlockValidation
+			// that owns setMined to mark the parent mined.
 			u.enqueueSetMined(block.Header.HashPrevBlock)
 
 			if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
@@ -2136,9 +2306,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			}
 
 			// An invalid transaction in the received subtrees. This CANNOT condemn the hash
-			// (bitcoin-sv/teranode#4844): subtree validation runs above block.Valid, so nothing has
-			// reconciled block.Subtrees against Header.HashMerkleRoot and the body is still whatever
-			// the serving peer chose. Relaying a genuine fresh header with a doctored subtree list
+			// (bitcoin-sv/teranode#4844): subtree validation runs above block.Valid, and it binds
+			// block.Subtrees to Header.HashMerkleRoot only when it reuses a cached subtree or takes
+			// the batched catch-up path, so in general the body is still whatever the serving peer
+			// chose. Relaying a genuine fresh header with a doctored subtree list
 			// costs nothing, and persisting on it both stores the peer's coinbase and poisons a real
 			// block hash so the honest body is later refused as already-invalid.
 			//
@@ -2294,7 +2465,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// honest multi-transaction block is never rejected here. Nothing has been added yet, so
 			// this matches the non-optimistic corrupt branch: strike the serving peer and return
 			// corrupt for re-download, under the corrupt-attempt cap. The residual under the opt-in
-			// is a body carrying subtrees, which cannot be bound until block.Valid is split.
+			// is a body carrying subtrees that subtree validation did not bind (none of them cached),
+			// which cannot be bound here until block.Valid is split.
 			if err = block.CheckCoinbaseOnlyBodyBound(); err != nil {
 				if !opts.IsRevalidation {
 					u.penalizeCorruptBlockPeer(ctx, opts.PeerID, block, err.Error())
@@ -2958,6 +3130,12 @@ func (u *BlockValidation) subtreeToCheckPresentBefore(ctx context.Context, block
 		idx, hash := i, *subtreeHash
 
 		g.Go(func() error {
+			// Present until the probe says otherwise, so a probe that panics fails safe like one
+			// that errors. The group's error is discarded, so the panic is only logged and counted.
+			present[idx] = true
+
+			defer recoverChildPanic(u.logger, recoveredPanicPathBlockValidation, nil, nil, "[subtreeToCheckPresentBefore][%s] subtree %s", block.Hash().String(), hash.String())
+
 			_, exists, err := findLocalSubtreeFile(ctx, u.subtreeStore, hash)
 			present[idx] = exists || err != nil
 
@@ -4010,8 +4188,20 @@ func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 //   - the inner backgroundTasks.Wait() goroutine and its done channel leak until the
 //     worker eventually exits. sync.WaitGroup has no cancellable wait, and on these paths
 //     the worker itself is already leaking (its ctx was never cancelled), so this adds
-//     nothing that outlives the worker. The daemon path never hits this.
+//     nothing that outlives the worker.
+//
+// The daemon path can reach ctx first too, since commitBlock registers its commit tail here: a
+// store that hangs past the stop deadline holds the tail for up to postCommitTimeout. Server.Stop
+// passes a ctx that ends before its own deadline (stopWaitContext), so Close still runs. Wait then
+// returns on ctx, the commit tail keeps running until the process exits, and the inner goroutine
+// ends with it.
 func (u *BlockValidation) Wait(ctx context.Context) {
+	// Close registration first, so trackBackgroundTask cannot Add from zero while
+	// backgroundTasks.Wait below is running.
+	u.backgroundTasksMu.Lock()
+	u.backgroundTasksClosed = true
+	u.backgroundTasksMu.Unlock()
+
 	done := make(chan struct{})
 
 	go func() {
@@ -4024,6 +4214,23 @@ func (u *BlockValidation) Wait(ctx context.Context) {
 	case <-ctx.Done():
 		u.logger.Warnf("[BlockValidation] Wait aborted before background tasks drained: %s", ctx.Err())
 	}
+}
+
+// trackBackgroundTask registers one unit of work with backgroundTasks, so Wait waits for it, and
+// returns the func that ends it. It returns ok false, and registers nothing, once Wait has started:
+// work begun after that is not waited for. Use it for work on a goroutine that no registered task
+// already covers, where a bare backgroundTasks.Add could start from zero during Wait.
+func (u *BlockValidation) trackBackgroundTask() (done func(), ok bool) {
+	u.backgroundTasksMu.Lock()
+	defer u.backgroundTasksMu.Unlock()
+
+	if u.backgroundTasksClosed {
+		return nil, false
+	}
+
+	u.backgroundTasks.Add(1)
+
+	return u.backgroundTasks.Done, true
 }
 
 // StopCaches stops the background cleanup goroutines for all expiring caches.

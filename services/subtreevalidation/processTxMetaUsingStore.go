@@ -213,6 +213,14 @@ func (u *Server) decorateReadPath(skipCachePopulation bool) (utxo.Store, []field
 // is true and the number of missing transactions exceeds the configured threshold.
 func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem,
 	blockIds map[uint32]bool, batched bool, failFast bool, skipCachePopulation bool) (int, error) {
+	return u.processTxMetaUsingStoreAllowing(ctx, txHashes, txMetaSlice, blockIds, batched, failFast, skipCachePopulation, 0)
+}
+
+// processTxMetaUsingStoreAllowing is processTxMetaUsingStore with the fail-fast miss
+// threshold raised by missAllowance, for misses already explained, such as txs the
+// validator rejected as conflicting, which are not in the store either.
+func (u *Server) processTxMetaUsingStoreAllowing(ctx context.Context, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem,
+	blockIds map[uint32]bool, batched bool, failFast bool, skipCachePopulation bool, missAllowance int) (int, error) {
 	if len(txHashes) != len(txMetaSlice) {
 		return 0, errors.NewInvalidArgumentError("txHashes and txMetaSlice must be the same length")
 	}
@@ -223,6 +231,9 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 	batchSize := u.settings.BlockValidation.ProcessTxMetaUsingStoreBatchSize
 	validateSubtreeInternalConcurrency := u.settings.BlockValidation.ProcessTxMetaUsingStoreConcurrency
 	missingTxThreshold := u.settings.BlockValidation.ProcessTxMetaUsingStoreMissingTxThreshold
+	if missingTxThreshold > 0 {
+		missingTxThreshold += missAllowance
+	}
 
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(u.logger, g, validateSubtreeInternalConcurrency)
@@ -235,6 +246,13 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 	store, decorateFields := u.decorateReadPath(skipCachePopulation)
 
 	var missed atomic.Int32
+
+	// Conflicting transactions are collected by whichever batch decorates them
+	// and checked against the chain once, after every batch is done (issue 2037).
+	// settleCollectedConflictingTxs checks them even when a batch failed, and
+	// clears them when the check fails, so no entry is left set without passing
+	// it.
+	var conflicting conflictingTxCollector
 
 	if batched {
 		for i := 0; i < len(txHashes); i += batchSize {
@@ -326,9 +344,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 
 						// if the tx is conflicting, we need to check if it is conflicting on the current chain
 						if txMetaSlice[data.Idx].conflicting {
-							if err = u.checkCounterConflictingOnCurrentChain(ctx, data.Hash, blockIds); err != nil {
-								return errors.NewProcessingError("[processTxMetaUsingStore][%s] failed to check counter conflicting tx on current chain", data.Hash.String(), err)
-							}
+							conflicting.add(data.Hash, data.Idx)
 						}
 					}
 
@@ -337,8 +353,8 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 			})
 		}
 
-		if err := g.Wait(); err != nil {
-			return int(missed.Load()), errors.NewContextCanceledError("[processTxMetaUsingStore]", err)
+		if err := u.settleCollectedConflictingTxs(ctx, g.Wait(), &conflicting, txMetaSlice, blockIds); err != nil {
+			return int(missed.Load()), settledError(ctx, "[processTxMetaUsingStore]", err)
 		}
 
 		return int(missed.Load()), nil
@@ -397,6 +413,16 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 									txInpoints:  txMeta.TxInpoints,
 								}
 
+								// The batched branch above collects these too; without it here,
+								// whether a block's counter-spends are caught depended on which
+								// branch SubtreeValidation.BatchMissingTransactions selected.
+								// Collected rather than checked per transaction, for the reason
+								// the batched branch collects: these transactions share cones,
+								// and one walk each costs ~N²/2 store reads (issue 2037).
+								if txMetaSlice[i+j].conflicting {
+									conflicting.add(txHash, i+j)
+								}
+
 								continue
 							}
 						}
@@ -413,10 +439,26 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 			})
 		}
 
-		if err := g.Wait(); err != nil {
-			return int(missed.Load()), errors.NewContextCanceledError(errProcessTxMetaContextDone, err)
+		if err := u.settleCollectedConflictingTxs(ctx, g.Wait(), &conflicting, txMetaSlice, blockIds); err != nil {
+			return int(missed.Load()), settledError(ctx, errProcessTxMetaContextDone, err)
 		}
 
 		return int(missed.Load()), nil
 	}
+}
+
+// settledError is the error processTxMetaUsingStore returns for what
+// settleCollectedConflictingTxs returned. Every failure keeps the ContextCanceled
+// wrap it has always had, and so its class at every caller, except a proven
+// conflict: that is a verdict on the block, and under ContextCanceled block
+// validation took it for this node's own cancellation and retried the block
+// (blockvalidation's isRecoverableBlockMessageError, and catchup's
+// releaseCatchupLock). Once ctx is done the caller has given up, and even a
+// proven conflict keeps the wrap.
+func settledError(ctx context.Context, message string, err error) error {
+	if ctx.Err() == nil && provenConflict(err) {
+		return err
+	}
+
+	return errors.NewContextCanceledError(message, err)
 }

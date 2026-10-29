@@ -184,17 +184,20 @@ func isRecoverableBlockMessageError(err error) bool {
 		errors.Is(err, errors.ErrStorageError) ||
 		errors.Is(err, errors.ErrThresholdExceeded) ||
 		errors.Is(err, errors.ErrContextCanceled) ||
-		errors.Is(err, errors.ErrExternal)
+		errors.Is(err, errors.ErrExternal) ||
+		isLocalProcessingFault(err)
 }
 
 // runBlockHandler runs blockHandler in the caller's goroutine, so when it returns the
 // handler has finished too. A panic is returned as a service error: it is a local
-// fault, so it is retried and the announcing peer is not blamed.
+// fault, so it is retried and the announcing peer is not blamed. The panic value goes
+// to the log, not the error text, so no text-matching classifier can misread it.
 func (u *Server) runBlockHandler(ctx context.Context, kafkaMsg *kafkamessage.KafkaBlockTopicMessage) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			u.logger.Errorf("[blockHandler][%s] PANIC: %v\n%s", kafkaMsg.Hash, r, debug.Stack())
-			err = errors.NewServiceError("[blockHandler][%s] panic: %v", kafkaMsg.Hash, r)
+			countRecoveredPanic(recoveredPanicPathKafka)
+			u.logger.Errorf("[blockHandler][%s] PANIC: %v stack=%q", kafkaMsg.Hash, r, debug.Stack())
+			err = errors.NewServiceError("[blockHandler][%s] recovered panic", kafkaMsg.Hash)
 		}
 	}()
 
