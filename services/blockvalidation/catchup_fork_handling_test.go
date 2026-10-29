@@ -409,7 +409,7 @@ func TestCatchup_DeepReorgDuringCatchup(t *testing.T) {
 			Return((*model.BlockHeader)(nil), (*model.BlockHeaderMeta)(nil),
 				errors.NewBlockNotFoundError("block not found")).Maybe()
 
-		// Fork cleanup (Step 3.5) queries the headers between the common ancestor and
+		// Fork cleanup (step 9.6) queries the headers between the common ancestor and
 		// our tip to clear their mined_set; an empty result keeps the test focused.
 		mockBlockchainClient.On("GetBlockHeadersByHeight", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil).Maybe()

@@ -120,12 +120,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   whole offered chain has less cumulative work than the best tip; equal work is still
   fetched. The check runs after the existing fork checks, so a fork deeper than coinbase
   maturity and the deep-fork secret-mining case are still refused with an error and
-  charged as before. Offered headers that do not link from the common ancestor are now
-  refused as an invalid response before any fork check weighs them, so a gap is never
-  read as secret mining or less work, and no fork block's mined state is cleared for it. In a
-  mixed-version deploy, a subtree
-  validation older than its block validation ignores the new request field and keeps the
-  hand-off off. The existing block-context queue-shed policy still accepts and unlocks
+  charged as before. In a mixed-version deploy, a subtree validation older than its block
+  validation ignores the new request field and keeps the hand-off off. The existing block-context queue-shed policy still accepts and unlocks
   a transaction without a template entry on `ErrThresholdExceeded`; durable recovery
   from that case is not added here. (#2075, partially addresses #2067)
 
@@ -400,6 +396,19 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   route rejects the block as invalid. A block that spends a UTXO this node has frozen,
   or that hits a UTXO hash mismatch in this node's store, stays a local fault.
   (#2022)
+
+- **Catchup rejects headers that do not form one chain on the common ancestor.**
+  Before, a peer could offer headers whose first entry built on some other stored
+  block, and catchup carried on under the wrong heights with only a warning. Now
+  catchup stops before it touches local state, and the error is coded
+  `NETWORK_INVALID_RESPONSE`, so it is charged to the peer. A header batch whose
+  headers do not link to each other, or that does not build on the last header of
+  the batch before it, is rejected the same way as soon as it arrives, before the
+  fetch is counted as a success for the peer. Catchup also now clears
+  `mined_set` on the blocks a fork replaces only after every header check has
+  passed, just before it fetches blocks, so a fork rejected by a later check, or a
+  peer with nothing past the ancestor, no longer un-stamps the node's own blocks.
+  No action needed. (#2034)
 
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,

@@ -4,7 +4,6 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
@@ -49,40 +48,6 @@ func TestOfferedChainHasLessWork_OnlyCompleteOfferIsCompared(t *testing.T) {
 				headersFetchResult: &catchup.Result{Headers: headers, ReachedTarget: tc.reached},
 			}
 			require.Equal(t, tc.want, srv.offeredChainHasLessWork(ctx))
-		})
-	}
-}
-
-// A list that skips a block weighs less than the chain it claims to be, so a peer could
-// otherwise talk us out of a heavier chain it announced, or pass a gap off as secret mining.
-// It is an invalid response, charged to the peer, whether or not the fetch reached the
-// announced block.
-func TestVerifyOfferedHeadersLink(t *testing.T) {
-	blocks := testhelpers.CreateTestBlockChain(t, 4)
-	for _, tc := range []struct {
-		name    string
-		headers []*model.BlockHeader
-		reached bool
-		invalid bool
-	}{
-		{"linked list", []*model.BlockHeader{blocks[0].Header, blocks[1].Header, blocks[2].Header, blocks[3].Header}, true, false},
-		{"gap inside the list", []*model.BlockHeader{blocks[0].Header, blocks[1].Header, blocks[3].Header}, true, true},
-		{"gap in a fetch that never reached the announced block", []*model.BlockHeader{blocks[0].Header, blocks[2].Header, blocks[3].Header}, false, true},
-		{"first header does not follow the ancestor", []*model.BlockHeader{blocks[0].Header, blocks[2].Header}, false, true},
-		{"nothing after the ancestor", []*model.BlockHeader{blocks[0].Header}, true, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := &CatchupContext{blockUpTo: blocks[3], commonAncestorIndex: 0,
-				commonAncestorHash: blocks[0].Header.Hash(),
-				headersFetchResult: &catchup.Result{Headers: tc.headers, ReachedTarget: tc.reached},
-			}
-
-			err := verifyOfferedHeadersLink(ctx)
-			if tc.invalid {
-				require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "got %v", err)
-			} else {
-				require.NoError(t, err)
-			}
 		})
 	}
 }
