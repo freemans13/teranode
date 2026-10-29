@@ -26,7 +26,7 @@ import (
 // holds.
 type deferredBlockDrain struct {
 	drainQueue        bool // false on the own-block path, which never drains
-	transactionMap    *SplitSwissMap
+	transactionMap    *SortedHashSet
 	losingTxHashesMap txmap.TxMap
 	conflictingHashes map[chainhash.Hash]struct{}
 }
@@ -38,6 +38,10 @@ type deferredBlockDrain struct {
 // reloads the unmined transactions from the UTXO store. Storage errors seen by
 // the flush keep the disk tx map's own reset path.
 func (stp *SubtreeProcessor) runDeferredBlockDrain(ctx context.Context, block *model.Block, drain *deferredBlockDrain) {
+	if drainStartHook != nil {
+		drainStartHook()
+	}
+
 	if drain.drainQueue {
 		if err := stp.runHandlerWithRecover("deferredBlockDrain", func() error {
 			return stp.drainQueueAfterBlock(ctx, drain)
@@ -89,6 +93,14 @@ func (stp *SubtreeProcessor) drainQueueAfterBlock(ctx context.Context, drain *de
 	})
 }
 
+// drainStartHook, when set, runs as the deferred drain starts. Nil in production; tests set it
+// to hold the drain where they need it, which ordering on newSubtreeChan cannot do reliably when
+// a test reads that channel with one gated goroutine. Production is not order-sensitive here:
+// runNewSubtreeListener (services/blockassembly/Server.go) hands each request to one of the
+// parallel storage workers and answers its ErrChan from there, so a snapshot store waits only
+// for its own write.
+var drainStartHook func()
+
 // drainChunkItems is about how many txs drainQueueAfterBlock takes off the
 // queue at a time: enough to keep every core busy, few enough that the queue
 // length stays close to the truth while a large backlog drains.
@@ -138,7 +150,7 @@ func (stp *SubtreeProcessor) addDrainedBatches(ctx context.Context, batches []*T
 // addDrainedNodesSequentially is dequeueDuringBlockMovement's per-tx loop
 // for nodes already taken from the queue, without conflicting hashes.
 func (stp *SubtreeProcessor) addDrainedNodesSequentially(nodes []subtreepkg.Node, inpoints []*subtreepkg.TxInpoints,
-	transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap) error {
+	transactionMap *SortedHashSet, losingTxHashesMap txmap.TxMap) error {
 	for i, node := range nodes {
 		if transactionMap != nil && transactionMap.Exists(node.Hash) {
 			continue
@@ -160,7 +172,7 @@ func (stp *SubtreeProcessor) addDrainedNodesSequentially(nodes []subtreepkg.Node
 
 // filterDrainedNodes reports, per node, whether it is neither in the block
 // nor on the losing side of a conflict. Both maps are read-only here.
-func filterDrainedNodes(nodes []subtreepkg.Node, transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap) []bool {
+func filterDrainedNodes(nodes []subtreepkg.Node, transactionMap *SortedHashSet, losingTxHashesMap txmap.TxMap) []bool {
 	keep := make([]bool, len(nodes))
 
 	forEachChunk(len(nodes), func(start, end int) {

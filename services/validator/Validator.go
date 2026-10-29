@@ -143,6 +143,14 @@ const (
 	txLockedMaxSafeRetries = 10
 )
 
+// DefaultTwoPhaseCommitTimeout is the fallback behind validator_twoPhaseCommitTimeout, the
+// budget that bounds a two-phase-commit unlock. Exported so a caller that performs the unlock
+// on the validator's behalf uses the SAME budget rather than a copy that can drift: subtree
+// validation retries the unlock for transactions the validator accepted but could not unlock
+// (see services/subtreevalidation unlockAcceptedTransactions) and has no setting of its own
+// for it. Read validator_twoPhaseCommitTimeout in preference to this when you have settings.
+const DefaultTwoPhaseCommitTimeout = defaultTwoPhaseCommitTimeout
+
 // childLockBudget returns how long a child spending a still-committing parent keeps
 // retrying before it is lost: the sum of the loop's exponential backoffs, which for
 // maxRetries retries of txLockedBaseBackoff doubling each time is
@@ -260,7 +268,10 @@ type Validator struct {
 	rejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI
 
 	// policyRejectedTxKafkaProducerClient publishes consensus-valid transactions that were
-	// rejected by local policy (ErrTxPolicy). This is a separate topic from
+	// rejected by local policy (ErrTxPolicy). A policy script failure whose consensus
+	// re-run timed out, found no free slot or reached the policy stack memory cap is
+	// published unconfirmed (see classifyPolicyScriptError), so consumers must validate
+	// what they take from it, as subtree validation does. This is a separate topic from
 	// rejectedTxKafkaProducerClient for two reasons:
 	//   1. Different message schema: this topic carries the full raw tx bytes
 	//      (KafkaTxPolicyRejectedTopicMessage.RawTx) so that consumers can reconstruct
@@ -284,11 +295,9 @@ type Validator struct {
 	// Memory cost: ~4 MB per million blocks (one uint32 per block), negligible for any
 	// foreseeable chain length.
 	//
-	// mtpMu guards concurrent access to mtpStore.
-	//   - EnsureMTPLoaded acquires the write lock for the duration of the fetch + append +
-	//     in-place overlap patch. Concurrent EnsureMTPLoaded callers serialise; the second
-	//     one fast-paths out after acquiring the lock if the first already populated the
-	//     range it needs.
+	// mtpMu guards concurrent access to mtpStore and mtpLoadWindows.
+	//   - EnsureMTPLoaded serializes fetches with mtpLoadMu, leaving readers free
+	//     during RPCs. It takes mtpMu only to inspect or publish the store.
 	//   - validateTransaction acquires the read lock around its MTP lookups. This protects
 	//     against the cross-block case where block N's per-tx goroutines are still reading
 	//     while block N+1's EnsureMTPLoaded is appending or patching overlap entries (the
@@ -296,8 +305,26 @@ type Validator struct {
 	//     readers may be addressing).
 	// Same-block contention is negligible: EnsureMTPLoaded runs once per block before per-tx
 	// goroutines start, and per-tx readers only contend with each other on the read lock.
-	mtpMu    sync.RWMutex
-	mtpStore []uint32
+	mtpLoadMu sync.Mutex
+	mtpMu     sync.RWMutex
+	mtpStore  []uint32
+	// mtpLoadWindows tracks the height ranges ([from, to)) that in-flight
+	// EnsureMTPLoaded calls are about to patch for reorg repair. Guarded by mtpMu.
+	// EnsureMTPLoaded's fast path (see comment there) must fall through to
+	// mtpLoadMu when the requested height falls inside a published window, even
+	// though the store already covers it, since the in-flight loader may be about
+	// to overwrite that entry. mtpLoadMu today serializes loaders one at a time,
+	// so at most one window is ever published, but this is kept as a collection
+	// so correctness does not depend on that serialization staying single-loader.
+	mtpLoadWindows []mtpLoadWindow
+}
+
+// mtpLoadWindow is a half-open height range [From, To) that an in-flight
+// EnsureMTPLoaded call may rewrite while repairing reorg-invalidated MTP
+// entries. See mtpLoadWindows.
+type mtpLoadWindow struct {
+	From uint32
+	To   uint32
 }
 
 // New creates a new Validator instance with the provided configuration.
@@ -760,14 +787,48 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 			}
 		}
 
-		// Publish consensus-valid but policy-rejected transactions so subtree validation
+		// Publish policy-rejected transactions so subtree validation
 		// pods can cache the raw tx bytes and avoid HTTP roundtrips to other miners.
 		if errors.Is(err, errors.ErrTxPolicy) {
 			v.publishPolicyRejectedTx(ctx, ctxLogger, tx, err)
 		}
+
+		// Publish a transaction rejected as conflicting on the same topic, flagged, so
+		// subtree validation can keep it aside when a peer subtree contains it, instead
+		// of writing it to the UTXO store before a block with proof of work references
+		// it. txMetaData is set when the block path stored it as conflicting; skip those.
+		// A tx with another input that failed for a different reason is not conflicting. The
+		// stores emit TX_CONFLICTING per input, so only the validator's own verdict counts.
+		if txMetaData == nil && errors.Is(err, errors.ErrTxRejectedConflicting) {
+			v.publishRejectedTx(ctx, ctxLogger, tx, err, true)
+		}
 	}
 
 	return txMetaData, err
+}
+
+// spendConflicts reports whether a spend failed only because its output is already spent
+// by a different tx, or is an output of a tx stored as conflicting. It reads the spend's
+// own code: the stores join the failed spends' errors into the first one's chain, so
+// errors.Is on one spend's error also matches the inputs after it.
+func spendConflicts(err error) bool {
+	var spendErr *errors.Error
+	if !errors.As(err, &spendErr) {
+		return false
+	}
+
+	return spendErr.Code() == errors.ERR_UTXO_SPENT || spendErr.Code() == errors.ERR_TX_CONFLICTING
+}
+
+// spendsImmatureCoinbase reports whether a spend failed because its output is a coinbase output not
+// yet mature at the spending height. Like spendConflicts, it reads the spend's own top-level code.
+func spendsImmatureCoinbase(err error) bool {
+	var spendErr *errors.Error
+	if !errors.As(err, &spendErr) {
+		return false
+	}
+
+	return spendErr.Code() == errors.ERR_TX_COINBASE_IMMATURE
 }
 
 // publishPolicyRejectedTx publishes the raw bytes of a policy-rejected transaction to
@@ -775,6 +836,13 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 // to populate a local cache, avoiding expensive HTTP fetches when a subtree from another
 // miner contains transactions our node rejected on policy grounds.
 func (v *Validator) publishPolicyRejectedTx(ctx context.Context, ctxLogger ulogger.Logger, tx *bt.Tx, validationErr error) {
+	v.publishRejectedTx(ctx, ctxLogger, tx, validationErr, false)
+}
+
+// publishRejectedTx publishes a rejected transaction's raw bytes on the policy-rejected
+// topic. conflicting marks a transaction rejected because an input is already spent by
+// a different transaction, rather than one rejected on policy.
+func (v *Validator) publishRejectedTx(ctx context.Context, ctxLogger ulogger.Logger, tx *bt.Tx, validationErr error, conflicting bool) {
 	if v.policyRejectedTxKafkaProducerClient == nil {
 		return
 	}
@@ -809,9 +877,10 @@ func (v *Validator) publishPolicyRejectedTx(ctx context.Context, ctxLogger ulogg
 	txHash := tx.TxIDChainHash()
 
 	m := &kafkamessage.KafkaTxPolicyRejectedTopicMessage{
-		TxHash: txHash.CloneBytes(),
-		RawTx:  tx.SerializeBytes(),
-		Reason: validationErr.Error(),
+		TxHash:      txHash.CloneBytes(),
+		RawTx:       tx.SerializeBytes(),
+		Reason:      validationErr.Error(),
+		Conflicting: conflicting,
 	}
 
 	value, marshalErr := proto.Marshal(m)
@@ -1062,8 +1131,6 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		}
 
 		if errors.Is(err, errors.ErrUtxoError) {
-			saveAsConflicting := false
-
 			// Collect failed spends and attach a capped aggregate to the
 			// returned error. The failure count scales with the tx's input
 			// count; an uncapped chain makes every subsequent errors.Is on it
@@ -1071,10 +1138,21 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			failedSpends := make([]error, 0, 8)
 			prunedReplay := false
 
+			// the capped aggregate cannot tell a double spend from a tx that also spends a
+			// frozen or mismatched output, so it is decided here over every failed spend
+			everyFailedSpendConflicts := true
+
+			// a spend of a coinbase output no block at this height may make
+			var immatureSpend error
+
 			for _, spend := range spentUtxos {
 				if spend.Err != nil {
-					if validationOptions.CreateConflicting && (errors.Is(spend.Err, errors.ErrSpent) || errors.Is(spend.Err, errors.ErrTxConflicting)) {
-						saveAsConflicting = true
+					if !spendConflicts(spend.Err) {
+						everyFailedSpendConflicts = false
+					}
+
+					if immatureSpend == nil && spendsImmatureCoinbase(spend.Err) {
+						immatureSpend = spend.Err
 					}
 
 					// Both replay answers, not only the marker: a missing parent
@@ -1089,6 +1167,49 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 					failedSpends = append(failedSpends, spend.Err)
 				}
 			}
+
+			// a block's verdict, as below: not below a checkpoint, where the block is valid by definition
+			blockVerdict := validationOptions.CreateConflicting && !validationOptions.SkipScriptValidation && !validationOptions.OutpointOnlySpend
+
+			// A store may answer a spent output UTXO_SPENT without checking its maturity: the SQL
+			// store checks maturity only on an unspent output. Another candidate may have spent it
+			// at a height where it was mature, so a double spend is checked for maturity here,
+			// whatever else failed.
+			if blockVerdict && immatureSpend == nil {
+				read := make(map[chainhash.Hash]struct{})
+
+				for _, spend := range spentUtxos {
+					if spend.Err == nil || spend.TxID == nil || !spendConflicts(spend.Err) {
+						continue
+					}
+
+					if _, ok := read[*spend.TxID]; ok {
+						continue
+					}
+
+					read[*spend.TxID] = struct{}{}
+
+					parent, readErr := readInputParent(decoupledCtx, v.utxoStore, spend.TxID)
+					if readErr != nil {
+						err = errors.NewProcessingError("[Validate][%s] failed to read parent %s of a spent output", txID, spend.TxID.String(), readErr)
+						span.RecordError(err)
+
+						return nil, err
+					}
+
+					if immatureErr := immatureCoinbase(parent, blockHeight, v.settings); immatureErr != nil {
+						immatureSpend = errors.NewTxCoinbaseImmatureError("[Validate][%s] %s:%d", txID, spend.TxID.String(), spend.Vout, immatureErr)
+						everyFailedSpendConflicts = false
+
+						break
+					}
+				}
+			}
+
+			// A block's tx is created as conflicting only when it is a double spend and nothing
+			// else: any other failed spend (an immature coinbase, a frozen or mismatched output)
+			// makes it invalid, and creating it as conflicting would drop that failure.
+			saveAsConflicting := validationOptions.CreateConflicting && len(failedSpends) > 0 && everyFailedSpendConflicts
 
 			// A replay of a transaction the pruner removed is never a conflict to
 			// reconcile, even when a sibling input answered ErrSpent. Taking the
@@ -1132,7 +1253,14 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 						// NOTE: cascaded descendants may still be in the subtree processor's in-memory template
 						// until the next reset/reload — this path has no subtreeProcessor handle to evict them.
 						if !txMetaData.Conflicting {
-							if _, _, setErr := utxo.MarkConflictingRecursively(decoupledCtx, v.utxoStore, []chainhash.Hash{*tx.TxIDChainHash()}); setErr != nil {
+							_, marked, setErr := utxo.MarkConflictingRecursively(decoupledCtx, v.utxoStore, []chainhash.Hash{*tx.TxIDChainHash()})
+
+							// subtree validation's txmeta cache holds these as non-conflicting.
+							// Evict on failure too: the tx is conflicting in the store by then,
+							// so a revalidation skips this branch and never evicts it.
+							v.sendTxMetaDeletesToKafka(marked)
+
+							if setErr != nil {
 								err = errors.NewProcessingError("[Validate][%s] failed to mark existing tx as conflicting", txID, setErr)
 								span.RecordError(err)
 
@@ -1158,6 +1286,24 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 				span.RecordError(err)
 
 				return txMetaData, err
+			}
+
+			// A double spend and nothing else: marked conflicting, so subtree validation can
+			// keep it aside without mistaking a tx with an invalid input for one.
+			if len(failedSpends) > 0 && everyFailedSpendConflicts {
+				err = errors.NewTxRejectedConflictingError("[Validate][%s] every failed spend conflicts with a spent output", txID, err)
+			}
+
+			// In a block, blockHeight is the block's own height, so an immature coinbase spend
+			// makes the tx, and with it the block, invalid. Outside a block the coinbase may yet
+			// mature. Below a checkpoint the block is valid by definition, and a failure is ours
+			// to retry. A frozen output is not a verdict: freezes and reassignment holds are this
+			// node's state, set at the height it applied the alert, and another node may differ.
+			if immatureSpend != nil && blockVerdict {
+				err = errors.NewTxInvalidError("[Validate][%s] spends a coinbase output not yet mature at height %d: %v", txID, blockHeight, immatureSpend, err)
+				span.RecordError(err)
+
+				return nil, err
 			}
 		} else if errors.Is(err, errors.ErrTxNotFound) {
 			// PHASE ASSUMPTION: this branch (and the ErrUtxoError branch above) assumes the
@@ -1552,11 +1698,17 @@ func (v *Validator) precheckTransaction(tx *bt.Tx, txID string, blockHeight uint
 // and its spends must stand.
 //
 // On the success path, if the unlock itself fails, err is set to the unlock error.
-// No caller currently acts on that signal specifically - the real recovery path is
-// the same self-healing loadUnminedTransactions route described above (see
-// docs/topics/features/two_phase_commit.md), not caller-side handling of this
-// error. Setting err is mainly for observability of the failure at the point it
-// happened.
+// That error is the typed errors.ErrTxUnlockFailed, and it means ACCEPTED, STILL
+// LOCKED - the spend, the record and the delivery to block assembly all succeeded.
+// Callers do act on it, by code rather than by trusting a nil error: propagation,
+// the RPC submit path, this package's own Kafka intake, legacy sync and subtree
+// validation all branch on it (see ErrTxUnlockFailed in errors/Error_types.go), and
+// subtree validation retries the unlock (unlockAcceptedTransactions in
+// services/subtreevalidation/SubtreeValidation.go). A caller must therefore not
+// reduce a non-nil error here to "rejected" without checking the code first. If
+// every retry fails, the recovery path is the self-healing loadUnminedTransactions
+// route described above (see docs/topics/features/two_phase_commit.md); the signal
+// to watch is the teranode_validator_unlock_failed counter.
 //
 // The unlock decision is gated on delivered, not on *err being nil. delivered only
 // becomes true once sendToBlockAssembler has actually returned successfully, so it
@@ -1640,7 +1792,9 @@ func (v *Validator) twoPhaseCommitTransaction(ctx context.Context, tx *bt.Tx, tx
 	// so we can now mark it as spendable again
 	if err := v.utxoStore.SetLocked(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, false); err != nil {
 		// this is not a fatal error, since the transaction will we marked as spendable on the next block it's mined into
-		err = errors.NewProcessingError("[Validate][%s] error marking tx as spendable", txID, err)
+		prometheusValidatorUnlockFailed.Inc()
+
+		err = errors.NewTxUnlockFailedError("[Validate][%s] error marking tx as spendable", txID, err)
 		span.RecordError(err)
 
 		return err
@@ -1844,6 +1998,30 @@ func (v *Validator) sendTxMetaToKafka(data *meta.Data, txHash *chainhash.Hash) e
 	return nil
 }
 
+// sendTxMetaDeletesToKafka publishes txmeta DELETEs so subtree validation evicts
+// cached entries for txs this validator has just marked conflicting. A no-op when
+// the txmeta topic is not configured.
+func (v *Validator) sendTxMetaDeletesToKafka(hashes []chainhash.Hash) {
+	if v.txmetaKafkaProducerClient == nil || len(hashes) == 0 {
+		return
+	}
+
+	items := make([]*txmetaBatchItem, len(hashes))
+	for i := range hashes {
+		items[i] = &txmetaBatchItem{hash: &hashes[i], isDelete: true}
+	}
+
+	if v.txmetaKafkaBatcher != nil {
+		for _, item := range items {
+			v.txmetaKafkaBatcher.Put(item)
+		}
+
+		return
+	}
+
+	v.sendTxMetaBatch(items)
+}
+
 // sendTxMetaBatch serializes and publishes a batch of TxMeta items to Kafka.
 //
 // The Kafka message key is set to the first item's tx hash. With franz-go's default
@@ -1861,17 +2039,78 @@ func (v *Validator) sendTxMetaBatch(batch []*txmetaBatchItem) {
 		return
 	}
 
-	if v.settings.Validator.TxMetaWireFormat == "v2" {
-		v.sendTxMetaBatchV2(batch)
-		return
+	// A batch has no size limit of its own (validator_txmeta_kafka_batchSize, or
+	// a whole demotion cascade), so it goes out as records of bounded size. In
+	// v1 every record of the batch keeps the batch's key, and so its partition.
+	key := *batch[0].hash // copied: the producer reads the key after this returns
+
+	for _, chunk := range splitTxMetaBatch(batch) {
+		if v.settings.Validator.TxMetaWireFormat == "v2" {
+			v.sendTxMetaBatchV2(chunk)
+
+			continue
+		}
+
+		v.txmetaKafkaProducerClient.Publish(&kafka.Message{
+			Key:   key[:],
+			Value: serializeTxMetaBatch(chunk),
+		})
+	}
+}
+
+// maxTxMetaRecordBytes bounds one txmeta record, leaving headroom under Kafka's
+// default 1 MiB message limit.
+const maxTxMetaRecordBytes = 768 * 1024
+
+// splitTxMetaBatch cuts batch into consecutive chunks whose serialised size, in
+// either wire format, stays under maxTxMetaRecordBytes (an item larger than that
+// goes alone), and none of which is txmetacache.V2LookalikeCount items long:
+// that v1 count encodes as the v2 header signature, and a receiver can read
+// such a record as v2 and drop every entry in it.
+func splitTxMetaBatch(batch []*txmetaBatchItem) [][]*txmetaBatchItem {
+	var chunks [][]*txmetaBatchItem
+
+	start, size := 0, txmetacache.WireV2HeaderLen
+
+	for i := 0; i < len(batch); i++ {
+		entry := txMetaEntrySize(batch[i])
+
+		if i > start && size+entry > maxTxMetaRecordBytes {
+			end := i
+			if end-start == txmetacache.V2LookalikeCount {
+				end-- // the item moved out starts the next chunk
+			}
+
+			chunks = append(chunks, batch[start:end])
+			start, size = end, txmetacache.WireV2HeaderLen
+
+			// Size the next chunk again from its first item, so an item carried
+			// out by the 767 adjustment is checked against the cap like any other.
+			i = end - 1
+
+			continue
+		}
+
+		size += entry
 	}
 
-	value := serializeTxMetaBatch(batch)
+	switch rest := batch[start:]; {
+	case len(rest) == txmetacache.V2LookalikeCount:
+		chunks = append(chunks, rest[:len(rest)-1], rest[len(rest)-1:])
+	case len(rest) > 0:
+		chunks = append(chunks, rest)
+	}
 
-	v.txmetaKafkaProducerClient.Publish(&kafka.Message{
-		Key:   batch[0].hash[:],
-		Value: value,
-	})
+	return chunks
+}
+
+// txMetaEntrySize is item's size on the v2 wire, the larger of the two formats.
+func txMetaEntrySize(item *txmetaBatchItem) int {
+	if item.isDelete {
+		return txmetacache.WireV2MinEntrySize
+	}
+
+	return txmetacache.WireV2MinEntrySize + len(item.metaBytes)
 }
 
 // serializeTxMetaBatch serializes a batch of TxMeta items to raw bytes.
@@ -2743,13 +2982,34 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 
 	needed := blockHeight
 
-	v.mtpMu.Lock()
-	defer v.mtpMu.Unlock()
+	// Fast path: the store already covers `needed` and no in-flight loader is
+	// about to rewrite that entry. A loader publishes the [From, To) window it is
+	// about to patch (see mtpLoadWindows) before it releases mtpMu to perform the
+	// fetch, so a covered-but-in-flight height falls through to the mtpLoadMu wait
+	// below instead of racing the patch.
+	v.mtpMu.RLock()
+	covered := uint32(len(v.mtpStore)) > needed
+	inFlight := false
+	if covered {
+		for _, w := range v.mtpLoadWindows {
+			if needed >= w.From && needed < w.To {
+				inFlight = true
+				break
+			}
+		}
+	}
+	v.mtpMu.RUnlock()
+	if covered && !inFlight {
+		return nil
+	}
 
-	// Fast path: store already covers the needed height.  A concurrent EnsureMTPLoaded
-	// that won the lock may have already populated the store; re-checking here avoids a
-	// redundant gRPC fetch.
+	// Serialize loaders without blocking readers of already loaded heights.
+	// Recheck after admission so concurrent callers do not duplicate RPCs.
+	v.mtpLoadMu.Lock()
+	defer v.mtpLoadMu.Unlock()
+	v.mtpMu.RLock()
 	currentLen := uint32(len(v.mtpStore))
+	v.mtpMu.RUnlock()
 	if currentLen > needed {
 		return nil
 	}
@@ -2763,6 +3023,25 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 		fromHeight = currentLen - mtpReorgOverlap
 	}
 
+	// Publish the window this load is about to patch so concurrent callers whose
+	// needed height falls inside it wait instead of taking the fast path above.
+	// Always removed on return, including on error, so a failed fetch cannot leave
+	// a stale window blocking future fast-path callers.
+	window := mtpLoadWindow{From: fromHeight, To: currentLen}
+	v.mtpMu.Lock()
+	v.mtpLoadWindows = append(v.mtpLoadWindows, window)
+	v.mtpMu.Unlock()
+	defer func() {
+		v.mtpMu.Lock()
+		for i, w := range v.mtpLoadWindows {
+			if w == window {
+				v.mtpLoadWindows = append(v.mtpLoadWindows[:i], v.mtpLoadWindows[i+1:]...)
+				break
+			}
+		}
+		v.mtpMu.Unlock()
+	}()
+
 	isInitialLoad := currentLen == 0
 	start := time.Now()
 
@@ -2775,6 +3054,9 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 	if uint32(len(fetched)) != expected {
 		return errors.NewProcessingError("[Validator][EnsureMTPLoaded] MTP count mismatch: expected %d, got %d", expected, len(fetched))
 	}
+
+	v.mtpMu.Lock()
+	defer v.mtpMu.Unlock()
 
 	// Patch any overlap values that changed (reorg-invalidated entries).
 	for i := fromHeight; i < currentLen; i++ {
@@ -2807,7 +3089,7 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 // Phase 2 is only executed when phase 1 succeeds and SkipPolicyChecks is true (block context).
 // This avoids the cost of MTP lookups when a transaction fails normal validation.
 // MTP values are read from v.mtpStore, pre-loaded by EnsureMTPLoaded before concurrent
-// goroutines start, so no gRPC calls or locking are needed here.
+// goroutines start; lookups take a read lock and do not issue gRPC calls.
 func (v *Validator) validateTransaction(ctx context.Context, tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, validationOptions *Options) error {
 	ctx, span, deferFn := tracing.Tracer("validator").Start(ctx, "validateTransaction",
 		tracing.WithHistogram(prometheusTransactionValidate),

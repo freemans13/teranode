@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/urlutil"
 	"github.com/ordishs/gocore"
 )
 
@@ -495,13 +497,22 @@ var localServiceHTTPClient = &http.Client{
 		t.MaxIdleConnsPerHost = 100
 		return t
 	}(),
+	// A redirect target is not necessarily loopback or TLS-protected, and this client's
+	// requests can carry the legacy peer pool's internal token header. Don't follow: return
+	// the redirect response as-is so the token never reaches whatever the target is.
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 }
 
 // DoLocalServiceHTTPRequestBodyReader streams a GET from one of this node's own services,
 // such as the legacy service reading blocks from the local asset service. The URL must come
 // from this node's settings, never from a peer: unlike DoHTTPRequestBodyReader it does not
 // refuse loopback or private addresses. The default timeout matches DoHTTPRequestBodyReader.
-func DoLocalServiceHTTPRequestBodyReader(ctx context.Context, url string) (io.ReadCloser, error) {
+//
+// headers is optional (existing callers pass none) and, when given, is set on the outgoing
+// request as-is - e.g. the legacy peer server's internal pool token header.
+func DoLocalServiceHTTPRequestBodyReader(ctx context.Context, url string, headers ...map[string]string) (io.ReadCloser, error) {
 	cancelFn := func() {
 		// noop
 	}
@@ -510,7 +521,20 @@ func DoLocalServiceHTTPRequestBodyReader(ctx context.Context, url string) (io.Re
 		ctx, cancelFn = context.WithTimeout(ctx, time.Duration(httpStreamingTimeout)*time.Millisecond)
 	}
 
-	bodyReaderCloser, cancelFn, err := executeHTTPRequestWithClient(ctx, cancelFn, localServiceHTTPClient, url)
+	// Merge every map passed; a later map wins on a duplicate key.
+	var reqHeaders map[string]string
+
+	for _, h := range headers {
+		for k, v := range h {
+			if reqHeaders == nil {
+				reqHeaders = make(map[string]string, len(h))
+			}
+
+			reqHeaders[k] = v
+		}
+	}
+
+	bodyReaderCloser, cancelFn, err := executeHTTPRequestWithClient(ctx, cancelFn, localServiceHTTPClient, url, reqHeaders)
 	if err != nil {
 		cancelFn()
 		return nil, err
@@ -563,10 +587,10 @@ func DoHTTPRequest(ctx context.Context, url string, requestBody ...[]byte) ([]by
 	// Wait for either read completion or context timeout
 	select {
 	case <-ctx.Done():
-		return nil, errors.NewNetworkTimeoutError("http request [%s] timed out while reading body", url)
+		return nil, errors.NewNetworkTimeoutError("http request [%s] timed out while reading body", urlutil.RedactString(url))
 	case <-done:
 		if readErr != nil {
-			return nil, errors.NewServiceError("http request [%s] failed to read body", url, readErr)
+			return nil, errors.NewServiceError("http request [%s] failed to read body", urlutil.RedactString(url), readErr)
 		}
 		return blockBytes, nil
 	}
@@ -614,14 +638,14 @@ func readBodyBounded(ctx context.Context, url string, body io.Reader, maxBytes i
 
 	select {
 	case <-ctx.Done():
-		return nil, errors.NewNetworkTimeoutError("http request [%s] timed out while reading body", url)
+		return nil, errors.NewNetworkTimeoutError("http request [%s] timed out while reading body", urlutil.RedactString(url))
 	case <-done:
 		if readErr != nil {
-			return nil, errors.NewServiceError("http request [%s] failed to read body", url, readErr)
+			return nil, errors.NewServiceError("http request [%s] failed to read body", urlutil.RedactString(url), readErr)
 		}
 
 		if int64(len(blockBytes)) > maxBytes {
-			return nil, errors.NewExternalError("http request [%s] response body exceeds %d bytes", url, maxBytes)
+			return nil, errors.NewExternalError("http request [%s] response body exceeds %d bytes", urlutil.RedactString(url), maxBytes)
 		}
 
 		return blockBytes, nil
@@ -721,7 +745,16 @@ func ValidateURL(rawURL string) error {
 
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return errors.NewInvalidArgumentError("invalid URL: %s", err)
+		// url.Parse embeds the string it was given verbatim in its error, so
+		// the reason is unwrapped from it rather than wrapped whole. No
+		// credential reaches here today (callers pass peer base URLs, and the
+		// userinfo check below rejects the rest), but this is the one message
+		// in this file still shaped like the leak the file was swept for.
+		//
+		// The "%s" is dropped for the reason in the 503 message above:
+		// errors.New* takes the trailing error as the wrapped error, leaving no
+		// parameters, so fmt.Errorf never runs and the verb survives.
+		return errors.NewInvalidArgumentError("invalid URL", urlutil.ParseErrorReason(err))
 	}
 
 	scheme := strings.ToLower(parsed.Scheme)
@@ -787,7 +820,7 @@ func executeHTTPRequest(ctx context.Context, cancelFn context.CancelFunc, rawURL
 		return nil, cancelFn, err
 	}
 
-	return executeHTTPRequestWithClient(ctx, cancelFn, httpClient, rawURL, requestBody...)
+	return executeHTTPRequestWithClient(ctx, cancelFn, httpClient, rawURL, nil, requestBody...)
 }
 
 // buildOutboundRequest constructs the http.Request shared by every path that talks to a
@@ -804,9 +837,21 @@ func executeHTTPRequest(ctx context.Context, cancelFn context.CancelFunc, rawURL
 // way it once did: the retry path used to build its own request and sent unsigned
 // application/json bodies, undoing both the WAF fix and peer-request signing on every
 // retried attempt.
-func buildOutboundRequest(ctx context.Context, rawURL string, requestBody ...[]byte) (*http.Request, error) {
+//
+// headers, when non-nil, are set after Content-Type (so a caller can override it) and
+// before signing (so a signer that covers headers sees them).
+func buildOutboundRequest(ctx context.Context, rawURL string, headers map[string]string, requestBody ...[]byte) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
+		// A URL that will not parse comes back as a *url.Error that quotes rawURL
+		// whole, password included. DoLocalServiceHTTPRequestBodyReader reaches
+		// here without ValidateURL in front of it, so this is the only place that
+		// path can strip it. Any other failure (a nil ctx) quotes no URL.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return nil, errors.NewServiceError("failed to create http request", urlutil.ParseErrorReason(urlErr))
+		}
+
 		return nil, errors.NewServiceError("failed to create http request", err)
 	}
 
@@ -825,6 +870,10 @@ func buildOutboundRequest(ctx context.Context, rawURL string, requestBody ...[]b
 		}
 		req.Method = http.MethodPost
 		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 
 	// Sign the request if a signer is configured (silently skip on error)
@@ -877,8 +926,8 @@ const maxRetrySecondWait = 2 * time.Second
 
 // executeHTTPRequestWithClient performs the request through client, which decides what
 // addresses may be reached.
-func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFunc, client *http.Client, rawURL string, requestBody ...[]byte) (io.ReadCloser, context.CancelFunc, error) {
-	req, err := buildOutboundRequest(ctx, rawURL, requestBody...)
+func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFunc, client *http.Client, rawURL string, headers map[string]string, requestBody ...[]byte) (io.ReadCloser, context.CancelFunc, error) {
+	req, err := buildOutboundRequest(ctx, rawURL, headers, requestBody...)
 	if err != nil {
 		return nil, cancelFn, err
 	}
@@ -902,7 +951,7 @@ func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFu
 		// reuse rather than tearing down, so the same bounded helper applies.
 		drainAndCloseErrorBody(resp.Body)
 
-		return nil, cancelFn, errors.NewServiceError("http request [%s] returned HTML - assume bad URL", rawURL)
+		return nil, cancelFn, errors.NewServiceError("http request [%s] returned HTML - assume bad URL", urlutil.RedactString(rawURL))
 	}
 
 	return resp.Body, cancelFn, nil
@@ -964,8 +1013,8 @@ const maxHTTPErrorBodyDrainBytes = 64 * 1024
 // up to defaultRetryConfig.maxAttempts attempts, so its worst case is
 // maxAttempts x this budget — 6 x 250ms = 1.5s — reached only against a peer that
 // dribbles its error body on every one of the six attempts. Set that against the
-// ~7.75s of exponential backoff the same ladder already spends between those attempts
-// (250ms doubling, capped at 5s), and the added share is bounded enough that the
+// ~7.75s or more of exponential backoff the same ladder already spends between those
+// attempts (250ms doubling, capped at 5s, jittered upwards), and the added share is bounded enough that the
 // budget is deliberately not shortened: cutting it would trade away the connection
 // reuse the synchronous drain exists to buy.
 const maxHTTPErrorBodyDrainWait = 250 * time.Millisecond
@@ -1067,7 +1116,7 @@ func buildHTTPError(resp *http.Response, rawURL string) error {
 		// maxHTTPErrorBodyBytes is unchanged.
 		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxHTTPErrorBodyBytes+1))
 		if readErr != nil {
-			return errFn("http request [%s] returned status code [%d]", rawURL, resp.StatusCode, readErr)
+			return errFn("http request [%s] returned status code [%d]", urlutil.RedactString(rawURL), resp.StatusCode, readErr)
 		}
 
 		b := raw
@@ -1079,14 +1128,14 @@ func buildHTTPError(resp *http.Response, rawURL string) error {
 
 		if b != nil {
 			if truncated {
-				return errFn("http request [%s] returned status code [%d] with body %q (truncated)", rawURL, resp.StatusCode, string(b))
+				return errFn("http request [%s] returned status code [%d] with body %q (truncated)", urlutil.RedactString(rawURL), resp.StatusCode, string(b))
 			}
 
-			return errFn("http request [%s] returned status code [%d] with body %q", rawURL, resp.StatusCode, string(b))
+			return errFn("http request [%s] returned status code [%d] with body %q", urlutil.RedactString(rawURL), resp.StatusCode, string(b))
 		}
 	}
 
-	return errFn("http request [%s] returned status code [%d]", rawURL, resp.StatusCode)
+	return errFn("http request [%s] returned status code [%d]", urlutil.RedactString(rawURL), resp.StatusCode)
 }
 
 // parseRetryAfter parses an HTTP Retry-After header value into a duration.
@@ -1133,14 +1182,21 @@ var defaultRetryConfig = retryConfig{
 //   - Other errors (404, 500, network errors) are returned immediately — they are not
 //     transient admission rejections.
 //   - Backoff is exponential starting at 250ms, doubling, capped at 5s. Up to 6 attempts,
-//     so a server that never relents and never sends Retry-After costs ~7.75s of backoff
-//     before the final error.
+//     so a server that never relents and never sends Retry-After costs ~7.75s of backoff,
+//     plus jitter, before the final error.
 //   - Honors the server's Retry-After header on each rejection, replacing that attempt's
 //     ladder delay outright when the header value is <= maxDelay; a larger value is
 //     ignored and the ladder delay is used instead. Retry-After is not a ceiling on top
 //     of the ladder — a compliant peer sending Retry-After: 5 on every rejection costs
 //     5 x 5s = 25s, well above the Retry-After-free worst case above.
-//   - ctx cancellation aborts the retry loop and returns the parent ctx error.
+//   - Every wait is jittered upwards by up to half, so requests rejected together do not
+//     retry together. The worst cases above grow by up to that half.
+//   - With a ctx deadline, the ladder spends at most half of the time left when it starts,
+//     leaving the rest for the response that is finally served; past that it stops early
+//     with the last rejection.
+//   - ctx cancellation aborts the retry loop and returns the parent ctx error. A deadline
+//     that runs out after a rejection returns that rejection instead, so the failure stays
+//     a rejection rather than reading as a local context error.
 //   - The final error keeps the classification of the last rejection, so a caller can
 //     still tell a rate limit apart from an unavailable server after the ladder runs out.
 //
@@ -1186,14 +1242,26 @@ func doHTTPRequestWithRetry(ctx context.Context, url string, cfg retryConfig, ti
 	var lastErr error
 	lastAttemptSecond := int64(-1)
 
+	// With a caller deadline, the ladder may spend at most half of what is left of it, so
+	// a request that is finally served still has the other half to stream its body. Past
+	// that point the loop stops and reports the last rejection rather than sleeping on.
+	var budgetEnd time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		budgetEnd = time.Now().Add(time.Until(deadline) / 2)
+	}
+
+	// rejections counts the 429/503 responses actually received, which is what the final
+	// error reports; an attempt cut short by the deadline is not one of them.
+	rejections := 0
+
 	for attempt := 1; attempt <= cfg.maxAttempts; attempt++ {
 		if attempt > 1 && signerSignsRequests(loadHTTPRequestSigner()) {
 			if err := waitOutRetrySecond(ctx, lastAttemptSecond); err != nil {
-				return nil, err
+				return nil, rejectionOrContextError(ctx, url, rejections, lastErr, 0, err)
 			}
 		}
 
-		body, retryAfter, err := doHTTPRequestWithRetryAfter(ctx, timeoutMs, url, requestBody...)
+		body, retryAfter, status, err := doHTTPRequestWithRetryAfter(ctx, timeoutMs, url, requestBody...)
 		// Read the clock after the attempt, not before it: the signer takes its
 		// timestamp while building the request, so a second that rolls over
 		// between a pre-attempt read and the signature would record S while the
@@ -1204,9 +1272,10 @@ func doHTTPRequestWithRetry(ctx context.Context, url string, cfg retryConfig, ti
 			return body, nil
 		}
 		if !errors.Is(err, errors.ErrServiceUnavailable) && !errors.Is(err, errors.ErrServiceRateLimited) {
-			return nil, err
+			return nil, rejectionOrContextError(ctx, url, rejections, lastErr, status, err)
 		}
 		lastErr = err
+		rejections++
 
 		if attempt == cfg.maxAttempts {
 			break
@@ -1217,9 +1286,17 @@ func doHTTPRequestWithRetry(ctx context.Context, url string, cfg retryConfig, ti
 			sleepFor = retryAfter
 		}
 
+		// Jitter upwards only, so a Retry-After is never undercut, and so a fan-out of
+		// requests rejected together does not come back together and trip the limiter again.
+		sleepFor += rand.N(sleepFor/2 + 1)
+
+		if !budgetEnd.IsZero() && time.Now().Add(sleepFor).After(budgetEnd) {
+			break
+		}
+
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, rejectionOrContextError(ctx, url, rejections, lastErr, 0, ctx.Err())
 		case <-time.After(sleepFor):
 		}
 
@@ -1229,22 +1306,43 @@ func doHTTPRequestWithRetry(ctx context.Context, url string, cfg retryConfig, ti
 		}
 	}
 
-	// Preserve the classification of the last rejection: collapsing a 429 into
-	// ErrServiceUnavailable here would reintroduce exactly the local-vs-remote
-	// confusion the separate code exists to avoid.
+	return nil, rejectedError(url, rejections, lastErr)
+}
+
+// rejectedError is the error for a server that was still rejecting us when the ladder gave up,
+// after attempts rejections.
+// It preserves the classification of the last rejection: collapsing a 429 into
+// ErrServiceUnavailable here would reintroduce exactly the local-vs-remote confusion the
+// separate code exists to avoid.
+func rejectedError(url string, attempts int, lastErr error) error {
 	errFn := errors.NewServiceUnavailableError
 	if errors.Is(lastErr, errors.ErrServiceRateLimited) {
 		errFn = errors.NewServiceRateLimitedError
 	}
 
-	return nil, errFn("http request [%s] still rejected after %d attempts", url, cfg.maxAttempts, lastErr)
+	return errFn("http request [%s] still rejected after %d attempts", urlutil.RedactString(url), attempts, lastErr)
+}
+
+// rejectionOrContextError returns err, unless the caller's deadline ran out after the server
+// had already rejected us and before it answered again. Then the server's rejection is what
+// used up the time, so that is what is reported: a bare deadline reads as a local fault to
+// catch-up, which would neither fail over nor attribute it. A cancellation is ours and is
+// returned as is, and so is any error carrying a status the server did send (status != 0):
+// a 404 or 500 must not be relabelled as a rate limit because the deadline also passed.
+func rejectionOrContextError(ctx context.Context, url string, rejections int, lastErr error, status int, err error) error {
+	if lastErr != nil && status == 0 && ctx.Err() == context.DeadlineExceeded {
+		return rejectedError(url, rejections, lastErr)
+	}
+
+	return err
 }
 
 // doHTTPRequestWithRetryAfter performs one attempt of the retry loop, applying timeoutMs
 // when ctx carries no deadline, and extracts the Retry-After header on non-OK responses.
-// The extraction is status-agnostic, so it covers 429 as well as 503. On success returns
-// (body, 0, nil).
-func doHTTPRequestWithRetryAfter(ctx context.Context, timeoutMs int, rawURL string, requestBody ...[]byte) (io.ReadCloser, time.Duration, error) {
+// The extraction is status-agnostic, so it covers 429 as well as 503. It also returns the
+// response status, or 0 when no response was received. On success returns
+// (body, 0, status, nil).
+func doHTTPRequestWithRetryAfter(ctx context.Context, timeoutMs int, rawURL string, requestBody ...[]byte) (io.ReadCloser, time.Duration, int, error) {
 	cancelFn := func() {}
 	if _, ok := ctx.Deadline(); !ok {
 		ctx, cancelFn = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
@@ -1252,26 +1350,26 @@ func doHTTPRequestWithRetryAfter(ctx context.Context, timeoutMs int, rawURL stri
 
 	if err := ValidateURL(rawURL); err != nil {
 		cancelFn()
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
-	req, err := buildOutboundRequest(ctx, rawURL, requestBody...)
+	req, err := buildOutboundRequest(ctx, rawURL, nil, requestBody...)
 	if err != nil {
 		cancelFn()
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		cancelFn()
-		return nil, 0, errors.NewServiceError("failed to do http request", err)
+		return nil, 0, 0, errors.NewServiceError("failed to do http request", err)
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 		err := buildHTTPError(resp, rawURL)
 		cancelFn()
-		return nil, retryAfter, err
+		return nil, retryAfter, resp.StatusCode, err
 	}
 
 	ct := strings.ToLower(resp.Header.Get("content-type"))
@@ -1286,8 +1384,8 @@ func doHTTPRequestWithRetryAfter(ctx context.Context, timeoutMs int, rawURL stri
 
 		cancelFn()
 
-		return nil, 0, errors.NewServiceError("http request [%s] returned HTML - assume bad URL", rawURL)
+		return nil, 0, resp.StatusCode, errors.NewServiceError("http request [%s] returned HTML - assume bad URL", urlutil.RedactString(rawURL))
 	}
 
-	return &readCloserWithCancel{ReadCloser: resp.Body, cancelFn: cancelFn}, 0, nil
+	return &readCloserWithCancel{ReadCloser: resp.Body, cancelFn: cancelFn}, 0, resp.StatusCode, nil
 }

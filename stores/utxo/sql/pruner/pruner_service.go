@@ -235,7 +235,19 @@ func isPruneRetryable(err error, engine string) bool {
 //
 // Only deletes parent transactions if their last spending child is mined and
 // stable (defensive mode only).
+//
+// Records that are currently unmined (unmined_since set) are skipped unless they
+// are conflicting, even if they still carry a delete_at_height:
+// MarkTransactionsOnLongestChain(false) does not clear it. This is defence in
+// depth: the check and the delete share one transaction, but a record that
+// becomes unmined concurrently with it is not covered. A skipped record has its
+// delete_at_height cleared (unless preserve_until is set), matching the store
+// invariant that an unmined transaction has no DAH, so it no longer matches the
+// DAH index in later cycles. The marker INSERT carries the same clause, so a
+// skipped record never gets a marker either.
 func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (deleted, heldBack int64, err error) {
+	s.clearUnminedDeleteAtHeight(ctx, blockHeight)
+
 	for attempt := 0; attempt < maxPruneAttempts; attempt++ {
 		deleted, heldBack, err = s.deleteTombstonedTx(ctx, blockHeight)
 		if err == nil {
@@ -437,6 +449,7 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
     AND substr(o.spending_data, 1, 32) = child.hash
   WHERE child.delete_at_height IS NOT NULL
     AND child.delete_at_height <= $1
+    AND (child.unmined_since IS NULL OR child.conflicting)
     AND NOT EXISTS (` + unverifiedClaimChild + `)
   ON CONFLICT (parent_id, child_hash) DO NOTHING`
 
@@ -450,6 +463,7 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
 	const deleteQuery = `DELETE FROM transactions
   WHERE delete_at_height IS NOT NULL
     AND delete_at_height <= $1
+    AND (unmined_since IS NULL OR conflicting)
     AND NOT EXISTS (` + unverifiedClaimTransactions + `)`
 
 	// The rows the DELETE is about to refuse: its own predicate with the
@@ -459,6 +473,7 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
 	const heldBackQuery = `SELECT count(*) FROM transactions
   WHERE delete_at_height IS NOT NULL
     AND delete_at_height <= $1
+    AND (unmined_since IS NULL OR conflicting)
     AND EXISTS (` + unverifiedClaimTransactions + `)`
 
 	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
@@ -506,6 +521,7 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 			FROM transactions t
 			WHERE t.delete_at_height IS NOT NULL
 			  AND t.delete_at_height <= $1
+			  AND (t.unmined_since IS NULL OR t.conflicting)
 			  AND NOT EXISTS (
 			    -- Find ANY unstable child - if found, parent cannot be deleted
 			    -- This ensures ALL children must be stable before parent deletion
@@ -535,6 +551,7 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 			FROM transactions t
 			WHERE t.delete_at_height IS NOT NULL
 			  AND t.delete_at_height <= $1
+			  AND (t.unmined_since IS NULL OR t.conflicting)
 			  AND NOT EXISTS (
 			    SELECT 1
 			    FROM outputs o
@@ -616,4 +633,27 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 	}
 
 	return deleted, heldBack, nil
+}
+
+// clearUnminedDeleteAtHeight clears delete_at_height on unmined, non-conflicting, non-preserved records
+// that are due for deletion, so the delete below skips them and later cycles no longer match them.
+// A failure is only logged: nothing is deleted on its account and the rows are retried next cycle.
+func (s *Service) clearUnminedDeleteAtHeight(ctx context.Context, blockHeight uint32) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE transactions
+		SET delete_at_height = NULL
+		WHERE delete_at_height IS NOT NULL
+		  AND delete_at_height <= $1
+		  AND unmined_since IS NOT NULL
+		  AND NOT conflicting
+		  AND preserve_until IS NULL
+	`, blockHeight)
+	if err != nil {
+		s.logger.Errorf("[pruner] failed to clear delete_at_height of unmined records: %v", err)
+		return
+	}
+
+	if count, err := result.RowsAffected(); err == nil && count > 0 {
+		s.logger.Infof("[pruner] cleared delete_at_height of %d unmined records", count)
+	}
 }

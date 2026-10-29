@@ -242,10 +242,10 @@ Provides a reader interface for accessing subtree data from the block persister 
 #### GetSubtreeTransactions
 
 ```go
-func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, error)
+func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, func(), error)
 ```
 
-Retrieves all transactions contained in a subtree, returned as a map keyed by transaction hash.
+Retrieves all transactions contained in a subtree, returned as a map keyed by transaction hash. The returned release function must be called once the caller is done with the map: the `asset_concurrency_get_subtree_transactions` permit budgets the map, so it is held until release rather than until the call returns.
 
 #### GetSubtreeExists
 
@@ -445,7 +445,7 @@ The Asset Service uses the following configuration values from the settings syst
 
 ### Security
 
-- `http_sign_response`: Whether to sign HTTP responses (default: false)
+- `asset_sign_http_responses`: Whether to sign HTTP responses (default: false)
 - `p2p_private_key`: Private key for signing responses
 
 ### Dashboard Configuration

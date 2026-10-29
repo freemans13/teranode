@@ -60,7 +60,7 @@ func TestProcessRemainderTxHashes_BoundedFanOut(t *testing.T) {
 
 	// Every node is in the block, so the pass finds no remainder and only the
 	// lookup phase does any work.
-	transactionMap := NewSplitSwissMap(64, totalHashes)
+	transactionMap := NewSortedHashSet(totalHashes)
 	chained := make([]*subtreepkg.Subtree, 0, subtrees)
 
 	for s := 0; s < subtrees; s++ {
@@ -76,7 +76,7 @@ func TestProcessRemainderTxHashes_BoundedFanOut(t *testing.T) {
 		chained = append(chained, st)
 	}
 
-	transactionMap.Freeze()
+	require.NoError(t, transactionMap.Freeze(runtime.GOMAXPROCS(0)))
 
 	baseline := runtime.NumGoroutine()
 
@@ -98,7 +98,7 @@ func TestProcessRemainderTxHashes_BoundedFanOut(t *testing.T) {
 		}
 	}()
 
-	require.NoError(t, stp.processRemainderTxHashes(context.Background(), chained, transactionMap, nil, stp.currentTxMap, true))
+	require.NoError(t, stp.processRemainderTxHashes(context.Background(), chained, transactionMap, nil, nil, stp.currentTxMap, true))
 
 	stop.Store(true)
 	<-done

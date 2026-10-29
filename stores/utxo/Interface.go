@@ -201,6 +201,18 @@ type IgnoreFlags struct {
 	// this flag a replay of a transaction whose parent was pruned too is blessed
 	// on the strength of the record the replay itself just created.
 	SpenderCreatedByCaller bool
+	// RequireParentOutputs makes a spend whose parent output is not found fail, even when the
+	// spending transaction already has a record. Without it the store reads that record as
+	// proof the spends were made in an earlier attempt and the parent has since been pruned
+	// ("already blessed"), which holds only when records are created after their spends. Set
+	// ONLY by DefaultSpendAndCreateMulti's second-wave spends for a WithBelowCheckpoint list,
+	// whose records the first wave created before any of those spends, so the record proves
+	// nothing. Its first-wave combined calls spend before they create and leave it unset.
+	//
+	// It says the same thing as SpenderCreatedByCaller, and both stores treat the two alike:
+	// no bless, and a failed call reverses what it wrote by error class (IsSpendRollbackError)
+	// rather than on a record-existence probe, which would always find the caller's record.
+	RequireParentOutputs bool
 }
 
 // ConflictingChildRemoval identifies one (parent, child) pair that should be
@@ -253,6 +265,8 @@ type CreateOptions struct {
 	MinedBlockInfos    []MinedBlockInfo
 	TxID               *chainhash.Hash
 	TxIDs              []chainhash.Hash // SpendAndCreateMulti only: one txid per transaction of the list
+	SubtreeIdxs        []int            // SpendAndCreateMulti only: one subtree index per transaction of the list
+	BelowCheckpoint    bool             // SpendAndCreateMulti only: the list is from a block the caller already knows is valid
 	IsCoinbase         *bool
 	Frozen             bool
 	Conflicting        bool
@@ -284,6 +298,98 @@ func WithTXID(txID *chainhash.Hash) CreateOption {
 	}
 }
 
+// WithSubtreeIdxs supplies the subtree index of each transaction of a SpendAndCreateMulti list,
+// in the same order, so a list that spans several subtrees of one block records each
+// transaction where it is. Each index replaces SubtreeIdx on the list's mined-block info for that
+// transaction only. It needs WithMinedBlockInfo and has no effect on SpendAndCreate.
+func WithSubtreeIdxs(idxs []int) CreateOption {
+	return func(o *CreateOptions) {
+		o.SubtreeIdxs = idxs
+	}
+}
+
+// WithBelowCheckpoint tells SpendAndCreateMulti that the list comes from a block at or below a
+// checkpoint the caller trusts, so the block is already known valid and the list may be written in
+// any order. DefaultSpendAndCreateMulti then writes it in two waves instead of one dependency
+// level at a time: a first wave that creates every record, spending in the same call the inputs
+// of each transaction with no parent in the list, and a second that spends the rest. A chain of
+// N transactions costs two rounds of store calls rather than N. A store that nets the list may ignore it. Never
+// set it above the checkpoint: there a transaction's inputs must be spent before its outputs
+// exist, or a transaction that fails its spends leaves outputs behind. It has no effect on
+// SpendAndCreate.
+func WithBelowCheckpoint() CreateOption {
+	return func(o *CreateOptions) {
+		o.BelowCheckpoint = true
+	}
+}
+
+// ItemOptions returns the options transaction i of a SpendAndCreateMulti list is written with: a
+// copy carrying its own subtree index on the mined-block info, with the list-only fields, which
+// describe the whole list, cleared.
+func (o *CreateOptions) ItemOptions(i int) *CreateOptions {
+	c := *o
+	c.TxIDs = nil
+	c.SubtreeIdxs = nil
+	c.BelowCheckpoint = false
+
+	if o.SubtreeIdxs != nil && i < len(o.SubtreeIdxs) && len(o.MinedBlockInfos) > 0 {
+		c.MinedBlockInfos = make([]MinedBlockInfo, len(o.MinedBlockInfos))
+		copy(c.MinedBlockInfos, o.MinedBlockInfos)
+
+		for k := range c.MinedBlockInfos {
+			c.MinedBlockInfos[k].SubtreeIdx = o.SubtreeIdxs[i]
+		}
+	}
+
+	return &c
+}
+
+// withRequireParentOutputs sets IgnoreFlags.RequireParentOutputs, for the spend wave of a
+// list written create-then-spend.
+func withRequireParentOutputs() CreateOption {
+	return func(o *CreateOptions) {
+		o.IgnoreFlags.RequireParentOutputs = true
+	}
+}
+
+// The boolean CreateOptions below return one of two package-level closures
+// rather than closing over their argument. A closure that captures anything is
+// heap-allocated the moment it escapes, and these escape on every call: they go
+// straight into SpendAndCreate's variadic list, which the quick-validation write
+// path built once per TRANSACTION when this was measured.
+//
+// That is one allocation per option per transaction, and on a node whose heap
+// sits at GOMEMLIMIT an allocation is not cheap. A CPU profile taken on Hetzner
+// mainnet while block 760431 was applied charged 14.77 core-seconds to
+// runtime.newobject underneath WithIgnoreLocked alone, inside a 25-second
+// window, because each allocation first pays off sweep debt through
+// runtime.deductSweepCredit before it is allowed to proceed.
+//
+// A closure that captures nothing is a static function value, so these cost
+// nothing at all. TestCreateOptionsDoNotAllocate holds them to that.
+var (
+	optFrozenTrue  CreateOption = func(o *CreateOptions) { o.Frozen = true }
+	optFrozenFalse CreateOption = func(o *CreateOptions) { o.Frozen = false }
+
+	optConflictingTrue  CreateOption = func(o *CreateOptions) { o.Conflicting = true }
+	optConflictingFalse CreateOption = func(o *CreateOptions) { o.Conflicting = false }
+
+	optLockedTrue  CreateOption = func(o *CreateOptions) { o.Locked = true }
+	optLockedFalse CreateOption = func(o *CreateOptions) { o.Locked = false }
+
+	optSkipExtendedInputsTrue  CreateOption = func(o *CreateOptions) { o.SkipExtendedInputs = true }
+	optSkipExtendedInputsFalse CreateOption = func(o *CreateOptions) { o.SkipExtendedInputs = false }
+
+	optIgnoreConflictingTrue  CreateOption = func(o *CreateOptions) { o.IgnoreFlags.IgnoreConflicting = true }
+	optIgnoreConflictingFalse CreateOption = func(o *CreateOptions) { o.IgnoreFlags.IgnoreConflicting = false }
+
+	optIgnoreLockedTrue  CreateOption = func(o *CreateOptions) { o.IgnoreFlags.IgnoreLocked = true }
+	optIgnoreLockedFalse CreateOption = func(o *CreateOptions) { o.IgnoreFlags.IgnoreLocked = false }
+
+	optSkipUTXOHashCheckTrue  CreateOption = func(o *CreateOptions) { o.IgnoreFlags.SkipUTXOHashCheck = true }
+	optSkipUTXOHashCheckFalse CreateOption = func(o *CreateOptions) { o.IgnoreFlags.SkipUTXOHashCheck = false }
+)
+
 // WithTXIDs supplies the txids of a SpendAndCreateMulti list, in the same order,
 // so the store does not rehash each transaction. It is the list form of WithTXID
 // and has no effect on SpendAndCreate.
@@ -302,48 +408,60 @@ func WithSetCoinbase(b bool) CreateOption {
 
 // WithFrozen returns a CreateOption that marks a UTXO as frozen.
 func WithFrozen(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.Frozen = b
+	if b {
+		return optFrozenTrue
 	}
+
+	return optFrozenFalse
 }
 
 // WithConflicting marks a transaction as conflicting with another transaction.
 func WithConflicting(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.Conflicting = b
+	if b {
+		return optConflictingTrue
 	}
+
+	return optConflictingFalse
 }
 
 // WithLocked sets the transactions as locked and not spendable on creation
 func WithLocked(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.Locked = b
+	if b {
+		return optLockedTrue
 	}
+
+	return optLockedFalse
 }
 
 // WithSkipExtendedInputs marks a create as minimal: compute meta with fee=0 (no GetFees) and
 // persist per-input parent script/satoshis as empty/zero, while ALWAYS retaining the per-input
 // outpoint and every output. Set ONLY on the gated below-checkpoint path (spec §3.2 Seam 3, §3.3).
 func WithSkipExtendedInputs(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.SkipExtendedInputs = b
+	if b {
+		return optSkipExtendedInputsTrue
 	}
+
+	return optSkipExtendedInputsFalse
 }
 
 // WithIgnoreConflicting makes the spend phase of SpendAndCreate ignore the
 // conflicting flag on the UTXOs being spent.
 func WithIgnoreConflicting(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.IgnoreFlags.IgnoreConflicting = b
+	if b {
+		return optIgnoreConflictingTrue
 	}
+
+	return optIgnoreConflictingFalse
 }
 
 // WithIgnoreLocked makes the spend phase of SpendAndCreate ignore the locked
 // flag on the UTXOs being spent.
 func WithIgnoreLocked(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.IgnoreFlags.IgnoreLocked = b
+	if b {
+		return optIgnoreLockedTrue
 	}
+
+	return optIgnoreLockedFalse
 }
 
 // WithSkipUTXOHashCheck disables the per-input utxo-hash integrity comparison in
@@ -352,9 +470,11 @@ func WithIgnoreLocked(b bool) CreateOption {
 // does not implement the outpoint-only fast path and treats this flag as a
 // no-op (see SupportsOutpointOnlySpend).
 func WithSkipUTXOHashCheck(b bool) CreateOption {
-	return func(o *CreateOptions) {
-		o.IgnoreFlags.SkipUTXOHashCheck = b
+	if b {
+		return optSkipUTXOHashCheckTrue
 	}
+
+	return optSkipUTXOHashCheckFalse
 }
 
 // WithSpenderCreatedByCaller marks the spending transaction's record as written
@@ -547,6 +667,25 @@ type Store interface {
 	// same reasons it is there: a spend repeated by the same spender is accepted
 	// as the same spend, and SpendAndCreate spends before it creates, so a
 	// record that exists has made its spends.
+	//
+	// A caller may repeat only the transactions that were not Created or
+	// Existed, with their parents in the list, in list order; quick validation
+	// does. The parents keep each transaction written the way it was the first
+	// time, which the store's reading of an existing record relies on. So a
+	// store that reports
+	// per-transaction failures must leave the store such that the shorter list
+	// finishes the write, with every parent that went through outside it. A
+	// store whose write depends on the whole list, one that leaves out the
+	// coins a later transaction of the list spends for instance, cannot: it
+	// returns an error for the whole call instead, and the caller repeats the
+	// whole list.
+	//
+	// WithBelowCheckpoint lets the store write the list in any order, because
+	// the caller already knows the block is valid. In that order a record can
+	// exist before its spends are made, after a crash for instance, so finding
+	// a record no longer proves its spends: the store makes the spends of a
+	// MultiTxExisted transaction itself before reporting it. See
+	// DefaultSpendAndCreateMulti for how the option changes the results.
 	//
 	// A list that breaks the caller's guarantees (a transaction spending a later
 	// one or an outpoint spent twice, an output index past the end of a parent

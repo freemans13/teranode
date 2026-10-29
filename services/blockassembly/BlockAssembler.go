@@ -122,6 +122,11 @@ type BlockAssembler struct {
 	// subtreeProcessor handles the processing and organization of transaction subtrees
 	subtreeProcessor subtreeprocessor.Interface
 
+	// txMetaEvictor publishes txmeta DELETEs for txs the conflict-intent replay
+	// marks conflicting, so subtree validation's txmeta cache drops them.
+	// Nil when the txmeta topic is not configured.
+	txMetaEvictor *subtreeprocessor.TxMetaEvictor
+
 	// bestBlock atomically stores the current best block header and height together
 	bestBlock atomic.Pointer[BestBlockInfo]
 
@@ -252,6 +257,20 @@ type blockWithMeta struct {
 	meta  *model.BlockHeaderMeta
 }
 
+// BlockAssemblerOption configures optional NewBlockAssembler dependencies.
+type BlockAssemblerOption func(*blockAssemblerOptions)
+
+type blockAssemblerOptions struct {
+	txMetaEvictor *subtreeprocessor.TxMetaEvictor
+}
+
+// WithTxMetaEvictor makes the assembler (and its subtree processor) publish txmeta
+// DELETEs for every tx a conflict demotion marks conflicting. A nil evictor
+// disables publishing.
+func WithTxMetaEvictor(e *subtreeprocessor.TxMetaEvictor) BlockAssemblerOption {
+	return func(o *blockAssemblerOptions) { o.txMetaEvictor = e }
+}
+
 // NewBlockAssembler creates and initializes a new BlockAssembler instance.
 //
 // Parameters:
@@ -267,7 +286,13 @@ type blockWithMeta struct {
 // Returns:
 //   - *BlockAssembler: New block assembler instance
 func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, stats *gocore.Stat, utxoStore utxo.Store,
-	subtreeStore blob.Store, blockchainClient blockchain.ClientI, newSubtreeChan chan subtreeprocessor.NewSubtreeRequest) (*BlockAssembler, error) {
+	subtreeStore blob.Store, blockchainClient blockchain.ClientI, newSubtreeChan chan subtreeprocessor.NewSubtreeRequest,
+	opts ...BlockAssemblerOption) (*BlockAssembler, error) {
+	var options blockAssemblerOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	// The main loop updates metrics (e.g. the disk tx map degraded gauge)
 	// whether or not a Server was built around this assembler.
 	initPrometheusMetrics()
@@ -293,6 +318,10 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 		stpOpts = append(stpOpts, subtreeprocessor.WithTxMapDirs(tSettings.BlockAssembly.TxMapDirs))
 	}
 
+	if options.txMetaEvictor != nil {
+		stpOpts = append(stpOpts, subtreeprocessor.WithTxMetaEvictor(options.txMetaEvictor))
+	}
+
 	subtreeProcessor, err := subtreeprocessor.NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan, stpOpts...)
 	if err != nil {
 		return nil, err
@@ -306,6 +335,7 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 		subtreeStore:        subtreeStore,
 		blockchainClient:    blockchainClient,
 		subtreeProcessor:    subtreeProcessor,
+		txMetaEvictor:       options.txMetaEvictor,
 		currentChainMap:     make(map[chainhash.Hash]uint32, tSettings.BlockAssembly.MaxBlockReorgCatchup),
 		currentChainMapIDs:  make(map[uint32]struct{}, tSettings.BlockAssembly.MaxBlockReorgCatchup),
 		defaultMiningNBits:  defaultMiningBits,
@@ -570,42 +600,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 
 			case resetReq := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
-
-				// If FullReset requested, run lightweight consistency scan first
-				if resetReq.FullReset {
-					if fixErr := b.fixUnminedSinceInconsistencies(ctx); fixErr != nil {
-						b.logger.Errorf("[BlockAssembler] error fixing unmined_since inconsistencies: %v", fixErr)
-					}
-				}
-
-				resp, err := b.resetWithResponse(ctx, resetReq.ValidateInputs)
-
-				// The Reset path replays moveForward blocks through the same
-				// conflict resolution, so it can queue refusals too. Unlike the
-				// reorg path this does not run inside processNewBlockAnnouncement,
-				// so nothing else would drain them until the next block arrives.
-				b.drainPendingInvalidations(ctx)
-
-				// empty out the reset channel. The reset that ran stands in for
-				// every drained request, so it counts as storage-triggered if
-				// any of them was.
-				storageTriggered := resetReq.StorageTriggered
-
-				for len(b.resetCh) > 0 {
-					bufferedCh := <-b.resetCh
-					storageTriggered = storageTriggered || bufferedCh.StorageTriggered
-
-					if bufferedCh.ErrCh != nil {
-						bufferedCh.ErrCh <- nil
-					}
-				}
-
-				b.onResetDone(storageTriggered, resp, err)
-
-				if resetReq.ErrCh != nil {
-					resetReq.ErrCh <- err
-				}
-
+				b.handleResetRequests(ctx, resetReq)
 				b.setCurrentRunningState(StateRunning)
 
 			case notification := <-b.blockchainSubscriptionCh:
@@ -628,6 +623,68 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 	return nil
 }
 
+// handleResetRequests runs one reset on behalf of first and of every request
+// already queued in resetCh, and answers each of them with that reset's result.
+//
+// The queue is drained before the reset runs, and the flags are merged: the reset
+// scans for unmined_since inconsistencies if any request asked for a full reset,
+// validates inputs if any asked for it, and counts as storage-triggered if any
+// was. Draining after the run instead would answer a queued validating or full
+// request with nil although the reset that ran did neither. A request that arrives
+// while the reset runs stays queued and gets its own reset on the next pass of the
+// loop.
+//
+// Each ErrCh is buffered (cap 1) by its sender (resetWithOptions,
+// resetStorageTriggered, resetAfterDrainFailure), which only logs a non-nil error.
+func (b *BlockAssembler) handleResetRequests(ctx context.Context, first resetRequest) {
+	batch := []resetRequest{first}
+
+	// Every sender is a goroutine blocked on resetCh once its two slots are full,
+	// and each receive lets the next one in, so drain until a receive would block
+	// rather than counting len once: a count takes only the buffered two and
+	// leaves the rest of a burst to run as resets of their own.
+drain:
+	for {
+		select {
+		case req := <-b.resetCh:
+			batch = append(batch, req)
+		default:
+			break drain
+		}
+	}
+
+	var fullReset, validateInputs, storageTriggered bool
+
+	for _, req := range batch {
+		fullReset = fullReset || req.FullReset
+		validateInputs = validateInputs || req.ValidateInputs
+		storageTriggered = storageTriggered || req.StorageTriggered
+	}
+
+	// If FullReset requested, run lightweight consistency scan first
+	if fullReset {
+		if fixErr := b.fixUnminedSinceInconsistencies(ctx); fixErr != nil {
+			b.logger.Errorf("[BlockAssembler] error fixing unmined_since inconsistencies: %v", fixErr)
+		}
+	}
+
+	resp, err := b.resetWithResponse(ctx, validateInputs)
+
+	// The Reset path replays moveForward blocks through the same
+	// conflict resolution, so it can queue refusals too. Unlike the
+	// reorg path this does not run inside processNewBlockAnnouncement,
+	// so nothing else would drain them until the next block arrives.
+	b.drainPendingInvalidations(ctx)
+
+	b.onResetDone(storageTriggered, resp, err)
+
+	for _, req := range batch {
+		if req.ErrCh != nil {
+			req.ErrCh <- err
+		}
+	}
+}
+
 // triggerReconcile asks the channel listener to run processNewBlockAnnouncement.
 // The send is non-blocking — reconcileCh is buffered cap 1 and acts as a
 // coalescing signal, so concurrent triggers fold into a single pass.
@@ -641,9 +698,10 @@ func (b *BlockAssembler) triggerReconcile() {
 // reset performs a full reset of the block assembler state by clearing all subtrees and reloading from blockchain.
 //
 // This is the "nuclear option" for handling blockchain reorganizations and is used when:
-// 1. Large reorgs (>= CoinbaseMaturity blocks AND height > 1000) where incremental reorg is too expensive
-// 2. Failed reorgs where subtreeProcessor.Reorg() encountered errors
-// 3. Reorgs involving invalid blocks that require clean state
+//  1. Large reorgs (>= CoinbaseMaturity blocks AND height > 1000, or >= the UTXO retention at any height)
+//     where incremental reorg is too expensive or the moveForward txs may already be pruned
+//  2. Failed reorgs where subtreeProcessor.Reorg() encountered errors
+//  3. Reorgs involving invalid blocks that require clean state
 //
 // The reset process:
 // 1. Waits for BlockValidation background jobs to complete (WaitForPendingBlocks)
@@ -673,6 +731,57 @@ func (b *BlockAssembler) triggerReconcile() {
 func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) error {
 	_, err := b.resetWithResponse(ctx, validateInputs...)
 	return err
+}
+
+// resetExistenceChunkSize bounds one BatchDecorate call in dropPrunedTxs.
+const resetExistenceChunkSize = 10_000
+
+// dropPrunedTxs returns hashes without the ones the UTXO store reports as not
+// found (pruned), in order. Any other per-tx error is no evidence the record is
+// gone, so that hash is kept: dropping a live tx would leave it flagged mined while
+// its block is off the chain, and nothing repairs that later. A failing lookup
+// call, or a cancelled ctx, returns an error.
+func (b *BlockAssembler) dropPrunedTxs(ctx context.Context, hashes []chainhash.Hash) ([]chainhash.Hash, error) {
+	kept := make([]chainhash.Hash, 0, len(hashes))
+	pruned, unverified := 0, 0
+
+	for start := 0; start < len(hashes); start += resetExistenceChunkSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		b.heartbeat.BeatIfStarted()
+
+		chunk := hashes[start:min(start+resetExistenceChunkSize, len(hashes))]
+
+		unresolved := make([]*utxo.UnresolvedMetaData, len(chunk))
+		for i := range chunk {
+			unresolved[i] = &utxo.UnresolvedMetaData{Hash: chunk[i], Idx: i}
+		}
+
+		if err := b.utxoStore.BatchDecorate(ctx, unresolved, fields.UnminedSince); err != nil {
+			return nil, err
+		}
+
+		for i, u := range unresolved {
+			switch {
+			case u.Err == nil:
+				kept = append(kept, chunk[i])
+			case errors.Is(u.Err, errors.ErrTxNotFound):
+				pruned++
+			default:
+				unverified++
+
+				kept = append(kept, chunk[i])
+			}
+		}
+	}
+
+	if pruned > 0 || unverified > 0 {
+		b.logger.Warnf("[BlockAssembler][Reset] moveBack transactions before the unmined mark: %d pruned (no record) left out, %d with a lookup error kept", pruned, unverified)
+	}
+
+	return kept, nil
 }
 
 // resetWithResponse is reset, also returning the subtree processor's reset
@@ -859,6 +968,25 @@ func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs .
 						}
 					}
 				}
+			}
+
+			// Leave out moveBack txs the UTXO store has already pruned. A moveBack block can
+			// sit deeper than the retention window, so its fully spent txs may be gone, and
+			// the store treats marking a missing record as fatal. A pruned tx was mined
+			// deeper than the retention window and has no record left to re-add to assembly;
+			// its live children stay protected by the pruner's parent preservation.
+			kept, existsErr := b.dropPrunedTxs(ctx, moveBackTxs)
+
+			switch {
+			case existsErr == nil:
+				moveBackTxs = kept
+			case ctx.Err() != nil:
+				return resp, existsErr
+			default:
+				// Cannot tell pruned from live: mark them all, as before the lookup existed.
+				// Leaving them out would strand live txs flagged mined with their block off
+				// the chain; a pruned tx among them still hits the store's fatal, as before.
+				b.logger.Errorf("[BlockAssembler][Reset] error checking moveBack transactions exist, marking all %d: %v", len(moveBackTxs), existsErr)
 			}
 
 			// Mark net unmined transactions as NOT on longest chain (set unmined_since)
@@ -1347,6 +1475,10 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions: %v", err)
 	}
 
+	// the unmined txs were added outside the processing loop, so the loop has not yet
+	// checked the resulting subtrees against blockmaxsize
+	b.subtreeProcessor.RequestBlockMaxSizeCheck()
+
 	// AddTx is already enqueueing on the gRPC side. If loadUnminedTransactions
 	// flagged any tx as conflicting (and cascaded its descendants), drain the
 	// input queue with that set as a drop filter before the event-loop
@@ -1615,17 +1747,39 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 		// says nothing about whether a losing transaction is confirmed on that
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
-		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, seeded,
-			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash))
-
-		return err
+		return b.processConflictingAndEvict(ctx, intent, seeded)
 	case utxo.ConflictIntentReverse:
-		_, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes)
-
-		return err
+		return b.reverseProcessConflictingAndEvict(ctx, intent)
 	default:
 		return errors.NewProcessingError("[replayConflictIntent] unknown conflict intent kind %q", intent.Kind)
 	}
+}
+
+// processConflictingAndEvict re-runs ProcessConflicting for a WAL intent and
+// evicts every tx it marked conflicting (losers and their cascaded descendants)
+// from subtree validation's txmeta cache. On failure it evicts what the run may
+// have flipped.
+func (b *BlockAssembler) processConflictingAndEvict(ctx context.Context, intent utxo.ConflictIntent, seeded map[chainhash.Hash]struct{}) error {
+	_, allMarkedConflicting, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, seeded,
+		utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash))
+
+	b.txMetaEvictor.Evict(allMarkedConflicting)
+
+	return err
+}
+
+// reverseProcessConflictingAndEvict re-runs ReverseProcessConflicting for a WAL
+// intent and evicts every tx the reverse flipped to conflicting (the demoted
+// winners and their descendants). The counter side it flips back to
+// non-conflicting needs no eviction: the txmeta cache never holds conflicting
+// entries, so there is nothing stale, and a miss repopulates from the store. On
+// failure it evicts what the run may have flipped.
+func (b *BlockAssembler) reverseProcessConflictingAndEvict(ctx context.Context, intent utxo.ConflictIntent) error {
+	cascadedToConflicting, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes)
+
+	b.txMetaEvictor.Evict(cascadedToConflicting)
+
+	return err
 }
 
 // healStaleConflictIntent converges the UTXO state for an intent whose block has
@@ -1645,7 +1799,7 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
 	switch intent.Kind {
 	case utxo.ConflictIntentForward:
-		if _, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes); err != nil {
+		if err := b.reverseProcessConflictingAndEvict(ctx, intent); err != nil {
 			return err
 		}
 
@@ -1661,10 +1815,7 @@ func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utx
 		// says nothing about whether a losing transaction is confirmed on that
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
-		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, seeded,
-			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash))
-
-		return err
+		return b.processConflictingAndEvict(ctx, intent, seeded)
 	default:
 		return errors.NewProcessingError("[healStaleConflictIntent] unknown conflict intent kind %q", intent.Kind)
 	}
@@ -2019,9 +2170,12 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 
 	prometheusBlockAssemblerGetMiningCandidate.Inc()
 
-	// Handle block-processing-in-progress state
+	// Handle block-processing-in-progress state. A reorg, reconcile or reset is
+	// still moving block assembly to the chain tip, so a candidate built on the
+	// block assembly tip would mine on the old side of a reorg.
 	currentState := b.GetCurrentRunningState()
-	if currentState == StateBlockchainSubscription || currentState == StateMovingUp {
+	if currentState == StateBlockchainSubscription || currentState == StateMovingUp ||
+		currentState == StateReorging || currentState == StateReconciling || currentState == StateResetting {
 		b.logger.Infof("[GetMiningCandidate] Block processing in progress (state: %s), returning empty block template for new height", StateStrings[currentState])
 
 		bestBlockHeader, bestBlockMeta, err := b.blockchainClient.GetBestBlockHeader(ctx)
@@ -2242,6 +2396,38 @@ func (b *BlockAssembler) generateEmptyBlockCandidate(ctx context.Context, bestBl
 	return miningCandidate, []*subtree.Subtree{}, nil
 }
 
+// reorgNeedsReset decides whether a reorg must go through a full reset instead of
+// subtreeProcessor.Reorg.
+//
+// A reorg whose deeper side reaches the effective UTXO retention can bring forward
+// blocks whose transactions the pruner has already deleted (delete-at-height is
+// height + retention), which reorgBlocks cannot handle after its commit point, so
+// those reorgs reset at any height. Reorgs of at least CoinbaseMaturity blocks reset
+// above height 1000; below that the incremental reorg is kept. A retention of 0
+// means pruning is disabled, so only the maturity rule applies.
+//
+// moveBack is what bounds the risk: the pruner runs at most up to block assembly's
+// tip (checkBlockAssemblySafeForPruner), so a side-chain record stamped after the
+// fork is deletable only once the main chain is retention blocks past it. Taking
+// the deeper of the two sides is deliberately conservative, and >= resets one block
+// before the earliest deletable height. Catch-up without a moveBack does not come
+// through here.
+//
+// It returns which rule fired, for the log, or "" when the reorg can go in place.
+func reorgNeedsReset(moveBack, moveForward int, currentHeight, coinbaseMaturity, utxoRetention uint32) string {
+	depth := uint64(max(moveBack, moveForward)) //nolint:gosec // block counts, never negative
+
+	if utxoRetention > 0 && depth >= uint64(utxoRetention) {
+		return "depth reaches UTXO retention"
+	}
+
+	if depth >= uint64(coinbaseMaturity) && currentHeight > 1000 {
+		return "depth reaches coinbase maturity above height 1000"
+	}
+
+	return ""
+}
+
 // handleReorg handles blockchain reorganization.
 //
 // Parameters:
@@ -2265,9 +2451,9 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 
 	_, currentHeight := b.CurrentBlock()
 
-	if (len(moveBackBlocksWithMeta) >= int(b.settings.ChainCfgParams.CoinbaseMaturity) || len(moveForwardBlocksWithMeta) >= int(b.settings.ChainCfgParams.CoinbaseMaturity)) && currentHeight > 1000 {
+	if why := reorgNeedsReset(len(moveBackBlocksWithMeta), len(moveForwardBlocksWithMeta), currentHeight, uint32(b.settings.ChainCfgParams.CoinbaseMaturity), b.settings.GetUtxoStoreBlockHeightRetention()); why != "" {
 		// large reorg, log it and Reset the block assembler
-		b.logger.Warnf("[BlockAssembler] large reorg detected, resetting block assembly, moveBackBlocks: %d, moveForwardBlocks: %d", len(moveBackBlocksWithMeta), len(moveForwardBlocksWithMeta))
+		b.logger.Warnf("[BlockAssembler] large reorg detected (%s), resetting block assembly, moveBackBlocks: %d, moveForwardBlocks: %d", why, len(moveBackBlocksWithMeta), len(moveForwardBlocksWithMeta))
 
 		// make sure we wait for the reset to complete
 		// validateInputs=true: getConflictingNodes() may miss conflicts not stored in subtree
@@ -2341,9 +2527,10 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 
 // handleCatchUp executes a forward-only catch-up. Delegates to the subtree
 // processor's reorgBlocks fast path (the `len(moveBackBlocks)==0 && len(moveForwardBlocks)>0`
-// branch, see SubtreeProcessor.go:2794), which iterates moveForwardBlock per block with
-// skipNotification + skipDequeue on every block except the last and rolls back to
-// pre-catchup state on mid-loop failure. ctx is unused at this layer — Reorg controls
+// branch), which drains the queue into the subtrees first, so every block's remainder pass
+// filters the backlog, then iterates moveForwardBlock per block with skipNotification +
+// skipDequeue on every block except the last, and rolls back to the drained pre-catchup
+// state on mid-loop failure. ctx is unused at this layer — Reorg controls
 // its own internal lifecycle via reorgBlockChan.
 func (b *BlockAssembler) handleCatchUp(_ context.Context, moveForward []blockWithMeta) error {
 	if len(moveForward) == 0 {
@@ -2893,7 +3080,12 @@ func (b *BlockAssembler) validateParentChain(
 		for h := range conflictingDescendants {
 			cascadeHashes = append(cascadeHashes, h)
 		}
-		if _, _, mErr := utxo.MarkConflictingRecursively(ctx, b.utxoStore, cascadeHashes); mErr != nil {
+		_, marked, mErr := utxo.MarkConflictingRecursively(ctx, b.utxoStore, cascadeHashes)
+
+		// a failed cascade may still have flipped some of them
+		b.txMetaEvictor.Evict(marked)
+
+		if mErr != nil {
 			b.logger.Errorf("[BlockAssembler][validateParentChain] failed to mark %d cascaded conflicting txs: %v", len(cascadeHashes), mErr)
 		} else {
 			b.logger.Infof("[BlockAssembler][validateParentChain] marked %d txs conflicting (descendants of conflicting parents)", len(cascadeHashes))
@@ -3262,9 +3454,9 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 	}
 
 	// Wait for the unmined_since index to be ready before attempting to get the iterator
-	if indexWaiter, ok := b.utxoStore.(interface {
+	if indexWaiter, ok := utxo.As[interface {
 		WaitForIndexReady(ctx context.Context, indexName string) error
-	}); ok {
+	}](b.utxoStore); ok {
 		indexName := "unminedSinceIndex"
 		prometheusBlockAssemblerUtxoIndexReady.WithLabelValues(indexName).Set(0)
 
@@ -3766,6 +3958,10 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 
 func (b *BlockAssembler) markAsConflicting(ctx context.Context, txHash chainhash.Hash) {
 	_, cascadedHashes, err := utxo.MarkConflictingRecursively(ctx, b.utxoStore, []chainhash.Hash{txHash})
+
+	// a failed cascade may still have flipped some of them
+	b.txMetaEvictor.Evict(cascadedHashes)
+
 	if err != nil {
 		b.logger.Errorf("[validateUnminedTxInputs][%s] failed to mark as conflicting: %v", txHash.String(), err)
 		return
@@ -3855,9 +4051,9 @@ func (b *BlockAssembler) CheckInputValidation(ctx context.Context) (int, error) 
 // for the startup load (fail on one).
 func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context, isReload bool) error {
 	// Wait for the unmined_since index to be ready
-	if indexWaiter, ok := b.utxoStore.(interface {
+	if indexWaiter, ok := utxo.As[interface {
 		WaitForIndexReady(ctx context.Context, indexName string) error
-	}); ok {
+	}](b.utxoStore); ok {
 		indexName := "unminedSinceIndex"
 		prometheusBlockAssemblerUtxoIndexReady.WithLabelValues(indexName).Set(0)
 

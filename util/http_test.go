@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1470,6 +1471,158 @@ func TestDoHTTPRequestBodyReaderWithRetry_ContextCancelAbortsRetries(t *testing.
 		"should not fire all 6 attempts if cancelled at 50ms with 200ms+ backoffs")
 }
 
+// Requests rejected together must not retry together: the wait is jittered upwards, never
+// below the server's Retry-After.
+func TestDoHTTPRequestBodyReaderWithRetry_JittersRetryAfter(t *testing.T) {
+	const retryAfter = time.Second
+
+	var (
+		mu    sync.Mutex
+		times []time.Time
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Record only our GETs: anything else probing the loopback port must not skew the gaps.
+		if r.Method != http.MethodGet {
+			return
+		}
+
+		mu.Lock()
+		times = append(times, time.Now())
+		n := len(times)
+		mu.Unlock()
+
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := retryConfig{maxAttempts: 2, initialDelay: 10 * time.Millisecond, maxDelay: 5 * time.Second}
+
+	body, err := doHTTPRequestBodyReaderWithRetry(context.Background(), server.URL, cfg)
+	require.NoError(t, err)
+	require.NoError(t, body.Close())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, times, 2)
+
+	gap := times[1].Sub(times[0])
+	require.GreaterOrEqual(t, gap, retryAfter-50*time.Millisecond, "jitter must never undercut Retry-After")
+	require.Less(t, gap, retryAfter+retryAfter/2+500*time.Millisecond, "jitter adds at most half")
+}
+
+// With a caller deadline the ladder stops at half of it rather than sleeping the deadline
+// away, and reports the rejection, not a context error.
+func TestDoHTTPRequestBodyReaderWithRetry_LadderSpendsAtMostHalfTheDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	cfg := retryConfig{maxAttempts: 10, initialDelay: 100 * time.Millisecond, maxDelay: time.Second}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := doHTTPRequestBodyReaderWithRetry(ctx, server.URL, cfg)
+
+	// Not asserted against a tighter wall-clock bound: when another test has installed a
+	// signer, each retry also waits out the current second, which the budget does not count.
+	require.Error(t, err)
+	require.NoError(t, ctx.Err(), "the ladder must stop before the caller's deadline")
+	require.True(t, errors.Is(err, errors.ErrServiceRateLimited), "got %T: %v", err, err)
+	require.False(t, errors.IsContextError(err), "got %T: %v", err, err)
+}
+
+// A deadline that expires during an attempt that follows a rejection is reported as that
+// rejection: the peer's rate limiting is what used the time up.
+func TestDoHTTPRequestBodyReaderWithRetry_DeadlineAfterRejectionKeepsRejectionClass(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Count only our GETs: anything else probing the loopback port must not skew the count.
+		if r.Method != http.MethodGet {
+			return
+		}
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	cfg := retryConfig{maxAttempts: 4, initialDelay: 10 * time.Millisecond, maxDelay: 50 * time.Millisecond}
+
+	// Long enough to outlast the up-to-1s wait for the next second that a signer, if another
+	// test installed one, adds before the retry, so the deadline lands in the second attempt.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := doHTTPRequestBodyReaderWithRetry(ctx, server.URL, cfg)
+	require.Error(t, err)
+	require.Equal(t, int32(2), atomic.LoadInt32(&attempts))
+	require.True(t, errors.Is(err, errors.ErrServiceRateLimited), "got %T: %v", err, err)
+	require.False(t, errors.IsContextError(err), "got %T: %v", err, err)
+	require.Contains(t, err.Error(), "still rejected after 1 attempts", "the attempt the deadline cut short got no answer and is not counted")
+}
+
+// A deadline with no rejection before it is an ordinary timeout and stays one.
+func TestDoHTTPRequestBodyReaderWithRetry_DeadlineWithoutRejectionStaysContextError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := doHTTPRequestBodyReaderWithRetry(ctx, server.URL, testRetryConfig)
+	require.Error(t, err)
+	require.True(t, errors.IsContextError(err), "got %T: %v", err, err)
+	require.False(t, errors.Is(err, errors.ErrServiceRateLimited), "got %T: %v", err, err)
+	require.False(t, errors.Is(err, errors.ErrServiceUnavailable), "got %T: %v", err, err)
+}
+
+// A status the server did send is never relabelled: a 404 that follows a 429 stays a 404 even
+// when the deadline has also passed by the time it is returned.
+func TestDoHTTPRequestBodyReaderWithRetry_StatusAfterRejectionIsNotRelabelled(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Count only our GETs: anything else probing the loopback port must not skew the count.
+		if r.Method != http.MethodGet {
+			return
+		}
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		w.(http.Flusher).Flush()
+		// Hold the error body open past the caller's deadline, so the deadline has expired
+		// by the time the 404 is returned.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	cfg := retryConfig{maxAttempts: 4, initialDelay: 10 * time.Millisecond, maxDelay: 50 * time.Millisecond}
+
+	// Long enough to outlast a signer's wait for the next second, if another test left one
+	// installed, so the 404 attempt is reached.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := doHTTPRequestBodyReaderWithRetry(ctx, server.URL, cfg)
+	require.Error(t, err)
+	require.Equal(t, int32(2), atomic.LoadInt32(&attempts))
+	require.True(t, errors.Is(err, errors.ErrNotFound), "got %T: %v", err, err)
+	require.False(t, errors.Is(err, errors.ErrServiceRateLimited), "got %T: %v", err, err)
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -1590,6 +1743,230 @@ func TestSharedAndSafeClientsShareRedirectRule(t *testing.T) {
 			require.Equal(t, sharedErr.Error(), safeErr.Error(), "both clients must give the same reason")
 		})
 	}
+}
+
+// TestBuildHTTPErrorRedactsURLPassword covers the status-code error built for a
+// non-OK response. That message is logged and forwarded, so a URL carrying a
+// password must reach it masked. Every return is exercised: no body, a body, a
+// truncated body, and a body read that fails.
+func TestBuildHTTPErrorRedactsURLPassword(t *testing.T) {
+	const password = "canary-http-error-password"
+
+	rawURL := "http://teranode:" + password + "@blob.example:8080/subtree"
+
+	bodies := map[string]func() io.ReadCloser{
+		"no body":    func() io.ReadCloser { return nil },
+		"short body": func() io.ReadCloser { return io.NopCloser(strings.NewReader("not found")) },
+		"truncated body": func() io.ReadCloser {
+			return io.NopCloser(strings.NewReader(strings.Repeat("x", maxHTTPErrorBodyBytes+10)))
+		},
+		"failed read": func() io.ReadCloser { return io.NopCloser(failingReader{}) },
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: http.StatusNotFound, Body: body()}
+
+			err := buildHTTPError(resp, rawURL)
+			require.Error(t, err)
+
+			require.NotContains(t, err.Error(), password, "the URL password reached the error message")
+			require.Contains(t, err.Error(), "teranode", "the username should survive redaction")
+			require.Contains(t, err.Error(), "blob.example:8080", "the host should survive redaction")
+		})
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+// withCredentials rewrites a test server URL to carry userinfo, so the
+// assertions below are about a URL that really holds a password rather than
+// about a string that merely looks like one.
+func withCredentials(t *testing.T, serverURL, password, path string) string {
+	t.Helper()
+
+	u, err := url.Parse(serverURL)
+	require.NoError(t, err)
+
+	u.User = url.UserPassword("teranode", password)
+	u.Path = path
+
+	return u.String()
+}
+
+// requireRedacted is the assertion every branch below shares: the password is
+// gone, and enough of the URL survives that the operator can still tell which
+// peer failed.
+func requireRedacted(t *testing.T, err error, password, host string) {
+	t.Helper()
+
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), password, "the URL password reached the error message")
+	require.Contains(t, err.Error(), "teranode", "the username should survive redaction")
+	require.Contains(t, err.Error(), host, "the host should survive redaction")
+}
+
+// TestDoHTTPRequestRedactsURLPasswordOnEveryFailurePath covers the branches
+// TestBuildHTTPErrorRedactsURLPassword does not reach: the body-read timeout,
+// the body-read error, and the "returned HTML" rejection. Each formats the
+// request URL into its message, so each is a place a store password can escape.
+func TestDoHTTPRequestRedactsURLPasswordOnEveryFailurePath(t *testing.T) {
+	const password = "canary-dohttp-password"
+
+	t.Run("timed out while reading body", func(t *testing.T) {
+		// Headers first, then a body that never arrives, so the failure lands
+		// in the read select rather than in the request itself.
+		release := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "64")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-release
+		}))
+
+		defer func() {
+			close(release)
+			server.Close()
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+
+		u, err := url.Parse(server.URL)
+		require.NoError(t, err)
+
+		_, err = DoHTTPRequest(ctx, withCredentials(t, server.URL, password, "/subtree"))
+		requireRedacted(t, err, password, u.Host)
+		require.Contains(t, err.Error(), "timed out while reading body")
+	})
+
+	t.Run("failed to read body", func(t *testing.T) {
+		// Declaring more bytes than are written makes the server close the
+		// connection short, so io.ReadAll fails with an unexpected EOF.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "1024")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("short"))
+		}))
+		defer server.Close()
+
+		u, err := url.Parse(server.URL)
+		require.NoError(t, err)
+
+		_, err = DoHTTPRequest(context.Background(), withCredentials(t, server.URL, password, "/subtree"))
+		requireRedacted(t, err, password, u.Host)
+		require.Contains(t, err.Error(), "failed to read body")
+	})
+
+	t.Run("returned HTML", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("<html>nope</html>"))
+		}))
+		defer server.Close()
+
+		u, err := url.Parse(server.URL)
+		require.NoError(t, err)
+
+		_, err = DoHTTPRequest(context.Background(), withCredentials(t, server.URL, password, "/subtree"))
+		requireRedacted(t, err, password, u.Host)
+		require.Contains(t, err.Error(), "returned HTML")
+	})
+}
+
+// TestDoHTTPRequestBodyReaderWithRetryRedactsAndRendersFully covers the message
+// built once the 503 ladder is exhausted. It carried three verbs and, after
+// errors.New* took lastErr as the wrapped error, only two arguments, so it
+// rendered "%!v(MISSING)" in production.
+func TestDoHTTPRequestBodyReaderWithRetryRedactsAndRendersFully(t *testing.T) {
+	const password = "canary-retry-password"
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	cfg := retryConfig{maxAttempts: 2, initialDelay: time.Millisecond, maxDelay: time.Millisecond}
+
+	_, err = doHTTPRequestBodyReaderWithRetry(context.Background(), withCredentials(t, server.URL, password, "/subtree"), cfg)
+	requireRedacted(t, err, password, u.Host)
+
+	require.Equal(t, int32(2), attempts.Load(), "the ladder should have been exhausted")
+	require.Contains(t, err.Error(), "still rejected after 2 attempts")
+	require.NotContains(t, err.Error(), "MISSING", "the message is formatted with fewer arguments than verbs")
+	require.NotContains(t, err.Error(), "%!", "the message renders a format verb literally")
+}
+
+// TestValidateURLRejectsUnparseableURLWithoutEchoingIt pins the last message in
+// this file shaped like the leak the file was swept for: url.Parse embeds the
+// string it was given verbatim in its error, so the reason is unwrapped from it
+// rather than wrapped whole.
+//
+// No credential reaches this line today - callers pass peer base URLs, and the
+// userinfo check a few lines below rejects the rest - so this is consistency
+// with the rest of the file rather than a live exposure.
+func TestValidateURLRejectsUnparseableURLWithoutEchoingIt(t *testing.T) {
+	const password = "canary-validateurl-password"
+
+	restore := SSRFProtectionEnabled()
+	SetSSRFProtection(true)
+
+	defer SetSSRFProtection(restore)
+
+	// A space in the host is what makes url.Parse refuse it.
+	err := ValidateURL("http://teranode:" + password + "@blob server:8080/subtree")
+	require.Error(t, err)
+
+	require.NotContains(t, err.Error(), password, "the URL password reached the error message")
+	require.NotContains(t, err.Error(), "teranode:", "the URL userinfo reached the error message")
+
+	require.Contains(t, err.Error(), "invalid URL")
+	require.Contains(t, strings.ToLower(err.Error()), "invalid character",
+		"expected the parse failure reason to survive, got: %v", err)
+	require.NotContains(t, err.Error(), "%", "the message renders a format verb literally")
+
+	// A raw "#" in the password ends the authority there, and url.Parse's own
+	// reason quotes everything before it as an invalid port. The full password
+	// is never in that reason, so the assertion is on the part that used to be.
+	err = ValidateURL("http://teranode:canary-validate#url-password@blobserver:8080/subtree")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "canary-validate", "the start of the URL password reached the error message")
+	require.Contains(t, err.Error(), "invalid URL")
+}
+
+// TestDoLocalServiceHTTPRequestRejectsUnparseableURLWithoutEchoingIt covers the
+// one request path that runs no ValidateURL before building the request, so the
+// *url.Error from http.NewRequestWithContext is the first thing to see a bad URL.
+// That error quotes the URL whole. The local service URLs come from this node's
+// settings, where userinfo is a working credential.
+func TestDoLocalServiceHTTPRequestRejectsUnparseableURLWithoutEchoingIt(t *testing.T) {
+	// A space in the host is what makes url.Parse refuse it; the password is
+	// intact in the string and in a leaking error.
+	const password = "canary-localservice-password"
+
+	_, err := DoLocalServiceHTTPRequestBodyReader(context.Background(), "http://teranode:"+password+"@asset server:8090/block")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), password, "the URL password reached the error message")
+	require.NotContains(t, err.Error(), "teranode:", "the URL userinfo reached the error message")
+	require.Contains(t, err.Error(), "failed to create http request")
+	require.Contains(t, strings.ToLower(err.Error()), "invalid character",
+		"expected the parse failure reason to survive, got: %v", err)
+
+	// A raw "/" in the password ends the authority there, and net/url's own
+	// reason quotes ":canary-local" as an invalid port.
+	_, err = DoLocalServiceHTTPRequestBodyReader(context.Background(), "http://teranode:canary-local/url-password@asset:8090/block")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "canary-local", "the start of the URL password reached the error message")
+	require.NotContains(t, err.Error(), "url-password", "the URL reached the error message")
 }
 
 func TestBuildHTTPError_429MapsToRateLimited(t *testing.T) {
@@ -1947,4 +2324,27 @@ func TestDoHTTPRequestBoundedWithRetry_UsesTheRequestTimeoutPerAttempt(t *testin
 	_, err := doHTTPRequestBoundedWithRetry(context.Background(), server.URL, 1024, testRetryConfig)
 	require.Error(t, err)
 	require.Less(t, time.Since(start), 5*time.Second, "the attempt must time out at the request timeout")
+}
+
+func TestDoLocalServiceHTTPRequestBodyReader_DoesNotFollowRedirects(t *testing.T) {
+	var targetReceivedToken atomic.Bool
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Teranode-Internal-Token") != "" {
+			targetReceivedToken.Store(true)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	_, err := DoLocalServiceHTTPRequestBodyReader(context.Background(), redirector.URL,
+		map[string]string{"X-Teranode-Internal-Token": "secret"})
+
+	require.Error(t, err, "the redirect response is not a 2xx, so the caller must see an error rather than the followed body")
+	require.False(t, targetReceivedToken.Load(), "the internal token header must never reach the redirect target")
 }

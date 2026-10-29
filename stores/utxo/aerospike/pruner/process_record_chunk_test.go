@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newChunkTestService(t *testing.T) *Service {
+func newTestService(t *testing.T) *Service {
 	t.Helper()
 	ensurePrometheusMetrics()
 
@@ -42,9 +42,13 @@ func newChunkTestService(t *testing.T) *Service {
 	}
 }
 
-func TestProcessRecordChunk_EmptyInputs(t *testing.T) {
+// TestProcessRecordChunk_RecordWithoutInputs verifies a record with no inputs
+// (e.g. coinbase) is processed without a parent update. The chunk is crafted
+// with zero inputs so no parent updates accumulate and the flushCleanupBatches
+// deletion path stays gated by SkipDeletions.
+func TestProcessRecordChunk_RecordWithoutInputs(t *testing.T) {
 	ctx := context.Background()
-	svc := newChunkTestService(t)
+	svc := newTestService(t)
 
 	var childTxID chainhash.Hash
 	for i := range childTxID {
@@ -73,7 +77,6 @@ func TestProcessRecordChunk_EmptyInputs(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, processed)
 	require.Equal(t, 0, skipped)
-
 }
 
 // TestProcessRecordChunk_MissingExternalTxIsSkippedNotFatal proves that a record
@@ -83,7 +86,7 @@ func TestProcessRecordChunk_EmptyInputs(t *testing.T) {
 // all pruning permanently.
 func TestProcessRecordChunk_MissingExternalTxIsSkippedNotFatal(t *testing.T) {
 	ctx := context.Background()
-	svc := newChunkTestService(t)
+	svc := newTestService(t)
 	svc.external = memory.New()
 
 	var missingTxID, healthyTxID chainhash.Hash

@@ -156,6 +156,13 @@ type Interface interface {
 	//   - error: Any error encountered during block processing
 	MoveForwardBlock(block *model.Block) error
 
+	// PrepareBlock starts building the transaction map of a block on the current tip that is
+	// still being validated, for MoveForwardBlock to use once that block is added.
+	//
+	// Parameters:
+	//   - block: The block being validated; nothing about it is trusted
+	PrepareBlock(block *model.Block)
+
 	// DrainPendingInvalidations returns and clears the blocks whose conflict
 	// resolution was refused because demoting a losing transaction would have
 	// reversed a spend confirmed on that block's own ancestry. Such a block is
@@ -455,6 +462,11 @@ type Interface interface {
 	// Returns:
 	//   - error: Any error encountered while waiting
 	WaitForPendingBlocks(ctx context.Context) error
+
+	// RequestBlockMaxSizeCheck asks the processing goroutine to check the first queued
+	// subtree against blockmaxsize on its next iteration, resizing the queued subtrees if
+	// it no longer fits. Used after subtrees were built outside the processing loop.
+	RequestBlockMaxSizeCheck()
 
 	// Stop gracefully shuts down the SubtreeProcessor.
 	// This method cancels the processor's internal context, which triggers the main

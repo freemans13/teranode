@@ -128,7 +128,7 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 	start := time.Now()
 	txMetaSlice := make([]metaSliceItem, len(txHashes))
 
-	missed, err := u.processTxMetaUsingCache(ctx, txHashes, txMetaSlice, false)
+	missed, err := u.processBlockTxMetaUsingCache(ctx, txHashes, txMetaSlice)
 	if err != nil {
 		return errors.NewProcessingError("[processTransactionsBatched] Failed to check txMeta cache", err)
 	}
@@ -138,6 +138,16 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 		if err != nil {
 			return errors.NewProcessingError("[processTransactionsBatched] Failed to check txMeta store", err)
 		}
+	}
+
+	storedConflictingOptions := validator.ProcessOptions(
+		validator.WithSkipPolicyChecks(true),
+		validator.WithCandidateBlockTime(candidateBlockTime),
+		validator.WithCandidateParentMedianTime(candidateParentMedianTime),
+	)
+
+	if err = u.checkStoredConflictingAtHeight(ctx, txHashes, txMetaSlice, allTransactions, blockHeight, storedConflictingOptions); err != nil {
+		return err
 	}
 
 	prometheusSubtreeValidationBatchStep.WithLabelValues("precheck").Observe(time.Since(start).Seconds())

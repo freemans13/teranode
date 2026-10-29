@@ -301,6 +301,10 @@ func (m *MockSubtreeProcessor) MoveForwardBlock(block *model.Block) error {
 	return args.Error(0)
 }
 
+func (m *MockSubtreeProcessor) PrepareBlock(block *model.Block) {
+	m.Called(block)
+}
+
 // DrainPendingInvalidations and QueueInvalidation implement the invalidation
 // side of Interface.
 //
@@ -352,6 +356,11 @@ func (m *MockSubtreeProcessor) InitCurrentBlockHeader(blockHeader *model.BlockHe
 func (m *MockSubtreeProcessor) WaitForPendingBlocks(ctx context.Context) error {
 	args := m.Called(ctx)
 	return args.Error(0)
+}
+
+// RequestBlockMaxSizeCheck implements Interface.RequestBlockMaxSizeCheck
+func (m *MockSubtreeProcessor) RequestBlockMaxSizeCheck() {
+	m.Called()
 }
 
 // Stop implements Interface.Stop
