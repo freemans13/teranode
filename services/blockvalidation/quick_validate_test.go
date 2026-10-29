@@ -2221,3 +2221,203 @@ func TestQuickValidateCompensationRecoversAfterFailedDelete(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, meta)
 }
+
+// cancelOnReplayStore wraps a real store and runs SpendAndCreateMulti through
+// the same utxo.DefaultSpendAndCreateMulti the SQL store uses, one call at a
+// time, with SpendAndCreate routed back through the wrapper. When the store
+// rejects a spend as a pruned replay it cancels the batch context, the way a
+// failing sibling subtree-file write cancels the batch errgroup in production,
+// so every wave-2 spend still queued behind the replay is never started.
+type cancelOnReplayStore struct {
+	utxo.Store
+	cancel context.CancelFunc
+}
+
+func (s *cancelOnReplayStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
+	data, spends, err := s.Store.SpendAndCreate(ctx, tx, blockHeight, opts...)
+	if err != nil && errors.Is(err, errors.ErrUtxoSpendingTxPruned) {
+		s.cancel()
+	}
+
+	return data, spends, err
+}
+
+func (s *cancelOnReplayStore) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.UniformSpendAndCreateMultiWidths(1), txs, blockHeight, opts...)
+}
+
+// TestQuickValidateRemovesPrunedReplayWhenBatchCancelledMidList: G (coinbase,
+// one output left unspent) -> P (two outputs, mined) -> C (spends P:0, mined)
+// -> E (spends C:0, mined); the pruner removes C and marks P. A block then lists
+// P, C and a valid X that spends P:1. P is a non-coinbase, so it can sit in the
+// list as C's parent: C gets a create-only call in wave 1 (Created) and its
+// spend in wave 2, which the store rejects as a pruned replay. The batch context
+// is cancelled at that moment, as a failing sibling subtree-file write cancels
+// it, so X's wave-2 spend never starts and writeCreateThenSpend returns C's
+// rejection together with ctx.Err(). The cleanup must still remove C's record.
+func TestQuickValidateRemovesPrunedReplayWhenBatchCancelledMidList(t *testing.T) {
+	t.Run("control, no cancel", func(t *testing.T) { runPrunedReplayCancelMidList(t, false) })
+	t.Run("cancelled after the wave-2 rejection", func(t *testing.T) { runPrunedReplayCancelMidList(t, true) })
+}
+
+func runPrunedReplayCancelMidList(t *testing.T, cancelOnReplay bool) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	sqlStore, ok := store.(*sql.Store)
+	require.True(t, ok)
+
+	sql.ResetPrunerServiceForTests()
+	t.Cleanup(sql.ResetPrunerServiceForTests)
+
+	bg := context.Background()
+	require.NoError(t, store.SetBlockHeight(1003))
+
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("QUICK_VALIDATE_CANCEL_MID_LIST"))
+
+	g := transactions.Create(t,
+		transactions.WithCoinbaseData(1, "/genesis/"),
+		transactions.WithP2PKHOutputs(2, 50000, publicKey),
+	)
+	_, err := sqlStore.Create(bg, g, 999)
+	require.NoError(t, err)
+
+	p := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(g, 0),
+		transactions.WithP2PKHOutputs(2, 20000, publicKey),
+	)
+	_, _, err = store.SpendAndCreate(bg, p, 1000)
+	require.NoError(t, err)
+
+	c := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(p, 0),
+		transactions.WithP2PKHOutputs(1, 15000, publicKey),
+	)
+	_, _, err = store.SpendAndCreate(bg, c, 1001)
+	require.NoError(t, err)
+
+	e := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(c, 0),
+		transactions.WithP2PKHOutputs(1, 10000, publicKey),
+	)
+	_, _, err = store.SpendAndCreate(bg, e, 1002)
+	require.NoError(t, err)
+
+	_, err = store.SetMinedMulti(bg, []*chainhash.Hash{g.TxIDChainHash(), p.TxIDChainHash(), c.TxIDChainHash(), e.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+	require.NoError(t, err)
+
+	prunerService, err := sqlStore.GetPrunerService()
+	require.NoError(t, err)
+
+	pruned, err := prunerService.Prune(bg, 1300, "quick-validate-cancel-mid-list")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), pruned, "fixture: the pruner must remove C only")
+
+	_, err = store.Get(bg, c.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "fixture: C pruned")
+
+	x := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(p, 1),
+		transactions.WithP2PKHOutputs(1, 15000, publicKey),
+	)
+
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+
+	onReplay := context.CancelFunc(func() {})
+	if cancelOnReplay {
+		onReplay = cancel
+	}
+
+	bv.utxoStore = &cancelOnReplayStore{Store: store, cancel: onReplay}
+	bv.spendRetryBackoff = time.Millisecond
+
+	block, batch := assignedReplayBatch(t, bv, p, c, x)
+
+	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err, "a block replaying a pruned transaction must not validate")
+	if cancelOnReplay {
+		require.Error(t, ctx.Err(), "precondition: the replay rejection cancelled the batch mid-list")
+	} else {
+		require.Contains(t, err.Error(), "spending transaction was pruned")
+	}
+
+	_, err = store.Get(bg, c.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound,
+		"the pruned replay was rejected in wave 2 before the cancel; its recreated record must not survive")
+}
+
+// failingLeftoverReadStore fails the leftover read (utxo.LeftoversAmong, the
+// only BatchDecorate that asks for fields.Locked) with a transient storage
+// error, as one item of a large BatchDecorate timing out would.
+type failingLeftoverReadStore struct {
+	utxo.Store
+}
+
+func (s *failingLeftoverReadStore) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, fieldNames ...fields.FieldName) error {
+	for _, f := range fieldNames {
+		if f == fields.Locked {
+			return errors.NewStorageError("injected transient read failure")
+		}
+	}
+
+	return s.Store.BatchDecorate(ctx, items, fieldNames...)
+}
+
+// TestQuickValidateRemovesOwnGhostsWhenLeftoverReadFails: the attempt itself
+// wrote D in wave 1 (Created=true), so no read is needed to know D is its own.
+// A failed leftover read must not stop D from being deleted.
+func TestQuickValidateRemovesOwnGhostsWhenLeftoverReadFails(t *testing.T) {
+	t.Run("locked", func(t *testing.T) {
+		bv, store, cleanup := newBlockValidationWithRealStore(t)
+		defer cleanup()
+
+		ctx := context.Background()
+		f := newPrunedChainFixture(t, store)
+
+		bv.utxoStore = &failingLeftoverReadStore{Store: store}
+
+		block, batch := assignedReplayBatch(t, bv, f.child, f.grandchild)
+
+		err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+		require.Error(t, err)
+
+		_, err = store.Get(ctx, f.grandchild.TxIDChainHash())
+		require.ErrorIs(t, err, errors.ErrTxNotFound,
+			"D was written by this attempt (Created=true); a failed leftover read must not leave it behind")
+	})
+
+	t.Run("skip utxo lock", func(t *testing.T) {
+		bv, store, cleanup := newBlockValidationWithRealStore(t)
+		defer cleanup()
+
+		bv.settings.BlockValidation.QuickValidateSkipUtxoLock = true
+		setCheckpointsOnBV(t, bv, 2000)
+
+		ctx := context.Background()
+		f := newPrunedChainFixture(t, store)
+
+		bv.utxoStore = &failingLeftoverReadStore{Store: store}
+
+		block, batch := assignedReplayBatch(t, bv, f.child, f.grandchild)
+		require.True(t, bv.quickValidateSkipsUtxoLock(block))
+
+		err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+		require.Error(t, err)
+
+		respend := transactions.Create(t,
+			transactions.WithPrivateKey(f.privateKey),
+			transactions.WithInput(f.grandchild, 0),
+			transactions.WithP2PKHOutputs(1, 1999, f.publicKey),
+		)
+
+		_, _, err = store.SpendAndCreate(ctx, respend, 1401)
+		require.ErrorIs(t, err, errors.ErrTxNotFound,
+			"D:0 was consumed by mined E; the unlocked ghost of D must not make it spendable again")
+	})
+}

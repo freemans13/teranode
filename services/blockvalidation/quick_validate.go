@@ -2867,6 +2867,15 @@ func (u *BlockValidation) applyList(ctx context.Context, block *model.Block, txs
 
 			return u.applyOneByOne(ctx, block, txs, subtreeIdxs, lockUTXOs, outpointOnly, collectExisting)
 		case err != nil:
+			// A pass cut short still reports what it wrote and what the store
+			// rejected before the cut, and the cleanup after a pruned replay needs
+			// both: a replay rejected in this pass would otherwise keep its record.
+			if len(results) == len(txs) {
+				for i, r := range results {
+					replays.observe(txids[i], r)
+				}
+			}
+
 			lastErr = err
 			continue
 		case len(results) != len(txs):
@@ -3022,37 +3031,25 @@ func (r *listReplays) observe(txid chainhash.Hash, result utxo.SpendAndCreateMul
 // Every store call runs on a context detached from ctx with its own bound. ctx
 // is the batch's errgroup context, shared with the subtree-file write, and a
 // failure there landing at the same moment would otherwise cancel the cleanup
-// and leave the ghost.
+// and leave the ghost. The leftover read and the delete get a bound each, so a
+// slow read cannot use up the delete's.
+//
+// A failed leftover read still deletes what this attempt wrote. Those records
+// are unlocked once a retry's first wave finds them, so LeftoversAmong would
+// never name them again, and with the lock skipped a ghost's outputs are
+// spendable at once.
 func (u *BlockValidation) removePrunedReplayGhosts(ctx context.Context, block *model.Block, txs []*bt.Tx, txids []chainhash.Hash, replays *listReplays) error {
 	if replays == nil || len(replays.rejected) == 0 {
 		return nil
 	}
 
+	leftovers, idMismatch, readErr := u.prunedReplayLeftovers(ctx, block, txids, replays)
+	if readErr != nil {
+		leftovers = nil
+	}
+
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensatingDeleteTimeout)
 	defer cancel()
-
-	notCreated := make([]*chainhash.Hash, 0, len(txids))
-
-	for i := range txids {
-		if _, ok := replays.created[txids[i]]; !ok {
-			notCreated = append(notCreated, &txids[i])
-		}
-	}
-
-	leftovers, err := utxo.LeftoversAmong(cleanupCtx, u.utxoStore, notCreated, block.ID)
-	if err != nil {
-		return errors.NewProcessingError("[removePrunedReplayGhosts][%s] failed to classify %d existing txs", block.Hash().String(), len(notCreated), err)
-	}
-
-	// A mismatch means another block is committed under this id, so the locked
-	// records are its, not this block's leftovers: none are trusted, and the
-	// attempt reports it so the retry takes an id of its own (recordedBlockID
-	// checks again before it adopts). What this attempt itself wrote is still
-	// its own and is still removed.
-	leftovers, idMismatch, err := utxo.ConfirmLeftovers(cleanupCtx, blockchain.CommittedBlockHashLookup(u.blockchainClient), block.Hash(), block.ID, leftovers)
-	if err != nil {
-		return errors.NewProcessingError("[removePrunedReplayGhosts][%s] failed to confirm the leftovers' block id", block.Hash().String(), err)
-	}
 
 	createdHere := func(txHash *chainhash.Hash) bool {
 		if _, ok := replays.created[*txHash]; ok {
@@ -3087,7 +3084,47 @@ func (u *BlockValidation) removePrunedReplayGhosts(ctx context.Context, block *m
 		return errors.NewProcessingError("[removePrunedReplayGhosts][%s] block id %d is held by another committed block; failing the attempt so the retry takes an id of its own", block.Hash().String(), block.ID, deleteErr)
 	}
 
+	if readErr != nil && deleteErr != nil {
+		return errors.Join(readErr, deleteErr)
+	}
+
+	if readErr != nil {
+		return readErr
+	}
+
 	return deleteErr
+}
+
+// prunedReplayLeftovers reads which of the records the list did not write are
+// leftovers of an earlier attempt at this block (utxo.LeftoversAmong), confirmed
+// against the committed block under this id (utxo.ConfirmLeftovers). A mismatch
+// means another block is committed under this id, so the locked records are its,
+// not this block's leftovers: none are trusted, and the attempt reports it so
+// the retry takes an id of its own (recordedBlockID checks again before it
+// adopts).
+func (u *BlockValidation) prunedReplayLeftovers(ctx context.Context, block *model.Block, txids []chainhash.Hash, replays *listReplays) (map[chainhash.Hash]struct{}, bool, error) {
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensatingDeleteTimeout)
+	defer cancel()
+
+	notCreated := make([]*chainhash.Hash, 0, len(txids))
+
+	for i := range txids {
+		if _, ok := replays.created[txids[i]]; !ok {
+			notCreated = append(notCreated, &txids[i])
+		}
+	}
+
+	leftovers, err := utxo.LeftoversAmong(readCtx, u.utxoStore, notCreated, block.ID)
+	if err != nil {
+		return nil, false, errors.NewProcessingError("[removePrunedReplayGhosts][%s] failed to classify %d existing txs", block.Hash().String(), len(notCreated), err)
+	}
+
+	leftovers, idMismatch, err := utxo.ConfirmLeftovers(readCtx, blockchain.CommittedBlockHashLookup(u.blockchainClient), block.Hash(), block.ID, leftovers)
+	if err != nil {
+		return nil, false, errors.NewProcessingError("[removePrunedReplayGhosts][%s] failed to confirm the leftovers' block id", block.Hash().String(), err)
+	}
+
+	return leftovers, idMismatch, nil
 }
 
 // withParentsInList returns the positions in failed, with the position of every parent in the
