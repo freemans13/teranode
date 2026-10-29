@@ -176,7 +176,7 @@ func TestValidateBlock_ProvenConflictIsNotACancellation(t *testing.T) {
 	t.Run("a mined counter-spender rejects the block", func(t *testing.T) {
 		f := newConflictBlockFixture(t, []utxostore.CreateOption{utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 0, BlockHeight: 0})})
 
-		subtreeErr := f.bv.validateBlockSubtrees(ctx, f.block, "", "http://localhost:8000")
+		subtreeErr := f.bv.validateBlockSubtrees(ctx, f.block, "", "http://localhost:8000", false)
 		require.ErrorIs(t, subtreeErr, errors.ErrTxInvalid)
 		require.NotErrorIs(t, subtreeErr, errors.ErrContextCanceled)
 		require.False(t, isRecoverableBlockMessageError(subtreeErr))
@@ -212,7 +212,7 @@ func TestValidateBlock_ProvenConflictIsNotACancellation(t *testing.T) {
 		f := newConflictBlockFixture(t, nil)
 		require.NoError(t, f.utxoStore.Delete(ctx, f.parent.TxIDChainHash()))
 
-		subtreeErr := f.bv.validateBlockSubtrees(ctx, f.block, "", "http://localhost:8000")
+		subtreeErr := f.bv.validateBlockSubtrees(ctx, f.block, "", "http://localhost:8000", false)
 		require.ErrorIs(t, subtreeErr, errors.ErrTxNotFound)
 		require.ErrorIs(t, subtreeErr, errors.ErrContextCanceled)
 		require.NotErrorIs(t, subtreeErr, errors.ErrTxInvalid)
@@ -233,7 +233,7 @@ func TestValidateBlock_ProvenConflictIsNotACancellation(t *testing.T) {
 			prev = child
 		}
 
-		subtreeErr := f.bv.validateBlockSubtrees(ctx, f.block, "", "http://localhost:8000")
+		subtreeErr := f.bv.validateBlockSubtrees(ctx, f.block, "", "http://localhost:8000", false)
 		require.ErrorIs(t, subtreeErr, errors.ErrUtxoWalkLimitExceeded)
 		require.ErrorIs(t, subtreeErr, errors.ErrContextCanceled)
 		require.NotErrorIs(t, subtreeErr, errors.ErrTxInvalid)

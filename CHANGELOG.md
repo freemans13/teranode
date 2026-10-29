@@ -138,6 +138,25 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   configuration change is required. Setting the reconcile interval to `0` disables
   ordinary polling; recovery of an unfinished reset still retries. Reload input validation keeps four parallel readers after closing the iterator, requests only input points, then applies conflict cascades serially. A reset that fails before its tx map rotation leaves the old pool in service and the replay carries on from its position. When the replay after a reset fails three passes in a row, block assembly gives the remaining history up, follows the best header and builds candidates from the pool the reset loaded; `teranode_blockassembly_processing_stuck_total{reason="best_tip_reset_replay_abandoned"}` counts each time, so alert on it. A past best tip whose move would take block assembly back over best-chain blocks at least coinbase maturity below the best tip is not moved to: its branch-only transactions are marked unmined where they lie and the pool is reloaded, so no confirmed spend of a coinbase is deleted. Resets skip conflict winners the UTXO store has already pruned. (#2074)
 
+- **A short catch-up from `RUNNING` hands its blocks' unseen transactions to block
+  assembly, and catch-up no longer fetches a chain with less work than the best tip.**
+  Every catch-up moves the FSM to `CATCHINGBLOCKS`, and subtree validation used to stop
+  handing transactions to block assembly in that state. A running node that fetched a
+  short competing branch therefore wrote the branch's transactions to the UTXO store but
+  not to the pool, and a child spending one of them could enter the pool without its
+  parent. A catch-up that starts from `RUNNING` and fetches at most
+  `blockvalidation_catchup_keep_block_assembly_max_blocks` blocks (new, default 6) now
+  keeps the hand-off on; such a run uses the level path, never the batched catch-up path.
+  Set the value to 0 to restore the old behaviour. Separately, catch-up now ends as a
+  no-op, charging no peer, when the header fetch reached the announced block and the
+  whole offered chain has less cumulative work than the best tip; equal work is still
+  fetched. The check runs after the existing fork checks, so a fork deeper than coinbase
+  maturity and the deep-fork secret-mining case are still refused with an error and
+  charged as before. In a mixed-version deploy, a subtree validation older than its block
+  validation ignores the new request field and keeps the hand-off off. The existing block-context queue-shed policy still accepts and unlocks
+  a transaction without a template entry on `ErrThresholdExceeded`; durable recovery
+  from that case is not added here. (#2075, partially addresses #2067)
+
 - **Catch-up quick validation waits for each block's `.subtree` writes before it commits
   the block, and a shutdown waits for a block's in-flight commit.** A block was stored with
   `subtrees_set` while its `.subtree` files could still be in flight, so a failed write
