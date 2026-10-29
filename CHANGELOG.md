@@ -121,7 +121,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   fetched. The check runs after the existing fork checks, so a fork deeper than coinbase
   maturity and the deep-fork secret-mining case are still refused with an error and
   charged as before. Offered headers that do not link from the common ancestor are now
-  refused as an invalid response before any fork block's mined state is cleared. In a
+  refused as an invalid response before any fork check weighs them, so a gap is never
+  read as secret mining or less work, and no fork block's mined state is cleared for it. In a
   mixed-version deploy, a subtree
   validation older than its block validation ignores the new request field and keeps the
   hand-off off. The existing block-context queue-shed policy still accepts and unlocks
