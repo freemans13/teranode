@@ -112,15 +112,24 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   failed write to the `on_main_chain` column and carry on, leaving chain membership
   and the by-height readers wrong until a restart. They now record the failure, every
   reader of the column takes its slower parent-link walk until the repair lands, and a
-  background loop retries the repair every 1 s to 30 s. A repair that only needs the
-  rows near the tip holds the lock `StoreBlock` takes, so while the database keeps
-  failing, each attempt can delay block storage by up to 30 s. A repair that walks the
-  whole chain does not hold that lock on PostgreSQL, but a `StoreBlock` that reorganises
-  the chain can still wait for it, up to 30 min, when it needs a row the walk has already
-  updated; if a chain change overlaps the walk, the walk runs again before readers go
-  back to the column. On SQLite the whole-chain repair does hold the lock, because SQLite
-  admits one writer at a time and `StoreBlock` would otherwise fail after its 5 s busy
-  timeout. Operators can watch
+  background loop retries the repair, waiting 1 s after the first failed attempt and
+  doubling to 30 s. Attempts are not capped while they keep failing: giving up would
+  leave every reader on the slow walk until a restart. Every `StoreBlock` call takes one
+  lock, so whenever a repair holds it or a `StoreBlock` holding it waits on a repair, all
+  block storage waits, not one block.
+    - A repair that only needs the rows near the tip holds that lock for up to 30 s per
+      attempt.
+    - On SQLite a repair that walks the whole chain also holds the lock, for up to 30 min
+      per attempt, because SQLite admits one writer at a time and `StoreBlock` would
+      otherwise fail after its 5 s busy timeout.
+    - On PostgreSQL the whole-chain repair, and the startup rebuild, run without the lock,
+      but a `StoreBlock` that reorganises the chain and needs a row the walk has already
+      updated waits for the walk to commit, up to 30 min, while it holds the lock. If a
+      chain change commits while one of these walks runs, the walk runs again, after the
+      same backoff, before readers go back to the column. After three such overlaps in a
+      row the next walk holds the lock, so block storage waits for that one walk.
+
+  Operators can watch
   `teranode_blockchain_sql_on_main_chain_repair_pending` (above 0 while a repair is
   owed) and `teranode_blockchain_sql_on_main_chain_write_failures{path}`. No action is
   needed. (#2049)

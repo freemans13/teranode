@@ -91,10 +91,10 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 	s.slowPathMu.Lock()
 	defer s.slowPathMu.Unlock()
 
-	// This call moves chain membership. A background repair walk running without
-	// slowPathMu may have read its rows before these commits; the bracket ends after the
-	// last of them, so that walk runs again rather than leave its older view in place.
-	defer s.beginOnMainChainWrite()()
+	// This call moves chain membership. A walk running without slowPathMu may have read its
+	// rows before these commits; counting the write after the last of them, before the
+	// lock drops, makes that walk run again rather than leave its older view in place.
+	defer s.noteOnMainChainWrite()
 
 	// recursively update all children blocks to invalid in 1 query.
 	// Also set mined_set = false (invalid blocks cannot be mined; this triggers

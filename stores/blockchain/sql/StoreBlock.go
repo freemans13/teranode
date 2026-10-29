@@ -186,12 +186,21 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		defer s.mainChainRebuilding.Add(-1)
 	}
 
-	// A non-extend runs reconcileOnMainChain, which can move chain membership. A background
-	// repair walk running without slowPathMu may have read its rows before that commits, so
-	// record the write and let the walk run again. An extend's INSERT adds a row and
-	// changes no existing one, so it needs no record.
+	// A non-extend runs reconcileOnMainChain, which can move chain membership. A walk
+	// running without slowPathMu may have read its rows before that commits, so count the
+	// write, before slowPathMu drops, and let the walk run again. Only a reconcile that
+	// changed a row is counted: a fork block that does not take the tip, and an invalid
+	// record, which skips the reconcile, add a row the walk's snapshot cannot see and
+	// change none it can. An extend's INSERT is the same. A failed transaction is counted,
+	// because a commit error does not prove nothing committed.
+	var membershipMoved bool
+
 	if !onMainChain {
-		defer s.beginOnMainChainWrite()()
+		defer func() {
+			if membershipMoved {
+				s.noteOnMainChainWrite()
+			}
+		}()
 	}
 
 	// The fork path writes the row and repairs on_main_chain in ONE transaction, so a
@@ -228,6 +237,7 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 			var storeErr error
 
 			reconcileErr = nil
+			membershipMoved = false
 
 			newBlockID, height, _, storedInvalid, storeErr = s.storeBlock(ctx, tx, block, peerID, storeBlockOptions, onMainChain)
 			if storeErr != nil {
@@ -242,16 +252,24 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 				return nil
 			}
 
-			reconcile := func() error { return s.reconcileOnMainChain(ctx, tx) }
-			if s.reconcileHook != nil {
-				reconcile = s.reconcileHook
+			reconcile := func() (bool, error) {
+				changed, err := s.reconcileOnMainChainRows(ctx, tx)
+
+				return changed > 0, err
 			}
 
-			reconcileErr = reconcile()
+			if s.reconcileHook != nil {
+				// A test's stand-in cannot say what it changed, so count it as a change.
+				reconcile = func() (bool, error) { return true, s.reconcileHook() }
+			}
+
+			membershipMoved, reconcileErr = reconcile()
 
 			return reconcileErr
 		})
 		if err != nil {
+			membershipMoved = true
+
 			// Label the error as the reconciliation's only when it is the very value the
 			// reconciliation returned. RetryTx hands back the closure's error unchanged, but
 			// it can also fail after a failed reconciliation attempt and before the next one
@@ -404,14 +422,13 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 			// record it before this bracket drops the guard, so readers keep walking and the
 			// background repair clears it; the mark records this block's height, so the
 			// bounded walk reaches it however far the tip moves before the repair lands.
-			endWrite := s.beginOnMainChainWrite()
-
 			if _, clearErr := s.db.ExecContext(postBestCtx, `UPDATE blocks SET on_main_chain = false WHERE id = $1`, newBlockID); clearErr != nil {
 				s.logger.Errorf("StoreBlock: clear sibling-fork on_main_chain: %v", clearErr)
 				s.markOnMainChainDirty(false, int64(height), "store_block_fork_clear", clearErr)
 			}
 
-			endWrite()
+			// The clear moves a row a walk without slowPathMu may already have read.
+			s.noteOnMainChainWrite()
 
 			if !guardWholeCall {
 				s.mainChainRebuilding.Add(-1)

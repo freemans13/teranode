@@ -30,7 +30,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "blockchain_sql",
 			Name:      "on_main_chain_write_failures",
-			Help:      "on_main_chain writes whose failure was swallowed, by path (invalidate_block|revalidate_block|startup_rebuild|store_block_fork_clear|store_block_best_lookup); each one is repaired in the background",
+			Help:      "on_main_chain writes whose failure was swallowed, by path (invalidate_block|revalidate_block|startup_rebuild|startup_rebuild_overlap|store_block_fork_clear|store_block_best_lookup); startup_rebuild_overlap counts a startup rebuild that landed while a chain write committed and may have overwritten it; each one is repaired in the background",
 		},
 		[]string{"path"},
 	)

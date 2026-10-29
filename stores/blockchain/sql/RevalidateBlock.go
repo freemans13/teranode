@@ -26,8 +26,8 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 	s.slowPathMu.Lock()
 	defer s.slowPathMu.Unlock()
 
-	// See the matching bracket in InvalidateBlock.
-	defer s.beginOnMainChainWrite()()
+	// See the matching count in InvalidateBlock.
+	defer s.noteOnMainChainWrite()
 
 	// Hold the rebuild guard from the UPDATE through the reconciliation so
 	// concurrent readers fall back to the authoritative CTE path during the

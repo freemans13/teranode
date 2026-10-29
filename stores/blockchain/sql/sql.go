@@ -111,7 +111,7 @@ type SQL struct {
 	rebuildSnapshotHook func(full bool)
 	// unlockedFullRepair is true when the background on_main_chain repair runs its full
 	// walk without slowPathMu. Only PostgreSQL, which lets other writers in while the walk
-	// runs; see runOnMainChainRepair.
+	// runs; see attemptOnMainChainRepair.
 	unlockedFullRepair bool
 	// onMainChainRepair records a failed on_main_chain write that the running process
 	// still owes a repair for. See on_main_chain_repair.go.
@@ -398,8 +398,16 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 
 		// Detection is a COUNT comparison — always fast, so the standard bounded
 		// timeout is appropriate.
+		//
+		// The floor a failed bounded rebuild is owed is read here as well, on this context
+		// rather than the rebuild's, so a slow read cannot eat the rebuild's budget or,
+		// by failing on it, turn the owed repair into a walk to genesis.
 		detectCtx, detectCancel := s.shutdownAwareContext(rebuildOffChainSetTimeout)
-		full, err := s.needsFullOnMainChainRebuild(detectCtx)
+		full, maxHeight, err := s.needsFullOnMainChainRebuildAt(detectCtx)
+		floor := noRepairFloor
+		if err == nil && !full {
+			floor = s.startupRepairFloor(detectCtx, maxHeight)
+		}
 		detectCancel()
 		if err != nil {
 			// On error we cannot determine whether this is a fresh migration or
@@ -429,7 +437,7 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 			rebuildTimeout = migrationFullRebuildTimeout
 		}
 		rebuildCtx, rebuildCancel := s.shutdownAwareContext(rebuildTimeout)
-		s.startupRebuildOnMainChain(rebuildCtx, full)
+		s.startupRebuildOnMainChain(rebuildCtx, full, floor)
 		rebuildCancel()
 
 		if useInMemory {
@@ -1494,15 +1502,23 @@ func (s *SQL) shutdownAwareContext(timeout time.Duration) (context.Context, cont
 // the two reads. A false-positive "needs rebuild" from an interleaved write
 // would only cost an extra full rebuild, not corrupt state.
 func (s *SQL) needsFullOnMainChainRebuild(ctx context.Context) (bool, error) {
+	full, _, err := s.needsFullOnMainChainRebuildAt(ctx)
+
+	return full, err
+}
+
+// needsFullOnMainChainRebuildAt is needsFullOnMainChainRebuild that also returns the
+// highest valid height it read, or -1 when it read none.
+func (s *SQL) needsFullOnMainChainRebuildAt(ctx context.Context) (bool, int64, error) {
 	var bestHeight int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(height), -1) FROM blocks WHERE invalid = false`,
 	).Scan(&bestHeight)
 	if err != nil {
-		return false, errors.NewStorageError("needsFullOnMainChainRebuild: failed to get best height", err)
+		return false, -1, errors.NewStorageError("needsFullOnMainChainRebuild: failed to get best height", err)
 	}
 	if bestHeight < 0 {
-		return false, nil // empty DB
+		return false, bestHeight, nil // empty DB
 	}
 
 	var onMainChainCount int64
@@ -1510,10 +1526,10 @@ func (s *SQL) needsFullOnMainChainRebuild(ctx context.Context) (bool, error) {
 		`SELECT COUNT(*) FROM blocks WHERE on_main_chain = true`,
 	).Scan(&onMainChainCount)
 	if err != nil {
-		return false, errors.NewStorageError("needsFullOnMainChainRebuild: failed to count on_main_chain", err)
+		return false, bestHeight, errors.NewStorageError("needsFullOnMainChainRebuild: failed to count on_main_chain", err)
 	}
 
-	return onMainChainCount != bestHeight+1, nil
+	return onMainChainCount != bestHeight+1, bestHeight, nil
 }
 
 // reconcileOnMainChain restores the invariant that on_main_chain is true on
@@ -1599,6 +1615,15 @@ func (s *SQL) needsFullOnMainChainRebuild(ctx context.Context) (bool, error) {
 // reconciliation commits or rolls back together with the INSERT. The error is the
 // driver's own, unwrapped, and the caller types it.
 func (s *SQL) reconcileOnMainChain(ctx context.Context, exec execQuerier) error {
+	_, err := s.reconcileOnMainChainRows(ctx, exec)
+
+	return err
+}
+
+// reconcileOnMainChainRows is reconcileOnMainChain returning how many rows the
+// reconciliation changed, so StoreBlock can tell a reorg from a fork block that left the
+// main chain where it was.
+func (s *SQL) reconcileOnMainChainRows(ctx context.Context, exec execQuerier) (int64, error) {
 	maxDepth := int64(s.chainParams.CoinbaseMaturity) * 2
 	if maxDepth < 100 {
 		maxDepth = 100
@@ -1640,9 +1665,18 @@ func (s *SQL) reconcileOnMainChain(ctx context.Context, exec execQuerier) error 
 	`
 	// The error is returned raw: StoreBlock runs this inside RetryTx, which needs the
 	// driver's concrete type to classify it, and types it once RetryTx returns.
-	_, err := exec.ExecContext(ctx, q, maxDepth)
+	res, err := exec.ExecContext(ctx, q, maxDepth)
+	if err != nil {
+		return 0, err
+	}
 
-	return err
+	changed, err := res.RowsAffected()
+	if err != nil {
+		// Both drivers report it; if one ever does not, assume the chain moved.
+		return 1, nil
+	}
+
+	return changed, nil
 }
 
 // rebuildOnMainChainFlag updates the on_main_chain column to accurately reflect the
@@ -1671,26 +1705,41 @@ func (s *SQL) rebuildOnMainChainFlag(ctx context.Context, full bool) error {
 	return s.rebuildOnMainChainFlagFrom(ctx, full, noRepairFloor)
 }
 
-// startupRebuildOnMainChain runs the startup rebuild New launches and records a failure.
+// startupRebuildOnMainChain runs the startup rebuild New launches. It records a failure,
+// or an overlap with a chain write, as a repair the background loop owes.
 //
 // A failed startup rebuild used to leave whatever the previous process wrote, or an
 // unpopulated column after a migration, trusted by every reader once New's goroutine
 // released the guard. A failure is now recorded, so the guard stays up and the repair
 // loop retries until it lands.
 //
-// A failed bounded rebuild is owed a bounded repair whose floor is the bottom of the
-// window this rebuild is about to walk, read before it starts. The window of each retry
-// is measured from the tip at that retry, and the floor keeps it reaching down to the
-// rows this rebuild was meant to cover however far the tip moves. Only when the floor
-// cannot be read is the repair a full walk.
-func (s *SQL) startupRebuildOnMainChain(ctx context.Context, full bool) {
-	floor := noRepairFloor
-	if !full {
-		floor = s.boundedRebuildWindowBottom(ctx)
+// floor is the bottom of the window a bounded rebuild is about to walk, which the caller
+// reads before the rebuild starts and on its own context; see startupRepairFloor. A
+// failed bounded rebuild is owed a bounded repair down to it. The window of each retry is
+// measured from the tip at that retry, and the floor keeps it reaching the rows this
+// rebuild was meant to cover however far the tip moves. Only a bounded rebuild with no
+// floor is owed a full walk.
+//
+// The rebuild runs without slowPathMu and reads its rows from a snapshot taken when it
+// began. On PostgreSQL a chain write that commits while it runs, such as a StoreBlock that
+// reorganises the chain, touches rows the rebuild does not, so neither aborts, and the
+// rebuild then commits its older view over the write. So the rebuild reads the chain-write
+// count before it starts and again under slowPathMu once it has committed, and records the
+// same repair a failure would when the count moved.
+func (s *SQL) startupRebuildOnMainChain(ctx context.Context, full bool, floor int64) {
+	if full {
+		floor = noRepairFloor
 	}
+
+	writesBefore := s.onMainChainWriteCount()
 
 	rebuildErr := s.rebuildOnMainChainFlag(ctx, full)
 	if rebuildErr == nil {
+		if s.onMainChainWritesSince(writesBefore) {
+			s.markOnMainChainDirty(full, floor, "startup_rebuild_overlap",
+				errors.NewProcessingError("a chain write committed while the startup rebuild ran, so the rebuild may have written an older view over it"))
+		}
+
 		return
 	}
 
@@ -1704,14 +1753,27 @@ func (s *SQL) startupRebuildOnMainChain(ctx context.Context, full bool) {
 	s.markOnMainChainDirty(full, floor, "startup_rebuild", rebuildErr)
 }
 
-// boundedRebuildWindowBottom returns the lowest height a bounded rebuild started now
-// would walk: the best block's height less 10×CoinbaseMaturity, clamped at zero. It
-// returns noRepairFloor when the best block cannot be read.
-func (s *SQL) boundedRebuildWindowBottom(ctx context.Context) int64 {
+// startupRepairFloor returns the bottom of the window a bounded startup rebuild started
+// now would walk: the best block's height less 10×CoinbaseMaturity, clamped at zero.
+//
+// When the best block cannot be read it falls back to maxHeight, the highest valid height
+// the caller has already read, rather than to noRepairFloor, which would turn a failed
+// bounded rebuild into a walk to genesis. maxHeight is at least the best block's height.
+// It is higher only when a longer valid fork has less work than the best chain, and then
+// the floor sits that many blocks above the window the rebuild meant to walk; a retry
+// still covers those rows from its own window unless the tip has moved by more than the
+// difference.
+func (s *SQL) startupRepairFloor(ctx context.Context, maxHeight int64) int64 {
 	var bestHeight int64
 
 	err := s.db.QueryRowContext(ctx, `SELECT height FROM blocks WHERE invalid = false ORDER BY chain_work DESC, peer_id ASC, id ASC LIMIT 1`).Scan(&bestHeight)
 	if err != nil {
+		s.logger.Warnf("startup: reading the best height for the on_main_chain repair floor failed, using the highest valid height %d: %v", maxHeight, err)
+
+		bestHeight = maxHeight
+	}
+
+	if bestHeight < 0 {
 		return noRepairFloor
 	}
 
@@ -1738,7 +1800,7 @@ func (s *SQL) rebuildOnMainChainFlagFrom(ctx context.Context, full bool, floor i
 	// (deadlock_detected) if a concurrent committed transaction modified a row it
 	// writes. Two callers run without slowPathMu held: the startup goroutine (see
 	// New) and, on PostgreSQL, the background repair's full walk (see
-	// runOnMainChainRepair); Invalidate/Revalidate hold slowPathMu and StoreBlock
+	// attemptOnMainChainRepair); Invalidate/Revalidate hold slowPathMu and StoreBlock
 	// holds it for its whole duration, so they cannot conflict. Those two can,
 	// however, race a slow-path write to the same rows — so retry the whole
 	// transaction (begin → reads → UPDATEs → commit) as a unit on those codes.
