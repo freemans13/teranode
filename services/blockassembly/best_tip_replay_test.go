@@ -242,10 +242,18 @@ func TestReplayBestTipChanges_LatestChangeOnOwnChainMovesBack(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, items.blockchainClient.SetBlockMinedSet(t.Context(), chain[2].Hash()))
 
+	// The mark names chain[2] as the tip that dropped. Block assembly applied it, so the reorg
+	// off it is the one reset; the dropped tip must not add a reset of its own.
+	markData, err := items.blockchainClient.GetState(t.Context(), model.BestTipLowWaterStateKey)
+	require.NoError(t, err)
+	mark, err := model.NewBestTipLowWaterFromBytes(markData)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{*chain[2].Hash()}, mark.DroppedTips)
+
 	items.blockAssembler.processNewBlockAnnouncement(t.Context())
 
 	require.Equal(t, []recordedMove{{back: headerHashes(chain[2]), forward: []string{}}}, *moves)
-	require.Equal(t, 1, resets, "moving off an invalid block resets block assembly")
+	require.Equal(t, 1, resets, "moving off an invalid block resets block assembly, once")
 	requireBlockAssemblyTip(t, items, chain[1])
 	requireReplayPosition(t, items, chain[1])
 	requireNoLowWater(t, items)
@@ -329,6 +337,46 @@ func TestReplayBestTipChanges_InvalidOnOwnChainIsLeftToTheNextChange(t *testing.
 	require.NoError(t, items.blockAssembler.applyBestTipChange(t.Context(), chain[0], meta, false))
 	require.Empty(t, *moves)
 	requireBlockAssemblyTip(t, items, chain[1])
+}
+
+// TestDroppedTipNeedsReset checks which dropped best tips the replay resets for: an invalid one
+// off block assembly's chain or one that is gone does, while one on block assembly's chain (the
+// move off it resets) or one valid again (the replay moves to it) does not.
+func TestDroppedTipNeedsReset(t *testing.T) {
+	initPrometheusMetrics()
+
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+
+	chain := buildChain(genesis, 3, 9500)
+	addChain(t, items, chain)
+	fork := buildChain(genesis, 1, 9600)
+	addChain(t, items, fork)
+	valid := buildChain(genesis, 1, 9700)
+	addChain(t, items, valid)
+	startReplayAt(t, items, chain[2], 3)
+
+	_, err := items.blockchainClient.InvalidateBlock(t.Context(), chain[1].Hash())
+	require.NoError(t, err)
+	_, err = items.blockchainClient.InvalidateBlock(t.Context(), fork[0].Hash())
+	require.NoError(t, err)
+
+	ba := items.blockAssembler
+
+	for name, tc := range map[string]struct {
+		hash chainhash.Hash
+		want bool
+	}{
+		"block assembly's tip":              {*chain[2].Hash(), false},
+		"invalid on block assembly's chain": {*chain[1].Hash(), false},
+		"invalid off it":                    {*fork[0].Hash(), true},
+		"valid again":                       {*valid[0].Hash(), false},
+		"deleted":                           {chainhash.Hash{0xde, 0xad}, true},
+	} {
+		got, err := ba.droppedTipNeedsReset(t.Context(), tc.hash)
+		require.NoError(t, err, name)
+		require.Equal(t, tc.want, got, name)
+	}
 }
 
 // TestReplayBestTipChanges_RestartResumesFromPersistedPosition checks that changes made while

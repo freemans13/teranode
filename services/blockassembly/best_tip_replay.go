@@ -263,8 +263,10 @@ func (b *BlockAssembler) settleBestTipLowWater(ctx context.Context, data []byte)
 // A drop of the best tip, by an invalidation or a delete, is recorded by the store in a
 // low-water mark. The pass reads the mark and also replays the blocks at or above it, so the
 // block the tip dropped to and every branch that won after it are handled although they may
-// sort below the position. Once the position has moved past the mark, the position is persisted
-// and the mark cleared. Valid fork blocks that sort better but were never the tip are moved to
+// sort below the position. The mark also names the blocks that were the best tip when it
+// dropped. One that block assembly never applied is in no read of valid blocks, so the pass
+// resets for it first (resetForUnappliedDroppedTips). Once the position has moved past the mark,
+// the position is persisted and the mark cleared. Valid fork blocks that sort better but were never the tip are moved to
 // as well; the pool still ends right, at the cost of those extra moves.
 //
 // Blocks below the height floor are skipped: retention bounds how far back block assembly can
@@ -302,6 +304,12 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 	if mark != nil {
 		from = &mark.Key
 		b.logger.Infof("[BlockAssembler] best tip dropped to %s since the last replay, replaying from there", mark.Key.Hash)
+
+		// The mark is cleared only once the reset has run and the position is saved, so a
+		// crash in between repeats the reset, which is safe.
+		if err = b.resetForUnappliedDroppedTips(ctx, mark); err != nil {
+			return read, err
+		}
 	}
 
 	// settle clears the mark once the position has moved past it, also when the pass stops
@@ -425,15 +433,7 @@ func (b *BlockAssembler) applyBestTipChange(ctx context.Context, header *model.B
 	if meta.Invalid {
 		b.logger.Warnf("[BlockAssembler] best tip change %s is invalid now and was never applied, resetting so its transactions are reloaded", hash)
 
-		if err := b.waitForBlockMinedSet(ctx, hash); err != nil {
-			if ctx.Err() != nil {
-				return err
-			}
-
-			b.logger.Warnf("[BlockAssembler] gave up waiting for invalid block %s to be processed: %v (resetting anyway)", hash, err)
-		}
-
-		if err := b.resetAndRecord(ctx, false); err != nil {
+		if err := b.resetAfterInvalidBlocks(ctx, []chainhash.Hash{*hash}); err != nil {
 			return errors.NewProcessingError("[applyBestTipChange] error resetting after invalid block %s", hash, err)
 		}
 
@@ -450,6 +450,100 @@ func (b *BlockAssembler) applyBestTipChange(ctx context.Context, header *model.B
 	b.logger.Infof("[BlockAssembler] replaying best tip change %d: %s", meta.Height, hash)
 
 	return b.moveToBlock(ctx, header, meta)
+}
+
+// resetAfterInvalidBlocks runs one reset to the best tip for invalid blocks block assembly never
+// applied. Their block-only transactions are in no valid block and in no pool, and block
+// validation stamps them unmined when it processes the invalidation, so the reset's reload finds
+// them. The reset waits for that, a bounded wait per block, and resets anyway once it gives up,
+// as a reset that moves back over an invalid block does.
+func (b *BlockAssembler) resetAfterInvalidBlocks(ctx context.Context, hashes []chainhash.Hash) error {
+	for i := range hashes {
+		if err := b.waitForBlockMinedSet(ctx, &hashes[i]); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+
+			b.logger.Warnf("[BlockAssembler] gave up waiting for invalid block %s to be processed: %v (resetting anyway)", hashes[i], err)
+		}
+	}
+
+	return b.resetAndRecord(ctx, false)
+}
+
+// resetForUnappliedDroppedTips resets block assembly once if the low-water mark names a block
+// that was the best tip when it was invalidated or deleted and that block assembly never applied.
+// The replay reads only valid blocks, so without this such a block's block-only transactions
+// would reach the pool only at the next reset or restart.
+//
+// A dropped tip on block assembly's own chain needs no reset here: the replay moves block
+// assembly off it, and a move back over an invalid block is a reset already. One that is valid
+// again needs none either, since it sorts better than the mark and the replay moves to it like
+// any other block. A mark that lost tips (DroppedTipsOverflow) resets regardless. One reset
+// covers every tip the mark names.
+func (b *BlockAssembler) resetForUnappliedDroppedTips(ctx context.Context, mark *model.BestTipLowWater) error {
+	unapplied := make([]chainhash.Hash, 0, len(mark.DroppedTips))
+
+	for _, hash := range mark.DroppedTips {
+		needs, err := b.droppedTipNeedsReset(ctx, hash)
+		if err != nil {
+			return err
+		}
+
+		if needs {
+			unapplied = append(unapplied, hash)
+		}
+	}
+
+	if len(unapplied) == 0 && !mark.DroppedTipsOverflow {
+		return nil
+	}
+
+	if len(unapplied) == 0 {
+		b.logger.Warnf("[BlockAssembler] best tip low-water mark lost track of some dropped tips, resetting so their transactions are reloaded")
+	} else {
+		b.logger.Warnf("[BlockAssembler] %d dropped best tips were never applied (first %s), resetting so their transactions are reloaded", len(unapplied), unapplied[0])
+	}
+
+	if err := b.resetAfterInvalidBlocks(ctx, unapplied); err != nil {
+		return errors.NewProcessingError("[resetForUnappliedDroppedTips] error resetting after dropped best tips", err)
+	}
+
+	return nil
+}
+
+// droppedTipNeedsReset reports whether a block that was the best tip when it dropped needs a reset
+// to bring its transactions back: it is invalid or gone, and not on block assembly's chain.
+func (b *BlockAssembler) droppedTipNeedsReset(ctx context.Context, hash chainhash.Hash) (bool, error) {
+	tip, tipHeight := b.CurrentBlock()
+	if tip != nil && tip.Hash().IsEqual(&hash) {
+		return false, nil
+	}
+
+	_, meta, err := b.blockchainClient.GetBlockHeader(ctx, &hash)
+	if err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
+			// Deleted, and not block assembly's tip.
+			return true, nil
+		}
+
+		return false, errors.NewProcessingError("[droppedTipNeedsReset] error getting dropped best tip %s", hash, err)
+	}
+
+	if !meta.Invalid {
+		return false, nil
+	}
+
+	if tip == nil || meta.Height > tipHeight {
+		return true, nil
+	}
+
+	onChain, err := b.blockchainClient.CheckBlockIsAncestorOfBlock(ctx, []uint32{meta.ID}, tip.Hash())
+	if err != nil {
+		return false, errors.NewProcessingError("[droppedTipNeedsReset] error checking whether %s is on block assembly's chain", hash, err)
+	}
+
+	return !onChain, nil
 }
 
 // restampDeepStaleBranch handles a past change whose move would take block assembly back over

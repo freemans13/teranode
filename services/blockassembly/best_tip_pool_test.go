@@ -260,3 +260,111 @@ func TestReplayBestTipChanges_LowWaterReplaysShortBranch(t *testing.T) {
 	}
 	require.Contains(t, inPool, branchOnly.TxIDChainHash().String(), "the transaction only the short branch S2 had must be in the pool")
 }
+
+// TestReplayBestTipChanges_DroppedTipNeverAppliedReloadsItsTransactions is the case the low-water
+// mark's key alone misses. Block assembly is on A1. X extends A1, carries a transaction P no other
+// block has, and becomes the best tip; X is then invalidated, so the best tip drops back to A1,
+// all before block assembly looks. The replay reads only valid blocks and the mark's key is A1,
+// where block assembly already is, so no move ever touches X. The mark names X as the tip that
+// dropped, and block assembly never applied it, so the replay resets and the reload finds P.
+func TestReplayBestTipChanges_DroppedTipNeverAppliedReloadsItsTransactions(t *testing.T) {
+	initPrometheusMetrics()
+	ctx := t.Context()
+	// The default retention keeps every move here an in-memory reorg, so the only reset is
+	// the one the dropped tip asks for: nothing else reloads P from the UTXO store.
+	items := setupBlockAssemblyTest(t, func(s *settings.Settings) {
+		s.BlockAssembly.StoreTxInpointsForSubtreeMeta = true
+	}, withCoinbaseMaturity(testCoinbaseMaturity))
+	ba := items.blockAssembler
+	ba.subtreeProcessor.Stop(context.Background())
+	stp, err := subtreeprocessor.NewSubtreeProcessor(ctx, ulogger.TestLogger{}, ba.settings, items.blobStore, items.blockchainClient, items.utxoStore, items.newSubtreeChan)
+	require.NoError(t, err)
+	ba.subtreeProcessor = stp
+	stp.Start(ctx)
+
+	genesis := genesisHeader(t, items)
+	a1 := buildChain(genesis, 1, 50000)[0]
+	addBlockWithMinedSet(ctx, t, items, a1)
+	startReplayAt(t, items, a1, 1)
+	stp.InitCurrentBlockHeader(a1)
+	require.NoError(t, items.utxoStore.SetBlockHeight(2))
+
+	// P spends a confirmed transaction, and only X contains it.
+	funding := replayPoolTx(&chainhash.Hash{}, 100)
+	blockOnly := replayPoolTx(funding.TxIDChainHash(), 99)
+	for _, tx := range []*bt.Tx{funding, blockOnly} {
+		_, err = items.utxoStore.(*utxosql.Store).Create(ctx, tx, 1)
+		require.NoError(t, err)
+	}
+	require.NoError(t, items.utxoStore.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*funding.TxIDChainHash(), *blockOnly.TxIDChainHash()}, true))
+
+	tree, err := subtree.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, tree.AddCoinbaseNode())
+	require.NoError(t, tree.AddNode(*blockOnly.TxIDChainHash(), 1, uint64(len(blockOnly.Bytes()))))
+	treeBytes, err := tree.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, items.blobStore.Set(ctx, tree.RootHash()[:], fileformat.FileTypeSubtree, treeBytes))
+
+	x := buildChain(a1, 1, 51000)[0]
+	coinbase, err := bt.NewTxFromString("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff03510101ffffffff0100f2052a01000000232103656065e6886ca1e947de3471c9e723673ab6ba34724476417fa9fcef8bafa604ac00000000")
+	require.NoError(t, err)
+	require.NoError(t, items.blockchainClient.AddBlock(ctx, &model.Block{Header: x, CoinbaseTx: coinbase, TransactionCount: 2, Subtrees: []*chainhash.Hash{tree.RootHash()}}, "", blockchainoptions.WithMinedSet(true)))
+	best, _, err := items.blockchainClient.GetBestBlockHeader(ctx)
+	require.NoError(t, err)
+	require.Equal(t, x.Hash().String(), best.Hash().String(), "X was the best tip")
+
+	_, genMeta, err := items.blockchainClient.GetBlockHeader(ctx, genesis.Hash())
+	require.NoError(t, err)
+	_, xMeta, err := items.blockchainClient.GetBlockHeader(ctx, x.Hash())
+	require.NoError(t, err)
+	_, err = items.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{funding.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: genMeta.ID, BlockHeight: 0, OnLongestChain: true})
+	require.NoError(t, err)
+	_, err = items.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{blockOnly.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: xMeta.ID, BlockHeight: 2, OnLongestChain: true})
+	require.NoError(t, err)
+
+	// X is invalidated, and block validation processes the invalidation: P loses X's block id
+	// and is stamped unmined, and X's mined_set is set again.
+	_, err = items.blockchainClient.InvalidateBlock(ctx, x.Hash())
+	require.NoError(t, err)
+	_, err = items.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{blockOnly.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: xMeta.ID, BlockHeight: 2, UnsetMined: true})
+	require.NoError(t, err)
+	require.NoError(t, items.blockchainClient.SetBlockMinedSet(ctx, x.Hash()))
+
+	best, _, err = items.blockchainClient.GetBestBlockHeader(ctx)
+	require.NoError(t, err)
+	require.Equal(t, a1.Hash().String(), best.Hash().String(), "the best tip dropped back to block assembly's tip")
+
+	markData, err := items.blockchainClient.GetState(ctx, model.BestTipLowWaterStateKey)
+	require.NoError(t, err)
+	mark, err := model.NewBestTipLowWaterFromBytes(markData)
+	require.NoError(t, err)
+	require.Equal(t, a1.Hash().String(), mark.Key.Hash.String())
+	require.Equal(t, []chainhash.Hash{*x.Hash()}, mark.DroppedTips)
+
+	require.False(t, poolContains(ba, blockOnly.TxIDChainHash()), "nothing but the replay puts P in the pool")
+
+	_, err = ba.replayBestTipChanges(ctx)
+	require.NoError(t, err)
+	requireBlockAssemblyTip(t, items, a1)
+	requireReplayPosition(t, items, a1)
+	requireNoLowWater(t, items)
+	require.False(t, ba.bestTipResetReplayPending.Load())
+
+	saved, err := items.blockchainClient.GetState(ctx, BestTipPositionStateKey)
+	require.NoError(t, err)
+	require.Equal(t, bestTipKeyOf(t, items, a1).Bytes(), saved, "the position is saved before the mark is cleared")
+
+	require.True(t, poolContains(ba, blockOnly.TxIDChainHash()), "the transaction only the dropped tip X had must be in the pool")
+}
+
+// poolContains reports whether the current subtree of block assembly holds hash.
+func poolContains(ba *BlockAssembler, hash *chainhash.Hash) bool {
+	for _, node := range ba.subtreeProcessor.GetCurrentSubtree().Nodes {
+		if node.Hash.IsEqual(hash) {
+			return true
+		}
+	}
+
+	return false
+}

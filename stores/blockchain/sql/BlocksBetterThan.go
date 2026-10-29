@@ -255,9 +255,10 @@ func bestTipKey(ctx context.Context, q execQuerier) (key model.BestTipKey, ok bo
 // move is a drop. It runs inside the transaction that changed the tip, and the caller holds
 // slowPathMu, so two drops never merge into the mark at once.
 //
-// The mark keeps the lower of its key and the new best's. It gets a new generation either way,
-// so a reader that read the old mark does not clear this drop with it. The keys are compared by
-// the database, under the same collation the best-tip order uses.
+// The mark keeps the lower of its key and the new best's, and adds the block that was the best
+// tip before to its dropped tips. It gets a new generation either way, so a reader that read the
+// old mark does not clear this drop with it. The keys are compared by the database, under the
+// same collation the best-tip order uses.
 func (s *SQL) recordBestTipDrop(ctx context.Context, tx *sql.Tx, before model.BestTipKey, hadBefore bool) error {
 	after, ok, err := bestTipKey(ctx, tx)
 	if err != nil || !ok || (hadBefore && after.ID == before.ID) {
@@ -276,10 +277,15 @@ func (s *SQL) recordBestTipDrop(ctx context.Context, tx *sql.Tx, before model.Be
 		old, decodeErr := model.NewBestTipLowWaterFromBytes(existing)
 		if decodeErr != nil {
 			// A mark this binary cannot read is replaced. The new best is a drop on its own,
-			// so recording it still makes the reader replay from it.
+			// so recording it still makes the reader replay from it. The tips the old mark
+			// listed are lost with it, so the overflow flag makes the reader reset anyway.
 			s.logger.Warnf("[recordBestTipDrop] replacing unreadable best tip low-water mark: %v", decodeErr)
+
+			mark.DroppedTipsOverflow = true
 		} else {
 			mark.Generation = old.Generation + 1
+			mark.DroppedTips = old.DroppedTips
+			mark.DroppedTipsOverflow = old.DroppedTipsOverflow
 
 			lower, cmpErr := s.sortsWorse(ctx, tx, old.Key, after)
 			if cmpErr != nil {
@@ -290,6 +296,12 @@ func (s *SQL) recordBestTipDrop(ctx context.Context, tx *sql.Tx, before model.Be
 				mark.Key = old.Key
 			}
 		}
+	}
+
+	// The block that was the best tip may never have been applied by block assembly, and once
+	// it is invalid or deleted no read of valid blocks returns it, so the mark names it.
+	if hadBefore {
+		mark.AddDroppedTip(before.Hash)
 	}
 
 	_, err = tx.ExecContext(ctx, `

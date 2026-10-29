@@ -114,8 +114,12 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   on each wake-up moves through the valid blocks that sort better, instead of jumping
   to the best header. A write that moves the best tip down, `InvalidateBlock` or
   `DeleteBlock`, records the block the tip dropped to as a low-water mark under a new
-  key in the blockchain `state` table, `BestTipLowWater`, in the same transaction;
-  block assembly also replays from that mark and clears it once it has passed it.
+  key in the blockchain `state` table, `BestTipLowWater`, in the same transaction,
+  together with the block that was the best tip when it dropped; block assembly also
+  replays from that mark and clears it once it has passed it. A dropped tip block
+  assembly never applied (a branch invalidated before block assembly looked) makes it
+  run one reset first, so that branch's block-only transactions are reloaded into the
+  pool instead of waiting for the next reset or restart.
   `DeleteBlock` now takes the same lock as `InvalidateBlock` and runs in one
   transaction. Valid fork blocks that sort better but were never the tip are moved
   to as well, so a fork race can cost extra reorgs; the pool still ends right. The

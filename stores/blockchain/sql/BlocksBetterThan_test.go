@@ -194,8 +194,9 @@ func TestBlocksBetterThan_FromIsInclusive(t *testing.T) {
 }
 
 // TestBestTipLowWater_WrittenByDrops: only a write that moves the best tip down records the
-// mark, the mark keeps the lowest place, every write gives it a new generation, and the
-// conditional clear removes only the bytes the caller read.
+// mark, the mark keeps the lowest place and every block that was the best tip when it dropped,
+// every write gives it a new generation, and the conditional clear removes only the bytes the
+// caller read.
 func TestBestTipLowWater_WrittenByDrops(t *testing.T) {
 	forEachBestTipEngine(t, func(t *testing.T, s *SQL) {
 		ctx := t.Context()
@@ -229,6 +230,8 @@ func TestBestTipLowWater_WrittenByDrops(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, a2.Hash().String(), mark.Key.Hash.String())
 		require.Equal(t, keyOf(t, s, a2.Hash()).ChainWork, mark.Key.ChainWork)
+		require.Equal(t, []chainhash.Hash{*a3.Hash()}, mark.DroppedTips, "the mark names the tip that was invalidated")
+		require.False(t, mark.DroppedTipsOverflow)
 
 		// A deeper drop lowers the mark to A1.
 		_, err = s.InvalidateBlock(ctx, a2.Hash())
@@ -237,6 +240,7 @@ func TestBestTipLowWater_WrittenByDrops(t *testing.T) {
 		mark, second, ok := lowWater(t, s)
 		require.True(t, ok)
 		require.Equal(t, a1.Hash().String(), mark.Key.Hash.String())
+		require.Equal(t, []chainhash.Hash{*a3.Hash(), *a2.Hash()}, mark.DroppedTips, "two drops before a read keep both tips")
 
 		// Revalidation only moves the tip up and writes nothing.
 		require.NoError(t, s.RevalidateBlock(ctx, a2.Hash()))
@@ -255,6 +259,7 @@ func TestBestTipLowWater_WrittenByDrops(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, a1.Hash().String(), mark.Key.Hash.String(), "the mark keeps the lower of the two")
 		require.NotEqual(t, second, third, "a reader holding the older bytes must not clear this drop")
+		require.Equal(t, []chainhash.Hash{*a3.Hash(), *a2.Hash()}, mark.DroppedTips, "a tip that drops again is listed once")
 
 		// The clear is conditional on the bytes read.
 		require.NoError(t, s.ClearBestTipLowWater(ctx, first))
@@ -296,6 +301,33 @@ func TestBestTipLowWater_DeleteBest(t *testing.T) {
 		mark, _, ok := lowWater(t, s)
 		require.True(t, ok)
 		require.Equal(t, a1.Hash().String(), mark.Key.Hash.String())
+		require.Equal(t, []chainhash.Hash{*a2.Hash()}, mark.DroppedTips, "the mark names the deleted tip")
+	})
+}
+
+// TestBestTipLowWater_UnreadableMarkResets: a drop merged into a mark this binary cannot read
+// loses whatever tips that mark listed, so the new mark asks the reader to reset regardless.
+func TestBestTipLowWater_UnreadableMarkResets(t *testing.T) {
+	forEachBestTipEngine(t, func(t *testing.T, s *SQL) {
+		ctx := t.Context()
+
+		a1 := createTestBlock(t, 1101, s.chainParams.GenesisHash)
+		a2 := createTestBlock(t, 1102, a1.Hash())
+
+		for _, b := range []*model.Block{a1, a2} {
+			storeOn(t, s, b, "p")
+		}
+
+		require.NoError(t, s.SetState(ctx, model.BestTipLowWaterStateKey, []byte{0xee}))
+
+		_, err := s.InvalidateBlock(ctx, a2.Hash())
+		require.NoError(t, err)
+
+		mark, _, ok := lowWater(t, s)
+		require.True(t, ok)
+		require.Equal(t, a1.Hash().String(), mark.Key.Hash.String())
+		require.Equal(t, []chainhash.Hash{*a2.Hash()}, mark.DroppedTips)
+		require.True(t, mark.DroppedTipsOverflow, "the tips the unreadable mark held are lost, so the reader must reset")
 	})
 }
 

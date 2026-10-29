@@ -71,28 +71,118 @@ func NewBestTipKeyFromBytes(b []byte) (BestTipKey, error) {
 // moved down, the lowest such key since the mark was last cleared. Generation grows on every
 // write, including one that keeps the old key because it was lower, so a reader that clears the
 // mark only when it still holds the bytes it read never clears a drop it has not seen.
+//
+// DroppedTips lists the blocks that were the best tip when it dropped, each once, in the order
+// they dropped. A block that was the best tip and was invalidated before block assembly applied
+// it is not among the valid blocks the replay reads, so this list is the only record that it
+// existed: its block-only transactions reach the pool through a reset. The list keeps at most
+// MaxBestTipLowWaterDroppedTips hashes. A drop past that, or one merged into a mark this binary
+// could not read, sets DroppedTipsOverflow instead, which tells the reader to reset whatever
+// the list says, so no drop is ever lost.
 type BestTipLowWater struct {
-	Key        BestTipKey
-	Generation uint64
+	Key                 BestTipKey
+	Generation          uint64
+	DroppedTips         []chainhash.Hash
+	DroppedTipsOverflow bool
 }
 
-// Bytes serialises the mark: the key followed by the generation.
+// MaxBestTipLowWaterDroppedTips bounds DroppedTips. Block assembly clears the mark on its next
+// replay, so the list only grows while it is down or failing, and one reset covers any number of
+// drops.
+const MaxBestTipLowWaterDroppedTips = 64
+
+// bestTipLowWaterTipsVersion marks the section after the generation that carries the dropped
+// tips. A mark with nothing after the generation is the first encoding, which had no tips.
+const bestTipLowWaterTipsVersion = 2
+
+// AddDroppedTip records that hash was the best tip when it dropped. A hash already listed is not
+// listed twice. Past MaxBestTipLowWaterDroppedTips the hash is not kept and DroppedTipsOverflow
+// is set.
+func (m *BestTipLowWater) AddDroppedTip(hash chainhash.Hash) {
+	for i := range m.DroppedTips {
+		if m.DroppedTips[i] == hash {
+			return
+		}
+	}
+
+	if len(m.DroppedTips) >= MaxBestTipLowWaterDroppedTips {
+		m.DroppedTipsOverflow = true
+		return
+	}
+
+	m.DroppedTips = append(m.DroppedTips, hash)
+}
+
+// Bytes serialises the mark: the key, the generation, then a version byte, a flags byte (bit 0
+// is DroppedTipsOverflow), the number of dropped tips as 4 bytes and the hashes.
 func (m BestTipLowWater) Bytes() []byte {
-	return binary.LittleEndian.AppendUint64(m.Key.Bytes(), m.Generation)
+	b := binary.LittleEndian.AppendUint64(m.Key.Bytes(), m.Generation)
+	b = append(b, bestTipLowWaterTipsVersion)
+
+	var flags byte
+	if m.DroppedTipsOverflow {
+		flags |= 1
+	}
+
+	b = append(b, flags)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(m.DroppedTips))) //nolint:gosec // bounded by MaxBestTipLowWaterDroppedTips
+
+	for i := range m.DroppedTips {
+		b = append(b, m.DroppedTips[i][:]...)
+	}
+
+	return b
 }
 
-// NewBestTipLowWaterFromBytes parses a mark written by Bytes.
+// NewBestTipLowWaterFromBytes parses a mark written by Bytes, or by the first encoding, which
+// ended at the generation and is read as a mark without dropped tips.
 func NewBestTipLowWaterFromBytes(b []byte) (BestTipLowWater, error) {
 	k, rest, err := readBestTipKey(b)
 	if err != nil {
 		return BestTipLowWater{}, err
 	}
 
-	if len(rest) != 8 {
+	if len(rest) < 8 {
 		return BestTipLowWater{}, errors.NewProcessingError("invalid best tip low-water mark: expected 8 bytes of generation, got %d", len(rest))
 	}
 
-	return BestTipLowWater{Key: k, Generation: binary.LittleEndian.Uint64(rest)}, nil
+	mark := BestTipLowWater{Key: k, Generation: binary.LittleEndian.Uint64(rest)}
+	rest = rest[8:]
+
+	if len(rest) == 0 {
+		return mark, nil
+	}
+
+	if rest[0] != bestTipLowWaterTipsVersion {
+		return BestTipLowWater{}, errors.NewProcessingError("invalid best tip low-water mark: unknown version %d", rest[0])
+	}
+
+	if len(rest) < 6 {
+		return BestTipLowWater{}, errors.NewProcessingError("invalid best tip low-water mark: truncated dropped tips header")
+	}
+
+	flags := rest[1]
+	if flags&^1 != 0 {
+		return BestTipLowWater{}, errors.NewProcessingError("invalid best tip low-water mark: unknown flags %#x", flags)
+	}
+
+	mark.DroppedTipsOverflow = flags&1 != 0
+
+	n := binary.LittleEndian.Uint32(rest[2:])
+	rest = rest[6:]
+
+	if n > MaxBestTipLowWaterDroppedTips || uint64(n)*chainhash.HashSize != uint64(len(rest)) {
+		return BestTipLowWater{}, errors.NewProcessingError("invalid best tip low-water mark: %d dropped tips in %d bytes", n, len(rest))
+	}
+
+	if n > 0 {
+		mark.DroppedTips = make([]chainhash.Hash, n)
+		for i := range mark.DroppedTips {
+			copy(mark.DroppedTips[i][:], rest[i*chainhash.HashSize:])
+		}
+	}
+
+	return mark, nil
 }
 
 func appendBestTipBytes(b, v []byte) []byte {
