@@ -431,13 +431,16 @@ func TestReplayBestTipChanges_RepeatedFailureFollowsBestHeader(t *testing.T) {
 	initPrometheusMetrics()
 
 	best := &model.BlockHeader{Version: 2, HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
-	bestMeta := &model.BlockHeaderMeta{ID: 42, Height: 11, ChainWork: []byte{1}}
+	bestMeta := &model.BlockHeaderMeta{ID: 42, PeerID: "peer", Height: 11, ChainWork: []byte{1}}
 
 	m := &blockchain.Mock{}
 	m.On("BlocksBetterThan", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return([]*model.BlockHeader(nil), []*model.BlockHeaderMeta(nil), errors.NewServiceError("down"))
 	m.On("GetState", mock.Anything, model.BestTipLowWaterStateKey).Return([]byte(nil), errors.NewNotFoundError("no mark"))
-	m.On("GetBestBlockHeader", mock.Anything).Return(best, bestMeta, nil)
+	// Over gRPC the best header's metadata has no block id or peer id; the block's own header
+	// metadata has both.
+	m.On("GetBestBlockHeader", mock.Anything).Return(best, withoutBestTipIdentity(bestMeta), nil)
+	m.On("GetBlockHeader", mock.Anything, best.Hash()).Return(best, bestMeta, nil)
 
 	ba := &BlockAssembler{blockchainClient: m, logger: ulogger.TestLogger{}, settings: createTestSettings(t)}
 	ba.bestTipPosKnown.Store(true)
@@ -449,7 +452,32 @@ func TestReplayBestTipChanges_RepeatedFailureFollowsBestHeader(t *testing.T) {
 	}
 
 	require.True(t, ba.followBestTipChanges(t.Context()))
-	require.Equal(t, model.NewBestTipKey(best, bestMeta), *ba.bestTipPos.Load(), "the position jumps to the best tip")
+	require.Equal(t, model.NewBestTipKey(best, bestMeta), *ba.bestTipPos.Load(), "the position jumps to the best tip, with its id and peer id")
+}
+
+// withoutBestTipIdentity returns a copy of meta as GetBestBlockHeader returns it over gRPC: without
+// the block id and peer id, which place a block among others of equal work.
+func withoutBestTipIdentity(meta *model.BlockHeaderMeta) *model.BlockHeaderMeta {
+	stripped := *meta
+	stripped.ID = 0
+	stripped.PeerID = ""
+
+	return &stripped
+}
+
+// grpcShapedBestHeaderClient serves GetBestBlockHeader as the gRPC client does, without the block
+// id and peer id.
+type grpcShapedBestHeaderClient struct {
+	blockchain.ClientI
+}
+
+func (c *grpcShapedBestHeaderClient) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	header, meta, err := c.ClientI.GetBestBlockHeader(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return header, withoutBestTipIdentity(meta), nil
 }
 
 // TestReturnToRunning_SavesAfterLeavingProcessingState checks that the replay position is written
@@ -521,12 +549,18 @@ func TestLoadBestTipPosition_NoPersistedPosition(t *testing.T) {
 	addChain(t, items, a)
 
 	ba := items.blockAssembler
+	local := ba.blockchainClient
+	ba.blockchainClient = &grpcShapedBestHeaderClient{ClientI: local}
 
 	ba.setBestBlockHeader(a[1], 3)
 	ba.bestTipPosKnown.Store(false)
 	ba.loadBestTipPosition(t.Context())
 	require.True(t, ba.bestTipPosKnown.Load())
 	requireReplayPosition(t, items, a[1])
+	// The whole key, not only the hash: without the id and peer id the position would sort
+	// better than the best block and hide a block of equal work.
+	require.Equal(t, bestTipKeyOf(t, items, a[1]), *ba.bestTipPos.Load(), "the position carries the best block's id and peer id")
+	ba.blockchainClient = local
 
 	moves := recordMoves(t, items)
 	ba.processNewBlockAnnouncement(t.Context())

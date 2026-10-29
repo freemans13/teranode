@@ -131,15 +131,22 @@ func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 		// The best-header path moves straight to the tip, so the blocks before it are
 		// given up. A block that sorts better after this read is replayed on the next pass.
 		//
-		// That includes the history a reset left pending. The reset already rebuilt the
-		// pool on its target, so giving the history up leaves the pool as it was before
-		// the replay existed, and candidates are built from it again. Holding on would
-		// keep every candidate empty for as long as the failure lasts.
-		if b.bestTipResetReplayPending.Load() || b.bestTipResetIncomplete.Load() {
-			b.logger.Errorf("[BlockAssembler] replay failed %d times in a row, giving up the history a reset left pending so mining candidates are built again: %v", failures, err)
+		// That includes the history a reset left pending. Holding on would keep every
+		// candidate empty for as long as the failure lasts. When the reset finished, it
+		// rebuilt the pool on its target, so giving the history up leaves the pool as it
+		// was before the replay existed. When it rotated the tx map and then failed
+		// (bestTipResetIncomplete), the pool may be partial: the flag stays set, so every
+		// later pass retries the reset's reload, and candidates are built from what the
+		// pool holds until one succeeds.
+		if b.bestTipResetReplayPending.Load() {
+			if b.bestTipResetIncomplete.Load() {
+				b.logger.Errorf("[BlockAssembler] replay failed %d times in a row, giving up the history a reset left pending so mining candidates are built again from a pool the reset may have left partial, retrying its reload on every pass: %v", failures, err)
+			} else {
+				b.logger.Errorf("[BlockAssembler] replay failed %d times in a row, giving up the history a reset left pending so mining candidates are built again: %v", failures, err)
+			}
+
 			prometheusBlockAssemblyProcessingStuck.WithLabelValues("best_tip_reset_replay_abandoned").Inc()
 			b.bestTipResetReplayPending.Store(false)
-			b.bestTipResetIncomplete.Store(false)
 		}
 
 		b.logger.Errorf("[BlockAssembler] replay of best tip changes failed %d times in a row, following the best header instead: %v", failures, err)
@@ -181,13 +188,13 @@ func (b *BlockAssembler) followBestTipChanges(ctx context.Context) bool {
 // persists it, and then clears a low-water mark, so the next pass does not replay the history
 // that kept failing. A failure to read the best tip leaves the position where it is.
 func (b *BlockAssembler) giveUpBestTipHistory(ctx context.Context) {
-	best, bestMeta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+	_, bestKey, err := b.bestBlockKey(ctx)
 	if err != nil {
 		b.logger.Errorf("[BlockAssembler] error getting best block header to give up the replay history: %v", err)
 		return
 	}
 
-	b.setBestTipPos(model.NewBestTipKey(best, bestMeta))
+	b.setBestTipPos(bestKey)
 
 	_, markData, err := b.readBestTipLowWater(ctx)
 	if err != nil || markData == nil {
@@ -277,21 +284,19 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 	// A reset can finalize its target before its reload or state write fails.
 	// Retry that rebuild before the hash-equality fast path can acknowledge it.
 	if b.bestTipResetIncomplete.Load() {
-		tip, height := b.CurrentBlock()
-		if tip == nil {
-			return read, errors.NewProcessingError("cannot retry incomplete reset without a tip")
-		}
-		_, meta, err := b.blockchainClient.GetBlockHeader(ctx, tip.Hash())
-		if err != nil {
-			return read, err
-		}
-		if meta.Invalid {
-			err = b.resetAndRecord(ctx, true)
-		} else {
-			err = b.resetToBlockAndRecord(ctx, tip, height, true)
-		}
-		if err != nil {
-			return read, err
+		historyGivenUp := !b.bestTipResetReplayPending.Load()
+
+		if err := b.retryIncompleteReset(ctx); err != nil {
+			if !historyGivenUp {
+				return read, err
+			}
+
+			// The history was given up after this reset kept failing, and candidates are
+			// built from the pool as it is. A failed retry must not hold them empty again or
+			// stop the replay; the next pass retries.
+			b.bestTipResetReplayPending.Store(false)
+			prometheusBlockAssemblyProcessingStuck.WithLabelValues("best_tip_reset_reload").Inc()
+			b.logger.Errorf("[BlockAssembler] retry of a reset that did not finish its reload failed, the pool may be partial, retrying on the next pass: %v", err)
 		}
 	}
 
@@ -388,6 +393,26 @@ func (b *BlockAssembler) replayBestTipChanges(ctx context.Context) (int, error) 
 			return read, nil
 		}
 	}
+}
+
+// retryIncompleteReset runs again a reset that rotated the tx map and then failed, on block
+// assembly's current tip, or to the best tip when that tip is invalid now.
+func (b *BlockAssembler) retryIncompleteReset(ctx context.Context) error {
+	tip, height := b.CurrentBlock()
+	if tip == nil {
+		return errors.NewProcessingError("cannot retry incomplete reset without a tip")
+	}
+
+	_, meta, err := b.blockchainClient.GetBlockHeader(ctx, tip.Hash())
+	if err != nil {
+		return err
+	}
+
+	if meta.Invalid {
+		return b.resetAndRecord(ctx, true)
+	}
+
+	return b.resetToBlockAndRecord(ctx, tip, height, true)
 }
 
 // applyBestTipChange moves block assembly to one block the replay read. last says the block is
@@ -717,12 +742,30 @@ func (b *BlockAssembler) branchOnlyTxs(ctx context.Context, hashes []chainhash.H
 	return kept, nil
 }
 
+// bestBlockKey returns the best block and its place in the best-tip order. The place is read from
+// the block's own header metadata: over gRPC, GetBestBlockHeader's metadata carries no block id or
+// peer id, and a key without them sorts better than the best block itself, so the replay would
+// miss a block of equal work that becomes the best tip on a lower peer id.
+func (b *BlockAssembler) bestBlockKey(ctx context.Context) (*model.BlockHeader, model.BestTipKey, error) {
+	best, _, err := b.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return nil, model.BestTipKey{}, err
+	}
+
+	header, meta, err := b.blockchainClient.GetBlockHeader(ctx, best.Hash())
+	if err != nil {
+		return nil, model.BestTipKey{}, err
+	}
+
+	return header, model.NewBestTipKey(header, meta), nil
+}
+
 // startingBestTipPosition is the replay position without a persisted one. On the best tip, block
 // assembly starts there: replaying older blocks would move it onto every stale branch within the
 // floor and back again. Off it, it starts at its own tip, the last block it processed, and the
 // replay moves it to the best tip through the blocks that sort better.
 func (b *BlockAssembler) startingBestTipPosition(ctx context.Context) (model.BestTipKey, error) {
-	best, bestMeta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+	best, bestKey, err := b.bestBlockKey(ctx)
 	if err != nil {
 		return model.BestTipKey{}, err
 	}
@@ -730,7 +773,7 @@ func (b *BlockAssembler) startingBestTipPosition(ctx context.Context) (model.Bes
 	tip, _ := b.CurrentBlock()
 	if tip == nil || best.Hash().IsEqual(tip.Hash()) {
 		b.logger.Infof("[BlockAssembler] no persisted best tip position, block assembly is on the best tip, starting there")
-		return model.NewBestTipKey(best, bestMeta), nil
+		return bestKey, nil
 	}
 
 	header, meta, err := b.blockchainClient.GetBlockHeader(ctx, tip.Hash())

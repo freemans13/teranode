@@ -29,15 +29,19 @@ func replayPoolTx(parent *chainhash.Hash, amount uint64) *bt.Tx {
 }
 
 func TestReplayBestTipChanges_ResetRecoversParentBeforeChild(t *testing.T) {
-	t.Run("normal", func(t *testing.T) { testReplayResetPool(t, false, testCoinbaseMaturity) })
-	t.Run("retry_after_target_finalized", func(t *testing.T) { testReplayResetPool(t, true, testCoinbaseMaturity) })
+	t.Run("normal", func(t *testing.T) { testReplayResetPool(t, false, false, testCoinbaseMaturity) })
+	t.Run("retry_after_target_finalized", func(t *testing.T) { testReplayResetPool(t, true, false, testCoinbaseMaturity) })
+	// The reload keeps failing until the replay gives the history up. Candidates are built
+	// again from the partial pool, and the reload is still retried on the next passes until
+	// it brings the child back.
+	t.Run("reload_retried_after_history_given_up", func(t *testing.T) { testReplayResetPool(t, true, true, testCoinbaseMaturity) })
 	// With maturity 1 the move from A1 to B2 would take A1 back although A3 builds on it,
 	// and a spend of A1's coinbase could already be confirmed. The replay restamps B
 	// where it lies instead, and the parent still reaches the pool ahead of its child.
-	t.Run("restamped_below_coinbase_maturity", func(t *testing.T) { testReplayResetPool(t, false, 1) })
+	t.Run("restamped_below_coinbase_maturity", func(t *testing.T) { testReplayResetPool(t, false, false, 1) })
 }
 
-func testReplayResetPool(t *testing.T, lateFailure bool, coinbaseMaturity uint16) {
+func testReplayResetPool(t *testing.T, lateFailure, giveUp bool, coinbaseMaturity uint16) {
 	initPrometheusMetrics()
 	items := setupBlockAssemblyTest(t, func(s *settings.Settings) {
 		s.GlobalBlockHeightRetention = 2
@@ -102,10 +106,24 @@ func testReplayResetPool(t *testing.T, lateFailure bool, coinbaseMaturity uint16
 			require.False(t, ba.followBestTipChanges(t.Context()))
 			require.Equal(t, pos.Bytes(), ba.bestTipPos.Load().Bytes(), "finalized target is not a successful reload")
 		}
+		if giveUp {
+			require.True(t, ba.followBestTipChanges(t.Context()), "the last failure gives the history up")
+			require.False(t, ba.bestTipResetReplayPending.Load(), "candidates are built again")
+			require.True(t, ba.bestTipResetIncomplete.Load(), "the reload is still owed")
+			// A retry that fails again keeps candidates open and the reload owed.
+			ba.followBestTipChanges(t.Context())
+			require.False(t, ba.bestTipResetReplayPending.Load(), "a failed retry does not hold candidates empty again")
+			require.True(t, ba.bestTipResetIncomplete.Load(), "the reload is still owed")
+		}
 		failing.iteratorDown.Store(false)
 	}
-	_, err = ba.replayBestTipChanges(t.Context())
-	require.NoError(t, err)
+	if giveUp {
+		ba.processNewBlockAnnouncement(t.Context())
+		require.False(t, ba.bestTipResetIncomplete.Load(), "the retried reload finished")
+	} else {
+		_, err = ba.replayBestTipChanges(t.Context())
+		require.NoError(t, err)
+	}
 	requireBlockAssemblyTip(t, items, a[1])
 	current := ba.subtreeProcessor.GetCurrentSubtree()
 	var hashes []chainhash.Hash
