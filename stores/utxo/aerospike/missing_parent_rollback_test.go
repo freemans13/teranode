@@ -108,14 +108,19 @@ func TestMissingParentRollsBackFreshSiblingSpend(t *testing.T) {
 	}
 }
 
-// TestBlessedInputIsKeptOutOfTheRollback: T spends G:0 (whose record is gone),
-// S:0 (present) and X:0 (which another transaction already holds). T's own
-// record exists, so the store blesses the missing parent and counts G:0 as
-// succeeded. X:0 answers ErrSpent, so the call fails and reverses what it wrote.
-// G:0 wrote nothing and has no record: when it was in the rollback set, Unspend
-// failed on it first and stopped, and S:0 stayed spent by a transaction that
-// will never be mined.
-func TestBlessedInputIsKeptOutOfTheRollback(t *testing.T) {
+// TestBlessedInputWithSpenderRecordKeepsTheSpends: T spends G:0 (whose record
+// is gone), S:0 (present) and X:0 (which another transaction already holds).
+// T's own record exists, so the store blesses the missing parent and counts G:0
+// as succeeded. X:0 answers ErrSpent, so the call fails.
+//
+// For an ordinary caller the rollback is gated on the spender having no record
+// (#1214), and T has one, so S:0 stays spent by T: clearing it would clear a
+// slot a live transaction owns. The bless needs that same record, so on this
+// path a blessed input never meets a rollback that fires. Spend still keeps a
+// blessed input out of the rollback set as a backstop: it wrote nothing and has
+// no record, and Unspend failing on it first used to stop the rollback before
+// S:0.
+func TestBlessedInputWithSpenderRecordKeepsTheSpends(t *testing.T) {
 	s := test.CreateBaseTestSettings(t)
 
 	_, store, ctx, cleanup := initAerospike(t, s, ulogger.New("blessed-input-rollback"))
@@ -167,5 +172,57 @@ func TestBlessedInputIsKeptOutOfTheRollback(t *testing.T) {
 
 	after, err := store.GetSpend(ctx, &utxo.Spend{TxID: survivor.TxIDChainHash(), Vout: 0, UTXOHash: hash})
 	require.NoError(t, err)
-	require.Nil(t, after.SpendingData, "the fresh spend of S:0 must be rolled back despite the blessed input")
+	require.NotNil(t, after.SpendingData, "T has a record, so an ordinary caller's spend of S:0 stays")
+	require.Equal(t, *spender.TxIDChainHash(), *after.SpendingData.TxID)
+}
+
+// TestRequireParentOutputsRollsBackLikeSpenderCreatedByCaller: the second wave
+// of a WithBelowCheckpoint list spends with RequireParentOutputs, after its first
+// wave wrote the spender's record. C spends S:0, whose record survives, and
+// G:0, whose record the pruner removed, and C's own record already exists. The
+// store must reverse the fresh spend of S:0 as it does for
+// SpenderCreatedByCaller: the block path then deletes C's record, and a spend
+// left in place would name a transaction the store no longer holds. The
+// ordinary rule would probe for C's record, find the one the first wave wrote,
+// and keep the spend.
+func TestRequireParentOutputsRollsBackLikeSpenderCreatedByCaller(t *testing.T) {
+	s := test.CreateBaseTestSettings(t)
+
+	_, store, ctx, cleanup := initAerospike(t, s, ulogger.New("require-parent-outputs-rollback"))
+	t.Cleanup(cleanup)
+	require.NoError(t, store.SetBlockHeight(1000))
+
+	newParent := func(seed string) *bt.Tx {
+		parent := bt.NewTx()
+		require.NoError(t, parent.From(seed, 0, "51", 30000))
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+
+		return parent
+	}
+
+	gone := newParent("8888888888888888888888888888888888888888888888888888888888888888")
+	survivor := newParent("9999999999999999999999999999999999999999999999999999999999999999")
+
+	_, err := store.Create(ctx, survivor, 1000)
+	require.NoError(t, err)
+
+	ghost := bt.NewTx()
+	for _, parent := range []*bt.Tx{gone, survivor} {
+		require.NoError(t, ghost.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	}
+
+	require.NoError(t, ghost.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+
+	_, err = store.Create(ctx, ghost, 1100)
+	require.NoError(t, err, "fixture: the first wave wrote C's record")
+
+	_, err = store.Spend(ctx, ghost, 1200, utxo.IgnoreFlags{RequireParentOutputs: true})
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "control: the pruned parent answers not found")
+
+	hash, err := util.UTXOHashFromOutput(survivor.TxIDChainHash(), survivor.Outputs[0], 0)
+	require.NoError(t, err)
+
+	after, err := store.GetSpend(ctx, &utxo.Spend{TxID: survivor.TxIDChainHash(), Vout: 0, UTXOHash: hash})
+	require.NoError(t, err)
+	require.Nil(t, after.SpendingData, "the fresh spend of the surviving parent must be rolled back")
 }

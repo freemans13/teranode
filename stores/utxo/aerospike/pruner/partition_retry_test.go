@@ -54,6 +54,18 @@ func ensurePrometheusMetrics() {
 		prometheusUtxoTimeoutEvents = prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "test_utxo_pruner_timeout_events_total",
 		})
+		prometheusUtxoParentUpdateFailures = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "test_utxo_pruner_parent_update_failures_total",
+		})
+		prometheusUtxoChildrenHeldUnverified = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "test_utxo_pruner_children_held_unverified_total",
+		})
+		prometheusUtxoMarkersSuperseded = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "test_utxo_pruner_markers_superseded_total",
+		})
+		prometheusUtxoMarkerWithdrawFailures = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "test_utxo_pruner_marker_withdraw_failures_total",
+		})
 	})
 }
 

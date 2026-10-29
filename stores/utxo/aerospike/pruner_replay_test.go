@@ -544,9 +544,10 @@ func TestPrunerMarksOnlyTheChildThatHeldTheSpend(t *testing.T) {
 	_, _, err = store.SpendAndCreate(ctx, winner, 1000)
 	require.NoError(t, err)
 
-	// The loser asks for the same outpoint and never gets it. It is stored, as a
-	// conflicting record would be, and tombstoned so it is a candidate in the
-	// same cycle as the winner.
+	// The loser asks for the same outpoint and never gets it. It is stored and
+	// marked conflicting, as ProcessConflicting leaves a loser, and tombstoned so
+	// it is a candidate in the same cycle as the winner. The pruner keeps an
+	// unmined record that is not conflicting, so the mark is what makes it one.
 	loser := bt.NewTx()
 	require.NoError(t, loser.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
 	require.NoError(t, loser.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2999))
@@ -566,7 +567,10 @@ func TestPrunerMarksOnlyTheChildThatHeldTheSpend(t *testing.T) {
 
 	loserKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), loser.TxIDChainHash().CloneBytes())
 	require.NoError(t, err)
-	require.NoError(t, client.Put(nil, loserKey, aerospike.BinMap{fields.DeleteAtHeight.String(): 1100}))
+	require.NoError(t, client.Put(nil, loserKey, aerospike.BinMap{
+		fields.DeleteAtHeight.String(): 1100,
+		fields.Conflicting.String():    true,
+	}))
 
 	astore.ResetPrunerServiceForTests()
 	t.Cleanup(astore.ResetPrunerServiceForTests)
