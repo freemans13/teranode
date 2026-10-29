@@ -106,6 +106,25 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A short catch-up from `RUNNING` hands its blocks' unseen transactions to block
+  assembly, and catch-up no longer fetches a chain with less work than the best tip.**
+  Every catch-up moves the FSM to `CATCHINGBLOCKS`, and subtree validation used to stop
+  handing transactions to block assembly in that state. A running node that fetched a
+  short competing branch therefore wrote the branch's transactions to the UTXO store but
+  not to the pool, and a child spending one of them could enter the pool without its
+  parent. A catch-up that starts from `RUNNING` and fetches at most
+  `blockvalidation_catchup_keep_block_assembly_max_blocks` blocks (new, default 6) now
+  keeps the hand-off on; such a run uses the level path, never the batched catch-up path.
+  Set the value to 0 to restore the old behaviour. Separately, catch-up now ends as a
+  no-op, charging no peer, when the header fetch reached the announced block and the
+  whole offered chain has less cumulative work than the best tip; equal work is still
+  fetched. The check runs after the existing fork checks, so a fork deeper than coinbase
+  maturity and the deep-fork secret-mining case are still refused with an error and
+  charged as before. In a mixed-version deploy, a subtree validation older than its block
+  validation ignores the new request field and keeps the hand-off off. The existing block-context queue-shed policy still accepts and unlocks
+  a transaction without a template entry on `ErrThresholdExceeded`; durable recovery
+  from that case is not added here. (#2075, partially addresses #2067)
+
 - **Catch-up quick validation waits for each block's `.subtree` writes before it commits
   the block, and a shutdown waits for a block's in-flight commit.** A block was stored with
   `subtrees_set` while its `.subtree` files could still be in flight, so a failed write
@@ -396,6 +415,19 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   route rejects the block as invalid. A block that spends a UTXO this node has frozen,
   or that hits a UTXO hash mismatch in this node's store, stays a local fault.
   (#2022)
+
+- **Catchup rejects headers that do not form one chain on the common ancestor.**
+  Before, a peer could offer headers whose first entry built on some other stored
+  block, and catchup carried on under the wrong heights with only a warning. Now
+  catchup stops before it touches local state, and the error is coded
+  `NETWORK_INVALID_RESPONSE`, so it is charged to the peer. A header batch whose
+  headers do not link to each other, or that does not build on the last header of
+  the batch before it, is rejected the same way as soon as it arrives, before the
+  fetch is counted as a success for the peer. Catchup also now clears
+  `mined_set` on the blocks a fork replaces only after every header check has
+  passed, just before it fetches blocks, so a fork rejected by a later check, or a
+  peer with nothing past the ancestor, no longer un-stamps the node's own blocks.
+  No action needed. (#2034)
 
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
