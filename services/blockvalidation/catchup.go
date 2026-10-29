@@ -501,6 +501,32 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// isPeerError left true.
 			errorType = "local_panic"
 			isPeerError = false
+		case isBlockCommitted(*err) || isSubtreeWritesNotLanded(*err):
+			// tryQuickValidation aborted the run on one of its two markers
+			// (bitcoin-sv/teranode#4978, bitcoin-sv/teranode#4987): a .subtree write for
+			// the block did not land, or commitBlock's AddBlock stored the block, or may
+			// have, and the run could not finish or rule out the commit. Both are this
+			// node's own storage or its own blockchain service, never the peer's, and
+			// isLocalCatchupFault already calls them local, so processCatchupChItem
+			// charges no one for them.
+			//
+			// This case must come straight after the panic case. A block_committed
+			// error is a ServiceError, which no code case below matches, so without it
+			// the error fell to the text cases: a flattened gRPC deadline from our own blockchain service was
+			// labelled local_context_cancelled only because of its wording, and a plain
+			// connection failure to it was labelled network_error and charged to the
+			// primary. It also precedes the storage case, which would otherwise take
+			// subtree_writes_not_landed (a StorageError) under the generic
+			// local_storage_fault label. Putting it this early shadows nothing
+			// peer-attributable: both markers are set only around this node's own
+			// .subtree writes, AddBlock, its existence probe and the UTXO unlock, after
+			// the block's subtree processing and coinbase checks have passed.
+			if isBlockCommitted(*err) {
+				errorType = "local_block_maybe_committed"
+			} else {
+				errorType = "local_subtree_writes_not_landed"
+			}
+			isPeerError = false
 		case errors.Is(*err, errors.ErrStorageError):
 			// A failed read or write of our own store — a torn, stale or mis-keyed
 			// external transaction blob (issue 1439), a full disk — is this node's
@@ -508,7 +534,8 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// storage errors, so this makes the terminal-error path agree with the
 			// per-fetch one.
 			//
-			// This case must come FIRST, and specifically ahead of the consensus
+			// This case must come first after the quick-validation marker case above,
+			// and specifically ahead of the consensus
 			// case below, because an error chain can carry both codes and errors.Is
 			// walks the whole chain. The aerospike UTXO store wraps its own bins'
 			// read failures — including a live client.Get on a paginated record —
@@ -1448,18 +1475,28 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 }
 
 // drainWriteJobs receives every subtree write job left in ch and counts it down, so a caller blocked
-// in wg.Wait() for a job no worker will ever receive is released (bitcoin-sv/teranode#4692).
+// in wg.Wait() for a job no worker will ever receive is released (bitcoin-sv/teranode#4692). Each
+// drained job was never written, so its Unwritten flag is raised first (bitcoin-sv/teranode#4978).
 //
 // Only safe to call once the producing errgroup has settled, because it relies on the channel being
-// closed to terminate. Nil-safe on both axes: ch is nil when quick validation is disabled (no worker
-// pool, no channel), and job.Done is nil for a job constructed without a barrier.
+// closed to terminate. Nil-safe on every axis: ch is nil when quick validation is disabled (no worker
+// pool, no channel), and job.Done or job.Unwritten is nil for a job constructed without a barrier.
 func drainWriteJobs(ch <-chan *SubtreeWriteJob) {
 	if ch == nil {
 		return
 	}
 
 	for job := range ch {
-		if job != nil && job.Done != nil {
+		if job == nil {
+			continue
+		}
+
+		// Never written, so flag it before releasing the waiter (bitcoin-sv/teranode#4978).
+		if job.Unwritten != nil {
+			job.Unwritten.Store(true)
+		}
+
+		if job.Done != nil {
 			job.Done.Done()
 		}
 	}
@@ -2149,6 +2186,45 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 				u.logger.Warnf("[catchup:tryQuickValidation][%s] block %s: catch-up context cancelled while waiting for subtree writes to settle, skipping cleanup",
 					catchupCtx.blockUpTo.Hash().String(), block.Hash().String())
 			}
+
+			return false, err
+		}
+
+		// This check must come before the local-panic one below. A panic in a post-commit
+		// unlock goroutine reaches here wrapped in the block-committed error, so err carries
+		// both markers, and the local-panic branch would sweep files that the stored block is
+		// recorded as having. Returning err unchanged keeps the panic marker, so
+		// releaseCatchupLock still labels the run local_panic.
+		//
+		// Two outcomes abort here, without a sweep, rather than fall through to the local-fault
+		// branch below. Its sweep and its fall-through are each wrong for both of them.
+		//
+		// The .subtree writes did not all land, so quickValidateBlockAsync refused to commit the
+		// block (bitcoin-sv/teranode#4978). The failing write worker has already cancelled the
+		// shared catch-up context, so normal validation would only fail on that and bury the
+		// storage fault. The block is not stored, so the next catch-up run validates it again from
+		// scratch. Do not sweep, whichever way the barrier failed. When a write failed and the
+		// barrier released, every job had been handled; when the context ended first, jobs may
+		// still be in flight and a delete could race them, as in the ctx.Done branches above.
+		// Leaving the files is harmless either way: the content is honest, every blob carries a
+		// finite DAH, and the next run rewrites it with AllowOverwrite.
+		//
+		// The block IS committed, or may be: AddBlock stored it with subtrees_set and mined_set and
+		// the post-commit unlock still failed after its retries, or AddBlock returned an error and
+		// commitBlock could not prove the block not stored, because every existence probe failed or
+		// ctx had ended (bitcoin-sv/teranode#4987). The files this
+		// attempt wrote can belong to a block recorded as having them, so a sweep can corrupt it,
+		// and normal validation would find the block stored and do nothing. No write can still be
+		// in flight: awaitSubtreeWrites returned nil before commitBlock ran, so no waitDone join is
+		// needed. If the block is stored, its outputs stay locked and nothing unlocks them later
+		// (bsv-blockchain/teranode#2015): the setMined worker skips a block with mined_set, and a
+		// stored block is skipped by catch-up and by processBlockFound.
+		// Quick validation spends locked outputs anyway (WithIgnoreLocked), so a later checkpointed
+		// block that spends them still commits. Only a spend through full validation or the
+		// validator fails, with ErrTxLocked.
+		if isSubtreeWritesNotLanded(err) || isBlockCommitted(err) {
+			u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: aborting without removing this attempt's .subtree files: %v",
+				catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)
 
 			return false, err
 		}

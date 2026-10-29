@@ -126,6 +126,23 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   run the new version. A client that calls `SetBlockMinedSet` with the field set must
   handle `ERR_STATE_ERROR`. (#2018)
 
+- **Catch-up quick validation waits for each block's `.subtree` writes before it commits
+  the block, and a shutdown waits for a block's in-flight commit.** A block was stored with
+  `subtrees_set` while its `.subtree` files could still be in flight, so a failed write
+  left a block recorded as having files it did not have. Each quick-validated block now
+  waits for its own writes to land; a write that fails leaves the block uncommitted for
+  the next catch-up run. Once the block is stored, unlocking its outputs is retried on a
+  context that a cancel does not stop, for up to 5 minutes. When `AddBlock` returns an
+  error, a retried existence check, bounded at 15 seconds, decides whether to finish the
+  commit or retry the block later. Shutdown now waits for a block's commit that is already
+  under way, including that check and the unlock, but only up to `service_manager_stopTimeout`
+  (default 30s), less up to 5s that shutdown keeps for flushing the invalid-block Kafka
+  producer. A stop during catch-up can now use the rest of that time. If the blockchain or
+  UTXO store hangs past the stop timeout at shutdown, the block's outputs stay locked
+  (tracked in #2015). To give the commit longer at shutdown, raise
+  `service_manager_stopTimeout` and the pod's `terminationGracePeriodSeconds` together.
+  (#2011)
+
 - **A mining candidate keeps its coinbase, and a solution without one is mined with it.**
   Affects miners and pools that use `getminingcandidate` and `submitminingsolution`. As in
   bitcoin-sv, block assembly now builds a candidate's coinbase once, keeps it on the job,
@@ -750,6 +767,19 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   which is the point, but it will move alert thresholds that counted on the old
   shape. The same collapse on the HTTP blob store's own client and server is fixed
   too; no shipped configuration uses that store. (#1963)
+
+- **A block whose coinbase is not final is rejected.** Affects every node and every miner.
+  bitcoin-sv applies its `IsFinalTx` rule to the coinbase as to any other transaction, and
+  Teranode now does too: a block whose coinbase has a non-final input sequence and an
+  nLockTime not yet reached is invalid (`bad-txns-nonfinal`). From CSV onwards a time-based
+  nLockTime is measured against the parent's median time past. `submitminingsolution`
+  refuses such a coinbase instead of mining a block peers reject, and keeps the job, so a
+  corrected coinbase can still be submitted against it. The time-based check needs the
+  parent's median time past, which is looked up only after the solution has passed the
+  proof-of-work check. A solution's time and nonce are no longer copied into the coinbase
+  as its nLockTime and input sequence; they go into the header only, as in bitcoin-sv. A
+  node on an earlier build accepts blocks this one rejects, so upgrade every node
+  together. (#2017)
 
 - **A block's conflicting transactions are checked in one walk, and
   `utxostore_conflictingChildrenMaxNodes` becomes a per-root budget for it.** Subtree
