@@ -409,6 +409,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 			tSettings.UtxoStore.LockedBatcherDrainMode, tSettings.UtxoStore.LockedBatcherGreedyAccumulate)
 	}
 
+	metricsPool.Store(pool)
+
 	return s, nil
 }
 
@@ -472,6 +474,7 @@ func (s *Store) Close(_ context.Context) error {
 		s.lockInFlight.Wait()
 	}
 
+	metricsPool.CompareAndSwap(s.pool, nil)
 	s.pool.Close()
 
 	return nil

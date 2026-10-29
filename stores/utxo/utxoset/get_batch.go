@@ -77,12 +77,21 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 		}
 	}
 
-	// The two lookups are independent, so a mixed batch runs them at the same time. Run one
-	// after the other, the body readers, validator parent resolution among them, waited for the
-	// whole no-body lookup first. lookupMany is already called from concurrent batches
-	// (background is true), and each half answers only its own items.
+	// The two lookups are independent, so a mixed batch runs them at the same time when the pool
+	// has a spare connection for the second. Run one after the other, the body readers, validator
+	// parent resolution among them, wait for the whole no-body lookup first. But the second
+	// lookup holds a connection of its own, and nothing caps how many batches run at once
+	// (background is true), so without a spare it would queue in front of the spend and create
+	// writers on the same pool. It then runs in turn on this goroutine's connection, as a batch
+	// of one kind does. Each half answers only its own items.
 	switch {
+	case len(withoutBody) > 0 && len(withBody) > 0 && !poolSpare(s.pool):
+		getBatchHalves.WithLabelValues("in_turn").Inc()
+		s.resolveGetItems(withBody, true)
+		s.resolveGetItems(withoutBody, false)
 	case len(withoutBody) > 0 && len(withBody) > 0:
+		getBatchHalves.WithLabelValues("together").Inc()
+
 		var wg sync.WaitGroup
 
 		wg.Add(1)
