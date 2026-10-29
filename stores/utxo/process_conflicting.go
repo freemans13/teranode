@@ -176,7 +176,8 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		TxHashes:    conflictingTxHashes,
 		StartedAt:   time.Now().UnixNano(),
 	}
-	if beginErr := s.BeginConflictIntent(ctx, walIntent); beginErr != nil {
+	intentInserted, beginErr := s.BeginConflictIntent(ctx, walIntent)
+	if beginErr != nil {
 		return nil, nil, errors.NewProcessingError("[ProcessConflicting] failed to record WAL intent before processing", beginErr)
 	}
 
@@ -188,10 +189,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	var (
 		// refusedAtStep0 is set when step 0 refuses the winner list itself: a
 		// winner that is the frozen placeholder, or one that is not conflicting
-		// and was not processed earlier in this run. Both depend only on the list
-		// and the winners' state, which no earlier run of the same list can have
-		// produced (a winner is cleared at step 4 only after its spends land, and
-		// block movement takes such winners out of the list first).
+		// and was not processed earlier in this run.
 		refusedAtStep0        atomic.Bool
 		step1Committed        bool
 		step2Committed        bool
@@ -205,19 +203,22 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 
 	// Registered before the rollback defer below, so it runs AFTER it (LIFO) and
 	// observes the final err (including a rollback-failure escalation). A
-	// successful operation removes the intent, and so does a step-0 refusal of
-	// the winner list: an intent left behind by that refusal would be replayed
-	// with the refusal bypassed, as happened on mainnet on 2026-10-19 against
-	// winners that were already resolved.
+	// successful operation removes the intent.
 	//
-	// Every other failure keeps the intent, a transient step-0 failure included.
-	// The intent id is deterministic and Begin is an upsert, so this call may
-	// have adopted the record of an earlier run of the same list that was killed
-	// after mutating. Deleting it on a failed Get or a cancelled ctx would drop
-	// the only record of that torn state. Completion is best-effort: a failed
-	// delete just leaves an intent that replays on the next restart.
+	// A step-0 refusal of the winner list removes it only when this call created
+	// it. Such a refusal mutated nothing, so an intent this call made records
+	// nothing to recover. But the intent id is deterministic, so an intent that
+	// already existed belongs to an earlier run of the same list, and that run
+	// may have produced the very state refused here: a rollback clears a pending
+	// winner's conflicting flag along with the rest of step 1's cascade, since a
+	// winner is in its own counter-conflicting set. Only the seeded replay of
+	// that intent repairs it, so it stays.
+	//
+	// Every other failure keeps the intent, a transient step-0 failure included,
+	// for the same reason. Completion is best-effort: a failed delete just leaves
+	// an intent that replays on the next restart.
 	defer func() {
-		if err == nil || refusedAtStep0.Load() {
+		if err == nil || (refusedAtStep0.Load() && intentInserted) {
 			_ = s.CompleteConflictIntent(ctx, walIntent.IntentID())
 		}
 	}()
@@ -590,7 +591,7 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 		TxHashes:    demotedTxHashes,
 		StartedAt:   time.Now().UnixNano(),
 	}
-	if beginErr := s.BeginConflictIntent(ctx, walIntent); beginErr != nil {
+	if _, beginErr := s.BeginConflictIntent(ctx, walIntent); beginErr != nil {
 		return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting] failed to record WAL intent before processing", beginErr)
 	}
 

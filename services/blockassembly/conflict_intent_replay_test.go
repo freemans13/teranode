@@ -61,8 +61,8 @@ func (s *replaySpyStore) PendingConflictIntents(_ context.Context) ([]utxo.Confl
 	return s.pending, s.pendingErr
 }
 
-func (s *replaySpyStore) BeginConflictIntent(_ context.Context, _ utxo.ConflictIntent) error {
-	return nil
+func (s *replaySpyStore) BeginConflictIntent(_ context.Context, _ utxo.ConflictIntent) (bool, error) {
+	return true, nil
 }
 
 func (s *replaySpyStore) CompleteConflictIntent(_ context.Context, intentID chainhash.Hash) error {
@@ -232,7 +232,8 @@ func TestReplayPendingConflictIntents_StaleForwardHealed(t *testing.T) {
 		TxHashes:    []chainhash.Hash{*txWHash},
 		StartedAt:   1,
 	}
-	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+	_, err = store.BeginConflictIntent(ctx, intent)
+	require.NoError(t, err)
 
 	// Block is off the longest chain → forward intent is stale → heal.
 	items.blockAssembler.blockchainClient = blockchainMembershipMock(false, false)
@@ -346,7 +347,8 @@ func TestReplayPendingConflictIntents_RealStoreReverseConverges(t *testing.T) {
 		TxHashes:    []chainhash.Hash{*txDHash},
 		StartedAt:   1,
 	}
-	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+	_, err = store.BeginConflictIntent(ctx, intent)
+	require.NoError(t, err)
 
 	pending, err := store.PendingConflictIntents(ctx)
 	require.NoError(t, err)
@@ -411,7 +413,8 @@ func TestReplayPendingConflictIntents_RealStoreForwardAlreadyApplied(t *testing.
 		TxHashes:    []chainhash.Hash{fx.winner},
 		StartedAt:   1,
 	}
-	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+	_, err := store.BeginConflictIntent(ctx, intent)
+	require.NoError(t, err)
 
 	// The intent's block is on the chain, so the forward intent is not stale.
 	items.blockAssembler.blockchainClient = blockchainMembershipMock(true, false)
@@ -452,7 +455,8 @@ func TestReplayPendingConflictIntents_StaleReverseLeavesResolvedWinnerAlone(t *t
 		TxHashes:    []chainhash.Hash{fx.winner},
 		StartedAt:   1,
 	}
-	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+	_, err := store.BeginConflictIntent(ctx, intent)
+	require.NoError(t, err)
 
 	// The block is on the longest chain again, so the reverse intent is stale.
 	items.blockAssembler.blockchainClient = blockchainMembershipMock(true, false)
@@ -618,7 +622,8 @@ func TestReplayPendingConflictIntents_DependentWinnersOneResolved(t *testing.T) 
 		TxHashes:    []chainhash.Hash{aHash, bHash},
 		StartedAt:   1,
 	}
-	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+	_, err = store.BeginConflictIntent(ctx, intent)
+	require.NoError(t, err)
 
 	bc := blockchainMembershipMock(true, false)
 	bc.On("CheckBlockIsAncestorOfBlock", mock.Anything, mock.Anything, mock.Anything).Return(true, nil)

@@ -37,6 +37,28 @@ func TestProcessConflicting_GuardFailureLeavesNoIntent(t *testing.T) {
 	require.Equal(t, []chainhash.Hash{spy.begun[0].IntentID()}, spy.completed, "a refusal that mutated nothing must take its intent back out of the WAL")
 }
 
+// TestProcessConflicting_RefusalKeepsAnEarlierRunsIntent pins that the refusal
+// above removes only an intent this call created. A failed earlier run of the
+// same list can leave a pending winner not conflicting: its rollback clears the
+// conflicting flag on all of step 1's cascade, and a winner is in its own
+// counter-conflicting set. The retry refuses that winner, and the intent the
+// failed run left is the only thing whose seeded replay repairs it.
+func TestProcessConflicting_RefusalKeepsAnEarlierRunsIntent(t *testing.T) {
+	ctx := context.Background()
+
+	winner := createTestHash("earlier-run-winner")
+
+	spy := &walSpyStore{MockUtxostore: &MockUtxostore{}, intentExists: true}
+	spy.On("Get", mock.Anything, &winner, mock.Anything).Return(&meta.Data{Tx: bt.NewTx(), Conflicting: false}, nil)
+
+	_, _, err := ProcessConflicting(ctx, spy, 100, chainhash.Hash{}, []chainhash.Hash{winner}, nil, NoAncestryGuard)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "tx is not conflicting")
+	require.Len(t, spy.begun, 1)
+	require.Empty(t, spy.completed, "a refusal must keep an intent an earlier run left behind")
+}
+
 // TestProcessConflicting_PartialStepOneKeepsIntent pins the other side of that
 // boundary. Step 1 marks the losers one cascade level per SetConflicting call,
 // each its own transaction, so a failure on a later level leaves the earlier
