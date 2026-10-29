@@ -186,6 +186,14 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		defer s.mainChainRebuilding.Add(-1)
 	}
 
+	// A non-extend runs reconcileOnMainChain, which can move chain membership. A background
+	// repair walk running without slowPathMu may have read its rows before that commits, so
+	// record the write and let the walk run again. An extend's INSERT adds a row and
+	// changes no existing one, so it needs no record.
+	if !onMainChain {
+		defer s.beginOnMainChainWrite()()
+	}
+
 	// The fork path writes the row and repairs on_main_chain in ONE transaction, so a
 	// failure between them cannot leave a committed block carrying a flag nothing will
 	// revisit. The reconciliation is a single statement bounded to the recent lineage,
@@ -396,10 +404,14 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 			// record it before this bracket drops the guard, so readers keep walking and the
 			// background repair clears it; the mark records this block's height, so the
 			// bounded walk reaches it however far the tip moves before the repair lands.
+			endWrite := s.beginOnMainChainWrite()
+
 			if _, clearErr := s.db.ExecContext(postBestCtx, `UPDATE blocks SET on_main_chain = false WHERE id = $1`, newBlockID); clearErr != nil {
 				s.logger.Errorf("StoreBlock: clear sibling-fork on_main_chain: %v", clearErr)
 				s.markOnMainChainDirty(false, int64(height), "store_block_fork_clear", clearErr)
 			}
+
+			endWrite()
 
 			if !guardWholeCall {
 				s.mainChainRebuilding.Add(-1)

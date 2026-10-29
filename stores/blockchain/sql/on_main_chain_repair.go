@@ -30,7 +30,7 @@ const (
 // behalf, so every flag reader keeps taking its flag-free walk, and the repair loop
 // retries rebuildOnMainChainFlag with backoff until an attempt lands. The count is
 // released by whichever repair lands first: the loop's own attempt, or a full rebuild a
-// later operator action runs successfully.
+// later operator action runs successfully while no loop attempt is in flight.
 type onMainChainRepairState struct {
 	mu sync.Mutex
 	// pending is true while a repair is owed.
@@ -49,6 +49,19 @@ type onMainChainRepairState struct {
 	generation uint64
 	// attempts counts failed loop attempts since the repair became owed.
 	attempts int
+	// chainWrites counts the starts and ends of slow-path writes that move chain
+	// membership: a fork-path StoreBlock, the sibling-fork clear, InvalidateBlock and
+	// RevalidateBlock. writing counts those still in flight. An attempt that does not
+	// hold slowPathMu reads its rows from a snapshot taken when it began, so a membership
+	// write that commits during the attempt can be overwritten by the attempt's older
+	// view without any row conflict to abort either. The loop compares both before and
+	// after an attempt and runs again when either moved.
+	chainWrites uint64
+	writing     int
+	// running is true while the loop has an attempt in flight. A rebuild outside the loop
+	// does not release the record then, because the attempt can commit after it from an
+	// older snapshot; the loop decides once the attempt has finished.
+	running bool
 	// backoff is the wait before the second attempt; it doubles from there. Tests
 	// shorten it.
 	backoff time.Duration
@@ -72,17 +85,21 @@ type onMainChainRepairState struct {
 // A failure while the store is shutting down is not recorded: it is almost always the
 // shutdown cancelling the write, and the record would die with the process anyway.
 func (s *SQL) markOnMainChainDirty(full bool, floor int64, path string, cause error) {
-	if s.closing() {
-		s.logger.Infof("on_main_chain: %s did not finish because the store is shutting down: %v", path, cause)
-
-		return
-	}
-
 	initPrometheusMetrics()
 
 	r := &s.onMainChainRepair
 
 	r.mu.Lock()
+
+	// Checked under r.mu: the loop releases its gauge under r.mu, and only after Close has
+	// signalled, so a mark either sees the store closing here or is seen by that release.
+	if s.closing() {
+		r.mu.Unlock()
+
+		s.logger.Infof("on_main_chain: %s did not finish because the store is shutting down: %v", path, cause)
+
+		return
+	}
 
 	if !r.pending {
 		r.pending = true
@@ -124,17 +141,42 @@ func (s *SQL) markOnMainChainDirty(full bool, floor int64, path string, cause er
 // onMainChainRepaired tells the record that a rebuild has just landed outside the loop.
 // A full walk satisfies any owed repair, because it leaves every flag right. A bounded
 // walk satisfies only an owed bounded repair.
+//
+// While a loop attempt is running the record is left alone. That attempt may commit after
+// this rebuild from a snapshot older than it, so only the loop can tell whether the flags
+// are right once it has finished. The callers run inside beginOnMainChainWrite, so the
+// loop sees the overlap and runs again.
 func (s *SQL) onMainChainRepaired(full bool) {
 	r := &s.onMainChainRepair
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !r.pending || (r.full && !full) {
+	if !r.pending || r.running || (r.full && !full) {
 		return
 	}
 
 	s.clearOnMainChainRepairLocked("a later rebuild")
+}
+
+// beginOnMainChainWrite records the start of a slow-path write that moves chain
+// membership and returns the function that records its end. The caller holds slowPathMu
+// and calls the returned function after its last commit, so a repair attempt whose
+// snapshot predates any of those commits sees the counters move and runs again.
+func (s *SQL) beginOnMainChainWrite() func() {
+	r := &s.onMainChainRepair
+
+	r.mu.Lock()
+	r.writing++
+	r.chainWrites++
+	r.mu.Unlock()
+
+	return func() {
+		r.mu.Lock()
+		r.writing--
+		r.chainWrites++
+		r.mu.Unlock()
+	}
 }
 
 // clearOnMainChainRepairLocked releases the record. The caller holds r.mu.
@@ -195,9 +237,11 @@ func (s *SQL) repairOnMainChainUntilClean() bool {
 		}
 
 		generation := r.generation
+		chainWrites := r.chainWrites
 		full := r.full
 		floor := r.floor
 		attempt := r.attempts + 1
+		r.running = true
 
 		r.mu.Unlock()
 
@@ -205,27 +249,27 @@ func (s *SQL) repairOnMainChainUntilClean() bool {
 
 		r.mu.Lock()
 
+		r.running = false
+
 		if err == nil {
-			if !r.pending {
-				// A rebuild outside the loop landed between this attempt's walk and
-				// now, and onMainChainRepaired already released the count. Releasing
-				// it again would drive mainChainRebuilding below zero. A mark recorded
-				// after that release sets pending again with a newer generation, so it
-				// takes the retry path below instead of this one.
-				r.mu.Unlock()
-
-				return true
-			}
-
-			if r.generation == generation {
+			// pending is still true here: nothing else clears the record while an attempt
+			// runs, because onMainChainRepaired leaves it alone until running drops.
+			raced := r.chainWrites != chainWrites || r.writing > 0
+			if !raced && r.generation == generation {
 				s.clearOnMainChainRepairLocked("the background repair")
 				r.mu.Unlock()
 
 				return true
 			}
 
-			// A new failure was recorded while this attempt ran, so run again against it.
+			// A new failure was recorded while this attempt ran, or a membership write
+			// overlapped it and the attempt may have committed an older view over it.
+			// Either way the flags are not known to be right, so run again at once.
 			r.mu.Unlock()
+
+			if raced {
+				s.logger.Infof("on_main_chain repair attempt %d overlapped a chain write, running it again", attempt)
+			}
 
 			continue
 		}
@@ -256,13 +300,20 @@ func (s *SQL) repairOnMainChainUntilClean() bool {
 // held, so no slow-path writer interleaves with a walk over the rows at the tip. It is
 // short: the window is the tip's plus the recorded floor, under a 30 s budget.
 //
-// A full attempt does not take slowPathMu. It can run for up to 30 min, and while the
-// database stays slow it is retried every 30 s, so holding the lock would stop block
-// storage for as long as the fault lasts. It runs the way the startup rebuild always has:
-// readers are on their flag-free walk because of the guard, rows a concurrent StoreBlock
-// inserts are flagged by that StoreBlock, and on Postgres a write-write conflict with a
-// concurrent slow path aborts the REPEATABLE READ walk, which rebuildOnMainChainFlag
-// retries.
+// On PostgreSQL a full attempt does not take slowPathMu. It can run for up to 30 min, and
+// while the database stays slow it is retried every 30 s, so holding the lock would stop
+// block storage for as long as the fault lasts. Readers are on their flag-free walk
+// because of the guard, and rows a concurrent StoreBlock inserts are flagged by that
+// StoreBlock. A membership write that commits during the attempt can touch only rows the
+// attempt does not, so REPEATABLE READ aborts neither, and the attempt can then commit
+// its older view over the write. The loop catches that through beginOnMainChainWrite and
+// runs the attempt again before it releases the guard. A fork-path StoreBlock whose
+// reconcile updates a row the walk has already updated still waits for the walk to
+// commit, with slowPathMu held.
+//
+// On SQLite a full attempt does take slowPathMu. SQLite lets one writer in at a time, so a
+// long walk would make each StoreBlock that needs to write fail with SQLITE_BUSY after the
+// 5 s busy timeout; waiting on the lock delays block storage without failing it.
 func (s *SQL) runOnMainChainRepair(full bool, floor int64) error {
 	timeout := rebuildOffChainSetTimeout
 	if full {
@@ -272,7 +323,7 @@ func (s *SQL) runOnMainChainRepair(full bool, floor int64) error {
 	ctx, cancel := s.shutdownAwareContext(timeout)
 	defer cancel()
 
-	if !full {
+	if !full || !s.unlockedFullRepair {
 		s.slowPathMu.Lock()
 		defer s.slowPathMu.Unlock()
 	}

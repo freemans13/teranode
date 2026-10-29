@@ -2,6 +2,7 @@ package sql
 
 import (
 	"context"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,9 @@ import (
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/test/utils/postgres"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -102,7 +106,8 @@ func waitForRepair(t *testing.T, s *SQL) {
 
 // A successful operator rebuild can acknowledge the repair after the worker has
 // selected its generation but before the worker accounts for its own success.
-// Both acknowledgments must release the pending repair's guard only once.
+// The acknowledgment leaves the record to the running attempt, so the guard is
+// released only once.
 func TestOnMainChainRepairDoesNotClearAnAlreadyRepairedGeneration(t *testing.T) {
 	s := newOnMainChainTestStore(t)
 	storeBlocks(t, s, block1, block2)
@@ -337,19 +342,146 @@ func TestOnMainChainRepairKeepsTheRecordedFloorAsTheTipMoves(t *testing.T) {
 
 // TestOnMainChainRepairWithoutAFloorWalksToGenesis: a bounded mark that cannot name the
 // lowest stale height cannot be covered by any bounded window, so it is owed a full walk.
+// That walk holds slowPathMu on SQLite, where a long write would otherwise make StoreBlock
+// fail on the busy timeout, and runs without it on PostgreSQL.
 func TestOnMainChainRepairWithoutAFloorWalksToGenesis(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		unlocked bool
+	}{
+		{name: "sqlite holds the lock", unlocked: false},
+		{name: "postgres runs without the lock", unlocked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newOnMainChainTestStore(t)
+			require.False(t, s.unlockedFullRepair, "a SQLite store holds the lock for a full repair")
+			s.unlockedFullRepair = tc.unlocked
+
+			setRepairBackoff(t, s, time.Millisecond)
+			storeBlocks(t, s, block1, block2)
+
+			fault := installRebuildFault(s)
+			fault.failing.Store(false)
+
+			s.markOnMainChainDirty(false, noRepairFloor, "test", errors.NewStorageError("injected"))
+			waitForRepair(t, s)
+
+			require.Equal(t, []bool{true}, fault.walks())
+			require.Equal(t, []bool{!tc.unlocked}, fault.lockHeld())
+		})
+	}
+}
+
+// TestOnMainChainRepairRerunsWhenAChainWriteOverlapsIt: a full walk that runs without
+// slowPathMu reads its rows from a snapshot taken when it began. RevalidateBlock can commit
+// in the meantime, its own rebuild can land and acknowledge the repair, and then the walk
+// commits its older view. On PostgreSQL the two touch different rows, so neither aborts.
+// The repair must not release the guard on that walk. It must run again.
+//
+// SQLite cannot hold two writers open at once, so this test stands in for the stale
+// commit: the loop's first attempt waits until RevalidateBlock has finished and then writes
+// what a walk from the old snapshot would write. The PostgreSQL test below runs the real
+// walk.
+func TestOnMainChainRepairRerunsWhenAChainWriteOverlapsIt(t *testing.T) {
 	s := newOnMainChainTestStore(t)
+	s.unlockedFullRepair = true
 	setRepairBackoff(t, s, time.Millisecond)
-	storeBlocks(t, s, block1, block2)
 
-	fault := installRebuildFault(s)
-	fault.failing.Store(false)
+	ctx := context.Background()
 
-	s.markOnMainChainDirty(false, noRepairFloor, "test", errors.NewStorageError("injected"))
+	// Main chain genesis -> 1 -> 2 -> 3, and a fork 1 -> alt2 -> alt3 -> alt4 that wins
+	// once alt4 is valid. Park alt4, so block3 is the best.
+	alt3 := createBlock3OnFork(blockAlternative2)
+	alt4 := createBlock3OnFork(alt3)
+	storeBlocks(t, s, block1, block2, block3, blockAlternative2, alt3, alt4)
+	_, err := s.InvalidateBlock(ctx, alt4.Hash())
+	require.NoError(t, err)
+	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
+
+	var calls atomic.Int32
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	s.rebuildTxHook = func(ctx context.Context, full bool, floor int64) error {
+		if calls.Add(1) != 1 {
+			return s.rebuildOnMainChainFlagTx(ctx, full, floor)
+		}
+
+		close(started)
+		<-release
+
+		// The walk's snapshot predates the revalidation: block3's chain was the best.
+		_, err := s.db.ExecContext(ctx, `UPDATE blocks SET on_main_chain = (hash IN ($1, $2)) WHERE height IN (2, 3, 4)`,
+			block2.Hash().CloneBytes(), block3.Hash().CloneBytes())
+
+		return err
+	}
+
+	gaugeBefore := repairPending(t)
+	s.markOnMainChainDirty(true, noRepairFloor, "test", errors.NewStorageError("injected"))
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the repair's first attempt did not start")
+	}
+
+	// alt4 becomes the best again, and RevalidateBlock's own rebuild lands while the
+	// loop's attempt is still in flight.
+	require.NoError(t, s.RevalidateBlock(ctx, alt4.Hash()))
+	require.True(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()))
+	require.Positive(t, s.mainChainRebuilding.Load(), "an acknowledgment during an attempt does not drop the guard")
+
+	close(release)
 	waitForRepair(t, s)
 
-	require.Equal(t, []bool{true}, fault.walks())
-	require.Equal(t, []bool{false}, fault.lockHeld(), "the full walk does not hold slowPathMu")
+	require.False(t, getOnMainChain(t, s, block3.Hash().CloneBytes()), "the rerun undoes the stale walk's write")
+	require.False(t, getOnMainChain(t, s, block2.Hash().CloneBytes()))
+	require.True(t, getOnMainChain(t, s, alt3.Hash().CloneBytes()))
+	require.True(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()))
+	require.EqualValues(t, 3, calls.Load(), "the stale attempt, RevalidateBlock's rebuild, and the rerun")
+	require.Equal(t, gaugeBefore, repairPending(t))
+}
+
+// TestStartupBoundedRebuildFailureKeepsItsWindowAsTheFloor: a failed bounded startup
+// rebuild is owed a bounded repair that still reaches the bottom of the window the startup
+// rebuild meant to cover, however far the tip moves before the repair lands.
+func TestStartupBoundedRebuildFailureKeepsItsWindowAsTheFloor(t *testing.T) {
+	s := newOnMainChainTestStoreWith(t, func(ts *settings.Settings) {
+		ts.ChainCfgParams.CoinbaseMaturity = 0
+	})
+	setRepairBackoff(t, s, 20*time.Millisecond)
+
+	storeBlocks(t, s, block1, block2)
+
+	// block2, at the tip at startup, is the row the previous process left wrong.
+	_, err := s.db.Exec(`UPDATE blocks SET on_main_chain = false WHERE hash = $1`, block2.Hash().CloneBytes())
+	require.NoError(t, err)
+
+	fault := installRebuildFault(s)
+
+	s.startupRebuildOnMainChain(context.Background(), false)
+	require.Positive(t, s.mainChainRebuilding.Load(), "a repair is owed")
+
+	require.Eventually(t, func() bool { return fault.calls.Load() >= 2 }, 5*time.Second, time.Millisecond, "the loop's first attempt runs")
+
+	// The tip moves past the startup window while the repair is failing.
+	storeBlocks(t, s, block3)
+
+	fault.failing.Store(false)
+	waitForRepair(t, s)
+
+	require.True(t, getOnMainChain(t, s, block2.Hash().CloneBytes()), "the repair reaches the startup window below the moved tip")
+
+	walks := fault.walks()
+	floors := fault.floorsSeen()
+
+	// The first call is the startup rebuild itself; the rest are the loop's attempts.
+	for i := 1; i < len(walks); i++ {
+		require.False(t, walks[i], "attempt %d stays bounded", i)
+		require.EqualValues(t, block2.Height, floors[i], "attempt %d keeps the startup window's bottom as its floor", i)
+	}
 }
 
 // TestOnMainChainMarkDropsCachedAnswers: GetBlockByHeight answers from the response cache
@@ -445,4 +577,87 @@ func TestALaterFullRebuildClearsThePendingRepair(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the repair loop did not stop on shutdown")
 	}
+}
+
+// TestOnMainChainRepairRacingRevalidate_PostgreSQL runs the overlap with the real walk on
+// the engine where the full repair runs without slowPathMu. The loop's walk is held after it
+// has taken its snapshot, with block3's chain as the best and block3's flag left false by
+// the failed write it is owed for. RevalidateBlock then makes alt4 the best and its own
+// rebuild commits. The held walk resumes and sets block3 true from its old snapshot. The
+// two rebuilds update different rows, so neither aborts, and without the rerun the table
+// ends with both block3 and alt3 flagged at height 3.
+func TestOnMainChainRepairRacingRevalidate_PostgreSQL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping PostgreSQL tests in short mode")
+	}
+
+	connStr, teardown, err := postgres.SetupTestPostgresContainer()
+	if err != nil {
+		t.Skipf("PostgreSQL container not available: %v", err)
+	}
+
+	t.Cleanup(func() { _ = teardown() })
+
+	storeURL, err := url.Parse(connStr)
+	require.NoError(t, err)
+
+	s, err := New(ulogger.TestLogger{}, storeURL, test.CreateBaseTestSettings(t))
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	waitForStartupRebuild(t, s)
+
+	require.True(t, s.unlockedFullRepair, "a PostgreSQL store runs the full repair without slowPathMu")
+	setRepairBackoff(t, s, time.Millisecond)
+
+	ctx := context.Background()
+
+	alt3 := createBlock3OnFork(blockAlternative2)
+	alt4 := createBlock3OnFork(alt3)
+	storeBlocks(t, s, block1, block2, block3, blockAlternative2, alt3, alt4)
+	_, err = s.InvalidateBlock(ctx, alt4.Hash())
+	require.NoError(t, err)
+	require.True(t, getOnMainChain(t, s, block3.Hash().CloneBytes()))
+
+	// The stale flag the failed write left behind.
+	_, err = s.db.Exec(`UPDATE blocks SET on_main_chain = false WHERE hash = $1`, block3.Hash().CloneBytes())
+	require.NoError(t, err)
+
+	var snapshots atomic.Int32
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	s.rebuildSnapshotHook = func(bool) {
+		if snapshots.Add(1) != 1 {
+			return
+		}
+
+		close(started)
+		<-release
+	}
+
+	gaugeBefore := repairPending(t)
+	s.markOnMainChainDirty(true, noRepairFloor, "test", errors.NewStorageError("injected"))
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the repair's walk did not reach its snapshot")
+	}
+
+	require.NoError(t, s.RevalidateBlock(ctx, alt4.Hash()))
+	require.True(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()))
+
+	close(release)
+	waitForRepair(t, s)
+
+	var atHeight3 int
+	require.NoError(t, s.db.QueryRow(`SELECT count(*) FROM blocks WHERE height = 3 AND on_main_chain = true`).Scan(&atHeight3))
+	require.Equal(t, 1, atHeight3, "one block per height on the main chain")
+	require.False(t, getOnMainChain(t, s, block3.Hash().CloneBytes()), "the rerun undoes the held walk's write")
+	require.True(t, getOnMainChain(t, s, alt3.Hash().CloneBytes()))
+	require.True(t, getOnMainChain(t, s, alt4.Hash().CloneBytes()))
+	require.GreaterOrEqual(t, snapshots.Load(), int32(3), "the held walk, RevalidateBlock's rebuild, and the rerun")
+	require.Equal(t, gaugeBefore, repairPending(t))
 }

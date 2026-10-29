@@ -105,6 +105,14 @@ type SQL struct {
 	// database fault. Per store for the same reason as reconcileHook. Always nil in
 	// production.
 	rebuildTxHook func(ctx context.Context, full bool, floor int64) error
+	// rebuildSnapshotHook, when set by a test, runs inside each on_main_chain rebuild
+	// transaction once it has read the best block, so a test can hold a walk at its
+	// snapshot while another writer commits. Always nil in production.
+	rebuildSnapshotHook func(full bool)
+	// unlockedFullRepair is true when the background on_main_chain repair runs its full
+	// walk without slowPathMu. Only PostgreSQL, which lets other writers in while the walk
+	// runs; see runOnMainChainRepair.
+	unlockedFullRepair bool
 	// onMainChainRepair records a failed on_main_chain write that the running process
 	// still owes a repair for. See on_main_chain_repair.go.
 	onMainChainRepair onMainChainRepairState
@@ -325,6 +333,7 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 		useInMemoryChainCheck:   useInMemory,
 		chainCheckShadowCompare: tSettings.BlockChain.ChainCheckShadowCompare,
 		blockTimestampCache:     newBlockTimestampCache(),
+		unlockedFullRepair:      util.SQLEngine(storeURL.Scheme) == util.Postgres,
 	}
 
 	s.backgroundDone = make(chan struct{})
@@ -420,23 +429,7 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 			rebuildTimeout = migrationFullRebuildTimeout
 		}
 		rebuildCtx, rebuildCancel := s.shutdownAwareContext(rebuildTimeout)
-		// A failed startup rebuild used to leave whatever the previous process wrote, or
-		// an unpopulated column after a migration, trusted by every reader once this
-		// goroutine released the guard. Record it so the guard stays up and the repair
-		// loop retries the same walk until it lands.
-		//
-		// A failed bounded rebuild is owed a full walk: its window was measured from the tip
-		// at startup, and the tip can move before the repair lands, so no bounded window can
-		// be shown to cover the rows the previous process left. The repair's full walk does
-		// not hold slowPathMu, the same as this startup rebuild.
-		if rebuildErr := s.rebuildOnMainChainFlag(rebuildCtx, full); rebuildErr != nil {
-			if s.closing() {
-				s.logger.Infof("startup: rebuildOnMainChainFlag stopped by shutdown: %v", rebuildErr)
-			} else {
-				s.logger.Errorf("startup: rebuildOnMainChainFlag: %v", rebuildErr)
-				s.markOnMainChainDirty(true, noRepairFloor, "startup_rebuild", rebuildErr)
-			}
-		}
+		s.startupRebuildOnMainChain(rebuildCtx, full)
 		rebuildCancel()
 
 		if useInMemory {
@@ -1678,6 +1671,58 @@ func (s *SQL) rebuildOnMainChainFlag(ctx context.Context, full bool) error {
 	return s.rebuildOnMainChainFlagFrom(ctx, full, noRepairFloor)
 }
 
+// startupRebuildOnMainChain runs the startup rebuild New launches and records a failure.
+//
+// A failed startup rebuild used to leave whatever the previous process wrote, or an
+// unpopulated column after a migration, trusted by every reader once New's goroutine
+// released the guard. A failure is now recorded, so the guard stays up and the repair
+// loop retries until it lands.
+//
+// A failed bounded rebuild is owed a bounded repair whose floor is the bottom of the
+// window this rebuild is about to walk, read before it starts. The window of each retry
+// is measured from the tip at that retry, and the floor keeps it reaching down to the
+// rows this rebuild was meant to cover however far the tip moves. Only when the floor
+// cannot be read is the repair a full walk.
+func (s *SQL) startupRebuildOnMainChain(ctx context.Context, full bool) {
+	floor := noRepairFloor
+	if !full {
+		floor = s.boundedRebuildWindowBottom(ctx)
+	}
+
+	rebuildErr := s.rebuildOnMainChainFlag(ctx, full)
+	if rebuildErr == nil {
+		return
+	}
+
+	if s.closing() {
+		s.logger.Infof("startup: rebuildOnMainChainFlag stopped by shutdown: %v", rebuildErr)
+
+		return
+	}
+
+	s.logger.Errorf("startup: rebuildOnMainChainFlag: %v", rebuildErr)
+	s.markOnMainChainDirty(full, floor, "startup_rebuild", rebuildErr)
+}
+
+// boundedRebuildWindowBottom returns the lowest height a bounded rebuild started now
+// would walk: the best block's height less 10×CoinbaseMaturity, clamped at zero. It
+// returns noRepairFloor when the best block cannot be read.
+func (s *SQL) boundedRebuildWindowBottom(ctx context.Context) int64 {
+	var bestHeight int64
+
+	err := s.db.QueryRowContext(ctx, `SELECT height FROM blocks WHERE invalid = false ORDER BY chain_work DESC, peer_id ASC, id ASC LIMIT 1`).Scan(&bestHeight)
+	if err != nil {
+		return noRepairFloor
+	}
+
+	bottom := bestHeight - int64(10)*int64(s.chainParams.CoinbaseMaturity)
+	if bottom < 0 {
+		bottom = 0
+	}
+
+	return bottom
+}
+
 // rebuildOnMainChainFlagFrom is rebuildOnMainChainFlag with a floor for the bounded walk:
 // when floor is not noRepairFloor, the window reaches down to it even if the tip has moved
 // more than 10×CoinbaseMaturity above it. The background repair passes the lowest height
@@ -1692,10 +1737,10 @@ func (s *SQL) rebuildOnMainChainFlagFrom(ctx context.Context, full bool, floor i
 	// transaction can abort with 40001 (serialization_failure) or 40P01
 	// (deadlock_detected) if a concurrent committed transaction modified a row it
 	// writes. Two callers run without slowPathMu held: the startup goroutine (see
-	// New) and the background repair's full walk (see runOnMainChainRepair);
-	// Invalidate/Revalidate hold slowPathMu and StoreBlock holds it for its whole
-	// duration, so they cannot conflict. Those two can, however, race a slow-path
-	// StoreBlock UPDATE — so retry the whole
+	// New) and, on PostgreSQL, the background repair's full walk (see
+	// runOnMainChainRepair); Invalidate/Revalidate hold slowPathMu and StoreBlock
+	// holds it for its whole duration, so they cannot conflict. Those two can,
+	// however, race a slow-path write to the same rows — so retry the whole
 	// transaction (begin → reads → UPDATEs → commit) as a unit on those codes.
 	// tx.ExecContext / tx.QueryRowContext are stdlib *sql.Tx methods and do NOT
 	// go through usql's per-statement retry, so the retry has to live here.
@@ -1793,6 +1838,10 @@ func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool, floor int
 			return err
 		}
 		return errors.NewStorageError("rebuildOnMainChainFlag: failed to get best block", err)
+	}
+
+	if s.rebuildSnapshotHook != nil {
+		s.rebuildSnapshotHook(full)
 	}
 
 	// Compute the walk bound. full=true walks to genesis (windowBottom=0); otherwise

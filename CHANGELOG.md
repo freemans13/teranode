@@ -115,7 +115,12 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   background loop retries the repair every 1 s to 30 s. A repair that only needs the
   rows near the tip holds the lock `StoreBlock` takes, so while the database keeps
   failing, each attempt can delay block storage by up to 30 s. A repair that walks the
-  whole chain does not hold that lock. Operators can watch
+  whole chain does not hold that lock on PostgreSQL, but a `StoreBlock` that reorganises
+  the chain can still wait for it, up to 30 min, when it needs a row the walk has already
+  updated; if a chain change overlaps the walk, the walk runs again before readers go
+  back to the column. On SQLite the whole-chain repair does hold the lock, because SQLite
+  admits one writer at a time and `StoreBlock` would otherwise fail after its 5 s busy
+  timeout. Operators can watch
   `teranode_blockchain_sql_on_main_chain_repair_pending` (above 0 while a repair is
   owed) and `teranode_blockchain_sql_on_main_chain_write_failures{path}`. No action is
   needed. (#2049)
