@@ -399,6 +399,19 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   or that hits a UTXO hash mismatch in this node's store, stays a local fault.
   (#2022)
 
+- **Catchup rejects headers that do not form one chain on the common ancestor.**
+  Before, a peer could offer headers whose first entry built on some other stored
+  block, and catchup carried on under the wrong heights with only a warning. Now
+  catchup stops before it touches local state, and the error is coded
+  `NETWORK_INVALID_RESPONSE`, so it is charged to the peer. A header batch whose
+  headers do not link to each other, or that does not build on the last header of
+  the batch before it, is rejected the same way as soon as it arrives, before the
+  fetch is counted as a success for the peer. Catchup also now clears
+  `mined_set` on the blocks a fork replaces only after every header check has
+  passed, just before it fetches blocks, so a fork rejected by a later check, or a
+  peer with nothing past the ancestor, no longer un-stamps the node's own blocks.
+  No action needed. (#2034)
+
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
   `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
