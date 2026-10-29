@@ -326,6 +326,10 @@ func (p *parentUpdateInfo) merge(other *parentUpdateInfo) {
 type pendingDeletion struct {
 	txHash *chainhash.Hash
 	keys   []*aerospike.Key
+	// page is set when the scanned record is a pagination record found on its
+	// own, so keys holds no master record. A refused page delete must not read
+	// as the master surviving: see executeBatchDeletions.
+	page bool
 }
 
 // externalFileInfo holds information about external files to delete
@@ -1281,7 +1285,7 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		// Accumulate deletions (master + pagination records), grouped by the
 		// transaction they belong to so flushCleanupBatches can hold back exactly
 		// the records whose parent markers did not land.
-		deletion := &pendingDeletion{txHash: txHash, keys: []*aerospike.Key{rec.Record.Key}}
+		deletion := &pendingDeletion{txHash: txHash, keys: []*aerospike.Key{rec.Record.Key}, page: s.isPaginationRecord(rec.Record, txHash)}
 
 		if totalExtraRecs, hasExtraRecs := rec.Record.Bins[s.fieldTotalExtraRecs].(int); hasExtraRecs && totalExtraRecs > 0 {
 			for i := 1; i <= totalExtraRecs; i++ {
@@ -3147,6 +3151,23 @@ func (s *Service) executeBatchParentUpdatesBatchWrite(ctx context.Context, updat
 	return s.reportParentUpdateTally(tally, len(batchRecords)), nil
 }
 
+// isPaginationRecord reports whether a scanned record is one of txHash's
+// pagination records rather than its master. A master carries the
+// totalExtraRecs bin, or, from a writer that does not set it, is stored under
+// the bare txid; a pagination record is neither.
+func (s *Service) isPaginationRecord(record *aerospike.Record, txHash *chainhash.Hash) bool {
+	if _, isMaster := record.Bins[s.fieldTotalExtraRecs]; isMaster {
+		return false
+	}
+
+	masterKey, err := aerospike.NewKey(s.namespace, s.set, uaerospike.CalculateKeySourceInternal(txHash, 0))
+	if err != nil {
+		return false
+	}
+
+	return !bytes.Equal(masterKey.Digest(), record.Key.Digest())
+}
+
 // executeBatchDeletions performs Phase 2b: removes child transaction records from Aerospike
 // after their parents have been updated (Phase 2a).
 //
@@ -3182,7 +3203,8 @@ func (s *Service) executeBatchDeletions(ctx context.Context, deletions []*pendin
 
 	keys := make([]*aerospike.Key, 0, len(deletions))
 	// masters maps the index of each child's master record in the batch to the
-	// child. keys[0] of a pendingDeletion is always the master record.
+	// child. keys[0] of a pendingDeletion is the master record, except for a
+	// pagination record scanned on its own, which has no master in the batch.
 	masters := make(map[int]*chainhash.Hash, len(deletions))
 
 	for _, deletion := range deletions {
@@ -3190,7 +3212,10 @@ func (s *Service) executeBatchDeletions(ctx context.Context, deletions []*pendin
 			continue
 		}
 
-		masters[len(keys)] = deletion.txHash
+		if !deletion.page {
+			masters[len(keys)] = deletion.txHash
+		}
+
 		keys = append(keys, deletion.keys...)
 	}
 
