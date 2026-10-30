@@ -3687,18 +3687,15 @@ outside:
 			}
 
 		case wire.InvTypeTx:
-			// Request the transaction if there is not already a pending request.
-			if _, requested := sm.requestedTxns.Get(iv.Hash); !requested {
-				if err := gdmsg.AddInvVect(iv); err != nil {
-					sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
-					break outside
-				}
-
-				sm.requestedTxns.Set(iv.Hash, struct{}{})
-				state.requestedTxns.Set(iv.Hash, struct{}{})
-
-				numRequested++
+			// Marked in requestedTxns by lookupInvBatch before the store read
+			// that put it here, so no check and no mark: a check here would
+			// skip every transaction the worker asked for.
+			if err := gdmsg.AddInvVect(iv); err != nil {
+				sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
+				break outside
 			}
+
+			numRequested++
 		}
 
 		// Dealt with one way or the other, so it comes off the queue. Every path
@@ -3852,6 +3849,11 @@ func (sm *SyncManager) blockHandler() {
 	// The relayed-transaction workers stop on quit, as this handler does.
 	for i := 0; i < sm.relayTxWorkers; i++ {
 		go sm.relayTxWorker()
+	}
+
+	// So do the announcement lookup workers; see inv_queue.go.
+	for i := 0; i < invLookupWorkers; i++ {
+		go sm.invLookupWorker()
 	}
 
 	// start the block queue handler
@@ -4728,10 +4730,14 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		settings:     tSettings,
 		peerNotifier: config.PeerNotifier,
 		// txMemPool:     config.TxMemPool,
-		orphanTxs:      expiringmap.New[chainhash.Hash, *orphanTxAndParents](tSettings.Legacy.OrphanEvictionDuration).WithMaxSize(tSettings.Legacy.MaxOrphanTxs),
-		chainParams:    config.ChainParams,
-		rejectedTxns:   txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns), // limit map size to maxRejectedTxns
-		requestedTxns:  expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
+		orphanTxs:    expiringmap.New[chainhash.Hash, *orphanTxAndParents](tSettings.Legacy.OrphanEvictionDuration).WithMaxSize(tSettings.Legacy.MaxOrphanTxs),
+		chainParams:  config.ChainParams,
+		rejectedTxns: txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns), // limit map size to maxRejectedTxns
+		// Hashes being looked up or asked for; ten seconds for a peer to answer
+		// a getdata. Capped at the announcement queue cap with one-step
+		// eviction, because a flood of unique hashes fills it at the lookup
+		// rate times ten seconds; an eviction costs one duplicate request.
+		requestedTxns:  expiringmap.New[chainhash.Hash, struct{}](10 * time.Second).WithMaxSize(invCap).WithRandomEviction(),
 		blockDownloads: newBlockDownloadTracker(assignmentCeiling),
 		peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		// progressLogger:  newBlockProgressLogger("Processed", log),

@@ -2,8 +2,11 @@ package netsync
 
 import (
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/settings"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
@@ -154,4 +157,170 @@ func (sm *SyncManager) releaseInvChunk(c *invChunk) {
 	n := int64(len(c.items))
 	c.state.queuedInvs.Add(-n)
 	prometheusLegacyNetsyncInvQueuedHashes.Set(float64(sm.invQueued.Add(-n)))
+}
+
+// takeInvBatch returns first plus, without waiting, further chunks from the
+// queue until the batch holds at least txInvLookupChunk hashes or the queue
+// is empty. Under load a batch spans many peers' small announcements, which
+// is the cross-peer batching the shared get batcher gave, without its 10 ms
+// timer; at a quiet tip a one-hash batch goes out at once.
+func (sm *SyncManager) takeInvBatch(first *invChunk) []*invChunk {
+	chunks := []*invChunk{first}
+	total := len(first.items)
+
+	for total < txInvLookupChunk {
+		select {
+		case c := <-sm.invQueue:
+			chunks = append(chunks, c)
+			total += len(c.items)
+		default:
+			return chunks
+		}
+	}
+
+	return chunks
+}
+
+// lookupInvBatch is one worker step. It takes a batch starting with first,
+// marks each hash it is going to read in requestedTxns, reads the batch from
+// the UTXO store in one call, appends every hash the store lacks to its
+// peer's request queue, and gives every chunk's hashes back to the counts. It
+// returns the chunks whose peer's request queue gained items, for
+// sendInvRequests.
+//
+// Before the read, in queue order, a hash is skipped when its peer is no
+// longer registered under the same state (it left, or reconnected), when it
+// has been rejected, or when SetIfAbsent finds it marked already: another
+// peer's copy is being read, or was requested within the last ten seconds.
+// Marking before the read, rather than after it in the drain, is what makes
+// the copies from other peers that arrive during the read skip the store too;
+// a transaction every peer announces is read about once instead of once per
+// peer. A hash the store turns out to hold stays marked until it expires,
+// which blocks nothing because the node holds it.
+//
+// A failed read unmarks the whole batch so the next announcement retries, and
+// counts the hashes under lookup_failed. A per-item error other than
+// not-found unmarks that hash and is counted in one warning for the batch,
+// as checkTxInvs did per chunk.
+func (sm *SyncManager) lookupInvBatch(first *invChunk) []*invChunk {
+	chunks := sm.takeInvBatch(first)
+
+	defer func() {
+		for _, c := range chunks {
+			sm.releaseInvChunk(c)
+		}
+	}()
+
+	items := make([]*utxostore.UnresolvedMetaData, 0, txInvLookupChunk)
+	invs := make([]*wire.InvVect, 0, txInvLookupChunk)
+	owners := make([]*invChunk, 0, txInvLookupChunk)
+
+	for _, c := range chunks {
+		if current, ok := sm.peerStates.Get(c.peer); !ok || current != c.state {
+			continue
+		}
+
+		for _, iv := range c.items {
+			if _, rejected := sm.rejectedTxns.Get(iv.Hash); rejected {
+				continue
+			}
+
+			if !sm.requestedTxns.SetIfAbsent(iv.Hash, struct{}{}) {
+				continue
+			}
+
+			items = append(items, &utxostore.UnresolvedMetaData{Hash: iv.Hash, Idx: len(items)})
+			invs = append(invs, iv)
+			owners = append(owners, c)
+		}
+	}
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	if err := sm.utxoStore.BatchDecorate(sm.ctx, items, fields.Fee); err != nil {
+		for _, item := range items {
+			sm.requestedTxns.Delete(item.Hash)
+		}
+
+		sm.logger.Warnf("[lookupInvBatch] Unexpected failure when checking %d announced transactions for existing inventory: %v", len(items), err)
+		prometheusLegacyNetsyncInvDropped.WithLabelValues(invDropLookupFailed).Add(float64(len(items)))
+
+		return nil
+	}
+
+	var (
+		touched  []*invChunk
+		seen     = make(map[*invChunk]struct{})
+		failed   int
+		firstErr error
+	)
+
+	for i, item := range items {
+		if item.Err == nil && item.Data != nil {
+			// Held: processed completely at our end.
+			continue
+		}
+
+		if item.Err != nil && !errors.Is(item.Err, errors.ErrTxNotFound) {
+			sm.requestedTxns.Delete(item.Hash)
+
+			failed++
+
+			if firstErr == nil {
+				firstErr = item.Err
+			}
+
+			continue
+		}
+
+		c := owners[i]
+		c.state.requestQueue.Append(invs[i])
+
+		if _, done := seen[c]; !done {
+			seen[c] = struct{}{}
+			touched = append(touched, c)
+		}
+	}
+
+	if failed > 0 {
+		sm.logger.Warnf("[lookupInvBatch] Unexpected failure when checking %d of %d announced transactions for existing inventory, first: %v", failed, len(items), firstErr)
+	}
+
+	return touched
+}
+
+// sendInvRequests drains the request queue of each distinct peer in touched
+// into a getdata and queues it to the peer, as handleInvMsg does after its
+// block pass.
+func (sm *SyncManager) sendInvRequests(touched []*invChunk) {
+	sent := make(map[*peerpkg.Peer]struct{}, len(touched))
+
+	for _, c := range touched {
+		if _, done := sent[c.peer]; done {
+			continue
+		}
+
+		sent[c.peer] = struct{}{}
+
+		gdmsg := sm.drainRequestQueue(c.peer, c.state)
+		if len(gdmsg.InvList) > 0 {
+			sm.logger.Debugf("[lookupInvBatch] Requesting %d transactions from %s", len(gdmsg.InvList), c.peer)
+			c.peer.QueueMessage(gdmsg, nil)
+		}
+	}
+}
+
+// invLookupWorker looks up queued announcements until quit closes.
+// blockHandler starts invLookupWorkers of them.
+func (sm *SyncManager) invLookupWorker() {
+	for {
+		select {
+		case <-sm.quit:
+			return
+		case c := <-sm.invQueue:
+			sm.sendInvRequests(sm.lookupInvBatch(c))
+		}
+	}
 }

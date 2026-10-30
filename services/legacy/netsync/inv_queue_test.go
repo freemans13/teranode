@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -23,6 +25,11 @@ func txInvs(n int, tag byte) []*wire.InvVect {
 	}
 
 	return items
+}
+
+// inv is one transaction announcement for h.
+func inv(h chainhash.Hash) *wire.InvVect {
+	return wire.NewInvVect(wire.InvTypeTx, &h)
 }
 
 // droppedInvs reads the announcement drop counter for one reason.
@@ -121,4 +128,123 @@ func TestAdmitTxInvs_AFullChannelDropsUnderNodeCap(t *testing.T) {
 	require.Equal(t, int64(1), sm.invQueued.Load())
 	require.Equal(t, int64(1), state.queuedInvs.Load())
 	require.Equal(t, before+1, droppedInvs("node_cap"))
+}
+
+// TestLookupInvBatch_CoalescesAcrossPeersAndRequestsPerPeer pins the batching
+// that replaces the shared get batcher's timer: two peers' small announcements
+// queued before a worker runs go to the store in one read, each peer's
+// request queue gains its own missing hashes, and every count is given back.
+func TestLookupInvBatch_CoalescesAcrossPeersAndRequestsPerPeer(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	store := newLookupStore(t, tSettings, "inv_queue_coalesce")
+	sm, p, state, _ := newInvHarness(t, tSettings, store, blockchain2.FSMStateRUNNING)
+	p2, state2 := newHarnessPeer(t, sm)
+
+	sm.admitTxInvs(p, state, txInvs(10, 0x01))
+	sm.admitTxInvs(p2, state2, txInvs(10, 0x02))
+
+	touched := sm.lookupInvBatch(<-sm.invQueue)
+
+	require.Equal(t, int64(1), store.batches.Load(), "both peers' chunks go to the store in one read")
+	require.Equal(t, int64(20), store.batchSize.Load())
+	require.Len(t, touched, 2)
+	require.Equal(t, 10, state.requestQueue.Length())
+	require.Equal(t, 10, state2.requestQueue.Length())
+	require.Zero(t, sm.invQueued.Load())
+	require.Zero(t, state.queuedInvs.Load()+state2.queuedInvs.Load())
+	require.Empty(t, sm.invQueue)
+}
+
+// TestLookupInvBatch_ReadsEachHashOnce pins the deduplication before the
+// read: a hash two peers announce, or one peer announces twice, is read once
+// and requested from the first announcer only; a hash already asked for, or
+// already rejected, is neither read nor requested.
+func TestLookupInvBatch_ReadsEachHashOnce(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	store := newLookupStore(t, tSettings, "inv_queue_dedup")
+	sm, p, state, _ := newInvHarness(t, tSettings, store, blockchain2.FSMStateRUNNING)
+	p2, state2 := newHarnessPeer(t, sm)
+
+	shared := chainhash.Hash{0x5a}
+	requested := chainhash.Hash{0x5b}
+	rejected := chainhash.Hash{0x5c}
+	sm.requestedTxns.Set(requested, struct{}{})
+	sm.rejectedTxns.Set(rejected, struct{}{})
+
+	sm.admitTxInvs(p, state, []*wire.InvVect{inv(shared), inv(shared), inv(requested), inv(rejected), inv(chainhash.Hash{0x01})})
+	sm.admitTxInvs(p2, state2, []*wire.InvVect{inv(shared), inv(chainhash.Hash{0x02})})
+
+	sm.lookupInvBatch(<-sm.invQueue)
+
+	require.Equal(t, int64(1), store.batches.Load())
+	require.Equal(t, int64(3), store.batchSize.Load(), "shared once, plus one own hash per peer")
+	require.Equal(t, 2, state.requestQueue.Length(), "the first peer asks for shared and its own")
+	require.Equal(t, 1, state2.requestQueue.Length(), "the second peer asks for its own only")
+
+	_, marked := sm.requestedTxns.Get(shared)
+	require.True(t, marked, "a hash read stays marked for the request-set expiry")
+}
+
+// TestLookupInvBatch_UnmarksOnAStoreError pins that a failed read leaves no
+// hash marked, so the next announcement of it is read again, and that the
+// failure is counted by hashes.
+func TestLookupInvBatch_UnmarksOnAStoreError(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	store := newLookupStore(t, tSettings, "inv_queue_fail")
+	sm, p, state, _ := newInvHarness(t, tSettings, store, blockchain2.FSMStateRUNNING)
+	before := droppedInvs("lookup_failed")
+
+	store.fail = errors.NewProcessingError("store down")
+	sm.admitTxInvs(p, state, txInvs(5, 0x01))
+
+	require.Empty(t, sm.lookupInvBatch(<-sm.invQueue))
+	require.Zero(t, sm.requestedTxns.Len(), "a failed read leaves nothing marked")
+	require.Zero(t, state.requestQueue.Length())
+	require.Zero(t, sm.invQueued.Load())
+	require.Equal(t, before+5, droppedInvs("lookup_failed"))
+
+	store.fail = nil
+	sm.admitTxInvs(p, state, txInvs(5, 0x01))
+	sm.lookupInvBatch(<-sm.invQueue)
+
+	require.Equal(t, 5, state.requestQueue.Length(), "the next announcement is read again")
+}
+
+// TestLookupInvBatch_SkipsAPeerThatLeftOrReconnected pins the liveness check:
+// a chunk whose peer has gone, or has reconnected with a new state, is
+// neither read nor marked, and still gives the node count back.
+func TestLookupInvBatch_SkipsAPeerThatLeftOrReconnected(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	store := newLookupStore(t, tSettings, "inv_queue_gone")
+	sm, p, state, _ := newInvHarness(t, tSettings, store, blockchain2.FSMStateRUNNING)
+
+	sm.admitTxInvs(p, state, txInvs(3, 0x01))
+	sm.peerStates.Delete(p)
+
+	require.Empty(t, sm.lookupInvBatch(<-sm.invQueue))
+	require.Zero(t, store.batches.Load())
+	require.Zero(t, sm.requestedTxns.Len())
+	require.Zero(t, sm.invQueued.Load(), "a gone peer's chunk still gives the node count back")
+
+	// Reconnected: the same peer key, a new state.
+	fresh := &peerSyncState{requestQueue: txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg)}
+	sm.peerStates.Set(p, fresh)
+	sm.admitTxInvs(p, state, txInvs(3, 0x02)) // queued against the old state
+
+	require.Empty(t, sm.lookupInvBatch(<-sm.invQueue))
+	require.Zero(t, store.batches.Load())
+	require.Zero(t, fresh.requestQueue.Length())
+	require.Zero(t, sm.invQueued.Load())
+}
+
+// TestTakeInvBatch_StopsAtAFullBatchOrAnEmptyQueue pins the coalescing rule:
+// take chunks without waiting until the batch holds a full chunk's worth of
+// hashes or the queue is empty.
+func TestTakeInvBatch_StopsAtAFullBatchOrAnEmptyQueue(t *testing.T) {
+	sm, p, state, _ := newInvHarness(t, test.CreateBaseTestSettings(t), nil, blockchain2.FSMStateRUNNING)
+
+	sm.admitTxInvs(p, state, txInvs(txInvLookupChunk+10, 0x01)) // one full chunk and one of 10
+
+	require.Len(t, sm.takeInvBatch(<-sm.invQueue), 1, "a full first chunk takes nothing more")
+	require.Len(t, sm.takeInvBatch(<-sm.invQueue), 1, "an empty queue ends the batch")
 }

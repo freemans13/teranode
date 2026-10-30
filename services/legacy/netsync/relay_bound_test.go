@@ -39,6 +39,9 @@ type lookupStore struct {
 	batches   atomic.Int64
 	batchSize atomic.Int64
 	gate      chan struct{}
+
+	// fail, when set, is what BatchDecorate returns instead of reading.
+	fail error
 }
 
 func (s *lookupStore) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fields.FieldName) (*meta.Data, error) {
@@ -50,6 +53,10 @@ func (s *lookupStore) Get(ctx context.Context, hash *chainhash.Hash, fieldNames 
 func (s *lookupStore) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, fieldNames ...fields.FieldName) error {
 	if s.gate != nil {
 		<-s.gate
+	}
+
+	if s.fail != nil {
+		return s.fail
 	}
 
 	s.batches.Add(1)
@@ -449,4 +456,19 @@ func TestRelayTxWorkerCount(t *testing.T) {
 	tSettings.UtxoStore.SpendBatcherSize = 10
 	tSettings.Validator.SendBatchSize = 0
 	require.Equal(t, relayTxMinWorkers, relayTxWorkerCount(tSettings))
+}
+
+// TestDrainRequestQueue_SendsATransactionTheWorkerMarked pins that the drain
+// no longer skips a transaction whose hash is in the request set: the lookup
+// worker marks a hash before the store read and then appends it, so a check
+// here would drop every transaction the worker asked for.
+func TestDrainRequestQueue_SendsATransactionTheWorkerMarked(t *testing.T) {
+	sm, p, state, _ := newInvHarness(t, test.CreateBaseTestSettings(t), nil, blockchain2.FSMStateRUNNING)
+
+	h := chainhash.Hash{0x7a}
+	sm.requestedTxns.Set(h, struct{}{})
+	state.requestQueue.Append(wire.NewInvVect(wire.InvTypeTx, &h))
+
+	gdmsg := sm.drainRequestQueue(p, state)
+	require.Len(t, gdmsg.InvList, 1, "the request set is checked before the read now, not here")
 }
