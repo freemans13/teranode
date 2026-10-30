@@ -1054,7 +1054,7 @@ func (s *Service) collectDeletedChildren(bins aerospike.BinMap, into map[string]
 
 	deletedMap, ok := raw.(map[interface{}]interface{})
 	if !ok {
-		s.logger.Debugf("deletedChildren bin wrong type: %T", raw)
+		s.logger.Debugf("deletedChildren bin wrong type: %T", raw) // urlsafe: logs only the Go type of a bin value, never a URL
 		return
 	}
 
