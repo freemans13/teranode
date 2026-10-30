@@ -246,7 +246,7 @@ func TestHandleInvMsg_SkipsTransactionItemsOutsideRunning(t *testing.T) {
 	require.Zero(t, state.requestQueue.Length())
 }
 
-func newRelayHarness(t *testing.T, queueLen int) (*SyncManager, *peerpkg.Peer) {
+func newRelayHarness(t *testing.T, queueLen int, budget int64) (*SyncManager, *peerpkg.Peer) {
 	t.Helper()
 
 	// A drop increments prometheusLegacyNetsyncRelayedTxDropped, which is nil
@@ -259,14 +259,20 @@ func newRelayHarness(t *testing.T, queueLen int) (*SyncManager, *peerpkg.Peer) {
 	require.NoError(t, err)
 
 	sm := &SyncManager{
-		logger:       ulogger.TestLogger{},
-		settings:     tSettings,
-		ctx:          context.Background(),
-		relayTxQueue: make(chan *txMsg, queueLen),
+		logger:             ulogger.TestLogger{},
+		settings:           tSettings,
+		ctx:                context.Background(),
+		relayTxQueue:       make(chan *txMsg, queueLen),
+		relayTxBytesBudget: budget,
 	}
 
 	return sm, p
 }
+
+// testRelayBudget is the byte budget the relay tests run with unless they are
+// about the budget itself: the production default, as the setting's loader
+// gives it.
+const testRelayBudget int64 = 256 << 20
 
 // queueTxWithin runs QueueTx and fails the test if it does not return, since
 // it runs on the peer's read loop and must never wait.
@@ -290,7 +296,7 @@ func queueTxWithin(t *testing.T, sm *SyncManager, tx *bsvutil.Tx, p *peerpkg.Pee
 // arriving with the queue full is dropped at once, not waited for, and that the
 // bytes it would have held are not left charged.
 func TestQueueTx_DropsWhenTheRelayQueueIsFull(t *testing.T) {
-	sm, p := newRelayHarness(t, 1)
+	sm, p := newRelayHarness(t, 1, testRelayBudget)
 	tx := bsvutil.NewTx(wire.NewMsgTx(1))
 	size := int64(tx.MsgTx().SerializeSize())
 
@@ -306,17 +312,19 @@ func TestQueueTx_DropsWhenTheRelayQueueIsFull(t *testing.T) {
 }
 
 // TestQueueTx_TakesOneTransactionLargerThanTheBudget pins the exception to the
-// byte bound: a transaction larger than relayTxBytesBudget is queued when
+// byte bound: a transaction larger than the byte budget is queued when
 // nothing else is held, so it is not refused for ever, and a second one is
 // dropped while the first is held.
 func TestQueueTx_TakesOneTransactionLargerThanTheBudget(t *testing.T) {
-	sm, p := newRelayHarness(t, 4)
+	const budget int64 = 1 << 20
+
+	sm, p := newRelayHarness(t, 4, budget)
 
 	big := wire.NewMsgTx(1)
-	big.AddTxOut(wire.NewTxOut(0, make([]byte, relayTxBytesBudget+1)))
+	big.AddTxOut(wire.NewTxOut(0, make([]byte, budget+1)))
 	tx := bsvutil.NewTx(big)
 	size := int64(big.SerializeSize())
-	require.Greater(t, size, int64(relayTxBytesBudget))
+	require.Greater(t, size, budget)
 
 	queueTxWithin(t, sm, tx, p)
 	require.Len(t, sm.relayTxQueue, 1, "a transaction larger than the budget must be taken when nothing else is held")
@@ -331,22 +339,37 @@ func TestQueueTx_TakesOneTransactionLargerThanTheBudget(t *testing.T) {
 }
 
 // TestQueueTx_DropsOverTheByteBudget pins the byte bound: a transaction that
-// would take the held bytes over relayTxBytesBudget is dropped, and one that
-// fits it exactly is queued.
+// would take the held bytes over the budget the setting gives is dropped, and
+// one that fits it exactly is queued.
 func TestQueueTx_DropsOverTheByteBudget(t *testing.T) {
-	sm, p := newRelayHarness(t, 4)
+	const budget int64 = 1 << 20
+
+	sm, p := newRelayHarness(t, 4, budget)
 	tx := bsvutil.NewTx(wire.NewMsgTx(1))
 	size := int64(tx.MsgTx().SerializeSize())
 
-	sm.relayTxBytes.Store(relayTxBytesBudget - size + 1)
+	sm.relayTxBytes.Store(budget - size + 1)
 	queueTxWithin(t, sm, tx, p)
 	require.Empty(t, sm.relayTxQueue, "a transaction over the byte budget must be dropped")
-	require.Equal(t, int64(relayTxBytesBudget-size+1), sm.relayTxBytes.Load())
+	require.Equal(t, budget-size+1, sm.relayTxBytes.Load())
 
-	sm.relayTxBytes.Store(relayTxBytesBudget - size)
+	sm.relayTxBytes.Store(budget - size)
 	queueTxWithin(t, sm, tx, p)
 	require.Len(t, sm.relayTxQueue, 1, "a transaction that fits the budget exactly must be queued")
+}
 
+// TestQueueTx_ZeroBudgetTakesOneTransactionAtATime pins what the setting's
+// floor means: with legacy_relayTxBytesBudget at zero the first transaction is
+// taken because nothing is held, and the next is dropped until it is handled.
+func TestQueueTx_ZeroBudgetTakesOneTransactionAtATime(t *testing.T) {
+	sm, p := newRelayHarness(t, 8, 0)
+	tx := bsvutil.NewTx(wire.NewMsgTx(1))
+
+	queueTxWithin(t, sm, tx, p)
+	require.Len(t, sm.relayTxQueue, 1, "the first transaction is taken when nothing is held")
+
+	queueTxWithin(t, sm, tx, p)
+	require.Len(t, sm.relayTxQueue, 1, "the second is dropped while the first is held")
 }
 
 // TestRelayTxWorker_HandsBackTheBytesAfterHandlingATx runs the real block
@@ -354,7 +377,7 @@ func TestQueueTx_DropsOverTheByteBudget(t *testing.T) {
 // transaction and hands its bytes back. Without that the budget fills and
 // every relayed transaction after it is dropped for the life of the node.
 func TestRelayTxWorker_HandsBackTheBytesAfterHandlingATx(t *testing.T) {
-	sm, p := newRelayHarness(t, 4)
+	sm, p := newRelayHarness(t, 4, testRelayBudget)
 	sm.relayTxWorkers = 2
 
 	running := blockchain2.FSMStateRUNNING

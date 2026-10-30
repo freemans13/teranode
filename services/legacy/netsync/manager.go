@@ -115,13 +115,6 @@ const (
 	// dropped.
 	relayTxQueueFactor = 4
 
-	// relayTxBytesBudget bounds the serialized bytes of relayed transactions
-	// queued or being validated. The queue bounds the count, and a count alone
-	// would let a peer relaying large transactions hold gigabytes. A transaction
-	// that would take the total over the budget is dropped, unless nothing else
-	// is held, so one transaction larger than the budget is still taken.
-	relayTxBytesBudget = 256 << 20
-
 	// recentlyFailedBlocksMaxTracked bounds recentlyFailedBlocks. Legacy sync
 	// only has a handful of failing block hashes in flight, but capping the map
 	// guarantees a pathological stream of distinct failing hashes can never grow
@@ -819,12 +812,22 @@ type SyncManager struct {
 
 	// relayTxQueue holds relayed transactions for the relayTxWorkers workers
 	// that validate them, and relayTxBytes the serialized bytes of those queued
-	// or being validated; see relayTxBytesBudget. QueueTx never waits on the
-	// queue: a transaction that finds it full, or over the byte budget, is
-	// dropped. Built in New; the workers are started by blockHandler.
-	relayTxQueue   chan *txMsg
-	relayTxWorkers int
-	relayTxBytes   atomic.Int64
+	// or being validated. QueueTx never waits on the queue: a transaction that
+	// finds it full, or over the byte budget, is dropped. Built in New; the
+	// workers are started by blockHandler.
+	//
+	// relayTxBytesBudget, from legacy_relayTxBytesBudget, bounds relayTxBytes.
+	// The queue bounds the count, and a count alone would let a peer relaying
+	// large transactions hold gigabytes. A transaction that would take the
+	// total over the budget is dropped, unless nothing else is held, so one
+	// transaction larger than the budget is still taken; zero or a negative
+	// budget therefore means one transaction at a time. The budget counts
+	// serialized bytes once, and a transaction inside a worker holds about
+	// three times that (its parsed wire form, a serialized copy, the bt.Tx).
+	relayTxQueue       chan *txMsg
+	relayTxWorkers     int
+	relayTxBytes       atomic.Int64
+	relayTxBytesBudget int64
 
 	// inFlightBlocks is the dedup half of the same block-admission gate whose
 	// other half is blockPrefetchBudget. It holds the hash of every block that is
@@ -3993,7 +3996,7 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 	// are given back by relayTxWorker once handleTxMsg returns.
 	size := int64(tx.MsgTx().SerializeSize())
 
-	if held := sm.relayTxBytes.Add(size); held-size > 0 && held > relayTxBytesBudget {
+	if held := sm.relayTxBytes.Add(size); held-size > 0 && held > sm.relayTxBytesBudget {
 		sm.relayTxBytes.Add(-size)
 		sm.dropRelayedTx(tx, peer, done, "relayed transaction bytes over budget")
 
@@ -4789,8 +4792,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	sm.relayTxWorkers = relayTxWorkerCount(tSettings)
 	sm.relayTxQueue = make(chan *txMsg, relayTxQueueFactor*sm.relayTxWorkers)
+	sm.relayTxBytesBudget = tSettings.Legacy.RelayTxBytesBudget
 	logger.Infof("[legacy] relayed transactions: %d validation workers, queue of %d, %d MiB budget",
-		sm.relayTxWorkers, cap(sm.relayTxQueue), relayTxBytesBudget>>20)
+		sm.relayTxWorkers, cap(sm.relayTxQueue), sm.relayTxBytesBudget>>20)
 	logger.Infof("[legacy] streaming pipeline active: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
 		capacity, tSettings.Legacy.MaxBlocksInTransitPerPeer, pipelineBlockSlotPeerAllowance)
 
