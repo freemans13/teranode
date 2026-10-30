@@ -310,9 +310,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   stream. Transaction announcements (`inv` items) are queued in chunks of 4096 behind
   `legacy_invQueueMaxHashes` (default 400,000 hashes, eight maximum-size announcements;
   a value below 4096 falls back to the default) and a per-peer share of 100,000 hashes,
-  and sixteen workers look them up in UTXO store batch reads of at least 4096, checking
-  the set of hashes already asked for before the read, so a transaction every peer
-  announces is read about once instead of once per peer. Announcements over either
+  and sixteen workers take whatever is queued and look it up in UTXO store batch reads
+  of up to 4096 hashes, checking the set of hashes already asked for before the read, so
+  a transaction every peer announces is read about once instead of once per peer. Announcements over either
   limit are dropped and counted in hashes in the new
   `teranode_legacy_netsync_inv_dropped_total` (label `reason`), and the new gauge
   `teranode_legacy_netsync_inv_queued_hashes` shows the queue. The set of hashes asked

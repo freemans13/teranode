@@ -24,7 +24,8 @@ const (
 	// invLookupWorkers is the number of goroutines that take announcements
 	// off invQueue and look them up in the UTXO store. It caps the store
 	// reads in flight from this path, which the review of PR 2045 asked for,
-	// and is not a memory bound (16 x 4,096 hashes in flight is about 10 MB),
+	// and is not a memory bound (a batch coalesces to under two chunks, so
+	// sixteen workers hold at most about 20 MB in flight),
 	// so it is a constant rather than a setting.
 	invLookupWorkers = 16
 
@@ -183,10 +184,10 @@ func (sm *SyncManager) takeInvBatch(first *invChunk) []*invChunk {
 
 // lookupInvBatch is one worker step. It takes a batch starting with first,
 // marks each hash it is going to read in requestedTxns, reads the batch from
-// the UTXO store in one call, appends every hash the store lacks to its
-// peer's request queue, and gives every chunk's hashes back to the counts. It
-// returns the chunks whose peer's request queue gained items, for
-// sendInvRequests.
+// the UTXO store in slices of at most txInvLookupChunk, appends every hash
+// the store lacks to its peer's request queue, and gives every chunk's hashes
+// back to the counts. It returns the chunks whose peer's request queue gained
+// items, for sendInvRequests.
 //
 // Before the read, in queue order, a hash is skipped when its peer is no
 // longer registered under the same state (it left, or reconnected), when it
@@ -198,8 +199,9 @@ func (sm *SyncManager) takeInvBatch(first *invChunk) []*invChunk {
 // peer. A hash the store turns out to hold stays marked until it expires,
 // which blocks nothing because the node holds it.
 //
-// A failed read unmarks the whole batch so the next announcement retries, and
-// counts the hashes under lookup_failed. A per-item error other than
+// A failed slice unmarks itself and every slice after it so the next
+// announcement retries, and counts those hashes under lookup_failed; the
+// slices read before it are still acted on. A per-item error other than
 // not-found unmarks that hash and is counted in one warning for the batch,
 // as checkTxInvs did per chunk.
 func (sm *SyncManager) lookupInvBatch(first *invChunk) []*invChunk {
@@ -239,17 +241,10 @@ func (sm *SyncManager) lookupInvBatch(first *invChunk) []*invChunk {
 		return nil
 	}
 
-	if err := sm.utxoStore.BatchDecorate(sm.ctx, items, fields.Fee); err != nil {
-		for _, item := range items {
-			sm.requestedTxns.Delete(item.Hash)
-		}
-
-		sm.logger.Warnf("[lookupInvBatch] Unexpected failure when checking %d announced transactions for existing inventory: %v", len(items), err)
-		prometheusLegacyNetsyncInvDropped.WithLabelValues(invDropLookupFailed).Add(float64(len(items)))
-
-		return nil
-	}
-
+	// One store read per slice of at most txInvLookupChunk, whatever the batch
+	// coalesced to: an Aerospike server refuses a batch request over its
+	// batch-max-requests, 5,000 by default, and one refusal would drop every
+	// hash in the batch under exactly the load that makes a batch coalesce.
 	var (
 		touched  []*invChunk
 		seen     = make(map[*invChunk]struct{})
@@ -257,30 +252,47 @@ func (sm *SyncManager) lookupInvBatch(first *invChunk) []*invChunk {
 		firstErr error
 	)
 
-	for i, item := range items {
-		if item.Err == nil && item.Data != nil {
-			// Held: processed completely at our end.
-			continue
-		}
+	for start := 0; start < len(items); start += txInvLookupChunk {
+		end := min(start+txInvLookupChunk, len(items))
 
-		if item.Err != nil && !errors.Is(item.Err, errors.ErrTxNotFound) {
-			sm.requestedTxns.Delete(item.Hash)
-
-			failed++
-
-			if firstErr == nil {
-				firstErr = item.Err
+		if err := sm.utxoStore.BatchDecorate(sm.ctx, items[start:end], fields.Fee); err != nil {
+			for _, item := range items[start:] {
+				sm.requestedTxns.Delete(item.Hash)
 			}
 
-			continue
+			sm.logger.Warnf("[lookupInvBatch] Unexpected failure when checking %d announced transactions for existing inventory: %v", len(items)-start, err)
+			prometheusLegacyNetsyncInvDropped.WithLabelValues(invDropLookupFailed).Add(float64(len(items) - start))
+
+			break
 		}
 
-		c := owners[i]
-		c.state.requestQueue.Append(invs[i])
+		for i := start; i < end; i++ {
+			item := items[i]
 
-		if _, done := seen[c]; !done {
-			seen[c] = struct{}{}
-			touched = append(touched, c)
+			if item.Err == nil && item.Data != nil {
+				// Held: processed completely at our end.
+				continue
+			}
+
+			if item.Err != nil && !errors.Is(item.Err, errors.ErrTxNotFound) {
+				sm.requestedTxns.Delete(item.Hash)
+
+				failed++
+
+				if firstErr == nil {
+					firstErr = item.Err
+				}
+
+				continue
+			}
+
+			c := owners[i]
+			c.state.requestQueue.Append(invs[i])
+
+			if _, done := seen[c]; !done {
+				seen[c] = struct{}{}
+				touched = append(touched, c)
+			}
 		}
 	}
 

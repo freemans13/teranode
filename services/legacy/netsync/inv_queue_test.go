@@ -248,3 +248,25 @@ func TestTakeInvBatch_StopsAtAFullBatchOrAnEmptyQueue(t *testing.T) {
 	require.Len(t, sm.takeInvBatch(<-sm.invQueue), 1, "a full first chunk takes nothing more")
 	require.Len(t, sm.takeInvBatch(<-sm.invQueue), 1, "an empty queue ends the batch")
 }
+
+// TestLookupInvBatch_ReadsInSlicesOfOneChunk pins the read bound: a worker's
+// batch may coalesce to nearly two chunks, but each store read is at most one
+// chunk, because an Aerospike server refuses a batch request over its
+// batch-max-requests, 5,000 by default, and that refusal would drop every
+// hash in the batch under exactly the load that makes a batch coalesce.
+func TestLookupInvBatch_ReadsInSlicesOfOneChunk(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	store := newLookupStore(t, tSettings, "inv_queue_slices")
+	sm, p, state, _ := newInvHarness(t, tSettings, store, blockchain2.FSMStateRUNNING)
+
+	sm.admitTxInvs(p, state, txInvs(txInvLookupChunk-1, 0x01)) // one chunk short of full
+	sm.admitTxInvs(p, state, txInvs(txInvLookupChunk, 0x02))   // one full chunk
+
+	touched := sm.lookupInvBatch(<-sm.invQueue)
+
+	require.Len(t, touched, 2, "both chunks are in one batch")
+	require.Equal(t, int64(2), store.batches.Load(), "a batch over one chunk is read in two slices")
+	require.LessOrEqual(t, store.batchSize.Load(), int64(txInvLookupChunk), "no store read is larger than one chunk")
+	require.Equal(t, 2*txInvLookupChunk-1, state.requestQueue.Length(), "every hash is still asked for")
+	require.Zero(t, sm.invQueued.Load())
+}
