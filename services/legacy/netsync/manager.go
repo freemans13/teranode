@@ -256,7 +256,6 @@ type blockRequestOrigin struct {
 type peerSyncState struct {
 	syncCandidate bool
 	requestQueue  *txmap.SyncedSlice[wire.InvVect]
-	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 
 	// queuedInvs is the transaction announcements from this peer queued for a
 	// UTXO store lookup or being looked up; admitTxInvs bounds it by invShare.
@@ -1571,7 +1570,6 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	state := &peerSyncState{
 		syncCandidate: isSyncCandidate,
 		requestQueue:  txmap.NewSyncedSlice[wire.InvVect](maxRequestedBlocks),
-		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](10 * time.Second), // allow the node 10 seconds to respond to the tx request
 	}
 
 	// The height the peer advertised about itself during the handshake. It is
@@ -1861,11 +1859,6 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 // entries in the global map — were never consulted at all. A block owed by a
 // peer that has gone was therefore owed forever, and was never asked for again.
 func (sm *SyncManager) clearRequestedState(peer *peerpkg.Peer, state *peerSyncState) {
-	// Drop the transactions we were waiting on, then stop the map's cleanup
-	// goroutine. Clear before Stop: after Stop nothing sweeps it any more.
-	state.requestedTxns.Clear()
-	state.requestedTxns.Stop()
-
 	// Release every block this peer owed us. Nothing needs telling: the
 	// wanted-range pass recomputes what it wants and who owes it on every call, so
 	// a released block is simply unowed on the next pass rather than needing to
@@ -1915,7 +1908,7 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 
 	peer := tmsg.peer
 
-	state, exists := sm.peerStates.Get(peer)
+	_, exists := sm.peerStates.Get(peer)
 	if !exists {
 		sm.logger.Warnf("Received tx message from unknown peer %s", peer)
 		return
@@ -1965,7 +1958,6 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 	// already knows about it and as such we shouldn't have any more
 	// instances of trying to fetch it, or we failed to insert and thus
 	// we'll retry next time we get an inv.
-	state.requestedTxns.Delete(*txHash)
 	sm.requestedTxns.Delete(*txHash)
 
 	if err != nil {
@@ -3467,9 +3459,26 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		processInvs = true
 	}
 
-	// Request as much as possible at once.  Anything that won't fit into
-	// the request will be requested on the next inv message.
-	sendGetData := func() {
+	// Request the advertised inventory if we don't already have it.  Also,
+	// request parent blocks of orphans if we receive one we already have.
+	// Finally, attempt to detect potential stalls due to long side chains
+	// we already have and request more blocks to prevent them.
+	//
+	// Blocks go first, in serial and in message order, in a pass of their own.
+	// The transaction pass below hands up to 50,000 items to the lookup
+	// workers, and a block announcement must never wait behind even that,
+	// whatever its position in the message. That includes the getdata for a
+	// block this node does not have: processInvMsg only queues it, so it is
+	// sent here, straight after the block pass.
+	for i, iv := range invVects {
+		if iv.Type == wire.InvTypeBlock {
+			sm.processInvMsg(i, iv, processInvs, peer, exists, state, lastBlock)
+		}
+	}
+
+	if lastBlock != -1 {
+		// Request as much as possible at once. Anything that won't fit into
+		// the request will be requested on the next inv message.
 		gdmsg := sm.drainRequestQueue(peer, state)
 
 		if len(gdmsg.InvList) > 0 {
@@ -3478,42 +3487,24 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		}
 	}
 
-	// Request the advertised inventory if we don't already have it.  Also,
-	// request parent blocks of orphans if we receive one we already have.
-	// Finally, attempt to detect potential stalls due to long side chains
-	// we already have and request more blocks to prevent them.
-	//
-	// Blocks go first, in serial and in message order, in a pass of their own.
-	// The transaction pass below waits on UTXO store lookups for up to 50,000
-	// items, and a block announcement must never wait behind that, whatever
-	// its position in the message. That includes the getdata for a block this
-	// node does not have: processInvMsg only queues it, so it is sent here,
-	// before the transaction pass, and not left for the send at the end.
-	for i, iv := range invVects {
-		if iv.Type == wire.InvTypeBlock {
-			sm.processInvMsg(i, iv, processInvs, peer, exists, state, lastBlock)
-		}
-	}
-
-	if lastBlock != -1 {
-		sendGetData()
-	}
-
 	// Outside RUNNING every transaction item is dropped unchecked, as
 	// processInvMsg does, and every type other than block and transaction is
-	// dropped in every state.
+	// dropped in every state. The items are queued for the lookup workers,
+	// which send the getdata for whatever the store lacks, so there is
+	// nothing left for this goroutine to send.
 	if processInvs {
 		sm.checkTxInvs(peer, state, invVects)
 	}
-
-	sendGetData()
 }
 
-// checkTxInvs queues for a getdata every transaction item in invVects that the
-// UTXO store does not hold and that has not been rejected. It does for the
-// transaction items of one inv message what processInvMsg does for one item,
-// in the same order, but looks them up in chunks of txInvLookupChunk with one
-// BatchDecorate call each, rather than with a goroutine and a Get per item.
+// checkTxInvs marks every transaction item in invVects as known for the peer
+// and hands the items to the announcement queue in chunks of
+// txInvLookupChunk, where the lookup workers find the ones the UTXO store
+// lacks and ask the peer for them (inv_queue.go). It does no store read and
+// never waits, so the goroutine handling the message ends at once; each item
+// used to cost a goroutine and a Get, and on 2026-10-19 that reached 223,118
+// goroutines. A chunk over the peer's share or the node cap is dropped and
+// counted there.
 func (sm *SyncManager) checkTxInvs(peer *peerpkg.Peer, state *peerSyncState, invVects []*wire.InvVect) {
 	txInvs := make([]*wire.InvVect, 0, len(invVects))
 
@@ -3531,75 +3522,7 @@ func (sm *SyncManager) checkTxInvs(peer *peerpkg.Peer, state *peerSyncState, inv
 		return
 	}
 
-	// The chunks of one message are looked up at once, one goroutine each, at
-	// most wire.MaxInvPerMsg/txInvLookupChunk+1 of them, so a single large
-	// message is not held to one store round trip at a time. The results are
-	// then acted on in message order.
-	chunks := make([][]*utxostore.UnresolvedMetaData, 0, len(txInvs)/txInvLookupChunk+1)
-	errs := make([]error, cap(chunks))
-
-	var wg sync.WaitGroup
-
-	for start := 0; start < len(txInvs); start += txInvLookupChunk {
-		chunk := txInvs[start:min(start+txInvLookupChunk, len(txInvs))]
-
-		items := make([]*utxostore.UnresolvedMetaData, len(chunk))
-		for i, iv := range chunk {
-			items[i] = &utxostore.UnresolvedMetaData{Hash: iv.Hash, Idx: start + i}
-		}
-
-		c := len(chunks)
-		chunks = append(chunks, items)
-
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			errs[c] = sm.utxoStore.BatchDecorate(sm.ctx, items, fields.Fee)
-		}()
-	}
-
-	wg.Wait()
-
-	for c, items := range chunks {
-		if errs[c] != nil {
-			sm.logger.Warnf("[handleInvMsg] Unexpected failure when checking %d transactions from %s for existing inventory: %v", len(items), peer, errs[c])
-			continue
-		}
-
-		failed := 0
-
-		var firstErr error
-
-		for _, item := range items {
-			if item.Err == nil && item.Data != nil {
-				// held: processed completely at our end
-				continue
-			}
-
-			if item.Err != nil && !errors.Is(item.Err, errors.ErrTxNotFound) {
-				failed++
-
-				if firstErr == nil {
-					firstErr = item.Err
-				}
-
-				continue
-			}
-
-			// Skip the transaction if it has already been rejected.
-			if _, rejected := sm.rejectedTxns.Get(item.Hash); rejected {
-				continue
-			}
-
-			state.requestQueue.Append(txInvs[item.Idx])
-		}
-
-		if failed > 0 {
-			sm.logger.Warnf("[handleInvMsg] Unexpected failure when checking %d of %d transactions from %s for existing inventory, first: %v", failed, len(items), peer, firstErr)
-		}
-	}
+	sm.admitTxInvs(peer, state, txInvs)
 }
 
 // drainRequestQueue turns as much of a peer's announcement queue as it can into

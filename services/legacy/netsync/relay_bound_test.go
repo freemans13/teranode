@@ -113,8 +113,7 @@ func newInvHarness(t *testing.T, tSettings *settings.Settings, store utxo.Store,
 	sm.initInvQueue(invQueueMaxHashes(ulogger.TestLogger{}, tSettings))
 
 	state := &peerSyncState{
-		requestQueue:  txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
-		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](time.Hour),
+		requestQueue: txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
 	}
 	sm.peerStates.Set(p, state)
 	sm.storeSyncPeer(p, &syncPeerState{})
@@ -131,8 +130,7 @@ func newHarnessPeer(t *testing.T, sm *SyncManager) (*peerpkg.Peer, *peerSyncStat
 	require.NoError(t, err)
 
 	state := &peerSyncState{
-		requestQueue:  txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
-		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](time.Hour),
+		requestQueue: txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
 	}
 	sm.peerStates.Set(p, state)
 
@@ -171,6 +169,14 @@ func TestHandleInvMsg_LooksUpTransactionsInBatches(t *testing.T) {
 	// checkTxInvs rather than handleInvMsg, whose getdata drains the queue
 	// this test reads.
 	sm.checkTxInvs(p, state, inv.InvList)
+
+	require.Zero(t, store.batches.Load(), "the handler goroutine does no store read of its own")
+	require.Len(t, sm.invQueue, 3, "the items are queued in chunks of txInvLookupChunk")
+
+	// What the lookup workers do, one batch at a time.
+	for i := 0; i < 3; i++ {
+		sm.lookupInvBatch(<-sm.invQueue)
+	}
 
 	require.Zero(t, store.gets.Load(), "transaction inventory must not be looked up one Get per item")
 	require.Equal(t, int64(3), store.batches.Load(), "items must be looked up in chunks of txInvLookupChunk")
@@ -225,7 +231,6 @@ func TestHandleInvMsg_BlockItemsDoNotWaitForTransactionLookups(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tSettings := test.CreateBaseTestSettings(t)
 			store := newLookupStore(t, tSettings, "relay_bound_block_first")
-			store.gate = make(chan struct{})
 
 			sm, p, _, client := newInvHarness(t, tSettings, store, blockchain2.FSMStateRUNNING)
 			blockActedOn := tc.arrange(client, sm)
@@ -236,22 +241,15 @@ func TestHandleInvMsg_BlockItemsDoNotWaitForTransactionLookups(t *testing.T) {
 			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{0x7b})))
 			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &blockHash)))
 
-			done := make(chan struct{})
-			go func() {
-				sm.handleInvMsg(&invMsg{inv: inv, peer: p})
-				close(done)
-			}()
+			// The handler returns with the block acted on and the transaction
+			// items queued, having read nothing from the store itself.
+			sm.handleInvMsg(&invMsg{inv: inv, peer: p})
 
-			require.True(t, WaitUntil(blockActedOn, 2*time.Second),
-				"the block item waited behind the transaction lookups")
+			require.True(t, blockActedOn(), "the block item waited behind the transaction lookups")
+			require.Zero(t, store.batches.Load(), "the handler goroutine does no store read of its own")
+			require.Equal(t, int64(2), sm.invQueued.Load())
 
-			close(store.gate)
-
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				require.Fail(t, "handleInvMsg did not finish once the store answered")
-			}
+			sm.lookupInvBatch(<-sm.invQueue)
 
 			require.Equal(t, int64(1), store.batches.Load(), "both transactions must be looked up in one batch")
 		})
@@ -273,6 +271,8 @@ func TestHandleInvMsg_SkipsTransactionItemsOutsideRunning(t *testing.T) {
 
 	require.Zero(t, store.gets.Load()+store.batches.Load())
 	require.Zero(t, state.requestQueue.Length())
+	require.Zero(t, sm.invQueued.Load(), "nothing is queued for a lookup outside RUNNING")
+	require.Empty(t, sm.invQueue)
 }
 
 func newRelayHarness(t *testing.T, queueLen int, budget int64) (*SyncManager, *peerpkg.Peer) {
