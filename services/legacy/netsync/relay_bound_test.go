@@ -1,13 +1,18 @@
 package netsync
 
 import (
+	"bytes"
 	"context"
 	"net/url"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -15,7 +20,9 @@ import (
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -471,4 +478,291 @@ func TestDrainRequestQueue_SendsATransactionTheWorkerMarked(t *testing.T) {
 
 	gdmsg := sm.drainRequestQueue(p, state)
 	require.Len(t, gdmsg.InvList, 1, "the request set is checked before the read now, not here")
+}
+
+// gatedFSMChain is the real LocalClient over a sqlitememory store whose FSM
+// lookup waits for gate to close, the way a slow blockchain service holds up
+// handleNewPeerMsg. entered is closed on the first lookup.
+type gatedFSMChain struct {
+	blockchain2.ClientI
+
+	gate      chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
+	gateOnce  sync.Once
+}
+
+func (c *gatedFSMChain) GetFSMCurrentState(ctx context.Context) (*blockchain2.FSMStateType, error) {
+	c.enterOnce.Do(func() { close(c.entered) })
+	<-c.gate
+
+	return c.ClientI.GetFSMCurrentState(ctx)
+}
+
+func (c *gatedFSMChain) open() {
+	c.gateOnce.Do(func() { close(c.gate) })
+}
+
+// relayRegistrationHarness is a SyncManager running its real block handler and
+// relay workers, with a blockchain client whose FSM lookup is gated, a
+// validator that records what it is asked to validate, and two ends of one
+// live connection as peers, since handleNewPeerMsg registers only a connected
+// peer.
+type relayRegistrationHarness struct {
+	sm        *SyncManager
+	peer      *peerpkg.Peer
+	other     *peerpkg.Peer
+	chain     *gatedFSMChain
+	validated chan chainhash.Hash
+	stopped   bool
+}
+
+var relayRegistrationStoreCounter atomic.Int64
+
+func newRelayRegistrationHarness(t *testing.T, queueLen int) *relayRegistrationHarness {
+	t.Helper()
+
+	sm, _ := newRelayHarness(t, queueLen, testRelayBudget)
+	sm.relayTxWorkers = 2
+
+	chainURL, err := url.Parse("sqlitememory:///relay_registration_" + strconv.FormatInt(relayRegistrationStoreCounter.Add(1), 10))
+	require.NoError(t, err)
+
+	bcStore, err := blockchainstore.NewStore(ulogger.TestLogger{}, chainURL, sm.settings)
+	require.NoError(t, err)
+
+	local, err := blockchain2.NewLocalClient(ulogger.TestLogger{}, sm.settings, bcStore, nil, nil)
+	require.NoError(t, err)
+
+	h := &relayRegistrationHarness{
+		sm:        sm,
+		chain:     &gatedFSMChain{ClientI: local, gate: make(chan struct{}), entered: make(chan struct{})},
+		validated: make(chan chainhash.Hash, 16),
+	}
+
+	sm.blockchainClient = h.chain
+	sm.chainParams = &chaincfg.MainNetParams
+	sm.validationClient = &validator.MockValidator{ValidateFunc: func(_ context.Context, tx *bt.Tx) (*meta.Data, error) {
+		h.validated <- *tx.TxIDChainHash()
+
+		return &meta.Data{}, nil
+	}}
+	sm.peerNotifier = &recordingNotifier{}
+	sm.peerStates = txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState]()
+	sm.orphanTxs = expiringmap.New[chainhash.Hash, *orphanTxAndParents](time.Minute)
+	sm.rejectedTxns = txmap.NewSyncedMap[chainhash.Hash, struct{}]()
+	sm.requestedTxns = expiringmap.New[chainhash.Hash, struct{}](time.Minute)
+	sm.msgChan = make(chan interface{})
+	sm.quit = make(chan struct{})
+	sm.handlerDone = make(chan struct{})
+
+	// Services are left at zero, so neither peer is a sync candidate and
+	// registering one does not start a sync.
+	peerCfg := peerpkg.Config{
+		UserAgentName:    "btcdtest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chaincfg.MainNetParams,
+	}
+
+	h.other, h.peer, err = MakeConnectedPeers(t, peerCfg, peerCfg, 61)
+	require.NoError(t, err)
+
+	go sm.blockHandler()
+
+	t.Cleanup(func() {
+		h.chain.open()
+		h.stop()
+		h.peer.DisconnectWithInfo("test over")
+		h.other.DisconnectWithInfo("test over")
+		_ = bcStore.Close(context.Background())
+	})
+
+	return h
+}
+
+// stop stops the block handler and waits for it.
+func (h *relayRegistrationHarness) stop() {
+	if h.stopped {
+		return
+	}
+
+	h.stopped = true
+
+	close(h.sm.quit)
+	<-h.sm.handlerDone
+}
+
+// relayedTx is a real transaction in the wire form a peer relays it in.
+func relayedTx(t *testing.T) *bsvutil.Tx {
+	t.Helper()
+
+	msg := wire.NewMsgTx(1)
+	require.NoError(t, msg.Deserialize(bytes.NewReader(transactions.CreateTestTransactionChainWithCount(t, 3)[1].Bytes())))
+
+	return bsvutil.NewTx(msg)
+}
+
+// waitDone fails the test unless done is answered within the timeout.
+func waitDone(t *testing.T, done chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, what)
+	}
+}
+
+// TestQueueTx_HandlesATransactionOnlyAfterItsPeerIsRegistered reproduces the
+// reordering the relay queue introduced: both handshake handlers register a
+// peer with NewPeer and do not wait, so the transactions the peer sends next
+// reach QueueTx while the block handler is still registering it, here held in
+// the FSM lookup. The shared message queue used to run the registration
+// first. The transaction must not be discarded as coming from an unknown
+// peer: it must be validated, and only once the peer is registered.
+func TestQueueTx_HandlesATransactionOnlyAfterItsPeerIsRegistered(t *testing.T) {
+	h := newRelayRegistrationHarness(t, 4)
+
+	go h.sm.NewPeer(h.peer, nil)
+
+	select {
+	case <-h.chain.entered:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the block handler never started registering the peer")
+	}
+
+	tx := relayedTx(t)
+	done := make(chan struct{}, 1)
+	queueTxWithinDone(t, h.sm, tx, h.peer, done)
+
+	// Handled while the registration is held means handled against an
+	// unknown peer, which discards it.
+	handledEarly := false
+	select {
+	case <-done:
+		handledEarly = true
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	h.chain.open()
+
+	if !handledEarly {
+		waitDone(t, done, "the transaction was never handled after its peer registered")
+	}
+
+	select {
+	case got := <-h.validated:
+		require.Equal(t, *tx.Hash(), got)
+	default:
+		require.Fail(t, "the transaction was discarded instead of validated")
+	}
+
+	require.False(t, handledEarly, "the transaction was handled before its peer was registered")
+	require.Zero(t, h.sm.relayTxBytes.Load(), "the transaction's bytes were not handed back")
+}
+
+// TestQueueTx_DropsHeldTransactionsOfAPeerThatLeftBeforeRegistration pins the
+// other ending: a peer that disconnects before its registration is handled is
+// never registered, so what it held is dropped, as handleTxMsg dropped a
+// transaction from an unknown peer. Its done channel is answered and its bytes
+// given back, or the budget would stay charged for the life of the node.
+func TestQueueTx_DropsHeldTransactionsOfAPeerThatLeftBeforeRegistration(t *testing.T) {
+	h := newRelayRegistrationHarness(t, 4)
+
+	// The other end's registration holds the block handler in the FSM lookup,
+	// so the peer's registration waits in msgChan behind it.
+	go h.sm.NewPeer(h.other, nil)
+
+	select {
+	case <-h.chain.entered:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the block handler never started registering the first peer")
+	}
+
+	go h.sm.NewPeer(h.peer, nil)
+
+	require.Eventually(t, func() bool {
+		h.sm.awaitingRegistrationMu.Lock()
+		defer h.sm.awaitingRegistrationMu.Unlock()
+
+		_, awaiting := h.sm.awaitingRegistration[h.peer]
+
+		return awaiting
+	}, 5*time.Second, 5*time.Millisecond)
+
+	tx := relayedTx(t)
+	done := make(chan struct{}, 1)
+	queueTxWithinDone(t, h.sm, tx, h.peer, done)
+
+	h.peer.DisconnectWithInfo("left before registration")
+	require.Eventually(t, func() bool { return !h.peer.Connected() }, 5*time.Second, 5*time.Millisecond)
+
+	dropped := testutil.ToFloat64(prometheusLegacyNetsyncRelayedTxDropped)
+
+	h.chain.open()
+	waitDone(t, done, "the held transaction's done channel was never answered")
+
+	require.False(t, h.sm.peerStates.Exists(h.peer), "a peer that left must not be registered")
+	require.Empty(t, h.validated, "a transaction from a peer that left must not be validated")
+	require.Equal(t, dropped+1, testutil.ToFloat64(prometheusLegacyNetsyncRelayedTxDropped))
+	require.Zero(t, h.sm.relayTxBytes.Load(), "the dropped transaction's bytes were not handed back")
+}
+
+// TestQueueTx_DropsHeldTransactionsWhenTheHandlerStops pins that a
+// transaction held for a registration the block handler will now never handle
+// is answered and its bytes given back when the handler stops.
+func TestQueueTx_DropsHeldTransactionsWhenTheHandlerStops(t *testing.T) {
+	h := newRelayRegistrationHarness(t, 4)
+
+	h.sm.markAwaitingRegistration(h.peer)
+
+	done := make(chan struct{}, 1)
+	queueTxWithinDone(t, h.sm, relayedTx(t), h.peer, done)
+	require.NotZero(t, h.sm.relayTxBytes.Load(), "harness check: the transaction is held")
+
+	h.stop()
+
+	waitDone(t, done, "the held transaction's done channel was never answered")
+	require.Empty(t, h.validated)
+	require.Zero(t, h.sm.relayTxBytes.Load(), "the dropped transaction's bytes were not handed back")
+}
+
+// TestQueueTx_HoldsAtMostAQueuesWorthPerPeer pins the count bound on what one
+// peer may hold before it is registered: as many transactions as the relay
+// queue holds, since that is all the registration can hand on without
+// dropping. The next one is dropped at once, without waiting.
+func TestQueueTx_HoldsAtMostAQueuesWorthPerPeer(t *testing.T) {
+	sm, p := newRelayHarness(t, 2, testRelayBudget)
+	sm.markAwaitingRegistration(p)
+
+	tx := bsvutil.NewTx(wire.NewMsgTx(1))
+	size := int64(tx.MsgTx().SerializeSize())
+
+	queueTxWithin(t, sm, tx, p)
+	queueTxWithin(t, sm, tx, p)
+
+	done := make(chan struct{}, 1)
+	queueTxWithinDone(t, sm, tx, p, done)
+	waitDone(t, done, "the transaction over the hold limit was not answered at once")
+
+	require.Len(t, sm.awaitingRegistration[p], 2)
+	require.Empty(t, sm.relayTxQueue, "nothing goes to the queue before the peer is registered")
+	require.Equal(t, 2*size, sm.relayTxBytes.Load(), "held transactions stay charged, the dropped one does not")
+}
+
+// queueTxWithinDone is queueTxWithin with a done channel.
+func queueTxWithinDone(t *testing.T, sm *SyncManager, tx *bsvutil.Tx, p *peerpkg.Peer, done chan struct{}) {
+	t.Helper()
+
+	returned := make(chan struct{})
+	go func() {
+		sm.QueueTx(tx, p, done)
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "QueueTx blocked the peer's read loop")
+	}
 }

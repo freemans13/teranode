@@ -832,6 +832,20 @@ type SyncManager struct {
 	relayTxBytes       atomic.Int64
 	relayTxBytesBudget int64
 
+	// awaitingRegistration holds, for each peer NewPeer has handed to the
+	// block handler and handleNewPeerMsg has not yet registered, the relayed
+	// transactions QueueTx took from that peer in the meantime. The handshake
+	// does not wait for registration, so a peer's first transactions can reach
+	// QueueTx before it is in peerStates, and handleTxMsg discards a
+	// transaction from a peer it does not know. Holding them here until
+	// handleNewPeerMsg finishes keeps "registered before its transactions are
+	// handled", which the shared msgChan gave when transactions went through
+	// it. Held transactions keep their bytes charged to relayTxBytes, and a
+	// peer holds at most cap(relayTxQueue) of them. awaitingRegistrationMu
+	// guards the map, which NewPeer makes on first use.
+	awaitingRegistrationMu sync.Mutex
+	awaitingRegistration   map[*peerpkg.Peer][]*txMsg
+
 	// invQueue holds chunks of transaction announcements for the
 	// invLookupWorkers workers, and invQueued the hashes in it or being looked
 	// up, bounded by invQueueCap from legacy_invQueueMaxHashes. See
@@ -1536,6 +1550,7 @@ func (sm *SyncManager) isSyncCandidate(peer *peerpkg.Peer) bool {
 func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	// Ignore if in the process of shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
+		sm.releaseHeldTxs(peer, false, "sync manager stopping before the peer was registered")
 		return
 	}
 
@@ -1543,8 +1558,12 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	// drained from msgChan, don't insert it into peerStates at all. Pairs
 	// with the Connected() guard in startSync to close the window during
 	// which a dead pointer can sit in the map waiting for a donePeerMsg.
+	// Its held transactions are dropped, as handleTxMsg would have dropped
+	// them for coming from a peer it does not know.
 	if !peer.Connected() {
 		sm.logger.Debugf("[handleNewPeerMsg] peer %s already disconnected before registration, skipping", peer.String())
+		sm.releaseHeldTxs(peer, false, "peer disconnected before it was registered")
+
 		return
 	}
 
@@ -1586,6 +1605,9 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	state.noteBestKnownHeight(peer.StartingHeight())
 
 	sm.peerStates.Set(peer, state)
+
+	// Only now, with the peer in peerStates, may its transactions be handled.
+	sm.releaseHeldTxs(peer, true, "")
 
 	// Start syncing by choosing the best candidate if needed.
 	if isSyncCandidate && sm.loadSyncPeer() == nil {
@@ -3897,6 +3919,10 @@ out:
 	// waiter on handlerDone (Stop, and the tests that run the handler) see them finished.
 	sm.handlerLoops.Wait()
 
+	// Registrations still in msgChan will not be handled now, so nothing will
+	// release what their peers hold.
+	sm.dropAllHeldTxs()
+
 	close(sm.handlerDone)
 	sm.logger.Infof("Block handler done")
 }
@@ -3910,13 +3936,20 @@ func (sm *SyncManager) NewPeer(peer *peerpkg.Peer, done chan struct{}) {
 		}
 		return
 	}
+
+	// Before the message is sent, so that a transaction the peer relays as
+	// soon as this returns is held for the registration rather than handled
+	// against a peer the sync manager does not know yet.
+	sm.markAwaitingRegistration(peer)
+
 	sm.msgChan <- &newPeerMsg{peer: peer, reply: done}
 }
 
 // QueueTx adds the passed transaction message and peer to the relayed
 // transaction queue, or drops it when the queue is full or over its byte
-// budget. Responds to the done channel argument once the tx message is
-// processed, or at once when it is dropped.
+// budget. A transaction from a peer whose registration has not been handled
+// yet is held until it is (see awaitingRegistration). Responds to the done
+// channel argument once the tx message is processed, or once it is dropped.
 func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan struct{}) {
 	// Don't accept more transactions if we're shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
@@ -3930,7 +3963,10 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 	// carries its blocks. A transaction over the byte budget or with the queue
 	// full is dropped: an unmined transaction is not consensus-critical, and it
 	// arrives again from another peer or in the block that mines it. The bytes
-	// are given back by relayTxWorker once handleTxMsg returns.
+	// are given back by relayTxWorker once handleTxMsg returns, or by
+	// releaseHeldTxs for a held transaction it drops. Holding a transaction
+	// for its peer's registration does not wait either: it appends under a
+	// mutex held only for the append.
 	size := int64(tx.MsgTx().SerializeSize())
 
 	if held := sm.relayTxBytes.Add(size); held-size > 0 && held > sm.relayTxBytesBudget {
@@ -3940,11 +3976,108 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 		return
 	}
 
+	msg := &txMsg{tx: tx, peer: peer, reply: done, size: size}
+
+	if awaiting, held := sm.holdUntilRegistered(msg); awaiting {
+		if !held {
+			sm.relayTxBytes.Add(-size)
+			sm.dropRelayedTx(tx, peer, done, "peer not registered yet and holding its limit of transactions")
+		}
+
+		return
+	}
+
 	select {
-	case sm.relayTxQueue <- &txMsg{tx: tx, peer: peer, reply: done, size: size}:
+	case sm.relayTxQueue <- msg:
 	default:
 		sm.relayTxBytes.Add(-size)
 		sm.dropRelayedTx(tx, peer, done, "relayed transaction queue full")
+	}
+}
+
+// markAwaitingRegistration records that peer's registration is on its way to
+// the block handler, so QueueTx holds the peer's transactions until
+// handleNewPeerMsg has run for it. Marking a peer already awaiting keeps what
+// it holds.
+func (sm *SyncManager) markAwaitingRegistration(peer *peerpkg.Peer) {
+	sm.awaitingRegistrationMu.Lock()
+	defer sm.awaitingRegistrationMu.Unlock()
+
+	if sm.awaitingRegistration == nil {
+		sm.awaitingRegistration = make(map[*peerpkg.Peer][]*txMsg)
+	}
+
+	if _, ok := sm.awaitingRegistration[peer]; !ok {
+		sm.awaitingRegistration[peer] = nil
+	}
+}
+
+// holdUntilRegistered holds msg for its peer's registration. awaiting reports
+// whether the peer is awaiting one; held whether msg was taken, which it is
+// unless the peer already holds cap(relayTxQueue) transactions, as many as
+// the queue can take when the registration releases them. A transaction
+// whose peer is not awaiting is left to the caller.
+func (sm *SyncManager) holdUntilRegistered(msg *txMsg) (awaiting, held bool) {
+	sm.awaitingRegistrationMu.Lock()
+	defer sm.awaitingRegistrationMu.Unlock()
+
+	queued, awaiting := sm.awaitingRegistration[msg.peer]
+	if !awaiting {
+		return false, false
+	}
+
+	if len(queued) >= cap(sm.relayTxQueue) {
+		return true, false
+	}
+
+	sm.awaitingRegistration[msg.peer] = append(queued, msg)
+
+	return true, true
+}
+
+// releaseHeldTxs ends peer's wait for registration and gives back what it
+// held. handleNewPeerMsg calls it on every return. When registered, the
+// transactions go to the relay queue, after the peer is in peerStates; any the
+// queue has no room for are dropped. Otherwise every one is dropped for
+// reason. A dropped transaction's bytes are given back and its done channel
+// answered, as QueueTx does for its own drops.
+func (sm *SyncManager) releaseHeldTxs(peer *peerpkg.Peer, registered bool, reason string) {
+	sm.awaitingRegistrationMu.Lock()
+	held := sm.awaitingRegistration[peer]
+	delete(sm.awaitingRegistration, peer)
+	sm.awaitingRegistrationMu.Unlock()
+
+	for _, msg := range held {
+		why := reason
+
+		if registered {
+			select {
+			case sm.relayTxQueue <- msg:
+				continue
+			default:
+				why = "relayed transaction queue full"
+			}
+		}
+
+		sm.relayTxBytes.Add(-msg.size)
+		sm.dropRelayedTx(msg.tx, msg.peer, msg.reply, why)
+	}
+}
+
+// dropAllHeldTxs drops the transactions of every peer still awaiting
+// registration when the block handler stops, since the registrations still in
+// msgChan will not be handled, and answers their done channels.
+func (sm *SyncManager) dropAllHeldTxs() {
+	sm.awaitingRegistrationMu.Lock()
+	peers := make([]*peerpkg.Peer, 0, len(sm.awaitingRegistration))
+
+	for peer := range sm.awaitingRegistration {
+		peers = append(peers, peer)
+	}
+	sm.awaitingRegistrationMu.Unlock()
+
+	for _, peer := range peers {
+		sm.releaseHeldTxs(peer, false, "sync manager stopping before the peer was registered")
 	}
 }
 
