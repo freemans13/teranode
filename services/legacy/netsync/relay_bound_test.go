@@ -81,6 +81,10 @@ func newLookupStore(t *testing.T, tSettings *settings.Settings, name string) *lo
 func newInvHarness(t *testing.T, tSettings *settings.Settings, store utxo.Store, fsm blockchain2.FSMStateType) (*SyncManager, *peerpkg.Peer, *peerSyncState, *blockchain2.Mock) {
 	t.Helper()
 
+	// A dropped announcement increments a counter that is nil until the
+	// metrics are registered; New does this in production.
+	initPrometheusMetrics()
+
 	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "localhost:8333")
 	require.NoError(t, err)
 
@@ -99,6 +103,7 @@ func newInvHarness(t *testing.T, tSettings *settings.Settings, store utxo.Store,
 		blockDownloads:   newBlockDownloadTracker(blockRequestAssignmentTTL),
 	}
 	sm.headersFirstMode.Store(false)
+	sm.initInvQueue(invQueueMaxHashes(ulogger.TestLogger{}, tSettings))
 
 	state := &peerSyncState{
 		requestQueue:  txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
@@ -108,6 +113,23 @@ func newInvHarness(t *testing.T, tSettings *settings.Settings, store utxo.Store,
 	sm.storeSyncPeer(p, &syncPeerState{})
 
 	return sm, p, state, client
+}
+
+// newHarnessPeer adds a second peer, registered with its own state, to an inv
+// harness, for the tests where two peers share one announcement queue.
+func newHarnessPeer(t *testing.T, sm *SyncManager) (*peerpkg.Peer, *peerSyncState) {
+	t.Helper()
+
+	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, sm.settings, &peerpkg.Config{}, "localhost:8334")
+	require.NoError(t, err)
+
+	state := &peerSyncState{
+		requestQueue:  txmap.NewSyncedSlice[wire.InvVect](wire.MaxInvPerMsg),
+		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](time.Hour),
+	}
+	sm.peerStates.Set(p, state)
+
+	return p, state
 }
 
 // TestHandleInvMsg_LooksUpTransactionsInBatches reproduces the inventory

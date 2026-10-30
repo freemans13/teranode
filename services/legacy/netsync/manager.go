@@ -258,6 +258,10 @@ type peerSyncState struct {
 	requestQueue  *txmap.SyncedSlice[wire.InvVect]
 	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 
+	// queuedInvs is the transaction announcements from this peer queued for a
+	// UTXO store lookup or being looked up; admitTxInvs bounds it by invShare.
+	queuedInvs atomic.Int64
+
 	// requestQueueMu serialises the drain of requestQueue.
 	//
 	// Inv messages are dispatched one goroutine per message (blockHandler's
@@ -828,6 +832,14 @@ type SyncManager struct {
 	relayTxWorkers     int
 	relayTxBytes       atomic.Int64
 	relayTxBytesBudget int64
+
+	// invQueue holds chunks of transaction announcements for the
+	// invLookupWorkers workers, and invQueued the hashes in it or being looked
+	// up, bounded by invQueueCap from legacy_invQueueMaxHashes. See
+	// inv_queue.go. Built in New; the workers are started by blockHandler.
+	invQueue    chan *invChunk
+	invQueueCap int
+	invQueued   atomic.Int64
 
 	// inFlightBlocks is the dedup half of the same block-admission gate whose
 	// other half is blockPrefetchBudget. It holds the hash of every block that is
@@ -4709,6 +4721,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, err
 	}
 
+	invCap := invQueueMaxHashes(logger, tSettings)
+
 	sm := SyncManager{
 		ctx:          ctx,
 		settings:     tSettings,
@@ -4795,6 +4809,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	sm.relayTxBytesBudget = tSettings.Legacy.RelayTxBytesBudget
 	logger.Infof("[legacy] relayed transactions: %d validation workers, queue of %d, %d MiB budget",
 		sm.relayTxWorkers, cap(sm.relayTxQueue), sm.relayTxBytesBudget>>20)
+	sm.initInvQueue(invCap)
+	logger.Infof("[legacy] transaction announcements: %d lookup workers, queue of %d hashes, per-peer share %d",
+		invLookupWorkers, sm.invQueueCap, sm.invShare())
 	logger.Infof("[legacy] streaming pipeline active: download admission budget sized as %d block slots (maxBlocksInTransitPerPeer=%d x %d)",
 		capacity, tSettings.Legacy.MaxBlocksInTransitPerPeer, pipelineBlockSlotPeerAllowance)
 
