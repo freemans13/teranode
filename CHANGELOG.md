@@ -316,8 +316,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   limit are dropped and counted in hashes in the new
   `teranode_legacy_netsync_inv_dropped_total` (label `reason`), and the new gauge
   `teranode_legacy_netsync_inv_queued_hashes` shows the queue. The set of hashes asked
-  for is capped at the same number as the queue. Announcements are no longer looked up
-  outside the RUNNING state, where they were already discarded. Before this, each
+  for is capped at the same number as the queue. Outside the RUNNING state, where
+  transaction announcements were already ignored without a lookup, they no longer get a
+  goroutine each. Before this, each
   relayed transaction and each announced item got its own goroutine with no ceiling,
   and on 2026-10-19 that reached 223,118 goroutines and got the node killed for
   exceeding its memory limit. (#2045)

@@ -93,14 +93,18 @@ const (
 	// hashes to store in memory.
 	maxRejectedTxns = 10_000
 
-	// txInvLookupChunk is the most transaction inventory items looked up in
-	// the UTXO store in one BatchDecorate call. Each item used to get its own
+	// txInvLookupChunk sizes the transaction announcement path in inv_queue.go
+	// in three places: admitTxInvs cuts a message's transaction items into
+	// chunks of at most this many for invQueue, takeInvBatch stops coalescing
+	// queued chunks, which may come from several peers, once a batch holds this
+	// many, and lookupInvBatch reads a batch from the UTXO store in
+	// BatchDecorate slices of at most this many. Each item used to get its own
 	// goroutine and its own Get: one inv message carries up to 50,000 items and
 	// each message is handled on its own goroutine, and on Hetzner mainnet on
 	// 2026-10-19 that reached 223,118 goroutines, 88,563 of them queued on one
-	// peer's known-inventory lock, before the cgroup killed the node. A message
-	// is now looked up in chunks on the goroutine that handles it, with no
-	// goroutine per item. 4096 matches utxostore_getBatcherSize in
+	// peer's known-inventory lock, before the cgroup killed the node. Now
+	// checkTxInvs only marks the items known and queues them, and the
+	// invLookupWorkers do the reads. 4096 matches utxostore_getBatcherSize in
 	// settings.conf, the batch the per-item Gets were being collected into.
 	txInvLookupChunk = 4096
 
