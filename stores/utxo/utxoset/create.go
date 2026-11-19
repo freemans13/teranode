@@ -136,16 +136,22 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// write the record, and LaneBurnReason says so. A batch that failed with its database
 	// transaction open says why on its result, and so does a direct call whose context had
 	// already ended.
+	//
+	// Two of those burns go back for reuse. A batch that rolled back before its COMMIT was sent
+	// wrote nothing. And a refused claim of a create that carries no block wrote nothing either; one
+	// that carries a block still adds the containment row, which can take this position.
 	var knownBurnReason string
 
 	if utxo.TookLanePosition(options.LanePosition, position) {
 		defer func() {
 			if knownBurnReason != "" && err != nil {
-				s.BurnLanePosition(utxo.CreatedTxID(tx, options), options.Caller, position, knownBurnReason)
+				s.BurnOrReturnLanePosition(utxo.CreatedTxID(tx, options), options.Caller, position, knownBurnReason,
+					knownBurnReason == utxo.LaneBurnRolledBack)
+
 				return
 			}
 
-			s.BurnCreateLanePosition(tx, options, position, err, nil)
+			s.BurnCreateLanePosition(tx, options, position, err, nil, refusedUnwritten(err, options))
 		}()
 	}
 
@@ -255,6 +261,21 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	committed = true
 
 	return data, cerr
+}
+
+// refusedUnwritten reports whether err, the final answer of a create, proves that no record carries
+// the create's lane position: ErrTxExists for a create that carries no block. The claim that refused
+// it wrote nothing (see createPlan.settle), and with no block there is no containment row, the one
+// write a refused claim still makes, whose position can be the create's own (minedLaneValue). The
+// answer must be final: a rerun after a batch whose COMMIT may have landed can meet its own record.
+func refusedUnwritten(err error, options *utxo.CreateOptions) bool {
+	if !errors.Is(err, errors.ErrTxExists) {
+		return false
+	}
+
+	_, mined := minedBlock(options.MinedBlockInfos)
+
+	return !mined
 }
 
 // appendCreate adds one transaction to the plan: its identity row, its serialized bytes, and

@@ -172,11 +172,13 @@ func TestLanePositionContractUtxoset(t *testing.T) {
 		s, _ := newUncheckpointedLaneStore(t)
 		tests.LanePositionContract(t, s)
 		t.Run("burns", func(t *testing.T) { tests.LanePositionBurns(t, s, "utxoset") })
+		t.Run("returns", func(t *testing.T) { tests.LanePositionReturns(t, s, utxosetLaneRules, utxosetLaneRows(s)) })
 	})
 
 	t.Run("no batchers", func(t *testing.T) {
 		s, _ := newUnbatchedLaneStore(t)
 		tests.LanePositionBurns(t, s, "utxoset")
+		t.Run("returns", func(t *testing.T) { tests.LanePositionReturns(t, s, utxosetLaneRules, utxosetLaneRows(s)) })
 	})
 
 	t.Run("checkpointed", func(t *testing.T) {
@@ -185,6 +187,35 @@ func TestLanePositionContractUtxoset(t *testing.T) {
 		tests.LanePositionMulti(t, s)
 		tests.LanePositionAbsentWithoutOption(t, s)
 	})
+}
+
+// utxosetLaneRules: a refused claim goes back only for a create with no block, since one with a
+// block still writes a containment row; a list's refusals stay burned.
+var utxosetLaneRules = tests.LaneReturnRules{Exists: true}
+
+// utxosetLaneRows counts the rows of every table with a lane_position column that carry any of
+// positions.
+func utxosetLaneRows(s *Store) tests.LanePositionCounter {
+	return func(t testing.TB, positions []uint64) int {
+		t.Helper()
+
+		signed := make([]int64, len(positions))
+		for i, p := range positions {
+			signed[i] = lane.ToSigned(p)
+		}
+
+		total := 0
+
+		for _, table := range laneColumnTables {
+			var n int
+			require.NoError(t, s.pool.QueryRow(context.Background(),
+				`SELECT count(*) FROM `+table+` WHERE lane_position = ANY($1)`, signed).Scan(&n))
+
+			total += n
+		}
+
+		return total
+	}
 }
 
 // storedLane reads the raw lane_position column of the named table for one transaction. ok is
@@ -1833,4 +1864,278 @@ func TestLanePositionBurnOfADirectCreateWithAnEndedContext(t *testing.T) {
 		tests.ReadLaneBurns(t, "utxoset").Since(before))
 	require.Equal(t, 0, identityCount(t, s, ctx, tx))
 	require.Equal(t, 0, utxoCount(t, s, ctx, tx))
+}
+
+// useReturningSource gives s a source that records the positions it hands back.
+func useReturningSource(t *testing.T, s *Store, positions ...uint64) *tests.ReturningLanePositions {
+	t.Helper()
+
+	source := tests.NewReturningLanePositions(positions...)
+	s.SetLanePositionSource(source)
+	t.Cleanup(func() { s.SetLanePositionSource(nil) })
+
+	return source
+}
+
+// requireReturnedNowhere requires source to have taken back exactly want, and no row of any table
+// with a lane_position column to carry what it took back.
+func requireReturnedNowhere(t *testing.T, s *Store, source *tests.ReturningLanePositions, want ...uint64) {
+	t.Helper()
+
+	returned := source.Returned()
+
+	if len(want) == 0 {
+		require.Empty(t, returned, "nothing goes back")
+		return
+	}
+
+	require.ElementsMatch(t, want, returned)
+	require.Zero(t, utxosetLaneRows(s)(t, returned), "a row carries a returned position")
+}
+
+// The returns only utxoset makes, which the shared contract cannot reach: a database transaction
+// that rolled back whole before its COMMIT returns its positions, and nothing whose write may have
+// landed does.
+func TestLanePositionReturnsOfAUtxosetStore(t *testing.T) {
+	failure := errors.NewProcessingError("injected failure")
+
+	t.Run("a create batch that rolled back", func(t *testing.T) {
+		s, ctx := newUncheckpointedLaneStore(t)
+		require.NotNil(t, s.createBatcher)
+
+		source := useReturningSource(t, s, burnPositions(1)...)
+
+		createBatchBeforeCommit = func() error { return failure }
+		t.Cleanup(func() { createBatchBeforeCommit = nil })
+
+		_, err := s.Create(ctx, mkTx(t, 1, 5_000), 1_000)
+		require.Error(t, err)
+
+		requireReturnedNowhere(t, s, source, burnPositions(1)...)
+	})
+
+	t.Run("a list chunk that rolled back, and not the chunk that never ran", func(t *testing.T) {
+		s, ctx := newUncheckpointedLaneStore(t)
+		forceChunkOfOne(t)
+
+		root := storedParent(t, s, ctx)
+		parent := spendOutput(t, root, 0, 2)
+		child := spendOutput(t, parent, 0, 3)
+		grandchild := spendOutput(t, child, 0, 1)
+
+		// Chunk 0 holds parent and commits, chunk 1 holds child and rolls back, chunk 2 never runs.
+		multiChunkFault = func(chunk int, stage string) error {
+			if chunk == 1 && stage == "spent" {
+				return failure
+			}
+
+			return nil
+		}
+
+		t.Cleanup(func() { multiChunkFault = nil })
+
+		source := useReturningSource(t, s, burnPositions(3)...)
+
+		_, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{parent, child, grandchild}, 1_100, utxo.WithIgnoreLocked(true))
+		multiChunkFault = nil
+		require.ErrorIs(t, err, failure)
+
+		requireReturnedNowhere(t, s, source, burnPositions(3)[1])
+		requireGetLane(t, s, ctx, parent, burnPositions(3)[0], "the committed chunk keeps its position")
+	})
+
+	t.Run("a below-checkpoint chunk that rolled back", func(t *testing.T) {
+		const height = 900
+
+		s, ctx := newTestStoreWith(t, func(ts *settings.Settings) {
+			ts.UtxoStore.LaneMigration = settings.LaneMigrationShadow
+			ts.UtxoStore.NettedBelowWorkers = 1
+		})
+		withNettedBelowChunkTxs(t, 1)
+
+		w := tests.BuildMultiWorkload(t, 0xbe, 1, 3)
+		w.StoreRoots(t, s, height-1)
+
+		list := outpointOnly(w.Txs)
+
+		nettedBelowFault = func(chunk []int) error {
+			if len(chunk) == 1 && chunk[0] == 1 {
+				return failure
+			}
+
+			return nil
+		}
+
+		t.Cleanup(func() { nettedBelowFault = nil })
+
+		source := useReturningSource(t, s, burnPositions(3)...)
+
+		_, err := s.SpendAndCreateMulti(ctx, list, height, belowCheckpointOptions(height)...)
+		nettedBelowFault = nil
+		require.ErrorIs(t, err, failure)
+
+		requireReturnedNowhere(t, s, source, burnPositions(3)[1])
+	})
+
+	t.Run("a list's refused spend and its child stay burned", func(t *testing.T) {
+		s, ctx := newUncheckpointedLaneStore(t)
+
+		root := storedParent(t, s, ctx)
+
+		_, _, err := s.SpendAndCreate(ctx, spendOutput(t, root, 0, 4), 1_100)
+		require.NoError(t, err)
+
+		parent := spendOutput(t, root, 0, 2)
+		child := spendOutput(t, parent, 0, 1)
+
+		source := useReturningSource(t, s, burnPositions(2)...)
+
+		results, err := s.SpendAndCreateMulti(ctx, []*bt.Tx{parent, child}, 1_100, utxo.WithIgnoreLocked(true))
+		require.NoError(t, err)
+		require.Equal(t, utxo.MultiTxFailed, results[0].Status)
+		require.Equal(t, utxo.MultiTxParentFailed, results[1].Status)
+
+		requireReturnedNowhere(t, s, source)
+	})
+
+	// A COMMIT that reported failure may have landed, and here it did: the record carries the
+	// position, so it must not go back.
+	for _, c := range []struct {
+		name  string
+		store func(t *testing.T) (*Store, context.Context)
+		call  func(ctx context.Context, s *Store, tx *bt.Tx) error
+	}{
+		{"a single-write Create whose commit reported failure", newUnbatchedLaneStore, func(ctx context.Context, s *Store, tx *bt.Tx) error {
+			_, err := s.Create(ctx, tx, 1_000)
+			return err
+		}},
+		{"a single-write SpendAndCreate whose commit reported failure", newUnbatchedLaneStore, func(ctx context.Context, s *Store, tx *bt.Tx) error {
+			_, _, err := s.SpendAndCreate(ctx, tx, 1_000, utxo.WithCreateOnly())
+			return err
+		}},
+		{"a create batch whose commit reported failure", newUncheckpointedLaneStore, func(ctx context.Context, s *Store, tx *bt.Tx) error {
+			_, err := s.Create(ctx, tx, 1_000)
+			return err
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, ctx := c.store(t)
+			source := useReturningSource(t, s, burnPositions(1)...)
+			_ = failNextCommit(t)
+
+			tx := mkTx(t, 1, 5_000)
+			require.Error(t, c.call(ctx, s, tx))
+
+			requireReturnedNowhere(t, s, source)
+			requireGetLane(t, s, ctx, tx, burnPositions(1)[0], "the commit landed with the position")
+		})
+	}
+
+	// The batch's COMMIT landed and reported failure, so the item reruns alone and meets its own
+	// record. That ErrTxExists is the item's own write and must not send the position back.
+	t.Run("a rerun that meets the record its batch wrote", func(t *testing.T) {
+		s, ctx := newUncheckpointedLaneStore(t)
+		require.NotNil(t, s.spendAndCreateBatcher)
+
+		root := tests.BuildMultiWorkload(t, 0xbf, 1, 1).Roots[0]
+		source := useReturningSource(t, s, burnPositions(1)...)
+
+		failed := false
+		spendAndCreateBatchAfterCommit = func() error {
+			if failed {
+				return nil
+			}
+
+			failed = true
+
+			return failure
+		}
+
+		t.Cleanup(func() { spendAndCreateBatchAfterCommit = nil })
+
+		_, _, err := s.SpendAndCreate(ctx, root, 1_000, utxo.WithCreateOnly())
+		require.ErrorIs(t, err, errors.ErrTxExists)
+		require.True(t, failed)
+
+		requireReturnedNowhere(t, s, source)
+		requireGetLane(t, s, ctx, root, burnPositions(1)[0], "the record carries the position")
+	})
+
+	// After a failed rerun, a record carrying another position is counted as a burn for the rerun's
+	// reason, which does not prove the position unwritten, so it stays burned.
+	t.Run("a rerun that meets another position", func(t *testing.T) {
+		s, ctx := newUncheckpointedLaneStore(t)
+
+		stored := tests.BuildMultiWorkload(t, 0xb7, 1, 1).Roots[0]
+
+		_, _, err := s.SpendAndCreate(ctx, stored, 1_000, utxo.WithCreateOnly(), utxo.WithLanePosition(lane.Pack(31, 1)))
+		require.NoError(t, err)
+
+		source := useReturningSource(t, s)
+
+		s.burnUnlessStored(ctx, stored, &utxo.CreateOptions{}, lane.Pack(30, 9), errors.NewTxExistsError("exists"), nil)
+
+		requireReturnedNowhere(t, s, source)
+	})
+}
+
+// laneLeases is a lane.LeaseSource with one lane and no other holder, enough for a real allocator.
+type laneLeases struct {
+	mu   sync.Mutex
+	high uint64
+}
+
+func (l *laneLeases) grant() lane.Grant {
+	g := lane.Grant{Lane: 5, First: l.high + 1, Last: l.high + 1_000}
+	l.high = g.Last
+
+	return g
+}
+
+func (l *laneLeases) OpenLaneLease(context.Context, string) (lane.LeaseID, lane.Grant, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return lane.LeaseID{1}, l.grant(), nil
+}
+
+func (l *laneLeases) RenewLaneLease(_ context.Context, r lane.Renewal) (lane.RenewResult, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if !r.WantGrant {
+		return lane.RenewResult{}, nil
+	}
+
+	return lane.RenewResult{Granted: true, Grant: l.grant()}, nil
+}
+
+func (l *laneLeases) ReleaseLaneLease(context.Context, lane.Release) (bool, error) {
+	return false, nil
+}
+
+// With the real allocator, a validator's second create of a stored transaction sends its position
+// back, and the next create writes it, so the lane keeps its run with no hole.
+func TestARefusedCreatesPositionIsWrittenByTheNextCreate(t *testing.T) {
+	s, ctx := newUncheckpointedLaneStore(t)
+
+	allocator := lane.NewAllocator(&laneLeases{}, "reuse-test", lane.Timings{Renew: time.Hour, Stop: 2 * time.Hour, GrantDuration: time.Hour}, nil)
+	t.Cleanup(func() { _ = allocator.Close() })
+
+	s.SetLanePositionSource(allocator)
+	t.Cleanup(func() { s.SetLanePositionSource(nil) })
+
+	w := tests.BuildMultiWorkload(t, 0xb6, 1, 2)
+
+	_, _, err := s.SpendAndCreate(ctx, w.Roots[0], 1_000, utxo.WithCreateOnly(), utxo.WithCaller(utxo.CallerValidator))
+	require.NoError(t, err)
+
+	_, _, err = s.SpendAndCreate(ctx, w.Roots[0], 1_000, utxo.WithCreateOnly(), utxo.WithCaller(utxo.CallerValidator))
+	require.ErrorIs(t, err, errors.ErrTxExists)
+
+	_, _, err = s.SpendAndCreate(ctx, w.Roots[1], 1_000, utxo.WithCreateOnly(), utxo.WithCaller(utxo.CallerValidator))
+	require.NoError(t, err)
+
+	requireGetLane(t, s, ctx, w.Roots[0], lane.Pack(5, 1), "the first create")
+	requireGetLane(t, s, ctx, w.Roots[1], lane.Pack(5, 2), "the refused create's position, written by the next")
 }

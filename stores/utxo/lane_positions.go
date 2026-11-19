@@ -16,6 +16,15 @@ type LanePositionSource interface {
 	Next(ctx context.Context) (uint64, error)
 }
 
+// LanePositionReturner is a LanePositionSource that takes back a position no record carries, so a
+// later Next gives it out again instead of leaving a hole in the lane. Return reports whether it
+// took the position back; one it does not stays burned. *lane.Allocator implements it. A store
+// returns a position only when its own code proves no record carries it; see
+// LanePositions.BurnOrReturnLanePosition.
+type LanePositionReturner interface {
+	Return(position uint64) bool
+}
+
 // LanePositionTaker is a store that gives each record it creates a position from a source. A store
 // takes the position before it spends or opens a database transaction, so a wait for one holds
 // nothing, and a create that cannot get one fails having written nothing. A store that plans a write
@@ -35,12 +44,18 @@ type LanePositionTaker interface {
 	// BurnLanePosition counts and logs a position taken from the source that no record carries;
 	// see LanePositions.BurnLanePosition.
 	BurnLanePosition(txid chainhash.Hash, caller Caller, position uint64, reason string)
+
+	// BurnOrReturnLanePosition is BurnLanePosition that also returns the position for reuse when
+	// unwritten proves no record carries it; see LanePositions.BurnOrReturnLanePosition.
+	BurnOrReturnLanePosition(txid chainhash.Hash, caller Caller, position uint64, reason string, unwritten bool)
 }
 
 // LanePositions is the part of a store that implements LanePositionTaker. With no source set, which
 // is every store with lane positions off, a create pays one nil check.
 type LanePositions struct {
 	source LanePositionSource
+	// returner is source when it takes positions back, and nil otherwise.
+	returner LanePositionReturner
 
 	// burnStore and burnLogger label and log the positions this store burns; see NameLaneBurns.
 	burnStore  string
@@ -50,6 +65,7 @@ type LanePositions struct {
 // SetLanePositionSource implements LanePositionTaker.
 func (l *LanePositions) SetLanePositionSource(source LanePositionSource) {
 	l.source = source
+	l.returner, _ = source.(LanePositionReturner)
 }
 
 // Take returns the position for the record that o describes: the caller's own if it named one,

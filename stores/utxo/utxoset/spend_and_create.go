@@ -77,6 +77,12 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		// batched path waits for its batch's answer whatever the caller's context does, and a batch
 		// that rolls back runs the item again with the same position, so the answer returned here
 		// is the final one.
+		//
+		// A rerun after a failed batch never returns its position: that batch's COMMIT may have
+		// landed with it. Otherwise the answer proves the position unwritten in two cases. An
+		// input's spend was refused: the single path rolls its transaction back, and the batch
+		// leaves a rejected item out of its create plan. Or the claim was refused for a create with
+		// no block (refusedUnwritten).
 		if utxo.TookLanePosition(options.LanePosition, position) {
 			defer func() {
 				if notSubmitted {
@@ -89,7 +95,7 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 					return
 				}
 
-				s.BurnCreateLanePosition(tx, options, position, err, spends)
+				s.BurnCreateLanePosition(tx, options, position, err, spends, spendAndCreateUnwritten(err, spends, options))
 			}()
 		}
 
@@ -279,6 +285,19 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 	}
 
 	return data, spends, nil
+}
+
+// spendAndCreateUnwritten reports whether err and spends, the final answer of a SpendAndCreate that
+// was not rerun after a failed batch, prove that no record carries its lane position: a refused
+// claim with no block (refusedUnwritten), or a spend refused when the call spent. A refused spend
+// never reaches a committed create: spendAndCreateOne returns before its COMMIT and rolls back, and
+// runSpendAndCreateBatch leaves a rejected item out of the plan it commits.
+func spendAndCreateUnwritten(err error, spends []*utxo.Spend, options *utxo.CreateOptions) bool {
+	if refusedUnwritten(err, options) {
+		return true
+	}
+
+	return !options.CreateOnly && utxo.LaneBurnReason(err, spends) == utxo.LaneBurnSpendRejected
 }
 
 // laneBurnProbeTimeout bounds burnUnlessStored's read. The read only labels a metric, and the

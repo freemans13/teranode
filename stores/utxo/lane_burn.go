@@ -19,6 +19,14 @@ import (
 // The code that took the position from the source records its burn, from the result it saw. A store
 // whose Create is handed a position the caller already took records nothing for it, so one burned
 // position is counted once.
+//
+// A burned position whose create the store can prove wrote no record carrying it goes back to the
+// source for reuse (BurnOrReturnLanePosition), so the next take fills the hole. Two things must both
+// hold: the code that saw the result proves nothing carries the position, and the reason is one of
+// those laneReturnable allows. The reason alone is a label and proves nothing; outcome_unknown in
+// particular can be a written position. A returned position is still counted as burned; the
+// allocator counts the ones it gives out again in teranode_lane_positions_reused_total, so the holes
+// left are burned minus reused.
 
 // The reasons a position burns.
 const (
@@ -119,6 +127,54 @@ var prometheusLanePositionsBurned = promauto.NewCounterVec(
 	[]string{"store", "reason", "caller"},
 )
 
+var prometheusLanePositionsReturned = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "lane",
+		Name:      "positions_returned_total",
+		Help:      "Burned lane positions a store proved no record carries and its source took back for reuse, by store and burn reason. Each is also counted in positions_burned_total; teranode_lane_positions_reused_total counts the ones given out again",
+	},
+	[]string{"store", "reason"},
+)
+
+// laneReturnable reports whether a position that burned for reason may go back to the source when
+// the store proves nothing carries it: the store refused the insert because the transaction exists,
+// an input's spend was refused before any create, or the database transaction rolled back whole.
+// Every other reason burns for good, outcome_unknown and error above all: a write whose outcome is
+// unknown may carry the position.
+func laneReturnable(reason string) bool {
+	switch reason {
+	case LaneBurnExists, LaneBurnSpendRejected, LaneBurnRolledBack:
+		return true
+	default:
+		return false
+	}
+}
+
+// laneUnwrittenKey marks an error with which a store proves its create wrote no record carrying the
+// create's lane position.
+const laneUnwrittenKey = "lane_position_unwritten"
+
+// MarkLanePositionUnwritten marks err, the error of a create, as proof that the create wrote no
+// record carrying its lane position, such as an insert the store refused because the transaction
+// exists. A store marks only an error its own code proves that for; an unmarked error proves
+// nothing. It returns err.
+func MarkLanePositionUnwritten(err error) error {
+	var te *errors.Error
+	if errors.As(err, &te) && te != nil {
+		te.SetData(laneUnwrittenKey, true)
+	}
+
+	return err
+}
+
+// LanePositionUnwritten reports whether a store marked err with MarkLanePositionUnwritten.
+func LanePositionUnwritten(err error) bool {
+	var te *errors.Error
+
+	return errors.As(err, &te) && te != nil && te.GetData(laneUnwrittenKey) == true
+}
+
 // LaneBurnReason returns why a create that took a position and failed with err burned it. spends are
 // the spends the call returned, if any: a refused input is reported on its Spend.
 func LaneBurnReason(err error, spends []*Spend) string {
@@ -180,8 +236,17 @@ func (l *LanePositions) NameLaneBurns(store string, logger ulogger.Logger) {
 	l.burnLogger = logger
 }
 
-// BurnLanePosition counts one burned position and logs it at info level.
+// BurnLanePosition counts one burned position and logs it at info level. The position stays burned.
 func (l *LanePositions) BurnLanePosition(txid chainhash.Hash, caller Caller, position uint64, reason string) {
+	l.BurnOrReturnLanePosition(txid, caller, position, reason, false)
+}
+
+// BurnOrReturnLanePosition counts and logs one burned position as BurnLanePosition does, and hands
+// it back to the source for reuse when unwritten is true and laneReturnable allows the reason.
+// unwritten is the caller's proof, from its own code, that no record carries the position; it is
+// called once the create or its batch has its outcome, never while a write that may carry the
+// position can still commit, and at most once per position taken.
+func (l *LanePositions) BurnOrReturnLanePosition(txid chainhash.Hash, caller Caller, position uint64, reason string, unwritten bool) {
 	store := l.burnStore
 	if store == "" {
 		store = "unknown"
@@ -189,18 +254,25 @@ func (l *LanePositions) BurnLanePosition(txid chainhash.Hash, caller Caller, pos
 
 	prometheusLanePositionsBurned.WithLabelValues(store, reason, caller.String()).Inc()
 
+	returned := unwritten && l.returner != nil && laneReturnable(reason) && l.returner.Return(position)
+	if returned {
+		prometheusLanePositionsReturned.WithLabelValues(store, reason).Inc()
+	}
+
 	if l.burnLogger != nil {
-		l.burnLogger.Infof("[lane] burned lane position %d (lane %d) of tx %s: store=%s reason=%s caller=%s",
-			position, lane.Lane(position), txid.String(), store, reason, caller.String())
+		l.burnLogger.Infof("[lane] burned lane position %d (lane %d) of tx %s: store=%s reason=%s caller=%s returned=%t",
+			position, lane.Lane(position), txid.String(), store, reason, caller.String(), returned)
 	}
 }
 
 // BurnCreateLanePosition records the burn of a create that took position from the source and
-// returned err, if it failed. A create that succeeded wrote the position, so it records nothing.
-func (l *LanePositions) BurnCreateLanePosition(tx *bt.Tx, o *CreateOptions, position uint64, err error, spends []*Spend) {
+// returned err, if it failed, and returns the position for reuse when unwritten proves no record
+// carries it (see BurnOrReturnLanePosition). A create that succeeded wrote the position, so it
+// records nothing.
+func (l *LanePositions) BurnCreateLanePosition(tx *bt.Tx, o *CreateOptions, position uint64, err error, spends []*Spend, unwritten bool) {
 	if err == nil || position == lane.None {
 		return
 	}
 
-	l.BurnLanePosition(CreatedTxID(tx, o), o.Caller, position, LaneBurnReason(err, spends))
+	l.BurnOrReturnLanePosition(CreatedTxID(tx, o), o.Caller, position, LaneBurnReason(err, spends), unwritten)
 }

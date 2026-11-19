@@ -423,10 +423,11 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 
 	// A position this call took from the source is its own to record if the create fails. A
 	// caller that stopped waiting for the batcher gets a context error while the batch may still
-	// write the record, and LaneBurnReason says so.
+	// write the record, and LaneBurnReason says so. An ErrTxExists that markRefusedCreate marked
+	// proves the position unwritten, so it goes back for reuse.
 	if utxo.TookLanePosition(options.LanePosition, position) {
 		defer func() {
-			s.BurnCreateLanePosition(tx, options, position, err, nil)
+			s.BurnCreateLanePosition(tx, options, position, err, nil, utxo.LanePositionUnwritten(err))
 		}()
 	}
 
@@ -437,8 +438,13 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 
 	// Postgres with createBatcher: enqueue and wait for batch callback
 	if s.createBatcher != nil {
-		return s.createBatched(ctx, tx, blockHeight, options)
+		txMeta, err = s.createBatched(ctx, tx, blockHeight, options)
+		return txMeta, markRefusedCreate(err, false)
 	}
+
+	// An attempt whose outcome is unknown may have committed with this position, and then a later
+	// attempt's ErrTxExists is this create's own record.
+	mayHaveCommitted := false
 
 	// Try the operation with retry logic for lock errors
 	for attempt := 0; attempt <= 3; attempt++ {
@@ -446,8 +452,10 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 
 		// If no error or not a lock error, return immediately
 		if err == nil || !isLockError(err) {
-			return txMeta, err
+			return txMeta, markRefusedCreate(err, mayHaveCommitted)
 		}
+
+		mayHaveCommitted = mayHaveCommitted || utxo.IsCreateOutcomeUnknown(err)
 
 		// For lock errors, retry with backoff
 		if attempt < 3 {
@@ -464,6 +472,21 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	}
 
 	return txMeta, err
+}
+
+// markRefusedCreate marks err as proof that the create wrote no record carrying its lane position
+// (utxo.MarkLanePositionUnwritten) when it is ErrTxExists and no earlier attempt of the create may
+// have committed. Every ErrTxExists this store's create returns proves that: the per-statement path
+// meets the unique violation, or the duplicate in a child table, inside its database transaction
+// and rolls it back, and the CTE paths, single and batched, insert with ON CONFLICT DO NOTHING and
+// gate every other insert on the transaction row they inserted, so a refused create writes no row
+// at all.
+func markRefusedCreate(err error, mayHaveCommitted bool) error {
+	if mayHaveCommitted || !errors.Is(err, errors.ErrTxExists) {
+		return err
+	}
+
+	return utxo.MarkLanePositionUnwritten(err)
 }
 
 // createBatched enqueues a Create request into the createBatcher for bulk processing.

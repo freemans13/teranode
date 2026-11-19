@@ -206,9 +206,14 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// A position this call took from the source is its own to record if the create fails. A
 	// caller that stopped waiting gets a context or outcome-unknown error while the batch may
 	// still write the record, and LaneBurnReason says so.
+	//
+	// It is never returned for reuse. Writes retry (aerospike_writePolicy sets MaxRetries), and
+	// the overload layer resubmits records that never answered, so KEY_EXISTS, read here as
+	// ErrTxExists, can be this create's own earlier attempt, written with this position. Telling
+	// the two apart needs a per-record answer threaded out of the batch.
 	if utxo.TookLanePosition(createOptions.LanePosition, lanePosition) {
 		defer func() {
-			s.BurnCreateLanePosition(tx, createOptions, lanePosition, err, nil)
+			s.BurnCreateLanePosition(tx, createOptions, lanePosition, err, nil, false)
 		}()
 	}
 

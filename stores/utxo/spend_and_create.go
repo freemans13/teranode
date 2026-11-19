@@ -184,7 +184,8 @@ func SequentialSpendAndCreate(ctx context.Context, logger ulogger.Logger, s Sequ
 					reason = LaneBurnError
 				}
 
-				taker.BurnLanePosition(CreatedTxID(tx, options), options.Caller, taken, reason)
+				// Create never ran, so no record carries the position whatever the spend did.
+				taker.BurnOrReturnLanePosition(CreatedTxID(tx, options), options.Caller, taken, reason, true)
 			}
 
 			return nil, spends, err
@@ -198,7 +199,9 @@ func SequentialSpendAndCreate(ctx context.Context, logger ulogger.Logger, s Sequ
 	md, err := s.Create(ctx, tx, blockHeight, opts...)
 	if err != nil {
 		if taken != lane.None {
-			taker.BurnLanePosition(CreatedTxID(tx, options), options.Caller, taken, LaneBurnReason(err, nil))
+			// Only the store knows whether its failed Create wrote the position; it says so by
+			// marking the error.
+			taker.BurnOrReturnLanePosition(CreatedTxID(tx, options), options.Caller, taken, LaneBurnReason(err, nil), LanePositionUnwritten(err))
 		}
 
 		if errors.Is(err, errors.ErrTxExists) {

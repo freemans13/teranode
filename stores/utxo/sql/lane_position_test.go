@@ -65,11 +65,36 @@ func lanePositionSettings(t *testing.T) *settings.Settings {
 	return tSettings
 }
 
+// sqlLaneRules: every ErrTxExists the SQL store returns proves the position unwritten (see
+// markRefusedCreate), with a block or without, and a list goes through SpendAndCreate.
+var sqlLaneRules = tests.LaneReturnRules{Exists: true, MinedExists: true, ListExists: true}
+
+// sqlLaneRows counts the transaction rows carrying any of positions, the one column the store
+// writes a position to.
+func sqlLaneRows(s *Store) tests.LanePositionCounter {
+	return func(t testing.TB, positions []uint64) int {
+		t.Helper()
+
+		total := 0
+
+		for _, p := range positions {
+			var n int
+			require.NoError(t, s.db.QueryRowContext(context.Background(),
+				`SELECT count(*) FROM transactions WHERE lane_position = $1`, lane.ToSigned(p)).Scan(&n))
+
+			total += n
+		}
+
+		return total
+	}
+}
+
 func TestLanePositionContractSQLite(t *testing.T) {
 	db, _ := setup(context.Background(), t)
 
 	tests.LanePositionContract(t, db)
 	t.Run("burns", func(t *testing.T) { tests.LanePositionBurns(t, db, "sql") })
+	t.Run("returns", func(t *testing.T) { tests.LanePositionReturns(t, db, sqlLaneRules, sqlLaneRows(db)) })
 }
 
 // Every Postgres create path writes the lane position: the create batcher's
@@ -103,6 +128,7 @@ func TestLanePositionContractPostgres(t *testing.T) {
 
 			tests.LanePositionContract(t, db)
 			t.Run("burns", func(t *testing.T) { tests.LanePositionBurns(t, db, "sql") })
+			t.Run("returns", func(t *testing.T) { tests.LanePositionReturns(t, db, sqlLaneRules, sqlLaneRows(db)) })
 		})
 	}
 }
