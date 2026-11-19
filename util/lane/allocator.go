@@ -382,14 +382,13 @@ func (a *Allocator) takeLocked() (v uint64, ok bool, changed chan struct{}, err 
 
 // leaveCurrentLocked settles the current grant and moves to the spare, or to no grant when there is
 // no spare, in which case the loop asks for one at once. The grant's returned positions are dropped
-// and stay burned; each is below the final number it settles at.
+// and stay burned, each below the final number it settles at: installLocked clears them, and with no
+// grant installed next is 0, which Return and takeLocked both refuse.
 func (a *Allocator) leaveCurrentLocked(usedUp bool) {
 	final := a.next - 1
 	if usedUp {
 		final = a.cur.Last
 	}
-
-	a.returned = a.returned[:0]
 
 	if !a.curFirstTake.IsZero() {
 		a.pending[a.npending] = Settles{First: a.cur.First, LastTaken: final}
@@ -406,7 +405,8 @@ func (a *Allocator) leaveCurrentLocked(usedUp bool) {
 	a.signal()
 }
 
-// installLocked makes g the current grant.
+// installLocked makes g the current grant, dropping the returned positions of the grant before it.
+// It is the one place they are dropped: every other way off a grant sets next to 0 until it runs.
 func (a *Allocator) installLocked(g Grant, requested time.Time) {
 	a.cur, a.next, a.curFirstTake, a.halfAsked = g, g.First, time.Time{}, false
 	a.curRequested = requested
@@ -641,7 +641,6 @@ func (a *Allocator) renew(want bool) error {
 		a.logger.Warnf("[lane] the blockchain service closed the lease of %s on lane %d; opening a new one", a.holder, a.lane)
 
 		a.leased, a.next, a.hasSpare, a.pending, a.npending = false, 0, false, [2]Settles{}, 0
-		a.returned = a.returned[:0]
 		a.broadcastLocked()
 
 		return nil
