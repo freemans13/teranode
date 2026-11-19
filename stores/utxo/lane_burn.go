@@ -161,8 +161,8 @@ const laneUnwrittenKey = "lane_position_unwritten"
 // MarkLanePositionUnwritten marks err, the error of a create, as proof that the create wrote no
 // record carrying its lane position, such as an insert the store refused because the transaction
 // exists. It sets the mark on the first *errors.Error in err's chain; an error with none, such as a
-// bare context error, is left unmarked, so it proves nothing. A store marks only an error its own
-// code proves that for; an unmarked error proves nothing. It returns err.
+// bare context error, is left unmarked. A store marks only an error its own code proves that for,
+// and an unmarked error proves nothing. It returns err.
 func MarkLanePositionUnwritten(err error) error {
 	var te *errors.Error
 	if errors.As(err, &te) && te != nil {
