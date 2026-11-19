@@ -295,3 +295,15 @@ func TestAllocatorNeverHandsOutAPositionTwiceUnderConcurrentReturns(t *testing.T
 	require.Empty(t, dupes)
 	require.Positive(t, returned)
 }
+
+// A store whose write ends after the allocator closed does not get its position counted as
+// returned: a closed allocator gives out nothing, so it takes nothing back.
+func TestAllocatorRefusesAReturnAfterClose(t *testing.T) {
+	a := newTestAllocator(t, newFakeLeases(1000), quiet, nil)
+
+	v := next(t, a)
+	next(t, a)
+
+	require.NoError(t, a.Close())
+	require.False(t, a.Return(v))
+}

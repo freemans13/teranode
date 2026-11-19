@@ -76,8 +76,8 @@ type Timings struct {
 // A store hands back, with Return, a position it took and can prove no record carries. Next gives
 // a returned position out again before the grant's next new one, but only from the grant it came
 // from: leaving a grant drops its returned positions, and they stay burned. A returned position is
-// always below the highest position taken, so the grant's final number and the release are the
-// same as without reuse.
+// always below the grant's next new position, so at or below the highest position taken, and the
+// grant's final number and the release are the same as without reuse.
 type Allocator struct {
 	src    LeaseSource
 	holder string

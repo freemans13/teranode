@@ -68,8 +68,9 @@ func lanePositionSettings(t *testing.T) *settings.Settings {
 	return tSettings
 }
 
-// sqlLaneRules: every ErrTxExists the SQL store returns proves the position unwritten (see
-// markRefusedCreate), with a block or without, and a list goes through SpendAndCreate.
+// sqlLaneRules: a create the SQL store refuses as ErrTxExists, with a block or without, wrote nothing
+// unless an earlier attempt of it may have committed (see markRefusedCreate and
+// TestLanePositionNotReturnedAfterAConflictLinkDeadlock), and a list goes through SpendAndCreate.
 var sqlLaneRules = tests.LaneReturnRules{Exists: true, MinedExists: true, ListExists: true}
 
 // sqlLaneRows counts the transaction rows carrying any of positions, the one column the store

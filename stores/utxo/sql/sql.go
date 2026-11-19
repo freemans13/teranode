@@ -477,11 +477,12 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 
 // markRefusedCreate marks err as proof that the create wrote no record carrying its lane position
 // (utxo.MarkLanePositionUnwritten) when it is ErrTxExists and no earlier attempt of the create may
-// have committed. Every ErrTxExists this store's create returns proves that: the per-statement path
-// meets the unique violation, or the duplicate in a child table, inside its database transaction
-// and rolls it back, and the CTE paths, single and batched, insert with ON CONFLICT DO NOTHING and
-// gate every other insert on the transaction row they inserted, so a refused create writes no row
-// at all.
+// have committed. Such a refusal proves it: the per-statement path meets the unique violation, or
+// the duplicate in a child table, inside its database transaction and rolls it back, and the CTE
+// paths, single and batched, insert with ON CONFLICT DO NOTHING and gate every other insert on the
+// transaction row they inserted, so a refused create writes no row at all. A retry after an attempt
+// that may have committed can meet this create's own record, which carries the position, so its
+// ErrTxExists is left unmarked.
 func markRefusedCreate(err error, mayHaveCommitted bool) error {
 	if mayHaveCommitted || !errors.Is(err, errors.ErrTxExists) {
 		return err
