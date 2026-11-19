@@ -85,6 +85,11 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		// no block (refusedUnwritten).
 		if utxo.TookLanePosition(options.LanePosition, position) {
 			defer func() {
+				// A call that wrote its record burned nothing; the proof below reads every spend.
+				if err == nil {
+					return
+				}
+
 				if notSubmitted {
 					s.BurnLanePosition(utxo.CreatedTxID(tx, options), options.Caller, position, utxo.LaneBurnError)
 					return
