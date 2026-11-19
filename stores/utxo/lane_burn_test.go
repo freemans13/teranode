@@ -225,7 +225,7 @@ func TestLaneReturnableAllowsOnlyProvableReasons(t *testing.T) {
 }
 
 // A burn goes back only when the store proved the position unwritten AND the reason is allowed.
-// Every burn is still counted and logged as burned.
+// Every burn is still counted as burned.
 func TestBurnOrReturnLanePositionReturnsOnlyAProvenAllowedBurn(t *testing.T) {
 	for _, reason := range allLaneBurnReasons {
 		for _, unwritten := range []bool{false, true} {

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -306,4 +307,25 @@ func TestAllocatorRefusesAReturnAfterClose(t *testing.T) {
 
 	require.NoError(t, a.Close())
 	require.False(t, a.Return(v))
+}
+
+// A returned position waits behind the same stop as a new one: once Stop has passed since the last
+// good renewal, the service may give the lane away, so Next hands out nothing, returned or new, even
+// though the grant is young.
+func TestAllocatorHandsOutNoReturnedPositionAfterStop(t *testing.T) {
+	clk := newStepClock()
+	src := newFakeLeases(1_000_000)
+	a := newTestAllocator(t, src, Timings{Renew: 10 * time.Millisecond, Stop: 2 * time.Minute, GrantDuration: time.Hour}, clk)
+	a.takeWait = 200 * time.Millisecond
+
+	v := next(t, a)
+	next(t, a)
+	src.setDown(true)
+
+	require.True(t, a.Return(v))
+
+	clk.step(2 * time.Minute)
+
+	_, err := a.Next(context.Background())
+	require.ErrorIs(t, err, errors.ErrServiceUnavailable, "the returned position stays put after Stop")
 }
