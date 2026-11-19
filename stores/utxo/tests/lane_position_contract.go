@@ -793,6 +793,25 @@ func LanePositionReturns(t *testing.T, db utxostore.Store, rules LaneReturnRules
 		requireReturned(t, db, count, source, ifReturned(rules.Exists, lane.Pack(41, 2)), root)
 	})
 
+	t.Run("a direct Create with a block refused because the transaction is stored", func(t *testing.T) {
+		creator, ok := utxostore.As[directCreator](db)
+		require.True(t, ok)
+
+		root := BuildMultiWorkload(t, 0xb3, 1, 1).Roots[0]
+		source := NewReturningLanePositions(lanePositionsFrom(48, 2)...)
+		useLanePositionSource(t, db, source)
+
+		mined := utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 52, BlockHeight: 952, SubtreeIdx: 0})
+
+		_, err := creator.Create(ctx, root, 952, mined)
+		require.NoError(t, err)
+
+		_, err = creator.Create(ctx, root, 952, mined)
+		require.ErrorIs(t, err, errors.ErrTxExists)
+
+		requireReturned(t, db, count, source, ifReturned(rules.MinedExists, lane.Pack(48, 2)), root)
+	})
+
 	t.Run("a create with a block refused because the transaction is stored", func(t *testing.T) {
 		w := BuildMultiWorkload(t, 0xba, 1, 1)
 		w.StoreRoots(t, db, 950)
@@ -900,6 +919,8 @@ func LanePositionReturns(t *testing.T, db utxostore.Store, rules LaneReturnRules
 		// Nothing is written, but the reason is error, which never goes back.
 		_, _, err := db.SpendAndCreate(cancelled, w.Txs[0], 951)
 		require.Error(t, err)
+		require.False(t, errors.Is(err, errors.ErrServiceUnavailable), "the call took its position before it gave up: %v", err)
+		require.Zero(t, source.Remaining())
 
 		requireReturned(t, db, count, source, nil, w.Txs[0])
 	})

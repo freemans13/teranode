@@ -347,3 +347,20 @@ func TestSequentialSpendAndCreateReturnsOnlyProvenPositions(t *testing.T) {
 		})
 	}
 }
+
+// A store switched to a source that takes nothing back must not keep handing positions to the
+// source it had before: those belong to the old allocator's grant.
+func TestSetLanePositionSourceDropsTheOldReturner(t *testing.T) {
+	old := &returningSource{}
+
+	var positions LanePositions
+
+	positions.SetLanePositionSource(old)
+	positions.SetLanePositionSource(onePosition{lane.Pack(1, 9)})
+	positions.BurnOrReturnLanePosition(CallerValidator, lane.Pack(1, 9), LaneBurnExists, true)
+
+	positions.SetLanePositionSource(nil)
+	positions.BurnOrReturnLanePosition(CallerValidator, lane.Pack(1, 10), LaneBurnExists, true)
+
+	require.Empty(t, old.returned)
+}

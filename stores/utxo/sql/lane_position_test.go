@@ -361,10 +361,11 @@ func TestLanePositionMigrationPostgresBoundsTheLockWait(t *testing.T) {
 }
 
 // A conflicting create on the single-CTE path commits its record, then writes the parent links in a
-// transaction of its own. When that second transaction dies on a deadlock, Create retries, and the
+// transaction of its own. When that second transaction dies on a lock error, Create retries, and the
 // retry meets the record the first attempt committed. That ErrTxExists is this create's own record,
-// which carries the position, so the position must not go back for reuse.
-func TestLanePositionNotReturnedAfterAConflictLinkDeadlock(t *testing.T) {
+// which carries the position, so the position must not go back for reuse. A serialization failure
+// is recognised only through the wrapped PgError, since its message names no lock.
+func TestLanePositionNotReturnedAfterAConflictLinkLockError(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Postgres integration test in short mode")
 	}
@@ -379,27 +380,49 @@ func TestLanePositionNotReturnedAfterAConflictLinkDeadlock(t *testing.T) {
 	require.Nil(t, db.createBatcher, "the test needs the single-CTE path")
 	require.True(t, db.settings.UtxoStore.BatchSQLOperations, "the test needs the single-CTE path")
 
-	deadlocks := 0
-	conflictingChildrenFault = func() error {
-		deadlocks++
-		return &pgconn.PgError{Code: usql.PgErrDeadlockDetected, Message: "deadlock detected"}
+	for i, c := range []struct {
+		name string
+		err  *pgconn.PgError
+	}{
+		{"a deadlock", &pgconn.PgError{Code: usql.PgErrDeadlockDetected, Message: "deadlock detected"}},
+		{"a serialization failure", &pgconn.PgError{Code: usql.PgErrSerializationFail, Message: "could not serialize access due to concurrent update"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			faults := 0
+			conflictingChildrenFault = func() error {
+				faults++
+				return c.err
+			}
+
+			t.Cleanup(func() { conflictingChildrenFault = nil })
+
+			first := lane.Pack(46, uint64(2*i+1)) //nolint:gosec // i is 0 or 1
+			source := tests.NewReturningLanePositions(first, first+1)
+			db.SetLanePositionSource(source)
+			t.Cleanup(func() { db.SetLanePositionSource(nil) })
+
+			tx := tests.BuildMultiWorkload(t, byte(0xab+i), 1, 1).Roots[0] //nolint:gosec // i is 0 or 1
+
+			_, err := db.Create(context.Background(), tx, 960, utxostore.WithConflicting(true))
+			require.ErrorIs(t, err, errors.ErrTxExists, "the retry meets the record the first attempt committed")
+			require.Equal(t, 1, faults, "only the first attempt reached the conflict links")
+
+			require.Empty(t, source.Returned(), "the record carries the position")
+
+			md, err := db.Get(context.Background(), tx.TxIDChainHash(), fields.LanePosition)
+			require.NoError(t, err)
+			require.Equal(t, first, md.LanePosition)
+		})
 	}
+}
 
-	t.Cleanup(func() { conflictingChildrenFault = nil })
-
-	source := tests.NewReturningLanePositions(lane.Pack(46, 1), lane.Pack(46, 2))
-	db.SetLanePositionSource(source)
-	t.Cleanup(func() { db.SetLanePositionSource(nil) })
-
-	tx := tests.BuildMultiWorkload(t, 0xb5, 1, 1).Roots[0]
-
-	_, err = db.Create(context.Background(), tx, 960, utxostore.WithConflicting(true))
-	require.ErrorIs(t, err, errors.ErrTxExists, "the retry meets the record the first attempt committed")
-	require.Equal(t, 1, deadlocks, "only the first attempt reached the conflict links")
-
-	require.Empty(t, source.Returned(), "the record carries the position")
-
-	md, err := db.Get(context.Background(), tx.TxIDChainHash(), fields.LanePosition)
-	require.NoError(t, err)
-	require.Equal(t, lane.Pack(46, 1), md.LanePosition)
+// markRefusedCreate marks only ErrTxExists, and only when no earlier attempt may have committed.
+func TestMarkRefusedCreate(t *testing.T) {
+	require.True(t, utxostore.LanePositionUnwritten(markRefusedCreate(errors.NewTxExistsError("exists"), false)))
+	require.False(t, utxostore.LanePositionUnwritten(markRefusedCreate(errors.NewTxExistsError("exists"), true)),
+		"an earlier attempt may have written the record")
+	require.False(t, utxostore.LanePositionUnwritten(markRefusedCreate(errors.NewStorageError("disk"), false)),
+		"only a refusal proves the position unwritten")
+	require.False(t, utxostore.LanePositionUnwritten(markRefusedCreate(errors.NewUtxoError("refused"), false)))
+	require.NoError(t, markRefusedCreate(nil, false))
 }
