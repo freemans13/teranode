@@ -811,6 +811,37 @@ func LanePositionReturns(t *testing.T, db utxostore.Store, rules LaneReturnRules
 		requireReturned(t, db, count, source, ifReturned(rules.MinedExists, lane.Pack(42, 2)), w.Txs[0])
 	})
 
+	// The block-application order: the record is stored before its inputs are spent. The spends go
+	// through and commit, the create is refused, and its unused position goes back.
+	t.Run("a create refused after its spends succeeded", func(t *testing.T) {
+		w := BuildMultiWorkload(t, 0xb4, 1, 1)
+		w.StoreRoots(t, db, 950)
+
+		source := NewReturningLanePositions(lanePositionsFrom(47, 2)...)
+		useLanePositionSource(t, db, source)
+
+		child := w.Txs[0]
+
+		_, _, err := db.SpendAndCreate(ctx, child, 951, utxostore.WithCreateOnly())
+		require.NoError(t, err)
+
+		_, spends, err := db.SpendAndCreate(ctx, child, 951, utxostore.WithCaller(utxostore.CallerValidator))
+		require.ErrorIs(t, err, errors.ErrTxExists)
+		require.NotEmpty(t, spends, "the spends stay in place")
+
+		inputs, err := utxostore.GetSpends(child)
+		require.NoError(t, err)
+
+		for i, in := range inputs {
+			resp, err := db.GetSpend(ctx, in)
+			require.NoError(t, err, "input %d", i)
+			require.NotEqual(t, int(utxostore.Status_OK), resp.Status, "input %d is spent", i)
+		}
+
+		requireReturned(t, db, count, source, ifReturned(rules.Exists, lane.Pack(47, 2)), child)
+		requireLanePosition(t, db, child, lane.Pack(47, 1), "the stored record keeps its position")
+	})
+
 	t.Run("a spend refused before any create", func(t *testing.T) {
 		w := BuildMultiWorkload(t, 0xbb, 1, 1)
 		w.StoreRoots(t, db, 950)

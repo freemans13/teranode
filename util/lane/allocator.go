@@ -382,7 +382,7 @@ func (a *Allocator) takeLocked() (v uint64, ok bool, changed chan struct{}, err 
 
 // leaveCurrentLocked settles the current grant and moves to the spare, or to no grant when there is
 // no spare, in which case the loop asks for one at once. The grant's returned positions are dropped
-// and stay burned, each below the final number it settles at: installLocked clears them, and with no
+// and stay burned, each at or below the final number it settles at: installLocked clears them, and with no
 // grant installed next is 0, which Return and takeLocked both refuse.
 func (a *Allocator) leaveCurrentLocked(usedUp bool) {
 	final := a.next - 1
