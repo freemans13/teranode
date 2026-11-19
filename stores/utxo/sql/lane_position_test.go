@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -16,6 +17,8 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/lane"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/usql"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -354,4 +357,48 @@ func TestLanePositionMigrationPostgresBoundsTheLockWait(t *testing.T) {
 	require.NoError(t, oldDB.QueryRow(`SELECT count(*) FROM information_schema.columns WHERE table_name = 'transactions' AND column_name = 'lane_position'`).Scan(&columns))
 	require.Equal(t, 1, columns)
 	require.NotNil(t, store)
+}
+
+// A conflicting create on the single-CTE path commits its record, then writes the parent links in a
+// transaction of its own. When that second transaction dies on a deadlock, Create retries, and the
+// retry meets the record the first attempt committed. That ErrTxExists is this create's own record,
+// which carries the position, so the position must not go back for reuse.
+func TestLanePositionNotReturnedAfterAConflictLinkDeadlock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Postgres integration test in short mode")
+	}
+
+	dbURL := startLanePositionPostgres(t)
+
+	tSettings := lanePositionSettings(t)
+	tSettings.UtxoStore.StoreBatcherSize = 1
+
+	db, err := New(context.Background(), ulogger.TestLogger{}, tSettings, dbURL)
+	require.NoError(t, err)
+	require.Nil(t, db.createBatcher, "the test needs the single-CTE path")
+	require.True(t, db.settings.UtxoStore.BatchSQLOperations, "the test needs the single-CTE path")
+
+	deadlocks := 0
+	conflictingChildrenFault = func() error {
+		deadlocks++
+		return &pgconn.PgError{Code: usql.PgErrDeadlockDetected, Message: "deadlock detected"}
+	}
+
+	t.Cleanup(func() { conflictingChildrenFault = nil })
+
+	source := tests.NewReturningLanePositions(lane.Pack(46, 1), lane.Pack(46, 2))
+	db.SetLanePositionSource(source)
+	t.Cleanup(func() { db.SetLanePositionSource(nil) })
+
+	tx := tests.BuildMultiWorkload(t, 0xb5, 1, 1).Roots[0]
+
+	_, err = db.Create(context.Background(), tx, 960, utxostore.WithConflicting(true))
+	require.ErrorIs(t, err, errors.ErrTxExists, "the retry meets the record the first attempt committed")
+	require.Equal(t, 1, deadlocks, "only the first attempt reached the conflict links")
+
+	require.Empty(t, source.Returned(), "the record carries the position")
+
+	md, err := db.Get(context.Background(), tx.TxIDChainHash(), fields.LanePosition)
+	require.NoError(t, err)
+	require.Equal(t, lane.Pack(46, 1), md.LanePosition)
 }

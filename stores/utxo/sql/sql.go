@@ -442,8 +442,8 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		return txMeta, markRefusedCreate(err, false)
 	}
 
-	// An attempt whose outcome is unknown may have committed with this position, and then a later
-	// attempt's ErrTxExists is this create's own record.
+	// An attempt whose outcome is unknown, or that failed after its record committed, may have
+	// written this position, and then a later attempt's ErrTxExists is this create's own record.
 	mayHaveCommitted := false
 
 	// Try the operation with retry logic for lock errors
@@ -455,7 +455,8 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 			return txMeta, markRefusedCreate(err, mayHaveCommitted)
 		}
 
-		mayHaveCommitted = mayHaveCommitted || utxo.IsCreateOutcomeUnknown(err)
+		_, committed := err.(*createCommittedError)
+		mayHaveCommitted = mayHaveCommitted || committed || utxo.IsCreateOutcomeUnknown(err)
 
 		// For lock errors, retry with backoff
 		if attempt < 3 {
@@ -1013,13 +1014,34 @@ func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, 
 
 	// Handle conflicting children (rare path — separate round-trip only when needed)
 	if txMeta.Conflicting {
-		if err = s.insertConflictingChildrenPgx(ctx, btTx, txHash); err != nil {
-			return nil, err
+		if conflictingChildrenFault != nil {
+			err = conflictingChildrenFault()
+		} else {
+			err = s.insertConflictingChildrenPgx(ctx, btTx, txHash)
+		}
+
+		if err != nil {
+			// The record and its lane position are committed; see createCommittedError.
+			return nil, &createCommittedError{err}
 		}
 	}
 
 	return txMeta, nil
 }
+
+// conflictingChildrenFault, when set, replaces createCTE's conflicting-children write with its
+// error. A test hook; nil in production.
+var conflictingChildrenFault func() error
+
+// createCommittedError is an error from the part of a create that runs after the record committed:
+// createCTE's conflicting-children write, a transaction of its own. Create may retry it as a lock
+// error, and the retry then meets this create's own record, so a later ErrTxExists proves nothing
+// about the lane position. It wraps the error unchanged.
+type createCommittedError struct{ err error }
+
+func (e *createCommittedError) Error() string { return e.err.Error() }
+
+func (e *createCommittedError) Unwrap() error { return e.err }
 
 // inputArrayParams holds parallel arrays for UNNEST input insertion.
 type inputArrayParams struct {
