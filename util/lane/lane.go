@@ -4,12 +4,15 @@
 //
 // The high byte is the lane: one per process that creates records, held under a
 // lease from the blockchain service. The low seven bytes are the position: the
-// record's place in that lane, counting up by one per record within a grant. A
-// lease lapses unless renewed; its holder stops giving out positions before the
-// service can close it and give the lane to another process, and every grant in a
-// lane starts above the lane's last one, so positions in a lane are never given out
-// twice and rise in the order their grants were recorded. A lane position is unique
-// across the grants recorded in one blockchain database and is written once, so
+// record's place in that lane. Within a grant, new positions count up by one per
+// take. A position a store proved no record carries can be returned and given out
+// again, only inside the grant it came from (Allocator.Return), so takes within a
+// grant need not rise. A lease lapses unless renewed; its holder stops giving out
+// positions before the service can close it and give the lane to another process,
+// and every grant in a lane starts above the lane's last one, so no two records
+// carry the same position in a lane, and the grants rise in the order they were
+// recorded. A lane position is unique among the records created under the grants
+// recorded in one blockchain database and is written once, so
 // later work can say which block took a record by keeping a range of positions per
 // lane per block, instead of writing to the record. Restoring an older blockchain
 // database could reuse positions, which is a listed limit of this phase.
