@@ -293,6 +293,9 @@ func TestMarkLanePositionUnwritten(t *testing.T) {
 	require.False(t, LanePositionUnwritten(context.Canceled))
 	require.NoError(t, MarkLanePositionUnwritten(nil))
 	require.Equal(t, context.Canceled, MarkLanePositionUnwritten(context.Canceled), "a foreign error is left as it is")
+
+	spent := errors.NewUtxoSpentError(chainhash.Hash{}, 0, chainhash.Hash{}, nil)
+	require.False(t, LanePositionUnwritten(MarkLanePositionUnwritten(spent)), "an error with its own data type stays unmarked")
 }
 
 // SequentialSpendAndCreate returns a position when its spend failed, since the create never ran,

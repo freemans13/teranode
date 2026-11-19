@@ -162,9 +162,12 @@ const laneUnwrittenKey = "lane_position_unwritten"
 
 // MarkLanePositionUnwritten marks err, the error of a create, as proof that the create wrote no
 // record carrying its lane position, such as an insert the store refused because the transaction
-// exists. It sets the mark on the first *errors.Error in err's chain; an error with none, such as a
-// bare context error, is left unmarked. A store marks only an error its own code proves that for,
-// and an unmarked error proves nothing. It returns err.
+// exists. It tries to set the mark on the first *errors.Error in err's chain. An error with none,
+// such as a bare context error, stays unmarked, and so does one that carries its own data type,
+// such as a spent-UTXO error, since SetData writes only into the generic data. Every error the
+// stores mark is ErrTxExists with generic data. A store marks only an error its own code proves that
+// for, and an unmarked error proves nothing, so a mark that does not take only loses a reuse. It
+// returns err.
 func MarkLanePositionUnwritten(err error) error {
 	var te *errors.Error
 	if errors.As(err, &te) && te != nil {
