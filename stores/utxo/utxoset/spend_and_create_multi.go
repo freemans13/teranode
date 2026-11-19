@@ -97,11 +97,14 @@ func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeig
 // transaction i's result and, when its chunk failed, why its position burned; with no outcome, or
 // for a transaction with no result and no failed chunk, the position burned for unsettled.
 //
-// It runs once the list has ended, so no chunk can still commit. Only rolled_back goes back for
-// reuse: it is set only for a chunk whose database transaction failed before its COMMIT, which then
-// rolls back whole, and a chunk whose COMMIT failed is outcome_unknown instead. exists and
-// spend_rejected stay burned on a list: its creates carry a block, and proving that a refused
-// claim's containment row and every rolled-back round left the position unwritten is not done here.
+// It runs once the list has ended, so no chunk can still commit. The two netted writers that call
+// it return only rolled_back for reuse: it is set only for a chunk whose database transaction
+// failed before its COMMIT, which then rolls back whole, and a chunk whose COMMIT failed is
+// outcome_unknown instead. exists and spend_rejected stay burned here, with a block or without:
+// proving that a refused claim's containment row, when the list carries a block, and every
+// rolled-back round of a chunk left the position unwritten is not done. A list the netted writers do
+// not model goes through DefaultSpendAndCreateMulti, whose SpendAndCreate calls follow their own
+// return rules.
 func (s *Store) burnList(list *utxo.SpendAndCreateMultiList, positions []uint64, unsettled string,
 	outcome func(i int) (utxo.SpendAndCreateMultiResult, string)) {
 	for i, position := range positions {

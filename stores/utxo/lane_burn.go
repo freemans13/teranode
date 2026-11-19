@@ -25,8 +25,11 @@ import (
 // hold: the code that saw the result proves nothing carries the position, and the reason is one of
 // those laneReturnable allows. The reason alone is a label and proves nothing; outcome_unknown in
 // particular can be a written position. A returned position is still counted as burned; the
-// allocator counts the ones it gives out again in teranode_lane_positions_reused_total, so the holes
-// left are burned minus reused.
+// allocator counts the ones it gives out again in teranode_lane_positions_reused_total. Burned minus
+// reused is the burns recorded less the reuses, not an exact count of holes: outcome_unknown, and
+// exists on a utxoset create that carries a block, can count a position that was written. Returned
+// minus reused is the positions still waiting for reuse plus those dropped unused, when the
+// allocator left their grant or closed.
 
 // The reasons a position burns.
 const (
