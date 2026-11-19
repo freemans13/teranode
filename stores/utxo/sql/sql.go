@@ -479,8 +479,10 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 // (utxo.MarkLanePositionUnwritten) when it is ErrTxExists and no earlier attempt of the create may
 // have committed. Such a refusal proves it: the per-statement path meets the unique violation, or
 // the duplicate in a child table, inside its database transaction and rolls it back, and the CTE
-// paths, single and batched, insert with ON CONFLICT DO NOTHING and gate every other insert on the
-// transaction row they inserted, so a refused create writes no row at all. A retry after an attempt
+// paths, single and batched, insert with ON CONFLICT DO NOTHING and gate the inputs, outputs and
+// block ids on the transaction row they inserted, so a refused create writes no row carrying its
+// lane position. The batch's later conflict-link write can still add a parent's link for a refused
+// conflicting create, but that table has no lane position. A retry after an attempt
 // that may have committed can meet this create's own record, which carries the position, so its
 // ErrTxExists is left unmarked.
 func markRefusedCreate(err error, mayHaveCommitted bool) error {
