@@ -4,7 +4,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/lane"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -12,8 +11,8 @@ import (
 
 // A burned lane position is one a store took from its source for a create and then wrote no record
 // carrying. Burning is safe, since no record has the position, but every burned position inside a
-// block's range is a hole in that block's lane map, so the stores count and log each one with why it
-// burned and which service asked for the create. A position whose write cannot be confirmed either
+// block's range is a hole in that block's lane map, so the stores count each one with why it burned
+// and which service asked for the create. A position whose write cannot be confirmed either
 // way is counted too, under outcome_unknown, so the counter can include positions that were written.
 //
 // The code that took the position from the source records its burn, from the result it saw. A store
@@ -33,11 +32,12 @@ import (
 
 // The reasons a position burns.
 const (
-	// LaneBurnExists: the create answered ErrTxExists, because the store already held the
-	// transaction. The record keeps the position it has. One exception: a utxoset create that
-	// carries a block, for a transaction held only as UTXO rows with no identity or containment
-	// row, writes the new position on the containment row it adds and still answers ErrTxExists,
-	// so it is counted here though the position was written.
+	// LaneBurnExists: the create answered ErrTxExists. Either the store already held the
+	// transaction, and the record keeps the position it has, or, on Aerospike, another create of
+	// the same transaction held its multi-record creation lock, and that create may still fail.
+	// One exception: a utxoset create that carries a block, for a transaction held only as UTXO
+	// rows with no identity or containment row, writes the new position on the containment row it
+	// adds and still answers ErrTxExists, so it is counted here though the position was written.
 	LaneBurnExists = "exists"
 
 	// LaneBurnSpendRejected: an input could not be spent, so the transaction was not created.
@@ -48,8 +48,10 @@ const (
 	// reason can include positions that were in fact written.
 	LaneBurnOutcomeUnknown = "outcome_unknown"
 
-	// LaneBurnRolledBack: a batch, or a chunk of a list, rolled back, and its positions were not
-	// written again.
+	// LaneBurnRolledBack: a utxoset create batch failed with its database transaction open, or a
+	// chunk of a list failed before its COMMIT (in planning, at BEGIN or with its transaction open),
+	// and the positions were not written again. A create batch that fails before its transaction
+	// opens, in partition setup or at BEGIN, counts as an ordinary error.
 	LaneBurnRolledBack = "rolled_back"
 
 	// LaneBurnParentFailed: a parent of the transaction earlier in its list failed, so the
@@ -111,7 +113,7 @@ var withCaller = func() (opts [callerCount]CreateOption) {
 }()
 
 // WithCaller names the service the create is made for. It changes nothing about the write: it labels
-// the burned lane position counter and log line when the create's position burns.
+// the burned lane position counter when the create's position burns.
 func WithCaller(c Caller) CreateOption {
 	if c >= callerCount {
 		c = CallerUnknown
@@ -232,25 +234,32 @@ func CreatedTxID(tx *bt.Tx, o *CreateOptions) chainhash.Hash {
 	return *tx.TxIDChainHash()
 }
 
-// NameLaneBurns gives the store's name and logger to the burned lane position counter and log line.
-// A store calls it when it is built. One that does not records its burns under store "unknown",
-// with no log line.
-func (l *LanePositions) NameLaneBurns(store string, logger ulogger.Logger) {
+// NameLaneBurns gives the store's name to the burned lane position counter. A store calls it when it
+// is built. One that does not records its burns under store "unknown".
+func (l *LanePositions) NameLaneBurns(store string) {
 	l.burnStore = store
-	l.burnLogger = logger
 }
 
-// BurnLanePosition counts one burned position and logs it at info level. The position stays burned.
-func (l *LanePositions) BurnLanePosition(txid chainhash.Hash, caller Caller, position uint64, reason string) {
-	l.BurnOrReturnLanePosition(txid, caller, position, reason, false)
+// BurnLanePosition counts one burned position. The position stays burned.
+func (l *LanePositions) BurnLanePosition(caller Caller, reason string) {
+	l.countBurn(caller, reason)
 }
 
-// BurnOrReturnLanePosition counts and logs one burned position as BurnLanePosition does, and hands
-// it back to the source for reuse when unwritten is true and laneReturnable allows the reason.
-// unwritten is the caller's proof, from its own code, that no record carries the position; it is
-// called once the create or its batch has its outcome, never while a write that may carry the
-// position can still commit, and at most once per position taken.
-func (l *LanePositions) BurnOrReturnLanePosition(txid chainhash.Hash, caller Caller, position uint64, reason string, unwritten bool) {
+// BurnOrReturnLanePosition counts one burned position as BurnLanePosition does, and hands it back to
+// the source for reuse when unwritten is true and laneReturnable allows the reason. unwritten is the
+// caller's proof, from its own code, that no record carries the position; it is called once the
+// create or its batch has its outcome, never while a write that may carry the position can still
+// commit, and at most once per position taken.
+func (l *LanePositions) BurnOrReturnLanePosition(caller Caller, position uint64, reason string, unwritten bool) {
+	store := l.countBurn(caller, reason)
+
+	if unwritten && l.returner != nil && laneReturnable(reason) && l.returner.Return(position) {
+		prometheusLanePositionsReturned.WithLabelValues(store, reason).Inc()
+	}
+}
+
+// countBurn counts one burned position and returns the store label it counted it under.
+func (l *LanePositions) countBurn(caller Caller, reason string) string {
 	store := l.burnStore
 	if store == "" {
 		store = "unknown"
@@ -258,25 +267,17 @@ func (l *LanePositions) BurnOrReturnLanePosition(txid chainhash.Hash, caller Cal
 
 	prometheusLanePositionsBurned.WithLabelValues(store, reason, caller.String()).Inc()
 
-	returned := unwritten && l.returner != nil && laneReturnable(reason) && l.returner.Return(position)
-	if returned {
-		prometheusLanePositionsReturned.WithLabelValues(store, reason).Inc()
-	}
-
-	if l.burnLogger != nil {
-		l.burnLogger.Infof("[lane] burned lane position %d (lane %d) of tx %s: store=%s reason=%s caller=%s returned=%t",
-			position, lane.Lane(position), txid.String(), store, reason, caller.String(), returned)
-	}
+	return store
 }
 
 // BurnCreateLanePosition records the burn of a create that took position from the source and
 // returned err, if it failed, and returns the position for reuse when unwritten proves no record
 // carries it (see BurnOrReturnLanePosition). A create that succeeded wrote the position, so it
 // records nothing.
-func (l *LanePositions) BurnCreateLanePosition(tx *bt.Tx, o *CreateOptions, position uint64, err error, spends []*Spend, unwritten bool) {
+func (l *LanePositions) BurnCreateLanePosition(o *CreateOptions, position uint64, err error, spends []*Spend, unwritten bool) {
 	if err == nil || position == lane.None {
 		return
 	}
 
-	l.BurnOrReturnLanePosition(CreatedTxID(tx, o), o.Caller, position, LaneBurnReason(err, spends), unwritten)
+	l.BurnOrReturnLanePosition(o.Caller, position, LaneBurnReason(err, spends), unwritten)
 }

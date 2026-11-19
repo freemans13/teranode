@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util/lane"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -91,7 +92,7 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 				}
 
 				if notSubmitted {
-					s.BurnLanePosition(utxo.CreatedTxID(tx, options), options.Caller, position, utxo.LaneBurnError)
+					s.BurnLanePosition(options.Caller, utxo.LaneBurnError)
 					return
 				}
 
@@ -100,7 +101,7 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 					return
 				}
 
-				s.BurnCreateLanePosition(tx, options, position, err, spends, spendAndCreateUnwritten(err, spends, options))
+				s.BurnCreateLanePosition(options, position, err, spends, spendAndCreateUnwritten(err, spends, options))
 			}()
 		}
 
@@ -315,7 +316,8 @@ var laneBurnProbeTimeout = 5 * time.Second
 // another position is taken as a burn for the rerun's own reason, exists for ErrTxExists, though
 // it does not prove one: block assembly can delete the record and re-create it with a new
 // position between the rerun and this read, and this read holds no lock against that. Missing, or
-// unreadable within laneBurnProbeTimeout, the outcome is unknown.
+// unreadable within laneBurnProbeTimeout, or read without a position (the read can answer from a
+// row that does not carry one, such as a live UTXO below the lookup floor), the outcome is unknown.
 func (s *Store) burnUnlessStored(ctx context.Context, tx *bt.Tx, options *utxo.CreateOptions, position uint64,
 	err error, spends []*utxo.Spend) {
 	txid := utxo.CreatedTxID(tx, options)
@@ -330,12 +332,12 @@ func (s *Store) burnUnlessStored(ctx context.Context, tx *bt.Tx, options *utxo.C
 	switch {
 	case getErr == nil && md != nil && md.LanePosition == position:
 		return
-	case getErr == nil && md != nil:
-		s.BurnLanePosition(txid, options.Caller, position, utxo.LaneBurnReason(err, spends))
+	case getErr == nil && md != nil && md.LanePosition != lane.None:
+		s.BurnLanePosition(options.Caller, utxo.LaneBurnReason(err, spends))
 	default:
 		// No record proves nothing: the failed batch's COMMIT may still be completing on its own
 		// connection, and this read does not wait for it.
-		s.BurnLanePosition(txid, options.Caller, position, utxo.LaneBurnOutcomeUnknown)
+		s.BurnLanePosition(options.Caller, utxo.LaneBurnOutcomeUnknown)
 	}
 }
 

@@ -82,12 +82,14 @@ func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeig
 	w := s.newNettedWrite(txs, list, blockHeight)
 	w.positions = positions
 
+	w.burns = newListBurns(positions)
+
 	results, err := w.writeFamilies(ctx)
 
 	// On a failed list the results are nil, but chunks that committed before the failure gave
 	// their transactions results, and those positions were written.
 	s.burnList(list, positions, utxo.LaneBurnListFailed, func(i int) (utxo.SpendAndCreateMultiResult, string) {
-		return w.items[i].result, w.items[i].burnReason
+		return w.items[i].result, w.burnAt(i)
 	})
 
 	return results, err
@@ -138,7 +140,7 @@ func (s *Store) burnList(list *utxo.SpendAndCreateMultiList, positions []uint64,
 			reason = unsettled
 		}
 
-		s.BurnOrReturnLanePosition(list.TxIDs[i], list.Options.Caller, position, reason, reason == utxo.LaneBurnRolledBack)
+		s.BurnOrReturnLanePosition(list.Options.Caller, position, reason, reason == utxo.LaneBurnRolledBack)
 	}
 }
 
@@ -212,10 +214,6 @@ type multiTx struct {
 	claims  []inputClaim
 	spends  []*utxo.Spend
 	result  utxo.SpendAndCreateMultiResult
-	// burnReason says why the transaction's lane position burned once its chunk failed:
-	// rolled_back, or outcome_unknown when the chunk's COMMIT failed and may have landed. Written
-	// by the goroutine running the chunk and read only after the write ends.
-	burnReason string
 }
 
 func (it *multiTx) dead() bool {
@@ -240,6 +238,82 @@ type nettedWrite struct {
 	position map[chainhash.Hash]int
 	// positions are the lane positions taken at the entry, by list index; nil with no source.
 	positions []uint64
+	// burns says why each transaction's lane position burned once its chunk failed, by list
+	// index. Allocated only with positions, so a list without them carries no byte for it. Each
+	// chunk writes only its own transactions', and they are read after every chunk ends.
+	burns []listBurn
+}
+
+// newListBurns is the burn-reason slice for a list that took positions, one byte per transaction,
+// or nil for a list that took none, which then carries nothing for it.
+func newListBurns(positions []uint64) []listBurn {
+	if positions == nil {
+		return nil
+	}
+
+	return make([]listBurn, len(positions))
+}
+
+// setBurn records why transaction i's position burned, when the list took positions.
+func (w *nettedWrite) setBurn(i int, b listBurn) {
+	if w.burns != nil {
+		w.burns[i] = b
+	}
+}
+
+// burnAt is the reason recorded for transaction i, or "" when none was.
+func (w *nettedWrite) burnAt(i int) string {
+	if w.burns == nil {
+		return ""
+	}
+
+	return w.burns[i].String()
+}
+
+// listBurn is a burned lane position's reason as one byte, so a list of a million transactions
+// spends a byte each on it rather than a string's sixteen.
+type listBurn uint8
+
+const (
+	listBurnNone listBurn = iota
+	listBurnExists
+	listBurnSpendRejected
+	listBurnOutcomeUnknown
+	listBurnRolledBack
+	listBurnParentFailed
+	listBurnListFailed
+	listBurnError
+)
+
+var listBurnReasons = [...]string{
+	listBurnNone:           "",
+	listBurnExists:         utxo.LaneBurnExists,
+	listBurnSpendRejected:  utxo.LaneBurnSpendRejected,
+	listBurnOutcomeUnknown: utxo.LaneBurnOutcomeUnknown,
+	listBurnRolledBack:     utxo.LaneBurnRolledBack,
+	listBurnParentFailed:   utxo.LaneBurnParentFailed,
+	listBurnListFailed:     utxo.LaneBurnListFailed,
+	listBurnError:          utxo.LaneBurnError,
+}
+
+// String returns the counter's reason label, or "" for none.
+func (b listBurn) String() string {
+	if int(b) >= len(listBurnReasons) {
+		return utxo.LaneBurnError
+	}
+
+	return listBurnReasons[b]
+}
+
+// listBurnFor is the code of one of utxo's reason labels.
+func listBurnFor(reason string) listBurn {
+	for b, r := range listBurnReasons {
+		if r == reason && b != int(listBurnNone) {
+			return listBurn(b) //nolint:gosec // b indexes a short fixed array
+		}
+	}
+
+	return listBurnError
 }
 
 // multiSlowListLog is the write time above which a list gets an info log line saying where the

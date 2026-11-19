@@ -217,7 +217,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		ctx:      ctx,
 	}
 
-	s.NameLaneBurns("sql", logger)
+	s.NameLaneBurns("sql")
 
 	otelTracer := tracing.Tracer("utxo").OTelTracer()
 	batcherOpts := func(name string) []batcher.Option {
@@ -427,7 +427,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// proves the position unwritten, so it goes back for reuse.
 	if utxo.TookLanePosition(options.LanePosition, position) {
 		defer func() {
-			s.BurnCreateLanePosition(tx, options, position, err, nil, utxo.LanePositionUnwritten(err))
+			s.BurnCreateLanePosition(options, position, err, nil, utxo.LanePositionUnwritten(err))
 		}()
 	}
 

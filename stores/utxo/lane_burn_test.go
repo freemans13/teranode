@@ -69,99 +69,69 @@ func TestTookLanePosition(t *testing.T) {
 	require.False(t, TookLanePosition(0, 0), "no source")
 }
 
-// burnLog captures the info lines a burn writes.
-type burnLog struct {
-	ulogger.TestLogger
-	lines []string
+// burnCount reads the burned lane position counter for one store, by reason and caller.
+func burnCount(store, reason string, caller Caller) float64 {
+	return testutil.ToFloat64(prometheusLanePositionsBurned.WithLabelValues(store, reason, caller.String()))
 }
 
-func (l *burnLog) Infof(format string, args ...interface{}) {
-	l.lines = append(l.lines, fmt.Sprintf(format, args...))
-}
-
-// Every burn writes one info line naming the transaction, the position and its lane, the store, the
-// reason and the caller. A create that wrote its record writes none.
-func TestBurnLanePositionLogsOneLine(t *testing.T) {
-	log := &burnLog{}
-
+// A create that wrote its record counts nothing; one that failed counts once, labelled with the
+// store, the reason and the caller.
+func TestBurnCreateLanePositionCountsOnce(t *testing.T) {
 	var positions LanePositions
 
-	positions.NameLaneBurns("teststore", log)
+	positions.NameLaneBurns("teststore")
 
-	tx := bt.NewTx()
-	tx.LockTime = 7
-	txid := *tx.TxIDChainHash()
-	position := lane.Pack(9, 1234)
+	before := burnCount("teststore", LaneBurnExists, CallerBlockValidation)
 
-	positions.BurnCreateLanePosition(tx, &CreateOptions{Caller: CallerBlockValidation}, position, nil, nil, false)
-	require.Empty(t, log.lines, "a create that wrote its record burns nothing")
+	positions.BurnCreateLanePosition(&CreateOptions{Caller: CallerBlockValidation}, lane.Pack(9, 1234), nil, nil, false)
+	require.Equal(t, before, burnCount("teststore", LaneBurnExists, CallerBlockValidation), "a written record burns nothing")
 
-	positions.BurnCreateLanePosition(tx, &CreateOptions{Caller: CallerBlockValidation}, position,
-		errors.NewTxExistsError("exists"), nil, false)
-	require.Len(t, log.lines, 1)
+	positions.BurnCreateLanePosition(&CreateOptions{Caller: CallerBlockValidation}, lane.Pack(9, 1234), errors.NewTxExistsError("exists"), nil, false)
+	require.Equal(t, before+1, burnCount("teststore", LaneBurnExists, CallerBlockValidation))
 
-	line := log.lines[0]
-	for _, want := range []string{txid.String(), fmt.Sprint(position), "lane 9", "store=teststore",
-		"reason=exists", "caller=block_validation", "returned=false"} {
-		require.Contains(t, line, want)
-	}
+	positions.BurnCreateLanePosition(&CreateOptions{Caller: CallerBlockValidation}, lane.None, errors.NewTxExistsError("exists"), nil, false)
+	require.Equal(t, before+1, burnCount("teststore", LaneBurnExists, CallerBlockValidation), "no position taken, nothing burned")
 }
 
-// A create that names its transaction's ID logs that ID, not the hash of the bytes it was given, as
-// a rebuilt transaction's create does.
-func TestBurnLanePositionLogsTheNamedTxID(t *testing.T) {
-	log := &burnLog{}
-
+// A store that never named itself counts under store "unknown".
+func TestBurnLanePositionWithoutAStoreName(t *testing.T) {
 	var positions LanePositions
 
-	positions.NameLaneBurns("teststore", log)
+	before := burnCount("unknown", LaneBurnError, CallerUnknown)
 
-	tx := bt.NewTx()
-	named := chainhash.HashH([]byte("the id the create names"))
-	require.NotEqual(t, named, *tx.TxIDChainHash())
+	positions.BurnLanePosition(CallerUnknown, LaneBurnError)
 
-	positions.BurnCreateLanePosition(tx, &CreateOptions{TxID: &named}, lane.Pack(9, 1), errors.NewTxExistsError("exists"), nil, false)
-
-	require.Len(t, log.lines, 1)
-	require.Contains(t, log.lines[0], named.String())
-	require.NotContains(t, log.lines[0], tx.TxIDChainHash().String())
+	require.Equal(t, before+1, burnCount("unknown", LaneBurnError, CallerUnknown))
 }
 
 // A caller that stopped waiting for its queued create gets its context error, and the record may
-// still be written: the position counts as outcome_unknown, and is logged.
+// still be written: the position counts as outcome_unknown.
 func TestBurnCreateLanePositionCountsAGivenUpWaiterAsUnknown(t *testing.T) {
-	log := &burnLog{}
-
 	var positions LanePositions
 
-	positions.NameLaneBurns("waiterstore", log)
+	positions.NameLaneBurns("waiterstore")
 
-	counter := prometheusLanePositionsBurned.WithLabelValues("waiterstore", LaneBurnOutcomeUnknown, CallerValidator.String())
-	before := testutil.ToFloat64(counter)
+	before := burnCount("waiterstore", LaneBurnOutcomeUnknown, CallerValidator)
 
-	positions.BurnCreateLanePosition(bt.NewTx(), &CreateOptions{Caller: CallerValidator}, lane.Pack(9, 2), context.Canceled, nil, false)
+	positions.BurnCreateLanePosition(&CreateOptions{Caller: CallerValidator}, lane.Pack(9, 2), context.Canceled, nil, false)
 
-	require.Equal(t, before+1, testutil.ToFloat64(counter))
-	require.Len(t, log.lines, 1)
-	require.Contains(t, log.lines[0], "reason=outcome_unknown")
+	require.Equal(t, before+1, burnCount("waiterstore", LaneBurnOutcomeUnknown, CallerValidator))
 }
 
 // A refused input reported on its Spend record counts as spend_rejected even when the call's error
 // has another code: the classification reads the records the call returned.
 func TestBurnCreateLanePositionReadsTheSpendRecords(t *testing.T) {
-	log := &burnLog{}
-
 	var positions LanePositions
 
-	positions.NameLaneBurns("spendstore", log)
+	positions.NameLaneBurns("spendstore")
+
+	before := burnCount("spendstore", LaneBurnSpendRejected, CallerUnknown)
 
 	refused := []*Spend{{Err: errors.NewUtxoSpentError(chainhash.Hash{}, 0, chainhash.Hash{}, nil)}}
 
-	positions.BurnCreateLanePosition(bt.NewTx(), &CreateOptions{}, lane.Pack(9, 3),
-		errors.NewProcessingError("the spend failed"), refused, false)
+	positions.BurnCreateLanePosition(&CreateOptions{}, lane.Pack(9, 3), errors.NewProcessingError("the spend failed"), refused, false)
 
-	require.Len(t, log.lines, 1)
-	require.Contains(t, log.lines[0], "reason=spend_rejected")
+	require.Equal(t, before+1, burnCount("spendstore", LaneBurnSpendRejected, CallerUnknown))
 }
 
 // lanedSequentialStore is the sequential fake with lane positions, so SequentialSpendAndCreate takes
@@ -176,47 +146,43 @@ type onePosition struct{ position uint64 }
 func (o onePosition) Next(context.Context) (uint64, error) { return o.position, nil }
 
 // SequentialSpendAndCreate records the burn of a position it took. A failed spend is classified from
-// the Spend records it returned, and a failed create logs the transaction's ID.
+// the Spend records it returned.
 func TestSequentialSpendAndCreateRecordsItsBurns(t *testing.T) {
 	tx := bt.NewTx()
 	tx.LockTime = 11
-	txid := *tx.TxIDChainHash()
 
 	t.Run("a spend refused on its record", func(t *testing.T) {
-		log := &burnLog{}
 		s := &lanedSequentialStore{fakeSequentialStore: fakeSequentialStore{
 			spends:   []*Spend{{Err: errors.NewUtxoSpentError(chainhash.Hash{}, 0, chainhash.Hash{}, nil)}},
 			spendErr: errors.NewProcessingError("the spend failed"),
 		}}
-		s.NameLaneBurns("seqstore", log)
+		s.NameLaneBurns("seqstore")
 		s.SetLanePositionSource(onePosition{lane.Pack(9, 4)})
+
+		before := burnCount("seqstore", LaneBurnSpendRejected, CallerValidator)
 
 		_, _, err := SequentialSpendAndCreate(context.Background(), ulogger.TestLogger{}, s, tx, 100,
 			WithCaller(CallerValidator))
 		require.Error(t, err)
 
-		require.Len(t, log.lines, 1)
-		require.Contains(t, log.lines[0], "reason=spend_rejected")
-		require.Contains(t, log.lines[0], "caller=validator")
-		require.Contains(t, log.lines[0], txid.String())
+		require.Equal(t, before+1, burnCount("seqstore", LaneBurnSpendRejected, CallerValidator))
 		require.Zero(t, s.createCalls, "the create never ran")
 	})
 
 	t.Run("a create that fails", func(t *testing.T) {
-		log := &burnLog{}
 		s := &lanedSequentialStore{fakeSequentialStore: fakeSequentialStore{
 			createErr: errors.NewTxExistsError("exists"),
 		}}
-		s.NameLaneBurns("seqstore", log)
+		s.NameLaneBurns("seqstore")
 		s.SetLanePositionSource(onePosition{lane.Pack(9, 5)})
+
+		before := burnCount("seqstore", LaneBurnExists, CallerBlockAssembly)
 
 		_, _, err := SequentialSpendAndCreate(context.Background(), ulogger.TestLogger{}, s, tx, 100,
 			WithCreateOnly(), WithCaller(CallerBlockAssembly))
 		require.ErrorIs(t, err, errors.ErrTxExists)
 
-		require.Len(t, log.lines, 1)
-		require.Contains(t, log.lines[0], "reason=exists")
-		require.Contains(t, log.lines[0], txid.String())
+		require.Equal(t, before+1, burnCount("seqstore", LaneBurnExists, CallerBlockAssembly))
 	})
 }
 
@@ -264,25 +230,22 @@ func TestBurnOrReturnLanePositionReturnsOnlyAProvenAllowedBurn(t *testing.T) {
 	for _, reason := range allLaneBurnReasons {
 		for _, unwritten := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/unwritten=%t", reason, unwritten), func(t *testing.T) {
-				log := &burnLog{}
 				src := &returningSource{}
 
 				var positions LanePositions
 
-				positions.NameLaneBurns("gatestore", log)
+				positions.NameLaneBurns("gatestore")
 				positions.SetLanePositionSource(src)
 
 				burned := prometheusLanePositionsBurned.WithLabelValues("gatestore", reason, CallerValidator.String())
 				returned := prometheusLanePositionsReturned.WithLabelValues("gatestore", reason)
 				burnedBefore, returnedBefore := testutil.ToFloat64(burned), testutil.ToFloat64(returned)
 
-				positions.BurnOrReturnLanePosition(chainhash.Hash{}, CallerValidator, lane.Pack(3, 77), reason, unwritten)
+				positions.BurnOrReturnLanePosition(CallerValidator, lane.Pack(3, 77), reason, unwritten)
 
 				want := unwritten && laneReturnable(reason)
 
 				require.InDelta(t, 1, testutil.ToFloat64(burned)-burnedBefore, 0, "every burn is counted")
-				require.Len(t, log.lines, 1)
-				require.Contains(t, log.lines[0], fmt.Sprintf("returned=%t", want))
 
 				if want {
 					require.Equal(t, []uint64{lane.Pack(3, 77)}, src.returned)
@@ -304,15 +267,15 @@ func TestBurnOrReturnLanePositionCountsOnlyWhatTheSourceTookBack(t *testing.T) {
 
 	var refusing LanePositions
 
-	refusing.NameLaneBurns("refusestore", nil)
+	refusing.NameLaneBurns("refusestore")
 	refusing.SetLanePositionSource(&returningSource{refuse: true})
-	refusing.BurnOrReturnLanePosition(chainhash.Hash{}, CallerValidator, lane.Pack(1, 1), LaneBurnExists, true)
+	refusing.BurnOrReturnLanePosition(CallerValidator, lane.Pack(1, 1), LaneBurnExists, true)
 
 	var plain LanePositions
 
-	plain.NameLaneBurns("refusestore", nil)
+	plain.NameLaneBurns("refusestore")
 	plain.SetLanePositionSource(onePosition{lane.Pack(1, 2)})
-	plain.BurnOrReturnLanePosition(chainhash.Hash{}, CallerValidator, lane.Pack(1, 2), LaneBurnExists, true)
+	plain.BurnOrReturnLanePosition(CallerValidator, lane.Pack(1, 2), LaneBurnExists, true)
 
 	require.InDelta(t, before, testutil.ToFloat64(returned), 0)
 }
@@ -367,7 +330,7 @@ func TestSequentialSpendAndCreateReturnsOnlyProvenPositions(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			src := &returningSource{position: lane.Pack(9, 40)}
 			s := &lanedSequentialStore{fakeSequentialStore: c.store}
-			s.NameLaneBurns("seqreturn", nil)
+			s.NameLaneBurns("seqreturn")
 			s.SetLanePositionSource(src)
 
 			_, _, err := SequentialSpendAndCreate(context.Background(), ulogger.TestLogger{}, s, tx, 100, c.opts...)

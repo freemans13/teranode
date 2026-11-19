@@ -213,7 +213,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// the two apart needs a per-record answer threaded out of the batch.
 	if utxo.TookLanePosition(createOptions.LanePosition, lanePosition) {
 		defer func() {
-			s.BurnCreateLanePosition(tx, createOptions, lanePosition, err, nil, false)
+			s.BurnCreateLanePosition(createOptions, lanePosition, err, nil, false)
 		}()
 	}
 
