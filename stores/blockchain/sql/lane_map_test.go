@@ -143,6 +143,12 @@ func TestInsertLaneMapRowsGivesUpWaitingForTheSQLiteLaneLock(t *testing.T) {
 	_, err = insert(gone)
 	require.ErrorIs(t, err, context.Canceled)
 
+	held, err := s.lockLaneProcessUntil(gone)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, held)
+	require.True(t, laneWriteMu.TryLock(), "the lock was left free")
+	laneWriteMu.Unlock()
+
 	none, err = s.LaneMapRows(t.Context(), 1_000)
 	require.NoError(t, err)
 	require.Empty(t, none)
