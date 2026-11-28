@@ -10,9 +10,10 @@
 // The Reader loads the rows of the last two days of main-chain blocks at start, then follows the
 // main chain: once a second it reads the best block, walks back along the chain until it meets a
 // block it holds, loads the rows of every block on the way, one call per block by ID, and moves
-// its index's tip. Loading by ID along the chain is the only way rows enter the index, so the
-// rows of a block deleted before the index read its header, which name an ID no chain reaches,
-// never enter. A block deleted between the header read and the row read, or after it was loaded,
+// its index's tip. Rows enter the index only by ID, along the chain or, for a loaded block that has
+// none and is not yet folded, on the follower's re-reads of it for about a minute (readLateRows),
+// so the rows of a block deleted before the index read its header, which name an ID no chain
+// reaches, never enter. A block deleted between the header read and the row read, or after it was loaded,
 // keeps its rows in use until the next tip move, and is then off the main chain (counted off_chain
 // where a height names it) until the floors pass it; a rewind runs with the node stopped.
 // A reorg moves the tip
@@ -60,6 +61,14 @@ const (
 
 	// maxUnreachable bounds the blocks remembered as having no held ancestor.
 	maxUnreachable = 1_024
+
+	// lateRowsReads is how many times the follower re-reads the rows of a loaded block that has
+	// none and is not yet folded, and lateRowsFirstWait the wait before the first re-read, doubling
+	// after each: 1, 2, 4, 8, 16 and 32 s, about a minute in all. A block can get its rows after it
+	// is stored: quick validation inserts them when another route stored the block first, without
+	// rows, after its own unlock. A block with rows is never re-read.
+	lateRowsReads     = 6
+	lateRowsFirstWait = time.Second
 
 	// minedWriteLimit is how long after a block is stored (its inserted_at) its rows' answers may
 	// count mined_pending while its mined write is unfinished. Mainnet's took about 3 s for a block
@@ -114,6 +123,19 @@ type Reader struct {
 	// can move it.
 	minedPending atomic.Pointer[minedWait]
 	now          func() time.Time
+
+	// late holds the follower's re-reads of rowless blocks, by block ID; only the follower touches
+	// it. awaiting is the set of those still to be re-read, which the answers read
+	// (KindRowsPending).
+	late     map[uint32]*lateRead
+	awaiting atomic.Pointer[map[uint32]struct{}]
+}
+
+// lateRead is a rowless block the follower re-reads: how many re-reads it has had, and when the
+// next is due.
+type lateRead struct {
+	reads int
+	due   time.Time
 }
 
 // minedWait is a best block whose mined write has not finished, and when its answers stop counting
@@ -247,6 +269,8 @@ func (r *Reader) follow(ctx context.Context) {
 
 		tip = next
 
+		r.readLateRows(ctx)
+
 		sleep(ctx, pollInterval)
 	}
 }
@@ -322,6 +346,102 @@ func (r *Reader) step(ctx context.Context, tip chainhash.Hash) (chainhash.Hash, 
 	r.publishMetrics()
 
 	return best, nil
+}
+
+// readLateRows re-reads the rows of each loaded block the index holds none for and has not folded,
+// when its next re-read is due (lateRowsReads), and gives the index any it finds. A block that gets
+// rows is counted in teranode_lane_reader_late_rows_total. The blocks still to be re-read are
+// published for the answers, which count rows_pending for them instead of no_rows.
+func (r *Reader) readLateRows(ctx context.Context) {
+	s := r.Snapshot()
+	if s == nil {
+		return
+	}
+
+	now := r.now()
+	ids := s.AwaitingRows()
+	late := make(map[uint32]*lateRead, len(ids))
+	awaiting := make(map[uint32]struct{}, len(ids))
+
+	var due []uint32
+
+	for _, id := range ids {
+		lr := r.late[id]
+		if lr == nil {
+			lr = &lateRead{due: now.Add(lateRowsFirstWait)}
+		}
+
+		late[id] = lr
+
+		if lr.reads >= lateRowsReads {
+			continue
+		}
+
+		awaiting[id] = struct{}{}
+
+		if !now.Before(lr.due) {
+			due = append(due, id)
+		}
+	}
+
+	r.late = late
+
+	if len(due) > 0 && r.lockLoad(ctx) {
+		r.fillLateRows(ctx, now, due, awaiting)
+		r.unlockLoad()
+	}
+
+	r.awaiting.Store(&awaiting)
+}
+
+// fillLateRows re-reads the rows of each block in due and gives the index those it finds, taking a
+// block that got rows, or has had its last re-read, out of awaiting. The caller holds the load
+// token.
+func (r *Reader) fillLateRows(ctx context.Context, now time.Time, due []uint32, awaiting map[uint32]struct{}) {
+	idx := r.idx.Load()
+	filled := false
+
+	for _, id := range due {
+		lr := r.late[id]
+		lr.reads++
+		lr.due = now.Add(lateRowsFirstWait << lr.reads)
+
+		if lr.reads >= lateRowsReads {
+			delete(awaiting, id)
+		}
+
+		readCtx, cancel := context.WithTimeout(ctx, readTimeout)
+		rows, err := r.source.LaneMapRows(readCtx, id)
+
+		cancel()
+
+		if err != nil {
+			prometheusLaneReaderLoads.WithLabelValues("error").Inc()
+
+			continue
+		}
+
+		prometheusLaneReaderLoads.WithLabelValues("ok").Inc()
+
+		got, err := idx.FillRows(id, rows)
+		if err != nil {
+			r.logger.Warnf("[lanereader] block %d's rows, read again after it was loaded without any, do not load: %v", id, err)
+
+			continue
+		}
+
+		if got {
+			filled = true
+
+			delete(awaiting, id)
+			delete(r.late, id)
+			prometheusLaneReaderLateRows.Inc()
+		}
+	}
+
+	if filled {
+		idx.Publish()
+	}
 }
 
 // noteMinedWrite records whether today's mined write of the best block has finished, reading its

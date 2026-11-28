@@ -101,8 +101,8 @@ func BenchmarkCompareHeightParallel(b *testing.B) {
 	disagreeHeight := s.TipHeight() + 1
 
 	for _, p := range probes[:1_000] {
-		require.Equal(b, KindAgree, classifyHeight(s, p.pos, v.Lookup(p.pos), true, p.height))
-		require.Equal(b, KindDifferentBlock, classifyHeight(s, p.pos, v.Lookup(p.pos), true, disagreeHeight))
+		require.Equal(b, KindAgree, (*Reader)(nil).classifyHeight(s, p.pos, v.Lookup(p.pos), true, p.height))
+		require.Equal(b, KindDifferentBlock, (*Reader)(nil).classifyHeight(s, p.pos, v.Lookup(p.pos), true, disagreeHeight))
 	}
 
 	for _, agree := range []bool{true, false} {

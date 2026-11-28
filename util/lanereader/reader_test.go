@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -380,6 +381,92 @@ func TestReaderCountsEachKind(t *testing.T) {
 			r.CompareBlocks(ReaderBlockParent, nil, h, lane.Pack(3, 5), []uint32{b1.id})
 		})
 	})
+}
+
+// A block loaded without rows takes the rows inserted after it: the follower re-reads it, counts it
+// in late_rows_total, and its next answer comes from those rows; until then its answers count
+// rows_pending. Blocks with rows, or of only a coinbase, are not read again, and a block that never
+// gets rows is re-read lateRowsReads times and then counts no_rows.
+func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
+	engines(t, func(t *testing.T, store blockchainstore.Store) {
+		ctx := t.Context()
+		c := newChain(t, store)
+
+		b1 := c.add(nil, takes(t, 3, 1, 2))
+		late := c.add(b1)
+		never := c.add(late)
+		coinbaseOnly := c.addCoinbaseOnly(never)
+
+		source := &countingRows{Store: store, reads: map[uint32]int{}}
+		r := newReader(ulogger.TestLogger{}, source, 100)
+
+		clock := time.Now()
+		r.now = func() time.Time { return clock }
+
+		follow(t, r)
+
+		h := chainhash.Hash{1}
+		lateRows := testutil.ToFloat64(prometheusLaneReaderLateRows)
+
+		// Seen without rows: answers count rows_pending, and no re-read is due yet.
+		r.readLateRows(ctx)
+		require.Equal(t, 1, source.of(late.id), "loaded once, not yet read again")
+		requireCounted(t, ReaderValidator, KindRowsPending, lane.ViaNone, func() {
+			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 7), true, late.height)
+		})
+		requireCounted(t, ReaderSubtreeAlreadyMined, KindRowsPending, lane.ViaNone, func() {
+			r.CompareBlocks(ReaderSubtreeAlreadyMined, r.MainView(), h, lane.Pack(3, 7), []uint32{late.id})
+		})
+
+		require.NoError(t, store.InsertLaneMapRows(ctx, late.id, takes(t, 3, 7, 8)))
+
+		clock = clock.Add(lateRowsFirstWait)
+		r.readLateRows(ctx)
+
+		require.Equal(t, 2, source.of(late.id))
+		require.InDelta(t, lateRows+1, testutil.ToFloat64(prometheusLaneReaderLateRows), 0)
+		requireCounted(t, ReaderValidator, KindAgree, lane.ViaRow, func() {
+			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 7), true, late.height)
+		})
+
+		// The rest of the schedule: each re-read due once, and none after the last.
+		for range lateRowsReads + 2 {
+			clock = clock.Add(time.Hour)
+			r.readLateRows(ctx)
+		}
+
+		require.Equal(t, 1+lateRowsReads, source.of(never.id), "loaded, then re-read lateRowsReads times")
+		require.Equal(t, 2, source.of(late.id), "not read again once it has rows")
+		require.Equal(t, 1, source.of(b1.id), "a block with rows is never read again")
+		require.Equal(t, 1, source.of(coinbaseOnly.id), "a block of only its coinbase is never read again")
+		require.InDelta(t, lateRows+1, testutil.ToFloat64(prometheusLaneReaderLateRows), 0)
+
+		requireCounted(t, ReaderValidator, KindNoRows, lane.ViaNone, func() {
+			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 99), true, never.height)
+		})
+	})
+}
+
+// countingRows counts the rows reads of each block.
+type countingRows struct {
+	blockchainstore.Store
+	mu    sync.Mutex
+	reads map[uint32]int
+}
+
+func (c *countingRows) LaneMapRows(ctx context.Context, id uint32) ([]lane.MapRow, error) {
+	c.mu.Lock()
+	c.reads[id]++
+	c.mu.Unlock()
+
+	return c.Store.LaneMapRows(ctx, id)
+}
+
+func (c *countingRows) of(id uint32) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.reads[id]
 }
 
 // A block's rows commit with it and today's mined write lands seconds later: until that write has
