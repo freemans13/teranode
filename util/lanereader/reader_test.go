@@ -402,7 +402,10 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		clock := time.Now()
 		r.now = func() time.Time { return clock }
 
-		r.readLateRows(ctx) // before the first snapshot: nothing to re-read
+		r.readLateRows(ctx) // before the first snapshot: nothing to re-read, and no set published
+		require.Nil(t, r.awaiting.Load())
+
+		// A process with no reader counts no_rows.
 		require.Equal(t, KindNoRows, (*Reader)(nil).noRowsKind(late.id))
 
 		follow(t, r)
