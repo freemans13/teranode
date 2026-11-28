@@ -502,7 +502,12 @@ func TestQuickLanePositionsCollect(t *testing.T) {
 
 	start := time.Now()
 	bv.readExistingLanePositions(ctx, quickLanePositionsFrom(ctx), []*chainhash.Hash{{0x01}})
-	require.WithinDuration(t, start.Add(quickLaneReadTimeout), <-deadline, 20*time.Millisecond, "the store is given the bound")
+	end := time.Now()
+
+	// The read sets its deadline between start and end, so the store sees one in that span plus the bound.
+	given := <-deadline
+	require.False(t, given.Before(start.Add(quickLaneReadTimeout)), "the store is given the bound")
+	require.False(t, given.After(end.Add(quickLaneReadTimeout)), "the store is given the bound")
 	require.Nil(t, bv.quickLaneRows(ctx, block))
 
 	bv = &BlockValidation{logger: ulogger.TestLogger{}, settings: tSettings, utxoStore: decorateFailingStore{stall: true, late: true}}

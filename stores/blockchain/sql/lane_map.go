@@ -234,8 +234,11 @@ const (
 // is a first insert. A live block can be stored with none: the coinbase is not in the rows (its
 // subtree holds a placeholder for it), so a coinbase-only block gets none; at shadow a block whose
 // subtrees' lane bitmaps are missing, or hold no position, gets none; and so does a block quick
-// validation stores when none of its records came back with a position. A block this node mined gets rows when the bitmaps of all its subtrees are
-// kept. A historical block with none has no readable transaction to place.
+// validation stores when none of its records came back with a position, when reading back its
+// existing records' positions fails, when its rows cannot be built, or when another route stored
+// it first and the insert of its rows after that failed. A block this node mined gets rows when
+// the bitmaps of all its subtrees are kept. A historical block with none has no readable
+// transaction to place.
 func (s *SQL) InsertLaneMapRows(ctx context.Context, blockID uint32, rows []lane.MapRow) error {
 	if err := lane.CheckMapRows(rows); err != nil {
 		return errors.NewProcessingError("block %d", blockID, err)
