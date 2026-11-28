@@ -402,6 +402,9 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		clock := time.Now()
 		r.now = func() time.Time { return clock }
 
+		r.readLateRows(ctx) // before the first snapshot: nothing to re-read
+		require.Equal(t, KindNoRows, (*Reader)(nil).noRowsKind(late.id))
+
 		follow(t, r)
 
 		h := chainhash.Hash{1}
@@ -416,13 +419,19 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		requireCounted(t, ReaderSubtreeAlreadyMined, KindRowsPending, lane.ViaNone, func() {
 			r.CompareBlocks(ReaderSubtreeAlreadyMined, r.MainView(), h, lane.Pack(3, 7), []uint32{late.id})
 		})
+		requireCounted(t, ReaderBlockDuplicate, KindRowsPending, lane.ViaNone, func() {
+			r.compareDuplicates(r.MainView(), KindNotReady, h, late.id, false)
+		})
 
 		require.NoError(t, store.InsertLaneMapRows(ctx, late.id, takes(t, 3, 7, 8)))
+
+		loadsOK := testutil.ToFloat64(prometheusLaneReaderLoads.WithLabelValues("ok"))
 
 		clock = clock.Add(lateRowsFirstWait)
 		r.readLateRows(ctx)
 
 		require.Equal(t, 2, source.of(late.id))
+		require.InDelta(t, loadsOK+2, testutil.ToFloat64(prometheusLaneReaderLoads.WithLabelValues("ok")), 0, "late and never were read")
 		require.InDelta(t, lateRows+1, testutil.ToFloat64(prometheusLaneReaderLateRows), 0)
 		requireCounted(t, ReaderValidator, KindAgree, lane.ViaRow, func() {
 			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 7), true, late.height)
@@ -520,6 +529,26 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		requireCounted(t, ReaderValidator, KindAgree, lane.ViaRow, func() {
 			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 500), true, more.height)
 		})
+	})
+}
+
+// The running follower takes a block's late rows on its own, within the first re-reads.
+func TestReaderFollowerTakesLateRows(t *testing.T) {
+	engines(t, func(t *testing.T, store blockchainstore.Store) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		c := newChain(t, store)
+		b1 := c.add(nil, takes(t, 3, 1))
+		late := c.add(b1)
+
+		r := newReader(ulogger.TestLogger{}, store, 100)
+
+		go r.follow(ctx)
+
+		require.Eventually(t, func() bool { return r.Snapshot() != nil && r.Snapshot().TipHeight() == late.height }, 10*time.Second, 10*time.Millisecond)
+		require.NoError(t, store.InsertLaneMapRows(ctx, late.id, takes(t, 3, 7)))
+		require.Eventually(t, func() bool { return r.MainView().Lookup(lane.Pack(3, 7)).Mined }, 15*time.Second, 50*time.Millisecond)
 	})
 }
 

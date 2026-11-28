@@ -501,6 +501,8 @@ func TestIndexFillRowsGivesRowsOnlyToARowlessUnfoldedBlock(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, got, "rows already held are never replaced")
 
+	require.ElementsMatch(t, []uint32{4, 5}, c.idx.Snapshot().AwaitingRows(), "not published until the next Publish")
+
 	c.idx.Publish()
 
 	require.ElementsMatch(t, []uint32{5}, c.idx.Snapshot().AwaitingRows())
@@ -512,6 +514,14 @@ func TestIndexFillRowsGivesRowsOnlyToARowlessUnfoldedBlock(t *testing.T) {
 	for _, p := range []uint64{6, 7, 8, 10} {
 		require.False(t, c.main().Lookup(Pack(3, p)).Mined, "refused rows did not go in: %d", p)
 	}
+
+	// The filled rows fold like any others once the block is the settle depth deep.
+	c.add(6, 5, 6)
+	c.tip(6)
+
+	a = c.main().Lookup(Pack(3, 9))
+	require.True(t, a.Mined)
+	require.Equal(t, ViaFloor, a.Via, "folded into the floor")
 }
 
 // A row whose hole data does not parse is refused.
