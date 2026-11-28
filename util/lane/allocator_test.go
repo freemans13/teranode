@@ -667,14 +667,19 @@ func TestAllocatorCountsEveryTakeAndGrant(t *testing.T) {
 	src.open[LeaseID{0xff}] = 0 // lane 0 is held elsewhere, so this allocator leases lane 1
 
 	a := newTestAllocator(t, src, quiet, nil)
-	a.takeWait = 100 * time.Millisecond
 
 	before := readLaneMetrics()
 	noLease, usedUp := laneWaitCount(t, waitNoLease), laneWaitCount(t, waitUsedUp)
 
+	// The service is down for the first open, so the first take always waits for the lease.
+	src.setDown(true)
+	time.AfterFunc(20*time.Millisecond, func() { src.setDown(false) })
+
 	for i := uint64(1); i <= 10; i++ {
 		require.Equal(t, Pack(1, i), next(t, a))
 	}
+
+	a.takeWait = 100 * time.Millisecond
 
 	require.Equal(t, noLease+1, laneWaitCount(t, waitNoLease), "the first take waited for the lease")
 

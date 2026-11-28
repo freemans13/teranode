@@ -127,7 +127,9 @@ const laneWriteLockPoll = time.Millisecond
 // laneWriteMu only until ctx ends, and then returns an error and holds nothing.
 func (s *SQL) lockLaneProcessUntil(ctx context.Context) (func(), error) {
 	if s.engine == util.Postgres {
-		return func() {}, nil
+		return func() {
+			// Nothing to release: on Postgres the lock is taken per block, inside the transaction.
+		}, nil
 	}
 
 	ticker := time.NewTicker(laneWriteLockPoll)
