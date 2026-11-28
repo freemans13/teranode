@@ -393,15 +393,7 @@ func (r *Reader) readLateRows(ctx context.Context) {
 
 	r.late = late
 
-	// Oldest due first, so blocks whose reads keep failing, which move back on each failure, do
-	// not hold the batch from the rest.
-	slices.SortFunc(due, func(a, b uint32) int {
-		if c := late[a].due.Compare(late[b].due); c != 0 {
-			return c
-		}
-
-		return cmp.Compare(a, b)
-	})
+	sortDue(due, late)
 
 	if len(due) > lateRowsBatch {
 		due = due[:lateRowsBatch]
@@ -413,6 +405,18 @@ func (r *Reader) readLateRows(ctx context.Context) {
 	}
 
 	r.awaiting.Store(&awaiting)
+}
+
+// sortDue orders due oldest due first, then by block ID, so blocks whose reads keep failing, which
+// move back on each failure, do not hold the batch from the rest.
+func sortDue(due []uint32, late map[uint32]*lateRead) {
+	slices.SortFunc(due, func(a, b uint32) int {
+		if c := late[a].due.Compare(late[b].due); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(a, b)
+	})
 }
 
 // fillLateRows re-reads the rows of each block in due, all within one readTimeout, and gives the

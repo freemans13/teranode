@@ -411,6 +411,7 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		lateRows := testutil.ToFloat64(prometheusLaneReaderLateRows)
 
 		require.Equal(t, 9, lateRowsReads, "the window the PR and the metric help give: 1 s doubling to 256 s")
+		require.Equal(t, time.Second, lateRowsFirstWait)
 
 		// Seen without rows: answers count rows_pending, and no re-read is due yet.
 		r.readLateRows(ctx)
@@ -582,6 +583,22 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		require.NoError(t, store.InsertLaneMapRows(ctx, last2.id, takes(t, 3, 600)))
 		require.Eventually(t, func() bool { return r.MainView().Lookup(lane.Pack(3, 600)).Mined }, 15*time.Second, 50*time.Millisecond)
 	})
+}
+
+// Due blocks are read oldest due first, whatever their IDs, and by ID when due together.
+func TestReaderSortsDueRowsOldestFirst(t *testing.T) {
+	now := time.Now()
+	late := map[uint32]*lateRead{
+		1: {due: now.Add(2 * time.Second)},
+		2: {due: now.Add(time.Second)},
+		3: {due: now},
+		4: {due: now},
+	}
+
+	due := []uint32{1, 4, 2, 3}
+	sortDue(due, late)
+
+	require.Equal(t, []uint32{3, 4, 2, 1}, due)
 }
 
 // countingRows counts the rows reads of each block that succeed, and fails them while failing is set
