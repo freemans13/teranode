@@ -37,7 +37,7 @@ func initMetrics() {
 			Namespace: "teranode",
 			Subsystem: "lane_reader",
 			Name:      "answers_total",
-			Help:      "Mined-state checks answered from the lane index beside today's answer, at utxostore_laneMigration shadow, by reader (validator, subtree_prefetch, subtree_already_mined, block_parent, block_duplicate), kind (agree, lanes_only, today_only, different_block, no_position, no_rows, not_loaded, not_ready, off_chain, coinbase, mined_pending: a lanes_only answer from the row of the best block at the follower's last poll while its mined write is unfinished, for at most a minute after the block was stored; rows_pending: a no_rows answer for a block the follower is still re-reading for rows inserted after it loaded the block, for about a minute) and what answered on the lanes side (row, floor, none). Nothing acts on the lanes answer",
+			Help:      "Mined-state checks answered from the lane index beside today's answer, at utxostore_laneMigration shadow, by reader (validator, subtree_prefetch, subtree_already_mined, block_parent, block_duplicate), kind (agree, lanes_only, today_only, different_block, no_position, no_rows, not_loaded, not_ready, off_chain, coinbase, mined_pending: a lanes_only answer from the row of the best block at the follower's last poll while its mined write is unfinished, for at most a minute after the block was stored; rows_pending: a no_rows answer for a block in the follower's last published set of blocks it is still re-reading for rows inserted after it loaded them, for about 8.5 minutes) and what answered on the lanes side (row, floor, none). Nothing acts on the lanes answer",
 		}, []string{"reader", "kind", "via"})
 		prometheusLaneReaderLookupSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 			Namespace: "teranode",
@@ -105,7 +105,7 @@ func initMetrics() {
 			Namespace: "teranode",
 			Subsystem: "lane_reader",
 			Name:      "late_rows_total",
-			Help:      "Blocks the lane index loaded without rows that got rows on a later re-read by the follower: rows inserted after the block was stored, as quick validation does when another route stored the block first. Its answers before then counted rows_pending",
+			Help:      "Blocks the lane index loaded without rows that got rows on a later re-read by the follower: rows inserted after the block was stored, as quick validation does when another route stored the block first. Its answers while the follower's published set named it counted rows_pending",
 		})
 
 		prometheusLaneReaderPrepareFailures = promauto.NewCounterVec(prometheus.CounterOpts{

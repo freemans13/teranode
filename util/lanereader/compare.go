@@ -53,10 +53,10 @@ const (
 	// one quick validation stored on a store that returns no positions, or our own block until
 	// block assembly writes rows), and lanes says not. Not a disagreement.
 	KindNoRows = "no_rows"
-	// KindRowsPending: what would count no_rows, for a block the follower is still re-reading for
-	// rows inserted after the index loaded it, about a minute (lateRowsReads). Counted in place of
-	// no_rows so the answers given before a block's late rows arrived show apart; once its rows
-	// arrive its answers are judged from them. Not a disagreement.
+	// KindRowsPending: what would count no_rows, for a block in the set the follower last published
+	// of blocks it is still re-reading for rows inserted after the index loaded it, about 8.5
+	// minutes (lateRowsReads). An answer in the moment before the set first names a block, or from
+	// an older snapshot after the set drops it, counts no_rows. Not a disagreement.
 	KindRowsPending = "rows_pending"
 	// KindNotLoaded: the index cannot judge the check. The block today names is outside what the
 	// index loaded or has been forgotten, a height names a fork block whose rows are gone, the

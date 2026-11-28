@@ -671,7 +671,8 @@ func TestAllocatorCountsEveryTakeAndGrant(t *testing.T) {
 	before := readLaneMetrics()
 	noLease, usedUp := laneWaitCount(t, waitNoLease), laneWaitCount(t, waitUsedUp)
 
-	// The open waits until the first take has counted its wait, so that take always waits.
+	// The open waits until the first take has counted its wait, or 5 s if the test stalls, so the
+	// first take waits.
 	gate := make(chan struct{})
 
 	src.mu.Lock()

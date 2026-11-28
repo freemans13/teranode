@@ -411,7 +411,7 @@ type IndexSnapshot struct {
 	// awaitingRows are the loaded blocks with no rows that are not folded (AwaitingRows).
 	awaitingRows []uint32
 	stats        IndexStats
-	mainView   *ChainView
+	mainView     *ChainView
 }
 
 // IndexStats is the index's size, for the metrics.

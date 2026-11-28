@@ -509,10 +509,9 @@ func TestQuickLanePositionsCollect(t *testing.T) {
 	start := time.Now()
 	bv.readExistingLanePositions(ctx, quickLanePositionsFrom(ctx), []*chainhash.Hash{{0x01}})
 
-	// The read sets its deadline after start and before it calls the store, so the deadline lies
-	// at most the bound past either: no shorter and no longer bound fits both. A worker that
-	// reaches its deadline check after the deadline never calls the store, and then there is no
-	// deadline to check.
+	// Lower and upper bounds: the read sets its deadline after start and before it calls the store,
+	// so it lies at least the bound past start and at most the bound past the call. A worker that
+	// reaches its deadline check late never calls the store, and then there is nothing to check.
 	select {
 	case given := <-deadline:
 		require.False(t, given.deadline.Before(start.Add(quickLaneReadTimeout)), "the store is given the bound")

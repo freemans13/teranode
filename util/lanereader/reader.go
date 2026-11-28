@@ -64,11 +64,16 @@ const (
 
 	// lateRowsReads is how many times the follower re-reads the rows of a loaded block that has
 	// none and is not yet folded, and lateRowsFirstWait the wait before the first re-read, doubling
-	// after each: 1, 2, 4, 8, 16 and 32 s, about a minute in all. A block can get its rows after it
-	// is stored: quick validation inserts them when another route stored the block first, without
-	// rows, after its own unlock. A block with rows is never re-read.
-	lateRowsReads     = 6
+	// after each: 1, 2, 4 and on to 256 s, about 8.5 minutes in all. A block can get its rows after
+	// it is stored: quick validation inserts them when another route stored the block first,
+	// without rows, after its own unlock, which retries for up to 5 minutes, and with 10 s for the
+	// insert. A read that fails is not counted. A block with rows is never re-read.
+	lateRowsReads     = 9
 	lateRowsFirstWait = time.Second
+
+	// lateRowsBatch bounds the blocks one pass re-reads, all within one readTimeout, so a pass
+	// holds the load token no longer than one read may take; the rest are read on later passes.
+	lateRowsBatch = 8
 
 	// minedWriteLimit is how long after a block is stored (its inserted_at) its rows' answers may
 	// count mined_pending while its mined write is unfinished. Mainnet's took about 3 s for a block
@@ -386,6 +391,10 @@ func (r *Reader) readLateRows(ctx context.Context) {
 
 	r.late = late
 
+	if len(due) > lateRowsBatch {
+		due = due[:lateRowsBatch]
+	}
+
 	if len(due) > 0 && r.lockLoad(ctx) {
 		r.fillLateRows(ctx, now, due, awaiting)
 		r.unlockLoad()
@@ -394,27 +403,19 @@ func (r *Reader) readLateRows(ctx context.Context) {
 	r.awaiting.Store(&awaiting)
 }
 
-// fillLateRows re-reads the rows of each block in due and gives the index those it finds, taking a
-// block that got rows, or has had its last re-read, out of awaiting. The caller holds the load
+// fillLateRows re-reads the rows of each block in due, all within one readTimeout, and gives the
+// index those it finds, taking a block that got rows, or has had its last re-read, out of awaiting.
+// A read that fails is not counted, and is tried again on the next pass. The caller holds the load
 // token.
 func (r *Reader) fillLateRows(ctx context.Context, now time.Time, due []uint32, awaiting map[uint32]struct{}) {
 	idx := r.idx.Load()
 	filled := false
 
+	readCtx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
 	for _, id := range due {
-		lr := r.late[id]
-		lr.reads++
-		lr.due = now.Add(lateRowsFirstWait << lr.reads)
-
-		if lr.reads >= lateRowsReads {
-			delete(awaiting, id)
-		}
-
-		readCtx, cancel := context.WithTimeout(ctx, readTimeout)
 		rows, err := r.source.LaneMapRows(readCtx, id)
-
-		cancel()
-
 		if err != nil {
 			prometheusLaneReaderLoads.WithLabelValues("error").Inc()
 
@@ -422,6 +423,14 @@ func (r *Reader) fillLateRows(ctx context.Context, now time.Time, due []uint32, 
 		}
 
 		prometheusLaneReaderLoads.WithLabelValues("ok").Inc()
+
+		lr := r.late[id]
+		lr.reads++
+		lr.due = now.Add(lateRowsFirstWait << lr.reads)
+
+		if lr.reads >= lateRowsReads {
+			delete(awaiting, id)
+		}
 
 		got, err := idx.FillRows(id, rows)
 		if err != nil {

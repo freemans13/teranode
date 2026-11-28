@@ -383,10 +383,9 @@ func TestReaderCountsEachKind(t *testing.T) {
 	})
 }
 
-// A block loaded without rows takes the rows inserted after it: the follower re-reads it, counts it
-// in late_rows_total, and its next answer comes from those rows; until then its answers count
-// rows_pending. Blocks with rows, or of only a coinbase, are not read again, and a block that never
-// gets rows is re-read lateRowsReads times and then counts no_rows.
+// A block loaded without rows takes rows inserted after it on the follower's next re-read, and
+// answers rows_pending until then; one that never gets them is re-read on schedule, failed reads
+// not counted, and then answers no_rows. Blocks with rows, or of only a coinbase, are not re-read.
 func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 	engines(t, func(t *testing.T, store blockchainstore.Store) {
 		ctx := t.Context()
@@ -429,11 +428,36 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 7), true, late.height)
 		})
 
-		// The rest of the schedule: each re-read due once, and none after the last.
-		for range lateRowsReads + 2 {
-			clock = clock.Add(time.Hour)
+		// never was re-read in that pass too. Each later re-read comes 2, 4 ... 256 s after the one
+		// before: none early, one when due, a failed one tried again on the next pass.
+		require.Equal(t, 2, source.of(never.id))
+
+		last := clock
+
+		for k := 1; k < lateRowsReads; k++ {
+			wait := lateRowsFirstWait << k
+
+			clock = last.Add(wait - time.Millisecond)
 			r.readLateRows(ctx)
+			require.Equal(t, 1+k, source.of(never.id), "re-read %d is not early", k+1)
+
+			clock = last.Add(wait)
+
+			if k == 3 {
+				source.failing.Store(true)
+				r.readLateRows(ctx)
+				source.failing.Store(false)
+				require.Equal(t, 1+k, source.of(never.id), "a failed read is not counted")
+			}
+
+			r.readLateRows(ctx)
+			require.Equal(t, 2+k, source.of(never.id), "re-read %d when due", k+1)
+
+			last = clock
 		}
+
+		clock = clock.Add(time.Hour)
+		r.readLateRows(ctx)
 
 		require.Equal(t, 1+lateRowsReads, source.of(never.id), "loaded, then re-read lateRowsReads times")
 		require.Equal(t, 2, source.of(late.id), "not read again once it has rows")
@@ -444,17 +468,47 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		requireCounted(t, ReaderValidator, KindNoRows, lane.ViaNone, func() {
 			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 99), true, never.height)
 		})
+
+		// One pass re-reads at most lateRowsBatch blocks; the rest wait for the next pass.
+		top := c.line(coinbaseOnly, lateRowsBatch+2)
+		follow(t, r)
+		r.readLateRows(ctx)
+
+		clock = clock.Add(lateRowsFirstWait)
+		r.readLateRows(ctx)
+
+		reread := func() int {
+			n := 0
+
+			for id := top.id - lateRowsBatch - 1; id <= top.id; id++ {
+				if source.of(id) == 2 {
+					n++
+				}
+			}
+
+			return n
+		}
+
+		require.Equal(t, lateRowsBatch, reread())
+
+		r.readLateRows(ctx)
+		require.Equal(t, lateRowsBatch+2, reread())
 	})
 }
 
-// countingRows counts the rows reads of each block.
+// countingRows counts the rows reads of each block that succeed, and fails them while failing is set.
 type countingRows struct {
 	blockchainstore.Store
-	mu    sync.Mutex
-	reads map[uint32]int
+	mu      sync.Mutex
+	reads   map[uint32]int
+	failing atomic.Bool
 }
 
 func (c *countingRows) LaneMapRows(ctx context.Context, id uint32) ([]lane.MapRow, error) {
+	if c.failing.Load() {
+		return nil, errors.NewServiceError("rows read failed")
+	}
+
 	c.mu.Lock()
 	c.reads[id]++
 	c.mu.Unlock()
