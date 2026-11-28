@@ -387,11 +387,17 @@ type decorateFailingStore struct {
 	// late, with stall, answers without error once the context has ended, as a store that does
 	// not follow its context answers after the bound.
 	late bool
-	// deadline, when set, receives the deadline of the context the store was given.
-	deadline chan time.Time
+	// deadline, when set, receives the deadline of the context the store was given, and when the
+	// store was called.
+	deadline chan storeDeadline
 	// hold, when set, blocks every call until it is closed, whatever the context says, as an
 	// Aerospike batch read does.
 	hold chan struct{}
+}
+
+// storeDeadline is the deadline a store call was given, and when it was called.
+type storeDeadline struct {
+	deadline, calledAt time.Time
 }
 
 func (s decorateFailingStore) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
@@ -401,7 +407,7 @@ func (s decorateFailingStore) BatchDecorate(ctx context.Context, items []*utxo.U
 
 	if s.deadline != nil {
 		d, _ := ctx.Deadline()
-		s.deadline <- d
+		s.deadline <- storeDeadline{deadline: d, calledAt: time.Now()}
 	}
 
 	if s.hold != nil {
@@ -494,7 +500,7 @@ func TestQuickLanePositionsCollect(t *testing.T) {
 
 	t.Cleanup(func() { quickLaneReadTimeout = timeout })
 
-	deadline := make(chan time.Time, 1)
+	deadline := make(chan storeDeadline, 1)
 
 	bv = &BlockValidation{logger: ulogger.TestLogger{}, settings: tSettings, utxoStore: decorateFailingStore{stall: true, deadline: deadline}}
 	ctx = bv.withQuickLanePositions(context.Background())
@@ -502,12 +508,12 @@ func TestQuickLanePositionsCollect(t *testing.T) {
 
 	start := time.Now()
 	bv.readExistingLanePositions(ctx, quickLanePositionsFrom(ctx), []*chainhash.Hash{{0x01}})
-	end := time.Now()
 
-	// The read sets its deadline between start and end, so the store sees one in that span plus the bound.
+	// The read sets its deadline after start and before it calls the store, so the deadline lies
+	// at most the bound past either: no shorter and no longer bound fits both.
 	given := <-deadline
-	require.False(t, given.Before(start.Add(quickLaneReadTimeout)), "the store is given the bound")
-	require.False(t, given.After(end.Add(quickLaneReadTimeout)), "the store is given the bound")
+	require.False(t, given.deadline.Before(start.Add(quickLaneReadTimeout)), "the store is given the bound")
+	require.False(t, given.deadline.After(given.calledAt.Add(quickLaneReadTimeout)), "the store is given the bound")
 	require.Nil(t, bv.quickLaneRows(ctx, block))
 
 	bv = &BlockValidation{logger: ulogger.TestLogger{}, settings: tSettings, utxoStore: decorateFailingStore{stall: true, late: true}}
