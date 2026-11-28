@@ -134,6 +134,23 @@ func TestInsertLaneMapRowsGivesUpWaitingForTheSQLiteLaneLock(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, none)
 
+	// A caller that has already given up takes no lock, even a free one.
+	unlock()
+
+	gone, cancelGone := context.WithCancel(t.Context())
+	cancelGone()
+
+	_, err = insert(gone)
+	require.ErrorIs(t, err, context.Canceled)
+
+	none, err = s.LaneMapRows(t.Context(), 1_000)
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	laneWriteMu.Lock()
+
+	release = sync.Once{}
+
 	// Released while an insert waits, the lock goes to it at once.
 	time.AfterFunc(50*time.Millisecond, unlock)
 

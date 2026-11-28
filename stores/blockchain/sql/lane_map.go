@@ -124,8 +124,8 @@ func (s *SQL) lockLaneProcess() func() {
 const laneWriteLockPoll = time.Millisecond
 
 // lockLaneProcessUntil is lockLaneProcess for a caller that can give up: on SQLite it tries
-// laneWriteMu every laneWriteLockPoll, checking ctx between tries, and returns an error holding
-// nothing once ctx has ended. A lock freed just as ctx ends can still be taken.
+// laneWriteMu every laneWriteLockPoll, and returns an error holding nothing as soon as ctx has
+// ended before a try, a free lock included.
 func (s *SQL) lockLaneProcessUntil(ctx context.Context) (func(), error) {
 	if s.engine == util.Postgres {
 		return func() {
@@ -136,15 +136,20 @@ func (s *SQL) lockLaneProcessUntil(ctx context.Context) (func(), error) {
 	ticker := time.NewTicker(laneWriteLockPoll)
 	defer ticker.Stop()
 
-	for !laneWriteMu.TryLock() {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.NewStorageError("wait for the lane write lock", err)
+		}
+
+		if laneWriteMu.TryLock() {
+			return laneWriteMu.Unlock, nil
+		}
+
 		select {
 		case <-ctx.Done():
-			return nil, errors.NewStorageError("wait for the lane write lock", ctx.Err())
 		case <-ticker.C:
 		}
 	}
-
-	return laneWriteMu.Unlock, nil
 }
 
 // lockLaneWrite takes the lock for one block's rows or for the segment tables, for the rest of tx
