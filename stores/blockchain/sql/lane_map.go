@@ -123,8 +123,9 @@ func (s *SQL) lockLaneProcess() func() {
 // laneWriteLockPoll is how often lockLaneProcessUntil tries laneWriteMu again.
 const laneWriteLockPoll = time.Millisecond
 
-// lockLaneProcessUntil is lockLaneProcess for a caller that can give up: on SQLite it waits for
-// laneWriteMu only until ctx ends, and then returns an error and holds nothing.
+// lockLaneProcessUntil is lockLaneProcess for a caller that can give up: on SQLite it takes
+// laneWriteMu if it is free, and otherwise waits for it only until ctx ends, then returns an error
+// and holds nothing.
 func (s *SQL) lockLaneProcessUntil(ctx context.Context) (func(), error) {
 	if s.engine == util.Postgres {
 		return func() {
