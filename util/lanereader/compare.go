@@ -53,6 +53,11 @@ const (
 	// one quick validation stored on a store that returns no positions, or our own block until
 	// block assembly writes rows), and lanes says not. Not a disagreement.
 	KindNoRows = "no_rows"
+	// KindRowsPending: what would count no_rows, for a block in the set the follower last published
+	// of blocks it is still re-reading for rows inserted after the index loaded it, about 8.5
+	// minutes (lateRowsReads). An answer in the moment before the set first names a block, or from
+	// an older snapshot after the set drops it, counts no_rows. Not a disagreement.
+	KindRowsPending = "rows_pending"
 	// KindNotLoaded: the index cannot judge the check. The block today names is outside what the
 	// index loaded or has been forgotten, a height names a fork block whose rows are gone, the
 	// chain's older ancestry is not held, or the duplicate check cannot place the earlier copy.
@@ -80,7 +85,22 @@ const (
 	KindMinedPending = "mined_pending"
 )
 
-var kinds = []string{KindAgree, KindLanesOnly, KindTodayOnly, KindDifferentBlock, KindNoPosition, KindNoRows, KindNotLoaded, KindNotReady, KindOffChain, KindCoinbase, KindMinedPending}
+var kinds = []string{KindAgree, KindLanesOnly, KindTodayOnly, KindDifferentBlock, KindNoPosition, KindNoRows, KindNotLoaded, KindNotReady, KindOffChain, KindCoinbase, KindMinedPending, KindRowsPending}
+
+// noRowsKind is KindNoRows for block id, or KindRowsPending while the follower re-reads its rows.
+func (r *Reader) noRowsKind(id uint32) string {
+	if r == nil {
+		return KindNoRows
+	}
+
+	if w := r.awaiting.Load(); w != nil {
+		if _, ok := (*w)[id]; ok {
+			return KindRowsPending
+		}
+	}
+
+	return KindNoRows
+}
 
 // minedPendingKind counts a lanes_only answer from a row of the best block under KindMinedPending
 // while today's mined write of that block has not finished, up to the wait's deadline.
@@ -149,7 +169,7 @@ func (r *Reader) CompareHeight(reader string, hash chainhash.Hash, pos uint64, t
 	}
 
 	a := r.lookup(s.Main(), pos)
-	kind := r.minedPendingKind(classifyHeight(s, pos, a, todayMined, todayHeight), a)
+	kind := r.minedPendingKind(r.classifyHeight(s, pos, a, todayMined, todayHeight), a)
 	count(reader, kind, a.Via)
 
 	if isDisagreement(kind) {
@@ -157,7 +177,7 @@ func (r *Reader) CompareHeight(reader string, hash chainhash.Hash, pos uint64, t
 	}
 }
 
-func classifyHeight(s *lane.IndexSnapshot, pos uint64, a lane.Answer, todayMined bool, todayHeight uint32) string {
+func (r *Reader) classifyHeight(s *lane.IndexSnapshot, pos uint64, a lane.Answer, todayMined bool, todayHeight uint32) string {
 	if !todayMined {
 		if a.Mined {
 			return KindLanesOnly
@@ -198,7 +218,7 @@ func classifyHeight(s *lane.IndexSnapshot, pos uint64, a lane.Answer, todayMined
 	}
 
 	if state, _ := s.Block(id); state == lane.BlockNoRows {
-		return KindNoRows
+		return r.noRowsKind(id)
 	}
 
 	return KindTodayOnly
@@ -230,7 +250,7 @@ func (r *Reader) compareBlocks(reader string, v *lane.ChainView, noView string, 
 	}
 
 	a := r.lookup(v, pos)
-	kind := r.minedPendingKind(classifyBlocks(v, a, todayBlockIDs), a)
+	kind := r.minedPendingKind(r.classifyBlocks(v, a, todayBlockIDs), a)
 	count(reader, kind, a.Via)
 
 	if isDisagreement(kind) {
@@ -238,7 +258,7 @@ func (r *Reader) compareBlocks(reader string, v *lane.ChainView, noView string, 
 	}
 }
 
-func classifyBlocks(v *lane.ChainView, a lane.Answer, todayBlockIDs []uint32) string {
+func (r *Reader) classifyBlocks(v *lane.ChainView, a lane.Answer, todayBlockIDs []uint32) string {
 	s := v.Snapshot()
 
 	var (
@@ -307,7 +327,7 @@ func classifyBlocks(v *lane.ChainView, a lane.Answer, todayBlockIDs []uint32) st
 		}
 
 		if state, _ := s.Block(firstOnChain); state == lane.BlockNoRows {
-			return KindNoRows
+			return r.noRowsKind(firstOnChain)
 		}
 
 		// On a chain the floors do not hold, a folded block's rows are no longer in memory.
@@ -387,7 +407,7 @@ func (r *Reader) compareDuplicates(v *lane.ChainView, noView string, hash chainh
 
 	switch {
 	case !hasRows:
-		kind = KindNoRows
+		kind = r.noRowsKind(blockID)
 	case taken == 0 && v.Disconnected():
 		// The ancestors the view does not hold may hold the earlier copy.
 		kind = KindNotLoaded

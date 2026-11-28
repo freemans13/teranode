@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sync/atomic"
 	"testing"
@@ -31,6 +32,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/lanereader"
 	testutil "github.com/bsv-blockchain/teranode/util/test"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -385,11 +387,17 @@ type decorateFailingStore struct {
 	// late, with stall, answers without error once the context has ended, as a store that does
 	// not follow its context answers after the bound.
 	late bool
-	// deadline, when set, receives the deadline of the context the store was given.
-	deadline chan time.Time
+	// deadline, when set, receives the deadline of the context the store was given, and when the
+	// store was called.
+	deadline chan storeDeadline
 	// hold, when set, blocks every call until it is closed, whatever the context says, as an
 	// Aerospike batch read does.
 	hold chan struct{}
+}
+
+// storeDeadline is the deadline a store call was given, and when it was called.
+type storeDeadline struct {
+	deadline, calledAt time.Time
 }
 
 func (s decorateFailingStore) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
@@ -399,7 +407,7 @@ func (s decorateFailingStore) BatchDecorate(ctx context.Context, items []*utxo.U
 
 	if s.deadline != nil {
 		d, _ := ctx.Deadline()
-		s.deadline <- d
+		s.deadline <- storeDeadline{deadline: d, calledAt: time.Now()}
 	}
 
 	if s.hold != nil {
@@ -492,7 +500,7 @@ func TestQuickLanePositionsCollect(t *testing.T) {
 
 	t.Cleanup(func() { quickLaneReadTimeout = timeout })
 
-	deadline := make(chan time.Time, 1)
+	deadline := make(chan storeDeadline, 1)
 
 	bv = &BlockValidation{logger: ulogger.TestLogger{}, settings: tSettings, utxoStore: decorateFailingStore{stall: true, deadline: deadline}}
 	ctx = bv.withQuickLanePositions(context.Background())
@@ -500,7 +508,18 @@ func TestQuickLanePositionsCollect(t *testing.T) {
 
 	start := time.Now()
 	bv.readExistingLanePositions(ctx, quickLanePositionsFrom(ctx), []*chainhash.Hash{{0x01}})
-	require.WithinDuration(t, start.Add(quickLaneReadTimeout), <-deadline, 20*time.Millisecond, "the store is given the bound")
+
+	// Lower and upper bounds: the read sets its deadline after start and before it calls the store,
+	// so it lies at least the bound past start and at most the bound past the call. A worker that
+	// reaches its deadline check late never calls the store, and then there is nothing to check.
+	select {
+	case given := <-deadline:
+		require.False(t, given.deadline.Before(start.Add(quickLaneReadTimeout)), "the store is given the bound")
+		require.False(t, given.deadline.After(given.calledAt.Add(quickLaneReadTimeout)), "the store is given the bound")
+	case <-time.After(time.Second):
+		t.Log("the read's worker reached its deadline before the store")
+	}
+
 	require.Nil(t, bv.quickLaneRows(ctx, block))
 
 	bv = &BlockValidation{logger: ulogger.TestLogger{}, settings: tSettings, utxoStore: decorateFailingStore{stall: true, late: true}}
@@ -735,6 +754,188 @@ func TestQuickValidatedBlockCommit(t *testing.T) {
 		require.Equal(t, lanereader.PruneVerdict{Lanes: lanereader.PruneDelete, Reason: lanereader.ReasonSettled}, verdict)
 	})
 
+	// Full validation of the same block, finding the subtree files quick validation wrote, saves no
+	// lane bitmaps and stores the block without rows. Whichever stores it first, the block ends with
+	// its records' rows, under the ID it was stored with, and a redo changes nothing.
+	for _, fullFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("full validation stores the block first=%t", fullFirst), func(t *testing.T) {
+			f := newQuickLaneCommitFixture(t, fmt.Sprintf("QUICK_LANE_RACE_%t", fullFirst))
+			bv, store, client, kind, layout, txs, block := f.bv, f.store, f.client, f.kind, f.layout, f.txs, f.block
+
+			bv.subtreeStore = blobmemory.New()
+
+			late := &lateInsertClient{ClientI: client}
+			bv.blockchainClient = late
+
+			ctx := context.Background()
+			failures := laneMetric(t, "teranode_lane_row_insert_failures_total", "block", lane.BlockPeer)
+			absent := laneMetric(t, "teranode_lane_missing_bitmaps_total", "reason", lane.MissingBitmapsAbsent)
+
+			// Full validation's own copy of the block, with no ID: the store gives it one.
+			full := &model.Block{Header: block.Header, CoinbaseTx: block.CoinbaseTx, Subtrees: block.Subtrees, TransactionCount: block.TransactionCount, Height: block.Height}
+			storeInFull := func() error { return client.AddBlock(ctx, full, "legacy", bv.buildAddBlockOpts(ctx, full)...) }
+
+			attempt := quickValidateAttempt(t, bv, block, layout, kind, 0, len(layout))
+
+			if fullFirst {
+				require.NoError(t, storeInFull())
+			}
+
+			require.NoError(t, bv.commitBlock(attempt, block, "", "test"))
+
+			if !fullFirst {
+				require.Error(t, storeInFull(), "the block is stored already")
+			}
+
+			wantInserts := 0
+			if fullFirst {
+				wantInserts = 1
+			}
+
+			require.Equal(t, wantInserts, late.calls, "a late insert only after AddBlock found the block stored")
+
+			require.Equal(t, absent+float64(len(block.Subtrees)), laneMetric(t, "teranode_lane_missing_bitmaps_total", "reason", lane.MissingBitmapsAbsent), "full validation found no lane bitmaps")
+
+			_, meta, err := client.GetBlockHeader(ctx, block.Hash())
+			require.NoError(t, err)
+
+			want := rowsOf(t, storedLanePositions(t, store, txs))
+
+			stored, err := client.LaneMapRows(ctx, meta.ID)
+			require.NoError(t, err)
+			require.Equal(t, want, stored)
+
+			redo := quickValidateAttempt(t, bv, block, layout, kind, 0, len(layout))
+			require.NoError(t, bv.commitBlock(redo, block, "", "test"))
+
+			stored, err = client.LaneMapRows(ctx, meta.ID)
+			require.NoError(t, err)
+			require.Equal(t, want, stored, "a redo changes no row")
+			require.Equal(t, failures, laneMetric(t, "teranode_lane_row_insert_failures_total", "block", lane.BlockPeer), "no insert failed")
+		})
+	}
+
+	// A late insert runs after the unlock, whether the unlock succeeds or fails, and after its
+	// caller gave up, on a context of its own with a deadline. One that fails is counted, and the
+	// commit still runs to its end.
+	for _, c := range []struct {
+		name                     string
+		insertFails, unlockFails bool
+	}{
+		{name: "a late insert"},
+		{name: "a late insert that fails", insertFails: true},
+		{name: "a late insert after a failed unlock", unlockFails: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			saved := postCommitUnlockRetryBackoff
+			postCommitUnlockRetryBackoff = time.Millisecond
+
+			t.Cleanup(func() { postCommitUnlockRetryBackoff = saved })
+
+			f := newQuickLaneCommitFixture(t, "QUICK_LANE_LATE_"+c.name)
+			bv, store, client, kind, layout, txs, block := f.bv, f.store, f.client, f.kind, f.layout, f.txs, f.block
+
+			ctx := context.Background()
+			full := &model.Block{Header: block.Header, CoinbaseTx: block.CoinbaseTx, Subtrees: block.Subtrees, TransactionCount: block.TransactionCount, Height: block.Height}
+			require.NoError(t, client.AddBlock(ctx, full, "legacy"), "stored first, without rows")
+
+			attempt := quickValidateAttempt(t, bv, block, layout, kind, 0, len(layout))
+
+			// The outputs to unlock, so the commit's unlock reaches the store.
+			subtree, err := subtreepkg.NewTreeByLeafCount(4)
+			require.NoError(t, err)
+			require.NoError(t, subtree.AddCoinbaseNode())
+			require.NoError(t, subtree.AddNode(*txs[0].TxIDChainHash(), 0, 0))
+
+			block.SubtreeSlices = []*subtreepkg.Subtree{subtree}
+
+			locks := &lockRecordingStore{Store: store}
+			if c.unlockFails {
+				locks.err = errors.NewStorageError("unlock failed")
+			}
+
+			bv.utxoStore = locks
+
+			// The unlocked output must be locked before the commit for its state at the insert to tell.
+			require.NoError(t, store.SetLocked(ctx, []chainhash.Hash{*txs[0].TxIDChainHash()}, true))
+
+			var lockedAtInsert bool
+
+			late := &lateInsertClient{ClientI: client, unlocks: &locks.unlocks, atInsert: func() {
+				md, getErr := store.Get(ctx, txs[0].TxIDChainHash(), fields.Locked)
+				require.NoError(t, getErr)
+
+				lockedAtInsert = md.Locked
+			}}
+			if c.insertFails {
+				late.err = errors.NewServiceError("insert failed")
+			}
+
+			bv.blockchainClient = late
+			failures := laneMetric(t, "teranode_lane_row_insert_failures_total", "block", lane.BlockPeer)
+
+			gaveUp, cancel := context.WithCancel(attempt)
+			cancel()
+
+			unlocked := histogramCount(t, prometheusBlockValidationQuickCommitUnlock)
+			start := time.Now()
+			err = bv.commitBlock(gaveUp, block, "", "test")
+
+			if c.unlockFails {
+				require.Error(t, err)
+				require.True(t, isBlockCommitted(err), "the block is stored")
+				require.Equal(t, unlocked, histogramCount(t, prometheusBlockValidationQuickCommitUnlock), "a failed unlock is not timed")
+			} else {
+				require.NoError(t, err, "the block is stored either way")
+				require.Equal(t, unlocked+1, histogramCount(t, prometheusBlockValidationQuickCommitUnlock), "the unlock is timed")
+
+				_, cached := bv.blockExistsCache.Get(*block.Hash())
+				require.True(t, cached, "the commit ran on to its end")
+			}
+
+			require.Equal(t, 1, late.calls, "one insert")
+			require.Positive(t, late.unlocksBefore, "the unlock reached the store")
+			require.Equal(t, locks.unlocks.Load(), late.unlocksBefore, "every unlock attempt, retries included, ended before the insert began")
+			require.Equal(t, c.unlockFails, lockedAtInsert, "the output is unlocked in the store when the insert begins, unless the unlock failed")
+			require.True(t, late.live, "the insert runs although the caller gave up")
+			require.WithinDuration(t, start.Add(quickLaneLateInsertTimeout), late.deadline, 5*time.Second)
+
+			_, meta, err := client.GetBlockHeader(ctx, block.Hash())
+			require.NoError(t, err)
+
+			rows, err := client.LaneMapRows(ctx, meta.ID)
+			require.NoError(t, err)
+
+			if c.insertFails {
+				require.Empty(t, rows)
+				require.Equal(t, failures+1, laneMetric(t, "teranode_lane_row_insert_failures_total", "block", lane.BlockPeer))
+
+				return
+			}
+
+			require.Equal(t, rowsOf(t, storedLanePositions(t, store, txs)), rows)
+			require.Equal(t, failures, laneMetric(t, "teranode_lane_row_insert_failures_total", "block", lane.BlockPeer))
+		})
+	}
+
+	t.Run("a commit with no rows sends no late insert", func(t *testing.T) {
+		f := newQuickLaneCommitFixture(t, "QUICK_LANE_LATE_NONE")
+		bv, client, kind, layout, block := f.bv, f.client, f.kind, f.layout, f.block
+
+		ctx := context.Background()
+		full := &model.Block{Header: block.Header, CoinbaseTx: block.CoinbaseTx, Subtrees: block.Subtrees, TransactionCount: block.TransactionCount, Height: block.Height}
+		require.NoError(t, client.AddBlock(ctx, full, "legacy"), "stored first, without rows")
+
+		quickValidateAttempt(t, bv, block, layout, kind, 0, len(layout))
+
+		late := &lateInsertClient{ClientI: client}
+		bv.blockchainClient = late
+
+		// A context with no position collection builds no rows.
+		require.NoError(t, bv.commitBlock(ctx, block, "", "test"))
+		require.Zero(t, late.calls)
+	})
+
 	t.Run("a failed position read stores the block without rows", func(t *testing.T) {
 		f := newQuickLaneCommitFixture(t, "QUICK_LANE_READ_FAILS")
 		bv, store, client, kind, layout, block := f.bv, f.store, f.client, f.kind, f.layout, f.block
@@ -757,6 +958,68 @@ func TestQuickValidatedBlockCommit(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, rows)
 	})
+}
+
+// lateInsertClient records the context the late lane rows insert ran on, and fails it with err.
+type lateInsertClient struct {
+	blockchain.ClientI
+	err      error
+	calls    int
+	deadline time.Time
+	live     bool
+	// unlocks, when set, counts the unlocks, and unlocksBefore is its value when the insert began.
+	unlocks       *atomic.Int32
+	unlocksBefore int32
+	// atInsert, when set, runs as the insert begins.
+	atInsert func()
+}
+
+func (c *lateInsertClient) InsertLaneMapRows(ctx context.Context, hash *chainhash.Hash, rows []lane.MapRow) error {
+	c.calls++
+	c.deadline, _ = ctx.Deadline()
+
+	if c.unlocks != nil {
+		c.unlocksBefore = c.unlocks.Load()
+	}
+
+	if c.atInsert != nil {
+		c.atInsert()
+	}
+	c.live = ctx.Err() == nil
+
+	if c.err != nil {
+		return c.err
+	}
+
+	return c.ClientI.InsertLaneMapRows(ctx, hash, rows)
+}
+
+// histogramCount is how many observations h holds.
+func histogramCount(t *testing.T, h prometheus.Histogram) uint64 {
+	t.Helper()
+
+	var m dto.Metric
+
+	require.NoError(t, h.Write(&m))
+
+	return m.GetHistogram().GetSampleCount()
+}
+
+// lockRecordingStore counts each unlock, and fails it with err.
+type lockRecordingStore struct {
+	utxo.Store
+	err     error
+	unlocks atomic.Int32
+}
+
+func (s *lockRecordingStore) SetLocked(ctx context.Context, hashes []chainhash.Hash, value bool) error {
+	s.unlocks.Add(1)
+
+	if s.err != nil {
+		return s.err
+	}
+
+	return s.Store.SetLocked(ctx, hashes, value)
 }
 
 // withQuickLaneBlockchain gives bv a blockchain client over a fresh SQLite blockchain store.

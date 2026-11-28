@@ -77,6 +77,98 @@ func TestLaneMapRowsInsertAndRead(t *testing.T) {
 	})
 }
 
+// On SQLite an insert waits for the lane write lock only until its caller gives up, writing
+// nothing, and goes in once the lock is free.
+func TestInsertLaneMapRowsGivesUpWaitingForTheSQLiteLaneLock(t *testing.T) {
+	storeURL, err := url.Parse("sqlitememory:///")
+	require.NoError(t, err)
+
+	s, err := New(ulogger.TestLogger{}, storeURL, test.CreateBaseTestSettings(t))
+	require.NoError(t, err)
+
+	rows := holedRows(t, 7, 1, 2, 3)
+
+	// insert runs one insert under its own 5 s bound, so a wait that never ends fails the test
+	// instead of hanging it, and reports how long the insert took.
+	insert := func(ctx context.Context) (time.Duration, error) {
+		done := make(chan error, 1)
+		start := time.Now()
+
+		go func() { done <- s.InsertLaneMapRows(ctx, 1_000, rows) }()
+
+		select {
+		case err := <-done:
+			return time.Since(start), err
+		case <-time.After(5 * time.Second):
+			t.Fatal("the insert did not return within 5 s")
+
+			return 0, nil
+		}
+	}
+
+	laneWriteMu.Lock()
+
+	var release sync.Once
+
+	unlock := func() { release.Do(laneWriteMu.Unlock) }
+	t.Cleanup(unlock)
+
+	// A 50 ms deadline, then a cancel at 50 ms: each ends the wait well inside 500 ms.
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	took, err := insert(ctx)
+
+	cancel()
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, took, 500*time.Millisecond, "it gave up at its deadline")
+
+	ctx, cancel = context.WithCancel(t.Context())
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	took, err = insert(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Less(t, took, 500*time.Millisecond, "it gave up when its caller cancelled")
+
+	none, err := s.LaneMapRows(t.Context(), 1_000)
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	// A caller that has already given up takes no lock, even a free one.
+	unlock()
+
+	gone, cancelGone := context.WithCancel(t.Context())
+	cancelGone()
+
+	_, err = insert(gone)
+	require.ErrorIs(t, err, context.Canceled)
+
+	held, err := s.lockLaneProcessUntil(gone)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, held)
+	require.True(t, laneWriteMu.TryLock(), "the lock was left free")
+	laneWriteMu.Unlock()
+
+	none, err = s.LaneMapRows(t.Context(), 1_000)
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	laneWriteMu.Lock()
+
+	release = sync.Once{}
+
+	// Released while an insert waits, the lock goes to it at once.
+	time.AfterFunc(50*time.Millisecond, unlock)
+
+	took, err = insert(t.Context())
+	require.NoError(t, err)
+	require.Less(t, took, 500*time.Millisecond, "it took the lock soon after it came free")
+
+	got, err := s.LaneMapRows(t.Context(), 1_000)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+}
+
 func TestLaneMapRowsRefuseInvalidRows(t *testing.T) {
 	t.Parallel() // a database of its own on the shared server
 

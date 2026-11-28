@@ -748,9 +748,13 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 
 	// At utxostore_laneMigration shadow the block's lane map rows, built from the positions of
 	// the records this attempt wrote or found, and stored in the block's own transaction.
-	if rows := u.quickLaneRows(ctx, block); rows != nil {
+	rows := u.quickLaneRows(ctx, block)
+	if rows != nil {
 		addOpts = append(addOpts, options.WithLaneMapRows(rows))
 	}
+
+	// insertRowsLate is set when AddBlock found the block stored already, so its rows may not be.
+	insertRowsLate := false
 
 	if err := u.blockchainClient.AddBlock(ctx, block, peerID, addOpts...); err != nil {
 		// An AddBlock error does not prove the block was not stored: a deadline or cancel can reach
@@ -772,6 +776,8 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 			// owns the block's flags. Either way the block is stored, so a sweep is wrong and the
 			// unlock is safe. Finish the commit tail.
 			u.logger.Warnf("[%s][%s] AddBlock returned an error but the block is stored, continuing the commit: %v", caller, block.Hash().String(), err)
+
+			insertRowsLate = rows != nil
 		case ctx.Err() != nil:
 			// The block is not stored yet, but ctx ended, so the server can still be committing it.
 			// Keep the files and abort.
@@ -793,11 +799,22 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 	// would delete the .subtree files of a block now recorded as having them, and fall through to
 	// normal validation, which finds the block stored and does nothing. ServiceError so the legacy
 	// park reads it as retry-later and keeps the block instead of rejecting a committed one.
-	if err := u.unlockSubtreeTransactionsWithRetry(ctx, block, caller); err != nil {
-		return markBlockCommitted(errors.NewServiceError("[%s][%s] block is committed but its UTXOs are still locked", caller, block.Hash().String(), err))
+	unlockErr := u.unlockSubtreeTransactionsWithRetry(ctx, block, caller)
+	if unlockErr == nil {
+		prometheusBlockValidationQuickCommitUnlock.Observe(time.Since(start).Seconds())
 	}
 
-	prometheusBlockValidationQuickCommitUnlock.Observe(time.Since(start).Seconds())
+	// After the unlock attempt, so a successful unlock never waits on the insert. After a failed one
+	// the outputs stay locked while the insert runs, and it still runs, since no later attempt
+	// quick-validates a stored block.
+	if insertRowsLate {
+		u.insertLaneRowsOfStoredBlock(ctx, block, rows, caller)
+	}
+
+	if unlockErr != nil {
+		return markBlockCommitted(errors.NewServiceError("[%s][%s] block is committed but its UTXOs are still locked", caller, block.Hash().String(), unlockErr))
+	}
+
 	start = time.Now()
 
 	// No updateSubtreesDAH here. The AddBlock above writes subtrees_set and mined_set in the

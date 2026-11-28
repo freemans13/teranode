@@ -459,6 +459,71 @@ func TestIndexAddBlockTwiceAddsItsRowsOnce(t *testing.T) {
 	require.Equal(t, Answer{}, c.main().Lookup(Pack(3, 8)), "the second load's rows are ignored")
 }
 
+// FillRows gives a loaded block that has no rows and is not folded the rows inserted after it was
+// loaded, and does nothing for a folded block, one with rows, one of only its coinbase, one not
+// loaded, or no rows. Rows that do not parse are refused.
+func TestIndexFillRowsGivesRowsOnlyToARowlessUnfoldedBlock(t *testing.T) {
+	c := newTestChain(t, 2)
+
+	c.add(1, 0, 1)
+	c.add(2, 1, 2, rowsOf(t, 3, 5))
+	require.NoError(t, c.idx.AddBlock(IndexBlock{ID: 3, Height: 3, Hash: blockHash(3), Parent: blockHash(2), TxCount: 1}, nil))
+	c.add(4, 3, 4)
+	c.add(5, 4, 5)
+	c.tip(5) // blocks 1 to 3 fold
+
+	require.ElementsMatch(t, []uint32{4, 5}, c.idx.Snapshot().AwaitingRows())
+
+	for _, tc := range []struct {
+		name string
+		id   uint32
+		rows []MapRow
+	}{
+		{"folded", 1, rowsOf(t, 3, 1)},
+		{"has rows", 2, rowsOf(t, 3, 6)},
+		{"coinbase only", 3, rowsOf(t, 3, 7)},
+		{"not loaded", 9, rowsOf(t, 3, 8)},
+		{"no rows", 4, nil},
+	} {
+		got, err := c.idx.FillRows(tc.id, tc.rows)
+		require.NoError(t, err, tc.name)
+		require.False(t, got, tc.name)
+	}
+
+	_, err := c.idx.FillRows(5, []MapRow{{Lane: 3, First: 0, Last: 1}})
+	require.Error(t, err, "a row that is not a range")
+
+	got, err := c.idx.FillRows(4, rowsOf(t, 3, 9))
+	require.NoError(t, err)
+	require.True(t, got)
+
+	got, err = c.idx.FillRows(4, rowsOf(t, 3, 10))
+	require.NoError(t, err)
+	require.False(t, got, "rows already held are never replaced")
+
+	require.ElementsMatch(t, []uint32{4, 5}, c.idx.Snapshot().AwaitingRows(), "not published until the next Publish")
+
+	c.idx.Publish()
+
+	require.ElementsMatch(t, []uint32{5}, c.idx.Snapshot().AwaitingRows())
+
+	a := c.main().Lookup(Pack(3, 9))
+	require.True(t, a.Mined)
+	require.Equal(t, uint32(4), a.BlockID)
+
+	for _, p := range []uint64{6, 7, 8, 10} {
+		require.False(t, c.main().Lookup(Pack(3, p)).Mined, "refused rows did not go in: %d", p)
+	}
+
+	// The filled rows fold like any others once the block is the settle depth deep.
+	c.add(6, 5, 6)
+	c.tip(6)
+
+	a = c.main().Lookup(Pack(3, 9))
+	require.True(t, a.Mined)
+	require.Equal(t, ViaFloor, a.Via, "folded into the floor")
+}
+
 // A row whose hole data does not parse is refused.
 func TestIndexRefusesHoleDataThatDoesNotParse(t *testing.T) {
 	idx := NewIndex(100)

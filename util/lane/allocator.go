@@ -37,6 +37,13 @@ const (
 	firstUnleasedLane = 254
 )
 
+// Why a take found no position in hand, the reason label of teranode_lane_wait_seconds.
+const (
+	waitAgedOut = "aged_out"
+	waitUsedUp  = "used_up"
+	waitNoLease = "no_lease"
+)
+
 // Timings are the lease timings a holder runs on (the blockchain_laneLease* and
 // blockchain_laneGrantDuration settings).
 type Timings struct {
@@ -118,8 +125,11 @@ type Allocator struct {
 	returned []uint64
 	spare    Grant
 	hasSpare bool
+	// noGrant is why the last grant left with no spare to move to was left: waitAgedOut or
+	// waitUsedUp.
+	noGrant string
 	// givingBack is the first position of a spare given back unused when the grant before it aged
-	// out, sent on grant requests until one is granted; 0 for none.
+	// out, sent on the next grant request and cleared when that request is granted or fails; 0 for none.
 	givingBack uint64
 	// pending settles the grants left and not yet reported, oldest first, until grant requests (the
 	// newest pair, pairToSendLocked) or the release (the oldest) carry them. It holds at most two: a
@@ -303,6 +313,12 @@ func (a *Allocator) Next(ctx context.Context) (uint64, error) {
 	}
 
 	v, ok, changed, err := a.takeLocked()
+
+	var reason string
+	if !ok && err == nil {
+		reason = a.waitReasonLocked()
+	}
+
 	a.mu.Unlock()
 
 	if ok {
@@ -316,6 +332,9 @@ func (a *Allocator) Next(ctx context.Context) (uint64, error) {
 	}
 
 	prometheusLaneWaits.Inc()
+
+	waitStart := time.Now()
+	defer func() { prometheusLaneWaitSeconds.WithLabelValues(reason).Observe(time.Since(waitStart).Seconds()) }()
 
 	timer := time.NewTimer(a.takeWait)
 	defer timer.Stop()
@@ -440,16 +459,31 @@ func (a *Allocator) leaveCurrentLocked(usedUp bool) {
 	switch {
 	case a.hasSpare && !usedUp && final != 0:
 		// The spare starts above this grant's unused tail. Giving it back lets the next grant start
-		// right after final instead.
+		// right after final instead. The grant aged out, so the take that now waits waits for that.
 		a.givingBack, a.hasSpare, a.next = a.spare.First, false, 0
+		a.noGrant = waitAgedOut
 	case a.hasSpare:
 		a.installLocked(a.spare, a.spareRequested)
 		a.hasSpare = false
 	default:
 		a.next = 0
+		a.noGrant = waitAgedOut
+
+		if usedUp {
+			a.noGrant = waitUsedUp
+		}
 	}
 
 	a.signal()
+}
+
+// waitReasonLocked is why a take that must wait found no position in hand.
+func (a *Allocator) waitReasonLocked() string {
+	if !a.leased || !a.withinStopLocked() {
+		return waitNoLease
+	}
+
+	return a.noGrant
 }
 
 // installLocked makes g the current grant, dropping the returned positions still held from the grant
@@ -718,6 +752,19 @@ func (a *Allocator) renew(want bool) error {
 	cancel()
 
 	if err != nil {
+		// The retry goes without the give-back, so a service that cannot take the spare back, such as
+		// one whose role may not delete hand-outs, still grants. Either way the request is safe to
+		// retry: had this one committed, its continuation is the lane's newest hand-out, not the spare.
+		// No grant is current while a give-back is in flight, so nothing sets another one meanwhile.
+		if r.GiveBack != 0 {
+			a.mu.Lock()
+			a.givingBack = 0
+			a.mu.Unlock()
+
+			prometheusLaneGiveBacksMissed.Inc()
+			a.logger.Warnf("[lane] grant request from %s giving back spare %d:%d failed, so the retry goes without it and positions after %d stay unused", a.holder, r.Lane, r.GiveBack, r.Settles.LastTaken)
+		}
+
 		return err
 	}
 

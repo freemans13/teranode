@@ -408,8 +408,10 @@ type IndexSnapshot struct {
 	forkHeights map[uint32]struct{}
 	// mainNoRows counts the loaded main-chain blocks with no rows.
 	mainNoRows int
-	stats      IndexStats
-	mainView   *ChainView
+	// awaitingRows are the loaded blocks with no rows that are not folded (AwaitingRows).
+	awaitingRows []uint32
+	stats        IndexStats
+	mainView     *ChainView
 }
 
 // IndexStats is the index's size, for the metrics.
@@ -468,6 +470,10 @@ func (s *IndexSnapshot) Block(id uint32) (BlockState, uint32) {
 
 	return BlockHasRows, b.height
 }
+
+// AwaitingRows are the loaded blocks the index holds no rows for and has not folded, which
+// FillRows can still give rows. A block of only its coinbase is never one: it has no rows by rule.
+func (s *IndexSnapshot) AwaitingRows() []uint32 { return s.awaitingRows }
 
 // MainBlockAt is the loaded main-chain block at height, if any.
 func (s *IndexSnapshot) MainBlockAt(height uint32) (uint32, bool) {
@@ -892,6 +898,49 @@ func (x *Index) AddBlock(b IndexBlock, rows []MapRow) error {
 	return nil
 }
 
+// FillRows gives rows to block id, loaded with none, for rows its store inserted after the index
+// loaded it. It does nothing, and reports false, for a block not loaded, one that has rows (rows
+// are insert-only, so those held are never replaced), one already folded into the floors, or no
+// rows. It is published with the next SetTip or Publish.
+func (x *Index) FillRows(id uint32, rows []MapRow) (bool, error) {
+	if len(rows) == 0 {
+		return false, nil
+	}
+
+	loaded := make([]*indexRow, len(rows))
+	lanes := make([]uint8, len(rows))
+
+	for i, r := range rows {
+		ir, err := loadRow(id, r)
+		if err != nil {
+			return false, err
+		}
+
+		loaded[i], lanes[i] = ir, r.Lane
+	}
+
+	x.mu.Lock()
+	defer x.mu.Unlock()
+
+	b, ok := x.blocks[id]
+	if !ok || b.hasRows || b.folded {
+		return false, nil
+	}
+
+	b.hasRows, b.rows, b.lanes = true, loaded, lanes
+
+	byLane := map[uint8][]*indexRow{}
+	for i, r := range loaded {
+		byLane[lanes[i]] = append(byLane[lanes[i]], r)
+	}
+
+	for l, add := range byLane {
+		x.replaceLane(l, add, nil)
+	}
+
+	return true, nil
+}
+
 // loadRow parses one row. Rows come from the blockchain store, which checked them, so this parses
 // without checking the encoding again.
 func loadRow(blockID uint32, r MapRow) (*indexRow, error) {
@@ -1178,6 +1227,10 @@ func (x *Index) publish() {
 			s.forkHeights[b.Height] = struct{}{}
 		case onMain && !b.hasRows:
 			s.mainNoRows++
+		}
+
+		if !b.hasRows && !b.folded {
+			s.awaitingRows = append(s.awaitingRows, id)
 		}
 	}
 

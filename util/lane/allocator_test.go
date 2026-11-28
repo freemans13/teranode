@@ -15,7 +15,9 @@ import (
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -349,7 +351,7 @@ func TestAllocatorGivesTheSpareBackWhenAGrantAgesOut(t *testing.T) {
 	}{
 		{"honoured", false, false, 52, ""},
 		{"ignored by an older service", true, false, 201, "[lane] blockchain service granted 0:201 to pod-3 instead of continuing after 51, so positions 52 to 200 stay unused"},
-		{"reply lost", false, true, 152, "[lane] blockchain service granted 0:152 to pod-3 instead of continuing after 51, so positions 52 to 151 stay unused"},
+		{"reply lost", false, true, 152, "[lane] grant request from pod-3 giving back spare 0:101 failed, so the retry goes without it and positions after 51 stay unused"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			clk := newStepClock()
@@ -374,8 +376,11 @@ func TestAllocatorGivesTheSpareBackWhenAGrantAgesOut(t *testing.T) {
 			require.Equal(t, Pack(0, 51), next(t, a), "still inside two minutes")
 
 			clk.step(time.Second)
+
+			agedOut := laneWaitCount(t, waitAgedOut)
 			require.Equal(t, Pack(0, c.next), next(t, a), "two minutes after the first take the spare goes back")
 			require.False(t, a.hasSpareGrant())
+			require.Equal(t, agedOut+1, laneWaitCount(t, waitAgedOut), "the take after the give-back waits, timed as an aged-out grant")
 
 			r := src.grantRequests()[1]
 			require.Equal(t, Settles{First: 1, LastTaken: 51}, r.Settles, "an aged grant settles at the highest position taken")
@@ -383,7 +388,7 @@ func TestAllocatorGivesTheSpareBackWhenAGrantAgesOut(t *testing.T) {
 			var gaps []string // the lost reply also logs its retry, which is not this warning
 
 			for _, w := range logs.warnings() {
-				if strings.Contains(w, "instead of continuing") {
+				if strings.Contains(w, "stay unused") {
 					gaps = append(gaps, w)
 				}
 			}
@@ -468,10 +473,13 @@ func TestAllocatorUnusedGrantExpiryWaitsForAFreshGrant(t *testing.T) {
 	a.takeWait = 30 * time.Millisecond
 	require.NoError(t, a.Start(context.Background()))
 	require.Eventually(t, func() bool { return a.Ready() == nil }, time.Second, time.Millisecond)
+	missed := testutil.ToFloat64(prometheusLaneGiveBacksMissed)
 	src.setDown(true)
 	clk.step(2 * time.Minute)
 	_, err := a.Next(context.Background())
 	require.ErrorIs(t, err, errors.ErrServiceUnavailable)
+	require.Error(t, a.renew(true), "a grant request to the down service fails, its error handled before renew returns")
+	require.Equal(t, missed, testutil.ToFloat64(prometheusLaneGiveBacksMissed), "a failed request that gives nothing back is no missed give-back")
 	require.NoError(t, a.Ready(), "the grant expired, not the lease")
 	src.setDown(false)
 	a.signal()
@@ -497,7 +505,10 @@ func TestAllocatorLateFirstTakeKeepsItsTwoMinuteUseWindow(t *testing.T) {
 	want := a.wantGrantLocked()
 	a.mu.Unlock()
 	require.False(t, want, "an aged-out grant alone asks for nothing before the next take")
+
+	agedOut := laneWaitCount(t, waitAgedOut)
 	require.Equal(t, Pack(0, 3), next(t, a), "switch exactly at the used-grant boundary, to a grant that continues the aged one")
+	require.Equal(t, agedOut+1, laneWaitCount(t, waitAgedOut), "the take waited for the grant after the aged one")
 	require.Equal(t, Settles{First: 1, LastTaken: 2}, src.grantRequests()[0].Settles)
 }
 
@@ -564,11 +575,22 @@ func TestAllocatorStopsTwoMinutesAfterItsLastGoodRenewal(t *testing.T) {
 
 	clk.step(time.Second)
 
+	before := laneWaitHistogram(t, waitNoLease)
+
 	start := time.Now()
 	_, err := a.Next(context.Background())
 	require.ErrorIs(t, err, errors.ErrServiceUnavailable)
 	require.Less(t, time.Since(start), 5*time.Second, "inside its bound")
 	require.Error(t, a.Ready())
+
+	// The take waited out its 200 ms under no_lease, and the histogram's buckets run 0.5 ms to 5 s.
+	after := laneWaitHistogram(t, waitNoLease)
+	require.Equal(t, before.GetSampleCount()+1, after.GetSampleCount())
+	require.GreaterOrEqual(t, after.GetSampleSum()-before.GetSampleSum(), a.takeWait.Seconds())
+
+	buckets := after.GetBucket()
+	require.InDelta(t, 0.0005, buckets[0].GetUpperBound(), 0)
+	require.InDelta(t, 5, buckets[len(buckets)-1].GetUpperBound(), 0)
 }
 
 func TestAllocatorTakesANewLeaseWhenItsLeaseWasClosed(t *testing.T) {
@@ -656,6 +678,65 @@ func TestNextFailsAfterClose(t *testing.T) {
 	require.ErrorIs(t, a.Ready(), errors.ErrServiceUnavailable, "a closed allocator is not ready, though its lease was recent")
 }
 
+// laneWaitHistogram is teranode_lane_wait_seconds for reason, read from the registry by name, or
+// an empty histogram before its first wait.
+func laneWaitHistogram(t *testing.T, reason string) *dto.Histogram {
+	t.Helper()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	for _, f := range families {
+		if f.GetName() != "teranode_lane_wait_seconds" {
+			continue
+		}
+
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "reason" && l.GetValue() == reason {
+					return m.GetHistogram()
+				}
+			}
+		}
+	}
+
+	return &dto.Histogram{}
+}
+
+// laneWaitCount is how many waits teranode_lane_wait_seconds holds for reason.
+func laneWaitCount(t *testing.T, reason string) uint64 {
+	t.Helper()
+
+	return laneWaitHistogram(t, reason).GetSampleCount()
+}
+
+// A take waits under no_lease when no lease is held, even one renewed a moment ago, or when the
+// last good renewal is older than the stop; otherwise under why its last grant was left.
+func TestAllocatorWaitReason(t *testing.T) {
+	clk := newStepClock()
+	a := NewAllocator(newFakeLeases(10), "wait-reason", Timings{Renew: time.Hour, Stop: 2 * time.Minute, GrantDuration: time.Hour}, nil)
+	a.now = clk.Now
+
+	for _, c := range []struct {
+		leased  bool
+		age     time.Duration
+		noGrant string
+		want    string
+	}{
+		{leased: false, age: 0, noGrant: waitAgedOut, want: waitNoLease},
+		{leased: true, age: 3 * time.Minute, noGrant: waitAgedOut, want: waitNoLease},
+		{leased: true, age: 0, noGrant: waitAgedOut, want: waitAgedOut},
+		{leased: true, age: 0, noGrant: waitUsedUp, want: waitUsedUp},
+	} {
+		a.mu.Lock()
+		a.leased, a.lastGood, a.noGrant = c.leased, clk.Now().Add(-c.age), c.noGrant
+		got := a.waitReasonLocked()
+		a.mu.Unlock()
+
+		require.Equal(t, c.want, got, "leased %t, last good renewal %s ago, grant left as %s", c.leased, c.age, c.noGrant)
+	}
+}
+
 // laneMetrics reads the per-process lane counters, which are process-wide, so tests compare deltas.
 type laneMetrics struct{ positions, grants, waits, failures float64 }
 
@@ -681,13 +762,37 @@ func TestAllocatorCountsEveryTakeAndGrant(t *testing.T) {
 	src.open[LeaseID{0xff}] = 0 // lane 0 is held elsewhere, so this allocator leases lane 1
 
 	a := newTestAllocator(t, src, quiet, nil)
-	a.takeWait = 100 * time.Millisecond
 
 	before := readLaneMetrics()
+	noLease, usedUp := laneWaitCount(t, waitNoLease), laneWaitCount(t, waitUsedUp)
+
+	// The open waits until the first take has counted its wait, so that take waits, unless the
+	// test stalls past the gate's 5 s fallback.
+	gate := make(chan struct{})
+
+	src.mu.Lock()
+	src.openGate, src.opening = gate, make(chan struct{})
+	src.mu.Unlock()
+
+	go func() {
+		for until := time.Now().Add(5 * time.Second); testutil.ToFloat64(prometheusLaneWaits) == before.waits && time.Now().Before(until); {
+			time.Sleep(time.Millisecond)
+		}
+
+		src.mu.Lock()
+		src.openGate, src.opening = nil, nil
+		src.mu.Unlock()
+
+		close(gate)
+	}()
 
 	for i := uint64(1); i <= 10; i++ {
 		require.Equal(t, Pack(1, i), next(t, a))
 	}
+
+	a.takeWait = 100 * time.Millisecond
+
+	require.Equal(t, noLease+1, laneWaitCount(t, waitNoLease), "the first take waited for the lease")
 
 	require.Eventually(t, a.hasSpareGrant, 5*time.Second, time.Millisecond)
 	require.Equal(t, laneMetrics{positions: 10, grants: 2, waits: 1}, readLaneMetrics().since(before),
@@ -705,6 +810,7 @@ func TestAllocatorCountsEveryTakeAndGrant(t *testing.T) {
 	_, err := a.Next(context.Background())
 	require.ErrorIs(t, err, errors.ErrServiceUnavailable)
 	require.Equal(t, laneMetrics{waits: 1, failures: 1}, readLaneMetrics().since(before), "the wait ran out")
+	require.Equal(t, usedUp+1, laneWaitCount(t, waitUsedUp), "the wait is timed, under the grant it used up")
 
 	// The caller gives up while it waits.
 	a.takeWait = time.Hour
@@ -1587,6 +1693,10 @@ func runAllocModel(t *testing.T, seed uint64, steps int) {
 			switch {
 			case src.answer == "error":
 				require.Error(t, err)
+
+				if req.GiveBack != 0 {
+					m.givingBack = 0 // the retry goes without it
+				}
 			case src.answer == "closed":
 				require.NoError(t, err)
 
