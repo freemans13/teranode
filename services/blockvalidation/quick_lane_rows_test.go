@@ -839,7 +839,17 @@ func TestQuickValidatedBlockCommit(t *testing.T) {
 
 			bv.utxoStore = locks
 
-			late := &lateInsertClient{ClientI: client, unlocks: &locks.unlocks}
+			// The unlocked output must be locked before the commit for its state at the insert to tell.
+			require.NoError(t, store.SetLocked(ctx, []chainhash.Hash{*txs[0].TxIDChainHash()}, true))
+
+			var lockedAtInsert bool
+
+			late := &lateInsertClient{ClientI: client, unlocks: &locks.unlocks, atInsert: func() {
+				md, getErr := store.Get(ctx, txs[0].TxIDChainHash(), fields.Locked)
+				require.NoError(t, getErr)
+
+				lockedAtInsert = md.Locked
+			}}
 			if c.insertFails {
 				late.err = errors.NewServiceError("insert failed")
 			}
@@ -869,6 +879,7 @@ func TestQuickValidatedBlockCommit(t *testing.T) {
 			require.Equal(t, 1, late.calls, "one insert")
 			require.Positive(t, late.unlocksBefore, "the unlock reached the store")
 			require.Equal(t, locks.unlocks.Load(), late.unlocksBefore, "every unlock attempt, retries included, ended before the insert began")
+			require.Equal(t, c.unlockFails, lockedAtInsert, "the output is unlocked in the store when the insert begins, unless the unlock failed")
 			require.True(t, late.live, "the insert runs although the caller gave up")
 			require.WithinDuration(t, start.Add(quickLaneLateInsertTimeout), late.deadline, 5*time.Second)
 
@@ -942,6 +953,8 @@ type lateInsertClient struct {
 	// unlocks, when set, counts the unlocks, and unlocksBefore is its value when the insert began.
 	unlocks       *atomic.Int32
 	unlocksBefore int32
+	// atInsert, when set, runs as the insert begins.
+	atInsert func()
 }
 
 func (c *lateInsertClient) InsertLaneMapRows(ctx context.Context, hash *chainhash.Hash, rows []lane.MapRow) error {
@@ -950,6 +963,10 @@ func (c *lateInsertClient) InsertLaneMapRows(ctx context.Context, hash *chainhas
 
 	if c.unlocks != nil {
 		c.unlocksBefore = c.unlocks.Load()
+	}
+
+	if c.atInsert != nil {
+		c.atInsert()
 	}
 	c.live = ctx.Err() == nil
 
@@ -978,10 +995,14 @@ type lockRecordingStore struct {
 	unlocks atomic.Int32
 }
 
-func (s *lockRecordingStore) SetLocked(context.Context, []chainhash.Hash, bool) error {
+func (s *lockRecordingStore) SetLocked(ctx context.Context, hashes []chainhash.Hash, value bool) error {
 	s.unlocks.Add(1)
 
-	return s.err
+	if s.err != nil {
+		return s.err
+	}
+
+	return s.Store.SetLocked(ctx, hashes, value)
 }
 
 // withQuickLaneBlockchain gives bv a blockchain client over a fresh SQLite blockchain store.
