@@ -509,12 +509,17 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 			source.failIDs.Store(id, true)
 		}
 
+		require.NoError(t, store.InsertLaneMapRows(ctx, more.id, takes(t, 3, 500)))
+
 		clock = clock.Add(lateRowsFirstWait)
 		r.readLateRows(ctx)
 		r.readLateRows(ctx)
 
 		require.Equal(t, 2, source.of(more.id-1), "read behind the failing batch")
 		require.Equal(t, 2, source.of(more.id), "read behind the failing batch")
+		requireCounted(t, ReaderValidator, KindAgree, lane.ViaRow, func() {
+			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 500), true, more.height)
+		})
 	})
 }
 
