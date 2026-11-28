@@ -671,9 +671,24 @@ func TestAllocatorCountsEveryTakeAndGrant(t *testing.T) {
 	before := readLaneMetrics()
 	noLease, usedUp := laneWaitCount(t, waitNoLease), laneWaitCount(t, waitUsedUp)
 
-	// The service is down for the first open, so the first take always waits for the lease.
-	src.setDown(true)
-	time.AfterFunc(20*time.Millisecond, func() { src.setDown(false) })
+	// The open waits until the first take has counted its wait, so that take always waits.
+	gate := make(chan struct{})
+
+	src.mu.Lock()
+	src.openGate, src.opening = gate, make(chan struct{})
+	src.mu.Unlock()
+
+	go func() {
+		for until := time.Now().Add(5 * time.Second); testutil.ToFloat64(prometheusLaneWaits) == before.waits && time.Now().Before(until); {
+			time.Sleep(time.Millisecond)
+		}
+
+		src.mu.Lock()
+		src.openGate, src.opening = nil, nil
+		src.mu.Unlock()
+
+		close(gate)
+	}()
 
 	for i := uint64(1); i <= 10; i++ {
 		require.Equal(t, Pack(1, i), next(t, a))
