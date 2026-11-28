@@ -11,7 +11,7 @@
 // main chain: once a second it reads the best block, walks back along the chain until it meets a
 // block it holds, loads the rows of every block on the way, one call per block by ID, and moves
 // its index's tip. Rows enter the index only by ID, along the chain or, for a loaded block that has
-// none and is not yet folded, on the follower's re-reads of it for about a minute (readLateRows),
+// none and is not yet folded, on the follower's re-reads of it for about 8.5 minutes (readLateRows),
 // so the rows of a block deleted before the index read its header, which name an ID no chain
 // reaches, never enter. A block deleted between the header read and the row read, or after it was loaded,
 // keeps its rows in use until the next tip move, and is then off the main chain (counted off_chain
@@ -25,7 +25,9 @@
 package lanereader
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -391,6 +393,16 @@ func (r *Reader) readLateRows(ctx context.Context) {
 
 	r.late = late
 
+	// Oldest due first, so blocks whose reads keep failing, which move back on each failure, do
+	// not hold the batch from the rest.
+	slices.SortFunc(due, func(a, b uint32) int {
+		if c := late[a].due.Compare(late[b].due); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(a, b)
+	})
+
 	if len(due) > lateRowsBatch {
 		due = due[:lateRowsBatch]
 	}
@@ -405,8 +417,8 @@ func (r *Reader) readLateRows(ctx context.Context) {
 
 // fillLateRows re-reads the rows of each block in due, all within one readTimeout, and gives the
 // index those it finds, taking a block that got rows, or has had its last re-read, out of awaiting.
-// A read that fails is not counted, and is tried again on the next pass. The caller holds the load
-// token.
+// A read that fails is not counted, and is tried again a second later, behind the blocks due before
+// it. The caller holds the load token.
 func (r *Reader) fillLateRows(ctx context.Context, now time.Time, due []uint32, awaiting map[uint32]struct{}) {
 	idx := r.idx.Load()
 	filled := false
@@ -418,6 +430,8 @@ func (r *Reader) fillLateRows(ctx context.Context, now time.Time, due []uint32, 
 		rows, err := r.source.LaneMapRows(readCtx, id)
 		if err != nil {
 			prometheusLaneReaderLoads.WithLabelValues("error").Inc()
+
+			r.late[id].due = now.Add(lateRowsFirstWait)
 
 			continue
 		}

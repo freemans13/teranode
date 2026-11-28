@@ -429,7 +429,7 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		})
 
 		// never was re-read in that pass too. Each later re-read comes 2, 4 ... 256 s after the one
-		// before: none early, one when due, a failed one tried again on the next pass.
+		// before: none early, one when due, a failed one tried again a second later.
 		require.Equal(t, 2, source.of(never.id))
 
 		last := clock
@@ -448,6 +448,11 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 				r.readLateRows(ctx)
 				source.failing.Store(false)
 				require.Equal(t, 1+k, source.of(never.id), "a failed read is not counted")
+
+				r.readLateRows(ctx)
+				require.Equal(t, 1+k, source.of(never.id), "a failed read is tried again a second later")
+
+				clock = clock.Add(lateRowsFirstWait)
 			}
 
 			r.readLateRows(ctx)
@@ -493,19 +498,38 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 
 		r.readLateRows(ctx)
 		require.Equal(t, lateRowsBatch+2, reread())
+
+		// Blocks whose reads keep failing move behind the rest, so they do not hold every batch.
+		more := c.line(top, lateRowsBatch+2)
+		follow(t, r)
+		r.readLateRows(ctx)
+
+		first := more.id - lateRowsBatch - 1
+		for id := first; id < first+lateRowsBatch; id++ {
+			source.failIDs.Store(id, true)
+		}
+
+		clock = clock.Add(lateRowsFirstWait)
+		r.readLateRows(ctx)
+		r.readLateRows(ctx)
+
+		require.Equal(t, 2, source.of(more.id-1), "read behind the failing batch")
+		require.Equal(t, 2, source.of(more.id), "read behind the failing batch")
 	})
 }
 
-// countingRows counts the rows reads of each block that succeed, and fails them while failing is set.
+// countingRows counts the rows reads of each block that succeed, and fails them while failing is set
+// or for the blocks in failIDs.
 type countingRows struct {
 	blockchainstore.Store
 	mu      sync.Mutex
 	reads   map[uint32]int
 	failing atomic.Bool
+	failIDs sync.Map
 }
 
 func (c *countingRows) LaneMapRows(ctx context.Context, id uint32) ([]lane.MapRow, error) {
-	if c.failing.Load() {
+	if _, fail := c.failIDs.Load(id); fail || c.failing.Load() {
 		return nil, errors.NewServiceError("rows read failed")
 	}
 
