@@ -410,6 +410,8 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		h := chainhash.Hash{1}
 		lateRows := testutil.ToFloat64(prometheusLaneReaderLateRows)
 
+		require.Equal(t, 9, lateRowsReads, "the window the PR and the metric help give: 1 s doubling to 256 s")
+
 		// Seen without rows: answers count rows_pending, and no re-read is due yet.
 		r.readLateRows(ctx)
 		require.Equal(t, 1, source.of(late.id), "loaded once, not yet read again")
@@ -466,6 +468,15 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 
 			r.readLateRows(ctx)
 			require.Equal(t, 2+k, source.of(never.id), "re-read %d when due", k+1)
+
+			want := KindRowsPending
+			if k == lateRowsReads-1 {
+				want = KindNoRows // its last re-read
+			}
+
+			requireCounted(t, ReaderValidator, want, lane.ViaNone, func() {
+				r.CompareHeight(ReaderValidator, h, lane.Pack(3, 99), true, never.height)
+			})
 
 			last = clock
 		}
@@ -530,8 +541,35 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 500), true, more.height)
 		})
 
+		// Drain every earlier re-read that is due, so the next batch holds only the blocks below.
+		source.failIDs.Clear()
+
+		clock = clock.Add(time.Hour)
+		for range 4 {
+			r.readLateRows(ctx)
+		}
+
+		// The oldest due go first: two blocks seen first are read in a full batch with later ones.
+		older := c.line(more, 2)
+		follow(t, r)
+		r.readLateRows(ctx)
+
+		clock = clock.Add(lateRowsFirstWait / 2)
+		newer := c.line(older, lateRowsBatch)
+		follow(t, r)
+		r.readLateRows(ctx)
+
+		clock = clock.Add(lateRowsFirstWait)
+		r.readLateRows(ctx)
+		require.Equal(t, 2, source.of(older.id-1), "older due first")
+		require.Equal(t, 2, source.of(older.id), "older due first")
+		require.Equal(t, 1, source.of(newer.id), "the newest waits for the next pass")
+
+		r.readLateRows(ctx)
+		require.Equal(t, 2, source.of(newer.id), "and is read on it")
+
 		// The running follower, on the real clock, takes a new block's late rows on its own.
-		last2 := c.add(more)
+		last2 := c.add(newer)
 
 		followCtx, stop := context.WithCancel(ctx)
 		defer stop()
