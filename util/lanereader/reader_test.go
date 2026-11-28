@@ -529,26 +529,20 @@ func TestReaderTakesRowsInsertedAfterItLoadedTheBlock(t *testing.T) {
 		requireCounted(t, ReaderValidator, KindAgree, lane.ViaRow, func() {
 			r.CompareHeight(ReaderValidator, h, lane.Pack(3, 500), true, more.height)
 		})
-	})
-}
 
-// The running follower takes a block's late rows on its own, within the first re-reads.
-func TestReaderFollowerTakesLateRows(t *testing.T) {
-	engines(t, func(t *testing.T, store blockchainstore.Store) {
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
+		// The running follower, on the real clock, takes a new block's late rows on its own.
+		last2 := c.add(more)
 
-		c := newChain(t, store)
-		b1 := c.add(nil, takes(t, 3, 1))
-		late := c.add(b1)
+		followCtx, stop := context.WithCancel(ctx)
+		defer stop()
 
-		r := newReader(ulogger.TestLogger{}, store, 100)
+		r.now = time.Now
 
-		go r.follow(ctx)
+		go r.follow(followCtx)
 
-		require.Eventually(t, func() bool { return r.Snapshot() != nil && r.Snapshot().TipHeight() == late.height }, 10*time.Second, 10*time.Millisecond)
-		require.NoError(t, store.InsertLaneMapRows(ctx, late.id, takes(t, 3, 7)))
-		require.Eventually(t, func() bool { return r.MainView().Lookup(lane.Pack(3, 7)).Mined }, 15*time.Second, 50*time.Millisecond)
+		require.Eventually(t, func() bool { return r.Snapshot().TipHeight() == last2.height }, 10*time.Second, 10*time.Millisecond)
+		require.NoError(t, store.InsertLaneMapRows(ctx, last2.id, takes(t, 3, 600)))
+		require.Eventually(t, func() bool { return r.MainView().Lookup(lane.Pack(3, 600)).Mined }, 15*time.Second, 50*time.Millisecond)
 	})
 }
 
